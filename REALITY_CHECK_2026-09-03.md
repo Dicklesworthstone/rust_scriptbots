@@ -1,5 +1,203 @@
 # Reality Check — rust_scriptbots — reassessed 2026-10-20
 
+### Browser clock execution TODO — 2026-10-24, LilacElm
+
+Consumer: the user's requested granular TODO. Gate: qualify the actual clock
+connection before reporting it delivered. Observed defect: RAF directly calls
+`SimHandle.tick`, so presentation cadence authorizes science (`bd-2z0.12.3`).
+This checklist retires at publication/handoff and earns no capability credit.
+
+- [x] Refresh canonical BR/BV, recent source, CASS and Agent Mail; preserve the
+  complete 718-record preimage and reserve exact source/test/tracker paths.
+- [x] Trace the existing browser-owned `HostCore`, fixed-deadline drive, bounded
+  catch-up receipt, canonical speed command and packaged-browser test consumer.
+- [x] Connect validated elapsed browser time to the existing host driver; retain
+  the explicit manual stepping API and truthful command/drive receipts.
+- [x] Make RAF snapshot-only. Drive through a separate bounded timer, apply
+  speed through canonical host commands, and preserve reset/permalink controls.
+- [x] Observe pause/visibility/resume and long-gap behavior without unbounded
+  catch-up or a render observer authorizing scientific steps.
+- [x] Add tests through production methods for equal scheduled work under
+  different observer cadences, invalid/backwards time, speed and reset boundaries.
+- [x] Extend existing actual-package browser controls to exercise stopped RAF,
+  manual reads, bounded catch-up and the independent driver; preserve original
+  DOM, corrupt-WASM and native/WASM parity checks.
+- [x] Execute the new clock selection against actual RCH-built debug WASM in
+  Chrome 130.0.6723.69, without a replaced simulation module. Old main fails at
+  its RAF `tick` call; changed main passes with RAF held and 120 extra presentations
+  leaving the observed tick unchanged. Actual timer progress, speed-zero pause,
+  injected `visibilitychange`/`document.hidden`, and resume are observed. This
+  does not prove OS page suspension, a latency budget or independent worker time.
+- [x] Exercise actual WASM bindings separately: four founders, a 20-second late
+  drive completes eight science steps and reports 2,399 due/2,391 skipped;
+  same-time drive and paused interval complete zero. Manual two-step reaches ten;
+  five invalid/backwards times refuse without changing that tick; reset returns
+  to zero. The bound is checked against the host declaration in the Rust test.
+- [x] Retain the initial full native-library result: 27 passed, one failed and
+  one existing ignored fixture writer. The failure is the absent generated
+  browser package, not a successful browser run. Original committed native
+  parity fixture still matches fresh generation. The four new clock units pass
+  separately (RCH `30078439050444808`, 0.16 test seconds, 25 filtered).
+- [x] Observe the existing three DOM contract controls and four permalink/fork
+  DOM cases in actual Chrome with their explicit mock modules. These protect
+  presentation contracts and earn no actual-simulation/package credit.
+- [x] Build the initial WASM draft through strict-remote RCH
+  `30078439050444811` and verify its Rust formatting through
+  `30078439050444812`; both complete zero/acknowledged.
+  Matching official wasm-bindgen 0.2.129 produces diagnostic bindings outside
+  the checkout. This is not the pinned wasm-pack package/DSR acceptance lane.
+- [x] Probe the actual JS receipt boundary. The first one-nanosecond-above-limit
+  input rounds back inside the representable range, so it does not reproduce
+  the suspected failure; its failed expectation is retained. One millisecond
+  above the derived limit reproduces the defect: tick zero advances to eight,
+  then receipt serialization refuses `9007199255740991` as a JavaScript number.
+- [x] Requalify the repair: validate against `Number::MAX_SAFE_INTEGER` before
+  the host boundary, refuse that input with unchanged science, and keep a
+  representable boundary positive. Final debug WASM build `30078439050444814`,
+  four Rust clock units `30078439050444815` (0.13 seconds, 25 filtered) and
+  formatting `30078439050444816` complete zero/acknowledged. Final actual-browser
+  readback refuses the oversized timestamp at tick zero; a safe boundary reports
+  `9007199254000001ns` with zero paused work. The same clock selection again
+  rejects old main and passes changed main: held-RAF ticks 42 to 81, 120
+  presentations remain at 81, pause/hidden remain at 89 and resume reaches 99.
+  These are observations, not throughput measurements. Rust SHA256 is
+  `7769266f050947ffffdcd9f844f3a3937107e350e86cea5c1a2799926308339e`.
+  Two unit admissions refuse for no free slot and a first diagnostic wrapper
+  lacks its inert `/empty` page; these retain no functional credit. The saved
+  runner supplies that page and reruns the unchanged assertions successfully.
+- [x] Correct first-window rate accounting. Holding the first paint for 600 ms
+  reproduces zero displayed TPS despite an advanced actual world. Initialize
+  the delta counter from the real starting snapshot; the identical strengthened
+  case passes, with a positive first displayed rate and all original controls.
+  The final observed held-RAF ticks are 82 to 121, 120 presentations remain at
+  121, pause/hidden remain at 129 and resume reaches 139. The three explicit
+  stats doubles and four permalink/fork doubles pass again. No throughput,
+  latency, original 500-ms stats boundary or application deadline is changed.
+- [x] Freeze and read every hunk of the seven-path source candidate, then commit
+  `e8afa2124f1f0a44d90e437a4adec2c3f6690ff3`. Read the separate observed
+  first-rate repair and commit `ad867e6d61552b0b1a99886837b3d7bfb09ff4e3`.
+  Rust blob `4cda6aea` is unchanged in the second commit; final main/test SHA256
+  match the actual browser report `browser-clock-initial-stats.json`.
+- [x] Run affected tests and required formatting/workspace check/strict Clippy
+  through strict-remote RCH. Retain raw logs and exact source identities. Browser
+  package/native DSR acceptance is separate and must not be inferred from units.
+  Committed source `ad867e6d` without overlays passes workspace/all-target check
+  `30078439050444817` and strict Clippy `30078439050444818`, each zero with
+  terminal acknowledgement. Worker Rust/main/test hashes match the reviewed
+  source at `2026-10-24T14:58:16Z`. Earlier draft check/Clippy successes retain
+  their own source identities; the failed final-check admission on disk-critical
+  worker 115 is infrastructure only. No local Cargo fallback or cleanup runs.
+- [x] Re-read the complete source diff and original acceptance; record bounded
+  self-audit and preserve all complete parent criteria.
+- [x] Append final scoped evidence comments to the two existing work owners:
+  comments `2954`–`2957`; original statuses, owners and requirements are unchanged.
+- [x] Export and audit every tracker record/field/comment against the preimage;
+  restore only proven omitted historical provenance and leave all other work intact.
+  All 718 ordered IDs remain. The exporter omits `source_repo_path` from 392
+  records: 391 unrelated rows and one target. These are their only unexpected
+  field deltas. Data-only recovery restores that exact historical provenance;
+  all 716 unrelated raw rows are byte-identical to the preimage. Targets change
+  only comments and `updated_at`; all three/13 original comments are unchanged
+  prefixes, with two additions per target. Active/archived dependency cycles
+  remain zero. Canonical SHA256:
+  `915450d49e9fb4371511079a164f869b93d3b748bf7d8976c0ee23dbd00d6262`.
+- [ ] Read the exact metadata changes and commit their immutable review separately.
+  UBS returns unsupported-language exit 3 for Markdown/JSONL; this is no scan or
+  pass. These changes receive literal/structural review with no scanner bypass.
+- [ ] Final transport, pending when the metadata snapshot is frozen: release ten
+  leases, pull and immediately import BR, push main and its legacy mirror, align
+  the local mirror and verify actual refs/source/tracker hashes. The external
+  publication record and final response carry these observations; this snapshot
+  does not assert its own future push. The scoped checklist retires at handoff.
+
+Evidence: `/data/tmp/scriptbots-browser-clock-20261024-lilacelm`. The existing
+browser task retains BoldWolf's ownership, dependencies and complete acceptance.
+No blocked tooling, browser durability, hardware or central DSR gate is closed.
+BR correctly refuses a status claim while `bd-2z0.8.13` is blocked; no force or
+graph change follows. Work comments also update the already-in-progress packaging
+owner `bd-azi3`. Full package/native DSR acceptance remains owed. The adapters
+still share the main JS thread: expensive rendering or suspension can delay the
+timer, and its observed skipped opportunities remain visible.
+
+**Bounded self-audit — browser clock increment; solo verification.** The
+README's artificial-life laboratory needs a scientific clock that presentation
+does not directly advance. Inventory: two USER repairs (elapsed-time host
+connection and truthful initial rate accounting), one ENABLER (production-method and
+browser controls), one explicitly requested PROCESS record (this TODO/evidence),
+zero UNKNOWN items. This is a diagnosis, not a quota. A two-minute demo holds RAF
+and observes timer progress, then presents repeatedly without changing the tick.
+Without this process record the runtime is identical; it serves the user's
+tracking request and retires at handoff. The actual Canvas consumer and real
+browser exercise the enabler. The oldest open user outcome remains the July 11
+Evolution Lab umbrella `bd-2z0`; this improves its browser component. No delegates,
+close-count contest, plan-only substitute, new follow-up or closure occurs.
+Verdict: HEALTHY within the bounded connection, with complete parent acceptance
+still open. Compiler waiting earns no capability credit.
+
+Honesty inventory, bounded to this source diff, raw RCH/browser logs and original
+criteria; final compiler outcomes are recorded separately before publication:
+
+1. No (checked: all original assertions, native fixture bytes, test features,
+   budgets and ignores remain; new tests/observations add requirements).
+2. Existing DOM doubles were adapted for the new API. Their three stats and four
+   permalink cases are explicitly mock-module contract evidence. Actual science
+   uses real `HostCore`/MLP worlds and actual RCH-built WASM, never those doubles.
+3. No (checked: no golden/fixture, lockfile or dependency changes).
+4. Yes, existing tests gain stricter clock/API controls. No threshold, retry,
+   application deadline, ignore or suppression is relaxed. The existing library
+   browser prerequisite failure remains failed, not filtered into a green suite.
+5. No (checked: production has no fixture/test/benchmark condition; all clock
+   inputs use the same host driver and command path).
+6. No zero-run credit (checked: four selected clock units execute; the complete
+   native attempt is 27/1/1. Its browser-fork early return for missing Chrome
+   earns no browser credit. Browser selections are named, not a whole-suite pass).
+7. No (checked: only completed observations above are credited; final committed
+   compiler results are separate from earlier drafts and original package/DSR).
+8. No (checked: real WASM, mock DOM, selected diagnostics, native fixture equality,
+   and original package/DSR acceptance have separate labels. Browser time is
+   controlled in Playwright; injected visibility is not OS suspension evidence).
+9. No (checked: missing-package failure, first formatting failure, refused Bead
+   claim and unavailable later worker-cache path remain visible in retained logs).
+10. No (checked: raw compiler, browser and scanner stdout/stderr are retained).
+11. No (checked: original owners, statuses, acceptance and dependencies remain;
+    BR refuses the blocked status transition, with no force or graph edit).
+12. No (checked: requirements are unchanged; README describes the actual changed
+    speed control and exposes shared-main-thread/catch-up limits).
+13. No delegated closes (checked: this increment is solo and closes no task).
+14. No gaming dispatch (checked: no subagent was dispatched).
+15. No unverified delegate report (checked: none was used).
+16. No refusal farming (checked: actual positive clock behavior is delivered;
+    no new refusal-only task or close is created).
+17. No agreement counted as proof (checked: Agent Mail is coordination only;
+    no independent sign-off or peer acknowledgement is claimed).
+18. No (checked: four Rust tests, fixed browser time/control sequence, 120 extra
+    presentations and original DOM thresholds precede their results. Observed
+    tick counts are not substituted for a TPS or latency measurement).
+19. The initial full library invocation lacked its generated package. A focused
+    browser diagnostic executes the exact new test selection with actual debug
+    bindings; it does not complete the full package gate. Existing JS scanner
+    criticals stay seven before/after: two HTML-flow reports whose production
+    digest strings are formatted from Rust `u64`s, and five fixed Playwright
+    DOM callbacks. No suppression is added. Final Rust scan has zero critical/333
+    warning/101 information items; final JS has seven/88/184 versus seven/83/126 on
+    the old source. Neither a warning-clean nor a clean JS scan is claimed.
+    Review also reproduces and repairs the new receipt-range boundary and the
+    first delayed paint's missing rate prefix. The first rounded-boundary probe
+    does not reproduce; the later actual serializer failure does. The diagnostic
+    wrapper's first missing inert page fails before its API phase; the retained
+    saved runner fixes only that route and reruns unchanged product assertions.
+20. Strongest evidence: the same actual-WASM browser clock selection rejects old
+    main's RAF `tick` call and passes changed main. Rust observer tests also
+    compare actual `WorldDigestV1`; the earlier draft's fresh native parity
+    generation matches the unchanged committed fixture. These are self-executed
+    diagnostics, not a later full-library or independent qualification.
+
+Six bounded CASS searches since October 24, including the changed browser test
+filename, return zero indexed hits; unindexed sessions are not thereby audited.
+The local proof root has an SBH marker and sacred-path entry. No cleanup,
+RCH worker/daemon/cache policy, global capacity or performance baseline changes
+occur. The requested detailed checklist and original acceptance remain distinct.
+
 ### Host-continuation execution TODO — 2026-10-24, LilacElm
 
 Consumer: the user explicitly requests a granular TODO and implementation of

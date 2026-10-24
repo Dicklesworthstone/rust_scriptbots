@@ -4,6 +4,21 @@
 
 **Evidence date:** 2026-07-11
 
+**Browser clock connection (2026-10-24):** [Currently In Progress — original
+`bd-2z0.12.3` acceptance; scoped source delivered by LilacElm]
+`e8afa212` connects the existing browser-owned `HostCore` fixed-deadline driver to
+a timer independent of RAF, with immutable snapshot presentation, canonical
+speed/manual commands, bounded catch-up, visible skipped opportunities and
+reset/permalink/visibility behavior. A reproduced too-large JS receipt timestamp
+is refused before science. `ad867e6d` includes actual pre-paint work in the first
+rate window. Four actual host units, debug-WASM/Chrome old/new controls and format
+pass; the complete native library attempt retains its missing-package failure.
+The final committed-source workspace check and strict Clippy pass through RCH.
+The detailed TODO and proof boundaries are in the existing Reality
+Check report. Shared-main-thread scheduling, original packaged-browser, blocked
+tooling, native/DSR, browser durability and platform acceptance stay open; no
+original owner, requirement, dependency or gate is removed.
+
 **Reality-check refresh (2026-10-20):** [Assessment completed — LilacElm;
 implementation and original acceptance remain in progress]
 The current 25-outcome checklist and ordered bridge are at the top of
