@@ -1456,8 +1456,8 @@ fn science_service_messages(
                         .map(|checkpoint| CheckpointViewEntry {
                             checkpoint_id: checkpoint.checkpoint_id,
                             tick: checkpoint.tick,
-                            agent_count: None,
-                            digest: None,
+                            agent_count: Some(checkpoint.agent_count),
+                            digest: Some(checkpoint.world_digest_v1),
                             file_size_bytes: checkpoint.byte_size,
                         })
                         .collect(),
@@ -18413,6 +18413,8 @@ for case in ('panic', 'subscription', 'renderer'):
         use frankentui_shell::{ShellMessage, ShellRoute};
         use science_screens::ScreenDataState;
 
+        const FOUNDERS: usize = 4;
+
         // Keep artifacts outside the checkout and retain them for independent
         // inspection. No cleanup guard deletes checkpoint or experiment evidence.
         let artifacts = std::env::temp_dir().join(format!(
@@ -18424,7 +18426,15 @@ for case in ('panic', 'subscription', 'renderer'):
             "retained terminal provider artifacts: {}",
             artifacts.display()
         );
-        let host = TerminalTestHost::take(command_characterization_world());
+        let world = command_characterization_world();
+        for _ in 0..FOUNDERS {
+            world
+                .lock()
+                .expect("founder setup before owner transfer")
+                .try_spawn_agent(scriptbots_core::AgentData::default())
+                .expect("actual nonempty checkpoint population");
+        }
+        let host = TerminalTestHost::take(world);
         let handle = ControlHandle::new(host.port())
             .with_artifacts_dir(artifacts.clone())
             .expect("reserve unique real data-service artifacts");
@@ -18464,6 +18474,9 @@ for case in ('panic', 'subscription', 'renderer'):
         assert_eq!(checkpoint.tick, owner_before.tick.0);
         assert_eq!(decoded.tick().0, checkpoint.tick);
         assert_eq!(decoded.source_digest(), &owner_before);
+        assert_eq!(checkpoint.agent_count, FOUNDERS);
+        assert_eq!(checkpoint.agent_count, decoded.agent_count());
+        assert_eq!(checkpoint.world_digest_v1, decoded.source_digest().overall);
         assert_eq!(checkpoint.byte_size, u64::try_from(bytes.len()).unwrap());
         assert_eq!(artifact.byte_size, checkpoint.byte_size);
         assert_eq!(artifact.checksum_blake3, checkpoint.checksum_blake3);
@@ -18485,10 +18498,17 @@ for case in ('panic', 'subscription', 'renderer'):
         assert_eq!(projected_checkpoint.checkpoint_id, checkpoint.checkpoint_id);
         assert_eq!(projected_checkpoint.tick, checkpoint.tick);
         assert_eq!(projected_checkpoint.file_size_bytes, checkpoint.byte_size);
-        assert_eq!(projected_checkpoint.agent_count, None);
-        assert_eq!(projected_checkpoint.digest, None);
+        assert_eq!(
+            projected_checkpoint.agent_count,
+            Some(decoded.agent_count())
+        );
+        assert_eq!(
+            projected_checkpoint.digest.as_deref(),
+            Some(decoded.source_digest().overall.as_str())
+        );
         assert_eq!(replay.observed_live_tick, None);
         assert!(replay.first_divergence.is_none());
+        let saved_catalog = replay.checkpoints.clone();
 
         let experiment_id = "terminal-provider";
         let seed = 77;
@@ -18616,11 +18636,13 @@ for case in ('panic', 'subscription', 'renderer'):
             let text = frankentui_shell::buffer_to_string(frame);
             match route {
                 ShellRoute::Replay => {
+                    assert!(text.contains(&format!("Selected: {}", checkpoint.checkpoint_id)));
                     let row = text
                         .lines()
-                        .find(|line| line.contains(&checkpoint.checkpoint_id))
-                        .expect("real checkpoint identity is visibly rendered");
-                    assert_eq!(row.matches("unavailable").count(), 2);
+                        .find(|line| line.trim_start().starts_with('>') && line.contains("ckpt-"))
+                        .expect("real checkpoint row is visibly rendered");
+                    assert!(!row.contains("unavailable"));
+                    assert!(row.contains(&decoded.source_digest().overall[..12]));
                     assert!(!text.contains(&checkpoint.checksum_blake3));
                     assert!(!text.contains(&decoded.source_digest().overall));
                     assert!(text.contains("No replay comparison recorded"));
@@ -18660,6 +18682,54 @@ for case in ('panic', 'subscription', 'renderer'):
                 .join(experiment_id)
                 .join("status.json")
                 .is_file()
+        );
+
+        // Change both tick and population through the actual owner after saving.
+        // A catalog query and an exact retry must retain the earlier saved cut.
+        let mut app = simulator.model().app.borrow_mut();
+        app.submit_and_wait(ControlCommand::SpawnAgent {
+            herbivore_tendency: 0.5,
+        })
+        .expect("change the live population");
+        app.submit_and_wait(ControlCommand::Step)
+            .expect("advance the live owner after capture");
+        let later = handle.capture_checkpoint_v1().expect("later owner cut");
+        assert!(later.tick().0 > checkpoint.tick);
+        assert_ne!(later.agent_count(), checkpoint.agent_count);
+        assert_ne!(later.source_digest().overall, checkpoint.world_digest_v1);
+        let retry = handle
+            .create_checkpoint(CheckpointCreateRequest {
+                description: Some("terminal provider positive proof".into()),
+                idempotency_key: Some("terminal-provider-checkpoint".into()),
+            })
+            .expect("same captured artifact after live changes");
+        assert_eq!(
+            serde_json::to_value(&retry).expect("retry metadata"),
+            serde_json::to_value(&checkpoint).expect("original metadata")
+        );
+        assert_eq!(
+            handle
+                .read_artifact_bytes(&retry.checkpoint_id)
+                .expect("unchanged retained artifact")
+                .1,
+            bytes
+        );
+        let retained = science_service_messages(&handle, ShellRoute::Replay, 5)
+            .into_iter()
+            .find_map(|message| match message {
+                ShellMessage::SetReplayData(ScreenDataState::Data(data)) => Some(data),
+                _ => None,
+            })
+            .expect("saved checkpoint remains available after the live world changes");
+        assert_eq!(retained.checkpoints, saved_catalog);
+        assert!(retained.first_divergence.is_none());
+        assert_eq!(
+            handle
+                .capture_checkpoint_v1()
+                .expect("read-only catalog")
+                .source_digest(),
+            later.source_digest(),
+            "catalog and retry must not advance science"
         );
     }
 

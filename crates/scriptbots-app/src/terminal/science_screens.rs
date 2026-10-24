@@ -413,6 +413,7 @@ impl ScienceScreensState {
 // ---------------------------------------------------------------------------
 
 const SCIENCE_TABLE_ROWS: usize = 5;
+const CHECKPOINT_ID_COLUMNS: usize = 19;
 
 fn first_visible_table_index(selected_index: usize, visible_rows: usize) -> usize {
     selected_index.saturating_sub(visible_rows.saturating_sub(1))
@@ -921,13 +922,14 @@ pub fn render_replay_screen(
                     };
                     let kb = cp.file_size_bytes / 1024;
                     let line = format!(
-                        " {} {:<19} {:<7} {:<7} {:<8}  {:.12}",
+                        " {} {:<id_width$.id_width$} {:<7} {:<7} {:<8}  {:.12}",
                         cursor,
                         cp.checkpoint_id,
                         cp.tick,
                         observation_text(cp.agent_count, |value| value.to_string()),
                         kb,
-                        cp.digest.as_deref().unwrap_or("unavailable")
+                        cp.digest.as_deref().unwrap_or("unavailable"),
+                        id_width = CHECKPOINT_ID_COLUMNS,
                     );
                     print_text(frame, 4, row, &line);
                 }
@@ -970,6 +972,14 @@ pub fn render_replay_screen(
 
             if let Some(receipt) = &data.export_receipt {
                 print_text(frame, 2, div_y + 3, &format!("  Export: {receipt}"));
+            }
+            if let Some(selected) = data.checkpoints.get(data.selected_checkpoint_index) {
+                print_text(
+                    frame,
+                    2,
+                    div_y + 4,
+                    &format!("  Selected: {}", selected.checkpoint_id),
+                );
             }
         }
     }
@@ -1472,6 +1482,70 @@ mod tests {
                 .expect("deserialize experiment measurements"),
             data
         );
+    }
+
+    #[test]
+    fn checkpoint_catalog_generated_ids_keep_measurements_and_selected_identity_visible() {
+        let checkpoints: Vec<_> = (0_u64..12)
+            .map(|index| CheckpointViewEntry {
+                checkpoint_id: format!(
+                    "ckpt-{}-t{}",
+                    &blake3::hash(&index.to_le_bytes()).to_hex()[..32],
+                    index + 100
+                ),
+                tick: index + 100,
+                agent_count: Some(40 + usize::try_from(index).expect("small population")),
+                digest: Some(
+                    blake3::hash(&[u8::try_from(index).expect("small fixture index")])
+                        .to_hex()
+                        .to_string(),
+                ),
+                file_size_bytes: 2048,
+            })
+            .collect();
+        let selected = checkpoints.last().expect("nonempty catalog");
+        let mut harness = FrankenTuiSimulatorHarness::new();
+        harness.init();
+        harness.dispatch(ShellMessage::SetReplayData(ScreenDataState::Data(
+            ReplayViewData {
+                checkpoints: checkpoints.clone(),
+                selected_checkpoint_index: checkpoints.len() - 1,
+                ..ReplayViewData::default()
+            },
+        )));
+        harness.dispatch(ShellMessage::Navigate(ShellRoute::Replay));
+        let frame = harness.capture_frame_str(80, 24);
+        let selected_row = row(&frame, &selected.checkpoint_id[..CHECKPOINT_ID_COLUMNS]);
+        assert!(selected_row.trim_start().starts_with('>'));
+        assert!(selected_row.contains(&format!(
+            "{:<7} {:<7}",
+            selected.tick,
+            selected.agent_count.expect("measured population")
+        )));
+        assert!(selected_row.contains(&selected.digest.as_ref().expect("measured digest")[..12]));
+        assert!(frame.contains(&format!("Selected: {}", selected.checkpoint_id)));
+        assert!(frame.contains("No replay comparison recorded"));
+        assert!(!frame.contains("Determinism verified"));
+        assert!(!frame.contains(&checkpoints[0].checkpoint_id[..CHECKPOINT_ID_COLUMNS]));
+        let table_rows: Vec<_> = frame
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| line.contains("ckpt-") && !line.contains("Selected:"))
+            .collect();
+        assert_eq!(table_rows.len(), SCIENCE_TABLE_ROWS);
+        let verification_row = frame
+            .lines()
+            .position(|line| line.contains("DETERMINISM VERIFICATION"))
+            .expect("verification stays visible");
+        assert!(
+            table_rows
+                .iter()
+                .all(|(index, _)| *index < verification_row)
+        );
+        for (width, height) in [(0, 0), (1, 1), (40, 12), (80, 16)] {
+            let frame = harness.capture_frame_str(width, height);
+            assert!(!frame.contains("Determinism verified"));
+        }
     }
 
     #[test]

@@ -221,6 +221,16 @@ RUST_LOG=info cargo run -p scriptbots-app
   envelope; application and journal durability are shown separately. Under render pressure,
   the runtime may select a labeled reduced-detail view. These paths are implemented; their
   current native and cross-platform qualification is tracked in the linked reality check.
+- In Replay (`7`), press `K` to save a checkpoint and use Up/Down to select a
+  catalog row. It shows that saved cut's population and first twelve characters
+  of its `WorldDigestV1`, separately from the live tick and artifact checksums.
+  The full selected checkpoint ID appears below the comparison section; table
+  IDs are shortened to keep measured columns visible in an 80-column terminal.
+  REST/MCP checkpoint metadata carries `agent_count` and the full
+  `world_digest_v1`. These values describe the saved cut even after the world
+  advances or an identical capture request is retried. Viewing the catalog
+  neither executes replay nor verifies determinism; no-comparison status remains
+  explicit. Native-window/PTY and full DSR acceptance remain open.
 - Auto selection: `SCRIPTBOTS_MODE=auto` (default) chooses only a renderer compiled into the binary—GPUI first, then Bevy—and only in a real native graphical session; otherwise it uses the terminal. Linux/Unix sessions require a display environment; local macOS sessions use the native window system without X11 variables, while SSH sessions choose the terminal.
 - Auto-mode policy overrides:
   - `SCRIPTBOTS_FORCE_TERMINAL=1` → choose terminal in Auto mode even when a display server is present.

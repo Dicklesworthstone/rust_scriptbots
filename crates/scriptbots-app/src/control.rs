@@ -644,6 +644,10 @@ pub struct CheckpointCreateRequest {
 pub struct CheckpointMetadataDto {
     pub checkpoint_id: String,
     pub tick: u64,
+    /// Live stable agents in the saved checkpoint, not the later live world.
+    pub agent_count: usize,
+    /// Captured WorldDigestV1 overall digest, distinct from either artifact checksum.
+    pub world_digest_v1: String,
     pub byte_size: u64,
     pub checksum_blake3: String,
     pub checksum_sha256: String,
@@ -1929,6 +1933,8 @@ impl ControlHandle {
         let meta = CheckpointMetadataDto {
             checkpoint_id: checkpoint_id.clone(),
             tick,
+            agent_count: checkpoint.agent_count(),
+            world_digest_v1: checkpoint.source_digest().overall.clone(),
             byte_size,
             checksum_blake3: blake3_hex.clone(),
             checksum_sha256: sha256_hex.clone(),
@@ -3931,6 +3937,12 @@ pub(crate) mod tests {
             .create_checkpoint(request.clone())
             .expect("exact retry");
         assert_eq!(result.checkpoint_id, pending.metadata.checkpoint_id);
+        let decoded = scriptbots_core::WorldCheckpointV1::decode(&original)
+            .expect("actual retained empty checkpoint");
+        assert_eq!(result.agent_count, 0);
+        assert_eq!(result.agent_count, decoded.agent_count());
+        assert_eq!(result.world_digest_v1, decoded.source_digest().overall);
+        assert_ne!(result.world_digest_v1, result.checksum_blake3);
         assert_eq!(
             serde_json::to_value(handle.create_checkpoint(request).expect("repeat retry"))
                 .expect("retry metadata"),
