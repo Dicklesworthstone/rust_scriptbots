@@ -1,5 +1,240 @@
 # Reality Check — rust_scriptbots — reassessed 2026-10-20
 
+### Saved checkpoint catalog TODO — 2026-10-24, LilacElm
+
+Consumer: the user's requested granular TODO. Gate: report this connection only
+after actual checkpoint capture/readback and live projection tests. Observed gap:
+the Replay provider always supplies absent population/digest despite an actual
+captured checkpoint. The checklist retires at publication/handoff; it is not a
+capability or replay-verification claim.
+
+- [x] Refresh canonical Beads/BV, recent commits, Agent Mail and CASS. Reserve
+  exact paths; protect the external proof directory and save all 718 records.
+- [x] Trace the actual owner capture, retained metadata/retry, catalog service,
+  live Replay provider and renderer. Preserve existing complete task criteria.
+- [x] Record population and scientific digest from the exact captured checkpoint;
+  actual file readback verifies both observations below.
+- [x] Connect those observations to Replay in the source without reading the
+  changing world or confusing the artifact checksum with the scientific digest.
+- [x] Fit full-length checkpoint IDs into their declared table column, retain
+  bounded selected rows and display the full selected ID below comparison;
+  preserve truthful unavailable observations and no-comparison state.
+- [x] Test a nonempty actual saved checkpoint and decoded readback; advance the
+  real owner and confirm old observations and idempotent retry remain unchanged.
+- [x] Test empty population, missing observations, long IDs, bounded scrolling,
+  selection and small terminal dimensions through production render paths.
+- [x] Run affected production tests, formatting, workspace check and strict
+  Clippy through remote RCH; retain exact source identity and all failures.
+- [x] Review every changed source/test hunk and UBS findings; fill the bounded
+  real-work/honesty audit, then commit the logical product change.
+- [x] Append scoped evidence to existing owners without closing broader gates;
+  export and audit every tracker record/field/comment against the fresh preimage.
+- [ ] Review and commit tracker/report metadata separately, release leases, pull
+  and immediately import, publish both required refs and verify actual identities.
+
+Proof root: `/data/tmp/scriptbots-checkpoint-catalog-20261024-lilacelm`.
+No unavailable macOS, native-window, performance or central DSR acceptance is
+claimed. `/data/projects/AGENTS.md` is still absent on this host; repository rules
+and unchanged original task requirements remain in force.
+
+Product commit: `dc8aa8bdb1884eb518f9292897a7535bb99b06eb`, the exact four-path
+reviewed candidate. Final comments `2960` / `2961` append scoped evidence to
+`bd-2z0.6.8` / `bd-2z0.5.13`; starting comments are `2958` / `2959`.
+Both remain in progress with LilacElm and unchanged complete acceptance.
+The 718-record export audit preserves ordered unique IDs, all 716 unrelated raw
+rows, every old target field/comment prefix, and all dependency edges. Only the
+two target comment arrays and update timestamps change (46→48 and 52→54 comments).
+The exporter again drops `source_repo_path` in 392 records; the reviewed repair
+restores only those proven omissions from the fresh preimage, including 391
+unrelated raw rows. Canonical SHA256 is
+`90e855322807014056d7ce9c286c62f0edf03b1213dc1ae5921103970578fd9b`;
+cycles including closed tasks remain empty. Metadata review/commit and actual
+transport are pending at this frozen report cut. Their later observed outcome
+belongs to the external `publication.json` and handoff, without a recursive
+documentation-only commit claiming its own future publication. This scoped TODO
+retires at that handoff; original product acceptance remains in Beads.
+
+Preparation observations: formatter `30078439050444824` passes on the final
+candidate, zero/acknowledged. Earlier formatter attempts `44819` and `44823`
+fail only new assertion layouts; their exact corrections preserve expectations.
+An initial compile-only draft `44820` is cooperatively cancelled after review
+finds a wrong test field type, before any test executes; recovery observes
+143/acknowledged. Preparation `44822` is also cooperatively cancelled, with
+143/acknowledged, before app code generation: its snapshot precedes the final
+width/count constant and assertion-layout refinements. Completed dependency
+artifacts remain cached for final-source preparation; neither cancelled run
+executes a test or counts as functional proof. No application
+deadline is extended; the 14,400-second cap is compile-only preparation, with
+the existing 1,800-second functional cap retained for actual test execution.
+
+Preparation `44825` completes zero/acknowledged at the final source, but selects
+the binary target. The three subsequent filtered binary invocations `44826`–
+`44828` each execute **zero tests** (81 filtered); they earn no functional credit.
+I selected the wrong target: `control` and `terminal` are declared in the app
+library. Correct `--lib` preparation and actual nonzero suite results were owed
+at that point; none of the zero-run results qualifies this connection. All raw
+attempts remain.
+
+Corrected library preparation `44829` completes zero/acknowledged. Actual library
+catalog tests `44830` execute two passes (0.01 test seconds, 648 filtered), and
+the actual owner/file/provider journey `44831` executes one pass (0.29 seconds,
+649 filtered). The owner has four real unbound founders; a later actual Spawn
+and Step change population/tick/digest, while original metadata, retained bytes
+and exact retry stay unchanged. The existing experiment-provider assertions
+remain. The new twelve-row ID control is explicitly a presentation fixture;
+the separate provider test creates and decodes a real checkpoint file.
+
+The broader unchanged retention selection `44832` is **seven passes/one failure**
+(3.03 seconds, 642 filtered). Its chmod-0500 refusal fixture assumes filesystem
+permission enforcement, but this worker is UID 0 with DAC override. An actual
+retained probe confirms that root can create a new file under mode 0500. No
+assertion, source, ignore, tolerance or test deadline is changed. RCH job `44833`
+observes DAC override removed and an actual PermissionError, then runs zero
+tests because the earlier managed-cache binary path has disappeared. The first
+provider directory is also no longer available for copying; its passed readback
+assertions and raw log remain, without a retained-file claim for that attempt.
+
+The retrieved library binary matches RCH's published BLAKE3 receipt
+`4a3bf76f88cdfa97669918c1608c8f675cffbd9f3606f506e98e109e6649daae`.
+It is copied into protected local/worker proof paths; SHA256 is
+`19570457a38b70693a97c6fdeb638391c178a88dc1eb098f7b2177acb76fbd54`.
+RCH non-compilation job `44834` runs that exact binary with only DAC override
+capabilities removed in its child. Observed effective capabilities are
+`000001fffffffff9`; the unchanged declared stack/thread settings are 33,554,432
+bytes/one. The original eight retention tests all pass (4.40 seconds), and the
+actual provider repeats successfully (one pass, 0.46 seconds). Hash checks before
+and after match. A unique protected TMPDIR retains these real files, now copied
+locally with a byte/hash inventory. This is eleven distinct passing focused
+tests across the two execution contexts, not a root-mode full-suite pass. The
+original root failure remains failed. New local result checks require nonzero
+executed cases; no zero-run or process-exit-only result earns test credit.
+
+Final-source RCH workspace/all-target check `30078439050444835` passes
+zero/acknowledged (3,035,269 execution milliseconds). Strict workspace/all-target
+Clippy with `-D warnings`, job `30078439050444836`, passes zero/acknowledged
+(322,653 execution milliseconds). Both use the same three-path clean overlay
+`efb6e3f54d754c2ef2b65b1de592f0ea8c2b03f10e8c68174344030a6e295ab8`
+on `6c418b06`; each actual worker source hash matches the frozen reviewed input.
+Formatting `44824` passes on that candidate. The distinct command durations are
+validation costs, not simulation performance evidence.
+All proof is self-executed; no independent, native-window, PTY, complete workspace
+test, performance or centralized DSR qualification is inferred.
+
+**Bounded written self-audit — saved checkpoint candidate, solo verification.**
+Window: the four-path product candidate reviewed against `6c418b06`, the raw
+attempts above, and this increment's tracking. The README's purpose is an
+artificial-life laboratory for observing and comparing evolving agents. Inventory:
+one USER connection (saved-cut observations and readable IDs), one ENABLER
+(extended real-provider/retention tests and a frame control), one explicitly
+requested PROCESS record (this TODO/evidence), no UNKNOWN items and no closes.
+This classification is diagnostic, not a quota. A short demo saves a checkpoint,
+inspects its population/digest and then advances the owner without relabeling
+that cut. The observation here is an actual host/file/readback plus headless
+production views; it is not a recorded native terminal demo. Without the process
+record the runtime is identical; it serves the user's tracking request. The
+tests actually exercise the production consumers. The oldest open user outcome
+remains the July Evolution Lab umbrella; the macOS P0 is unavailable here, and
+persistent-host reliability remains higher priority overall. This bounded
+connection uses the Linux services available now. No delegate, close-count
+contest, plan-only substitute or follow-up split occurs. Verdict: real product
+work, with **DRIFT in validation logistics** from the wrong target and volatile
+artifact assumptions. Correcting those earns no product capability credit.
+
+Process-artifact worksheet, filled for this existing TODO/evidence section:
+running product code does not branch on the section. Consumer: the user, who
+explicitly requests a complete granular TODO. Gate: the requested accounting of
+this connection and its actual qualification. Observed defects: discarded
+checkpoint observations, zero matching test selections and retired cache paths
+above. The explicit request supplies the process creation authority; retirement
+is publication/handoff, without deleting the historical record. Integrity
+controls protect raw failures, the exact 718-record preimage and the retrieved
+binary: prior exports omit provenance and this run loses managed-cache paths.
+At this actual scale these are necessary, minimal retained snapshots; a later
+summary alone would not preserve the missing bytes. The highest ready P0 needs
+the affected macOS host, so an extra hour of process writing here cannot repair
+it. The bounded existing report suffices; no permanent validator or reporting
+framework is introduced.
+
+Honesty inventory, bounded to these actual diffs and attempts; the completed
+compiler outcomes above remain separate from original product acceptance:
+
+1. No original guard is deleted or weakened. The provider's old absent-field
+   assertions become actual decoded-count/digest assertions; the original
+   missing-value and no-comparison controls remain. Full ID availability moves
+   into an explicit selected-ID assertion, with measured row columns added.
+2. The twelve-row screen input is a declared presentation fixture. Real capture,
+   decode, later owner commands, retry and storage acknowledgements use production
+   services/files; no fixture substitutes for those observations. Scanner cleanup
+   retention only preserves temporary copies; it replaces no analyzer findings.
+3. No golden or snapshot is regenerated; no dependency or lockfile changes.
+4. Existing tests gain requirements alongside the feature. No original budget,
+   tolerance, deadline, ignore, suppression or retry count changes. Compile-only
+   preparation is separate from the unchanged functional cap. Removing child DAC
+   overrides makes the original filesystem-denial premise real; the root failure
+   remains recorded, rather than being skipped or reclassified as a pass.
+5. No product fixture/test/benchmark condition, environment sniff or hardcoded
+   expected digest is added. Both observations come from the captured object.
+6. Yes: three wrong-target binary selections run zero cases. They receive zero
+   credit. The corrected library selections execute actual cases, with nonzero
+   count checks. Compile-only and the missing-binary attempt also earn no tests.
+7. No unobserved command is credited. The early statement that a test binary
+   compiled was true of the binary target, but did not establish compilation of
+   the intended library tests; the explicit target correction above narrows it.
+8. No model fixture is called actual capture, and no source/unit/headless result
+   is promoted to OS input, HTTP/MCP transport, native-window, performance or DSR
+   acceptance. Direct service projection is not a network E2E.
+9. Failed formatting, cancellations, zero selections, root 7/1 and the missing
+   binary remain visible. The permission-respecting 8/0 lane is separately named;
+   it does not retroactively turn the root run green.
+10. Native/scanner stdout and stderr are retained. No result depends on a pipe's
+    exit status being mistaken for the underlying tool's outcome.
+11. No work item is closed or split. Both original owners, statuses, requirements
+    and dependencies are retained; the final graph audit remains a publication gate.
+12. No acceptance criterion is edited to match the increment. The plan annotation
+    and README describe saved-cut inspection and keep full original acceptance open.
+13. No delegated or peer closes: this increment is solo and closes nothing.
+14. No subagent dispatch or gaming-prone delegated success criterion is used.
+15. No delegate report is accepted as evidence; there is no delegate result.
+16. No refusal-only task is minted or closed. The positive user outcome is the
+    populated, readable saved-cut catalog; permission diagnostics only qualify it.
+17. Agent Mail is coordination, not peer agreement or independent verification.
+18. Distinct-case counts are the union of the named selections, with repeated
+    provider execution kept separate. Timings are raw test durations, not a
+    throughput improvement or post-hoc performance denominator.
+19. Moments to explain: the source was not fully frozen before early preparation,
+    causing avoidable cancellation/restart work; the wrong Cargo target added
+    zero-run work; the first two UBS scans cleaned their own temporary shadows;
+    and reported remote cache paths later disappeared. Source and retained reports
+    remain. Final scanning retains its shadows, nonzero execution is required,
+    and the recovered binary is protected/hash-bound before reuse. One proof-marker
+    truncating write is blocked before execution; the guard's append alternative
+    succeeds without an override. These logistics costs are disclosed, not wins.
+20. Strongest evidence: the actual four-founder owner creates a decoded file,
+    then actual Spawn/Step change its live state while metadata, artifact bytes
+    and idempotent retry retain the saved cut. The same candidate's real storage
+    retry and model controls pass; actual worker source hashes match the frozen
+    candidate. This is reproducible solo proof, not independent certification.
+
+Disposition: PL-1 (coverage/nonzero execution) now requires observed case counts;
+PL-2 keeps readback and application evidence distinct from exit status; SM-11
+retains every first-attempt failure and execution context. The target selection,
+artifact handling and scanner cleanup behavior are corrected and disclosed in
+place. Six bounded CASS audit queries since October 24 return zero indexed hits;
+this does not audit unindexed sessions. Required compiler outcomes are recorded
+above; final graph integrity and transport remain separate publication observations.
+
+Two early UBS invocations remove their own temporary shadow copies through
+the tool's cleanup traps. I should have accounted for that before calling them;
+source files and retained reports remain. The final static invocation preserves
+its temporary copies using per-child shell/Python cleanup retention outside the
+project; scanner rules/findings are not replaced. Final candidate and precommit
+invocations both observe zero critical,
+3,125 warning and 775 information findings, not a warning-clean result. This is
+static analysis, not compilation or native acceptance.
+The separate metadata-only UBS invocation exits 3 because Markdown/JSONL have
+no supported analyzer; it is not a successful scan. Literal document review and
+the exact-record structural comparison qualify these metadata changes.
+
 ### Browser clock execution TODO — 2026-10-24, LilacElm
 
 Consumer: the user's requested granular TODO. Gate: qualify the actual clock

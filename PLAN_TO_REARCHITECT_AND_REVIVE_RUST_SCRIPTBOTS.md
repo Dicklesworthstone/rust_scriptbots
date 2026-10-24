@@ -4,6 +4,17 @@
 
 **Evidence date:** 2026-07-11
 
+**Saved checkpoint catalog (2026-10-24):** [Currently In Progress — LilacElm,
+`bd-2z0.6.8` / `bd-2z0.5.13`; scoped source committed as `dc8aa8bd`]
+That source connects the exact captured checkpoint population and
+scientific digest to the live Replay catalog, retains its identity across retries,
+and keeps selected rows readable. Eleven distinct focused tests pass across the
+recorded root/permission-respecting contexts; the original root permission test
+failure remains recorded. Final-source remote formatting, workspace/all-target
+check and strict Clippy pass. This is saved-cut inspection; original rewind,
+replay comparison, native/PTY and centralized DSR acceptance remain open.
+The existing Reality Check carries the granular execution TODO and evidence.
+
 **Browser clock connection (2026-10-24):** [Currently In Progress — original
 `bd-2z0.12.3` acceptance; scoped source delivered by LilacElm]
 `e8afa212` connects the existing browser-owned `HostCore` fixed-deadline driver to
