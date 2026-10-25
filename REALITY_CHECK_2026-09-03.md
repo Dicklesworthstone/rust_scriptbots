@@ -1,5 +1,255 @@
 # Reality Check — rust_scriptbots — reassessed 2026-10-20
 
+### Experiment artifact delivery TODO — 2026-10-25, LilacElm
+
+Consumer: the user's granular execution request and remote experiment clients.
+Gate: report bundle delivery only after real completed files are discoverable and
+downloaded through the existing service and REST/MCP surfaces. At baseline
+`841543ea`, only checkpoint completion inserts into the artifact catalog;
+experiment bundles are verified on disk but exposed only as server-local paths. Retire this scoped TODO
+at publication/handoff; the original full API acceptance stays open.
+
+- [x] Refresh canonical BR/BV, recent commits, Agent Mail and CASS; retain the
+  complete original export and reserve exact source/tracking paths.
+- [x] Trace artifact producers, catalog consumers, bundle verification and root
+  ownership. The existing Tokio stack setting is already implemented, not new work.
+- [x] Execute the actual completed-batch discovery/download regression on old code.
+- [x] Publish completed bundle files to the existing artifact catalog with observed
+  byte sizes/checksums and captured source directories, before reporting completion.
+- [x] Verify actual file downloads, source-root rotation, tamper refusal and
+  publication failures; preserve all original assertions and gates.
+- [x] Exercise actual REST/MCP discovery and HTTP bytes against the original
+  experiment/checkpoint lifecycle, with explicit fixture limits.
+- [x] Run affected tests and mandatory format/workspace-check/strict-Clippy through
+  RCH, preserving every result and exact source identity.
+- [x] Review all source/test hunks and UBS findings; write the bounded work/honesty
+  audit, then commit the source separately from tracking.
+- [x] Update the original API owner and audit the complete export, provenance,
+  original acceptance/dependencies and comment history.
+- [ ] Commit tracking, release leases, pull/import, push and verify both refs.
+  Record the subsequent actual outcome and retire this final publication item
+  in external `publication.json` at the proof root, without a recursive
+  documentation-only certification commit.
+
+Proof root: `/data/tmp/scriptbots-experiment-artifacts-20261025-lilacelm`.
+CASS's bounded query since October 20 returns zero indexed hits; this does not
+audit unindexed history. The suite-wide `/data/projects/AGENTS.md` is absent.
+
+**Preparation cut; functional execution pending.** The three-file implementation
+is frozen on base `841543ea`, source tree `2a786ff0c3d4f502c39f12900b0f55a8da0fc138`.
+Remote formatter `30078439050444850` passes zero/acknowledged on overlay
+`03320e9f79ed673906ebb10c7974fafa1494b65bf2b068f235be1f4d1ada875e`.
+The initial formatter request refuses 103 before execution because its default
+four-core estimate exceeds worker B's three slots; the env-wrapper retry refuses
+RCH-E301/exit 1 before execution. The supported per-invocation `RCH_BUILD_SLOTS=1`
+requests one slot for formatting without changing persistent policy. Formatter
+`44849` then runs and fails new layouts; those are corrected manually before
+the final pass. None of the refusals or formatting results is a functional case.
+Old-code library preparation `44848` compiles separately on worker A, with its
+actual source hash matching the retained tests-only snapshot. The required
+candidate workspace check runs on worker B; its actual source inputs match the
+frozen local files and all three retained UBS inputs. Initial one-build logistics
+are explicitly adjusted after fresh capacity evidence to two independent workers,
+one compilation per pair/target. Their source authorities are not replaced while
+Cargo runs. UBS observes 0 critical / 1,257 warning / 432 information findings;
+this is not warning-clean. Changed-line findings are reviewed: test assertions,
+intentional caught mutex poison, bounded clones and path joins whose production
+consumer verifies identity, normal components and canonical containment. No rule
+or finding is suppressed. Automatic cross-command RCH timing banners are not
+performance evidence. Actual old/candidate functional and compiler outcomes
+remain pending at this preparation cut.
+
+Fresh source review subsequently simplifies two expressions in the publisher:
+explicit checked byte accumulation and `if let Some(entry)` without a redundant
+unwrap. Their limits and behavior are unchanged. The formatter/UBS/source-review
+snapshot above is intermediate; final-source formatting, static inputs and all
+required compiler/functional gates must bind the revised bytes before commit.
+The running check retains its original immutable worker inputs; local edits do
+not replace them. Its result cannot qualify the later source by implication.
+
+Old preparation `44848` subsequently reaches the inherited 1,800-second
+Cargo-test deadline: exit 137/acknowledged, zero tests executed. The requested
+build-class timeout did not control this test-class invocation. Retry
+`30079889725980673` requests both build/test-class 14,400-second limits for
+`--no-run` preparation only; actual functional execution retains its separate
+1,800-second cap. The exact saved tests-only source is recaptured under the owned
+lease, then the preserved candidate is restored after remote execution starts.
+Old worker SHA256 `7509574583a6badb50182ecdc7a3500fdb92acc1bf88fb16a3f2dd08dc90c525`
+matches both attempts; restored candidate SHA256 is
+`aaeb96d3de60ba1aa1b290cec3661bb9668c14c81aefe5e32e898fab87ddeec8`.
+No foreign edit is observed before restoration, and both snapshots are retained.
+Final-source UBS reports 0 critical / 1,256 warning / 432 information findings,
+with all retained scan inputs matching the revised source. No warning-clean or
+functional-pass claim follows from this static result.
+
+Final-source formatter `30079889725980674` passes zero/acknowledged, with
+10,139 execution milliseconds. Final workspace/all-target check `80675` also
+passes zero/acknowledged, with 49,763 execution milliseconds. Both use final
+overlay `10eafefab5c0d5f46b6b2cafb8396d38345d77388b701fce5ab0e52ee5dfbc39`.
+The earlier check `44851` passes on its intermediate overlay only. Strict
+workspace/all-target Clippy `80676` passes zero/acknowledged, with 409,111
+execution milliseconds on the same final overlay. A separate 45-second attach
+attempt times out while that original job continues; it replays no command and
+is not a lint failure. Functional results are not inferred from compiler/lint
+checks. Final source review tree
+is `b77ed21d96e0a63ec6b5daa30004bd005b047a30`.
+
+Old preparation retry `80673` passes zero/acknowledged after 3,457,141 execution
+milliseconds. Its retained binary matches the published BLAKE3 receipt
+`f0f5666253884248af8c03d0be13ef30fb1c8c7f3f0f4098ca229467d9604218` and SHA256
+`96a63a25ab25ad34bd49417917ebf6bf96dc5a93d8d39b3ebce1057bca792a45`.
+Actual RCH execution `80677` observes 3 passed / 1 failed / 0 ignored / 650
+filtered in 0.73 seconds, exit 101/acknowledged. The new positive test reads the
+completed run's real manifest, derives three declared files, and fails because
+the old catalog is empty. All three earlier creation regressions pass. Binary
+SHA256 checks before and after match. An initial execution request is rejected
+by CLI argument validation (`--job` conflicts with `--clean-overlay`), before
+admission or tests; the corrected non-compilation job runs the protected binary.
+Candidate library/full-conformance preparation is subsequent, not inferred green.
+
+A supplementary final-Clippy worker-source read fails because RCH has retired
+that checkout after completion. Its empty output is not a source identity
+observation. The acknowledged base/overlay receipts remain retained; candidate
+source hashes are to be captured while its preparation is active.
+
+Candidate preparation `80678` captures all three final source SHA256 values on
+the active worker; each matches the frozen local input. The old run's 15 files
+(36,974 bytes) are copied only after transfer completion and all sizes/SHA256
+values match the remote inventory. This inventory is retention evidence, not
+an additional scientific or functional case.
+
+**Functional cut.** Candidate preparation `80678` passes zero/acknowledged
+(400,149 execution milliseconds), on final overlay `10eafefa…` above. Both
+retained binaries match their published RCH BLAKE3 receipts: library
+`1833f65f74b51973f9681f18bf332a4cb6635b10ae62277d235b3ab925b96e05`,
+conformance `1435d4fbdd83e75064dacb55d47185e5dcd578e52cd0eddc02b3e01d73f7e50b`.
+Actual non-compilation job `30079889725980679` passes zero/acknowledged,
+14,258 execution milliseconds, with SHA256 checks before and after. Its four
+invocations observe 5/0/0 creation cases (650 filtered, 1.17s), 1/0/0 exact
+checkpoint-root/retention case (654 filtered, 0.10s), 1/0/0 exact oversized
+retained-checkpoint case (654 filtered, 0.14s), and the complete 9/0/0
+conformance binary (zero filtered, 8.06s): 16 distinct passes, zero failed or
+ignored. This denominator was declared before execution. The positive unit
+downloads every manifest-declared file and the manifest after root rotation,
+then corrupts an actual file and observes refusal, retaining the original bytes.
+The catalog-poison unit observes failed publication with one completed science
+run, zero failed science runs and a still-verifiable bundle. REST/MCP metadata
+match; HTTP bytes reconstruct both seed-specific bundles and the existing verifier
+accepts them. The fixture uses a real in-process HTTP/HostThread/ControlRuntime
+with NullPersistence/VolatileJournal and real artifact-only experiment files.
+It is not production file-storage subprocess, restart durability, native/DSR,
+full workspace tests, scientific comparison or performance acceptance. One unit
+bundle is deliberately left corrupt after the refusal test; its preserved copy
+is retained. Do not report every retained bundle as currently valid.
+
+**Written real-work audit, baseline `841543ea` through this frozen increment.**
+At this audit cut there are no new commits or Bead closures. The actual diff,
+last four commits and original canonical record were read. README purpose:
+faithful deterministic artificial-life simulation with visualization, swappable
+brains and first-class analytics. Work-item classification: artifact delivery
+USER 1; its executed regression/transport/compiler qualification ENABLER 1;
+requested TODO, provenance preservation and tracking PROCESS 1; UNKNOWN 0.
+These counts describe three work items, not a productivity score.
+1. Nothing is newly published at this cut. The two-minute demo is create an
+   experiment, list its real files and download a verifier-accepted bundle;
+   the executed lifecycle demonstrates that behavior before publication.
+2. Without tracking, runtime behavior is identical; without the minimal retained
+   preimage, the known exporter can lose 392 unrelated provenance values.
+3. Qualification exercised the actual service, HTTP/MCP and files; it is not
+   speculative infrastructure. No new framework or generalized gate was built.
+4. The oldest open canonical item is `bd-2z0` (July 11), deterministic Evolution
+   Lab revival. This increment implements its remote experiment delivery path;
+   the ready macOS `bd-e6ff` P0 requires its affected host, unavailable here.
+5. Solo; no panes, delegation, closes or independent-verifier claim.
+6. No acceptance was replaced by a plan edit or follow-up issue. The original
+   seven criteria and dependencies remain open and unchanged.
+Verdict: bounded capability work with costly cold compilation, not completion
+of the project. Correction: finish source/tracking publication; add no machinery.
+
+**Written honesty inventory, same bounded increment; fresh solo verification.**
+1. No (checked all frozen test hunks, original assertions/deadlines and unchanged
+   CI/manifests; no deletion, skip or ignore was introduced).
+2. No (checked new tests: real runners/files and real caught mutex poison; the
+   existing NullPersistence/VolatileJournal fixture is explicitly qualified).
+3. No (checked changed paths; no golden, snapshot or baseline was regenerated).
+4. Yes: conformance assertions are added with the feature. Fresh hunk review
+   and the old-code discriminator retain every existing assertion and limit.
+   Compile-only preparation requests the correct 14,400-second test-class cap
+   after the recorded 1,800-second deadline failure; functional execution keeps
+   1,800 seconds, units 30 seconds and conformance 300 seconds. No lint allowance,
+   bypass, tolerance change or gate weakening lands in source.
+5. No (checked production publisher and shared runner declarations; no fixture
+   identity, environment-specific success path or benchmark tuning).
+6. No (checked actual summaries: old 4 cases; candidate 5+1+1+9, zero ignored;
+   compile-only commands are never counted as functional cases).
+7. No (checked retained raw commands/receipts; intermediate inputs and failed
+   supplemental worker read are distinguished from final source observations).
+8. No (checked proof wording: in-process/volatile/artifact-only boundaries are
+   explicit; no restart, production subprocess, native or DSR proof is claimed).
+9. No (checked attempt record: refusals, formatter failure, old preparation137,
+   CLI argument rejection, attach timeout and retired-checkout read remain).
+10. No (checked commands: stdout and stderr are retained together or separately,
+    including the failed supplementary read; no cited stderr was discarded).
+11. No (checked target stays in_progress; no new issues or closures).
+12. No (checked original seven criteria/dependencies against the full preimage;
+    plan annotations describe scope and leave complete acceptance open).
+13–16. Inapplicable because this increment was solo; no subagents were dispatched,
+    accepted as evidence, or allowed to close/farm an item.
+17. No (checked messages and report: peer coordination is not verification).
+18. No (checked predeclared 16-case denominator and negative controls; automatic
+    RCH cross-command timing banners receive no performance credit).
+19. The wrong preparation timeout knob cost a failed cold build; formatter/job
+    CLI refusals also cost time. They are retained, corrected at invocation,
+    and never converted into green cases. Static UBS still has 1,256 warnings;
+    zero critical is not warning-clean. No independent verifier participated.
+    A mistyped full source-commit ID in the draft notes is corrected from
+    `git rev-parse HEAD` before the tracking commit; the operator is told.
+20. Strongest evidence: exact receipt-bound old/candidate binaries and complete
+    raw execution, including actual completed-file absence on old code and
+    reconstruction from HTTP bytes on the candidate. A skeptic can rerun these
+    retained bytes and commands; source identities and all artifacts are saved.
+CASS's five audit phrases plus the touched-conformance query each return zero
+indexed hits; unindexed older history is not audited. Disposition for item4 and
+item19: invocation mistakes corrected in place, failures disclosed in this
+report, and the proof-laundering/gate-self-weakening countermeasure is explicit:
+preparation earns zero functional credit; keep every original gate and require
+actual nonzero case counts on exact retained binaries. This is self-review,
+not independent certification; original API acceptance remains open.
+
+The exact reviewed source is committed as
+`2d287047a8ef474075119212ca095724374a1150`; the source review tree above is
+the immutable authority. Candidate artifact
+copies finish before verification: all 31 unit files (67,166,470 bytes) and
+24 conformance files (74,415 bytes) match the remote size/SHA256 inventories.
+This includes the deliberate corruption and preserved original; no all-valid
+bundle claim is added. Tracking/publication remains the final TODO above.
+
+Original owner `bd-2z0.12.2` receives start/final comments 2964/2965 and stays
+in_progress under LilacElm. The complete export contains the same 718 ordered
+unique IDs. The audited canonical file retains all 717 unrelated rows verbatim,
+restoring exactly 392 exporter-omitted `source_repo_path` values; raw export and
+preimage remain saved. Only target `comments` and `updated_at` differ. Its ten
+original comments, all seven acceptance criteria and dependencies are unchanged.
+Canonical SHA256 is `f395a7a3668b5a077145cb9177f3e68b1d8db33aff07d70338b59471780b96c2`;
+the all-record dependency-cycle probe returns an empty list. No tasks are newly
+created or closed. Runtime/cache files and all proof binaries stay uncommitted.
+UBS classifies the three tracking paths as unsupported Markdown/JSONL and
+returns 3 without a scanner; this is not a clean scan. Their literal Markdown
+hunks and the exact immutable JSONL projection require separate review.
+
+Process worksheet for this requested TODO: running code does not branch on it.
+Consumer: the operator's explicit granular tracking request. Gate: declaring the
+new artifact delivery implemented and observed. Defect: the traced checkpoint-only
+catalog writer leaves completed experiment files undiscoverable. Retirement:
+publication/handoff, with complete original acceptance retained in Beads. Integrity
+exception: the preimage and retained proof files prevent the already-observed
+392-field export loss and volatile artifact reaping. They are necessary at this
+718-record graph and hour-scale build cost, are bounded exact snapshots, and have
+no cheaper equivalent that preserves the lost values/bytes. Opportunity cost:
+the highest ready macOS P0 needs its affected host; locally, this file-delivery
+connection is the selected user capability. Verdict: minimal requested process
+plus integrity copies, zero capability credit; continue actual execution.
+
 ### Experiment retry admission TODO — 2026-10-24, LilacElm
 
 Consumer: the user's explicit granular TODO request. Gate: report atomic retry

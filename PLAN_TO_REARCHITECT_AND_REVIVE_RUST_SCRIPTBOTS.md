@@ -4,6 +4,18 @@
 
 **Evidence date:** 2026-07-11
 
+**Experiment artifact delivery (2026-10-25):** [Currently In Progress — LilacElm,
+`bd-2z0.12.2`; scoped source committed as `2d287047`]
+Completed bundle manifests and their declared files now enter the existing
+REST/MCP artifact catalog, retaining observed size/checksums and their original
+root across configuration changes. Publication errors report failed batches
+without falsifying completed science counts. Old code fails the real completed
+file-discovery regression; the candidate passes 16 distinct service, retained
+checkpoint and complete conformance cases, including reconstruction from HTTP
+bytes. Final-source remote formatting, workspace/all-target check and strict
+Clippy pass. The catalog remains process-local; original complete API,
+production file-storage subprocess, restart, native/DSR acceptance stays open.
+
 **Experiment retry admission (2026-10-24):** [Currently In Progress — LilacElm,
 `bd-2z0.12.2` reopened; scoped source committed as `3757fc93`]
 The committed source serializes keyed lookup through admission, retains the
