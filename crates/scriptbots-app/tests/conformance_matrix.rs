@@ -1194,6 +1194,123 @@ fn test_experiments_checkpoints_and_artifacts_lifecycle() {
         "distinct seeds must yield distinct final worlds"
     );
 
+    // Discover and fetch completed bundles through the public surfaces. A remote
+    // client reconstructs the portable directories from these bytes, rather than
+    // needing access to the server-local bundle_path reported by the runner.
+    let (catalog_status, catalog_body) = http_request(
+        fixture.rest_addr,
+        "GET",
+        "/api/v1/artifacts?limit=100",
+        &[],
+        None,
+    )
+    .expect("completed experiment artifact catalog");
+    assert_eq!(catalog_status, 200, "{catalog_body}");
+    let catalog: Value = serde_json::from_str(&catalog_body).expect("catalog JSON");
+    let (mcp_catalog_status, mcp_catalog) = mcp_json_rpc(
+        fixture.mcp_addr,
+        Some(150),
+        "tools/call",
+        Some(serde_json::json!({"name":"artifact_list","arguments":{"limit":100}})),
+    )
+    .expect("MCP completed artifact catalog");
+    assert_eq!(mcp_catalog_status, 200);
+    let mcp_catalog: Value = serde_json::from_str(
+        mcp_catalog["result"]["content"][0]["text"]
+            .as_str()
+            .expect("catalog result"),
+    )
+    .expect("MCP catalog JSON");
+    assert_eq!(catalog, mcp_catalog);
+    let mut expected_files = 0;
+    for run in finished_runs {
+        let source = std::path::Path::new(run["bundle_path"].as_str().expect("bundle"));
+        let manifest: scriptbots_storage::RunBundleV1 = serde_json::from_slice(
+            &std::fs::read(source.join("bundle_manifest.json")).expect("source manifest"),
+        )
+        .expect("actual bundle manifest");
+        let paths: Vec<_> = std::iter::once("bundle_manifest.json")
+            .chain(
+                manifest
+                    .artifacts
+                    .iter()
+                    .map(|entry| entry.relative_path.as_str()),
+            )
+            .collect();
+        expected_files += paths.len();
+        let downloaded_root = source.with_extension("api-download");
+        for path in paths {
+            let suffix = format!(
+                "experiments/{exp_id}/{}/{path}",
+                run["run_id"].as_str().unwrap()
+            );
+            let matches: Vec<_> = catalog["items"]
+                .as_array()
+                .expect("catalog items")
+                .iter()
+                .filter(|item| item["relative_path"].as_str() == Some(suffix.as_str()))
+                .collect();
+            assert_eq!(matches.len(), 1, "missing or duplicate {suffix}: {catalog}");
+            let metadata = matches[0];
+            let id = metadata["artifact_id"].as_str().expect("artifact ID");
+            let (download_status, bytes) = http_request_raw(
+                fixture.rest_addr,
+                "GET",
+                &format!("/api/v1/artifacts/{id}/download"),
+                &[],
+                None,
+            )
+            .expect("download completed experiment file");
+            assert_eq!(download_status, 200, "{metadata}");
+            assert_eq!(
+                bytes,
+                std::fs::read(source.join(path)).expect("source bytes")
+            );
+            assert_eq!(metadata["byte_size"], bytes.len() as u64);
+            assert_eq!(
+                metadata["checksum_sha256"],
+                scriptbots_app::control::compute_sha256(&bytes)
+            );
+            assert_eq!(
+                metadata["checksum_blake3"],
+                scriptbots_app::control::compute_blake3(&bytes)
+            );
+            let (mcp_meta_status, mcp_meta) = mcp_json_rpc(
+                fixture.mcp_addr,
+                Some(151),
+                "tools/call",
+                Some(serde_json::json!({"name":"artifact_get","arguments":{"artifact_id":id}})),
+            )
+            .expect("MCP experiment file metadata");
+            assert_eq!(mcp_meta_status, 200);
+            let mcp_meta: Value = serde_json::from_str(
+                mcp_meta["result"]["content"][0]["text"]
+                    .as_str()
+                    .expect("metadata result"),
+            )
+            .expect("MCP metadata JSON");
+            assert_eq!(&mcp_meta, metadata);
+            let destination = downloaded_root.join(path);
+            std::fs::create_dir_all(destination.parent().expect("parent"))
+                .expect("download directory");
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(destination)
+                .expect("reserve downloaded file")
+                .write_all(&bytes)
+                .expect("retain HTTP bytes");
+        }
+        let verified = scriptbots_storage::verify_run_bundle(&downloaded_root)
+            .expect("verify the portable bundle reconstructed from HTTP downloads");
+        assert_eq!(
+            verified.max_tick,
+            run["total_ticks"].as_u64().expect("run ticks")
+        );
+    }
+    assert_eq!(catalog["total"], expected_files);
+    assert_eq!(catalog["has_more"], false);
+
     // Cancelling a finished batch is idempotent and reports the terminal state.
     let (st_cancel, body_cancel) = http_request(
         fixture.rest_addr,

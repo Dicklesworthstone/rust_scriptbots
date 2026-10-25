@@ -27,10 +27,10 @@ use thiserror::Error;
 use tracing::{error, info};
 
 const STATUS_SCHEMA_VERSION: u16 = 2;
-const MAX_STATUS_BYTES: u64 = 16 * 1024 * 1024;
-const MAX_BUNDLE_ARTIFACTS: usize = 32;
-const MAX_BUNDLE_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024;
-const MAX_BUNDLE_TOTAL_ARTIFACT_BYTES: u64 = 32 * 1024 * 1024;
+pub(crate) const MAX_STATUS_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const MAX_BUNDLE_ARTIFACTS: usize = 32;
+pub(crate) const MAX_BUNDLE_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const MAX_BUNDLE_TOTAL_ARTIFACT_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_BATCH_RUNS: usize = 4_096;
 const MAX_RUN_COMPONENT_BYTES: usize = 128;
 const MAX_TICKS_PER_RUN: u64 = 10_000_000;
@@ -511,7 +511,7 @@ impl MatchedSeedExperimentRunner {
     /// bundle manifest is keyed by `RunId`. BLAKE3 over that exact string keeps the
     /// mapping deterministic and collision-resistant, and the readable identity is still
     /// carried in the manifest's `experiment_id`, `variant_id`, and `scenario_id`.
-    fn bundle_run_id(run_id: &str) -> RunId {
+    pub(crate) fn bundle_run_id(run_id: &str) -> RunId {
         let digest = blake3::hash(run_id.as_bytes());
         let mut leading = [0_u8; 16];
         leading.copy_from_slice(&digest.as_bytes()[..16]);

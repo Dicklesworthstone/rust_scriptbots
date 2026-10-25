@@ -893,7 +893,7 @@ pub fn compute_blake3(data: &[u8]) -> String {
     blake3::hash(data).to_hex().to_string()
 }
 
-fn read_artifact_file_bounded(path: &Path) -> Result<Vec<u8>, ControlError> {
+fn read_artifact_file_bounded(path: &Path, max_bytes: usize) -> Result<Vec<u8>, ControlError> {
     let file = fs::File::open(path).map_err(|error| ControlError::NotFound(error.to_string()))?;
     let metadata = file
         .metadata()
@@ -903,17 +903,17 @@ fn read_artifact_file_bounded(path: &Path) -> Result<Vec<u8>, ControlError> {
             "artifact is not a regular file".to_owned(),
         ));
     }
-    let limit = u64::try_from(MAX_ARTIFACT_DOWNLOAD_BYTES).expect("download limit fits u64");
+    let limit = u64::try_from(max_bytes).expect("artifact limit fits u64");
     if metadata.len() > limit {
         return Err(ControlError::PayloadTooLarge(
             "artifact exceeds the download byte bound".to_owned(),
         ));
     }
     let mut bytes = Vec::new();
-    file.take(limit + 1)
+    file.take(limit.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|error| ControlError::Serialization(error.to_string()))?;
-    if bytes.len() > MAX_ARTIFACT_DOWNLOAD_BYTES {
+    if bytes.len() > max_bytes {
         return Err(ControlError::PayloadTooLarge(
             "artifact grew beyond the download byte bound".to_owned(),
         ));
@@ -933,6 +933,7 @@ struct ExperimentJob {
     running: std::sync::Arc<std::sync::atomic::AtomicBool>,
     last_error: std::sync::Arc<Mutex<Option<String>>>,
     created_at_utc: String,
+    artifact_root: PathBuf,
 }
 
 impl std::fmt::Debug for ExperimentJob {
@@ -947,7 +948,7 @@ impl std::fmt::Debug for ExperimentJob {
 impl ExperimentJob {
     /// Start (or restart) the batch worker. `running` is raised before the
     /// thread exists so a status read can never observe a false idle gap.
-    fn start(&self) {
+    fn start(&self, services: std::sync::Arc<DataServices>) {
         use std::sync::atomic::Ordering;
         self.running.store(true, Ordering::Release);
         let runner = std::sync::Arc::clone(&self.runner);
@@ -955,10 +956,16 @@ impl ExperimentJob {
         let cancel = std::sync::Arc::clone(&self.cancel);
         let running = std::sync::Arc::clone(&self.running);
         let last_error = std::sync::Arc::clone(&self.last_error);
+        let artifact_root = self.artifact_root.clone();
         let spawned = std::thread::Builder::new()
             .name(format!("experiment-{}", runner.experiment_id))
             .spawn(move || {
-                let outcome = runner.execute_batch_until_cancelled(&state_file, &cancel);
+                let outcome = match runner.execute_batch_until_cancelled(&state_file, &cancel) {
+                    Ok(status) => services
+                        .publish_experiment_artifacts(&status, &artifact_root)
+                        .map_err(|error| format!("artifact publication failed: {error}")),
+                    Err(error) => Err(error.to_string()),
+                };
                 if let Err(error) = outcome {
                     tracing::error!(
                         experiment_id = %runner.experiment_id,
@@ -1034,14 +1041,14 @@ impl ExperimentJob {
             "cancelling"
         } else if running {
             if any_started { "running" } else { "pending" }
+        } else if error_reason.is_some() {
+            "failed"
         } else if finished {
             if status.failed_runs > 0 {
                 "failed"
             } else {
                 "completed"
             }
-        } else if error_reason.is_some() {
-            "failed"
         } else if cancel_requested {
             "cancelled"
         } else {
@@ -1090,12 +1097,18 @@ impl ExperimentJob {
 pub struct DataServices {
     experiments: Mutex<BTreeMap<String, ExperimentJob>>,
     checkpoints: Mutex<BTreeMap<String, CheckpointMetadataDto>>,
-    artifacts: Mutex<BTreeMap<String, ArtifactMetadataDto>>,
+    artifacts: Mutex<BTreeMap<String, RetainedArtifact>>,
     /// Process-local admission authority: request key -> (payload hash, admitted ID).
     /// Status is read from the job rather than cached as a creation response.
     idempotency: Mutex<BTreeMap<String, (String, String)>>,
     artifacts_dir: RwLock<PathBuf>,
     checkpoint_retention: Mutex<CheckpointRetentionState>,
+}
+
+#[derive(Debug, Clone)]
+struct RetainedArtifact {
+    metadata: ArtifactMetadataDto,
+    directory: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -1294,6 +1307,164 @@ impl DataServices {
             .read()
             .map(|p| p.clone())
             .unwrap_or_else(|_| std::env::temp_dir().join("scriptbots_artifacts"))
+    }
+
+    /// Publish only completed, bounded, verified bundles. Stage the entire slice
+    /// before taking the catalog lock so a failure cannot expose a partial slice.
+    fn publish_experiment_artifacts(
+        &self,
+        status: &crate::experiment_runner::ExperimentBatchStatus,
+        root: &Path,
+    ) -> Result<(), ControlError> {
+        use crate::experiment_runner::{
+            MAX_BUNDLE_ARTIFACT_BYTES, MAX_BUNDLE_ARTIFACTS, MAX_BUNDLE_TOTAL_ARTIFACT_BYTES,
+            MAX_STATUS_BYTES, MatchedSeedExperimentRunner, RunState,
+        };
+        let manifest_limit = usize::try_from(MAX_STATUS_BYTES).expect("manifest limit fits usize");
+        let mut staged = BTreeMap::new();
+        for run in status
+            .runs
+            .iter()
+            .filter(|run| run.state == RunState::Completed)
+        {
+            let relative_bundle = PathBuf::from("experiments")
+                .join(&status.experiment_id)
+                .join(&run.run_id);
+            let bundle_dir = root.join(&relative_bundle);
+            scriptbots_storage::bundle::verify_run_bundle_bounded(
+                &bundle_dir,
+                scriptbots_storage::bundle::RunBundleVerificationLimits {
+                    max_manifest_bytes: MAX_STATUS_BYTES,
+                    max_artifacts: MAX_BUNDLE_ARTIFACTS,
+                    max_artifact_bytes: MAX_BUNDLE_ARTIFACT_BYTES,
+                    max_total_artifact_bytes: MAX_BUNDLE_TOTAL_ARTIFACT_BYTES,
+                },
+            )
+            .map_err(|error| ControlError::InvalidPatch(error.to_string()))?;
+            let manifest_path = bundle_dir.join("bundle_manifest.json");
+            let manifest_bytes = read_artifact_file_bounded(&manifest_path, manifest_limit)?;
+            let bundle: scriptbots_storage::RunBundleV1 =
+                serde_json::from_slice(&manifest_bytes)
+                    .map_err(|error| ControlError::Serialization(error.to_string()))?;
+            if bundle.manifest.run_id != MatchedSeedExperimentRunner::bundle_run_id(&run.run_id)
+                || bundle.manifest.experiment_id.as_deref() != Some(status.experiment_id.as_str())
+                || bundle.manifest.variant_id.as_deref() != Some(run.variant_id.as_str())
+                || bundle.manifest.root_seed != run.seed
+                || bundle.digests.max_tick != run.total_ticks
+                || bundle.artifacts.len() > MAX_BUNDLE_ARTIFACTS
+                || bundle.bundle_version != scriptbots_storage::bundle::RUN_BUNDLE_SCHEMA_VERSION
+            {
+                return Err(ControlError::InvalidPatch(
+                    "bundle identity changed before artifact publication".to_owned(),
+                ));
+            }
+            let total_bytes = bundle.artifacts.iter().try_fold(0_u64, |total, entry| {
+                if entry.bytes_len > MAX_BUNDLE_ARTIFACT_BYTES {
+                    None
+                } else {
+                    total.checked_add(entry.bytes_len)
+                }
+            });
+            if !total_bytes.is_some_and(|total| total <= MAX_BUNDLE_TOTAL_ARTIFACT_BYTES) {
+                return Err(ControlError::PayloadTooLarge(
+                    "bundle artifact bytes exceed the runner's publication bounds".to_owned(),
+                ));
+            }
+            for (relative_path, expected) in std::iter::once(("bundle_manifest.json", None)).chain(
+                bundle
+                    .artifacts
+                    .iter()
+                    .map(|entry| (entry.relative_path.as_str(), Some(entry))),
+            ) {
+                let relative = relative_bundle.join(relative_path);
+                let canonical = root
+                    .join(&relative)
+                    .canonicalize()
+                    .map_err(|error| ControlError::Serialization(error.to_string()))?;
+                if !canonical.starts_with(root)
+                    || relative
+                        .components()
+                        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+                {
+                    return Err(ControlError::BadRequest(
+                        "bundle artifact escapes its source root".to_owned(),
+                    ));
+                }
+                let bytes = if let Some(entry) = expected {
+                    read_artifact_file_bounded(
+                        &canonical,
+                        usize::try_from(entry.bytes_len)
+                            .expect("bounded artifact length fits usize"),
+                    )?
+                } else {
+                    manifest_bytes.clone()
+                };
+                let byte_size = bytes.len() as u64;
+                let checksum_blake3 = compute_blake3(&bytes);
+                if let Some(entry) = expected
+                    && (entry.bytes_len != byte_size || entry.blake3_hex != checksum_blake3)
+                {
+                    return Err(ControlError::InvalidPatch(
+                        "bundle artifact changed before publication".to_owned(),
+                    ));
+                }
+                let relative_path = relative
+                    .components()
+                    .map(|component| component.as_os_str().to_str().expect("UTF-8 bundle path"))
+                    .collect::<Vec<_>>()
+                    .join("/");
+                let artifact_id =
+                    format!("experiment-{}", compute_blake3(relative_path.as_bytes()));
+                let metadata = ArtifactMetadataDto {
+                    artifact_id: artifact_id.clone(),
+                    filename: relative
+                        .file_name()
+                        .expect("validated normal path")
+                        .to_string_lossy()
+                        .into_owned(),
+                    content_type: match relative
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                    {
+                        Some("json") => "application/json",
+                        Some("csv") => "text/csv",
+                        _ => "application/octet-stream",
+                    }
+                    .to_owned(),
+                    byte_size,
+                    checksum_blake3,
+                    checksum_sha256: compute_sha256(&bytes),
+                    created_at_utc: bundle.created_at_utc.clone(),
+                    relative_path,
+                };
+                staged.insert(
+                    artifact_id,
+                    RetainedArtifact {
+                        metadata,
+                        directory: root.to_path_buf(),
+                    },
+                );
+            }
+        }
+        let mut catalog = self.artifacts.lock().map_err(|_| ControlError::Lock)?;
+        for (id, observed) in &staged {
+            if let Some(retained) = catalog.get(id)
+                && (retained.directory != observed.directory
+                    || retained.metadata.relative_path != observed.metadata.relative_path
+                    || retained.metadata.byte_size != observed.metadata.byte_size
+                    || retained.metadata.checksum_blake3 != observed.metadata.checksum_blake3
+                    || retained.metadata.checksum_sha256 != observed.metadata.checksum_sha256)
+            {
+                return Err(ControlError::Conflict(
+                    "published experiment artifact changed; original identity is retained"
+                        .to_owned(),
+                ));
+            }
+        }
+        for (id, observed) in staged {
+            catalog.entry(id).or_insert(observed);
+        }
+        Ok(())
     }
 }
 
@@ -1665,11 +1836,8 @@ impl ControlHandle {
         let default_concurrency = std::thread::available_parallelism()
             .map_or(1, std::num::NonZeroUsize::get)
             .clamp(1, 4);
-        let output_dir = self
-            .data_services
-            .artifacts_dir()
-            .join("experiments")
-            .join(&experiment_id);
+        let artifact_root = self.data_services.artifacts_dir();
+        let output_dir = artifact_root.join("experiments").join(&experiment_id);
         let runner = crate::experiment_runner::MatchedSeedExperimentRunner::new(
             experiment_id.clone(),
             crate::experiment_runner::MatchedSeedCohort {
@@ -1699,6 +1867,7 @@ impl ControlHandle {
             running: std::sync::Arc::default(),
             last_error: std::sync::Arc::default(),
             created_at_utc: format!("{secs}"),
+            artifact_root,
         };
         {
             let mut lock = self
@@ -1711,7 +1880,7 @@ impl ControlHandle {
                     "experiment_id '{experiment_id}' already exists"
                 )));
             }
-            job.start();
+            job.start(std::sync::Arc::clone(&self.data_services));
             lock.insert(experiment_id.clone(), job);
         }
         // Admission has happened even if the first status read fails. Publish
@@ -1798,7 +1967,7 @@ impl ControlHandle {
         if let Ok(mut error) = job.last_error.lock() {
             *error = None;
         }
-        job.start();
+        job.start(std::sync::Arc::clone(&self.data_services));
         job.status_dto(experiment_id)
     }
 
@@ -2001,8 +2170,10 @@ impl ControlHandle {
         identity: &str,
         mut retained: RetainedCheckpoint,
     ) -> Result<CheckpointMetadataDto, ControlError> {
-        let bytes =
-            read_artifact_file_bounded(&retained.directory.join(&retained.artifact.relative_path))?;
+        let bytes = read_artifact_file_bounded(
+            &retained.directory.join(&retained.artifact.relative_path),
+            MAX_ARTIFACT_DOWNLOAD_BYTES,
+        )?;
         if bytes.len() as u64 != retained.metadata.byte_size
             || compute_blake3(&bytes) != retained.metadata.checksum_blake3
             || compute_sha256(&bytes) != retained.metadata.checksum_sha256
@@ -2045,7 +2216,10 @@ impl ControlHandle {
                 .map_err(|_| ControlError::Lock)?
                 .insert(
                     retained.artifact.artifact_id.clone(),
-                    retained.artifact.clone(),
+                    RetainedArtifact {
+                        metadata: retained.artifact.clone(),
+                        directory: retained.directory.clone(),
+                    },
                 );
             retained.acknowledged = true;
             retention
@@ -2158,6 +2332,11 @@ impl ControlHandle {
 
     /// Look up artifact metadata by ID.
     pub fn get_artifact(&self, artifact_id: &str) -> Result<ArtifactMetadataDto, ControlError> {
+        self.retained_artifact(artifact_id)
+            .map(|artifact| artifact.metadata)
+    }
+
+    fn retained_artifact(&self, artifact_id: &str) -> Result<RetainedArtifact, ControlError> {
         let lock = self
             .data_services
             .artifacts
@@ -2189,8 +2368,12 @@ impl ControlHandle {
             .lock()
             .map_err(|_| ControlError::Lock)?;
         let total = lock.len();
-        let items: Vec<ArtifactMetadataDto> =
-            lock.values().skip(offset).take(limit).cloned().collect();
+        let items: Vec<ArtifactMetadataDto> = lock
+            .values()
+            .skip(offset)
+            .take(limit)
+            .map(|artifact| artifact.metadata.clone())
+            .collect();
 
         let has_more = offset + items.len() < total;
         let next_cursor = if has_more {
@@ -2214,7 +2397,8 @@ impl ControlHandle {
         &self,
         artifact_id: &str,
     ) -> Result<(ArtifactMetadataDto, Vec<u8>), ControlError> {
-        let artifact = self.get_artifact(artifact_id)?;
+        let retained = self.retained_artifact(artifact_id)?;
+        let artifact = retained.metadata;
         let rel_path = &artifact.relative_path;
 
         if rel_path.contains("..")
@@ -2227,16 +2411,7 @@ impl ControlHandle {
             ));
         }
 
-        let dir = self
-            .data_services
-            .checkpoint_retention
-            .lock()
-            .map_err(|_| ControlError::Lock)?
-            .requests
-            .values()
-            .find(|entry| entry.artifact.artifact_id == artifact_id)
-            .map(|entry| entry.directory.clone())
-            .unwrap_or_else(|| self.data_services.artifacts_dir());
+        let dir = retained.directory;
         let file_path = dir.join(rel_path);
         let canonical_file = file_path
             .canonicalize()
@@ -2246,7 +2421,7 @@ impl ControlHandle {
                 "path traversal detected: outside artifacts dir".to_owned(),
             ));
         }
-        let bytes = read_artifact_file_bounded(&canonical_file)?;
+        let bytes = read_artifact_file_bounded(&canonical_file, MAX_ARTIFACT_DOWNLOAD_BYTES)?;
 
         if bytes.len() > MAX_ARTIFACT_DOWNLOAD_BYTES {
             return Err(ControlError::PayloadTooLarge(format!(
@@ -3632,6 +3807,131 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn experiment_creation_publishes_downloadable_bundle_files() {
+        let (handle, _host) = handle();
+        let created = handle
+            .create_experiment(experiment_creation_request())
+            .expect("create actual experiment");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let completed = loop {
+            let status = handle
+                .get_experiment(&created.experiment_id)
+                .expect("actual experiment status");
+            if status.status == "completed" {
+                break status;
+            }
+            assert_ne!(status.status, "failed", "{status:?}");
+            assert!(std::time::Instant::now() < deadline, "{status:?}");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        let original_root = handle.artifacts_dir();
+        let bundle_dir = Path::new(completed.runs[0].bundle_path.as_ref().expect("bundle"));
+        let bundle: scriptbots_storage::RunBundleV1 = serde_json::from_slice(
+            &fs::read(bundle_dir.join("bundle_manifest.json")).expect("actual manifest"),
+        )
+        .expect("decode actual manifest");
+        assert!(bundle_dir.starts_with(&original_root));
+        let prefix = format!(
+            "experiments/{}/{}",
+            completed.experiment_id, completed.runs[0].run_id
+        );
+        let expected: std::collections::BTreeSet<_> = bundle
+            .artifacts
+            .iter()
+            .map(|entry| format!("{prefix}/{}", entry.relative_path))
+            .chain(std::iter::once(format!("{prefix}/bundle_manifest.json")))
+            .collect();
+        let catalog = handle.list_artifacts(Some(100), None).expect("catalog");
+        let actual: std::collections::BTreeSet<_> = catalog
+            .items
+            .iter()
+            .map(|item| item.relative_path.clone())
+            .collect();
+        assert_eq!(expected, actual, "completed files must be discoverable");
+        assert!(!catalog.has_more);
+        let handle = handle
+            .with_artifacts_dir(original_root.with_extension("rotated"))
+            .expect("rotate the active artifact root");
+        for artifact in &catalog.items {
+            let (metadata, bytes) = handle
+                .read_artifact_bytes(&artifact.artifact_id)
+                .expect("download from the original root");
+            assert_eq!(
+                bytes,
+                fs::read(original_root.join(&artifact.relative_path)).unwrap()
+            );
+            assert_eq!(metadata.byte_size, bytes.len() as u64);
+            assert_eq!(metadata.checksum_blake3, compute_blake3(&bytes));
+            assert_eq!(metadata.checksum_sha256, compute_sha256(&bytes));
+        }
+        let artifact = &catalog.items[0];
+        let path = original_root.join(&artifact.relative_path);
+        fs::copy(&path, path.with_extension("preserved-original"))
+            .expect("retain the real pre-corruption bytes");
+        fs::write(&path, b"deliberately changed after publication").expect("actual tamper");
+        assert!(matches!(
+            handle.read_artifact_bytes(&artifact.artifact_id),
+            Err(ControlError::InvalidPatch(_))
+        ));
+    }
+
+    #[test]
+    fn experiment_creation_catalog_failure_is_not_completion() {
+        let (handle, _host) = handle();
+        let services = std::sync::Arc::clone(&handle.data_services);
+        let poisoned = std::thread::spawn(move || {
+            let _guard = services
+                .artifacts
+                .lock()
+                .expect("initially healthy catalog");
+            panic!("intentional artifact catalog poison");
+        });
+        assert!(poisoned.join().is_err());
+        let created = handle
+            .create_experiment(experiment_creation_request())
+            .expect("admit run");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let failed = loop {
+            let status = handle
+                .get_experiment(&created.experiment_id)
+                .expect("actual status");
+            assert_ne!(status.status, "completed", "publication failed: {status:?}");
+            if status.status == "failed" {
+                break status;
+            }
+            assert!(std::time::Instant::now() < deadline, "{status:?}");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        assert_eq!(
+            failed.completed_runs, 1,
+            "science completed before publication failed"
+        );
+        assert_eq!(failed.failed_runs, 0);
+        assert!(
+            failed
+                .error_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("artifact publication failed"))
+        );
+        scriptbots_storage::verify_run_bundle(Path::new(
+            failed.runs[0]
+                .bundle_path
+                .as_ref()
+                .expect("retained bundle"),
+        ))
+        .expect("publication failure preserves the real completed bundle");
+        assert!(
+            handle
+                .data_services
+                .artifacts
+                .lock()
+                .unwrap_err()
+                .into_inner()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn experiment_creation_status_failure_retains_the_admitted_identity() {
         let (handle, _host) = handle();
         let mut request = experiment_creation_request();
@@ -4231,7 +4531,7 @@ pub(crate) mod tests {
         file.sync_all().expect("retained fixture sync");
         drop(file);
         assert!(matches!(
-            read_artifact_file_bounded(&path),
+            read_artifact_file_bounded(&path, MAX_ARTIFACT_DOWNLOAD_BYTES),
             Err(ControlError::PayloadTooLarge(_))
         ));
         let (handle, _host) = checkpoint_test_handle(&directory, 2, bytes - 1);
