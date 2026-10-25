@@ -986,55 +986,26 @@ impl ExperimentJob {
         }
     }
 
-    fn status_dto(&self, experiment_id: &str) -> Result<ExperimentBatchStatusDto, ControlError> {
-        use crate::experiment_runner::{ExperimentBatchStatus, RunState};
+    fn status_dto(&self) -> Result<ExperimentBatchStatusDto, ControlError> {
+        use crate::experiment_runner::RunState;
         use std::sync::atomic::Ordering;
         let running = self.running.load(Ordering::Acquire);
         let cancel_requested = self.cancel.load(Ordering::Acquire);
         let error_reason = self.last_error.lock().ok().and_then(|slot| slot.clone());
-        let (status, updated_at_utc) = match fs::read(&self.state_file) {
-            Ok(bytes) => {
-                let status: ExperimentBatchStatus =
-                    serde_json::from_slice(&bytes).map_err(|error| {
-                        ControlError::Serialization(format!(
-                            "experiment status {} is unreadable: {error}",
-                            self.state_file.display()
-                        ))
-                    })?;
-                let modified = fs::metadata(&self.state_file)
-                    .and_then(|meta| meta.modified())
-                    .ok()
-                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map_or_else(|| self.created_at_utc.clone(), |d| d.as_secs().to_string());
-                (status, modified)
-            }
-            // The worker has not written its first status yet: the plan is the status.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let runs = self
-                    .runner
-                    .plan_batch()
-                    .map_err(|error| ControlError::BadRequest(error.to_string()))?;
-                (
-                    ExperimentBatchStatus {
-                        schema_version: 2,
-                        generation: 0,
-                        plan_digest: String::new(),
-                        experiment_id: experiment_id.to_string(),
-                        total_runs: runs.len(),
-                        completed_runs: 0,
-                        failed_runs: 0,
-                        runs,
-                    },
-                    self.created_at_utc.clone(),
-                )
-            }
-            Err(error) => {
-                return Err(ControlError::Serialization(format!(
+        let status = self
+            .runner
+            .status_snapshot(&self.state_file)
+            .map_err(|error| {
+                ControlError::Serialization(format!(
                     "experiment status {} is unreadable: {error}",
                     self.state_file.display()
-                )));
-            }
-        };
+                ))
+            })?;
+        let updated_at_utc = fs::metadata(&self.state_file)
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or_else(|| self.created_at_utc.clone(), |d| d.as_secs().to_string());
         let finished = status.is_finished();
         let any_started = status.runs.iter().any(|run| run.state != RunState::Pending);
         let label = if running && cancel_requested {
@@ -1908,7 +1879,7 @@ impl ControlHandle {
         let job = lock.get(experiment_id).ok_or_else(|| {
             ControlError::NotFound(format!("experiment '{experiment_id}' not found"))
         })?;
-        job.status_dto(experiment_id)
+        job.status_dto()
     }
 
     /// Request cooperative cancellation. The wave already executing finishes;
@@ -1926,7 +1897,7 @@ impl ControlHandle {
             ControlError::NotFound(format!("experiment '{experiment_id}' not found"))
         })?;
         job.cancel.store(true, std::sync::atomic::Ordering::Release);
-        job.status_dto(experiment_id)
+        job.status_dto()
     }
 
     /// Resume a stopped experiment whose batch still has pending runs.
@@ -1942,7 +1913,7 @@ impl ControlHandle {
         let job = lock.get(experiment_id).ok_or_else(|| {
             ControlError::NotFound(format!("experiment '{experiment_id}' not found"))
         })?;
-        let current = job.status_dto(experiment_id)?;
+        let current = job.status_dto()?;
         match current.status.as_str() {
             "running" | "pending" => {
                 return Err(ControlError::Conflict(format!(
@@ -1968,7 +1939,7 @@ impl ControlHandle {
             *error = None;
         }
         job.start(std::sync::Arc::clone(&self.data_services));
-        job.status_dto(experiment_id)
+        job.status_dto()
     }
 
     /// List experiments with bounded pagination.
@@ -1993,11 +1964,11 @@ impl ControlHandle {
             .map_err(|_| ControlError::Lock)?;
         let total = lock.len();
         let items: Vec<ExperimentSummaryDto> = lock
-            .iter()
+            .values()
             .skip(offset)
             .take(limit)
-            .map(|(id, job)| {
-                job.status_dto(id).map(|e| ExperimentSummaryDto {
+            .map(|job| {
+                job.status_dto().map(|e| ExperimentSummaryDto {
                     experiment_id: e.experiment_id,
                     status: e.status,
                     total_runs: e.total_runs,
@@ -3804,6 +3775,182 @@ pub(crate) mod tests {
             Err(ControlError::Conflict(_))
         ));
         assert_eq!(handle.list_experiments(Some(100), None).unwrap().total, 1);
+    }
+
+    #[test]
+    fn experiment_status_refuses_changed_plan_and_terminal_evidence() {
+        let (handle, _host) = handle();
+        let created = handle
+            .create_experiment(experiment_creation_request())
+            .expect("create actual experiment");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let completed = loop {
+            let status = handle.get_experiment(&created.experiment_id).unwrap();
+            if status.status == "completed" {
+                break status;
+            }
+            assert_ne!(status.status, "failed", "{status:?}");
+            assert!(std::time::Instant::now() < deadline, "{status:?}");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        let state_file = handle
+            .artifacts_dir()
+            .join("experiments")
+            .join(&created.experiment_id)
+            .join("status.json");
+        let original = fs::read(&state_file).expect("actual completed status");
+        fs::copy(&state_file, state_file.with_extension("preserved-original"))
+            .expect("preserve completed status before fault inputs");
+        let valid: Value = serde_json::from_slice(&original).unwrap();
+        let mutations = [
+            (
+                "/schema_version",
+                serde_json::json!(completed.schema_version + 1),
+            ),
+            (
+                "/plan_digest",
+                serde_json::json!(compute_blake3(b"foreign plan")),
+            ),
+            ("/experiment_id", serde_json::json!("foreign-experiment")),
+            ("/total_runs", serde_json::json!(completed.total_runs + 1)),
+            ("/completed_runs", serde_json::json!(0)),
+            ("/failed_runs", serde_json::json!(1)),
+            ("/runs/0/run_id", serde_json::json!("foreign-run")),
+            ("/runs/0/variant_id", serde_json::json!("foreign-variant")),
+            ("/runs/0/brain_family", serde_json::json!("dwraon")),
+            (
+                "/runs/0/seed",
+                serde_json::json!(completed.runs[0].seed ^ 1),
+            ),
+            (
+                "/runs/0/total_ticks",
+                serde_json::json!(completed.runs[0].total_ticks + 1),
+            ),
+            ("/runs/0/final_digest", serde_json::json!("invalid-digest")),
+            (
+                "/runs/0/bundle_path",
+                serde_json::json!("outside-the-experiment"),
+            ),
+            ("/runs/0/state", serde_json::json!("pending")),
+        ];
+        let mut observed_paths = std::collections::BTreeSet::new();
+        let mut admitted = Vec::new();
+        for (pointer, value) in mutations {
+            assert!(observed_paths.insert(pointer), "duplicate mutation cell");
+            let mut changed = valid.clone();
+            let field = changed.pointer_mut(pointer).expect("actual declared field");
+            assert_ne!(*field, value, "mutation must change its field: {pointer}");
+            *field = value;
+            let bytes = serde_json::to_vec(&changed).unwrap();
+            fs::write(&state_file, &bytes).expect("actual changed status");
+            let get_refused = matches!(
+                handle.get_experiment(&created.experiment_id),
+                Err(ControlError::Serialization(_))
+            );
+            let list_refused = matches!(
+                handle.list_experiments(Some(100), None),
+                Err(ControlError::Serialization(_))
+            );
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "case": pointer, "get_refused": get_refused, "list_refused": list_refused,
+                    "input_sha256": compute_sha256(&bytes), "input_bytes": bytes.len()
+                })
+            );
+            if !get_refused || !list_refused {
+                admitted.push(pointer);
+            }
+            assert_eq!(
+                fs::read(&state_file).unwrap(),
+                bytes,
+                "reads must not rewrite evidence"
+            );
+        }
+        fs::write(&state_file, &original).expect("restore exact preserved completed bytes");
+        let readback = handle.get_experiment(&created.experiment_id).unwrap();
+        assert_eq!(
+            serde_json::to_value(&readback.runs).unwrap(),
+            serde_json::to_value(&completed.runs).unwrap()
+        );
+        assert_eq!(readback.plan_digest, completed.plan_digest);
+        assert!(
+            admitted.is_empty(),
+            "unvalidated status cells admitted: {admitted:?}"
+        );
+    }
+
+    #[test]
+    fn experiment_status_enforces_the_runner_byte_bound_without_rewriting() {
+        let (handle, _host) = handle();
+        let created = handle
+            .create_experiment(experiment_creation_request())
+            .expect("create actual experiment");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let completed = loop {
+            let status = handle.get_experiment(&created.experiment_id).unwrap();
+            if status.status == "completed" {
+                break status;
+            }
+            assert_ne!(status.status, "failed", "{status:?}");
+            assert!(std::time::Instant::now() < deadline, "{status:?}");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        let state_file = handle
+            .artifacts_dir()
+            .join("experiments")
+            .join(&created.experiment_id)
+            .join("status.json");
+        let original = fs::read(&state_file).unwrap();
+        fs::copy(&state_file, state_file.with_extension("preserved-original"))
+            .expect("preserve completed status");
+        let cap = usize::try_from(crate::experiment_runner::MAX_STATUS_BYTES).unwrap();
+        let mut observations = Vec::new();
+        for size in [cap - 1, cap, cap + 1] {
+            let mut bytes = original.clone();
+            assert!(bytes.len() < size);
+            bytes.resize(size, b' ');
+            fs::write(&state_file, &bytes).unwrap();
+            let get = handle.get_experiment(&created.experiment_id);
+            let list = handle.list_experiments(Some(100), None);
+            let get_matches = if size > cap {
+                matches!(get, Err(ControlError::Serialization(_)))
+            } else {
+                get.is_ok_and(|status| {
+                    serde_json::to_value(&status.runs).unwrap()
+                        == serde_json::to_value(&completed.runs).unwrap()
+                })
+            };
+            let list_matches = if size > cap {
+                matches!(list, Err(ControlError::Serialization(_)))
+            } else {
+                list.is_ok_and(|page| {
+                    page.total == 1
+                        && page.items.len() == 1
+                        && page.items[0].completed_runs == completed.completed_runs
+                        && page.items[0].failed_runs == completed.failed_runs
+                })
+            };
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "input_bytes": size, "cap": cap, "get_matches": get_matches,
+                    "list_matches": list_matches, "input_sha256": compute_sha256(&bytes)
+                })
+            );
+            observations.push(get_matches && list_matches);
+            assert_eq!(fs::read(&state_file).unwrap(), bytes);
+        }
+        fs::copy(
+            &state_file,
+            state_file.with_extension("over-limit-preserved"),
+        )
+        .expect("preserve actual oversized input");
+        fs::write(&state_file, original).expect("restore exact completed bytes");
+        assert!(
+            observations.iter().all(|matched| *matched),
+            "bound observations: {observations:?}"
+        );
     }
 
     #[test]

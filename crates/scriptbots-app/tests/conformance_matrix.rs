@@ -1194,6 +1194,109 @@ fn test_experiments_checkpoints_and_artifacts_lifecycle() {
         "distinct seeds must yield distinct final worlds"
     );
 
+    // The real runner writes valid status, but readers must also refuse altered
+    // persisted observations. Exercise both transports without rewriting the
+    // malformed evidence or changing completed science.
+    let status_path = std::path::Path::new(
+        finished_runs[0]["bundle_path"]
+            .as_str()
+            .expect("completed bundle"),
+    )
+    .parent()
+    .expect("experiment directory")
+    .join("status.json");
+    let original_status = std::fs::read(&status_path).expect("actual completed status");
+    std::fs::copy(
+        &status_path,
+        status_path.with_extension("preserved-original"),
+    )
+    .expect("retain pre-fault status bytes");
+    let persisted: Value = serde_json::from_slice(&original_status).unwrap();
+    for (pointer, replacement, reason) in [
+        ("/schema_version", serde_json::json!(0), "schema_version"),
+        (
+            "/experiment_id",
+            serde_json::json!("foreign-experiment"),
+            "experiment_id",
+        ),
+        ("/completed_runs", serde_json::json!(0), "derived counters"),
+    ] {
+        let mut changed = persisted.clone();
+        let field = changed.pointer_mut(pointer).expect("actual status field");
+        assert_ne!(*field, replacement, "fault input must differ: {pointer}");
+        *field = replacement;
+        let bytes = serde_json::to_vec(&changed).unwrap();
+        std::fs::write(&status_path, &bytes).expect("inject real status fault");
+        for path in [
+            format!("/api/v1/experiments/{exp_id}"),
+            "/api/v1/experiments?limit=100".to_owned(),
+        ] {
+            let (code, body) = http_request(fixture.rest_addr, "GET", &path, &[], None)
+                .expect("REST status fault response");
+            assert_eq!(code, 500, "{pointer}: {body}");
+            assert!(body.contains(reason), "{pointer}: {body}");
+        }
+        for (tool, arguments) in [
+            (
+                "experiment_status",
+                serde_json::json!({"experiment_id":exp_id}),
+            ),
+            ("experiment_list", serde_json::json!({"limit":100})),
+        ] {
+            let (code, response) = mcp_json_rpc(
+                fixture.mcp_addr,
+                Some(152),
+                "tools/call",
+                Some(serde_json::json!({"name":tool,"arguments":arguments})),
+            )
+            .expect("MCP status fault response");
+            assert_eq!(code, 200, "{pointer}: {response}");
+            // Serialization maps to InternalError; FastMCP propagates that
+            // framework-terminal code as a sanitized JSON-RPC failure rather
+            // than application-level isError tool content.
+            assert!(response.get("result").is_none(), "{pointer}: {response}");
+            assert_eq!(response["id"], 152, "{pointer}: {response}");
+            assert_eq!(response["error"]["code"], -32603, "{pointer}: {response}");
+            assert_eq!(
+                response["error"]["message"], "Internal server error",
+                "{pointer}: {response}"
+            );
+        }
+        assert_eq!(std::fs::read(&status_path).unwrap(), bytes);
+    }
+    std::fs::write(&status_path, &original_status).expect("restore exact preserved status");
+    let (restored_code, restored_body) = http_request(
+        fixture.rest_addr,
+        "GET",
+        &format!("/api/v1/experiments/{exp_id}"),
+        &[],
+        None,
+    )
+    .expect("REST restored status");
+    assert_eq!(restored_code, 200, "{restored_body}");
+    let restored: Value = serde_json::from_str(&restored_body).unwrap();
+    assert_eq!(restored["runs"], finished_json["runs"]);
+    assert_eq!(restored["plan_digest"], finished_json["plan_digest"]);
+    let (restored_mcp_code, restored_mcp) = mcp_json_rpc(
+        fixture.mcp_addr,
+        Some(153),
+        "tools/call",
+        Some(serde_json::json!({
+            "name":"experiment_status", "arguments":{"experiment_id":exp_id}
+        })),
+    )
+    .expect("MCP restored status");
+    assert_eq!(restored_mcp_code, 200);
+    let restored_mcp: Value = serde_json::from_str(
+        restored_mcp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("MCP restored status JSON"),
+    )
+    .unwrap();
+    assert_eq!(restored_mcp["runs"], finished_json["runs"]);
+    assert_eq!(restored_mcp["plan_digest"], finished_json["plan_digest"]);
+    assert_eq!(std::fs::read(&status_path).unwrap(), original_status);
+
     // Discover and fetch completed bundles through the public surfaces. A remote
     // client reconstructs the portable directories from these bytes, rather than
     // needing access to the server-local bundle_path reported by the runner.

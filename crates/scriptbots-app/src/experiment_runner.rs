@@ -458,6 +458,38 @@ impl MatchedSeedExperimentRunner {
         self.load_or_create_status_locked(state_file, &plan)
     }
 
+    /// Read one bounded, plan-validated snapshot without writing or taking the
+    /// batch's writer lease. Before the first atomic publication, expose the
+    /// actual initial plan rather than an invented schema or empty identity.
+    pub(crate) fn status_snapshot(
+        &self,
+        state_file: &Path,
+    ) -> Result<ExperimentBatchStatus, ExperimentRunnerError> {
+        let plan = self.validated_plan()?;
+        match self.load_existing_status(state_file, &plan) {
+            Ok(status) => Ok(status),
+            Err(ExperimentRunnerError::Io { source, .. })
+                if source.kind() == io::ErrorKind::NotFound =>
+            {
+                Ok(self.initial_status(&plan))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn initial_status(&self, plan: &ValidatedPlan) -> ExperimentBatchStatus {
+        ExperimentBatchStatus {
+            schema_version: STATUS_SCHEMA_VERSION,
+            generation: 0,
+            plan_digest: plan.digest.clone(),
+            experiment_id: self.experiment_id.clone(),
+            total_runs: plan.runs.len(),
+            completed_runs: 0,
+            failed_runs: 0,
+            runs: plan.runs.clone(),
+        }
+    }
+
     fn load_or_create_status_locked(
         &self,
         state_file: &Path,
@@ -475,16 +507,7 @@ impl MatchedSeedExperimentRunner {
             return self.load_existing_status(state_file, plan);
         }
 
-        let status = ExperimentBatchStatus {
-            schema_version: STATUS_SCHEMA_VERSION,
-            generation: 0,
-            plan_digest: plan.digest.clone(),
-            experiment_id: self.experiment_id.clone(),
-            total_runs: plan.runs.len(),
-            completed_runs: 0,
-            failed_runs: 0,
-            runs: plan.runs.clone(),
-        };
+        let status = self.initial_status(plan);
         self.write_status_atomically(state_file, &status, plan)?;
         Ok(status)
     }
@@ -1849,6 +1872,62 @@ pub(crate) fn insert_dotted_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn experiment_status_snapshot_is_plan_bound_and_read_only() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let state_file = directory.join("status.json");
+        let runner = MatchedSeedExperimentRunner::new(
+            "status-reader",
+            MatchedSeedCohort {
+                cohort_id: "cohort".into(),
+                seeds: vec![7],
+            },
+            vec![ScenarioVariant {
+                variant_id: "baseline".into(),
+                brain_family: "mlp".into(),
+                config_overrides: BTreeMap::new(),
+            }],
+            2,
+            1,
+            directory.join("bundles"),
+        );
+        let planned = runner.status_snapshot(&state_file).expect("initial plan");
+        assert_eq!(planned.schema_version, STATUS_SCHEMA_VERSION);
+        assert_eq!(planned.generation, 0);
+        assert_eq!(planned.total_runs, 1);
+        assert_eq!(
+            fs::read_dir(&directory).unwrap().count(),
+            0,
+            "read created files"
+        );
+        let persisted = runner
+            .load_or_create_status(&state_file)
+            .expect("real writer");
+        assert_eq!(
+            planned, persisted,
+            "initial reader must bind the writer's exact plan"
+        );
+        let original = fs::read(&state_file).unwrap();
+        let _lease = ExperimentStatusWriterLease::acquire(&state_file).expect("hold writer lease");
+        let names_before: BTreeSet<_> = fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        let observed = runner
+            .status_snapshot(&state_file)
+            .expect("read alongside writer lease");
+        assert_eq!(observed, persisted);
+        assert_eq!(fs::read(&state_file).unwrap(), original);
+        let names_after: BTreeSet<_> = fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            names_before, names_after,
+            "read must not create recovery or lock files"
+        );
+    }
 
     #[test]
     fn canonical_arm_application_is_strict_and_type_preserving() {
