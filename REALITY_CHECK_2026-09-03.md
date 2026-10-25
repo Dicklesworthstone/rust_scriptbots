@@ -1,5 +1,251 @@
 # Reality Check — rust_scriptbots — reassessed 2026-10-20
 
+### Experiment status reader TODO — 2026-10-25, LilacElm
+
+Consumer: the requested execution TODO and remote experiment clients. Gate:
+claim bounded, plan-bound status only after positive reads and actual malformed
+file refusals. Observed defect: `ExperimentJob::status_dto` bypasses the existing
+runner validator with unbounded `fs::read`/direct deserialization. Retire this
+scoped TODO at publication/handoff; original `bd-2z0.12.2` acceptance stays open.
+
+- [x] Refresh canonical BR/BV, recent source/commits, CASS and Agent Mail.
+- [x] Preserve the complete canonical preimage; reserve the six exact paths;
+  append progress to the original in-progress owner and coordinate compilation.
+- [x] Trace producer, bounded reader, plan/schema/identity/evidence validation and
+  the get/list/cancel/resume and REST/MCP consumers.
+- [x] Execute old-source regressions on real completed-run status files: distinct
+  changed fields and declared cap−1/cap/cap+1, with read-only preservation checks.
+- [x] Connect the existing bounded validator without reader writes or acquiring
+  the batch-long writer lease; derive initial status from its actual plan/schema.
+- [x] Preserve valid initial/live/completed reads and original creation, retry,
+  cancellation, root-retention and artifact assertions.
+- [x] Verify actual REST/MCP errors and restored reads after status mutation,
+  retaining existing conformance assertions, cases and deadlines.
+- [x] Pass RCH formatting, workspace/all-target check, strict Clippy and the
+  declared affected library/full-conformance cases on the exact final source.
+- [x] Review all immutable source hunks and UBS findings; write the bounded
+  work/honesty disposition, then commit source separately from tracking.
+- [x] Append exact scoped evidence; audit all original Beads records, provenance,
+  criteria, dependencies and comment prefixes, and confirm no cycles.
+- [ ] Commit tracking, release exact leases, pull/import, publish both required
+  refs, verify actual identities and hand off. Retire publication in the external
+  proof record rather than another documentation-only certification commit.
+
+Proof root: `/data/tmp/scriptbots-status-read-20261025-lilacelm`. Parent
+`/data/projects/AGENTS.md` remains absent; project AGENTS/README are unchanged
+since the complete earlier reading. CASS's bounded recent query has zero hits;
+unindexed history is not audited. The ready macOS P0 needs its affected host,
+and persistence's outstanding engine/DSR qualifications are not replaced by
+this concrete API boundary repair. Minimal preimage/binary copies prevent the
+observed exporter provenance loss and ephemeral artifact reaping; they earn no
+capability credit. No new task, framework, requirement or gate is created.
+
+Preparation record: old tests-only library job `30079889725980680` runs on
+fleet-selected `hz3`; its active worker SHA256 matches the retained input before
+local production edits. Formatter `80681` fails new layouts, corrected manually;
+`80682` passes an intermediate snapshot. After adding an explicit restored-MCP
+positive read, final formatter `80683` passes zero/acknowledged on overlay
+`6238317316cf26973c82401e5fb64534ee1cecb6fd321c860fbcbb0feac92847`.
+Workspace/all-target check `80684` runs on `vmi1149989`; all three active-worker
+source hashes match the frozen local/UBS inputs. The initial one-compiler
+logistics explicitly changes to at most two owned correctness compilers after
+fresh healthy-worker capacity evidence (118.6/56.7 GiB free), on separate
+source pairs/targets with Cargo `-j1`. No worker policy, admission, quota or
+priority changes. Preparation uses the declared 14,400-second compile-only
+limits; functional execution retains 1,800 seconds and original unit/conformance
+deadlines. No functional cases have run at this cut.
+
+Frozen source review tree `044254920190aa4dbd8f2eee2ad370b13f33b63b` has all hunks
+read. UBS observes 0 critical / 1,355 warning / 472 information findings, not
+warning-clean. Its three retained inputs match the final bytes. All 144
+changed-line findings across 12 rules are inspected against those hunks: test
+assertions/checked indexing, intentional actual fault writes and preservation,
+bounded plan/fixture copies, plus integer comparisons and slash-containing JSON
+pointers mislabeled as floating comparison/division. No rule is suppressed and
+no output class is promoted. The declared candidate denominator is 17 distinct
+cases: three status/reader units, five original creation cases and the complete
+nine-case conformance binary. Actual results remain pending, not inferred from
+formatting, UBS or source review.
+
+**Observed failures and corrections after that preparation cut.** Old functional
+job `30079889725980688` executes both declared regressions: 0 pass / 2 fail,
+0 ignored, 655 filtered, 5.29 seconds, exit 101/acknowledged. Fourteen distinct
+changed-field inputs have distinct SHA256s. Thirteen are admitted by both old
+get/list; the lowercase `pending` enum is already refused by serde. Thus thirteen,
+not fourteen, are newly protected cells. Valid JSON at cap−1 and cap passes; at
+cap+1 the old reader wrongly admits it. The cap comes from `MAX_STATUS_BYTES`
+(16 MiB), not copied prose. The scratch diagnostic expecting fourteen old
+admissions was wrong; the original test inputs/assertions remain unchanged.
+All 15 old evidence files (16,815,677 bytes) are retained and hash-verified.
+
+Initial workspace check `80684` fails E0425 in four new conformance assertions:
+the existing variable is `finished_json`, not `finished`. Those references are
+corrected manually. Corrected formatter `80686`, workspace check `80687` and
+strict Clippy `80690` pass zero/acknowledged on intermediate overlay `a3df45b8…`.
+Candidate preparation `80689` passes and both retained test binaries match RCH's
+published BLAKE3 hashes. Actual execution `80691` passes three status/reader
+units and five original creation units, then eight of nine conformance cases;
+one new assertion incorrectly expects MCP application-error content. Actual
+response is sanitized JSON-RPC InternalError, code −32603. Existing production
+`map_control_error` and FastMCP's own framework-terminal error tests establish
+that contract. The assertion now requires exactly that code/message, matching
+request ID and absent result; REST still requires each fault's specific cause.
+No production error mapping, original assertion, case or deadline changes.
+The failed run's 58 files (16,909,571 bytes) are retained and hash-verified.
+
+RCH namespace initialization refuses old execution `80685` and later candidate
+preparations `80693`/`80697` before any tests/compilation. Supported recovery
+settles each owned lease (exit 1/acknowledged), without replay or policy bypass.
+These are infrastructure refusals, not red/green suites. Formatter `80694`
+then reports one layout in the corrected assertion; fixed manually. Formatter
+`80696` passes on final overlay
+`6b66cde6e517908a7767a9d127413b3768b198213a349f7a5c921ec78d367858`.
+Workspace check and subsequent functional proof are being rerun on final bytes;
+the earlier passing gates do not qualify that source by implication.
+
+Final-source formatter `80696` and workspace/all-target check `80698` pass
+zero/acknowledged on that exact final overlay. The active check and subsequent
+candidate worker hashes match all three local source files. Full immutable
+source tree `6ff6cf4a3ba43e93656588202eec5ecd6f956901` is reviewed hunk by hunk.
+Final UBS input copies match those bytes: 0 critical / 1,356 warning / 472
+information findings, including 145 added-line observations across 12 rules.
+All eight new diagnostic signatures since the first scan are inspected; they
+are the corrected assertions, and the seven removed signatures are replaced
+assertions plus the removed diagnostic string allocation. Nothing is suppressed.
+
+Further `hz3` namespace attempts `80700`/`80701` refuse before compilation;
+supported recovery settles both owned leases without replay. The source-receipt
+attempt produces no receipt and earns no source-binding credit. One incompatible
+receipt/overlay flag combination and one malformed recovery identity are rejected
+by argument validation; the actual named lease is subsequently recovered. No
+namespace guard or local-fallback protection is disabled. Cold alternate-worker
+preparation `30079889725980699` then passes zero/acknowledged on `vmi1149989`:
+3,011,656 ms execution, 3,088,161 ms wrapper, including artifact retrieval. This
+is build logistics, not performance evidence. Both final binaries are retained
+locally and under the protected worker proof root. Their local BLAKE3 hashes
+match RCH's published artifact hashes, and their SHA256s match the protected
+worker copies. The worker lacks `b3sum` and local Python lacks its optional
+module; the installed local `b3sum` provides the actual comparison. No dependency
+is installed to paper over those diagnostic failures. The earlier attempted
+hash read after a worker pair was retired failed; it earns no observation credit.
+
+**Final observed result; source committed as `5e9752b7`.** RCH functional job
+`30079889725980710` returns zero/acknowledged: status/reader 3 pass (4.82 s),
+original creation 5 pass (1.08 s), full conformance 9 pass (8.26 s), zero ignored;
+the conformance binary has zero filtered cases. The two library selections
+filter 655/653 other cases; this is not a full library/workspace test claim.
+All fourteen distinct mutation inputs are refused by get/list, including the
+one pre-existing enum refusal. Actual cap−1/cap/cap+1 observations all match,
+and both executable SHA256s pass before/after checks. Sixty-five final evidence
+files (16,947,419 bytes) are copied back and verified by size and SHA256. The
+scratch extractor initially assumed a JSON key order and missed the bound rows;
+the corrected parser selects actual object keys. Test output and gates do not
+change. Final strict Clippy `30079889725980712` passes zero/acknowledged with
+`--workspace --all-targets -- -D warnings`; its active source hashes match the
+final formatter/check, candidate inputs, UBS copies and reviewed source blobs.
+Formatting `80696`, check `80698` and Clippy `80712` all bind final overlay
+`6b66cde6e517908a7767a9d127413b3768b198213a349f7a5c921ec78d367858`
+on base `4cb68085052bfb27ab5f5ece2348137306725258`. The exact reviewed tree is
+committed through the private-index protocol as
+`5e9752b7a4a17a7d4c10910470a2deb3db6ab571`, not an invented full revision.
+
+This is real in-process HTTP/MCP, actual HostThread simulation and actual
+artifact/status files. Its fixture uses NullPersistence/VolatileJournal; it is
+not the production file-storage subprocess, restart, complete API acceptance or
+full native/DSR proof. Validation is structural and plan-bound; a well-formed
+digest is not authentication of completed science or bundle bytes. Cancellation
+still sets its cooperative flag before reading status; read-only claims here
+cover file observations and the get/list tests, not absence of cancellation
+side effects. No performance comparison ran. The original API owner remains
+in progress with all seven acceptance criteria, dependencies and history.
+
+**Real-work audit, this single status-reader increment.** Actual inputs: the
+four recent commits, canonical 718-record preimage, current owner and bounded
+recent-close listing; no item closes in this increment. Work units: one USER
+source repair (including its tests) and one PROCESS tracking update; no new
+framework/enabler is credited as capability.
+
+1. Demo: observe the real initial/completed plan, corrupt its schema, see REST
+   refuse it, restore the exact bytes and observe the same completed runs.
+2. Omitting tracking changes would not change runtime behavior. The user asked
+   for that TODO; minimal provenance/binary retention prevents observed loss.
+3. The existing runner validator is exercised by get/list and real REST/MCP
+   consumers. The held-writer-lease read verifies the positive observation path.
+4. The oldest open user goal is `bd-2z0` (July 11), the deterministic Evolution
+   Lab. This API increment serves it; the ready macOS P0 needs the absent host.
+5. Solo work: zero closes, no delegated or peer-certified result.
+6. No requirements are replaced with plan prose and no follow-up is minted to
+   absorb unmet acceptance. The original complete API item stays in progress.
+
+Verdict: useful scoped repair, costly cold compilation, bounded process. Freeze
+further apparatus and finish publication. Process receives zero capability
+credit; this audit retires with the session report.
+
+**Honesty inventory, same increment and bounded indexed CASS history.**
+
+1. No (checked every immutable source/test hunk and unchanged CI/config paths):
+   no existing test is deleted, weakened, skipped or ignored; no history rewrite.
+2. No (checked the three new units and added lifecycle assertions): actual
+   simulation/files are exercised; the pre-existing fixture's limits are above.
+3. No (checked changed paths): no golden, snapshot or baseline changes.
+4. Yes: conformance assertions accompany the fix. The new MCP expectation was
+   wrong and corrected against production mapping and pinned SDK tests. Exact
+   code/message/ID/no-result and restored positives replace it; original gates,
+   schema, diagnostics, limits, deadlines, pins and suppressions are unchanged.
+5. No (checked production and negative/positive paths): no fixture-specific
+   branch, environment sniff, invented output or chosen-after-results scope.
+6. No (checked raw summaries): final 3+5+9 actually execute; no ignored cases.
+   Compile-only preparation and infrastructure refusals earn no test credit.
+7. No (checked cited receipts and retained artifacts): only observed commands
+   and matching input hashes qualify the final result. Failed hash reads do not.
+8. No (checked fixture classes and report language): in-process proof is not
+   presented as production file-storage, restart, scientific authentication,
+   full workspace tests, native/DSR or performance qualification.
+9. Yes, failures require explicit disclosure: compiler E0425, wrong new MCP
+   assertion, namespace refusals and diagnostic mistakes are retained above.
+   First conformance was 8/9; only the final execution is 9/9.
+10. No (checked command redirections/raw logs): stderr is retained, including
+    intentional caught poison panics in the original creation tests.
+11. No (checked original owner and scope): no closure or acceptance laundering.
+12. No (checked plan annotation and original criteria): prose records source
+    behavior and limits; it does not revise the original seven requirements.
+13. No (checked tracker operations): solo; no self/peer closure.
+14. No (checked session dispatch): no subagent is dispatched.
+15. No (checked evidence origin): no delegated claim is accepted as proof.
+16. No (checked work/closure list): no refusal-only close or guard farming.
+17. No (checked Agent Mail): coordination is not independent verification.
+18. No (checked pre-execution declaration and actual cells): denominator stays
+    17 cases, 14 mutations, 3 bounds; incremental field protection is 13, not 14.
+19. Yes: repeated namespace retries, cold compilation, wrong variable/error
+    assumptions and diagnostic parser/tool failures cost time. They are corrected
+    in place and disclosed here; argument-validation failures execute no job.
+20. Strongest evidence: retained old production fails both regressions; the
+    candidate's hash-bound binaries pass all declared cases, exercise actual
+    completed files and restore positive observations. A skeptic can rerun them.
+
+Disposition: corrected and disclosed; RH-1 countermeasure is exact existing
+error-contract plus positive/negative checks, RH-17 is retention of every failed
+attempt, and RH-2 is explicit fixture-class qualification. CASS's five stock
+queries plus session-specific `status_snapshot` return zero indexed hits; this
+does not audit unindexed history. A bounded web search yields no contract hit;
+the pinned local SDK source/tests establish the contract. This is fresh solo
+reverification, not independent certification. Full original acceptance stays
+open; final graph audit and publication outcomes are recorded next.
+
+**Tracking integrity.** Progress/final comments `2966`/`2967` extend the original
+twelve-comment prefix without changing status, acceptance, dependencies or any
+other owner field except `updated_at`. The strict export contains all 718
+ordered unique records, 1,348 dependencies and 1,738 labels. Its known loss of
+392 unrelated `source_repo_path` fields is detected and restored from the
+preserved canonical preimage only after proving every other field equal. All
+717 unrelated rows are byte-identical to that preimage. Canonical JSONL SHA256:
+`530a93fce2d39bc8bc019de89409252d95c6e8c39876b837cb5c53be2678caef`.
+The all-status dependency-cycle query is empty. Raw export, restored canonical
+copy and complete integrity audit remain in the proof root. Cache/base/WAL
+files are preserved and excluded from commits. Final source and tracking are
+separate logical commits; actual publication/retirement is recorded externally
+after the required pull/import, both pushes and ref verification.
+
 ### Experiment artifact delivery TODO — 2026-10-25, LilacElm
 
 Consumer: the user's granular execution request and remote experiment clients.

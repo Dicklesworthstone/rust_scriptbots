@@ -4,6 +4,18 @@
 
 **Evidence date:** 2026-07-11
 
+**Experiment status reader (2026-10-25):** [Currently In Progress — LilacElm,
+`bd-2z0.12.2` / `bd-0oro`; scoped source committed as `5e9752b7`]
+API status reads now use the runner's existing bounded plan/schema/identity
+validator and derive initial observations from its actual plan. Old production
+admits thirteen independently changed fields and cap+1 valid JSON; the candidate
+passes all seventeen declared status, creation and complete conformance cases.
+Remote final formatting, workspace/all-target check and strict Clippy pass on
+the same reviewed bytes. Reader file preservation and held-writer-lease reads
+are observed; science/bundle authentication, production file-storage subprocess,
+restart and full native/DSR acceptance remain outside this proof. The original
+owner stays in progress; the existing Reality Check holds the TODO and evidence.
+
 **Experiment artifact delivery (2026-10-25):** [Currently In Progress — LilacElm,
 `bd-2z0.12.2`; scoped source committed as `2d287047`]
 Completed bundle manifests and their declared files now enter the existing
