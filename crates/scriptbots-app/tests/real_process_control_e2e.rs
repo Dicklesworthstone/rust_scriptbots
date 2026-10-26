@@ -2350,7 +2350,7 @@ fn real_process_experiments_checkpoints_artifacts_e2e() -> Result<()> {
         assert!(tool_result(200, &invalid.to_string(), 10).is_err());
     }
 
-    let outcome: Result<()> = (|| {
+    let outcome: Result<_> = (|| {
         // --- 1. Version and Schema Discovery ---
         let start = Instant::now();
         let (v_code, v_body) = http(rest_addr, "GET", "/api/v1/version")?;
@@ -3364,138 +3364,148 @@ fn real_process_experiments_checkpoints_artifacts_e2e() -> Result<()> {
             String::from_utf8_lossy(&replay.stderr)
         );
 
-        // Independent readers and separate CLI processes join API identities to durable rows.
-        let reader = scriptbots_storage::StorageReader::open_finished(&db.to_string_lossy())?;
-        let checkpoints = reader.load_checkpoints()?;
-        assert_eq!(checkpoints.len(), 2);
-        for (id, bytes) in [
-            (chk_id.as_str(), &dl_bytes),
-            (mcp_checkpoint_id, &second_bytes),
-        ] {
-            let row = checkpoints
-                .iter()
-                .find(|row| row.checkpoint_id == id)
-                .expect("API checkpoint identity must exist in durable SQL");
-            assert_eq!(row.world_checkpoint()?.encode()?, *bytes);
-        }
-        let sql_bytes = checkpoints.iter().try_fold(0_u64, |total, row| {
-            u64::try_from(
-                row.checkpoint_id.len()
-                    + row.format.len()
-                    + row.payload.len()
-                    + row.payload_digest.len()
-                    + row.metadata_json.len(),
-            )
-            .map(|bytes| total + bytes)
-        })?;
-        assert_eq!(retention["sql_bytes"].as_u64(), Some(sql_bytes));
-        let manifest = reader.run_manifest()?;
-        let watermarks = reader.persistence_watermarks()?;
-        assert!(watermarks.admitted.is_some(), "nonempty production outbox");
-        assert_eq!(watermarks.admitted, watermarks.applied);
-        assert_eq!(watermarks.applied, watermarks.durable);
-        let events = reader.load_replay_events()?;
-        let ledger = reader.run_ledger_summary()?;
-        assert!(ledger.tick_count > 0);
-        assert!(!events.is_empty());
-        reader.close()?;
-        let bundle_dir = run_dir.join("finished-bundle");
-        let exported = Command::new(binary())
-            .arg("--create-bundle")
-            .arg(&db)
-            .arg("--bundle-output")
-            .arg(&bundle_dir)
-            .output()?;
-        println!(
-            "FINISHED_BUNDLE_CREATE: {}\n{}\n{}",
-            exported.status,
-            String::from_utf8_lossy(&exported.stdout),
-            String::from_utf8_lossy(&exported.stderr)
-        );
-        assert!(exported.status.success(), "finished export must succeed");
-        let verified = Command::new(binary())
-            .arg("--verify-bundle")
-            .arg(&bundle_dir)
-            .output()?;
-        println!(
-            "FINISHED_BUNDLE_VERIFY: {}\n{}\n{}",
-            verified.status,
-            String::from_utf8_lossy(&verified.stdout),
-            String::from_utf8_lossy(&verified.stderr)
-        );
-        assert!(
-            verified.status.success(),
-            "separate bundle verification must succeed"
-        );
-        let copied = scriptbots_storage::StorageReader::open_finished(
-            &bundle_dir.join("run.db").to_string_lossy(),
-        )?;
-        assert_eq!(copied.run_manifest()?, manifest);
-        assert_eq!(copied.load_checkpoints()?, checkpoints);
-        assert_eq!(copied.load_replay_events()?, events);
-        assert_eq!(copied.persistence_watermarks()?, watermarks);
-        assert_eq!(copied.run_ledger_summary()?.tick_count, ledger.tick_count);
-        copied.close()?;
-        let bundle: scriptbots_storage::bundle::RunBundleV1 =
-            serde_json::from_slice(&std::fs::read(bundle_dir.join("bundle_manifest.json"))?)?;
-        assert_eq!(bundle.manifest, manifest);
-        assert_eq!(
-            bundle.digests.checkpoint_count,
-            u64::try_from(checkpoints.len())?
-        );
-        assert_eq!(bundle.digests.event_count, u64::try_from(events.len())?);
-        assert_eq!(
-            bundle.digests.persistence_watermarks,
-            Some(scriptbots_storage::bundle::RunBundleWatermarks::from(
-                watermarks
-            ))
-        );
-        log_event(
-            serde_json::json!({"phase": "durable_bundle_readback", "run": manifest.run_id,
-            "watermarks": scriptbots_storage::bundle::RunBundleWatermarks::from(watermarks),
-            "checkpoint_count": checkpoints.len(),
-            "sql_bytes": sql_bytes, "event_count": events.len(), "tick_count": ledger.tick_count,
-            "bundle": bundle_dir}),
-        );
-
-        let persisted_manifest: serde_json::Value = serde_json::from_str(&manifest.manifest_json)?;
-        let persisted_source = persisted_manifest["build"]["source_revision"].as_str();
-        assert_eq!(persisted_source, option_env!("SCRIPTBOTS_SOURCE_REVISION"));
-        let fault_observations = [
-            ("empty_variants", bad_var_code),
-            ("unknown_brain_family", bad_brain_code),
-            ("missing_experiment", not_found_code),
-            ("artifact_path_traversal", trav_code),
-            ("missing_artifact", missing_art_code),
-        ];
-        println!(
-            "{}",
-            serde_json::json!({
-                "schema": "scriptbots.e2e-experiment-checkpoint-artifact.v3",
-                "status": "pass", "binary": binary(), "mode": "server", "storage": "file",
-                "tools_count": tools.len(), "experiments_count": experiments_count,
-                "checkpoints_count": checkpoints.len(), "checkpoint_artifacts_count": retention["file_count"],
-                "artifacts_count": final_catalog["total"],
-                "experiment_delivery": {
-                    "experiment_id":exp_id, "retry_experiment_id":retried["experiment_id"],
-                    "expected_run_count":expected_runs, "status":completed,
-                    "expected_ticks_per_run":exp_payload["ticks_per_run"],
-                    "downloaded_files":downloaded_files,"verified_bundles":verified_experiments,
-                    "status_faults":status_faults,"restored_rest":restored,"restored_mcp":restored_mcp,
-                    "status_before_sha256":scriptbots_app::control::compute_sha256(&original),
-                    "status_after_sha256":scriptbots_app::control::compute_sha256(&std::fs::read(&state_file)?),
-                },
-                "injected_faults_handled": fault_observations.len(), "fault_observations": fault_observations,
-                "checksums_verified": true, "ordered_shutdown_exit_code": shutdown_exit.code(),
-                "source_commit": persisted_source, "compiler_identity": option_env!("SCRIPTBOTS_RUSTC_VV"),
-                "retained_root": run_dir, "run_id": manifest.run_id,
+        // The live journey and finished SQL readback must not retain both frames:
+        // the combined path overflowed the ordinary test-harness stack. Keep the
+        // same readback and assertions, without increasing the stack allowance.
+        let mcp_checkpoint_id = mcp_checkpoint_id.to_owned();
+        let retention = retention.clone();
+        let tools_count = tools.len();
+        Ok(move || -> Result<()> {
+            // Independent readers and separate CLI processes join API identities to durable rows.
+            let reader = scriptbots_storage::StorageReader::open_finished(&db.to_string_lossy())?;
+            let checkpoints = reader.load_checkpoints()?;
+            assert_eq!(checkpoints.len(), 2);
+            for (id, bytes) in [
+                (chk_id.as_str(), &dl_bytes),
+                (mcp_checkpoint_id.as_str(), &second_bytes),
+            ] {
+                let row = checkpoints
+                    .iter()
+                    .find(|row| row.checkpoint_id == id)
+                    .expect("API checkpoint identity must exist in durable SQL");
+                assert_eq!(row.world_checkpoint()?.encode()?, *bytes);
+            }
+            let sql_bytes = checkpoints.iter().try_fold(0_u64, |total, row| {
+                u64::try_from(
+                    row.checkpoint_id.len()
+                        + row.format.len()
+                        + row.payload.len()
+                        + row.payload_digest.len()
+                        + row.metadata_json.len(),
+                )
+                .map(|bytes| total + bytes)
+            })?;
+            assert_eq!(retention["sql_bytes"].as_u64(), Some(sql_bytes));
+            let manifest = reader.run_manifest()?;
+            let watermarks = reader.persistence_watermarks()?;
+            assert!(watermarks.admitted.is_some(), "nonempty production outbox");
+            assert_eq!(watermarks.admitted, watermarks.applied);
+            assert_eq!(watermarks.applied, watermarks.durable);
+            let events = reader.load_replay_events()?;
+            let ledger = reader.run_ledger_summary()?;
+            assert!(ledger.tick_count > 0);
+            assert!(!events.is_empty());
+            reader.close()?;
+            let bundle_dir = run_dir.join("finished-bundle");
+            let exported = Command::new(binary())
+                .arg("--create-bundle")
+                .arg(&db)
+                .arg("--bundle-output")
+                .arg(&bundle_dir)
+                .output()?;
+            println!(
+                "FINISHED_BUNDLE_CREATE: {}\n{}\n{}",
+                exported.status,
+                String::from_utf8_lossy(&exported.stdout),
+                String::from_utf8_lossy(&exported.stderr)
+            );
+            assert!(exported.status.success(), "finished export must succeed");
+            let verified = Command::new(binary())
+                .arg("--verify-bundle")
+                .arg(&bundle_dir)
+                .output()?;
+            println!(
+                "FINISHED_BUNDLE_VERIFY: {}\n{}\n{}",
+                verified.status,
+                String::from_utf8_lossy(&verified.stdout),
+                String::from_utf8_lossy(&verified.stderr)
+            );
+            assert!(
+                verified.status.success(),
+                "separate bundle verification must succeed"
+            );
+            let copied = scriptbots_storage::StorageReader::open_finished(
+                &bundle_dir.join("run.db").to_string_lossy(),
+            )?;
+            assert_eq!(copied.run_manifest()?, manifest);
+            assert_eq!(copied.load_checkpoints()?, checkpoints);
+            assert_eq!(copied.load_replay_events()?, events);
+            assert_eq!(copied.persistence_watermarks()?, watermarks);
+            assert_eq!(copied.run_ledger_summary()?.tick_count, ledger.tick_count);
+            copied.close()?;
+            let bundle: scriptbots_storage::bundle::RunBundleV1 =
+                serde_json::from_slice(&std::fs::read(bundle_dir.join("bundle_manifest.json"))?)?;
+            assert_eq!(bundle.manifest, manifest);
+            assert_eq!(
+                bundle.digests.checkpoint_count,
+                u64::try_from(checkpoints.len())?
+            );
+            assert_eq!(bundle.digests.event_count, u64::try_from(events.len())?);
+            assert_eq!(
+                bundle.digests.persistence_watermarks,
+                Some(scriptbots_storage::bundle::RunBundleWatermarks::from(
+                    watermarks
+                ))
+            );
+            log_event(
+                serde_json::json!({"phase": "durable_bundle_readback", "run": manifest.run_id,
                 "watermarks": scriptbots_storage::bundle::RunBundleWatermarks::from(watermarks),
-                "bundle_directory": bundle_dir,
-            })
-        );
+                "checkpoint_count": checkpoints.len(),
+                "sql_bytes": sql_bytes, "event_count": events.len(), "tick_count": ledger.tick_count,
+                "bundle": bundle_dir}),
+            );
 
-        Ok(())
+            let persisted_manifest: serde_json::Value =
+                serde_json::from_str(&manifest.manifest_json)?;
+            let persisted_source = persisted_manifest["build"]["source_revision"].as_str();
+            assert_eq!(persisted_source, option_env!("SCRIPTBOTS_SOURCE_REVISION"));
+            let fault_observations = [
+                ("empty_variants", bad_var_code),
+                ("unknown_brain_family", bad_brain_code),
+                ("missing_experiment", not_found_code),
+                ("artifact_path_traversal", trav_code),
+                ("missing_artifact", missing_art_code),
+            ];
+            println!(
+                "{}",
+                serde_json::json!({
+                    "schema": "scriptbots.e2e-experiment-checkpoint-artifact.v3",
+                    "status": "pass", "binary": binary(), "mode": "server", "storage": "file",
+                    "tools_count": tools_count, "experiments_count": experiments_count,
+                    "checkpoints_count": checkpoints.len(), "checkpoint_artifacts_count": retention["file_count"],
+                    "artifacts_count": final_catalog["total"],
+                    "experiment_delivery": {
+                        "experiment_id":exp_id, "retry_experiment_id":retried["experiment_id"],
+                        "expected_run_count":expected_runs, "status":completed,
+                        "expected_ticks_per_run":exp_payload["ticks_per_run"],
+                        "downloaded_files":downloaded_files,"verified_bundles":verified_experiments,
+                        "status_faults":status_faults,"restored_rest":restored,"restored_mcp":restored_mcp,
+                        "status_before_sha256":scriptbots_app::control::compute_sha256(&original),
+                        "status_after_sha256":scriptbots_app::control::compute_sha256(&std::fs::read(&state_file)?),
+                    },
+                    "injected_faults_handled": fault_observations.len(), "fault_observations": fault_observations,
+                    "checksums_verified": true, "ordered_shutdown_exit_code": shutdown_exit.code(),
+                    "source_commit": persisted_source, "compiler_identity": option_env!("SCRIPTBOTS_RUSTC_VV"),
+                    "retained_root": run_dir, "run_id": manifest.run_id,
+                    "watermarks": scriptbots_storage::bundle::RunBundleWatermarks::from(watermarks),
+                    "bundle_directory": bundle_dir,
+                })
+            );
+
+            Ok(())
+        })
     })();
+    let outcome = outcome.and_then(|readback| readback());
 
     if let Err(ref e) = outcome {
         eprintln!("E2E TEST FAILED: {e:?}");
