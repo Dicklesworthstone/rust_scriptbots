@@ -375,16 +375,48 @@ verify_evidence() {
     if [[ "$lane" == connectivity ]]; then
         jq -R -s -e --arg source "$expected" --rawfile compiler "$directory/rustc.txt" '
             split("\n") | map(fromjson? | select(.schema == "scriptbots.real-process-e2e.v3"
-                or .schema == "scriptbots.e2e-experiment-checkpoint-artifact.v2"))
+                or .schema == "scriptbots.e2e-experiment-checkpoint-artifact.v3"))
             | length == 2 and ([.[].schema] | unique | length) == 2
             and all(.[]; .source_commit == $source and .compiler_identity == ($compiler | rtrimstr("\n"))
                 and .ordered_shutdown_exit_code == 0 and .tools_count > 0)
             and all(.[] | select(.schema == "scriptbots.real-process-e2e.v3");
                 .application_state == "applied" and .proved_level == "applied"
                 and .status_code == 200 and .pause_code == 200 and .screenshot_code == 409)
-            and all(.[] | select(.schema == "scriptbots.e2e-experiment-checkpoint-artifact.v2");
+            and all(.[] | select(.schema == "scriptbots.e2e-experiment-checkpoint-artifact.v3");
                 .status == "pass" and .experiments_count > 0 and .checkpoints_count > 0
-                and .checkpoints_count == .artifacts_count and .checksums_verified == true
+                and .checkpoints_count == .checkpoint_artifacts_count and .checksums_verified == true
+                and (.experiment_delivery as $delivery
+                    | $delivery.expected_run_count > 0 and $delivery.expected_ticks_per_run > 0
+                    and $delivery.experiment_id == $delivery.retry_experiment_id
+                    and $delivery.status.experiment_id == $delivery.experiment_id
+                    and $delivery.status.status == "completed"
+                    and $delivery.status.total_runs == $delivery.expected_run_count
+                    and $delivery.status.completed_runs == $delivery.expected_run_count
+                    and $delivery.status.failed_runs == 0
+                    and ($delivery.status.runs | length) == $delivery.expected_run_count
+                    and all($delivery.status.runs[];
+                        .state == "completed" and .total_ticks == $delivery.expected_ticks_per_run
+                        and (.final_digest | type) == "string" and (.final_digest | length) > 0)
+                    and ($delivery.verified_bundles | length) == $delivery.expected_run_count
+                    and ([$delivery.verified_bundles[].run_id] | sort) == ([$delivery.status.runs[].run_id] | sort)
+                    and all($delivery.verified_bundles[];
+                        .cli_exit_code == 0 and .file_count > 0 and .max_tick == $delivery.expected_ticks_per_run
+                        and (.cli_stdout | contains("Verified run bundle V1")))
+                    and ($delivery.downloaded_files | length) == ([$delivery.verified_bundles[].file_count] | add)
+                    and ($delivery.downloaded_files | length) == ([$delivery.downloaded_files[].relative_path] | unique | length)
+                    and all($delivery.downloaded_files[];
+                        .byte_size > 0 and (.sha256 | test("^[0-9a-f]{64}$")) and (.blake3 | test("^[0-9a-f]{64}$")))
+                    and .artifacts_count == (.checkpoint_artifacts_count + ($delivery.downloaded_files | length))
+                    and ($delivery.status_faults | length) == 3
+                    and ([$delivery.status_faults[].field] | sort) == ["/completed_runs","/experiment_id","/schema_version"]
+                    and ([$delivery.status_faults[].input_sha256] | unique | length) == 3
+                    and all($delivery.status_faults[]; .rest_codes == [500,500] and .mcp_codes == [-32603,-32603])
+                    and $delivery.restored_rest.runs == $delivery.status.runs
+                    and $delivery.restored_mcp.runs == $delivery.status.runs
+                    and $delivery.restored_rest.plan_digest == $delivery.status.plan_digest
+                    and $delivery.restored_mcp.plan_digest == $delivery.status.plan_digest
+                    and ($delivery.status_before_sha256 | test("^[0-9a-f]{64}$"))
+                    and $delivery.status_after_sha256 == $delivery.status_before_sha256)
                 and .watermarks.admitted > 0 and .watermarks.admitted == .watermarks.applied
                 and .watermarks.applied == .watermarks.durable
                 and .injected_faults_handled == (.fault_observations | length)

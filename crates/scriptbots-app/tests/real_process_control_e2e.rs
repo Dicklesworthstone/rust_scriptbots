@@ -223,7 +223,11 @@ type ServerLog = Arc<Mutex<Vec<String>>>;
 type ServerEndpoints = (SocketAddr, SocketAddr, ServerLog);
 
 /// Read the child's stderr until both REST and MCP listeners announce their bound addresses.
-fn wait_for_control_addresses(child: &mut Child, timeout: Duration) -> Result<ServerEndpoints> {
+fn wait_for_control_addresses(
+    child: &mut Child,
+    timeout: Duration,
+    mut retained_stderr: Option<std::fs::File>,
+) -> Result<ServerEndpoints> {
     let stderr = child
         .stderr
         .take()
@@ -235,6 +239,9 @@ fn wait_for_control_addresses(child: &mut Child, timeout: Duration) -> Result<Se
     std::thread::spawn(move || {
         let reader = BufReader::new(stderr);
         for line in reader.lines().map_while(std::result::Result::ok) {
+            if let Some(file) = retained_stderr.as_mut() {
+                writeln!(file, "{line}").expect("retain actual server stderr");
+            }
             let trimmed = line.trim_end().to_string();
             if let Ok(mut l) = log_clone.lock() {
                 l.push(trimmed.clone());
@@ -438,7 +445,8 @@ fn real_process_configuration_cli_receipts_and_rejections() -> Result<()> {
         .stdout(std::fs::File::create(run_dir.join("server.stdout"))?)
         .stderr(Stdio::piped())
         .spawn()?;
-    let (addr, _, log) = match wait_for_control_addresses(&mut child, Duration::from_secs(90)) {
+    let (addr, _, log) = match wait_for_control_addresses(&mut child, Duration::from_secs(90), None)
+    {
         Ok(found) => found,
         Err(error) => {
             let _ = child.kill();
@@ -709,7 +717,8 @@ fn real_process_cadence_aligned_shutdown_replays_non_vacuously() -> Result<()> {
         .stdout(std::fs::File::create(run_dir.join("server.stdout"))?)
         .stderr(Stdio::piped())
         .spawn()?;
-    let (addr, _, log) = match wait_for_control_addresses(&mut child, Duration::from_secs(90)) {
+    let (addr, _, log) = match wait_for_control_addresses(&mut child, Duration::from_secs(90), None)
+    {
         Ok(found) => found,
         Err(error) => {
             let _ = child.kill();
@@ -803,7 +812,7 @@ fn real_process_partial_checkpoint_write_remains_charged_and_unpublished() -> Re
         .spawn()
         .context("spawn actual server under the kernel file-size limit")?;
     let (rest_addr, _, server_log) =
-        match wait_for_control_addresses(&mut child, Duration::from_secs(90)) {
+        match wait_for_control_addresses(&mut child, Duration::from_secs(90), None) {
             Ok(found) => found,
             Err(error) => {
                 let _ = child.kill();
@@ -976,7 +985,7 @@ fn real_process_server_mode_applies_commands_and_refuses_an_unpresented_screensh
         .context("failed to spawn the shipped binary")?;
 
     let (rest_addr, mcp_addr, server_log) =
-        match wait_for_control_addresses(&mut child, Duration::from_secs(90)) {
+        match wait_for_control_addresses(&mut child, Duration::from_secs(90), None) {
             Ok(found) => found,
             Err(error) => {
                 let _ = child.kill();
@@ -2263,6 +2272,9 @@ fn real_process_experiments_checkpoints_artifacts_e2e() -> Result<()> {
     let run_dir = tempdir()?.keep();
     let artifacts_dir = run_dir.join("artifacts");
     let jsonl_log_path = run_dir.join("e2e_events.jsonl");
+    println!("production experiment artifacts: {}", run_dir.display());
+    let stdout = std::fs::File::create(run_dir.join("server.stdout.log"))?;
+    let stderr = std::fs::File::create(run_dir.join("server.stderr.log"))?;
 
     // The cadence is far longer than this run, so the paused world is always between
     // persistence ticks: the checkpoint below must flush the partial tail itself (bd-2mpi).
@@ -2281,13 +2293,13 @@ fn real_process_experiments_checkpoints_artifacts_e2e() -> Result<()> {
         .env("SCRIPTBOTS_ARTIFACTS_DIR", &artifacts_dir)
         .env("RUST_LOG", "warn,scriptbots_app=info")
         .current_dir(&run_dir)
-        .stdout(Stdio::null())
+        .stdout(Stdio::from(stdout))
         .stderr(Stdio::piped())
         .spawn()
         .context("failed to spawn shipped binary in server mode with file storage")?;
 
     let (rest_addr, mcp_addr, server_log) =
-        match wait_for_control_addresses(&mut child, Duration::from_secs(90)) {
+        match wait_for_control_addresses(&mut child, Duration::from_secs(90), Some(stderr)) {
             Ok(found) => found,
             Err(error) => {
                 let _ = child.kill();
@@ -2306,6 +2318,37 @@ fn real_process_experiments_checkpoints_artifacts_e2e() -> Result<()> {
             let _ = writeln!(f, "{}", event);
         }
     };
+
+    // Transport success is not tool success. Use the actual JSON-RPC identity
+    // and typed tool envelope before interpreting any experiment observation.
+    let tool_result = |code: u16, body: &str, id: u64| -> Result<serde_json::Value> {
+        let envelope: serde_json::Value = serde_json::from_str(body)?;
+        if code != 200
+            || envelope["jsonrpc"] != "2.0"
+            || envelope["id"].as_u64() != Some(id)
+            || !envelope["error"].is_null()
+            || !matches!(
+                envelope["result"].get("isError"),
+                None | Some(serde_json::Value::Bool(false))
+            )
+        {
+            bail!("MCP tool {id} did not succeed ({code}): {body}");
+        }
+        let text = envelope["result"]["content"][0]["text"]
+            .as_str()
+            .ok_or_else(|| anyhow!("MCP tool {id} has no result JSON: {body}"))?;
+        serde_json::from_str(text).context("decode actual MCP tool result JSON")
+    };
+    // Parser controls, not live-server fault observations: HTTP 200 alone,
+    // wrong correlation, tool failure and missing JSON must not pass this gate.
+    for invalid in [
+        serde_json::json!({"jsonrpc":"2.0","id":10,"result":{"content":[{"text":"{}"}]},"error":{"code":-32603,"message":"Internal server error"}}),
+        serde_json::json!({"jsonrpc":"2.0","id":11,"result":{"content":[{"text":"{}"}]}}),
+        serde_json::json!({"jsonrpc":"2.0","id":10,"result":{"isError":true,"content":[{"text":"{}"}]}}),
+        serde_json::json!({"jsonrpc":"2.0","id":10,"result":{}}),
+    ] {
+        assert!(tool_result(200, &invalid.to_string(), 10).is_err());
+    }
 
     let outcome: Result<()> = (|| {
         // --- 1. Version and Schema Discovery ---
@@ -2472,7 +2515,7 @@ fn real_process_experiments_checkpoints_artifacts_e2e() -> Result<()> {
                 "arguments": { "experiment_id": exp_id }
             }
         });
-        let (mcp_st_code, _) = http_with_body(
+        let (mcp_st_code, mcp_st_body) = http_with_body(
             mcp_addr,
             "POST",
             "/mcp",
@@ -2480,6 +2523,24 @@ fn real_process_experiments_checkpoints_artifacts_e2e() -> Result<()> {
             Some("application/json"),
         )?;
         assert_eq!(mcp_st_code, 200);
+        let mcp_status = tool_result(mcp_st_code, &mcp_st_body, 10)?;
+        assert_eq!(mcp_status["experiment_id"], exp_id);
+        assert_eq!(mcp_status["total_runs"], exp_json["total_runs"]);
+
+        let retry_payload = serde_json::json!({
+            "jsonrpc":"2.0", "id":12, "method":"tools/call",
+            "params":{"name":"experiment_create","arguments":exp_payload}
+        });
+        let (retry_code, retry_body) = http_with_body(
+            mcp_addr,
+            "POST",
+            "/mcp",
+            &serde_json::to_vec(&retry_payload)?,
+            Some("application/json"),
+        )?;
+        let retried = tool_result(retry_code, &retry_body, 12)?;
+        assert_eq!(retried["experiment_id"], exp_id);
+        assert_eq!(retried["plan_digest"], exp_json["plan_digest"]);
 
         // Cancel experiment
         let (cancel_code, cancel_resp) = http(
@@ -2534,7 +2595,7 @@ fn real_process_experiments_checkpoints_artifacts_e2e() -> Result<()> {
                 "arguments": { "experiment_id": exp_id }
             }
         });
-        let (mcp_res_code, _) = http_with_body(
+        let (mcp_res_code, mcp_res_body) = http_with_body(
             mcp_addr,
             "POST",
             "/mcp",
@@ -2542,6 +2603,86 @@ fn real_process_experiments_checkpoints_artifacts_e2e() -> Result<()> {
             Some("application/json"),
         )?;
         assert_eq!(mcp_res_code, 200);
+        if terminal == "cancelled" {
+            let resumed = tool_result(mcp_res_code, &mcp_res_body, 11)?;
+            assert_eq!(resumed["experiment_id"], exp_id);
+        } else {
+            let refused: serde_json::Value = serde_json::from_str(&mcp_res_body)?;
+            assert_eq!(refused["id"], 11);
+            assert!(refused["error"].is_null(), "{mcp_res_body}");
+            assert_eq!(refused["result"]["isError"], true, "{mcp_res_body}");
+            assert!(
+                refused["result"]["content"][0]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("no pending runs")),
+                "{mcp_res_body}"
+            );
+        }
+
+        let completion_deadline = Instant::now() + Duration::from_secs(60);
+        let completed = loop {
+            let (code, body) = http(rest_addr, "GET", &format!("/api/v1/experiments/{exp_id}"))?;
+            assert_eq!(code, 200, "{body}");
+            let status: serde_json::Value = serde_json::from_str(&body)?;
+            if status["status"] == "completed" {
+                break status;
+            }
+            assert!(
+                matches!(status["status"].as_str(), Some("running" | "pending")),
+                "{status}"
+            );
+            assert!(
+                Instant::now() < completion_deadline,
+                "actual completion: {status}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        let expected_runs = exp_payload["seeds"]
+            .as_array()
+            .expect("declared seeds")
+            .len()
+            * exp_payload["variants"]
+                .as_array()
+                .expect("declared variants")
+                .len();
+        assert_eq!(
+            completed["total_runs"].as_u64(),
+            Some(u64::try_from(expected_runs)?)
+        );
+        assert_eq!(completed["completed_runs"], completed["total_runs"]);
+        assert_eq!(completed["failed_runs"], 0);
+        let runs = completed["runs"].as_array().expect("actual runs");
+        assert_eq!(runs.len(), expected_runs);
+        let mut run_ids = std::collections::BTreeSet::new();
+        let mut digests = std::collections::BTreeSet::new();
+        for run in runs {
+            assert_eq!(run["state"], "completed");
+            assert_eq!(run["total_ticks"], exp_payload["ticks_per_run"]);
+            assert!(run_ids.insert(run["run_id"].as_str().expect("run identity")));
+            let digest = run["final_digest"].as_str().expect("actual final digest");
+            assert!(!digest.is_empty());
+            assert!(digests.insert(digest), "different declared seeds: {run}");
+        }
+        for variant in exp_payload["variants"]
+            .as_array()
+            .expect("declared variants")
+        {
+            for seed in exp_payload["seeds"].as_array().expect("declared seeds") {
+                assert_eq!(
+                    runs.iter()
+                        .filter(|run| {
+                            run["variant_id"] == variant["variant_id"] && run["seed"] == *seed
+                        })
+                        .count(),
+                    1,
+                    "exactly one completed run per declared variant and seed"
+                );
+            }
+        }
+        log_event(
+            serde_json::json!({"phase":"completed_experiment", "status":completed,
+            "retry_experiment_id":retried["experiment_id"], "terminal_before_resume":terminal}),
+        );
 
         // List experiments
         let (exp_list_code, exp_list_body) =
@@ -2554,6 +2695,250 @@ fn real_process_experiments_checkpoints_artifacts_e2e() -> Result<()> {
         assert_eq!(
             experiments_count, 1,
             "the actual created experiment is listed"
+        );
+
+        // Reconstruct the completed portable bundles exclusively from API bytes.
+        // Local source files are an independent byte comparison, not the source
+        // of the downloaded manifest or its declared file set.
+        let (catalog_code, catalog_body) = http(rest_addr, "GET", "/api/v1/artifacts?limit=100")?;
+        assert_eq!(catalog_code, 200, "{catalog_body}");
+        let catalog: serde_json::Value = serde_json::from_str(&catalog_body)?;
+        let catalog_request = serde_json::json!({
+            "jsonrpc":"2.0", "id":13, "method":"tools/call",
+            "params":{"name":"artifact_list","arguments":{"limit":100}}
+        });
+        let (code, body) = http_with_body(
+            mcp_addr,
+            "POST",
+            "/mcp",
+            &serde_json::to_vec(&catalog_request)?,
+            Some("application/json"),
+        )?;
+        assert_eq!(tool_result(code, &body, 13)?, catalog);
+        assert_eq!(catalog["has_more"], false);
+        let mut downloaded_files = Vec::new();
+        let mut verified_experiments = Vec::new();
+        for run in runs {
+            let run_id = run["run_id"].as_str().expect("run identity");
+            assert_eq!(std::path::Path::new(run_id).components().count(), 1);
+            assert!(
+                std::path::Path::new(run_id)
+                    .components()
+                    .all(|part| matches!(part, std::path::Component::Normal(_)))
+            );
+            let prefix = format!("experiments/{exp_id}/{run_id}/");
+            let source = std::path::Path::new(run["bundle_path"].as_str().expect("source bundle"));
+            let downloaded = run_dir.join("downloaded-experiments").join(run_id);
+            let mut paths = std::collections::BTreeSet::new();
+            for metadata in catalog["items"].as_array().expect("actual catalog") {
+                let relative = metadata["relative_path"].as_str().expect("artifact path");
+                let Some(path) = relative.strip_prefix(&prefix) else {
+                    continue;
+                };
+                assert!(
+                    std::path::Path::new(path)
+                        .components()
+                        .all(|part| matches!(part, std::path::Component::Normal(_)))
+                );
+                assert!(
+                    paths.insert(path.to_owned()),
+                    "duplicate catalog file: {relative}"
+                );
+                let id = metadata["artifact_id"].as_str().expect("artifact identity");
+                let (code, bytes) = http_with_body_raw(
+                    rest_addr,
+                    "GET",
+                    &format!("/api/v1/artifacts/{id}/download"),
+                    &[],
+                    None,
+                )?;
+                assert_eq!(code, 200, "{metadata}");
+                assert_eq!(bytes, std::fs::read(source.join(path))?);
+                assert_eq!(
+                    metadata["byte_size"].as_u64(),
+                    Some(u64::try_from(bytes.len())?)
+                );
+                let sha256 = scriptbots_app::control::compute_sha256(&bytes);
+                let blake3 = scriptbots_app::control::compute_blake3(&bytes);
+                assert_eq!(metadata["checksum_sha256"], sha256);
+                assert_eq!(metadata["checksum_blake3"], blake3);
+                let request = serde_json::json!({
+                    "jsonrpc":"2.0", "id":14, "method":"tools/call",
+                    "params":{"name":"artifact_get","arguments":{"artifact_id":id}}
+                });
+                let (code, body) = http_with_body(
+                    mcp_addr,
+                    "POST",
+                    "/mcp",
+                    &serde_json::to_vec(&request)?,
+                    Some("application/json"),
+                )?;
+                assert_eq!(&tool_result(code, &body, 14)?, metadata);
+                let destination = downloaded.join(path);
+                std::fs::create_dir_all(destination.parent().expect("download parent"))?;
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(destination)?
+                    .write_all(&bytes)?;
+                downloaded_files.push(serde_json::json!({"run_id":run_id,"artifact_id":id,
+                    "relative_path":relative,"byte_size":bytes.len(),"sha256":sha256,"blake3":blake3}));
+            }
+            let manifest: scriptbots_storage::RunBundleV1 =
+                serde_json::from_slice(&std::fs::read(downloaded.join("bundle_manifest.json"))?)?;
+            let required: std::collections::BTreeSet<_> =
+                std::iter::once("bundle_manifest.json".to_owned())
+                    .chain(
+                        manifest
+                            .artifacts
+                            .iter()
+                            .map(|entry| entry.relative_path.clone()),
+                    )
+                    .collect();
+            assert_eq!(paths, required, "actual manifest's complete file set");
+            let verified = scriptbots_storage::verify_run_bundle(&downloaded)?;
+            assert_eq!(Some(verified.max_tick), run["total_ticks"].as_u64());
+            let evidence: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(downloaded.join("evidence/run.json"))?)?;
+            assert_eq!(evidence["experiment_id"], exp_id);
+            assert_eq!(evidence["plan_digest"], completed["plan_digest"]);
+            for field in [
+                "run_id",
+                "variant_id",
+                "brain_family",
+                "seed",
+                "total_ticks",
+                "final_digest",
+            ] {
+                assert_eq!(
+                    evidence[field], run[field],
+                    "downloaded science observation: {field}"
+                );
+            }
+            let cli = Command::new(binary())
+                .arg("--verify-bundle")
+                .arg(&downloaded)
+                .output()?;
+            std::fs::write(
+                run_dir.join(format!("{run_id}.verify.stdout.log")),
+                &cli.stdout,
+            )?;
+            std::fs::write(
+                run_dir.join(format!("{run_id}.verify.stderr.log")),
+                &cli.stderr,
+            )?;
+            assert!(
+                cli.status.success(),
+                "independent experiment CLI verification: {}\n{}",
+                cli.status,
+                String::from_utf8_lossy(&cli.stderr)
+            );
+            let cli_stdout = String::from_utf8(cli.stdout)?;
+            assert!(
+                cli_stdout.contains("Verified run bundle V1"),
+                "{cli_stdout}"
+            );
+            verified_experiments.push(serde_json::json!({"run_id":run_id,
+                "directory":downloaded,"max_tick":verified.max_tick,"file_count":paths.len(),
+                "cli_exit_code":cli.status.code(),"cli_stdout":cli_stdout}));
+        }
+        assert_eq!(
+            catalog["total"].as_u64(),
+            Some(u64::try_from(downloaded_files.len())?)
+        );
+        assert_eq!(verified_experiments.len(), expected_runs);
+
+        // Fault the real completed status, preserve it, then prove both transports
+        // refuse it and read the exact original again after restoration.
+        let state_file = std::path::Path::new(runs[0]["bundle_path"].as_str().expect("bundle"))
+            .parent()
+            .expect("experiment root")
+            .join("status.json");
+        let original = std::fs::read(&state_file)?;
+        std::fs::copy(&state_file, state_file.with_extension("preserved-original"))?;
+        let persisted: serde_json::Value = serde_json::from_slice(&original)?;
+        let mut status_faults = Vec::new();
+        for (pointer, replacement, reason) in [
+            ("/schema_version", serde_json::json!(0), "schema_version"),
+            (
+                "/experiment_id",
+                serde_json::json!("foreign-experiment"),
+                "experiment_id",
+            ),
+            ("/completed_runs", serde_json::json!(0), "derived counters"),
+        ] {
+            let mut changed = persisted.clone();
+            let field = changed.pointer_mut(pointer).expect("actual status field");
+            assert_ne!(*field, replacement);
+            *field = replacement;
+            let changed = serde_json::to_vec(&changed)?;
+            std::fs::write(&state_file, &changed)?;
+            let mut rest_codes = Vec::new();
+            for path in [
+                format!("/api/v1/experiments/{exp_id}"),
+                "/api/v1/experiments?limit=10".to_owned(),
+            ] {
+                let (code, body) = http(rest_addr, "GET", &path)?;
+                assert_eq!(code, 500, "{pointer}: {body}");
+                assert!(body.contains(reason), "{pointer}: {body}");
+                rest_codes.push(code);
+            }
+            let mut mcp_codes = Vec::new();
+            for (name, arguments) in [
+                (
+                    "experiment_status",
+                    serde_json::json!({"experiment_id":exp_id}),
+                ),
+                ("experiment_list", serde_json::json!({"limit":10})),
+            ] {
+                let request = serde_json::json!({"jsonrpc":"2.0","id":15,"method":"tools/call",
+                    "params":{"name":name,"arguments":arguments}});
+                let (code, body) = http_with_body(
+                    mcp_addr,
+                    "POST",
+                    "/mcp",
+                    &serde_json::to_vec(&request)?,
+                    Some("application/json"),
+                )?;
+                assert_eq!(code, 200, "{pointer}: {body}");
+                let refused: serde_json::Value = serde_json::from_str(&body)?;
+                assert_eq!(refused["id"], 15);
+                assert!(refused.get("result").is_none(), "{body}");
+                assert_eq!(refused["error"]["code"], -32603, "{body}");
+                assert_eq!(
+                    refused["error"]["message"], "Internal server error",
+                    "{body}"
+                );
+                mcp_codes.push(
+                    refused["error"]["code"]
+                        .as_i64()
+                        .expect("actual error code"),
+                );
+            }
+            assert_eq!(std::fs::read(&state_file)?, changed);
+            status_faults.push(serde_json::json!({"field":pointer,"rest_codes":rest_codes,
+                "mcp_codes":mcp_codes,"input_sha256":scriptbots_app::control::compute_sha256(&changed)}));
+        }
+        std::fs::write(&state_file, &original)?;
+        let (code, body) = http(rest_addr, "GET", &format!("/api/v1/experiments/{exp_id}"))?;
+        assert_eq!(code, 200);
+        let restored: serde_json::Value = serde_json::from_str(&body)?;
+        assert_eq!(restored["runs"], completed["runs"]);
+        assert_eq!(restored["plan_digest"], completed["plan_digest"]);
+        let (code, body) = http_with_body(
+            mcp_addr,
+            "POST",
+            "/mcp",
+            &serde_json::to_vec(&mcp_st_payload)?,
+            Some("application/json"),
+        )?;
+        let restored_mcp = tool_result(code, &body, 10)?;
+        assert_eq!(restored_mcp["runs"], completed["runs"]);
+        assert_eq!(restored_mcp["plan_digest"], completed["plan_digest"]);
+        assert_eq!(std::fs::read(&state_file)?, original);
+        log_event(
+            serde_json::json!({"phase":"experiment_delivery", "files":downloaded_files,
+            "verified_bundles":verified_experiments,"status_faults":status_faults}),
         );
 
         // --- 5. Checkpoint and Artifact Lifecycle ---
@@ -2850,6 +3235,20 @@ fn real_process_experiments_checkpoints_artifacts_e2e() -> Result<()> {
         );
         println!("CHECKPOINT_RETENTION_OBSERVED: {after_body}");
 
+        let (catalog_code, catalog_body) = http(rest_addr, "GET", "/api/v1/artifacts?limit=100")?;
+        assert_eq!(catalog_code, 200, "{catalog_body}");
+        let final_catalog: serde_json::Value = serde_json::from_str(&catalog_body)?;
+        assert_eq!(final_catalog["has_more"], false);
+        assert_eq!(
+            final_catalog["total"].as_u64(),
+            Some(
+                u64::try_from(downloaded_files.len())?
+                    + retention["file_count"]
+                        .as_u64()
+                        .expect("observed checkpoint files")
+            )
+        );
+
         let db = std::fs::read_dir(run_dir.join("runs"))?
             .filter_map(|entry| entry.ok().map(|entry| entry.path()))
             .find(|path| path.extension().is_some_and(|ext| ext == "sqlite"))
@@ -3072,10 +3471,20 @@ fn real_process_experiments_checkpoints_artifacts_e2e() -> Result<()> {
         println!(
             "{}",
             serde_json::json!({
-                "schema": "scriptbots.e2e-experiment-checkpoint-artifact.v2",
+                "schema": "scriptbots.e2e-experiment-checkpoint-artifact.v3",
                 "status": "pass", "binary": binary(), "mode": "server", "storage": "file",
                 "tools_count": tools.len(), "experiments_count": experiments_count,
-                "checkpoints_count": checkpoints.len(), "artifacts_count": retention["file_count"],
+                "checkpoints_count": checkpoints.len(), "checkpoint_artifacts_count": retention["file_count"],
+                "artifacts_count": final_catalog["total"],
+                "experiment_delivery": {
+                    "experiment_id":exp_id, "retry_experiment_id":retried["experiment_id"],
+                    "expected_run_count":expected_runs, "status":completed,
+                    "expected_ticks_per_run":exp_payload["ticks_per_run"],
+                    "downloaded_files":downloaded_files,"verified_bundles":verified_experiments,
+                    "status_faults":status_faults,"restored_rest":restored,"restored_mcp":restored_mcp,
+                    "status_before_sha256":scriptbots_app::control::compute_sha256(&original),
+                    "status_after_sha256":scriptbots_app::control::compute_sha256(&std::fs::read(&state_file)?),
+                },
                 "injected_faults_handled": fault_observations.len(), "fault_observations": fault_observations,
                 "checksums_verified": true, "ordered_shutdown_exit_code": shutdown_exit.code(),
                 "source_commit": persisted_source, "compiler_identity": option_env!("SCRIPTBOTS_RUSTC_VV"),

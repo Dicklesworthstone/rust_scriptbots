@@ -18,6 +18,10 @@
 # 12. Production host-artifact comparison reports the first observed divergent tick/stage;
 #     corrupt and truncated closed database copies refuse without advancing science or journal
 #     prefixes, with original artifacts and raw subprocess streams retained beneath DSR TMPDIR
+# 13. Actual MCP tool envelopes and REST-to-MCP keyed experiment retry preserve identity;
+#     completed runs join downloaded bundle evidence, reconstructed manifests and CLI verification
+# 14. Three real completed-status faults are refused by REST/MCP; restored reads and file bytes
+#     match their original observations. Experiment and checkpoint artifact counts are separate.
 #
 # The unchanged connectivity replay-process-tests row executes replay_e2e in full, including
 # mock_free_full_host_checkpoint_continuation_e2e. This wrapper accepts no filtered test lane.
