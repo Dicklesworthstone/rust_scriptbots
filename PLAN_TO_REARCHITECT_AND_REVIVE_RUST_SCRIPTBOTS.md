@@ -4,6 +4,27 @@
 
 **Evidence date:** 2026-07-11
 
+**Production experiment journey (2026-10-26):** [Currently In Progress —
+LilacElm, `bd-2z0.12.2`; scoped test source committed as `12632a26`]
+Strengthen the existing real server/file-storage test to inspect MCP envelopes,
+join actual completed runs to downloadable experiment bundles, and verify the
+portable downloads through the shipped CLI. Preserve original checkpoint,
+retention, replay, export and shutdown gates. Full existing connectivity DSR
+acceptance remains required; HTTP 200 and in-process fixtures cannot replace it.
+Final RCH formatting, workspace/all-target check and strict Clippy pass on the
+reviewed test source. Corrected preparation binds the measured compiler and
+retained executable hashes. The complete ordinary RCH process file observes
+4 passed, 3 failed and 3 existing ignored: six downloaded experiment files and
+two CLI-verified bundles complete, then original control-command deadlines fail.
+A separate selected diagnostic later exposes harness stack overflow. These
+failures remain under investigation; no whole-journey acceptance is claimed.
+A phase-separation experiment (`8c34db32`) still overflows in the ordinary file;
+`5cf8f08f` manually restores the exact checked `12632a26` source tree. The later
+full attempt aborts with two visible passes, two failures and two ordinary cases
+unreached, retaining all three existing ignores. Its genuine partial delivery
+and all failed/transport/debugger evidence remain in the existing Reality Check.
+The user explicitly chose RCH-only builds and left native DSR acceptance open.
+
 **Experiment status reader (2026-10-25):** [Currently In Progress — LilacElm,
 `bd-2z0.12.2` / `bd-0oro`; scoped source committed as `5e9752b7`]
 API status reads now use the runner's existing bounded plan/schema/identity

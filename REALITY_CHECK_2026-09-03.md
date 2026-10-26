@@ -1,5 +1,289 @@
 # Reality Check — rust_scriptbots — reassessed 2026-10-20
 
+### Production experiment journey TODO — 2026-10-26, LilacElm
+
+Consumer: requested execution TODO and production API criterion 5. Gate: real
+file-storage process proof of completed experiment delivery. Observed gap: the
+existing E2E accepts experiment MCP calls by HTTP 200, never joins completed
+runs to artifact downloads and checks only checkpoint bytes. Retire this scoped
+TODO at publication/handoff; do not close the unchanged complete API owner on a
+partial lane. Minimal canonical preimage/binary retention prevents the already
+observed exporter provenance loss and artifact reaping, not a new framework.
+
+- [x] Refresh genuine Agent Mail session, BR/BV, CASS and source history; pull
+  and immediately import. AGENTS/README are unchanged since full reading;
+  `/data/projects/AGENTS.md` remains absent. Recent indexed CASS query has no hits.
+- [x] Preserve canonical 718-record preimage and reserve exact test, wrapper,
+  plan, report and JSONL paths; announce scope and one-compiler logistics.
+- [x] Mark progress on original owner without reducing any of its seven criteria.
+- [x] Read complete existing lifecycle and mandatory DSR consumer; trace actual
+  experiment status/creation/artifact responses and independent bundle verifier.
+- [x] Capture child stdout and retain stderr/evidence; reject misleading MCP
+  success envelopes, prove cross-transport retry identity and actual completion.
+- [x] Discover every completed bundle file through REST/MCP; download, compare
+  original bytes/checksums, reconstruct portable directories and verify by CLI.
+- [x] Exercise actual malformed status and restored positive reads through both
+  transports, retaining all original checkpoint/replay/export/shutdown assertions.
+- [x] Pass appropriate RCH source checks and immutable source review; commit
+  source without claiming unexecuted production acceptance.
+- [x] Compile the exact source commit with actual worker source/compiler inputs;
+  retain app/test binaries, run the complete ordinary Linux file on RCH and retain
+  its actual counts, streams and artifacts. Keep the three existing ignores visible.
+- [x] Execute the same-file phase-separation candidate, record its continuing
+  overflow and manually remove the ineffective change, preserving the stronger test.
+- [ ] Resolve the actual harness overflow while preserving every SQL/provenance
+  assertion and the ordinary stack allowance; the attempted separation did not qualify.
+- [ ] Resolve the observed production control-command timeouts without changing
+  original assertions, complete-case denominator or deadlines.
+- [ ] Run full existing connectivity lane in a clean expected-commit pinned DSR
+  profile, with unique external proof directory and full typed-verdict/readback.
+  **Deferred by the user's 2026-10-26 decision:** keep RCH-only; leave native
+  DSR acceptance open. RCH diagnostic execution cannot satisfy this checkbox.
+- [ ] Fix observed product failures without weakening gates; retain every attempt.
+- [x] Complete bounded work/honesty audit; append exact original-owner evidence,
+  preserve every record/provenance/comment prefix/dependency, verify no cycles.
+- [ ] Commit tracking separately; release exact leases, pull/import, push both
+  required refs, verify publication and send genuine Agent Mail handoff. The
+  post-commit publication receipt in the external proof root retires this item;
+  this pre-publication snapshot does not claim that those actions already happened.
+
+Source: `12632a26e4787170b86cdd53b906ae763828cca0`, reviewed tree
+`fc870c014e17e22ba677b714a4a3ad5863cffd16`. Final RCH format/check/strict-Clippy
+jobs `30079889725980788`, `30079889725980790` and `30079889725980791` all exit
+zero with acknowledged receipts.
+The completed Cargo logs retain the pre-existing `proc-macro-error2 v2.0.1`
+future-compatibility notice; the initial zero-warning statement was corrected.
+The error-envelope parser control now retains valid result JSON, so that its
+error guard must discriminate. A first build command was refused before dispatch
+for incompatible optional RCH flags. Supported compile-only job
+`30079889725980793` passed, but its worker target and returned local executables
+were reaped before retention. Its log also shows RCH rejecting the multiline
+`SCRIPTBOTS_RUSTC_VV` environment value, so it does not establish the intended
+embedded compiler identity. This limitation was disclosed before runtime claims.
+The repeat preparation `30081342398005259` was cancelled on that observation;
+exact-wrapper recovery acknowledges exit 143 (the daemon first recorded 130).
+A corrected attempt then refused unfinished source authority, exit 103, before
+that recovery completed. Neither refusal nor cancellation is a test result.
+The corrected preparation uses Cargo's explicit `env.SCRIPTBOTS_RUSTC_VV.value`
+configuration with the actual measured worker compiler text and `force=true`;
+no source cleanliness/digest is fabricated. The safety guard refused generated
+shell setup, so external retention uses explicit non-overwriting paths. All
+attempts remain in the proof root; the corrected runtime result follows below.
+Worker selection was corrected from fresh observations: the VPS has ten cores,
+load 23.31 and about 40 GiB available memory; `hz4` has 64 cores, load 5.40 and
+about 207 GiB available. The single VPS job `30081342398005261` was cancelled
+through its exact wrapper and recovered exit 143/acknowledged before transfer.
+RCH refused `-j4` against `hz4`'s configured three-slot ceiling, so preparation
+uses the permitted `-j3`/three slots, with no worker-policy edits. Its active
+three source hashes and actual compiler text match the reviewed inputs.
+**Actual runtime:** corrected clean-archive preparation `30081342398005262`
+passes zero/acknowledged on `hz4`, with the measured compiler text embedded through
+Cargo configuration. Original/copy app, CLI and test hashes match before and after
+the complete non-compilation job `30081342398005264`: **4 passed / 3 failed /
+3 pre-existing ignored / 0 filtered**, 117.83 seconds, exit 101/acknowledged.
+The original cadence pause fails HTTP 503/channel admission reply after ten
+seconds. Experiment delivery reaches the unchanged checkpoint pause and fails
+HTTP 503/durable command lookup after ten seconds. The original memory-server
+case later receives MCP InternalError on apply. None is qualified as a pass.
+Supported RCH job mode cannot use archive flags; both pre-dispatch CLI refusals
+remain recorded. Runtime source identity comes from the clean-archive executable
+preparation and six before/after hashes, not its unused normal source transfer.
+
+The partial experiment branch actually completes seeds 1/2 at tick 5 with distinct
+digests `d4a1d207d86fbd85` / `355dc6d5eb03bfed` and 16 living agents each. The
+completed-job resume refusal, six downloads, two shipped-CLI bundle verifications,
+three malformed-status refusals and restored reads all execute before failure.
+Independent Python SHA-256 and `b3sum` readback matches every original/downloaded
+file: six files, 35,847 bytes; the preserved original status equals restored bytes.
+These are artifact-only experiment bundles; CLI explicitly reports reproducible
+false because source cleanliness/status/diff inputs remain unknown. No scientific
+equilibrium, interrupted resume, per-experiment SQL durability or whole-journey
+success is inferred. The exact existing connectivity predicate rejects the actual
+failed raw log, exit 1. Its genuine positive and ten planned single-field controls
+remain unrun; no pass record is manufactured from partial events.
+
+Owned diagnostics remain separate: `30081342398005265` manually drives the same
+app bytes/flags, observes pause 200 after 1.85 seconds and ordered exit zero, with
+GDB detached/TracerPid zero and ptrace policy unchanged at 1. It does not reproduce
+the original timeout. `30081342398005266` refuses namespace setup before tests;
+exact recovery acknowledges its administrative exit 1. Retry `05267` executes
+only the original experiment case, reaches checkpoint/quota science advancement,
+then aborts with an explicit harness stack overflow, exit 134/acknowledged.
+The waiting observer expires without a boundary and supplies no trace. Debugger
+job `05268` instead hits another real ten-second lookup failure before overflow;
+its administrative zero contains an inner 0-pass/1-fail/9-filtered result. GDB's
+startup shell changes that attempt's temporary root; it is disabled afterward.
+`05269` misses the panic because the supplied symbol does not exist; retained ELF
+symbols identify `std::panicking::panic_with_hook` for the corrected capture.
+Corrected capture `05270` refuses namespace setup before execution and is settled
+through exact-wrapper recovery. `05271` hits the actual panic hook before unwind:
+checkpoint creation fails HTTP 503/owner inspection after ten seconds. Its debugger
+administrative exit zero contains an inner 0-pass/1-fail/9-filtered test result.
+The owned child's host waits in `StorageSink::submit_with_receipt_using_clock_for_island`
+through `HostCore::seal_core_persistence` and checkpoint flush. Storage is inside
+`Storage::complete_host_journal_archive` → flush transaction → FrankenSQLite's
+transaction-start memory reload; the preceding `/proc` observation is `D` state
+at `jbd2_log_wait_commit`. This locates the blocked boundary and I/O context,
+not a universal engine cause or permission to weaken validation or deadlines.
+GDB was installed without upgrades/removals; owned processes are detached with
+TracerPid zero and ptrace policy 1 unchanged. All 110 copied diagnostic files
+independently match the retained remote size/SHA-256 inventory.
+
+The test-only candidate `8c34db32` returns finished SQL/readback from the live
+closure to run after that frame returns, on the same thread and ordinary stack.
+Format `05274` and workspace/all-target check `05275` pass zero/acknowledged;
+UBS observes 0 critical / 448 warning / 348 information for that exact test file.
+Changed/readback findings are retained assertions/required-row expectation,
+serde-JSON read indexing, output/file observations and the owned retention clone;
+none is suppressed. Candidate Clippy `05278` is subsequently cancelled through
+its exact owner: local wrapper SIGTERM, recovered exit 143/acknowledged, with
+the daemon's earlier 130 retained. It is not a passing Clippy result.
+At 19:54, fresh capacity measurements change the self-imposed one-build logistics
+to at most two distinct-host jobs: the existing cold Clippy and one `-j1` executable
+preparation on `hz4`. Its 199,053 MiB (approximately 194.4 GiB) available RAM,
+load 7.7 and 55 GiB
+disk headroom support the bounded choice; `hz2` has about 0.5 GiB disk free and is
+excluded. RCH admission remains binding with no policy or cleanup changes, and
+genuine Agent Mail message 200 communicates the change. Preparation `05290`
+refuses namespace initialization before Cargo; exact-wrapper recovery records
+administrative exit 1/acknowledged. Its retry starts after more than 60 seconds.
+
+Corrected preparation `05291` compiles the exact `8c34db32` archive with the
+measured compiler, zero/acknowledged; all three active source hashes match.
+The existing target pool still emits fresh dependency artifacts, so this is
+not reported as a cache hit. All three executables are retained immediately,
+with original/copy hashes. Runtime admission on `hz4` then refuses critical disk
+pressure, exit 103 before tests. The same bytes are copied and independently
+hashed locally, then transferred to admitted `hz3` (approximately 85 GiB free,
+compatible loader). Its RCH job creates only absent embedded-path aliases, refuses
+existing paths and stack overrides, and verifies all six alias/copy hashes before
+and after. Compilation remains attributed to `hz4`, execution to `hz3`; no code,
+executable, assertion, case, ignore or deadline changes during transport.
+
+**Candidate full-file result `05297`: abort, not a completed suite.** The visible
+ordinary results are two passes (map/replay CLI), two failures (cadence stays at
+tick 0 through its deadline despite healthy/running status; configuration resume
+applies but its journal remains pending past the durable deadline), then the
+experiment case overflows its harness stack after actual quota science tick 11.
+Two remaining ordinary cases are unreached; all three existing ignores are
+visible, and no filter arguments are used. There is no final harness summary.
+All six post-run hashes match. The frontend reports transport error/exit 1;
+exact recovery acknowledges delivery exit 255 versus the daemon's earlier 130.
+The inner numeric abort status was not observed and is not invented.
+
+That failed case nevertheless completes two actual seeded experiments, six
+downloads (35,847 bytes), two separate CLI verifications, all three status faults
+and restoration, both checkpoint downloads/retention and live-export refusal.
+Independent SHA-256, `b3sum` and original/download byte comparison match all six
+files again; restored status equals its preserved original (SHA-256
+`57d6d28741430b23bd1d1d42eed2ab1a14ca751dc34c181f14852f2b32137243`).
+This remains partial artifact-only delivery; SQL readback and whole-journey
+success are not inferred. The first predicate application included the transport
+prelude's numeric UID and errors with exit 5. The retained contiguous actual
+test-output segment (running ten cases through abort, without record filtering)
+correctly returns false/exit 1. Zero required pass records exist; the genuine
+positive and all ten predeclared field controls remain unrun.
+
+One selected debugger probe is refused at namespace setup (`05299`, recovered
+1/acknowledged). Retry `05300` runs the original experiment case but fails
+checkpoint inspection HTTP 503 after ten seconds before reaching the overflow:
+0 passed / 1 failed / 9 filtered, debugger administrative 1/acknowledged.
+Missing split-DWARF warnings and all raw output remain; no overflow trace or
+engine cause is claimed. All 168 copied runtime/debugger evidence files match
+their remote size/SHA-256 inventory; executable copies are separately hash-bound.
+
+**Disposition:** phase separation has no qualified benefit. Manual rollback
+`5cf8f08f` restores the exact previously checked `12632a26` source tree
+`fc870c014e17e22ba677b714a4a3ad5863cffd16`, preserving all stronger tests and
+failed history. Existing completed check/Clippy evidence applies to that identical
+tree; neither command is claimed freshly rerun after restoration. Fresh RCH
+format `05304` passes zero/acknowledged; restored-file UBS is 0 critical /
+448 warning / 347 information. No production fix, stack fix, complete API,
+native DSR, performance, durability or scientific acceptance is claimed.
+
+Final original-owner comment 2970 retains the failed qualification and user policy.
+The canonical graph still has 718 ordered unique records and empty cycles. Its
+717 unrelated raw lines are byte-identical; only this owner's comments (14 → 17,
+appending 2968/2969/2970) and update timestamp change. All seven criteria,
+dependencies, labels, assignee and prior comment prefixes remain. The raw export's
+known loss of 392 `source_repo_path` values is repaired from the unchanged preimage;
+both raw export and audited candidate are retained. Canonical SHA-256 before
+publication is `d6c5afeeb3616dab3229035385b7d6dd5a74f68534ba832f5d6bc44146290162`.
+Tracking-only UBS reports `no-supported-languages`, exit 3, with zero files and
+scanners for Markdown/JSONL; it earns no code-scan credit. Structured graph
+validation and the complete immutable tracking diff are the applicable checks.
+Run logs and retained probe sources are external. Proof root:
+`/data/tmp/scriptbots-production-experiments-20261026-lilacelm`.
+
+Creation worksheet: runtime does not branch on the report. The user's explicit
+granular TODO and existing production-file acceptance are its consumer/gate;
+the unchecked MCP and absent experiment-download observations are actual source
+defects. Retirement is this session's publication. The single preimage and exact
+raw proof/binaries are the smallest reliable protection at the observed risk;
+no cheaper equivalent preserves provenance or executable inputs. P0 `bd-e6ff`
+requires the affected macOS host. Atlas wiring would change multiple backends'
+visual authority and needs a coordinated lane decision. This existing production
+consumer is the next concrete API gap; process earns no capability credit.
+
+**Bounded work audit.** Inventory: test source `12632a26` is ENABLER work;
+failed candidate `8c34db32` and rollback `5cf8f08f` earn no capability credit.
+The fixed six-commit window before `12632a26`
+contains three USER API repairs and three PROCESS tracking commits
+(`audit-seven-commits.txt`). Six answers:
+(1) create a real experiment and download its verified bundles is the visible
+journey; this increment tests earlier production repairs, not a new feature.
+(2) Removing tracking changes would not change product behavior; retaining graph
+history and the requested TODO is their limited purpose. (3) The exact existing
+production process consumer exercises the partial delivery above and fails its
+complete journey; no whole-capability enablement is claimed.
+(4) July's open Evolution Lab/UI roots remain meaningful; this ready API owner
+targets their concrete external-execution gap, while the macOS P0 needs its host.
+(5) Solo work; no swarm close/capability comparison. (6) No follow-up minted,
+criterion reduced, or original closed. Verdict: verification debt, not shipped
+capability. Keep this block on execution; add no process machinery or task graph.
+
+**Honesty inventory, current source increment and retained attempts.** Older CASS
+coverage is limited to six retained query/view pairs, not all historic sessions.
+1. No (checked: complete immutable source/test/DSR diff; no original ignore,
+   assertion, filter or deadline removed; no history rewrite).
+2. No (checked: child binary, real sockets/storage/files/CLI; the four explicit
+   envelope parser inputs are controls, not claimed live faults).
+3. No (checked: three-path source tree; no golden/snapshot change).
+4. Yes: this is a test/gate increment. Original gates remain, the DSR consumer's
+   new predicate is separately retained and rejects the genuine failed raw run;
+   an actual positive and its altered-record controls remain pending.
+5. No (checked: no product special case, feature reduction or environment sniff).
+6. No (checked: every `--no-run` is labeled preparation, with zero runtime credit;
+   ordinary denominator declared before execution: seven plus three existing ignores).
+7. No (checked: retained command/receipt inventory; no unrun native/DSR command claimed).
+8. No (checked: RCH diagnostics explicitly excluded from native/full acceptance).
+9. Yes: an initial zero-warning statement was wrong. Completed logs retain the
+   existing `proc-macro-error2` notice; commentary and this report correct it.
+   The later capacity note also confused MiB with GiB; its measured 199,053 MiB
+   is approximately 194.4 GiB, corrected here and publicly before further claims.
+10. No (checked: both command streams retained; server stderr described as observed
+    UTF-8 lines, not an exact byte stream; original server stdout discard corrected).
+11. No (checked: original owner remains in progress with unchanged seven criteria).
+12. No (checked: plan change records progress/limits, not weaker requirements).
+13–17. Not applicable: solo implementation/review; no subagent verdict or consensus credit.
+18. No (checked: frozen whole-file denominator and ten predicate controls predate results).
+19. Yes: reaped binaries, rejected multiline identity, cancellation and namespace
+    refusal consumed preparation time. Later cold compilation and the ineffective
+    phase experiment consumed substantial verification time without a product fix.
+    All logs remain; the failed experiment is removed, and its unfinished Clippy
+    is cancelled instead of being defended on sunk cost. The first predicate
+    input mistakenly included transport metadata; the failed application and
+    corrected contiguous test-output input are both retained.
+20. Strongest partial positive is the six actual HTTP files joined to completed
+    runs and independently hash-checked, with two separate CLI verifications.
+    Strongest whole-journey result is the actual 4-pass/3-fail raw process run.
+
+Disposition: RH-1 requires intact original gates plus discriminating actual-record
+controls before relying on the new predicate; RH-5 corrected the error-envelope
+control to keep valid result JSON. RH-2/PL-1 separate preparation, diagnostics and
+native acceptance; the warning claim was corrected publicly. SM-11 retains every
+failure/cancellation rather than presenting reruns as first-attempt success.
+
 ### Experiment status reader TODO — 2026-10-25, LilacElm
 
 Consumer: the requested execution TODO and remote experiment clients. Gate:
