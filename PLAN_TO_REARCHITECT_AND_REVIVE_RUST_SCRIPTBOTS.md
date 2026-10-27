@@ -4,6 +4,19 @@
 
 **Evidence date:** 2026-07-11
 
+**Experiment catalog recovery (2026-10-27):** [Qualified increment;
+original `bd-2z0.5.11` Currently In Progress — VioletTrout]. `11cb7a28`
+persists a validated, versioned definition before the worker starts, discovers
+stopped jobs after restart, and restores ID-only status/list/resume and keyed
+request identity. The actual killed server discovers one stopped job, restores
+tick 2, finishes tick 12 with its uninterrupted digest, and verifies both bundles
+without another create request. Clean-source runner controls pass 19/0/0 and the
+complete ordinary process lane passes 8/0/3 unchanged ignores; all-target
+workspace check, strict Clippy and formatting pass. Plan/build/cut checks and
+malformed-state refusals remain. Full resource/fault/native acceptance and the
+previously observed runtime handoff timeout remain open. Exact failure history,
+fixture-boundary change and evidence scope are in the existing reality check.
+
 **Durable experiment continuation (2026-10-27, afternoon):** [Qualified increment;
 original `bd-2z0.5.11` Currently In Progress — VioletTrout, all seven criteria retained]
 `9bee85d6` pairs the actual settled volatile journal with the canonical full-host
@@ -18,8 +31,9 @@ file-journal refusals and all prior status/bundle guards remain intact.
 The full clean runtime suite records 237/1/6: one unchanged cross-thread handoff
 times out at its 500ms port budget. Isolated old/new passes do not explain that
 loss; no deadline changed. Total resource/fault/status-boundary coverage,
-portable checkpoint chains, automatic API catalog recovery and native DSR
-acceptance remain open. See the current reality-check record and raw RCH logs.
+portable checkpoint chains and native DSR acceptance remain open. The subsequent
+catalog increment above delivers API discovery. See the current reality-check
+record and raw RCH logs.
 
 **Command admission reliability (2026-10-27):** [Scoped repair qualified —
 VioletTrout, `bd-2z0.12.2.1` closed under the unchanged open API umbrella]

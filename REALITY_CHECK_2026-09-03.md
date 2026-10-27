@@ -1,6 +1,264 @@
 # Reality Check — rust_scriptbots — implementation continuation 2026-10-27
 
-## Current implementation status — 2026-10-27, VioletTrout
+## Current implementation — experiment catalog recovery, VioletTrout
+
+Source **`11cb7a28beadcbca90ab0e235e7f28ec2666f43e`** delivers durable API
+catalog discovery and ID-only experiment continuation after server restart.
+Definitions are committed before worker startup; recovered unfinished jobs stay
+stopped until explicit resume. Keyed retries recover their admitted identity.
+The unchanged baseline fails the same live journey at an empty catalog; the
+new server discovers one job, restores tick 2 and reaches tick 12 with its
+uninterrupted digest. Clean-source runner tests pass **19/0/0**, and the complete
+ordinary process lane passes **8/0/3 unchanged ignores**, alongside workspace
+check, strict Clippy, formatting and whitespace checks. Reused, hash-identical
+clean-built binaries pass another **10 control tests and 1 restart test** through
+RCH on vmi1152480. Thirty actual child files are now retained locally, including
+both bundles, checkpoints and CLI logs; exact readback scope is below.
+
+Original `bd-2z0.5.11` remains in progress with all seven criteria. Full resource,
+fault/status-boundary coverage, portable checkpoint chains, branch primitives and
+native DSR qualification remain open. The earlier full-runtime handoff timeout
+is still unexplained. No performance or complete-provenance claim is made.
+
+### Completed bounded TODO
+
+- [x] Read current repository rules and README; recheck authoritative ready work.
+- [x] Reserve exact existing source/test/docs/tracker paths and notify API owner.
+- [x] Continue the original claimed runner task without a diluted child or closure.
+- [x] Implement a bounded, versioned definition before starting the worker.
+- [x] Bind definition to the canonical plan/build identity and root-derived paths.
+- [x] Implement discovery into stopped jobs; reads never launch a worker.
+- [x] Recover keyed identities and retain conflicting-payload/duplicate-ID refusals.
+- [x] Preserve direct access to healthy jobs while surfacing malformed catalog evidence.
+- [x] Cover restart, corrupt/foreign definitions, absent/invalid status and conflicts.
+- [x] Kill the shipped server; list/get/resume by ID only; compare oracle and verify bundles.
+- [x] Run focused controls, full ordinary process lane, workspace check, strict Clippy, fmt and UBS.
+- [x] Re-execute the original runner controls on the clean committed source.
+- [x] Re-execute the exact clean-built control suite through RCH.
+- [x] Collect actual child artifacts from an external RCH output root and verify copied bytes.
+- [x] Retain failures, source identity and actual counts; preserve runtime timeout qualifier.
+- [x] Update bounded README claims, original Bead notes and this TODO from evidence.
+- [x] Prepare source/docs/tracker snapshots for review and guarded publication.
+
+This extends the existing requested TODO. No additional planning framework or
+acceptance certificate is introduced; completed entries retire to cited evidence.
+Publication and lease release are observed after these immutable snapshots are
+committed; the final conversation handoff supplies that receipt.
+
+Before/after control: the updated real-process journey against unchanged
+`139b1bec` production source fails **0 passed / 1 failed / 0 ignored**, 10
+filtered, at catalog `total=0` after the actual kill/restart. It never reaches
+resume. The first candidate unit launch is an RCH **admission refusal** because
+the selected source files changed while uploading; no tests execute and no local
+fallback occurs. Source is frozen before the next invocation. The earlier
+workspace check passes on its recorded candidate overlay; final-source checks
+were pending at that stage. Logs are retained under
+`/data/tmp/scriptbots-catalog-recovery-20261027-violettrout/`.
+
+Candidate controls execute **9 passed / 1 failed / 0 ignored**, 659 filtered.
+All three new catalog tests pass, including ten distinct checksum/semantic
+mutations. The failure is the existing unreadable-status fixture: it pre-creates
+an orphan run directory with no durable definition, so the new admission boundary
+correctly retains **zero** admitted jobs instead of the fixture's expected one.
+The corrected setup persists a valid definition bound to the exact request, then
+places the same real directory at `status.json`, modelling the crash between
+durable admission and its first status observation. Both original retry/error
+assertions and both exact one-job assertions remain. The admitted set does not
+expand: orphan/partial definitions still refuse; valid admitted jobs with unreadable
+status retain their identity. This setup change does not re-qualify every original
+initial-create fault timing. No status verifier is weakened.
+
+Strict Clippy first fails `collapsible_if` in the new identity check. The nested
+conditional is collapsed without suppression. A second upload is refused after
+the fixture edit changes its selected input; this is a second source-admission
+failure with no executed lint result. The frozen replacement follows. All raw
+stderr is retained, and no local build fallback occurs.
+
+Reviewed source is committed as **`11cb7a28bead`**, tree
+`11339a24e5df95bf5d784cd4fb0230765282082e`. The final candidate overlay
+`207ed0045269e1166e17ff715fa42ac95d79da55773c5fbdaa349fbd18c2e40a`
+passes **10 focused experiment/control tests**, 0 failures, 0 ignores, 659
+filtered, 8.06s. This includes real creation/completion followed by a fresh
+service's exact keyed retry and changed-payload conflict. The saved pending
+definition test confirms repeated reads create neither status nor science.
+All ten mutation cells are distinct; semantic cells receive valid recomputed
+checksums so they exercise the plan/identity checks. The new definition reader
+reuses the existing no-follow, regular-file, single-link and bounded-read checks;
+checkpoint callers retain their unchanged byte cap. UBS on the three changed
+source files reports **0 critical, 1,682 warnings, 803 informational findings**,
+not a warning-free scan. Full process and final clean-source qualification follow.
+
+The candidate's complete ordinary process lane passes **8 / 0 / 3 unchanged
+ignores**, 0 filtered, 103.90s. The restarted server receives only list/get/resume,
+discovers one stopped job, preserves its creation timestamp, restores tick 2 and
+finishes tick 12 with uninterrupted digest `2b53b4f0e5755203`. Both bundles pass
+the library verifier and separate shipped CLI verifier. Strict workspace Clippy
+passes on that exact overlay (remote command exit 0, 199.553s); the existing
+future-compiler `proc-macro-error2` notice remains.
+
+An immediate read-only SSH/tar copy, before launching another job on that worker,
+still fails because the printed remote directory no longer exists. Its 20-byte
+archive is failed retrieval, not artifact evidence. This narrows the observation
+from the prior handoff: later checkout reuse is not necessary for the loss; its
+cause remains unproven. Use RCH's supported declared-result collection for the
+next focused child execution rather than claiming the failed archive was retained.
+
+Clean `11cb7a28` now passes the full ordinary process lane **8 / 0 / 3 unchanged
+ignores**, 0 filtered, 105.56s, with the same nonzero restore and oracle digest.
+Workspace all-target check (67.183s remote command) and strict Clippy (104.753s)
+both pass; formatting and whitespace checks pass locally. The real-process
+fixture records the exact embedded source commit and leaves unavailable compiler
+identity as null; bundle reproducibility remains false, not an invented complete
+provenance claim. A declared-result attempt is refused at CLI parsing because
+RCH forbids `--job` with `--clean-overlay`; no job or tests run in that invocation.
+The corrected collection will execute the already clean-built test binary as an
+RCH job and identify that narrower evidence boundary explicitly.
+
+Clean-source original runner controls pass **19 / 0 / 0**, 650 filtered,
+184.56s. Actual child kills resume MLP cut 5 and DWRAON cut 6 to tick 40 with
+their uninterrupted digests `a5bdbf8a1615575e` and `82544897a98c1431`.
+The unchanged checkpoint cap and alias guards, all four distinct family/seed
+cells at concurrency 1 and 2, completed-companion recovery, corruption and
+cross-run bundle controls execute again. A subsequent collection job initially
+returns RCH exit 103 before tests; this is infrastructure, not a test result.
+Its actual refusal is the generic job's default four-core estimate against a
+two-slot worker, rather than fleet exhaustion. Supported per-invocation
+`RCH_BUILD_SLOTS=2` and `RCH_TEST_SLOTS=2` make the request admissible. The next
+attempt is stopped by `RCH_SYNC_LIVE_CHECKOUT_REFUSED` before execution: generic
+job mode selected a live source destination. No guard is bypassed. The corrected
+job uses an external, clean `main` source mirror and the exact existing binaries
+from the successful clean-source Cargo runs. These refusals earn no test credit.
+The first external-mirror admission also refuses because the default canonical
+root is `/data/projects`; the actual mirror is under `/data/tmp`. The corrected
+invocation explicitly configures `RCH_CANONICAL_PROJECT_ROOT=/data/tmp` for that
+one job, retaining the live-checkout safety guard and leaving global config alone.
+That admission reveals unfinished source ownership from the two earlier failed
+generic jobs. `rch jobs recover` reconciles only the exact owned wrappers
+`rchw-d5bcd861-a444-4350-a20a-bfef4e88f4dc` and
+`rchw-e5f4280f-45a7-4c60-85e6-bf76641a6b28`, returning acknowledged terminal
+failure for each; the unfinished-wrapper query then returns an empty set. No
+lease file is removed, no other job is cancelled, and no command is replayed by
+recovery. A new invocation after that changed state still refuses overlapping
+source ownership, before tests. Local acknowledgement does not prove the worker's
+underlying ownership conflict is resolved. The failed preparations remain
+separate from test execution.
+
+Collection returns to the ordinary clean-source Cargo lane with a forced external
+`TMPDIR`, leaving the code and scientific inputs unchanged. A new hz2 admission
+returns 103: the fresh worker probe reports **0 slots, 3.516 GiB free, critical
+disk pressure**. No deletion or cleanup is attempted. Worker vmi1152480 reports
+3 slots and 57.883 GiB free (ratio warning); the remaining readback runs there.
+Its test outputs use `/data/tmp/scriptbots-catalog-proof-20261027-1858`, outside
+the temporary source checkout, and both stdout/stderr are retained. Compilation
+and test execution remain RCH-only. The failed declared-result route on hz2 is
+not called working.
+That extra Cargo lane begins rebuilding dependencies on the check-only cache;
+its exact owned wrapper `rchw-1cbc6988-5378-4bd0-9be6-b82e2e5df410` is cancelled
+before tests. Cancellation is retained, not a test failure or pass. The existing
+clean-built library-test, process-test and app binaries are instead copied as
+data artifacts into a previously absent cache directory on vmi1152480, using
+no-overwrite extraction and SHA-256 readback. Their original build paths retain
+the `hz2` component; the execution host remains honestly named vmi1152480. This
+is reuse of exact tested binaries for artifact readback, not a new native build,
+an independent review, a performance comparison, or complete provenance proof.
+
+Final readback succeeds through an ordinary RCH job on vmi1152480, using the
+external output root and copied binaries rather than the failed declared-result
+route. All three executed binary SHA-256 values equal their original clean-built
+files. The exact library binary executes **10/0/0**, 659 filtered, 6.62s; the
+exact process binary executes **1/0/0**, 10 filtered, 28.94s, restores tick 2 and
+matches `2b53b4f0e5755203` at tick 12. Both shipped CLI bundle checks pass there.
+The whole server-test directory is copied successfully and unpacked with
+no-overwrite semantics under
+`/data/tmp/scriptbots-catalog-recovery-20261027-violettrout/retained-server-readback/`.
+It contains **30 files**. Local transport-integrity readback recomputes all
+**4 listed artifact BLAKE3 hashes** across **2 bundles**, validates both saved
+checkpoint frame checksums, confirms both embedded source revisions equal
+`11cb7a28`, and compares the retained completed/oracle digests. This readback is
+additional byte/identity evidence; the semantic verifiers executed remotely.
+The archive SHA-256 is
+`92522c93f3ed824e101b330f75dd7631858fded11ee90603747d5bcc1498afc5`.
+`reproducible=false` remains explicit. The two initial failed archives remain
+failed retrievals; they are not substituted for this successful copy.
+
+Tracker update preserves all **720** canonical records. Only appended notes and
+`updated_at` on original `bd-2z0.5.11` and existing infrastructure `bd-x1ec`
+change; **718 records remain byte-identical**, and every original acceptance,
+dependency, owner, status, label, comment and provenance field is preserved.
+Explicit re-import succeeds and dependency-cycle count is zero. Neither task is
+closed. The infrastructure note records actual worker pressure and failed
+ownership recovery rather than claiming that generic collection now works.
+
+### Bounded anti-ceremony audit for this catalog increment
+
+Creation worksheet: running code branches on the saved definition (FEATURE;
+Parts 2–4 do not apply to runtime state). This existing TODO/report is PROCESS:
+the operator explicitly requested granular tracking; its consumer is that
+operator, its gate is an accurate implementation handoff, and its observed gap
+is the real restarted server's empty catalog. It retires to evidence at handoff.
+Raw external logs are the minimal integrity control for the previously observed
+loss of remote child artifacts: retain exact commands, failures and identities;
+no separate certificate or speculative framework is created. The highest-value
+claimed executable item is this runner's usable interrupted-experiment recovery;
+an hour implementing it has more value than expanding this report. Verdict:
+FEATURE for the definition, minimal legitimate requested tracking for the report.
+The observed artifact loss makes retention necessary at this actual scale;
+existing logs and external-output retention are the smallest available controls,
+and there is no cheaper replacement that retains the missing child bytes.
+
+Real-work worksheet, this increment: the README promises an evolutionary
+simulation laboratory with control APIs and reproducible experiments. The one
+source commit is USER; report/tracker updates are PROCESS, with user instructions
+in README. The demo is kill a server, list the recovered stopped experiment and
+resume by ID. Omitting process updates would not change simulation behavior;
+they preserve the requested handoff and disclose qualification. The saved
+definition enables the existing real runner, rather than a future framework.
+The original long-standing runner acceptance is still open; the absolute oldest
+user-facing task was not established by this bounded audit. This task was chosen
+because its existing owner-cut implementation made API recovery immediately
+executable. No prerequisite is
+split off to close it. Solo work, no pane/close tally. Verdict: capability work
+is concrete. Late collection work drifted into expensive infrastructure setup;
+stop that machinery now that the files are retained, publish the capability and
+leave infrastructure observations on the existing task. No extra framework.
+
+Honesty inventory, checked against both exact reviewed source trees, their
+two-hunk correction, the original seven criteria and retained RCH logs:
+
+1. No (checked: all touched tests; no assertion, ignore or deadline is removed).
+2. No (checked: definition fixtures exercise real filesystem recovery; process tests use the shipped binary).
+3. No (checked: no golden or snapshot file is changed).
+4. Yes: a shared file-reader signature and fault-fixture setup change alongside the feature. Every checkpoint caller retains its exact cap and guards; the fixture's failure, changed admission boundary and unchanged assertions are disclosed above. No suppressions, bypasses, retries or tolerances are added.
+5. No (checked: the normal service writer/reader execute the feature; no benchmark/demo-only branch).
+6. No (checked: focused success executes ten tests with 659 explicitly filtered; refused uploads execute none and earn no test credit).
+7. No (checked: actual logged results are distinguished from pending clean-source qualification).
+8. No (checked: filesystem fault fixtures, real child execution, RCH and native DSR are separately qualified).
+9. No (checked: baseline failure, candidate 9/1, Clippy error, two upload refusals and prior runtime timeout are retained).
+10. No (checked: cited remote commands redirect both stdout and stderr into retained logs).
+11. No (checked: original task remains in progress with all criteria; no new child or closure).
+12. No (checked: plan adds an active implementation entry; original acceptance is unchanged).
+13. No (checked: solo work; no delegated closures).
+14. No (checked: no subagents dispatched).
+15. No (checked: no subagent report accepted).
+16. No (checked: no panes/subagents or refusal-only closure).
+17. No (checked: same-origin development and fresh verification are not called independent review).
+18. No (checked: the existing full ordinary process file and focused test selection are declared before results; individual semantic cells differ).
+19. Yes: two uploads were wasted by editing selected source during admission; later collection mistakes and a cancelled cold rebuild add avoidable overhead. Refusals and cancellation earn no test or product credit. The successful route reuses exact binaries with external output retention; the fault-fixture change is explicitly explained above. Stop expanding verification machinery now.
+20. Strongest falsifiable proof is the same killed-server journey: unchanged production lists zero experiments; the candidate must discover one stopped job, restore a nonzero owner cut, match an uninterrupted digest and pass both bundle verifiers. Its final result is reported with the actual clean-source logs above.
+
+Disposition: gate-change and proof-class inflation risks (RH-1 and RH-2) are
+disclosed in place. No acceptance or verifier is
+relaxed. Source-admission failures remain separate from test outcomes. The
+session-derived CASS query finds zero indexed matches. Five broad historical
+queries each return one bounded hit; canonical message-index followups inspect
+all five. They show retained deadline losses, an initialization defect missed by
+software-skipped native acceptance, scanner review, an older wrapped-build
+diagnosis, and a prior search. They do not establish blanket historical safety
+or qualify native behavior here. The raw queries/views are retained externally.
+This is solo re-verification,
+not an independent certification or native/performance qualification.
+
+## Previous qualified increment — 2026-10-27, VioletTrout
 
 Afternoon continuation after `41e9aae6`, original `bd-2z0.5.11`:
 

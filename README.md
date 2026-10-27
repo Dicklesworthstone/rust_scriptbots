@@ -1087,8 +1087,8 @@ For an interactive run, ScriptBots parses the control environment and transactio
   - `POST /api/v1/experiments` → start a matched-seed batch (`variants` × `seeds`, `ticks_per_run`) that executes on a
     background worker; `GET /api/v1/experiments/{id}` reports per-run state, final digest and bundle path;
     `POST .../cancel` stops before the next wave; `POST .../resume` continues pending runs and
-    recovers verified completed bundles saved before their final status write.
-    Unfinished in-flight runs still require checkpoint recovery and are refused.
+    unfinished runs from validated owner/journal cuts, and recovers verified completed
+    bundles saved before their final status write. Missing or incompatible cuts are refused.
   - `POST /api/v1/checkpoints` → capture a `WorldCheckpointV1` and record it in the run database (usable by
     `--checkpoint-start`); `GET /api/v1/checkpoints`, `/api/v1/artifacts`
   - Playback (fire-and-forget acknowledgement): `POST /api/pause`, `POST /api/resume`,
@@ -1107,6 +1107,21 @@ counts existing binary artifacts without labelling them current-run checkpoints.
 `SCRIPTBOTS_ARTIFACTS_DIR` for an explicit directory; otherwise each control service reserves
 a unique temporary directory. Files, including partial failed captures, are never automatically
 removed or overwritten.
+
+For experiment recovery after a server restart, configure the same explicit
+`SCRIPTBOTS_ARTIFACTS_DIR`. Experiment creation saves a versioned, checksummed
+definition before starting its worker. List/status discover those definitions
+without starting science; unfinished jobs report `stopped` until an explicit
+`POST /api/v1/experiments/{id}/resume`. The original create payload is no longer
+required. Keyed create retries recover their admitted ID and still reject a changed
+payload. Discovery admits at most 1,024 experiments and reads at most 1 MiB per
+definition, with the runner's existing plan/build, status, checkpoint and bundle
+checks retained. These are input bounds, not filesystem deadlines. Corrupt,
+foreign and incomplete definitions produce an error and preserve their files;
+direct status access to a healthy companion remains available. Older directories
+without a definition require explicit reconciliation. Checksums detect corruption
+and do not authenticate an artifact's author. Complete resource/fault/platform
+qualification remains open under `bd-2z0.5.11`; see the current reality check.
 
 `GET /api/status` and MCP `get_status` report one immutable owner publication:
 `paused`, `lifecycle`, tagged `health` (including blocker/fault detail),
@@ -1239,8 +1254,9 @@ cargo run -p scriptbots-app --bin control_cli -- watch --interval-ms 500
   - Experiments: `experiment_create` runs a real matched-seed batch (MLP/DWRAON/Assembly arms × seeds) on a
     background worker and writes a verified run bundle per run; `experiment_status`, `experiment_list`,
     `experiment_cancel` (stops before the next wave), `experiment_resume` (continues pending runs
-    and recovers verified completed bundles saved before their final status write;
-    unfinished in-flight runs are refused)
+    and unfinished runs from validated owner/journal cuts, and recovers verified completed
+    bundles saved before their final status write; missing or incompatible cuts are refused).
+    The same saved-definition discovery supports status/list/resume by ID after restart.
   - Checkpoints and artifacts: `checkpoint_create` (captured from the world owner and recorded in the run database
     through the storage worker), `checkpoint_list`, `checkpoint_status`, `artifact_list`, `artifact_get`
 Notes: Only HTTP transport is supported here; stdio/SSE are not used.
