@@ -601,6 +601,8 @@ impl MatchedSeedExperimentRunner {
     /// complete partial-failure set. An interrupted `Running` record can recover
     /// an already completed, verified bundle. Unfinished runs remain a typed
     /// refusal until composite checkpoint resume exists.
+    /// Verified companions are saved even if another bundle fails verification;
+    /// that failure is still returned before any pending runs are admitted.
     ///
     /// # Errors
     ///
@@ -670,7 +672,11 @@ impl MatchedSeedExperimentRunner {
                                 ),
                             }
                         })?;
-                    self.verify_completed_bundle(record, variant, *family, &plan.digest)?;
+                    if let Err(error) =
+                        self.verify_completed_bundle(record, variant, *family, &plan.digest)
+                    {
+                        recovery_error.get_or_insert(error);
+                    }
                 }
                 RunState::Pending | RunState::Failed => {}
             }
@@ -2379,6 +2385,50 @@ mod tests {
             runner
                 .execute_batch(&state_file)
                 .expect("restored success")
+                .runs,
+            completed
+        );
+    }
+
+    #[test]
+    fn completed_bundle_recovery_preserves_finished_work_after_prior_bundle_corruption() {
+        let (runner, state_file, mut expected, completed) = completed_bundle_gap_fixture(&[7, 9]);
+        expected.runs[0] = completed[0].clone();
+        recompute_status_counts(&mut expected);
+        runner
+            .save_status(&state_file, &mut expected)
+            .expect("prior completion published");
+        let summary = runner
+            .output_dir
+            .join(&completed[0].run_id)
+            .join("exports/summary.csv");
+        let original = fs::read(&summary).expect("original summary");
+        fs::write(&summary, b"corrupt prior completion\n").expect("plant corruption");
+
+        assert!(matches!(
+            runner.execute_batch(&state_file),
+            Err(ExperimentRunnerError::Bundle { run_id, .. }) if run_id == completed[0].run_id
+        ));
+        expected.runs[1] = completed[1].clone();
+        expected.generation += 1;
+        recompute_status_counts(&mut expected);
+        assert_eq!(
+            runner
+                .load_or_create_status(&state_file)
+                .expect("verified companion retained"),
+            expected
+        );
+        let bytes = fs::read(&state_file).expect("recovered status");
+        assert!(matches!(
+            runner.execute_batch(&state_file),
+            Err(ExperimentRunnerError::Bundle { run_id, .. }) if run_id == completed[0].run_id
+        ));
+        assert_eq!(fs::read(&state_file).expect("unchanged refusal"), bytes);
+        fs::write(&summary, original).expect("restore prior completion");
+        assert_eq!(
+            runner
+                .execute_batch(&state_file)
+                .expect("restored bundles verify")
                 .runs,
             completed
         );
