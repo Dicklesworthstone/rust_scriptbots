@@ -143,6 +143,153 @@ fn storage_persists_metrics_roundtrip() {
     let _ = fs::remove_file(&path);
 }
 
+/// Cargo's RUST_MIN_STACK must not hide a finished reader that aborts outside Cargo.
+#[test]
+fn finished_reader_validates_durable_rows_and_schema_on_two_mib_stack() {
+    const CHILD_PATH: &str = "SCRIPTBOTS_STACK_READER_PATH";
+    const CHILD_TICK: &str = "SCRIPTBOTS_STACK_READER_TICK";
+    const CHILD_BATCH: &str = "SCRIPTBOTS_STACK_READER_BATCH";
+    const CHILD_REFUSAL: &str = "SCRIPTBOTS_STACK_READER_REFUSAL";
+
+    if let Some(path) = std::env::var_os(CHILD_PATH) {
+        assert!(std::env::var_os("RUST_MIN_STACK").is_none());
+        std::thread::Builder::new()
+            .name("finished-reader-two-mib".to_owned())
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                let reader = StorageReader::open_finished(&path.to_string_lossy());
+                if std::env::var_os(CHILD_REFUSAL).is_some() {
+                    assert!(matches!(
+                        reader,
+                        Err(StorageError::InvalidData {
+                            context: "storage.recovery_schema",
+                            ..
+                        })
+                    ));
+                    println!("ordinary-stack reader refused unsupported schema");
+                    return;
+                }
+                let reader = reader.expect("finished reader on an ordinary stack");
+                let tick = std::env::var(CHILD_TICK)
+                    .expect("expected durable tick")
+                    .parse::<u64>()
+                    .expect("numeric tick");
+                let batch = std::env::var(CHILD_BATCH)
+                    .expect("expected durable batch")
+                    .parse::<u64>()
+                    .expect("numeric batch");
+                assert_eq!(reader.max_tick().expect("durable rows"), Some(tick));
+                let watermarks = reader.persistence_watermarks().expect("durable progress");
+                assert_eq!(watermarks.admitted, watermarks.applied);
+                assert_eq!(watermarks.applied, watermarks.durable);
+                assert_eq!(watermarks.durable.expect("nonempty progress").get(), batch);
+                assert!(!reader.load_replay_events().expect("replay rows").is_empty());
+                reader.close().expect("close on connection-owning thread");
+                println!("ordinary-stack reader observed durable tick {tick}, batch {batch}");
+            })
+            .expect("ordinary reader thread")
+            .join()
+            .expect("reader must neither panic nor overflow");
+        return;
+    }
+
+    let path = temp_run_path("ordinary_stack_reader");
+    let path_str = path.to_str().expect("UTF-8 test path");
+    let mut pipeline = StoragePipeline::create_unattributed_file(path_str).expect("file worker");
+    let config = ScriptBotsConfig {
+        world_width: 64,
+        world_height: 64,
+        food_cell_size: 16,
+        rng_seed: Some(0x6_59c),
+        population_minimum: 0,
+        population_spawn_interval: 0,
+        persistence_interval: 1,
+        ..ScriptBotsConfig::default()
+    };
+    let (mut world, mut persistence) =
+        WorldState::with_persistence(config, Box::new(pipeline.sink())).expect("world");
+    world.try_spawn_agent(AgentData::default()).expect("agent");
+    persistence.step(&mut world).expect("first persisted tick");
+    persistence.step(&mut world).expect("second persisted tick");
+    let shutdown = pipeline.shutdown().expect("durable close and join");
+    assert_eq!(
+        shutdown.guarantee,
+        scriptbots_storage::PersistenceGuarantee::Durable
+    );
+    let child = |refusal: bool| {
+        let before = fs::read(&path).expect("database preimage");
+        let mut command = Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .args([
+                "--exact",
+                "finished_reader_validates_durable_rows_and_schema_on_two_mib_stack",
+                "--nocapture",
+            ])
+            .env_remove("RUST_MIN_STACK")
+            .env(CHILD_PATH, &path)
+            .env(
+                CHILD_TICK,
+                shutdown.committed_tick.expect("durable tick").to_string(),
+            )
+            .env(
+                CHILD_BATCH,
+                shutdown
+                    .watermarks
+                    .durable
+                    .expect("durable batch")
+                    .get()
+                    .to_string(),
+            )
+            .env_remove(CHILD_REFUSAL);
+        if refusal {
+            command.env(CHILD_REFUSAL, "1");
+        }
+        let output = command.output().expect("reader subprocess");
+        assert!(
+            output.status.success(),
+            "ordinary-stack reader failed: {}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let observation = if refusal {
+            "ordinary-stack reader refused unsupported schema".to_owned()
+        } else {
+            format!(
+                "ordinary-stack reader observed durable tick {}, batch {}",
+                shutdown.committed_tick.expect("durable tick"),
+                shutdown.watermarks.durable.expect("durable batch").get()
+            )
+        };
+        assert!(
+            stdout.contains(&observation),
+            "reader subprocess must execute its selected case: {stdout}"
+        );
+        assert_eq!(before, fs::read(&path).expect("database after read"));
+        print!("{stdout}");
+    };
+    child(false);
+
+    let connection = Connection::open_existing(path_str).expect("control writer");
+    let version = connection
+        .query_row("PRAGMA user_version")
+        .expect("schema version")
+        .get_typed::<i64>(0)
+        .expect("integer version");
+    connection
+        .execute("PRAGMA user_version = 0")
+        .expect("plant unsupported schema");
+    connection.close().expect("close control writer");
+    child(true);
+    let connection = Connection::open_existing(path_str).expect("restore writer");
+    connection
+        .execute(&format!("PRAGMA user_version = {version}"))
+        .expect("restore version");
+    connection.close().expect("close restored writer");
+    child(false);
+}
+
 const NARRATIVE_CHILD_PATH: &str = "SCRIPTBOTS_NARRATIVE_CHILD_PATH";
 const NARRATIVE_CHILD_SEED: &str = "SCRIPTBOTS_NARRATIVE_CHILD_SEED";
 const NARRATIVE_CRASH_EXIT: i32 = 86;
@@ -168,14 +315,41 @@ fn narrative_log_buffer() -> NarrativeLogBuffer {
     static BUFFER: LazyLock<NarrativeLogBuffer> = LazyLock::new(|| {
         let buffer = NarrativeLogBuffer(Arc::new(Mutex::new(Vec::new())));
         let writer = buffer.clone();
-        let _ = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
+        // Preserve every storage evidence field without retaining the SQL
+        // interpreter's per-instruction dependency TRACE stream in memory.
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(
+                "warn,scriptbots_storage=trace",
+            ))
             .with_ansi(false)
             .with_writer(move || writer.clone())
-            .try_init();
+            .try_init()
+            .expect("install the narrative evidence subscriber");
         buffer
     });
     BUFFER.clone()
+}
+
+#[test]
+fn narrative_log_capture_preserves_storage_trace_and_dependency_warnings() {
+    let logs = narrative_log_buffer();
+    let marker = format!("narrative-capture-policy-{}", std::process::id());
+    tracing::trace!(target: "scriptbots_storage::capture_probe", probe = %marker, "storage trace witness");
+    tracing::warn!(target: "fsqlite_core::capture_probe", probe = %marker, "dependency warning witness");
+    tracing::trace!(target: "fsqlite_core::capture_probe", probe = %marker, "dependency instruction trace");
+    let records = logs.records_for(&marker);
+    for required in ["storage trace witness", "dependency warning witness"] {
+        assert!(
+            records.iter().any(|line| line.contains(required)),
+            "evidence capture omitted {required}: {records:?}"
+        );
+    }
+    assert!(
+        records
+            .iter()
+            .all(|line| !line.contains("dependency instruction trace")),
+        "dependency instruction tracing must not flood the evidence buffer"
+    );
 }
 
 impl NarrativeLogBuffer {

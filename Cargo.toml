@@ -115,6 +115,12 @@ opt-level = 3
 [profile.dev]
 split-debuginfo = "unpacked"
 
+# The unoptimized SQL dispatcher alone exceeds a normal 2 MiB thread stack
+# (bd-6sgk). Optimize the same engine for every debug consumer, including readers
+# launched outside Cargo; do not rely on Cargo's RUST_MIN_STACK environment.
+[profile.dev.package.fsqlite-core]
+opt-level = 1
+
 [profile.release-dbg]
 inherits = "release"
 debug = true
