@@ -10,7 +10,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -174,7 +174,7 @@ fn json_str(body: &str, key: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
-/// Extract the bound address from the listener announcement.
+/// Remove terminal styling before reading structured server fields.
 ///
 /// Deliberately NOT a `split_whitespace().strip_prefix("address=")` match. The
 /// tracing formatter colours field NAMES independently, so on a colour-enabled
@@ -183,23 +183,25 @@ fn json_str(body: &str, key: &str) -> Option<String> {
 /// recognising the line it was waiting for, and reports a timeout that looks like
 /// "the server never started" when the server started in 0.4s. Strip ANSI first,
 /// then search anywhere in the line.
-fn parse_announced_address(line: &str) -> Option<SocketAddr> {
-    let plain: String = {
-        let mut out = String::with_capacity(line.len());
-        let mut chars = line.chars();
-        while let Some(ch) = chars.next() {
-            if ch == '\u{1b}' {
-                for esc in chars.by_ref() {
-                    if esc.is_ascii_alphabetic() {
-                        break;
-                    }
+fn plain_server_log(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            for esc in chars.by_ref() {
+                if esc.is_ascii_alphabetic() {
+                    break;
                 }
-            } else {
-                out.push(ch);
             }
+        } else {
+            out.push(ch);
         }
-        out
-    };
+    }
+    out
+}
+
+fn parse_announced_address(line: &str) -> Option<SocketAddr> {
+    let plain = plain_server_log(line);
     let start = plain.find("address=")? + "address=".len();
     let rest = &plain[start..];
     let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
@@ -2263,6 +2265,208 @@ fn real_process_cli_replay_journal_roundtrip_and_divergence() -> Result<()> {
         "CLI replay with tampered journal must fail"
     );
 
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn real_process_named_experiment_continues_after_server_kill() -> Result<()> {
+    const TICKS: u64 = 12;
+    const MINIMUM_SAVED_CUTS: usize = 3;
+    let directory = tempdir()?.keep();
+    println!(
+        "shipped server continuation evidence: {}",
+        directory.display()
+    );
+    let spawn = |root: &Path, label: &str| -> Result<(ChildGuard, SocketAddr, ServerLog)> {
+        std::fs::create_dir_all(root)?;
+        let stderr = std::fs::File::create(root.join(format!("{label}.stderr.log")))?;
+        let child = cadence_replay_command()
+            .args(["--mode", "server", "--storage", "memory", "--threads", "2"])
+            .args(["--checkpoint-interval", "0"])
+            .env("SCRIPTBOTS_CONTROL_REST_ENABLED", "1")
+            .env("SCRIPTBOTS_CONTROL_REST_ADDR", "127.0.0.1:0")
+            .env("SCRIPTBOTS_CONTROL_MCP", "http")
+            .env("SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR", "127.0.0.1:0")
+            .env("SCRIPTBOTS_ARTIFACTS_DIR", root.join("artifacts"))
+            .current_dir(root)
+            .stdout(Stdio::from(std::fs::File::create(
+                root.join(format!("{label}.stdout.log")),
+            )?))
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let mut guard = ChildGuard(Some(child));
+        let (address, _, log) = wait_for_control_addresses(
+            guard.0.as_mut().unwrap(),
+            Duration::from_secs(90),
+            Some(stderr),
+        )?;
+        let (code, body) = http(address, "POST", "/api/control/pause")?;
+        assert_eq!(code, 200, "{body}");
+        let id = json_str(&body, "command_id").context("pause command identity")?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let (code, body) = http(address, "GET", &format!("/api/control/status/{id}"))?;
+            let receipt: serde_json::Value = serde_json::from_str(&body)?;
+            if code == 200
+                && receipt["application_state"] == "applied"
+                && receipt["journal_state"] == "committed_volatile"
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "pause did not settle: {body}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Ok((guard, address, log))
+    };
+    let payload = serde_json::json!({
+        "experiment_id": "server-continuation", "description": "hard process restart",
+        "variants": [{"variant_id":"mlp", "brain_family":"mlp"}],
+        "seeds": [92], "ticks_per_run": TICKS, "max_concurrency": 1,
+        "idempotency_key": "server-continuation-v1"
+    });
+    let bytes = serde_json::to_vec(&payload)?;
+    let create = |address| -> Result<serde_json::Value> {
+        let (code, body) = http_with_body(
+            address,
+            "POST",
+            "/api/v1/experiments",
+            &bytes,
+            Some("application/json"),
+        )?;
+        assert_eq!(code, 201, "create/reattach: {body}");
+        Ok(serde_json::from_str(&body)?)
+    };
+    let finish = |address| -> Result<serde_json::Value> {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let (code, body) = http(address, "GET", "/api/v1/experiments/server-continuation")?;
+            assert_eq!(code, 200, "{body}");
+            let status: serde_json::Value = serde_json::from_str(&body)?;
+            if status["status"] == "completed" {
+                return Ok(status);
+            }
+            assert_ne!(status["status"], "failed", "{body}");
+            assert!(
+                Instant::now() < deadline,
+                "experiment did not finish: {body}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let interrupted = directory.join("interrupted");
+    let (mut first, address, _) = spawn(&interrupted, "first")?;
+    let created = create(address)?;
+    let run_id = created["runs"][0]["run_id"]
+        .as_str()
+        .context("actual run identity")?;
+    let output = interrupted.join("artifacts/experiments/server-continuation");
+    let checkpoint = output.join(format!("{run_id}.checkpoint"));
+    let mut observed = std::collections::BTreeSet::new();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while observed.len() < MINIMUM_SAVED_CUTS {
+        if let Ok(bytes) = std::fs::read(&checkpoint)
+            && let Some(end) = bytes.len().checked_sub(blake3::OUT_LEN)
+            && blake3::hash(&bytes[..end]).as_bytes() == &bytes[end..]
+        {
+            observed.insert(blake3::hash(&bytes).to_hex().to_string());
+        }
+        assert!(
+            first.0.as_mut().unwrap().try_wait()?.is_none(),
+            "server exited before interruption"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "no distinct complete checkpoint cuts appeared"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    first.0.as_mut().unwrap().kill()?;
+    assert!(!first.0.as_mut().unwrap().wait()?.success());
+    let interrupted_status: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(output.join("status.json"))?)?;
+    assert_eq!(interrupted_status["runs"][0]["state"], "Running");
+    let (resumed_guard, resumed_address, resumed_log) = spawn(&interrupted, "resumed")?;
+    let attached = create(resumed_address)?;
+    assert_eq!(attached["experiment_id"], created["experiment_id"]);
+    let completed = finish(resumed_address)?;
+    let restored_ticks = resumed_log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|line| line.contains("restored durable experiment continuation cut"))
+        .filter_map(|line| {
+            let plain = plain_server_log(line);
+            plain
+                .split_once("checkpoint_tick=")?
+                .1
+                .split_whitespace()
+                .next()?
+                .parse::<u64>()
+                .ok()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        restored_ticks.len(),
+        1,
+        "actual restore log: {:?}",
+        *resumed_log.lock().unwrap()
+    );
+    let minimum_tick = u64::try_from(MINIMUM_SAVED_CUTS - 1)?;
+    assert!(
+        (minimum_tick..TICKS).contains(&restored_ticks[0]),
+        "restored tick {}",
+        restored_ticks[0]
+    );
+    let oracle_root = directory.join("oracle");
+    let (oracle_guard, oracle_address, _) = spawn(&oracle_root, "oracle")?;
+    create(oracle_address)?;
+    let expected = finish(oracle_address)?;
+    assert_eq!(completed["completed_runs"], 1);
+    assert_eq!(completed["failed_runs"], 0);
+    assert_eq!(completed["runs"][0]["total_ticks"], TICKS);
+    let actual_digest = completed["runs"][0]["final_digest"]
+        .as_str()
+        .context("completed digest")?;
+    let expected_digest = expected["runs"][0]["final_digest"]
+        .as_str()
+        .context("oracle digest")?;
+    assert_eq!(actual_digest, expected_digest);
+    for root in [&interrupted, &oracle_root] {
+        let bundle = root
+            .join("artifacts/experiments/server-continuation")
+            .join(run_id);
+        let verified = scriptbots_storage::bundle::verify_run_bundle(&bundle)?;
+        assert_eq!(verified.max_tick, TICKS);
+        let cli = Command::new(binary())
+            .arg("--verify-bundle")
+            .arg(&bundle)
+            .output()?;
+        std::fs::write(root.join("verify.stdout.log"), &cli.stdout)?;
+        std::fs::write(root.join("verify.stderr.log"), &cli.stderr)?;
+        assert!(
+            cli.status.success(),
+            "bundle CLI failed: {}",
+            String::from_utf8_lossy(&cli.stderr)
+        );
+        assert!(String::from_utf8(cli.stdout)?.contains("Verified run bundle V1"));
+    }
+    // Reattach to an existing plan is intentionally distinguished from automatic
+    // server-catalog recovery: this test supplies the exact original named request.
+    println!(
+        "shipped server restored tick {}, completed {TICKS}, digest {}",
+        restored_ticks[0], completed["runs"][0]["final_digest"]
+    );
+    std::fs::write(
+        directory.join("completed.json"),
+        serde_json::to_vec_pretty(&completed)?,
+    )?;
+    std::fs::write(
+        directory.join("oracle.json"),
+        serde_json::to_vec_pretty(&expected)?,
+    )?;
+    drop(oracle_guard);
+    drop(resumed_guard);
     Ok(())
 }
 

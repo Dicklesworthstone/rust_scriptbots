@@ -61,6 +61,9 @@ pub const HOST_CHECKPOINT_V1_CODEC: &str = "postcard-envelope+json+blake3-v1";
 /// Fixed resource ceiling for a complete encoded host artifact.
 pub const MAX_HOST_CHECKPOINT_BYTES: usize = 256 * 1024 * 1024;
 const MAX_HOST_CHECKPOINT_ENTRIES: usize = 65_536;
+const VOLATILE_HOST_CHECKPOINT_MAGIC: &[u8] = b"SBVHCHK1";
+/// Encoded-byte ceiling for a paired owner and volatile-journal checkpoint.
+pub const MAX_VOLATILE_HOST_CHECKPOINT_BYTES: usize = MAX_HOST_CHECKPOINT_BYTES;
 
 /// Actual owner sequence cut, compared with a continued journal adapter's observed prefix.
 ///
@@ -154,6 +157,137 @@ fn checkpoint_error(path: &'static str, detail: impl Into<String>) -> HostCheckp
 pub struct HostCheckpointV1 {
     state: HostCheckpointStateV1,
     world: scriptbots_core::WorldCheckpointV1,
+}
+
+/// A full owner cut paired with the actual settled volatile adapter's retained history.
+///
+/// Encoding does not itself persist anything. The caller must atomically persist the complete
+/// artifact before claiming crash recovery. Journal receipts remain `CommittedVolatile`;
+/// a restored adapter does not advertise file-backed event or command authority.
+#[derive(Debug, Clone)]
+pub struct VolatileHostCheckpointV1 {
+    host: HostCheckpointV1,
+    journal: VolatileJournalCheckpointV1,
+}
+
+impl VolatileHostCheckpointV1 {
+    /// Independently validated owner and science portion of this joint cut.
+    #[must_use]
+    pub const fn host_checkpoint(&self) -> &HostCheckpointV1 {
+        &self.host
+    }
+
+    fn validate(&self) -> Result<(), HostCheckpointError> {
+        self.host.validate()?;
+        self.journal.validate()?;
+        if self.host.journal_cut() != self.journal.cut {
+            return Err(checkpoint_error(
+                "volatile_pair.cut",
+                "owner and actual adapter cuts differ",
+            ));
+        }
+        let retained: HashMap<_, _> = self
+            .journal
+            .scientific_entries
+            .iter()
+            .map(|entry| (entry.sequence, entry))
+            .collect();
+        for entry in &self.host.state.events.entries {
+            if let Some(archived) = retained.get(&entry.event.sequence)
+                && (archived.batch_id != entry.event.batch_id
+                    || archived.applied.tick != entry.event.tick
+                    || archived.applied.revisions != entry.event.revisions
+                    || archived.boundary.as_ref() != entry.event.boundary.as_ref())
+            {
+                return Err(checkpoint_error(
+                    "volatile_pair.history",
+                    "owner and adapter disagree on retained scientific evidence",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Encode both components with fixed-width lengths and a checksum over their full framing.
+    pub fn encode(&self) -> Result<Vec<u8>, HostCheckpointError> {
+        self.validate()?;
+        let host = self.host.encode()?;
+        let journal = serde_json::to_vec(&self.journal)
+            .map_err(|error| checkpoint_error("volatile_pair.encode", error.to_string()))?;
+        let header_bytes = VOLATILE_HOST_CHECKPOINT_MAGIC.len() + size_of::<[u64; 2]>();
+        let length = header_bytes
+            .checked_add(host.len())
+            .and_then(|length| length.checked_add(journal.len()))
+            .and_then(|length| length.checked_add(blake3::OUT_LEN))
+            .filter(|length| *length <= MAX_VOLATILE_HOST_CHECKPOINT_BYTES)
+            .ok_or_else(|| {
+                checkpoint_error("volatile_pair.size", "joint artifact exceeds bound")
+            })?;
+        let mut encoded = Vec::with_capacity(length);
+        encoded.extend_from_slice(VOLATILE_HOST_CHECKPOINT_MAGIC);
+        for component in [&host, &journal] {
+            let bytes = u64::try_from(component.len())
+                .map_err(|error| checkpoint_error("volatile_pair.size", error.to_string()))?;
+            encoded.extend_from_slice(&bytes.to_le_bytes());
+        }
+        encoded.extend_from_slice(&host);
+        encoded.extend_from_slice(&journal);
+        let digest = *blake3::hash(&encoded).as_bytes();
+        encoded.extend_from_slice(&digest);
+        Ok(encoded)
+    }
+
+    /// Decode bounded slices before allocating either component; reject stale or corrupt framing.
+    pub fn decode(encoded: &[u8]) -> Result<Self, HostCheckpointError> {
+        let header_bytes = VOLATILE_HOST_CHECKPOINT_MAGIC.len() + size_of::<[u64; 2]>();
+        if encoded.len() > MAX_VOLATILE_HOST_CHECKPOINT_BYTES
+            || encoded.len() < header_bytes + blake3::OUT_LEN
+            || !encoded.starts_with(VOLATILE_HOST_CHECKPOINT_MAGIC)
+        {
+            return Err(checkpoint_error(
+                "volatile_pair.wire",
+                "invalid joint artifact framing",
+            ));
+        }
+        let payload_end = encoded.len() - blake3::OUT_LEN;
+        if blake3::hash(&encoded[..payload_end]).as_bytes() != &encoded[payload_end..] {
+            return Err(checkpoint_error(
+                "volatile_pair.hash",
+                "joint artifact checksum differs",
+            ));
+        }
+        let mut lengths = [0_usize; 2];
+        for (length, bytes) in lengths.iter_mut().zip(
+            encoded[VOLATILE_HOST_CHECKPOINT_MAGIC.len()..header_bytes]
+                .as_chunks::<{ size_of::<u64>() }>()
+                .0,
+        ) {
+            *length = usize::try_from(u64::from_le_bytes(*bytes))
+                .map_err(|error| checkpoint_error("volatile_pair.size", error.to_string()))?;
+        }
+        let host_end = header_bytes
+            .checked_add(lengths[0])
+            .filter(|end| *end <= payload_end)
+            .ok_or_else(|| checkpoint_error("volatile_pair.size", "host length exceeds wire"))?;
+        if host_end.checked_add(lengths[1]) != Some(payload_end) {
+            return Err(checkpoint_error(
+                "volatile_pair.size",
+                "journal length differs from wire",
+            ));
+        }
+        let host = HostCheckpointV1::decode(&encoded[header_bytes..host_end])?;
+        let journal = serde_json::from_slice(&encoded[host_end..payload_end])
+            .map_err(|error| checkpoint_error("volatile_pair.decode", error.to_string()))?;
+        let checkpoint = Self { host, journal };
+        checkpoint.validate()?;
+        if checkpoint.encode()? != encoded {
+            return Err(checkpoint_error(
+                "volatile_pair.canonical",
+                "noncanonical joint artifact",
+            ));
+        }
+        Ok(checkpoint)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -821,11 +955,13 @@ struct VolatileJournalEntry {
     batch: Arc<JournalBatch>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct VolatileScientificEntry {
     batch_id: JournalBatchId,
     sequence: EventSequence,
     applied: AppliedCommand,
+    #[serde(with = "super::serde_arc")]
     boundary: Arc<ScientificBoundary>,
     committed: bool,
 }
@@ -841,6 +977,94 @@ struct VolatileJournalArchive {
 struct VolatileEventArchiveView {
     entries: Vec<VolatileScientificEntry>,
     available_range: Option<EventSequenceRange>,
+}
+
+/// Opaque snapshot of an actual settled volatile journal, not an asserted sequence cursor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VolatileJournalCheckpointV1 {
+    schema_version: u16,
+    cut: HostJournalCutV1,
+    capacity: usize,
+    scientific_entries: Vec<VolatileScientificEntry>,
+}
+
+impl VolatileJournalCheckpointV1 {
+    fn validate(&self) -> Result<(), HostCheckpointError> {
+        let expected_len = usize::try_from(self.cut.last_scientific_event_sequence)
+            .unwrap_or(usize::MAX)
+            .min(self.capacity);
+        if self.schema_version != 1
+            || self.cut.commitment_requirement != ShutdownCommitRequirement::CommittedVolatile
+            || self.cut.last_journal_sequence == 0
+            || self.cut.last_journal_sequence == u64::MAX
+            || self.cut.last_scientific_event_sequence > self.cut.last_journal_sequence
+            || self.capacity > MAX_HOST_CHECKPOINT_ENTRIES
+            || self.scientific_entries.len() != expected_len
+            || self.capacity == 0
+        {
+            return Err(checkpoint_error(
+                "volatile_journal.cut",
+                "invalid version, cut or retention",
+            ));
+        }
+        let mut previous = None;
+        for entry in &self.scientific_entries {
+            let event = ScientificEvent {
+                session_id: self.cut.session_id,
+                sequence: entry.sequence,
+                batch_id: entry.batch_id,
+                tick: entry.applied.tick,
+                revisions: entry.applied.revisions,
+                boundary: Arc::clone(&entry.boundary),
+            };
+            if !entry.committed
+                || entry.batch_id.session_id() != self.cut.session_id
+                || entry.batch_id.sequence() == 0
+                || entry.batch_id.sequence() > self.cut.last_journal_sequence
+                || entry.sequence.get() == 0
+                || !super::scientific_boundary_matches_event(&event)
+                || previous.is_some_and(|(sequence, batch): (u64, u64)| {
+                    sequence.checked_add(1) != Some(entry.sequence.get())
+                        || batch >= entry.batch_id.sequence()
+                })
+            {
+                return Err(checkpoint_error(
+                    "volatile_journal.history",
+                    "unsettled or incoherent evidence",
+                ));
+            }
+            previous = Some((entry.sequence.get(), entry.batch_id.sequence()));
+        }
+        if self
+            .scientific_entries
+            .last()
+            .map_or(self.cut.last_scientific_event_sequence != 0, |entry| {
+                entry.sequence.get() != self.cut.last_scientific_event_sequence
+            })
+        {
+            return Err(checkpoint_error(
+                "volatile_journal.history",
+                "retained tip is absent",
+            ));
+        }
+        Ok(())
+    }
+
+    fn restore(&self) -> Result<VolatileJournal, HostCheckpointError> {
+        self.validate()?;
+        let mut journal = VolatileJournal::with_capacity(self.capacity);
+        journal.highest_accepted = Some(JournalBatchId::new(
+            self.cut.session_id,
+            self.cut.last_journal_sequence,
+        ));
+        journal.archive.scientific_entries = self.scientific_entries.iter().cloned().collect();
+        journal.event_view.store(Arc::new(volatile_event_view(
+            &journal.archive,
+            self.cut.session_id,
+        )));
+        Ok(journal)
+    }
 }
 
 impl Default for VolatileJournal {
@@ -1004,6 +1228,26 @@ impl EventJournalReader for VolatileEventReader {
 }
 
 impl JournalPort for VolatileJournal {
+    fn capture_volatile_checkpoint_v1(
+        &self,
+        session_id: HostSessionId,
+    ) -> Result<VolatileJournalCheckpointV1, HostCheckpointError> {
+        let cut = self
+            .continuation_cut()
+            .filter(|cut| cut.session_id == session_id)
+            .ok_or(HostCheckpointError::Busy {
+                reason: HostCheckpointBusy::Journal,
+            })?;
+        let checkpoint = VolatileJournalCheckpointV1 {
+            schema_version: 1,
+            cut,
+            capacity: self.archive.capacity,
+            scientific_entries: self.archive.scientific_entries.iter().cloned().collect(),
+        };
+        checkpoint.validate()?;
+        Ok(checkpoint)
+    }
+
     fn continuation_cut(&self) -> Option<HostJournalCutV1> {
         let highest = self.highest_accepted?;
         if !self.continuation_eligible
@@ -3614,6 +3858,39 @@ impl HostCore {
         Ok(checkpoint)
     }
 
+    /// Capture the complete owner together with its actual settled volatile adapter.
+    pub fn capture_volatile_host_checkpoint_v1(
+        &self,
+    ) -> Result<VolatileHostCheckpointV1, HostCheckpointError> {
+        let host = self.capture_host_checkpoint_v1()?;
+        let journal = self
+            .journal
+            .capture_volatile_checkpoint_v1(self.session_id)?;
+        let checkpoint = VolatileHostCheckpointV1 { host, journal };
+        checkpoint.validate()?;
+        Ok(checkpoint)
+    }
+
+    /// Restore a paired volatile cut with the caller's independently prepared world and sink.
+    /// No file-backed journal requirement or persistence adapter is weakened by this path.
+    pub fn restore_volatile_host_checkpoint_v1(
+        checkpoint: &VolatileHostCheckpointV1,
+        world: WorldState,
+        persistence: PersistenceAdmissionSession,
+        resolver: Option<PreparedConfigPatchResolver>,
+        now: ManualInstant,
+    ) -> Result<Self, HostCheckpointError> {
+        checkpoint.validate()?;
+        Self::restore_host_checkpoint_v1(
+            &checkpoint.host,
+            world,
+            persistence,
+            Box::new(checkpoint.journal.restore()?),
+            resolver,
+            now,
+        )
+    }
+
     fn ensure_host_checkpoint_quiescent(&self) -> Result<(), HostCheckpointError> {
         let shared = self.shared.borrow();
         if self.lifecycle != HostLifecycle::Running
@@ -5373,7 +5650,11 @@ impl HostCore {
         // The flushed boundary is the state a checkpoint captures, and a paused run may be
         // shut down at this very tick, leaving shutdown nothing to project. Anchor the
         // canonical digest here so replay verification still has a final state to compare.
-        if self.world.config().persistence_interval != 0 {
+        let sealed = self.world.persistence_boundary_status()
+            == (scriptbots_core::PersistenceBoundaryStatus::Sealed {
+                tick: self.world.tick(),
+            });
+        if self.world.config().persistence_interval != 0 && !sealed {
             self.world.request_replay_world_digest();
         }
         let persistence = match self.persistence.stage_final_batch(&mut self.world) {
@@ -6250,6 +6531,149 @@ mod tests {
             port.submit(CommandEnvelope::new(CommandId::new(1), HostCommand::Resume)),
             Err(HostAccessError::CommandIdCollision { .. })
         ));
+    }
+
+    #[test]
+    fn volatile_host_checkpoint_restores_actual_history_and_next_science_tick() {
+        for completed in [0_u64, 2, 5] {
+            let mut config = options(true);
+            config.scientific_event_capacity = 1;
+            config.volatile_event_history_capacity = 3;
+            config.trace_history_capacity = 2;
+            let make_owner = || {
+                HostCore::new(HostSessionId::new(0xc021), continuation_world(), config)
+                    .expect("real volatile owner")
+            };
+            let mut original = make_owner();
+            let mut oracle = make_owner();
+            let flush = CommandEnvelope::new(CommandId::new(90), HostCommand::FlushPersistence);
+            settle_continuation_command(&mut original, flush.clone(), 0);
+            settle_continuation_command(&mut oracle, flush, 0);
+            for sequence in 1..=completed {
+                let envelope =
+                    CommandEnvelope::new(CommandId::new(u128::from(sequence)), HostCommand::Step);
+                settle_continuation_command(&mut original, envelope.clone(), sequence * 10);
+                settle_continuation_command(&mut oracle, envelope, sequence * 10);
+            }
+            // Flushing an already sealed boundary must not create a deferred
+            // replay anchor which only another science tick could resolve.
+            let repeated = CommandEnvelope::new(CommandId::new(91), HostCommand::FlushPersistence);
+            settle_continuation_command(&mut original, repeated.clone(), completed * 10 + 1);
+            settle_continuation_command(&mut oracle, repeated, completed * 10 + 1);
+            let paired = original.capture_volatile_host_checkpoint_v1().unwrap();
+            assert_eq!(paired.host_checkpoint().tick(), Tick(completed));
+            assert_eq!(
+                paired.journal.scientific_entries.len(),
+                usize::try_from(completed.min(3)).unwrap()
+            );
+            let encoded = paired.encode().unwrap();
+            let decoded = VolatileHostCheckpointV1::decode(&encoded).unwrap();
+            assert_eq!(decoded.encode().unwrap(), encoded);
+            drop(original);
+            let world = decoded
+                .host_checkpoint()
+                .restore_world(scriptbots_core::BrainRegistry::new())
+                .unwrap();
+            let persistence = world.bind_persistence(Box::new(NullPersistence)).unwrap();
+            let mut restored = HostCore::restore_volatile_host_checkpoint_v1(
+                &decoded,
+                world,
+                persistence,
+                None,
+                ManualInstant::from_nanos(100),
+            )
+            .unwrap();
+            assert_continued_owner_outputs(&restored, &oracle);
+            if completed > 0 {
+                assert_continued_command_retry(&restored, completed);
+            }
+            let restored_history = restored
+                .journal
+                .capture_volatile_checkpoint_v1(restored.session_id)
+                .unwrap();
+            let oracle_history = oracle
+                .journal
+                .capture_volatile_checkpoint_v1(oracle.session_id)
+                .unwrap();
+            assert_eq!(
+                serde_json::to_vec(&restored_history).unwrap(),
+                serde_json::to_vec(&oracle_history).unwrap()
+            );
+            let envelope =
+                CommandEnvelope::new(CommandId::new(u128::from(completed + 1)), HostCommand::Step);
+            settle_continuation_command(&mut restored, envelope.clone(), 200);
+            settle_continuation_command(&mut oracle, envelope, 200);
+            assert_eq!(restored.world_tick(), Tick(completed + 1));
+            assert_continued_owner_outputs(&restored, &oracle);
+        }
+    }
+
+    #[test]
+    fn volatile_host_checkpoint_refuses_corrupt_frames_and_invented_cuts() {
+        assert!(matches!(
+            VolatileJournal::default().capture_volatile_checkpoint_v1(HostSessionId::new(1)),
+            Err(HostCheckpointError::Busy {
+                reason: HostCheckpointBusy::Journal
+            })
+        ));
+        let mut original = HostCore::new(
+            HostSessionId::new(0xc022),
+            continuation_world(),
+            options(true),
+        )
+        .unwrap();
+        settle_continuation_command(
+            &mut original,
+            CommandEnvelope::new(CommandId::new(1), HostCommand::Step),
+            10,
+        );
+        let checkpoint = original.capture_volatile_host_checkpoint_v1().unwrap();
+        let bytes = checkpoint.encode().unwrap();
+        for length in [0, VOLATILE_HOST_CHECKPOINT_MAGIC.len(), bytes.len() - 1] {
+            assert!(VolatileHostCheckpointV1::decode(&bytes[..length]).is_err());
+        }
+        let mut corrupt = bytes.clone();
+        corrupt[VOLATILE_HOST_CHECKPOINT_MAGIC.len()] ^= 1;
+        assert!(matches!(
+            VolatileHostCheckpointV1::decode(&corrupt),
+            Err(HostCheckpointError::Contract {
+                path: "volatile_pair.hash",
+                ..
+            })
+        ));
+        // A valid checksum must not turn a malicious length into an allocation request.
+        let begin = VOLATILE_HOST_CHECKPOINT_MAGIC.len();
+        corrupt[begin..begin + size_of::<u64>()].copy_from_slice(&u64::MAX.to_le_bytes());
+        let end = corrupt.len() - blake3::OUT_LEN;
+        let digest = *blake3::hash(&corrupt[..end]).as_bytes();
+        corrupt[end..].copy_from_slice(&digest);
+        assert!(matches!(
+            VolatileHostCheckpointV1::decode(&corrupt),
+            Err(HostCheckpointError::Contract {
+                path: "volatile_pair.size",
+                ..
+            })
+        ));
+        let mut changed = checkpoint.clone();
+        changed.journal.cut.last_journal_sequence += 1;
+        assert!(matches!(
+            changed.encode(),
+            Err(HostCheckpointError::Contract {
+                path: "volatile_pair.cut",
+                ..
+            })
+        ));
+        let mut unsettled = checkpoint.clone();
+        unsettled.journal.scientific_entries[0].committed = false;
+        assert!(matches!(
+            unsettled.encode(),
+            Err(HostCheckpointError::Contract {
+                path: "volatile_journal.history",
+                ..
+            })
+        ));
+        assert_eq!(checkpoint.encode().unwrap(), bytes);
+        assert!(VolatileHostCheckpointV1::decode(&bytes).is_ok());
     }
 
     #[test]

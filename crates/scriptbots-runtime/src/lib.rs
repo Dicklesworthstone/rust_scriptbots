@@ -93,8 +93,9 @@ pub use archipelago::{
 pub use host_core::{
     HOST_CHECKPOINT_V1_CODEC, HOST_CHECKPOINT_V1_CODEC_VERSION, HOST_CHECKPOINT_V1_SCHEMA,
     HostCheckpointBusy, HostCheckpointError, HostCheckpointV1, HostCore, HostCoreBuildError,
-    HostCoreOptions, HostJournalCutV1, LocalHostPort, MAX_HOST_CHECKPOINT_BYTES, MigrationArrival,
-    PreparedConfigPatchResolver, VolatileJournal,
+    HostCoreOptions, HostJournalCutV1, LocalHostPort, MAX_HOST_CHECKPOINT_BYTES,
+    MAX_VOLATILE_HOST_CHECKPOINT_BYTES, MigrationArrival, PreparedConfigPatchResolver,
+    VolatileHostCheckpointV1, VolatileJournal, VolatileJournalCheckpointV1,
 };
 pub use native::{FixedDeadlineHost, NativeDriveReceipt, NativeDriveTrigger, NativeScheduleError};
 
@@ -3432,6 +3433,18 @@ pub trait CommandAuthorityReader: Send + Sync {
 /// not wait for database I/O, worker progress, or durability. A rejected batch
 /// remains owned by the caller through the original [`Arc<JournalBatch>`].
 pub trait JournalPort {
+    /// Capture an actual settled volatile adapter, including retained scientific history.
+    /// Other adapters refuse rather than fabricating an equivalent volatile cursor.
+    fn capture_volatile_checkpoint_v1(
+        &self,
+        _session_id: HostSessionId,
+    ) -> Result<VolatileJournalCheckpointV1, HostCheckpointError> {
+        Err(HostCheckpointError::Contract {
+            path: "journal.volatile_checkpoint",
+            detail: "this adapter does not expose a volatile-journal checkpoint".to_owned(),
+        })
+    }
+
     /// Actual adapter-observed continued-session prefix, if this adapter was opened for restore.
     ///
     /// Fresh adapters return `None`. A continuation adapter must return this only after checking
