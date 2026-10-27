@@ -38779,6 +38779,195 @@ mod tests {
         rows
     }
 
+    fn recovered_durable_authority_fixture(
+        label: &str,
+    ) -> Result<(Storage, HostSessionId, CommandEnvelope, CommandStatus), Box<dyn std::error::Error>>
+    {
+        let path = temp_db_path(label);
+        let path_text = path.to_string_lossy().into_owned();
+        let session = HostSessionId::new(0xc09e);
+        let (mut pipeline, mut owner, mut frontend) =
+            host_checkpoint_file_owner(&path_text, session, 4243);
+        let run_id = pipeline.run_id();
+        let envelope = CommandEnvelope::new(
+            CommandId::from_client_sequence(session.get(), 1),
+            HostCommand::Step,
+        );
+        let mut clock = 0;
+        let receipt =
+            apply_host_checkpoint_command(&mut frontend, &mut owner, &envelope, &mut clock);
+        drop(frontend);
+        drop(owner);
+        pipeline.shutdown()?;
+
+        Ok((
+            Storage::recover_existing_run(&path_text, run_id)?,
+            session,
+            envelope,
+            receipt,
+        ))
+    }
+
+    #[test]
+    fn durable_authority_enforces_claim_codec_cap_and_rejects_corrupt_envelopes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (storage, session, envelope, receipt) =
+            recovered_durable_authority_fixture("durable-authority-claim-guards")?;
+        let run_id = storage.run_id();
+        let encoded = postcard::to_allocvec(&envelope)?;
+        let command = envelope.command_id.to_string();
+        let session_text = encode_journal_u64(session.get());
+        let connection = storage.connection()?;
+        let stored_envelope: String = connection
+            .query_row_with_params(
+                "SELECT envelope_postcard_hex FROM host_command_claims
+                 WHERE command_id = ?1 AND host_session_id = ?2 AND run_id = ?3",
+                &[
+                    command.as_str().into(),
+                    session_text.as_str().into(),
+                    sqlite_run_id(run_id),
+                ],
+            )?
+            .get_typed(0)?;
+        assert_eq!(
+            stored_envelope,
+            encode_command_envelope_postcard_hex(
+                "host_command_claims.envelope_postcard_hex",
+                &envelope,
+            )?
+        );
+        // The storage cap covers its versioned claim codec. Receipt identity
+        // separately hashes the runtime envelope's serialization.
+        let claim_bytes = stored_envelope.len() / 2;
+        let request = CommandAuthorityRequest::Status {
+            max_envelope_bytes: claim_bytes,
+        };
+        let expected = storage.resolve_command_authority(session, envelope.command_id, &request)?;
+        assert!(matches!(
+            &expected,
+            CommandAuthorityLookup::Found(authority)
+                if authority.status() == &receipt
+                    && authority.envelope_digest() == *blake3::hash(&encoded).as_bytes()
+        ));
+        let limit = claim_bytes.checked_sub(1).expect("nonempty claim codec");
+        assert_eq!(
+            storage.resolve_command_authority(
+                session,
+                envelope.command_id,
+                &CommandAuthorityRequest::Status {
+                    max_envelope_bytes: limit,
+                },
+            )?,
+            CommandAuthorityLookup::Failed(CommandAuthorityLookupFailure::Oversized {
+                bytes: claim_bytes,
+                limit,
+            })
+        );
+
+        connection.execute("BEGIN")?;
+        let changed = connection.execute_with_params(
+            "UPDATE host_command_claims SET envelope_postcard_hex = '00'
+             WHERE command_id = ?1 AND host_session_id = ?2 AND run_id = ?3",
+            &[
+                command.as_str().into(),
+                session_text.as_str().into(),
+                sqlite_run_id(run_id),
+            ],
+        )?;
+        let refused = storage.resolve_command_authority(session, envelope.command_id, &request);
+        connection.execute("ROLLBACK")?;
+        assert_eq!(
+            changed, 1,
+            "the negative must change its actual bound claim"
+        );
+        assert!(matches!(
+            refused,
+            Err(StorageError::InvalidData {
+                context: "host_command_claims.envelope_postcard_hex",
+                ..
+            })
+        ));
+        assert_eq!(
+            storage.resolve_command_authority(session, envelope.command_id, &request)?,
+            expected,
+            "rollback must restore the exact original durable authority"
+        );
+        println!(
+            "AUTHORITY_GUARD_WIDTHS: runtime_receipt_bytes={} stored_claim_bytes={claim_bytes}",
+            encoded.len()
+        );
+        storage.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn durable_authority_rejects_missing_archive_then_restores_exact_receipt()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (storage, session, envelope, receipt) =
+            recovered_durable_authority_fixture("durable-authority-archive-guard")?;
+        let run_id = storage.run_id();
+        let request = CommandAuthorityRequest::Status {
+            max_envelope_bytes: MAX_COMMAND_ENVELOPE_BYTES,
+        };
+        let expected = storage.resolve_command_authority(session, envelope.command_id, &request)?;
+        assert!(
+            matches!(&expected, CommandAuthorityLookup::Found(authority) if authority.status() == &receipt)
+        );
+        let command = envelope.command_id.to_string();
+        let session_text = encode_journal_u64(session.get());
+        let connection = storage.connection()?;
+        let journal: String = connection
+            .query_row_with_params(
+                "SELECT journal_sequence FROM host_command_records
+                 WHERE command_id = ?1 AND host_session_id = ?2 AND run_id = ?3",
+                &[
+                    command.as_str().into(),
+                    session_text.as_str().into(),
+                    sqlite_run_id(run_id),
+                ],
+            )?
+            .get_typed(0)?;
+        connection.execute("PRAGMA foreign_keys = OFF")?;
+        connection.execute("BEGIN")?;
+        let changed = connection.execute_with_params(
+            "DELETE FROM host_journal_archive
+             WHERE journal_sequence = ?1 AND host_session_id = ?2 AND run_id = ?3",
+            &[
+                journal.as_str().into(),
+                session_text.as_str().into(),
+                sqlite_run_id(run_id),
+            ],
+        )?;
+        let refused = storage.resolve_command_authority(session, envelope.command_id, &request);
+        connection.execute("ROLLBACK")?;
+        connection.execute("PRAGMA foreign_keys = ON")?;
+        assert_eq!(
+            changed, 1,
+            "the negative must remove its actual bound archive"
+        );
+        assert!(matches!(
+            refused,
+            Err(StorageError::InvalidData {
+                context: "host_command_claims.archive_binding",
+                ..
+            })
+        ));
+        assert_eq!(
+            storage.resolve_command_authority(session, envelope.command_id, &request)?,
+            expected,
+            "rollback must restore the exact original durable authority"
+        );
+        assert_eq!(
+            connection
+                .query_row("PRAGMA foreign_keys")?
+                .get_typed::<i64>(0)?,
+            1,
+            "the isolated corruption connection must restore foreign-key enforcement"
+        );
+        storage.close()?;
+        Ok(())
+    }
+
     #[test]
     fn retained_command_receipt_bypasses_unrelated_durable_lookup()
     -> Result<(), Box<dyn std::error::Error>> {
