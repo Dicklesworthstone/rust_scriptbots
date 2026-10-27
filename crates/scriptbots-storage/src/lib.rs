@@ -24259,9 +24259,11 @@ pub fn reset_reaper_registry_for_test() {
 }
 
 #[doc(hidden)]
+#[cfg(panic = "unwind")]
 pub fn poison_reaper_registry_for_test() {
     let _ = std::panic::catch_unwind(|| {
         let _guard = reaper_registry().lock().unwrap();
+        // ubs:ignore[rust.ownership.panic-macro] — caught poison hook; abort builds omit it.
         panic!("intentional test poison for reaper registry");
     });
 }
