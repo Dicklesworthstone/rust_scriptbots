@@ -2334,7 +2334,7 @@ fn real_process_named_experiment_continues_after_server_kill() -> Result<()> {
             &bytes,
             Some("application/json"),
         )?;
-        assert_eq!(code, 201, "create/reattach: {body}");
+        assert_eq!(code, 201, "create: {body}");
         Ok(serde_json::from_str(&body)?)
     };
     let finish = |address| -> Result<serde_json::Value> {
@@ -2387,8 +2387,32 @@ fn real_process_named_experiment_continues_after_server_kill() -> Result<()> {
         serde_json::from_slice(&std::fs::read(output.join("status.json"))?)?;
     assert_eq!(interrupted_status["runs"][0]["state"], "Running");
     let (resumed_guard, resumed_address, resumed_log) = spawn(&interrupted, "resumed")?;
-    let attached = create(resumed_address)?;
-    assert_eq!(attached["experiment_id"], created["experiment_id"]);
+    let (code, body) = http(resumed_address, "GET", "/api/v1/experiments")?;
+    assert_eq!(code, 200, "discovered catalog: {body}");
+    let catalog: serde_json::Value = serde_json::from_str(&body)?;
+    assert_eq!(catalog["total"], 1);
+    assert_eq!(
+        catalog["items"][0]["experiment_id"],
+        created["experiment_id"]
+    );
+    let (code, body) = http(
+        resumed_address,
+        "GET",
+        "/api/v1/experiments/server-continuation",
+    )?;
+    assert_eq!(code, 200, "recovered status: {body}");
+    let attached: serde_json::Value = serde_json::from_str(&body)?;
+    assert_eq!(
+        attached["status"], "stopped",
+        "reads must not start science"
+    );
+    assert_eq!(attached["created_at_utc"], created["created_at_utc"]);
+    let (code, body) = http(
+        resumed_address,
+        "POST",
+        "/api/v1/experiments/server-continuation/resume",
+    )?;
+    assert_eq!(code, 200, "resume by ID only: {body}");
     let completed = finish(resumed_address)?;
     let restored_ticks = resumed_log
         .lock()
@@ -2451,8 +2475,7 @@ fn real_process_named_experiment_continues_after_server_kill() -> Result<()> {
         );
         assert!(String::from_utf8(cli.stdout)?.contains("Verified run bundle V1"));
     }
-    // Reattach to an existing plan is intentionally distinguished from automatic
-    // server-catalog recovery: this test supplies the exact original named request.
+    // The restarted process receives only list/get/resume, never another create.
     println!(
         "shipped server restored tick {}, completed {TICKS}, digest {}",
         restored_ticks[0], completed["runs"][0]["final_digest"]

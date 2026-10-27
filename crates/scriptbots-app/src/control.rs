@@ -921,6 +921,100 @@ fn read_artifact_file_bounded(path: &Path, max_bytes: usize) -> Result<Vec<u8>, 
     Ok(bytes)
 }
 
+const MAX_EXPERIMENT_DEFINITION_BYTES: u64 = 1024 * 1024;
+const MAX_CATALOG_EXPERIMENTS: usize = 1024;
+
+/// Immutable admission definition. Paths are derived from the configured root,
+/// never deserialized. The checksum detects corruption, not hostile authorship.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExperimentDefinitionV1 {
+    schema_version: u16,
+    experiment_id: String,
+    cohort: crate::experiment_runner::MatchedSeedCohort,
+    variants: Vec<crate::experiment_runner::ScenarioVariant>,
+    max_ticks: u64,
+    max_concurrency: usize,
+    plan_digest: String,
+    created_at_utc: String,
+    request_identity: Option<(String, String)>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExperimentCatalogRecord {
+    definition: ExperimentDefinitionV1,
+    checksum: String,
+}
+
+fn experiment_catalog_error(path: &Path, error: impl std::fmt::Display) -> ControlError {
+    ControlError::Serialization(format!(
+        "experiment catalog {}: {error}; preserve the files and reconcile the saved definition before retrying",
+        path.display()
+    ))
+}
+
+fn validate_experiment_directory(path: &Path) -> Result<(), ControlError> {
+    let metadata = fs::symlink_metadata(path).map_err(|e| experiment_catalog_error(path, e))?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || path
+            .canonicalize()
+            .map_err(|e| experiment_catalog_error(path, e))?
+            != path
+    {
+        return Err(experiment_catalog_error(
+            path,
+            "expected an unaliased directory",
+        ));
+    }
+    Ok(())
+}
+
+impl ExperimentDefinitionV1 {
+    fn persist(self, directory: &Path) -> Result<(), ControlError> {
+        let payload = serde_json::to_vec(&self).map_err(ControlError::serialization)?;
+        let record = ExperimentCatalogRecord {
+            checksum: compute_blake3(&payload),
+            definition: self,
+        };
+        let bytes = serde_json::to_vec(&record).map_err(ControlError::serialization)?;
+        if bytes.len() as u64 > MAX_EXPERIMENT_DEFINITION_BYTES {
+            return Err(ControlError::PayloadTooLarge(
+                "experiment definition exceeds 1 MiB".into(),
+            ));
+        }
+        // A new directory is the cross-process admission reservation. Never
+        // overwrite a prior definition, status, cut, bundle, or partial admission.
+        let parent = directory.parent().ok_or(ControlError::Lock)?;
+        fs::create_dir_all(parent).map_err(|e| experiment_catalog_error(parent, e))?;
+        validate_experiment_directory(parent)?;
+        fs::create_dir(directory).map_err(|e| experiment_catalog_error(directory, e))?;
+        let temporary = directory.join("definition.json.tmp");
+        let committed = directory.join("definition.json");
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|e| experiment_catalog_error(&temporary, e))?;
+        file.write_all(&bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|e| experiment_catalog_error(&temporary, e))?;
+        drop(file);
+        fs::rename(&temporary, &committed).map_err(|e| experiment_catalog_error(&committed, e))?;
+        #[cfg(unix)]
+        for path in [Some(directory), Some(parent), parent.parent()]
+            .into_iter()
+            .flatten()
+        {
+            fs::File::open(path)
+                .and_then(|f| f.sync_all())
+                .map_err(|e| experiment_catalog_error(path, e))?;
+        }
+        Ok(())
+    }
+}
+
 /// A REST/MCP-created matched-seed batch executing on a background runner thread.
 ///
 /// The runner's atomically written status file is the only source of run
@@ -1069,7 +1163,8 @@ pub struct DataServices {
     experiments: Mutex<BTreeMap<String, ExperimentJob>>,
     checkpoints: Mutex<BTreeMap<String, CheckpointMetadataDto>>,
     artifacts: Mutex<BTreeMap<String, RetainedArtifact>>,
-    /// Process-local admission authority: request key -> (payload hash, admitted ID).
+    /// Admission authority, recovered from immutable experiment definitions:
+    /// request key -> (payload hash, admitted ID).
     /// Status is read from the job rather than cached as a creation response.
     idempotency: Mutex<BTreeMap<String, (String, String)>>,
     artifacts_dir: RwLock<PathBuf>,
@@ -1278,6 +1373,149 @@ impl DataServices {
             .read()
             .map(|p| p.clone())
             .unwrap_or_else(|_| std::env::temp_dir().join("scriptbots_artifacts"))
+    }
+
+    /// Reconstitute admission only. Reads never launch a worker or rewrite status.
+    fn recover_experiment(&self, experiment_id: &str) -> Result<(), ControlError> {
+        if experiment_id.is_empty()
+            || experiment_id.len() > 128
+            || experiment_id.contains("..")
+            || !experiment_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        {
+            return Err(ControlError::BadRequest("invalid experiment_id".into()));
+        }
+        // Use the same lock order as create, including unkeyed admissions.
+        let mut identities = self.idempotency.lock().map_err(|_| ControlError::Lock)?;
+        let mut jobs = self.experiments.lock().map_err(|_| ControlError::Lock)?;
+        if jobs.contains_key(experiment_id) {
+            return Ok(());
+        }
+        let root = self.artifacts_dir();
+        let parent = root.join("experiments");
+        let directory = parent.join(experiment_id);
+        match fs::symlink_metadata(&directory) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(experiment_catalog_error(&directory, e)),
+            Ok(_) => {}
+        }
+        validate_experiment_directory(&parent)?;
+        validate_experiment_directory(&directory)?;
+        let path = directory.join("definition.json");
+        let bytes = crate::experiment_runner::read_experiment_file_bounded(
+            &path,
+            MAX_EXPERIMENT_DEFINITION_BYTES,
+        )
+        .map_err(|e| experiment_catalog_error(&path, e))?;
+        let record: ExperimentCatalogRecord =
+            serde_json::from_slice(&bytes).map_err(|e| experiment_catalog_error(&path, e))?;
+        let definition = record.definition;
+        let payload = serde_json::to_vec(&definition).map_err(ControlError::serialization)?;
+        if record.checksum != compute_blake3(&payload)
+            || definition.schema_version != 1
+            || definition.experiment_id != experiment_id
+            || definition.cohort.cohort_id != experiment_id
+            || definition.cohort.seeds.len() > 128
+            || definition.variants.len() > 64
+            || definition.max_ticks == 0
+            || definition.created_at_utc.parse::<u64>().is_err()
+        {
+            return Err(experiment_catalog_error(
+                &path,
+                "definition checksum, version or identity mismatch",
+            ));
+        }
+        let runner = crate::experiment_runner::MatchedSeedExperimentRunner::new(
+            experiment_id,
+            definition.cohort,
+            definition.variants,
+            definition.max_ticks,
+            definition.max_concurrency,
+            &directory,
+        );
+        if runner
+            .plan_digest()
+            .map_err(|e| experiment_catalog_error(&path, e))?
+            != definition.plan_digest
+        {
+            return Err(experiment_catalog_error(
+                &path,
+                "saved plan/source differs from the current runner",
+            ));
+        }
+        if let Some((key, hash)) = &definition.request_identity
+            && (key.is_empty()
+                || key.len() > 1024
+                || hash.len() != blake3::OUT_LEN * 2
+                || !hash
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+                || identities
+                    .get(key)
+                    .is_some_and(|stored| stored != &(hash.clone(), experiment_id.to_owned())))
+        {
+            return Err(experiment_catalog_error(
+                &path,
+                "invalid or conflicting keyed admission identity",
+            ));
+        }
+        if jobs.len() >= MAX_CATALOG_EXPERIMENTS {
+            return Err(experiment_catalog_error(
+                &path,
+                "experiment catalog capacity reached",
+            ));
+        }
+        if let Some((key, hash)) = definition.request_identity {
+            identities.insert(key, (hash, experiment_id.to_owned()));
+        }
+        jobs.insert(
+            experiment_id.to_owned(),
+            ExperimentJob {
+                runner: Arc::new(runner),
+                state_file: directory.join("status.json"),
+                cancel: Arc::default(),
+                running: Arc::default(),
+                last_error: Arc::default(),
+                created_at_utc: definition.created_at_utc,
+                artifact_root: root,
+            },
+        );
+        Ok(())
+    }
+
+    fn recover_experiment_catalog(&self) -> Result<(), ControlError> {
+        let directory = self.artifacts_dir().join("experiments");
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(experiment_catalog_error(&directory, e)),
+        };
+        validate_experiment_directory(&directory)?;
+        let mut names = Vec::new();
+        for entry in entries.take(MAX_CATALOG_EXPERIMENTS + 1) {
+            let entry = entry.map_err(|e| experiment_catalog_error(&directory, e))?;
+            names.push(
+                entry
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| experiment_catalog_error(&directory, "non-UTF-8 experiment ID"))?,
+            );
+        }
+        if names.len() > MAX_CATALOG_EXPERIMENTS {
+            return Err(experiment_catalog_error(
+                &directory,
+                "experiment catalog capacity exceeded",
+            ));
+        }
+        names.sort();
+        let mut first_error = None;
+        for name in names {
+            if let Err(error) = self.recover_experiment(&name) {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Publish only completed, bounded, verified bundles. Stage the entire slice
@@ -1652,6 +1890,7 @@ impl ControlHandle {
         &self,
         request: ExperimentCreateRequest,
     ) -> Result<ExperimentBatchStatusDto, ControlError> {
+        self.data_services.recover_experiment_catalog()?;
         if request.variants.is_empty() {
             return Err(ControlError::BadRequest("variants cannot be empty".into()));
         }
@@ -1724,20 +1963,15 @@ impl ControlHandle {
                 Ok((key.clone(), compute_blake3(&payload)))
             })
             .transpose()?;
-        // Keep keyed admission serialized from lookup through publication. The
-        // background runner never needs this lock; unkeyed creates do not take it.
-        let mut idempotency = request_identity
-            .as_ref()
-            .map(|_| {
-                self.data_services
-                    .idempotency
-                    .lock()
-                    .map_err(|_| ControlError::Lock)
-            })
-            .transpose()?;
-        if let (Some((key, payload_hash)), Some(registry)) =
-            (request_identity.as_ref(), idempotency.as_ref())
-            && let Some((stored_hash, experiment_id)) = registry.get(key)
+        // Serialize discovery and every create through publication. The worker
+        // never needs this lock; its status writer has its own OS lease.
+        let mut idempotency = self
+            .data_services
+            .idempotency
+            .lock()
+            .map_err(|_| ControlError::Lock)?;
+        if let Some((key, payload_hash)) = request_identity.as_ref()
+            && let Some((stored_hash, experiment_id)) = idempotency.get(key)
         {
             if stored_hash != payload_hash {
                 return Err(ControlError::Conflict(
@@ -1767,7 +2001,7 @@ impl ControlHandle {
             }
             if !trimmed
                 .chars()
-                .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
                 || trimmed.contains("..")
             {
                 return Err(ControlError::BadRequest(
@@ -1824,13 +2058,19 @@ impl ControlHandle {
         runner
             .plan_batch()
             .map_err(|error| ControlError::BadRequest(error.to_string()))?;
-        fs::create_dir_all(&output_dir).map_err(|error| {
-            ControlError::Serialization(format!(
-                "cannot create experiment directory {}: {error}",
-                output_dir.display()
-            ))
-        })?;
-
+        let definition = ExperimentDefinitionV1 {
+            schema_version: 1,
+            experiment_id: experiment_id.clone(),
+            cohort: runner.cohort.clone(),
+            variants: runner.variants.clone(),
+            max_ticks: runner.max_ticks,
+            max_concurrency: runner.max_concurrency,
+            plan_digest: runner
+                .plan_digest()
+                .map_err(|e| ControlError::BadRequest(e.to_string()))?,
+            created_at_utc: secs.to_string(),
+            request_identity: request_identity.clone(),
+        };
         let job = ExperimentJob {
             runner: std::sync::Arc::new(runner),
             state_file: output_dir.join("status.json"),
@@ -1851,16 +2091,20 @@ impl ControlHandle {
                     "experiment_id '{experiment_id}' already exists"
                 )));
             }
+            if lock.len() >= MAX_CATALOG_EXPERIMENTS {
+                return Err(ControlError::PayloadTooLarge(
+                    "experiment catalog capacity reached".into(),
+                ));
+            }
+            definition.persist(&output_dir)?;
             job.start(std::sync::Arc::clone(&self.data_services));
             lock.insert(experiment_id.clone(), job);
         }
         // Admission has happened even if the first status read fails. Publish
         // its identity before that fallible observation so an exact retry can
         // only look up this job, never start a second sweep.
-        if let (Some((key, payload_hash)), Some(registry)) =
-            (request_identity, idempotency.as_mut())
-        {
-            registry.insert(key, (payload_hash, experiment_id.clone()));
+        if let Some((key, payload_hash)) = request_identity {
+            idempotency.insert(key, (payload_hash, experiment_id.clone()));
         }
         drop(idempotency);
         self.get_experiment(&experiment_id)
@@ -1871,6 +2115,7 @@ impl ControlHandle {
         &self,
         experiment_id: &str,
     ) -> Result<ExperimentBatchStatusDto, ControlError> {
+        self.data_services.recover_experiment(experiment_id)?;
         let lock = self
             .data_services
             .experiments
@@ -1888,6 +2133,7 @@ impl ControlHandle {
         &self,
         experiment_id: &str,
     ) -> Result<ExperimentBatchStatusDto, ControlError> {
+        self.data_services.recover_experiment(experiment_id)?;
         let lock = self
             .data_services
             .experiments
@@ -1905,6 +2151,7 @@ impl ControlHandle {
         &self,
         experiment_id: &str,
     ) -> Result<ExperimentBatchStatusDto, ControlError> {
+        self.data_services.recover_experiment(experiment_id)?;
         let lock = self
             .data_services
             .experiments
@@ -1948,6 +2195,7 @@ impl ControlHandle {
         limit: Option<usize>,
         cursor: Option<&str>,
     ) -> Result<PaginatedExperimentsResponse, ControlError> {
+        self.data_services.recover_experiment_catalog()?;
         let limit = limit.unwrap_or(20).clamp(1, 100);
         let offset = if let Some(c) = cursor {
             c.trim()
@@ -3705,6 +3953,177 @@ pub(crate) mod tests {
         }
     }
 
+    fn pending_catalog_definition(root: &Path, id: &str) -> PathBuf {
+        let directory = root.join("experiments").join(id);
+        let runner = crate::experiment_runner::MatchedSeedExperimentRunner::new(
+            id,
+            crate::experiment_runner::MatchedSeedCohort {
+                cohort_id: id.into(),
+                seeds: vec![7],
+            },
+            vec![crate::experiment_runner::ScenarioVariant {
+                variant_id: "mlp".into(),
+                brain_family: "mlp".into(),
+                config_overrides: BTreeMap::new(),
+            }],
+            2,
+            1,
+            &directory,
+        );
+        ExperimentDefinitionV1 {
+            schema_version: 1,
+            experiment_id: id.into(),
+            cohort: runner.cohort.clone(),
+            variants: runner.variants.clone(),
+            max_ticks: runner.max_ticks,
+            max_concurrency: runner.max_concurrency,
+            plan_digest: runner.plan_digest().unwrap(),
+            created_at_utc: "123456".into(),
+            request_identity: Some((format!("key-{id}"), compute_blake3(id.as_bytes()))),
+        }
+        .persist(&directory)
+        .unwrap();
+        directory.join("definition.json")
+    }
+
+    #[test]
+    fn experiment_catalog_recovers_admission_without_executing_or_rewriting() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let path = pending_catalog_definition(&root, "saved");
+        let original = fs::read(&path).unwrap();
+        let services = DataServices::new(root.clone());
+        for _ in 0..2 {
+            services.recover_experiment_catalog().unwrap();
+            let jobs = services.experiments.lock().unwrap();
+            assert_eq!(jobs.len(), 1);
+            let job = jobs.get("saved").unwrap();
+            let status = job.status_dto().unwrap();
+            assert_eq!(status.status, "stopped");
+            assert_eq!(status.created_at_utc, "123456");
+            assert_eq!(status.total_runs, 1);
+            assert_eq!(status.runs[0].state, "pending");
+            assert!(
+                !job.state_file.exists(),
+                "read must not initialize status or science"
+            );
+            assert_eq!(fs::read(&path).unwrap(), original);
+        }
+        assert_eq!(
+            services.idempotency.lock().unwrap().get("key-saved"),
+            Some(&(compute_blake3(b"saved"), "saved".into()))
+        );
+        drop(services);
+        let restarted = DataServices::new(root);
+        restarted.recover_experiment("saved").unwrap();
+        assert_eq!(restarted.experiments.lock().unwrap().len(), 1);
+        assert_eq!(fs::read(path).unwrap(), original);
+    }
+
+    #[test]
+    fn experiment_catalog_refuses_foreign_or_corrupt_definitions_and_retains_companions() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let path = pending_catalog_definition(&root, "a-corrupt");
+        let healthy = pending_catalog_definition(&root, "z-healthy");
+        let original = fs::read(&path).unwrap();
+        fs::copy(&path, root.join("preserved-definition.json")).unwrap();
+        let valid: Value = serde_json::from_slice(&original).unwrap();
+        let mutations = [
+            ("/definition/schema_version", serde_json::json!(2)),
+            (
+                "/definition/plan_digest",
+                serde_json::json!(compute_blake3(b"foreign source")),
+            ),
+            ("/definition/experiment_id", serde_json::json!("another")),
+            ("/definition/cohort/cohort_id", serde_json::json!("another")),
+            ("/definition/cohort/seeds/0", serde_json::json!(8)),
+            (
+                "/definition/variants/0/brain_family",
+                serde_json::json!("dwraon"),
+            ),
+            ("/definition/max_concurrency", serde_json::json!(0)),
+            ("/definition/request_identity/0", serde_json::json!("")),
+            (
+                "/definition/request_identity/1",
+                serde_json::json!("unbound"),
+            ),
+            ("/checksum", serde_json::json!(compute_blake3(b"corrupt"))),
+        ];
+        let mut cases = std::collections::BTreeSet::new();
+        for (pointer, value) in mutations {
+            assert!(cases.insert(pointer));
+            let mut changed = valid.clone();
+            let field = changed.pointer_mut(pointer).unwrap();
+            assert_ne!(*field, value, "distinct falsifying input: {pointer}");
+            *field = value;
+            // Semantic controls carry valid checksums, so they exercise the
+            // identity/plan gates rather than all failing at the same byte guard.
+            if pointer != "/checksum" {
+                let definition: ExperimentDefinitionV1 =
+                    serde_json::from_value(changed["definition"].clone()).unwrap();
+                changed["checksum"] =
+                    compute_blake3(&serde_json::to_vec(&definition).unwrap()).into();
+            }
+            let bytes = serde_json::to_vec(&changed).unwrap();
+            fs::write(&path, &bytes).unwrap();
+            let services = DataServices::new(root.clone());
+            assert!(
+                matches!(
+                    services.recover_experiment_catalog(),
+                    Err(ControlError::Serialization(_))
+                ),
+                "mutation admitted: {pointer}"
+            );
+            services.recover_experiment("z-healthy").unwrap();
+            let jobs = services.experiments.lock().unwrap();
+            assert!(!jobs.contains_key("a-corrupt"));
+            assert_eq!(jobs["z-healthy"].status_dto().unwrap().status, "stopped");
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            assert!(healthy.is_file());
+            eprintln!(
+                "catalog refusal {pointer}, sha256={}",
+                compute_sha256(&bytes)
+            );
+        }
+        fs::write(&path, &original).unwrap();
+        let services = DataServices::new(root);
+        services.recover_experiment_catalog().unwrap();
+        assert_eq!(services.experiments.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn experiment_catalog_refuses_oversized_aliased_and_interrupted_definitions() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let path = pending_catalog_definition(&root, "saved");
+        fs::copy(&path, root.join("original.json")).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(MAX_EXPERIMENT_DEFINITION_BYTES + 1)
+            .unwrap();
+        let services = DataServices::new(root.clone());
+        assert!(services.recover_experiment("saved").is_err());
+        assert!(services.experiments.lock().unwrap().is_empty());
+        #[cfg(unix)]
+        {
+            let symlink_dir = root.join("experiments/symlink");
+            std::os::unix::fs::symlink(path.parent().unwrap(), &symlink_dir).unwrap();
+            assert!(services.recover_experiment("symlink").is_err());
+            let alias = root.join("experiments/alias");
+            fs::create_dir(&alias).unwrap();
+            fs::hard_link(root.join("original.json"), alias.join("definition.json")).unwrap();
+            assert!(services.recover_experiment("alias").is_err());
+        }
+        let interrupted = root.join("experiments/interrupted");
+        fs::create_dir(&interrupted).unwrap();
+        let temporary = interrupted.join("definition.json.tmp");
+        fs::write(&temporary, b"partial").unwrap();
+        assert!(services.recover_experiment("interrupted").is_err());
+        assert_eq!(fs::read(&temporary).unwrap(), b"partial");
+        assert!(services.recover_experiment("../outside").is_err());
+        assert!(services.experiments.lock().unwrap().is_empty());
+    }
+
     #[test]
     fn experiment_creation_concurrent_retry_admits_one_real_batch() {
         let (handle, _host) = handle();
@@ -3768,13 +4187,35 @@ pub(crate) mod tests {
             .expect("completed retry");
         assert_eq!(retry.experiment_id, *experiment_id);
         assert_eq!(retry.completed_runs, 1);
-        let mut changed = request;
+        let mut changed = request.clone();
         changed.seeds.push(8);
         assert!(matches!(
             handle.create_experiment(changed),
             Err(ControlError::Conflict(_))
         ));
         assert_eq!(handle.list_experiments(Some(100), None).unwrap().total, 1);
+        let root = handle.artifacts_dir();
+        let identity = experiment_id.clone();
+        drop(handle);
+        let (mut restarted, _restarted_host) = self::handle();
+        restarted.data_services = Arc::new(DataServices::new(root));
+        let recovered = restarted.create_experiment(request.clone()).unwrap();
+        assert_eq!(recovered.experiment_id, identity);
+        assert_eq!(recovered.status, "completed");
+        assert_eq!(
+            recovered.runs[0].final_digest,
+            completed.runs[0].final_digest
+        );
+        let mut changed = request;
+        changed.seeds.push(9);
+        assert!(matches!(
+            restarted.create_experiment(changed),
+            Err(ControlError::Conflict(_))
+        ));
+        assert_eq!(
+            restarted.list_experiments(Some(100), None).unwrap().total,
+            1
+        );
     }
 
     #[test]
@@ -4081,10 +4522,38 @@ pub(crate) mod tests {
     #[test]
     fn experiment_creation_status_failure_retains_the_admitted_identity() {
         let (handle, _host) = handle();
-        let mut request = experiment_creation_request();
-        request.experiment_id = Some("status-unreadable".to_owned());
-        // A real directory at the expected status-file path makes every read fail;
-        // it does not replace the runner or synthesize a status response.
+        let definition_path =
+            pending_catalog_definition(&handle.artifacts_dir(), "status-unreadable");
+        let mut record: ExperimentCatalogRecord =
+            serde_json::from_slice(&fs::read(&definition_path).unwrap()).unwrap();
+        let definition = &record.definition;
+        let request = ExperimentCreateRequest {
+            experiment_id: Some(definition.experiment_id.clone()),
+            description: None,
+            variants: definition
+                .variants
+                .iter()
+                .map(|v| ExperimentVariantDto {
+                    variant_id: v.variant_id.clone(),
+                    brain_family: v.brain_family.clone(),
+                    config_overrides: Some(serde_json::to_value(&v.config_overrides).unwrap()),
+                })
+                .collect(),
+            seeds: definition.cohort.seeds.clone(),
+            ticks_per_run: Some(definition.max_ticks),
+            max_concurrency: Some(definition.max_concurrency),
+            idempotency_key: Some("status-unreadable-key".into()),
+        };
+        record.definition.request_identity = Some((
+            request.idempotency_key.clone().unwrap(),
+            compute_blake3(&serde_json::to_vec(&request).unwrap()),
+        ));
+        record.checksum = compute_blake3(&serde_json::to_vec(&record.definition).unwrap());
+        fs::write(&definition_path, serde_json::to_vec(&record).unwrap()).unwrap();
+        // Model a crash after durable definition admission, before its first
+        // fallible status observation. An orphan directory without a definition
+        // is now refused before admission and cannot model this boundary.
+        // The real directory at status.json still makes every status read fail.
         let status_path = handle
             .artifacts_dir()
             .join("experiments/status-unreadable/status.json");

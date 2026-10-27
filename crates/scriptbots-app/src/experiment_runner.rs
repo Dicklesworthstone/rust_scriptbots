@@ -423,7 +423,10 @@ fn seal_run_checkpoint(
     )
 }
 
-fn read_checkpoint_file(path: &Path) -> Result<Vec<u8>, ExperimentRunnerError> {
+pub(crate) fn read_experiment_file_bounded(
+    path: &Path,
+    max_bytes: u64,
+) -> Result<Vec<u8>, ExperimentRunnerError> {
     let before = fs::symlink_metadata(path).map_err(|source| ExperimentRunnerError::Io {
         operation: "inspect checkpoint file",
         path: path.to_path_buf(),
@@ -456,9 +459,7 @@ fn read_checkpoint_file(path: &Path) -> Result<Vec<u8>, ExperimentRunnerError> {
             path: path.to_path_buf(),
             source,
         })?;
-    if !opened.is_file()
-        || opened.len() > MAX_RUN_CHECKPOINT_BYTES
-        || !same_status_file_identity(&before, &opened)
+    if !opened.is_file() || opened.len() > max_bytes || !same_status_file_identity(&before, &opened)
     {
         return Err(invalid_checkpoint(
             path,
@@ -468,14 +469,14 @@ fn read_checkpoint_file(path: &Path) -> Result<Vec<u8>, ExperimentRunnerError> {
     let mut bytes = Vec::with_capacity(
         usize::try_from(opened.len()).map_err(|error| invalid_checkpoint(path, error))?,
     );
-    file.take(MAX_RUN_CHECKPOINT_BYTES + 1)
+    file.take(max_bytes.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|source| ExperimentRunnerError::Io {
             operation: "read checkpoint file",
             path: path.to_path_buf(),
             source,
         })?;
-    if u64::try_from(bytes.len()).map_or(true, |length| length > MAX_RUN_CHECKPOINT_BYTES) {
+    if u64::try_from(bytes.len()).map_or(true, |length| length > max_bytes) {
         return Err(invalid_checkpoint(path, "checkpoint exceeded its read cap"));
     }
     let after = fs::symlink_metadata(path).map_err(|source| ExperimentRunnerError::Io {
@@ -496,7 +497,11 @@ fn read_optional_run_checkpoint(
     path: &Path,
 ) -> Result<Option<RunCheckpointV1>, ExperimentRunnerError> {
     match fs::symlink_metadata(path) {
-        Ok(_) => RunCheckpointV1::decode(&read_checkpoint_file(path)?, path).map(Some),
+        Ok(_) => RunCheckpointV1::decode(
+            &read_experiment_file_bounded(path, MAX_RUN_CHECKPOINT_BYTES)?,
+            path,
+        )
+        .map(Some),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(source) => Err(ExperimentRunnerError::Io {
             operation: "inspect checkpoint",
@@ -717,6 +722,11 @@ impl MatchedSeedExperimentRunner {
     /// ambiguous, unsupported, or exceeds the runner's explicit resource bounds.
     pub fn plan_batch(&self) -> Result<Vec<RunRecord>, ExperimentRunnerError> {
         self.validated_plan().map(|plan| plan.runs)
+    }
+
+    /// Bind a saved definition to the same source-aware plan as status and cuts.
+    pub(crate) fn plan_digest(&self) -> Result<String, ExperimentRunnerError> {
+        self.validated_plan().map(|plan| plan.digest)
     }
 
     /// Loads existing status file if present, or initializes a new batch plan.
@@ -1608,7 +1618,7 @@ impl MatchedSeedExperimentRunner {
         let temporary = status_temporary_path(&path)?;
         let candidate = match fs::symlink_metadata(&temporary) {
             Ok(_) => {
-                let bytes = read_checkpoint_file(&temporary)?;
+                let bytes = read_experiment_file_bounded(&temporary, MAX_RUN_CHECKPOINT_BYTES)?;
                 match RunCheckpointV1::decode(&bytes, &temporary) {
                     Ok(candidate) => candidate,
                     Err(error) => {
@@ -3282,7 +3292,7 @@ mod tests {
             .set_len(MAX_RUN_CHECKPOINT_BYTES + 1)
             .unwrap();
         assert!(matches!(
-            read_checkpoint_file(&temporary),
+            read_experiment_file_bounded(&temporary, MAX_RUN_CHECKPOINT_BYTES),
             Err(ExperimentRunnerError::InvalidCheckpoint { .. })
         ));
         #[cfg(unix)]
@@ -3290,7 +3300,7 @@ mod tests {
             let symlink = directory.path().join("symlink.checkpoint");
             std::os::unix::fs::symlink(&path, &symlink).unwrap();
             assert!(matches!(
-                read_checkpoint_file(&symlink),
+                read_experiment_file_bounded(&symlink, MAX_RUN_CHECKPOINT_BYTES),
                 Err(ExperimentRunnerError::InvalidCheckpoint { .. })
             ));
             let hardlinked = directory.path().join("hardlinked.checkpoint");
@@ -3298,7 +3308,7 @@ mod tests {
             let alias = directory.path().join("alias.checkpoint");
             fs::hard_link(&hardlinked, &alias).unwrap();
             assert!(matches!(
-                read_checkpoint_file(&alias),
+                read_experiment_file_bounded(&alias, MAX_RUN_CHECKPOINT_BYTES),
                 Err(ExperimentRunnerError::InvalidCheckpoint { .. })
             ));
             assert_eq!(fs::read(&path).unwrap(), original);
