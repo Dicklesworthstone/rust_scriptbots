@@ -3460,7 +3460,10 @@ fn real_process_experiments_checkpoints_artifacts_e2e() -> Result<()> {
 
         let persisted_manifest: serde_json::Value = serde_json::from_str(&manifest.manifest_json)?;
         let persisted_source = persisted_manifest["build"]["source_revision"].as_str();
-        assert_eq!(persisted_source, option_env!("SCRIPTBOTS_SOURCE_REVISION"));
+        // The embedded identity also accepts a plain RCH commit stamp when
+        // explicit ScriptBots source metadata is absent.
+        let compiled_build = scriptbots_app::BuildProvenanceV0::current();
+        assert_eq!(persisted_source, compiled_build.source_revision.as_deref());
         let fault_observations = [
             ("empty_variants", bad_var_code),
             ("unknown_brain_family", bad_brain_code),
