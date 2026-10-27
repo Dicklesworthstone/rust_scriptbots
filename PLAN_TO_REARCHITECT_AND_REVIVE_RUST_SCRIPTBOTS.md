@@ -4,6 +4,36 @@
 
 **Evidence date:** 2026-07-11
 
+**Command admission reliability (2026-10-27):** [Scoped repair qualified —
+VioletTrout, `bd-2z0.12.2.1` closed under the unchanged open API umbrella]
+Diagnose the remaining real memory/server MCP map-apply authority lookup
+timeout with original deadlines and actual worker observations; the repair and
+existing process/identity/corruption guards are qualified below.
+The debug pager-only repair `d1d8b8c9` passes the complete original process file
+7/0/3 with unchanged deadlines; this is maintenance, not a speedup claim.
+Clean runner B later passes both map transports and shutdown, then exposes a
+separate source-provider assertion defect after real bundle verification.
+`bac44ceb` corrects that expectation with strict equality; the final clean-source
+process result is 6/1/3: experiment delivery passes but MCP authority still times
+out. The debug pager alone is insufficient. The combined memory-history repair
+`9e20fd96` passes the whole original process file 7/0/3 and observes distinct
+actual memory/file/
+independent-connection history policies. A fresh clean-commit process rerun
+also passes 7/0/3, with persistence 12/0/2 ignored and journal 10/0/0 on that
+exact revision, plus workspace all-targets check, strict Clippy and formatting.
+New actual durable-authority probes (`41b01db8`) pass both codec/corruption/archive
+cases, retaining the failed
+35-versus-16-byte test attempts. Original API/native DSR acceptance stays open.
+
+**Terminal capability qualification (2026-10-27):** [Reopened —
+`bd-2z0.14.2.6`, original owner and full acceptance preserved]
+The complete instrumented app-library run fails theme/glyph independence at
+canvas braille/256 under HighContrast. Terminal code and goldens are unchanged.
+Diagnose the actual differing cells before any gate/fixture change; the new
+failure does not erase historical export functionality. A passing rerun alone
+does not explain it. Exact source, execution context and hashes are in the
+reality check and original Bead.
+
 **Experiment recovery (2026-10-26):** [Currently In Progress — VioletTrout,
 `bd-2z0.5.11`, reopened with original acceptance intact]
 Recover completed bundles interrupted before the final status commit through
@@ -13,6 +43,16 @@ an unfinished run; all 14 focused runner tests, workspace all-targets check,
 strict Clippy and formatting pass. Exact commands/failures are in the reality check.
 Exact next-tick recovery of unfinished runs,
 complete resource admission and interrupted-process qualification remain open.
+Additional active edge, 2026-10-27: qualify companion recovery when an older
+Completed bundle is corrupt, preserving the global verification refusal.
+`2b53c028` repairs this edge: its regression fails on the old code at the lost
+companion, then all 15 runner tests pass within the final 661-pass app library.
+The existing tournament publication test also passes with actual clean-origin
+Git/compiler metadata; this does not qualify the larger scientific program.
+B-code workspace check and strict Clippy pass. Final composite source `9e20fd96`
+also passes all 15 runner tests, the complete ordinary process file, storage
+integrations, workspace check, strict Clippy and formatting. Original unfinished-run
+crash recovery, resource/fault E2E and native acceptance remain open.
 
 **Finished-reader stack safety (2026-10-26):** [Currently In Progress —
 VioletTrout continuing preserved LilacElm work, `bd-6sgk`]

@@ -2,6 +2,243 @@
 
 ## Current implementation status — 2026-10-27, VioletTrout
 
+Qualified implementation after `226dce74` (`bd-2z0.12.2.1`, VioletTrout):
+
+Clean source `9e20fd966b9d3c1f417bd6616d6baf874f627cb4` passes the complete
+ordinary process file **7 / 0 / 3 unchanged ignored**, all **15 runner tests**,
+storage integrations **12 / 0 / 2 ignored** and **10 / 0 / 0**, workspace
+all-targets check, strict Clippy and formatting. The memory-control repair combines
+the debug pager policy with the connection-local eager SQL-history opt-out.
+Policy readback observes ScriptBots memory 0 / file 1 / independent memory 1,
+with foreign keys enabled. The child is closed against its original four
+criteria after fresh solo re-execution; this is not independent review.
+
+Both individual settings proved insufficient: the opt-out alone fails 6/1/3;
+the pager alone first passes, then clean `bac44ceb` again fails the MCP deadline
+6/1/3. Those losses remain below. No deadline was raised. Original API,
+unfinished-run resume, UI diagnosis and native DSR acceptance remain open;
+no measured speedup or project-wide completion is claimed.
+
+- [x] Reproduce the unchanged memory/server MCP map-apply failure and observe
+  the actual worker/owner boundary with bounded diagnostics.
+- [x] Retain both intrusive stack observations as diagnostics: journal commits
+  are executing engine memory-snapshot reloads while later authority work waits.
+  Observers hit their own 25s/15s limits; the later probe observes TracerPid 0
+  and both exact owned children subsequently exit. These runs qualify no timing.
+- [x] Try the documented memory snapshot-capture opt-out alone. The original
+  full process file still fails 6 passed / 1 failed / 3 ignored; revert that
+  candidate in full and credit no repair or performance win.
+- [x] Qualify the pager-only debug profile candidate against the complete
+  original process file, without debugger, changed SQL or changed deadlines.
+  RCH `30081342398005339`: 7 passed, 0 failed, 3 unchanged ignored, 0 filtered.
+  Both real map transports and ordered memory shutdown pass. The candidate is
+  only Cargo's debug `fsqlite-pager` optimization; release and engine pin remain
+  unchanged. The full storage library now passes 269 tests with one existing
+  ignored long lane. Later clean-source outcomes and final gates are below.
+  Storage's existing Asupersync `test-internals` dev dependency makes its
+  library-test graph differ from the shipped process. The earlier tracker
+  wording that there were no test-only dependency features was too broad and
+  is explicitly corrected there; report these two proof scopes separately.
+- [x] Identify the observed engine journal-commit boundary and bank the debug
+  pager repair as `d1d8b8c9`. Durable command identity, payload/schema guards,
+  ordering, SQL and all original deadlines are unchanged. This is debug-build
+  maintenance, not an algorithmic or measured performance win.
+- [x] Exercise the positive path and existing collision/corruption/recovery
+  controls, then the complete original process file and required source checks.
+- [x] Execute the added same-thread durable-authority probes against a real
+  HostCore-produced file receipt: exact envelope cap, corrupt claim, missing
+  canonical archive, rollback restoration and observed foreign-key restoration.
+  The exact missing-archive resolver branch had no explicit negative in the
+  inspected tests; the 269-pass suite alone does not qualify that branch.
+- [x] Check and lint the new test source after it passes. The successful check
+  and strict Clippy on the earlier App overlay do not cover this later test.
+  Final clean `9e20fd96` covers both the authority tests and later policy test.
+- [x] Execute both corrected durable-authority probes: 2 passed / 0 failed,
+  270 filtered. Retain both earlier failed attempts: they incorrectly used the
+  runtime receipt codec's 35 bytes for the stored claim codec's observed 16
+  bytes. The corrected test accepts the actual claim width and refuses one byte
+  below it; no production cap changed. Corrupt claim and missing archive each
+  reach their distinct typed refusal, then rollback restores the full receipt.
+- [x] Restore the reviewed authority-test additions from
+  `authority-guard-additions.pre-waiver.patch` (exact saved Git blob
+  `776b3897d2a62a979602ba5738c5af6b6d4235cd`) after the separate reaper gate review.
+  They were temporarily out of the working file to keep that review independent;
+  the restored blob differs from that backup by only the two reviewed reaper
+  lines. No file was deleted. The 189 test lines are committed as `41b01db8`.
+- [x] Qualify the unwind-only reaper poison helper and its single UBS exception.
+  The original public helper is not test-gated; under release's abort strategy
+  an explicit call could not be caught. Its existing unwind recovery test passes
+  1 / 0 / 0 with 13 filtered. The unmodified-source UBS control still reports its
+  critical panic; the constrained source reports zero criticals. Valid compiler
+  API inventories observe the poison function absent in abort and present in
+  unwind, with the Storage struct and reset helper present in both.
+- [x] Correct the separate process-test expectation for documented RCH source
+  fallback, retaining strict equality. The clean-B original file runs 6 / 1 / 3:
+  both map transports and shutdown pass; experiment bundles create and verify,
+  then its assertion expects only explicit metadata (`None`) instead of the
+  correctly persisted RCH revision (`Some(B)`). Re-run the complete file and
+  embedded-input characterization tests on a clean commit without explicit
+  source metadata; retain this first failure and publish the admission split.
+  The isolated correction is `bac44ceb`; completed exact-source reruns are below.
+- [x] Run the complete process file and embedded-input characterization on
+  clean `bac44ceba5e13443a93ed01ef69fac3d019bf301`, without explicit source
+  metadata. Require actual ordinary-case counts and both known/unknown input
+  behavior; do not infer provenance or call a zero-test result green.
+  Characterization passes 21/0/0; process fails 6/1/3 at MCP authority, so this
+  execution does not satisfy the child's positive acceptance.
+- [x] Qualify the combined memory-history candidate with observed memory/file/
+  independent-connection policy differences, existing journal/authority guards,
+  and the complete original process file. Retain
+  both failed individual levers and do not count a retry as a repair.
+- [x] Finish workspace all-targets check on committed `9e20fd96`: 1m37s, exit 0.
+  The earlier `bac44ceb` check also passes, but cannot cover the final policy.
+- [x] Finish strict workspace all-targets Clippy on the same `9e20fd96` source:
+  6m53s, exit 0, `-- -D warnings`; formatting and whitespace checks pass.
+- [x] Repeat both authority probes and the native poison-recovery case on clean
+  `bac44ceb`: 2 / 0 / 0 (270 filtered, 6.30s) and 1 / 0 / 0 (13 filtered,
+  0.65s), respectively. The actual caught panic remains visible in stderr.
+- [x] Run the existing embedded-input characterization tests on clean `bac44ceb`
+  with no explicit source metadata: 21 / 0 / 0, 641 filtered, 0.48s. Both actual
+  current-build and nine-input precedence/unknown-source tests execute.
+- [x] Under original `bd-2z0.5.11`, prove and repair the separate prior-Completed
+  corruption case: retain its refusal while saving another verified finished
+  run; require byte-identical repeated refusal and restored positive completion.
+  The old-production regression fails at the exact lost-companion state;
+  source `2b53c028` passes all 15 runner tests within the full 661-pass app run.
+- [x] Reassess original acceptance and record exact results on the original
+  Beads. Close only `.12.2.1`; retain all seven original `.5.11` criteria,
+  umbrella blockers and original UI ownership. All 719 original descriptions,
+  criteria, dependencies, assignees, provenance and comment prefixes survive.
+- [ ] Delivery receipt: publish the reviewed source/report/tracker snapshots,
+  verify both remote refs, and release the exact reservations. This report is
+  sealed before its own publication; the final handoff records that observation.
+- [x] Build final library proof with real provenance from a clean committed
+  source checkout and the actual remote compiler, using the existing compile-time
+  fields. Preserve archive-unknown failures; never infer a clean Git state from
+  an archive. Bind the origin's exact commit/bytes to the pinned RCH transfer.
+- [x] Reopen original `bd-2z0.14.2.6` qualification, preserving its owner and
+  full acceptance, for the newly observed theme/glyph failure. Notify YellowLake
+  with exact evidence; no terminal source, assertion or golden changed.
+- [ ] Original UI owner: diagnose the differing rendered cells/dynamic inputs
+  behind the HighContrast glyph mismatch; a passing rerun is not an explanation.
+  Read-only follow-up identifies a concrete varying input: `capability_frame`
+  creates a new live owner per theme, and `TerminalApp::new` performs a real
+  5ms agent inspection during `refresh_snapshot`. Success fills focused outputs;
+  timeout leaves them absent. Reduced motion freezes shimmer, not that request.
+  Mail 234 sends this source observation to YellowLake; it is a hypothesis until
+  actual cells and inspection outcomes distinguish the original mismatch.
+
+This requested TODO is consumed by the user/implementer at handoff and retires
+to a bounded evidence record then. Minimal raw logs and stack observations
+preserve the actual failed boundary; they are not another acceptance framework.
+The umbrella claim was refused by its existing `.5.11` blocker. The concrete
+observed memory/MCP defect is tracked as child `.12.2.1`; original umbrella
+ownership, acceptance and blockers remain unchanged.
+
+### Continuation evidence and qualification ledger
+
+All new raw evidence is retained under
+`/data/tmp/scriptbots-command-lookup-20261027-violettrout/`.
+
+| Attempt | Observed result and limit |
+|---|---|
+| Memory snapshot opt-out, `process-after-full.log`, RCH `30081342398005337` | 6 passed / 1 failed / 3 ignored. Candidate fully reverted; no acceptance credit. |
+| Pager debug profile, `pager-debug-process-full.log`, RCH `30081342398005339` | Complete original process file: 7 passed / 0 failed / 3 unchanged ignored. This is functional debug-build maintenance; no release or speedup claim. |
+| Baseline libraries, `shared-library-red-retry.log`, RCH `30081342398005342` | Old production runner plus the new regression: app 657 passed / 4 failed / 1 ignored. The new test observes generation 2 with the companion still Running instead of generation 3 with both completed. Existing failures are permission-based checkpoint reservation on the root worker, theme/glyph independence, and unknown-source tournament publication. Storage's full library passes 269 / 0 / 1 ignored, 0 filtered, in 1,813.24s. The combined command exits 101 with only the app target failing; it is not an overall green. |
+| Final runner source | `2b53c0280aa450b7753572abbceafa0c512cee43`, file blob `54f9281afee737a523b5d8e9acc8cd50fa8dd60f`. Corrupt Completed records accumulate the existing verification error; verified Running companions are saved before returning that error and before admitting pending work. All 15 runner tests pass within the final full app library: 661 passed / 0 failed / 1 unchanged ignored, 0 filtered, 67.29s; strict RCH `30082790271746049` exits zero. |
+| Real source provenance | `source-origin-2b53c028.json` records an actual pristine detached Git checkout at that exact commit, its observed empty status/diff SHA-256 values, lockfile hash and actual remote compiler output. `source-origin-2b53c028-hz2.json` also binds the observed unprivileged worker/compiler identity. RCH `30082790271746049` uses those existing public metadata fields with pinned no-overlay source. Independent worker hashes match the origin's Cargo.toml, Cargo.lock, runner and app library. The exact-source receipt's base tree matches Git `ad6a119e…`; the unchanged tournament publication guard passes. This describes the Git origin of the archive, not the dirty shared checkout or nonexistent worker Git metadata. It qualifies this test invocation, not the full scientific publication program. |
+| B source gates | Final App blob is transferred on base `d1d8b8c9` with overlay `7e7ed288…`; workspace all-targets check, RCH `30081342398005344`, passes in 77m43s. Independent worker hashes match committed Cargo.toml, Cargo.lock and runner bytes. Receipt `tree=671d3a55…` is the base tree, as confirmed in RCH source; the separately recorded overlay supplies the final runner. Strict Clippy also passes on that base/overlay. These checks precede the authority tests and gate changes; final composite checks are below. Targeted runner UBS exits zero with zero critical findings and 215 warnings; skipped Cargo phases are not compiler evidence. |
+| New authority probes | `durable-authority-guards-correct-codec.log`: 2 passed / 0 failed / 0 ignored, 270 filtered, 7.90s. The first two failed attempts measured the runtime codec (35 bytes) instead of the actual persisted claim codec (16 bytes). The corrected boundary uses observed writer/SQL values: 16 admitted, 15 refused. No production cap changed. Each actual claim/archive corruption reaches its distinct typed refusal; rollback restores the exact durable receipt. Subsequent source-bound reruns are below. |
+| Clean B process | `final-process-complete.log`: 6 passed / 1 failed / 3 unchanged ignored, 0 filtered, 185.20s. Both map transports and ordered shutdown pass. The real experiment journey creates and CLI-verifies the bundle, then the old assertion expects `None` rather than correctly persisted `Some(B)`. `bac44ceb` separately corrects that provider mismatch, retaining strict equality and the existing independent characterization guards. |
+| Reaper panic strategy | `f68241a5` omits the public hidden poison helper under panic=abort; its panic is catchable only under unwind. The original UBS control reports 1 critical / 1,925 warnings / 714 info; the two-line correction reports 0 / 1,925 / 714 with one explicit rule/line exception. Restored authority tests produce 0 / 1,937 / 715. No other scanner rule is suppressed. The existing native poison-recovery test passes 1 / 0 / 0, 13 filtered; both compiler API inventories below qualify the conditional declaration. |
+| Final clean guard qualification | `clean-final-authority-guards.log`: 2 / 0 / 0, 270 filtered, 6.30s. `clean-final-reaper-recovery.log`: 1 / 0 / 0, 13 filtered, 0.65s. `clean-final-provenance-characterization.log`: 21 / 0 / 0, 641 filtered, 0.48s, including both actual current-build inputs and the independent nine-input source matrix. All three strict-RCH invocations pin `bac44ceb`, no overlay or explicit provenance metadata; exact-source receipts name tree `64d64e83…`. |
+| Abort API inventory | Supported strict-RCH CargoDoc JSON exits zero, retaining 11 documentation warnings. Its valid 20,788,579-byte JSON contains the actual Storage struct and reset function, but no poison function under `-Cpanic=abort`. SHA-256 `d1d93e3fb9748ac8cba53b7ebe07e14f2726418f463af4a7b1f8f8cacc715e17`. An initial name-only checker incorrectly counted the distinct Storage enum variant too; inspecting actual item kinds corrects that checker without changing compiler output or source. The unwind counterpart is below. This is compiler API evidence, not release execution or performance proof. |
+| Unwind API inventory | The counterpart also exits zero and yields valid 20,789,397-byte JSON: Storage struct 1, reset function 1, poison function 1. SHA-256 `2431c88d147b75bcea32b0d253ea58d1814e9979db7d36ca45f065777ecb03d6`. Both inventories bind the same committed reaper source bytes: abort uses B plus its exact two-line overlay; unwind pins `f68241a5`. The 0-versus-1 function observation, unchanged sentinels and actual native recovery qualify the conditional API, without claiming release execution. |
+| Final clean process loss | `clean-final-process.log`, source `bac44ceb`: 6 / 1 / 3, 0 filtered, 180.01s, exit 101. Experiment delivery now passes: two completed runs, six downloads, two shipped-CLI verified bundles, three status-fault controls and byte-identical restored status. Actual source_commit is `bac44ceb`; compiler identity remains null and bundles remain honestly non-reproducible. MCP command 6 still times out at 10s. No closure; pager-only maintenance is insufficient. |
+| Final clean storage integrations | `clean-final-storage-integrations.log`, clean `bac44ceb`: persistence 12 / 0 / 2 unchanged ignored, 26.17s; journal 10 / 0 / 0, 49.24s. This includes the actual explicit-stack reader, collision, exact retry, eviction/restart and ordered durable-shutdown paths. These successes do not erase the full-process deadline failure. |
+| First final Clippy admission | The first attempt refuses queue_timeout with exit 103 and explicitly refuses local fallback. No Cargo/test result is inferred. The later admitted final-source invocation passes, as recorded below. |
+| Combined memory-history repair | `9e20fd96`, Storage blob `aac6b227…`: six production lines disable connection-local eager SQL history only on memory writers. ScriptBots has no SQL time-travel reader; replay uses application tables. Exact candidate overlay `08878ce6…` on `bac44ceb` passes the original whole process file 7 / 0 / 3, 0 filtered, 97.24s, with both map transports and ordered shutdown. This is a functional deadline result; durations are not a comparative performance claim. The old-code policy test fails at actual memory value 1 versus expected 0; new code passes 1 / 0 / 0, 272 filtered, 1.20s, observing memory 0 / file 1 / independent memory 1 and FK 1. Authority probes pass 2 / 0 / 0, 271 filtered, 7.52s. Targeted UBS exits zero: 0 critical / 1,940 warnings / 715 info, retaining the reaper-only exception. Clean reruns and compiler checks follow below. |
+| Combined clean-commit qualification | `combined-clean-process.log`: 7 / 0 / 3 unchanged ignored, 0 filtered, 96.30s, strict-RCH exit zero on no-overlay `9e20fd96`, tree `88415312…`. The experiment header observes that actual source commit, compiler identity null, two completed runs, six downloads, two CLI-verified bundles and restored status corruption controls. The transport header's optional explicit source/compiler fields remain null; no attribution is fabricated there. `combined-clean-storage-integrations.log`: persistence 12 / 0 / 2 unchanged ignored, 26.45s, journal 10 / 0 / 0, 48.74s, same clean revision/tree. Both invocations return zero; final source gates below also pass. |
+| Final composite runner qualification | `combined-clean-runner.log`: all 15 `experiment_runner::tests::` cases pass, 0 failed / 0 ignored, 647 filtered, 2.13s, strict-RCH clean `9e20fd96` with no overlay. Runner bytes remain `2b53c028`; this fresh pass also includes the final storage policy. The prior-Completed corruption regression retains the exact error, full recovered companion metadata/generation, repeated-refusal file identity and restored positive completion. Original full in-flight/resource/native runner acceptance remains open. |
+| Final composite source gates | `combined-clean-workspace-check.log`: workspace all-targets check passes in 1m37s. `combined-clean-workspace-clippy.log`: workspace all-targets strict Clippy `-- -D warnings` passes in 6m53s. Both strict-RCH invocations exit zero, pin no-overlay `9e20fd966b9d3c1f417bd6616d6baf874f627cb4` and return exact tree `884153120c9229bb8f9f4e529fd88923c54155f0`. Local formatting and diff whitespace checks also pass. The earlier `bac44ceb` check passes in 47m05s, separately scoped. |
+
+The standalone storage build was cancelled before executing tests, then recovered
+through supported RCH acknowledgement. The first combined attempt refused an
+unfinished source owner; its retry followed that acknowledgement. Neither earns
+a red or green test count. No worker cache, lock file or source file was deleted.
+The first provenance preparation also refused incompatible
+`--clean-overlay`/`--source-content-receipt` flags before admitting a job. The
+corrected invocation keeps pinned no-overlay mode and independently checks the
+four named source-file hashes; it does not claim a per-root content receipt.
+
+### Bounded anti-ceremony audit — continuation after `226dce74`
+
+Creation worksheet: the runtime does not consume this TODO/report. The user
+explicitly requested detailed tracking and a reality check; that request supplies
+the consumer and gate. The concrete incidents are the command-lookup timeout and
+lost verified companion above. The TODO retires to this evidence record at
+handoff. Minimal raw logs also preserve timed-out diagnostics and the exact
+source boundary; summaries alone would lose those facts. At this run's scale
+they are necessary, smaller than a new harness, and have no equally reliable
+cheaper substitute. The ready user capability is responsive recorded control,
+followed by interrupted experiment recovery. Another hour of reporting would
+not improve either; no new reporting framework is being built.
+
+Real-work worksheet: the README's purpose is a usable evolutionary simulation
+laboratory. The two functional outcomes are responsive recorded control through
+the combined pager/memory-writer repair, and verified-result companion recovery
+(USER, with final compiler qualification complete and publication pending).
+The profile alone is maintenance; the authority probes, source-provider correction, conditional
+poison helper and compiler API inventories are ENABLERS, not additional user
+features. The clean final process and runner tests pass.
+Actual provenance is an ENABLER consumed by the existing tournament publication
+test; the full scientific program remains open. Requested plan,
+report and Beads updates are PROCESS and earn no capability credit. No source
+increment is a spec change. Without process updates the executable behavior
+would be identical, but the requested handoff would lose failures and ownership.
+The pager repair's existing consumer is the real server/MCP process. A short
+demo would apply a map through MCP and observe ordered shutdown. The final test
+cases take 96.30s; remote build/admission add to the full invocation. Exact
+in-flight resume remains the older critical gap,
+and this recovery increment does not close it. This is solo work, with no
+close-producing pane or independent reviewer. Verdict: bounded implementation
+work; stop adding audit apparatus and finish the reviewed publication.
+
+Honesty inventory, all twenty prompts:
+
+1. Yes: `bac44ceb` corrects a defective process-test source provider after actual clean-B `Some(B)` versus `None` failure. Equality remains strict; the independent literal precedence/unknown-input matrix is unchanged and executes in the 21-pass characterization run. The clean final process passes and observes actual experiment source `9e20fd96`; unknown compiler fields stay null and publication stays honestly partial. No workflow, ignore, timeout or golden changed.
+2. No (checked: the added fixture uses actual HostCore runs, real bundles, corruption and file readback).
+3. No (checked: changed paths and source diffs contain no golden or snapshot regeneration).
+4. Yes: the debug dependency profile changed explicitly in `d1d8b8c9` (maintenance). `f68241a5` separately adds one specific UBS panic-macro exception to the caught unwind-only poison hook, and removes that API from abort builds. The unchanged-source scanner control still rejects the original panic. `9e20fd96` explicitly disables unused eager SQL history only on memory writers; observed file/independent defaults and application replay guards remain intact. No tolerance, retry or release profile changed. This is disclosed maintenance, not a general scanner clean bill or a measured performance win.
+5. No (checked: the profile applies to the dependency generally; no command/test-name or environment special case was added).
+6. No (checked: final process 7/0/3, runner 15/0/0 and storage integrations 12/0/2 plus 10/0/0 execute actual cases on clean `9e20fd96`; baseline failures retain their counts. Compilation, cancellation and admission refusal receive no test credit).
+7. Yes: earlier tracker wording said there were no test-only dependency features. Storage already enables Asupersync `test-internals`; the tracker/report explicitly correct the claim and separate library from shipped-process evidence.
+8. No (checked: intrusive GDB observations are labelled diagnostic, instrumented libraries are distinct from the real process, and native/DSR acceptance stays open).
+9. No (checked: the ledger retains the failed opt-out, all four baseline app failures, clean-B provenance failure, later clean `bac44ceb` MCP deadline failure and both incorrect-codec test attempts beside subsequent positives. The pager alone was insufficient; the unexplained first theme failure remains open on its original owner).
+10. No (checked: cited command logs retain stdout/stderr; observer timeouts and the first missing explicit detach are disclosed).
+11. No (checked: only the new independently executable command-timeout bug closes after its original four criteria pass on exact final source. The original API and runner acceptance stays intact and open; original UI qualification is reopened. This is a fresh solo acceptance pass, not independent review).
+12. No (checked: plan changes mark work in progress; original Beads acceptance and blockers are preserved).
+13. No (checked: no subagents were spawned and no peer closure was accepted).
+14. No (checked: no delegation or gamable subagent success criterion was issued).
+15. No (checked: no subagent report was used as evidence).
+16. No (checked: this solo continuation implements positive control/recovery paths; no refusal-farming agent exists).
+17. No (checked: no agent agreement or self-review is called independent verification).
+18. No (checked: the complete original process file and complete baseline library targets were selected before their results; ignored cases remain in the denominator report).
+19. Yes: the failed snapshot lever, later pager-only deadline loss, intrusive debugger delays, cancelled cold build, source-owner refusal, overly broad feature claim and DCG rejection of dynamic Git argv merit disclosure. The safe replacement used literal read-only Git argv; no bypass occurred. The reaper control first hit source-sync exit 103 before Cargo, then passed on retry. RCH refused CargoRustc classification; supported CargoDoc JSON supplies the API evidence. The first inventory checker counted an enum variant as a struct; inspecting actual item kinds corrects that checker without changing compiler output. Final Clippy's first admission also refuses with 103 and no local fallback. Cold qualification costs earn no capability credit.
+20. Clean committed `9e20fd96` executes the entire ordinary real-process file 7/0/3, including both actual map transports, ordered shutdown and two downloaded CLI-verified experiment bundles. Its runner passes 15/0/0; its storage integrations pass 12/0/2 plus 10/0/0. Identical candidate bytes pass the policy readback and both authority probes. This follows retained old-code and individual-lever failures. Exact final-source workspace check, strict Clippy and formatting pass. This is a fresh solo acceptance pass, not independent review or full native/project acceptance.
+
+Disposition: the overbroad feature claim is corrected in place and disclosed
+above. RH-2/PL-4 require separate feature/execution scopes; SM-11 requires keeping
+the initial failures. RH-1/RH-15 require separate evidence for the documented
+source-provider correction and one explicit scanner exception, retaining strict
+equality and all deadlines; neither is hidden inside the runtime repair. RH-9
+keeps the original incomplete acceptance open. The CASS follow-up used the
+snapshot-pragma query and actual message indexes 317/3796; those historical
+source discussions are not execution proof. No clean bill is inferred from a
+search or a passing rerun.
+
+### Previous delivered increment — source `226dce74`
+
 Three source increments are committed: `979f37c1` fixes ordinary-stack debug SQL
 readers and the storage narrative capture fixture; `edffa215` recovers verified
 completed experiment bundles before their final status publication; `1c8d5c2a`
