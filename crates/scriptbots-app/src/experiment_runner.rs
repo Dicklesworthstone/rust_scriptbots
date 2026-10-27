@@ -631,6 +631,7 @@ impl MatchedSeedExperimentRunner {
         let mut status = self.load_or_create_status_locked(state_file, &plan)?;
 
         let mut recovered = false;
+        let mut recovery_error = None;
         for record in &mut status.runs {
             match record.state {
                 RunState::Running => {
@@ -638,7 +639,16 @@ impl MatchedSeedExperimentRunner {
                         .variants
                         .get(&record.variant_id)
                         .expect("validated status variant exists");
-                    *record = self.recover_completed_run(record, variant, *family, &plan.digest)?;
+                    let completed =
+                        self.recover_completed_run(record, variant, *family, &plan.digest);
+                    let completed = match completed {
+                        Ok(completed) => completed,
+                        Err(error) => {
+                            recovery_error.get_or_insert(error);
+                            continue;
+                        }
+                    };
+                    *record = completed;
                     recovered = true;
                     info!(
                         experiment_id = %self.experiment_id,
@@ -646,7 +656,7 @@ impl MatchedSeedExperimentRunner {
                         tick = record.total_ticks,
                         digest = ?record.final_digest,
                         bundle_path = ?record.bundle_path,
-                        "recovered verified completed bundle before admitting pending runs"
+                        "verified completed bundle for status recovery"
                     );
                 }
                 RunState::Completed => {
@@ -668,6 +678,9 @@ impl MatchedSeedExperimentRunner {
         if recovered {
             recompute_status_counts(&mut status);
             self.save_status_transition_locked(state_file, &mut status, &plan)?;
+        }
+        if let Some(error) = recovery_error {
+            return Err(error);
         }
 
         let pending = status
@@ -2265,7 +2278,7 @@ mod tests {
 
     #[test]
     fn completed_bundles_recover_the_status_commit_gap_without_reexecution() {
-        let (runner, state_file, running, completed) = completed_bundle_gap_fixture();
+        let (runner, state_file, running, completed) = completed_bundle_gap_fixture(&[7, 9]);
         let before = completed
             .iter()
             .map(|record| {
@@ -2313,8 +2326,7 @@ mod tests {
 
     #[test]
     fn completed_bundle_recovery_refuses_corruption_and_cross_run_swaps() {
-        let (runner, state_file, _, completed) = completed_bundle_gap_fixture();
-        let status_bytes = fs::read(&state_file).expect("running status");
+        let (runner, state_file, mut expected, completed) = completed_bundle_gap_fixture(&[7, 9]);
         let first = runner.output_dir.join(&completed[0].run_id);
         let second = runner.output_dir.join(&completed[1].run_id);
         let paths = [
@@ -2329,7 +2341,18 @@ mod tests {
             runner.execute_batch(&state_file),
             Err(ExperimentRunnerError::Bundle { .. })
         ));
-        assert_eq!(fs::read(&state_file).expect("refused status"), status_bytes);
+        // The corrupt run remains Running, while its independently verified
+        // companion must survive the failed batch recovery.
+        expected.runs[1] = completed[1].clone();
+        expected.generation += 1;
+        recompute_status_counts(&mut expected);
+        assert_eq!(
+            runner
+                .load_or_create_status(&state_file)
+                .expect("partial recovery"),
+            expected
+        );
+        let status_bytes = fs::read(&state_file).expect("partially recovered status");
         fs::write(first.join(paths[2]), &original[2]).expect("restore summary");
 
         // All swapped bytes remain mutually consistent. The semantic run/seed
@@ -2361,7 +2384,42 @@ mod tests {
         );
     }
 
-    fn completed_bundle_gap_fixture() -> (
+    #[test]
+    fn completed_bundle_recovery_publishes_finished_runs_before_refusing_unfinished_work() {
+        for seed in [7, 9] {
+            let (runner, state_file, running, completed) = completed_bundle_gap_fixture(&[seed]);
+            let unfinished = running
+                .runs
+                .iter()
+                .find(|record| record.seed != seed)
+                .expect("one unfinished run");
+            assert!(matches!(
+                runner.execute_batch(&state_file),
+                Err(ExperimentRunnerError::ResumeCheckpointUnavailable { run_id, .. })
+                    if run_id == unfinished.run_id
+            ));
+            let recovered = runner
+                .load_or_create_status(&state_file)
+                .expect("saved recovery");
+            assert_eq!(recovered.completed_runs, completed.len());
+            assert_eq!(recovered.generation, running.generation + 1);
+            assert!(recovered.runs.contains(&completed[0]));
+            assert!(recovered.runs.contains(unfinished));
+            let bytes = fs::read(&state_file).expect("partially recovered status");
+            assert!(matches!(
+                runner.execute_batch(&state_file),
+                Err(ExperimentRunnerError::ResumeCheckpointUnavailable { .. })
+            ));
+            assert_eq!(
+                fs::read(&state_file).expect("unchanged retry status"),
+                bytes
+            );
+        }
+    }
+
+    fn completed_bundle_gap_fixture(
+        seeds_to_complete: &[u64],
+    ) -> (
         MatchedSeedExperimentRunner,
         PathBuf,
         ExperimentBatchStatus,
@@ -2383,7 +2441,7 @@ mod tests {
                 config_overrides: BTreeMap::new(),
             }],
             2,
-            1,
+            2,
             directory.join("bundles"),
         );
         let mut running = runner
@@ -2395,13 +2453,14 @@ mod tests {
         runner
             .save_status(&state_file, &mut running)
             .expect("durable running boundary");
-        let completed = [7, 9]
-            .map(|seed| {
+        let completed = seeds_to_complete
+            .iter()
+            .map(|&seed| {
                 runner
                     .execute_single_run(&runner.variants[0], seed)
                     .expect("real completed HostCore run")
             })
-            .to_vec();
+            .collect();
         (runner, state_file, running, completed)
     }
 
