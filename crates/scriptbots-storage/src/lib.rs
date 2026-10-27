@@ -15462,6 +15462,12 @@ impl Storage {
         };
         conn.execute("PRAGMA foreign_keys = ON;")?;
         conn.execute("PRAGMA synchronous = FULL;")?;
+        if matches!(target, StorageTarget::Memory) {
+            // ScriptBots replay uses its journal tables, not SQL FOR SYSTEM_TIME
+            // history. Avoid cloning all memory tables at every commit while
+            // keeping current-state SQL and application durability unchanged.
+            conn.execute("PRAGMA fsqlite_capture_time_travel_snapshots = false;")?;
+        }
         if recover_existing {
             let validation = existing_lease
                 .as_ref()
@@ -30713,6 +30719,40 @@ mod tests {
         let mut second = StoragePipeline::unattributed_memory()?;
         first.shutdown()?;
         second.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn memory_history_policy_is_local_and_preserves_file_defaults()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-memory-history-policy");
+        let file = create_file_storage(&path.to_string_lossy())?;
+        let memory = Storage::unattributed_memory()?;
+        for (storage, expected) in [(memory, 0_i64), (file, 1)] {
+            let connection = storage.connection()?;
+            assert_eq!(
+                connection
+                    .query_row("PRAGMA fsqlite_capture_time_travel_snapshots")?
+                    .get_typed::<i64>(0)?,
+                expected
+            );
+            assert_eq!(
+                connection
+                    .query_row("PRAGMA foreign_keys")?
+                    .get_typed::<i64>(0)?,
+                1
+            );
+            storage.close()?;
+        }
+        let independent = Connection::open(":memory:")?;
+        assert_eq!(
+            independent
+                .query_row("PRAGMA fsqlite_capture_time_travel_snapshots")?
+                .get_typed::<i64>(0)?,
+            1,
+            "the ScriptBots writer policy must not change unrelated connections"
+        );
+        independent.close()?;
         Ok(())
     }
 
