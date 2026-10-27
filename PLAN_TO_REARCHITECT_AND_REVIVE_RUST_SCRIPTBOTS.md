@@ -4,6 +4,23 @@
 
 **Evidence date:** 2026-07-11
 
+**Durable experiment continuation (2026-10-27, afternoon):** [Qualified increment;
+original `bd-2z0.5.11` Currently In Progress — VioletTrout, all seven criteria retained]
+`9bee85d6` pairs the actual settled volatile journal with the canonical full-host
+cut, persists it before Running and after completed ticks, and continues the
+same session/commands/RNG through the real runner. Clean-source proofs pass
+19 runner tests, the full ordinary process lane 8/0/3 (three unchanged ignores),
+workspace check and strict Clippy. The shipped server restores tick 2 after a
+hard kill through an identical named-create request, reaches tick 12 with the
+uninterrupted digest, and both bundles pass separate CLI verification. Four
+distinct MLP/DWRAON seed cells agree at concurrency 1 and 2. Fresh/advanced
+file-journal refusals and all prior status/bundle guards remain intact.
+The full clean runtime suite records 237/1/6: one unchanged cross-thread handoff
+times out at its 500ms port budget. Isolated old/new passes do not explain that
+loss; no deadline changed. Total resource/fault/status-boundary coverage,
+portable checkpoint chains, automatic API catalog recovery and native DSR
+acceptance remain open. See the current reality-check record and raw RCH logs.
+
 **Command admission reliability (2026-10-27):** [Scoped repair qualified —
 VioletTrout, `bd-2z0.12.2.1` closed under the unchanged open API umbrella]
 Diagnose the remaining real memory/server MCP map-apply authority lookup

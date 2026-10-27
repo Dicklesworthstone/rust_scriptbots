@@ -2,6 +2,201 @@
 
 ## Current implementation status — 2026-10-27, VioletTrout
 
+Afternoon continuation after `41e9aae6`, original `bd-2z0.5.11`:
+
+Source **`9bee85d6a66b1c742c28cf48169f93e5cf413ae7`**, reviewed tree
+`ae78f38ad8cc77fcb4eda3785f72649bf27658dd`, delivers actual unfinished-run
+continuation. The shipped server resumes a saved nonzero cut when the client
+resubmits the original explicitly named experiment request. The original launch
+manifest, owner session, brain/RNG state, command identities and retained journal
+history survive. Missing/corrupt/unrelated cuts remain refusals.
+
+Fresh clean-source RCH proofs: **19 runner tests passed**, 647 filtered,
+187.97s; **8 process tests passed**, 3 original ignores, 0 filtered, 106.05s;
+workspace all-targets check (29.73s), strict Clippy (34.28s), formatting and
+whitespace checks pass. UBS scans all four changed source files with **0 critical,
+3,096 warnings, 851 informational findings**; this is not a warning-free scan.
+The shipped server restores tick **2**, finishes tick **12**, matches its
+uninterrupted digest `2b53b4f0e5755203`, and both bundles pass separate CLI
+verification. Actual worker processes resume MLP cut **9** and DWRAON cut **6**
+to tick 40, matching their uninterrupted digests. The concurrency comparison
+reopens all four distinct family/seed cells at concurrency 1 and 2.
+
+**Open qualification:** the clean full runtime suite is **237 passed / 1 failed /
+6 existing ignores**. The unchanged
+`cross_thread_handoff_reply_and_owner_join_preserve_the_exact_captured_cut`
+times out at the actual 500ms port budget; its caller's five-second bound cannot
+extend that budget. Earlier same-source candidates pass 238/0/6. A bounded
+isolated prior-baseline/current comparison passes once each, but does not explain
+the full-suite loss. No deadline, test or gate was relaxed. Mail 241 notifies the
+production checkpoint owner; the gap remains on the original open work.
+
+The existing lab-assistant consumer also passes **10 / 0 / 0**, 656 filtered,
+35.31s, on clean `9bee85d6`. Raw logs are retained in
+`/data/tmp/scriptbots-next-gap-20261027-violettrout/`. A later read-only copy of
+the printed remote process directory fails with No such file; its empty 45-byte
+archive is a failed retrieval, not recovered artifact evidence. This is fresh solo
+re-execution, not independent review, a full-workspace test pass, a performance
+claim, or native DSR acceptance.
+
+- [x] Re-triage the authoritative graph and inspect the runner's actual restore seam.
+- [x] Reserve the exact runtime/runner/report/tracker paths; retain the prior tracker dirt.
+- [x] Capture the actual settled volatile journal, including retained scientific history.
+- [x] Validate and encode a paired host/journal artifact without caller-invented cursors.
+- [x] Restore the original session, commands, event history, RNG and science state.
+- [x] Prove zero/nonzero cut round trips, exact retry/collision behavior and bad-cut refusal.
+- [x] Prepare each run's initial durable cut before its Running status transition.
+- [x] Atomically retain completed-tick cuts and wire the runner to resume their next tick.
+- [x] Preserve original launch provenance and bounded plan/family/seed/config validation.
+- [x] Handle interrupted writes without silently promoting partial or unrelated artifacts.
+- [x] Compare interrupted/resumed real runs against uninterrupted MLP/DWRAON runs.
+- [x] Compare all real MLP/DWRAON seed cells at concurrency 1 and 2; reopen results.
+- [x] Re-execute existing companion-recovery and status/bundle corruption controls.
+- [x] Run the real process interruption/restart path and required source checks through RCH.
+- [x] Qualify the shipped server's identical named-create reattachment and CLI bundle readback.
+- [x] Check the lab assistant consumer of the changed recording policy.
+- [x] Reassess the original seven criteria; keep unmet resource/fault/native work open.
+- [x] Prepare the reviewed source, report and canonical tracker snapshots for guarded publication.
+
+The final push/ref/reservation receipt is reported in the conversation handoff,
+after these immutable documentation and tracker snapshots are committed.
+
+The existing report is the user-requested TODO and handoff consumer; this block
+retires to an evidence record at handoff. Raw probes retain actual failures and
+source identity. No new planning framework or acceptance certificate is added.
+
+Runtime candidate RCH proof `volatile-pair-sealed-zero.log` executes 2 tests,
+0 failures, 242 filtered (0.26s), from base `41e9aae6` and explicit runtime
+overlay fingerprint `ff169d40271a526582d9e95061cee9791686a928f2de4fb49d6226bb41383a7c`.
+The first attempt is retained: 1 pass / 1 failure because tick-zero founders
+had an unflushed `host.persistence_tail`. The correction executes the existing
+canonical FlushPersistence command; the quiescence guard is unchanged. No
+runner capability is qualified by these two runtime tests alone. This early
+probe preceded the consumer and restart proofs now recorded above.
+
+Later candidate evidence supersedes that early qualification boundary: the
+complete runtime suite passes **238 / 0 / 6 existing ignores** after the sealed
+flush repair. Runner overlay `9b05c34dd958a49ea2cdc40bd0e0db604a81762180a49737d9b67437d4cc36c2`
+passes **19 / 0 / 0**, 647 filtered, 186.53s. Its actual worker-process kills
+observe MLP cut 9 and DWRAON cut 7, each continuing to tick 40 with the same
+digest as its uninterrupted process (`a5bdbf8a1615575e` and `82544897a98c1431`).
+The six zero/nonzero restore cells also retain an extra real same-tick command,
+which distinguishes their saved journal histories from a deterministic rerun.
+All four family/seed cells differ and agree between concurrency 1 and 2.
+These are real runner processes; the separate shipped-server proof is above.
+Workspace all-targets check and strict Clippy pass on that exact overlay;
+the later shipped-process test is qualified separately on clean `9bee85d6`.
+
+Retained failed attempts: the first runner compile lacks a LocalHostPort type
+argument; the first executed runner suite is **9 / 9 / 0**, exposing disabled
+recording's pending founders. Experiments now select recording cadence 1 in
+their actual constructor and manifest, while complete treatment arms remain
+validated. A separate repeated-flush control fails **1 / 1 / 0**: the existing
+flush unnecessarily requests an anchor at an already sealed boundary. The
+repair avoids that request; the full checkpoint guard and file-journal exact
+prefix requirement are unchanged. Strict runtime Clippy first catches the new
+chunk loop; it is corrected with fixed-array slices, without a suppression.
+A redundant cold-worker Clippy job is explicitly cancelled through its owned
+RCH wrapper, not counted as a lint result; the warm-worker full check passes.
+
+Original `bd-2z0.5.11` remains in progress with all seven criteria intact.
+This increment does not complete total disk/resident-memory/deadline/cancellation
+bounds, every status-write/fault boundary, portable checkpoint-chain publication,
+automatic API catalog reconstruction, branch/intervention semantics, or native
+DSR acceptance. The live API source can reconstruct the same named plan from a
+repeated create request after restart, and the shipped test verifies that
+specific route. No automatic experiment-ID-only catalog recovery is inferred.
+
+### Bounded anti-ceremony audit — afternoon continuation
+
+Creation worksheet: runtime branches on the paired checkpoint and run sidecar,
+so they are FEATURE state. The existing report and Beads are PROCESS: the
+operator explicitly requested the detailed TODO, reality check and task tracking;
+that request supplies their consumer and gate. The observed defect was Running
+status without a restorable owner/journal cut. This TODO retires to the handoff
+record after publication. Minimal raw failed/successful logs preserve the
+observed crash/restore decisions; they are
+necessary at this scale, smaller than another harness, and have no cheaper
+equivalent. Another reporting framework would delay the ready continuation work
+and is rejected. All four creation questions and the integrity exception are
+therefore bounded to this existing requested record.
+
+Real-work worksheet: the README promises an evolutionary simulation laboratory
+with reproducible research. The source commit is USER (runtime/codec/tests are
+its exercised ENABLERS, not extra delivered features). The requested docs and
+tracker commits are PROCESS. The handoff tally is one USER, zero separately
+banked ENABLERS, two planned PROCESS units, zero UNKNOWN; it is not a quota.
+A short demo kills the shipped server, reattaches the same named plan, observes
+nonzero restoration and compares the finished bundle with its uninterrupted
+oracle. Removing the process updates would leave the runtime behavior identical
+but lose the operator's requested TODO and the full-runtime failure. Both the
+runner and real REST worker consume the new runtime state. This original P1
+blocker was chosen ahead of native graphics/performance work outside the approved
+RCH lane. No agents were delegated, no closes were farmed, no requirements were
+weakened and no follow-up was minted to close the original. Verdict: HEALTHY,
+with the correction to stop expansion after consumer verification and publish;
+the unresolved runtime timing result stays visible rather than triggering
+retries until green.
+
+Honesty inventory, bounded to the four source diffs, original acceptance,
+reviewed tree, raw RCH logs, current graph and publication:
+
+1. No (checked: every hunk of the immutable source review; no existing test,
+   ignore, deadline, CI gate or golden was removed or weakened).
+2. No (checked: both real families, actual HostCore/journal, real files, OS kills,
+   shipped REST servers and CLI readers; NullPersistence is the runner's existing
+   production adapter, and its receipts remain explicitly volatile).
+3. No (checked: no golden/snapshot path changed).
+4. Yes: the process test extracts the existing ANSI-removal body into
+   `plain_server_log` for the actual restore observation. Its old address-parser
+   conditions are unchanged; the complete process file passes. New checkpoint
+   validators are product state boundaries, not weakened release gates. No lint
+   waiver, tolerance or deadline relaxation was added. The extraction was read
+   hunk by hunk, not treated as an incidental gate fix.
+5. No (checked: the ordinary runner and existing REST worker use the same live
+   path; no demo identity, benchmark input or environment changes product behavior).
+6. No (checked: actual counts are 19/0/0 and 8/0/3; the full-runtime 237/1/6 is
+   red. CLI-argument rejections and the cancelled cold job qualify no tests).
+7. No (checked: each claimed execution has retained output and a pinned revision;
+   source-only inspection and historical candidates are labeled separately).
+8. No (checked: metadata/frame mutations are labeled parser controls; process
+   restart is observed live; there is no independent/native/performance claim).
+9. No (checked: initial unflushed capture, compiler omission, runner 9/9,
+   repeated-flush 1/1, first Clippy failure, clean runtime timeout and failed
+   remote artifact retrieval are retained and qualified).
+10. No (checked: RCH stdout/stderr are retained. Child logs were written into
+    their test artifact directories; the later unavailable remote directory is
+    disclosed and those files are not claimed locally retained).
+11. No (checked: original bd-2z0.5.11 remains in progress with all seven criteria;
+    no new item carries away acceptance to permit closure).
+12. No (checked: plan edits describe implementation status; original criteria
+    and declared treatment validation remain intact. Recording cadence 1 is an
+    actual constructor policy bound by each manifest, not a prose-only change).
+13. Not applicable: solo work; no delegated agent closed any item.
+14. Not applicable: no dispatch or success-only subagent instructions.
+15. Not applicable: no delegated report was accepted as verification.
+16. Not applicable: no swarm/pane activity or refusal farming.
+17. No (checked: peer mail is coordination; agreement supplies no proof).
+18. No (checked: test scopes and seed/family/concurrency inputs precede execution;
+    the retained full-runtime loss is not removed from a denominator).
+19. Explain the failed integration assumptions and the one unnecessary cold
+    Clippy launch, cancelled through its exact owned wrapper. Three first clean
+    invocations omitted a required RCH flag and never built; corrected commands
+    are retained separately. Six bounded CASS searches and follow-up views were
+    read, but historical line anchors landed partly in physical log metadata;
+    that index cannot certify the current session or exhaust older behavior.
+20. Strongest repeatable evidence: clean `9bee85d6` shipped server hard kill,
+    actual nonzero restore log, equal uninterrupted digest, separate bundle CLI
+    verification, and the real extra-command continuation/negative controls.
+
+Disposition: the parser extraction is disclosed above and requires no relaxation
+to reverse; its unchanged conditions and full process proof are retained as the
+RH-1 countermeasure. Failed probes are preserved in place and disclosed, with
+RH-2 proof-class boundaries and RH-9 original-acceptance retention explicit.
+The runtime handoff loss is not corrected by a passing isolated rerun; its open
+qualification is recorded and sent to the checkpoint owner. No independent
+verifier was available; no self-review is presented as one.
+
 Qualified implementation after `226dce74` (`bd-2z0.12.2.1`, VioletTrout):
 
 Clean source `9e20fd966b9d3c1f417bd6616d6baf874f627cb4` passes the complete
@@ -109,9 +304,9 @@ no measured speedup or project-wide completion is claimed.
   Beads. Close only `.12.2.1`; retain all seven original `.5.11` criteria,
   umbrella blockers and original UI ownership. All 719 original descriptions,
   criteria, dependencies, assignees, provenance and comment prefixes survive.
-- [ ] Delivery receipt: publish the reviewed source/report/tracker snapshots,
-  verify both remote refs, and release the exact reservations. This report is
-  sealed before its own publication; the final handoff records that observation.
+- [x] Prior delivery receipt: source/report/tracker snapshots were published,
+  reservations released, and both remote refs observed at `41e9aae630aca5a2ed95b716271e02a652129f9e`.
+  The afternoon continuation independently reads both refs at that revision.
 - [x] Build final library proof with real provenance from a clean committed
   source checkout and the actual remote compiler, using the existing compile-time
   fields. Preserve archive-unknown failures; never infer a clean Git state from
