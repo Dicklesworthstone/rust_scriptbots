@@ -2278,47 +2278,48 @@ fn real_process_named_experiment_continues_after_server_kill() -> Result<()> {
         "shipped server continuation evidence: {}",
         directory.display()
     );
-    let spawn = |root: &Path, label: &str| -> Result<(ChildGuard, SocketAddr, ServerLog)> {
-        std::fs::create_dir_all(root)?;
-        let stderr = std::fs::File::create(root.join(format!("{label}.stderr.log")))?;
-        let child = cadence_replay_command()
-            .args(["--mode", "server", "--storage", "memory", "--threads", "2"])
-            .args(["--checkpoint-interval", "0"])
-            .env("SCRIPTBOTS_CONTROL_REST_ENABLED", "1")
-            .env("SCRIPTBOTS_CONTROL_REST_ADDR", "127.0.0.1:0")
-            .env("SCRIPTBOTS_CONTROL_MCP", "http")
-            .env("SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR", "127.0.0.1:0")
-            .env("SCRIPTBOTS_ARTIFACTS_DIR", root.join("artifacts"))
-            .current_dir(root)
-            .stdout(Stdio::from(std::fs::File::create(
-                root.join(format!("{label}.stdout.log")),
-            )?))
-            .stderr(Stdio::piped())
-            .spawn()?;
-        let mut guard = ChildGuard(Some(child));
-        let (address, _, log) = wait_for_control_addresses(
-            guard.0.as_mut().unwrap(),
-            Duration::from_secs(90),
-            Some(stderr),
-        )?;
-        let (code, body) = http(address, "POST", "/api/control/pause")?;
-        assert_eq!(code, 200, "{body}");
-        let id = json_str(&body, "command_id").context("pause command identity")?;
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            let (code, body) = http(address, "GET", &format!("/api/control/status/{id}"))?;
-            let receipt: serde_json::Value = serde_json::from_str(&body)?;
-            if code == 200
-                && receipt["application_state"] == "applied"
-                && receipt["journal_state"] == "committed_volatile"
-            {
-                break;
+    let spawn =
+        |root: &Path, label: &str| -> Result<(ChildGuard, SocketAddr, SocketAddr, ServerLog)> {
+            std::fs::create_dir_all(root)?;
+            let stderr = std::fs::File::create(root.join(format!("{label}.stderr.log")))?;
+            let child = cadence_replay_command()
+                .args(["--mode", "server", "--storage", "memory", "--threads", "2"])
+                .args(["--checkpoint-interval", "0"])
+                .env("SCRIPTBOTS_CONTROL_REST_ENABLED", "1")
+                .env("SCRIPTBOTS_CONTROL_REST_ADDR", "127.0.0.1:0")
+                .env("SCRIPTBOTS_CONTROL_MCP", "http")
+                .env("SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR", "127.0.0.1:0")
+                .env("SCRIPTBOTS_ARTIFACTS_DIR", root.join("artifacts"))
+                .current_dir(root)
+                .stdout(Stdio::from(std::fs::File::create(
+                    root.join(format!("{label}.stdout.log")),
+                )?))
+                .stderr(Stdio::piped())
+                .spawn()?;
+            let mut guard = ChildGuard(Some(child));
+            let (address, mcp_address, log) = wait_for_control_addresses(
+                guard.0.as_mut().unwrap(),
+                Duration::from_secs(90),
+                Some(stderr),
+            )?;
+            let (code, body) = http(address, "POST", "/api/control/pause")?;
+            assert_eq!(code, 200, "{body}");
+            let id = json_str(&body, "command_id").context("pause command identity")?;
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let (code, body) = http(address, "GET", &format!("/api/control/status/{id}"))?;
+                let receipt: serde_json::Value = serde_json::from_str(&body)?;
+                if code == 200
+                    && receipt["application_state"] == "applied"
+                    && receipt["journal_state"] == "committed_volatile"
+                {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "pause did not settle: {body}");
+                std::thread::sleep(Duration::from_millis(20));
             }
-            assert!(Instant::now() < deadline, "pause did not settle: {body}");
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        Ok((guard, address, log))
-    };
+            Ok((guard, address, mcp_address, log))
+        };
     let payload = serde_json::json!({
         "experiment_id": "server-continuation", "description": "hard process restart",
         "variants": [{"variant_id":"mlp", "brain_family":"mlp"}],
@@ -2355,7 +2356,7 @@ fn real_process_named_experiment_continues_after_server_kill() -> Result<()> {
         }
     };
     let interrupted = directory.join("interrupted");
-    let (mut first, address, _) = spawn(&interrupted, "first")?;
+    let (mut first, address, _, _) = spawn(&interrupted, "first")?;
     let created = create(address)?;
     let run_id = created["runs"][0]["run_id"]
         .as_str()
@@ -2386,7 +2387,7 @@ fn real_process_named_experiment_continues_after_server_kill() -> Result<()> {
     let interrupted_status: serde_json::Value =
         serde_json::from_slice(&std::fs::read(output.join("status.json"))?)?;
     assert_eq!(interrupted_status["runs"][0]["state"], "Running");
-    let (resumed_guard, resumed_address, resumed_log) = spawn(&interrupted, "resumed")?;
+    let (resumed_guard, resumed_address, _, resumed_log) = spawn(&interrupted, "resumed")?;
     let (code, body) = http(resumed_address, "GET", "/api/v1/experiments")?;
     assert_eq!(code, 200, "discovered catalog: {body}");
     let catalog: serde_json::Value = serde_json::from_str(&body)?;
@@ -2443,7 +2444,7 @@ fn real_process_named_experiment_continues_after_server_kill() -> Result<()> {
         restored_ticks[0]
     );
     let oracle_root = directory.join("oracle");
-    let (oracle_guard, oracle_address, _) = spawn(&oracle_root, "oracle")?;
+    let (oracle_guard, oracle_address, _, _) = spawn(&oracle_root, "oracle")?;
     create(oracle_address)?;
     let expected = finish(oracle_address)?;
     assert_eq!(completed["completed_runs"], 1);
@@ -2488,8 +2489,148 @@ fn real_process_named_experiment_continues_after_server_kill() -> Result<()> {
         directory.join("oracle.json"),
         serde_json::to_vec_pretty(&expected)?,
     )?;
-    drop(oracle_guard);
+    let (code, body) = http(resumed_address, "GET", "/api/v1/artifacts?limit=100")?;
+    assert_eq!(code, 200, "original artifact catalog: {body}");
+    let original_catalog: serde_json::Value = serde_json::from_str(&body)?;
+    let items = original_catalog["items"]
+        .as_array()
+        .context("actual artifact entries")?;
+    let source_bundle = output.join(run_id);
+    let manifest: scriptbots_storage::RunBundleV1 =
+        serde_json::from_slice(&std::fs::read(source_bundle.join("bundle_manifest.json"))?)?;
+    assert_eq!(items.len(), manifest.artifacts.len() + 1);
+    let status_bytes = std::fs::read(output.join("status.json"))?;
     drop(resumed_guard);
+    let (recovered_guard, recovered_address, recovered_mcp, _) =
+        spawn(&interrupted, "completed-restart")?;
+    // A known ID must work before any list, create or resume request.
+    let first_id = items[0]["artifact_id"]
+        .as_str()
+        .context("saved artifact ID")?;
+    let initialize = serde_json::json!({"jsonrpc":"2.0", "id":40, "method":"initialize",
+        "params":{"protocolVersion":"2024-11-05", "capabilities":{},
+            "clientInfo":{"name":"completed-artifact-recovery", "version":"1"}}});
+    let (code, body) = http_with_body(
+        recovered_mcp,
+        "POST",
+        "/mcp",
+        &serde_json::to_vec(&initialize)?,
+        Some("application/json"),
+    )?;
+    assert_eq!(code, 200, "MCP initialize: {body}");
+    let initialized: serde_json::Value = serde_json::from_str(&body)?;
+    assert_eq!(initialized["id"], 40);
+    assert!(initialized["error"].is_null(), "{body}");
+    assert_eq!(initialized["result"]["protocolVersion"], "2024-11-05");
+    let notification = serde_json::json!({"jsonrpc":"2.0", "method":"notifications/initialized"});
+    let (code, body) = http_with_body(
+        recovered_mcp,
+        "POST",
+        "/mcp",
+        &serde_json::to_vec(&notification)?,
+        Some("application/json"),
+    )?;
+    assert_eq!(code, 202, "MCP initialized notification: {body}");
+    let request = serde_json::json!({"jsonrpc":"2.0", "id":41, "method":"tools/call",
+        "params":{"name":"artifact_get","arguments":{"artifact_id":first_id}}});
+    let (code, body) = http_with_body(
+        recovered_mcp,
+        "POST",
+        "/mcp",
+        &serde_json::to_vec(&request)?,
+        Some("application/json"),
+    )?;
+    assert_eq!(code, 200, "cold MCP artifact lookup: {body}");
+    let reply: serde_json::Value = serde_json::from_str(&body)?;
+    assert_eq!(reply["jsonrpc"], "2.0");
+    assert_eq!(reply["id"], 41);
+    assert!(reply["error"].is_null(), "{body}");
+    assert!(
+        matches!(
+            reply["result"].get("isError"),
+            None | Some(serde_json::Value::Bool(false))
+        ),
+        "{body}"
+    );
+    let metadata: serde_json::Value = serde_json::from_str(
+        reply["result"]["content"][0]["text"]
+            .as_str()
+            .context("artifact metadata result")?,
+    )?;
+    assert_eq!(metadata, items[0], "MCP recovers the original metadata");
+    let (code, _) = http_with_body_raw(
+        recovered_address,
+        "GET",
+        &format!("/api/v1/artifacts/{first_id}/download"),
+        &[],
+        None,
+    )?;
+    assert_eq!(code, 200, "download by original artifact identity");
+    let (code, body) = http(recovered_address, "GET", "/api/v1/artifacts?limit=100")?;
+    assert_eq!(code, 200, "recovered artifact catalog: {body}");
+    let recovered_catalog: serde_json::Value = serde_json::from_str(&body)?;
+    assert_eq!(recovered_catalog, original_catalog);
+    let downloaded = interrupted.join("downloaded-after-restart");
+    let prefix = format!("experiments/server-continuation/{run_id}/");
+    for item in items {
+        let id = item["artifact_id"].as_str().context("artifact ID")?;
+        let relative = item["relative_path"].as_str().context("artifact path")?;
+        let path = Path::new(relative.strip_prefix(&prefix).context("run-scoped path")?);
+        assert!(
+            path.components()
+                .all(|part| matches!(part, std::path::Component::Normal(_)))
+        );
+        let (code, bytes) = http_with_body_raw(
+            recovered_address,
+            "GET",
+            &format!("/api/v1/artifacts/{id}/download"),
+            &[],
+            None,
+        )?;
+        assert_eq!(code, 200, "recovered file: {id}");
+        assert_eq!(bytes, std::fs::read(source_bundle.join(path))?);
+        assert_eq!(
+            item["checksum_blake3"],
+            scriptbots_app::control::compute_blake3(&bytes)
+        );
+        assert_eq!(
+            item["checksum_sha256"],
+            scriptbots_app::control::compute_sha256(&bytes)
+        );
+        let destination = downloaded.join(path);
+        std::fs::create_dir_all(destination.parent().context("download parent")?)?;
+        std::fs::write(destination, bytes)?;
+    }
+    let verified = scriptbots_storage::verify_run_bundle(&downloaded)?;
+    assert_eq!(verified.max_tick, TICKS);
+    let cli = Command::new(binary())
+        .arg("--verify-bundle")
+        .arg(&downloaded)
+        .output()?;
+    std::fs::write(
+        interrupted.join("recovered-download-verify.stdout.log"),
+        &cli.stdout,
+    )?;
+    std::fs::write(
+        interrupted.join("recovered-download-verify.stderr.log"),
+        &cli.stderr,
+    )?;
+    assert!(
+        cli.status.success(),
+        "downloaded bundle CLI: {}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    assert_eq!(
+        std::fs::read(output.join("status.json"))?,
+        status_bytes,
+        "completed recovery must not re-run or rewrite status"
+    );
+    println!(
+        "completed server restart recovered and downloaded {} original artifact IDs",
+        items.len()
+    );
+    drop(oracle_guard);
+    drop(recovered_guard);
     Ok(())
 }
 

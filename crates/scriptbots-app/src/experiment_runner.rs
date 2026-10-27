@@ -763,6 +763,27 @@ impl MatchedSeedExperimentRunner {
         }
     }
 
+    /// Verify every completed member of an already-read status before exposing
+    /// its artifacts. This is read-only and retains the runner's complete
+    /// plan/family/config/evidence checks rather than only bundle byte hashes.
+    pub(crate) fn verify_completed_status(
+        &self,
+        state_file: &Path,
+        status: &ExperimentBatchStatus,
+    ) -> Result<(), ExperimentRunnerError> {
+        let plan = self.validated_plan()?;
+        self.validate_status(state_file, status, &plan)?;
+        for record in status
+            .runs
+            .iter()
+            .filter(|run| run.state == RunState::Completed)
+        {
+            let (variant, family) = &plan.variants[&record.variant_id];
+            self.verify_completed_bundle(record, variant, *family, &plan.digest)?;
+        }
+        Ok(())
+    }
+
     fn initial_status(&self, plan: &ValidatedPlan) -> ExperimentBatchStatus {
         ExperimentBatchStatus {
             schema_version: STATUS_SCHEMA_VERSION,

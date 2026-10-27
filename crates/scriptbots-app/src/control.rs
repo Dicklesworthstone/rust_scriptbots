@@ -1018,8 +1018,8 @@ impl ExperimentDefinitionV1 {
 /// A REST/MCP-created matched-seed batch executing on a background runner thread.
 ///
 /// The runner's atomically written status file is the only source of run
-/// progress; this job adds only the process-local execution state (whether a
-/// worker is live, whether cancellation was requested, and a batch-level error).
+/// progress; this job adds process-local execution state and the last status
+/// generation whose completed artifacts were verified and published.
 struct ExperimentJob {
     runner: std::sync::Arc<crate::experiment_runner::MatchedSeedExperimentRunner>,
     state_file: PathBuf,
@@ -1028,6 +1028,7 @@ struct ExperimentJob {
     last_error: std::sync::Arc<Mutex<Option<String>>>,
     created_at_utc: String,
     artifact_root: PathBuf,
+    artifact_generation: Mutex<Option<u64>>,
 }
 
 impl std::fmt::Debug for ExperimentJob {
@@ -1040,6 +1041,26 @@ impl std::fmt::Debug for ExperimentJob {
 }
 
 impl ExperimentJob {
+    fn recover_artifacts(&self, services: &DataServices) -> Result<(), ControlError> {
+        let status = self
+            .runner
+            .status_snapshot(&self.state_file)
+            .map_err(|error| experiment_catalog_error(&self.state_file, error))?;
+        let mut published = self
+            .artifact_generation
+            .lock()
+            .map_err(|_| ControlError::Lock)?;
+        if published.is_some_and(|generation| generation >= status.generation) {
+            return Ok(());
+        }
+        self.runner
+            .verify_completed_status(&self.state_file, &status)
+            .map_err(|error| experiment_catalog_error(&self.state_file, error))?;
+        services.publish_experiment_artifacts(&status, &self.artifact_root)?;
+        *published = Some(status.generation);
+        Ok(())
+    }
+
     /// Start (or restart) the batch worker. `running` is raised before the
     /// thread exists so a status read can never observe a false idle gap.
     fn start(&self, services: std::sync::Arc<DataServices>) {
@@ -1479,6 +1500,7 @@ impl DataServices {
                 last_error: Arc::default(),
                 created_at_utc: definition.created_at_utc,
                 artifact_root: root,
+                artifact_generation: Mutex::new(None),
             },
         );
         Ok(())
@@ -1512,6 +1534,20 @@ impl DataServices {
         let mut first_error = None;
         for name in names {
             if let Err(error) = self.recover_experiment(&name) {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// Recover healthy batches even when another saved batch is unreadable.
+    /// Whole-list discovery still reports the error; a direct lookup can use a
+    /// successfully published companion without concealing that global refusal.
+    fn recover_experiment_artifacts(&self) -> Result<(), ControlError> {
+        let mut first_error = self.recover_experiment_catalog().err();
+        let jobs = self.experiments.lock().map_err(|_| ControlError::Lock)?;
+        for job in jobs.values() {
+            if let Err(error) = job.recover_artifacts(self) {
                 first_error.get_or_insert(error);
             }
         }
@@ -2079,6 +2115,7 @@ impl ControlHandle {
             last_error: std::sync::Arc::default(),
             created_at_utc: format!("{secs}"),
             artifact_root,
+            artifact_generation: Mutex::new(None),
         };
         {
             let mut lock = self
@@ -2556,14 +2593,34 @@ impl ControlHandle {
     }
 
     fn retained_artifact(&self, artifact_id: &str) -> Result<RetainedArtifact, ControlError> {
-        let lock = self
+        if let Some(artifact) = self
             .data_services
             .artifacts
             .lock()
-            .map_err(|_| ControlError::Lock)?;
-        lock.get(artifact_id)
+            .map_err(|_| ControlError::Lock)?
+            .get(artifact_id)
             .cloned()
-            .ok_or_else(|| ControlError::NotFound(format!("artifact '{artifact_id}' not found")))
+        {
+            return Ok(artifact);
+        }
+        // Do not hold the artifact lock while discovery takes the job locks or
+        // publishes verified files. The miss path also supports cold downloads
+        // when the client already knows an ID and never asks for a list.
+        let discovery = self.data_services.recover_experiment_artifacts();
+        if let Some(artifact) = self
+            .data_services
+            .artifacts
+            .lock()
+            .map_err(|_| ControlError::Lock)?
+            .get(artifact_id)
+            .cloned()
+        {
+            return Ok(artifact);
+        }
+        discovery?;
+        Err(ControlError::NotFound(format!(
+            "artifact '{artifact_id}' not found"
+        )))
     }
 
     /// List discoverable artifacts with bounded pagination.
@@ -2581,6 +2638,7 @@ impl ControlHandle {
             0
         };
 
+        self.data_services.recover_experiment_artifacts()?;
         let lock = self
             .data_services
             .artifacts
@@ -4437,6 +4495,32 @@ pub(crate) mod tests {
             .collect();
         assert_eq!(expected, actual, "completed files must be discoverable");
         assert!(!catalog.has_more);
+        let (mut restarted, _restarted_host) = self::handle();
+        restarted.data_services = Arc::new(DataServices::new(original_root.clone()));
+        let recovered = restarted
+            .list_artifacts(Some(100), None)
+            .expect("recovered catalog");
+        assert_eq!(
+            recovered.total, catalog.total,
+            "restart must recover the original files"
+        );
+        assert_eq!(
+            serde_json::to_value(&recovered.items).unwrap(),
+            serde_json::to_value(&catalog.items).unwrap(),
+            "artifact identities and hashes survive restart"
+        );
+        let (mut direct, _direct_host) = self::handle();
+        direct.data_services = Arc::new(DataServices::new(original_root.clone()));
+        for artifact in &catalog.items {
+            let (metadata, bytes) = direct
+                .read_artifact_bytes(&artifact.artifact_id)
+                .expect("cold download by the original ID without a list/create/resume");
+            assert_eq!(metadata.artifact_id, artifact.artifact_id);
+            assert_eq!(
+                bytes,
+                fs::read(original_root.join(&artifact.relative_path)).unwrap()
+            );
+        }
         let handle = handle
             .with_artifacts_dir(original_root.with_extension("rotated"))
             .expect("rotate the active artifact root");
@@ -4461,6 +4545,132 @@ pub(crate) mod tests {
             handle.read_artifact_bytes(&artifact.artifact_id),
             Err(ControlError::InvalidPatch(_))
         ));
+    }
+
+    #[test]
+    fn experiment_artifact_recovery_rejects_semantic_tampering_and_preserves_healthy_jobs() {
+        let (handle, _host) = handle();
+        let mut finished = Vec::new();
+        for (id, seeds) in [("a-corrupt", vec![7, 8]), ("z-healthy", vec![9])] {
+            let mut request = experiment_creation_request();
+            request.experiment_id = Some(id.into());
+            request.idempotency_key = Some(format!("key-{id}"));
+            request.seeds = seeds;
+            handle.create_experiment(request).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let status = handle.get_experiment(id).unwrap();
+                if status.status == "completed" {
+                    finished.push(status);
+                    break;
+                }
+                assert_ne!(status.status, "failed", "{status:?}");
+                assert!(std::time::Instant::now() < deadline, "{status:?}");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        let root = handle.artifacts_dir();
+        let original_catalog = handle.list_artifacts(Some(100), None).unwrap();
+        let statuses = finished
+            .iter()
+            .map(|batch| {
+                let path = root
+                    .join("experiments")
+                    .join(&batch.experiment_id)
+                    .join("status.json");
+                let bytes = fs::read(&path).unwrap();
+                (path, bytes)
+            })
+            .collect::<Vec<_>>();
+        let bad_batch = &finished[0];
+        assert_ne!(
+            bad_batch.runs[0].final_digest,
+            bad_batch.runs[1].final_digest
+        );
+        let bundle_dir = Path::new(bad_batch.runs[1].bundle_path.as_ref().unwrap());
+        let manifest_path = bundle_dir.join("bundle_manifest.json");
+        let evidence_path = bundle_dir.join("evidence/run.json");
+        let original_manifest = fs::read(&manifest_path).unwrap();
+        let original_evidence = fs::read(&evidence_path).unwrap();
+        fs::copy(&manifest_path, root.join("preserved-bundle-manifest.json")).unwrap();
+        fs::copy(&evidence_path, root.join("preserved-run-evidence.json")).unwrap();
+        let mut evidence: Value = serde_json::from_slice(&original_evidence).unwrap();
+        evidence["final_digest"] = bad_batch.runs[0].final_digest.clone().unwrap().into();
+        let changed = serde_json::to_vec(&evidence).unwrap();
+        fs::write(&evidence_path, &changed).unwrap();
+        let mut manifest: scriptbots_storage::RunBundleV1 =
+            serde_json::from_slice(&original_manifest).unwrap();
+        let entry = manifest
+            .artifacts
+            .iter_mut()
+            .find(|entry| entry.relative_path == "evidence/run.json")
+            .unwrap();
+        entry.blake3_hex = compute_blake3(&changed);
+        entry.bytes_len = changed.len() as u64;
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        scriptbots_storage::verify_run_bundle(bundle_dir)
+            .expect("byte-valid control must pass the generic verifier");
+
+        let (mut restarted, _restarted_host) = self::handle();
+        restarted.data_services = Arc::new(DataServices::new(root.clone()));
+        assert!(
+            matches!(
+                restarted.list_artifacts(Some(100), None),
+                Err(ControlError::Serialization(_))
+            ),
+            "science mismatch must refuse publication"
+        );
+        let healthy = original_catalog
+            .items
+            .iter()
+            .filter(|item| item.relative_path.starts_with("experiments/z-healthy/"))
+            .collect::<Vec<_>>();
+        assert!(!healthy.is_empty());
+        {
+            let retained = restarted.data_services.artifacts.lock().unwrap();
+            assert_eq!(
+                retained.len(),
+                healthy.len(),
+                "no partial files from the bad two-run batch"
+            );
+            assert!(retained.values().all(|item| {
+                item.metadata
+                    .relative_path
+                    .starts_with("experiments/z-healthy/")
+            }));
+        }
+        let (mut direct, _direct_host) = self::handle();
+        direct.data_services = Arc::new(DataServices::new(root.clone()));
+        for artifact in healthy {
+            let (_, bytes) = direct
+                .read_artifact_bytes(&artifact.artifact_id)
+                .expect("cold healthy lookup succeeds despite the companion refusal");
+            assert_eq!(bytes, fs::read(root.join(&artifact.relative_path)).unwrap());
+        }
+        let bad_artifact = original_catalog
+            .items
+            .iter()
+            .find(|item| item.relative_path.starts_with("experiments/a-corrupt/"))
+            .unwrap();
+        assert!(matches!(
+            restarted.get_artifact(&bad_artifact.artifact_id),
+            Err(ControlError::Serialization(_))
+        ));
+        fs::write(&evidence_path, &original_evidence).unwrap();
+        fs::write(&manifest_path, &original_manifest).unwrap();
+        let restored = restarted.list_artifacts(Some(100), None).unwrap();
+        assert_eq!(
+            serde_json::to_value(restored.items).unwrap(),
+            serde_json::to_value(original_catalog.items).unwrap(),
+            "same-generation repair must retry verification without duplicate identities"
+        );
+        for (path, bytes) in statuses {
+            assert_eq!(
+                fs::read(path).unwrap(),
+                bytes,
+                "discovery never rewrites science status"
+            );
+        }
     }
 
     #[test]
