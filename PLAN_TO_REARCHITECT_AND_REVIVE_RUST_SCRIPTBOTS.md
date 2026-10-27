@@ -4,6 +4,26 @@
 
 **Evidence date:** 2026-07-11
 
+**Experiment recovery (2026-10-26):** [Currently In Progress — VioletTrout,
+`bd-2z0.5.11`, reopened with original acceptance intact]
+Recover completed bundles interrupted before the final status commit through
+the existing canonical verifier (`edffa215`; 13 focused RCH tests pass).
+The mixed-batch follow-up `1c8d5c2a` retains verified companions before refusing
+an unfinished run; all 14 focused runner tests, workspace all-targets check,
+strict Clippy and formatting pass. Exact commands/failures are in the reality check.
+Exact next-tick recovery of unfinished runs,
+complete resource admission and interrupted-process qualification remain open.
+
+**Finished-reader stack safety (2026-10-26):** [Currently In Progress —
+VioletTrout continuing preserved LilacElm work, `bd-6sgk`]
+The retained debug binary's SQL dispatcher reserves over 2 MiB in one frame.
+The original configuration fails the explicit 2 MiB reader regression with a
+stack overflow. Dependency-only debug optimization (`979f37c1`) passes that
+read/schema-refusal/restoration sequence and all 22 targeted persistence/journal
+tests. Ordinary thread allowance, reader validation and release profile remain
+intact. Release/native qualification remains unfinished on the original owner.
+This does not qualify the separate production command deadlines or native DSR.
+
 **Production experiment journey (2026-10-26):** [Currently In Progress —
 LilacElm, `bd-2z0.12.2`; scoped test source committed as `12632a26`]
 Strengthen the existing real server/file-storage test to inspect MCP envelopes,

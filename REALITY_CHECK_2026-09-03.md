@@ -1,4 +1,423 @@
-# Reality Check — rust_scriptbots — reassessed 2026-10-20
+# Reality Check — rust_scriptbots — implementation continuation 2026-10-27
+
+## Current implementation status — 2026-10-27, VioletTrout
+
+Three source increments are committed: `979f37c1` fixes ordinary-stack debug SQL
+readers and the storage narrative capture fixture; `edffa215` recovers verified
+completed experiment bundles before their final status publication; `1c8d5c2a`
+retains independently verified companions when another run cannot recover.
+The final source passes all 14 focused runner tests, workspace all-targets
+check, strict Clippy and formatting.
+
+The final storage targets pass **22 tests**, with two unchanged ignored lanes.
+The final runner source passes all **14 focused tests**. The complete production
+process file runs
+**6 passed / 1 failed / 3 ignored**: the experiment/checkpoint/artifact journey
+passes, but MCP map-apply still hits its durable-authority lookup deadline.
+The app library runs **658 passed / 1 failed / 1 ignored**; its tournament
+publication test refuses incomplete clean-source/compiler provenance in the RCH
+source archive. That refusal is retained; no provenance was fabricated.
+Those broader process/library runs precede the mixed-batch follow-up; its
+exact final source is covered by the 14 focused tests and workspace checks.
+
+Exact next-tick recovery for unfinished experiment runs, native DSR qualification,
+and the remaining control reliability failure stay open on their original owners.
+No project-wide completion, native acceptance or performance win is claimed.
+The granular TODO, original failed attempts and audit worksheets follow the
+baseline assessment.
+
+## Baseline audit snapshot — 2026-10-26 22:29 UTC, VioletTrout
+
+**ScriptBots has a real deterministic simulation, real inherited brains, a real sole-owner
+runtime, and substantial storage, replay, control and analysis machinery. It does not yet
+deliver the complete, reliable, polished Evolution Lab promised by the recovery plan.
+The largest gap is reliable composition: keeping a recorded run responsive, resuming
+interrupted scientific work, using the actual frontends, and publishing qualified results.**
+
+This assessment supersedes the October 20 status statements where source has changed.
+It preserves every existing implementation TODO and historical failed attempt below.
+This snapshot began as an isolated review proposal while LilacElm held the shared
+leases. The implementation continuation below subsequently acquired those exact
+paths after Agent Mail's stale-session check; the original audit is historical.
+
+### Inspection and execution boundary
+
+Inspected main `d94adc5ea327ab43a567943f5906c9bc15bbaf3f`, including the existing
+uncommitted dependency-only debug optimization and storage regression as unfinished work.
+Read the complete 1,057-line repository AGENTS.md and 1,492-line README.md, the root
+`/AGENTS.md`, active recovery roadmap, Franken integration constraints, and relevant
+architecture, rendering, browser, scenario and scientific acceptance documents. Historical
+Markdown and source inspection is bounded; this is not a line-by-line review of every
+historical report, every open description or every implementation file.
+The required `/data/projects/AGENTS.md` remains absent. No replacement suite rules are invented.
+
+Production consumers inspected include main startup and HostThread, HostCore/checkpoint
+contracts, production brain registration, core offspring/checkpoint boundaries, storage
+admission/read boundaries, experiment execution/status/bundles, FrankenTUI, Bevy material
+construction, browser timer/RAF, GPU certification, analytics and real-process acceptance.
+Keyword and AST scans supplement these reads; they do not prove implementation completeness.
+
+| Observation | Exact scope and practical limit |
+|---|---|
+| Fresh executable diagnostics | Retained app SHA-256 `66b17b1993c3082576d0e2dba8679a8a184583093253adb4d134150e8ebdb760`, embedded source `12632a26e4787170b86cdd53b906ae763828cca0`, pinned August 31 compiler. This is an earlier identified executable, not a fresh build of inspected HEAD or the pending reader optimization. |
+| Fresh file-backed terminal run | Ordinary scenario-free ecology, seed 42, one thread, three headless frames, controls disabled, checkpoints disabled: starts at tick 0, presents ticks 1/2/3 with 20 agents, exits zero. Actual TestBackend buffers have 2,439/2,442/2,443 nonblank cells and distinct full-cell hashes. Final storage receipt observes committed tick 3 and admitted/applied/durable batch IDs all 1. No births, deaths or interactions occur; this cannot prove evolution, PTY behavior, checkpointing or long-run reliability. |
+| Fresh repeatability discriminator | Two seed-42 characterization runs have identical five points at ticks 0–4; seed 43 differs. These are V0 characterization observations with evaluator state explicitly uncovered, not full WorldDigestV1 or cross-target determinism qualification. Embedded build provenance is incomplete and remains labelled so. |
+| Current production acceptance evidence, reread | October 26 RCH job `30081342398005264` executes the complete original process file: 4 passed, 3 failed, 3 pre-existing ignored, 0 filtered. The raw log records pause/admission and durable-lookup timeouts plus MCP InternalError. A later same-file attempt explicitly aborts on stack overflow. Partial successes do not clear these failures. |
+| Completed experiment delivery, reread | The retained two-seed MLP batch completes five ticks per arm, produces distinct digests, and six downloaded files total 35,847 bytes. Two shipped-CLI bundle verifications succeed; three malformed-status controls refuse and restored status reads succeed. These are artifact-only bundles, explicitly reproducible=false, before the larger journey fails at checkpoint pause. |
+| Fresh DSR preflight | The declared `scriptbots-verify` launcher refuses/2 with `missing DSR configuration` on this host. Default `dsr config validate` succeeding does not establish the missing runnable profile/host configuration. No new compiler, workspace-test, GPU, browser, PTY, performance or release acceptance is claimed. |
+| Published product | Fresh GitHub release API: latest is v0.4.0, published October 14; its attached-assets array is empty. All four returned releases have zero attached assets. Source releases exist; current main and downloadable qualified platform binaries are separate deliverables. |
+
+Fresh logs, traces, report and database are retained under
+`/data/tmp/scriptbots-reality-check-20261026-violettrout/`. The terminal database is retained
+without cleanup. It was not independently reopened through the pending default-stack reader
+candidate. The shutdown receipt establishes the observed worker acknowledgement, not a new
+crash-recovery test. Older RCH evidence remains under the original production-experiment root.
+
+### Vision checklist and coverage
+
+PARTIAL credits implemented behavior while naming a missing boundary. UNPROVEN means the
+required execution has not been established here. No aggregate completion percentage is
+meaningful across these outcomes. Owners below retain their complete original acceptance.
+
+| # | Testable product promise | Source reality and remaining gap | Existing acceptance owner |
+|---|---|---|---|
+| 1 | Agents sense, act, compete and reproduce | Real staged SoA kernel, grid, resource ledger and oracle/metamorphic machinery. Fresh three-tick smoke observes ticking/resource summaries but no lifecycle events. Long scientific acceptance remains distinct. | `bd-2z0.10.5`, `bd-lmk6` |
+| 2 | Default offspring inherit real brains | Production installer admits MLP/DWRAON/Assembly versioned families; genome/evaluator inheritance is implemented. Placeholder ML is excluded. This delivered foundation should not be described as absent. | Delivered `bd-2z0.3.6`; family extension `.3.12.*` |
+| 3 | Optional brain backends are honestly supported | Candle has inference code; Tract/tch/no-backend wrapper still copies sensors. NeuroFlow is explicitly selectable and withheld from mixed founders. FtBrain has code but outstanding compile/determinism/benchmark/learning acceptance. | `bd-2z0.3.12.3`–`.6` |
+| 4 | One authority owns native scientific time | Main transfers world/session to HostThread, which constructs HostCore; frontends/control use ports and publications. The July split-clock diagnosis is historical. Remaining native input/lifecycle qualification is PARTIAL. | `bd-2z0.4.11`, `.6.8`, `.7.14` |
+| 5 | Pause/step/config changes have truthful receipts | Typed identities, revision guards and independent application/journal axes exist. Recent real process deadlines still fail. Availability of last published status does not prove timely command completion. | `bd-w1oi`, `bd-j8o2`, `bd-2z0.12.2`, `bd-0oro` |
+| 6 | Recorded runs stay responsive and durably stop | Bounded worker, durable outbox, exact retry, watermarks, leases and explicit shutdown are real. Tiny file smoke passes. Persistent throughput, growth, timeout and whole-suite qualification remain open. | `bd-l103`, `bd-kgob`, `bd-w1oi`, `bd-50bg`, `bd-vrb3` |
+| 7 | Finished SQL readers work on ordinary stacks | Real read-only reader exists; SQL execution has no hard deadline. An existing 2 MiB regression and dependency-only debug optimization are being qualified, not accepted by this review. | `bd-6sgk` |
+| 8 | Seeded science has honest deterministic identity | Stable UIDs, domain/agent RNG, canonical V1 digest and stage traces exist; complete provenance and supported bit-exact lane remain necessary. V0 repeatability is weaker evidence. | Delivered RNG/digest owners; `.4.11`, `.13.9` |
+| 9 | Tick-zero and checkpoint replay reject divergence | Real nonempty replay paths, core checkpoints, stage comparison and negative tests exist. Current-source full continuation acceptance remains UNPROVEN. | `bd-2z0.5.13` |
+| 10 | A complete host can deliberately hand off and continue | HostCheckpointV1, journal/session cut, schedule cursor, CLI handoff/restore and real subprocess test exist. Full original native/DSR, exact-retry/history/counter acceptance is still open. | `bd-2z0.5.13` |
+| 11 | Interrupted matched-seed experiments resume exactly | **Implementation gap hidden by a closed owner:** Running status always returns ResumeCheckpointUnavailable. Pending-wave resume is implemented; in-flight crash resume is not. | Original `bd-2z0.5.11`, proposed reopening |
+| 12 | Bounded matched-seed runs execute actual families | Real MLP/DWRAON/Assembly execution through HostCore, bounded waves, stable IDs, CAS status and artifact bundles. Per-run durable science/checkpoint recovery and complete resource/cancel policy remain PARTIAL. | Original `.5.11`; transport `.12.2` |
+| 13 | REST/MCP can discover, download and verify experiments | Real services, completed artifact catalog, checksum downloads, retry/status validation and real process test exist. Latest whole journey still fails; catalogs are process-local. | `bd-2z0.12.2` |
+| 14 | Checkpoint retention and finished bundles are bounded/coherent | Shared quotas, file inventory, leases and logical bundle verification are implemented. Complete operational and composed process acceptance remains open. | `bd-2z0.16`, `.17`, `.19` |
+| 15 | Analytics explains actual evolutionary changes | Real read-only report registry, native statistics, fnx graph and FrankenPandas/Parquet consumers. Existing real seeded report evidence does not finish planted-intervention/null, complete lineage/FTS and repeated-run acceptance. | `bd-2z0.11.9`, `bd-16g.2.9.*` |
+| 16 | Brain comparisons are publishable | Tournament/ratings code is real. Checked-in leaderboard advertises 32 seeds/three families/20k ticks, but its displayed ratings state four seeds/eight matches and two families, with source unknown. Full original publication remains unfinished. | `bd-16g.12.3` |
+| 17 | First launch is a lasting, understandable meadow | Scenario-free ecology spreads founders and differs from core/scenario defaults. Meadow envelope is only 360 ticks; bd-lmk6 records a measured explosion around 1,200, not rerun here. Short-envelope success cannot establish balance. | `bd-lmk6`, `bd-2z0.10.4`, `.10.5` |
+| 18 | Terminal users complete the laboratory workflow | Actual FrankenTUI Program/Model and six science providers exist, with retained widgets and real scoped PTY evidence. Fresh TestBackend frames are not native PTY or complete capability/input-storm proof. | `bd-2z0.6.8`, `bd-dkd9`, `.14.3.5.2` |
+| 19 | Native GUI provides scientific controls and inspection | Real owner-fed GPUI/Bevy/wgpu and control/capture pieces. Complete workflow panes, per-window input, native framebuffer/device/platform qualification remain PARTIAL. | `bd-2z0.7.6`, `.7.6.1`, `.7.8`, `.7.11`, `.7.14` |
+| 20 | Cinematic GPU meadow scales to target populations | Bevy still calls spawn_part for body/ornaments, allocating a StandardMaterial per part. Instancing/LOD, integrated terrain/effects and hardware showcase are incomplete. | `.7.3`, `.14.1.1*`, `.14.1.20`, `.14.1.21` |
+| 21 | Rendering/performance numbers are reproducible | GPUI decision prose claims one Bevy draw and 2.1 ms without inspected raw acceptance; live per-part code cannot establish those claims. Existing exact-class CPU gate is valuable but July Apple-class evidence is not current Linux performance. | `.7.7`, `.14.3.10`, `.14.3.5.3`, `bd-h33` |
+| 22 | GPU sensing certification binds the actual target | Since October 20, matcher now checks full device/backend/driver/build/shader/fixture identities and real dispatch/value counts. This code repair deserves credit; hardware 1,000-tick, shader-fault and scaling acceptance remains UNPROVEN. | `bd-16g.15.3` |
+| 23 | Browser time is independent of painting | Since October 20, timer drives the browser-owned HostCore; RAF only snapshots/presents. Main-thread suspension still has no hard timing guarantee. Packaged-browser/platform acceptance remains open. | `bd-2z0.12.3`, `bd-azi3`, `.12.4`, `.12.7` |
+| 24 | Browser science survives reload durably | Bindings and Canvas exist; WebGPU remains an unwired prototype. No integrated IndexedDB journal/SQLite-image durability path is observed. Native storage success cannot qualify this. | `bd-ywtv`, `.12.3`, `bd-ac4l` |
+| 25 | Maps, islands and scientific extensions serve real workflows | Rule/sample maps, draft history/files, guarded owner Apply and bounded recorded migration are real. Native resource/editor acceptance, long/scaling/speciation, distributed transport, communication study and integrated sound remain PARTIAL. | `.10.7`, `.10.8`, `bd-16g.5`, `bd-t3ge`, `bd-brw4`, `bd-16g.7*`, `.14` |
+| 26 | Claimed fidelity and released products are qualified | Source-derived C++ micro-oracles exist; captured legacy execution and deliberate-divergence ledger remain unqualified. Supported matrix, tutorials, whole journey and verified binary assets remain unfinished. | `.18`, `bd-1bdd`, `.13.3`, `.13.9`, `.13.11` |
+
+### The five answers
+
+1. **What works?** The kernel and versioned heredity, sole-owner host, typed controls,
+   durable-storage protocol, nonempty replay and checkpoints, bounded experiment execution,
+   artifact verification, analytics, maps, recorded migration and real frontend components.
+   The fresh file smoke gives a small executed user path; retained larger runs have exact scopes.
+2. **What is missing or broken?** In-flight experiment crash resume is explicitly absent;
+   complete recorded-run/control reliability has current failures. Long-lived scenario balance,
+   complete native frontend/GPU scaling, browser durability, full comparative science and
+   independently verified release distribution remain unfinished or unqualified.
+3. **What blocks completion?** Storage/journal latency and size-dependent work, ordinary-stack
+   reader qualification, joining the existing host checkpoint seam into experiment recovery,
+   actual platform/hardware/browser environments, and complete source-bound acceptance/collection.
+   These require implementation and executed proof, not more generic framework or renderer polish.
+4. **Would finishing all currently open/in-progress issues close everything?** Not as an
+   unqualified claim: original runner recovery acceptance is hidden in closed `.5.11`.
+   Host continuation and API resume labels do not implement that runner transition. Reopen
+   the original owner and execute the complete original criteria; then the inspected essential
+   goals have identifiable owners. No finite survey guarantees that no further defect exists.
+5. **What has no actionable coverage?** The concrete discovery is incorrectly closed coverage
+   for exact in-flight experiment recovery, not absence of any issue text. No new duplicate epic
+   is needed. The remaining listed product gaps map to original open owners. Missing suite
+   instructions and local DSR setup are disclosed environment/workflow limits, not invented
+   product capabilities or grounds to mark acceptance passed.
+
+### Ordered bridge, after three ambition passes
+
+1. **Reliable recorded science first — L.** Finish the existing reader/engine/storage owners
+   (`bd-6sgk`, `bd-l103`, `bd-kgob`, `bd-w1oi`, `bd-j8o2`, `bd-50bg`, `bd-vrb3`). Keep original
+   command deadlines, size/long probes and schema checks; reproduce a causal repair, then
+   complete file/memory progress, responsive controls, graceful shutdown, independent durable
+   readback and the unchanged full connectivity/workspace suites. Run performance only through
+   the required pinned DSR exact-class comparison with a live incumbent in the same invocation.
+2. **Complete recovery where users need it — L.** Qualify `.5.13` and consume its exact
+   HostCheckpointV1/session/storage boundary in original `.5.11`. Durably join status generation
+   and scientific checkpoint; preserve run IDs and completed siblings; resume next tick after
+   interruption before/after every write. Test actual nonzero MLP/DWRAON interruptions,
+   concurrency 1/N, changed/stale/foreign cuts, cancellation and bounded joined workers.
+   Keep useful current refusals as negatives; pending-only resume is not the positive witness.
+3. **Qualify the intended first-run ecosystem — L.** Decide core/scenario ecology under
+   `bd-lmk6`, retain deliberate scientific changes in versioned provenance, and run `.10.5`
+   with identical declared cohort/config/brains/threads through actual terminal and native GUI.
+   Recompute raw ledger identities; retain extinction/explosion. Change goldens only by the
+   existing reviewed process. Do not choose an attractive seed or shrink the horizon.
+4. **Finish the scientific outputs — L.** Complete `.11.9` using planted scarcity and a
+   meaningful null, exact ancestry/interaction/FTS joins and all registered reports. Run the
+   original tournament protocol twice and publish its actual rows/ratings/metadata; retain
+   smoke as smoke. Reuse source-bound report/bundle verifiers rather than another proof system.
+5. **Finish presentation and optional reach — L–XL.** Complete FrankenTUI PTY/capability
+   acceptance and the actual GPU meadow, native interactions, resident instancing and resource
+   budgets. Qualify corrected GPU evidence predicates on real hardware. Test packaged browser
+   scheduling independently of RAF; implement/qualify browser storage separately. Finish map,
+   island, communication and audio acceptance without placing optional polish ahead of recovery.
+6. **Compose and distribute one qualified product — M–L after predecessors.** Use `.19`,
+   `.13.9` and `.13.11` for scenario → evolved agents → inspection → acknowledged intervention
+   → durable checkpoint/restart → matched-seed analysis → independent bundle verification.
+   Join source/run/checkpoint/command identities across every required cell; publish the exact
+   DSR-collected binary assets and truthful supported/experimental matrix under `bd-1bdd`.
+
+Ambition pass 1 changed the unit of completion from a component to the whole user journey.
+Pass 2 required interruption, overload, stale identity, resource and durability boundaries.
+Pass 3 required actual causal science and actual hardware scaling; deterministic replay is
+not evidence that a biological hypothesis or performance target is true. All three preserve
+the complete vision and existing gates. They do not add speculative mathematical machinery.
+
+### Bead generation, refinement and graph result
+
+The skill's exact Phase 3a and Phase 5 operators are retained verbatim under **Frozen operators**
+below and applied here. Generation/re-generation reuses the existing detailed owners. The
+specific delta is a proposed reopening of original `.5.11` with a self-contained seven-part
+implementation/test/logging bridge, not another split that leaves the original false closure.
+
+Five refinement passes checked: (1) code/status distinctions and the `.5.11` counterexample;
+(2) original owner overlap and unchanged features/criteria; (3) interruption/negative tests and
+the distinction between volatile artifacts and durable science; (4) exact source, dependency,
+readiness and publication joins; (5) a final reread, which adds no further issue or dependency.
+The `.5.11` proposal preserves the original acceptance and all existing dependency edges.
+
+Canonical initial graph: **718 issues, 577 closed, 107 open, 34 in progress**; BR sees the
+unexported reader claim as 106 open/35 in progress, so those views are explicitly distinguished.
+Authoritative BV triage agrees with the canonical export and reports 76 graph-actionable
+items; BR authorizes 29 claims. Native active BR cycle check is empty. BV's old macOS/exFAT
+top recommendation is not this Linux host's product diagnosis. No completion ETA is inferred.
+Final canonical BV insights computes its named metrics, with 100-sample approximate
+betweenness and an empty computed cycle list; authority/data hash is
+`e58375c5ffaba5fdab99fb23bfbfb2456c51c0c47d68888a67350ef741333cfb`.
+The isolated proposed reopening retains 718 records, changes readiness to 30 with `.5.11`
+ready, and has zero active cycles. It does not count as a canonical tracker change.
+
+The installed BR export normalizes existing machine-local `source_repo_path` fields to null.
+The isolated proposal exposes this collateral normalization and must not replace the shared
+JSONL wholesale. Its exact canonical preimage remains in the external proof root. No issue
+criteria, comments, assignees, IDs or dependencies are intentionally discarded.
+At this audit snapshot, shared publication waited for the exclusive writer.
+The subsequent continuation acquired its paths without bypassing a hook.
+
+Fresh AST scan observes zero todo! invocations and five unimplemented! invocations, all in
+test fixture surfaces (three genome-diff cases and two cfg(test) genome-browser cases).
+The runtime ML fallback and explicit experiment-resume refusal were established by reading
+their bodies, not by assuming a low TODO count means completeness. Source includes large
+monoliths (core lib 57,225 lines; storage lib 43,350; render lib 32,243 at this snapshot),
+so maintainability remains real work under the existing characterization/extraction owners.
+
+This audit stage changed no Rust source, science, test, tolerance, golden or
+dependency. Its assessment, bridge and proposed tracker correction are planning
+work. The separate implementation continuation below records subsequent source
+changes and their actual qualification. No issue closes or performance win are
+claimed; partial or older-source evidence is not promoted to product acceptance.
+
+### Finished-reader stack TODO — 2026-10-26, LilacElm (`bd-6sgk`)
+
+Continuation owner: VioletTrout, 2026-10-26 23:22 UTC. Agent Mail's stale
+reservation check confirmed the previous session inactive; all existing edits
+are retained. Execution order: reader correctness first, then production
+control/lifecycle failures, then interrupted experiment recovery. None of these
+steps substitutes for the original owners' complete acceptance criteria.
+
+Runner continuation TODO (`bd-2z0.5.11`, reopened with all seven criteria intact):
+
+- [x] Trace the final bundle/status interruption window and existing verifier.
+- [x] Wire a Running record to verified completed-bundle recovery without
+  overwriting artifacts or advancing simulation again.
+- [x] Test fresh completion, interruption before the final status write, repeat recovery,
+  corrupt artifact refusal, restored success, and a cross-run bundle swap.
+- [x] Qualify mixed-batch recovery in both run orders: publish verified finished
+  runs before returning the unfinished-run refusal; retain the unfinished record
+  exactly and leave repeated recovery byte-identical. A corrupt run also remains
+  Running while its independently verified companion is retained. The swap guard
+  still requires refusal and no subsequent status rewrite.
+  Intermediate `30081342398005331` executes 14 tests: 13 pass, while the old
+  corruption fixture's whole-status byte-equality assertion rejects the newly
+  retained valid companion. The final fixture now checks the exact corrupt
+  record unchanged plus that verified companion, then preserves byte equality
+  on the subsequent swap refusal. The failed attempt remains in
+  `runner-partial-batch-auto.log`. Final `30081342398005333` passes all 14
+  runner tests (647 unrelated tests filtered), including the exact partial
+  status, swap refusal and restored-success controls. Its source is base
+  `edffa215` plus overlay fingerprint
+  `732d295da9dc6fd10e3ec9ec510467c1499d6fcd2cacc2f2653fdfef5f5ed2ce`.
+- [x] Run the focused runner tests on RCH.
+  RCH `30081342398005315` passes all 13 runner tests, including both new
+  completion-recovery cases; final `30081342398005333` passes 14/14 after
+  mixed-batch qualification. Each filters 647 unrelated app tests.
+- [x] Execute required workspace check, strict Clippy, formatting and the
+  complete production process file. Retain its one observed failure below.
+- [x] Retain exact next-tick checkpoint recovery, resource limits and the full
+  interrupted-process E2E as unfinished original-owner acceptance.
+
+The next unfinished-run implementation must pair `HostCheckpointV1` with the
+actual journal continuation cut and freshly bound persistence session. A world
+checkpoint restored into a fresh host cannot preserve saved command and event
+authority. Persist that complete boundary before claiming next-tick recovery,
+then prove interruption at checkpoint/status boundaries, repeat recovery,
+cross-source/family refusal and concurrency 1/N digest identity.
+
+Consumer: the user's requested granular TODO; gate: qualify the default-stack
+reader path before claiming a fix. Observed defect: the retained debug engine
+dispatcher reserves `0x217000 + 0xa68` bytes before doing SQL work. Retire this
+scoped TODO at handoff. The minimal external canonical preimage protects the
+known BR exporter provenance loss; retained logs distinguish actual attempts.
+
+- [x] Refresh Agent Mail, current BR/BV and CASS; preserve canonical JSONL.
+- [x] Trace the storage/journal boundary and inspect the retained binary's
+  actual dispatcher prologue; distinguish engine stack use from caller frames.
+- [x] Claim the original reader-stack Bead and reserve exact edit paths.
+- [x] Add a real-file subprocess regression with an explicit 2 MiB SQL thread,
+  durable row/watermark readback and an unsupported-schema refusal control.
+- [x] Execute that regression against the original debug configuration on RCH.
+  Executed: `30081342398005314`, 0 passed/1 failed, explicit 2 MiB reader
+  subprocess stack overflow/SIGABRT. The preceding cold build exceeded RCH's
+  outer 1800-second build allowance and ran zero tests.
+- [x] Qualify the smallest dependency-only debug optimization with the same
+  regression; do not raise stacks or weaken SQL, lease or schema checks.
+  The explicit 2 MiB case passes in RCH job `30081342398005312` and the final
+  complete storage targets `30081342398005318`; the unoptimized baseline fails.
+- [x] Qualify the separate narrative capture repair against the original
+  recovery assertions and deadlines. The first full file ran 9 passed, 2 failed,
+  2 ignored: recovery startup and later fresh metrics startup each timed out at
+  120 seconds. The metrics case alone passes in 2.02 seconds. GDB observes the
+  owner actively formatting tracing events while its caller waits for shutdown;
+  the fixture retains all dependencies at TRACE in a process-wide Vec.
+  Capture policy split: storage TRACE/DEBUG/INFO and all dependency WARN/ERROR
+  remain admitted; dependency TRACE/DEBUG/INFO are excluded. Existing event
+  identities, structured fields, SQL/schema assertions and deadlines stay intact.
+  A planted three-cell logging probe must retain storage TRACE and dependency
+  WARN while excluding dependency TRACE. Subscriber installation must succeed.
+- [ ] Check the same real-file regression in release configuration, where the
+  override must leave the existing optimized reader behavior unchanged.
+- [x] Run appropriate RCH storage tests, workspace check, strict Clippy and format.
+  Final storage run `30081342398005318` completes with 12 persistence tests and
+  10 journal tests passed, zero failures, and two unchanged ignored observation
+  lanes. Required original narrative identities/fields and 120-second deadlines
+  remain intact. Final mixed-batch source passes workspace all-targets check
+  and strict Clippy (`-D warnings`), each exit zero, plus local `cargo fmt --check`
+  and `git diff --check`. The existing proc-macro-error2 v2.0.1 future-compiler
+  incompatibility notice remains; this is not a warning-free dependency claim.
+- [x] Run the original production process test file with unchanged deadlines,
+  assertions and three existing ignored long lanes; record all actual outcomes.
+  Executed `30081342398005320`: 6 passed, 1 failed, 3 unchanged ignored, zero
+  filtered. The experiment/checkpoint/artifact journey now passes. The remaining
+  MCP map-apply admission fails on a durable-authority lookup after the unchanged
+  10-second deadline. This is not a green production suite.
+- [ ] Follow runtime reliability with actual workspace lint inheritance in the
+  nine remaining crates (`bd-6hb5`). Source has four inheriting members out of
+  thirteen; the old all-thirteen claim in `bd-tqpj` is incorrect. Its original
+  core-only scope remains satisfied. Do not mix that diagnostic backlog into
+  these runtime fixes.
+- [x] Reassess source against the original Bead; keep broader API timeouts,
+  interrupted lifecycle and native DSR acceptance open where unproven.
+- [x] Review and commit the exact qualified source in three immutable snapshots.
+  Tracker and report publication are separate final actions; the operator
+  handoff records actual ref results instead of this commit claiming its own
+  future push. Preserve unrelated tracker metadata and scratch files.
+
+Final canonical tracker: 719 records. Only the original reader/runner/API
+evidence rows change, plus new `bd-6hb5` for the nine missing lint inheritors.
+BR authors every semantic issue change; the external export is applied by exact
+changed fields so unrelated rows and machine-local provenance remain intact.
+The original runner acceptance, dependencies and comment prefix are preserved.
+The active `br dep cycles --json` result is empty. No issue closes in this window.
+
+Final source commands, run through strict remote RCH on base `edffa215` with
+the exact overlay fingerprint above:
+
+```text
+cargo test --locked -j1 -p scriptbots-app --lib experiment_runner::tests -- --test-threads=1
+cargo check --locked -j1 --workspace --all-targets
+cargo clippy --locked -j1 --workspace --all-targets -- -D warnings
+```
+
+Raw logs are `runner-final-mixed.log`, `workspace-check-final-mixed.log` and
+`workspace-clippy-final-mixed.log` in the proof root. An earlier duplicate
+check's wrapper exits 143 while RCH cancellation remains unacknowledged in its
+durable queue record (`30081342398005332`); it executed no tests and earns no
+check result. No daemon restart, cache deletion or admission bypass was used.
+
+### Bounded work and honesty audit — 2026-10-26/27, VioletTrout
+
+Scope: this implementation continuation and three reviewed source commits
+`979f37c1`/`edffa215`/`1c8d5c2a`. The README's
+purpose is an evolving neural-agent simulation that supports usable observation,
+control and scientific experiments. No claim of whole-project completion follows.
+
+Creation worksheet: the operator explicitly requested the granular TODO and
+Beads updates (consumer/gate/defect provenance). Retire this execution checklist
+at handoff; keep unfinished acceptance on its original Beads. The exact canonical
+preimage and raw logs prevent the observed BR provenance normalization and loss
+of failed attempts. At 719 records they are necessary, minimal and have no cheaper
+equally reliable replacement: Git does not contain the pre-existing shared edits.
+Highest-priority remaining capability is the actual durable-command lookup path;
+an additional hour of reporting would provide less value than fixing that path.
+
+Real-work worksheet: disjoint work items are the reader fix (USER), completed-run
+recovery (USER), narrative capture repair (ENABLER), and requested tracking/report
+(PROCESS): USER 2, ENABLER 1, PROCESS 1, UNKNOWN 0. These are diagnostics, not quotas.
+The mechanical record is the source diffs and retained RCH results, not a close count.
+1. Two-minute demo: explicit 2 MiB reader fails on the original build, succeeds
+with durable rows and schema refusal after the fix; completed bundles recover
+without another HostCore run. 2. Removing the process item changes no runtime
+behavior, but loses the requested work/evidence handoff. 3. The capture
+discriminator and original narrative assertions pass; the two targeted
+storage/journal suites pass 22 tests. 4. Production command
+reliability remains open; the reader defect and missing completion recovery were
+concrete prerequisites addressed in this window. 5. Solo work; no pane/close
+comparison. 6. No plan edit substitutes for code; `.5.11` was reopened with all
+seven original criteria intact. Verdict: product progress is real, with bounded
+requested process. Stop further provenance-probe work now that the archive's
+missing Git metadata is observed; qualify the remaining code and retain the
+native acceptance gap rather than constructing another proof framework.
+
+Honesty inventory (bounded checks, not an independent certification):
+
+| Prompt | Answer and checked evidence |
+|---|---|
+| 1. Weaken/delete/ignore tests? | No (checked: complete reviewed source diffs; original data/schema assertions, deadlines and ignored lanes retained). |
+| 2. Specialized mock to satisfy a test? | No (checked: new tests use actual HostCore runs, real bundles and a real file-backed storage worker). |
+| 3. Regenerate goldens? | No (checked: changed paths contain no golden, snapshot or baseline). |
+| 4. Change a gate or timeout? | Yes: narrative capture excludes dependency TRACE/DEBUG/INFO, preserves storage TRACE and all dependency WARN/ERROR, and requires successful subscriber installation. The three-cell probe passes. Outer RCH build allowances increased from 1800 to 7200 seconds after zero-test compile deadlines; product/test deadlines are unchanged. The mixed-batch guard expects exact verified-companion progress while preserving the corrupt record; swap refusal and byte-identical retry remain required. |
+| 5. Demo hardcoding or selected denominator? | No (checked: package-wide debug optimization applies to every consumer; complete process file and all library tests were run). |
+| 6. Zero-run green? | No (checked: source-check success is kept separate from actual test counts; admission refusals, cancelled duplicate compilation and build deadlines are not test results). |
+| 7. Claim an unrun command? | No (checked: every cited execution has retained tool output/raw logs; pending qualification stays pending). |
+| 8. Promote a lower proof class? | No (checked: RCH diagnostics, unit tests, process tests and native DSR remain distinct; no native/performance qualification is claimed). |
+| 9. Hide a material failure? | No (checked: initial storage 9/2/2, process 6/1/3 and app library 658/1/1 results remain recorded). |
+| 10. Discard cited stderr? | No (checked: RCH streams are retained together; failed SSH/namespace probes remain visible). |
+| 11. Close unmet acceptance? | No (checked: no issue closes in this continuation; original runner closure was corrected). |
+| 12. Rewrite requirements to fit code? | No (checked: original acceptance/dependencies/comment prefixes preserved; unfinished next-tick recovery remains on `.5.11`). |
+| 13. Agent closure evidence? | Not applicable: no subagents or delegated closures. |
+| 14. Gameable delegation? | Not applicable: no delegation. |
+| 15. Trust a subagent report? | Not applicable: shared proposed edits were personally reviewed and freshly executed. |
+| 16. Refusal farming? | No (checked: actual durable readback, completed recovery and original experiment journey successes accompany the negative guards). |
+| 17. Agreement as confirmation? | No (checked: Agent Mail messages coordinate ownership; executable observations support claims). |
+| 18. Choose a denominator afterward? | No (checked: runner subset and complete app/process/storage scopes are explicitly labelled; original ignores remain visible). |
+| 19. Moment needing explanation? | The source-archive metadata probe produced no qualified publication build. Its missing-Git failure is retained; no clean flag or compiler metadata was fabricated. |
+| 20. Strongest repeatable evidence? | The planted original 2 MiB stack failure, fixed read/schema/restoration sequence, full storage/journal pass, and real HostCore bundle recovery with corruption/swap controls. |
+
+Older-session boundary: CASS's five suggested queries plus the exact new reader
+test name were searched; the first hit from each nonempty query was followed
+using canonical message indices. Those five bounded archive windows include
+earlier disclosed startup/test assumptions and an old honesty search; they do
+not establish a repository-wide historical clean bill. The observed current
+four-of-thirteen lint inheritance gap is retained as `bd-6hb5` without undoing
+the completed core-only owner.
+
+Disposition for prompt 4: revision-scoped capture/guard diffs were reviewed;
+the policy's admission/exclusion split and original failed attempts are disclosed
+above and in operator updates. RH-1 (gate self-weakening) and RH-15 (tolerance
+widening) countermeasures are explicit field/severity probes, exact partial-state
+assertions and unchanged product deadlines. Final mixed-batch probes pass all
+14 focused runner tests. This is a solo bounded review, not self-issued independent
+certification or a native DSR sign-off.
 
 ### Production experiment journey TODO — 2026-10-26, LilacElm
 
