@@ -1086,7 +1086,9 @@ For an interactive run, ScriptBots parses the control environment and transactio
   - `GET /api/narrative/search` → search the recent birth/death/combat narrative
   - `POST /api/v1/experiments` → start a matched-seed batch (`variants` × `seeds`, `ticks_per_run`) that executes on a
     background worker; `GET /api/v1/experiments/{id}` reports per-run state, final digest and bundle path;
-    `POST .../cancel` stops before the next wave, `POST .../resume` continues pending runs
+    `POST .../cancel` stops before the next wave; `POST .../resume` continues pending runs and
+    recovers verified completed bundles saved before their final status write.
+    Unfinished in-flight runs still require checkpoint recovery and are refused.
   - `POST /api/v1/checkpoints` → capture a `WorldCheckpointV1` and record it in the run database (usable by
     `--checkpoint-start`); `GET /api/v1/checkpoints`, `/api/v1/artifacts`
   - Playback (fire-and-forget acknowledgement): `POST /api/pause`, `POST /api/resume`,
@@ -1236,7 +1238,9 @@ cargo run -p scriptbots-app --bin control_cli -- watch --interval-ms 500
   - Maps: `map_generate` → procedural sandbox map generation; `map_apply` → apply map artifact to running simulation
   - Experiments: `experiment_create` runs a real matched-seed batch (MLP/DWRAON/Assembly arms × seeds) on a
     background worker and writes a verified run bundle per run; `experiment_status`, `experiment_list`,
-    `experiment_cancel` (stops before the next wave), `experiment_resume` (continues pending runs)
+    `experiment_cancel` (stops before the next wave), `experiment_resume` (continues pending runs
+    and recovers verified completed bundles saved before their final status write;
+    unfinished in-flight runs are refused)
   - Checkpoints and artifacts: `checkpoint_create` (captured from the world owner and recorded in the run database
     through the storage worker), `checkpoint_list`, `checkpoint_status`, `artifact_list`, `artifact_get`
 Notes: Only HTTP transport is supported here; stdio/SSE are not used.

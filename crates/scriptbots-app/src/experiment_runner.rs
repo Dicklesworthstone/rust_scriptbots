@@ -598,8 +598,9 @@ impl MatchedSeedExperimentRunner {
     /// Executes the full batch using deterministic bounded scheduling and durable status.
     ///
     /// Failed runs become terminal status records so the caller can inspect the
-    /// complete partial-failure set. An interrupted `Running` record is instead a
-    /// typed refusal until composite checkpoint resume exists.
+    /// complete partial-failure set. An interrupted `Running` record can recover
+    /// an already completed, verified bundle. Unfinished runs remain a typed
+    /// refusal until composite checkpoint resume exists.
     ///
     /// # Errors
     ///
@@ -629,13 +630,24 @@ impl MatchedSeedExperimentRunner {
         let _lease = ExperimentStatusWriterLease::acquire(state_file)?;
         let mut status = self.load_or_create_status_locked(state_file, &plan)?;
 
-        for record in &status.runs {
+        let mut recovered = false;
+        for record in &mut status.runs {
             match record.state {
                 RunState::Running => {
-                    return Err(ExperimentRunnerError::ResumeCheckpointUnavailable {
-                        run_id: record.run_id.clone(),
-                        completed_ticks: record.total_ticks,
-                    });
+                    let (variant, family) = plan
+                        .variants
+                        .get(&record.variant_id)
+                        .expect("validated status variant exists");
+                    *record = self.recover_completed_run(record, variant, *family, &plan.digest)?;
+                    recovered = true;
+                    info!(
+                        experiment_id = %self.experiment_id,
+                        run_id = %record.run_id,
+                        tick = record.total_ticks,
+                        digest = ?record.final_digest,
+                        bundle_path = ?record.bundle_path,
+                        "recovered verified completed bundle before admitting pending runs"
+                    );
                 }
                 RunState::Completed => {
                     let (variant, family) =
@@ -652,6 +664,10 @@ impl MatchedSeedExperimentRunner {
                 }
                 RunState::Pending | RunState::Failed => {}
             }
+        }
+        if recovered {
+            recompute_status_counts(&mut status);
+            self.save_status_transition_locked(state_file, &mut status, &plan)?;
         }
 
         let pending = status
@@ -1378,6 +1394,50 @@ impl MatchedSeedExperimentRunner {
             bundle_path: Some(bundle_dir.to_string_lossy().into_owned()),
             error_reason: None,
         };
+        self.verify_completed_bundle(&completed, variant, family, plan_digest)?;
+        Ok(completed)
+    }
+
+    /// Recover only the bundle/status commit gap; never replay an unfinished run.
+    fn recover_completed_run(
+        &self,
+        record: &RunRecord,
+        variant: &ScenarioVariant,
+        family: ResolvedBrainFamily,
+        plan_digest: &str,
+    ) -> Result<RunRecord, ExperimentRunnerError> {
+        let bundle_dir = self.output_dir.join(&record.run_id);
+        let exists = bundle_dir
+            .try_exists()
+            .map_err(|source| ExperimentRunnerError::Io {
+                operation: "inspect interrupted run bundle",
+                path: bundle_dir.clone(),
+                source,
+            })?;
+        if !exists {
+            return Err(ExperimentRunnerError::ResumeCheckpointUnavailable {
+                run_id: record.run_id.clone(),
+                completed_ticks: record.total_ticks,
+            });
+        }
+
+        let evidence_path = bundle_dir.join("evidence/run.json");
+        let evidence_bytes =
+            read_bounded_file(&evidence_path, MAX_STATUS_BYTES, "read recovery evidence")?;
+        let evidence: RunEvidenceV1 =
+            serde_json::from_slice(&evidence_bytes).map_err(|source| {
+                ExperimentRunnerError::Bundle {
+                    run_id: record.run_id.clone(),
+                    reason: format!("recovery evidence JSON is invalid: {source}"),
+                }
+            })?;
+        let mut completed = record.clone();
+        completed.state = RunState::Completed;
+        completed.total_ticks = self.max_ticks;
+        completed.final_digest = Some(evidence.final_digest);
+        completed.bundle_path = Some(bundle_dir.to_string_lossy().into_owned());
+        // The parsed evidence is untrusted until both byte integrity and every
+        // run/plan/family/config identity pass the existing canonical verifier.
         self.verify_completed_bundle(&completed, variant, family, plan_digest)?;
         Ok(completed)
     }
@@ -2201,6 +2261,148 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn completed_bundles_recover_the_status_commit_gap_without_reexecution() {
+        let (runner, state_file, running, completed) = completed_bundle_gap_fixture();
+        let before = completed
+            .iter()
+            .map(|record| {
+                fs::read(
+                    runner
+                        .output_dir
+                        .join(&record.run_id)
+                        .join("bundle_manifest.json"),
+                )
+                .expect("completed manifest")
+            })
+            .collect::<Vec<_>>();
+
+        // Cancellation prevents admitting new work, but must not hide completed
+        // work that already passed the canonical verifier.
+        let recovered = runner
+            .execute_batch_until_cancelled(&state_file, &std::sync::atomic::AtomicBool::new(true))
+            .expect("recover completed bundles");
+        assert_eq!(recovered.runs, completed);
+        assert_eq!(recovered.completed_runs, 2);
+        assert_eq!(recovered.failed_runs, 0);
+        assert_eq!(recovered.generation, running.generation + 1);
+        for (record, bytes) in recovered.runs.iter().zip(before) {
+            assert_eq!(
+                fs::read(
+                    runner
+                        .output_dir
+                        .join(&record.run_id)
+                        .join("bundle_manifest.json")
+                )
+                .expect("retained manifest"),
+                bytes
+            );
+        }
+        let status_bytes = fs::read(&state_file).expect("recovered status");
+        assert_eq!(
+            runner.execute_batch(&state_file).expect("repeat recovery"),
+            recovered
+        );
+        assert_eq!(
+            fs::read(&state_file).expect("unchanged status"),
+            status_bytes
+        );
+    }
+
+    #[test]
+    fn completed_bundle_recovery_refuses_corruption_and_cross_run_swaps() {
+        let (runner, state_file, _, completed) = completed_bundle_gap_fixture();
+        let status_bytes = fs::read(&state_file).expect("running status");
+        let first = runner.output_dir.join(&completed[0].run_id);
+        let second = runner.output_dir.join(&completed[1].run_id);
+        let paths = [
+            "bundle_manifest.json",
+            "evidence/run.json",
+            "exports/summary.csv",
+        ];
+        let original = paths.map(|path| fs::read(first.join(path)).expect("original artifact"));
+
+        fs::write(first.join(paths[2]), b"corrupt summary\n").expect("plant corrupt artifact");
+        assert!(matches!(
+            runner.execute_batch(&state_file),
+            Err(ExperimentRunnerError::Bundle { .. })
+        ));
+        assert_eq!(fs::read(&state_file).expect("refused status"), status_bytes);
+        fs::write(first.join(paths[2]), &original[2]).expect("restore summary");
+
+        // All swapped bytes remain mutually consistent. The semantic run/seed
+        // binding must reject them even though their artifact hashes still pass.
+        for path in paths {
+            fs::write(
+                first.join(path),
+                fs::read(second.join(path)).expect("other run bytes"),
+            )
+            .expect("plant complete cross-run swap");
+        }
+        assert!(matches!(
+            runner.execute_batch(&state_file),
+            Err(ExperimentRunnerError::Bundle { .. })
+        ));
+        assert_eq!(
+            fs::read(&state_file).expect("refused swap status"),
+            status_bytes
+        );
+        for (path, bytes) in paths.into_iter().zip(original) {
+            fs::write(first.join(path), bytes).expect("restore original bundle");
+        }
+        assert_eq!(
+            runner
+                .execute_batch(&state_file)
+                .expect("restored success")
+                .runs,
+            completed
+        );
+    }
+
+    fn completed_bundle_gap_fixture() -> (
+        MatchedSeedExperimentRunner,
+        PathBuf,
+        ExperimentBatchStatus,
+        Vec<RunRecord>,
+    ) {
+        let directory = tempfile::tempdir()
+            .expect("completion gap directory")
+            .keep();
+        let state_file = directory.join("status.json");
+        let runner = MatchedSeedExperimentRunner::new(
+            "completion-gap",
+            MatchedSeedCohort {
+                cohort_id: "cohort".into(),
+                seeds: vec![7, 9],
+            },
+            vec![ScenarioVariant {
+                variant_id: "mlp".into(),
+                brain_family: "mlp".into(),
+                config_overrides: BTreeMap::new(),
+            }],
+            2,
+            1,
+            directory.join("bundles"),
+        );
+        let mut running = runner
+            .load_or_create_status(&state_file)
+            .expect("fresh batch");
+        for record in &mut running.runs {
+            record.state = RunState::Running;
+        }
+        runner
+            .save_status(&state_file, &mut running)
+            .expect("durable running boundary");
+        let completed = [7, 9]
+            .map(|seed| {
+                runner
+                    .execute_single_run(&runner.variants[0], seed)
+                    .expect("real completed HostCore run")
+            })
+            .to_vec();
+        (runner, state_file, running, completed)
     }
 
     #[test]
