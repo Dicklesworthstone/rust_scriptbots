@@ -121,6 +121,12 @@ split-debuginfo = "unpacked"
 [profile.dev.package.fsqlite-core]
 opt-level = 1
 
+# The memory control path also traverses pager/cache eviction while other
+# commands await authority (bd-2z0.12.2.1). Keep that dependency optimized in
+# debug builds without changing application deadlines or the release profile.
+[profile.dev.package.fsqlite-pager]
+opt-level = 1
+
 [profile.release-dbg]
 inherits = "release"
 debug = true
