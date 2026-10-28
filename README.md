@@ -1123,6 +1123,14 @@ without a definition require explicit reconciliation. Checksums detect corruptio
 and do not authenticate an artifact's author. Complete resource/fault/platform
 qualification remains open under `bd-2z0.5.11`; see the current reality check.
 
+Completed experiment files also reappear through artifact list/get/download after
+restart, using their original IDs. A first request verifies the saved scientific
+evidence and complete bundle before publishing its files; no create or resume
+request is required. Whole-list discovery reports an invalid saved batch, while
+a known ID from another healthy batch remains readable. Successful publication
+is cached by saved status generation; downloads still check the file size,
+BLAKE3 and SHA-256. These reads neither run the experiment nor rewrite its status.
+
 `GET /api/status` and MCP `get_status` report one immutable owner publication:
 `paused`, `lifecycle`, tagged `health` (including blocker/fault detail),
 `last_applied_command`, `command_queue_depth`, and `snapshot_revision`, alongside

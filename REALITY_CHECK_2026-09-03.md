@@ -1,5 +1,231 @@
 # Reality Check — rust_scriptbots — implementation continuation 2026-10-27
 
+## Completed TODO — recovered experiment downloads, VioletTrout
+
+Source `7ad6b1d4` now restores verified original-ID artifact downloads after a
+completed server restart. Clean-source verification passes 11 control tests,
+19 runner tests and 8 ordinary process tests, with 3 unchanged process ignores;
+workspace/all-target check, strict Clippy, formatting and whitespace checks pass.
+The original runner task remains in progress with all seven criteria intact.
+
+The operator requested continued implementation and granular tracking. Before
+this fix, a saved completed experiment reappeared after restart with an empty
+artifact registry. Resume correctly refused a completed job, so clients could
+not restore downloads.
+This block wires the existing verified publisher into that real consumer. The
+existing report is the requested TODO; it retires to evidence at handoff.
+
+- [x] Recheck authoritative ready work, current instructions, source and handoff.
+- [x] Continue original `bd-2z0.5.11`; reserve exact paths and notify API owner.
+- [x] Demonstrate the missing artifact catalog against the unchanged baseline.
+- [x] Implement canonical semantic verification before recovered artifact publication.
+- [x] Connect list/get/download discovery without stepping or rewriting science.
+- [x] Cache successful publication by saved status generation; failed publication remains retryable.
+- [x] Preserve atomic per-batch publication and readable healthy companions in the implementation.
+- [x] Add controls for recovered bytes/IDs, byte-valid wrong science and same-generation repair/retry.
+- [x] Extend the shipped process test with completed-server restart, cold MCP ID lookup, REST downloads and bundle verification.
+- [x] Run relevant RCH controls, full ordinary process lane, workspace check, strict Clippy, fmt and UBS.
+- [x] Retain raw failures and actual artifacts using the working external-output route.
+- [x] Re-verify the exact committed source; update original notes without changing acceptance.
+- [x] Review source/docs/tracker snapshots and prepare guarded publication and lease release.
+
+No new planning framework, diluted child or premature closure is introduced.
+
+Implementation reuses the existing runner's full completed-bundle semantics,
+then the existing staged artifact publisher. A two-run bad batch cannot publish
+its otherwise healthy first run before validation of the second. Discovery still
+processes other healthy jobs before reporting a list error; a known healthy ID
+can be downloaded directly. The cache records only successful publication,
+supports newer generations after resumed work, and does not claim continuous
+scrubbing of already-published immutable files. Download byte checks remain.
+The new fault control changes an actual completed run's evidence digest to its
+different real companion's digest and updates the artifact hash. The generic
+byte verifier must accept that control while recovery must reject its scientific
+mismatch. Observed RCH results follow; broader qualification is not inferred
+from this implementation.
+The process control also exercises a cold MCP `artifact_get`, then REST downloads
+and a fresh CLI verification of the reconstructed downloaded bundle. Expected
+file membership comes from the actual bundle manifest, not a copied count.
+The unit control compares both saved job statuses, and the process control
+compares the recovered job's saved status and all original artifact identities.
+No deadline, ignore, fixture hash or science setting is
+relaxed for these new requests. Native acceptance and the earlier runtime timeout
+remain outside this increment's proof scope.
+
+Baseline probe uses `7e071a1a` production code with only the new restart assertions
+overlaid. It executes **0 passed / 1 failed / 0 ignored**, 668 filtered, and
+fails at the intended observation: recovered artifact count **0**, original
+count **3**. The actual run and original publication complete first. The cold
+dependency build is retained in the same log; it is compilation cost, not a
+test latency or performance result. The source remains frozen for the candidate
+tests. Final UBS on the three changed source files reports **0 critical, 1,767 warnings,
+846 informational findings**; this is not a warning-free scan.
+
+Candidate experiment/control selection passes **11/0/0**, 659 filtered,
+10.31s. It includes actual byte-valid semantic tampering, atomic refusal of the
+bad two-run batch, cold access to a separate healthy job, same-generation repair
+and exact original status preservation. The two-core admission first returns
+RCH 103 because hz2 now exposes one slot; the supported Cargo `-j1` invocation
+then executes the tests. That refusal is infrastructure, not a test failure.
+The tested overlay is pinned in its raw RCH receipt; the source is still under
+whole-process and workspace verification. External test output remains outside
+the temporary source checkout. No test deadline or assertion was loosened.
+
+The first whole-process candidate reaches the actual resumed/completed run, then
+the new cold MCP request is correctly refused with JSON-RPC `-32600`: the test
+client omitted its required initialize handshake. The correction adds the same
+initialize/initialized exchange used by the existing process controls, before
+the unchanged artifact-get assertions. The server guard is not changed or
+bypassed. This is a test-client setup failure, not passing artifact readback;
+the original log and child files remain retained.
+Its whole-file result is **7 passed / 1 failed / 3 unchanged ignores**, 0
+filtered, 101.48s. The replacement reruns that whole file with the valid MCP
+client lifecycle; it does not skip the failed artifact lookup or its downstream
+byte/metadata/status assertions.
+
+The initialized-client candidate passes the complete ordinary process file:
+**8 passed / 0 failed / 3 unchanged ignores**, 0 filtered, 100.06s. After the
+completed-server restart it recovers **3 original artifact IDs**, accepts a cold
+MCP lookup, downloads every file through REST, and separately verifies the
+downloaded bundle through the canonical library and shipped CLI. The earlier
+nonzero continuation still restores tick 2 and reaches 12 with oracle digest
+`2b53b4f0e5755203`. Its actual child directory is copied successfully from the
+external test root; the failed client attempt is not substituted as evidence.
+
+Reviewed source is committed as **`7ad6b1d407d826f97935e487187eebe5a3a7dbce`**,
+tree `ae9dbb1d7ddead68655c9fb10e15df908ad55d61`. The only change after the
+initial source review is the explicit client handshake; its exact tree delta is
+also reviewed. A fresh clean-source pass follows. Full workspace verification is
+still compiling cold dependency metadata; no workspace pass is claimed yet.
+
+The fresh `7ad6b1d4` clean-source control pass executes **11 passed / 0 failed /
+0 ignored**, 659 filtered, 10.35s. The RCH receipt binds its source tree to
+`ae9dbb1d7ddead68655c9fb10e15df908ad55d61`; the clean command uses both
+`--clean-overlay` and `--no-overlay`. Runner and full process re-verification
+continue with the same committed source and unchanged test budgets.
+
+Clean committed-source runner selection passes **19/0/0**, 651 filtered,
+182.47s. Its real child-kill controls restore MLP at durable tick 5 and DWRAON
+at tick 6, finish at 40, and match their respective uninterrupted digests
+`a5bdbf8a1615575e` and `82544897a98c1431`. Candidate artifact-copy readback
+retains 37 actual files: original, oracle and downloaded bundles each contain two
+indexed artifacts at tick 12; original/downloaded bytes match, all three final
+digests are `2b53b4f0e5755203`, and both checkpoint frames pass BLAKE3 checks.
+Candidate source-revision fields are null and `reproducible=false`; they are
+not substituted for the clean source receipt or full attribution.
+
+Final clean committed-source ordinary process run passes **8 passed / 0 failed /
+3 unchanged ignores**, 0 filtered, 101.71s. It observes restored tick 2, final
+tick 12 and uninterrupted digest `2b53b4f0e5755203`, followed by cold MCP
+metadata recovery and REST downloads of all **3 original artifact IDs**. Both
+canonical and shipped CLI verification of the downloaded bundle pass, as does
+the exact unchanged-status assertion. The first clean process launch is RCH 103
+(`no_free_slots`), not a test result; the replacement is admitted after backoff.
+All raw logs remain. Its actual successful child output is
+`/data/tmp/scriptbots-artifact-proof-20261027-2322/.tmpV4yxgY`, outside the
+retired source checkout; this is the final artifact-copy source.
+
+The final archive and extracted readback retain **37 actual files**. All three
+bundle manifests identify exact source `7ad6b1d407d826f97935e487187eebe5a3a7dbce`,
+contain two verified indexed artifacts and end at tick 12. Original/downloaded
+bytes match; all final digests match `2b53b4f0e5755203`; both checkpoint frames
+are BLAKE3-valid. The actual CLI log still says `Reproducible: false`. Local
+data/hash readback supplements, and does not replace, canonical RCH verification.
+Raw commands, stdout/stderr, admission refusals, RCH receipts and both archives
+are retained at `/data/tmp/scriptbots-artifact-recovery-20261027-violettrout/`.
+
+The earlier candidate-overlay workspace/all-target check passes. Its receipt
+retains tree `32f3c5e2620812f62988fee707c053f2f33d9ab3`; this predates the
+final test-client handshake and is not called final exact-source qualification.
+Cold compilation takes 51m21s and contributes no performance credit. Cargo
+reports dependency future incompatibility in `proc-macro-error2 v2.0.1`; no
+compiler error occurs. Clean committed-source strict Clippy and check follow on
+that warmed worker, without changing source or narrowing all-target scope.
+
+Clean committed-source workspace/all-target strict Clippy passes with
+`-- -D warnings` in 3m12s. Its receipt binds base `7ad6b1d4` and exact tree
+`ae9dbb1d7ddead68655c9fb10e15df908ad55d61`. Cargo's dependency future-
+compatibility warning remains; no lint suppression is introduced. The subsequent
+clean compiler launch receives RCH 103 capacity refusal and executes no check;
+the backed-off retry follows with a separate raw log.
+
+Final clean committed-source workspace/all-target compiler check passes in
+46.64s at the same exact tree. The worker now has one total slot, so the admitted
+retry uses Cargo `-j1`; scope, source, target and compiler policy are unchanged.
+Strict Clippy used `-j2` before that capacity change. Formatting and whitespace
+also pass. Tests are the focused selections and ordinary process file above;
+this does not claim a new all-workspace test pass or resolve the earlier runtime
+timeout. UBS remains 0 critical / 1,767 warnings / 846 informational findings.
+No performance run or native DSR acceptance was attempted.
+
+Original Bead notes now include the observed final gates. The selective external
+export preserves all 720 canonical records; only `bd-2z0.5.11` notes and
+`updated_at` change semantically, and every other line stays byte-identical.
+Acceptance, dependencies, ownership and provenance are preserved. Explicit
+re-import succeeds and dependency cycles remain empty. The source snapshot was
+reviewed before commit; docs and tracker receive separate immutable reviews.
+Guarded publication and release happen after those snapshots, with the observed
+ref/lease receipt in the final conversation handoff. This completed TODO retires
+to evidence; it does not close the original runner contract.
+
+### Bounded anti-ceremony review — this artifact-recovery increment
+
+Creation worksheet, existing operator-requested TODO/evidence block:
+
+- Boundary: process; application code never reads this report.
+- Consumer: the operator who requested a detailed TODO and continued implementation.
+- Gate: the requested handoff must distinguish observed recovered downloads from open runner acceptance.
+- Observed defect: baseline restart exposes zero of three original artifact files.
+- Retirement: this active TODO retires to evidence at publication; no recurring review system is added.
+- Integrity exception Q1–Q4: not invoked; this report is not recovery state, is not needed by runtime, is not the minimal recovery artifact, and raw logs are cheaper evidence.
+- Opportunity Q1: original `bd-2z0.5.11` recovery remains the claimed capability; Q2: another hour implementing its remaining contract would beat another report. Keep this review bounded.
+- Verdict: minimal legitimate operator-requested record, zero capability credit.
+
+Work worksheet, source `7ad6b1d4` and accompanying documentation/tracker update:
+
+- Purpose: evolve autonomous neural agents in a controllable simulation and retain usable scientific results.
+- Inventory: one source capability commit USER; README change USER; existing plan/report update PROCESS; original Bead note PROCESS. Tally by these four deliverables: USER 2, ENABLER 0, PROCESS 2, UNKNOWN 0. This is no quota, independent proof or completion count.
+- Q1: demonstrate a completed server restart, original-ID lookup/download, then verify the downloaded bundle.
+- Q2: omitting process updates would not change runtime behavior; it would omit the operator's requested TODO and qualification limits.
+- Q3: no separate speculative enabler; the existing verifier/publisher is exercised by live server consumers.
+- Q4: oldest non-epic unresolved record observed is lifecycle/contention/soak `bd-2z0.4.11`; this block instead completes the next directly connected user journey in the already-claimed experiment contract.
+- Q5: solo; no panes or delegated closes.
+- Q6: no acceptance split or closure. Plan updates describe a source implementation while all seven original runner criteria remain.
+- Verdict: user capability moved, process must stay bounded. Finish exact-source qualification and publication before another planning round.
+
+Honesty inventory, the source diff, test logs, reflog, current docs and original Bead:
+
+1. No (checked: every test hunk in `7ad6b1d4`; all original assertions, deadlines and three process ignores retained).
+2. No (checked: tests execute actual worlds, saved jobs and server processes; deliberately corrupted real evidence is a negative control).
+3. No (checked: commit paths contain no golden or snapshot; repaired test files restore their captured original bytes).
+4. Production discovery now calls the unchanged semantic verifier; tests add assertions and an MCP handshake. No relaxation (checked: no verifier/CI/config suppression, deadline or tolerance changes in the source diff).
+5. No (checked: generation cache and discovery are ordinary production branches, without fixture/path sniffing or a success shortcut).
+6. No (checked: actual nonzero control, runner and process result lines; filtered counts and original ignores are reported separately).
+7. No (checked: reports distinguish baseline, overlay candidate, committed source, then-pending gates and final workspace results).
+8. No (checked: live child logs/artifacts support the process claim; RCH does not certify native DSR, performance or complete provenance).
+9. The first MCP client fails initialization; its 7/1/3 result remains above. The earlier full-runtime 237/1/6 timeout remains unexplained. Neither is called a pass.
+10. No (checked: proof commands retain stdout and stderr together or in adjacent named files; no cited failure is discarded).
+11. No (checked: original `bd-2z0.5.11` is in progress with all seven unchanged criteria; no replacement child or close).
+12. No (checked: README/plan scope is recovered downloads, and the original acceptance text is preserved).
+13. Not applicable: solo, no delegated task or closure.
+14. Not applicable: no subagent dispatch.
+15. Not applicable: no subagent report accepted.
+16. Not applicable: no swarm; successful original-ID bytes are the positive outcome, not refusal counts.
+17. No (checked: author re-execution is explicitly self-verification, never independent review).
+18. No (checked: selected original runner suite, experiment controls and whole ordinary process file; expected artifact membership derives from the actual manifest).
+19. The omitted MCP initialization was a real test-client mistake. The server rejected it correctly; adding the standard handshake preserves its refusal and every artifact assertion. Cold remote compilation also consumes substantial wall time without adding capability.
+20. The reproducible skeptical probe is the committed whole-process test: it kills/restarts the actual server and verifies all original-ID downloads through both library and shipped CLI; baseline zero-versus-three supplies the before control.
+
+History scope: healthy lexical CASS search returns 43 matches for the combined
+five suggested phrases and 140 for the session-derived `artifact_generation`
+query. Two bounded `cass view` contexts resolve to old September semantic-identity
+and DSR-profile work, not this current increment; no historical clearance follows.
+Raw searches/views and stderr are external under the current proof root.
+Disposition: retain the failed MCP-client chain, fix its setup and report it;
+preserve strict protocol/error guards (RH-1), and keep live/candidate/clean/native
+proof classes distinct (RH-2). No independent acceptance or whole-project
+completion is claimed. Final gate outcomes are above; the publication receipt follows.
+
 ## Current implementation — experiment catalog recovery, VioletTrout
 
 Source **`11cb7a28beadcbca90ab0e235e7f28ec2666f43e`** delivers durable API

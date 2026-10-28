@@ -4,6 +4,19 @@
 
 **Evidence date:** 2026-07-11
 
+**Recovered experiment downloads (2026-10-27; proof 2026-10-28):** [Qualified
+increment; original `bd-2z0.5.11` Currently In Progress — VioletTrout].
+`7ad6b1d4` rebuilds artifact publication from saved definitions/status through
+the unchanged semantic bundle verifier and staged publisher. Clean-source
+controls pass 11/0/0, original runner tests 19/0/0, and the complete ordinary
+process file 8/0/3 unchanged ignores. After completed-server restart, cold MCP
+lookup and all three original-ID REST downloads succeed; the downloaded bundle
+passes canonical and shipped CLI verification without rewriting status. Byte-valid
+wrong-science batches refuse atomically while another healthy job stays readable;
+repair retries the same generation. Clean workspace/all-target compiler check,
+strict Clippy and formatting pass. The original resource/fault/native
+acceptance and earlier runtime handoff timeout remain unchanged and open.
+
 **Experiment catalog recovery (2026-10-27):** [Qualified increment;
 original `bd-2z0.5.11` Currently In Progress — VioletTrout]. `11cb7a28`
 persists a validated, versioned definition before the worker starts, discovers
