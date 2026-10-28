@@ -4,6 +4,19 @@
 
 **Evidence date:** 2026-07-11
 
+**Active-run cancellation (2026-10-28):** [Qualified increment; original
+`bd-2z0.5.11` Currently In Progress — VioletTrout]. `280f1803` wires the existing
+token to durable tick boundaries; test setup is corrected in `e748b15d469b`.
+Clean-source self-verification passes 20 runner tests, 11 experiment controls
+and 8 ordinary process tests, with three unchanged long-run ignores. Both real
+MLP/DWRAON owners stop at tick 3, resume through MCP to 40 with uninterrupted
+digests, and pass canonical/CLI bundle verification. Runtime proof uses DWARF
+off with debug/overflow checks on, confirmed by actual Cargo artifact records.
+Default-profile workspace/all-target check, strict Clippy and formatting pass.
+No status guard, deadline or acceptance criterion changes. Full resource/fault,
+portable-chain/provenance/native qualification and the earlier runtime handoff
+failure remain open; no hard wall-clock cancellation guarantee is claimed.
+
 **Recovered experiment downloads (2026-10-27; proof 2026-10-28):** [Qualified
 increment; original `bd-2z0.5.11` Currently In Progress — VioletTrout].
 `7ad6b1d4` rebuilds artifact publication from saved definitions/status through

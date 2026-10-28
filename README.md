@@ -1086,7 +1086,8 @@ For an interactive run, ScriptBots parses the control environment and transactio
   - `GET /api/narrative/search` → search the recent birth/death/combat narrative
   - `POST /api/v1/experiments` → start a matched-seed batch (`variants` × `seeds`, `ticks_per_run`) that executes on a
     background worker; `GET /api/v1/experiments/{id}` reports per-run state, final digest and bundle path;
-    `POST .../cancel` stops before the next wave; `POST .../resume` continues pending runs and
+    `POST .../cancel` stops active runs between durable ticks and prevents another wave;
+    `POST .../resume` continues pending runs and
     unfinished runs from validated owner/journal cuts, and recovers verified completed
     bundles saved before their final status write. Missing or incompatible cuts are refused.
   - `POST /api/v1/checkpoints` → capture a `WorldCheckpointV1` and record it in the run database (usable by
@@ -1130,6 +1131,12 @@ request is required. Whole-list discovery reports an invalid saved batch, while
 a known ID from another healthy batch remains readable. Successful publication
 is cached by saved status generation; downloads still check the file size,
 BLAKE3 and SHA-256. These reads neither run the experiment nor rewrite its status.
+
+Cancellation is cooperative: a request can report `cancelling` while the current
+host or checkpoint operation finishes. A successfully stopped unfinished batch
+reports `cancelled`; its unfinished run records retain `running`, with actual
+progress in validated owner/journal cuts for resume. A batch that finishes before
+the request takes effect still reports `completed`.
 
 `GET /api/status` and MCP `get_status` report one immutable owner publication:
 `paused`, `lifecycle`, tagged `health` (including blocker/fault detail),
@@ -1261,7 +1268,7 @@ cargo run -p scriptbots-app --bin control_cli -- watch --interval-ms 500
   - Maps: `map_generate` → procedural sandbox map generation; `map_apply` → apply map artifact to running simulation
   - Experiments: `experiment_create` runs a real matched-seed batch (MLP/DWRAON/Assembly arms × seeds) on a
     background worker and writes a verified run bundle per run; `experiment_status`, `experiment_list`,
-    `experiment_cancel` (stops before the next wave), `experiment_resume` (continues pending runs
+    `experiment_cancel` (stops active runs between durable ticks), `experiment_resume` (continues pending runs
     and unfinished runs from validated owner/journal cuts, and recovers verified completed
     bundles saved before their final status write; missing or incompatible cuts are refused).
     The same saved-definition discovery supports status/list/resume by ID after restart.

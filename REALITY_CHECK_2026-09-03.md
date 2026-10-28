@@ -1,5 +1,273 @@
 # Reality Check — rust_scriptbots — implementation continuation 2026-10-27
 
+## Active TODO — active-run cancellation, VioletTrout, 2026-10-28
+
+Before this increment, the cancel API set a real atomic token, but workers read
+it only before a wave. Source `280f1803`, with test setup corrected in
+`e748b15d469b71a4108780cdb7c31058679d959b`, connects that token to durable tick
+cuts. Clean-source self-verification passes 20 runner tests, 11 API controls and
+8 ordinary process tests, with three unchanged long-run ignores. Default-profile
+workspace/all-target check and strict Clippy, formatting and whitespace pass.
+Runtime uses debug symbols off, with debug assertions and overflow checks on;
+Cargo's actual executable records confirm those settings. Continue the original
+`bd-2z0.5.11`; all seven criteria stay intact and the task stays open.
+
+- [x] Recheck unchanged instructions, README changes, ready graph and source.
+- [x] Claim continuation, reserve eight exact paths and notify the API owner.
+- [x] Execute a valid baseline negative: the active run completes despite cancellation (2 completed vs 1 required).
+- [x] Restore the preserved candidate production patch after the baseline counterfactual; only test setup differs.
+- [x] Wire cancellation between durable ticks in production worker execution.
+- [x] Implement owner shutdown and resumable cut retention, preserving Pending and Completed companions.
+- [x] Keep Running status validation and terminal evidence guards unchanged.
+- [x] Test MLP/DWRAON, concurrency 1/2, nonzero cuts, stable stopped files and exact resume digests.
+- [x] Exercise real server cancellation and ID-only resume through REST/MCP.
+- [x] Run relevant RCH suites, workspace/all-target check, strict Clippy, formatting and UBS.
+- [x] Retain actual artifacts, failures, exact source receipts and scope limits.
+- [x] Re-verify committed source and update original notes without relaxing acceptance.
+- [x] Review source/docs/tracker snapshots and prepare guarded publication and lease release.
+
+Creation worksheet for this continuation of the requested TODO: boundary PROCESS;
+consumer is the operator requesting granular tracking; gate is the requested
+source-bound implementation handoff; observed defect is active waves ignoring
+the cancellation token until their tick budgets finish; retirement is this
+block's publication. Integrity exception Q1–Q4 is not invoked: report loss does
+not lose runtime state, runtime does not need it, raw logs are smaller evidence,
+and the existing report is cheaper than another artifact. Opportunity Q1 is
+the already-claimed runner cancellation capability; Q2 is yes, implementation
+beats another hour of reporting. Verdict: minimal requested record only, zero
+capability credit. End-of-block work and honesty review follows actual results.
+
+Implementation passes the existing token to workers and checks it before the
+next Step. The current tick and joint-cut write complete first; shutdown still
+uses the canonical command/receipt boundary and must observe Stopped. Incomplete
+records retain Running with no terminal tick/digest/bundle evidence; their actual
+tick remains in the validated joint cut. All Running status guards are unchanged,
+and the new negative attempts nonzero status ticks and requires refusal without
+changing the saved status. A cancellation arriving after the final tick still
+allows legitimate completion. No executing host/filesystem call is interrupted,
+and no hard wall-clock cancellation or full resource contract is claimed.
+
+The existing process journey retains every kill/restart/download assertion, then
+adds live MLP/DWRAON cancellation, stable stopped files, initialized MCP ID-only
+resume, exact nonzero restore-log checks, uninterrupted oracles and canonical/CLI
+bundle verification. Its original deadlines and ignores are unchanged.
+
+The following execution record is chronological; pending statements describe
+their then-current stage, not the final qualification above.
+
+The first partial workspace check predates the
+complete test additions and is replaced by a strict full-source Clippy lane.
+RCH's exact wrapper cancellation/recovery acknowledges terminal exit 143; the
+partial check is no pass. A replacement refuses an unfinished source owner;
+recovery reconciles that owner, then the next attempt fails SSH setup with
+connection reset before compilation. Raw logs and refusals are retained under
+`/data/tmp/scriptbots-cancellation-20261028-violettrout/`; local fallback stays
+disabled. The separate unchanged-production negative is still compiling.
+
+The first baseline exits **137** at the fixed 1,800-second wrapper limit while
+compiling dependencies; it executes no tests and is not the negative proof.
+Its retained source diff adds only the test. The baseline job is already terminal
+and acknowledged. hz2 subsequently has **0 slots**, **disk_free_gb=11.6756** and critical
+disk pressure; another worker is unavailable/draining. Those are infrastructure
+observations, not permission to delete files or weaken admission.
+
+During the counterfactual phase, only the leased runner file was manually returned
+to unchanged production plus the stronger test, verified as one added-test hunk.
+The complete candidate is preserved externally as `candidate-experiment_runner.rs`
+with SHA-256 `a02510152b35d02e0616299cdf4175ab0f2d85999d9dc4091c51093442b84e80`
+under the proof root. Restore its production patch manually and compare that hash
+before source publication. The full-source candidate Clippy snapshot is already
+frozen remotely and is unaffected. A separate pinned baseline library prebuild
+is now admitted on vmi1156319; ordinary test execution retains the original
+1,800-second wrapper limit and all in-test deadlines/assertions. A library build
+alone contributes no test pass. This separates compilation from execution and
+does not change feature flags or the testing gate.
+
+Candidate workspace/all-target strict Clippy passes in **58m45s** on the
+retained overlay fingerprint
+`6a98cb049ba258f2a025cf292fb4c8578e3cd64080ff4d01c119bc6e0861755c`.
+The subsequent candidate adds only test-artifact retention; final-source UBS
+reports **0 critical / 1,860 warnings / 889 informational**, not warning-free.
+The candidate runner is manually restored and its bytes match the preserved
+SHA-256 exactly. Every source hunk is reviewed and committed locally as
+`280f1803395e0ec0dfffa962a6dba933dcc873b8`, tree
+`3820a19a0c7801b1217c204b080b345f57a12d88`. This is an immutable verification
+anchor, not publication or a runtime pass. Fresh workspace checks now use that
+commit with both `--clean-overlay` and `--no-overlay`, independent of the
+older baseline-control overlay. The working runner will briefly return to
+unchanged production for the negative probe if needed; final restoration and
+byte comparison remain required before publication.
+
+The baseline library prebuild passes in **29m51s**. Source inspection confirms
+that the real CPU-PNG acceptance test consumes the render dev-dependency,
+which pulls GPUI into test compilation; no dependency or test is removed.
+The selected ordinary process-test target is now prebuilt under the compilation
+budget to warm that same dev-dependency graph. A prebuild is no executed test.
+
+Final clean committed-source workspace/all-target compiler check passes in
+**11m09s** at `280f1803`, tree `3820a19a0c7801b1217c204b080b345f57a12d88`.
+Final strict Clippy also passes at that same source/tree with
+`-- -D warnings`. Both use the clean no-overlay invocation; runtime execution
+remains pending and is not inferred from these compiler results.
+
+The ordinary process-target prebuild succeeds, but vmi1156319 then reports
+**0 slots**, **disk_free_gb=4.9524** and critical disk pressure; both two-job and
+one-job negative-test launches refuse admission. No test executes. The expanded
+default debug build footprint exhausted another worker's admissible capacity.
+Default-profile final compiler check and strict Clippy already pass; runtime
+qualification now uses an explicitly recorded smaller profile on vmi1152480:
+`profile.dev.debug=0`, `profile.test.debug=0`, with **debug-assertions=true** and
+**overflow-checks=true** explicitly set in both profiles. Features, optimization,
+panic policy, test filters, assertions, original ignores and deadlines are not
+changed. This suppresses DWARF symbols, not runtime checks. All application test
+targets are prebuilt first; subsequent test commands retain those same profile
+settings. Results must be labelled with this runtime build configuration rather
+than presented as execution of the default debug-symbol binaries. No files are
+deleted and no disk-admission threshold is weakened.
+
+The smaller-profile baseline prebuild passes in 31m31s; it executes no tests.
+Two new-test setup defects then fail before the intended observation: the 40×40
+grid omitted `food_cell_size=10`, and the completed companion skipped its saved
+Pending→Running boundary. Correct only these test inputs/sequencing, including
+the process request's grid; production validators remain byte-identical.
+The valid unchanged-production baseline subsequently executes **0 passed / 1
+failed / 0 ignored**, 670 filtered, 3.53s. It fails at the intended completed-count
+assertion: actual **2**, required **1**. The real active run completed despite
+the token. Its source is `7207aade` plus overlay
+`aab028f9069eb4d0cb4361ebda3c928bc7e63e733732866db3af65682eae52fc`;
+the earlier setup failures are not negative capability evidence. The production
+candidate is now manually restored, with `git diff` against `280f1803` showing
+only the corrected new-test setup. The candidate executes **1 passed / 0 failed /
+0 ignored**, 670 filtered, 54.21s, covering all four distinct family/concurrency
+cells. All stopped-cut, Pending/Completed companion, unchanged status guard and
+exact uninterrupted-digest assertions execute. This uses the explicit smaller
+runtime profile above. Setup corrections are separately reviewed and committed
+as `e748b15d469b`, tree `e9e44c27e92536d2ea9e6c61406737fa7e8a19a5`;
+broader clean-source qualification now targets that exact revision.
+Final fixture-corrected UBS reports **0 critical / 1,862 warnings / 889 info**.
+An attempted post-run source copy finds RCH's checkout already retired; no source
+copy is claimed from that attempt. External test artifacts survive separately.
+
+Clean `e748b15d469b71a4108780cdb7c31058679d959b` runner selection passes
+**20/0/0**, 651 filtered, 212.01s, including the four active-cancellation cells
+and the unchanged real process-kill controls. The latter restore MLP tick 8 and
+DWRAON tick 6 to tick 40 with their uninterrupted digests. This is the stated
+smaller-profile execution, not an all-workspace runtime pass. The candidate's
+four retained cancelled statuses independently show one Completed companion,
+one/two Running cuts, and two/one Pending companions; each resumes to all four
+Completed, with eight actual interrupted/oracle bundles per cell. Raw early
+attempts and candidate files are copied to `early-runtime-cases.tar.gz` under
+the proof root (SHA-256
+`1e5e251ad725cdb06a111dd13fc8d439d7d4190b1b5330995f647d78687daad3`).
+The clean-source experiment control selection also passes **11/0/0**, 660
+filtered, 15.33s. Intentional poison panics in its fault controls are captured
+and their refusal assertions pass; they are not hidden process failures.
+
+The complete ordinary process file passes **8/0/3 unchanged ignores**, zero
+filtered, 119.86s. Both actual active runs stop at durable **tick 3**, resume
+through initialized MCP to **tick 40**, and match their uninterrupted digests:
+MLP `c3b6a5d81f15444c`, DWRAON `97f91d076158868c`. All four active-run bundles
+pass canonical and shipped CLI verification. The original server-kill restore
+at tick 2, tick-12 oracle, completed restart and three original-ID downloads
+also pass. The new assertions are part of the existing process test; they do
+not count as additional independent tests. The clean selections total **39
+distinct executed tests**, plus the three unchanged long-run ignores, rather
+than an all-feature or full-workspace runtime pass. No independent verifier is
+claimed. Default-profile final workspace/all-target compiler check passes in
+19.36s at `e748b15d`; strict Clippy passes in 21.45s at the same clean source.
+`cargo fmt --check` and `git diff --check` pass. The existing
+`proc-macro-error2` future-compatibility notice remains; UBS is not warning-free.
+
+The retained clean runner archive contains **36 actual bundle manifests**, all
+identifying `e748b15d469b71a4108780cdb7c31058679d959b`, all with
+`reproducible=false`. That includes 32 matrix bundles and four existing
+process-kill/oracle bundles. `clean-runner-cases.tar.gz` SHA-256 is
+`90c845f020e3a57d4c2993dbd017ac1c75ad63f28270a2c66bdd13357bb59148`.
+Missing source-tree/compiler/profile provenance in manifests is still missing;
+the separate Cargo build artifact records are required for the runtime-profile
+qualification and do not promote those manifests to complete provenance.
+
+The final clean Cargo JSON build succeeds in 42.78s. It executes no tests.
+Its actual library test, ordinary-process test and shipped server executable
+records are all fresh and report `opt_level="0"`, `debuginfo=0`,
+`debug_assertions=true`, `overflow_checks=true`. The raw log retains those records
+and the exact source receipt in `clean-runtime-profile-artifacts.log`. No profile
+value is inferred from the incomplete run-manifest provenance.
+
+The actual process journey's seven retained manifests also identify that source;
+its cancelled/resumed/oracle JSON contains both distinct families, and four CLI
+stdout/stderr pairs are present. `clean-process-cases.tar.gz` also preserves the
+other retained ordinary-process cases; its SHA-256 is
+`4ec819539d949ae9a8744f25dac1f8bcbb481e423d92f6fc72384b0a7dd49e1b`.
+
+Original acceptance still to execute under `bd-2z0.5.11` (no closure or diluted child):
+
+- [ ] Enforce the complete queued/run/thread/checkpoint/disk/artifact resource and deadline policy.
+- [ ] Inject and qualify every step/storage/checkpoint/status/bundle failure and interruption boundary, including cancellation faults.
+- [ ] Expose the deterministic checkpoint restore/branch primitive.
+- [ ] Bind portable checkpoint chains and complete provenance; satisfy the original reproducibility criterion.
+- [ ] Complete the original structured resource/latency evidence and native/approved acceptance lanes.
+- [ ] Explain or fix the previously recorded full-runtime 237/1/6 handoff failure; isolated passes are not its resolution.
+
+Tracker readback preserves all 720 canonical rows: only `notes` and `updated_at`
+change on `bd-2z0.5.11` and the existing infrastructure task `bd-x1ec`; every
+other line is byte-identical. Both original statuses/owners and all acceptance,
+dependencies, comments and labels remain unchanged. Explicit import succeeds
+and dependency cycles are empty. Source files still match verified `e748b15d`.
+The immutable source/doc/tracker review is the final publication gate; remote
+ref checks and actual lease release are recorded in the session handoff.
+
+End-of-block work audit (cancellation increment; own source commits `280f1803`
+and `e748b15d`, actual test logs and canonical open graph examined): purpose is
+the README's deterministic evolutionary simulation and experiment workflow.
+The feature commit is USER, fixture correction is ENABLER, README behavior docs
+are USER, and requested report/tracker work is PROCESS: work-item tally 2/1/1/0
+USER/ENABLER/PROCESS/UNKNOWN, not a capability or commit-rate metric.
+
+1. Most visible increment: cancel the real two-family batch at tick 3, then resume by ID to tick 40 with both uninterrupted digests; the retained process case demonstrates it.
+2. Without process work, runtime behavior would be identical; the explicitly requested TODO and failure/scope handoff would be absent. It earns zero capability credit.
+3. The ENABLER is exercised: valid-grid and saved-Running setup permits the real negative and four positive cells to execute, without modifying validators.
+4. The oldest open user goal is `bd-2z0`, the Evolution Lab revival. This original runner task directly advances its scientific experiment workflow rather than starting another roadmap.
+5. Solo: no panes, delegates, close leaderboard or swarm activity to classify.
+6. No specification substituted for implementation: all seven original criteria and dependencies remain; no closure or diluted follow-up is created.
+
+Verdict: concrete USER progress, with excessive cold-build cost and avoidable
+test setup mistakes. Correction: finish this publication, retain the failures,
+and add no verification framework or further reporting rounds.
+
+Honesty inventory for this block (self-review, not independent verification):
+
+1. No (checked: all source/test diffs against `7207aade`, immutable code reviews, original assertions/ignores/deadlines and unchanged CI/config). No test was weakened, deleted or skipped to obtain green.
+2. No (checked: new tests use real HostCore, durable cuts, actual processes, both brain families, uninterrupted worlds and shipped CLI verification).
+3. No (checked: changed paths exclude every golden and performance baseline).
+4. Yes, feature tests were added and runtime DWARF disabled after disk refusals. No validator, gate, repository profile, tolerance or runtime assertion changes; debug/overflow checks are explicitly on and observed in actual Cargo records. Default-profile compiler/Clippy still pass. This qualification must accompany runtime results (RH-1/proof-class control).
+5. No (checked: ordinary run path and unchanged source guards; no benchmark/demo/environment success branch, removed dependency or narrowed acceptance).
+6. No (checked: final selections execute 20, 11 and 8 tests). Prebuilds/profile readback execute none and receive no test credit; RCH 103 refuses before execution.
+7. No (checked: cited counts, durations, source receipts, raw failures and copied actual artifacts). The baseline setup failures and cold-build timeout are not capability proof.
+8. No (checked: reported runtime profile, live oracle comparisons and `reproducible=false` manifests). No native, performance, complete-provenance or all-workspace runtime qualification is claimed.
+9. No (checked: this block retains the two setup errors, baseline 137, admission/SSH/source-owner failures, UBS warnings and the earlier unexplained runtime 237/1/6). Original acceptance stays open.
+10. No (checked: cited commands retain stdout and stderr). Cargo JSON initially omitted panic detail; ordinary diagnostic reruns captured it before interpreting the failure.
+11. No (checked: original task remains in_progress with its complete acceptance; no issue closes or new child).
+12. No (checked: original acceptance and dependencies; plan/README changes describe this implemented increment and its limits).
+13. No (checked: no subagents or swarm closes in this solo block).
+14. No (checked: no delegation or make-green dispatch).
+15. No (checked: no subagent report accepted; all cited checks executed directly through RCH).
+16. No (checked: no panes or refusal-only closures; positive cancel/resume is executed).
+17. No (checked: no inter-agent agreement used as proof; same-origin tests are explicitly self-verification).
+18. No (checked: declared MLP/DWRAON × concurrency 1/2 and the original runner/control/process selections). Counts derive from executed suites and files; failures, ignores and incomplete criteria remain visible countermetrics.
+19. Yes: two avoidable fixture errors, an unnecessary early check cancellation/reconciliation, an accidental remote Cargo-help invocation, and expensive default-debug builds consumed time. A metadata redaction also missed a token embedded in JSON text and printed it in tool output; it was not written into repository files. Later output selects fields. The first source commit was a verification anchor before runtime success, never a published success claim. Corrections and cost are disclosed here, not hidden by the final green runs.
+20. Strongest positive evidence: the clean shipped-server process case stops both actual families at tick 3, restores those exact cuts, reaches tick 40 with oracle digests and separately verifies all four bundles. Re-execute the exact pinned commands retained in the raw RCH logs with the recorded profile.
+
+Older-session check is bounded: CASS's five suggested phrases produce 43 hits,
+two returned; the session-derived cancellation query returns two older-session
+hits. A `cass view` around the derived hit yields an old DSR transfer/event, not
+current cancellation evidence. This is not a historical all-clear. Raw query
+and view data remain external. Disposition: fixture inputs/sequencing corrected
+in place; profile scope and failure chain disclosed; RH-1/proof-class inflation
+and RH-17/failure-erasure countermeasures are explicit unchanged guards, retained
+failures, actual profile records and open original acceptance. No independent
+certificate or extra governance artifact is created.
+
 ## Completed TODO — recovered experiment downloads, VioletTrout
 
 Source `7ad6b1d4` now restores verified original-ID artifact downloads after a
