@@ -2501,7 +2501,7 @@ fn real_process_named_experiment_continues_after_server_kill() -> Result<()> {
     assert_eq!(items.len(), manifest.artifacts.len() + 1);
     let status_bytes = std::fs::read(output.join("status.json"))?;
     drop(resumed_guard);
-    let (recovered_guard, recovered_address, recovered_mcp, _) =
+    let (recovered_guard, recovered_address, recovered_mcp, recovered_log) =
         spawn(&interrupted, "completed-restart")?;
     // A known ID must work before any list, create or resume request.
     let first_id = items[0]["artifact_id"]
@@ -2629,6 +2629,251 @@ fn real_process_named_experiment_continues_after_server_kill() -> Result<()> {
         "completed server restart recovered and downloaded {} original artifact IDs",
         items.len()
     );
+
+    // Exercise active cancellation through the shipped API after all original
+    // kill/restart/download assertions, then resume by ID through initialized MCP.
+    const CANCEL_TICKS: u64 = 40;
+    let cancel_request = serde_json::json!({
+        "experiment_id":"active-cancel", "idempotency_key":"active-cancel-v1",
+        "variants":[
+            {"variant_id":"mlp", "brain_family":"mlp",
+             "config_overrides":{"world_width":40,"world_height":40}},
+            {"variant_id":"dwraon", "brain_family":"dwraon",
+             "config_overrides":{"world_width":40,"world_height":40}}
+        ],
+        "seeds":[93], "ticks_per_run":CANCEL_TICKS, "max_concurrency":2
+    });
+    let cancel_payload = serde_json::to_vec(&cancel_request)?;
+    let (code, body) = http_with_body(
+        recovered_address,
+        "POST",
+        "/api/v1/experiments",
+        &cancel_payload,
+        Some("application/json"),
+    )?;
+    assert_eq!(code, 201, "active create: {body}");
+    let created: serde_json::Value = serde_json::from_str(&body)?;
+    let active_runs = created["runs"]
+        .as_array()
+        .context("active run identities")?;
+    let cancel_output = interrupted.join("artifacts/experiments/active-cancel");
+    let mut observed = std::collections::BTreeMap::new();
+    for run in active_runs {
+        observed.insert(
+            run["run_id"].as_str().context("active run ID")?.to_owned(),
+            std::collections::BTreeSet::new(),
+        );
+    }
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while observed
+        .values()
+        .any(|cuts| cuts.len() < MINIMUM_SAVED_CUTS)
+    {
+        for (id, cuts) in &mut observed {
+            if let Ok(bytes) = std::fs::read(cancel_output.join(format!("{id}.checkpoint")))
+                && let Some(end) = bytes.len().checked_sub(blake3::OUT_LEN)
+                && blake3::hash(&bytes[..end]).as_bytes() == &bytes[end..]
+            {
+                cuts.insert(blake3::hash(&bytes).to_hex().to_string());
+            }
+        }
+        assert!(Instant::now() < deadline, "both real families must advance");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let (code, body) = http(
+        recovered_address,
+        "POST",
+        "/api/v1/experiments/active-cancel/cancel",
+    )?;
+    assert_eq!(code, 200, "active cancel: {body}");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let cancelled = loop {
+        let (code, body) = http(
+            recovered_address,
+            "GET",
+            "/api/v1/experiments/active-cancel",
+        )?;
+        assert_eq!(code, 200, "active status: {body}");
+        let status: serde_json::Value = serde_json::from_str(&body)?;
+        if status["status"] == "cancelled" {
+            break status;
+        }
+        assert_ne!(
+            status["status"], "completed",
+            "active wave must stop before its full budget"
+        );
+        assert_ne!(status["status"], "failed", "{body}");
+        assert!(
+            Instant::now() < deadline,
+            "active cancellation did not settle: {body}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(cancelled["completed_runs"], 0);
+    assert_eq!(cancelled["failed_runs"], 0);
+    assert!(cancelled["runs"].as_array().unwrap().iter().all(|run| {
+        run["state"] == "running" && run["final_digest"].is_null() && run["bundle_path"].is_null()
+    }));
+    std::fs::write(
+        interrupted.join("active-cancelled.json"),
+        serde_json::to_vec_pretty(&cancelled)?,
+    )?;
+    let saved_status = std::fs::read(cancel_output.join("status.json"))?;
+    let mut saved_cuts = Vec::new();
+    for id in observed.keys() {
+        let path = cancel_output.join(format!("{id}.checkpoint"));
+        let bytes = std::fs::read(&path)?;
+        std::fs::write(
+            interrupted.join(format!("cancelled-{id}.checkpoint")),
+            &bytes,
+        )?;
+        saved_cuts.push((path, bytes));
+    }
+    std::thread::sleep(Duration::from_millis(20));
+    assert_eq!(
+        std::fs::read(cancel_output.join("status.json"))?,
+        saved_status
+    );
+    for (path, bytes) in &saved_cuts {
+        assert_eq!(&std::fs::read(path)?, bytes);
+    }
+    let resume = serde_json::json!({"jsonrpc":"2.0","id":42,"method":"tools/call",
+        "params":{"name":"experiment_resume","arguments":{"experiment_id":"active-cancel"}}});
+    let (code, body) = http_with_body(
+        recovered_mcp,
+        "POST",
+        "/mcp",
+        &serde_json::to_vec(&resume)?,
+        Some("application/json"),
+    )?;
+    assert_eq!(code, 200, "active MCP resume: {body}");
+    let reply: serde_json::Value = serde_json::from_str(&body)?;
+    assert_eq!(reply["id"], 42);
+    assert!(reply["error"].is_null(), "{body}");
+    assert!(
+        matches!(
+            reply["result"].get("isError"),
+            None | Some(serde_json::Value::Bool(false))
+        ),
+        "{body}"
+    );
+    let wait_for_active = |address| -> Result<serde_json::Value> {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let (code, body) = http(address, "GET", "/api/v1/experiments/active-cancel")?;
+            assert_eq!(code, 200, "active finish: {body}");
+            let status: serde_json::Value = serde_json::from_str(&body)?;
+            if status["status"] == "completed" {
+                return Ok(status);
+            }
+            assert_ne!(status["status"], "failed", "{body}");
+            assert!(
+                Instant::now() < deadline,
+                "active resume did not finish: {body}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    let resumed = wait_for_active(recovered_address)?;
+    let (code, body) = http_with_body(
+        oracle_address,
+        "POST",
+        "/api/v1/experiments",
+        &cancel_payload,
+        Some("application/json"),
+    )?;
+    assert_eq!(code, 201, "active oracle: {body}");
+    let expected = wait_for_active(oracle_address)?;
+    let ticks_for = |message: &str, id: &str| -> Vec<u64> {
+        recovered_log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|line| {
+                let plain = plain_server_log(line);
+                if !plain.contains(message) {
+                    return None;
+                }
+                let recorded_id = plain
+                    .split_once("run_id=")?
+                    .1
+                    .split_whitespace()
+                    .next()?
+                    .trim_matches('"');
+                if recorded_id != id {
+                    return None;
+                }
+                plain
+                    .split_once("checkpoint_tick=")?
+                    .1
+                    .split_whitespace()
+                    .next()?
+                    .parse()
+                    .ok()
+            })
+            .collect()
+    };
+    for (actual, expected) in resumed["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(expected["runs"].as_array().unwrap())
+    {
+        let id = actual["run_id"].as_str().context("resumed run ID")?;
+        assert_eq!(actual["run_id"], expected["run_id"]);
+        assert_eq!(actual["final_digest"], expected["final_digest"]);
+        assert_eq!(actual["total_ticks"], CANCEL_TICKS);
+        let stopped = ticks_for(
+            "experiment owner stopped after cancellation; durable cut retained",
+            id,
+        );
+        assert_eq!(
+            stopped.len(),
+            1,
+            "one observed cancellation per owner: {id}"
+        );
+        assert!((minimum_tick..CANCEL_TICKS).contains(&stopped[0]));
+        let restored = ticks_for("restored durable experiment continuation cut", id);
+        assert_eq!(
+            restored,
+            vec![0, stopped[0]],
+            "exact nonzero continuation: {id}"
+        );
+        for (label, record) in [("resumed", actual), ("oracle", expected)] {
+            let bundle = Path::new(record["bundle_path"].as_str().context("active bundle")?);
+            let verified = scriptbots_storage::verify_run_bundle(bundle)?;
+            assert_eq!(verified.max_tick, CANCEL_TICKS);
+            let cli = Command::new(binary())
+                .arg("--verify-bundle")
+                .arg(bundle)
+                .output()?;
+            std::fs::write(
+                interrupted.join(format!("active-{label}-{id}-verify.stdout.log")),
+                &cli.stdout,
+            )?;
+            std::fs::write(
+                interrupted.join(format!("active-{label}-{id}-verify.stderr.log")),
+                &cli.stderr,
+            )?;
+            assert!(
+                cli.status.success(),
+                "active bundle CLI: {}",
+                String::from_utf8_lossy(&cli.stderr)
+            );
+        }
+        println!(
+            "active cancel/resume {id}: durable tick {}, final {}, oracle digest {}",
+            stopped[0], CANCEL_TICKS, actual["final_digest"]
+        );
+    }
+    std::fs::write(
+        interrupted.join("active-resumed.json"),
+        serde_json::to_vec_pretty(&resumed)?,
+    )?;
+    std::fs::write(
+        oracle_root.join("active-oracle.json"),
+        serde_json::to_vec_pretty(&expected)?,
+    )?;
     drop(oracle_guard);
     drop(recovered_guard);
     Ok(())

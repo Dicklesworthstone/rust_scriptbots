@@ -2164,8 +2164,8 @@ impl ControlHandle {
         job.status_dto()
     }
 
-    /// Request cooperative cancellation. The wave already executing finishes;
-    /// unadmitted runs stay pending and can be resumed.
+    /// Request cooperative cancellation at the next durable tick boundary.
+    /// Unfinished runs retain their continuation cuts; unadmitted runs stay pending.
     pub fn cancel_experiment(
         &self,
         experiment_id: &str,
@@ -2183,7 +2183,7 @@ impl ControlHandle {
         job.status_dto()
     }
 
-    /// Resume a stopped experiment whose batch still has pending runs.
+    /// Resume a stopped experiment with pending or checkpointed unfinished runs.
     pub fn resume_experiment(
         &self,
         experiment_id: &str,
@@ -2206,7 +2206,7 @@ impl ControlHandle {
             }
             "cancelling" => {
                 return Err(ControlError::Conflict(format!(
-                    "experiment '{experiment_id}' is still finishing its current wave; retry after it reports cancelled"
+                    "experiment '{experiment_id}' is still stopping at a durable tick boundary; retry after it reports cancelled"
                 )));
             }
             _ => {}

@@ -906,6 +906,7 @@ impl MatchedSeedExperimentRunner {
             seed,
             &run_id,
             &plan.digest,
+            &std::sync::atomic::AtomicBool::new(false),
         )
     }
 
@@ -928,11 +929,13 @@ impl MatchedSeedExperimentRunner {
         self.execute_batch_until_cancelled(state_file, &std::sync::atomic::AtomicBool::new(false))
     }
 
-    /// [`Self::execute_batch`] with cooperative cancellation between execution waves.
+    /// [`Self::execute_batch`] with cooperative cancellation at durable tick boundaries.
     ///
-    /// `cancel` is checked before each wave is admitted. A wave already running
-    /// finishes, so no record is left `Running`; the returned status keeps the
-    /// unadmitted runs `Pending`, and a later call on the same state file resumes them.
+    /// `cancel` is checked before admitting a wave and before each scientific tick.
+    /// Active owners finish their current tick/checkpoint and shut down; their
+    /// records remain `Running` with progress in the validated continuation cut.
+    /// Unadmitted runs remain `Pending`. A later call resumes those exact cuts.
+    /// This does not interrupt an executing host or filesystem operation.
     ///
     /// # Errors
     ///
@@ -1100,6 +1103,7 @@ impl MatchedSeedExperimentRunner {
                                 seed,
                                 &run_id,
                                 &plan_digest,
+                                cancel,
                             )
                         }),
                     ));
@@ -1119,20 +1123,29 @@ impl MatchedSeedExperimentRunner {
 
             for (index, result) in results {
                 match result {
-                    Ok(completed) => {
-                        info!(
-                            experiment_id = %self.experiment_id,
-                            run_id = %completed.run_id,
-                            variant_id = %completed.variant_id,
-                            brain_family = %completed.brain_family,
-                            seed = completed.seed,
-                            tick = completed.total_ticks,
-                            digest = completed.final_digest.as_deref().unwrap_or(""),
-                            bundle_path = completed.bundle_path.as_deref().unwrap_or(""),
-                            scheduler_slot = index,
-                            "matched-seed run completed and bundle reopened"
-                        );
-                        status.runs[index] = completed;
+                    Ok(record) => {
+                        if record.state == RunState::Completed {
+                            info!(
+                                experiment_id = %self.experiment_id,
+                                run_id = %record.run_id,
+                                variant_id = %record.variant_id,
+                                brain_family = %record.brain_family,
+                                seed = record.seed,
+                                tick = record.total_ticks,
+                                digest = record.final_digest.as_deref().unwrap_or(""),
+                                bundle_path = record.bundle_path.as_deref().unwrap_or(""),
+                                scheduler_slot = index,
+                                "matched-seed run completed and bundle reopened"
+                            );
+                        } else {
+                            info!(
+                                experiment_id = %self.experiment_id,
+                                run_id = %record.run_id,
+                                scheduler_slot = index,
+                                "matched-seed run suspended with its durable continuation cut"
+                            );
+                        }
+                        status.runs[index] = record;
                     }
                     Err(source) => {
                         error!(
@@ -1852,6 +1865,7 @@ impl MatchedSeedExperimentRunner {
         seed: u64,
         run_id: &str,
         plan_digest: &str,
+        cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<RunRecord, ExperimentRunnerError> {
         let path = self.run_checkpoint_path(run_id);
         let _lease = ExperimentStatusWriterLease::acquire(&path)?;
@@ -1874,7 +1888,12 @@ impl MatchedSeedExperimentRunner {
             "restored durable experiment continuation cut"
         );
 
+        let mut cancelled = false;
         for expected_tick in core.world_tick().0 + 1..=self.max_ticks {
+            if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                cancelled = true;
+                break;
+            }
             let submitted = frontend
                 .submit_envelope(CommandEnvelope::new(
                     CommandId::from_client_sequence(client_namespace, expected_tick),
@@ -1904,7 +1923,8 @@ impl MatchedSeedExperimentRunner {
             parent_digest = blake3::hash(&bytes).to_hex().to_string();
         }
 
-        if core.world_tick().0 != self.max_ticks {
+        let completed_ticks = core.world_tick().0;
+        if !cancelled && completed_ticks != self.max_ticks {
             return Err(ExperimentRunnerError::Host {
                 run_id: run_id.to_owned(),
                 operation: "observe final tick",
@@ -1927,7 +1947,7 @@ impl MatchedSeedExperimentRunner {
 
         let submitted = frontend
             .submit_envelope(CommandEnvelope::new(
-                CommandId::from_client_sequence(client_namespace, self.max_ticks + 1),
+                CommandId::from_client_sequence(client_namespace, completed_ticks + 1),
                 HostCommand::Shutdown,
             ))
             .map_err(|source| ExperimentRunnerError::Host {
@@ -1941,7 +1961,7 @@ impl MatchedSeedExperimentRunner {
             &mut frontend,
             &mut core,
             submitted.command_id(),
-            self.max_ticks,
+            completed_ticks,
             &mut next_nanos,
         )?;
         if core.latest_snapshot().lifecycle != HostLifecycle::Stopped {
@@ -1952,6 +1972,28 @@ impl MatchedSeedExperimentRunner {
                     "latest host lifecycle is {:?}, expected Stopped",
                     core.latest_snapshot().lifecycle
                 ),
+            });
+        }
+
+        if cancelled {
+            info!(
+                experiment_id = %self.experiment_id,
+                run_id,
+                checkpoint_tick = completed_ticks,
+                "experiment owner stopped after cancellation; durable cut retained"
+            );
+            return Ok(RunRecord {
+                run_id: run_id.to_owned(),
+                variant_id: variant.variant_id.clone(),
+                brain_family: family.canonical_name().to_owned(),
+                seed,
+                state: RunState::Running,
+                // The unchanged status schema carries tick/digest evidence only
+                // for terminal records. Actual progress stays in the joint cut.
+                total_ticks: 0,
+                final_digest: None,
+                bundle_path: None,
+                error_reason: None,
             });
         }
 
@@ -3653,6 +3695,177 @@ mod tests {
             })
             .collect();
         (runner, state_file, running, completed)
+    }
+
+    #[test]
+    fn active_wave_cancellation_retains_nonzero_cuts_and_resumes_exact_science() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        let families = ["mlp", "dwraon"];
+        let concurrency_levels = [1, 2];
+        let mut observed_cells = BTreeSet::new();
+        for family in families {
+            for concurrency in concurrency_levels {
+                let directory = tempfile::tempdir().unwrap().keep();
+                println!(
+                    "active cancellation evidence: {} family={family} concurrency={concurrency}",
+                    directory.display()
+                );
+                let runner = MatchedSeedExperimentRunner::new(
+                    "active-cancel",
+                    MatchedSeedCohort {
+                        cohort_id: "cohort".into(),
+                        seeds: vec![3, 4, 5, 6],
+                    },
+                    vec![ScenarioVariant {
+                        variant_id: family.into(),
+                        brain_family: family.into(),
+                        config_overrides: BTreeMap::from([
+                            ("world_width".into(), serde_json::json!(40)),
+                            ("world_height".into(), serde_json::json!(40)),
+                        ]),
+                    }],
+                    40,
+                    concurrency,
+                    directory.join("interrupted"),
+                );
+                let state_file = directory.join("status.json");
+                let mut initial = runner.load_or_create_status(&state_file).unwrap();
+                initial.runs[0] = runner
+                    .execute_single_run(&runner.variants[0], runner.cohort.seeds[0])
+                    .unwrap();
+                recompute_status_counts(&mut initial);
+                runner.save_status(&state_file, &mut initial).unwrap();
+                let completed_bundle = runner.output_dir.join(&initial.runs[0].run_id);
+                let original_manifest =
+                    fs::read(completed_bundle.join("bundle_manifest.json")).unwrap();
+                let active_ids = initial
+                    .runs
+                    .iter()
+                    .skip(1)
+                    .take(concurrency)
+                    .map(|record| record.run_id.clone())
+                    .collect::<Vec<_>>();
+                let cancel = AtomicBool::new(false);
+                let stopped = std::thread::scope(|scope| {
+                    let worker =
+                        scope.spawn(|| runner.execute_batch_until_cancelled(&state_file, &cancel));
+                    let deadline = Instant::now() + Duration::from_secs(30);
+                    loop {
+                        let all_started = active_ids.iter().all(|id| {
+                            read_optional_run_checkpoint(&runner.run_checkpoint_path(id))
+                                .ok()
+                                .flatten()
+                                .is_some_and(|cut| cut.owner.host_checkpoint().tick().0 > 0)
+                        });
+                        if all_started {
+                            cancel.store(true, Ordering::Release);
+                            break;
+                        }
+                        assert!(Instant::now() < deadline, "active cuts never appeared");
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    worker.join().unwrap().unwrap()
+                });
+                assert_eq!(stopped.completed_runs, 1);
+                assert_eq!(stopped.failed_runs, 0);
+                assert!(!stopped.is_finished());
+                assert_eq!(stopped.runs[0], initial.runs[0]);
+                let active_count = stopped
+                    .runs
+                    .iter()
+                    .filter(|record| record.state == RunState::Running)
+                    .count();
+                assert_eq!(active_count, concurrency);
+                observed_cells.insert((stopped.runs[1].brain_family.clone(), active_count));
+                let mut saved_cuts = Vec::new();
+                for (index, record) in stopped.runs.iter().enumerate().skip(1) {
+                    if index <= concurrency {
+                        assert_eq!(record.state, RunState::Running, "active run must suspend");
+                        assert_eq!(record.total_ticks, 0, "status retains its existing schema");
+                        assert!(record.final_digest.is_none());
+                        assert!(record.bundle_path.is_none());
+                        assert!(record.error_reason.is_none());
+                        let path = runner.run_checkpoint_path(&record.run_id);
+                        let bytes = fs::read(&path).unwrap();
+                        let cut = RunCheckpointV1::decode(&bytes, &path).unwrap();
+                        let tick = cut.owner.host_checkpoint().tick().0;
+                        assert!(tick > 0 && tick < runner.max_ticks, "stopped tick {tick}");
+                        let restored = restore_run_owner(
+                            &cut,
+                            ResolvedBrainFamily::resolve(&runner.variants[0]).unwrap(),
+                            &record.run_id,
+                            &path,
+                        )
+                        .unwrap();
+                        assert_eq!(restored.latest_snapshot().lifecycle, HostLifecycle::Running);
+                        assert!(!runner.output_dir.join(&record.run_id).exists());
+                        fs::write(
+                            directory.join(format!("stopped-{}.checkpoint", record.run_id)),
+                            &bytes,
+                        )
+                        .unwrap();
+                        saved_cuts.push((path, bytes));
+                    } else {
+                        assert_eq!(record.state, RunState::Pending);
+                        assert!(!runner.run_checkpoint_path(&record.run_id).exists());
+                    }
+                }
+                let status_bytes = fs::read(&state_file).unwrap();
+                fs::write(directory.join("cancelled-status.json"), &status_bytes).unwrap();
+                assert_eq!(
+                    runner
+                        .execute_batch_until_cancelled(&state_file, &cancel)
+                        .unwrap(),
+                    stopped,
+                    "repeated cancellation must not admit another wave"
+                );
+                assert_eq!(fs::read(&state_file).unwrap(), status_bytes);
+                for (path, bytes) in saved_cuts {
+                    assert_eq!(fs::read(path).unwrap(), bytes);
+                }
+                let mut invalid = stopped.clone();
+                invalid.runs[1].total_ticks = 1;
+                assert!(matches!(
+                    runner.save_status(&state_file, &mut invalid),
+                    Err(ExperimentRunnerError::InvalidStatus { .. })
+                ));
+                assert_eq!(fs::read(&state_file).unwrap(), status_bytes);
+                let resumed = runner.execute_batch(&state_file).unwrap();
+                assert!(resumed.is_finished());
+                assert_eq!(resumed.failed_runs, 0);
+                assert_eq!(resumed.completed_runs, resumed.total_runs);
+                assert_eq!(
+                    fs::read(completed_bundle.join("bundle_manifest.json")).unwrap(),
+                    original_manifest
+                );
+                let oracle = MatchedSeedExperimentRunner::new(
+                    &runner.experiment_id,
+                    runner.cohort.clone(),
+                    runner.variants.clone(),
+                    runner.max_ticks,
+                    concurrency,
+                    directory.join("oracle"),
+                );
+                let expected = oracle
+                    .execute_batch(&directory.join("oracle.json"))
+                    .unwrap();
+                for (actual, expected) in resumed.runs.iter().zip(expected.runs) {
+                    assert_eq!(actual.run_id, expected.run_id);
+                    assert_eq!(actual.final_digest, expected.final_digest);
+                    assert_eq!(actual.total_ticks, expected.total_ticks);
+                    scriptbots_storage::verify_run_bundle(Path::new(
+                        actual.bundle_path.as_ref().unwrap(),
+                    ))
+                    .unwrap();
+                }
+            }
+        }
+        assert_eq!(
+            observed_cells.len(),
+            families.len() * concurrency_levels.len()
+        );
     }
 
     #[test]
