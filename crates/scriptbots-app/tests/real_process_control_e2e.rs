@@ -2637,9 +2637,9 @@ fn real_process_named_experiment_continues_after_server_kill() -> Result<()> {
         "experiment_id":"active-cancel", "idempotency_key":"active-cancel-v1",
         "variants":[
             {"variant_id":"mlp", "brain_family":"mlp",
-             "config_overrides":{"world_width":40,"world_height":40}},
+             "config_overrides":{"world_width":40,"world_height":40,"food_cell_size":10}},
             {"variant_id":"dwraon", "brain_family":"dwraon",
-             "config_overrides":{"world_width":40,"world_height":40}}
+             "config_overrides":{"world_width":40,"world_height":40,"food_cell_size":10}}
         ],
         "seeds":[93], "ticks_per_run":CANCEL_TICKS, "max_concurrency":2
     });

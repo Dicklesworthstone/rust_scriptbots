@@ -3724,6 +3724,7 @@ mod tests {
                         config_overrides: BTreeMap::from([
                             ("world_width".into(), serde_json::json!(40)),
                             ("world_height".into(), serde_json::json!(40)),
+                            ("food_cell_size".into(), serde_json::json!(10)),
                         ]),
                     }],
                     40,
@@ -3732,6 +3733,8 @@ mod tests {
                 );
                 let state_file = directory.join("status.json");
                 let mut initial = runner.load_or_create_status(&state_file).unwrap();
+                initial.runs[0].state = RunState::Running;
+                runner.save_status(&state_file, &mut initial).unwrap();
                 initial.runs[0] = runner
                     .execute_single_run(&runner.variants[0], runner.cohort.seeds[0])
                     .unwrap();
