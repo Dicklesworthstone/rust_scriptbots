@@ -4,6 +4,19 @@
 
 **Evidence date:** 2026-07-11
 
+**Shared experiment admission (2026-10-29):** [Qualified increment; original
+`bd-2z0.5.11` Currently In Progress — VioletTrout]. `16773382df01` shares run-slot
+reservations across REST/MCP create/resume, bounds admission before files/state
+mutation and releases on worker exit. Listing reports reservations; real
+over-cap refusal and exact-request release/retry match uninterrupted science.
+Clean-source self-verification passes 77 runner/control/server tests and 8
+ordinary process tests, with three unchanged ignores. Runtime has DWARF off,
+debug/overflow checks on, confirmed by actual executable records; default-profile
+workspace/all-target check and strict Clippy pass. UBS retains three reviewed
+pre-existing critical false positives and exit 1. Full resource/fault/provenance/
+native acceptance, the earlier runtime handoff failure and an intermittent
+configuration CLI readback failure remain open. All seven original criteria stay intact.
+
 **Active-run cancellation (2026-10-28):** [Qualified increment; original
 `bd-2z0.5.11` Currently In Progress — VioletTrout]. `280f1803` wires the existing
 token to durable tick boundaries; test setup is corrected in `e748b15d469b`.

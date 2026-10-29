@@ -570,6 +570,7 @@ cargo build -p scriptbots-brain-ml --features candle # library tensor inference;
 - `SCRIPTBOTS_CONTROL_REST_ADDR` — REST bind address (default `127.0.0.1:8088`).
 - `SCRIPTBOTS_CONTROL_SWAGGER_PATH` — Swagger UI path (default `/docs`).
 - `SCRIPTBOTS_CONTROL_REST_ENABLED` — `true|false`.
+- `SCRIPTBOTS_EXPERIMENT_RUN_SLOTS` — shared create/resume run-slot capacity for this control service; defaults to the runner's maximum per-batch concurrency. Zero disables new execution while existing jobs and artifacts remain readable. Invalid values fail startup before storage reservation.
 - `SCRIPTBOTS_CONTROL_MCP` — `disabled|http` (default `http`).
 - `SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR` — MCP HTTP bind address (default `127.0.0.1:8090`).
 - `SCRIPTBOTS_CONTROL_ALLOWED_AUTHORITIES` — comma-separated additional advertised `host:port` values for REST and MCP HTTP. By default each listener accepts its actual bound IP/port and, for loopback, `localhost` at that port. Wildcard binds require explicit advertised authorities; a foreign or wrong-port Host is refused.
@@ -1137,6 +1138,18 @@ host or checkpoint operation finishes. A successfully stopped unfinished batch
 reports `cancelled`; its unfinished run records retain `running`, with actual
 progress in validated owner/journal cuts for resume. A batch that finishes before
 the request takes effect still reports `completed`.
+
+Experiment create and resume share one execution budget across REST, MCP and
+cloned control handles. Each worker reserves the smaller of its concurrency and
+unfinished-run count, and keeps those slots through preparation and artifact
+publication. Exhaustion returns REST 503 or an actionable MCP tool result with
+`isError=true` before admitting a new job; a refused resume preserves its
+saved state. Retry after slots are
+released. Exact keyed retries of an existing job remain readable at capacity.
+`GET /api/v1/experiments` includes `execution_capacity`: `max_run_slots`,
+`reserved_run_slots` and `reserved_batches`. Reservations are not a measurement
+of simultaneous science activity. This budget does not bound Rayon threads,
+other processes, disk bytes or executing filesystem/host-call duration.
 
 `GET /api/status` and MCP `get_status` report one immutable owner publication:
 `paused`, `lifecycle`, tagged `health` (including blocker/fault detail),

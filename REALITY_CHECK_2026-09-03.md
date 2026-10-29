@@ -1,5 +1,378 @@
 # Reality Check — rust_scriptbots — implementation continuation 2026-10-27
 
+## Active TODO — shared experiment execution admission, VioletTrout, 2026-10-29
+
+Source `16773382df01` now shares run-slot reservations across REST/MCP create
+and resume, releases capacity on worker exit and exposes actual reservations.
+Clean-source self-verification passes 77 selected unit tests and 8 ordinary
+process tests, with three unchanged long-run ignores; default-profile workspace
+check and strict Clippy pass. Runtime proof has DWARF off, debug/overflow checks
+on. UBS remains non-green with three reviewed pre-existing false positives.
+Original `bd-2z0.5.11` stays in progress, with all seven acceptance criteria
+intact; full resources, faults, provenance and native acceptance remain open.
+
+- [x] Recheck unchanged source, instructions, prior evidence and authoritative BR/BV graph.
+- [x] Continue the original in-progress task, reserve exact files and notify its API owner.
+- [x] Implement shared run-slot ownership and a startup setting consumed by both transports.
+- [x] Implement bounded unfinished-wave reservation before new definition/files or resume-state mutation.
+- [x] Implement ownership-based release and verify real publication failure plus scoped drop/unwind controls.
+- [x] Add coherent limit/reservation counts to experiment listing and schema.
+- [x] Prove limits with real jobs: full admission, over-cap refusal, idempotent reads, stable refused state, release and successful retry/resume.
+- [x] Exercise REST/MCP sharing in the existing shipped-server journey with unchanged original assertions/deadlines/ignores.
+- [x] Execute the unchanged-production process negative: extra real job returns 201 instead of required 503.
+- [x] Execute focused/full ordinary RCH selections, workspace/all-target check, strict Clippy, fmt and UBS; retain UBS's non-green result.
+- [x] Retain raw failures and actual artifacts outside temporary RCH checkouts, bound to exact source/profile.
+- [x] Review and re-verify committed source with actual executable profile readback.
+- [x] Append original Beads notes without changing acceptance/dependencies or other rows.
+- [x] Finalize source/evidence review and prepare exact docs/tracker snapshots for guarded publication plus lease release; outcomes follow in the session handoff.
+
+Remaining original acceptance, without new child tasks or closure credit:
+
+- [ ] Complete thread/process, checkpoint/disk-byte, hard deadline and partial-failure resource policy.
+- [ ] Complete fault injection at every step/storage/checkpoint/status/bundle boundary and the restore/branch primitive.
+- [ ] Bind full portable checkpoint chains, build/source/toolchain provenance and logs; qualify any future reproducible=true claim.
+- [ ] Resolve the earlier 237/1/6 runtime handoff failure and this block's unexplained configuration CLI readback failure; later greens are insufficient explanations.
+- [ ] Complete native and broader runtime acceptance and the original remaining observability requirements.
+
+Creation worksheet for this requested TODO: boundary PROCESS; consumer is the
+operator's explicit granular-tracking request; gate is this implementation
+handoff; observed defect is independent API jobs bypassing a shared execution
+budget; retirement is publication. Integrity exception Q1–Q4: no lost runtime
+state, no runtime dependence, raw logs are the smaller evidence, and this
+existing report is cheaper than another artifact. Opportunity Q1 is the real
+shared admission path; Q2 is yes, implementation wins over more process work.
+Verdict: retain this minimal requested record, with no capability credit.
+
+The baseline is `aaee6ae7194b4b753c031422940ec06078785d45` with only the new
+process assertions overlaid; all candidate production changes stay outside that
+snapshot. RCH is required and the ordinary in-test/wrapper deadlines remain.
+The vmi1152480 cache was cleared between sessions (543 MiB when checked), so
+the initial baseline admission required rebuilding its dependency graph before tests.
+Raw logs and source receipts live outside the checkout under
+`/data/tmp/scriptbots-continuation-20261029-violettrout/`; test artifacts use a
+unique external worker directory. The runtime profile retains the previous
+qualified choice: debug symbols off, debug assertions and overflow checks on.
+
+Initial four-file UBS exits 1 with **3 critical / 2,674 warnings / 1,331 info**.
+All three critical sites are pre-existing response-header-flow findings in the
+server file; unchanged baseline server scanning also exits 1 with **3 critical**
+(691 warnings / 401 info). The production HTTP-policy body and the test function
+containing both other sites compare byte-identically with baseline. The former
+validates the configured origin before reflecting an already-typed HeaderValue;
+the latter two sites construct request headers, not response headers. No scanner
+rule, guard, exclusion or suppression is changed, and no green UBS scan is
+claimed. The existing HTTP-policy negative tests will be re-executed alongside
+the new configuration and real-service tests before publication.
+
+The baseline build completes in **20m50s**. Its single selected process test
+executes **0 passed / 1 failed / 0 ignored**, 10 filtered, 17.20s. It passes the
+original server-kill restoration and all three recovered original-ID downloads,
+observes both real active-family cuts, then fails exactly at the new admission
+assertion: the extra `capacity-retry` job returns **201**, required **503**.
+The response contains its real Pending run identity; this is the intended
+missing shared-admission behavior, not a setup failure. The exact baseline
+overlay is `b9bb2acdfd09fb00e3717ee33fd461a8098a2938eb91bd6f70305fb3abeb41f7`.
+Candidate admission tests now execute against an explicit four-source-file
+overlay. No source changes are made to the already-frozen baseline checkout.
+
+Candidate admission tests pass **2/0/0**, 672 filtered, 8.69s. The real-job case
+fills two slots with distinct MLP/DWRAON runs, refuses a separate create before
+files/key admission, cancels and releases, admits a one-run job despite its
+higher concurrency allowance, preserves exact status/cut bytes on refused
+resume, and then completes both jobs within the combined three-slot policy.
+All three final run digests match uninterrupted owners and their bundles reopen.
+Zero capacity preserves completed keyed reads and refuses new execution. The
+separate private reservation unwind is an ownership-unit control, not a real
+OS spawn-failure or release-abort proof. Its intentional caught panic is retained.
+
+All four source-file hunks are reviewed and committed as `3f0abbbbae0a`, tree
+`3211ffc619b6b235dcea3df5197d9f1ecee8915f`, for clean-source qualification.
+The candidate overlay fingerprint is
+`57615bf437a64afc11ce9cb59af4eaf58380e9b850f6c62ac2651603131c5c5a`.
+An attempted overlay-tree comparison used RCH's clean **base** tree rather than
+its overlay fingerprint; that comparison is not source-equivalence proof. The
+new pinned clean run avoids that ambiguity. Fresh source-anchor UBS still
+reports the same **3 / 2,674 / 1,331** findings, with no failed scanner modules;
+it is not reported as a green scan. The commit is not yet published and broader
+compiler/runtime qualification is still pending.
+
+The pinned clean-source experiment control selection passes **13/0/0**, 661
+filtered, 15.90s at `3f0abbbbae0ad1d5a82d6f9e38bd511e32841821`. It includes
+both new reservation controls and the existing actual publication-poison case,
+which now also observes zero retained reservations after its worker failure.
+Every original control assertion remains. The clean receipt binds tree
+`3211ffc619b6b235dcea3df5197d9f1ecee8915f`; broader qualification continues.
+The failed baseline's actual child directory is retained locally in
+`baseline-process-case.tar.gz` (SHA-256
+`4c7c185d8b3901bbf7343b56f9d91d693069ca5b1026f8e7273ad29ac6c25dae`).
+
+The entire clean-source server unit module passes **44/0/0**, 630 filtered,
+4.74s. It executes the new target-width/zero/invalid setting cases and the
+unchanged HTTP-policy negatives. The pinned `http` 1.5.0 source also rejects
+CR/LF in `HeaderValue`; the three UBS sites are reviewed unchanged false
+positives (one guarded typed response and two request-test inputs). The raw
+scan remains exit 1; no rule is weakened or excluded to obtain zero findings.
+The six retained admission-case bundles all name the clean source and retain
+`reproducible=false`; cancelled and completed JSON plus stopped cuts are copied
+in `clean-admission-case.tar.gz` (SHA-256
+`fcd945403fb410520e2c28bea48aca2bacd2e015af06e960a43ed4fa7119c5da`).
+
+The first clean ordinary process run at `3f0abbbb` executes **7 passed / 1
+failed / 3 unchanged ignored**, 193.49s, exit 101. The new MCP assertion fails:
+the library masks its InternalError message, leaving only generic `-32603`.
+REST already refuses 503. Pinned FastMCP 0.10.0 explicitly preserves codes but
+masks server error messages; no global masking protection is disabled. Follow-up
+source `f835d48791e9`, tree `3e8aae7298a39d77b3fc22de7b2008299de2c7c8`, maps
+this typed capacity condition to resource-exhausted `-32006`. The new wire
+assertion now requires that distinct code and the masked message, while all
+original assertions plus actual quota/no-admission/retry checks remain. This
+corrects the new transport contract, not a failing old gate. Raw failed log and
+child `.tmpDgrvIA` remain. The four-file UBS still reports **3 / 2,674 / 1,331**
+and exit 1; formatting and whitespace checks pass. Full clean process
+qualification restarts at the corrected source.
+
+The second clean process run at `f835d487` executes **6/2/3**, 156.94s,
+exit 101. Its capacity response is actually a successful JSON-RPC envelope
+with `result.isError=true` and the full actionable refusal text: FastMCP's
+router converts non-framework tool failures into that form before protocol
+masking. The new numeric-code expectation was wrong; it is not used as proof.
+The final mapping uses the semantic `ToolExecutionError` variant and requires
+exact request ID, no protocol error, `isError=true`, and capacity text. This
+matches the pinned router and the MCP tool execution error contract, while
+keeping generic InternalError masking and every old policy/runner guard.
+The positive retry and no-admission checks still have to execute.
+
+The other failure is the unchanged configuration CLI combined value/tick
+readback guard, after a real applied/durable set receipt. Its failure message
+previously omitted the before snapshot, so a diagnostic now includes that
+snapshot without changing the predicate, deadlines or selection. This is not
+explained by an isolated green rerun. Both actual failed child directories are
+retained in `failed-v2-process-cases.tar.gz`; the first failed MCP child is in
+`failed-mcp-process-case.tar.gz` (SHA-256
+`1ac13483651d0042feaadfc70e575503ab55d6c490b6e8571d19e746c0b84795`).
+
+Final source `48386dff6d3090032c5db4ec94eb9c502532433f`, tree
+`88d68bf5496592d68d1646a89508d49413e86ce7`, passes the complete ordinary
+process file **8/0/3 unchanged ignores**, zero filtered, 128.88s, exit 0.
+REST 503 and MCP `isError=true` both execute at the shared two-slot limit.
+After release, the exact refused one-run request completes and matches an
+uninterrupted oracle (`e7bc2dc082639b77`), with zero residual reservations and
+an identical keyed retry. Both active-family owners stop at actual tick **5**,
+resume through MCP to **40**, and match the unchanged MLP/DWRAON oracle digests
+`c3b6a5d81f15444c` / `97f91d076158868c`; all four original canonical and CLI
+bundle checks execute. The original server-kill restoration/download journey
+also executes. Keepdirs `.tmpQIDn4g` and `.tmp6zmDub` are copied externally.
+The configuration CLI case passes its unchanged predicate this time; this does
+**not** explain or close the second-run readback failure. Final UBS is still
+non-green: **3 critical / 2,675 warnings / 1,331 info**. The critical sites are
+the same reviewed pre-existing false positives; no suppression is added.
+
+The actual successful process archive has SHA-256
+`646f538ac0ce878b21676a3216aaf2667ecddb826dcf14fbd3781314bd6d0a02`.
+All **nine** retained bundle manifests name final `source_revision=48386dff…`
+and `reproducible=false`; all four active CLI stdout/stderr pairs are retained.
+The two second-run failed children have archive SHA-256
+`cafeb4ed650852d842514e5c87774c01f10a396495947b118910f44c01f2eaaf`.
+Read-only worker hashes for the four changed sources, lockfile and toolchain
+match the pinned commit exactly. A preliminary worker `git rev-parse` cannot
+work because RCH materializes a Git-less tree; that is not counted as evidence.
+An initial manifest reader asked for `source_commit` rather than the declared
+`manifest.source_revision` and failed; the corrected nine-file check above
+computes the actual field and does not infer a reproducibility promotion.
+
+The final-source combined runner/control/server unit selection executes **76
+passed / 1 failed / 0 ignored**, 597 filtered, 199.31s. The failure is the old
+process-restart test: a parent initialized by preceding WorldState controls has
+8 Rayon threads, while the fresh child initializes Rayon's default 10 before
+its first plan. Retained parent and child build objects differ only in
+`core.rayon_threads`. Recomputing the declaration-order JSON/BLAKE3 plan with
+10 gives the exact saved `2cc8785af63ce633ca1b53339995897f5e83e63fa1bf21cc65193f6da5399f77`;
+changing only that field to 8 gives the exact refused current
+`db6e691e857d2ee0f63ffff7f56326c239e57d29e4b8b345550ce8559e049e9b`.
+The first sorted-key reconstruction did not match; declaration order does, so
+only the latter is credited. The guard correctly rejects that different class.
+The fixture correction explicitly builds the child's pool to the parent's
+observed count before planning, without changing launch-provenance variables.
+No production plan field, validator, assertion, timeout or ignore changes.
+Win/lose split: matched parent/child thread classes may now complete this
+restart proof; the observed mismatched-class state still fails unchanged
+validation. A full combined re-execution, not an isolated green, is required.
+
+The eleven-line test-only fixture correction is `16773382df0170c156cd47fa188a40a96ce1ccc1`,
+tree `5058987614cce4adab3a30aef3232fe67bb3e121`. Its source review contains only
+the private child setting, explicit pool creation/assertion and inherited actual
+count. The previous source's four production/control/process files otherwise
+compare unchanged. UBS is **3 / 2,681 / 1,331**, exit 1, no failed module; all
+three critical sites remain the reviewed unchanged server false positives.
+Failed restart archive SHA-256 is
+`413084e0b0a5033c127a2c90deddfd01776a065274ead5ef06b7bc59e58c4f29`;
+the successful four-cell cancellation and admission cases from that selection
+are retained in `clean-unit-cases.tar.gz` (SHA-256
+`5dd5bbc20c12d3c789d9f6b8877e4386c7fcaab7d0e99e083a625f4dab93532d`).
+
+The cold default-profile workspace/all-target compiler check passes at
+`48386dff`, **16m59s**, exit 0, with the existing third-party future-compatibility
+warning for proc-macro-error2. Its clean receipt binds that source and tree.
+A final-source refresh initially requests an additional RCH content receipt;
+the CLI refuses that option in combination with clean-overlay (exit 2, zero
+compilation). The corrected refresh retains the established clean-overlay /
+no-overlay / expected-source contract; no failed invocation is compiler credit.
+
+The final-source default-profile workspace/all-target check passes at
+`16773382`, **16.42s**, exit 0. Its clean-overlay receipt names tree
+`5058987614cce4adab3a30aef3232fe67bb3e121` and the empty overlay fingerprint
+`fe0d5151031be8fda7951fe7fe1f42f7ce344018fdb3ed21e6ada866b230b195`.
+
+Strict default-profile workspace/all-target Clippy with `-D warnings` also
+passes at `16773382`, exit 0, and retains the identical clean source/tree
+receipt. Final combined runtime selection is now re-executing the exact
+77-test denominator including the corrected real process restart fixture.
+
+Final combined selection at `16773382` passes **77/0/0**, 597 filtered,
+**196.84s**, exit 0: 20 runner cases, 13 experiment controls and 44 server cases.
+Both actual restart children now complete: MLP is killed at durable tick **7**
+and resumes to 40 with `a5bdbf8a1615575e`; DWRAON is killed at tick **8** and
+resumes to 40 with `82544897a98c1431`, each matching its uninterrupted owner.
+This is the same combined selection that previously failed, not an isolated
+green or a narrowed filter. All four MLP/DWRAON × concurrency 1/2 cancellation
+cells execute. The final ordinary process suite follows at this identical pin.
+Strict Clippy takes **2m25s**. Final local formatting/whitespace pass; UBS remains
+**3 / 2,681 / 1,331**, exit 1, no failed modules.
+
+Final ordinary process file at `16773382` passes **8/0/3 unchanged ignores**,
+zero filtered, **118.99s**, exit 0. Active MLP stops at tick **5**, DWRAON at
+tick **3**; both resume through MCP to 40 with the same oracle digests above.
+Both capacity transports refuse before admission, then the exact request
+completes with `e7bc2dc082639b77` after release and reopens canonically. These
+are **85 distinct selected tests** (77 + 8), not a full-workspace runtime claim.
+The old configuration CLI predicate passes again, without explaining its
+retained earlier failure. The final compile-only Cargo JSON check is exit 0
+and has three fresh actual executables: library test, process harness and
+shipped server. Each has opt-level 0, debuginfo 0, debug_assertions=true,
+overflow_checks=true; executable paths match the actual runtime logs. No
+runtime test credit is assigned to that compile-only invocation.
+
+The seven retained unit cases contain **42** bundle manifests at source
+`16773382`, all reproducible=false. Both restart/oracle pairs record actual
+Rayon class 8. `final-unit-cases.tar.gz` SHA-256:
+`6dd30aafdd475a09ecfc45a15e935a7cdbc52684d8c322a7efa876fc121c7c62`.
+The final process cases contain **14** manifests (including downloaded copies),
+all at that source and reproducible=false; this is an artifact count, not
+additional independent runs. `final-process-cases.tar.gz` SHA-256:
+`9568969307a5d8f849427a63674e13785a87555ffa5849f52014262fd8aae251`.
+The separately retained passing configuration CLI child has archive SHA-256
+`059f7fb11fef160d9e760c7dcff92122b70649b55e2a624434c18b819c070f67`.
+All exact RCH commands, stdout/stderr, clean source/tree receipts, failures,
+UBS scans and actual artifacts remain under the external proof directory above.
+
+Canonical tracker export is reconciled selectively: **720** rows, **719**
+byte-identical lines; only `notes` and `updated_at` change on original
+`bd-2z0.5.11`. Prior notes, all seven acceptance criteria, dependencies, status
+and owner remain. Canonical re-import succeeds and `br dep cycles` is empty.
+The generated `beads.base.jsonl` normalization and nine pre-existing scratch
+directories are preserved outside the owned commit. Reviewed documentation and
+canonical tracker are prepared as separate immutable snapshots; guarded push,
+both-ref readback and lease release are recorded in the final session handoff.
+
+End-of-block work audit (source work through `16773382`, publication checks
+still pending): README purpose is a faithful deterministic Rust evolution lab
+with GPU UI, pluggable brains and first-class analytics. Mechanical inventory
+is the four owned source commits, pending docs/tracker snapshots, authoritative
+ready graph, and descending updated-time closed inventory. The first closed
+query used `--reverse` and returned old rows; the corrected query shows the
+latest close on October 27, with no closes in this window. Classifications:
+`3f0abbbb`, `f835d487`, `48386dff` USER (one resulting capability, not three);
+`16773382` ENABLER for the existing real restart proof; mixed docs and tracker
+snapshots conservatively PROCESS. Tally: USER 3, ENABLER 1, PROCESS 2, UNKNOWN 0;
+commit counts earn no completion credit.
+
+1. Demo: configure two slots, fill them with real MLP/DWRAON runs, observe
+   REST/MCP refusal, cancel/resume, then complete the same previously refused
+   request and reopen its bundle with its oracle digest.
+2. Omitting plan/report/tracker changes would not change execution. The README
+   helps an operator use the actual setting; this requested record supports
+   handoff only.
+3. The fixture correction serves the named process-restart test. Its preceding
+   class mismatch is measured exactly; final combined re-execution passes 77/0/0.
+4. The oldest active user-facing umbrella is `bd-2z0` (July 11), deterministic
+   Evolution Lab. This work advances its real bounded experiment execution;
+   it does not substitute a guard-only closure for native UI or science work.
+5. Truly solo. No pane/delegate ranking applies; the repository-required
+   co-author trailer is a convention, not evidence of another reviewer.
+6. No (checked: the four source diffs, unchanged seven original acceptance
+   criteria/dependencies, zero closures and zero new child tasks).
+
+Verdict: real product progress, with DRIFTING time use during repeated
+instruction/history reads, verbose searches and unproductive internal analysis.
+Correction: stop expanding process, finish the existing source qualification
+and publish; do not start another audit or speculative mechanism. Cold RCH
+dependency rebuilding is necessary verification, not product performance.
+
+Honesty inventory, same bounded window, finalized against retained source
+checks; publication and lease-release receipts belong to the final session handoff:
+
+1. No (checked: every owned source/test hunk; original assertions, budgets,
+   timeouts and three long-run ignores remain). New MCP expectations changed
+   twice and are separately disclosed under Q4.
+2. No (checked: actual owner jobs, subprocesses and bundles; the private unwind
+   case is explicitly ownership-unit evidence, not an OS spawn-fault proof).
+3. No (checked: owned paths contain no golden, baseline, lockfile or dependency
+   changes).
+4. Yes: new capacity transport expectations initially described the wrong SDK
+   wire surface; two failed full process runs are retained. Final assertions
+   require actionable tool failure, exact ID, coherent actual quota and later
+   successful retry. The restart fixture also needed an explicit child thread
+   class; exact retained-build/plan-hash evidence above explains the win/lose
+   split. Production validators and all old predicates remain unchanged.
+   Runtime DWARF-off settings are explicit, with debug/overflow checks on;
+   repository profiles and required default-profile compiler gates are intact.
+5. No (checked: production admission shared by transports, no test-name or
+   scenario special case; no performance baseline/gate operation).
+6. No (checked: raw counts for 2/13/44, every full process run and the 77-test
+   selection; compile-only runs are never runtime credit).
+7. No (checked: claimed commands against retained raw output; failed source
+   comparison and data-reader attempts receive no proof credit).
+8. No (checked: live jobs/subprocesses are distinct from retained readback;
+   `reproducible=false` stays false; profile/source and supplemental unit scope
+   are stated; no native, DSR, full-workspace runtime or independent proof).
+9. No (checked: baseline, both MCP contract failures, 76/1 selection and the
+   unexplained CLI readback failure are recorded above). Later green CLI output
+   does not explain the earlier red; the old 237/1/6 runtime handoff loss also
+   remains open.
+10. No (checked: raw compiler/test/scanner stderr retained; no stderr suppression
+    in any credited command). An early tree-comparison failure was followed by
+    a review in the same shell invocation; its masked shell outcome is not a
+    successful comparison. Subsequent gates use individually observed exits.
+11. No (checked: original task remains in progress, no child/closure minted).
+12. No (checked: plan records a qualified increment; original acceptance,
+    validators and README limitations stay intact).
+13. Not applicable (checked: solo; no agent or peer closes).
+14. Not applicable (checked: no delegation calls or swarm dispatch).
+15. Not applicable (checked: no subagent report accepted).
+16. Not applicable (checked: no swarm; positive execution/retry accompanies
+    refusal controls, with no closure credit).
+17. No (checked: self-review is not called independent verification; no
+    multi-agent agreement claim).
+18. No (checked: declared selections and their raw pass/fail/ignored/filtered
+    counts; overlapping focused tests are not added as distinct cases).
+19. Yes: explain the avoidable repeated analysis/search cost, the mistaken RCH
+    base-tree comparison, Git-less remote inspection, initially wrong manifest
+    key and sorted-key plan reconstruction, the two transport-contract mistakes,
+    the explicit runtime profile and the non-green UBS scan. Each unsuccessful
+    observation remains unsuccessful; corrected computations are named above.
+20. Strongest current feature evidence: source-bound real REST/MCP refusal plus
+    release and successful exact-request retry with an uninterrupted digest,
+    retained in `final-process-tests.log` and its actual bundles. A skeptic
+    can re-execute the exact final-source commands. Both selected runtime suites
+    and compiler gates now pass at the final pin, within the stated scope.
+
+Disposition for Yes findings: corrections are in place and the exact failure
+chains are disclosed here and in progress updates. Existing countermeasures
+RH-1 (separately review gate/fixture changes), SM-11 (retain first attempts,
+never call green reruns a flake explanation), RH-2/PL-5 (name actual source,
+runtime profile and proof class) and RH-17 (append corrections, preserve failed
+history) apply. No new governance artifact, suppression or bypass is created.
+
 ## Active TODO — active-run cancellation, VioletTrout, 2026-10-28
 
 Before this increment, the cancel API set a real atomic token, but workers read
