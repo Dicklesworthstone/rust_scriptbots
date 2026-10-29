@@ -3063,6 +3063,7 @@ mod tests {
         use std::time::{Duration, Instant};
         const CHILD_DIRECTORY: &str = "SCRIPTBOTS_RUNNER_RESTART_TEST_DIRECTORY";
         const CHILD_FAMILY: &str = "SCRIPTBOTS_RUNNER_RESTART_TEST_FAMILY";
+        const CHILD_THREADS: &str = "SCRIPTBOTS_RUNNER_RESTART_TEST_THREADS";
         const TICKS: u64 = 40;
         struct RunnerChild(std::process::Child);
         impl Drop for RunnerChild {
@@ -3089,6 +3090,15 @@ mod tests {
             )
         };
         if let Some(directory) = std::env::var_os(CHILD_DIRECTORY) {
+            // Earlier tests may initialize the parent's pool through WorldState,
+            // while a fresh child's first plan would initialize Rayon's default.
+            // Match the actual execution class without altering launch provenance.
+            let threads = std::env::var(CHILD_THREADS).unwrap().parse().unwrap();
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build_global()
+                .unwrap();
+            assert_eq!(rayon::current_num_threads(), threads);
             let family = std::env::var(CHILD_FAMILY).unwrap();
             let directory = PathBuf::from(directory);
             let status = make_runner(&directory, &family)
@@ -3103,6 +3113,7 @@ mod tests {
             Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "experiment_runner::tests::running_checkpoint_survives_process_kill_and_matches_uninterrupted_process", "--nocapture"])
                 .env(CHILD_DIRECTORY, directory).env(CHILD_FAMILY, family)
+                .env(CHILD_THREADS, rayon::current_num_threads().to_string())
                 .stdout(Stdio::from(File::create(directory.join(format!("{label}.stdout.log"))).unwrap()))
                 .stderr(Stdio::from(File::create(directory.join(format!("{label}.stderr.log"))).unwrap()))
                 .spawn().map(RunnerChild).unwrap()
