@@ -1,5 +1,333 @@
 # Reality Check — rust_scriptbots — implementation continuation 2026-10-27
 
+## Active TODO — startup control ordering, VioletTrout, 2026-10-29
+
+The retained fix queues initial Resume before serving transport clients, so
+startup cannot overwrite their early Pause. Source 40d3 passes all 47 server
+tests, including three new real-owner/socket/cleanup regressions; test-only
+follow-up 1b71 uses the protocol's canonical command-ID formatter. Exact 1b71
+workspace/all-target check and strict Clippy pass, as do all 47 server tests
+and the existing terminal integration test. Broader process acceptance is
+**not green**: source
+40d3 has 5 passed, 3 failed, 3 unchanged long-run ignores. A storage API trial
+has 7/1/3 and is fully reverted. Original `bd-2z0.5.11` remains in progress
+with every acceptance criterion and prior note intact.
+
+- [x] Recheck unchanged instructions/source, authoritative priorities and retained failure.
+- [x] Continue the existing claim and reserve exact diagnostic/tracker paths.
+- [x] Retain before/after values, HTTP codes and each discriminating predicate.
+- [x] Decode the retained failed command order and compare it with startup source.
+- [x] Author the startup ordering fix and update every existing reservation consumer.
+- [x] Add and execute playback-choice, real-socket ordering and refused-admission cleanup regressions.
+- [x] Execute up to twenty real shipped-CLI journeys against unchanged production; stop on a failure.
+- [x] Repair the retained startup-order cause; preserve the distinct later admission timeout as unresolved.
+- [x] Execute appropriate clean-source compiler/runtime checks with original gates intact; record the broader failures separately.
+- [x] Freeze and review the five owned source files as `40d3e9aac09e51f5039151b0c22f0340b5c6fdab`.
+- [x] Execute the complete server module and ordinary process file on 40d3; retain the 47/0 and 5/3/3 outcomes separately.
+- [x] Replace the new test's copied ID width with the protocol formatter in 1b71.
+- [x] Re-execute the server module and existing terminal caller on final 1b71: 47/0/0 and 1/0/0.
+- [x] Retain the fixed-source process failures with the original guards: 5 passed, 3 failed, 3 ignored.
+- [x] Capture the owned host/storage threads during the repeated admission stall; do not call it a proven deadlock.
+- [x] Compare the untouched checkpoint-quota timing guard against unchanged production: the same guard fails.
+- [x] Author a bounded prepared-write API candidate without changing SQL, bindings, transaction or count guards.
+- [x] Decide the storage candidate from the full-file countercheck: one admission loss persists; revert it completely. Cancelled conformance has zero test credit.
+- [x] Execute default-profile workspace/all-target check and strict Clippy on final 1b71; both pass.
+- [x] Retain actual selected executable profiles and their execution limits.
+- [x] Finish original notes and prepare owned snapshots for normal publication and lease release.
+- [x] Append current progress to the original Bead; preserve the other 719 canonical rows byte-for-byte and keep dependency cycles empty.
+
+Creation worksheet: this requested TODO is PROCESS; consumer is the operator,
+gate is the implementation handoff, defect is the recorded unexplained readback
+failure, retirement is publication. No runtime/integrity exception is invoked:
+the existing report plus raw logs is smaller than a new apparatus. Opportunity:
+observing the cause and fixing product behavior wins over more audit prose.
+
+Read-only forensic extraction of the retained failed child's SQLite-format
+image (immutable external copy, not native engine qualification) identifies
+Pause at journal sequence 1, Resume at 2, then UpdateConfig at 3, all initially
+at tick zero; automatic tick boundaries follow. Main launches control listeners
+before submitting its initial Resume. An early client Pause can therefore win
+the first command identity and then be overridden by startup. Raw offline
+observations are in `forensic-journal.json` under
+`/data/tmp/scriptbots-followthrough-20261029-violettrout/`. The production fix
+admits initial Resume after both routers prepare and before spawning transport
+consumers, retaining canonical queue order; terminal startup remains paused.
+A real preconnected-socket test
+queues Pause before launch and verifies the later command wins. The unchanged
+production diagnostic probe was still compiling at this stage; its actual
+execution and distinct later failure are recorded below.
+
+The first diagnostic compile-only RCH invocation reaches its unchanged
+1800-second wrapper limit and exits 137 after 824 compiler artifacts; zero tests
+execute. It is infrastructure/build evidence, not a red or green test result.
+The identical pinned-baseline/test-only-overlay build retries with its retained
+cache; no deadline or source guard is widened. The initial format check also
+identifies one diagnostic line-wrap change, deferred until that frozen probe
+has executed so the build and runtime overlay identities remain identical.
+
+The identical compile retry succeeds; its test-only overlay fingerprint is
+`9371f06a7574d452ff32305ac8c903814b58eb89df77eb1e42ff84fb6b365c78`.
+An attempted RCH job loop runs no tests: clean-overlay is incompatible with
+job mode, its base/overlay arguments require that mode, and the plain job then
+refuses admission (103, estimated 4 cores versus this worker's 2 slots).
+No resource override or local fallback is used. The bounded twenty-trial
+sequence therefore uses ordinary pinned `cargo test -j2` invocations, stopping
+on the first executed test failure. Compile-only executable hashes/profile
+records and every failed invocation remain external.
+
+Before any trial executes, vmi1152480 drops to roughly 14 GiB free and RCH
+admits zero slots. Normal Cargo trials also refuse (103), including a one-job
+request after backoff; no refusal is a test result. No cleanup, health override,
+or estimator trick is used. Healthy Linux workers have no ScriptBots target
+cache; vmi1153651 has about 75 GiB free and now runs the same pinned baseline
+plus diagnostic-only overlay. An attempted read-only executable archive fails
+because all three paths are already absent; that empty archive is not retained-executable proof.
+Their earlier Cargo/hash records survive, but no trial ran on those files.
+The failed archive attempt modifies no source. This is functional Linux
+verification, not a cross-machine performance comparison.
+
+The second worker's cold diagnostic attempt also reaches RCH's unchanged
+1800-second limit (137) before tests execute. The same pinned source,
+test-only overlay, worker and runtime profile retry with the warm partial
+cache. Neither timeout is a runtime assertion result.
+Its first warm retry also exits 137 at the same wrapper limit before tests;
+it completes the FrankenSQLite facade and reaches GPUI/MCP dependency work.
+The next identical retry retains that progress. All three timed-out compile
+attempts across both workers have zero runtime-test credit.
+
+The first executed baseline case stops the bounded sequence: 0 passed, 1 failed,
+10 filtered, 33.29s. All three configuration observations have HTTP/value/tick
+predicates true at tick zero. A later real Pause CLI instead receives HTTP 503:
+host admission reply exceeded 10 seconds. This is a distinct retained failure,
+not a fresh reproduction of the old tick-readback loss. Its external child
+archive is `baseline-first-executed-case.tar.gz`; the raw pinned execution is
+`baseline-trial-01-worker2-retry2.log`. No deadline or assertion is changed.
+The before-Pause status is running and healthy at tick 9, with the explicit
+Resume last applied. Archive SHA256 is
+`3b252c4ea52b1980927f8cefb2ff8cc875a2089771075bcd27c222e1d8cd9f9b`.
+The overlay manifest explicitly retains `reproducible=false` and missing build
+provenance qualifiers. Formatting now passes. Final five-file UBS exits 1:
+3 critical, 2,346 warnings, 1,317 informational, zero failed modules. All three
+critical locations are the same reviewed header-flow false positives; the
+production HTTP policy and request-header negative-test region compare byte
+identically with the baseline. No suppressions or scanner configuration change.
+
+Source `40d3e9aac09e51f5039151b0c22f0340b5c6fdab`, tree
+`2c0556fe67bd40315cc3be4263998d011ffd46b4`, contains the ordering fix,
+three real-owner/socket/cleanup tests, explicit paused terminal consumers and
+discriminating readback retention. Clean-source qualification is now running;
+the source commit itself is not a passing test result.
+The complete server module now passes on that exact source: 47 passed, zero
+failed/ignored, 630 filtered, 14.39s. The three new tests execute and pass:
+both playback choices are observed through the real owner, a real queued
+socket Pause follows initial admission and remains applied/paused, and refused
+initial admission releases the reserved listener. This is self-verification;
+no independent verifier or native-window acceptance is claimed. The ordinary
+process file is running next with the same source and runtime profile.
+
+The ordinary file returns **5 passed, 3 failed, 3 unchanged ignores**, zero
+filtered, 379.41s. Cadence shutdown and configuration CLI Pause both exceed
+the unchanged 10-second host admission deadline. The third failure is the
+unchanged 30-second periodic checkpoint-quota observation guard. The two
+completed failed children are retained in
+`fixed-source-failed-pause-cases.tar.gz`; configuration reads all pass at tick
+1, and its later before-Pause status is healthy/running at tick 13. The real
+experiment/checkpoint/artifact journey and cancellation/resume journeys still
+execute; there is no full-file pass claim.
+
+Two isolated debugger-assisted configuration journeys also fail the same
+Pause deadline. They are diagnostic executions, not acceptance or performance
+proof. GDB targets only a newly created configuration child matching the exact
+40d3 source environment, executable and owned storage path. Existing ptrace
+policy stays at 1; root already has CAP_SYS_PTRACE. Normal detach is observed.
+The first command's heredoc redirection mistakenly captures no full stack in
+its intended file; tool output is partial, so no retained-stack claim comes
+from that attempt. Corrected `admission-debug-watcher-v2.log` retains the full
+successful capture: host waits for `StorageSink` admission in
+`seal_core_persistence`, while the storage worker compiles a 41-column agent
+insert through the existing bounded-insert transaction. This is active SQL
+work, not evidence of a lock cycle. Further source inspection distinguishes
+the SELECT-only prepared query lane from the prepared INSERT execution lane.
+`0c9700e0` without overlays also fails the quota guard: 0/1/0, ten filtered,
+33.76s, in `baseline-quota-guard.log`. Neither later failure is attributed to
+the startup fix. The admission loss remains open.
+
+The bounded storage candidate changes the existing insert helper from
+`query_with_params(...).len()` to `execute_with_params(...)`. SQL including
+RETURNING, binding/chunk bounds, transaction finalization and the exact count
+predicate stay intact; the candidate observes the engine's affected-row count.
+The pinned write API admits ordinary INSERTs to prepared execution, whereas
+the ad-hoc query reuse predicate accepts SELECT only. The existing zero-row
+guard and cross-chunk physical row/rollback/foreign-key controls are running
+unchanged. This is an unqualified functional wiring experiment, not a speedup,
+performance-budget pass or native/DSR acceptance claim.
+The standalone storage unit selection starts a cold feature graph because its
+declared dev dependency explicitly enables Asupersync `test-internals`.
+RCH's numeric cancellation reports a typed wrapper-ownership refusal despite
+process exit zero; it does not cancel anything. The named owned wrapper is
+then cancelled through `rch jobs cancel`, typed `cancelled`, original exit
+143, zero tests. IDs are kept as exact decimal strings (they exceed JavaScript's
+safe-integer range). No other build, test feature or dependency is changed.
+This costs avoidable compile time; the corrected order probes the candidate's
+actual shipped-app behavior first, then pays for the required cold conformance
+lane only if that behavior earns retention. Joint package selection cannot
+erase the storage lane's explicit test feature. Earlier progress wording that
+the engine build had finished was too strong: Cargo had announced its facade,
+not completed the entire build.
+
+Cancellation initially leaves the source-pair ownership guard refusing the
+app probe before compilation (103). Supported `rch jobs recover` reconciles
+the same owned wrapper's exit 143 and acknowledges terminal state without
+replay. The identical app probe then reaches compilation with pooled target
+reuse intact. No owner file is deleted, overwritten or hand-certified.
+`prepared-write-process-probe-v2.log` binds base 40d3 to the storage-only
+overlay `92761fa9f3770444745125265d0e4841be5f95d4aaf65de012a69d5e22dd8433`.
+It **passes 1/0/0**, ten filtered, 24.41s: all three configuration predicates
+remain true at tick zero; actual Pause is applied/durable at scientific
+revision 17, actual Step at 18, and ordered shutdown succeeds. This is the
+normal app graph under the unchanged deadlines, not a performance comparison
+or storage-unit conformance pass. The full ordinary process file is running
+with that same storage-only overlay. Cold storage controls, final clean-source
+union checks and publication are still required before retaining the candidate.
+The full-file countercheck is **7 passed, 1 failed, 3 unchanged ignores**, zero
+filtered, 386.94s: the configuration CLI Pause still exceeds the same admission
+deadline. That falsifies a robust repair despite the earlier isolated pass.
+The storage experiment is **reverted**, not retained or certified. Every code,
+manifest, lockfile, toolchain, script and CI path now compares byte-identically
+with committed 40d3. The extra storage lease is released; its cancelled unit
+selection ran zero tests and earns no conformance credit. No native/performance
+win is claimed. Default-profile workspace compiler checks now run on clean
+40d3 without overlays; remaining SQL admission/quotas stay with the original
+open acceptance work.
+
+The first default-profile workspace/all-target check reaches RCH's unchanged
+1800-second wrapper limit (137) while checking Bevy; it is not a completed
+compiler check. The identical clean-source command retries with its warm
+metadata cache. The completed experiment case survives in the partial tar
+`retained-source-process-artifacts.tar.gz`: tar exits 2 because two other
+temporary case roots are already absent. Actual archive scope is one root,
+64 entries, one source-bound manifest, SHA256
+`09ff75cd64546263f5c6d0b839356c64e37ed8542f34ad3e071eb5b35e78830e`.
+That manifest names 40d3 and retains `reproducible=false`, incomplete provenance,
+and missing rustc/cleanliness/status/diff evidence. The archive is not described
+as a complete three-case retention or native acceptance proof.
+
+Bounded work audit, current startup increment through 40d3 and the reverted
+storage trial. Purpose, from README: a faithful deterministic evolution lab
+with pluggable brains, GPU UI and first-class analytics. Mechanical inventory:
+the source commit and its full frozen diff, four-entry reflog, oldest open
+Beads in both sort directions, and three newest closed records; no item closes
+in this window. USER: one retained startup fix. ENABLER: its regression and
+compiler qualification. PROCESS: requested tracking and this required audit.
+The discarded storage trial earns zero delivered capability credit.
+
+Work questions: (1) Demo an already-connected client Pause surviving startup;
+the real socket/owner regression does that. (2) Omitting process records changes
+no runtime behavior, but loses the requested handoff and failure boundaries.
+(3) Real server consumers execute the retained initialization; the rejected
+storage experiment enables no retained capability. (4) Oldest open bd-2z0 is
+the deterministic Evolution Lab; this control-order repair serves it and its
+sole-owner host child rather than displacing them. (5) Solo; no pane/closure
+comparison applies. (6) No spec substitution or follow-up laundering: the
+original issue stays open with all criteria and prior notes. Verdict: DRIFTING
+in time use, despite a real fix. Repeated infrastructure experiments, long
+hypothesis loops and sparse updates waste time. Correction: stop storage
+lever exploration, retain the counterexample, finish mandatory checks and
+publish the proven increment; no new process machinery.
+
+Honesty inventory (bounded to this increment and the inspected history):
+
+1. No (checked: complete five-file frozen diff, unchanged original predicates,
+   deadlines and ignores, and no CI/config/validator changes).
+2. No (checked: existing real HostCore helper, real socket and closed owner;
+   no new mocks, fake DB rows or production test branches).
+3. No (checked: source/path diff; no golden, snapshot or baseline change).
+4. Yes, tests accompany the fix; they add runtime observations and diagnostics.
+   Existing guards are unchanged. The storage experiment changes no test and
+   is fully reverted; no relaxation is retained.
+5. No (checked: shipped initializer consumes the new argument, all callers
+   updated, all three new cases actually run; no demo-only branch).
+6. No (checked: 47 named server executions; full-file 5/3/3 and trial 7/1/3
+   retained separately. Compile-only, cancellation and refusal earn zero tests).
+7. Yes: early archive/progress wording overstates retention or build completion.
+   Missing executable/archive members and the incomplete first GDB capture are
+   corrected on this record and in commentary; only actual surviving data is
+   credited. Compiler-stage announcements are not completion observations.
+8. No (checked: offline immutable-image forensics is labeled; GDB is diagnostic,
+   RCH results are functional self-verification, not native/DSR or performance).
+9. No (checked: raw failures and TODO keep all source-40 failures, the rejected
+   trial and the older unexplained 237/1/6 loss visible).
+10. No for cited evidence (checked: RCH, child stderr and corrected GDB logs
+    retain stderr; one exploratory path search suppressed errors but supplies
+    no proof and is replaced by successful exact-revision Git reads).
+11. No (checked: original in_progress/owner/criteria/dependencies preserved;
+    canonical progress edit changes only notes/updated_at, other 719 rows exact).
+12. No (checked: plan status records implementation and failures; original
+    acceptance/specification and budgets are unchanged).
+13. Not applicable: solo; no agent closes a record.
+14. Not applicable: no subagent dispatch.
+15. Not applicable: no subagent report is accepted.
+16. Not applicable: no swarm or refusal-farming pane.
+17. No (checked: self-verification is explicit; mandated coauthor trailer is
+    not an independent review or consensus claim).
+18. No (checked: full module/file and bounded stop-on-first-failure selection
+    precede outcomes; warning counts keep their file denominator; no speedup).
+19. Yes: incompatible RCH job attempts, cold feature-graph work, cancellation
+    and recovery, the heredoc redirection mistake, and excess speculation
+    consume avoidable time. Long analysis gaps also break update cadence.
+    The candidate is rejected on its countermetric instead of redefining success.
+20. Strongest retained evidence: exact-source real-socket admission order,
+    applied Pause and actual paused owner, plus both playback choices and
+    listener rebind after refused startup. Final source is 1b71;
+    broader process/native acceptance remains unqualified.
+
+Disposition: artifact/progress overclaims are corrected in place and disclosed;
+RH-2/PL-2 require observed artifact existence, scope and typed outcomes before
+credit. PL-1 keeps cancelled/compile-only/filtered work out of passed counts;
+PL-3 keeps profile and execution-surface limits attached. The process-capture
+correction is delivery of the existing fix, not another audit framework.
+The prior five-query CASS sweep remains in the preceding block. This block's
+derived `initial Resume` query returns five of 517 matches; all returned hit
+windows are viewed (overlapping 15325/15326 together). They include old failures
+and raw/index coordinate limitations, not an explanation of today's stall or
+a broad clean-history certificate.
+
+Final source review replaces the new test's copied hexadecimal padding width
+with the protocol type's `CommandId::to_string()`. Immutable follow-up
+`1b71ac02c74a5cca49b50c80a1c93af20d0c9e06`, tree
+`522cacb0f84ee7cd7de224b7e3f00662de5f036f`, changes that test line only.
+The entire production server prefix compares byte-identically with 40d3;
+all original assertions remain. Formatting passes and the exact-1b71 five-file
+UBS scan remains exit 1, 3 critical / 2,346 warnings / 1,317 info, zero failed
+modules. Default-profile workspace/all-target `cargo check` passes in 52.62s
+and strict Clippy passes in 6m05s on 1b71, both with empty overlays and the
+expected tree. This is the workspace's configured lint coverage; the separate
+open lint-inheritance gap is not certified away. Exact-source selected runtime
+checks pass: server module 47/0/0, 630 filtered, 9.92s; existing terminal
+integration 1/0/0, four filtered, 0.48s. The latter verifies the actual published
+frame through the endpoint using Ratatui's test backend, not a native window;
+its report's embedded source string is empty, while RCH binds execution to the
+expected source/tree. `retained-runtime-selection.log` retains the full raw
+results. The full-file 5/3/3 evidence above remains bound to 40d3; its production
+code is unchanged by the final test-formatting commit.
+The exact-source Cargo JSON no-run readback completes successfully. It contains
+three selected test executable records and two ordinary binary records. All
+three tests have opt-level 0, debuginfo 0, debug assertions and overflow checks
+true. The server and terminal executable paths match the actual runtime log;
+the process-file target is compile-only on 1b71 and earns no new runtime credit.
+Raw Cargo metadata and extracted records are `retained-executable-profiles.log`
+and `.json`; no physical-executable retention claim is inferred from a path.
+An extraction attempted before the wrapper's final source receipt correctly
+refuses; it is rerun only after that receipt and process exit zero arrive.
+All three original UBS critical regions remain byte-identical to the reviewed
+baseline; no scanner suppression, count-based success claim or gate change.
+Final progress is appended to original `bd-2z0.5.11`, which remains in progress.
+Only its notes and timestamp change; all prior notes/criteria/dependencies/owner
+and the other 719 canonical rows are preserved. BR imports canonical truth and
+reports no dependency cycles. Docs and tracker are reviewed as separate immutable
+snapshots; normal main/mirror publication and release are reported from their
+actual command outcomes, not pre-certified by this pre-publication snapshot.
+
 ## Active TODO — shared experiment execution admission, VioletTrout, 2026-10-29
 
 Source `16773382df01` now shares run-slot reservations across REST/MCP create

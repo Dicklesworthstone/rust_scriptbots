@@ -4,6 +4,22 @@
 
 **Evidence date:** 2026-07-11
 
+**Startup control ordering (2026-10-29):** [Qualified increment; original
+`bd-2z0.5.11` Currently In Progress — VioletTrout]. The retained failure journal
+orders client Pause before startup Resume. Final source `1b71ac02c74a` admits
+initialization after router preparation and before client consumers; terminal
+playback stays paused. Clean-source self-verification passes all 47 server tests,
+including real queued-socket ordering and refusal cleanup, plus the existing
+terminal integration test. Default-profile workspace/all-target check, strict
+Clippy and formatting pass; UBS retains three reviewed pre-existing critical
+false positives and exit 1. The ordinary process file on production-identical
+`40d3e9aac09e` is 5 passed, 3 failed, 3 unchanged ignores: later Pause admission
+and checkpoint-quota observation remain open. Unchanged production separately
+reproduces both failure classes. A storage API trial fails its full-file
+countercheck and is completely reverted. All original criteria, earlier runtime
+handoff loss and full resource/fault/provenance/native acceptance remain open;
+raw evidence and the granular TODO are in the existing reality check.
+
 **Shared experiment admission (2026-10-29):** [Qualified increment; original
 `bd-2z0.5.11` Currently In Progress — VioletTrout]. `16773382df01` shares run-slot
 reservations across REST/MCP create/resume, bounds admission before files/state
