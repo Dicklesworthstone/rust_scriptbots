@@ -1,5 +1,208 @@
 # Reality Check — rust_scriptbots — implementation continuation 2026-10-27
 
+## Active TODO — portable final experiment state, VioletTrout, 2026-10-29
+
+Original `bd-2z0.5.11` remains in progress. Before this increment, completed
+bundles carried summary/evidence but left their existing final HostCore cut
+outside the bundle; reported final digests were compared with each other rather
+than recomputed from that cut. This increment exports and consumes the actual final state, without
+claiming complete checkpoint-chain, build-provenance or native acceptance.
+
+- [x] Recheck unchanged instructions, current source, canonical Beads and priorities.
+- [x] Continue the original task and reserve the exact implementation/test paths.
+- [x] Trace checkpoint writing, bundle assembly, semantic verification and API download consumers.
+- [x] Plant a byte-valid forged-final-digest test: unchanged production admits it; the negative fails 0/1/0.
+- [x] Export the canonical final cut as a bounded, indexed bundle artifact; execute its real consumers on the fixed snapshot.
+- [x] Restore and check plan, manifest, exact final tick, computed scientific digest and actual summary population on that snapshot.
+- [x] Exercise real MLP/DWRAON/Assembly output, zero ticks, missing/corrupt/wrong-tick/cross-run cuts and mutually consistent forged reports on the fixed snapshot.
+- [x] Exercise API-only download/restart and existing runner/control/server tests on that snapshot: 83 unit tests and two real process journeys pass with original guards intact.
+- [x] Qualify clean source `03973d0d`: 83 selected unit tests and both real process journeys pass.
+- [x] Retain actual executable profiles and match both selected test paths to the executed runtime log.
+- [x] Retain and inspect the actual API-downloaded bundles: three bundles, 12 files, all declared artifact lengths/BLAKE3 checksums match.
+- [x] Run workspace/all-target compiler check and strict Clippy, formatting and touched-source UBS on committed source `03973d0d`.
+- [x] Record exact outcomes and remaining gaps on the original Bead; prepare owned source/docs/tracker snapshots for normal publication.
+
+Creation worksheet: requested TODO is PROCESS, consumed by this operator's
+implementation handoff; observed defect is the missing portable final state.
+It retires at publication. No integrity exception or new tracking framework is
+needed. The next product work is the final-state export/verification itself;
+additional planning prose would displace it.
+
+The first unchanged-production negative build reaches RCH's existing
+1800-second limit (137) before any test; it earns zero runtime credit.
+Its retry keeps production byte-identical to published `15f381f4`, with the
+same negative predicate and additional new test observers filtered out.
+The worker readback confirms production-prefix SHA256
+`0f8cb026639f319e82fe0ac97447ec2ab1c5cbf67eaec91391fa69083ffa217a`;
+test-only overlay is `612facd0927606398f14aa12419e5e9d54e96d9bbad7c2544e6ce6c7adba4210`.
+It executes **0 passed, 1 failed, 0 ignored**, 679 filtered, 9.51s, exit 101:
+generic byte verification succeeds, then the original semantic verifier returns
+`Ok(())` for the mutually consistent false final digest. This is the intended
+negative result, not a passing suite or a storage/performance observation.
+The fixed working code is restored byte-for-byte to reviewed tree `e027f82f`.
+Raw logs/readbacks and both test-only diffs are in
+`/data/tmp/scriptbots-portable-final-20261029-violettrout/`.
+
+Formatting and a two-file static UBS scan pass (0 critical, 1,144 warnings,
+651 info; zero failed modules). These are that file set's raw counts, not a
+warning-reduction claim; the prior server-file critical findings are outside
+this scan. Runtime keeps debuginfo off and debug/overflow checks on. Retained
+dependency fingerprints show `-Z threads=4 -C target-cpu=x86-64-v3` on the
+Linux RCH worker; this is functional self-verification, not native/DSR or
+performance qualification. The fixed runner/control/server selection and the
+actual artifact-download/restart journeys execute below.
+
+The fixed snapshot completes **83 passed, 0 failed/ignored**, 597 filtered,
+779.32s, then **two process tests passed**, nine filtered, 309.57s. The new
+forged-digest negative now passes; corruption/tick/run mismatches yield distinct
+reasons, a false population is refused, and an exact repair verifies again.
+Real MLP/DWRAON/Assembly cuts restore with their observed digests; completed
+reopening succeeds after the external continuation files are moved aside.
+The actual API download and killed-server restart journeys pass unchanged.
+
+Immutable source `03973d0d9fbe70f9ffab56666fa2753a824dc3b9`, tree
+`e027f82f0bd830a13072cdb60719596efdc91961`, freezes the two source files.
+The earlier test-snapshot receipt reports baseline tree `cd8b0fe3` plus its
+overlay fingerprint `e639699e7eea64467401a5b950eb90ac51ab03a9a82e56a737d308529cc3ee55`;
+that tree is not the union tree. Post-run worker-source hashing finds both
+files already absent and earns no source-byte credit. RCH rejects combining
+clean-overlay and source-content-receipt modes before execution (zero tests).
+Clean-commit qualification therefore uses pinned no-overlay mode and captures
+live worker hashes. Both edited files and the root Cargo manifest, lockfile,
+toolchain and Cargo config match their committed bytes. Exact-source formatting
+and the same two-file UBS scan pass; completed runtime qualification is recorded below.
+Runtime runs on `vmi1153651`, while default-profile workspace/all-target check
+passes on scheduler-selected `hz3` (exit 0, 20m55s); no cross-machine performance
+comparison is claimed. The repeated dependency build has matching retained
+compiler/profile/config/flag fingerprints; its cache invalidation cause is not
+established, and no cache policy or timestamp is changed.
+The first clean-source runtime attempt exits 137 at the unchanged 1800-second
+wrapper limit before tests; its identical retry retains partial compiler work.
+Two strict-Clippy launches refuse worker namespace initialization on `hz3`
+(103) before the compiler runs. The same default-profile workspace/all-target
+command then passes on healthy `hz2`, `-D warnings`, exit 0, 10m45s; its receipt
+binds source `03973d0d` and tree `e027f82f`. No local fallback or worker policy
+change is used. Infrastructure refusals are not red or green test/lint results.
+
+The unchanged clean-source runtime retry completes with exit 0: **83 unit
+tests passed, 0 failed/ignored**, 597 filtered, 628.73s, and **two real process
+tests passed, 0 failed/ignored**, nine filtered, 168.51s. Its receipt binds
+`03973d0d` / `e027f82f`; raw command, build flags, expected negative output and
+every test result remain in `final-source-runtime-clean-retry.log`. These
+durations are observations, not a performance comparison. This is the selected
+runner/control/server/download/restart union, not all workspace runtime tests.
+
+Actual Cargo executable records retain four artifacts: the two executed test
+binaries, shipped app and control CLI. All declare opt-level 0, debuginfo 0,
+debug assertions and overflow checks enabled; both selected test paths match
+the actual runtime log. `final-executable-profiles.json` retains these records;
+the separate metadata-only command executes zero tests. Executable paths and
+metadata are not a claim that physical binaries were archived independently.
+
+`api-downloaded-final-bundles.tar.gz` successfully retains only the main
+journey's downloaded-experiments directory and the restart journey's
+downloaded-after-restart directory. Full archive inspection observes 25 members,
+12 regular files, three bundles and exactly one final checkpoint per bundle;
+every declared artifact length and BLAKE3 checksum matches. Archive bytes are
+2,107,239; SHA256 is
+`e9295c738dd0b183e3d0fdea8215c3f1056958a593c6d43bfad7d111ea2cf121`.
+All three embedded manifests name source `03973d0d` and explicitly retain
+`reproducible=false` / `provenance_complete=false`: build-time rustc identity,
+source cleanliness/status/diff and rustflags remain unavailable. Main-journey
+manifests observe eight Rayon threads; restarted-run manifest observes two.
+No common performance class, full-case archive, native or independent proof
+is inferred from this scoped archive. `retained-download-inspection.json`
+retains its actual contents and qualifiers.
+
+Scope: final state is consumed by runner completion/recovery and API artifact
+recovery. Standalone `--verify-bundle` still performs generic byte/manifest
+verification. Complete checkpoint chains, embedded build provenance, original
+resource/fault/native/DSR acceptance and prior storage failures remain open.
+
+Bounded work audit (2026-10-29 continuation, last two committed changes):
+README purpose is a reproducible, controllable evolutionary simulation for
+LLM-assisted science. Mechanical log/reflog and canonical tracker queries are
+retained with the proof logs. `03973d0d` is USER (portable final state and actual
+verification); shared `5358d9bb` is PROCESS (generated Beads metadata, not this
+agent's implementation). Tally: USER 1, ENABLER 0, PROCESS 1, UNKNOWN 0.
+Working report/plan/tracker edits are PROCESS and earn zero capability credit.
+
+Audit questions: (1) Demo the actual API-downloaded final checkpoint and the
+forged-report refusal. (2) Omitting process edits changes no product behavior;
+it loses the requested TODO and exact limitations. (3) No separately counted
+enabler; the runner and API consume the exported checkpoint. (4) The oldest
+open user goal is `bd-2z0`, deterministic Evolution Lab; portable scientific
+state advances it. Brain/owner parents remain open. (5) Solo, no swarm/pane
+comparison. (6) No new follow-up or closure; original seven criteria and
+dependencies remain intact. Verdict **DRIFTING**: product behavior is real,
+but avoidable receipt-mode/cache investigation and long reasoning intervals
+cost time. Correction: freeze implementation and machinery, complete the
+required checks, then publish this bounded increment. No new audit framework.
+
+Honesty inventory, this increment (self-review, no independent verifier):
+
+1. No (checked: complete reviewed source/test diff; existing assertions,
+   ignores, timeouts and dynamic download-count checks preserved; reflog has
+   ordinary commits, no rewrite in this window).
+2. No (checked: new cases use real owners, brains, checkpoints and bundle
+   hashing; no specialized mock or stub added).
+3. No (checked: no golden/fixture changes in the source commit).
+4. Yes: runtime semantic validation and tests change together. The validator
+   is strengthened; the byte-valid negative executes against byte-identical
+   old production and fails as intended. No suppression, gate bypass,
+   tolerance, retry-count or deadline relaxation is retained (RH-1/RH-15).
+5. No (checked: no benchmark/demo hardcoding, dependency/config/CI/script
+   edits or alternate product entry point; selected tests are reported with
+   their actual denominator, not as whole-workspace runtime acceptance).
+6. No (checked: fixed-snapshot 83 unit plus two process tests execute;
+   timeout, refused launch and compile-only work earn zero runtime credit).
+7. Yes, an early source-identity interpretation needed correction: an
+   overlay receipt's baseline tree is not its union tree, and post-run
+   hashing finds missing files. Both limits are recorded above; pinned
+   clean-source live hashing supplies the byte observation (RH-2/PL-3).
+8. No (checked: tests are live self-verification; neither source hashes nor
+   old captures are presented as independent/native/DSR qualification).
+9. No (checked: original storage/admission/quota/handoff failures and all
+   full-task gaps remain explicit; two targeted green journeys do not repair
+   the broader ordinary process file).
+10. No (checked: cited commands retain stderr with stdout or in a named
+    companion log; failed readbacks and refused launches remain retained).
+11. No (checked: original task remains in progress; zero closes/new children).
+12. No (checked: plan adds an in-progress evidence marker, preserves original
+    requirements; canonical target row changes notes/timestamp only).
+13. No (checked: solo, no delegated tracker closures).
+14. No (checked: no subagents dispatched).
+15. No (checked: no subagent reports used).
+16. No (checked: no subagent/pane work or refusal-only closure credit).
+17. No (checked: peer coordination earns no independent verification credit).
+18. No (checked: runtime selection and original guards fixed before results;
+    raw static counts name their two-file set and do not imply improvement).
+19. Yes: avoidable incompatible-mode exploration, failed post-run source
+    readback and long commentary gaps deserve explanation before replay.
+    Corrected by pinned no-overlay execution, live byte checks and bounded
+    verification/publication; no cache-policy or infrastructure redesign
+    (RH-2/SM-11, anti-ceremony machinery freeze).
+20. Strongest observed result: identical forged-digest predicate
+    fails on unchanged production and passes with restored real owner cuts,
+    plus the actual API download/restart journeys. Exact committed-source
+    execution repeats 83 unit and two process passes; the retained downloaded
+    bundles, profile records and logs expose the evidence and its limits.
+
+Older-session check: retained `cass` query `final checkpoint` returns three
+hits, but physical line views land on compaction/tool records and output is
+bounded/truncated. This is inconclusive, not a clean-history finding. The
+earlier five-query sweep remains in its prior audit; it was not rerun here.
+Disposition: validation strengthening is backed by the executed old negative;
+source-proof limitations are corrected/disclosed rather than hidden, and
+RH-2/PL-3/SM-11 prevent promoting hashes, retries or stale captures to higher
+proof. Original acceptance remains open; exact-source self-verification is
+complete for the declared selection, with higher proof classes still open.
+The final original-Bead note preserves all seven criteria and dependencies;
+the other 719 canonical rows remain byte-identical, import skips all 720, and
+dependency cycles are empty. Source remains byte-identical to `03973d0d`.
+Normal publication and own-lease release follow the immutable metadata reviews;
+their observed final refs belong in the final handoff, not a pre-push claim.
+
 ## Active TODO — startup control ordering, VioletTrout, 2026-10-29
 
 The retained fix queues initial Resume before serving transport clients, so

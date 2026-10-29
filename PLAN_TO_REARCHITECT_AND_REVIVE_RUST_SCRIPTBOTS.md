@@ -4,6 +4,18 @@
 
 **Evidence date:** 2026-07-11
 
+**Portable final experiment state (2026-10-29):** [Qualified increment;
+original `bd-2z0.5.11` Currently In Progress — VioletTrout]. Source `03973d0d9fbe` exports the existing
+canonical final HostCore cut and recomputes its scientific digest and summary
+population during runner/API semantic verification. The unchanged-production
+forged-report negative reproduces false admission. Exact clean-source
+self-verification passes 83 selected unit tests plus two real download/restart
+journeys, workspace/all-target check, strict Clippy and formatting. Actual
+executable profiles and three downloaded bundles are retained and inspected;
+their embedded provenance remains incomplete and reproducible=false.
+Standalone CLI verification remains generic byte/manifest checking. Full-chain,
+resource/fault/provenance/native criteria and prior storage failures remain open.
+
 **Startup control ordering (2026-10-29):** [Qualified increment; original
 `bd-2z0.5.11` Currently In Progress — VioletTrout]. The retained failure journal
 orders client Pause before startup Resume. Final source `1b71ac02c74a` admits
