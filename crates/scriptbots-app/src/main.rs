@@ -5187,7 +5187,8 @@ fn run_verify_bundle_cli(bundle_path: &Path) -> Result<()> {
         bundle_path = %bundle_path.display(),
         "Verifying portable deterministic run bundle"
     );
-    let result = scriptbots_storage::verify_run_bundle(bundle_path)?;
+    let verified = scriptbots_app::experiment_runner::verify_portable_run_bundle(bundle_path)?;
+    let result = &verified.artifacts;
     println!(
         "✓ Verified run bundle V1 for run {} at {}",
         result.run_id,
@@ -5200,6 +5201,12 @@ fn run_verify_bundle_cli(bundle_path: &Path) -> Result<()> {
     println!("  Total Bytes Verified: {}", result.total_bytes_verified);
     println!("  Max Tick: {}", result.max_tick);
     println!("  Reproducible: {}", result.reproducible);
+    if let Some(state) = verified.final_state {
+        println!(
+            "  Scientific final state: restored; tick={}; alive_agents={}; digest={}",
+            state.tick, state.alive_agents, state.scientific_digest
+        );
+    }
     Ok(())
 }
 

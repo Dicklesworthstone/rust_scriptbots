@@ -17,8 +17,8 @@ use scriptbots_runtime::{
     RunId, VolatileHostCheckpointV1,
 };
 use scriptbots_storage::{
-    RunBundleV1, bundle::RunBundleVerificationLimits, bundle::verify_run_bundle_bounded,
-    create_run_bundle_from_artifacts,
+    RunBundleV1, RunBundleVerificationResult, bundle::RunBundleVerificationLimits,
+    bundle::verify_run_bundle_bounded, create_run_bundle_from_artifacts,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -45,6 +45,11 @@ const FINAL_CHECKPOINT_ARTIFACT: (&str, &str) = (
     "checkpoints/final.checkpoint",
     "experiment-final-checkpoint",
 );
+const REQUIRED_EXPERIMENT_ARTIFACTS: &[(&str, &str)] = &[
+    ("exports/summary.csv", "experiment-summary"),
+    ("evidence/run.json", "experiment-run-evidence"),
+    FINAL_CHECKPOINT_ARTIFACT,
+];
 
 /// Typed failure from matched-seed planning, status recovery, execution, or bundle verification.
 #[derive(Debug, Error)]
@@ -432,14 +437,14 @@ pub(crate) fn read_experiment_file_bounded(
     max_bytes: u64,
 ) -> Result<Vec<u8>, ExperimentRunnerError> {
     let before = fs::symlink_metadata(path).map_err(|source| ExperimentRunnerError::Io {
-        operation: "inspect checkpoint file",
+        operation: "inspect experiment artifact",
         path: path.to_path_buf(),
         source,
     })?;
     if before.file_type().is_symlink() || !before.is_file() {
         return Err(invalid_checkpoint(
             path,
-            "checkpoint must be a regular file",
+            "experiment artifact must be a regular file",
         ));
     }
     let mut options = OpenOptions::new();
@@ -452,14 +457,14 @@ pub(crate) fn read_experiment_file_bounded(
     let file = options
         .open(path)
         .map_err(|source| ExperimentRunnerError::Io {
-            operation: "open checkpoint file",
+            operation: "open experiment artifact",
             path: path.to_path_buf(),
             source,
         })?;
     let opened = file
         .metadata()
         .map_err(|source| ExperimentRunnerError::Io {
-            operation: "inspect opened checkpoint",
+            operation: "inspect opened experiment artifact",
             path: path.to_path_buf(),
             source,
         })?;
@@ -467,7 +472,7 @@ pub(crate) fn read_experiment_file_bounded(
     {
         return Err(invalid_checkpoint(
             path,
-            "opened checkpoint identity, type or byte cap differs",
+            "opened experiment artifact identity, type or byte cap differs",
         ));
     }
     let mut bytes = Vec::with_capacity(
@@ -476,22 +481,25 @@ pub(crate) fn read_experiment_file_bounded(
     file.take(max_bytes.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|source| ExperimentRunnerError::Io {
-            operation: "read checkpoint file",
+            operation: "read experiment artifact",
             path: path.to_path_buf(),
             source,
         })?;
     if u64::try_from(bytes.len()).map_or(true, |length| length > max_bytes) {
-        return Err(invalid_checkpoint(path, "checkpoint exceeded its read cap"));
+        return Err(invalid_checkpoint(
+            path,
+            "experiment artifact exceeded its read cap",
+        ));
     }
     let after = fs::symlink_metadata(path).map_err(|source| ExperimentRunnerError::Io {
-        operation: "reinspect checkpoint file",
+        operation: "reinspect experiment artifact",
         path: path.to_path_buf(),
         source,
     })?;
     if after.file_type().is_symlink() || !same_status_file_identity(&before, &after) {
         return Err(invalid_checkpoint(
             path,
-            "checkpoint file identity changed while reading",
+            "experiment artifact identity changed while reading",
         ));
     }
     Ok(bytes)
@@ -645,6 +653,244 @@ struct RunEvidenceV1 {
     total_ticks: u64,
     final_digest: String,
     manifest_digest: String,
+}
+
+/// Scientific observations computed from a restored final experiment checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedExperimentFinalState {
+    /// Experiment-local identity read from the verified evidence and cut.
+    pub run_id: String,
+    /// Exact scientific boundary observed after restoration.
+    pub tick: u64,
+    /// Actual restored population, not the reported CSV value.
+    pub alive_agents: usize,
+    /// Scientific digest recomputed by the restored owner.
+    pub scientific_digest: String,
+}
+
+/// Artifact integrity and, when declared, the separately observed final science.
+#[derive(Debug)]
+pub struct PortableRunBundleVerification {
+    /// Canonical byte/database verification result.
+    pub artifacts: RunBundleVerificationResult,
+    /// Restored observations only for a declared matched-seed experiment run.
+    pub final_state: Option<VerifiedExperimentFinalState>,
+}
+
+/// Verify a portable bundle, restoring declared experiment final states offline.
+///
+/// This checks final-state consistency, not the whole cohort's plan, checkpoint
+/// chain, source authenticity or completeness of its build provenance. Ordinary
+/// database bundles retain the storage verifier's database/replay checks.
+///
+/// # Errors
+/// Refuses invalid artifact bytes or experiment metadata, unsupported checkpoint
+/// codecs/families, and reports that disagree with the restored scientific state.
+pub fn verify_portable_run_bundle(
+    bundle_dir: &Path,
+) -> Result<PortableRunBundleVerification, ExperimentRunnerError> {
+    let bytes =
+        read_experiment_file_bounded(&bundle_dir.join("bundle_manifest.json"), MAX_STATUS_BYTES)?;
+    let bundle: RunBundleV1 =
+        serde_json::from_slice(&bytes).map_err(|source| ExperimentRunnerError::Json {
+            operation: "decode portable bundle manifest",
+            source,
+        })?;
+    let manifest_value: serde_json::Value = serde_json::from_str(&bundle.manifest.manifest_json)
+        .map_err(|source| ExperimentRunnerError::Json {
+            operation: "decode embedded portable manifest",
+            source,
+        })?;
+    let declares_experiment = bundle.artifacts.iter().any(|entry| {
+        matches!(
+            entry.artifact_type.as_str(),
+            "experiment-summary" | "experiment-run-evidence" | "experiment-final-checkpoint"
+        ) || matches!(
+            entry.relative_path.as_str(),
+            "evidence/run.json" | "checkpoints/final.checkpoint"
+        )
+    }) || manifest_value
+        .pointer("/scenario/population_recipe")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|recipe| recipe.starts_with("fixed-4x4-registered-brain-grid-v1;brain="));
+    let artifacts = if declares_experiment {
+        verify_run_bundle_bounded(
+            bundle_dir,
+            RunBundleVerificationLimits {
+                max_manifest_bytes: MAX_STATUS_BYTES,
+                max_artifacts: MAX_BUNDLE_ARTIFACTS,
+                max_artifact_bytes: MAX_BUNDLE_ARTIFACT_BYTES,
+                max_total_artifact_bytes: MAX_BUNDLE_TOTAL_ARTIFACT_BYTES,
+            },
+        )
+    } else {
+        scriptbots_storage::verify_run_bundle(bundle_dir)
+    }
+    .map_err(|error| ExperimentRunnerError::Bundle {
+        run_id: bundle.digests.run_id.clone(),
+        reason: format!("canonical artifact verification failed: {error}"),
+    })?;
+    if !declares_experiment {
+        return Ok(PortableRunBundleVerification {
+            artifacts,
+            final_state: None,
+        });
+    }
+    for &(path, role) in REQUIRED_EXPERIMENT_ARTIFACTS {
+        if bundle
+            .artifacts
+            .iter()
+            .filter(|entry| entry.relative_path == path && entry.artifact_type == role)
+            .count()
+            != 1
+        {
+            return Err(ExperimentRunnerError::Bundle {
+                run_id: bundle.digests.run_id.clone(),
+                reason: format!("experiment bundle must index `{path}` exactly once as `{role}`"),
+            });
+        }
+    }
+    let manifest: RunManifestV3 =
+        serde_json::from_value(manifest_value).map_err(|source| ExperimentRunnerError::Json {
+            operation: "decode experiment run manifest",
+            source,
+        })?;
+    let evidence: RunEvidenceV1 = serde_json::from_slice(&read_experiment_file_bounded(
+        &bundle_dir.join("evidence/run.json"),
+        MAX_STATUS_BYTES,
+    )?)
+    .map_err(|source| ExperimentRunnerError::Json {
+        operation: "decode experiment run evidence",
+        source,
+    })?;
+    let selector = ScenarioVariant {
+        variant_id: evidence.variant_id.clone(),
+        brain_family: evidence.brain_family.clone(),
+        config_overrides: BTreeMap::new(),
+    };
+    let family = ResolvedBrainFamily::resolve(&selector)?;
+    let fail = |reason: &str| ExperimentRunnerError::Bundle {
+        run_id: evidence.run_id.clone(),
+        reason: reason.to_owned(),
+    };
+    if evidence.schema != "scriptbots.experiment-run-evidence.v1"
+        || manifest.identity.run_id != MatchedSeedExperimentRunner::bundle_run_id(&evidence.run_id)
+        || manifest.identity.experiment_id.as_deref() != Some(evidence.experiment_id.as_str())
+        || manifest.identity.variant_id.as_deref() != Some(evidence.variant_id.as_str())
+        || manifest.identity.requested_tick_budget != Some(evidence.total_ticks)
+        || manifest.identity.live_run_policy.is_some()
+        || manifest.root_seed != evidence.seed
+        || manifest.scenario.id != evidence.run_id
+        || manifest.scenario.population_recipe
+            != format!(
+                "fixed-4x4-registered-brain-grid-v1;brain={}",
+                family.canonical_name()
+            )
+        || manifest.brain_roster.len() != 1
+        || manifest.brain_roster[0].kind != family.canonical_name()
+        || evidence.brain_family != family.canonical_name()
+        || bundle.digests.max_tick != evidence.total_ticks
+    {
+        return Err(fail(
+            "experiment evidence differs from its run manifest or exact boundary",
+        ));
+    }
+    let projected = manifest
+        .to_storage_record()
+        .map_err(|error| fail(&error.to_string()))?;
+    let canonical = manifest
+        .canonical_json_bytes()
+        .map_err(|error| fail(&error.to_string()))?;
+    if projected != bundle.manifest
+        || evidence.manifest_digest != blake3::hash(&canonical).to_hex().as_str()
+    {
+        return Err(fail("experiment manifest projection or digest differs"));
+    }
+    let path = bundle_dir.join(FINAL_CHECKPOINT_ARTIFACT.0);
+    let checkpoint = RunCheckpointV1::decode(
+        &read_experiment_file_bounded(&path, MAX_RUN_CHECKPOINT_BYTES)?,
+        &path,
+    )?;
+    let final_state =
+        verify_restored_final_checkpoint(bundle_dir, &checkpoint, &manifest, &evidence, family)?;
+    Ok(PortableRunBundleVerification {
+        artifacts,
+        final_state: Some(final_state),
+    })
+}
+
+fn verify_restored_final_checkpoint(
+    bundle_dir: &Path,
+    checkpoint: &RunCheckpointV1,
+    manifest: &RunManifestV3,
+    evidence: &RunEvidenceV1,
+    family: ResolvedBrainFamily,
+) -> Result<VerifiedExperimentFinalState, ExperimentRunnerError> {
+    let path = bundle_dir.join(FINAL_CHECKPOINT_ARTIFACT.0);
+    let host = checkpoint.owner.host_checkpoint();
+    let actual_config =
+        serde_json::to_value(host.config()).map_err(|error| invalid_checkpoint(&path, error))?;
+    if checkpoint.metadata.manifest != *manifest
+        || checkpoint.metadata.run_id != evidence.run_id
+        || checkpoint.metadata.plan_digest != evidence.plan_digest
+        || host.tick().0 != evidence.total_ticks
+        || host.session_id() != host_identifiers(&evidence.run_id).0
+        || actual_config != manifest.normalized_config
+        || host.has_schedule()
+        || host.playback()
+            != (PlaybackSnapshot {
+                paused: true,
+                speed_multiplier: 1.0,
+            })
+        || (host.tick().0 == 0) != checkpoint.metadata.parent_digest.is_none()
+        || checkpoint
+            .metadata
+            .parent_digest
+            .as_ref()
+            .is_some_and(|digest| {
+                digest.len() != blake3::OUT_LEN * 2
+                    || !digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+    {
+        return Err(invalid_checkpoint(
+            &path,
+            "final cut differs from the bundle manifest, evidence, session or exact completion tick",
+        ));
+    }
+    let core = restore_run_owner(checkpoint, family, &evidence.run_id, &path)?;
+    let digest = core
+        .scientific_digest_v1()
+        .map_err(|error| invalid_checkpoint(&path, error))?;
+    if digest.overall != evidence.final_digest {
+        return Err(invalid_checkpoint(
+            &path,
+            "computed scientific digest differs from the reported result",
+        ));
+    }
+    let summary_path = bundle_dir.join("exports/summary.csv");
+    let summary = read_experiment_file_bounded(&summary_path, MAX_BUNDLE_ARTIFACT_BYTES)?;
+    let expected_summary = format!(
+        "tick,alive_agents,seed,brain_family,final_digest\n{},{},{},{},{}\n",
+        core.world_tick().0,
+        core.world().agents().len(),
+        evidence.seed,
+        family.canonical_name(),
+        digest.overall
+    );
+    if summary != expected_summary.as_bytes() {
+        return Err(invalid_checkpoint(
+            &summary_path,
+            "summary differs from the restored final population, tick, family, seed or digest",
+        ));
+    }
+    Ok(VerifiedExperimentFinalState {
+        run_id: evidence.run_id.clone(),
+        tick: core.world_tick().0,
+        alive_agents: core.world().agents().len(),
+        scientific_digest: digest.overall,
+    })
 }
 
 /// Deterministic matched-seed experiment runner.
@@ -2163,11 +2409,7 @@ impl MatchedSeedExperimentRunner {
                 run_id: record.run_id.clone(),
                 reason: format!("bundle manifest JSON is invalid: {source}"),
             })?;
-        for (required_path, required_type) in [
-            ("exports/summary.csv", "experiment-summary"),
-            ("evidence/run.json", "experiment-run-evidence"),
-            FINAL_CHECKPOINT_ARTIFACT,
-        ] {
+        for &(required_path, required_type) in REQUIRED_EXPERIMENT_ARTIFACTS {
             let matches = bundle
                 .artifacts
                 .iter()
@@ -2290,40 +2532,13 @@ impl MatchedSeedExperimentRunner {
                 &record.run_id,
                 plan_digest,
             )?;
-            if checkpoint.metadata.manifest != full_manifest
-                || checkpoint.owner.host_checkpoint().tick().0 != self.max_ticks
-            {
-                return Err(invalid_checkpoint(
-                    &checkpoint_path,
-                    "final cut differs from the bundle manifest or exact completion tick",
-                ));
-            }
-            let core = restore_run_owner(&checkpoint, family, &record.run_id, &checkpoint_path)?;
-            let digest = core
-                .scientific_digest_v1()
-                .map_err(|error| invalid_checkpoint(&checkpoint_path, error))?;
-            if digest.overall != evidence.final_digest {
-                return Err(invalid_checkpoint(
-                    &checkpoint_path,
-                    "computed scientific digest differs from the reported result",
-                ));
-            }
-            let summary_path = bundle_dir.join("exports/summary.csv");
-            let summary = read_experiment_file_bounded(&summary_path, MAX_BUNDLE_ARTIFACT_BYTES)?;
-            let expected_summary = format!(
-                "tick,alive_agents,seed,brain_family,final_digest\n{},{},{},{},{}\n",
-                core.world_tick().0,
-                core.world().agents().len(),
-                record.seed,
-                family.canonical_name(),
-                digest.overall
-            );
-            if summary != expected_summary.as_bytes() {
-                return Err(invalid_checkpoint(
-                    &summary_path,
-                    "summary differs from the restored final population, tick, family, seed or digest",
-                ));
-            }
+            verify_restored_final_checkpoint(
+                &bundle_dir,
+                &checkpoint,
+                &full_manifest,
+                &evidence,
+                family,
+            )?;
             Ok(())
         };
         verify_final_checkpoint().map_err(|error| ExperimentRunnerError::Bundle {
@@ -3687,6 +3902,64 @@ mod tests {
             error.to_string().contains("restored final checkpoint"),
             "{error}"
         );
+        let error = verify_portable_run_bundle(&bundle_dir)
+            .expect_err("offline verification must reject the same byte-valid false science");
+        assert!(
+            error.to_string().contains("computed scientific digest"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn offline_verification_restores_relocated_bundles_and_requires_experiment_roles() {
+        let (runner, _state_file, _running, completed) = completed_bundle_gap_fixture(&[7]);
+        let record = &completed[0];
+        let original = runner.output_dir.join(&record.run_id);
+        let relocated = runner.output_dir.join("renamed-portable-bundle");
+        fs::rename(&original, &relocated).unwrap();
+        let verified = verify_portable_run_bundle(&relocated).unwrap();
+        let final_state = verified.final_state.unwrap();
+        assert_eq!(final_state.run_id, record.run_id);
+        assert_eq!(final_state.tick, record.total_ticks);
+        assert_eq!(Some(final_state.scientific_digest), record.final_digest);
+        assert_eq!(verified.artifacts.max_tick, final_state.tick);
+
+        let path = relocated.join("bundle_manifest.json");
+        let original_manifest = fs::read(&path).unwrap();
+        let bundle: RunBundleV1 = serde_json::from_slice(&original_manifest).unwrap();
+        let mut absent = bundle.clone();
+        absent
+            .artifacts
+            .retain(|entry| entry.relative_path != FINAL_CHECKPOINT_ARTIFACT.0);
+        let mut mislabelled = bundle.clone();
+        mislabelled
+            .artifacts
+            .iter_mut()
+            .find(|entry| entry.relative_path == FINAL_CHECKPOINT_ARTIFACT.0)
+            .unwrap()
+            .artifact_type = "ordinary-binary".into();
+        let mut stripped = bundle;
+        stripped.artifacts.clear();
+        let cases = [absent, mislabelled, stripped];
+        let expected_cells = cases.len();
+        let mut refused = 0;
+        for changed in cases {
+            fs::write(&path, serde_json::to_vec(&changed).unwrap()).unwrap();
+            scriptbots_storage::verify_run_bundle(&relocated)
+                .expect("these index changes preserve byte integrity");
+            let error = verify_portable_run_bundle(&relocated)
+                .expect_err("declared experiment cannot fall back to byte-only verification");
+            assert!(error.to_string().contains("exactly once"), "{error}");
+            refused += 1;
+        }
+        assert_eq!(refused, expected_cells);
+        fs::write(&path, original_manifest).unwrap();
+        assert!(
+            verify_portable_run_bundle(&relocated)
+                .unwrap()
+                .final_state
+                .is_some()
+        );
     }
 
     #[test]
@@ -3726,6 +3999,13 @@ mod tests {
                 Some(restored.scientific_digest_v1().unwrap().overall),
                 run.final_digest
             );
+            let offline = verify_portable_run_bundle(&runner.output_dir.join(&run.run_id))
+                .unwrap()
+                .final_state
+                .unwrap();
+            assert_eq!(offline.tick, 0);
+            assert_eq!(offline.alive_agents, restored.world().agents().len());
+            assert_eq!(Some(offline.scientific_digest), run.final_digest);
         }
         assert_eq!(runner.execute_batch(&state_file).unwrap(), status);
     }
@@ -3786,6 +4066,10 @@ mod tests {
                 "failure must name the bundled cut it actually read: {reason}"
             );
             observed.insert(reason);
+            assert!(
+                verify_portable_run_bundle(&bundle_dir).is_err(),
+                "offline consumer must also reject {label}"
+            );
         }
         assert_eq!(
             observed.len(),
@@ -3823,6 +4107,9 @@ mod tests {
         let error = runner
             .verify_completed_bundle(record, variant, *family, &plan.digest)
             .expect_err("reported population must match the restored final state");
+        assert!(error.to_string().contains("summary differs"), "{error}");
+        let error = verify_portable_run_bundle(&bundle_dir)
+            .expect_err("offline population must come from the actual owner");
         assert!(error.to_string().contains("summary differs"), "{error}");
         fs::write(&summary_path, &original_summary).unwrap();
         fs::write(&manifest_path, &original_manifest).unwrap();
@@ -4334,6 +4621,13 @@ mod tests {
                 Some(restored.scientific_digest_v1().unwrap().overall),
                 run.final_digest
             );
+            let offline = verify_portable_run_bundle(&output_dir.join(&run.run_id))
+                .unwrap()
+                .final_state
+                .unwrap();
+            assert_eq!(offline.tick, run.total_ticks);
+            assert_eq!(offline.alive_agents, restored.world().agents().len());
+            assert_eq!(Some(offline.scientific_digest), run.final_digest);
             fs::rename(
                 &standalone,
                 temp_dir

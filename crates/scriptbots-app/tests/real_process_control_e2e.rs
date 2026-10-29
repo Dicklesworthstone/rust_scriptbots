@@ -2639,6 +2639,12 @@ fn real_process_named_experiment_continues_after_server_kill() -> Result<()> {
         "downloaded bundle CLI: {}",
         String::from_utf8_lossy(&cli.stderr)
     );
+    assert!(
+        String::from_utf8_lossy(&cli.stdout)
+            .contains(&format!("Scientific final state: restored; tick={TICKS};")),
+        "{}",
+        String::from_utf8_lossy(&cli.stdout)
+    );
     assert_eq!(
         std::fs::read(output.join("status.json"))?,
         status_bytes,
@@ -3605,7 +3611,7 @@ fn real_process_experiments_checkpoints_artifacts_e2e() -> Result<()> {
             )?;
             assert!(
                 cli.status.success(),
-                "independent experiment CLI verification: {}\n{}",
+                "standalone experiment CLI verification: {}\n{}",
                 cli.status,
                 String::from_utf8_lossy(&cli.stderr)
             );
@@ -3613,6 +3619,78 @@ fn real_process_experiments_checkpoints_artifacts_e2e() -> Result<()> {
             assert!(
                 cli_stdout.contains("Verified run bundle V1"),
                 "{cli_stdout}"
+            );
+            assert!(
+                cli_stdout.contains(&format!(
+                    "Scientific final state: restored; tick={};",
+                    verified.max_tick
+                )),
+                "{cli_stdout}"
+            );
+            assert!(
+                cli_stdout.contains(&format!("digest={}", run["final_digest"].as_str().unwrap())),
+                "{cli_stdout}"
+            );
+            let forged = run_dir.join("forged-downloads").join(run_id);
+            let actual_digest = evidence["final_digest"]
+                .as_str()
+                .context("observed final digest")?;
+            let false_digest = format!(
+                "{:0width$x}",
+                u64::from_str_radix(actual_digest, 16)?.wrapping_add(1),
+                width = size_of::<u64>() * 2
+            );
+            assert_ne!(actual_digest, false_digest);
+            let mut forged_manifest = manifest.clone();
+            for entry in &mut forged_manifest.artifacts {
+                let mut bytes = std::fs::read(downloaded.join(&entry.relative_path))?;
+                if entry.artifact_type == "experiment-run-evidence" {
+                    let mut changed = evidence.clone();
+                    changed["final_digest"] = serde_json::json!(false_digest);
+                    bytes = serde_json::to_vec(&changed)?;
+                } else if entry.artifact_type == "experiment-summary" {
+                    let summary = String::from_utf8(bytes)?;
+                    assert!(summary.contains(actual_digest));
+                    bytes = summary.replace(actual_digest, &false_digest).into_bytes();
+                }
+                let destination = forged.join(&entry.relative_path);
+                std::fs::create_dir_all(destination.parent().context("forged artifact parent")?)?;
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(destination)?
+                    .write_all(&bytes)?;
+                entry.bytes_len = u64::try_from(bytes.len())?;
+                entry.blake3_hex = scriptbots_app::control::compute_blake3(&bytes);
+            }
+            std::fs::write(
+                forged.join("bundle_manifest.json"),
+                serde_json::to_vec(&forged_manifest)?,
+            )?;
+            scriptbots_storage::verify_run_bundle(&forged)
+                .context("forged reports must still pass actual artifact integrity checks")?;
+            let refused = Command::new(binary())
+                .arg("--verify-bundle")
+                .arg(&forged)
+                .output()?;
+            std::fs::write(forged.join("verify.stdout.log"), &refused.stdout)?;
+            std::fs::write(forged.join("verify.stderr.log"), &refused.stderr)?;
+            println!(
+                "CLI_FORGED_FINAL_DIGEST: {}",
+                serde_json::json!({"run_id":run_id,"actual_digest":actual_digest,
+                    "reported_digest":false_digest,"artifact_integrity":"pass",
+                    "cli_exit_code":refused.status.code(),"directory":forged})
+            );
+            assert!(
+                !refused.status.success(),
+                "offline CLI must recompute final science instead of admitting byte-valid forged reports: {}",
+                String::from_utf8_lossy(&refused.stdout)
+            );
+            assert!(
+                String::from_utf8_lossy(&refused.stderr)
+                    .contains("computed scientific digest differs from the reported result"),
+                "forged-report refusal must observe the actual digest mismatch: {}",
+                String::from_utf8_lossy(&refused.stderr)
             );
             verified_experiments.push(serde_json::json!({"run_id":run_id,
                 "directory":downloaded,"max_tick":verified.max_tick,"file_count":paths.len(),
