@@ -179,7 +179,9 @@ fn run_tui_path(document: &ScenarioDocumentV1, seed: u64, ticks: u64) -> TuiRunR
         };
         let reservation =
             scriptbots_app::ControlServerReservation::prepare(config).expect("prepare control");
-        reservation.launch(port.clone()).expect("launch control")
+        reservation
+            .launch(port.clone(), false)
+            .expect("launch control")
     };
 
     let context = RendererContext {

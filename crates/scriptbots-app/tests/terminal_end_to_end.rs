@@ -1889,7 +1889,7 @@ fn tui_evidence_e2e_serves_the_frame_the_renderer_published() -> Result<()> {
     let rest_addr = reservation
         .rest_address()
         .ok_or_else(|| anyhow::anyhow!("REST listener was not bound"))?;
-    let (control_runtime, command_submit) = reservation.launch(host.port())?;
+    let (control_runtime, command_submit) = reservation.launch(host.port(), false)?;
 
     let renderer = TerminalRenderer::default();
     {

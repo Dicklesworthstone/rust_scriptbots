@@ -683,9 +683,19 @@ impl ControlServerReservation {
         Ok(Self { config, rest, mcp })
     }
 
-    /// Launch the control runtime using the exact listeners reserved earlier.
-    pub fn launch(self, host: ChannelHostPort) -> Result<(ControlRuntime, CommandSubmit)> {
-        ControlRuntime::launch_reserved_with_timeout(host, self, CONTROL_STARTUP_TIMEOUT)
+    /// Launch the reserved listeners, optionally admitting Resume before clients.
+    /// The owner's queue applies that initialization before any client command.
+    pub fn launch(
+        self,
+        host: ChannelHostPort,
+        start_running: bool,
+    ) -> Result<(ControlRuntime, CommandSubmit)> {
+        ControlRuntime::launch_reserved_with_timeout(
+            host,
+            self,
+            CONTROL_STARTUP_TIMEOUT,
+            start_running,
+        )
     }
 
     /// Actual REST address, including the assigned port when configured with port zero.
@@ -756,13 +766,14 @@ impl ControlRuntime {
         host: ChannelHostPort,
         config: ControlServerConfig,
     ) -> Result<(Self, CommandSubmit)> {
-        ControlServerReservation::prepare(config)?.launch(host)
+        ControlServerReservation::prepare(config)?.launch(host, false)
     }
 
     fn launch_reserved_with_timeout(
         host: ChannelHostPort,
         reservation: ControlServerReservation,
         startup_timeout: Duration,
+        start_running: bool,
     ) -> Result<(Self, CommandSubmit)> {
         let handle = ControlHandle::new(host)
             .with_database(reservation.config.database_path.clone())
@@ -788,6 +799,7 @@ impl ControlRuntime {
                 }
             }
         });
+        let initial_resume = start_running.then(|| command_submit.clone());
         let (shutdown, shutdown_rx) = watch::channel(false);
         let shutdown_for_thread = shutdown.clone();
         let (startup_tx, startup_rx) = mpsc::sync_channel(1);
@@ -818,6 +830,7 @@ impl ControlRuntime {
                         shutdown_rx,
                         startup_tx,
                         status_for_thread.clone(),
+                        initial_resume,
                     )),
                     Err(source) => {
                         let error =
@@ -1032,14 +1045,16 @@ async fn run_control_servers(
     shutdown: watch::Receiver<bool>,
     startup: mpsc::SyncSender<ControlStartupSignal>,
     status: watch::Sender<ControlRuntimeStatus>,
+    initial_resume: Option<CommandSubmit>,
 ) -> Result<()> {
-    let mut servers = match start_control_servers(handle, reservation, shutdown.clone()).await {
-        Ok(servers) => servers,
-        Err(error) => {
-            let _ = startup.send(ControlStartupSignal::Failed(format!("{error:#}")));
-            return Err(error);
-        }
-    };
+    let mut servers =
+        match start_control_servers(handle, reservation, shutdown.clone(), initial_resume).await {
+            Ok(servers) => servers,
+            Err(error) => {
+                let _ = startup.send(ControlStartupSignal::Failed(format!("{error:#}")));
+                return Err(error);
+            }
+        };
 
     if servers.rest.is_none() && servers.mcp.is_none() {
         status.send_replace(ControlRuntimeStatus::Disabled);
@@ -1198,6 +1213,7 @@ async fn start_control_servers(
     handle: ControlHandle,
     reservation: ControlServerReservation,
     shutdown: watch::Receiver<bool>,
+    initial_resume: Option<CommandSubmit>,
 ) -> Result<RunningControlServers> {
     let ControlServerReservation {
         config,
@@ -1222,6 +1238,15 @@ async fn start_control_servers(
         }
         Some(reserved) => Some(prepare_mcp_server(handle, &config, reserved).await?),
     };
+
+    // Finish preparing both transports before changing playback. Admit startup
+    // before serving clients so a later Resume cannot override their Pause.
+    // The owner queue orders application after this admission acknowledgement.
+    if let Some(submit) = initial_resume {
+        let command_id = submit(scriptbots_core::ControlCommand::Resume)
+            .ok_or_else(|| anyhow!("host did not acknowledge initial resume admission"))?;
+        info!(%command_id, "initial Resume admitted before control transports start");
+    }
 
     let rest = prepared_rest.map(|prepared| {
         let shutdown = shutdown.clone();
@@ -5122,6 +5147,115 @@ mod tests {
     }
 
     #[test]
+    fn startup_playback_choice_reaches_the_owner_with_disabled_transports() {
+        for start_running in [false, true] {
+            let host = test_host();
+            let reservation = ControlServerReservation::prepare(ControlServerConfig {
+                rest_enabled: false,
+                mcp_transport: McpTransportConfig::Disabled,
+                ..ControlServerConfig::default()
+            })
+            .expect("prepare disabled transports");
+            let (runtime, _) = reservation
+                .launch(host.port.clone(), start_running)
+                .expect("launch control runtime");
+            let handle = runtime.control_handle().unwrap();
+            // The same speed command in each case is an application barrier;
+            // it preserves playback and follows any startup command in the queue.
+            let speed = handle.set_speed(1.0, None).expect("speed barrier");
+            host.wait_applied(&speed);
+            assert_eq!(
+                handle.status().unwrap().paused,
+                !start_running,
+                "observed playback for start_running={start_running}"
+            );
+            runtime.shutdown().expect("shutdown controls");
+        }
+    }
+
+    #[test]
+    fn startup_resume_precedes_a_pause_already_waiting_on_the_reserved_socket() {
+        let host = test_host();
+        let reservation = ControlServerReservation::prepare(ControlServerConfig {
+            rest_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            rest_enabled: true,
+            mcp_transport: McpTransportConfig::Disabled,
+            ..ControlServerConfig::default()
+        })
+        .expect("reserve REST");
+        let address = reservation.rest_address().expect("REST address");
+        // A real client can connect while the OS listener is reserved but the
+        // runtime has not started accepting requests. Keep its Pause queued.
+        let mut stream = TcpStream::connect(address).expect("connect before launch");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("read timeout");
+        write!(
+            stream,
+            "POST /api/control/pause HTTP/1.1\r\nHost: {address}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .expect("queue Pause");
+        let (runtime, _) = reservation
+            .launch(host.port.clone(), true)
+            .expect("launch with initial Resume");
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .expect("Pause response");
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let receipt: CommandStatusDto =
+            serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+        let pause = host.wait_applied(&receipt);
+        let resume_id = u128::from_str_radix(&pause.command_id, 16)
+            .unwrap()
+            .checked_sub(1)
+            .expect("startup command precedes client identity");
+        let handle = runtime.control_handle().unwrap();
+        let resume = handle
+            .command_status(&format!("{resume_id:032x}"))
+            .unwrap()
+            .expect("initial Resume receipt");
+        assert_eq!(resume.application_state, "applied");
+        assert_eq!(
+            pause.admission_sequence,
+            resume.admission_sequence.unwrap().checked_add(1)
+        );
+        let status = handle.status().unwrap();
+        assert!(
+            status.paused,
+            "startup must preserve the later client Pause"
+        );
+        assert_eq!(
+            status.last_applied_command.as_deref(),
+            Some(pause.command_id.as_str())
+        );
+        runtime.shutdown().expect("shutdown controls");
+    }
+
+    #[test]
+    fn refused_initial_resume_releases_the_reserved_listener() {
+        let port = {
+            let host = test_host();
+            host.port.clone()
+        };
+        let reservation = ControlServerReservation::prepare(ControlServerConfig {
+            rest_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            rest_enabled: true,
+            mcp_transport: McpTransportConfig::Disabled,
+            ..ControlServerConfig::default()
+        })
+        .expect("reserve REST");
+        let address = reservation.rest_address().unwrap();
+        let error = reservation
+            .launch(port, true)
+            .err()
+            .expect("stopped owner cannot admit initial Resume");
+        assert!(format!("{error:#}").contains("initial resume admission"));
+        let listener = TcpListener::bind(address).expect("failed launch releases reservation");
+        drop(listener);
+    }
+
+    #[test]
     fn acknowledged_rest_startup_and_shutdown_own_the_listener_exactly_once() {
         let rest_address = unused_loopback_address();
         let config = ControlServerConfig {
@@ -5166,7 +5300,9 @@ mod tests {
         );
 
         let host = test_host();
-        let (runtime, _submit) = reservation.launch(host.port.clone()).expect("MCP startup");
+        let (runtime, _submit) = reservation
+            .launch(host.port.clone(), false)
+            .expect("MCP startup");
         assert_eq!(runtime.status(), ControlRuntimeStatus::Running);
         let response = http_get(mcp_address, "/health");
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
@@ -5200,7 +5336,7 @@ mod tests {
 
         let host = test_host();
         let (runtime, _submit) = reservation
-            .launch(host.port.clone())
+            .launch(host.port.clone(), false)
             .expect("REST plus MCP startup");
         assert!(http_get(rest_address, "/api/knobs").starts_with("HTTP/1.1 200"));
         assert!(http_get(mcp_address, "/health").starts_with("HTTP/1.1 200"));

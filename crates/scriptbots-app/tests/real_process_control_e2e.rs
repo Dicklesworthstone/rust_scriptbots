@@ -505,6 +505,7 @@ fn real_process_configuration_cli_receipts_and_rejections() -> Result<()> {
     let result = (|| {
         apply_cadence_control(addr, "/api/control/pause", b"")?;
         let (_, before) = http(addr, "GET", "/api/config")?;
+        std::fs::write(run_dir.join("configuration-before.json"), &before)?;
         let before: serde_json::Value = serde_json::from_str(&before)?;
         let mut command_ids = Vec::new();
         for (name, arguments, field, expected) in [
@@ -571,7 +572,24 @@ fn real_process_configuration_cli_receipts_and_rejections() -> Result<()> {
                 std::thread::sleep(Duration::from_millis(25));
             }
             let (code, after) = http(addr, "GET", "/api/config")?;
+            std::fs::write(
+                run_dir.join(format!("{name}-configuration-after.json")),
+                &after,
+            )?;
             let after: serde_json::Value = serde_json::from_str(&after)?;
+            let observation = serde_json::json!({
+                "operation":name, "http_code":code, "field":field,
+                "expected":expected, "observed":after["config"][field],
+                "before_tick":before["tick"], "after_tick":after["tick"],
+                "http_matches":code == 200,
+                "value_matches":after["config"][field] == expected,
+                "tick_matches":after["tick"] == before["tick"]
+            });
+            std::fs::write(
+                run_dir.join(format!("{name}-configuration-observation.json")),
+                serde_json::to_vec_pretty(&observation)?,
+            )?;
+            println!("CONFIGURATION_READBACK: {observation}");
             anyhow::ensure!(
                 code == 200
                     && after["config"][field] == expected

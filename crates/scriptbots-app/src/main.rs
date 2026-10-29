@@ -991,14 +991,10 @@ fn main() -> Result<()> {
                 anyhow::anyhow!("control listeners were not reserved before runtime startup")
             })?
             .with_checkpoint_writer(storage_pipeline.checkpoint_writer());
-        let (control_runtime, command_submit) = control_reservation.launch(host_port.clone())?;
-        // Retain teardown ownership even if initial resume or renderer startup fails.
+        let (control_runtime, command_submit) =
+            control_reservation.launch(host_port.clone(), renderer.name() != "terminal")?;
+        // Retain teardown ownership even if renderer startup fails.
         let control_runtime = control_to_close.insert(control_runtime);
-        if renderer.name() != "terminal"
-            && command_submit(scriptbots_core::ControlCommand::Resume).is_none()
-        {
-            return Err(anyhow!("host refused initial resume"));
-        }
         info!(
             requested_mode = cli.mode.as_str(),
             active_mode = active_mode.as_str(),
