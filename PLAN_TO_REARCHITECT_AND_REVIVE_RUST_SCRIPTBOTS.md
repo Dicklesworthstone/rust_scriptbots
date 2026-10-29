@@ -4,6 +4,15 @@
 
 **Evidence date:** 2026-07-11
 
+**Offline experiment verification (2026-10-29):** [Qualified increment;
+original `bd-2z0.5.11` Currently In Progress — VioletTrout]. Source
+`afb8f1bc6b47` wires the exported final owner cut into shipped `--verify-bundle`:
+it restores scientific state and rejects byte-valid false reports. The actual
+old CLI admits the planted forgery; pinned source passes 84 unit tests and both
+real download/restart journeys, workspace check and strict Clippy. Relocated
+bundles verify without external status. Full provenance/checkpoint-chain/
+resource/native criteria and earlier broader process failures remain open.
+
 **Portable final experiment state (2026-10-29):** [Qualified increment;
 original `bd-2z0.5.11` Currently In Progress — VioletTrout]. Source `03973d0d9fbe` exports the existing
 canonical final HostCore cut and recomputes its scientific digest and summary

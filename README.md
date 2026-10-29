@@ -613,8 +613,14 @@ unfinished persistence, nonempty WAL/journal files and changed/aliased source pa
 export does not checkpoint or rewrite the source. The copied database is independently opened
 and compared with the manifest, events, checkpoints, maximum tick and persistence watermarks
 before the final bundle manifest is written. `--verify-bundle DIRECTORY` repeats those logical
-checks alongside artifact hashes. Database-free experiment bundles remain valid and report
-zero persisted events/checkpoints. A failed export retains partial files without a success manifest.
+checks alongside artifact hashes. For matched-seed experiment bundles it also restores the
+included final HostCore checkpoint and compares the actual scientific digest and population
+with the reports. The printed `Scientific final state` line names those observed values;
+renaming or moving the bundle does not require its external continuation file or status.
+This checks the saved result, not the whole cohort plan or source authenticity, and does not
+promote incomplete build provenance to reproducibility. Database-free experiment bundles
+report zero database-persisted events/checkpoints even though their final owner cut is included.
+A failed export retains partial files without a success manifest.
 
 ### Dual-window mode (GUI)
 - ScriptBots opens two GPUI windows as one transactional launch and tiles them inside the primary display's visible frame: a flexible World window and a narrow `ScriptBots Lab` companion. The Lab does not duplicate the canvas; its Overview, Inspect, Analytics, and Timeline tabs keep one task-focused surface visible at a time, with dense diagnostics closed by default and the active section vertically scrollable. On narrow displays the pair stacks without overlap.
