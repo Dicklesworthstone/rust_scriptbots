@@ -2715,11 +2715,8 @@ fn real_process_named_experiment_continues_after_server_kill() -> Result<()> {
     assert_eq!(code, 200, "capacity MCP transport: {body}");
     let refused: serde_json::Value = serde_json::from_str(&body)?;
     assert_eq!(refused["id"], 43);
-    assert_eq!(refused["error"]["code"], -32603, "{body}");
-    assert!(
-        body.contains("experiment execution capacity exhausted"),
-        "{body}"
-    );
+    assert_eq!(refused["error"]["code"], -32006, "{body}");
+    assert_eq!(refused["error"]["message"], "Internal server error");
     assert!(
         !interrupted
             .join("artifacts/experiments/capacity-retry")
