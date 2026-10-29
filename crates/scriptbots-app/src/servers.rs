@@ -5212,7 +5212,7 @@ mod tests {
             .expect("startup command precedes client identity");
         let handle = runtime.control_handle().unwrap();
         let resume = handle
-            .command_status(&format!("{resume_id:032x}"))
+            .command_status(&scriptbots_runtime::CommandId::new(resume_id).to_string())
             .unwrap()
             .expect("initial Resume receipt");
         assert_eq!(resume.application_state, "applied");
