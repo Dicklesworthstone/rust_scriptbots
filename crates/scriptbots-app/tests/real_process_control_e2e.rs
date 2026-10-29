@@ -3555,6 +3555,23 @@ fn real_process_experiments_checkpoints_artifacts_e2e() -> Result<()> {
                     )
                     .collect();
             assert_eq!(paths, required, "actual manifest's complete file set");
+            let final_cuts = manifest
+                .artifacts
+                .iter()
+                .filter(|entry| entry.artifact_type == "experiment-final-checkpoint")
+                .collect::<Vec<_>>();
+            assert_eq!(final_cuts.len(), 1, "exactly one portable final owner cut");
+            let final_cut = std::fs::read(downloaded.join(&final_cuts[0].relative_path))?;
+            assert_eq!(
+                final_cut,
+                std::fs::read(
+                    source
+                        .parent()
+                        .context("experiment output directory")?
+                        .join(format!("{run_id}.checkpoint")),
+                )?,
+                "API bytes must contain the actual sealed final owner cut"
+            );
             let verified = scriptbots_storage::verify_run_bundle(&downloaded)?;
             assert_eq!(Some(verified.max_tick), run["total_ticks"].as_u64());
             let evidence: serde_json::Value =

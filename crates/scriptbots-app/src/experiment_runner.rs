@@ -41,6 +41,10 @@ pub(crate) const MAX_CONCURRENT_RUNS: usize = 64;
 const HOST_RECEIPT_DRIVE_LIMIT: usize = 16;
 const RUN_CHECKPOINT_MAGIC: &[u8] = b"SBRUNCH1";
 const MAX_RUN_CHECKPOINT_BYTES: u64 = MAX_BUNDLE_ARTIFACT_BYTES;
+const FINAL_CHECKPOINT_ARTIFACT: (&str, &str) = (
+    "checkpoints/final.checkpoint",
+    "experiment-final-checkpoint",
+);
 
 /// Typed failure from matched-seed planning, status recovery, execution, or bundle verification.
 #[derive(Debug, Error)]
@@ -969,7 +973,6 @@ impl MatchedSeedExperimentRunner {
                             .and_then(|_lease| {
                                 self.load_run_checkpoint(
                                     variant,
-                                    *family,
                                     record.seed,
                                     &record.run_id,
                                     &plan.digest,
@@ -1572,23 +1575,23 @@ impl MatchedSeedExperimentRunner {
 
     fn validate_run_checkpoint(
         &self,
+        path: &Path,
         checkpoint: &RunCheckpointV1,
         variant: &ScenarioVariant,
-        family: ResolvedBrainFamily,
         seed: u64,
         run_id: &str,
         plan_digest: &str,
     ) -> Result<(), ExperimentRunnerError> {
-        let path = self.run_checkpoint_path(run_id);
+        let family = ResolvedBrainFamily::resolve(variant)?;
         let metadata = &checkpoint.metadata;
         let manifest = &metadata.manifest;
         let host = checkpoint.owner.host_checkpoint();
         let expected_config = config_for_run(&variant.config_overrides, seed)
-            .map_err(|error| invalid_checkpoint(&path, error))?;
+            .map_err(|error| invalid_checkpoint(path, error))?;
         let expected_config = serde_json::to_value(expected_config)
-            .map_err(|error| invalid_checkpoint(&path, error))?;
-        let actual_config = serde_json::to_value(host.config())
-            .map_err(|error| invalid_checkpoint(&path, error))?;
+            .map_err(|error| invalid_checkpoint(path, error))?;
+        let actual_config =
+            serde_json::to_value(host.config()).map_err(|error| invalid_checkpoint(path, error))?;
         if metadata.plan_digest != plan_digest
             || metadata.run_id != run_id
             || manifest.identity.run_id != Self::bundle_run_id(run_id)
@@ -1625,13 +1628,13 @@ impl MatchedSeedExperimentRunner {
             })
         {
             return Err(invalid_checkpoint(
-                &path,
+                path,
                 "checkpoint differs from the validated plan, build, manifest, family, config, session or execution boundary",
             ));
         }
         manifest
             .to_storage_record()
-            .map_err(|error| invalid_checkpoint(&path, error))?;
+            .map_err(|error| invalid_checkpoint(path, error))?;
         Ok(())
     }
 
@@ -1639,7 +1642,6 @@ impl MatchedSeedExperimentRunner {
     fn load_run_checkpoint(
         &self,
         variant: &ScenarioVariant,
-        family: ResolvedBrainFamily,
         seed: u64,
         run_id: &str,
         plan_digest: &str,
@@ -1647,7 +1649,7 @@ impl MatchedSeedExperimentRunner {
         let path = self.run_checkpoint_path(run_id);
         let committed = read_optional_run_checkpoint(&path)?;
         if let Some(checkpoint) = &committed {
-            self.validate_run_checkpoint(checkpoint, variant, family, seed, run_id, plan_digest)?;
+            self.validate_run_checkpoint(&path, checkpoint, variant, seed, run_id, plan_digest)?;
         }
         let temporary = status_temporary_path(&path)?;
         let candidate = match fs::symlink_metadata(&temporary) {
@@ -1699,7 +1701,7 @@ impl MatchedSeedExperimentRunner {
                 });
             }
         };
-        self.validate_run_checkpoint(&candidate, variant, family, seed, run_id, plan_digest)?;
+        self.validate_run_checkpoint(&temporary, &candidate, variant, seed, run_id, plan_digest)?;
         let expected_parent = committed
             .as_ref()
             .map(|checkpoint| {
@@ -1759,9 +1761,7 @@ impl MatchedSeedExperimentRunner {
                 path: bundle,
             });
         }
-        if let Some(checkpoint) =
-            self.load_run_checkpoint(variant, family, seed, run_id, plan_digest)?
-        {
+        if let Some(checkpoint) = self.load_run_checkpoint(variant, seed, run_id, plan_digest)? {
             if checkpoint.owner.host_checkpoint().tick().0 != 0 {
                 return Err(invalid_checkpoint(
                     &path,
@@ -1771,7 +1771,7 @@ impl MatchedSeedExperimentRunner {
             return Ok(());
         }
         let checkpoint = self.initial_run_checkpoint(variant, family, seed, run_id, plan_digest)?;
-        self.validate_run_checkpoint(&checkpoint, variant, family, seed, run_id, plan_digest)?;
+        self.validate_run_checkpoint(&path, &checkpoint, variant, seed, run_id, plan_digest)?;
         write_run_checkpoint(&path, &checkpoint.encode(&path)?)
     }
 
@@ -1870,7 +1870,7 @@ impl MatchedSeedExperimentRunner {
         let path = self.run_checkpoint_path(run_id);
         let _lease = ExperimentStatusWriterLease::acquire(&path)?;
         let mut checkpoint = self
-            .load_run_checkpoint(variant, family, seed, run_id, plan_digest)?
+            .load_run_checkpoint(variant, seed, run_id, plan_digest)?
             .ok_or_else(|| ExperimentRunnerError::ResumeCheckpointUnavailable {
                 run_id: run_id.to_owned(),
                 completed_ticks: 0,
@@ -2035,6 +2035,9 @@ impl MatchedSeedExperimentRunner {
             family.canonical_name(),
             digest_hex
         );
+        // Export the exact sealed pre-shutdown cut, including evaluator/RNG and
+        // owner-journal state. Reporting its digest alone is not portable state.
+        let final_checkpoint_bytes = checkpoint.encode(&path)?;
         let bundle_dir = self.output_dir.join(run_id);
         if bundle_dir.exists() {
             return Err(ExperimentRunnerError::BundleAlreadyExists {
@@ -2056,6 +2059,11 @@ impl MatchedSeedExperimentRunner {
                     "evidence/run.json",
                     "experiment-run-evidence",
                     &evidence_bytes,
+                ),
+                (
+                    FINAL_CHECKPOINT_ARTIFACT.0,
+                    FINAL_CHECKPOINT_ARTIFACT.1,
+                    &final_checkpoint_bytes,
                 ),
             ],
         )
@@ -2158,6 +2166,7 @@ impl MatchedSeedExperimentRunner {
         for (required_path, required_type) in [
             ("exports/summary.csv", "experiment-summary"),
             ("evidence/run.json", "experiment-run-evidence"),
+            FINAL_CHECKPOINT_ARTIFACT,
         ] {
             let matches = bundle
                 .artifacts
@@ -2269,6 +2278,58 @@ impl MatchedSeedExperimentRunner {
                     .to_owned(),
             });
         }
+        let checkpoint_path = bundle_dir.join(FINAL_CHECKPOINT_ARTIFACT.0);
+        let verify_final_checkpoint = || -> Result<(), ExperimentRunnerError> {
+            let bytes = read_experiment_file_bounded(&checkpoint_path, MAX_RUN_CHECKPOINT_BYTES)?;
+            let checkpoint = RunCheckpointV1::decode(&bytes, &checkpoint_path)?;
+            self.validate_run_checkpoint(
+                &checkpoint_path,
+                &checkpoint,
+                variant,
+                record.seed,
+                &record.run_id,
+                plan_digest,
+            )?;
+            if checkpoint.metadata.manifest != full_manifest
+                || checkpoint.owner.host_checkpoint().tick().0 != self.max_ticks
+            {
+                return Err(invalid_checkpoint(
+                    &checkpoint_path,
+                    "final cut differs from the bundle manifest or exact completion tick",
+                ));
+            }
+            let core = restore_run_owner(&checkpoint, family, &record.run_id, &checkpoint_path)?;
+            let digest = core
+                .scientific_digest_v1()
+                .map_err(|error| invalid_checkpoint(&checkpoint_path, error))?;
+            if digest.overall != evidence.final_digest {
+                return Err(invalid_checkpoint(
+                    &checkpoint_path,
+                    "computed scientific digest differs from the reported result",
+                ));
+            }
+            let summary_path = bundle_dir.join("exports/summary.csv");
+            let summary = read_experiment_file_bounded(&summary_path, MAX_BUNDLE_ARTIFACT_BYTES)?;
+            let expected_summary = format!(
+                "tick,alive_agents,seed,brain_family,final_digest\n{},{},{},{},{}\n",
+                core.world_tick().0,
+                core.world().agents().len(),
+                record.seed,
+                family.canonical_name(),
+                digest.overall
+            );
+            if summary != expected_summary.as_bytes() {
+                return Err(invalid_checkpoint(
+                    &summary_path,
+                    "summary differs from the restored final population, tick, family, seed or digest",
+                ));
+            }
+            Ok(())
+        };
+        verify_final_checkpoint().map_err(|error| ExperimentRunnerError::Bundle {
+            run_id: record.run_id.clone(),
+            reason: format!("restored final checkpoint verification failed: {error}"),
+        })?;
         Ok(())
     }
 }
@@ -3332,7 +3393,7 @@ mod tests {
             }
             fs::write(&temporary, changed.encode(&path).unwrap()).unwrap();
             assert!(
-                matches!(runner.load_run_checkpoint(variant, *family, first.seed, &first.run_id, &plan.digest),
+                matches!(runner.load_run_checkpoint(variant, first.seed, &first.run_id, &plan.digest),
                 Err(ExperimentRunnerError::InvalidCheckpoint { reason, .. }) if reason.contains("validated plan")),
                 "{field}"
             );
@@ -3418,7 +3479,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            runner.load_run_checkpoint(variant, *family, first.seed, &first.run_id, &plan.digest),
+            runner.load_run_checkpoint(variant, first.seed, &first.run_id, &plan.digest),
             Err(ExperimentRunnerError::InvalidCheckpoint { .. })
         ));
         assert_eq!(fs::read(&path).unwrap(), original);
@@ -3426,13 +3487,13 @@ mod tests {
         checkpoint.metadata.parent_digest = Some("0".repeat(blake3::OUT_LEN * 2));
         fs::write(&temporary, checkpoint.encode(&path).unwrap()).unwrap();
         assert!(matches!(
-            runner.load_run_checkpoint(variant, *family, first.seed, &first.run_id, &plan.digest),
+            runner.load_run_checkpoint(variant, first.seed, &first.run_id, &plan.digest),
             Err(ExperimentRunnerError::InvalidCheckpoint { .. })
         ));
         assert_eq!(fs::read(&path).unwrap(), original);
         fs::write(&temporary, &candidate).unwrap();
         let promoted = runner
-            .load_run_checkpoint(variant, *family, first.seed, &first.run_id, &plan.digest)
+            .load_run_checkpoint(variant, first.seed, &first.run_id, &plan.digest)
             .unwrap()
             .unwrap();
         assert_eq!(promoted.owner.host_checkpoint().tick().0, 1);
@@ -3442,7 +3503,7 @@ mod tests {
         fs::write(&temporary, partial).unwrap();
         assert_eq!(
             runner
-                .load_run_checkpoint(variant, *family, first.seed, &first.run_id, &plan.digest)
+                .load_run_checkpoint(variant, first.seed, &first.run_id, &plan.digest)
                 .unwrap()
                 .unwrap()
                 .owner
@@ -3460,7 +3521,7 @@ mod tests {
         // it cannot silently overwrite evidence or create unbounded forensic files.
         fs::write(&temporary, partial).unwrap();
         assert!(matches!(
-            runner.load_run_checkpoint(variant, *family, first.seed, &first.run_id, &plan.digest),
+            runner.load_run_checkpoint(variant, first.seed, &first.run_id, &plan.digest),
             Err(ExperimentRunnerError::InvalidCheckpoint { .. })
         ));
         assert_eq!(fs::read(&temporary).unwrap(), partial);
@@ -3470,7 +3531,7 @@ mod tests {
         corrupt[RUN_CHECKPOINT_MAGIC.len()] ^= 1;
         fs::write(&path, &corrupt).unwrap();
         assert!(matches!(
-            runner.load_run_checkpoint(variant, *family, first.seed, &first.run_id, &plan.digest),
+            runner.load_run_checkpoint(variant, first.seed, &first.run_id, &plan.digest),
             Err(ExperimentRunnerError::InvalidCheckpoint { .. })
         ));
         assert_eq!(fs::read(&path).unwrap(), corrupt);
@@ -3533,6 +3594,7 @@ mod tests {
             "bundle_manifest.json",
             "evidence/run.json",
             "exports/summary.csv",
+            FINAL_CHECKPOINT_ARTIFACT.0,
         ];
         let original = paths.map(|path| fs::read(first.join(path)).expect("original artifact"));
 
@@ -3564,6 +3626,8 @@ mod tests {
             )
             .expect("plant complete cross-run swap");
         }
+        scriptbots_storage::verify_run_bundle(&first)
+            .expect("the complete cross-run swap remains byte-valid");
         assert!(matches!(
             runner.execute_batch(&state_file),
             Err(ExperimentRunnerError::Bundle { .. })
@@ -3582,6 +3646,212 @@ mod tests {
                 .runs,
             completed
         );
+    }
+
+    #[test]
+    fn completed_bundle_verification_recomputes_the_reported_final_digest() {
+        let (runner, _state_file, _running, completed) = completed_bundle_gap_fixture(&[7, 9]);
+        assert_ne!(completed[0].final_digest, completed[1].final_digest);
+        let mut forged = completed[1].clone();
+        let actual_digest = forged.final_digest.clone().unwrap();
+        forged.final_digest = completed[0].final_digest.clone();
+        let false_digest = forged.final_digest.as_ref().unwrap();
+        let bundle_dir = runner.output_dir.join(&forged.run_id);
+        let evidence_path = bundle_dir.join("evidence/run.json");
+        let mut evidence: RunEvidenceV1 =
+            serde_json::from_slice(&fs::read(&evidence_path).unwrap()).unwrap();
+        evidence.final_digest.clone_from(false_digest);
+        fs::write(&evidence_path, serde_json::to_vec(&evidence).unwrap()).unwrap();
+        let summary_path = bundle_dir.join("exports/summary.csv");
+        let summary = fs::read_to_string(&summary_path).unwrap();
+        assert!(summary.contains(&actual_digest));
+        fs::write(&summary_path, summary.replace(&actual_digest, false_digest)).unwrap();
+        let manifest_path = bundle_dir.join("bundle_manifest.json");
+        let mut bundle: RunBundleV1 =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        for entry in &mut bundle.artifacts {
+            let bytes = fs::read(bundle_dir.join(&entry.relative_path)).unwrap();
+            entry.bytes_len = u64::try_from(bytes.len()).unwrap();
+            entry.blake3_hex = blake3::hash(&bytes).to_hex().to_string();
+        }
+        fs::write(&manifest_path, serde_json::to_vec(&bundle).unwrap()).unwrap();
+        scriptbots_storage::verify_run_bundle(&bundle_dir)
+            .expect("all forged reports remain mutually consistent and byte-valid");
+
+        let plan = runner.validated_plan().unwrap();
+        let (variant, family) = &plan.variants[&forged.variant_id];
+        let error = runner
+            .verify_completed_bundle(&forged, variant, *family, &plan.digest)
+            .expect_err("reported digest must match the actual restored final checkpoint");
+        assert!(
+            error.to_string().contains("restored final checkpoint"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn zero_tick_completed_bundle_restores_its_initial_owner_cut() {
+        let directory = tempfile::tempdir().unwrap();
+        let runner = MatchedSeedExperimentRunner::new(
+            "zero-tick",
+            MatchedSeedCohort {
+                cohort_id: "cohort".into(),
+                seeds: vec![17],
+            },
+            vec![ScenarioVariant {
+                variant_id: "mlp".into(),
+                brain_family: "mlp".into(),
+                config_overrides: BTreeMap::new(),
+            }],
+            0,
+            1,
+            directory.path().join("bundles"),
+        );
+        let state_file = directory.path().join("status.json");
+        let status = runner.execute_batch(&state_file).unwrap();
+        assert_eq!(status.completed_runs, status.total_runs);
+        assert_eq!(status.failed_runs, 0);
+        for run in &status.runs {
+            let path = runner
+                .output_dir
+                .join(&run.run_id)
+                .join(FINAL_CHECKPOINT_ARTIFACT.0);
+            let checkpoint = RunCheckpointV1::decode(&fs::read(&path).unwrap(), &path).unwrap();
+            assert!(checkpoint.metadata.parent_digest.is_none());
+            let restored =
+                restore_run_owner(&checkpoint, ResolvedBrainFamily::Mlp, &run.run_id, &path)
+                    .unwrap();
+            assert_eq!(restored.world_tick().0, runner.max_ticks);
+            assert_eq!(
+                Some(restored.scientific_digest_v1().unwrap().overall),
+                run.final_digest
+            );
+        }
+        assert_eq!(runner.execute_batch(&state_file).unwrap(), status);
+    }
+
+    #[test]
+    fn completed_bundle_final_checkpoint_guards_observe_distinct_defects() {
+        let (runner, _state_file, _running, completed) = completed_bundle_gap_fixture(&[7, 9]);
+        let record = &completed[0];
+        let plan = runner.validated_plan().unwrap();
+        let (variant, family) = &plan.variants[&record.variant_id];
+        let bundle_dir = runner.output_dir.join(&record.run_id);
+        let checkpoint_path = bundle_dir.join(FINAL_CHECKPOINT_ARTIFACT.0);
+        let manifest_path = bundle_dir.join("bundle_manifest.json");
+        let original_checkpoint = fs::read(&checkpoint_path).unwrap();
+        let original_manifest = fs::read(&manifest_path).unwrap();
+        let other = fs::read(
+            runner
+                .output_dir
+                .join(&completed[1].run_id)
+                .join(FINAL_CHECKPOINT_ARTIFACT.0),
+        )
+        .unwrap();
+        assert_ne!(original_checkpoint, other);
+        let initial = runner
+            .initial_run_checkpoint(variant, *family, record.seed, &record.run_id, &plan.digest)
+            .unwrap()
+            .encode(&checkpoint_path)
+            .unwrap();
+        let mut corrupt = original_checkpoint.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        let mut observed = BTreeSet::new();
+        let cases = [
+            ("corrupt", corrupt, "frame checksum differs"),
+            ("wrong-tick", initial, "exact completion tick"),
+            ("cross-run", other, "validated plan"),
+        ];
+        let expected_cells = cases.len();
+        for (label, bytes, expected_reason) in cases {
+            fs::write(&checkpoint_path, &bytes).unwrap();
+            let mut bundle: RunBundleV1 = serde_json::from_slice(&original_manifest).unwrap();
+            let entry = bundle
+                .artifacts
+                .iter_mut()
+                .find(|entry| entry.relative_path == FINAL_CHECKPOINT_ARTIFACT.0)
+                .unwrap();
+            entry.bytes_len = u64::try_from(bytes.len()).unwrap();
+            entry.blake3_hex = blake3::hash(&bytes).to_hex().to_string();
+            fs::write(&manifest_path, serde_json::to_vec(&bundle).unwrap()).unwrap();
+            scriptbots_storage::verify_run_bundle(&bundle_dir)
+                .expect("outer artifact hashes remain valid for each distinct defect");
+            let error = runner
+                .verify_completed_bundle(record, variant, *family, &plan.digest)
+                .expect_err(label);
+            let reason = error.to_string();
+            assert!(reason.contains(expected_reason), "{label}: {reason}");
+            assert!(
+                reason.contains(&checkpoint_path.display().to_string()),
+                "failure must name the bundled cut it actually read: {reason}"
+            );
+            observed.insert(reason);
+        }
+        assert_eq!(
+            observed.len(),
+            expected_cells,
+            "all declared defect cells must differ"
+        );
+        fs::write(&checkpoint_path, &original_checkpoint).unwrap();
+        fs::write(&manifest_path, &original_manifest).unwrap();
+        runner
+            .verify_completed_bundle(record, variant, *family, &plan.digest)
+            .expect("the exact original cut still verifies");
+
+        let summary_path = bundle_dir.join("exports/summary.csv");
+        let original_summary = fs::read(&summary_path).unwrap();
+        let summary = format!(
+            "tick,alive_agents,seed,brain_family,final_digest\n{},{},{},{},{}\n",
+            record.total_ticks,
+            usize::MAX,
+            record.seed,
+            record.brain_family,
+            record.final_digest.as_ref().unwrap()
+        );
+        fs::write(&summary_path, summary.as_bytes()).unwrap();
+        let mut changed: RunBundleV1 = serde_json::from_slice(&original_manifest).unwrap();
+        let entry = changed
+            .artifacts
+            .iter_mut()
+            .find(|entry| entry.relative_path == "exports/summary.csv")
+            .unwrap();
+        entry.bytes_len = u64::try_from(summary.len()).unwrap();
+        entry.blake3_hex = blake3::hash(summary.as_bytes()).to_hex().to_string();
+        fs::write(&manifest_path, serde_json::to_vec(&changed).unwrap()).unwrap();
+        scriptbots_storage::verify_run_bundle(&bundle_dir)
+            .expect("a forged population still has valid artifact hashes");
+        let error = runner
+            .verify_completed_bundle(record, variant, *family, &plan.digest)
+            .expect_err("reported population must match the restored final state");
+        assert!(error.to_string().contains("summary differs"), "{error}");
+        fs::write(&summary_path, &original_summary).unwrap();
+        fs::write(&manifest_path, &original_manifest).unwrap();
+
+        let mut missing_index: RunBundleV1 = serde_json::from_slice(&original_manifest).unwrap();
+        missing_index
+            .artifacts
+            .retain(|entry| entry.relative_path != FINAL_CHECKPOINT_ARTIFACT.0);
+        fs::write(&manifest_path, serde_json::to_vec(&missing_index).unwrap()).unwrap();
+        scriptbots_storage::verify_run_bundle(&bundle_dir)
+            .expect("an unindexed file does not prove the required role");
+        let error = runner
+            .verify_completed_bundle(record, variant, *family, &plan.digest)
+            .expect_err("the final cut must be indexed with its actual artifact role");
+        assert!(error.to_string().contains("exactly once"), "{error}");
+        fs::write(&manifest_path, &original_manifest).unwrap();
+
+        let preserved = runner.output_dir.join("preserved-final-checkpoint");
+        fs::rename(&checkpoint_path, &preserved).unwrap();
+        assert!(
+            runner
+                .verify_completed_bundle(record, variant, *family, &plan.digest)
+                .is_err(),
+            "an absent indexed cut must refuse verification"
+        );
+        fs::rename(&preserved, &checkpoint_path).unwrap();
+        runner
+            .verify_completed_bundle(record, variant, *family, &plan.digest)
+            .expect("restoring the same physical cut repairs the bundle");
     }
 
     #[test]
@@ -4048,10 +4318,34 @@ mod tests {
             assert_eq!(manifest.brain_roster[0].kind, run.brain_family);
             assert_eq!(manifest.identity.requested_tick_budget, Some(2));
             assert_eq!(manifest.root_seed, 1001);
+            let checkpoint_path = output_dir
+                .join(&run.run_id)
+                .join(FINAL_CHECKPOINT_ARTIFACT.0);
+            let bytes = fs::read(&checkpoint_path).expect("portable final state");
+            let standalone = runner.run_checkpoint_path(&run.run_id);
+            assert_eq!(bytes, fs::read(&standalone).unwrap(), "exact sealed cut");
+            let checkpoint = RunCheckpointV1::decode(&bytes, &checkpoint_path).unwrap();
+            let plan = runner.validated_plan().unwrap();
+            let (_, family) = &plan.variants[&run.variant_id];
+            let restored =
+                restore_run_owner(&checkpoint, *family, &run.run_id, &checkpoint_path).unwrap();
+            assert_eq!(restored.world_tick().0, run.total_ticks);
+            assert_eq!(
+                Some(restored.scientific_digest_v1().unwrap().overall),
+                run.final_digest
+            );
+            fs::rename(
+                &standalone,
+                temp_dir
+                    .path()
+                    .join(format!("preserved-{}.checkpoint", run.run_id)),
+            )
+            .unwrap();
         }
 
         // A completed resume reopens and semantically verifies all bundles rather
-        // than trusting the status JSON or executing duplicate runs.
+        // than trusting status JSON, depending on the external continuation cuts,
+        // or executing duplicate runs.
         let resumed_status = runner.execute_batch(&state_file).unwrap();
         assert_eq!(resumed_status.completed_runs, 3);
         assert_eq!(resumed_status.failed_runs, 0);
