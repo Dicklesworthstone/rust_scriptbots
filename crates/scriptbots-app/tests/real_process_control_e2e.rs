@@ -576,7 +576,7 @@ fn real_process_configuration_cli_receipts_and_rejections() -> Result<()> {
                 code == 200
                     && after["config"][field] == expected
                     && after["tick"] == before["tick"],
-                "{name} configuration readback differs: expected {field}={expected}, actual {after}"
+                "{name} configuration readback differs: expected {field}={expected}, before {before}, actual {after}"
             );
             command_ids.push(receipt.command_id);
         }
@@ -2715,8 +2715,14 @@ fn real_process_named_experiment_continues_after_server_kill() -> Result<()> {
     assert_eq!(code, 200, "capacity MCP transport: {body}");
     let refused: serde_json::Value = serde_json::from_str(&body)?;
     assert_eq!(refused["id"], 43);
-    assert_eq!(refused["error"]["code"], -32006, "{body}");
-    assert_eq!(refused["error"]["message"], "Internal server error");
+    assert!(refused.get("error").is_none(), "{body}");
+    assert_eq!(refused["result"]["isError"], true, "{body}");
+    assert!(
+        refused["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("experiment execution capacity exhausted")),
+        "{body}"
+    );
     assert!(
         !interrupted
             .join("artifacts/experiments/capacity-retry")

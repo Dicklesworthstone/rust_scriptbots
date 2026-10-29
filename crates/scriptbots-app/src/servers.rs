@@ -4598,10 +4598,10 @@ fn map_control_error(err: ControlError) -> McpError {
     tracing::warn!(error = %err, "MCP control operation failed");
     match err {
         capacity @ ControlError::ExperimentCapacity(_) => {
-            // FastMCP masks server-error messages on the wire. Preserve its
-            // protection while exposing resource exhaustion programmatically;
-            // experiment_list supplies the coherent reservation counts.
-            McpError::new(McpErrorCode::Custom(-32006), capacity.to_string())
+            // Capacity is a retryable tool execution failure. FastMCP returns
+            // its actionable text with isError=true, while InternalError would
+            // become a masked protocol failure.
+            McpError::new(McpErrorCode::ToolExecutionError, capacity.to_string())
         }
         ControlError::CheckpointCapacity(message)
         | ControlError::CheckpointRetentionUnavailable(message) => {
