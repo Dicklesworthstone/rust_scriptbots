@@ -180,6 +180,8 @@ pub struct KnobUpdate {
 /// Errors produced by the control domain when mutating configuration.
 #[derive(Debug, Error)]
 pub enum ControlError {
+    #[error("experiment execution capacity exhausted: {0}")]
+    ExperimentCapacity(String),
     #[error("checkpoint retention exhausted: {0}")]
     CheckpointCapacity(String),
     #[error("checkpoint retention unavailable: {0}")]
@@ -680,6 +682,51 @@ pub struct PaginatedExperimentsResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
     pub has_more: bool,
+    pub execution_capacity: ExperimentExecutionCapacityDto,
+}
+
+/// Service-wide reservations, including owners preparing or publishing a wave.
+/// These counts describe reserved capacity, not simultaneous science activity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ExperimentExecutionCapacityDto {
+    pub max_run_slots: usize,
+    pub reserved_run_slots: usize,
+    pub reserved_batches: usize,
+}
+
+/// A unique reservation spans preparation, execution and artifact publication.
+/// Dropping an unstarted or unwinding worker returns its capacity as well.
+struct ExperimentExecutionReservation {
+    capacity: Arc<Mutex<ExperimentExecutionCapacityDto>>,
+    run_slots: usize,
+    experiment_id: String,
+    running: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl Drop for ExperimentExecutionReservation {
+    fn drop(&mut self) {
+        let observed = {
+            // Reservation updates compute all fallible work before changing counts.
+            // Poison must not prevent this unique owner's reservation being returned.
+            let mut capacity = self.capacity.lock().unwrap_or_else(PoisonError::into_inner);
+            capacity.reserved_run_slots -= self.run_slots;
+            capacity.reserved_batches -= 1;
+            *capacity
+        };
+        if let Some(running) = &self.running {
+            running.store(false, std::sync::atomic::Ordering::Release);
+        }
+        if !std::thread::panicking() {
+            tracing::info!(
+                experiment_id = %self.experiment_id,
+                released_run_slots = self.run_slots,
+                reserved_run_slots = observed.reserved_run_slots,
+                reserved_batches = observed.reserved_batches,
+                max_run_slots = observed.max_run_slots,
+                "experiment execution reservation released"
+            );
+        }
+    }
 }
 
 /// Paginated response for checkpoints.
@@ -1063,18 +1110,23 @@ impl ExperimentJob {
 
     /// Start (or restart) the batch worker. `running` is raised before the
     /// thread exists so a status read can never observe a false idle gap.
-    fn start(&self, services: std::sync::Arc<DataServices>) {
+    fn start(
+        &self,
+        services: std::sync::Arc<DataServices>,
+        mut reservation: ExperimentExecutionReservation,
+    ) {
         use std::sync::atomic::Ordering;
         self.running.store(true, Ordering::Release);
+        reservation.running = Some(std::sync::Arc::clone(&self.running));
         let runner = std::sync::Arc::clone(&self.runner);
         let state_file = self.state_file.clone();
         let cancel = std::sync::Arc::clone(&self.cancel);
-        let running = std::sync::Arc::clone(&self.running);
         let last_error = std::sync::Arc::clone(&self.last_error);
         let artifact_root = self.artifact_root.clone();
         let spawned = std::thread::Builder::new()
             .name(format!("experiment-{}", runner.experiment_id))
             .spawn(move || {
+                let _reservation = reservation;
                 let outcome = match runner.execute_batch_until_cancelled(&state_file, &cancel) {
                     Ok(status) => services
                         .publish_experiment_artifacts(&status, &artifact_root)
@@ -1091,7 +1143,6 @@ impl ExperimentJob {
                         *slot = Some(error.to_string());
                     }
                 }
-                running.store(false, Ordering::Release);
             });
         if let Err(error) = spawned {
             if let Ok(mut slot) = self.last_error.lock() {
@@ -1182,6 +1233,7 @@ impl ExperimentJob {
 #[derive(Debug)]
 pub struct DataServices {
     experiments: Mutex<BTreeMap<String, ExperimentJob>>,
+    execution_capacity: Arc<Mutex<ExperimentExecutionCapacityDto>>,
     checkpoints: Mutex<BTreeMap<String, CheckpointMetadataDto>>,
     artifacts: Mutex<BTreeMap<String, RetainedArtifact>>,
     /// Admission authority, recovered from immutable experiment definitions:
@@ -1371,6 +1423,11 @@ impl DataServices {
         };
         Self {
             experiments: Mutex::new(BTreeMap::new()),
+            execution_capacity: Arc::new(Mutex::new(ExperimentExecutionCapacityDto {
+                max_run_slots: crate::experiment_runner::MAX_CONCURRENT_RUNS,
+                reserved_run_slots: 0,
+                reserved_batches: 0,
+            })),
             checkpoints: Mutex::new(BTreeMap::new()),
             artifacts: Mutex::new(BTreeMap::new()),
             idempotency: Mutex::new(BTreeMap::new()),
@@ -1711,6 +1768,52 @@ impl DataServices {
         }
         Ok(())
     }
+
+    fn reserve_experiment_execution(
+        &self,
+        experiment_id: &str,
+        run_slots: usize,
+    ) -> Result<ExperimentExecutionReservation, ControlError> {
+        if run_slots == 0 {
+            return Err(ControlError::BadRequest(
+                "experiment execution must reserve at least one run slot".to_owned(),
+            ));
+        }
+        let mut capacity = self
+            .execution_capacity
+            .lock()
+            .map_err(|_| ControlError::Lock)?;
+        let reserved_run_slots = capacity
+            .reserved_run_slots
+            .checked_add(run_slots)
+            .filter(|count| *count <= capacity.max_run_slots)
+            .ok_or_else(|| ControlError::ExperimentCapacity(format!(
+                "requested_run_slots={run_slots}, reserved_run_slots={}, max_run_slots={}; no experiment worker admitted; retry after capacity is released or change SCRIPTBOTS_EXPERIMENT_RUN_SLOTS at startup",
+                capacity.reserved_run_slots, capacity.max_run_slots,
+            )))?;
+        let reserved_batches = capacity.reserved_batches.checked_add(1).ok_or_else(|| {
+            ControlError::ExperimentCapacity("batch reservation count overflow".to_owned())
+        })?;
+        let reservation = ExperimentExecutionReservation {
+            capacity: Arc::clone(&self.execution_capacity),
+            run_slots,
+            experiment_id: experiment_id.to_owned(),
+            running: None,
+        };
+        capacity.reserved_run_slots = reserved_run_slots;
+        capacity.reserved_batches = reserved_batches;
+        let observed = *capacity;
+        drop(capacity);
+        tracing::info!(
+            experiment_id,
+            requested_run_slots = run_slots,
+            reserved_run_slots = observed.reserved_run_slots,
+            reserved_batches = observed.reserved_batches,
+            max_run_slots = observed.max_run_slots,
+            "experiment execution capacity reserved"
+        );
+        Ok(reservation)
+    }
 }
 
 impl Default for DataServices {
@@ -1783,6 +1886,25 @@ impl ControlHandle {
         }
         retention.limits = limits;
         drop(retention);
+        Ok(self)
+    }
+
+    /// Bound create/resume execution shared by every clone and control transport.
+    /// Zero disables new execution while retained jobs and artifacts remain readable.
+    pub fn with_experiment_run_capacity(self, max_run_slots: usize) -> Result<Self, ControlError> {
+        let mut capacity = self
+            .data_services
+            .execution_capacity
+            .lock()
+            .map_err(|_| ControlError::Lock)?;
+        if max_run_slots < capacity.reserved_run_slots {
+            return Err(ControlError::ExperimentCapacity(format!(
+                "cannot reduce max_run_slots to {max_run_slots} while {} slots are reserved",
+                capacity.reserved_run_slots,
+            )));
+        }
+        capacity.max_run_slots = max_run_slots;
+        drop(capacity);
         Ok(self)
     }
 
@@ -1913,6 +2035,7 @@ impl ControlHandle {
                 "CheckpointRetentionDto".into(),
                 "ArtifactMetadataDto".into(),
                 "PaginatedExperimentsResponse".into(),
+                "ExperimentExecutionCapacityDto".into(),
                 "PaginatedCheckpointsResponse".into(),
                 "PaginatedArtifactsResponse".into(),
                 "CommandStatusDto".into(),
@@ -2091,9 +2214,11 @@ impl ControlHandle {
             &output_dir,
         );
         // Refuse an invalid plan synchronously, before any thread or file exists.
-        runner
+        let run_slots = runner
             .plan_batch()
-            .map_err(|error| ControlError::BadRequest(error.to_string()))?;
+            .map_err(|error| ControlError::BadRequest(error.to_string()))?
+            .len()
+            .min(runner.max_concurrency);
         let definition = ExperimentDefinitionV1 {
             schema_version: 1,
             experiment_id: experiment_id.clone(),
@@ -2133,8 +2258,11 @@ impl ControlHandle {
                     "experiment catalog capacity reached".into(),
                 ));
             }
+            let reservation = self
+                .data_services
+                .reserve_experiment_execution(&experiment_id, run_slots)?;
             definition.persist(&output_dir)?;
-            job.start(std::sync::Arc::clone(&self.data_services));
+            job.start(std::sync::Arc::clone(&self.data_services), reservation);
             lock.insert(experiment_id.clone(), job);
         }
         // Admission has happened even if the first status read fails. Publish
@@ -2217,12 +2345,21 @@ impl ControlHandle {
                 current.status
             )));
         }
+        let run_slots = current
+            .runs
+            .iter()
+            .filter(|run| matches!(run.state.as_str(), "pending" | "running"))
+            .count()
+            .min(job.runner.max_concurrency);
+        let reservation = self
+            .data_services
+            .reserve_experiment_execution(experiment_id, run_slots)?;
         job.cancel
             .store(false, std::sync::atomic::Ordering::Release);
         if let Ok(mut error) = job.last_error.lock() {
             *error = None;
         }
-        job.start(std::sync::Arc::clone(&self.data_services));
+        job.start(std::sync::Arc::clone(&self.data_services), reservation);
         job.status_dto()
     }
 
@@ -2279,6 +2416,11 @@ impl ControlHandle {
             offset,
             next_cursor,
             has_more,
+            execution_capacity: *self
+                .data_services
+                .execution_capacity
+                .lock()
+                .map_err(|_| ControlError::Lock)?,
         })
     }
 
@@ -4045,6 +4187,284 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn experiment_execution_capacity_is_shared_released_and_retryable() {
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+
+        let root = tempfile::tempdir().unwrap().keep();
+        println!("shared run-slot evidence: {}", root.display());
+        let (handle, _host) = handle();
+        let handle = handle
+            .with_artifacts_dir(root.clone())
+            .unwrap()
+            .with_experiment_run_capacity(2)
+            .unwrap();
+        let wait_for = |id: &str, target: &str| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let status = handle.get_experiment(id).unwrap();
+                if status.status == target {
+                    break status;
+                }
+                assert_ne!(status.status, "failed", "{status:?}");
+                assert!(
+                    Instant::now() < deadline,
+                    "waiting for {target}: {status:?}"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        let mut primary = experiment_creation_request();
+        primary.experiment_id = Some("slots-primary".into());
+        primary.idempotency_key = Some("slots-primary-key".into());
+        primary.ticks_per_run = Some(40);
+        primary.max_concurrency = Some(2);
+        let mut dwraon = primary.variants[0].clone();
+        dwraon.variant_id = "dwraon".into();
+        dwraon.brain_family = "dwraon".into();
+        primary.variants.push(dwraon);
+        let created = handle.create_experiment(primary.clone()).unwrap();
+        let full = handle
+            .clone()
+            .list_experiments(None, None)
+            .unwrap()
+            .execution_capacity;
+        assert_eq!(full.reserved_run_slots, primary.variants.len());
+        assert_eq!(full.reserved_batches, 1);
+        assert_eq!(full.max_run_slots, primary.variants.len());
+        assert_eq!(
+            handle
+                .create_experiment(primary.clone())
+                .unwrap()
+                .experiment_id,
+            created.experiment_id
+        );
+        assert_eq!(
+            handle
+                .list_experiments(None, None)
+                .unwrap()
+                .execution_capacity,
+            full
+        );
+
+        let mut secondary = experiment_creation_request();
+        secondary.experiment_id = Some("slots-secondary".into());
+        secondary.idempotency_key = Some("slots-secondary-key".into());
+        secondary.seeds = vec![9];
+        secondary.ticks_per_run = Some(40);
+        secondary.max_concurrency = Some(crate::experiment_runner::MAX_CONCURRENT_RUNS);
+        assert!(matches!(
+            handle.create_experiment(secondary.clone()),
+            Err(ControlError::ExperimentCapacity(_))
+        ));
+        assert!(!root.join("experiments/slots-secondary").exists());
+        assert!(
+            !handle
+                .data_services
+                .idempotency
+                .lock()
+                .unwrap()
+                .contains_key("slots-secondary-key")
+        );
+
+        let mut cuts = BTreeMap::<PathBuf, std::collections::BTreeSet<String>>::new();
+        for run in &created.runs {
+            cuts.insert(
+                root.join("experiments/slots-primary")
+                    .join(format!("{}.checkpoint", run.run_id)),
+                Default::default(),
+            );
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while cuts.values().any(|observed| observed.len() < 2) {
+            for (path, observed) in &mut cuts {
+                if let Ok(bytes) = fs::read(path)
+                    && let Some(end) = bytes.len().checked_sub(blake3::OUT_LEN)
+                    && blake3::hash(&bytes[..end]).as_bytes() == &bytes[end..]
+                {
+                    observed.insert(compute_blake3(&bytes));
+                }
+            }
+            assert!(Instant::now() < deadline, "both real owners must advance");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        handle.cancel_experiment("slots-primary").unwrap();
+        let stopped = wait_for("slots-primary", "cancelled");
+        assert!(stopped.runs.iter().all(|run| run.state == "running"));
+        assert_eq!(
+            handle
+                .list_experiments(None, None)
+                .unwrap()
+                .execution_capacity
+                .reserved_run_slots,
+            0
+        );
+        fs::write(
+            root.join("cancelled.json"),
+            serde_json::to_vec_pretty(&stopped).unwrap(),
+        )
+        .unwrap();
+        let status_path = root.join("experiments/slots-primary/status.json");
+        let saved_status = fs::read(&status_path).unwrap();
+        let saved_cuts = cuts
+            .keys()
+            .map(|path| {
+                let bytes = fs::read(path).unwrap();
+                fs::write(
+                    root.join(format!(
+                        "stopped-{}",
+                        path.file_name().unwrap().to_str().unwrap()
+                    )),
+                    &bytes,
+                )
+                .unwrap();
+                (path.clone(), bytes)
+            })
+            .collect::<Vec<_>>();
+
+        handle.create_experiment(secondary.clone()).unwrap();
+        let occupied = handle
+            .list_experiments(None, None)
+            .unwrap()
+            .execution_capacity;
+        assert_eq!(occupied.reserved_run_slots, secondary.seeds.len());
+        assert_eq!(occupied.reserved_batches, 1);
+        assert!(matches!(
+            handle.resume_experiment("slots-primary"),
+            Err(ControlError::ExperimentCapacity(_))
+        ));
+        assert_eq!(fs::read(&status_path).unwrap(), saved_status);
+        for (path, bytes) in saved_cuts {
+            assert_eq!(fs::read(path).unwrap(), bytes);
+        }
+        assert!(
+            handle.data_services.experiments.lock().unwrap()["slots-primary"]
+                .cancel
+                .load(Ordering::Acquire)
+        );
+        assert!(matches!(
+            handle.clone().with_experiment_run_capacity(0),
+            Err(ControlError::ExperimentCapacity(_))
+        ));
+        assert_eq!(
+            handle
+                .list_experiments(None, None)
+                .unwrap()
+                .execution_capacity,
+            occupied
+        );
+
+        handle.clone().with_experiment_run_capacity(3).unwrap();
+        handle.resume_experiment("slots-primary").unwrap();
+        let combined = handle
+            .list_experiments(None, None)
+            .unwrap()
+            .execution_capacity;
+        assert_eq!(
+            combined.reserved_run_slots,
+            primary.variants.len() + secondary.seeds.len()
+        );
+        assert_eq!(combined.reserved_batches, 2);
+        assert_eq!(combined.reserved_run_slots, combined.max_run_slots);
+        let completed = [
+            wait_for("slots-primary", "completed"),
+            wait_for("slots-secondary", "completed"),
+        ];
+        let free = handle
+            .list_experiments(None, None)
+            .unwrap()
+            .execution_capacity;
+        assert_eq!(free.reserved_run_slots, 0);
+        assert_eq!(free.reserved_batches, 0);
+        for status in &completed {
+            let original = Arc::clone(
+                &handle.data_services.experiments.lock().unwrap()[&status.experiment_id].runner,
+            );
+            let oracle = crate::experiment_runner::MatchedSeedExperimentRunner::new(
+                &original.experiment_id,
+                original.cohort.clone(),
+                original.variants.clone(),
+                original.max_ticks,
+                original.max_concurrency,
+                root.join("oracle").join(&status.experiment_id),
+            );
+            let expected = oracle
+                .execute_batch(&oracle.output_dir.join("status.json"))
+                .unwrap();
+            assert_eq!(status.runs.len(), expected.runs.len());
+            for (actual, expected) in status.runs.iter().zip(expected.runs) {
+                assert_eq!(actual.run_id, expected.run_id);
+                assert_eq!(actual.brain_family, expected.brain_family);
+                assert_eq!(actual.total_ticks, expected.total_ticks);
+                assert_eq!(actual.final_digest, expected.final_digest);
+                scriptbots_storage::verify_run_bundle(Path::new(
+                    actual.bundle_path.as_ref().unwrap(),
+                ))
+                .unwrap();
+            }
+        }
+        fs::write(
+            root.join("completed.json"),
+            serde_json::to_vec_pretty(&completed).unwrap(),
+        )
+        .unwrap();
+        handle.clone().with_experiment_run_capacity(0).unwrap();
+        let retry = handle.create_experiment(primary).unwrap();
+        assert_eq!(retry.experiment_id, completed[0].experiment_id);
+        let mut disabled = secondary;
+        disabled.experiment_id = Some("disabled".into());
+        disabled.idempotency_key = Some("disabled-key".into());
+        assert!(matches!(
+            handle.create_experiment(disabled),
+            Err(ControlError::ExperimentCapacity(_))
+        ));
+        assert!(!root.join("experiments/disabled").exists());
+        assert_eq!(
+            handle
+                .list_experiments(None, None)
+                .unwrap()
+                .execution_capacity
+                .max_run_slots,
+            0
+        );
+    }
+
+    #[test]
+    fn experiment_execution_reservation_returns_capacity_on_unstarted_drop_and_unwind() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let root = tempfile::tempdir().unwrap();
+        let services = DataServices::new(root.path().to_path_buf());
+        services.execution_capacity.lock().unwrap().max_run_slots = 1;
+        let running = Arc::new(AtomicBool::new(false));
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut reservation = services.reserve_experiment_execution("unwind", 1).unwrap();
+                assert!(matches!(
+                    services.reserve_experiment_execution("over-cap", 1),
+                    Err(ControlError::ExperimentCapacity(_))
+                ));
+                running.store(true, Ordering::Release);
+                reservation.running = Some(Arc::clone(&running));
+                panic!("intentional execution reservation unwind");
+            }))
+            .is_err()
+        );
+        assert!(!running.load(Ordering::Acquire));
+        let reservation = services
+            .reserve_experiment_execution("unstarted", 1)
+            .unwrap();
+        drop(reservation);
+        let free = *services.execution_capacity.lock().unwrap();
+        assert_eq!(free.reserved_run_slots, 0);
+        assert_eq!(free.reserved_batches, 0);
+        assert!(matches!(
+            services.reserve_experiment_execution("zero", 0),
+            Err(ControlError::BadRequest(_))
+        ));
+        assert_eq!(*services.execution_capacity.lock().unwrap(), free);
+    }
+
+    #[test]
     fn experiment_catalog_recovers_admission_without_executing_or_rewriting() {
         let root = tempfile::tempdir().unwrap().keep();
         let path = pending_catalog_definition(&root, "saved");
@@ -4718,6 +5138,12 @@ pub(crate) mod tests {
                 .expect("retained bundle"),
         ))
         .expect("publication failure preserves the real completed bundle");
+        let capacity = handle
+            .list_experiments(None, None)
+            .unwrap()
+            .execution_capacity;
+        assert_eq!(capacity.reserved_run_slots, 0);
+        assert_eq!(capacity.reserved_batches, 0);
         assert!(
             handle
                 .data_services

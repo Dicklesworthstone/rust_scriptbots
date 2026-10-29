@@ -2289,6 +2289,7 @@ fn real_process_named_experiment_continues_after_server_kill() -> Result<()> {
                 .env("SCRIPTBOTS_CONTROL_REST_ADDR", "127.0.0.1:0")
                 .env("SCRIPTBOTS_CONTROL_MCP", "http")
                 .env("SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR", "127.0.0.1:0")
+                .env("SCRIPTBOTS_EXPERIMENT_RUN_SLOTS", "2")
                 .env("SCRIPTBOTS_ARTIFACTS_DIR", root.join("artifacts"))
                 .current_dir(root)
                 .stdout(Stdio::from(std::fs::File::create(
@@ -2680,6 +2681,63 @@ fn real_process_named_experiment_continues_after_server_kill() -> Result<()> {
         assert!(Instant::now() < deadline, "both real families must advance");
         std::thread::sleep(Duration::from_millis(2));
     }
+    let capacity_request = serde_json::json!({
+        "experiment_id":"capacity-retry", "idempotency_key":"capacity-retry-v1",
+        "variants":[{"variant_id":"mlp", "brain_family":"mlp",
+            "config_overrides":{"world_width":40,"world_height":40,"food_cell_size":10}}],
+        "seeds":[94], "ticks_per_run":2, "max_concurrency":64
+    });
+    let capacity_payload = serde_json::to_vec(&capacity_request)?;
+    let (code, body) = http_with_body(
+        recovered_address,
+        "POST",
+        "/api/v1/experiments",
+        &capacity_payload,
+        Some("application/json"),
+    )?;
+    assert_eq!(
+        code, 503,
+        "a separate real batch must not exceed shared capacity: {body}"
+    );
+    assert!(
+        body.contains("experiment execution capacity exhausted"),
+        "{body}"
+    );
+    let capacity_mcp = serde_json::json!({"jsonrpc":"2.0","id":43,"method":"tools/call",
+        "params":{"name":"experiment_create","arguments":capacity_request}});
+    let (code, body) = http_with_body(
+        recovered_mcp,
+        "POST",
+        "/mcp",
+        &serde_json::to_vec(&capacity_mcp)?,
+        Some("application/json"),
+    )?;
+    assert_eq!(code, 200, "capacity MCP transport: {body}");
+    let refused: serde_json::Value = serde_json::from_str(&body)?;
+    assert_eq!(refused["id"], 43);
+    assert_eq!(refused["error"]["code"], -32603, "{body}");
+    assert!(
+        body.contains("experiment execution capacity exhausted"),
+        "{body}"
+    );
+    assert!(
+        !interrupted
+            .join("artifacts/experiments/capacity-retry")
+            .exists()
+    );
+    let (code, body) = http(recovered_address, "GET", "/api/v1/experiments")?;
+    assert_eq!(code, 200, "capacity list: {body}");
+    let capacity: serde_json::Value = serde_json::from_str(&body)?;
+    assert_eq!(capacity["execution_capacity"]["max_run_slots"], 2);
+    assert_eq!(
+        capacity["execution_capacity"]["reserved_run_slots"],
+        observed.len()
+    );
+    assert_eq!(capacity["execution_capacity"]["reserved_batches"], 1);
+    std::fs::write(
+        interrupted.join("capacity-refused.json"),
+        serde_json::to_vec_pretty(&refused)?,
+    )?;
     let (code, body) = http(
         recovered_address,
         "POST",
@@ -2874,6 +2932,73 @@ fn real_process_named_experiment_continues_after_server_kill() -> Result<()> {
         oracle_root.join("active-oracle.json"),
         serde_json::to_vec_pretty(&expected)?,
     )?;
+    let wait_for_capacity_retry = |address| -> Result<serde_json::Value> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let (code, body) = http(address, "GET", "/api/v1/experiments/capacity-retry")?;
+            assert_eq!(code, 200, "capacity retry status: {body}");
+            let status: serde_json::Value = serde_json::from_str(&body)?;
+            if status["status"] == "completed" {
+                return Ok(status);
+            }
+            assert_ne!(status["status"], "failed", "{body}");
+            assert!(
+                Instant::now() < deadline,
+                "capacity retry did not finish: {body}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    let mut capacity_results = Vec::new();
+    for address in [recovered_address, oracle_address] {
+        let (code, body) = http_with_body(
+            address,
+            "POST",
+            "/api/v1/experiments",
+            &capacity_payload,
+            Some("application/json"),
+        )?;
+        assert_eq!(
+            code, 201,
+            "released capacity must admit the exact prior request: {body}"
+        );
+        let completed = wait_for_capacity_retry(address)?;
+        assert_eq!(completed["total_runs"], 1);
+        let bundle = Path::new(
+            completed["runs"][0]["bundle_path"]
+                .as_str()
+                .context("capacity bundle")?,
+        );
+        scriptbots_storage::verify_run_bundle(bundle)?;
+        let (code, body) = http_with_body(
+            address,
+            "POST",
+            "/api/v1/experiments",
+            &capacity_payload,
+            Some("application/json"),
+        )?;
+        assert_eq!(code, 201, "idempotent completed retry: {body}");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&body)?, completed);
+        let (code, body) = http(address, "GET", "/api/v1/experiments")?;
+        assert_eq!(code, 200);
+        let listed: serde_json::Value = serde_json::from_str(&body)?;
+        assert_eq!(listed["execution_capacity"]["reserved_run_slots"], 0);
+        assert_eq!(listed["execution_capacity"]["reserved_batches"], 0);
+        capacity_results.push(completed);
+    }
+    assert_eq!(
+        capacity_results[0]["runs"][0]["final_digest"],
+        capacity_results[1]["runs"][0]["final_digest"]
+    );
+    std::fs::write(
+        interrupted.join("capacity-retry-results.json"),
+        serde_json::to_vec_pretty(&capacity_results)?,
+    )?;
+    println!(
+        "shared capacity refused REST/MCP at {} slots; exact request later completed with oracle digest {}",
+        observed.len(),
+        capacity_results[0]["runs"][0]["final_digest"]
+    );
     drop(oracle_guard);
     drop(recovered_guard);
     Ok(())

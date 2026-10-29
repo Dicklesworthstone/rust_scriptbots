@@ -40,13 +40,13 @@ use crate::control::{
     AgentScoreEntry, ApiSchemaDto, ApiVersionDto, AppliedInterventionDto, ArtifactMetadataDto,
     CheckpointCreateRequest, CheckpointMetadataDto, CheckpointRetentionDto, CommandStatusDto,
     ConfigSnapshot, ControlError, ControlHandle, DietClassDto, EventEntry, EventKind,
-    ExperimentBatchStatusDto, ExperimentCreateRequest, ExperimentRunRecordDto,
-    ExperimentSummaryDto, ExperimentVariantDto, HydrologySnapshot, InterveneRequestBody,
-    InterventionsPollDto, KnobEntry, KnobUpdate, MapApplyAgentPolicy, MapApplyRequestBody,
-    MapGenerateRequestBody, PaginatedArtifactsResponse, PaginatedCheckpointsResponse,
-    PaginatedExperimentsResponse, Scoreboard, SelectionModeDto, SelectionSnapshotDto,
-    SelectionStateDto, SimulationStatusDto, SpeedRequest, parse_intervention_command,
-    parse_map_artifact,
+    ExperimentBatchStatusDto, ExperimentCreateRequest, ExperimentExecutionCapacityDto,
+    ExperimentRunRecordDto, ExperimentSummaryDto, ExperimentVariantDto, HydrologySnapshot,
+    InterveneRequestBody, InterventionsPollDto, KnobEntry, KnobUpdate, MapApplyAgentPolicy,
+    MapApplyRequestBody, MapGenerateRequestBody, PaginatedArtifactsResponse,
+    PaginatedCheckpointsResponse, PaginatedExperimentsResponse, Scoreboard, SelectionModeDto,
+    SelectionSnapshotDto, SelectionStateDto, SimulationStatusDto, SpeedRequest,
+    parse_intervention_command, parse_map_artifact,
 };
 use crate::narrative_search::{NarrativeAroundQuery, NarrativeSearchHitDto, NarrativeSearchQuery};
 use scriptbots_core::{
@@ -139,6 +139,9 @@ pub struct ControlServerConfig {
     pub allowed_origins: Vec<String>,
     /// Checkpoint file and SQL bounds; payload representations are accounted separately.
     pub checkpoint_retention_limits: scriptbots_storage::CheckpointRetentionLimits,
+    /// Run-owner slots reserved across all experiment create/resume workers.
+    /// This does not bound Rayon, process threads, disk bytes or operation duration.
+    pub experiment_run_slots: usize,
 }
 
 impl Default for ControlServerConfig {
@@ -158,6 +161,7 @@ impl Default for ControlServerConfig {
             allowed_authorities: Vec::new(),
             allowed_origins: Vec::new(),
             checkpoint_retention_limits: scriptbots_storage::CheckpointRetentionLimits::default(),
+            experiment_run_slots: crate::experiment_runner::MAX_CONCURRENT_RUNS,
         }
     }
 }
@@ -167,6 +171,18 @@ impl ControlServerConfig {
     /// for validation at the launch/reservation boundary.
     pub fn from_env() -> Self {
         let mut config = Self::default();
+
+        if let Some(raw) = read_control_environment(
+            "SCRIPTBOTS_EXPERIMENT_RUN_SLOTS",
+            &mut config.environment_errors,
+        ) {
+            match raw.trim().parse::<usize>() {
+                Ok(slots) => config.experiment_run_slots = slots,
+                Err(error) => config.environment_errors.push(format!(
+                    "SCRIPTBOTS_EXPERIMENT_RUN_SLOTS={raw:?} must be a nonnegative integer fitting this target: {error}"
+                )),
+            }
+        }
 
         for (name, values) in [
             (
@@ -751,7 +767,8 @@ impl ControlRuntime {
         let handle = ControlHandle::new(host)
             .with_database(reservation.config.database_path.clone())
             .with_checkpoint_writer(reservation.config.checkpoint_writer.clone())
-            .with_checkpoint_retention_limits(reservation.config.checkpoint_retention_limits)?;
+            .with_checkpoint_retention_limits(reservation.config.checkpoint_retention_limits)?
+            .with_experiment_run_capacity(reservation.config.experiment_run_slots)?;
         let submit_handle = handle.clone();
         let command_submit: CommandSubmit = Arc::new(move |command| {
             match submit_handle.submit_command(command, None) {
@@ -1503,6 +1520,7 @@ pub struct SpeedRequestBody {
             ExperimentCreateRequest,
             ExperimentRunRecordDto,
             ExperimentBatchStatusDto,
+            ExperimentExecutionCapacityDto,
             ExperimentSummaryDto,
             CheckpointCreateRequest,
             CheckpointMetadataDto,
@@ -1610,6 +1628,9 @@ fn require_json_content_type(headers: &HeaderMap, bytes: &[u8]) -> Result<(), Ap
 impl From<ControlError> for AppError {
     fn from(err: ControlError) -> Self {
         match err {
+            capacity @ ControlError::ExperimentCapacity(_) => {
+                Self::service_unavailable(capacity.to_string())
+            }
             ControlError::CheckpointCapacity(message) => Self {
                 status: StatusCode::INSUFFICIENT_STORAGE,
                 message,
@@ -2947,7 +2968,10 @@ async fn get_v1_schema(State(state): State<ApiState>) -> Result<Json<ApiSchemaDt
     path = "/api/v1/experiments",
     tag = "experiments",
     request_body = ExperimentCreateRequest,
-    responses((status = 201, body = ExperimentBatchStatusDto))
+    responses(
+        (status = 201, body = ExperimentBatchStatusDto),
+        (status = 503, description = "Shared experiment run-slot capacity exhausted; no worker admitted")
+    )
 )]
 async fn post_v1_experiments(
     State(state): State<ApiState>,
@@ -3016,7 +3040,10 @@ async fn post_v1_experiment_cancel(
     path = "/api/v1/experiments/{experiment_id}/resume",
     tag = "experiments",
     params(("experiment_id" = String, Path, description = "Unique experiment identifier")),
-    responses((status = 200, body = ExperimentBatchStatusDto))
+    responses(
+        (status = 200, body = ExperimentBatchStatusDto),
+        (status = 503, description = "Shared experiment run-slot capacity exhausted; saved job remains stopped")
+    )
 )]
 async fn post_v1_experiment_resume(
     State(state): State<ApiState>,
@@ -4570,6 +4597,9 @@ where
 fn map_control_error(err: ControlError) -> McpError {
     tracing::warn!(error = %err, "MCP control operation failed");
     match err {
+        capacity @ ControlError::ExperimentCapacity(_) => {
+            McpError::new(McpErrorCode::InternalError, capacity.to_string())
+        }
         ControlError::CheckpointCapacity(message)
         | ControlError::CheckpointRetentionUnavailable(message) => {
             McpError::new(McpErrorCode::InternalError, message)
@@ -4811,6 +4841,7 @@ mod tests {
     }
 
     const CONTROL_ENVIRONMENT_VARIABLES: &[&str] = &[
+        "SCRIPTBOTS_EXPERIMENT_RUN_SLOTS",
         "SCRIPTBOTS_CONTROL_REST_ADDR",
         "SCRIPTBOTS_CONTROL_SWAGGER_PATH",
         "SCRIPTBOTS_CONTROL_REST_ENABLED",
@@ -5724,6 +5755,34 @@ mod tests {
             control_runtime_health(&status_rx),
             Err("late published root failure".to_string())
         );
+    }
+
+    #[test]
+    #[serial]
+    fn experiment_run_slot_environment_is_validated_before_reservation() {
+        let _guard = ControlEnvironmentGuard::cleared();
+        for slots in [0, 2, usize::MAX] {
+            // SAFETY: this serial test owns the control environment variables.
+            unsafe { env::set_var("SCRIPTBOTS_EXPERIMENT_RUN_SLOTS", slots.to_string()) };
+            assert_eq!(
+                ControlServerConfig::try_from_env()
+                    .unwrap()
+                    .experiment_run_slots,
+                slots
+            );
+        }
+        for raw in [
+            String::new(),
+            "-1".into(),
+            "invalid".into(),
+            format!("{}0", usize::MAX),
+        ] {
+            // SAFETY: this serial test owns the control environment variables.
+            unsafe { env::set_var("SCRIPTBOTS_EXPERIMENT_RUN_SLOTS", &raw) };
+            let error = ControlServerConfig::try_from_env().unwrap_err();
+            assert!(format!("{error:#}").contains("SCRIPTBOTS_EXPERIMENT_RUN_SLOTS"));
+            assert!(ControlServerReservation::prepare(ControlServerConfig::from_env()).is_err());
+        }
     }
 
     #[test]
