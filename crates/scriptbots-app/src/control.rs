@@ -3034,10 +3034,10 @@ impl ControlHandle {
                 );
             }
         }
-        if &world
+        if world
             .world_digest_v1()
             .map_err(|error| ControlError::Serialization(error.to_string()))?
-            != &current.digest
+            != current.digest
         {
             return Err(ControlError::InvalidPatch(
                 "event replay differs from the captured current scientific digest; canvas unchanged".into(),
