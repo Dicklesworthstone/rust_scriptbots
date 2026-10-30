@@ -38,7 +38,7 @@ use crate::{
     FixedDeadlineHost, HostAccessError, HostBlocker, HostCheckpointError, HostCheckpointV1,
     HostDriveInterest, HostEvent, HostPort, HostSessionId, LocalHostPort, ManualInstant,
     NativeDriveTrigger, NativeScheduleError, ProtocolEventSequence, RenderSnapshot, SnapshotHub,
-    SnapshotRevision,
+    SnapshotRevision, WorldCheckpointCut, WorldDigestCut,
 };
 use scriptbots_core::{
     AgentDebugInfo, AgentDebugQuery, AgentUid, CharacterizationDigestV0, INPUT_SIZE, MutationRates,
@@ -159,13 +159,13 @@ enum IngressMessage {
         reply: Sender<Result<(), HostAccessError>>,
     },
     ScientificDigest {
-        reply: Sender<Result<WorldDigestV1, HostAccessError>>,
+        reply: Sender<Result<WorldDigestCut, HostAccessError>>,
     },
     WorldDigests {
         reply: Sender<Result<(CharacterizationDigestV0, WorldDigestV1), HostAccessError>>,
     },
     CaptureCheckpoint {
-        reply: Sender<Result<scriptbots_core::WorldCheckpointV1, HostAccessError>>,
+        reply: CaptureReply,
     },
     CaptureHostCheckpoint {
         request: HostCaptureRequest,
@@ -497,6 +497,12 @@ impl ChannelHostPort {
     /// Compute the full scientific digest at an owner boundary.
     pub fn scientific_digest_v1(&self) -> Result<WorldDigestV1, HostAccessError> {
         self.read_owner(|reply| IngressMessage::ScientificDigest { reply })
+            .map(|cut: WorldDigestCut| cut.digest)
+    }
+
+    /// Read the full scientific digest and owner revision domains atomically, without flushing.
+    pub fn scientific_digest_cut(&self) -> Result<WorldDigestCut, HostAccessError> {
+        self.read_owner(|reply| IngressMessage::ScientificDigest { reply })
     }
 
     /// Compute physical-layout and logical-science digests at the same owner boundary.
@@ -514,6 +520,13 @@ impl ChannelHostPort {
     pub fn capture_checkpoint_v1(
         &self,
     ) -> Result<scriptbots_core::WorldCheckpointV1, HostAccessError> {
+        self.read_owner(|reply| IngressMessage::CaptureCheckpoint { reply })
+            .map(|cut: WorldCheckpointCut| cut.checkpoint)
+    }
+
+    /// Capture the checkpoint and its scientific owner revision in one owner read.
+    /// Parked requests capture every field when the eventual boundary is quiescent.
+    pub fn capture_checkpoint_cut(&self) -> Result<WorldCheckpointCut, HostAccessError> {
         self.read_owner(|reply| IngressMessage::CaptureCheckpoint { reply })
     }
 
@@ -876,7 +889,7 @@ pub struct ChannelHostDriver {
     handoff: HandoffState,
 }
 
-type CaptureReply = Sender<Result<scriptbots_core::WorldCheckpointV1, HostAccessError>>;
+type CaptureReply = Sender<Result<WorldCheckpointCut, HostAccessError>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HandoffState {
@@ -969,9 +982,9 @@ impl ChannelHostDriver {
     /// admitted, or did not leave the world quiescent (a stopped or faulted host), is the
     /// refusal returned. Every other refusal is returned unchanged.
     fn capture_or_park(&mut self, reply: CaptureReply) {
-        let error = match self.host.core().world().capture_checkpoint_quiescent() {
-            Ok(checkpoint) => {
-                let _ = reply.send(Ok(checkpoint));
+        let error = match self.host.core().capture_checkpoint_cut() {
+            Ok(cut) => {
+                let _ = reply.send(Ok(cut));
                 return;
             }
             Err(error) => error,
@@ -1289,7 +1302,7 @@ impl ChannelHostDriver {
                 let result = self
                     .host
                     .core()
-                    .scientific_digest_v1()
+                    .scientific_digest_cut()
                     .map_err(|error| ChannelHostPort::protocol_violation(error.to_string()));
                 let _ = reply.send(result);
             }

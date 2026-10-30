@@ -53,6 +53,10 @@ pub enum ShellEffect {
     ReviewCheckpoint {
         checkpoint_id: String,
     },
+    ReviewNarrative {
+        route: ShellRoute,
+        event: scriptbots_core::narrative::EventRecord,
+    },
     BranchCheckpoint {
         checkpoint_id: String,
         branch_name: String,
@@ -388,6 +392,8 @@ pub enum ShellMessage {
     CreateCheckpoint,
     /// Inspect the selected saved cut without changing the live owner.
     ReviewSelectedCheckpoint,
+    /// Replay an out-of-cache narrative event from a source-bound checkpoint.
+    ReviewNarrativeEvent(scriptbots_core::narrative::EventRecord),
     /// Branch simulation from an existing checkpoint.
     BranchCheckpoint {
         checkpoint_id: String,
@@ -1058,6 +1064,16 @@ impl Model for FrankenTuiModel {
                 self.status_message = Some(format!(
                     "Pending: checkpoint {request_id} awaiting host result"
                 ));
+                Cmd::none()
+            }
+            ShellMessage::ReviewNarrativeEvent(event) => {
+                if self.enqueue_effect(ShellEffect::ReviewNarrative {
+                    route: self.route,
+                    event,
+                }) {
+                    self.status_message =
+                        Some("Loading event canvas from a saved checkpoint".into());
+                }
                 Cmd::none()
             }
             ShellMessage::ReviewSelectedCheckpoint => {

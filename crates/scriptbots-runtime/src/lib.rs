@@ -95,7 +95,8 @@ pub use host_core::{
     HostCheckpointBusy, HostCheckpointError, HostCheckpointV1, HostCore, HostCoreBuildError,
     HostCoreOptions, HostJournalCutV1, LocalHostPort, MAX_HOST_CHECKPOINT_BYTES,
     MAX_VOLATILE_HOST_CHECKPOINT_BYTES, MigrationArrival, PreparedConfigPatchResolver,
-    VolatileHostCheckpointV1, VolatileJournal, VolatileJournalCheckpointV1,
+    VolatileHostCheckpointV1, VolatileJournal, VolatileJournalCheckpointV1, WorldCheckpointCut,
+    WorldDigestCut,
 };
 pub use native::{FixedDeadlineHost, NativeDriveReceipt, NativeDriveTrigger, NativeScheduleError};
 

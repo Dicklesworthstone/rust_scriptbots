@@ -82,6 +82,37 @@ pub struct HostJournalCutV1 {
     pub commitment_requirement: ShutdownCommitRequirement,
 }
 
+/// Science checkpoint and the owner observations captured at that same boundary.
+/// This does not attest storage durability or contain a replay input history.
+#[derive(Debug, Clone)]
+pub struct WorldCheckpointCut {
+    /// Independently restorable core science state.
+    pub checkpoint: scriptbots_core::WorldCheckpointV1,
+    /// Owner whose monotonic scientific revision accompanies the checkpoint.
+    pub session_id: HostSessionId,
+    /// Actual owner revision, including science-changing commands between ticks.
+    pub scientific_revision: ScientificRevision,
+    /// Actual configuration revision; config edits use a distinct revision domain.
+    pub config_revision: ConfigRevision,
+    /// Total declared schedule inputs, including completed entries; an empty queue is zero.
+    pub scheduled_input_count: u64,
+}
+
+/// Atomic read-only scientific anchor; capturing it never requests a persistence flush.
+#[derive(Debug, Clone)]
+pub struct WorldDigestCut {
+    /// Full scientific digest, including its actual completed tick.
+    pub digest: WorldDigestV1,
+    /// Owner session bound to this digest.
+    pub session_id: HostSessionId,
+    /// Scientific revision at the digest boundary.
+    pub scientific_revision: ScientificRevision,
+    /// Configuration revision at the digest boundary.
+    pub config_revision: ConfigRevision,
+    /// Total declared schedule inputs, including completed entries; an empty queue is zero.
+    pub scheduled_input_count: u64,
+}
+
 /// Capture, wire or continued-owner reconstruction refusal.
 #[derive(Debug, Error)]
 pub enum HostCheckpointError {
@@ -3761,6 +3792,17 @@ impl HostCore {
         self.world.world_digest_v1()
     }
 
+    /// Read a full digest and its owner provenance without driving or flushing the owner.
+    pub fn scientific_digest_cut(&self) -> Result<WorldDigestCut, CharacterizationError> {
+        Ok(WorldDigestCut {
+            digest: self.world.world_digest_v1()?,
+            session_id: self.session_id,
+            scientific_revision: self.revisions.scientific,
+            config_revision: self.revisions.config,
+            scheduled_input_count: self.scheduled_input_count(),
+        })
+    }
+
     /// Capture a full typed `WorldCheckpointV1` from the owned world at a quiescent boundary.
     pub fn capture_checkpoint_v1(
         &self,
@@ -3769,6 +3811,28 @@ impl HostCore {
             HostAccessError::ProtocolViolation {
                 message: error.to_string(),
             }
+        })
+    }
+
+    /// Capture science and its owner provenance without allowing an intervening drive.
+    pub fn capture_checkpoint_cut(
+        &self,
+    ) -> Result<WorldCheckpointCut, scriptbots_core::WorldCheckpointError> {
+        Ok(WorldCheckpointCut {
+            checkpoint: self.world.capture_checkpoint_quiescent()?,
+            session_id: self.session_id,
+            scientific_revision: self.revisions.scientific,
+            config_revision: self.revisions.config,
+            scheduled_input_count: self.scheduled_input_count(),
+        })
+    }
+
+    fn scheduled_input_count(&self) -> u64 {
+        self.schedule.as_ref().map_or(0, |queue| {
+            queue
+                .remaining
+                .back()
+                .map_or(queue.completed_sequence, |patch| patch.sequence)
         })
     }
 
@@ -6674,6 +6738,130 @@ mod tests {
         ));
         assert_eq!(checkpoint.encode().unwrap(), bytes);
         assert!(VolatileHostCheckpointV1::decode(&bytes).is_ok());
+    }
+
+    #[test]
+    fn checkpoint_cut_observes_revision_domains_and_declared_schedule_inputs() {
+        let mut core = HostCore::new(HostSessionId::new(0xc071), world(0), options(true)).unwrap();
+        let initial = core.capture_checkpoint_cut().unwrap();
+        assert_eq!(initial.scheduled_input_count, 0);
+        assert_eq!(initial.session_id, core.session_id);
+        assert_eq!(
+            initial.checkpoint.source_digest(),
+            &core.scientific_digest_v1().unwrap()
+        );
+        core.install_schedule(
+            vec![scheduled(1, 0, serde_json::json!({"food_max": 0.61}))],
+            resolve_test_schedule,
+        )
+        .unwrap();
+        assert!(
+            core.capture_checkpoint_cut().unwrap().scheduled_input_count == 1,
+            "declared inputs must be counted before they run"
+        );
+        let mut config = core.world().config().clone();
+        config.food_max *= 0.5;
+        settle_continuation_command(
+            &mut core,
+            CommandEnvelope::new(
+                CommandId::new(1),
+                HostCommand::UpdateConfig(Box::new(config)),
+            ),
+            1,
+        );
+        let configured = core.capture_checkpoint_cut().unwrap();
+        assert_eq!(configured.checkpoint.tick(), initial.checkpoint.tick());
+        assert_eq!(configured.scientific_revision, initial.scientific_revision);
+        assert!(configured.config_revision.get() > initial.config_revision.get());
+        settle_continuation_command(
+            &mut core,
+            CommandEnvelope::new(
+                CommandId::new(2),
+                HostCommand::SpawnAgent {
+                    herbivore_tendency: 1.0,
+                },
+            ),
+            2,
+        );
+        settle_continuation_command(
+            &mut core,
+            CommandEnvelope::new(CommandId::new(3), HostCommand::Step),
+            3,
+        );
+        let stepped = core.capture_checkpoint_cut().unwrap();
+        assert_eq!(stepped.checkpoint.tick().0, initial.checkpoint.tick().0 + 1);
+        assert_eq!(
+            stepped.scientific_revision.get(),
+            initial.scientific_revision.get() + 2
+        );
+        assert_eq!(stepped.config_revision, configured.config_revision);
+        assert_eq!(
+            stepped.checkpoint.source_digest(),
+            &core.scientific_digest_v1().unwrap()
+        );
+        assert_eq!(stepped.checkpoint.agent_count(), core.world().agent_count());
+        eprintln!(
+            "atomic checkpoint cut: tick={} science={} config={} declared_schedule_inputs={}",
+            stepped.checkpoint.tick().0,
+            stepped.scientific_revision.get(),
+            stepped.config_revision.get(),
+            stepped.scheduled_input_count
+        );
+        let digest = core.scientific_digest_cut().unwrap();
+        assert_eq!(digest.digest, *stepped.checkpoint.source_digest());
+        assert_eq!(digest.session_id, stepped.session_id);
+        assert_eq!(digest.scientific_revision, stepped.scientific_revision);
+        assert_eq!(digest.config_revision, stepped.config_revision);
+        assert_eq!(digest.scheduled_input_count, stepped.scheduled_input_count);
+        assert!(core.schedule.as_ref().unwrap().remaining.is_empty());
+        assert_eq!(
+            digest.scheduled_input_count, 1,
+            "completed inputs do not become an empty schedule"
+        );
+        let mut empty = HostCore::new(HostSessionId::new(0xc073), world(0), options(true)).unwrap();
+        empty
+            .install_schedule(Vec::new(), resolve_test_schedule)
+            .unwrap();
+        assert!(
+            empty.schedule.is_some(),
+            "the real application installs an empty queue"
+        );
+        assert_eq!(
+            empty.scientific_digest_cut().unwrap().scheduled_input_count,
+            0
+        );
+        assert_eq!(
+            empty
+                .capture_checkpoint_cut()
+                .unwrap()
+                .scheduled_input_count,
+            0
+        );
+
+        let mut deferred =
+            HostCore::new(HostSessionId::new(0xc072), world(3), options(true)).unwrap();
+        settle_continuation_command(
+            &mut deferred,
+            CommandEnvelope::new(CommandId::new(4), HostCommand::Step),
+            1,
+        );
+        assert!(matches!(
+            deferred.world().capture_checkpoint_quiescent(),
+            Err(scriptbots_core::WorldCheckpointError::DeferredHostOutput { .. })
+        ));
+        let snapshot = deferred.latest_snapshot();
+        let journal_sequence = deferred.next_journal_sequence;
+        let digest = deferred.scientific_digest_cut().unwrap();
+        assert_eq!(digest.digest, deferred.scientific_digest_v1().unwrap());
+        assert!(Arc::ptr_eq(&snapshot, &deferred.latest_snapshot()));
+        assert_eq!(journal_sequence, deferred.next_journal_sequence);
+        assert!(
+            matches!(
+                deferred.world().capture_checkpoint_quiescent(),
+                Err(scriptbots_core::WorldCheckpointError::DeferredHostOutput { .. })
+            ),
+            "a digest anchor must leave the real deferred persistence tail unflushed"
+        );
     }
 
     #[test]

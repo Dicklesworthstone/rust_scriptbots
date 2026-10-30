@@ -1258,6 +1258,19 @@ struct RetainedCheckpoint {
     directory: PathBuf,
     database_metadata: Value,
     acknowledged: bool,
+    source_session: scriptbots_runtime::HostSessionId,
+    source_scientific_revision: scriptbots_runtime::ScientificRevision,
+    source_config_revision: scriptbots_runtime::ConfigRevision,
+    source_scheduled_input_count: u64,
+}
+
+/// Hard bound on the complete checkpoint-to-current verification interval.
+pub(crate) const MAX_EVENT_REVIEW_TICKS: u64 = 1_024;
+
+pub(crate) struct EventCanvasReview {
+    pub snapshot: Arc<RenderSnapshot>,
+    pub checkpoint_id: String,
+    pub base_tick: u64,
 }
 
 #[derive(Debug)]
@@ -2481,7 +2494,8 @@ impl ControlHandle {
         }
         retention.refresh()?;
         retention.admit(0)?;
-        let checkpoint = self.capture_checkpoint_v1()?;
+        let captured = self.host.capture_checkpoint_cut()?;
+        let checkpoint = &captured.checkpoint;
         let encoded_bytes = checkpoint
             .encode()
             .map_err(|e| ControlError::Serialization(e.to_string()))?;
@@ -2538,6 +2552,10 @@ impl ControlHandle {
             directory: dir,
             database_metadata: serde_json::json!({"source": "control_api", "description": request.description}),
             acknowledged: false,
+            source_session: captured.session_id,
+            source_scientific_revision: captured.scientific_revision,
+            source_config_revision: captured.config_revision,
+            source_scheduled_input_count: captured.scheduled_input_count,
         };
         let mut file = fs::OpenOptions::new()
             .write(true)
@@ -2879,6 +2897,14 @@ impl ControlHandle {
         &self,
         checkpoint_id: &str,
     ) -> Result<Arc<RenderSnapshot>, ControlError> {
+        let checkpoint = self.verified_canvas_checkpoint(checkpoint_id)?;
+        self.project_canvas_world(Self::restore_canvas_world(&checkpoint)?)
+    }
+
+    fn verified_canvas_checkpoint(
+        &self,
+        checkpoint_id: &str,
+    ) -> Result<scriptbots_core::WorldCheckpointV1, ControlError> {
         let metadata = self.get_checkpoint(checkpoint_id)?;
         let (artifact, bytes) = self.read_artifact_bytes(checkpoint_id)?;
         let checkpoint = scriptbots_core::WorldCheckpointV1::decode(&bytes)
@@ -2895,6 +2921,12 @@ impl ControlHandle {
                 "checkpoint catalog and verified artifact disagree".into(),
             ));
         }
+        Ok(checkpoint)
+    }
+
+    fn restore_canvas_world(
+        checkpoint: &scriptbots_core::WorldCheckpointV1,
+    ) -> Result<WorldState, ControlError> {
         let mut restored = None;
         for preset in [
             None,
@@ -2914,7 +2946,7 @@ impl ControlHandle {
                         .map_err(|error| ControlError::Serialization(error.to_string()))?
                 }
             };
-            match WorldState::restore_checkpoint_v1(&checkpoint, registry) {
+            match WorldState::restore_checkpoint_v1(checkpoint, registry) {
                 Ok(world) => {
                     restored = Some(world);
                     break;
@@ -2936,6 +2968,10 @@ impl ControlHandle {
                 "reconstructed checkpoint scientific digest differs from its saved cut".into(),
             ));
         }
+        Ok(world)
+    }
+
+    fn project_canvas_world(&self, world: WorldState) -> Result<Arc<RenderSnapshot>, ControlError> {
         let projection = scriptbots_runtime::HostCore::new(
             self.host.session_id(),
             world,
@@ -2950,6 +2986,116 @@ impl ControlHandle {
         )
         .map_err(|error| ControlError::Serialization(error.to_string()))?;
         Ok(projection.latest_snapshot())
+    }
+
+    /// Reconstruct an older event only for an interval proven to contain ticks alone.
+    /// The owner cut is atomic; schedules and extra scientific revisions refuse before
+    /// stepping. The full current digest must also match before a target is published.
+    pub(crate) fn event_canvas(&self, target_tick: u64) -> Result<EventCanvasReview, ControlError> {
+        let retained = self
+            .data_services
+            .checkpoint_retention
+            .lock()
+            .map_err(|_| ControlError::Lock)?
+            .requests
+            .values()
+            .filter(|entry| entry.acknowledged && entry.metadata.tick <= target_tick)
+            .max_by_key(|entry| (entry.metadata.tick, entry.source_scientific_revision.get()))
+            .cloned()
+            .ok_or_else(|| {
+                ControlError::NotFound(format!(
+                    "no source-bound checkpoint at or before event tick {target_tick}"
+                ))
+            })?;
+        let checkpoint_id = retained.metadata.checkpoint_id.clone();
+        let checkpoint = self.verified_canvas_checkpoint(&checkpoint_id)?;
+        let base_tick = checkpoint.tick().0;
+        if target_tick == base_tick {
+            return Ok(EventCanvasReview {
+                snapshot: self.project_canvas_world(Self::restore_canvas_world(&checkpoint)?)?,
+                checkpoint_id,
+                base_tick,
+            });
+        }
+        let current = self.host.scientific_digest_cut()?;
+        let current_tick = current.digest.tick.0;
+        Self::validate_event_review_span(&retained, &current, target_tick)?;
+        let mut world = Self::restore_canvas_world(&checkpoint)?;
+        let mut target = None;
+        while world.tick().0 < current_tick {
+            world
+                .step()
+                .map_err(|error| ControlError::Serialization(error.to_string()))?;
+            if world.tick().0 == target_tick {
+                target = Some(
+                    world
+                        .capture_checkpoint_quiescent()
+                        .map_err(|error| ControlError::Serialization(error.to_string()))?,
+                );
+            }
+        }
+        if &world
+            .world_digest_v1()
+            .map_err(|error| ControlError::Serialization(error.to_string()))?
+            != &current.digest
+        {
+            return Err(ControlError::InvalidPatch(
+                "event replay differs from the captured current scientific digest; canvas unchanged".into(),
+            ));
+        }
+        let target = target.ok_or_else(|| {
+            ControlError::InvalidPatch(
+                "event replay did not capture the requested target tick".into(),
+            )
+        })?;
+        Ok(EventCanvasReview {
+            snapshot: self.project_canvas_world(Self::restore_canvas_world(&target)?)?,
+            checkpoint_id,
+            base_tick,
+        })
+    }
+
+    fn validate_event_review_span(
+        retained: &RetainedCheckpoint,
+        current: &scriptbots_runtime::WorldDigestCut,
+        target_tick: u64,
+    ) -> Result<(), ControlError> {
+        let base_tick = retained.metadata.tick;
+        let current_tick = current.digest.tick.0;
+        let span = current_tick.checked_sub(base_tick).filter(|span| {
+            *span <= MAX_EVENT_REVIEW_TICKS && target_tick >= base_tick && target_tick <= current_tick
+        }).ok_or_else(|| ControlError::BadRequest(format!(
+            "event tick {target_tick} requires a reachable checkpoint-to-current interval of at most {MAX_EVENT_REVIEW_TICKS} ticks"
+        )))?;
+        if retained.source_session != current.session_id {
+            return Err(ControlError::InvalidPatch(
+                "checkpoint owner session differs".into(),
+            ));
+        }
+        if retained.source_scheduled_input_count != 0 || current.scheduled_input_count != 0 {
+            return Err(ControlError::BadRequest(
+                "event review needs recorded inputs for a nonempty owner schedule".into(),
+            ));
+        }
+        // Core config revision saturates; equality at its ceiling cannot prove no edits.
+        if retained.source_config_revision.checked_next().is_none()
+            || retained.source_config_revision != current.config_revision
+        {
+            return Err(ControlError::BadRequest(
+                "event review needs recorded inputs for intervening configuration revisions".into(),
+            ));
+        }
+        if current
+            .scientific_revision
+            .get()
+            .checked_sub(retained.source_scientific_revision.get())
+            != Some(span)
+        {
+            return Err(ControlError::BadRequest(
+                "event review needs recorded inputs for intervening scientific revisions".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Produce a PNG snapshot of the world without a live window.
@@ -4110,6 +4256,13 @@ pub(crate) mod tests {
 
     impl TestHost {
         pub(crate) fn spawn(world: WorldState) -> Self {
+            Self::spawn_with_schedule(world, None)
+        }
+
+        fn spawn_with_schedule(
+            world: WorldState,
+            schedule: Option<Vec<scriptbots_runtime::ScheduledConfigPatch>>,
+        ) -> Self {
             let (send, receive) = std::sync::mpsc::sync_channel(1);
             let clock_gate = Arc::new(Mutex::new(()));
             let owner_gate = Arc::clone(&clock_gate);
@@ -4120,7 +4273,7 @@ pub(crate) mod tests {
                     PlaybackSnapshot,
                     channel::{ChannelHostDriver, ChannelHostOptions},
                 };
-                let core = HostCore::new(
+                let mut core = HostCore::new(
                     HostSessionId::new(0xc017),
                     world,
                     HostCoreOptions {
@@ -4133,6 +4286,10 @@ pub(crate) mod tests {
                     },
                 )
                 .expect("test host");
+                if let Some(schedule) = schedule {
+                    core.install_schedule(schedule, crate::resolve_scheduled_config_patch)
+                        .expect("actual application schedule resolver");
+                }
                 let (mut driver, port) = ChannelHostDriver::new(
                     FixedDeadlineHost::new(core),
                     ChannelHostOptions::default(),
@@ -5335,6 +5492,332 @@ pub(crate) mod tests {
             })
             .expect("checkpoint policy");
         (handle, host)
+    }
+
+    #[test]
+    fn event_canvas_replays_real_tick_only_intervals_and_rejects_missing_inputs() {
+        let mut digests = std::collections::BTreeSet::new();
+        for preset in [
+            None,
+            Some(crate::BrainPreset::Mlp),
+            Some(crate::BrainPreset::Dwraon),
+            Some(crate::BrainPreset::Assembly),
+            Some(crate::BrainPreset::Mixed),
+        ] {
+            let directory = tempfile::Builder::new()
+                .prefix("event-canvas-control-")
+                .tempdir()
+                .unwrap()
+                .keep();
+            eprintln!("event canvas preset {preset:?}: {}", directory.display());
+            let mut world = WorldState::new(ScriptBotsConfig {
+                rng_seed: Some(42),
+                world_width: 120,
+                world_height: 120,
+                food_cell_size: 20,
+                persistence_interval: if preset.is_none() { 3 } else { 0 },
+                closed: true,
+                metabolism_drain: 0.0,
+                movement_drain: 0.0,
+                reproduction_energy_threshold: 0.0,
+                ..ScriptBotsConfig::default()
+            })
+            .unwrap();
+            if let Some(preset) = preset {
+                let brains = crate::install_brains(&mut world, preset)
+                    .unwrap()
+                    .population;
+                crate::seed_founders(&mut world, &brains, crate::FounderRecipe::Spread).unwrap();
+            }
+            let host = TestHost::spawn(world);
+            let handle = host.handle().with_artifacts_dir(directory.clone()).unwrap();
+            assert!(matches!(
+                handle.event_canvas(0),
+                Err(ControlError::NotFound(_))
+            ));
+            host.wait_applied(&handle.step().unwrap());
+            let checkpoint = handle
+                .create_checkpoint(CheckpointCreateRequest::default())
+                .unwrap();
+            for _ in 0..3 {
+                host.wait_applied(&handle.step().unwrap());
+            }
+            let oracle = host.port.snapshot_hub().latest();
+            let target_tick = oracle.world.tick;
+            for _ in 0..3 {
+                host.wait_applied(&handle.step().unwrap());
+            }
+            let current = host.port.snapshot_hub().latest();
+            let current_digest = host.port.scientific_digest_v1().unwrap();
+            let review = handle.event_canvas(target_tick).unwrap();
+            assert_eq!(review.checkpoint_id, checkpoint.checkpoint_id);
+            assert_eq!(review.base_tick, checkpoint.tick);
+            assert_eq!(review.snapshot.world.tick, target_tick);
+            assert!(review.snapshot.agent_visuals_complete());
+            let logical = |mut value: Value| {
+                for agent in value["agents"].as_array_mut().unwrap() {
+                    agent.as_object_mut().unwrap().remove("id").unwrap();
+                }
+                value["summary"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("deaths")
+                    .unwrap();
+                value
+            };
+            assert_eq!(
+                logical(serde_json::to_value(&review.snapshot.world).unwrap()),
+                logical(serde_json::to_value(&oracle.world).unwrap())
+            );
+            assert!(
+                digests.insert(current_digest.overall.clone()),
+                "registry rows must differ"
+            );
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), current_digest);
+            assert!(Arc::ptr_eq(&host.port.snapshot_hub().latest(), &current));
+            assert!(matches!(
+                handle.event_canvas(current.world.tick + 1),
+                Err(ControlError::BadRequest(_))
+            ));
+            let (key, original) = handle
+                .data_services
+                .checkpoint_retention
+                .lock()
+                .unwrap()
+                .requests
+                .iter()
+                .find(|(_, entry)| entry.metadata.checkpoint_id == checkpoint.checkpoint_id)
+                .map(|(key, entry)| (key.clone(), entry.clone()))
+                .unwrap();
+            let mut saturated_source = original.clone();
+            let mut saturated_current = host.port.scientific_digest_cut().unwrap();
+            saturated_source.source_config_revision =
+                scriptbots_runtime::ConfigRevision::new(u64::MAX);
+            saturated_current.config_revision = saturated_source.source_config_revision;
+            assert!(
+                matches!(ControlHandle::validate_event_review_span(&saturated_source, &saturated_current, target_tick),
+                Err(ControlError::BadRequest(message)) if message.contains("configuration revisions")),
+                "equal saturated config revisions cannot attest an input-free interval"
+            );
+            for fault in ["session", "science", "config", "schedule"] {
+                let mut changed = original.clone();
+                match fault {
+                    "session" => {
+                        changed.source_session = scriptbots_runtime::HostSessionId::new(
+                            original.source_session.get() ^ 1,
+                        )
+                    }
+                    "science" => {
+                        changed.source_scientific_revision =
+                            scriptbots_runtime::ScientificRevision::new(
+                                original.source_scientific_revision.get() + 1,
+                            )
+                    }
+                    "config" => {
+                        changed.source_config_revision = scriptbots_runtime::ConfigRevision::new(
+                            original.source_config_revision.get() + 1,
+                        )
+                    }
+                    "schedule" => changed.source_scheduled_input_count = 1,
+                    _ => unreachable!(),
+                }
+                handle
+                    .data_services
+                    .checkpoint_retention
+                    .lock()
+                    .unwrap()
+                    .requests
+                    .insert(key.clone(), changed);
+                let error = match handle.event_canvas(target_tick) {
+                    Ok(_) => panic!("source cut fault {fault} was admitted"),
+                    Err(error) => error,
+                };
+                let expected = match fault {
+                    "session" => "owner session",
+                    "science" => "scientific revisions",
+                    "config" => "configuration revisions",
+                    "schedule" => "owner schedule",
+                    _ => unreachable!(),
+                };
+                assert!(error.to_string().contains(expected), "{fault}: {error}");
+                assert_eq!(host.port.scientific_digest_v1().unwrap(), current_digest);
+                assert!(Arc::ptr_eq(&host.port.snapshot_hub().latest(), &current));
+                handle
+                    .data_services
+                    .checkpoint_retention
+                    .lock()
+                    .unwrap()
+                    .requests
+                    .insert(key.clone(), original.clone());
+            }
+            if preset == Some(crate::BrainPreset::Mlp) {
+                // An actual other world carries internally valid bytes and matching counters.
+                // Bind its catalog to this owner to isolate the anchor-digest guard.
+                let other = TestHost::spawn(
+                    WorldState::new(ScriptBotsConfig {
+                        rng_seed: Some(137),
+                        closed: true,
+                        persistence_interval: 0,
+                        world_width: 120,
+                        world_height: 120,
+                        food_cell_size: 20,
+                        ..ScriptBotsConfig::default()
+                    })
+                    .unwrap(),
+                );
+                let mut wrong = other
+                    .handle()
+                    .with_artifacts_dir(directory.join("wrong-world"))
+                    .unwrap();
+                other.wait_applied(&wrong.step().unwrap());
+                wrong
+                    .create_checkpoint(CheckpointCreateRequest::default())
+                    .unwrap();
+                wrong.host = host.port.clone();
+                assert!(
+                    matches!(wrong.event_canvas(target_tick), Err(ControlError::InvalidPatch(message))
+                    if message.contains("current scientific digest"))
+                );
+                host.wait_applied(
+                    &handle
+                        .submit_control_command(ControlCommand::SpawnAgent {
+                            herbivore_tendency: 1.0,
+                        })
+                        .unwrap(),
+                );
+                assert!(
+                    matches!(handle.event_canvas(target_tick), Err(ControlError::BadRequest(message))
+                    if message.contains("scientific revisions"))
+                );
+                // Real config edits have their own revision domain, including a round trip.
+                let food_max = current.config.food_max;
+                host.wait_applied(
+                    &handle
+                        .apply_patch(serde_json::json!({"food_max": food_max * 0.5}))
+                        .unwrap(),
+                );
+                host.wait_applied(
+                    &handle
+                        .apply_patch(serde_json::json!({"food_max": food_max}))
+                        .unwrap(),
+                );
+                assert!(
+                    matches!(handle.event_canvas(target_tick), Err(ControlError::BadRequest(message))
+                    if message.contains("configuration revisions"))
+                );
+                let fresh = handle
+                    .create_checkpoint(CheckpointCreateRequest::default())
+                    .unwrap();
+                assert!(fresh.tick > checkpoint.tick);
+                host.wait_applied(&handle.step().unwrap());
+                let fresh_target = host.port.snapshot_hub().latest().world.tick;
+                host.wait_applied(&handle.step().unwrap());
+                let review = handle.event_canvas(fresh_target).unwrap();
+                assert_eq!(review.base_tick, fresh.tick);
+                assert_eq!(review.checkpoint_id, fresh.checkpoint_id);
+                assert_eq!(review.snapshot.world.tick, fresh_target);
+            }
+            fs::write(
+                directory.join("target-oracle.json"),
+                serde_json::to_vec_pretty(&oracle.world).unwrap(),
+            )
+            .unwrap();
+            fs::write(
+                directory.join("target-review.json"),
+                serde_json::to_vec_pretty(&review.snapshot.world).unwrap(),
+            )
+            .unwrap();
+            let (artifact, bytes) = handle
+                .read_artifact_bytes(&checkpoint.checkpoint_id)
+                .unwrap();
+            fs::write(directory.join("before-corruption.bin"), bytes).unwrap();
+            fs::OpenOptions::new()
+                .append(true)
+                .open(directory.join(artifact.relative_path))
+                .unwrap()
+                .write_all(&[0xff])
+                .unwrap();
+            assert!(matches!(
+                handle.event_canvas(target_tick),
+                Err(ControlError::InvalidPatch(_))
+            ));
+            eprintln!(
+                "event canvas preset {preset:?}: base={} target={target_tick} current={} actual science={}; distinct state, matching projection, source guards and corrupt bytes checked",
+                checkpoint.tick, current.world.tick, current_digest.overall
+            );
+        }
+        assert_eq!(digests.len(), 5);
+        // Both work and schedule refusals use real owners rather than invented ticks.
+        for scheduled in [false, true] {
+            let directory = tempfile::Builder::new()
+                .prefix("event-canvas-bounds-")
+                .tempdir()
+                .unwrap()
+                .keep();
+            let world = WorldState::new(ScriptBotsConfig {
+                rng_seed: Some(42),
+                closed: true,
+                persistence_interval: 0,
+                world_width: 120,
+                world_height: 120,
+                food_cell_size: 20,
+                ..ScriptBotsConfig::default()
+            })
+            .unwrap();
+            let host = TestHost::spawn_with_schedule(
+                world,
+                scheduled.then(|| {
+                    vec![
+                        scriptbots_runtime::ScheduledConfigPatch::new(
+                            1,
+                            Tick(10),
+                            serde_json::json!({"food_max": 0.61}),
+                        )
+                        .unwrap(),
+                    ]
+                }),
+            );
+            let handle = host.handle().with_artifacts_dir(directory.clone()).unwrap();
+            handle
+                .create_checkpoint(CheckpointCreateRequest::default())
+                .unwrap();
+            let ticks = if scheduled {
+                2
+            } else {
+                MAX_EVENT_REVIEW_TICKS + 1
+            };
+            for _ in 0..ticks {
+                host.wait_applied(&handle.step().unwrap());
+            }
+            let before = host.port.scientific_digest_v1().unwrap();
+            let error = match handle.event_canvas(1) {
+                Ok(_) => panic!("bound admitted"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains(if scheduled {
+                "owner schedule"
+            } else {
+                "at most"
+            }));
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+            if scheduled {
+                let mut retention = handle.data_services.checkpoint_retention.lock().unwrap();
+                let entry = retention.requests.values_mut().next().unwrap();
+                assert_eq!(
+                    entry.source_scheduled_input_count, 1,
+                    "writer retains the declared input count from the real schedule"
+                );
+                entry.source_scheduled_input_count = 0;
+                drop(retention);
+                assert!(
+                    matches!(handle.event_canvas(1), Err(ControlError::BadRequest(message)) if message.contains("owner schedule"))
+                );
+            }
+            eprintln!(
+                "event canvas bound: schedule={scheduled} actual_ticks={ticks} refused; {}",
+                directory.display()
+            );
+        }
     }
 
     #[test]

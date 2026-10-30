@@ -236,9 +236,19 @@ RUST_LOG=info cargo run -p scriptbots-app
   `x`, navigation or selection changes discard a pending result, and `g` returns
   to the live canvas. Live controls and status continue to address the live owner.
   This exact-cut review supports current application brain registries; custom
-  registries and arbitrary event-tick replay remain outside it. The canvas labels
+  registries and general recorded-input event replay remain outside it. The canvas labels
   reconstructed checkpoint state separately from cached frames: original arena
   handles, per-tick activity counts and presentation history are not restored.
+  Narrative `v` first uses an exact cached frame. Outside that cache it can
+  replay from a newly saved checkpoint when atomic owner observations show an
+  unchanged configuration, zero declared scheduled inputs, and only science ticks in the
+  checkpoint-to-current interval. The complete verification interval is limited
+  to 1,024 ticks. Empty installed queues are supported; completed inputs still
+  count. It checks the reconstructed current digest before showing the
+  requested event as `CHECKPOINT REPLAY`; `g` returns live. Intervened/scheduled
+  spans require recorded-input replay and remain explicit refusals. Loading,
+  duplicate bounds, cancellation and stale selection checks use the same worker
+  slot as direct checkpoint review. Live controls continue to address the owner.
   Native-window/PTY
   and full DSR acceptance remain open.
 - Auto selection: `SCRIPTBOTS_MODE=auto` (default) chooses only a renderer compiled into the binary—GPUI first, then Bevy—and only in a real native graphical session; otherwise it uses the terminal. Linux/Unix sessions require a display environment; local macOS sessions use the native window system without X11 variables, while SSH sessions choose the terminal.
