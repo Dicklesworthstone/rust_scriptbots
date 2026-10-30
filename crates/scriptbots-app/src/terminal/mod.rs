@@ -632,6 +632,8 @@ impl Model for LiveTerminalModel<'_> {
             match message {
                 LiveTerminalMessage::Event(event) => {
                     if self.checkpoint_review_in_flight.is_some()
+                        && !app.palette_open
+                        && !app.help_visible
                         && matches!(&event, ftui::core::event::Event::Key(key)
                             if key.kind == ftui::core::event::KeyEventKind::Press
                                 && key.modifiers == ftui::core::event::Modifiers::NONE
@@ -24190,6 +24192,20 @@ for case in ('panic', 'subscription', 'renderer'):
         }
         let _ = model.update(key(KeyCode::Char('g')));
         assert_eq!(paint(&mut model.app.borrow_mut()), live_cells);
+        // A modal owns its text and Escape keys while the real worker is pending.
+        let _ = model.update(key(KeyCode::Char('7')));
+        model.last_service_poll = Some(Instant::now());
+        let work = task(model.update(key(KeyCode::Enter)));
+        model.app.borrow_mut().palette_open = true;
+        let _ = model.update(key(KeyCode::Char('g')));
+        assert!(!model.checkpoint_review_cancelled);
+        assert!(model.app.borrow().palette_query.ends_with('g'));
+        let _ = model.update(key(KeyCode::Escape));
+        assert!(!model.app.borrow().palette_open);
+        assert!(!model.checkpoint_review_cancelled);
+        let _ = model.update(std::thread::spawn(work).join().unwrap());
+        assert!(model.app.borrow().canvas_review.is_some());
+        let _ = model.update(key(KeyCode::Char('g')));
         for cancel in ["x", "g", "navigation", "selection"] {
             let _ = model.update(key(KeyCode::Char('7')));
             model.last_service_poll = Some(Instant::now());
