@@ -71,6 +71,7 @@ pub const MAX_SCENARIO_ID_BYTES: usize = 512;
 const CARGO_LOCK_BYTES: &[u8] = include_bytes!("../../../Cargo.lock");
 const RUST_TOOLCHAIN_BYTES: &[u8] = include_bytes!("../../../rust-toolchain.toml");
 const RUST_TOOLCHAIN_TEXT: &str = include_str!("../../../rust-toolchain.toml");
+const CARGO_BUILD_RUSTC_VV: &str = include_str!(concat!(env!("OUT_DIR"), "/rustc-vv.txt"));
 
 /// Build identity V0 embedded in the V3 run manifest and characterization trace.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -85,6 +86,8 @@ pub struct BuildProvenanceV0 {
     pub declared_toolchain: String,
     pub compiler_toolchain: Option<String>,
     pub rustc_vv: Option<String>,
+    /// Cargo's executable target, distinct from the compiler's host platform.
+    pub target_triple: Option<String>,
     pub toolchain_file_digest: String,
     pub lockfile_digest: String,
     pub compiled_features: Vec<String>,
@@ -137,8 +140,10 @@ impl BuildProvenanceV0 {
     /// plain hexadecimal `RCH_BUILD_SOURCE` commit stamp when no explicit ScriptBots
     /// revision is supplied),
     /// `SCRIPTBOTS_SOURCE_TREE_CLEAN=true`, `SCRIPTBOTS_SOURCE_STATUS_DIGEST`,
-    /// `SCRIPTBOTS_SOURCE_DIFF_DIGEST`, and `SCRIPTBOTS_RUSTC_VV` while invoking Cargo. These are
-    /// deliberately compile-time inputs: a shipped binary must never describe the caller's
+    /// `SCRIPTBOTS_SOURCE_DIFF_DIGEST` while invoking Cargo. Cargo's build script observes the
+    /// full selected compiler identity; an explicit reviewed `SCRIPTBOTS_RUSTC_VV` takes
+    /// precedence. These are deliberately compile-time inputs: a shipped binary
+    /// must never describe the caller's
     /// current directory, current Git checkout, or currently installed compiler as the source of
     /// the already-built executable. Missing values remain visibly unknown; provenance is never
     /// fabricated. The two runtime environment fields come from the pinned
@@ -157,7 +162,8 @@ impl BuildProvenanceV0 {
             compile_time_text(option_env!("SCRIPTBOTS_SOURCE_STATUS_DIGEST"));
         let source_diff_digest = compile_time_text(option_env!("SCRIPTBOTS_SOURCE_DIFF_DIGEST"));
         let compiler_toolchain = compile_time_text(option_env!("RUSTUP_TOOLCHAIN"));
-        let rustc_vv = compile_time_text(option_env!("SCRIPTBOTS_RUSTC_VV"));
+        let rustc_vv = compile_time_text(option_env!("SCRIPTBOTS_RUSTC_VV"))
+            .or_else(|| compile_time_text(Some(CARGO_BUILD_RUSTC_VV)));
 
         let mut compiled_features = Vec::new();
         for (enabled, name) in [
@@ -204,6 +210,7 @@ impl BuildProvenanceV0 {
             declared_toolchain: tracked_toolchain_spec(),
             compiler_toolchain,
             rustc_vv,
+            target_triple: Some(env!("SCRIPTBOTS_COMPILE_TARGET").to_owned()),
             toolchain_file_digest: manifest_digest("rust-toolchain.toml", RUST_TOOLCHAIN_BYTES),
             lockfile_digest: manifest_digest("Cargo.lock", CARGO_LOCK_BYTES),
             compiled_features,
@@ -237,6 +244,7 @@ impl BuildProvenanceV0 {
                 .as_deref()
                 .is_some_and(is_nonblank_text)
             && self.rustc_vv.as_deref().is_some_and(is_nonblank_text)
+            && self.target_triple.as_deref().is_some_and(is_nonblank_text)
             && is_nonblank_text(&self.declared_toolchain)
             && is_nonblank_text(&self.toolchain_file_digest)
             && is_nonblank_text(&self.lockfile_digest)
@@ -1478,13 +1486,9 @@ impl RunManifestV3 {
         })?;
         let target_triple = self
             .build
-            .rustc_vv
-            .as_deref()
-            .and_then(|details| {
-                details
-                    .lines()
-                    .find_map(|line| line.strip_prefix("host: ").map(str::to_owned))
-            })
+            .target_triple
+            .clone()
+            .filter(|target| is_nonblank_text(target))
             .unwrap_or_else(|| {
                 format!(
                     "{}-unknown-{}",
@@ -2315,6 +2319,7 @@ mod characterization_tests {
             declared_toolchain: "nightly-2026-07-09".to_owned(),
             compiler_toolchain: Some("nightly-2026-07-09-test-target".to_owned()),
             rustc_vv: Some("rustc 1.99.0-nightly test".to_owned()),
+            target_triple: Some(env!("SCRIPTBOTS_COMPILE_TARGET").to_owned()),
             toolchain_file_digest: "fnv1a64:1111111111111111".to_owned(),
             lockfile_digest: "fnv1a64:2222222222222222".to_owned(),
             compiled_features: vec!["fast-alloc".to_owned(), "ml".to_owned()],
@@ -2366,6 +2371,11 @@ mod characterization_tests {
         assert_eq!(
             build.rustc_vv,
             compile_time_text(option_env!("SCRIPTBOTS_RUSTC_VV"))
+                .or_else(|| compile_time_text(Some(CARGO_BUILD_RUSTC_VV)))
+        );
+        assert_eq!(
+            build.target_triple.as_deref(),
+            Some(env!("SCRIPTBOTS_COMPILE_TARGET"))
         );
         assert_eq!(
             build.provenance_complete,

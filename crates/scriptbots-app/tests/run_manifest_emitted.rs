@@ -148,6 +148,133 @@ fn observed_science_pool_widths(output: &std::process::Output) -> Vec<usize> {
 }
 
 #[test]
+fn build_compiler_identity_is_present_and_ignores_launch_time_spoofing() {
+    let dir = run_dir("build_compiler_identity");
+    println!("build compiler identity evidence: {}", dir.display());
+    let runtime_spoof = "launch-time compiler identity must never describe this executable";
+    let output = launch_with(&dir, &[("SCRIPTBOTS_RUSTC_VV", runtime_spoof)], &[]);
+    std::fs::write(dir.join("stdout.log"), &output.stdout).expect("retain app stdout");
+    std::fs::write(dir.join("stderr.log"), &output.stderr).expect("retain app stderr");
+    let sidecar = manifest_of(&output, &dir);
+    println!(
+        "BUILD_COMPILER_IDENTITY_OBSERVED: {}",
+        serde_json::json!({"directory":dir, "compiler":sidecar["build"]["rustc_vv"],
+            "runtime_spoof":runtime_spoof, "exit_code":output.status.code()})
+    );
+    let compiler = sidecar["build"]["rustc_vv"]
+        .as_str()
+        .expect("ordinary Cargo builds must embed their actual full compiler identity");
+    assert!(compiler.starts_with("rustc "), "{compiler}");
+    for field in [
+        "binary: ",
+        "commit-hash: ",
+        "commit-date: ",
+        "host: ",
+        "release: ",
+        "LLVM version: ",
+    ] {
+        assert!(
+            compiler.lines().any(|line| line.starts_with(field)),
+            "missing {field}: {compiler}"
+        );
+    }
+    assert_ne!(compiler, runtime_spoof);
+    let target = sidecar["build"]["target_triple"]
+        .as_str()
+        .expect("Cargo must record the executable target separately from the compiler host");
+    assert_eq!(Some(target), option_env!("SCRIPTBOTS_COMPILE_TARGET"));
+    let database = dir.join("run.sqlite");
+    let reader = StorageReader::open(database.to_str().expect("database path"))
+        .expect("open actual completed run");
+    let persisted = reader
+        .run_manifest()
+        .expect("read actual persisted launch manifest");
+    let durable: serde_json::Value =
+        serde_json::from_str(&persisted.manifest_json).expect("persisted manifest JSON");
+    assert_eq!(durable["build"]["rustc_vv"].as_str(), Some(compiler));
+    assert_eq!(durable["build"]["target_triple"].as_str(), Some(target));
+    assert_eq!(persisted.target_triple, target);
+    reader.close().expect("close actual read-only run");
+}
+
+#[test]
+fn manifest_projection_distinguishes_compiler_host_and_compilation_target() {
+    // These are typed metadata countermodels, not claims of native ARM/musl execution.
+    const HOST: &str = "x86_64-unknown-linux-gnu";
+    let targets = [
+        ("aarch64-apple-darwin", "aarch64", "macos"),
+        ("x86_64-unknown-linux-musl", "x86_64", "linux"),
+    ];
+    let world = scriptbots_core::WorldState::new(scriptbots_core::ScriptBotsConfig {
+        rng_seed: Some(7),
+        population_minimum: 0,
+        population_spawn_interval: 0,
+        ..Default::default()
+    })
+    .expect("real launch-boundary world");
+    let mut observed = Vec::new();
+    for (index, (target, arch, os)) in targets.into_iter().enumerate() {
+        let mut fields = serde_json::to_value(scriptbots_app::BuildProvenanceV0::current())
+            .expect("build metadata JSON");
+        fields["source_revision"] = serde_json::json!("explicit-projection-fixture");
+        fields["source_tree_clean"] = serde_json::json!(true);
+        fields["source_status_digest"] = serde_json::json!("fixture-status");
+        fields["source_diff_digest"] = serde_json::json!("fixture-diff");
+        fields["rustc_vv"] = serde_json::json!(format!("rustc projection fixture\nhost: {HOST}\n"));
+        fields["target_triple"] = serde_json::json!(target);
+        fields["core"]["target_arch"] = serde_json::json!(arch);
+        fields["core"]["target_os"] = serde_json::json!(os);
+        fields["provenance_complete"] = serde_json::json!(true);
+        fields["warnings"] = serde_json::json!([]);
+        let build = serde_json::from_value(fields).expect("typed countermodel");
+        let identity =
+            scriptbots_app::RunIdentityV1::new(RunId::new(1 + index as u128), 1, Some(0), None);
+        let manifest = RunManifestV3::from_world_with_provenance(
+            identity,
+            scriptbots_app::ScenarioIdentityV0::caller_seeded("target-projection-fixture"),
+            &world,
+            build,
+        )
+        .expect("countermodel manifest");
+        let record = manifest
+            .to_storage_record()
+            .expect("actual storage projection");
+        assert_eq!(record.target_triple, target);
+        assert_ne!(record.target_triple, HOST);
+        observed.push(record.target_triple);
+        for unknown in [serde_json::Value::Null, serde_json::json!(" ")] {
+            let mut incomplete = serde_json::to_value(&manifest).expect("manifest JSON");
+            incomplete["build"]["target_triple"] = unknown;
+            let incomplete: RunManifestV3 =
+                serde_json::from_value(incomplete).expect("unknown-target manifest");
+            assert!(!incomplete.build.derived_provenance_complete());
+            assert!(matches!(
+                incomplete.to_storage_record(),
+                Err(
+                    scriptbots_app::RunManifestError::InconsistentBuildProvenance {
+                        recorded: true,
+                        derived: false
+                    }
+                )
+            ));
+            let mut partial = incomplete;
+            partial.build.provenance_complete = false;
+            partial.reproducible = false;
+            let partial = partial
+                .to_storage_record()
+                .expect("an honestly partial target record remains admitted");
+            assert!(!partial.reproducible);
+            assert_eq!(partial.target_triple, format!("{arch}-unknown-{os}"));
+        }
+    }
+    assert_ne!(observed.first(), observed.last());
+    println!(
+        "TARGET_PROJECTION_COUNTERMODELS: {}",
+        serde_json::json!({"compiler_host":HOST,"observed_targets":observed})
+    );
+}
+
+#[test]
 fn persisted_manifests_withhold_unverified_host_session_continuation() {
     let mut previous_roster = None;
     for brain in ["mlp", "mixed"] {
@@ -620,6 +747,7 @@ fn a_real_run_writes_a_manifest_next_to_its_database() {
         "declared_toolchain",
         "compiler_toolchain",
         "rustc_vv",
+        "target_triple",
         "toolchain_file_digest",
         "lockfile_digest",
         "provenance_complete",
@@ -658,6 +786,9 @@ fn a_real_run_writes_a_manifest_next_to_its_database() {
             .as_str()
             .is_some_and(|value| !value.trim().is_empty())
         && build["rustc_vv"]
+            .as_str()
+            .is_some_and(|value| !value.trim().is_empty())
+        && build["target_triple"]
             .as_str()
             .is_some_and(|value| !value.trim().is_empty());
     assert_eq!(
