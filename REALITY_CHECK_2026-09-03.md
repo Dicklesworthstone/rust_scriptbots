@@ -1,5 +1,141 @@
 # Reality Check — rust_scriptbots — implementation continuation 2026-10-27
 
+## Active TODO — terminal narrative canvas review, VioletTrout, 2026-10-30
+
+The operator requested continued implementation and a granular TODO. Consumer:
+the terminal narrative rail and existing map painter; this checklist retires at
+handoff. The observed gap is selection without a canvas-review consumer.
+
+- [x] Read the current terminal paint/input paths and original `bd-ji3a` scope.
+- [x] Continue the original Bead and reserve implementation/docs/tracker paths.
+- [x] Retain a bounded history of immutable owner publications; coalesce duplicate ticks.
+- [x] Connect exact selected-event review and return-to-live to terminal input.
+- [x] Wire the dropped semantic rail-click region to the existing event-selection handler.
+- [x] Paint cached agents, food, terrain and tick while keeping owner/status/narrative live.
+- [x] Prevent historic canvas picking/hover from targeting current agents.
+- [x] Prove real input, changed canvas content, unchanged owner playback/digests, missing/evicted ticks and retention bounds.
+- [x] Review the four intentional timeline-title golden deltas, including nonrail stability and matrix diversity.
+- [x] Re-execute the four golden comparisons and existing layout/cell mutation control against the reviewed fixtures.
+- [x] Run appropriate terminal tests, workspace check/strict Clippy, formatting and source review.
+- [x] Update original Bead without narrowing scope; retain evidence and complete the bounded honesty audit (final tracker note accompanies this report).
+- [x] Prepare reviewed publication; final handoff records the actual push/ref/lease observations.
+
+Original acceptance still open, in logical order: complete checkpoint-backed
+event-tick replay/jump through the existing owner/replay path, then exercise
+three curated headless seeds through real persistence/reload with expected
+event-kind assertions and full info-level event-table logging. The bounded
+GUI/TUI visual-review increments do not substitute for either requirement.
+Final tracker export/import preserves all 719 other canonical rows byte-for-byte;
+only this original Bead's notes and timestamp change. Dependency-cycle check
+returns zero active and zero total cycles; no graph structure is changed.
+
+Initial draft qualification on `hz4` executes the real-owner canvas test:
+**1 passed, 0 failed, 0 ignored**, 681 filtered, 1.00s; its cold unoptimized
+build takes 25m56s, not a performance result. The final candidate additionally
+exercises the real rail-click handler, a live speed-control receipt during
+review, empty/modifier cases and an observed-canvas-per-tick oracle. Those
+additions are qualified by the final pinned run below.
+The first candidate request exits **103 before compilation**: worker source
+namespace initialization is killed with status 73. This is not a test result.
+After the backoff, read-only fleet inspection finds `hz2` admissible again,
+so the unchanged candidate uses normal remote admission there. All raw attempts
+are retained in `/data/tmp/scriptbots-terminal-review-20261030-violettrout/`.
+The candidate Rust scan exits 0: zero critical, 2,430 warnings, 552 info; no
+warning-improvement or clean-warning claim, and no scanner-policy changes.
+The alternate pre-freeze candidate completes all **10 narrative tests**, no
+failures/ignores, 673 filtered, 8.83s. Final frozen source
+`d546b65b0318aeae9877c840da6af37e547a738b`, tree `c36dc196`, then passes those
+same **10 tests** in 8.79s on `hz2`, outer exit 0. This final run includes the
+fresh-paint picking guard, real rail mouse dispatch, live speed-control receipt,
+actual cached/live cell comparison and exact missing/evicted-frame refusal.
+Repetitions are not additional distinct tests or independent verification.
+The second `hz4` request also refuses during namespace setup; no cause is
+claimed from its opaque status-73 `Killed` output, and no timeout/ownership
+policy is altered. The admitted `hz2` build is retained; no job was cancelled.
+The final source scan exits 0 with 0 critical, 2,431 warnings, 552 info.
+Full workspace/all-targets `cargo check` completes on `d546b65b`, outer exit 0,
+26m54s unoptimized build time. This is compilation evidence, not a performance
+result. Strict Clippy and reviewed rendering-golden qualification pass below.
+The normal golden comparison first fails all four selected tests (0 passed,
+4 failed, 679 filtered, 3.97s); that failure output supplies the candidates.
+The exact reviewed fixture/README commit is `238090e4bdae70d512da7781a0f79d55ddaec0bd`,
+tree `e21f0cc5`; Rust source is unchanged from the qualified `d546b65b`.
+
+Golden review changes only the intentional timeline title's rail and enclosing
+frame hashes/nonblank counts. Geometry, styled counts, contrast values, markers,
+region counts and all nonrail regions remain byte-identical. Nonblank deltas
+equal the difference in spaces between the old/new titles clipped to each
+viewport's available title width. Capability has 8 rows/8 distinct frame hashes,
+resize ladder 5/5, resize storm 12/11, theme matrix 30/6; these counts are the
+same before and after. Thirty theme rows are not thirty distinct renderings.
+No `RUST_REGEN_GOLDEN` run, assertion weakening, scenario removal or guard edit.
+The four reviewed-fixture comparisons pass (0 failed/ignored, 679 filtered,
+3.86s), and the unchanged layout/cell mutation control passes (0 failed/ignored,
+682 filtered, 0.51s), both outer exits 0 on pinned `238090e4`. That control
+removes a rail region and separately changes a cell; both perturbations must
+change the recorded evidence. Across the narrative, golden and mutation filters
+there are **15 distinct passed test IDs**. Runtime Cargo JSON binds each executed
+app test artifact to opt-level 0, debuginfo 0, debug assertions and overflow
+checks enabled; executable paths match the actual `Running` lines. Pinned RCH
+receipts bind `d546b65b`/`c36dc196` and `238090e4`/`e21f0cc5`; the latter changes
+only reviewed fixtures and README. This is scoped self-verification, not an
+independent review. Final formatting exits 0. Strict workspace/all-targets
+Clippy with `-D warnings` completes on `238090e4`, outer exit 0, build time
+7m56s; its pinned receipt names tree `e21f0cc5`. Cargo emits a future-compatibility
+warning for existing locked dependency `proc-macro-error2` 2.0.1. This is not a
+zero-warning dependency claim. No source, dependency, feature, profile, deadline
+or policy changes follow the qualified Rust source; the fixture/README commit
+is the only change between the two qualified pins.
+
+DCG blocks one proposed external-data analysis command before execution with
+`windows.filesystem:windows-filesystem-semantic-unverified`. `dcg explain` on the
+exact command subsequently says ALLOW; this discrepancy does not establish a
+cause. No override is used. Literal read-only artifact reads and in-memory
+comparisons replace the blocked mutation; all reviewed assertions above pass.
+
+Bounded audit (final runtime, lint and golden qualification observed):
+creation Q1–Q4 are the operator, requested TODO/handoff, observed disconnected
+rail click/review path, and retirement at handoff. This is the minimum requested
+LEGITIMATE GATE, not feature credit; no integrity-framework exception is invoked.
+Opportunity cost: finish this ready user-facing `bd-ji3a` increment rather than
+create another process artifact. Work inventory is the exact source/README
+diff (USER candidate) plus generated-base-only `33c60638` (PROCESS, not credited
+to this implementation); no closure. The two-minute demo is rail click, cached
+canvas review and return live. Omitting this report changes no runtime behavior.
+No speculative enabler is claimed; the existing painter is the consumer.
+This original July timeline item is being advanced rather than minting easy
+leaves; no exhaustive oldest-item claim. Solo, no pane/close contest, no scope
+or acceptance rewrite. Verdict **DRIFTING**: analysis during cold builds grew
+too long and the alternate-worker detour rebuilt dependencies. Correction:
+freeze this candidate and finish exact-source qualification, not more design.
+
+Honesty inventory, prompts 1–20:
+1. No (checked: all source diff hunks); no existing assertion is removed or weakened. The title assertion now requires the truthful cached-review qualifier for the new behavior.
+2. No (checked: test construction); existing real owner and headless backend are reused. The unchanged dummy auxiliary runtime is not HTTP/MCP/file-persistence proof.
+3. Yes: four existing golden data files change for the intentional rail title. Every changed row is reviewed; nonblank deltas match clipped title spaces, nonrail data and matrix diversity are unchanged. The original failures remain retained, no regeneration flag or guard edit is used, and the unchanged mutation control passes.
+4. No (checked: source/config diff); no release validator, CI, scanner policy, suppression, deadline or tolerance changes. UI-copy expectations change with the feature and actual cells/input/refusal guards remain mandatory.
+5. No (checked: runtime branches); no fixture seed or benchmark special case.
+6. No (checked: raw logs); initial draft runs one test; candidate admission refusal earns zero test credit.
+7. No (checked: logs against claims); pinned narrative runtime, reviewed-fixture comparisons, mutation control, workspace check, strict Clippy and formatting pass. Cargo's dependency future-compatibility warning and the scanner's warning counts are explicitly retained.
+8. No (checked: claim scope); headless production handlers and a real owner are not described as native PTY/GPU or persisted checkpoint replay.
+9. No (checked: retained attempts); formatting corrections, both source-namespace refusals, four pre-review golden failures and the DCG rejection remain recorded.
+10. No (checked: redirections); qualification retains both output streams.
+11. No (checked: canonical Bead); original item remains in progress, without a new child or closure.
+12. No (checked: plan/Bead diff); original requirements remain unchanged.
+13. Not applicable: solo; no delegated closure.
+14. Not applicable: no subagent dispatch.
+15. Not applicable: no delegated evidence accepted.
+16. Not applicable: no panes or refusal-farming agents.
+17. No (checked: claims); self-verification is not independent agreement.
+18. No (checked: passed IDs and artifact profiles); ten narrative, four golden and one mutation-control tests are distinct. Earlier repetitions add no unique-test or independent-review credit; failed/refused attempts are retained and no performance denominator is selected.
+19. The long analysis and cold-worker detour should have been shorter. A patch anchor failed without mutation and was corrected; no failed result is hidden. Stop adding scope and finish the pinned candidate.
+20. The pinned ten-test run exercises real mouse selection, cached/live cells, current speed receipts, owner invariants, missing/evicted ticks and the return-to-live picking transition. This is real-owner/headless-handler evidence, not persisted replay or native terminal execution.
+CASS query `review_selected_canvas` returns 102 broad matches; a followed hit is
+old selection-precedence documentation, not this implementation. Earlier
+conversation sweeps are retained in the preceding audit; no historical clean
+bill is claimed. Countermeasures: no orphan-helper credit (SM-10), no hidden
+attempts (SM-11), and no zero-run promotion (PL-1); no new enforcement apparatus.
+
 ## Active TODO — narrative frame review, VioletTrout, 2026-10-30
 
 Consumer: the existing GUI narrative rail and bounded visual playback cache.

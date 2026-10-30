@@ -1306,6 +1306,18 @@ capture-filename false positives, not a clean scanner result. The original
 TUI/disk-backed replay and three-seed acceptance remain open; the GUI increment
 does not close the Bead or certify native GPU execution.
 
+**[Currently In Progress] terminal continuation, 2026-10-30:** source `d546b65b`
+connects the existing map painter to bounded retained owner publications for
+exact event-tick canvas review (`v`) and return live (`g`), and fixes dropped
+rail-click dispatch. Current owner/status/narrative state stays independent;
+missing frames refuse, historical picking is disabled and live picking resumes
+after a fresh paint. Ten pinned narrative tests and workspace/all-targets check
+pass. Reviewed title-only fixture commit `238090e4` passes all four rendering
+goldens and the unchanged layout/cell mutation control; strict workspace Clippy
+and formatting pass. Cargo retains an existing dependency future-compatibility
+warning. This is retained visual review, not checkpoint-based world reconstruction;
+the full original Bead and curated persisted-seed scope stay open.
+
 Viewport size, camera, selected agent, requested detail, and chart window are per-client inputs, not mutable global projection state and not scientific world state. The TUI, GUI HUD, server ASCII capture, and web snapshot reuse semantic projection functions and caches keyed by request/revision. They may render the result differently.
 
 The selected-brain detail slice is now an explicit, synchronous, read-only pull
