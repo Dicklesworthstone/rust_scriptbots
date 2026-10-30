@@ -1,5 +1,202 @@
 # Reality Check — rust_scriptbots — implementation continuation 2026-10-27
 
+## Active TODO — exact replay windows, VioletTrout, 2026-10-30
+
+Delivered source `9a461de71b02a01c7825786c858d18e68aadd676`, tree `f9bcf1df`,
+fixes explicit replay horizons and their displayed counts. The final real-file
+regression and existing checkpoint-start regression pass; required checks pass.
+Original `bd-ji3a` remains in progress for interactive checkpoint-backed event
+jumping. Qualification, failed attempts and audit are retained below.
+
+Consumer: the existing `--replay-db --tick-limit` CLI and the bounded replay
+prerequisite for original `bd-ji3a` event jumping. Observed code mismatch:
+simulation stops at the requested horizon, while tick-zero recorded/comparison
+streams and displayed counts still include the full run. The requested TODO
+gates this handoff and retires with it; no new process framework. Creation Q1–Q4
+are the operator, exact bounded replay, the observed window mismatch and handoff
+retirement. Verdict LEGITIMATE GATE for this checklist; runtime fix is FEATURE.
+No integrity-control exception or speculative enabler is claimed.
+
+- [x] Trace timeline/checkpoint/replay consumers and identify a concrete bounded replay defect.
+- [x] Continue original Bead; reserve exact paths without changing its acceptance/dependencies.
+- [x] Add real-world/file regression cases with actual shipped verification subprocesses.
+- [x] Execute the new regression against unchanged production and retain the exact failure chain.
+- [x] Prepare the fixed candidate's matching windows/counts; non-vacuity and first-divergence guards are unchanged.
+- [x] Add an extra candidate tick and its bounded-prefix counterpart to protect default full-run length checking.
+- [x] Execute the fixed candidate's nine dispositions and inspect the before/after win/lose split.
+- [x] Re-execute existing real interval-checkpoint/start replay on the final source.
+- [x] Run required workspace/all-targets check, strict Clippy, formatting and touched-source scan.
+- [x] Update exact evidence, Beads and bounded honesty audit; preserve the remaining UI event-jump scope.
+- [x] Review source and prepare exact owned metadata for publication; final handoff records actual push/ref/lease observations.
+
+The initial before-production attempt used immutable test-only pin
+`f06b3b30acc8894c52b6933126b2000270748a14`, tree `c6a1ee34`. Production source is
+byte-identical to `6940f2fa`; intervening `d30bfb63` changes generated Beads base
+only and earns no feature credit. All regression hunks were reviewed; formatting
+passes and its Rust scan exits 0 (0 critical, 502 warnings, 40 info).
+That initial test defined four MLP world/file recordings, attempted raw
+early/late agent arrivals and seven CLI comparisons. Its two fixture defects
+below prevented the intended execution; only the corrected meteor version
+establishes the actual reproduction. Interactive checkpoint-backed event jump
+remains open.
+
+While that isolated control compiled, intermediate fixed candidate
+`c3f622d0cc096d79499e924177b1798476c83342`, tree `4717274c`, was prepared independently
+and entered workspace checking on another worker. Its two additional cases use
+a real longer world: default full comparison must still fail on its extra tick,
+while an explicitly requested matching prefix may pass. The original seven
+expectations remain unchanged. Full-source format check exits 0; changed Rust
+scan exits 0 with 0 critical, 1,293 warnings and 397 info. No warning-clean claim.
+At that stage neither before nor after runtime success was claimed. The corrected
+source and actual results follow below. Every raw attempt stays in
+`/data/tmp/scriptbots-replay-window-20261030-violettrout/`.
+The first fixed workspace-check request exits 103 before compilation:
+`hz3` refuses admission (`no_free_slots`) while advertising zero slots and
+`disk_free_gb=9.28` under disk-pressure protection. This is neither a red nor green
+compiler result. Retry uses normal admission on healthy `hz4` after backoff;
+no worker policy, deadline, resource override or deletion is attempted.
+The first before-control attempt also remains retained: RCH terminates its cold
+dependency build at 1,802,997ms with exit 137, before any test runs. It supplies
+neither a red regression nor a green result. A second invocation uses the exact
+same `f06b3b30` pin, command, profile and ordinary deadline on the warmed worker.
+That second attempt compiles and runs one test, but fails immediately (exit 101,
+0.00s) in the fixture encoder, before producing a world: RON cannot serialize
+the arbitrary-precision JSON number wrapper (`InvalidIdentifier` naming
+`$serde_json::private::Number`). This is my test defect, not a replay reproduction.
+Correction `19b419fd4d92` uses the supported direct typed TOML serializer already
+used by production `run_det_check`; expectations and all nine cases are unchanged.
+Format check exits 0 and the corrected test's UBS scan exits 0 (0 critical,
+501 warnings, 40 info). The corrected before control uses clean production base
+`f06b3b30` plus exactly one explicit overlay: the committed test blob from
+`19b419fd` (`a050e580115fd7462eded7074fed0dc10a540670`). It is an explicitly bound
+composite control, not a claim that the complete source is a single clean commit.
+At that point the fixed candidate was `19b419fd`; its production bytes match `c3f622d0`.
+Every earlier attempt remains retained and earns no functional credit.
+The corrected-TOML control then runs but fails at 4.77s: a raw mid-run founding
+arrival is refused with `PersistenceBoundarySealed { tick: 7 }`. This is a second
+fixture error, not the requested reproduction. Correction `9a461de71b02` instead
+queues real early/late `Meteor` interventions and requires their actually applied
+records to name affected agents and cells. All nine disposition expectations
+stay intact; no lifecycle guard is altered. The control again uses old production
+plus only that committed test blob (`202555478056705404d4f2f021dd870653312e12`).
+The final after candidate is `9a461de7`, tree `f9bcf1df`; its production bytes
+remain `c3f622d0`. Formatting passes; its test-only UBS scan exits 0 with 0 critical,
+504 warnings and 40 info. Intermediate `c3f622d0` workspace/all-targets check exits
+0 (26m05s); the final test-file correction also passes a new pinned workspace check.
+
+The corrected before control finally reproduces the actual defect: **1 failed,
+0 passed, 0 ignored, 6 filtered**, 15.73s, outer exit 101. The complete baseline
+matches 616 events across 12 ticks. Valid tick-five prefixes instead report
+12 recorded versus 5 simulated digests and wrongly demand event tick 6, seq 0.
+All nine subprocesses execute before the expected assertion failure. The control
+is the clean `f06b3b30` production base plus the single committed test blob
+`202555478056705404d4f2f021dd870653312e12`; RCH binds its explicit overlay as
+`f5e4b7d78fb8e26ad5ffc74ca3ef0d583d23712d15767eea7cc86f1e4bb729f5`.
+The final overlay's live hashes were requested after RCH had removed its source
+namespace and were unavailable; do not promote this composite recipe into a
+single clean-commit or separately live-hashed control claim.
+
+The fixed `9a461de7` run passes **1 test, 0 failed, 0 ignored, 6 filtered**, 15.63s,
+outer exit 0. This is one integration test with five real MLP world/file recordings
+and nine actual verification subprocesses, not nine independent tests. A matching
+prefix has 379 events and exactly 5 canonical digests in every displayed stream.
+The complete baseline retains 616 events and 12 digests. Observed win/lose split:
+
+| CLI case | Old production | Fixed production | Evidence |
+| --- | --- | --- | --- |
+| complete baseline | pass | pass | 616 events, 12 digests |
+| baseline through tick 5 | false failure | pass | 379 events, 5 digests |
+| late meteor, prefix through 5 | false failure | pass | both prefixes identical |
+| early meteor, prefix through 5 | fails during self-check | genuine candidate failure | self-check passes, candidate differs at tick 3/seq 5 |
+| early meteor, complete run | candidate failure | candidate failure | tick 3/seq 5 |
+| late meteor, complete run | candidate failure | candidate failure | tick 8/seq 5 |
+| extra candidate tick, complete run | candidate failure | candidate failure | 12 versus 13 digests |
+| extra candidate tick, prefix through 5 | false failure | pass | both prefixes identical |
+| missing canonical digests | refusal | refusal | recorded digests 0; vacuous-nonzero guard |
+
+Both meteor worlds must actually apply the intervention to nonempty agent/cell
+sets. Every recording requires nonempty equal admitted/applied/durable watermarks;
+every source database is byte-identical after all readbacks. The source recordings
+use the production core and file sink with unattributed manifests; they are not
+application-produced, fully journaled host recordings. The readers are actual
+CLI processes, not constructed replay rows or captured output substituted for
+execution. The complete streams undergo identity validation before filtering;
+non-vacuity, digest and first-divergence guards remain intact. No default full-run
+candidate suffix is clipped, and no golden/CI/suppression/threshold is changed.
+
+Before/after databases, config and all 18 subprocess stdout/stderr/process records
+are copied without deletion/overwrite into `before-retained-M4qixB/` and
+`after-retained-oU1T7P/` under the proof root. Failed fixture directories are also
+retained as `encoder-failure-GXKcjY/` and `boundary-failure-gmgArc/`. The after RCH
+receipt binds commit/tree exactly; five live worker hashes match main source,
+test, manifest, lockfile and toolchain at that pin. Cargo JSON matches the actual
+integration and child executable paths, opt-level 0, debug info 0, assertions and
+overflow checks enabled. The old composite control uses the same native profile.
+
+Final required checks on `9a461de7`: workspace/all-targets check exits 0 (24.02s),
+strict workspace/all-targets Clippy with `-D warnings` exits 0 (3m11s), formatting
+exits 0, and the exact two changed Rust files' UBS scan exits 0 (0 critical,
+1,295 warnings, 397 info). Existing
+`interval_checkpoints_recorded_by_a_real_run_support_checkpoint_start_replay`
+also passes **1 test, 0 failed, 0 ignored, 6 filtered**, 28.24s, outer exit 0.
+The runtime build's existing `proc-macro-error2` future-compatibility warning is
+retained. No source changes follow qualification. Native PTY/GPU, performance,
+whole-workspace runtime, centralized DSR migration and independent verification
+are not established by these results.
+Final semantic Beads update preserves the original status/assignee, acceptance,
+description and dependencies. Only its notes/timestamp differ from the starting
+canonical row; all other 719 rows are byte-identical. Canonical re-import succeeds
+and the active dependency-cycle probe reports count 0. Generated base/WAL files
+remain outside this increment's commit.
+
+Bounded real-work audit: the four source commits are one USER fix (`c3f622d0`)
+and three exercised ENABLER test increments (`f06b3b30`, `19b419fd`, `9a461de7`);
+the final requested TODO/Beads/report handoff is PROCESS and earns no capability
+credit. The peer's generated-base `d30bfb63` is excluded from this credit. Zero
+Beads close. Core purpose: reproducible evolutionary-agent simulation with useful
+observation, control and persistence. Q1/two-minute demo: replay a finished run
+through tick five, then compare a real later perturbation's unchanged prefix.
+Q2: omitting PROCESS changes no runtime result. Q3: the added test actually runs
+the fixed CLI; it is no speculative framework. Q4: this advances the original
+July narrative/event-jump item rather than claiming globally oldest priority or
+minting an easier replacement. Q5: solo; no close-count or pane ranking. Q6:
+original acceptance/dependencies are unchanged; no follow-up laundering. Creation
+Part 3: no exception needed; Part 4: finish this replay prerequisite rather than
+spend another hour exploring the UI or producing process artifacts. Verdict
+**DRIFTING** during broad initial exploration and noisy/truncated reads, corrected
+by freezing the real CLI increment and completing its qualification. Two fixture
+mistakes also cost extra runs; they were fixed without weakening expectations.
+
+Honesty inventory for this continuation, all prompts 1–20:
+1. No (checked: complete source/test/config diffs): no existing test is weakened, removed, ignored or bypassed; the original seven expectations remain and two length controls are added.
+2. No (checked: producer, sink and subprocess paths): real MLP worlds, real files and actual CLI execution; no specialized mock or fabricated replay row.
+3. No (checked: changed paths): no golden or snapshot regeneration.
+4. Yes: the runtime verifier changes. The separate diff review and observed win/lose table above justify the window repair; existing integrity/digest guards, profile, CI and deadlines remain unchanged (RH-1 countermeasure).
+5. No (checked: full-run suffix and early-change controls): no demo special-case or denominator selected to hide failures.
+6. No (checked: raw test summaries): each claimed successful runtime invocation executes one test; six unrelated tests are explicitly filtered, not claimed.
+7. No (checked: commands, raw outputs and status chronology): compilation, fixture failures, reproduction and final success are distinguished; predicted outcomes were not reported as observations.
+8. No (checked: actual proof boundaries): native core/file recordings plus live verifier processes; no application-recording, PTY/GPU, DSR, perf or independent-review promotion (RH-2).
+9. No (checked: every retained attempt): exit-103 admission refusal, exit-137 incomplete build and both exit-101 fixture defects are disclosed before the actual regression result (SM-11).
+10. No (checked: raw-log redirections and readers): stdout and stderr are retained; bounded excerpts do not replace the originals.
+11. No (checked: original Bead status and acceptance): original stays in progress, with no new replacement item or closure.
+12. No (checked: plan and original Bead diff): plan records the delivered prerequisite and explicitly retains the interactive requirement.
+13. No (checked: solo activity and tracker): no peer/self closure or verifier authority claim.
+14. No (checked: tool history): no subagent dispatch.
+15. No (checked: tool history): no accepted subagent report; this is self-verification only.
+16. No (checked: work inventory): no swarm, refusal farming or refusal-only closure.
+17. No (checked: evidence claims): no peer agreement counted as confirmation; both qualification runs are same-origin evidence.
+18. No (checked: case declarations before execution): five worlds/nine cases and six filtered tests stay explicit; no performance statistic is claimed.
+19. Yes: broad architecture exploration, noisy tool reads and two avoidable fixture mistakes cost time without shipping capability. Stop that loop, retain the failures and finish this frozen consumer; SM-2/SM-11 countermeasures are the unchanged original scope and full attempt history. A premature live-hash request and a post-cleanup one failed; neither is presented as a match.
+20. Strongest evidence: the retained old-control false failures versus the pinned fixed CLI's nine observed dispositions, exact counts, planted real perturbations and unchanged database bytes. A skeptic can rerun the named test/commands; this is not independent certification.
+
+History scope: the prior bounded five CASS sweeps remain in the earlier audit.
+This continuation adds `bounded_replay_scopes` (353 fuzzy matches, three returned)
+and follows the first hit at transcript `be1cdb09…:5686`; it is an unrelated timer
+loop, not evidence about this verifier. No historical clean bill is inferred.
+Disposition: gate repair evidenced/disclosed (RH-1), fixture errors corrected and
+all attempts retained (SM-11), exploratory drift stopped and original scope left
+open (SM-2). Fresh self-review is explicitly not independent verification.
+
 ## Active TODO — real headless narrative seeds, VioletTrout, 2026-10-30
 
 The user requested continued execution and a granular TODO. Consumer: the

@@ -1331,6 +1331,18 @@ the exact source but retain incomplete cleanliness/status/diff provenance; this
 is native RCH functional proof, not centralized DSR migration acceptance.
 Checkpoint-backed event-tick jump remains open; the original Bead is not closed.
 
+**[Implemented and native-qualified] `bd-ji3a` bounded replay prerequisite,
+2026-10-30:** `9a461de7` scopes explicit `--tick-limit` streams and displayed
+counts to the same inclusive horizon. The unchanged-production control rejects
+valid tick-five prefixes by expecting tick six; the fixed real-world/file test
+passes all nine CLI dispositions, including genuine early/tail divergence,
+an extra candidate tick and missing-digest refusal. Existing checkpoint-start
+replay also passes. Workspace/all-targets check, strict Clippy and formatting
+pass. Two fixture errors were corrected without changing expectations; raw
+attempts and the win/lose split are in `REALITY_CHECK_2026-09-03.md`.
+**[Currently In Progress]** The original interactive checkpoint-backed
+event-tick jump remains open; this CLI prerequisite does not complete it.
+
 Viewport size, camera, selected agent, requested detail, and chart window are per-client inputs, not mutable global projection state and not scientific world state. The TUI, GUI HUD, server ASCII capture, and web snapshot reuse semantic projection functions and caches keyed by request/revision. They may render the result differently.
 
 The selected-brain detail slice is now an explicit, synchronous, read-only pull
