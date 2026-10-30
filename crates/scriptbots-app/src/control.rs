@@ -2873,7 +2873,9 @@ impl ControlHandle {
     /// never drives or replaces the live owner, advances science, or opens SQL.
     /// Only exact registries produced by the compiled application presets are
     /// supported; the core's full registry and restored-digest checks still apply.
-    pub fn checkpoint_canvas(
+    /// This is a reconstructed science projection, not the original host publication:
+    /// arena handles, per-tick activity counts and presentation history are not retained.
+    pub(crate) fn checkpoint_canvas(
         &self,
         checkpoint_id: &str,
     ) -> Result<Arc<RenderSnapshot>, ControlError> {
@@ -5391,9 +5393,26 @@ pub(crate) mod tests {
             assert_eq!(frame.world.tick, checkpoint.tick);
             assert_eq!(frame.world.agents.len(), checkpoint.agent_count);
             assert!(frame.agent_visuals_complete());
-            assert_eq!(
-                serde_json::to_vec(&frame.world).unwrap(),
-                serde_json::to_vec(&oracle.world).unwrap()
+            let original = serde_json::to_value(&oracle.world).unwrap();
+            let reconstructed = serde_json::to_value(&frame.world).unwrap();
+            // Core checkpoints retain scientific UIDs/state, not arena slot handles
+            // or the preceding tick's death counter. Keep their raw difference
+            // visible, then compare every remaining projected field exactly.
+            let logical = |mut value: Value| {
+                for agent in value["agents"].as_array_mut().unwrap() {
+                    agent.as_object_mut().unwrap().remove("id").unwrap();
+                }
+                value["summary"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("deaths")
+                    .unwrap();
+                value
+            };
+            assert_eq!(logical(reconstructed.clone()), logical(original.clone()));
+            eprintln!(
+                "checkpoint canvas preset {preset:?}: original deaths={} reconstructed deaths={}; arena handles are reallocated, scientific UIDs and remaining projection fields match",
+                original["summary"]["deaths"], reconstructed["summary"]["deaths"]
             );
             assert_eq!(host.port.scientific_digest_v1().unwrap(), live);
             assert!(Arc::ptr_eq(

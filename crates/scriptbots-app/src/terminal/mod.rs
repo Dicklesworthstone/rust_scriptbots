@@ -724,7 +724,7 @@ impl Model for LiveTerminalModel<'_> {
                         {
                             match result {
                                 Ok(snapshot) => {
-                                    app.show_canvas_review(&snapshot);
+                                    app.show_canvas_review(&snapshot, Some(checkpoint_id.clone()));
                                     app.push_toast(format!(
                                         "Reviewing saved checkpoint {checkpoint_id} at tick {}; live owner unchanged",
                                         snapshot.world.tick
@@ -3751,11 +3751,12 @@ impl<'a> TerminalApp<'a> {
             .map(|checkpoint| checkpoint.checkpoint_id.as_str())
     }
 
-    fn show_canvas_review(&mut self, frame: &RenderSnapshot) {
+    fn show_canvas_review(&mut self, frame: &RenderSnapshot, source_checkpoint: Option<String>) {
         self.canvas_review = Some(CanvasReviewFrame {
             snapshot: Snapshot::from_render(frame),
             terrain: TerrainView::from_snapshot(frame),
             day_night: frame.config.render.resolved_day_night(),
+            source_checkpoint,
         });
         self.archipelago_view = false;
         self.hover_tooltip = None;
@@ -3781,7 +3782,7 @@ impl<'a> TerminalApp<'a> {
             return;
         };
         let frame = frame.clone();
-        self.show_canvas_review(&frame);
+        self.show_canvas_review(&frame, None);
         self.push_toast(format!(
             "Reviewing cached canvas tick {tick}; owner playback unchanged"
         ));
@@ -4371,8 +4372,13 @@ impl<'a> TerminalApp<'a> {
 
     fn draw_map(&mut self, frame: &mut Frame<'_>, area: Rect) {
         let title = if let Some(review) = &self.canvas_review {
+            let source = if review.source_checkpoint.is_some() {
+                "CHECKPOINT STATE"
+            } else {
+                "REVIEW"
+            };
             format!(
-                "World Map {}×{} | REVIEW tick {} (live {}) | g live",
+                "World Map {}×{} | {source} tick {} (live {}) | g live",
                 review.snapshot.world_size.0,
                 review.snapshot.world_size.1,
                 review.snapshot.tick,
@@ -7969,6 +7975,7 @@ struct CanvasReviewFrame {
     snapshot: Snapshot,
     terrain: TerrainView,
     day_night: (u32, f32),
+    source_checkpoint: Option<String>,
 }
 
 /// One agent's senses, explained (bd-16g.4.2).
@@ -24149,7 +24156,9 @@ for case in ('panic', 'subscription', 'renderer'):
                 .draw(|frame| app.draw_map(frame, frame.area()))
                 .unwrap();
             let text = buffer_text(&rendered);
-            assert!(text.contains(&format!("REVIEW tick {saved_tick} (live {live_tick})")));
+            assert!(text.contains(&format!(
+                "CHECKPOINT STATE tick {saved_tick} (live {live_tick})"
+            )));
             fs::write(directory.join("review-map.txt"), text).unwrap();
             fs::write(
                 directory.join("saved-cells.txt"),

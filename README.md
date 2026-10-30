@@ -236,7 +236,10 @@ RUST_LOG=info cargo run -p scriptbots-app
   `x`, navigation or selection changes discard a pending result, and `g` returns
   to the live canvas. Live controls and status continue to address the live owner.
   This exact-cut review supports current application brain registries; custom
-  registries and arbitrary event-tick replay remain outside it. Native-window/PTY
+  registries and arbitrary event-tick replay remain outside it. The canvas labels
+  reconstructed checkpoint state separately from cached frames: original arena
+  handles, per-tick activity counts and presentation history are not restored.
+  Native-window/PTY
   and full DSR acceptance remain open.
 - Auto selection: `SCRIPTBOTS_MODE=auto` (default) chooses only a renderer compiled into the binary—GPUI first, then Bevy—and only in a real native graphical session; otherwise it uses the terminal. Linux/Unix sessions require a display environment; local macOS sessions use the native window system without X11 variables, while SSH sessions choose the terminal.
 - Auto-mode policy overrides:
