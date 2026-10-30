@@ -4275,7 +4275,7 @@ struct AppCli {
     /// Optional comparison database for divergence analysis.
     #[arg(long = "compare-db", value_name = "FILE", requires = "replay_db")]
     compare_db: Option<PathBuf>,
-    /// Limit the number of ticks simulated during replay verification.
+    /// Inclusive terminal world tick for replay verification and comparison.
     #[arg(long = "tick-limit", value_name = "TICKS", requires = "replay_db")]
     tick_limit: Option<u64>,
     /// Resume headless deterministic replay from the latest recorded checkpoint rather than tick zero.
@@ -5228,7 +5228,6 @@ fn run_replay_cli(
     let mut persisted_events = storage.load_replay_events()?;
     canonicalize_replay_event_order(&mut persisted_events)
         .context("recorded replay stream contains an invalid or duplicate identity")?;
-    let recorded_counts = storage.replay_event_counts()?;
     let recorded_batch_ticks = storage.summary_ticks()?;
     let journaled = !storage.host_journal_sessions()?.is_empty();
     // Ordered by tick; interval recording usually leaves one at the final tick, which
@@ -5257,6 +5256,9 @@ fn run_replay_cli(
     let tick_limit = cli
         .tick_limit
         .unwrap_or(recorded_max_tick.max(events_max_tick));
+    // Validate the complete source above, then compare only the requested
+    // prefix. A valid future suffix is not evidence about this replay window.
+    persisted_events.retain(|event| event.tick <= tick_limit);
     let latest_checkpoint = checkpoints
         .iter()
         .rev()
@@ -5373,17 +5375,10 @@ fn run_replay_cli(
     )?;
     let diff = diff_event_stream(&persisted_events, &replay_run.events);
 
-    let recorded_map = if cli.checkpoint_start {
-        count_event_kinds(&persisted_events)
-            .into_iter()
-            .map(|(key, value)| (key.to_string(), value))
-            .collect::<HashMap<_, _>>()
-    } else {
-        recorded_counts
-            .into_iter()
-            .map(|entry| (entry.event_type, entry.count))
-            .collect::<HashMap<_, _>>()
-    };
+    let recorded_map = count_event_kinds(&persisted_events)
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value))
+        .collect::<HashMap<_, _>>();
     let simulated_counts = count_event_kinds(&replay_run.events)
         .into_iter()
         .map(|(key, value)| (key.to_string(), value))
@@ -5437,11 +5432,12 @@ fn run_replay_cli(
         let mut other_events = other.load_replay_events()?;
         canonicalize_replay_event_order(&mut other_events)
             .context("comparison replay stream contains an invalid or duplicate identity")?;
-        let other_counts = other.replay_event_counts()?;
         other.close()?;
 
-        if cli.checkpoint_start {
-            other_events.retain(|e| e.tick > start_tick && e.tick <= tick_limit);
+        if cli.checkpoint_start || cli.tick_limit.is_some() {
+            other_events.retain(|event| {
+                event.tick <= tick_limit && (!cli.checkpoint_start || event.tick > start_tick)
+            });
         }
 
         println!(
@@ -5451,17 +5447,10 @@ fn run_replay_cli(
             compare_display.cyan()
         );
         let compare_diff = diff_event_stream(&persisted_events, &other_events);
-        let other_map = if cli.checkpoint_start {
-            count_event_kinds(&other_events)
-                .into_iter()
-                .map(|(key, value)| (key.to_string(), value))
-                .collect::<HashMap<_, _>>()
-        } else {
-            other_counts
-                .into_iter()
-                .map(|entry| (entry.event_type, entry.count))
-                .collect::<HashMap<_, _>>()
-        };
+        let other_map = count_event_kinds(&other_events)
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value))
+            .collect::<HashMap<_, _>>();
         print_event_counts("baseline", &recorded_map, None);
         print_event_counts("candidate", &other_map, Some(&recorded_map));
 

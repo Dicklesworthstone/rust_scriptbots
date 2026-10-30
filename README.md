@@ -1282,6 +1282,13 @@ cargo run -p scriptbots-app --bin control_cli -- watch --interval-ms 500
 - **Replay status**: `--replay-db` and `--compare-db` load, re-simulate, and diff encoded event streams. Production instrumentation projects per-agent actions in canonical `AgentUid` order through `replay_event_tick_cap` (default `512`), budgeted per tick (`bd-a9h1`, fixed). Typed combat and food-share edges preserve source tick, core ordinal, stable actor/target UIDs, positions, and magnitude in the indexed FrankenSQLite `interactions` table. `interaction_event_tick_stride=1` (the default) selects every tick, `N > 1` selects ticks divisible by `N`, and `0` selects aggregates-only; `interaction_event_tick_cap` (default `512`, `0` also aggregates-only) is the hard ceiling on each selected tick. Both knobs are serialized with run provenance. Durable `interaction_events_observed`, `interaction_events_persisted`, `interaction_events_sampled_out`, and `interaction_events_truncated` counters make completeness auditable, while shutdown logs the corresponding run totals at info. The default 5k-agent shape retains at most 512 edges per selected tick and is covered by the bounded-admission/flush gate; raise the cap only after checking the run's payload budget. The mock-free terminal→FrankenSQLite→export→replay E2E is `crates/scriptbots-app/tests/replay_e2e.rs`, and nonzero empty-vs-empty runs fail closed instead of claiming verification.
 - **Storage helpers**: FrankenSQLite-backed accessors (`max_tick`, `load_replay_events`, `replay_event_counts`) underpin the CLI so analytics pipelines or external tools can reuse the same deterministic data.
 
+`--replay-db FILE --tick-limit N` verifies through completed world tick `N`,
+inclusive. Recorded events, comparison events and displayed counts use that same
+window; checkpoint-start replay begins after its validated checkpoint. Without
+an explicit cutoff, full-run comparison still checks the entire candidate,
+including extra trailing ticks. A nonzero prefix needs recorded canonical
+digest evidence within its window.
+
 ### MCP HTTP server (Model Context Protocol)
 - Default: `127.0.0.1:8090` over HTTP; disable with `SCRIPTBOTS_CONTROL_MCP=disabled`.
 - Override bind address: `SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR=127.0.0.1:9090`.

@@ -987,7 +987,7 @@ fn bounded_replay_scopes_real_streams_without_hiding_in_window_divergence() {
         .num_threads(1)
         .build()
         .unwrap();
-    let produce = |name: &str, injection: Option<u64>, digests: bool| {
+    let produce = |name: &str, injection: Option<u64>, digests: bool, ticks: u64| {
         let database = directory.join(format!("{name}.sqlite"));
         pool.install(|| {
             let mut pipeline = StoragePipeline::create_unattributed_file_with_thresholds(
@@ -1004,7 +1004,7 @@ fn bounded_replay_scopes_real_streams_without_hiding_in_window_divergence() {
                 .unwrap()
                 .population;
             seed_founders(&mut world, &brains, FounderRecipe::Spread).unwrap();
-            for _ in 0..HORIZON {
+            for _ in 0..ticks {
                 if injection == Some(world.tick().0) {
                     let id = world.try_spawn_agent(AgentData::default()).unwrap();
                     assert!(world.bind_agent_brain(id, brains[0]).unwrap());
@@ -1026,10 +1026,11 @@ fn bounded_replay_scopes_real_streams_without_hiding_in_window_divergence() {
         });
         database
     };
-    let baseline = produce("baseline", None, true);
-    let late = produce("late-injection", Some(PREFIX + 2), true);
-    let early = produce("early-injection", Some(2), true);
-    let no_digest = produce("no-digest", None, false);
+    let baseline = produce("baseline", None, true, HORIZON);
+    let late = produce("late-injection", Some(PREFIX + 2), true, HORIZON);
+    let early = produce("early-injection", Some(2), true, HORIZON);
+    let no_digest = produce("no-digest", None, false, HORIZON);
+    let longer = produce("longer", None, true, HORIZON + 1);
     let reader = StorageReader::open(baseline.to_str().unwrap()).unwrap();
     let baseline_events = reader.load_replay_events().unwrap();
     reader.close().unwrap();
@@ -1047,7 +1048,8 @@ fn bounded_replay_scopes_real_streams_without_hiding_in_window_divergence() {
     };
     assert_eq!(u64::try_from(digest_count(PREFIX)).unwrap(), PREFIX);
     assert_eq!(u64::try_from(digest_count(HORIZON)).unwrap(), HORIZON);
-    let preimages = [&baseline, &late, &early, &no_digest].map(|path| fs::read(path).unwrap());
+    let preimages =
+        [&baseline, &late, &early, &no_digest, &longer].map(|path| fs::read(path).unwrap());
     let cases = [
         ("full-baseline", &baseline, None, None, true),
         ("prefix-baseline", &baseline, None, Some(PREFIX), true),
@@ -1055,6 +1057,14 @@ fn bounded_replay_scopes_real_streams_without_hiding_in_window_divergence() {
         ("prefix-early", &baseline, Some(&early), Some(PREFIX), false),
         ("full-early", &baseline, Some(&early), None, false),
         ("full-late", &baseline, Some(&late), None, false),
+        ("full-longer", &baseline, Some(&longer), None, false),
+        (
+            "prefix-longer",
+            &baseline,
+            Some(&longer),
+            Some(PREFIX),
+            true,
+        ),
         ("missing-digest", &no_digest, None, Some(PREFIX), false),
     ];
     let mut observations = Vec::new();
@@ -1080,7 +1090,7 @@ fn bounded_replay_scopes_real_streams_without_hiding_in_window_divergence() {
                 "wrong refusal: {text}"
             );
         }
-        if matches!(name, "full-early" | "full-late") {
+        if matches!(name, "full-early" | "full-late" | "full-longer") {
             assert!(
                 text.contains("divergence") && text.contains("candidate"),
                 "missing genuine divergence: {text}"
@@ -1113,7 +1123,7 @@ fn bounded_replay_scopes_real_streams_without_hiding_in_window_divergence() {
         );
         observations.push((name, output.status.success(), expected, text));
     }
-    for (path, before) in [&baseline, &late, &early, &no_digest]
+    for (path, before) in [&baseline, &late, &early, &no_digest, &longer]
         .into_iter()
         .zip(preimages)
     {
