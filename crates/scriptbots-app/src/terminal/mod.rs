@@ -115,6 +115,8 @@ const UI_TICK_MILLIS: u64 = 100;
 const DEFAULT_HEADLESS_FRAMES: usize = 12;
 const MAX_HEADLESS_FRAMES: usize = 360;
 const EVENT_LOG_CAPACITY: usize = 16;
+/// Observed visual publications, not a complete checkpoint/replay archive.
+const MAX_CANVAS_HISTORY_FRAMES: usize = 128;
 /// Exact envelopes retained while transport cannot establish admission.
 const UNRESOLVED_COMMAND_CAPACITY: usize = 32;
 /// Selection outcomes awaiting an owner publication or a local focus override.
@@ -1679,6 +1681,9 @@ struct TerminalApp<'a> {
     scheduled_patch_watermark: u64,
     last_event_tick: u64,
     snapshot: Snapshot,
+    canvas_history: VecDeque<Arc<RenderSnapshot>>,
+    /// A separate visual projection: live controls/read models never read this.
+    canvas_review: Option<CanvasReviewFrame>,
     baseline: Option<Baseline>,
     last_autopause_tick: Option<u64>,
     map_scratch: Vec<CellOccupancy>,
@@ -1897,6 +1902,8 @@ impl<'a> TerminalApp<'a> {
             scheduled_patch_watermark: 0,
             last_event_tick: 0,
             snapshot: Snapshot::default(),
+            canvas_history: VecDeque::with_capacity(MAX_CANVAS_HISTORY_FRAMES),
+            canvas_review: None,
             baseline: None,
             last_autopause_tick: None,
             map_scratch: Vec::new(),
@@ -3012,12 +3019,11 @@ impl<'a> TerminalApp<'a> {
         }
 
         // Draw the map (or tiled archipelago view) while avoiding holding an external borrow across &mut self
-        let world_size = self.snapshot.world_size;
         if self.archipelago_view {
             let published = self.analytics_provider.snapshot();
             self.draw_archipelago(frame, layout.map, &published);
         } else {
-            self.draw_map(frame, layout.map, world_size);
+            self.draw_map(frame, layout.map);
         }
         if let Some(probe) = layout.probe {
             self.draw_probe(frame, probe, &self.snapshot);
@@ -3511,13 +3517,12 @@ impl<'a> TerminalApp<'a> {
 
     /// The narrative rail (bd-16g.2.4): a read-only projection of `RunNarrative`.
     /// One glyph per retained event, coloured by the shared core rail model, with
-    /// the selected event's full text beneath. STAGE 1 of the seek contract: the
-    /// rail SELECTS — it never moves the simulation clock, and nothing here
-    /// invites the user to believe otherwise.
+    /// the selected event's full text beneath. Cached canvas review is separate
+    /// from selection and never moves the simulation clock.
     fn draw_rail(&self, frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot) {
         let block = Block::default()
             .borders(Borders::ALL)
-            .title("Timeline — run history (select-only; rewind not yet available)");
+            .title("Timeline — ←/→ select | v review cached canvas | g live");
         let inner = block.inner(area);
         frame.render_widget(block, area);
         if inner.height < 2 || inner.width < 8 {
@@ -3628,6 +3633,50 @@ impl<'a> TerminalApp<'a> {
                 ..inner
             },
         );
+    }
+
+    fn record_canvas_frame(&mut self, frame: Arc<RenderSnapshot>) {
+        if let Some(last) = self.canvas_history.back_mut()
+            && last.world.tick == frame.world.tick
+        {
+            *last = frame;
+            return;
+        }
+        if self.canvas_history.len() == MAX_CANVAS_HISTORY_FRAMES {
+            self.canvas_history.pop_front();
+        }
+        self.canvas_history.push_back(frame);
+    }
+
+    fn review_selected_canvas(&mut self) {
+        let index = self.rail_selection.map_or(
+            self.snapshot.narrative.len().saturating_sub(1),
+            |(index, _, _)| index,
+        );
+        let Some(event) = self.snapshot.narrative.get(index) else {
+            self.push_toast("No selected narrative event to review");
+            return;
+        };
+        let tick = event.tick.0;
+        let Some(frame) = self
+            .canvas_history
+            .iter()
+            .find(|frame| frame.world.tick == tick)
+        else {
+            self.push_toast(format!("No cached canvas at tick {tick}; view unchanged"));
+            return;
+        };
+        self.canvas_review = Some(CanvasReviewFrame {
+            snapshot: Snapshot::from_render(frame),
+            terrain: TerrainView::from_snapshot(frame),
+            day_night: frame.config.render.resolved_day_night(),
+        });
+        self.archipelago_view = false;
+        self.hover_tooltip = None;
+        self.navigate_route(frankentui_shell::ShellRoute::WorldCanvas);
+        self.push_toast(format!(
+            "Reviewing cached canvas tick {tick}; owner playback unchanged"
+        ));
     }
 
     /// Select a rail event by index, clamping at both ends.
@@ -4212,8 +4261,21 @@ impl<'a> TerminalApp<'a> {
         frame.render_widget(trend_text, trend_layout[4]);
     }
 
-    fn draw_map(&mut self, frame: &mut Frame<'_>, area: Rect, world_size: (u32, u32)) {
-        let title = format!("World Map {}×{}", world_size.0, world_size.1);
+    fn draw_map(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        let title = if let Some(review) = &self.canvas_review {
+            format!(
+                "World Map {}×{} | REVIEW tick {} (live {}) | g live",
+                review.snapshot.world_size.0,
+                review.snapshot.world_size.1,
+                review.snapshot.tick,
+                self.snapshot.tick
+            )
+        } else {
+            format!(
+                "World Map {}×{}",
+                self.snapshot.world_size.0, self.snapshot.world_size.1
+            )
+        };
         let block = Block::default()
             .title(self.palette.title(title))
             .borders(Borders::ALL);
@@ -4224,7 +4286,9 @@ impl<'a> TerminalApp<'a> {
         // Follow the selection: a zoomed canvas that stayed centred on the world
         // while the user selected an agent elsewhere would show them a region
         // with nothing in it and no way to tell why.
-        if let Some(position) = self.focused_agent_position() {
+        if self.canvas_review.is_none()
+            && let Some(position) = self.focused_agent_position()
+        {
             self.map_pan_offset = position;
         }
 
@@ -4249,7 +4313,15 @@ impl<'a> TerminalApp<'a> {
                     self.canvas_capability.mode,
                 ));
             }
-            let tick_phase = self.tick_phase();
+            let tick_phase = self.canvas_review.as_ref().map_or_else(
+                || self.tick_phase(),
+                |review| TickPhase::compute(review.snapshot.tick, true, 0, self.motion),
+            );
+            let (snapshot, terrain, day_night) = if let Some(review) = &self.canvas_review {
+                (&review.snapshot, &review.terrain, review.day_night)
+            } else {
+                (&self.snapshot, &self.terrain, self.day_night)
+            };
             let canvas = if use_canvas {
                 self.map_canvas.as_mut()
             } else {
@@ -4257,13 +4329,13 @@ impl<'a> TerminalApp<'a> {
             };
             frame.render_widget(
                 MapWidget {
-                    snapshot: &self.snapshot,
-                    terrain: &self.terrain,
+                    snapshot,
+                    terrain,
                     palette: &self.palette,
                     scratch: &mut self.map_scratch,
                     stamp: self.map_stamp,
                     canvas,
-                    day_night: self.day_night,
+                    day_night,
                     capability: self.canvas_capability,
                     motion: self.motion,
                     tick_phase,
@@ -5564,7 +5636,7 @@ impl<'a> TerminalApp<'a> {
             Line::raw(" a        Toggle tiled archipelago view"),
             Line::raw(" [ / ]    Cycle brain layers (console view)"),
             Line::raw(" ↑ / ↓    Page brain heatmap rows (console view)"),
-            Line::raw(" ← / →    Change focused agent (console view)"),
+            Line::raw(" ← / →    Select rail event / change agent when rail is hidden"),
             Line::raw(" m/t/o    Focus mode: Manual / TopPredator / Oldest"),
             Line::raw(" i        Toggle sense probe (egocentric view of the focused agent)"),
             Line::raw(" , / .    Sense probe: cycle one eye cone / all cones"),
@@ -5572,6 +5644,7 @@ impl<'a> TerminalApp<'a> {
             Line::raw(" f        Cycle event filter"),
             Line::raw(" Enter    Focus the selected event's agent"),
             Line::raw(" r        Toggle the timeline rail"),
+            Line::raw(" v / g    Review selected event's cached canvas / return canvas live"),
             Line::raw(" B        Toggle sub-cell map rendering"),
             Line::raw(" Ctrl+T   Cycle colour theme"),
             Line::raw(""),
@@ -5858,7 +5931,7 @@ impl<'a> TerminalApp<'a> {
                 }
                 pointer::HeaderHitTarget::HelpToggle => self.help_visible = !self.help_visible,
             },
-            pointer::HitRegion::Map { .. } => {
+            pointer::HitRegion::Map { .. } | pointer::HitRegion::Rail(_) => {
                 self.handle_mouse_click(click.col, click.row);
             }
             pointer::HitRegion::SidebarPanel(panel) => {
@@ -5996,6 +6069,10 @@ impl<'a> TerminalApp<'a> {
     /// The world point under a terminal cell, or `None` when the cell is outside
     /// the map pane.
     fn world_at_cell(&self, col: u16, row: u16) -> Option<(f32, f32)> {
+        // Historical coordinates must never select or hover a current agent.
+        if self.canvas_review.is_some() {
+            return None;
+        }
         let area = self.map_area?;
         if area.width == 0
             || area.height == 0
@@ -6967,13 +7044,24 @@ impl<'a> TerminalApp<'a> {
                     self.refresh_snapshot();
                 }
             }
+            (KeyCode::Char('v'), KeyModifiers::NONE) => {
+                self.review_selected_canvas();
+            }
+            (KeyCode::Char('g'), KeyModifiers::NONE) => {
+                self.canvas_review = None;
+                // Coordinates still describe the historical screen until paint.
+                self.map_area = None;
+                self.hover_tooltip = None;
+                self.pointer_gesture.cancel("canvas returned live");
+                self.push_toast("Canvas returned live; simulation playback unchanged");
+            }
             (KeyCode::Char('r') | KeyCode::Char('R'), _) => {
                 self.rail_visible = !self.rail_visible;
                 self.push_event(
                     self.snapshot.tick,
                     EventKind::Info,
                     if self.rail_visible {
-                        "Timeline rail shown (select-only; rewind needs replay)"
+                        "Timeline rail shown (v reviews cached canvas; g returns live)"
                     } else {
                         "Timeline rail hidden"
                     },
@@ -7125,6 +7213,7 @@ impl<'a> TerminalApp<'a> {
         }
 
         let world = Arc::clone(&self.retained_render);
+        self.record_canvas_frame(Arc::clone(&world));
         self.reconcile_selection_focus(&world);
         self.paused = world.playback.paused;
         self.speed_multiplier = world.playback.speed_multiplier;
@@ -7764,6 +7853,14 @@ struct Snapshot {
     focused_outputs: Option<[f32; scriptbots_core::OUTPUT_SIZE]>,
     /// The focused agent's raw bounded activation snapshot (for attribution).
     focused_activations: Option<BrainActivations>,
+}
+
+/// One independently projected visual frame can remain pinned after ring eviction.
+/// Current controls, receipts and narrative always use `TerminalApp::snapshot`.
+struct CanvasReviewFrame {
+    snapshot: Snapshot,
+    terrain: TerrainView,
+    day_night: (u32, f32),
 }
 
 /// One agent's senses, explained (bd-16g.4.2).
@@ -23515,9 +23612,9 @@ for case in ('panic', 'subscription', 'renderer'):
             text.contains("5 earlier events dropped"),
             "detail pane must explain the truncation; buffer:\n{text}"
         );
-        // THE SEEK CONTRACT: the rail says what it is — select-only history.
+        // The review promise names its bounded source rather than full replay.
         assert!(
-            text.contains("select-only"),
+            text.contains("v review cached canvas"),
             "rail title must not overstate the seek contract; buffer:\n{text}"
         );
     }
@@ -23765,6 +23862,233 @@ for case in ('panic', 'subscription', 'renderer'):
             app.snapshot.narrative_dropped, world_dropped,
             "the TUI rail must report the world's exact dropped count"
         );
+    }
+
+    #[test]
+    fn narrative_canvas_review_uses_real_frames_and_keeps_owner_and_status_live() {
+        let world = narrative_e2e_world(1);
+        rail_test_app!(world, app, _backend);
+        app.manual_focus_cleared = true;
+        app.refresh_snapshot();
+        let initial_events = app.snapshot.narrative.len();
+        let step = |app: &mut TerminalApp<'_>| {
+            apply_terminal_owner_command_without_refresh(
+                app,
+                ControlCommand::UpdateSimulation(SimulationCommand {
+                    paused: None,
+                    speed_multiplier: None,
+                    step_once: true,
+                }),
+            );
+            app.refresh_snapshot();
+        };
+        let spawn = |app: &mut TerminalApp<'_>| {
+            for _ in 0..20 {
+                apply_terminal_owner_command_without_refresh(
+                    app,
+                    ControlCommand::SpawnAgent {
+                        herbivore_tendency: 1.0,
+                    },
+                );
+            }
+            app.refresh_snapshot();
+        };
+        let paint = |app: &mut TerminalApp<'_>| {
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+            terminal
+                .draw(|frame| app.draw_map(frame, frame.area()))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let area = buffer.area;
+            let mut cells = Vec::new();
+            // Compare the actual canvas, excluding the deliberately different
+            // live/review title; a label-only change cannot satisfy this oracle.
+            for y in area.y + 1..area.bottom() - 1 {
+                for x in area.x + 1..area.right() - 1 {
+                    cells.push(buffer[(x, y)].clone());
+                }
+            }
+            cells
+        };
+        spawn(&mut app);
+        let mut captures = vec![(app.snapshot.tick, app.snapshot.agent_count, paint(&mut app))];
+        for _ in 0..160 {
+            step(&mut app);
+            captures.push((app.snapshot.tick, app.snapshot.agent_count, paint(&mut app)));
+            if app.snapshot.narrative.len() > initial_events {
+                break;
+            }
+        }
+        assert!(app.snapshot.narrative.len() > initial_events);
+        let event = app.snapshot.narrative.last().unwrap().clone();
+        // Detection may report a change before its notification tick. Use the
+        // actual canvas observed at the event tick, never relabel a later image.
+        let (_, source_agents, captured) = captures
+            .into_iter()
+            .rev()
+            .find(|(tick, _, _)| *tick == event.tick.0)
+            .expect("the event tick must have an actually observed canvas");
+        step(&mut app);
+        spawn(&mut app);
+        let live = paint(&mut app);
+        assert_ne!(
+            live, captured,
+            "the real intervention must change canvas cells"
+        );
+        assert_ne!(app.snapshot.agent_count, source_agents);
+        assert_eq!(
+            app.canvas_history.back().unwrap().world.agents.len(),
+            app.snapshot.agent_count
+        );
+        let source_index = app
+            .snapshot
+            .narrative
+            .iter()
+            .position(|row| row.tick == event.tick && row.kind == event.kind)
+            .unwrap();
+        assert!(source_index > 0, "the mouse must change the selected event");
+        app.select_rail_event_by_index(0);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(140, 48)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let rail = app.hit_regions.rail_rect.unwrap();
+        let marker_width = if app.snapshot.narrative_dropped > 0 {
+            9
+        } else {
+            0
+        };
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            app.handle_mouse(MouseEvent {
+                kind,
+                column: rail.x + 1 + marker_width + source_index as u16,
+                row: rail.y + 1,
+                modifiers: KeyModifiers::NONE,
+            })
+            .unwrap();
+        }
+        assert_eq!(app.rail_selection.unwrap().0, source_index);
+        let live_tick = app.snapshot.tick;
+        let before = app.host.world_digests().unwrap();
+        let owner = app.host.snapshot_hub().latest();
+        let playback = (owner.playback.paused, owner.playback.speed_multiplier);
+        let sequence = app.command_sequence;
+        let press = |app: &mut TerminalApp<'_>, key| {
+            app.handle_ftui_event(ftui::core::event::Event::Key(
+                ftui::core::event::KeyEvent::new(ftui::core::event::KeyCode::Char(key)),
+            ))
+            .unwrap();
+        };
+        press(&mut app, 'v');
+        assert_eq!(
+            app.frankentui.route,
+            frankentui_shell::ShellRoute::WorldCanvas
+        );
+        assert_eq!(
+            app.canvas_review.as_ref().unwrap().snapshot.tick,
+            event.tick.0
+        );
+        assert_eq!(app.snapshot.tick, live_tick);
+        assert_eq!(paint(&mut app), captured);
+        let area = app.map_area.unwrap();
+        app.handle_mouse_click(area.x + 1, area.y + 1);
+        assert!(app.world_at_cell(area.x + 1, area.y + 1).is_none());
+        assert_eq!(app.command_sequence, sequence);
+        assert_eq!(app.host.world_digests().unwrap(), before);
+        let owner = app.host.snapshot_hub().latest();
+        assert_eq!(
+            (owner.playback.paused, owner.playback.speed_multiplier),
+            playback
+        );
+
+        // A new live control and its real application receipt must remain
+        // visible while the canvas continues to show the earlier frame.
+        let command = app
+            .submit_with_visible_receipt(ControlCommand::SetSpeed(2.0))
+            .unwrap();
+        assert_eq!(
+            wait_for_terminal_receipt(&mut app, &command).status,
+            frankentui_shell::ReceiptStatusKind::Applied
+        );
+        app.refresh_snapshot();
+        assert_eq!(app.speed_multiplier, 2.0);
+        assert_eq!(app.snapshot.tick, live_tick);
+        assert_eq!(paint(&mut app), captured);
+        let sequence = app.command_sequence;
+        let before = app.host.world_digests().unwrap();
+
+        // A real old event predating this client's history must not replace the
+        // pinned frame with a neighbour or clear the review.
+        app.select_rail_event_by_index(0);
+        assert!(
+            !app.canvas_history
+                .iter()
+                .any(|frame| frame.world.tick == app.snapshot.narrative[0].tick.0)
+        );
+        press(&mut app, 'v');
+        assert_eq!(
+            app.canvas_review.as_ref().unwrap().snapshot.tick,
+            event.tick.0
+        );
+        press(&mut app, 'g');
+        assert!(app.canvas_review.is_none());
+        assert!(app.world_at_cell(area.x + 1, area.y + 1).is_none());
+        assert_eq!(paint(&mut app), live);
+        assert!(app.world_at_cell(area.x + 1, area.y + 1).is_some());
+        assert_eq!(app.command_sequence, sequence);
+        assert_eq!(app.host.world_digests().unwrap(), before);
+
+        let owner = app.host.snapshot_hub().latest();
+        assert_eq!(
+            (owner.playback.paused, owner.playback.speed_multiplier),
+            (true, 2.0)
+        );
+
+        for _ in 0..MAX_CANVAS_HISTORY_FRAMES {
+            step(&mut app);
+        }
+        assert_eq!(app.canvas_history.len(), MAX_CANVAS_HISTORY_FRAMES);
+        app.refresh_snapshot();
+        assert_eq!(app.canvas_history.len(), MAX_CANVAS_HISTORY_FRAMES);
+        assert!(
+            !app.canvas_history
+                .iter()
+                .any(|frame| frame.world.tick == event.tick.0)
+        );
+        assert_eq!(app.snapshot.narrative[source_index].tick, event.tick);
+        app.select_rail_event_by_index(source_index);
+        let before = app.host.world_digests().unwrap();
+        press(&mut app, 'v');
+        assert!(app.canvas_review.is_none());
+        assert_eq!(app.host.world_digests().unwrap(), before);
+    }
+
+    #[test]
+    fn narrative_canvas_review_without_events_and_modified_shortcuts_is_read_only() {
+        let world = command_characterization_world();
+        rail_test_app!(world, app, _backend);
+        let before = app.host.world_digests().unwrap();
+        let sequence = app.command_sequence;
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.canvas_review.is_none());
+        assert_eq!(
+            app.toasts.back().unwrap().message,
+            "No selected narrative event to review"
+        );
+        assert!(app.snapshot.narrative.is_empty());
+        let toast_count = app.toasts.len();
+        for key in ['v', 'g'] {
+            for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+                app.handle_key(KeyEvent::new(KeyCode::Char(key), modifiers))
+                    .unwrap();
+            }
+        }
+        assert_eq!(app.toasts.len(), toast_count);
+        assert!(app.canvas_review.is_none());
+        assert_eq!(app.command_sequence, sequence);
+        assert_eq!(app.host.world_digests().unwrap(), before);
     }
 
     /// Fixture brain for the attribution panel (bd-16g.4.3): reports one
