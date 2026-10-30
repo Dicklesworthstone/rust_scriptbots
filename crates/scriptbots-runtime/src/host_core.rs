@@ -6741,7 +6741,7 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_cut_observes_revision_domains_and_declared_schedule_inputs() {
+    fn checkpoint_cut_observes_scientific_and_config_revision_domains() {
         let mut core = HostCore::new(HostSessionId::new(0xc071), world(0), options(true)).unwrap();
         let initial = core.capture_checkpoint_cut().unwrap();
         assert_eq!(initial.scheduled_input_count, 0);
@@ -6808,6 +6808,10 @@ mod tests {
         assert_eq!(digest.scientific_revision, stepped.scientific_revision);
         assert_eq!(digest.config_revision, stepped.config_revision);
         assert_eq!(digest.scheduled_input_count, stepped.scheduled_input_count);
+    }
+
+    #[test]
+    fn checkpoint_cuts_count_declared_pending_and_completed_schedule_inputs() {
         let mut scheduled_owner =
             HostCore::new(HostSessionId::new(0xc074), world(0), options(true)).unwrap();
         scheduled_owner
@@ -6865,7 +6869,10 @@ mod tests {
                 .scheduled_input_count,
             0
         );
+    }
 
+    #[test]
+    fn scientific_digest_cut_does_not_flush_deferred_persistence_output() {
         let mut deferred =
             HostCore::new(HostSessionId::new(0xc072), world(3), options(true)).unwrap();
         settle_continuation_command(
