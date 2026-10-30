@@ -944,6 +944,201 @@ persistence_interval = 32
     }
 }
 
+/// An explicit replay horizon scopes both streams, counts and comparison evidence.
+/// Genuine differences inside that window, full-run tail changes and empty digest
+/// evidence must continue to fail.
+#[test]
+fn bounded_replay_scopes_real_streams_without_hiding_in_window_divergence() {
+    use scriptbots_app::{BrainPreset, FounderRecipe, install_brains, seed_founders};
+    use scriptbots_core::{AgentData, ScriptBotsConfig, WorldState};
+    use scriptbots_storage::StoragePipeline;
+
+    const HORIZON: u64 = 12;
+    const PREFIX: u64 = 5;
+    let root = env::var_os("SCRIPTBOTS_TEST_ARTIFACT_ROOT")
+        .map_or_else(env::temp_dir, std::path::PathBuf::from);
+    fs::create_dir_all(&root).expect("external replay-window root");
+    let directory = tempfile::Builder::new()
+        .prefix("bounded-replay-")
+        .tempdir_in(root)
+        .expect("unique retained replay-window proof")
+        .keep();
+    eprintln!(
+        "bounded replay evidence retained at {}",
+        directory.display()
+    );
+    let config = ScriptBotsConfig {
+        rng_seed: Some(SEED),
+        world_width: 120,
+        world_height: 120,
+        food_cell_size: 20,
+        closed: true,
+        persistence_interval: 1,
+        replay_event_tick_cap: 65_536,
+        ..ScriptBotsConfig::default()
+    };
+    let config_path = directory.join("source.ron");
+    fs::write(
+        &config_path,
+        ron::ser::to_string(&serde_json::to_value(&config).unwrap()).unwrap(),
+    )
+    .unwrap();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .unwrap();
+    let produce = |name: &str, injection: Option<u64>, digests: bool| {
+        let database = directory.join(format!("{name}.sqlite"));
+        pool.install(|| {
+            let mut pipeline = StoragePipeline::create_unattributed_file_with_thresholds(
+                database.to_str().unwrap(),
+                1,
+                1,
+                1,
+                1,
+            )
+            .expect("real file-backed world sink");
+            let (mut world, mut persistence) =
+                WorldState::with_persistence(config.clone(), Box::new(pipeline.sink())).unwrap();
+            let brains = install_brains(&mut world, BrainPreset::Mlp)
+                .unwrap()
+                .population;
+            seed_founders(&mut world, &brains, FounderRecipe::Spread).unwrap();
+            for _ in 0..HORIZON {
+                if injection == Some(world.tick().0) {
+                    let id = world.try_spawn_agent(AgentData::default()).unwrap();
+                    assert!(world.bind_agent_brain(id, brains[0]).unwrap());
+                }
+                if digests {
+                    world.request_replay_world_digest();
+                }
+                persistence
+                    .step(&mut world)
+                    .expect("real recorded science step");
+            }
+            persistence.finalize(&mut world).unwrap();
+            drop(persistence);
+            drop(world);
+            let receipt = pipeline.shutdown().expect("durable world close");
+            assert!(receipt.watermarks.durable.is_some());
+            assert_eq!(receipt.watermarks.admitted, receipt.watermarks.applied);
+            assert_eq!(receipt.watermarks.applied, receipt.watermarks.durable);
+        });
+        database
+    };
+    let baseline = produce("baseline", None, true);
+    let late = produce("late-injection", Some(PREFIX + 2), true);
+    let early = produce("early-injection", Some(2), true);
+    let no_digest = produce("no-digest", None, false);
+    let reader = StorageReader::open(baseline.to_str().unwrap()).unwrap();
+    let baseline_events = reader.load_replay_events().unwrap();
+    reader.close().unwrap();
+    let digest_count = |limit| {
+        baseline_events
+            .iter()
+            .filter(|event| {
+                event.tick <= limit
+                    && matches!(
+                        event.event.kind,
+                        scriptbots_core::ReplayEventKind::WorldDigest { .. }
+                    )
+            })
+            .count()
+    };
+    assert_eq!(u64::try_from(digest_count(PREFIX)).unwrap(), PREFIX);
+    assert_eq!(u64::try_from(digest_count(HORIZON)).unwrap(), HORIZON);
+    let preimages = [&baseline, &late, &early, &no_digest].map(|path| fs::read(path).unwrap());
+    let cases = [
+        ("full-baseline", &baseline, None, None, true),
+        ("prefix-baseline", &baseline, None, Some(PREFIX), true),
+        ("prefix-late", &baseline, Some(&late), Some(PREFIX), true),
+        ("prefix-early", &baseline, Some(&early), Some(PREFIX), false),
+        ("full-early", &baseline, Some(&early), None, false),
+        ("full-late", &baseline, Some(&late), None, false),
+        ("missing-digest", &no_digest, None, Some(PREFIX), false),
+    ];
+    let mut observations = Vec::new();
+    for (name, source, compare, limit, expected) in cases {
+        let mut command = base_command(env!("CARGO_BIN_EXE_scriptbots-app"));
+        command
+            .arg("--replay-db")
+            .arg(source)
+            .arg("--config")
+            .arg(&config_path)
+            .args(["--brain", "mlp", "--threads", "1"]);
+        if let Some(path) = compare {
+            command.arg("--compare-db").arg(path);
+        }
+        if let Some(tick) = limit {
+            command.arg("--tick-limit").arg(tick.to_string());
+        }
+        let output = retained_host_output(&directory, name, &mut command);
+        let text = strip_ansi(&format!("{}{}", stdout_text(&output), stderr_text(&output)));
+        if name == "missing-digest" {
+            assert!(
+                text.contains("vacuous nonzero run"),
+                "wrong refusal: {text}"
+            );
+        }
+        if matches!(name, "full-early" | "full-late") {
+            assert!(
+                text.contains("divergence") && text.contains("candidate"),
+                "missing genuine divergence: {text}"
+            );
+        }
+        if output.status.success() {
+            assert!(text.contains("Replay matched"));
+            let expected_digests = digest_count(limit.unwrap_or(HORIZON));
+            // These are the displayed recorded/simulated/baseline/candidate counts,
+            // not only the final success sentence. A stale full-run count must fail.
+            let count_rows = text
+                .lines()
+                .filter(|line| line.trim_start().starts_with("world_digest "))
+                .collect::<Vec<_>>();
+            assert_eq!(count_rows.len(), if compare.is_some() { 4 } else { 2 });
+            for line in count_rows {
+                assert_eq!(
+                    line.split_whitespace()
+                        .nth(1)
+                        .unwrap()
+                        .parse::<usize>()
+                        .unwrap(),
+                    expected_digests
+                );
+            }
+        }
+        eprintln!(
+            "bounded replay case {name}: actual={} expected={expected}",
+            output.status.success()
+        );
+        observations.push((name, output.status.success(), expected, text));
+    }
+    for (path, before) in [&baseline, &late, &early, &no_digest]
+        .into_iter()
+        .zip(preimages)
+    {
+        assert_eq!(
+            fs::read(path).unwrap(),
+            before,
+            "replay must leave its source file unchanged"
+        );
+    }
+    for (name, actual, expected, text) in observations {
+        assert_eq!(
+            actual, expected,
+            "bounded replay disposition for {name}; see retained streams"
+        );
+        if name == "prefix-early" {
+            assert!(
+                text.contains("Replay matched")
+                    && text.contains("candidate")
+                    && text.contains("divergence"),
+                "the in-window control must reach the actual candidate comparison: {text}"
+            );
+        }
+    }
+}
+
 fn strip_ansi(input: &str) -> String {
     let mut cleaned = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
