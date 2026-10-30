@@ -230,7 +230,14 @@ RUST_LOG=info cargo run -p scriptbots-app
   `world_digest_v1`. These values describe the saved cut even after the world
   advances or an identical capture request is retried. Viewing the catalog
   neither executes replay nor verifies determinism; no-comparison status remains
-  explicit. Native-window/PTY and full DSR acceptance remain open.
+  explicit. Press Enter to inspect the selected saved cut on the World canvas;
+  the retained artifact's checksums, reconstructed scientific digest, saved tick
+  and population must agree before it is shown. Loading runs in the background;
+  `x`, navigation or selection changes discard a pending result, and `g` returns
+  to the live canvas. Live controls and status continue to address the live owner.
+  This exact-cut review supports current application brain registries; custom
+  registries and arbitrary event-tick replay remain outside it. Native-window/PTY
+  and full DSR acceptance remain open.
 - Auto selection: `SCRIPTBOTS_MODE=auto` (default) chooses only a renderer compiled into the binary—GPUI first, then Bevy—and only in a real native graphical session; otherwise it uses the terminal. Linux/Unix sessions require a display environment; local macOS sessions use the native window system without X11 variables, while SSH sessions choose the terminal.
 - Auto-mode policy overrides:
   - `SCRIPTBOTS_FORCE_TERMINAL=1` → choose terminal in Auto mode even when a display server is present.

@@ -881,7 +881,12 @@ pub fn render_replay_screen(
             );
             print_text(frame, 2, y_start + 2, &live_observation);
 
-            print_text(frame, 2, y_start + 4, "  CHECKPOINT PERSISTENCE CATALOG:");
+            print_text(
+                frame,
+                2,
+                y_start + 4,
+                "  CHECKPOINT CATALOG: Enter reviews saved canvas; g returns live",
+            );
             print_text(
                 frame,
                 4,

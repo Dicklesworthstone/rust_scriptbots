@@ -359,6 +359,11 @@ enum LiveTerminalMessage {
         request_id: String,
         result: std::result::Result<crate::control::CheckpointMetadataDto, String>,
     },
+    CheckpointCanvas {
+        request: u64,
+        checkpoint_id: String,
+        result: std::result::Result<Arc<RenderSnapshot>, String>,
+    },
 }
 
 impl From<ftui::core::event::Event> for LiveTerminalMessage {
@@ -380,6 +385,9 @@ struct LiveTerminalModel<'a> {
     service_in_flight: Option<(frankentui_shell::ShellRoute, u64)>,
     cancelled_service_route: Option<frankentui_shell::ShellRoute>,
     checkpoint_in_flight: bool,
+    checkpoint_review_in_flight: Option<(u64, String)>,
+    checkpoint_review_generation: u64,
+    checkpoint_review_cancelled: bool,
     pending_checkpoints: RefCell<VecDeque<String>>,
     presented_checkpoint: RefCell<Option<String>>,
     active_request: RefCell<Option<PendingTerminalRequest>>,
@@ -460,6 +468,9 @@ impl<'a> LiveTerminalModel<'a> {
             service_in_flight: None,
             cancelled_service_route: None,
             checkpoint_in_flight: false,
+            checkpoint_review_in_flight: None,
+            checkpoint_review_generation: 0,
+            checkpoint_review_cancelled: false,
             pending_checkpoints: RefCell::new(VecDeque::new()),
             presented_checkpoint: RefCell::new(None),
             active_request: RefCell::new(None),
@@ -620,6 +631,19 @@ impl Model for LiveTerminalModel<'_> {
             let mut app = self.app.borrow_mut();
             match message {
                 LiveTerminalMessage::Event(event) => {
+                    if self.checkpoint_review_in_flight.is_some()
+                        && matches!(&event, ftui::core::event::Event::Key(key)
+                            if key.kind == ftui::core::event::KeyEventKind::Press
+                                && key.modifiers == ftui::core::event::Modifiers::NONE
+                                && matches!(key.code,
+                                    ftui::core::event::KeyCode::Char('x' | 'g')
+                                        | ftui::core::event::KeyCode::Escape))
+                    {
+                        self.checkpoint_review_cancelled = true;
+                        app.frankentui.status_message = Some(
+                            "Checkpoint review cancelled; its running result will be discarded".into(),
+                        );
+                    }
                     if matches!(&event, ftui::core::event::Event::Mouse(_))
                         && !self.pointer_frame_presented.get()
                     {
@@ -687,7 +711,44 @@ impl Model for LiveTerminalModel<'_> {
                     app.record_checkpoint_result(request_id, result);
                     Ok(false)
                 }
+                LiveTerminalMessage::CheckpointCanvas {
+                    request,
+                    checkpoint_id,
+                    result,
+                } => {
+                    if self.checkpoint_review_in_flight.as_ref() == Some(&(request, checkpoint_id.clone())) {
+                        self.checkpoint_review_in_flight = None;
+                        if !self.checkpoint_review_cancelled
+                            && app.frankentui.route == frankentui_shell::ShellRoute::Replay
+                            && app.selected_checkpoint_id() == Some(checkpoint_id.as_str())
+                        {
+                            match result {
+                                Ok(snapshot) => {
+                                    app.show_canvas_review(&snapshot);
+                                    app.push_toast(format!(
+                                        "Reviewing saved checkpoint {checkpoint_id} at tick {}; live owner unchanged",
+                                        snapshot.world.tick
+                                    ));
+                                }
+                                Err(error) => {
+                                    app.frankentui.status_message = Some(format!(
+                                        "Checkpoint review failed: {error}; canvas unchanged"
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    Ok(false)
+                }
             }
+            .inspect(|_| {
+                if let Some((_, checkpoint_id)) = &self.checkpoint_review_in_flight
+                    && (app.frankentui.route != frankentui_shell::ShellRoute::Replay
+                        || app.selected_checkpoint_id() != Some(checkpoint_id.as_str()))
+                {
+                    self.checkpoint_review_cancelled = true;
+                }
+            })
         };
         match result {
             Ok(true) => return Cmd::quit(),
@@ -1124,6 +1185,36 @@ impl LiveTerminalModel<'_> {
                         );
                     } else {
                         self.pending_checkpoints.borrow_mut().push_back(request_id);
+                    }
+                }
+                ShellEffect::ReviewCheckpoint { checkpoint_id } => {
+                    if self.checkpoint_review_in_flight.is_some() {
+                        app.frankentui.status_message = Some(
+                            "A checkpoint review is still running; wait for its result".into(),
+                        );
+                    } else if let Some(request) = self.checkpoint_review_generation.checked_add(1) {
+                        if let Some(handle) = app.control.control_handle() {
+                            self.checkpoint_review_generation = request;
+                            self.checkpoint_review_cancelled = false;
+                            self.checkpoint_review_in_flight =
+                                Some((request, checkpoint_id.clone()));
+                            commands.push(Cmd::task(move || {
+                                LiveTerminalMessage::CheckpointCanvas {
+                                    request,
+                                    result: handle
+                                        .checkpoint_canvas(&checkpoint_id)
+                                        .map_err(|error| error.to_string()),
+                                    checkpoint_id,
+                                }
+                            }));
+                        } else {
+                            app.frankentui.status_message = Some(
+                                "Checkpoint review unavailable: data services are disabled".into(),
+                            );
+                        }
+                    } else {
+                        app.frankentui.status_message =
+                            Some("Checkpoint review request identities exhausted".into());
                     }
                 }
                 ShellEffect::BranchCheckpoint {
@@ -3212,6 +3303,9 @@ impl<'a> TerminalApp<'a> {
                             K::Up => Some(ShellMessage::SelectPreviousItem),
                             K::Down => Some(ShellMessage::SelectNextItem),
                             K::Char('k') => Some(ShellMessage::CreateCheckpoint),
+                            K::Enter if self.frankentui.route == ShellRoute::Replay => {
+                                Some(ShellMessage::ReviewSelectedCheckpoint)
+                            }
                             K::Char('x') => Some(ShellMessage::CancelActiveQuery),
                             K::Escape => Some(ShellMessage::Navigate(ShellRoute::Dashboard)),
                             _ => None,
@@ -3648,6 +3742,26 @@ impl<'a> TerminalApp<'a> {
         self.canvas_history.push_back(frame);
     }
 
+    fn selected_checkpoint_id(&self) -> Option<&str> {
+        self.frankentui
+            .science
+            .replay
+            .data()
+            .and_then(|data| data.checkpoints.get(data.selected_checkpoint_index))
+            .map(|checkpoint| checkpoint.checkpoint_id.as_str())
+    }
+
+    fn show_canvas_review(&mut self, frame: &RenderSnapshot) {
+        self.canvas_review = Some(CanvasReviewFrame {
+            snapshot: Snapshot::from_render(frame),
+            terrain: TerrainView::from_snapshot(frame),
+            day_night: frame.config.render.resolved_day_night(),
+        });
+        self.archipelago_view = false;
+        self.hover_tooltip = None;
+        self.navigate_route(frankentui_shell::ShellRoute::WorldCanvas);
+    }
+
     fn review_selected_canvas(&mut self) {
         let index = self.rail_selection.map_or(
             self.snapshot.narrative.len().saturating_sub(1),
@@ -3666,14 +3780,8 @@ impl<'a> TerminalApp<'a> {
             self.push_toast(format!("No cached canvas at tick {tick}; view unchanged"));
             return;
         };
-        self.canvas_review = Some(CanvasReviewFrame {
-            snapshot: Snapshot::from_render(frame),
-            terrain: TerrainView::from_snapshot(frame),
-            day_night: frame.config.render.resolved_day_night(),
-        });
-        self.archipelago_view = false;
-        self.hover_tooltip = None;
-        self.navigate_route(frankentui_shell::ShellRoute::WorldCanvas);
+        let frame = frame.clone();
+        self.show_canvas_review(&frame);
         self.push_toast(format!(
             "Reviewing cached canvas tick {tick}; owner playback unchanged"
         ));
@@ -23878,6 +23986,255 @@ for case in ('panic', 'subscription', 'renderer'):
         assert_eq!(
             app.snapshot.narrative_dropped, world_dropped,
             "the TUI rail must report the world's exact dropped count"
+        );
+    }
+
+    #[test]
+    fn checkpoint_canvas_real_worker_renders_saved_cells_and_discards_cancelled_results() {
+        use frankentui_shell::{ShellMessage, ShellRoute};
+        use ftui::core::event::{Event, KeyCode, KeyEvent};
+        use std::io::Write as _;
+
+        fn task(
+            command: Cmd<LiveTerminalMessage>,
+        ) -> Box<dyn FnOnce() -> LiveTerminalMessage + Send> {
+            match command {
+                Cmd::Task(_, work) => work,
+                Cmd::Batch(mut commands) => {
+                    assert_eq!(commands.len(), 1, "one actual review task");
+                    task(commands.pop().unwrap())
+                }
+                _ => panic!("Enter did not dispatch the actual review worker"),
+            }
+        }
+        fn key(code: KeyCode) -> LiveTerminalMessage {
+            LiveTerminalMessage::Event(Event::Key(KeyEvent::new(code)))
+        }
+        let paint = |app: &mut TerminalApp<'_>| {
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+            terminal
+                .draw(|frame| app.draw_map(frame, frame.area()))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let mut cells = Vec::new();
+            for y in 1..buffer.area.height - 1 {
+                for x in 1..buffer.area.width - 1 {
+                    cells.push(buffer[(x, y)].clone());
+                }
+            }
+            cells
+        };
+        let mut world = WorldState::new(ScriptBotsConfig {
+            rng_seed: Some(42),
+            world_width: 120,
+            world_height: 120,
+            food_cell_size: 20,
+            persistence_interval: 0,
+            closed: true,
+            ..ScriptBotsConfig::default()
+        })
+        .unwrap();
+        let brains = crate::install_brains(&mut world, crate::BrainPreset::Mlp)
+            .unwrap()
+            .population;
+        crate::seed_founders(&mut world, &brains, crate::FounderRecipe::Spread).unwrap();
+        let host = TerminalTestHost::take(Arc::new(std::sync::Mutex::new(world)));
+        let (runtime, _) = ControlRuntime::launch(
+            host.port(),
+            crate::servers::ControlServerConfig {
+                rest_enabled: false,
+                mcp_transport: crate::servers::McpTransportConfig::Disabled,
+                ..crate::servers::ControlServerConfig::default()
+            },
+        )
+        .unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix("terminal-checkpoint-canvas-")
+            .tempdir()
+            .unwrap()
+            .keep();
+        eprintln!(
+            "actual checkpoint canvas artifacts: {}",
+            directory.display()
+        );
+        let handle = runtime
+            .control_handle()
+            .unwrap()
+            .with_artifacts_dir(directory.clone())
+            .unwrap();
+        let renderer = TerminalRenderer::default();
+        let mut app = TerminalApp::new(&renderer, host.context(&runtime));
+        app.palette = Palette::test_backend_evidence();
+        app.manual_focus_cleared = true;
+        for _ in 0..3 {
+            apply_terminal_owner_command_without_refresh(&mut app, ControlCommand::Step);
+        }
+        app.refresh_snapshot();
+        let saved_cells = paint(&mut app);
+        let saved_tick = app.snapshot.tick;
+        let checkpoint = handle
+            .create_checkpoint(crate::control::CheckpointCreateRequest::default())
+            .unwrap();
+        for _ in 0..20 {
+            apply_terminal_owner_command_without_refresh(
+                &mut app,
+                ControlCommand::SpawnAgent {
+                    herbivore_tendency: 1.0,
+                },
+            );
+        }
+        apply_terminal_owner_command_without_refresh(&mut app, ControlCommand::Step);
+        app.refresh_snapshot();
+        let live_cells = paint(&mut app);
+        assert_ne!(
+            saved_cells, live_cells,
+            "real arrivals and a science tick must change the canvas"
+        );
+        assert_ne!(saved_tick, app.snapshot.tick);
+        let live_tick = app.snapshot.tick;
+        let _second_cut = handle
+            .create_checkpoint(crate::control::CheckpointCreateRequest::default())
+            .unwrap();
+        let live_digest = host.port().scientific_digest_v1().unwrap();
+        app.navigate_route(ShellRoute::Replay);
+        for message in science_service_messages(&handle, ShellRoute::Replay, 1) {
+            app.frankentui.update(message);
+        }
+        let selected = app
+            .frankentui
+            .science
+            .replay
+            .data()
+            .unwrap()
+            .checkpoints
+            .iter()
+            .position(|cut| cut.checkpoint_id == checkpoint.checkpoint_id)
+            .unwrap();
+        app.frankentui
+            .science
+            .replay
+            .data_mut()
+            .unwrap()
+            .selected_checkpoint_index = selected;
+        let mut model = LiveTerminalModel::new(app).unwrap();
+        model.last_service_poll = Some(Instant::now());
+        let work = task(model.update(key(KeyCode::Enter)));
+        assert!(
+            model.app.borrow().canvas_review.is_none(),
+            "dispatch alone must not claim a review"
+        );
+        let request = model.checkpoint_review_generation;
+        let _ = model.update(key(KeyCode::Enter));
+        assert_eq!(
+            model.checkpoint_review_generation, request,
+            "duplicate intent cannot spawn another worker"
+        );
+        let observed = std::thread::spawn(work).join().unwrap();
+        let _ = model.update(observed);
+        {
+            let mut app = model.app.borrow_mut();
+            assert_eq!(app.frankentui.route, ShellRoute::WorldCanvas);
+            assert_eq!(
+                app.canvas_review.as_ref().unwrap().snapshot.tick,
+                saved_tick
+            );
+            assert_eq!(app.snapshot.tick, live_tick);
+            assert_eq!(
+                paint(&mut app),
+                saved_cells,
+                "restored cells must match the actual saved-time canvas, not only its label"
+            );
+            let mut rendered = Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+            rendered
+                .draw(|frame| app.draw_map(frame, frame.area()))
+                .unwrap();
+            let text = buffer_text(&rendered);
+            assert!(text.contains(&format!("REVIEW tick {saved_tick} (live {live_tick})")));
+            fs::write(directory.join("review-map.txt"), text).unwrap();
+            fs::write(
+                directory.join("saved-cells.txt"),
+                format!("{saved_cells:?}"),
+            )
+            .unwrap();
+            fs::write(directory.join("live-cells.txt"), format!("{live_cells:?}")).unwrap();
+        }
+        let _ = model.update(key(KeyCode::Char('g')));
+        assert_eq!(paint(&mut model.app.borrow_mut()), live_cells);
+        for cancel in ["x", "g", "navigation", "selection"] {
+            let _ = model.update(key(KeyCode::Char('7')));
+            model.last_service_poll = Some(Instant::now());
+            let work = task(model.update(key(KeyCode::Enter)));
+            match cancel {
+                "x" => {
+                    let _ = model.update(key(KeyCode::Char('x')));
+                }
+                "g" => {
+                    let _ = model.update(key(KeyCode::Char('g')));
+                }
+                "navigation" => {
+                    let _ = model.update(key(KeyCode::Char('2')));
+                    let _ = model.update(key(KeyCode::Char('7')));
+                }
+                "selection" => {
+                    let _ = model.update(key(KeyCode::Down));
+                    let _ = model.update(key(KeyCode::Up));
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                model.checkpoint_review_cancelled,
+                "{cancel} must invalidate the pending review"
+            );
+            assert!(
+                model.checkpoint_review_in_flight.is_some(),
+                "a cancelled running worker still occupies its slot"
+            );
+            let _ = model.update(std::thread::spawn(work).join().unwrap());
+            assert!(
+                model.app.borrow().canvas_review.is_none(),
+                "late {cancel} reply must not replace the canvas"
+            );
+            assert!(model.checkpoint_review_in_flight.is_none());
+        }
+        assert_eq!(host.port().scientific_digest_v1().unwrap(), live_digest);
+        let _ = model.update(key(KeyCode::Char('7')));
+        model.last_service_poll = Some(Instant::now());
+        let work = task(model.update(key(KeyCode::Enter)));
+        let _ = model.update(std::thread::spawn(work).join().unwrap());
+        assert!(model.app.borrow().canvas_review.is_some());
+        let (artifact, before) = handle
+            .read_artifact_bytes(&checkpoint.checkpoint_id)
+            .unwrap();
+        fs::write(directory.join("before-corruption.bin"), &before).unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(directory.join(artifact.relative_path))
+            .unwrap()
+            .write_all(&[0xff])
+            .unwrap();
+        let _ = model.update(key(KeyCode::Char('7')));
+        model.last_service_poll = Some(Instant::now());
+        let work = task(model.update(key(KeyCode::Enter)));
+        let _ = model.update(std::thread::spawn(work).join().unwrap());
+        assert!(
+            model
+                .app
+                .borrow()
+                .frankentui
+                .status_message
+                .as_deref()
+                .unwrap()
+                .contains("Checkpoint review failed")
+        );
+        assert_eq!(
+            paint(&mut model.app.borrow_mut()),
+            saved_cells,
+            "a corrupt artifact must preserve the previous real review"
+        );
+        assert_eq!(host.port().scientific_digest_v1().unwrap(), live_digest);
+        eprintln!(
+            "checkpoint canvas actual saved={saved_tick} live={live_tick}; real pixels differ; restored pixels match; cancellation x/g/navigation/selection and corruption preserve live digest {}",
+            live_digest.overall
         );
     }
 

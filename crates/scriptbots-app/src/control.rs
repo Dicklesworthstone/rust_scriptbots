@@ -2867,6 +2867,89 @@ impl ControlHandle {
         Ok((artifact, bytes))
     }
 
+    /// Reconstruct the selected saved cut for read-only canvas inspection.
+    ///
+    /// File reads and reconstruction run on the caller's background worker. This
+    /// never drives or replaces the live owner, advances science, or opens SQL.
+    /// Only exact registries produced by the compiled application presets are
+    /// supported; the core's full registry and restored-digest checks still apply.
+    pub fn checkpoint_canvas(
+        &self,
+        checkpoint_id: &str,
+    ) -> Result<Arc<RenderSnapshot>, ControlError> {
+        let metadata = self.get_checkpoint(checkpoint_id)?;
+        let (artifact, bytes) = self.read_artifact_bytes(checkpoint_id)?;
+        let checkpoint = scriptbots_core::WorldCheckpointV1::decode(&bytes)
+            .map_err(|error| ControlError::Serialization(error.to_string()))?;
+        if metadata.schema != scriptbots_core::WORLD_CHECKPOINT_V1_SCHEMA
+            || metadata.tick != checkpoint.tick().0
+            || metadata.agent_count != checkpoint.agent_count()
+            || metadata.world_digest_v1 != checkpoint.source_digest().overall
+            || metadata.byte_size != artifact.byte_size
+            || metadata.checksum_blake3 != artifact.checksum_blake3
+            || metadata.checksum_sha256 != artifact.checksum_sha256
+        {
+            return Err(ControlError::InvalidPatch(
+                "checkpoint catalog and verified artifact disagree".into(),
+            ));
+        }
+        let mut restored = None;
+        for preset in [
+            None,
+            Some(crate::BrainPreset::Mlp),
+            Some(crate::BrainPreset::Dwraon),
+            Some(crate::BrainPreset::Assembly),
+            Some(crate::BrainPreset::Mixed),
+            Some(crate::BrainPreset::Ft),
+        ] {
+            if preset == Some(crate::BrainPreset::Ft) && !cfg!(feature = "brain-ft") {
+                continue;
+            }
+            let registry = match preset {
+                None => scriptbots_core::BrainRegistry::new(),
+                Some(preset) => {
+                    crate::create_brain_registry_for_config(preset, checkpoint.config())
+                        .map_err(|error| ControlError::Serialization(error.to_string()))?
+                }
+            };
+            match WorldState::restore_checkpoint_v1(&checkpoint, registry) {
+                Ok(world) => {
+                    restored = Some(world);
+                    break;
+                }
+                Err(scriptbots_core::WorldCheckpointError::RegistryMismatch { .. }) => {}
+                Err(error) => return Err(ControlError::Serialization(error.to_string())),
+            }
+        }
+        let world = restored.ok_or_else(|| {
+            ControlError::BadRequest(
+                "checkpoint requires a registry outside the compiled application presets".into(),
+            )
+        })?;
+        let actual_digest = world
+            .world_digest_v1()
+            .map_err(|error| ControlError::Serialization(error.to_string()))?;
+        if &actual_digest != checkpoint.source_digest() {
+            return Err(ControlError::InvalidPatch(
+                "reconstructed checkpoint scientific digest differs from its saved cut".into(),
+            ));
+        }
+        let projection = scriptbots_runtime::HostCore::new(
+            self.host.session_id(),
+            world,
+            scriptbots_runtime::HostCoreOptions {
+                initial_playback: scriptbots_runtime::PlaybackSnapshot {
+                    paused: true,
+                    speed_multiplier: 1.0,
+                },
+                capture_agent_visuals: true,
+                ..scriptbots_runtime::HostCoreOptions::default()
+            },
+        )
+        .map_err(|error| ControlError::Serialization(error.to_string()))?;
+        Ok(projection.latest_snapshot())
+    }
+
     /// Produce a PNG snapshot of the world without a live window.
     pub fn snapshot_png(&self, width: u32, height: u32) -> Result<Vec<u8>, ControlError> {
         #[cfg(feature = "gui")]
@@ -5250,6 +5333,133 @@ pub(crate) mod tests {
             })
             .expect("checkpoint policy");
         (handle, host)
+    }
+
+    #[test]
+    fn checkpoint_canvas_restores_real_application_presets_without_changing_the_owner() {
+        let mut distinct_digests = std::collections::BTreeSet::new();
+        for preset in [
+            None,
+            Some(crate::BrainPreset::Mlp),
+            Some(crate::BrainPreset::Dwraon),
+            Some(crate::BrainPreset::Assembly),
+            Some(crate::BrainPreset::Mixed),
+        ] {
+            let directory = tempfile::Builder::new()
+                .prefix("checkpoint-canvas-")
+                .tempdir()
+                .unwrap()
+                .keep();
+            eprintln!(
+                "checkpoint canvas preset {preset:?}: {}",
+                directory.display()
+            );
+            let mut world = WorldState::new(ScriptBotsConfig {
+                rng_seed: Some(42),
+                world_width: 120,
+                world_height: 120,
+                food_cell_size: 20,
+                persistence_interval: 0,
+                closed: true,
+                ..ScriptBotsConfig::default()
+            })
+            .unwrap();
+            if let Some(preset) = preset {
+                let brains = crate::install_brains(&mut world, preset)
+                    .unwrap()
+                    .population;
+                crate::seed_founders(&mut world, &brains, crate::FounderRecipe::Spread).unwrap();
+            }
+            let host = TestHost::spawn(world);
+            let handle = host.handle().with_artifacts_dir(directory.clone()).unwrap();
+            host.wait_applied(&handle.step().unwrap());
+            let oracle = host.port.snapshot_hub().latest();
+            let checkpoint = handle
+                .create_checkpoint(CheckpointCreateRequest::default())
+                .unwrap();
+            assert!(
+                distinct_digests.insert(checkpoint.world_digest_v1.clone()),
+                "preset matrix must contain distinct science states"
+            );
+            let (artifact, bytes) = handle
+                .read_artifact_bytes(&checkpoint.checkpoint_id)
+                .unwrap();
+            host.wait_applied(&handle.step().unwrap());
+            let live = host.port.scientific_digest_v1().unwrap();
+            let live_snapshot = host.port.snapshot_hub().latest();
+            let frame = handle.checkpoint_canvas(&checkpoint.checkpoint_id).unwrap();
+            assert_eq!(frame.world.tick, checkpoint.tick);
+            assert_eq!(frame.world.agents.len(), checkpoint.agent_count);
+            assert!(frame.agent_visuals_complete());
+            assert_eq!(
+                serde_json::to_vec(&frame.world).unwrap(),
+                serde_json::to_vec(&oracle.world).unwrap()
+            );
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), live);
+            assert!(Arc::ptr_eq(
+                &host.port.snapshot_hub().latest(),
+                &live_snapshot
+            ));
+            let artifact_path = directory.join(&artifact.relative_path);
+            assert_eq!(fs::read(&artifact_path).unwrap(), bytes);
+            fs::write(directory.join("before-corruption.bin"), &bytes).unwrap();
+            fs::write(
+                directory.join("checkpoint-metadata.json"),
+                serde_json::to_vec_pretty(&checkpoint).unwrap(),
+            )
+            .unwrap();
+            fs::write(
+                directory.join("review-world.json"),
+                serde_json::to_vec_pretty(&frame.world).unwrap(),
+            )
+            .unwrap();
+            assert!(matches!(
+                handle.checkpoint_canvas("unknown"),
+                Err(ControlError::NotFound(_))
+            ));
+            for mismatch in ["tick", "population", "digest"] {
+                let mut changed = checkpoint.clone();
+                match mismatch {
+                    "tick" => changed.tick += 1,
+                    "population" => changed.agent_count += 1,
+                    "digest" => changed.world_digest_v1.push('!'),
+                    _ => unreachable!(),
+                }
+                handle
+                    .data_services
+                    .checkpoints
+                    .lock()
+                    .unwrap()
+                    .insert(checkpoint.checkpoint_id.clone(), changed);
+                assert!(
+                    matches!(handle.checkpoint_canvas(&checkpoint.checkpoint_id),
+                    Err(ControlError::InvalidPatch(message)) if message.contains("catalog and verified artifact disagree"))
+                );
+                handle
+                    .data_services
+                    .checkpoints
+                    .lock()
+                    .unwrap()
+                    .insert(checkpoint.checkpoint_id.clone(), checkpoint.clone());
+            }
+            eprintln!(
+                "checkpoint canvas preset {preset:?}: actual tick={} agents={} digest={}; owner digest={} unchanged; catalog tick/population/digest mismatches refused",
+                checkpoint.tick, checkpoint.agent_count, checkpoint.world_digest_v1, live.overall
+            );
+
+            // A real retained artifact is made corrupt by appending, preserving its preimage.
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&artifact_path)
+                .unwrap()
+                .write_all(&[0xff])
+                .unwrap();
+            assert!(matches!(
+                handle.checkpoint_canvas(&checkpoint.checkpoint_id),
+                Err(ControlError::InvalidPatch(_))
+            ));
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), live);
+        }
     }
 
     #[test]

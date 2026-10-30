@@ -50,6 +50,9 @@ pub enum ShellEffect {
     CreateCheckpoint {
         request_id: String,
     },
+    ReviewCheckpoint {
+        checkpoint_id: String,
+    },
     BranchCheckpoint {
         checkpoint_id: String,
         branch_name: String,
@@ -383,6 +386,8 @@ pub enum ShellMessage {
     SetDiagnosticsData(ScreenDataState<DiagnosticsViewData>),
     /// Trigger simulation checkpoint creation workflow.
     CreateCheckpoint,
+    /// Inspect the selected saved cut without changing the live owner.
+    ReviewSelectedCheckpoint,
     /// Branch simulation from an existing checkpoint.
     BranchCheckpoint {
         checkpoint_id: String,
@@ -757,6 +762,9 @@ impl Model for FrankenTuiModel {
                 KeyCode::Char('f') | KeyCode::Char('F') => {
                     self.update(ShellMessage::CycleEventFilter)
                 }
+                KeyCode::Enter if self.route == ShellRoute::Replay => {
+                    self.update(ShellMessage::ReviewSelectedCheckpoint)
+                }
                 KeyCode::Enter => self.update(ShellMessage::FocusSelectedEvent),
                 KeyCode::Char('?') => self.update(ShellMessage::ToggleHelp),
                 KeyCode::Char(' ') => {
@@ -1050,6 +1058,23 @@ impl Model for FrankenTuiModel {
                 self.status_message = Some(format!(
                     "Pending: checkpoint {request_id} awaiting host result"
                 ));
+                Cmd::none()
+            }
+            ShellMessage::ReviewSelectedCheckpoint => {
+                let selected = self
+                    .science
+                    .replay
+                    .data()
+                    .and_then(|data| data.checkpoints.get(data.selected_checkpoint_index))
+                    .map(|checkpoint| checkpoint.checkpoint_id.clone());
+                if let Some(checkpoint_id) = selected {
+                    if self.enqueue_effect(ShellEffect::ReviewCheckpoint { checkpoint_id }) {
+                        self.status_message = Some("Loading selected saved canvas".into());
+                    }
+                } else {
+                    self.status_message =
+                        Some("Review unavailable: no checkpoint is selected".into());
+                }
                 Cmd::none()
             }
             ShellMessage::BranchCheckpoint {
