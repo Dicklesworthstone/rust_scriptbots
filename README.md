@@ -858,6 +858,7 @@ Deterministic, staged tick pipeline (six seeded, domain-separated RNG streams; e
 - GPUI renders food tiles and agents (circles/spikes) in a dedicated World window beside a compact tabbed Lab. The pair launches transactionally under `QuitMode::LastWindowClosed`; closing either window ends the session, so a launch/close failure cannot leave a degraded or orphaned UI.
 - Camera controls: scroll to zoom, middle-drag to pan, `0` or the World toolbar to fit; display toggles live beside the canvas.
 - Lab tabs separate overview/run controls, agent inspection, analytics/history, and the narrative timeline. Optional diagnostic cards are keyboard disclosures (`1`, `2`, `3`) in the scrollable Overview.
+- The Timeline's **Review World frame** action pauses the World view at the selected event's exact cached tick. **Return World to live** exits that review. Missing, uncaptured or evicted frames are reported without changing the view. Lab keeps the current narrative and receipts; these presentation actions do not change simulation playback or rewind the scientific owner. This uses World's bounded visual cache, not disk-backed replay.
 - Functional search: the settings panel includes a live search bar that filters parameters across all categories via a centralized filter, making it fast to find and tweak knobs.
 - Inspector: per-agent stats and genome/brain views (scoped to plan milestones); mutation-rate adjusters (±) for primary/secondary let you tweak an agent’s evolution parameters live.
 - Optional audio via `kira` (feature `audio`).

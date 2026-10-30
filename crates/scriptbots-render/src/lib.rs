@@ -2734,6 +2734,18 @@ fn open_gui_session_windows(
             detail: format!("{error:?}"),
         })?;
 
+    let world_view = canvas
+        .update(app, |_, _, cx| cx.entity().downgrade())
+        .map_err(|error| GuiWindowLaunchFailure {
+            role: GuiViewRole::WorldCanvas,
+            detail: format!("connect World review: {error:?}"),
+        })?;
+    hud.update(app, |view, _, _| view.world_view = Some(world_view))
+        .map_err(|error| GuiWindowLaunchFailure {
+            role: GuiViewRole::Hud,
+            detail: format!("connect timeline review: {error:?}"),
+        })?;
+
     Ok(GuiWindowHandles { hud, canvas })
 }
 
@@ -4532,6 +4544,9 @@ pub struct SimulationView {
     selection_projection: Arc<Mutex<Option<Vec<AgentId>>>>,
     selection_submission: Arc<Mutex<()>>,
     playback: PlaybackState,
+    /// The Lab reviews frames in the actual World window, whose cache is independent.
+    world_view: Option<gpui::WeakEntity<SimulationView>>,
+    world_review_feedback: Option<String>,
     perf: PerfStats,
     last_perf: PerfSnapshot,
     /// When set, `render` must NOT overwrite `last_perf` (bd-c7pg).
@@ -4656,6 +4671,8 @@ impl SimulationView {
             selection_projection,
             selection_submission,
             playback: PlaybackState::new(240),
+            world_view: None,
+            world_review_feedback: None,
             perf: PerfStats::new(240),
             last_perf: PerfSnapshot::default(),
             forced_perf: None,
@@ -7916,7 +7933,7 @@ impl SimulationView {
     /// The narrative rail (bd-16g.2.4): a read-only projection of `RunNarrative`
     /// along the bottom of the canvas — one glyph per retained event, coloured by
     /// the shared core rail model (the same table the TUI reads), click to select.
-    /// STAGE 1 of the seek contract: selection never moves the simulation clock.
+    /// Selection and cached-frame review never move the simulation clock.
     fn render_narrative_rail(&self, snapshot: &HudSnapshot, cx: &mut Context<Self>) -> Div {
         let events = &snapshot.narrative;
         let mut rail = div()
@@ -7933,7 +7950,7 @@ impl SimulationView {
             div()
                 .text_xs()
                 .text_color(chrome::text_secondary())
-                .child("Timeline — run history (select-only; rewind needs replay bd-2z0.5.3)"),
+                .child("Timeline — run history · cached World review"),
         );
         let toggle_listener = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
             this.rail_visible = !this.rail_visible;
@@ -7948,6 +7965,27 @@ impl SimulationView {
                 .on_mouse_down(MouseButton::Left, toggle_listener),
         );
         rail = rail.child(header_row);
+
+        let return_live = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.return_world_to_live(cx);
+        });
+        rail = rail.child(
+            div()
+                .debug_selector(|| "narrative-world-live".to_owned())
+                .text_xs()
+                .text_color(chrome::accent())
+                .cursor_pointer()
+                .child("Return World to live")
+                .on_mouse_down(MouseButton::Left, return_live),
+        );
+        if let Some(feedback) = &self.world_review_feedback {
+            rail = rail.child(
+                div()
+                    .text_xs()
+                    .text_color(chrome::text_secondary())
+                    .child(feedback.clone()),
+            );
+        }
 
         if events.is_empty() {
             return rail.child(div().text_xs().text_color(chrome::text_muted()).child(
@@ -7998,6 +8036,19 @@ impl SimulationView {
 
         // Detail line: the selected event's full text, plus the honest markers.
         let selected_event = &events[selection];
+        let tick = selected_event.tick.0;
+        let review = cx.listener(move |this, _event: &MouseDownEvent, _, cx| {
+            this.review_world_frame(tick, cx);
+        });
+        rail = rail.child(
+            div()
+                .debug_selector(|| "narrative-review-frame".to_owned())
+                .text_xs()
+                .text_color(chrome::accent())
+                .cursor_pointer()
+                .child(format!("Review World frame at tick {tick}"))
+                .on_mouse_down(MouseButton::Left, review),
+        );
         let aged_out = if self.rail_selection_aged_out {
             " | selected event aged out of the ring"
         } else {
@@ -8024,6 +8075,47 @@ impl SimulationView {
                 )),
         );
         rail
+    }
+
+    fn review_world_frame(&mut self, tick: u64, cx: &mut Context<Self>) {
+        let reviewed = self.world_view.as_ref().and_then(|world| {
+            world
+                .update(cx, |view, cx| {
+                    let found = view.playback.seek_world_frame(tick);
+                    if found {
+                        cx.notify();
+                    }
+                    found
+                })
+                .ok()
+        });
+        self.world_review_feedback = Some(match reviewed {
+            Some(true) => {
+                format!("Selected cached World tick {tick}; simulation playback unchanged.")
+            }
+            Some(false) => format!(
+                "No cached World frame at tick {tick} (not captured or evicted); view unchanged."
+            ),
+            None => "World window unavailable; view unchanged.".to_owned(),
+        });
+        cx.notify();
+    }
+
+    fn return_world_to_live(&mut self, cx: &mut Context<Self>) {
+        let returned = self.world_view.as_ref().is_some_and(|world| {
+            world
+                .update(cx, |view, cx| {
+                    view.playback.go_live();
+                    cx.notify();
+                })
+                .is_ok()
+        });
+        self.world_review_feedback = Some(if returned {
+            "World view returned to live.".to_owned()
+        } else {
+            "World window unavailable; view unchanged.".to_owned()
+        });
+        cx.notify();
     }
 
     /// Select a rail event by index, clamped to the retained events. A fresh
@@ -17220,6 +17312,10 @@ impl PlaybackState {
         snapshot.simulation_fault = live.simulation_fault;
         snapshot.command_feedback = live.command_feedback;
         snapshot.perf = live.perf;
+        // The rail navigates the current run even while its science HUD is paused.
+        snapshot.narrative = live.narrative;
+        snapshot.narrative_dropped = live.narrative_dropped;
+        snapshot.narrative_capacity = live.narrative_capacity;
         snapshot
     }
 
@@ -17229,6 +17325,22 @@ impl PlaybackState {
         }
         self.mode = PlaybackMode::Paused;
         self.pointer = 0;
+    }
+
+    /// Only an exact retained visual frame qualifies; gaps never round to a neighbour.
+    fn seek_world_frame(&mut self, tick: u64) -> bool {
+        let Some(index) = self.timeline.iter().position(|snapshot| {
+            snapshot.tick == tick
+                && snapshot
+                    .render_frame
+                    .as_ref()
+                    .is_some_and(|frame| frame.tick == tick)
+        }) else {
+            return false;
+        };
+        self.pointer = index;
+        self.mode = PlaybackMode::Paused;
+        true
     }
 
     fn step_back(&mut self) {
@@ -17370,6 +17482,20 @@ mod playback_state_tests {
         let status = playback.status();
         assert_eq!(status.total, 1);
         assert_eq!(status.current_tick, Some(7));
+    }
+
+    #[test]
+    fn world_frame_seek_refuses_empty_or_nonvisual_history_without_moving_playback() {
+        let mut playback = PlaybackState::new(2);
+        assert!(!playback.seek_world_frame(7));
+        playback.record(&snapshot(7));
+        playback.record(&snapshot(9));
+        playback.restart();
+        for tick in [7, 8, 9] {
+            assert!(!playback.seek_world_frame(tick));
+            assert_eq!(playback.mode(), PlaybackMode::Paused);
+            assert_eq!(playback.status().current_tick, Some(7));
+        }
     }
 
     #[test]
@@ -28351,6 +28477,139 @@ mod command_characterization_tests {
             snapshot.narrative_dropped, world_dropped,
             "the GPU lab rail must report the world's exact dropped count"
         );
+    }
+
+    #[test]
+    fn narrative_review_clicks_seek_exact_world_frames_without_changing_science() {
+        let host = TestHost::take(narrative_e2e_world(1));
+        let initial_events = host.snapshot().narrative_events.len();
+        let session = Arc::new(GuiSession::new(
+            host.port.clone(),
+            AnalyticsSnapshotProvider::empty(),
+            Arc::new(|_| panic!("frame review must not submit scientific commands")),
+        ));
+        let context = gpui::TestAppContext::single();
+        let windows = context.update(|app| session.install(app)).unwrap();
+        let world = context.update(|app| windows.canvas.root(app)).unwrap();
+        let hud = context.update(|app| windows.hud.root(app)).unwrap();
+        let cache_capacity = 8;
+        context.update(|app| {
+            world.update(app, |view, _| {
+                view.playback = PlaybackState::new(cache_capacity);
+            });
+            hud.update(app, |view, _| {
+                let _ = view.snapshot();
+                view.playback.restart();
+            });
+        });
+        for _ in 0..20 {
+            host.apply(scriptbots_runtime::HostCommand::SpawnAgent {
+                herbivore_tendency: 1.0,
+            });
+        }
+        let mut event = None;
+        for _ in 0..160 {
+            host.apply(scriptbots_runtime::HostCommand::UpdateSimulation(
+                SimulationCommand {
+                    paused: None,
+                    speed_multiplier: None,
+                    step_once: true,
+                },
+            ));
+            context.update(|app| {
+                world.update(app, |view, _| {
+                    let _ = view.snapshot();
+                });
+            });
+            let published = host.snapshot();
+            if published.narrative_events.len() > initial_events {
+                event = published.narrative_events.last().cloned();
+                break;
+            }
+        }
+        let event = event.expect("real population intervention must emit a narrative event");
+        let mut canvas = gpui::VisualTestContext::from_window(windows.canvas.into(), &context);
+        let frame = context
+            .update(|app| {
+                world
+                    .read(app)
+                    .playback
+                    .timeline
+                    .iter()
+                    .find(|snapshot| snapshot.tick == event.tick.0)
+                    .and_then(|snapshot| snapshot.render_frame.clone())
+            })
+            .expect("the exact emitted-event frame must have been captured");
+        context.update(|app| {
+            hud.update(app, |view, _| {
+                view.dashboard_tab = DashboardTab::Timeline;
+                let index = host.snapshot().narrative_events.len() - 1;
+                view.select_rail_event(index);
+            });
+        });
+        let mut lab = gpui::VisualTestContext::from_window(windows.hud.into(), &context);
+        lab.simulate_resize(size(px(480.0), px(1400.0)));
+        let redraw = |lab: &mut gpui::VisualTestContext| {
+            lab.update(|window, app| {
+                window.refresh();
+                window.draw(app).clear();
+            });
+        };
+        redraw(&mut lab);
+        let click = |lab: &mut gpui::VisualTestContext, selector| {
+            let bounds = lab
+                .debug_bounds(selector)
+                .expect("timeline control laid out");
+            lab.simulate_click(bounds.center(), gpui::Modifiers::default());
+            redraw(lab);
+        };
+        let before = host.port.world_digests().unwrap();
+        click(&mut lab, "narrative-review-frame");
+        redraw(&mut canvas);
+        context.update(|app| {
+            world.update(app, |view, _| {
+                assert_eq!(view.playback.mode(), PlaybackMode::Paused);
+                assert_eq!(view.playback.status().current_tick, Some(event.tick.0));
+                let live = view.snapshot();
+                let shown = view.playback.snapshot_for_render(live);
+                assert_eq!(shown.render_frame, Some(frame));
+            });
+            assert_eq!(hud.read(app).playback.mode(), PlaybackMode::Paused);
+        });
+        assert_eq!(host.port.world_digests().unwrap(), before);
+
+        click(&mut lab, "narrative-world-live");
+        context.update(|app| assert_eq!(world.read(app).playback.mode(), PlaybackMode::Live));
+        assert_eq!(host.port.world_digests().unwrap(), before);
+
+        for _ in 0..cache_capacity {
+            host.apply(scriptbots_runtime::HostCommand::UpdateSimulation(
+                SimulationCommand {
+                    paused: None,
+                    speed_multiplier: None,
+                    step_once: true,
+                },
+            ));
+            context.update(|app| {
+                world.update(app, |view, _| {
+                    let _ = view.snapshot();
+                });
+            });
+        }
+        redraw(&mut lab);
+        let before_refusal = host.port.world_digests().unwrap();
+        click(&mut lab, "narrative-review-frame");
+        context.update(|app| {
+            assert_eq!(world.read(app).playback.mode(), PlaybackMode::Live);
+            assert!(
+                hud.read(app)
+                    .world_review_feedback
+                    .as_ref()
+                    .unwrap()
+                    .starts_with("No cached World frame at tick")
+            );
+        });
+        assert_eq!(host.port.world_digests().unwrap(), before_refusal);
     }
 
     #[test]
