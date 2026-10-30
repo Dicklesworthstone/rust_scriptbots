@@ -1343,6 +1343,18 @@ attempts and the win/lose split are in `REALITY_CHECK_2026-09-03.md`.
 **[Currently In Progress]** The original interactive checkpoint-backed
 event-tick jump remains open; this CLI prerequisite does not complete it.
 
+**[Implemented — native component qualification] `bd-ji3a` saved-checkpoint canvas review, 2026-10-30:**
+source `50960acd` connects Replay Enter to verified saved-cut reconstruction on
+the World canvas. Live owner state/controls stay independent, cancelled results
+cannot replace the canvas, and `g` returns live. Six distinct native tests, full
+workspace/all-targets check, strict Clippy and formatting pass. The reconstructed
+science projection is labelled separately from original host publications;
+arena handles, per-tick activity and presentation/session history are not restored.
+Raw attempts, the initial oracle failure/repair and bounded audit are retained
+in `REALITY_CHECK_2026-09-03.md`. **[Currently In Progress]** Original arbitrary
+event-tick replay and broader `bd-ji3a` acceptance remain unchanged and open;
+this is not native PTY/GPU, full Program scheduler or DSR acceptance.
+
 Viewport size, camera, selected agent, requested detail, and chart window are per-client inputs, not mutable global projection state and not scientific world state. The TUI, GUI HUD, server ASCII capture, and web snapshot reuse semantic projection functions and caches keyed by request/revision. They may render the result differently.
 
 The selected-brain detail slice is now an explicit, synchronous, read-only pull

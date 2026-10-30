@@ -1,5 +1,275 @@
 # Reality Check — rust_scriptbots — implementation continuation 2026-10-27
 
+## Active TODO — saved-checkpoint canvas review, VioletTrout, 2026-10-30
+
+Delivered source `50960acd`, tree `0f855efd`, passes six distinct native component
+tests, required workspace/all-targets check, strict Clippy and formatting. Replay
+Enter now reviews a verified saved cut; `g` returns live. Original arbitrary
+event-tick replay and broader `bd-ji3a` acceptance remain open.
+
+Consumer: Enter on the existing Replay catalog's selected checkpoint. At the start,
+the catalog exposed saved metadata but had no canvas consumer for the real retained
+artifact. The operator requested this TODO; it gates the reviewed handoff and
+retires at handoff (creation Q1–Q4). Runtime review is FEATURE; this minimal
+checklist/audit is a LEGITIMATE GATE. No new framework or integrity exception.
+Opportunity cost: finish this original `bd-ji3a` consumer as this block's ready
+capability. An additional hour of report machinery would give less user value;
+keep only the requested bounded handoff, then retire this checklist.
+
+- [x] Inspect current graph and original scope; continue original `bd-ji3a`.
+- [x] Trace verified artifact reads, core restoration and existing canvas review.
+- [x] Reserve exact paths and mark the active plan/Bead before implementation.
+- [x] Implement immutable visual reconstruction from the selected verified saved cut.
+- [x] Require actual saved tick, population and scientific digest to agree with catalog metadata.
+- [x] Dispatch review on the existing background-task path; bound concurrent requests.
+- [x] Connect Replay Enter, loading/result/error feedback and return-to-live behavior.
+- [x] Implement late-reply discard after cancellation, navigation or a new selection.
+- [x] Exercise a real MLP checkpoint after live advancement; inspect rendered saved/live ticks.
+- [x] Preserve corrupt-artifact/unknown-ID/error behavior and actual live-owner invariance.
+- [x] Run required workspace check, strict Clippy, formatting and touched-source scan.
+- [x] Retain exact native evidence and full bounded honesty audit; preserve original remaining acceptance.
+- [x] Review source and prepare exact owned metadata for publication; final handoff records actual push/ref/lease observations.
+
+Initial immutable candidate `1b4048edc30172492e5acb57f7a628a1b0eaefb0`, tree
+`d3b9a18a`, contains the actual service/Enter/background-reply/canvas consumer plus
+two inline real-component tests. All immutable hunks are reviewed. Formatting
+exits 0; the exact four changed Rust files' UBS scan exits 0 (0 critical,
+3,944 warnings, 984 info). Runtime qualification is pending; no success is claimed.
+The first workspace-check request is refused with outer exit 103 before compilation;
+that infrastructure result is retained separately from compiler/test outcomes.
+Every raw attempt and retained artifact goes under
+`/data/tmp/scriptbots-checkpoint-review-20261030-violettrout/`.
+Initial native execution is **1 passed, 1 failed, 0 ignored, 683 filtered**, 1.10s,
+outer exit 101. The real MLP TUI case passes: saved tick 3/live tick 4 have different
+cells; reconstructed cells match; the actual background closures, duplicate bound,
+x/g/navigation/selection cancellation and corrupt-file refusal preserve the live
+digest. The service matrix passes its empty-world row, then fails at MLP because
+its new oracle compared the full original publication byte-for-byte. Decoding the
+retained assertion reveals exactly 12 differences: 11 regenerated arena handles
+and a preceding-tick death count (original 9, reconstructed 0), with no other
+projected-field difference. Raw worlds and every difference are retained in the
+proof root. Core checkpoints explicitly exclude host/presentation history.
+The correction qualifies the service as an internal reconstructed-science canvas,
+labels it `CHECKPOINT STATE` separately from cached-frame review, and compares all
+original projection fields exactly except those observed non-scientific handles
+and death counter. It does not mask births or alter float tolerances, scientific
+digests, registry validation, artifact checksums, cancellation or pixel assertions.
+This new-oracle repair admits the scientifically identical reconstructed state;
+it explicitly does not certify original slot identities or per-tick activity.
+All pre-turn test assertions remain unchanged; the new oracle is relaxed exactly
+as disclosed above. Fixed execution is still pending at this intermediate point.
+Two `hz4` check requests are refused with exit 103; worker status reports no disk
+space. A normal healthy-`hz3` request then fails during remote source setup with
+RCH-E104 SSH timeout and unobserved terminal acknowledgement. None is a compiler
+result, and no worker limit, policy, lease authority or filesystem cleanup changes.
+The projection-label/oracle correction is committed as `4f421d857152`, tree
+`8302c774`. Three corrected-test requests on `hz2` are refused with exit 103;
+the latest retained worker facts show `disk_free_gb=14.48` and critical disk-ratio pressure, so no
+more blind retries or cleanup are attempted there. Normal admission on Linux
+worker `vmi1149989` is compiling that exact intermediate pin while `hz3` checks it.
+Only the configured external test TMPDIR was created on that worker; no OS package,
+resource, deadline or policy change was made.
+While those isolated builds run, source review finds that a successful result
+could leave the status bar at Loading. Final candidate `6764312b57e5`, tree
+`7e268c47`, replaces it with actual successful review feedback and explicitly
+reports navigation/selection cancellation. The test additionally requires the
+actual source checkpoint ID and completed success status. All immutable hunks
+are reviewed. Final formatting check exits 0; four-source UBS exits 0 (0 critical,
+3,956 warnings, 987 info). Native final qualification is still pending; the
+intermediate source and final source are not conflated.
+The final modal-input pass preserves command-palette/help ownership while a review
+is pending. The real-worker test now types `g` and closes the palette with Escape,
+requiring neither to cancel the review. Frozen source is
+`ceedb1cbae2d2f891db1867db15a6b20b0c7e2f2`, tree `8ef7ece4`; the earlier `6764312b`
+status fix is intermediate. All hunks are reviewed. No further implementation
+expansion is planned; qualify this exact source and the existing cached-review
+regressions before publication.
+
+Qualification infrastructure, retained without compiler credit: the intermediate
+`4f421d85` workspace check on `hz3` loses SSH execution with exit 255. Normal
+`rch jobs recover` acknowledges that terminal result (the recovery command's exit
+0 is not a compiler pass; its stderr also records the earlier daemon exit 130).
+The final `ceedb1cb` request on that worker refuses source-namespace initialization
+with status 73/outer 103 before compilation. No namespace guard is bypassed.
+The intermediate native build on `vmi1149989` reaches its ordinary 30-minute limit
+and exits 137 without running tests. Final source `ceedb1cb` retries through normal
+admission on that warmed worker, with the unchanged profile/deadline and no local
+fallback. Seven live source hashes (four changed Rust files plus Cargo manifest,
+lockfile and toolchain) match the final pin; raw binding receipts are retained.
+Final native outcomes remain pending here until actually observed.
+The first final-pin native attempt also exits 137 after 1,804,273ms while
+compiling `scriptbots-storage`, before any test executes. Its unchanged-command
+retry uses the same worker/cache through normal RCH admission; deadline and
+profile remain unchanged. Both raw logs are retained.
+That retry observes **2 passed, 0 failed, 0 ignored, 683 filtered**, 3.57s,
+outer 0, exact `ceedb1cb`/`8ef7ece4` receipt. All five registry rows run and
+have distinct actual scientific digests; saved tick 1 populations are
+empty=0, MLP=11, DWRAON=15, Assembly=9 and Mixed=10. Original/reconstructed
+death counters are respectively 0/0, 9/0, 5/0, 11/0 and 10/0. Remaining
+projection fields agree exactly, live owner digests/publications remain unchanged,
+and all catalog/corruption guards pass. The real TUI case passes saved tick 3
+versus live tick 4 pixels, source identity/status, duplicate bound, modal ownership
+and cancelled-result checks. Six retained artifact directories are copied locally
+under `ceed-native-artifacts/`, without overwriting prior evidence.
+The compiler reports one unused test import. Separately reviewed
+`50960acd8d4a0621ee3fc5e0f77d0fce73e4e377`, tree `0f855efd`, removes only that
+import; no case or assertion changes. Formatting exits 0. This is the new frozen
+source. Its native re-execution passes **2/0/0**, 683 filtered, 2.14s, outer 0,
+with no compiler diagnostics. The receipt binds full commit/tree above; seven
+live source/manifest/lock/toolchain hashes match. Cargo JSON names the executed
+application test binary with opt-level 0, debug-info 0, debug assertions and
+overflow checks enabled. Six final artifact directories are retained under
+`509-native-artifacts/`. Final four-source UBS exits 0 (0 critical, 3,962 warnings,
+987 info); no warning-clean claim. Fresh fleet telemetry shows `hz2` recovered
+to `disk_free_gb=25.15`/advertised slots and `hz4` to `disk_free_gb=53.28`/advertised slots. Final
+workspace check and strict Clippy therefore use normal admission on those
+separate workers, with no resource/policy changes. Their actual outcomes and
+existing cached-canvas/catalog regressions remain pending.
+The two existing `narrative_canvas_review` regressions pass on final source:
+2/0/0, 683 filtered, 2.15s, outer 0. They exercise real cached frames, unchanged
+live owner/status and modified-shortcut/no-event behavior. The retained final
+rendered map was inspected directly: `CHECKPOINT STATE tick 3 (live 4)`.
+Parsing the five copied metadata files independently finds five distinct digests.
+Both existing checkpoint-catalog regressions also pass on final source:
+2/0/0, 683 filtered, 0.04s, outer 0. Total qualification is **six distinct test
+IDs**, not eight by counting the preceding pin again. No pre-turn assertions,
+goldens or catalogue verification semantics change. Workspace compiler checks
+are the remaining qualification gate.
+Final workspace/all-targets `cargo check` passes on normally admitted `hz2`:
+outer 0, Cargo build-finished success true, 22m56s build, no compiler diagnostics.
+Its receipt binds `50960acd` / `0f855efd`. Strict workspace/all-targets Clippy
+on `hz4` is the remaining compiler gate.
+Its first attempt reaches application integration-test targets without a compiler
+diagnostic, then exits 137 at the unchanged ordinary deadline (1,810,153ms).
+This remains incomplete, not lint success. An unchanged-command, same-worker
+warm-cache retry is submitted through normal admission; both raw logs remain retained.
+That retry refuses source-namespace initialization (status 73/outer 103) before
+Clippy executes. RCH records the first exit-137 build as terminal-acknowledged;
+the new refused wrapper has no observed terminal command result. Normal recovery
+is requested for that exact wrapper, without replay, force, cancellation,
+namespace bypass or cleanup. Its protocol result cannot establish lint success.
+Recovery returns protocol exit 0 with `status=completed`, terminal acknowledged,
+and recovered command exit 1. That acknowledges the failed preparation, not a
+Clippy result. After recovery/backoff, one normal same-command attempt is
+submitted on the warmed worker; any continued guard refusal will use another
+worker rather than changing authority or limits.
+The third normally admitted Clippy attempt passes on the unchanged final source:
+outer 0, Cargo build-finished success true, 1m20s build, no compiler diagnostics,
+and the exact `50960acd` / `0f855efd` receipt. It uses workspace/all-targets and
+`-D warnings` unchanged. All required checks for this increment now pass.
+Original `bd-ji3a` remains in progress for arbitrary event-tick replay and full
+original acceptance; native component self-verification is not PTY/GPU, a full
+Program scheduler exercise, whole-workspace runtime, performance or DSR proof.
+Final semantic Beads update changes only `bd-ji3a.notes` and `updated_at`
+(`2026-10-30T19:49:46.142831277Z`). All 719 other raw lines remain byte-identical
+to the starting snapshot; its status/assignee, description, acceptance and
+dependencies remain unchanged. Canonical import succeeds (720 skipped because
+the semantic DB is already current); active dependency cycles are empty.
+The pre-existing modified `.beads/beads.base.jsonl` and nine WAL-index directories
+are preserved and excluded from publication. Final handoff reports actual pushes,
+remote-ref agreement and release of only this agent's reservations.
+
+| Observation | Initial `1b4048ed` | Final `50960acd` |
+| --- | --- | --- |
+| Full original publication identity | Empty row passes; MLP fails (11 handles, deaths 9→0); remaining rows unreached | Still not claimed; original handles/activity history unavailable |
+| Exact scientific reconstruction and remaining projection fields | MLP digest restore succeeds before the overbroad oracle fails | All five rows pass; no float tolerance or digest relaxation |
+| Saved versus live canvas cells | Actual MLP saved/live case passes | Actual saved 3/live 4 case passes; saved cells match exactly |
+| Completion/modal feedback | Later source review finds stale loading/modal ownership gaps | Explicit source ID/completed status and palette g/Escape assertions pass |
+| Corrupt/catalog/unknown/stale replies | Actual TUI negatives pass; service matrix incomplete | All declared real negative controls pass, live owner unchanged |
+
+This admits the scientifically identical reconstructed projection and loses no
+claim silently: original publication/session/history fidelity remains open.
+
+### Bounded work and honesty audit — checkpoint consumer
+
+Window: published base `7e2cb7ce` through frozen source `50960acd` and this
+handoff. Project purpose (README): a faithful deterministic artificial-life lab
+with usable visualization, interchangeable brains and reproducible analytics.
+Four source commits are USER work on **one** consumer increment, not four
+features: `1b4048ed` implementation, `4f421d85` projection qualification,
+`6764312b` completion feedback and `ceedb1cb` modal ownership. `50960acd` is
+one ENABLER compiler-warning fix for this increment's strict qualification.
+The requested
+TODO/Beads/plan/audit handoff is PROCESS and earns zero capability credit.
+There are zero closures, no subagents, no speculative enabler and no performance
+claim. Exact final qualification is recorded above; original acceptance stays open.
+
+Real-work questions: (1) two-minute demonstration is Replay `7`, select a saved
+cut, Enter, observe `CHECKPOINT STATE` versus the live tick, then `g`;
+(2) omitting PROCESS changes no runtime behavior; (3) the actual consumer is
+artifact read → core restore → immutable projection → existing canvas;
+(4) oldest open user-facing umbrella is July's `bd-2z0`, with its genome,
+host and frontend children also open; this work advances original `bd-ji3a`
+which blocks narrative surfacing, not a claim of globally oldest-ready work;
+(5) solo, no close-farming pane; (6) no substitute Bead or acceptance edit.
+Observed graph denominator is 107 open + 37 in progress, not a completion
+percentage. Verdict **DRIFTING, corrected**: initial overbroad oracle and noisy
+exploration cost time. Freeze apparatus and implementation; finish this real
+consumer's required checks and handoff before another feature.
+
+Honesty inventory (all twenty prompts; bounded to this window):
+
+1. **Yes.** `4f421d85` relaxed the newly added full-publication oracle by
+   excluding exactly arena IDs and the previous-tick death counter. Initial
+   failure is retained: empty row passes, MLP fails on 11 IDs plus deaths 9→0;
+   later presets were unreached. This is an explicitly disclosed new-oracle
+   repair, not an untouched-test claim. All remaining fields and scientific
+   digests stay exact. Original history fidelity is expressly unproved.
+2. No (checked: both inline tests use real owner threads, application brains,
+   retained artifacts and production task closures; no replacement restore).
+3. No (checked: all source diffs; no golden files or regeneration).
+4. **Yes.** Feature and its new test were committed together; the oracle
+   correction is a separately reviewed commit with the observed failure and
+   admitted/lost claims above. No CI, suppression, retry count, tolerance,
+   deadline, feature-set, worker policy or resource limit is changed.
+5. No (checked: preset reconstruction is production registry matching, not
+   test/environment sniffing; all five declared default rows must have distinct
+   actual scientific digests; existing integrity gates remain in use).
+6. No (checked: first native run executes two tests, one fails; final new tests
+   execute two and pass, with four distinct existing regressions also executed).
+7. No (checked: raw attempts distinguish initial, intermediate and final pins;
+   pending final execution is not called a pass).
+8. No (checked: proof is scoped native component/model self-verification,
+   real files/owner/widgets; it is not a CLI/PTY/full Program scheduler, GPU,
+   DSR, whole-workspace runtime or independent-verifier result. Cancellation
+   ordering holds real closures before execution, not a claim to interrupt I/O).
+9. No (checked: initial failure and every 103/73/137/SSH-255 attempt retained
+   above; recovery protocol exit 0 explicitly earns no compiler credit).
+10. No (checked: cited build/test/scanner commands retain stderr with stdout
+    or in a named sibling file; display truncation does not replace raw logs).
+11. No (checked: original `bd-ji3a` remains in progress; no closure or new
+    issue carrying away unmet scope).
+12. **Yes, new increment's claim corrected.** Initial full-publication
+    assumption was too broad; UI/README now explicitly identify reconstructed
+    science state. Original Bead description, acceptance and dependencies are
+    unchanged; arbitrary event-tick replay remains open.
+13. No (checked: solo session and no issue closure).
+14. No (checked: no subagent dispatch).
+15. No (checked: no subagent report accepted; this is self-verification).
+16. No (checked: no panes/subagents or refusal-only closure).
+17. No (checked: no model/agent agreement used as evidence; repeated runs
+    of the same source add no independent credit).
+18. No (checked: five registry configurations, one seed 42, declared before
+    final execution; not five seeds. The TUI case separately compares actual
+    saved/live cells and keeps corrupt/cancel/modal controls).
+19. **Yes.** The first oracle conflated scientific restoration with absent
+    presentation history; broad reads/searches also produced avoidable noisy
+    and truncated output. Initial exact failure and narrow repair are retained;
+    freeze further expansion and complete runtime qualification. A derived
+    CASS search for `checkpoint_canvas_real_worker` has zero hits; previous
+    bounded sweeps are reused, not presented as a historical clean bill.
+20. Strongest observed evidence is re-executable exact saved/live cell
+    comparison plus scientific digest/metadata/all-retained-field agreement,
+    corrupt-artifact rejection and unchanged actual owner digest. Only observed
+    final outcomes above support that scoped claim; seven source hashes and
+    pinned RCH receipts bind it to the reviewed source.
+
+Disposition: the yes findings are corrected in place, disclosed here and in the
+operator report, and named as **RH-1 gate self-weakening**, **RH-10 spec editing**
+and **SM-1 commit-count gaming / SM-11 first-attempt amnesia** countermeasures: preserve the before failure,
+publish the win/lose split, retain original acceptance, and freeze apparatus.
+No independent verification is available; never promote self-review to it.
+
 ## Active TODO — exact replay windows, VioletTrout, 2026-10-30
 
 Delivered source `9a461de71b02a01c7825786c858d18e68aadd676`, tree `f9bcf1df`,
