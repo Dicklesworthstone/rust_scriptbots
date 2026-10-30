@@ -977,12 +977,8 @@ fn bounded_replay_scopes_real_streams_without_hiding_in_window_divergence() {
         replay_event_tick_cap: 65_536,
         ..ScriptBotsConfig::default()
     };
-    let config_path = directory.join("source.ron");
-    fs::write(
-        &config_path,
-        ron::ser::to_string(&serde_json::to_value(&config).unwrap()).unwrap(),
-    )
-    .unwrap();
+    let config_path = directory.join("source.toml");
+    fs::write(&config_path, toml::to_string_pretty(&config).unwrap()).unwrap();
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(1)
         .build()
