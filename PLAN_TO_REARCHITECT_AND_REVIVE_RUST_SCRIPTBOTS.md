@@ -1316,7 +1316,20 @@ pass. Reviewed title-only fixture commit `238090e4` passes all four rendering
 goldens and the unchanged layout/cell mutation control; strict workspace Clippy
 and formatting pass. Cargo retains an existing dependency future-compatibility
 warning. This is retained visual review, not checkpoint-based world reconstruction;
-the full original Bead and curated persisted-seed scope stay open.
+the original Bead stays open. The later seed qualification below addresses the
+persisted-seed slice separately.
+
+**[Currently In Progress] `bd-ji3a`, native three-seed slice qualified, 2026-10-30:**
+source `bf3731bd` exposes the headless owner's actual retained narrative records
+and dropped count in JSON and info logs. One pinned integration test passes
+four real application runs and four offline readbacks: quiet seed42 (0 rows),
+boom seed137 (1), extinction seed20260717 (3), and a capacity-one extinction
+repeat (1 observed, 2 dropped, all 3 durable). Complete records/prose, actual
+info rows, durable watermarks, exact ticks/seeds and read-only database bytes
+are checked. Workspace check, strict Clippy and formatting pass. Manifests name
+the exact source but retain incomplete cleanliness/status/diff provenance; this
+is native RCH functional proof, not centralized DSR migration acceptance.
+Checkpoint-backed event-tick jump remains open; the original Bead is not closed.
 
 Viewport size, camera, selected agent, requested detail, and chart window are per-client inputs, not mutable global projection state and not scientific world state. The TUI, GUI HUD, server ASCII capture, and web snapshot reuse semantic projection functions and caches keyed by request/revision. They may render the result differently.
 

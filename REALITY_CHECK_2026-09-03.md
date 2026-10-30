@@ -1,5 +1,123 @@
 # Reality Check — rust_scriptbots — implementation continuation 2026-10-27
 
+## Active TODO — real headless narrative seeds, VioletTrout, 2026-10-30
+
+The user requested continued execution and a granular TODO. Consumer: the
+headless application report plus original `bd-ji3a` acceptance item 5. Observed
+gap: existing storage round trips use constructed records, while live-world
+surface checks do not prove durable headless provenance. This checklist gates
+the requested handoff and retires with it; no new tracker or validation framework.
+Creation worksheet: runtime branches on the report's data, so the report change
+is FEATURE; this requested TODO/audit is a LEGITIMATE GATE. Operator, original
+headless-run acceptance, the observed disconnected proof paths, and retirement
+at handoff answer creation Q1–Q4. No integrity-control exception is needed.
+Opportunity cost: qualify this original narrative bottleneck rather than create
+more planning artifacts or take the already-owned full-host checkpoint work.
+
+- [x] Inspect current Beads graph and original acceptance; preserve its full scope.
+- [x] Reserve exact paths and mark original work in progress through Beads.
+- [x] Trace actual owner publications, headless report, storage info rows and typed reader.
+- [x] Expose the final observed narrative ring and dropped count in the real headless report and info log.
+- [x] Implement distinct quiet, boom and extinction seeded application runs with retained subprocess streams.
+- [x] Compare every published event field/prose byte with finished durable rows and offline CLI output.
+- [x] Require zero ring drops for the three complete tables, exact tick/seed, equal persistence watermarks and three distinct actual event-kind sets.
+- [x] Add a real capacity-one extinction repeat: require positive drops, exact retained-record membership and complete durable/offline rows.
+- [x] Execute the real subprocess test; inspect full event tables and retain every attempt.
+- [x] Run required workspace/all-targets check, formatting and touched-source scan.
+- [x] Complete strict workspace/all-targets Clippy with warnings denied.
+- [x] Complete source-bound evidence and bounded honesty audit; final tracker note accompanies this report without closing incomplete acceptance.
+- [x] Review source and prepare final metadata for publication; handoff records actual push/ref/lease observations.
+- [ ] Original remaining acceptance: checkpoint-backed event-tick jump; the seed increment does not implement it.
+
+Frozen source `bf3731bd58ae285505f49c2e051c61fc61a76eaa`, tree `5a0f6b09`,
+contains the report/log consumer and one integration test with three distinct
+seeds and four actual run variants (the fourth is the clipping control). All
+immutable source/README hunks are reviewed. Formatting exits 0. Touched-source
+UBS exits 0 with 0 critical, 2,897 warnings and 585 info; no clean-warning or
+scanner-improvement claim. Pinned qualification results follow.
+Pinned native RCH qualification now passes **1 integration test, 0 failed,
+0 ignored, 5 filtered**, 119.79s, outer exit 0. Its 24m46s cold unoptimized build
+is not a performance result. Four actual application runs and four actual
+offline CLI readbacks finish successfully on three distinct seeds:
+
+| Case | Seed | Tick | Published | Dropped | Durable/CLI rows | Observed kinds |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| quiet | 42 | 96 | 0 | 0 | 0 | empty |
+| boom | 137 | 96 | 1 | 0 | 1 | population_boom |
+| extinction | 20260717 | 96 | 3 | 0 | 3 | energy_collapse, extinction, population_crash |
+| extinction-clipped | 20260717 | 96 | 1 | 2 | 3 | same complete durable set; partial observed ring |
+
+The first three kind sets differ. Complete published `EventRecord`s match
+durable records byte-for-byte after canonical identity ordering; the clipping
+control instead requires exact retained-record membership and the actual
+missing-row/drop count. Every durable row has its actual info log, and each
+observed ring has one full JSON info table, including the empty case. The
+application reports dropped observations rather than inventing an event row.
+All cases require nonempty equal admitted/applied/durable watermarks and exact
+tick/seed, and compare database bytes before and after typed/CLI readback.
+
+Actual databases, scenarios, manifests, reports and all eight subprocess
+stdout/stderr/process records are copied without deletion or overwrite into
+`/data/tmp/scriptbots-narrative-seeds-20261030-violettrout/retained-Ablm51/`.
+The RCH receipt binds `bf3731bd` to tree `5a0f6b09`. Cargo JSON matches the
+executed integration binary and both actual child executables: opt-level 0,
+debuginfo 0, debug assertions and overflow checks enabled. Five live worker
+hashes (both changed Rust files, manifest, lockfile, toolchain) match the frozen
+source. This is one test's scoped self-verification, not four independent tests.
+All four retained launch manifests name source `bf3731bd`; they honestly retain
+`provenance_complete=false` because source-tree cleanliness, status digest and
+diff digest are unavailable inside the worker namespace. The exact RCH receipt
+and observed source hashes bind this functional proof; they do not turn those
+unavailable manifest fields into a complete provenance certificate.
+Workspace/all-targets check also exits 0 on the same pin, build 25m02s. Strict
+workspace/all-targets Clippy with `-D warnings` exits 0, build 3m45s, receipt bound
+to the same source/tree. The runtime build's existing `proc-macro-error2` 2.0.1
+future-compatibility warning remains retained. No source changes follow this
+runtime qualification; no gate, feature, profile or deadline changes obtain it.
+Native PTY/GPU, performance, complete workspace runtime, centralized DSR migration
+acceptance and independent verification are outside this evidence. The original
+checkpoint-backed event jump stays open.
+
+Bounded audit at handoff: inventory is one USER commit (`bf3731bd`:
+headless typed records/info log and its real acceptance consumer), zero closures;
+the requested TODO/Beads metadata handoff is PROCESS, not capability credit. No speculative
+ENABLER or UNKNOWN work is credited. Core purpose: a reproducible evolutionary
+agent simulation with usable observation and persistence. Two-minute demo:
+run headlessly, inspect the typed observed timeline and its dropped count, then
+query the actual closed run. Omitting PROCESS artifacts changes no runtime result.
+The July original `bd-ji3a` is being advanced rather than minting a smaller item;
+no exhaustive global-oldest claim. Solo, no pane/close comparison. Original scope
+and acceptance stay intact; the plan marks implementation and qualification separately.
+Verdict **DRIFTING** during initial noisy/truncated exploration; correction is to
+freeze the concrete source and finish its actual qualification, not expand scope.
+
+Honesty inventory, prompts 1–20 (updated at handoff with actual qualification):
+1. No (checked: complete source diff): no existing test is removed, ignored or weakened.
+2. No (checked: subprocess/reader paths): actual binaries, MLP worlds, scheduled commands and real files; no constructed narrative records or custom test double.
+3. No (checked: changed paths): no golden or snapshot fixture changes.
+4. Yes: new acceptance checks accompany the report feature. Existing validators, CI, assertions, deadlines and tolerances are unchanged; no suppression or bypass.
+5. No (checked: production branches): the generic report copies actual publications; no seed/case special path. Controlled ecology is explicit test input and detector policy is unchanged.
+6. No (checked: actual libtest/child records): one passed integration test executes four real application runs and four real CLI readbacks; the five filtered tests earn no credit.
+7. No (checked: pinned logs against claims): runtime, workspace check and strict Clippy pass. Source scans and formatting are not counted as runtime evidence; incomplete manifest provenance remains explicit.
+8. No (checked: evidence scope): real headless subprocess/file evidence is not interactive PTY/GPU, centralized DSR migration acceptance or independent verification.
+9. No (checked: retained proof directory): all attempted runs and their two streams remain retained.
+10. No (checked: redirections and process helper): both stdout and stderr are retained.
+11. No (checked: original Bead): no closure, new child or moved acceptance.
+12. No (checked: plan/tracker diff): progress annotations do not change original requirements.
+13. Not applicable: solo, no delegated closure.
+14. Not applicable: no subagent dispatch.
+15. Not applicable: no delegated evidence accepted.
+16. Not applicable: no panes or refusal farming.
+17. No (checked: claims): self-verification is explicitly scoped; no independent agreement claim.
+18. No (checked: test declaration): three distinct seeded complete-run cases plus one real clipping repeat, in one integration test. Counts are not multiplied into four independent tests.
+19. Initial broad reads, a BV schema-filter mistake and a nonmutating failed document-patch anchor produced avoidable noise; narrowed reads and the frozen candidate correct that detour. Compilation time is waiting, not feature progress.
+20. Strongest evidence is the pinned real application → actual owner publication/info table → finished typed SQL → actual offline CLI chain, including zero-event and positive-drop controls. The exact-source integration command and retained files/streams are re-executable.
+CASS's derived `curated_headless_narrative` query returns 30 broad matches;
+one followed September hit concerns storage recovery logs, not this feature.
+Earlier conversation-wide sweeps remain in prior audits; no historical clean
+bill is inferred. Countermeasures: SM-10 (real report consumer), SM-11 (retained
+attempts), PL-1 (no zero-run promotion); no new enforcement apparatus.
+
 ## Active TODO — terminal narrative canvas review, VioletTrout, 2026-10-30
 
 The operator requested continued implementation and a granular TODO. Consumer:
@@ -20,11 +138,11 @@ handoff. The observed gap is selection without a canvas-review consumer.
 - [x] Update original Bead without narrowing scope; retain evidence and complete the bounded honesty audit (final tracker note accompanies this report).
 - [x] Prepare reviewed publication; final handoff records the actual push/ref/lease observations.
 
-Original acceptance still open, in logical order: complete checkpoint-backed
-event-tick replay/jump through the existing owner/replay path, then exercise
-three curated headless seeds through real persistence/reload with expected
-event-kind assertions and full info-level event-table logging. The bounded
-GUI/TUI visual-review increments do not substitute for either requirement.
+Original acceptance still open: complete checkpoint-backed event-tick replay/jump
+through the existing owner/replay path. The later real-headless seed qualification
+above exercises the three-seed persistence/reload/info-table criterion on native
+RCH; the bounded GUI/TUI visual-review increments alone did not establish it.
+Centralized DSR migration acceptance is not claimed by this functional proof.
 Final tracker export/import preserves all 719 other canonical rows byte-for-byte;
 only this original Bead's notes and timestamp change. Dependency-cycle check
 returns zero active and zero total cycles; no graph structure is changed.
