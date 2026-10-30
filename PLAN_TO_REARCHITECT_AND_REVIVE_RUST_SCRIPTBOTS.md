@@ -1296,6 +1296,16 @@ Shared pure projection functions or a keyed projection broker perform work that 
 - terrain/food glyph or color classification;
 - capability-neutral labels and semantic colors.
 
+**[Currently In Progress] `bd-ji3a`, 2026-10-30:** source `32770e10` connects the
+GUI narrative rail to exact retained visual frames in the actual World window,
+with return-to-live and explicit missing/evicted-frame refusal. Narrative
+navigation stays current during paused Lab HUD playback. Pinned headless
+GPUI/real-owner qualification passes 18 distinct tests; workspace/all-targets
+check, strict Clippy and formatting pass. UBS has two reviewed unchanged
+capture-filename false positives, not a clean scanner result. The original
+TUI/disk-backed replay and three-seed acceptance remain open; the GUI increment
+does not close the Bead or certify native GPU execution.
+
 Viewport size, camera, selected agent, requested detail, and chart window are per-client inputs, not mutable global projection state and not scientific world state. The TUI, GUI HUD, server ASCII capture, and web snapshot reuse semantic projection functions and caches keyed by request/revision. They may render the result differently.
 
 The selected-brain detail slice is now an explicit, synchronous, read-only pull

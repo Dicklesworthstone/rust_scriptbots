@@ -1,5 +1,159 @@
 # Reality Check — rust_scriptbots — implementation continuation 2026-10-27
 
+## Active TODO — narrative frame review, VioletTrout, 2026-10-30
+
+Consumer: the existing GUI narrative rail and bounded visual playback cache.
+This operator-requested checklist retires at handoff; no new process framework.
+
+- [x] Trace real timeline/playback consumers and original Beads dependencies.
+- [x] Claim original `bd-ji3a`, reserve exact paths, retain unchanged full scope.
+- [x] Wire Lab to the actual World entity through a weak handle, without sharing window-owned caches.
+- [x] Implement explicit event review, exact visual-frame matching and return-to-live controls (verification below).
+- [x] Refuse missing/evicted frames without changing playback; keep narrative navigation current even when Lab's science HUD is paused.
+- [x] Verify real-world frame review leaves owner tick/state untouched, plus cache boundaries.
+- [x] Run focused renderer tests, required workspace check/strict Clippy and formatting.
+- [x] Record exact evidence and remaining original acceptance; update only the owned Beads row.
+- [x] Freeze source and prepare owned docs/tracker for reviewed publication; final handoff records guarded pushes, remote refs and own-lease release.
+- [x] Complete the bounded work/honesty audit, retaining all incomplete attempts and explicit limits.
+
+The actual World and Lab windows have independent caches. This increment connects
+Lab to the World entity through a weak handle, so a successful review changes the
+visible World frame. It leaves scientific playback and Lab's science playback
+alone. The narrative list and its ring metadata now remain current even during
+Lab HUD playback, matching the current events that selection resolves against.
+
+Initial working qualification runs the real intervention/click/return/eviction
+test: **1 passed, 0 failed, 0 ignored**, 196 library tests filtered, 0.68s. The
+unoptimized dependency build takes 14m37s; that duration is not a performance
+result. Three integration tests are filtered out by that focused invocation and
+earn no runtime credit. Final source `32770e10728be58d0853e66226e9ab589cb458d3`,
+tree `6de82d82`, adds a stricter paused-Lab case and actual World repaint;
+the pinned qualification below verifies those additions. Source/README review
+reads all immutable hunks before committing.
+
+Pinned source qualification now passes **4 narrative tests** (193 filtered,
+7.68s) and **7 playback tests** (190 filtered, 0.00s), no failures/ignores, both
+outer exits 0. The stronger real click test paints the actual World view and
+keeps the current event rail usable while Lab's science HUD remains paused.
+Exact cached `RenderFrame` equality and unchanged owner digests are asserted;
+eviction and empty/nonvisual history refuse without moving playback. These
+11 distinct tests share one test binary; the earlier working repetition adds
+no distinct-test or independent-review credit. Both pinned receipts bind source
+`32770e10` to tree `6de82d82`. Qualification for existing window controls and
+workspace compilation/lint is recorded separately below.
+
+All **7 existing window tests** then pass (190 filtered, 15.73s), including
+shared command receipts, pause/speed state, shortcut scope, repaint-independent
+digests and both window layouts. The three filters have **18 distinct passed
+test IDs, zero overlap**, no failures or ignores. Runtime Cargo JSON records
+the actual executed renderer test artifact: opt-level 0, debuginfo 0, debug
+assertions and overflow checks enabled; its executable matches each `Running`
+line. This is one binary's scoped self-verification, not three independent
+implementations or native GPU certification. Five live worker hashes match the
+frozen local renderer/config/lock/toolchain files during the workspace check.
+`cargo check --workspace --all-targets` completes successfully on pinned source
+`32770e10`, outer exit 0. Local `cargo fmt --check` also exits 0. No source
+changes follow the 18-test qualification.
+Strict Clippy's first RCH admission exits **103** before lint execution; this is retained
+as an infrastructure refusal, neither a red nor green Clippy result. Retry
+uses the prescribed backoff and a separate raw log.
+The second `hz2` request also exits 103. Read-only fleet inspection finds no
+active builds but `hz2` at zero advertised slots under disk-pressure protection
+(`disk_free_gb=13.66`). `hz4` remains admissible (`disk_free_gb=46.90`),
+so the unchanged pinned strict-Clippy command moves there through normal RCH
+admission. No cleanup, resource override or worker-policy edit is attempted.
+The first admitted `hz4` lint run ends **137 after 1,816.874s**, without a lint
+completion. Its configured external limit is 1,800s; the timing is consistent
+with that limit, but the raw exit does not independently rule out other kill
+causes. No lint diagnostic is reported before it ends. This is an incomplete
+run, not a pass. The unchanged command retries using the existing cache,
+without widening the limit; the first raw log remains retained.
+That retry completes **strict workspace/all-targets Clippy with `-D warnings`,
+outer exit 0**, in 9m08s of build time. Its receipt binds the same source
+`32770e10` and tree `6de82d82`; no policy, source or limit changed to obtain it.
+The two admission refusals and incomplete 137 run remain part of this result.
+The original Bead remains in progress for its broader TUI/replay and curated
+persisted-seed acceptance. No whole-workspace runtime, native GPU, performance
+win, checkpoint-based review or independent-review claim follows.
+Canonical reconciliation changes only `bd-ji3a` status/assignee/notes/timestamp;
+all 719 other raw rows remain byte-identical to the initial snapshot, and the
+original description/dependencies/acceptance are unchanged. BR imports that
+canonical file and reports zero dependency cycles. The metadata-only UBS
+invocation exits 3 because no supported source language is present; it adds no
+scanner credit. The unchanged Rust source retains its explicit false-positive
+disposition below. Generated Beads base/scratch files remain outside the owned
+commit paths and are preserved.
+
+UBS scans the entire changed Rust file, without exclusions, and exits **1**:
+2 critical, 3,026 warnings, 937 info. Both critical matches are unchanged
+`SystemTime`-based names for capture paths at lines 1024/1262, not credentials
+or security tokens; their bodies and call context were reviewed. This is a
+manual false-positive disposition, **not a UBS pass**. No scanner policy,
+baseline, suppression or test exclusion changes. Raw logs, source receipts and
+all attempts are retained under
+`/data/tmp/scriptbots-event-review-20261030-violettrout/`.
+
+### Bounded work and honesty audit — this increment through source `32770e10`
+
+**Creation worksheet.** Runtime does not branch on this report. Consumer:
+the requesting operator; gate: the explicitly requested granular TODO and
+truthful implementation handoff; observed defect: the rail had no consumer of
+the existing visual cache, and prior sessions over-credited metadata progress.
+The user's request supplies creation Q1–Q3; retirement: this TODO stops driving
+work at handoff, with the report retained under the no-deletion rule. Integrity
+exception Q1–Q4 is not invoked: no additional integrity framework is proposed.
+Opportunity cost Q1: finish the selected ready `bd-ji3a` capability; Q2: yes,
+more implementation beats another hour of reporting, so this is one bounded
+entry in the existing report. Verdict: **LEGITIMATE GATE**, the minimal requested
+handoff; no feature credit.
+
+**Real-work worksheet.** Purpose: a deterministic evolutionary-agent lab with
+observable experiments. Actual `git log --since=2026-10-30T00:52:24Z --stat`
+shows source/README `32770e10` (USER) and separately generated base-only
+`f3df7654` (PROCESS, not credited to this implementation): USER 1, ENABLER 0,
+PROCESS 1, UNKNOWN 0. This handoff/tracker update is also PROCESS. Q1: demo
+Timeline review and return-to-live in two windows. Q2: omitting the process
+record would leave identical runtime behavior, but lose the requested handoff.
+Q3: no speculative enabler is claimed; real clicks exercise the new consumer.
+Q4: the old July `bd-ji3a` user-facing gap is the item being advanced; other
+earlier work remains, and no exhaustive oldest-item claim is made. Q5: solo,
+no pane/close contest. Q6: no new child, closure or acceptance rewrite; plan
+notes describe the implementation's limits. **DRIFTING:** initial triage took
+about ten minutes before claiming work. Correction: stop further architecture
+speculation and finish the positive runtime connection and required checks.
+
+**Honesty inventory (all 20 prompts).**
+
+1. No (checked: every source/README review hunk); existing tests/gates are not weakened, deleted or ignored.
+2. No (checked: new tests); real owner/intervention and existing GPUI test platform drive actual handlers; nonvisual HUD unit inputs are explicitly synthetic.
+3. No (checked: changed paths); no golden or snapshot regeneration.
+4. No (checked: full diff/config paths); no validator, CI, scanner policy, suppression, timeout or tolerance change. UBS remains nonzero with the two reviewed false positives above.
+5. No (checked: runtime branches and original Bead); no seed/benchmark special case or narrowed acceptance used for completion.
+6. The initial command also reports two zero-run integration harnesses; those three filtered tests earn no credit. Pinned `--lib` lanes execute nonzero test sets (PL-1).
+7. No (checked: raw commands/logs); completed Rust gates are distinguished from the two refused admissions and incomplete first lint run.
+8. No (checked: claim wording); this is headless GPUI/real-owner proof, not native GPU, persisted replay or an independent review.
+9. No (checked: report versus logs); UBS exit 1, preliminary formatting corrections, admission refusals and lint exit 137 are retained and disclosed.
+10. No (checked: command redirections); cited qualification retains stdout and stderr together; no failure output is discarded.
+11. No (checked: canonical Beads); `bd-ji3a` stays in progress, with all original scope retained and no follow-up laundering.
+12. No (checked: plan/Bead diffs); implementation notes do not replace original requirements.
+13. Not applicable: solo, no subagent or peer closure accepted.
+14. Not applicable: no delegation or success-only subagent prompt.
+15. Not applicable: no delegated report accepted as proof.
+16. Not applicable: no panes or refusal-farming subagents.
+17. No (checked: claims); self-verification is not described as independent agreement.
+18. No (checked: recorded test IDs); all three pinned filters are retained, with 18 distinct passed IDs and no overlap; no performance denominator is selected.
+19. Initial triage was too long. One test declaration was briefly patched into the wrong context and corrected before qualification. A next RCH request began during the preceding invocation's post-Cargo artifact retrieval; recorded Cargo execution times do not overlap, and subsequent jobs wait for the full process exit. No failed result is hidden.
+20. Strongest evidence: the pinned real-click test compares the exact cached `RenderFrame` and owner digests across review, return and eviction refusal; its command is retained in `pinned-narrative.log` and can be rerun from `32770e10`.
+
+Older-session check: five bounded global CASS searches return broad matches;
+two followed September 4 physical locations are a token-usage row and a tool
+call, so they do not establish historical behavior. The feature-specific
+`narrative-review-frame` query returns zero hits. No historical clean bill is
+claimed. Disposition: zero-run harnesses are excluded explicitly (PL-1), all
+attempts remain visible (SM-11), and no orphan/helper-only credit is taken
+(SM-10). Early triage drift is disclosed and corrected by the working UI
+increment (SM-3); this record introduces no new enforcement apparatus.
+
 ## Active TODO — automatic compiler identity, VioletTrout, 2026-10-29
 
 At this increment's start, the existing manifest reader accepts full build-time
