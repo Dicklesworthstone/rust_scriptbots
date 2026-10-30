@@ -725,10 +725,12 @@ impl Model for LiveTerminalModel<'_> {
                             match result {
                                 Ok(snapshot) => {
                                     app.show_canvas_review(&snapshot, Some(checkpoint_id.clone()));
-                                    app.push_toast(format!(
+                                    let message = format!(
                                         "Reviewing saved checkpoint {checkpoint_id} at tick {}; live owner unchanged",
                                         snapshot.world.tick
-                                    ));
+                                    );
+                                    app.frankentui.status_message = Some(message.clone());
+                                    app.push_toast(message);
                                 }
                                 Err(error) => {
                                     app.frankentui.status_message = Some(format!(
@@ -745,8 +747,12 @@ impl Model for LiveTerminalModel<'_> {
                 if let Some((_, checkpoint_id)) = &self.checkpoint_review_in_flight
                     && (app.frankentui.route != frankentui_shell::ShellRoute::Replay
                         || app.selected_checkpoint_id() != Some(checkpoint_id.as_str()))
+                    && !self.checkpoint_review_cancelled
                 {
                     self.checkpoint_review_cancelled = true;
+                    app.frankentui.status_message = Some(
+                        "Checkpoint review cancelled after navigation or selection changed".into(),
+                    );
                 }
             })
         };
@@ -24146,6 +24152,21 @@ for case in ('panic', 'subscription', 'renderer'):
                 saved_tick
             );
             assert_eq!(app.snapshot.tick, live_tick);
+            assert_eq!(
+                app.canvas_review
+                    .as_ref()
+                    .unwrap()
+                    .source_checkpoint
+                    .as_deref(),
+                Some(checkpoint.checkpoint_id.as_str())
+            );
+            assert!(
+                app.frankentui
+                    .status_message
+                    .as_deref()
+                    .unwrap()
+                    .starts_with("Reviewing saved checkpoint")
+            );
             assert_eq!(
                 paint(&mut app),
                 saved_cells,
