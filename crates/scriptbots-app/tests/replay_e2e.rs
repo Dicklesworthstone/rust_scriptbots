@@ -950,7 +950,7 @@ persistence_interval = 32
 #[test]
 fn bounded_replay_scopes_real_streams_without_hiding_in_window_divergence() {
     use scriptbots_app::{BrainPreset, FounderRecipe, install_brains, seed_founders};
-    use scriptbots_core::{AgentData, ScriptBotsConfig, WorldState};
+    use scriptbots_core::{Intervention, Region, ScriptBotsConfig, WorldState};
     use scriptbots_storage::StoragePipeline;
 
     const HORIZON: u64 = 12;
@@ -983,7 +983,7 @@ fn bounded_replay_scopes_real_streams_without_hiding_in_window_divergence() {
         .num_threads(1)
         .build()
         .unwrap();
-    let produce = |name: &str, injection: Option<u64>, digests: bool, ticks: u64| {
+    let produce = |name: &str, perturbation: Option<u64>, digests: bool, ticks: u64| {
         let database = directory.join(format!("{name}.sqlite"));
         pool.install(|| {
             let mut pipeline = StoragePipeline::create_unattributed_file_with_thresholds(
@@ -1001,9 +1001,15 @@ fn bounded_replay_scopes_real_streams_without_hiding_in_window_divergence() {
                 .population;
             seed_founders(&mut world, &brains, FounderRecipe::Spread).unwrap();
             for _ in 0..ticks {
-                if injection == Some(world.tick().0) {
-                    let id = world.try_spawn_agent(AgentData::default()).unwrap();
-                    assert!(world.bind_agent_brain(id, brains[0]).unwrap());
+                let perturb_now = perturbation == Some(world.tick().0);
+                if perturb_now {
+                    world
+                        .enqueue_intervention(Intervention::Meteor {
+                            region: Region::All,
+                            lethality: 0.1,
+                            scorch: 0.5,
+                        })
+                        .expect("queue a real perturbation at the next science boundary");
                 }
                 if digests {
                     world.request_replay_world_digest();
@@ -1011,6 +1017,12 @@ fn bounded_replay_scopes_real_streams_without_hiding_in_window_divergence() {
                 persistence
                     .step(&mut world)
                     .expect("real recorded science step");
+                if perturb_now {
+                    let applied = world.applied_interventions().back().unwrap();
+                    assert_eq!(applied.kind, "meteor");
+                    assert!(applied.agents_affected > 0);
+                    assert!(applied.cells_affected > 0);
+                }
             }
             persistence.finalize(&mut world).unwrap();
             drop(persistence);
@@ -1023,8 +1035,8 @@ fn bounded_replay_scopes_real_streams_without_hiding_in_window_divergence() {
         database
     };
     let baseline = produce("baseline", None, true, HORIZON);
-    let late = produce("late-injection", Some(PREFIX + 2), true, HORIZON);
-    let early = produce("early-injection", Some(2), true, HORIZON);
+    let late = produce("late-meteor", Some(PREFIX + 2), true, HORIZON);
+    let early = produce("early-meteor", Some(2), true, HORIZON);
     let no_digest = produce("no-digest", None, false, HORIZON);
     let longer = produce("longer", None, true, HORIZON + 1);
     let reader = StorageReader::open(baseline.to_str().unwrap()).unwrap();
