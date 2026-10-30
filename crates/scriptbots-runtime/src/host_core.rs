@@ -6750,17 +6750,9 @@ mod tests {
             initial.checkpoint.source_digest(),
             &core.scientific_digest_v1().unwrap()
         );
-        core.install_schedule(
-            vec![scheduled(1, 0, serde_json::json!({"food_max": 0.61}))],
-            resolve_test_schedule,
-        )
-        .unwrap();
-        assert!(
-            core.capture_checkpoint_cut().unwrap().scheduled_input_count == 1,
-            "declared inputs must be counted before they run"
-        );
         let mut config = core.world().config().clone();
-        config.food_max *= 0.5;
+        config.food_max *= 2.0;
+        assert!(config.validate().is_ok());
         settle_continuation_command(
             &mut core,
             CommandEnvelope::new(
@@ -6769,6 +6761,7 @@ mod tests {
             ),
             1,
         );
+        applied(&status(&mut core.local_port(), 1));
         let configured = core.capture_checkpoint_cut().unwrap();
         assert_eq!(configured.checkpoint.tick(), initial.checkpoint.tick());
         assert_eq!(configured.scientific_revision, initial.scientific_revision);
@@ -6783,11 +6776,13 @@ mod tests {
             ),
             2,
         );
+        applied(&status(&mut core.local_port(), 2));
         settle_continuation_command(
             &mut core,
             CommandEnvelope::new(CommandId::new(3), HostCommand::Step),
             3,
         );
+        applied(&status(&mut core.local_port(), 3));
         let stepped = core.capture_checkpoint_cut().unwrap();
         assert_eq!(stepped.checkpoint.tick().0, initial.checkpoint.tick().0 + 1);
         assert_eq!(
@@ -6813,9 +6808,35 @@ mod tests {
         assert_eq!(digest.scientific_revision, stepped.scientific_revision);
         assert_eq!(digest.config_revision, stepped.config_revision);
         assert_eq!(digest.scheduled_input_count, stepped.scheduled_input_count);
-        assert!(core.schedule.as_ref().unwrap().remaining.is_empty());
+        let mut scheduled_owner =
+            HostCore::new(HostSessionId::new(0xc074), world(0), options(true)).unwrap();
+        scheduled_owner
+            .install_schedule(
+                vec![scheduled(1, 0, serde_json::json!({"food_max": 0.61}))],
+                resolve_test_schedule,
+            )
+            .unwrap();
         assert_eq!(
-            digest.scheduled_input_count, 1,
+            scheduled_owner
+                .capture_checkpoint_cut()
+                .unwrap()
+                .scheduled_input_count,
+            1,
+            "declared inputs must be counted before they run"
+        );
+        settle_continuation_command(
+            &mut scheduled_owner,
+            CommandEnvelope::new(CommandId::new(5), HostCommand::Step),
+            4,
+        );
+        applied(&status(&mut scheduled_owner.local_port(), 5));
+        assert!(scheduled_owner.schedule.as_ref().unwrap().remaining.is_empty());
+        assert_eq!(
+            scheduled_owner
+                .scientific_digest_cut()
+                .unwrap()
+                .scheduled_input_count,
+            1,
             "completed inputs do not become an empty schedule"
         );
         let mut empty = HostCore::new(HostSessionId::new(0xc073), world(0), options(true)).unwrap();
