@@ -6830,7 +6830,14 @@ mod tests {
             4,
         );
         applied(&status(&mut scheduled_owner.local_port(), 5));
-        assert!(scheduled_owner.schedule.as_ref().unwrap().remaining.is_empty());
+        assert!(
+            scheduled_owner
+                .schedule
+                .as_ref()
+                .unwrap()
+                .remaining
+                .is_empty()
+        );
         assert_eq!(
             scheduled_owner
                 .scientific_digest_cut()
