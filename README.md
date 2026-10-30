@@ -552,7 +552,7 @@ cargo build -p scriptbots-brain-ml --features candle # library tensor inference;
 - `SCRIPTBOTS_BOOTSTRAP_TICKS` — explicit pre-frontend science ticks (default `0`, equivalent to `--bootstrap-ticks`; set a nonzero value only when an intentional warmup is part of the run).
 - `SCRIPTBOTS_TERMINAL_HEADLESS` — render TUI to an in-memory buffer for CI smoke tests.
 - `SCRIPTBOTS_TERMINAL_HEADLESS_FRAMES` — number of frames to render in headless mode (default 12; max 360).
-- `SCRIPTBOTS_TERMINAL_HEADLESS_REPORT` — file path to write a JSON summary from a headless run.
+- `SCRIPTBOTS_TERMINAL_HEADLESS_REPORT` — file path to write a JSON summary from a headless run. It includes the final observed typed `narrative_events` ring and its `narrative_dropped_events` count. The same ring is logged at info level; zero dropped events is required before treating it as the complete run timeline.
 - `SCRIPTBOTS_MAX_THREADS` — explicit application thread budget, below `--threads` and above auto-tune or low-power defaults. Startup passes the resolved number directly to Rayon. Standalone core callers retain the physical-CPU-capped default when `RAYON_NUM_THREADS` is absent; world construction never rewrites either variable.
   Full-host checkpoint continuation restores the launch manifest's resolved budget, when present, before reconstructing the world. The debug observation reports pool capacity at science-step entry, rather than busy-worker utilization.
  - `SCRIPTBOTS_TERMINAL_EMOJI` — force emoji mode `1|true|yes|on` or disable with `0|false|off|no`.

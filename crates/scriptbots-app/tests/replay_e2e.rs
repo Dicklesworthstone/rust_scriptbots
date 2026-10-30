@@ -687,6 +687,263 @@ fn stdout_text(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+/// Live owner publication, durable typed rows and offline CLI must tell the same story.
+#[test]
+fn curated_headless_narrative_seeds_persist_real_events_and_full_info_tables() {
+    use scriptbots_core::narrative::{EventKind, EventRecord};
+
+    const BOOTSTRAP: u64 = 94;
+    const FRAMES: u64 = 2;
+    const TICKS: u64 = BOOTSTRAP + FRAMES;
+    let artifact_root = env::var_os("SCRIPTBOTS_TEST_ARTIFACT_ROOT")
+        .map_or_else(env::temp_dir, std::path::PathBuf::from);
+    fs::create_dir_all(&artifact_root).expect("external narrative artifact root");
+    let directory = tempfile::Builder::new()
+        .prefix("headless-narrative-seeds-")
+        .tempdir_in(artifact_root)
+        .expect("unique retained narrative proof")
+        .keep();
+    eprintln!(
+        "headless narrative evidence retained at {}",
+        directory.display()
+    );
+    let cases: [(u64, &str, &str, usize, &[EventKind]); 4] = [
+        (42, "quiet", "", 64, &[]),
+        (
+            137,
+            "boom",
+            "\n[[interventions]]\ntick = 40\n[interventions.set]\nclosed = false\npopulation_minimum = 48\n",
+            64,
+            &[EventKind::PopulationBoom],
+        ),
+        (
+            20_260_717,
+            "extinction",
+            "\n[[interventions]]\ntick = 40\n[interventions.set]\nmetabolism_drain = 1.0\n",
+            64,
+            &[EventKind::PopulationCrash, EventKind::Extinction],
+        ),
+        (
+            20_260_717,
+            "extinction-clipped",
+            "\n[[interventions]]\ntick = 40\n[interventions.set]\nmetabolism_drain = 1.0\n",
+            1,
+            &[EventKind::PopulationCrash, EventKind::Extinction],
+        ),
+    ];
+    let mut observed_kinds = Vec::new();
+    for (seed, label, intervention, capacity, required_kinds) in cases {
+        let database = directory.join(format!("{label}.sqlite"));
+        let scenario = directory.join(format!("{label}.scenario.toml"));
+        let report_path = directory.join(format!("{label}.report.json"));
+        // Freeze non-intervention ecology rather than relaxing detector policy.
+        // Real MLP agents, real scheduled config commands and real owner ticks run below.
+        fs::write(
+            &scenario,
+            format!(
+                r#"schema = "scriptbots.scenario.v1"
+schema_version = 1
+id = "narrative-{label}"
+[config]
+rng_seed = {seed}
+world_width = 120
+world_height = 120
+food_cell_size = 20
+initial_food = 0.0
+food_respawn_interval = 0
+food_growth_rate = 0.0
+food_intake_rate = 0.0
+metabolism_drain = 0.0
+metabolism_ramp_rate = 0.0
+metabolism_boost_penalty = 0.0
+movement_drain = 0.0
+temperature_discomfort_rate = 0.0
+topography_enabled = false
+bot_speed = 0.0
+spike_damage = 0.0
+spike_energy_cost = 0.0
+food_sharing_rate = 0.0
+food_transfer_rate = 0.0
+reproduction_energy_threshold = 0.0
+aging_health_decay_rate = 0.0
+closed = true
+population_minimum = 0
+population_spawn_interval = 0
+chart_flush_interval = 0
+history_capacity = 128
+narrative_interval = 1
+narrative_capacity = {capacity}
+persistence_interval = 32
+{intervention}"#
+            ),
+        )
+        .expect("write actual scenario input");
+        let mut command = base_command(env!("CARGO_BIN_EXE_scriptbots-app"));
+        command
+            .env("SCRIPTBOTS_TERMINAL_HEADLESS", "1")
+            .env("SCRIPTBOTS_TERMINAL_HEADLESS_FRAMES", FRAMES.to_string())
+            .env("SCRIPTBOTS_TERMINAL_HEADLESS_REPORT", &report_path)
+            .env("SCRIPTBOTS_STORAGE_PATH", &database)
+            .args(["--storage", "file", "--threads", "1", "--brain", "mlp"])
+            .arg("--scenario")
+            .arg(&scenario)
+            .arg("--bootstrap-ticks")
+            .arg(BOOTSTRAP.to_string());
+        let output = retained_host_output(&directory, label, &mut command);
+        assert!(
+            output.status.success(),
+            "{label} seed {seed} failed: stdout={} stderr={}",
+            stdout_text(&output),
+            stderr_text(&output)
+        );
+        assert_host_science_pool(&output, TICKS);
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(&report_path).expect("actual headless report"))
+                .expect("decode actual headless report");
+        assert_eq!(report["summary"]["final_tick"], TICKS);
+        let dropped = report["narrative_dropped_events"]
+            .as_u64()
+            .expect("actual dropped count");
+        if capacity == 1 {
+            assert!(
+                dropped > 0,
+                "the clipped control must actually evict records"
+            );
+        } else {
+            assert_eq!(dropped, 0);
+        }
+        let mut published: Vec<EventRecord> =
+            serde_json::from_value(report["narrative_events"].clone())
+                .expect("complete typed owner narrative publication");
+        let emitted_json = serde_json::to_string(&published).expect("published event table");
+        let stderr = strip_ansi(&stderr_text(&output));
+        let table_lines = stderr
+            .lines()
+            .filter(|line| line.contains("observed headless narrative ring"))
+            .collect::<Vec<_>>();
+        assert_eq!(table_lines.len(), 1, "one complete observed table per run");
+        assert!(table_lines[0].contains("INFO"));
+        assert!(table_lines[0].contains(&format!("events_json={emitted_json}")));
+        if required_kinds.is_empty() {
+            assert!(
+                published.is_empty(),
+                "quiet runs must have no synthetic event rows"
+            );
+        } else if dropped == 0 {
+            for kind in required_kinds {
+                assert!(
+                    published.iter().any(|event| event.kind == *kind),
+                    "{label} seed {seed} must actually emit {kind:?}: {emitted_json}"
+                );
+            }
+        }
+        published.sort_by(|a, b| {
+            (a.tick.0, a.kind.as_str(), &a.metric).cmp(&(b.tick.0, b.kind.as_str(), &b.metric))
+        });
+        let mut kinds = published
+            .iter()
+            .map(|event| event.kind.as_str())
+            .collect::<Vec<_>>();
+        kinds.sort_unstable();
+        kinds.dedup();
+        if dropped == 0 {
+            observed_kinds.push(kinds);
+        }
+        let before = fs::read(&database).expect("closed database preimage");
+        let reader = StorageReader::open_finished(database.to_str().expect("UTF-8 path"))
+            .expect("validate actual finished run");
+        let manifest = reader.run_manifest().expect("actual persisted provenance");
+        let config: scriptbots_core::ScriptBotsConfig =
+            serde_json::from_str(&manifest.normalized_config_json).expect("recorded config");
+        assert_eq!(config.rng_seed, Some(seed));
+        assert_eq!(reader.max_tick().expect("last persisted tick"), Some(TICKS));
+        let watermarks = reader.persistence_watermarks().expect("durable watermarks");
+        assert!(watermarks.durable.is_some());
+        assert_eq!(watermarks.admitted, watermarks.applied);
+        assert_eq!(watermarks.applied, watermarks.durable);
+        let stored = reader
+            .recent_run_events(
+                published.len() + usize::try_from(dropped).expect("bounded drops") + 1,
+            )
+            .expect("bounded complete typed rows")
+            .into_iter()
+            .map(|event| event.into_parts().1)
+            .collect::<Vec<_>>();
+        for kind in required_kinds {
+            assert!(stored.iter().any(|event| event.kind == *kind));
+        }
+        if dropped == 0 {
+            assert_eq!(
+                serde_json::to_vec(&stored).expect("stored full event records"),
+                serde_json::to_vec(&published).expect("published full event records"),
+                "{label} must round-trip every field and prose byte, not only the event count"
+            );
+        } else {
+            assert_eq!(published.len(), capacity);
+            assert_eq!(
+                u64::try_from(stored.len() - published.len()).unwrap(),
+                dropped
+            );
+            for event in &published {
+                let bytes = serde_json::to_vec(event).unwrap();
+                assert!(
+                    stored
+                        .iter()
+                        .any(|row| serde_json::to_vec(row).unwrap() == bytes)
+                );
+            }
+        }
+        let persisted_logs = stderr
+            .lines()
+            .filter(|line| line.contains("narrative event persisted"))
+            .collect::<Vec<_>>();
+        assert_eq!(persisted_logs.len(), stored.len());
+        for event in &stored {
+            assert!(
+                persisted_logs.iter().any(|line| {
+                    line.contains("INFO")
+                        && line.contains(&format!("event_tick={} ", event.tick.0))
+                        && line.contains(&format!("event_kind={} ", event.kind.as_str()))
+                        && line.contains(&event.human_text)
+                }),
+                "every durable narrative row must have its actual info-level evidence"
+            );
+        }
+        reader.close().expect("close actual reader");
+        let mut around = base_command(env!("CARGO_BIN_EXE_control_cli"));
+        around
+            .args(["narrative", "around", "0", "--window"])
+            .arg(TICKS.to_string())
+            .arg("--db")
+            .arg(&database)
+            .arg("--json");
+        let queried = retained_host_output(&directory, &format!("{label}-readback"), &mut around);
+        assert!(
+            queried.status.success(),
+            "offline readback: {}",
+            stderr_text(&queried)
+        );
+        let hits: Vec<scriptbots_app::narrative_search::NarrativeSearchHitDto> =
+            serde_json::from_slice(&queried.stdout).expect("actual offline CLI hits");
+        assert_eq!(hits.len(), stored.len());
+        for (hit, event) in hits.iter().zip(&stored) {
+            assert_eq!(hit.tick, event.tick.0);
+            assert_eq!(hit.kind, event.kind.as_str());
+            assert_eq!(hit.severity, event.severity);
+            assert_eq!(hit.human_text.as_bytes(), event.human_text.as_bytes());
+        }
+        assert_eq!(fs::read(&database).expect("readback database"), before);
+    }
+    for (i, first) in observed_kinds.iter().enumerate() {
+        for second in observed_kinds.iter().skip(i + 1) {
+            assert_ne!(
+                first, second,
+                "the three real trajectories must not collapse"
+            );
+        }
+    }
+}
+
 fn strip_ansi(input: &str) -> String {
     let mut cleaned = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();

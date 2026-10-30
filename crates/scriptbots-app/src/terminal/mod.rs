@@ -8739,6 +8739,9 @@ pub struct HeadlessReport {
     initial: FrameStats,
     frames: Vec<FrameStats>,
     summary: ReportSummary,
+    /// The final observed narrative ring, not a claim that every run event was retained.
+    narrative_events: Vec<scriptbots_core::narrative::EventRecord>,
+    narrative_dropped_events: u64,
 }
 
 /// Scenario identity carried by every headless report so CI evidence names the run.
@@ -8766,16 +8769,30 @@ impl HeadlessReport {
             initial: FrameStats::from_snapshot(&initial_snapshot, None),
             frames: Vec::new(),
             summary: ReportSummary::default(),
+            narrative_events: initial_snapshot.narrative,
+            narrative_dropped_events: initial_snapshot.narrative_dropped,
         }
     }
 
     fn record(&mut self, snapshot: &Snapshot, buffer: HeadlessBufferEvidence) {
         self.frames
             .push(FrameStats::from_snapshot(snapshot, Some(buffer)));
+        self.narrative_events.clone_from(&snapshot.narrative);
+        self.narrative_dropped_events = snapshot.narrative_dropped;
     }
 
     fn finalize(&mut self, world_digest: Option<String>) {
         self.summary = ReportSummary::from(&self.initial, &self.frames, world_digest);
+        match serde_json::to_string(&self.narrative_events) {
+            Ok(events_json) => info!(
+                final_tick = self.summary.final_tick,
+                event_count = self.narrative_events.len(),
+                dropped_events = self.narrative_dropped_events,
+                events_json = %events_json,
+                "observed headless narrative ring"
+            ),
+            Err(error) => warn!(%error, "headless narrative ring serialization failed"),
+        }
     }
 
     fn write_json(&self, path: &Path) -> Result<()> {
