@@ -5693,7 +5693,7 @@ pub(crate) mod tests {
                 let food_max = current.config.food_max;
                 host.wait_applied(
                     &handle
-                        .apply_patch(serde_json::json!({"food_max": food_max * 0.5}))
+                        .apply_patch(serde_json::json!({"food_max": food_max * 2.0}))
                         .unwrap(),
                 );
                 host.wait_applied(
