@@ -24006,7 +24006,7 @@ for case in ('panic', 'subscription', 'renderer'):
 
     #[test]
     fn checkpoint_canvas_real_worker_renders_saved_cells_and_discards_cancelled_results() {
-        use frankentui_shell::{ShellMessage, ShellRoute};
+        use frankentui_shell::ShellRoute;
         use ftui::core::event::{Event, KeyCode, KeyEvent};
         use std::io::Write as _;
 
