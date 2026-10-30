@@ -606,6 +606,12 @@ identity takes precedence. Unknown, dirty and overlay RCH stamps leave that fall
 unavailable. Runtime environment changes cannot replace the embedded identity. A known
 commit still requires separate verified clean-tree, status/diff and compiler evidence
 before the manifest can report complete build provenance and reproducibility.
+Normal Cargo builds capture the full selected compiler identity and the executable's
+resolved target at build time. The compiler host and executable target are recorded
+separately, including when cross-compiling. A reviewed `SCRIPTBOTS_RUSTC_VV` build stamp
+takes precedence over automatic compiler capture; launch-time environment changes cannot
+replace either captured fact. Missing target evidence cannot support a complete provenance
+claim, and missing source/cleanliness evidence remains unknown.
 
 `--create-bundle RUN_DB --bundle-output DIRECTORY` exports a finished, checkpointed database
 under its existing writer/path/identity lease. The destination must be new. Live writers,

@@ -1,5 +1,151 @@
 # Reality Check — rust_scriptbots — implementation continuation 2026-10-27
 
+## Active TODO — automatic compiler identity, VioletTrout, 2026-10-29
+
+At this increment's start, the existing manifest reader accepts full build-time
+compiler identity, but normal Cargo builds have no producer; retained earlier
+pinned bundles show it null. The qualified change below connects that producer.
+The consumer is `RunManifestV3` and its real storage/export readers. This TODO
+is the operator-requested handoff checklist, retiring at publication; no new
+process framework. Compiler identity alone cannot complete source provenance.
+
+- [x] Recheck current source/instructions and canonical Beads; compare ready product gaps.
+- [x] Continue original `bd-2z0.5.11` and reserve exact implementation/test/docs/tracker paths.
+- [x] Execute real-manifest and host/target projection negatives against unchanged production.
+- [x] Add the Cargo build-time compiler observer and connect its existing consumer; keep explicit reviewed values authoritative and failures visibly unknown.
+- [x] Prove complete compiler text and the actual Cargo target reach the real sidecar/database and ignore a spoofed launch-time compiler value.
+- [x] Run focused provenance/manifest tests, workspace check, strict Clippy, formatting and supported-source UBS; retain exact source and all failed attempts.
+- [x] Record remaining original criteria, canonical one-row Beads update, empty dependency cycles and bounded work/honesty audit.
+- [x] Freeze source and prepare owned docs/tracker for reviewed publication; final handoff records guarded pushes, own-lease release and remote-ref observations.
+
+Scope correction from actual consumer tracing: storage projected compiler
+`host:` as the executable target. The same increment now captures Cargo's
+resolved target separately, projects that recorded field, and requires it for
+complete build provenance. Source/cleanliness evidence is still not inferred.
+The new optional metadata field is not a storage-schema or dependency change.
+Known targets remain complete when other evidence is complete; missing/blank
+targets with a complete flag are refused, while honestly partial records remain
+admitted with explicit unknowns. ARM/Darwin and GNU-to-musl metadata cases are
+typed countermodels, not native cross-platform execution claims.
+
+Old source `3561099e` plus only the existing integration-test file executes both
+intended negatives: real app exits 0 but writes compiler=null; projection emits
+the x86 GNU compiler host for the declared ARM/Darwin target. Initial cases are
+0/1/0 (2.67s and 0.04s), outer 101. After making each countermodel's core target
+class agree with its declaration, the combined unchanged-source controls are
+0 passed / 2 failed / 0 ignored, 18 filtered, 2.68s, outer 101. All original
+failing predicates remain; final tests add honest-partial admission guards.
+Post-run worker hash readback finds its source files absent and earns no live
+source-byte credit. The explicit pinned base/test-only overlay and raw execution
+remain retained in `/data/tmp/scriptbots-next-capability-20261029-violettrout/`.
+
+Reviewed source tree `167d8794` is frozen. A generated-base-only commit moved
+HEAD to `d9e726f1`; its crate/config bytes match initial `3561099e` exactly and
+it is not credited as this increment. Working qualification on `hz2` first
+passes the complete characterization/provenance module: **21/0/0**, 660 filtered,
+0.44s, outer 0. The complete manifest integration file then starts, retaining
+actual executable profiles in that runtime invocation. Formatting passes after
+manual whitespace fixes. Three-file UBS exits 0: **0 critical, 678 warnings,
+238 info**, no failed modules; counts are not a warning-improvement claim.
+No desktop-renderer/DSR, full provenance, whole-workspace runtime or independent-review
+claim follows from these scoped checks.
+The working integration pass completes **20/0/0**, zero filtered, 59.06s,
+outer 0. The real sidecar and FrankenSQLite reader agree on full compiler text
+and Cargo target; runtime spoofing does not replace them. Countermodel outputs
+are actually distinct: ARM/Darwin and x86 musl rather than the x86 GNU host.
+Source `bd58cccfa2e490db19c5060ee36a5019d63c8cd3`, tree `167d8794`, commits
+the fully reviewed candidate. Pinned no-overlay qualification passes the same
+**21 unit tests** (660 filtered, 0.42s) and **all 20 integration tests**
+(zero filtered, 58.68s), no failures/ignores, both outer exits 0. These are
+repeated self-verification of 41 distinct tests, not 82 distinct tests or an
+independent review. Pinned default-profile workspace/all-target check passes
+(59.34s), then strict Clippy with `-D warnings` passes (55.32s), both outer 0.
+Four executable records from the two actual runtime invocations retain opt-level
+0, debuginfo 0, debug assertions and overflow checks enabled; both selected test
+paths match separate `Running` lines. The build-script records carry actual
+Cargo target `x86_64-unknown-linux-gnu`. Working source/config readback matches
+all seven frozen files; a later pinned readback finds the removed RCH source
+directory and earns no live byte credit. Pinned receipts bind `bd58cccf` to
+tree `167d8794`; the working receipt's `73c35214` is only its baseline tree,
+with base `d9e726f1` plus overlay `3ea1a9e6` binding the transferred input.
+
+Actual pinned compiler-identity process files are retained as
+`pinned-compiler-artifacts.tar.gz`: 400,268 bytes, SHA256
+`15c1b4a3f5d25de99b84dc84c2a9dca0f698569dda364877e7434a0cf54e79cc`,
+13 members / 12 regular files, including the database, WAL-related files,
+sidecar and stdout/stderr. The sidecar records source `bd58cccf`, full rustc
+1.100.0-nightly / LLVM 23.1.0 identity and actual Cargo target; it still records
+unknown source cleanliness/status/diff and `reproducible=false`. Archive
+structure/file hashes are inspected without extraction; the real integration
+test queried the source database through `StorageReader`. This is not a new
+post-copy engine-recovery proof or a physical executable archive.
+The original Bead's final note is written through `br`, exported externally
+and transplanted back as only notes/timestamp changes: 720 canonical rows,
+other 719 byte-identical, original status/assignee/criteria/dependencies intact.
+Import completes with exit 0 and dependency cycles remain empty. The original
+task stays in progress for full source/chain/resource/fault/observability/native
+acceptance and the earlier broad process failures. Generated base/scratch state
+is outside the owned publication. Live push/release/ref observations belong
+to the final handoff rather than this pre-publication report.
+
+Bounded older-history inspection: CASS query `SCRIPTBOTS_RUSTC_VV` reports
+148 matches; three minimal hits point to the same September 4 archive. Two
+physical-line views (2995/7100, five context lines) show tool/token/encrypted
+events and a compiling-status message rather than resolved keyword context.
+This is inconclusive, not a clean-history claim. Raw search/views remain in
+the proof directory; the previous broad sweep is not rerun here.
+
+Bounded work audit for this compiler/target increment, starting 23:47 UTC:
+**DRIFTING**. I repeatedly revisited settled design/proof details and let
+completed jobs sit before starting the next action. That wasted tokens and
+delayed delivery. The source is now frozen and all declared checks pass;
+the correction is publication, with no additional speculative machinery.
+The README's purpose remains a faithful deterministic evolution simulator with
+first-class analytics. Actual record: `git log -3 --stat`, complete source
+review and canonical ready work. Owned inventory is USER 1 (compiler/target
+producer-to-manifest fix plus tests), PROCESS 2 (docs/TODO and tracker notes),
+ENABLER/UNKNOWN 0; generated-base-only `d9e726f1` is separate PROCESS work and
+receives no feature credit. No Bead closes in this increment.
+
+Work-audit answers: (1) a two-minute demo is the real headless run's manifest
+and database containing compiler/target facts despite a launch-time spoof;
+(2) removing process notes changes no runtime behavior, but loses the requested
+TODO/failure handoff; (3) no speculative enabler is claimed, since the existing
+manifest and storage projection consume the observed facts; (4) the oldest
+unfinished user item remains the Evolution Lab umbrella, advanced through its
+original matched-seed runner child; (5) solo, no pane comparison; (6) no
+spec reduction or scope-split closure. The target requirement strengthens the
+existing completeness claim after the observed host/target defect.
+
+Honesty inventory, current increment and the bounded older-history check above:
+
+1. No (checked: full source diff; no existing ignore, guard deletion or timeout change).
+2. No mock substitute (checked: actual binary/database; ARM/musl inputs are explicitly typed countermodels exercising the real projection).
+3. No (checked: changed paths and Git history; no golden or snapshot regenerated).
+4. Yes, the completeness validator and its tests change together. Full hunks were reviewed; old host projection fails, and the fixed guard rejects null/blank complete claims while admitting honest partial records. No relaxation or suppression.
+5. No (checked: generic Cargo observer and recorded-field projection; no demo subject/environment success branch).
+6. No (checked: 21 unit and 20 integration results per fixed pass, not zero-run green; scans and compiler checks are separately labelled).
+7. No (checked: raw logs/outer exits; absent post-run worker files receive no hash credit).
+8. No (checked: native Linux process evidence versus labelled cross-target countermodels; no physical binary or independent-review claim).
+9. No (checked: all old negative failures, format corrections and failed readbacks remain recorded; broader original failures stay open).
+10. No (checked: cited stderr retained; compiler-probe stderr is printed as an escaped Cargo diagnostic).
+11. No (checked: original `bd-2z0.5.11` remains in progress; no new child or acceptance removal).
+12. No acceptance reduction (checked: original seven criteria; scope expanded only for the observed host/target bug, with the stricter rule documented).
+13. N/A: solo; no delegated or peer closure.
+14. N/A: no subagent dispatch.
+15. N/A: no subagent report accepted.
+16. N/A: no panes; positive real writer/reader paths run alongside refusal guards.
+17. No (checked: all repeated passes are labelled self-verification, with no independent authority inferred from agreement).
+18. No (checked: full characterization module and complete manifest file selected before the fixed runs; 660 filtered unit cases remain outside the runtime claim).
+19. Yes: excess analysis delayed execution; late readbacks found removed source directories; an initial metadata filter assumed the wrong Cargo package-ID spelling. The package filter is corrected against raw records; no absent result is promoted. No extra gate is invented to repair the narrative.
+20. Strongest proof is pinned `bd58cccf` running the actual manifest writer/FrankenSQLite reader, launch-time spoofing control and two distinct projection countermodels, following the real old-source negatives. Commands and artifacts are retained for re-execution.
+
+Disposition: RH-1/RH-2/SM-11 countermeasures are the old-source negative,
+documented known/unknown admission split, explicit proof classes and retained
+failures. Analysis overhead is disclosed here and must be disclosed at handoff;
+the disposition stays DRIFTING rather than declaring the inefficiency cured.
+No original-task completion or retrospective independent certification.
+
 ## Active TODO — offline experiment verification, VioletTrout, 2026-10-29
 
 Continue original `bd-2z0.5.11`: at this increment's start, the exported final

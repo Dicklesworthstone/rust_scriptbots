@@ -4,6 +4,16 @@
 
 **Evidence date:** 2026-07-11
 
+**Compiler and target identity (2026-10-29/30):** [Qualified increment;
+original `bd-2z0.5.11` Currently In Progress — VioletTrout]. Source
+`bd58cccfa2e4` captures full build-time compiler identity and Cargo's actual
+executable target, replacing the incorrect compiler-host projection. Reviewed
+explicit compiler stamps retain priority; complete provenance now requires a
+known target, while source/cleanliness gaps remain unknown. Pinned source passes
+21 provenance/characterization unit tests, all 20 manifest integration tests,
+workspace check and strict Clippy. Cross-target cases are typed countermodels;
+full source/chain/resource/native acceptance remains open. No dependencies change.
+
 **Offline experiment verification (2026-10-29):** [Qualified increment;
 original `bd-2z0.5.11` Currently In Progress — VioletTrout]. Source
 `afb8f1bc6b47` wires the exported final owner cut into shipped `--verify-bundle`:
