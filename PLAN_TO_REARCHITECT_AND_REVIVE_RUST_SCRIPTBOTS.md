@@ -1355,6 +1355,21 @@ in `REALITY_CHECK_2026-09-03.md`. **[Currently In Progress]** Original arbitrary
 event-tick replay and broader `bd-ji3a` acceptance remain unchanged and open;
 this is not native PTY/GPU, full Program scheduler or DSR acceptance.
 
+**[Implemented — native component qualification] `bd-ji3a` tick-only event review, 2026-10-31:**
+source `b45ef355` connects out-of-cache narrative `v` to a verified saved cut.
+Atomic source/current cuts require matching sessions and science/tick deltas,
+unchanged nonsaturated config revision and zero declared schedule inputs; the
+current read does not request a persistence flush. Replay is bounded to 1,024
+ticks and must match the captured-current digest before publishing the target.
+Native proof reviews the actual extinction at tick 47 from checkpoint 0 while
+live remains at 224, after cache eviction; target cells match and modal/cancel/
+corruption controls pass. All 28 selected app tests, 241 runtime tests, required
+workspace check, strict Clippy and formatting pass. Raw first failures and the
+bounded audit remain in `REALITY_CHECK_2026-09-03.md`.
+**[Currently In Progress]** Original general recorded-input replay and all
+broader acceptance remain unchanged and open; this is not PTY/GPU, full Program
+scheduler, whole-workspace runtime, DSR or independent verification.
+
 Viewport size, camera, selected agent, requested detail, and chart window are per-client inputs, not mutable global projection state and not scientific world state. The TUI, GUI HUD, server ASCII capture, and web snapshot reuse semantic projection functions and caches keyed by request/revision. They may render the result differently.
 
 The selected-brain detail slice is now an explicit, synchronous, read-only pull

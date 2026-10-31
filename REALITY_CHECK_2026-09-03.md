@@ -1,5 +1,372 @@
 # Reality Check — rust_scriptbots — implementation continuation 2026-10-27
 
+## Active TODO — checkpoint-backed tick-only event review, VioletTrout, 2026-10-30
+
+Consumer: the existing narrative rail's `v` action when the selected event is
+outside the bounded canvas cache. Existing core scrub alone omits operator and
+scenario inputs, so directly showing its result would make an unsupported claim.
+Continue original `bd-ji3a`; general recorded-input replay remains open.
+The operator requested this granular TODO; it gates this increment's handoff and
+retires there. Runtime work is FEATURE; this bounded report is a LEGITIMATE GATE,
+not a new process framework or additional capability credit.
+
+- [x] Refresh authoritative triage and inspect original replay/owner consumers.
+- [x] Identify the omitted-input hazard in a direct core scrub integration.
+- [x] Reserve exact paths and mark original Bead/active plan before implementation.
+- [x] Implement atomic checkpoint/session/scientific/configuration/schedule-count capture.
+- [x] Implement the read-only atomic current digest cut without a persistence-flush request.
+- [x] Retain the source cut with new checkpoint artifacts without changing their core format.
+- [x] Implement matching sessions, tick/scientific deltas, unchanged nonsaturated config revision, zero declared inputs and the fixed work bound.
+- [x] Implement target reconstruction and current-anchor digest verification before canvas publication.
+- [x] Connect out-of-cache narrative review to the existing single background slot.
+- [x] Preserve cached review, direct checkpoint review, modal keys and cancellation on navigation/selection.
+- [x] Exercise a real brain-driven target older than the cache, distinct target/live cells and unchanged owner.
+- [x] Plant source-cut, intervention, schedule, work-bound, checksum and stale-result negatives.
+- [x] Re-execute final runtime-library regressions after organizing the new cut tests.
+- [x] Complete required current-pin workspace/all-targets check and strict Clippy after the observed-tick assertion.
+- [x] Pass formatting and changed-file source scans after each correction, with warnings retained.
+- [x] Retain final current-pin six-file scan and exact source bindings.
+- [x] Execute final app event/canvas and catalog regressions on the final pin.
+- [x] Retain first failures, exact source/artifacts, all honesty answers and unchanged original acceptance.
+- [x] Review source and prepare exact owned metadata for publication; handoff records observed refs and lease release.
+
+Current frozen source is `b45ef35537d8e85ac7e4e74a630a69840c6f959d`, tree
+`0994e520`. Its runtime library passes 241 tests with six existing ignores;
+required workspace check, strict Clippy, formatting and source scan pass, with
+nine matching worker hashes. Native app/canvas/catalog execution passes 28 distinct
+tests: an actual extinction at tick 47 is reviewed from checkpoint 0 while live
+remains at tick 224. General recorded-input replay and full original acceptance
+remain open; this is component/model self-verification, not PTY/GPU, full Program
+scheduler, whole-workspace runtime, DSR or independent verification. Raw evidence is retained under
+`/data/tmp/scriptbots-event-jump-20261030T2230-violettrout/`.
+
+Qualification history below preserves the source pins and first failures; its
+intermediate pending states are superseded by the final results above and below.
+Source inspection distinguishes the revision domains: `apply_config_command`
+advances config/control, not scientific revision. The admission guard therefore
+also requires an unchanged configuration revision; scientific delta alone would
+be insufficient. This is a draft-source correction before runtime qualification,
+not an accepted capability or an assumption that config equals the science clock.
+The current anchor uses a separate read-only digest cut: requesting an ordinary
+checkpoint can legitimately flush a paused persistence tail, which an event view
+must not do. A real deferred-tail test requires that the digest read leaves it
+deferred, preserves the publication and allocates no journal sequence. The guard
+also rejects saturated config revisions because the core increments that domain
+with `saturating_add`; equality at its ceiling cannot prove no intervening edits.
+Another source-observed draft correction: `HostThread::start` installs an empty
+queue for ordinary application runs. Rejecting presence would wrongly refuse
+every such run. The cut now counts declared inputs from the validated queue's
+last sequence (or completed sequence after exhaustion). Zero-input installed
+queues may pass; pending and completed nonempty schedules remain refused. This
+changes the draft admission rule before its first native execution, not a shipped
+gate or a runtime before/after claim. Tests distinguish all three observations.
+Frozen candidate `b5e1aaffe1ae336ae9e218a164c04e05bcb36b6f`, tree
+`04534f70`, contains the producer, consumer and real-owner tests. Every immutable
+hunk is reviewed; formatting passes. Six-file source UBS exits 0 with 0 critical,
+6,757 warnings and 1,354 info; its working-copy scan preceded the code commit and
+is not warning-clean. Pinned native app/runtime tests and workspace/all-targets
+check are submitted through remote-required RCH on separate workers. No runtime
+success is claimed before their actual results.
+
+First native runtime execution of `b5e1aaff` is **0 passed, 1 failed,
+0 ignored, 244 filtered**, outer 101. The new fixture halved default `food_max`
+to 0.25 while initial food and respawn amount remained 0.5; the production
+configuration validator rejects that command, so its config revision does not
+advance. The settlement helper accepts terminal failures as well as application;
+the new test had failed to distinguish them. The correction uses a validated
+capacity increase, requires actual Applied receipts, and exercises the real
+scheduled-patch owner separately from the pure-tick revision-domain owner.
+All original tick/scientific/configuration assertions and pending/completed
+schedule observations remain. The analogous new app round-trip fixture was
+corrected by source inspection before its first app result; that is not an
+observed app failure. No production input guard was weakened.
+
+Corrected native runtime cut test at `61dd5bd9` is **1 passed, 0 failed,
+0 ignored, 244 filtered**, 0.08s, outer 0. It observes real revision domains,
+pending/completed declared inputs, installed empty queues and an unflushed
+deferred persistence tail. Final source candidate is `5328ba97779a2ca5561d242ae3717cb81684d9a2`,
+tree `f192c1df`; its app fixture is now valid. Final runtime-library regressions,
+app qualification and required workspace checks remain pending. The six-file
+scan exits 0 with 0 critical / 6,759 warnings / 1,354 info; a separate scan of the
+corrected app fixture exits 0. These are source checks, not runtime proof.
+One avoidable sequencing error is retained: the runtime fixture correction was
+committed before its asynchronous fmt result was read; formatting then reported
+one assertion layout difference. The next reviewed commit applies exactly that
+format. The two runtime correction commits also reused a stale pre-edit UBS
+scan instead of waiting for a fresh scan. The subsequent six-file scan is
+post-commit evidence, not a retroactive pre-commit claim. Wait for each required
+check before the next mutation or commit; do not bypass the gate (RH-14/SM-11).
+
+Final-source runtime-library execution is **239 passed, 0 failed, 6 ignored,
+0 filtered**, 26.19s, outer 0. The six ignored cases are existing long-lane/DSR
+measurements, not new exclusions. An intentional status-mirror poison panic is
+caught by its existing test; it is not an uncaught suite failure. Nine remote
+source/manifest/lockfile/toolchain hashes match `5328ba97`; the clean-overlay
+receipt binds the whole materialized tree to `f192c1df`. Two failed hash-read
+attempts are retained: SSH lacked its configured identity, then the materialized
+namespace correctly had no `.git`. The successful read hashes actual files and
+does not invent a remote Git HEAD. Strict workspace Clippy is submitted on this
+same final source. App and workspace-check outcomes are still pending here.
+
+Initial `b5e1aaff` app build exits **137 after 1,804,377ms**, without executing
+tests. The initial workspace check similarly exits **137 after 1,802,509ms**
+before completion. Both retain the unchanged ordinary deadline and all raw
+compiler output; neither is a test failure or a compiler pass. Final-source
+workspace retry on `hz3` refuses namespace initialization (status 73/outer 103)
+before compilation. Normal `rch jobs recover` acknowledges that exact refused
+wrapper with protocol exit 0 and recovered command exit 1; it earns no compiler
+credit. No replay/force/cancellation, policy change, namespace bypass or cleanup.
+The final app/canvas regression request is normally admitted on the warmed app
+worker; required compiler gates remain pending. Final-source formatting and
+six-file UBS pass (0 critical / 6,759 warnings / 1,354 info, not warning-clean).
+
+Strict Clippy at `5328ba97` executes and exits **101 after 1,127,484ms** on
+`clippy::op_ref`: the new full anchor-digest comparison needlessly borrows both
+operands. Reviewed source `f90c752a94d209834a9c068524194a6e7ecb4a10`, tree
+`c50964df`, compares the same complete values directly. Formatting and the
+fresh changed-file UBS scan pass before that commit; no allowance, tolerance,
+input guard or test changes. Required check and strict Clippy are submitted
+on this new pin. The app worker is still qualifying the preceding pin, so its
+results cannot silently become final-pin results. Inventory is now one USER
+feature commit plus four ENABLER corrections; still one consumer increment.
+
+The next strict Clippy run exits **101 after 337,465ms** on the new runtime test's
+147/100 function-size limit. Source `1d6cce28fcd97035ebbf20f83d13fa8e76934a97`,
+tree `d8b63b5d`, separates its revision-domain, declared-schedule-count and
+read-only deferred-tail observations into three independently named tests.
+Every assertion remains; no suppression or lint-limit change. Fresh formatting
+and changed-file UBS pass before the reviewed commit. This is one additional
+ENABLER test organization fix, not a second consumer feature. Final-pin native
+runtime-library re-execution is submitted before the next strict Clippy pass.
+
+At `1d6cce28`, the final runtime library passes **241/0/6 ignored/0 filtered**,
+26.24s, outer 0. The two extra test IDs are the split above, not added observation
+coverage. Strict workspace/all-targets Clippy with unchanged `-D warnings` then
+passes: outer 0, Cargo build-finished success true, 1m04s, no diagnostics, exact
+`1d6cce28` / `d8b63b5d` receipt. Final formatting and six-file UBS pass
+(0 critical / 6,759 warnings / 1,354 info). A late live-hash read finds that RCH
+has already removed its successful source namespace; no final-pin nine-hash
+success is invented from that empty output. Earlier `5328ba97` and `f90c752a`
+bindings remain separately retained. Final-pin workspace check is now submitted
+on the warmed Clippy worker; intermediate `f90c752a` check and `5328ba97` app
+execution remain distinct pending attempts. The older Beads progress export's
+source-path normalization is not copied into canonical JSONL: the successful
+data-only update transplants just this item's notes/timestamp, preserving 719
+other raw rows and its original description/scope/dependencies.
+
+Final-pin required workspace/all-targets `cargo check` passes on `hz2`: outer 0,
+Cargo build-finished success true, 3m03s, no compiler diagnostics, exact
+`1d6cce28` / `d8b63b5d` receipt. The live namespace is captured during this run:
+all nine actual source/manifest/lockfile/toolchain hashes match the final pin
+(`1d-source-bindings.json`). The earlier failed late read stays retained.
+The remaining qualification is app-native event/canvas/catalog execution;
+no app or full original replay success is inferred from compiler checks.
+
+One final source-observed test-evidence correction, before native app execution:
+the new bound-case log called its requested loop count `actual_ticks` without
+checking the digest tick. Source `b45ef35537d8e85ac7e4e74a630a69840c6f959d`, tree
+`0994e520`, asserts the observed digest tick equals the requested completed
+interval and prints that observed tick. This makes the cap refusal distinguishable
+from a future/unreachable target; production behavior and all existing assertions
+remain unchanged. Fresh formatting and changed-file UBS pass before commit.
+This is the sixth ENABLER correction for the one USER increment. Final compiler
+qualification restarts on this exact pin; the passing `1d6cce28` observations
+are retained as that revision's results rather than silently relabelled.
+
+At `b45ef355`, workspace/all-targets check passes (outer 0, Cargo success true,
+33.62s, exact `0994e520` tree receipt). All nine worker source/manifest/lockfile/
+toolchain hashes match; the initial read before materialization is retained as
+a failed read, not a binding. Final six-file UBS exits 0 with 0 critical,
+6,760 warnings and 1,354 info. Strict Clippy is running on this pin.
+The preceding `5328ba97` app/canvas build also reaches the unchanged deadline,
+exiting **137 after 1,805,810ms**, before any tests run. Both app build attempts
+are incomplete, not failures of an executed functional test. The current
+`b45ef355` native app/canvas retry is normally admitted on the warmed worker.
+
+Strict workspace/all-targets Clippy also passes at `b45ef355` (outer 0, Cargo
+success true, 30.55s, exact `0994e520` receipt, no diagnostics). Required compiler
+checks are again complete for the actual current pin. Its runtime library is
+being re-executed so the final record need not rely on unchanged-component
+equivalence to `1d6cce28`. The obsolete intermediate `f90c752a` workspace check
+on `hz3` reaches its ordinary deadline and exits **137 after 1,802,395ms**;
+that incomplete attempt is retained without another retry, since the actual
+current-pin workspace check has passed on `hz2`.
+
+Final-pin runtime-library re-execution at `b45ef355` passes **241 passed,
+0 failed, 6 existing ignored, 0 filtered**, 25.64s, outer 0, with the exact
+`0994e520` receipt. Formatting, source scan, workspace check, strict Clippy,
+runtime library and nine worker hashes now bind to the same current pin.
+Native app/canvas/catalog execution remains the outstanding gate.
+
+The first `b45ef355` app/canvas build reaches the same ordinary deadline while
+compiling FrankenSQLite core and exits **137 after 1,805,863ms**, before tests.
+An identical-command retry is submitted on the same worker, preserving the
+completed dependency cache, source pin, features, assertions/overflow checks,
+resource limits, deadline and remote-only policy. This is an incomplete build,
+not a functional test result or flaky-test rerun. Read-only process diagnosis
+identified the active app/Asupersync compiler and about 39 GB available memory;
+the older Cargo process belongs to another project and is left untouched.
+
+That same-pin retry also reaches the ordinary deadline, exiting **137 after
+1,804,648ms** before any functional tests. It completes FrankenSQLite core and
+advances through the workspace/native UI dependencies. A further identical
+`b45ef355` retry is normally submitted against the same cache; none of these
+incomplete builds counts as a test result. Only the eleven existing owned file
+reservations are renewed by one hour (new expiry 2026-10-31 02:35:53 UTC);
+no new paths, worker limits or execution policies are introduced.
+
+The next identical `b45ef355` build completes (1m09s compile), then actually runs
+the native canvas suite: **26 passed, 0 failed, 0 ignored, 661 filtered**, 58.22s,
+outer 0, exact `0994e520` receipt. The selected catalog regressions independently
+run **2 passed, 0 failed, 0 ignored, 685 filtered**, 0.58s, outer 0, on that same
+pin. These are 28 distinct app test IDs, not repeated credit for the same cases.
+The new service case observes five distinct tick-7 science digests for the five
+declared registry configurations; each reconstructs target 4 from base 1.
+Real spawn/config round-trip, planted session/science/config/schedule/saturated
+counter faults, actual wrong-world binding and corruption are refused. The work
+case observes digest tick 1,025, so target 1 is reachable and the refusal really
+exercises the 1,024-tick cap. The real scheduled case observes tick 2 and a
+declared future input, and both source/current schedule guards are exercised.
+
+The new TUI case uses the actual emitted `extinction` record at tick 47, reporting
+population 20 to 0, with checkpoint 0 and live tick 224. The 128-frame cache has
+evicted the target. Actual target/live cells differ; reconstructed target cells
+match exactly. The actual production task closure runs on a real thread;
+duplicate-slot, modal g/Escape ownership, x/g/navigation/selection cancellation,
+corrupt-file rejection and unchanged live digest `17f35168117f0c0f` all pass.
+The exported map names `CHECKPOINT REPLAY tick 47 (live 224) from 0`.
+Existing direct checkpoint review also passes real saved 3/live 4 cells and its
+negatives, as do both old cached-review tests and the catalog honesty tests.
+
+All fourteen real artifact directories are copied locally under
+`native-artifacts-b45/`, including original target/live cells, event record,
+target world, review map, checkpoint binaries and corruption preimages.
+`b45-app-test-executable.json` retains the actual executable and Cargo profile:
+opt-level 0, assertions and overflow checks on, default/fast-alloc/ml/neuro
+features. The source scan remains 0 critical / 6,760 warnings / 1,354 info;
+no warning-clean or native SQL migration proof is claimed. Original `bd-ji3a`
+is not closed or narrowed. Exact final publication/ref/lease observations belong
+to the handoff, not a speculative pre-push claim in this record.
+
+Final tracker update changes only `bd-ji3a.notes` and `updated_at`
+(`2026-10-31T01:21:47.606226938Z`). All 719 other raw rows remain byte-identical
+to this block's starting snapshot; description, acceptance, dependencies, status
+and assignee are unchanged. Completed schedules are tested at the real producer
+count boundary; pending schedules and planted source/current counts exercise
+the app refusal, with no separate completed-schedule app journey claimed.
+Canonical import succeeds and active dependency cycles are empty. The pre-existing
+tracker base normalization and nine WAL-index directories are retained and
+excluded from publication. All in-scope implementation/qualification preparation
+items above are complete; the original broader replay item remains in progress.
+
+### Bounded work and honesty audit — old-event consumer
+
+Window: published base `3afcbac9` through source `b45ef355` and this qualification
+block. README purpose: a faithful deterministic artificial-life lab with usable
+visualization, interchangeable brains and reproducible analytics. Inventory:
+one USER feature commit (`b5e1aaff`), six ENABLER fixture/format/lint/evidence corrections
+(`9522ad31`, `61dd5bd9`, `5328ba97`, `f90c752a`, `1d6cce28`, `b45ef355`),
+one PROCESS handoff, zero closures,
+zero subagents and zero performance claims. This is one consumer increment,
+not seven capabilities. No source/golden/CI/dependency/profile change is hidden
+inside the later corrections; their complete diffs are reviewed separately.
+
+Creation gate for this existing report: the user explicitly requested the
+granular TODO and skill audit (consumer/provenance); their gate is this event
+review handoff; the actual initial invalid fixture and premature check sequencing
+are the defect observations; the active checklist retires at handoff. No new
+report framework is created and no integrity exception is invoked. An extra hour
+of report machinery would not improve the event-review consumer. Original
+`bd-ji3a` is continued instead of minting a cheap ready item. Triage observes
+107 open + 37 in progress; this is not a completion percentage or a claim that
+the chosen item is globally oldest-ready.
+
+Real-work questions: (1) the two-minute demo is save a checkpoint, let an actual
+event age out of the canvas cache, select it and press `v`, inspect its tick and
+then `g`; the actual tick-47/live-224 component journey now passes;
+(2) omitting PROCESS changes no runtime behavior; (3) the atomic cuts are consumed
+by the actual event worker's eligibility and full anchor-digest check, with real
+runtime cut observations already passing; (4) July's open `bd-2z0` umbrella
+remains older, while this original narrative item directly advances the blocked
+timeline consumer; (5) solo, no high-close pane; (6) no substitute Bead, closure
+or acceptance edit. Verdict **DRIFTING, corrected**: overlong exploration and
+premature check sequencing cost time. Freeze implementation and apparatus;
+finish the named consumer's required qualification and handoff.
+
+Honesty inventory (all twenty prompts, bounded to this window):
+
+1. No (checked: every source/test hunk from `3afcbac9` through `b45ef355`;
+   no pre-turn assertions deleted or skipped. The new fixture uses a valid
+   config increase and explicit Applied receipts, and separates actual schedule
+   execution from unchanged-config pure stepping; every original observation
+   remains. The older projection qualifier excludes only the already disclosed
+   regenerated handles/prior death counter, not new mismatches or tolerances).
+2. No (checked: new tests use actual owners, default application brain factories,
+   retained files and production task closures. Planted source-cut/saturated
+   counter controls are explicitly unit faults, not live counter-exhaustion
+   evidence. `TestHost` gains real optional schedule installation).
+3. No (checked: complete changed-path list and diffs; no golden regeneration).
+4. **Yes.** New eligibility guards and tests accompany the feature. Draft source
+   inspection replaces queue presence with declared input count because the
+   application always installs an empty queue: empty queues become eligible,
+   pending/completed nonempty schedules remain refused. Separate config-domain
+   and saturation guards tighten the original draft. This is before first app
+   execution, not a shipped-gate or measured-runtime repair. No CI, suppression,
+   deadline, automatic retry limit, worker policy, feature set or resource limit changes. The stale
+   pre-commit scanner and unread fmt result are explicitly disclosed above;
+   later passing scans do not retroactively satisfy their sequencing requirement.
+5. No (checked: the general production narrative cache-miss worker consumes this
+   capability; no test/environment sniffing or hard-coded success. The work cap
+   bounds the complete verification interval, not just its convenient prefix).
+6. No (checked: the failed new runtime test executes one case; its corrected run
+   executes one; final runtime library executes 241. Six existing long-lane/DSR
+   ignores are named above. Final app runs execute 26 canvas and two distinct
+   catalog cases, with no new ignore or zero-run green).
+7. No (checked: raw pinned attempts and source-hash reads; compiler/source checks
+   and incomplete builds are not reported as native success. A draft Clippy
+   timing typo is corrected to the actual 30.55s before publication).
+8. No (checked: proof class is native component/model self-verification, not
+   PTY/GPU/full Program scheduler/whole-workspace runtime/DSR or independent
+   verification. Cancellation holds an actual closure before executing it on
+   a real thread; this does not establish interruption of in-progress I/O).
+9. No (checked: initial assertion failure, format failure, stale scan timing,
+   unsuccessful SSH/Git hash reads, both lint failures, namespace refusal and
+   all six incomplete app/workspace builds are retained explicitly).
+10. No (checked: all cited commands retain stderr beside or with stdout; display
+    truncation is not substituted for the raw log).
+11. No (checked: original `bd-ji3a` remains in progress, original full replay
+    acceptance remains open, and no follow-up is minted to carry it away).
+12. No (checked: README/plan describe this bounded subset and retain general
+    recorded-input replay; original Bead description, acceptance and dependencies
+    are unchanged. No claimed full-publication restoration).
+13. No (checked: no delegation or closure).
+14. No (checked: no subagents dispatched).
+15. No (checked: no subagent report accepted; qualification is self-verification).
+16. No (checked: no panes/subagents or refusal-only closure; the positive native
+    tick-47 event review passes before capability credit).
+17. No (checked: repeated same-origin runs and hashes are not independent proof).
+18. No (checked: five registry configurations at seed 42, wrong-world negative
+    at 137 and separate UI seed 42 were declared before execution; these are
+    not five seeds or the original three-curated-seed acceptance).
+19. **Yes.** Invalid new fixture assumptions, noisy/truncated exploration and
+    premature fmt/UBS sequencing deserve explanation. Their exact failure chain
+    and corrections are above. A session-derived CASS query for the atomic-cut
+    test returns zero indexed hits; five earlier bounded archive searches and
+    their read followups remain the historical scope, not a historical clean bill.
+20. Strongest observed evidence is the actual emitted extinction at tick 47,
+    absent from the 128-frame cache at live tick 224: target/live cells differ,
+    reconstructed cells match, the full captured-current digest agrees and the
+    owner remains unchanged. Actual task/modal/cancellation/corruption negatives
+    pass on `b45ef355`; fourteen retained directories, exact executable/profile,
+    nine source hashes and pinned receipts make the scoped result re-executable.
+
+Disposition: the yes findings are corrected in place and disclosed in this
+operator-requested record. Countermeasures **RH-1** (separate guard/fixture
+review), **RH-14** (wait for checks; no bypass), **SM-1** (no commit-count credit)
+and **SM-11** (retain first failures) name the loops to avoid. No independent
+verifier is claimed. The source and required native qualification are complete;
+the original broader item remains open and publication is reported on observation.
+
 ## Active TODO — saved-checkpoint canvas review, VioletTrout, 2026-10-30
 
 Delivered source `50960acd`, tree `0f855efd`, passes six distinct native component
