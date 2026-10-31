@@ -3025,16 +3025,22 @@ impl ControlHandle {
             Ok(()) => Vec::new(),
             Err(error) => {
                 let span = Self::validate_event_review_boundary(&retained, &current, target_tick)?;
-                // Preserve the original refusal when the missing input is not solely config.
+                // Audit fallback requires a strictly increasing, nonsaturated config revision.
                 if retained.source_config_revision >= current.config_revision
                     || current.config_revision.checked_next().is_none()
-                    || current
-                        .scientific_revision
-                        .get()
-                        .checked_sub(retained.source_scientific_revision.get())
-                        != Some(span)
                 {
                     return Err(error);
+                }
+                if current
+                    .scientific_revision
+                    .get()
+                    .checked_sub(retained.source_scientific_revision.get())
+                    != Some(span)
+                {
+                    return Err(ControlError::BadRequest(
+                        "event review needs recorded inputs for intervening scientific revisions"
+                            .into(),
+                    ));
                 }
                 let published = self.read_snapshot()?;
                 Self::event_review_config_audit(&retained, &current, &published)?
@@ -6091,7 +6097,7 @@ pub(crate) mod tests {
                 );
                 assert!(
                     matches!(handle.event_canvas(target_tick), Err(ControlError::BadRequest(message))
-                    if message.contains("configuration revisions"))
+                    if message.contains("scientific revisions"))
                 );
                 let fresh = handle
                     .create_checkpoint(CheckpointCreateRequest::default())
