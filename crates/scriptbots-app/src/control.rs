@@ -5790,6 +5790,7 @@ pub(crate) mod tests {
                 host.wait_applied(&handle.step().unwrap());
             }
             let before = host.port.scientific_digest_v1().unwrap();
+            assert_eq!(before.tick.0, ticks, "observe the completed owner interval");
             let error = match handle.event_canvas(1) {
                 Ok(_) => panic!("bound admitted"),
                 Err(error) => error,
@@ -5814,7 +5815,8 @@ pub(crate) mod tests {
                 );
             }
             eprintln!(
-                "event canvas bound: schedule={scheduled} actual_ticks={ticks} refused; {}",
+                "event canvas bound: schedule={scheduled} actual_ticks={} refused; {}",
+                before.tick.0,
                 directory.display()
             );
         }
