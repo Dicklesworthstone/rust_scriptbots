@@ -24174,7 +24174,7 @@ for case in ('panic', 'subscription', 'renderer'):
                 .map(|(index, (tick, rate))| {
                     scriptbots_runtime::ScheduledConfigPatch::new(
                         index as u64 + 1,
-                        Tick(tick),
+                        scriptbots_core::Tick(tick),
                         serde_json::json!({"food_growth_rate":rate}),
                     )
                     .unwrap()
