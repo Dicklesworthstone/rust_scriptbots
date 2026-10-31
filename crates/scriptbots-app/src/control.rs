@@ -2991,8 +2991,9 @@ impl ControlHandle {
     }
 
     /// Reconstruct an older event from ticks and a complete published config audit.
-    /// Schedules and extra scientific revisions refuse before stepping. The atomic
-    /// current digest must also match before the reconstructed target is published.
+    /// Configuration schedules require their complete committed outcome history;
+    /// extra scientific revisions refuse before stepping. The atomic current digest
+    /// must also match before the reconstructed target is published.
     pub(crate) fn event_canvas(&self, target_tick: u64) -> Result<EventCanvasReview, ControlError> {
         let retained = self
             .data_services
@@ -3020,6 +3021,9 @@ impl ControlHandle {
             });
         }
         let current = self.host.scientific_digest_cut()?;
+        Self::validate_event_review_boundary(&retained, &current, target_tick)?;
+        let published = self.read_snapshot()?;
+        Self::validate_event_review_schedule(&retained, &current, &published)?;
         let config_audit = match Self::validate_event_review_span(&retained, &current, target_tick)
         {
             Ok(()) => Vec::new(),
@@ -3042,7 +3046,6 @@ impl ControlHandle {
                             .into(),
                     ));
                 }
-                let published = self.read_snapshot()?;
                 Self::event_review_config_audit(&retained, &current, &published)?
             }
         };
@@ -3142,12 +3145,66 @@ impl ControlHandle {
                 "checkpoint owner session differs".into(),
             ));
         }
-        if retained.source_scheduled_input_count != 0 || current.scheduled_input_count != 0 {
+        if retained.source_scheduled_input_count != current.scheduled_input_count {
             return Err(ControlError::BadRequest(
-                "event review needs recorded inputs for a nonempty owner schedule".into(),
+                "event review needs matching source and current owner schedule declarations".into(),
             ));
         }
         Ok(span)
+    }
+
+    fn validate_event_review_schedule(
+        retained: &RetainedCheckpoint,
+        current: &scriptbots_runtime::WorldDigestCut,
+        published: &RenderSnapshot,
+    ) -> Result<(), ControlError> {
+        if retained.source_scheduled_input_count == 0 && current.scheduled_input_count == 0 {
+            return Ok(());
+        }
+        // HostCore installs configuration-only schedules once, before driving. Count
+        // includes completed entries, so an exhausted queue cannot hide missing work.
+        // Require the whole committed history, even entries before the saved cut.
+        let mut previous_tick = 0;
+        let mut previous_revision = 0;
+        let complete = retained.source_scheduled_input_count == current.scheduled_input_count
+            && published.session_id == current.session_id
+            && published.scheduled_patches.len() as u64 == current.scheduled_input_count
+            && published
+                .scheduled_patches
+                .iter()
+                .enumerate()
+                .all(|(index, status)| {
+                    let evidence = &status.evidence;
+                    let sequence = u64::try_from(index)
+                        .ok()
+                        .and_then(|index| index.checked_add(1));
+                    let valid = Some(evidence.scheduled.sequence) == sequence
+                        && status.batch_id.session_id() == current.session_id
+                        && evidence.validate().is_ok()
+                        && matches!(
+                            evidence.outcome,
+                            scriptbots_runtime::ScheduledPatchOutcome::Applied { .. }
+                        )
+                        && matches!(
+                            status.journal,
+                            scriptbots_runtime::JournalState::CommittedVolatile
+                                | scriptbots_runtime::JournalState::Durable
+                        )
+                        && evidence.boundary.tick.0 >= previous_tick
+                        && evidence.boundary.tick <= current.digest.tick
+                        && evidence.boundary.revisions.config.get() > previous_revision
+                        && evidence.boundary.revisions.config <= current.config_revision
+                        && evidence.boundary.revisions.scientific <= current.scientific_revision;
+                    previous_tick = evidence.boundary.tick.0;
+                    previous_revision = evidence.boundary.revisions.config.get();
+                    valid
+                });
+        if !complete {
+            return Err(ControlError::BadRequest(
+                "event review needs a complete committed successful owner schedule history".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn validate_event_review_span(
@@ -5656,6 +5713,213 @@ pub(crate) mod tests {
             })
             .expect("checkpoint policy");
         (handle, host)
+    }
+
+    #[test]
+    // Actual scheduled applications plus corrupt outcome/audit negatives share one owner.
+    #[allow(clippy::too_many_lines)]
+    fn event_canvas_replays_completed_configuration_schedules_with_full_target_oracles() {
+        let directory = tempfile::Builder::new()
+            .prefix("event-scheduled-canvas-")
+            .tempdir()
+            .unwrap()
+            .keep();
+        let mut world = WorldState::new(ScriptBotsConfig {
+            rng_seed: Some(42),
+            world_width: 120,
+            world_height: 120,
+            food_cell_size: 20,
+            persistence_interval: 0,
+            closed: true,
+            topography_enabled: false,
+            food_growth_rate: 0.001,
+            ..ScriptBotsConfig::default()
+        })
+        .unwrap();
+        let brains = crate::install_brains(&mut world, crate::BrainPreset::Mlp)
+            .unwrap()
+            .population;
+        crate::seed_founders(&mut world, &brains, crate::FounderRecipe::Spread).unwrap();
+        let schedule = [(1, 0.004), (1, 0.002), (4, 0.0002), (6, 0.001)]
+            .into_iter()
+            .enumerate()
+            .map(|(index, (tick, rate))| {
+                scriptbots_runtime::ScheduledConfigPatch::new(
+                    index as u64 + 1,
+                    Tick(tick),
+                    serde_json::json!({"food_growth_rate":rate}),
+                )
+                .unwrap()
+            })
+            .collect();
+        let host = TestHost::spawn_with_schedule(world, Some(schedule));
+        let handle = host.handle().with_artifacts_dir(directory.clone()).unwrap();
+        let checkpoint = handle
+            .create_checkpoint(CheckpointCreateRequest::default())
+            .unwrap();
+        let mut oracles = Vec::new();
+        for _ in 0..8 {
+            host.wait_applied(&handle.step().unwrap());
+            oracles.push((
+                handle.read_snapshot().unwrap(),
+                host.port.scientific_digest_v1().unwrap(),
+            ));
+        }
+        let current = host.port.scientific_digest_cut().unwrap();
+        let published = handle.read_snapshot().unwrap();
+        let retained = handle
+            .data_services
+            .checkpoint_retention
+            .lock()
+            .unwrap()
+            .requests
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        assert_eq!(retained.source_scheduled_input_count, 4);
+        assert_eq!(published.scheduled_patches.len(), 4);
+        assert_eq!(
+            current.scheduled_input_count, 4,
+            "exhaustion retains the declaration"
+        );
+        assert_eq!(
+            published
+                .scheduled_patches
+                .iter()
+                .map(|s| s.evidence.boundary.tick.0)
+                .collect::<Vec<_>>(),
+            [1, 1, 4, 6]
+        );
+        let audit =
+            ControlHandle::event_review_config_audit(&retained, &current, &published).unwrap();
+        let saved = handle
+            .verified_canvas_checkpoint(&checkpoint.checkpoint_id)
+            .unwrap();
+        // Avoid same-boundary ambiguity: each target follows application of its due edits.
+        for (oracle, digest) in [&oracles[1], &oracles[4], &oracles[6]] {
+            let target = ControlHandle::replay_event_canvas_world(
+                &saved,
+                &current.digest,
+                &audit,
+                oracle.world.tick,
+                0,
+            )
+            .unwrap();
+            assert_eq!(
+                &target.world_digest_v1().unwrap(),
+                digest,
+                "full actual target digest"
+            );
+            let review = handle.event_canvas(oracle.world.tick).unwrap();
+            assert_eq!(review.snapshot.world.tick, oracle.world.tick);
+            assert_eq!(
+                review.snapshot.config.food_growth_rate.to_bits(),
+                oracle.config.food_growth_rate.to_bits()
+            );
+            assert_ne!(*digest, current.digest);
+        }
+        assert_ne!(
+            oracles[1].0.config.food_growth_rate.to_bits(),
+            oracles[4].0.config.food_growth_rate.to_bits()
+        );
+        for fault in [
+            "missing",
+            "order",
+            "pending",
+            "failed",
+            "session",
+            "future",
+            "revision",
+            "declaration",
+        ] {
+            let mut changed = (*published).clone();
+            let mut source = retained.clone();
+            let statuses = Arc::make_mut(&mut changed.scheduled_patches);
+            match fault {
+                "missing" => {
+                    statuses.remove(0);
+                }
+                "order" => statuses.swap(0, 1),
+                "pending" => statuses[0].journal = scriptbots_runtime::JournalState::Pending,
+                "failed" => {
+                    statuses[0].evidence.outcome = scriptbots_runtime::ScheduledPatchOutcome::Failed(
+                        scriptbots_runtime::ApplicationFailure {
+                            code: "test_failure".into(),
+                            message: "not applied".into(),
+                        },
+                    )
+                }
+                "session" => {
+                    statuses[0].batch_id = scriptbots_runtime::JournalBatchId::new(
+                        scriptbots_runtime::HostSessionId::new(77),
+                        1,
+                    )
+                }
+                "future" => {
+                    statuses[3].evidence.boundary.tick = Tick(9);
+                    statuses[3].evidence.scheduled.due_tick = Tick(9);
+                }
+                "revision" => {
+                    statuses[3].evidence.boundary.revisions.config =
+                        scriptbots_runtime::ConfigRevision::new(99)
+                }
+                "declaration" => source.source_scheduled_input_count = 0,
+                _ => unreachable!(),
+            }
+            assert!(
+                matches!(
+                    ControlHandle::validate_event_review_schedule(&source, &current, &changed),
+                    Err(ControlError::BadRequest(_))
+                ),
+                "{fault}"
+            );
+        }
+        let mut missing_audit = (*published).clone();
+        Arc::make_mut(&mut missing_audit.config_audit).remove(0);
+        assert!(
+            ControlHandle::event_review_config_audit(&retained, &current, &missing_audit).is_err()
+        );
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), current.digest);
+        assert!(Arc::ptr_eq(&handle.read_snapshot().unwrap(), &published));
+        fs::write(
+            directory.join("schedule.json"),
+            serde_json::to_vec_pretty(published.scheduled_patches.as_ref()).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            directory.join("current-digest.json"),
+            serde_json::to_vec_pretty(&current.digest).unwrap(),
+        )
+        .unwrap();
+        eprintln!(
+            "completed configuration schedule: source={} targets=2,5,7 live={} digest={}; {}",
+            checkpoint.tick,
+            current.digest.tick.0,
+            current.digest.overall,
+            directory.display()
+        );
+        // An exhausted schedule before the source cut also permits the tick-only
+        // path; retaining old outcomes is not mistaken for new configuration work.
+        let later = handle
+            .create_checkpoint(CheckpointCreateRequest::default())
+            .unwrap();
+        host.wait_applied(&handle.step().unwrap());
+        let later_oracle = host.port.scientific_digest_v1().unwrap();
+        host.wait_applied(&handle.step().unwrap());
+        assert_eq!(
+            handle.event_canvas(later_oracle.tick.0).unwrap().base_tick,
+            later.tick
+        );
+        let science = handle
+            .submit_control_command(ControlCommand::SpawnAgent {
+                herbivore_tendency: 0.5,
+            })
+            .unwrap();
+        host.wait_applied(&science);
+        assert!(
+            matches!(handle.event_canvas(later_oracle.tick.0), Err(ControlError::BadRequest(message)) if message.contains("scientific revisions"))
+        );
     }
 
     #[test]

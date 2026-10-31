@@ -17035,6 +17035,14 @@ for case in ('panic', 'subscription', 'renderer'):
         }
 
         fn with_options(world: SharedWorld, options: scriptbots_runtime::HostCoreOptions) -> Self {
+            Self::with_schedule(world, options, Vec::new())
+        }
+
+        fn with_schedule(
+            world: SharedWorld,
+            options: scriptbots_runtime::HostCoreOptions,
+            schedule: Vec<scriptbots_runtime::ScheduledConfigPatch>,
+        ) -> Self {
             let world = Arc::try_unwrap(world)
                 // ubs:ignore[rust.ownership.panic-macro] — test requires sole-owner construction.
                 .unwrap_or_else(|_| panic!("terminal fixture must transfer sole world ownership"))
@@ -17043,7 +17051,7 @@ for case in ('panic', 'subscription', 'renderer'):
             let persistence = world
                 .bind_persistence(Box::new(scriptbots_core::NullPersistence))
                 .expect("bind real host persistence session");
-            let owner = crate::host_thread::HostThread::spawn(
+            let owner = crate::host_thread::HostThread::spawn_with_bootstrap(
                 scriptbots_runtime::HostSessionId::new(0x5455_4954),
                 world,
                 persistence,
@@ -17052,6 +17060,10 @@ for case in ('panic', 'subscription', 'renderer'):
                 )),
                 options,
                 scriptbots_runtime::channel::ChannelHostOptions::default(),
+                crate::host_thread::HostBootstrap {
+                    schedule,
+                    ..crate::host_thread::HostBootstrap::default()
+                },
             )
             .expect("start real terminal host");
             Self { owner: Some(owner) }
@@ -24072,6 +24084,15 @@ for case in ('panic', 'subscription', 'renderer'):
 
     #[test]
     fn event_canvas_real_worker_reviews_an_actual_event_after_cache_eviction() {
+        event_canvas_worker_journey(false);
+    }
+
+    #[test]
+    fn event_canvas_real_worker_reviews_completed_configuration_schedules() {
+        event_canvas_worker_journey(true);
+    }
+
+    fn event_canvas_worker_journey(scheduled: bool) {
         use frankentui_shell::ShellRoute;
         use ftui::core::event::{Event, KeyCode, KeyEvent};
         use std::io::Write as _;
@@ -24146,7 +24167,34 @@ for case in ('panic', 'subscription', 'renderer'):
             .unwrap()
             .population;
         crate::seed_founders(&mut world, &brains, crate::FounderRecipe::Spread).unwrap();
-        let host = TerminalTestHost::take(Arc::new(std::sync::Mutex::new(world)));
+        let schedule = if scheduled {
+            [(1, 0.008), (2, 0.004)]
+                .into_iter()
+                .enumerate()
+                .map(|(index, (tick, rate))| {
+                    scriptbots_runtime::ScheduledConfigPatch::new(
+                        index as u64 + 1,
+                        Tick(tick),
+                        serde_json::json!({"food_growth_rate":rate}),
+                    )
+                    .unwrap()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let host = TerminalTestHost::with_schedule(
+            Arc::new(std::sync::Mutex::new(world)),
+            scriptbots_runtime::HostCoreOptions {
+                initial_playback: scriptbots_runtime::PlaybackSnapshot {
+                    paused: true,
+                    speed_multiplier: 1.0,
+                },
+                capture_agent_visuals: true,
+                ..scriptbots_runtime::HostCoreOptions::default()
+            },
+            schedule,
+        );
         let (runtime, _) = ControlRuntime::launch(
             host.port(),
             crate::servers::ControlServerConfig {
@@ -24186,10 +24234,16 @@ for case in ('panic', 'subscription', 'renderer'):
         }
         let live_cells = paint(&mut app);
         let live_tick = app.snapshot.tick;
-        let index = app.snapshot.narrative.iter().position(|event| {
-            event.kind == NarrativeEventKind::Extinction && event.tick.0 > checkpoint.tick
-                && event.tick.0 + u64::try_from(MAX_CANVAS_HISTORY_FRAMES).unwrap() < live_tick
-        }).expect("real aging must produce an old extinction event without operator or schedule inputs");
+        let index = app
+            .snapshot
+            .narrative
+            .iter()
+            .position(|event| {
+                event.kind == NarrativeEventKind::Extinction
+                    && event.tick.0 > checkpoint.tick
+                    && event.tick.0 + u64::try_from(MAX_CANVAS_HISTORY_FRAMES).unwrap() < live_tick
+            })
+            .expect("real aging must produce an old extinction event");
         let event = app.snapshot.narrative[index].clone();
         let (oracle, target_cells) = references.get(&event.tick.0).unwrap();
         assert_ne!(
@@ -24317,7 +24371,14 @@ for case in ('panic', 'subscription', 'renderer'):
             }
         }
         let config_publication = handle.read_snapshot().unwrap();
-        assert_eq!(config_publication.revisions.config.get(), 2);
+        assert_eq!(
+            config_publication.revisions.config.get(),
+            if scheduled { 4 } else { 2 }
+        );
+        assert_eq!(
+            config_publication.scheduled_patches.len(),
+            if scheduled { 2 } else { 0 }
+        );
         assert_eq!(host.port().scientific_digest_v1().unwrap(), owner_digest);
         model.app.borrow_mut().refresh_snapshot();
         model.app.borrow_mut().select_rail_event_by_index(index);
