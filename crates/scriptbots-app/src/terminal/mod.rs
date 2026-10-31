@@ -24296,9 +24296,50 @@ for case in ('panic', 'subscription', 'renderer'):
             model.app.borrow_mut().select_rail_event_by_index(index);
             assert_eq!(host.port().scientific_digest_v1().unwrap(), owner_digest);
         }
+        // Config edits after the selected event must use the published audit in the
+        // same real worker, without replacing the original tick-only assertions above.
+        for rate in [0.008, 0.004] {
+            let command = handle
+                .apply_patch(serde_json::json!({"food_growth_rate": rate}))
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let status = handle.command_status(&command.command_id).unwrap().unwrap();
+                if status.application_state == "applied" {
+                    break;
+                }
+                assert_eq!(status.application_state, "admitted");
+                assert!(
+                    Instant::now() < deadline,
+                    "actual config command must settle"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        let config_publication = handle.read_snapshot().unwrap();
+        assert_eq!(config_publication.revisions.config.get(), 2);
+        assert_eq!(host.port().scientific_digest_v1().unwrap(), owner_digest);
+        model.app.borrow_mut().refresh_snapshot();
+        model.app.borrow_mut().select_rail_event_by_index(index);
         model.last_service_poll = Some(Instant::now());
         let work = task(model.update(key(KeyCode::Char('v'))));
         let _ = model.update(std::thread::spawn(work).join().unwrap());
+        assert_eq!(&paint(&mut model.app.borrow_mut()), target_cells);
+        assert_eq!(
+            model
+                .app
+                .borrow()
+                .canvas_review
+                .as_ref()
+                .unwrap()
+                .snapshot
+                .tick,
+            event.tick.0
+        );
+        assert!(Arc::ptr_eq(
+            &handle.read_snapshot().unwrap(),
+            &config_publication
+        ));
         let (artifact, bytes) = handle
             .read_artifact_bytes(&checkpoint.checkpoint_id)
             .unwrap();

@@ -94,6 +94,8 @@ pub struct WorldCheckpointCut {
     pub scientific_revision: ScientificRevision,
     /// Actual configuration revision; config edits use a distinct revision domain.
     pub config_revision: ConfigRevision,
+    /// Actual owner cadence; the independent science checkpoint normalizes this to zero.
+    pub persistence_interval: u32,
     /// Total declared schedule inputs, including completed entries; an empty queue is zero.
     pub scheduled_input_count: u64,
 }
@@ -3823,6 +3825,7 @@ impl HostCore {
             session_id: self.session_id,
             scientific_revision: self.revisions.scientific,
             config_revision: self.revisions.config,
+            persistence_interval: self.world.config().persistence_interval,
             scheduled_input_count: self.scheduled_input_count(),
         })
     }
@@ -6869,6 +6872,21 @@ mod tests {
                 .scheduled_input_count,
             0
         );
+    }
+
+    #[test]
+    fn checkpoint_cut_retains_raw_persistence_cadence_outside_normalized_science() {
+        for interval in [0, 3] {
+            let owner =
+                HostCore::new(HostSessionId::new(0xc075), world(interval), options(true)).unwrap();
+            let captured = owner.capture_checkpoint_cut().unwrap();
+            assert_eq!(captured.persistence_interval, interval);
+            assert_eq!(captured.checkpoint.config().persistence_interval, 0);
+            assert_eq!(
+                captured.checkpoint.source_digest(),
+                &owner.scientific_digest_v1().unwrap()
+            );
+        }
     }
 
     #[test]

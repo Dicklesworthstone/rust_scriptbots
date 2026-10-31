@@ -1261,6 +1261,7 @@ struct RetainedCheckpoint {
     source_session: scriptbots_runtime::HostSessionId,
     source_scientific_revision: scriptbots_runtime::ScientificRevision,
     source_config_revision: scriptbots_runtime::ConfigRevision,
+    source_persistence_interval: u32,
     source_scheduled_input_count: u64,
 }
 
@@ -2555,6 +2556,7 @@ impl ControlHandle {
             source_session: captured.session_id,
             source_scientific_revision: captured.scientific_revision,
             source_config_revision: captured.config_revision,
+            source_persistence_interval: captured.persistence_interval,
             source_scheduled_input_count: captured.scheduled_input_count,
         };
         let mut file = fs::OpenOptions::new()
@@ -2988,9 +2990,9 @@ impl ControlHandle {
         Ok(projection.latest_snapshot())
     }
 
-    /// Reconstruct an older event only for an interval proven to contain ticks alone.
-    /// The owner cut is atomic; schedules and extra scientific revisions refuse before
-    /// stepping. The full current digest must also match before a target is published.
+    /// Reconstruct an older event from ticks and a complete published config audit.
+    /// Schedules and extra scientific revisions refuse before stepping. The atomic
+    /// current digest must also match before the reconstructed target is published.
     pub(crate) fn event_canvas(&self, target_tick: u64) -> Result<EventCanvasReview, ControlError> {
         let retained = self
             .data_services
@@ -3018,14 +3020,69 @@ impl ControlHandle {
             });
         }
         let current = self.host.scientific_digest_cut()?;
-        let current_tick = current.digest.tick.0;
-        Self::validate_event_review_span(&retained, &current, target_tick)?;
-        let mut world = Self::restore_canvas_world(&checkpoint)?;
+        let config_audit = match Self::validate_event_review_span(&retained, &current, target_tick)
+        {
+            Ok(()) => Vec::new(),
+            Err(error) => {
+                let span = Self::validate_event_review_boundary(&retained, &current, target_tick)?;
+                // Preserve the original refusal when the missing input is not solely config.
+                if retained.source_config_revision >= current.config_revision
+                    || current.config_revision.checked_next().is_none()
+                    || current
+                        .scientific_revision
+                        .get()
+                        .checked_sub(retained.source_scientific_revision.get())
+                        != Some(span)
+                {
+                    return Err(error);
+                }
+                let published = self.read_snapshot()?;
+                Self::event_review_config_audit(&retained, &current, &published)?
+            }
+        };
+        let world = Self::replay_event_canvas_world(
+            &checkpoint,
+            &current.digest,
+            &config_audit,
+            target_tick,
+            retained.source_persistence_interval,
+        )?;
+        Ok(EventCanvasReview {
+            snapshot: self.project_canvas_world(world)?,
+            checkpoint_id,
+            base_tick,
+        })
+    }
+
+    fn replay_event_canvas_world(
+        checkpoint: &scriptbots_core::WorldCheckpointV1,
+        current: &scriptbots_core::WorldDigestV1,
+        config_audit: &[ConfigAuditEntry],
+        target_tick: u64,
+        source_persistence_interval: u32,
+    ) -> Result<WorldState, ControlError> {
+        let mut world = Self::restore_canvas_world(checkpoint)?;
+        let mut edits = config_audit.iter().peekable();
         let mut target = None;
-        while world.tick().0 < current_tick {
-            world
-                .step()
-                .map_err(|error| ControlError::Serialization(error.to_string()))?;
+        loop {
+            while edits
+                .peek()
+                .is_some_and(|entry| entry.tick == world.tick().0)
+            {
+                let expected = world.config_revision().checked_add(1).ok_or_else(|| {
+                    ControlError::InvalidPatch("replayed configuration revision saturated".into())
+                })?;
+                Self::apply_event_review_config(
+                    &mut world,
+                    edits.next().expect("peeked audit entry"),
+                    source_persistence_interval,
+                )?;
+                if world.config_revision() != expected {
+                    return Err(ControlError::InvalidPatch(
+                        "recorded config edit did not advance its revision".into(),
+                    ));
+                }
+            }
             if world.tick().0 == target_tick {
                 target = Some(
                     world
@@ -3033,11 +3090,22 @@ impl ControlHandle {
                         .map_err(|error| ControlError::Serialization(error.to_string()))?,
                 );
             }
+            if world.tick() == current.tick {
+                break;
+            }
+            world
+                .step()
+                .map_err(|error| ControlError::Serialization(error.to_string()))?;
+        }
+        if edits.peek().is_some() {
+            return Err(ControlError::InvalidPatch(
+                "event replay left recorded configuration edits unapplied".into(),
+            ));
         }
         if world
             .world_digest_v1()
             .map_err(|error| ControlError::Serialization(error.to_string()))?
-            != current.digest
+            != *current
         {
             return Err(ControlError::InvalidPatch(
                 "event replay differs from the captured current scientific digest; canvas unchanged".into(),
@@ -3048,18 +3116,14 @@ impl ControlHandle {
                 "event replay did not capture the requested target tick".into(),
             )
         })?;
-        Ok(EventCanvasReview {
-            snapshot: self.project_canvas_world(Self::restore_canvas_world(&target)?)?,
-            checkpoint_id,
-            base_tick,
-        })
+        Self::restore_canvas_world(&target)
     }
 
-    fn validate_event_review_span(
+    fn validate_event_review_boundary(
         retained: &RetainedCheckpoint,
         current: &scriptbots_runtime::WorldDigestCut,
         target_tick: u64,
-    ) -> Result<(), ControlError> {
+    ) -> Result<u64, ControlError> {
         let base_tick = retained.metadata.tick;
         let current_tick = current.digest.tick.0;
         let span = current_tick.checked_sub(base_tick).filter(|span| {
@@ -3077,6 +3141,15 @@ impl ControlHandle {
                 "event review needs recorded inputs for a nonempty owner schedule".into(),
             ));
         }
+        Ok(span)
+    }
+
+    fn validate_event_review_span(
+        retained: &RetainedCheckpoint,
+        current: &scriptbots_runtime::WorldDigestCut,
+        target_tick: u64,
+    ) -> Result<(), ControlError> {
+        let span = Self::validate_event_review_boundary(retained, current, target_tick)?;
         // Core config revision saturates; equality at its ceiling cannot prove no edits.
         if retained.source_config_revision.checked_next().is_none()
             || retained.source_config_revision != current.config_revision
@@ -3096,6 +3169,91 @@ impl ControlHandle {
             ));
         }
         Ok(())
+    }
+
+    fn event_review_config_audit(
+        retained: &RetainedCheckpoint,
+        current: &scriptbots_runtime::WorldDigestCut,
+        published: &RenderSnapshot,
+    ) -> Result<Vec<ConfigAuditEntry>, ControlError> {
+        let missing = || {
+            ControlError::BadRequest(
+            "event review needs a complete ordered configuration audit for the captured interval".into(),
+        )
+        };
+        let source_revision = retained.source_config_revision.get();
+        let current_revision = current.config_revision.get();
+        // Core records one entry per applied config revision, retaining a suffix. Never
+        // infer ordinals at saturation, or assume this later publication equals the cut.
+        let audit_base = published
+            .revisions
+            .config
+            .get()
+            .checked_sub(published.config_audit.len() as u64)
+            .ok_or_else(missing)?;
+        if published.session_id != current.session_id
+            || current.config_revision.checked_next().is_none()
+            || published.revisions.config.checked_next().is_none()
+            || current_revision <= source_revision
+            || current_revision > published.revisions.config.get()
+        {
+            return Err(missing());
+        }
+        let start = source_revision
+            .checked_sub(audit_base)
+            .ok_or_else(missing)?;
+        let end = current_revision
+            .checked_sub(audit_base)
+            .ok_or_else(missing)?;
+        let start = usize::try_from(start).map_err(|_| missing())?;
+        let end = usize::try_from(end).map_err(|_| missing())?;
+        let entries = published.config_audit.get(start..end).ok_or_else(missing)?;
+        let mut preceding_tick = retained.metadata.tick;
+        for entry in entries {
+            if entry.tick < preceding_tick || entry.tick > current.digest.tick.0 {
+                return Err(missing());
+            }
+            preceding_tick = entry.tick;
+        }
+        Ok(entries.to_vec())
+    }
+
+    fn apply_event_review_config(
+        world: &mut WorldState,
+        entry: &ConfigAuditEntry,
+        source_persistence_interval: u32,
+    ) -> Result<(), ControlError> {
+        // set_closed records a sparse patch and deliberately does not run the full
+        // config-update cache/food refresh. Preserve that operation's actual semantics.
+        if let Some(patch) = entry.patch.as_object()
+            && patch.len() == 1
+            && let Some(closed) = patch.get("closed").and_then(Value::as_bool)
+        {
+            world
+                .set_closed(closed)
+                .map_err(|error| ControlError::InvalidPatch(error.to_string()))?;
+            return Ok(());
+        }
+        let mut config = world.config().clone();
+        // Checkpoint restore disables persistence. Rehydrate only for patch validation;
+        // replay never enables it or opens the live database.
+        config.persistence_interval = source_persistence_interval;
+        let mut value = serde_json::to_value(config).map_err(ControlError::serialization)?;
+        merge_value(&mut value, &entry.patch, &mut SmallVec::new())?;
+        let mut config: ScriptBotsConfig =
+            serde_json::from_value(value).map_err(ControlError::serialization)?;
+        if config.persistence_interval != source_persistence_interval {
+            return Err(ControlError::BadRequest(
+                "event review does not replay persistence interval changes".into(),
+            ));
+        }
+        config
+            .validate()
+            .map_err(|error| ControlError::InvalidPatch(error.to_string()))?;
+        config.persistence_interval = 0;
+        world
+            .apply_config_update(config)
+            .map_err(|error| ControlError::InvalidPatch(error.to_string()))
     }
 
     /// Produce a PNG snapshot of the world without a live window.
@@ -5492,6 +5650,236 @@ pub(crate) mod tests {
             })
             .expect("checkpoint policy");
         (handle, host)
+    }
+
+    #[test]
+    // One actual owner journey, including anchor corruption and pruning, per persistence mode.
+    #[allow(clippy::too_many_lines)]
+    fn event_canvas_replays_recorded_config_edits_at_their_actual_boundaries() {
+        let mut distinct = std::collections::BTreeSet::new();
+        for persistence_interval in [0, 3] {
+            let directory = tempfile::Builder::new()
+                .prefix("event-config-canvas-")
+                .tempdir()
+                .unwrap()
+                .keep();
+            let mut world = WorldState::new(ScriptBotsConfig {
+                rng_seed: Some(42),
+                world_width: 120,
+                world_height: 120,
+                food_cell_size: 20,
+                persistence_interval,
+                closed: true,
+                topography_enabled: false,
+                initial_food: 0.0,
+                food_intake_rate: 0.0,
+                food_decay_rate: 0.0,
+                food_diffusion_rate: 0.0,
+                food_respawn_interval: 0,
+                metabolism_drain: 0.0,
+                movement_drain: 0.0,
+                reproduction_energy_threshold: 0.0,
+                ..ScriptBotsConfig::default()
+            })
+            .unwrap();
+            let brains = crate::install_brains(&mut world, crate::BrainPreset::Mlp)
+                .unwrap()
+                .population;
+            crate::seed_founders(&mut world, &brains, crate::FounderRecipe::Spread).unwrap();
+            let host = TestHost::spawn(world);
+            let handle = host.handle().with_artifacts_dir(directory.clone()).unwrap();
+            host.wait_applied(
+                &handle
+                    .apply_patch(serde_json::json!({"food_growth_rate":0.001}))
+                    .unwrap(),
+            );
+            host.wait_applied(&handle.step().unwrap());
+            let checkpoint = handle
+                .create_checkpoint(CheckpointCreateRequest::default())
+                .unwrap();
+            // Two edits at the source boundary, plus edits at the target and later boundaries.
+            for rate in [0.004, 0.002] {
+                host.wait_applied(
+                    &handle
+                        .apply_patch(serde_json::json!({"food_growth_rate":rate}))
+                        .unwrap(),
+                );
+            }
+            for _ in 0..3 {
+                host.wait_applied(&handle.step().unwrap());
+            }
+            host.wait_applied(
+                &handle
+                    .apply_patch(serde_json::json!({"food_growth_rate":0.0002}))
+                    .unwrap(),
+            );
+            let oracle = handle.read_snapshot().unwrap();
+            let oracle_digest = host.port.scientific_digest_v1().unwrap();
+            for _ in 0..2 {
+                host.wait_applied(&handle.step().unwrap());
+            }
+            host.wait_applied(
+                &handle
+                    .apply_patch(serde_json::json!({"food_growth_rate":0.001}))
+                    .unwrap(),
+            );
+            for _ in 0..2 {
+                host.wait_applied(&handle.step().unwrap());
+            }
+            let current = host.port.scientific_digest_cut().unwrap();
+            let published = handle.read_snapshot().unwrap();
+            let source = handle
+                .data_services
+                .checkpoint_retention
+                .lock()
+                .unwrap()
+                .requests
+                .values()
+                .next()
+                .unwrap()
+                .clone();
+            assert_eq!(
+                source.source_config_revision.get(),
+                1,
+                "nonempty audit prefix"
+            );
+            assert_eq!(current.config_revision.get(), 5);
+            assert_eq!(source.source_persistence_interval, persistence_interval);
+            let audit =
+                ControlHandle::event_review_config_audit(&source, &current, &published).unwrap();
+            assert_eq!(
+                audit.iter().map(|entry| entry.tick).collect::<Vec<_>>(),
+                [1, 1, 4, 6]
+            );
+            let saved = handle
+                .verified_canvas_checkpoint(&checkpoint.checkpoint_id)
+                .unwrap();
+            let target = ControlHandle::replay_event_canvas_world(
+                &saved,
+                &current.digest,
+                &audit,
+                oracle.world.tick,
+                source.source_persistence_interval,
+            )
+            .unwrap();
+            assert_eq!(
+                target.world_digest_v1().unwrap(),
+                oracle_digest,
+                "full target science oracle"
+            );
+            assert_eq!(target.config().persistence_interval, 0);
+            assert_ne!(
+                oracle_digest, current.digest,
+                "actual target/live science differs"
+            );
+            distinct.insert(current.digest.overall.clone());
+            let review = handle.event_canvas(oracle.world.tick).unwrap();
+            assert_eq!(review.base_tick, checkpoint.tick);
+            assert_eq!(review.snapshot.world.tick, oracle.world.tick);
+            assert_eq!(
+                review.snapshot.config.food_growth_rate.to_bits(),
+                oracle.config.food_growth_rate.to_bits()
+            );
+            assert_ne!(
+                review.snapshot.config.food_growth_rate.to_bits(),
+                published.config.food_growth_rate.to_bits()
+            );
+            for fault in ["value", "tick", "missing", "persistence"] {
+                let mut changed = audit.clone();
+                match fault {
+                    "value" => changed[1].patch["food_growth_rate"] = serde_json::json!(0.000001),
+                    "tick" => changed[2].tick += 1,
+                    "missing" => {
+                        changed.remove(2);
+                    }
+                    "persistence" => {
+                        changed[0].patch["persistence_interval"] = serde_json::json!(7)
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(
+                    ControlHandle::replay_event_canvas_world(
+                        &saved,
+                        &current.digest,
+                        &changed,
+                        oracle.world.tick,
+                        source.source_persistence_interval,
+                    )
+                    .is_err(),
+                    "{fault}"
+                );
+            }
+            for fault in ["pruned", "order", "future", "session", "saturated", "older"] {
+                let mut changed = (*published).clone();
+                match fault {
+                    "pruned" => {
+                        Arc::make_mut(&mut changed.config_audit).drain(..2);
+                    }
+                    "order" => Arc::make_mut(&mut changed.config_audit)[3].tick = 0,
+                    "future" => {
+                        Arc::make_mut(&mut changed.config_audit)[3].tick = current.digest.tick.0 + 1
+                    }
+                    "session" => {
+                        changed.session_id =
+                            scriptbots_runtime::HostSessionId::new(current.session_id.get() ^ 1)
+                    }
+                    "saturated" => {
+                        changed.revisions.config = scriptbots_runtime::ConfigRevision::new(u64::MAX)
+                    }
+                    "older" => changed.revisions.config = source.source_config_revision,
+                    _ => unreachable!(),
+                }
+                assert!(
+                    ControlHandle::event_review_config_audit(&source, &current, &changed).is_err(),
+                    "{fault}"
+                );
+            }
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), current.digest);
+            assert!(Arc::ptr_eq(&handle.read_snapshot().unwrap(), &published));
+            fs::write(
+                directory.join("target-digest.json"),
+                serde_json::to_vec_pretty(&oracle_digest).unwrap(),
+            )
+            .unwrap();
+            fs::write(
+                directory.join("current-digest.json"),
+                serde_json::to_vec_pretty(&current.digest).unwrap(),
+            )
+            .unwrap();
+            eprintln!(
+                "config replay: interval={persistence_interval} base={} target={} live={} revisions=1..5 full target={} current={}; {}",
+                checkpoint.tick,
+                oracle.world.tick,
+                current.digest.tick.0,
+                oracle_digest.overall,
+                current.digest.overall,
+                directory.display()
+            );
+            // The actual bounded ring must refuse rather than fabricate a missing prefix.
+            let mut updates = 0;
+            loop {
+                let snapshot = handle.read_snapshot().unwrap();
+                if snapshot.revisions.config.get() - source.source_config_revision.get()
+                    > snapshot.config_audit.len() as u64
+                {
+                    break;
+                }
+                assert!(
+                    updates < MAX_EVENT_REVIEW_TICKS,
+                    "observe audit pruning within the work bound"
+                );
+                host.wait_applied(&handle.apply_patch(serde_json::json!({"food_growth_rate":if updates % 2 == 0 {0.02} else {0.01}})).unwrap());
+                updates += 1;
+            }
+            assert!(
+                matches!(handle.event_canvas(oracle.world.tick), Err(ControlError::BadRequest(message)) if message.contains("complete ordered configuration audit"))
+            );
+        }
+        assert_eq!(
+            distinct.len(),
+            1,
+            "persistence isolation preserves identical science"
+        );
     }
 
     #[test]
