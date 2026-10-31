@@ -1,5 +1,190 @@
 # Reality Check — rust_scriptbots — implementation continuation 2026-10-27
 
+## Active TODO — configuration-audit event review, VioletTrout, 2026-10-31
+
+Consumer: existing narrative `v` outside the canvas cache after operator config
+edits. Before this increment, published audit entries had a writer but this
+replay consumer did not read them. Continue original `bd-ji3a`, with no closure or scope edit.
+This operator-requested TODO gates this increment's handoff and retires there;
+it is process, with zero capability credit. Evidence is retained under
+`/data/tmp/scriptbots-config-review-20261031T0500-violettrout/`.
+
+- [x] Refresh source, ready Beads and graph triage; disprove the suspected missing checkpoint-save action.
+- [x] Trace live config/audit publication and finished-run replay ownership; choose the existing audit consumer connection.
+- [x] Reserve exact paths and append progress on original `bd-ji3a` without changing acceptance or dependencies.
+- [x] Admit only complete, ordered, nonsaturated config-audit suffixes for the captured owner interval.
+- [x] Apply recorded config at actual completed-tick boundaries in the isolated world, preserving persistence isolation.
+- [x] Retain all current tick/science/session/schedule/work and full-current-digest guards.
+- [x] Document that target config edits are included without claiming the original within-tick event publication.
+- [x] Exercise actual configuration edits and reversions with distinct target/live observations and unchanged owner.
+- [x] Exercise pruning, corrupt/missing audit, ordering, unsupported persistence and scientific-input refusals.
+- [x] Qualify the existing narrative consumer and original tick-only/direct/cached regressions.
+- [x] Execute related checkpoint regression selection and collect real worker artifacts/profile.
+- [x] Complete current-source workspace check, strict Clippy, formatting and fresh changed-source scans.
+- [x] Retain raw attempts/source bindings, complete honesty audit and update docs with exact limitations.
+- [x] Review qualified code and prepare publication metadata; final ref/lease observations belong to the session handoff.
+
+**[Qualified — bounded native component, original Bead remains in progress]** Source is
+`67d8d92ea32bb21cb8be1c5adaa4de5ab17f3926`, tree `bd88bd0e`.
+Its full canvas selection passes **27 tests, 0 failed, 0 ignored**, outer 0,
+42.88s. Actual config edits at source/target/later boundaries reconstruct target
+tick 4 with full digest `51ba92681611ce84`, while the owner stays at tick 8 with
+digest `4510da920922de38`; persistence modes 0 and 3 retain identical science.
+Both real worker journeys pass, including the evicted extinction at tick 47,
+two later config edits, exact target cells, modal/cancel/corruption controls and
+unchanged owner `17f35168117f0c0f` at tick 224. Sixteen actual canvas artifact
+directories and the compiler's actual default-feature test profile are retained
+locally. Corrected workspace/all-target check passes (outer 0, matching receipt).
+All **20 checkpoint tests pass** with DAC override/read-search capabilities
+dropped (outer 0, 352.62s); the permission failure and real process-kill/restart
+cases remain enabled. The two selections cover **45 distinct app tests**, with
+two named overlaps, not 47 independent tests. Ten observed checkpoint artifact
+roots are copied locally, along with the exact 216,063,640-byte test executable
+and its checksum after the observed earlier cache loss. Strict workspace/all-target
+Clippy passes with `-D warnings` (outer 0, matching receipt). Final formatting and
+the three-file source scan pass with **0 critical / 5,497 warnings / 1,185 info**;
+the scan is not claimed clean. Runtime's **242 passed /
+6 existing ignores** remain bound to `5a121770`; the only source change from
+there to this pin is app `control.rs`, so runtime inputs remain unchanged.
+Original broader acceptance remains open; all of this is self-verification.
+
+Qualification history (pending states below are superseded by the current
+observations above): source candidate `5a121770a528fe0074d5438e40c63ead4dceb704`,
+tree `c66f4e24`, implements the existing consumer connection. The atomic source
+cut additionally retains the original persistence interval because the science
+checkpoint intentionally normalizes it to zero. Formatting and the three-file
+source scan pass (0 critical / 5,497 warnings / 1,185 info; not a clean scan).
+All four source/lockfile hashes match on both initial RCH workers. Required
+workspace/all-target check passed at this pin (outer 0, clean-overlay receipt).
+The first app build reached the unchanged 30-minute infrastructure limit before
+tests (exit 137); strict Clippy admission on hz2 later refused with exit 103
+because that worker had no slots. Neither is a test verdict. Same-pin app
+execution remains pending on two workers; hz4 strict workspace/all-target Clippy
+passes with `-D warnings`, outer 0 and a matching clean-overlay receipt.
+The first app retry also hit its unchanged 30-minute build limit before tests
+(exit 137). Its next same-pin retry starts immediately against the existing
+worker cache; the separate worker attempt is retained too. No retry is counted
+as a green result without actual executed tests.
+The same-pin runtime library passes **242 tests,
+0 failed, 6 existing ignores**, outer 0, 29.76s, with its matching clean-overlay
+receipt. Its new cadence test observes raw 0/3 owner settings and normalized-zero
+science independently. App execution is still pending. This
+increment will not establish arbitrary operator/scientific/scheduled replay,
+native PTY/GPU, whole-workspace runtime, DSR or independent acceptance.
+
+Pre-publication source review found a stale signal: when a span contains both
+recorded config edits and an unrecorded scientific command, the audit fallback
+returned the old configuration refusal without naming the actual missing science
+input. The correction preserves the refusal and asserts the precise scientific
+revision reason after the real SpawnAgent/config round trip. The original test's
+error variant and refusal remain required; no assertion or guard is removed.
+This is a product error-label correction, not a test-gate relaxation. The original
+source's results above remain bound to `5a121770`; corrected-pin qualification is
+pending, and old-pin app attempts remain retained rather than promoted to it.
+
+First corrected-pin app execution is **23 passed / 3 failed / 0 ignored**, outer
+101, 5.18s. All three failures occur in `tempfile::Builder::tempdir()` before
+world/replay assertions: the forced TMPDIR parent was not provisioned on this
+new worker. The later real checkpoint/event worker tests pass after their setup
+creates that parent; both first-run artifact directories were copied locally.
+Provision the unchanged TMPDIR explicitly, keep the source/flags/deadlines, and
+rerun. This failed suite remains a failed suite, not an infrastructure green.
+Comparing named tests also found that `canvas_` omitted the prior
+`every_reducing_source_reaches_the_canvas` test. The rerun uses `canvas`, restoring
+all 26 prior tests plus the new config journey; no passing subset is substituted.
+
+The broader checkpoint selection is **19 passed / 1 failed / 0 ignored** under
+the worker's full root privileges, outer 101, 151.67s. Its unchanged permission
+fixture (`chmod 0500`) does not deny root's DAC override, so it is not an actual
+denial in that execution class. The tests remain unchanged. A same-worker probe
+with DAC override/read-search capabilities dropped observes a real denied write
+and a successful write after access is restored; its UID/capability mask is
+retained in `checkpoint-dac-denial-probe.json`. The full checkpoint selection is
+being re-executed through that capability-reduced Cargo runner. This runtime-only
+configuration invalidated Cargo's cache and its prior executable, an avoidable
+rebuild cost. A cancellation request using the build ID was rejected as owned by
+the durable wrapper and stopped nothing; the active build is retained. No direct
+binary reuse or successful capped suite is claimed yet. Corrected workspace
+check also reached the unchanged 30-minute build limit and is retried unchanged.
+The capped build and its first retry reached their unchanged build/test limits;
+the first retry actually passed the permission case before its overall timeout.
+The second capped retry executes all 20 cases and passes at the exact corrected
+pin. The corrected check's first two attempts timed out; its third passes.
+Raw failures, aborted attempts and typed receipts remain in their separate logs.
+Final corrected check passes in `corrected-check-primary-retry2.log`; final strict
+lint passes in `corrected-clippy-primary.log`. Canvas and capability-reduced
+checkpoint results are in `corrected-app-retry1.log` and
+`corrected-checkpoint-dac-retry2.log`. The complete observed-name union is retained
+as `observed-app-test-names.json`. Publication/ref/lease observations follow in
+the final session handoff, at which this requested checklist retires.
+
+### Bounded real-work and honesty audit — current increment
+
+Window: this configuration-replay continuation, original candidate `5a121770`
+and diagnostic correction `67d8d92e`. README purpose: an observable, reproducible
+agent simulation and brain testbed. One USER capability candidate connects the
+existing audit producer to narrative review; the diagnostic fix is its ENABLER.
+Notes/TODO/proof bookkeeping are PROCESS and earn no capability credit. No new
+framework or Bead was created. Early investigation drift was corrected by
+implementing this consumer and freezing further feature work for qualification.
+The original replay item remains open; no claim is made that this bounded audit
+established the oldest user-facing item across all 720 records. No delegation.
+
+1. No (checked: both source diffs). Original refusal checks remain; the real
+   SpawnAgent/config case now requires the accurate scientific reason. No test
+   is removed or newly ignored.
+2. No (checked: new tests). Real worlds, owner commands, codec artifacts and the
+   existing production worker are exercised; cloned publications plant negatives.
+3. No (checked: tracked paths). No golden or baseline changed.
+4. Yes: product admission expands only with complete audited config inputs, and
+   one new cohesive journey has a documented `too_many_lines` allowance. The
+   diagnostic expectation changes with its corrected observation; release gates,
+   strict warning policy, deadlines and tolerances are unchanged.
+5. No (checked: production branches). No demo/environment-specific success path.
+6. No (checked: raw results). 27 canvas and 20 checkpoint cases pass with 45
+   distinct names; runtime has 242 passed. Timed-out/failed suites are not green.
+7. No (checked: raw logs and source bindings). App/check results name corrected
+   `67d8d92e`; runtime's unchanged inputs retain the explicit `5a121770` binding.
+8. No (checked: claims and labels). Component/model self-verification is not
+   PTY/GPU, full Program scheduler, SQL migration, DSR or independent acceptance.
+9. No (checked: attempt files). Build exits 137, admission exits 103 and the
+   actual 23/3 and 19/1 failed suites remain retained and visible. The old pin's
+   results are not promoted to the corrected pin; partial suites are not green.
+10. No (checked: commands). stdout/stderr are retained; progress tails do not
+    replace the full logs.
+11. No (checked: original Bead). Status remains in progress, with zero closures.
+12. No (checked: JSONL diff). Original description, acceptance and dependencies
+    remain unchanged; bounded implemented behavior is not full original scope.
+13. No (checked: solo tool record). No agent or peer closure.
+14. No (checked: solo tool record). No subagent dispatched.
+15. No (checked: solo tool record). No subagent report accepted.
+16. No (checked: original status and positive implementation). No refusal closes.
+17. No (checked: evidence attribution). Multiple workers are self-execution,
+    not independent verifier agreement.
+18. Yes: the initial `canvas_` filter missed one existing test. Comparing exact
+    names exposed it; the broader `canvas` rerun restores all prior cases and
+    adds the new journey. All selections and overlaps are explicit. The two
+    cadence modes intentionally retain one science identity; target/live config
+    values and real UI cells must actually differ.
+19. Yes: within-tick event publication is not recoverable from this tick-only
+    identity. README now names the reconstructed point; original acceptance
+    stays open. The stale scientific-input refusal is corrected before handoff.
+    Missing temp-parent setup and Cargo runner cache invalidation were avoidable
+    verification detours, disclosed with their failed attempts and corrections.
+20. Strongest evidence is the observed full target digest at tick 4, distinct
+    captured-current digest at tick 8, and production worker's exact evicted
+    event cells with unchanged owner. All are re-executable from the pinned
+    command/source, with raw artifacts and actual compiled features retained.
+
+CASS: five prescribed searches plus a current-function query, followed by actual
+message-index views, found prior deadline and first-frame capture failures and
+meta-search hits. The exact current function had no indexed hit. This is a
+bounded history check, not a complete misconduct audit. Prior report admissions
+remain unchanged below. Disposition: preserve first attempts (SM-11), do not
+promote proof class, retain the original acceptance, preserve the restored test
+coverage and complete the publication handoff. No independent verifier or item
+closure is claimed. Runtime/within-tick qualifiers and all first failures remain.
+
 ## Active TODO — checkpoint-backed tick-only event review, VioletTrout, 2026-10-30
 
 Consumer: the existing narrative rail's `v` action when the selected event is

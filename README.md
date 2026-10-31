@@ -240,11 +240,17 @@ RUST_LOG=info cargo run -p scriptbots-app
   reconstructed checkpoint state separately from cached frames: original arena
   handles, per-tick activity counts and presentation history are not restored.
   Narrative `v` first uses an exact cached frame. Outside that cache it can
-  replay from a newly saved checkpoint when atomic owner observations show an
-  unchanged configuration, zero declared scheduled inputs, and only science ticks in the
-  checkpoint-to-current interval. The complete verification interval is limited
-  to 1,024 ticks. Empty installed queues are supported; completed inputs still
-  count. It checks the reconstructed current digest before showing the
+  replay from a newly saved checkpoint when atomic owner observations show
+  zero declared scheduled inputs and only science ticks in the checkpoint-to-current
+  interval. Configuration edits can also replay when the published audit retains
+  their complete ordered suffix; edits run at their recorded completed-tick
+  boundaries. For ticks after the saved cut, the target includes config edits at
+  that tick through the captured current revision. Selecting the saved tick itself
+  shows that saved cut. This does not recover the event's original within-tick
+  publication. Pruned audit history and persistence-interval changes refuse review.
+  Persistence stays disabled in the reconstructed world. The complete verification
+  interval is limited to 1,024 ticks. Empty installed queues are supported;
+  completed inputs still count. It checks the reconstructed current digest before showing the
   requested event as `CHECKPOINT REPLAY`; `g` returns live. Intervened/scheduled
   spans require recorded-input replay and remain explicit refusals. Loading,
   duplicate bounds, cancellation and stale selection checks use the same worker

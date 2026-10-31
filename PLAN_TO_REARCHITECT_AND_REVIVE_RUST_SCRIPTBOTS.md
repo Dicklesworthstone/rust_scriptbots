@@ -1370,6 +1370,21 @@ bounded audit remain in `REALITY_CHECK_2026-09-03.md`.
 broader acceptance remain unchanged and open; this is not PTY/GPU, full Program
 scheduler, whole-workspace runtime, DSR or independent verification.
 
+**[Implemented — native component qualification, VioletTrout, 2026-10-31]**
+Original `bd-ji3a`, source `67d8d92e`, connects published configuration audits to
+historical narrative review. A complete ordered audit suffix is applied at its
+recorded tick boundaries in an isolated world; the full captured-current digest
+must match. Target tick 4 matches its observed digest after actual config edits,
+while live remains at tick 8; the real UI worker also reviews the evicted tick-47
+event after config edits. All 45 distinct selected app tests, required workspace
+check, strict Clippy and formatting pass. Checkpoint permission cases run with
+DAC overrides dropped; the actual privilege probe and all first failures are
+retained in the reality check. The runtime's unchanged inputs retain its earlier
+242-test qualification at `5a121770`. **[Currently In Progress]** General recorded
+scientific/operator/scheduled replay, HUD/three-seed persistence acceptance and
+all broader original requirements remain unchanged and open. This is not native
+PTY/GPU, full Program scheduler, whole-workspace runtime, DSR or independent proof.
+
 Viewport size, camera, selected agent, requested detail, and chart window are per-client inputs, not mutable global projection state and not scientific world state. The TUI, GUI HUD, server ASCII capture, and web snapshot reuse semantic projection functions and caches keyed by request/revision. They may render the result differently.
 
 The selected-brain detail slice is now an explicit, synchronous, read-only pull
