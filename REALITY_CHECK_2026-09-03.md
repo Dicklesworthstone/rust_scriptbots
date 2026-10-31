@@ -1,5 +1,187 @@
 # Reality Check — rust_scriptbots — implementation continuation 2026-10-27
 
+## Active TODO — completed configuration schedule review, VioletTrout, 2026-10-31
+
+Continue original `bd-ji3a`. At the start of this increment, typed schedule
+outcomes and config audits had writers, while historical narrative review
+refused every declared schedule.
+The operator requested this granular TODO. Its consumer is the operator's handoff,
+its gate is this increment's completion claim, and it retires at that handoff.
+It is process with zero capability credit; the feature is the replay consumer.
+Evidence root: `/data/tmp/scriptbots-schedule-review-20261031T1940-violettrout/`.
+
+- [x] Refresh authoritative graph/ready work, source and coordination; retain the original Bead's scope.
+- [x] Trace actual immutable configuration schedules, outcome publication and config-audit semantics.
+- [x] Reserve exact paths and mark continuation on original `bd-ji3a`.
+- [x] Connect complete committed schedule evidence to existing isolated event replay (qualified source `0634bbd8`).
+- [x] Exercise future/incomplete/pruned/failed/uncommitted/changed schedule refusals.
+- [x] Prove actual scheduled edits and reversions against full target/live digests without changing the owner.
+- [x] Exercise malformed/missing schedule outcomes and existing scientific/audit/persistence guards.
+- [x] Exercise the real narrative worker after scheduled edits with its existing cancellation/stale-result guards.
+- [x] Run the complete source-bound remote app `canvas` regression selection.
+- [x] Complete the required workspace/all-target compiler check.
+- [x] Complete strict workspace/all-target Clippy with `-D warnings`.
+- [x] Verify formatting and a fresh two-file source scan.
+- [x] Inspect the source hunks and fresh scan; record failures and the honesty inventory.
+- [x] Update feature documentation and original Bead evidence; prepare publication metadata. Final immutable review/ref/lease observations belong to the session handoff.
+
+**[Qualified — bounded native component; original Bead remains in progress]** Corrected source
+`0634bbd8f10c39f224d93ecddd375f878270faf9`, tree `39b7e12c`, passes all
+**29 selected app tests, 0 failed, 0 ignored, 661 filtered out**, outer 0,
+52.21s. The observed name set is exactly the previous 27 plus the two new
+scheduled owner/worker tests. The new owner journey checks full actual target
+digests at ticks 2, 5 and 7 against the owner at tick 8 (`13c015df2f4cb647`),
+then verifies an exhausted schedule before a later saved cut and refuses an
+actual subsequent SpawnAgent. The new UI journey reviews the real extinction
+at tick 47 after cache eviction; live remains at tick 224 with digest
+`ed24f34448e18a02`. Exact target cells match, live/target cells differ, and
+modal/cancellation/stale-selection/corruption checks all pass. The original UI
+journey still passes with its distinct live digest `17f35168117f0c0f`.
+The older config-edit 0/3 persistence-isolation cases also retain their actual
+target/current digests `51ba92681611ce84` / `4510da920922de38`.
+
+All three long-attempt worker source/lock hashes match. The app's matching RCH
+receipt binds this corrected commit and tree; raw output includes the actual
+default/fast-alloc/ml/neuro feature list, test profile, opt-level 0, debug-info 0,
+debug assertions true and overflow checks true. Eighteen observed artifact
+directories are copied locally (copy outer 0; all eighteen directories observed).
+The dynamic-argument copy was blocked by DCG's argv-verification rule; an explicit
+static-path SCP was accepted, with no override or bypass. Copying the compiler's
+reported test-executable path failed because it no longer existed; a subsequent
+read observes the completed private job namespace absent. The executable is not
+claimed retained. Raw source, profile, logs and the eighteen artifact directories
+remain available for rebuilding/re-execution. Cargo repeats the pre-existing
+`proc-macro-error2 2.0.1` future-compatibility warning, also present in the prior
+source's log. Fresh publication formatting and two-file UBS pass (outer 0; 0 critical /
+3,789 warnings / 983 info); the scan is not clean. Strict workspace/all-target
+Clippy passes with `-D warnings` (outer 0, matching source/tree receipt).
+The workspace/all-target compiler check also passes (outer 0, matching clean
+source/tree receipt) in `recovered-cache-workspace-check.log`, after the retained
+two-hour attempt timed out. Both required workspace gates bind the same corrected
+source and tree. The README's generated shortcut table consumed by the renderer
+test stays byte-identical; the final documentation/Beads tree is not claimed
+executed. This is solo native component verification, not general
+scientific/operator replay, PTY/GPU/full-Program/DSR or broader Bead acceptance.
+
+Qualification history (intermediate pending states below are superseded by the
+observed app and workspace results above): initial source
+`13cb5ac394e0cdc3a5b1f6ced603cba3e61a68bc`, tree `e05cc8a0`, consumes
+the existing successful committed outcome history without changing the owner,
+schedule resolver, config-audit writer or isolated replay algorithm. Both source
+and current declared counts must match; all schedule outcomes must be present,
+contiguous, same-session, applied, committed and within the captured revision/tick
+cut. Existing config-audit, science-revision, persistence-isolation, 1,024-tick
+bound and full-current-digest guards remain. The prior blanket refusal now admits
+only that evidenced completed configuration-schedule class. Future scheduled work
+remains refused, including the original real due-tick-10/current-tick-2 case.
+The old negative test is unchanged. The original tick-only real worker journey
+retains every assertion and is reused by a separate scheduled variant.
+Predeclared app selection: all tests matching `canvas`, expected 29 named tests
+(27 prior plus the scheduled owner and worker tests), with observed test count,
+failure/ignore count and outer process exit required. Default app features,
+debug assertions and overflow checks remain enabled. Permission-sensitive test
+execution uses the previously proven runner with only DAC overrides dropped.
+No performance run or performance claim is involved.
+
+Formatting and initial two-file UBS pass (outer 0; 0 critical / 3,789 warnings /
+983 info, not a clean scan). Remote app tests and workspace check started on
+`vmi1152480` and `vmi1149989`. First strict Clippy attempt on `hz4` failed during
+source namespace setup (status 73, killed; outer 103), before compilation. Retry
+on `hz3` refused admission for insufficient slots (outer 103). Neither is a lint
+verdict. The next attempt on `vmi1153651` is compiling. All commands require remote
+execution and refuse local fallback; source and flags remain pinned unchanged.
+
+Subsequent source review found an unqualified `Tick` in the new UI test (not
+imported in that module). Correction `0634bbd8f10c39f224d93ecddd375f878270faf9`,
+tree `39b7e12c`, qualifies the existing type; no runtime behavior or assertion
+changes. Its one-file UBS passes (0 critical / 2,575 warnings / 593 info).
+RCH accepted cancellation through the three exact old-pin wrapper identities;
+each original local outer process exited 143. Remote process-group quiescence
+was not independently established and is not claimed. Initial
+build-ID cancellation requests were refused for ownership and released zero
+slots; the returned wrapper-specific commands then confirmed cancellation.
+No broad process kill, forced cancellation or file cleanup was used. New clean,
+no-overlay jobs for app tests, workspace check and strict Clippy bind corrected
+source `0634bbd8` on the same three workers. Cancelled jobs qualify nothing.
+Those first corrected jobs all refused before compilation (outer 103): RCH's
+source-authority guard retained an unfinished owner after cancellation. The next
+attempt uses its documented `RCH_DISABLE_TARGET_REUSE=1` fresh-namespace option;
+the guard is not disabled or edited. This sacrifices cache reuse, retains the same
+source/test/lint options, and avoids writing over the unfinished source pair.
+All three private cold builds reached the 1,800-second infrastructure limit and
+exited 137 before an app test harness or successful compiler/lint result appeared.
+These are retained unsuccessful build attempts, not red/green test suites. A
+same-source retry explicitly sets the supported per-invocation RCH
+`RCH_BUILD_TIMEOUT_SEC=7200` and `RCH_TEST_TIMEOUT_SEC=7200`; live `config get`
+confirms both values. This is a disclosed increase to the remote job allowance
+for cold compilation, not a change to any test-case deadline, assertion, scenario,
+feature, compiler profile, application behavior or acceptance threshold. No host
+or repository RCH configuration is edited. The original 30-minute results remain
+retained. The fresh namespace option sacrifices the partial target cache, so the
+retry must compile cold again; its outcome is pending.
+Later read-only `rch jobs recover` calls reconcile all three cancelled old-pin
+wrappers as completed with exit 143 and terminal acknowledgements. They replay
+no command, qualify no current source and do not establish independent remote
+process-group quiescence.
+
+Strict Clippy subsequently completes on corrected source with outer 0 and its
+matching clean source/tree receipt. The separate workspace check reaches its
+7,200-second remote job limit and exits 137 before completion; it is not a green
+compiler result. After the supported old-job reconciliation above, a same-source
+retry uses RCH's normal managed cache, leaving its ownership guards intact, with
+a disclosed 10,800-second per-invocation job allowance. Compiler/profile options,
+default features, assertions and test-case deadlines stay unchanged. No source
+change is made. The managed-cache retry subsequently passes (outer 0), with its
+receipt binding corrected source `0634bbd8` and tree `39b7e12c`; that result
+supersedes the intermediate pending state, without crediting any failed attempt.
+
+Bounded honesty review for this increment (app and required workspace results observed):
+the README's stated purpose is a faithful deterministic artificial-life laboratory
+with first-class analytics. Source commit `13cb5ac3` is USER work; its test-type
+correction `0634bbd8` is ENABLER work; this TODO/Beads/plan accounting is PROCESS
+and earns zero capability credit. The most visible result to demonstrate is an
+older narrative event reviewed after actual scheduled edits, with matching target
+cells and an unchanged live digest. Omitting process would change the handoff's
+traceability, not the simulation. This consumes existing schedule/audit publication,
+not speculative infrastructure. Original `bd-ji3a` is the chosen open user-facing
+item; no follow-up or acceptance reduction is used. There are no swarm panes or
+closure-count metrics. Disposition is the bounded native qualification above;
+original broader acceptance remains open.
+
+Honesty inventory, current source block, all twenty prompts:
+
+1. No (checked: both complete source diffs): no old assertion, ignore, feature or test was removed; the old worker journey is called unchanged by the original test.
+2. No (checked: tests construct real worlds, MLP founders, owners, config schedules and UI tasks): altered publications are negative-only probes, not positive stand-ins.
+3. No (checked: changed paths): no golden or snapshot regeneration.
+4. Yes: production admission replaces the blanket schedule refusal with complete committed outcome validation. The admitted class and retained refusals are stated above; tests show both. One new `too_many_lines` allowance keeps an actual owner journey together. The RCH job allowance is explicitly increased from 1,800 to 7,200 seconds after three cold compilation timeouts, then to 10,800 for the remaining workspace check after its two-hour timeout; this does not alter a test-case deadline, correctness lint, tolerance, CI gate or assertion. Original unsuccessful attempts remain visible.
+5. No (checked: source paths): no scenario-specific branch or fabricated successful replay.
+6. No (checked: actual test output, exact name-set comparison and outer 0): all 29 selected tests ran; the previous 27 are retained, with zero failures or ignores.
+7. No (checked: command logs and status wording): compilation, cancellations and admission refusals have not been claimed as passing tests.
+8. No (checked: proof labels): isolated reconstruction and in-memory UI cells are component evidence, not live PTY/GPU/full-Program/DSR proof.
+9. Yes: the initial source pin contains the missing UI test qualification. It was disclosed, corrected explicitly, and its jobs cancelled rather than credited to the correction; all attempts remain retained.
+10. No (checked: qualification commands): both output streams are retained in raw logs.
+11. No (checked: original Bead): still in progress; zero closures or substitute follow-ups.
+12. No (checked: plan and original description): progress notes preserve all original acceptance; no spec reduction is represented as completion.
+13. Not applicable: solo work; no delegated closure.
+14. Not applicable: no subagent dispatched.
+15. Not applicable: no subagent report accepted.
+16. Not applicable: no panes and no refusal-only closure.
+17. No (checked: claims): there is no independent verifier or agent-agreement claim.
+18. Yes for artifact collection: the first prefix-specific regex found 13 roots because it missed five direct-checkpoint prefixes. Checking every raw path corrected the observed set to 18 before copying. The test denominator stayed the predeclared full `canvas` selection of 29, with failures/ignores/outer exits as countermetrics; no test was omitted, and three earlier science targets differ from live.
+19. Yes: the missing test qualification cost cancelled build time. Initial direct BV output was discarded in favor of the required authoritative wrapper, and an accidental binary text read produced noise; neither is cited as proof. The guarded Beads transplant also stopped because export had already advanced the baseline; post-import comparison verifies only own notes/time changed in both 720-row files, preserving the other 719 raw rows. Stop noisy reads, preserve failures, and use the corrected pin.
+20. The strongest evidence is the actual full-target digest comparisons plus real scheduled UI-worker cells, passed by test name at corrected pin `0634bbd8`; a skeptic can rebuild and re-execute them. The executable copy failed and is not claimed retained.
+
+Countermeasures/disposition: RH-1/PL-1 require retained positive and negative tests
+with observed executions before claiming qualification; RH-17 keeps the explicit
+correction and original attempts visible. PL-1 also requires artifact selection
+to agree with all observed raw paths, rather than a partial prefix list. No
+history rewrite or guard bypass.
+CASS searched the five prescribed phrases plus the actual new test name (six
+queries, three hits each maximum); first-hit contexts are retained with canonical
+message indices. Examined snippets concern prior scanner warnings, unchanged
+deadlines, a startup bug and prior search/docs output; they provide bounded context,
+not an exhaustive historical exoneration. No independent verification is claimed.
+
 ## Active TODO — configuration-audit event review, VioletTrout, 2026-10-31
 
 Consumer: existing narrative `v` outside the canvas cache after operator config

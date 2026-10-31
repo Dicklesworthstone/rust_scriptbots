@@ -1371,6 +1371,20 @@ broader acceptance remain unchanged and open; this is not PTY/GPU, full Program
 scheduler, whole-workspace runtime, DSR or independent verification.
 
 **[Implemented — native component qualification, VioletTrout, 2026-10-31]**
+Original `bd-ji3a`: connect the immutable schedule's complete successful
+committed outcome history to the existing audit-based isolated event replay.
+Future, incomplete, pruned, failed or uncommitted schedules continue to refuse;
+extra scientific revisions and a mismatching current digest still refuse.
+At corrected source `0634bbd8`, all 29 selected app tests pass: full actual
+target oracles at ticks 2/5/7, plus the real worker's evicted event at tick 47
+while live stays at tick 224. Required workspace/all-target compiler check,
+strict Clippy with `-D warnings`, and formatting pass at that source. Detailed
+attempts and retained artifacts are in the reality check.
+**[Currently In Progress]** Original broader acceptance remains unchanged and
+open; this is solo component verification, not native PTY/GPU, full Program,
+whole-workspace runtime tests or DSR acceptance.
+
+**[Implemented — native component qualification, VioletTrout, 2026-10-31]**
 Original `bd-ji3a`, source `67d8d92e`, connects published configuration audits to
 historical narrative review. A complete ordered audit suffix is applied at its
 recorded tick boundaries in an isolated world; the full captured-current digest

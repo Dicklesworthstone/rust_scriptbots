@@ -240,19 +240,20 @@ RUST_LOG=info cargo run -p scriptbots-app
   reconstructed checkpoint state separately from cached frames: original arena
   handles, per-tick activity counts and presentation history are not restored.
   Narrative `v` first uses an exact cached frame. Outside that cache it can
-  replay from a newly saved checkpoint when atomic owner observations show
-  zero declared scheduled inputs and only science ticks in the checkpoint-to-current
-  interval. Configuration edits can also replay when the published audit retains
-  their complete ordered suffix; edits run at their recorded completed-tick
-  boundaries. For ticks after the saved cut, the target includes config edits at
-  that tick through the captured current revision. Selecting the saved tick itself
-  shows that saved cut. This does not recover the event's original within-tick
+  reconstruct from a newly saved checkpoint across simulation ticks and
+  configuration edits. Save a checkpoint before the event you want to revisit.
+  Edits require their complete ordered published audit and run at their recorded
+  completed-tick boundaries. For ticks after the saved cut, the target includes
+  config edits at that tick through the captured current revision. Selecting the
+  saved tick itself shows that saved cut. This does not recover the event's original within-tick
   publication. Pruned audit history and persistence-interval changes refuse review.
   Persistence stays disabled in the reconstructed world. The complete verification
-  interval is limited to 1,024 ticks. Empty installed queues are supported;
-  completed inputs still count. It checks the reconstructed current digest before showing the
-  requested event as `CHECKPOINT REPLAY`; `g` returns live. Intervened/scheduled
-  spans require recorded-input replay and remain explicit refusals. Loading,
+  interval is limited to 1,024 ticks. Completed configuration schedules also require
+  an unchanged declaration and the complete ordered successful committed outcome
+  history; future, incomplete, failed or pruned schedules refuse review. Empty
+  installed queues are supported. It checks the reconstructed current digest
+  before showing the requested event as `CHECKPOINT REPLAY`; `g` returns live.
+  Other scientific/operator inputs still require general recorded-input replay. Loading,
   duplicate bounds, cancellation and stale selection checks use the same worker
   slot as direct checkpoint review. Live controls continue to address the owner.
   Native-window/PTY
