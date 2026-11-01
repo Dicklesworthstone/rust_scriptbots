@@ -21,38 +21,46 @@
 //! a frame's identity is. A module that duplicated that hash would be the same
 //! defect bd-c1z8 was filed for, one directory over.
 
-use ratatui::buffer::Buffer;
+use ratatui::buffer::{Buffer, Cell, CellDiffOption};
 use ratatui::style::{Color, Modifier};
 
 /// Serialize the buffer as plain text, one line per row.
 ///
-/// Deterministic and lossless in symbols: every cell contributes its grapheme
-/// exactly once, so the row count is the buffer height and a row's visual width
-/// is the buffer width. Trailing blanks are kept rather than trimmed — a trimmed
-/// row would silently change the column a reader counts to, which defeats using
-/// the export to locate a rendering fault.
+/// Each leading grapheme is emitted once; its covered cells are skipped, so wide
+/// symbols do not shift later columns. Trailing blanks are kept rather than
+/// trimmed, preserving the columns needed to locate a rendering fault.
 #[must_use]
 pub fn buffer_to_plain_text(buffer: &Buffer) -> String {
     let area = buffer.area;
     let mut out = String::with_capacity(usize::from(area.width) * usize::from(area.height));
     for y in area.y..area.bottom() {
-        for x in area.x..area.right() {
-            out.push_str(cell_symbol(buffer, x, y));
+        for cell in row_cells(buffer, y) {
+            out.push_str(cell.symbol());
         }
         out.push('\n');
     }
     out
 }
 
-/// A cell's grapheme, normalizing the empty continuation cell of a wide glyph.
-///
-/// Ratatui stores a double-width glyph in its first cell and leaves the second
-/// with an EMPTY symbol — not a space. Emitting that empty string verbatim would
-/// shorten the line by one column and misalign everything after it, which is
-/// exactly the misreading the emoji vocabulary is prone to.
-fn cell_symbol(buffer: &Buffer, x: u16, y: u16) -> &str {
-    let symbol = buffer[(x, y)].symbol();
-    if symbol.is_empty() { "" } else { symbol }
+/// Visit grapheme-leading cells, skipping the columns covered by a wide glyph.
+/// Ratatui resets those covered cells to spaces. Their symbols and styles must
+/// not be emitted again: the leading grapheme already occupies their columns.
+/// Use the same width policy as the live FrankenTUI presentation bridge.
+fn row_cells(buffer: &Buffer, y: u16) -> impl Iterator<Item = &Cell> {
+    let mut x = buffer.area.x;
+    std::iter::from_fn(move || {
+        if x >= buffer.area.right() {
+            return None;
+        }
+        let cell = &buffer[(x, y)];
+        let width = match cell.diff_option {
+            CellDiffOption::ForcedWidth(width) => width.get(),
+            _ => u16::try_from(ftui::core::text_width::display_width(cell.symbol()))
+                .unwrap_or(u16::MAX),
+        };
+        x = x.saturating_add(width.max(1));
+        Some(cell)
+    })
 }
 
 /// Serialize the buffer as ANSI, preserving per-cell foreground, background, and
@@ -68,16 +76,20 @@ pub fn buffer_to_ansi(buffer: &Buffer) -> String {
     let area = buffer.area;
     let mut out = String::new();
     for y in area.y..area.bottom() {
-        let mut active: Option<(Color, Color, Modifier)> = None;
-        for x in area.x..area.right() {
-            let cell = &buffer[(x, y)];
-            let style = (cell.fg, cell.bg, cell.modifier);
+        let mut active: Option<(Color, Color, Color, Modifier)> = None;
+        for cell in row_cells(buffer, y) {
+            let style = (cell.fg, cell.bg, cell.underline_color, cell.modifier);
             if active != Some(style) {
                 out.push_str(RESET);
-                out.push_str(&sgr_for(cell.fg, cell.bg, cell.modifier));
+                out.push_str(&sgr_for(
+                    cell.fg,
+                    cell.bg,
+                    cell.underline_color,
+                    cell.modifier,
+                ));
                 active = Some(style);
             }
-            out.push_str(cell_symbol(buffer, x, y));
+            out.push_str(cell.symbol());
         }
         out.push_str(RESET);
         out.push('\n');
@@ -86,7 +98,7 @@ pub fn buffer_to_ansi(buffer: &Buffer) -> String {
 }
 
 /// Build the SGR sequence for one cell's style.
-fn sgr_for(fg: Color, bg: Color, modifier: Modifier) -> String {
+fn sgr_for(fg: Color, bg: Color, underline_color: Color, modifier: Modifier) -> String {
     let mut codes: Vec<String> = Vec::new();
     if modifier.contains(Modifier::BOLD) {
         codes.push("1".into());
@@ -100,8 +112,21 @@ fn sgr_for(fg: Color, bg: Color, modifier: Modifier) -> String {
     if modifier.contains(Modifier::UNDERLINED) {
         codes.push("4".into());
     }
+    // SGR's blink rates are mutually exclusive; rapid takes precedence when
+    // both modifier bits are present.
+    if modifier.contains(Modifier::RAPID_BLINK) {
+        codes.push("6".into());
+    } else if modifier.contains(Modifier::SLOW_BLINK) {
+        codes.push("5".into());
+    }
     if modifier.contains(Modifier::REVERSED) {
         codes.push("7".into());
+    }
+    if modifier.contains(Modifier::HIDDEN) {
+        codes.push("8".into());
+    }
+    if modifier.contains(Modifier::CROSSED_OUT) {
+        codes.push("9".into());
     }
     if let Some(code) = color_code(fg, true) {
         codes.push(code);
@@ -109,11 +134,39 @@ fn sgr_for(fg: Color, bg: Color, modifier: Modifier) -> String {
     if let Some(code) = color_code(bg, false) {
         codes.push(code);
     }
+    if let Some(code) = underline_color_code(underline_color) {
+        codes.push(code);
+    }
     if codes.is_empty() {
         String::new()
     } else {
         format!("\x1b[{}m", codes.join(";"))
     }
+}
+
+fn underline_color_code(color: Color) -> Option<String> {
+    let index = match color {
+        Color::Reset => return None,
+        Color::Rgb(r, g, b) => return Some(format!("58;2;{r};{g};{b}")),
+        Color::Indexed(index) => index,
+        Color::Black => 0,
+        Color::Red => 1,
+        Color::Green => 2,
+        Color::Yellow => 3,
+        Color::Blue => 4,
+        Color::Magenta => 5,
+        Color::Cyan => 6,
+        Color::Gray => 7,
+        Color::DarkGray => 8,
+        Color::LightRed => 9,
+        Color::LightGreen => 10,
+        Color::LightYellow => 11,
+        Color::LightBlue => 12,
+        Color::LightMagenta => 13,
+        Color::LightCyan => 14,
+        Color::White => 15,
+    };
+    Some(format!("58;5;{index}"))
 }
 
 /// SGR parameter for one color, or `None` for `Reset` (the terminal default).
@@ -230,9 +283,8 @@ mod tests {
         }
     }
 
-    /// A double-width glyph occupies two cells, the second holding an EMPTY
-    /// symbol. Emitting that verbatim keeps the line's visual width correct;
-    /// emitting a space instead would widen the row by one column per emoji.
+    /// Explicit empty continuation symbols remain supported as well as the
+    /// reset-to-space cells produced by Ratatui's actual string renderer.
     #[test]
     fn wide_glyph_continuation_cells_do_not_widen_the_row() {
         let mut buffer = buffer_with(4, 1);
@@ -252,6 +304,58 @@ mod tests {
             3,
             "one wide glyph plus two narrow ones is three graphemes across four columns"
         );
+    }
+
+    #[test]
+    fn rendered_wide_glyphs_keep_their_displayed_columns_in_both_exports() {
+        let mut buffer = Buffer::empty(Rect::new(3, 2, 10, 2));
+        buffer.set_string(3, 2, "🌊xy界e\u{301} Z ", Style::default());
+        buffer.set_string(3, 3, " A 界 B   ", Style::default());
+        assert_eq!(buffer[(4, 2)].symbol(), " ");
+
+        let expected = "🌊xy界e\u{301} Z \n A 界 B   \n";
+        assert_eq!(buffer_to_plain_text(&buffer), expected);
+        assert_eq!(strip_ansi(&buffer_to_ansi(&buffer)), expected);
+    }
+
+    #[test]
+    fn ansi_preserves_all_displayed_modifiers_and_underline_color() {
+        let mut buffer = buffer_with(1, 1);
+        buffer[(0, 0)].set_char('X').set_style(
+            Style::default()
+                .add_modifier(Modifier::all())
+                .underline_color(Color::Rgb(12, 34, 56)),
+        );
+        let ansi = buffer_to_ansi(&buffer);
+        assert_eq!(ansi, "\x1b[0m\x1b[1;2;3;4;6;7;8;9;58;2;12;34;56mX\x1b[0m\n");
+    }
+
+    #[test]
+    fn ansi_preserves_slow_blink_and_changes_in_underline_color() {
+        let mut buffer = buffer_with(3, 1);
+        for (x, color) in [Color::Red, Color::Indexed(200), Color::Reset]
+            .into_iter()
+            .enumerate()
+        {
+            buffer[(x as u16, 0)].set_char('X').set_style(
+                Style::default()
+                    .add_modifier(Modifier::UNDERLINED | Modifier::SLOW_BLINK)
+                    .underline_color(color),
+            );
+        }
+        assert_eq!(
+            buffer_to_ansi(&buffer),
+            "\x1b[0m\x1b[4;5;58;5;1mX\x1b[0m\x1b[4;5;58;5;200mX\x1b[0m\x1b[4;5mX\x1b[0m\n"
+        );
+    }
+
+    #[test]
+    fn wide_glyphs_clipped_by_the_renderer_keep_narrow_rows_blank() {
+        let mut buffer = buffer_with(1, 2);
+        buffer.set_string(0, 0, "🌊", Style::default());
+        buffer.set_string(0, 1, "界", Style::default());
+        assert_eq!(buffer_to_plain_text(&buffer), " \n \n");
+        assert_eq!(strip_ansi(&buffer_to_ansi(&buffer)), " \n \n");
     }
 
     /// The two formats must describe the same frame. If they ever diverge, the

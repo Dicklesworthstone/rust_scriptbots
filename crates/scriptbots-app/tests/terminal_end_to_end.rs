@@ -1941,6 +1941,44 @@ fn tui_evidence_e2e_serves_the_frame_the_renderer_published() -> Result<()> {
         "the served frame must contain the HUD header it was drawn with"
     );
 
+    let (ansi_status, ansi_headers, ansi_body) =
+        http_get(rest_addr, "/api/screenshot/ascii?format=ansi")?;
+    assert_eq!(ansi_status, 200, "ANSI export refused: {ansi_body}");
+    assert_eq!(
+        scriptbots_app::terminal::export::strip_ansi(&ansi_body),
+        body,
+        "both transports must describe the same actually rendered terminal frame"
+    );
+    assert!(
+        ansi_body.contains('\x1b'),
+        "ANSI export must contain SGR styling"
+    );
+    assert!(
+        ansi_headers
+            .iter()
+            .any(|(key, value)| { key == "x-scriptbots-frame-format" && value == "ansi" })
+    );
+
+    let ansi_path = report_dir.path().join("presented-frame.ans");
+    let cli = std::process::Command::new(env!("CARGO_BIN_EXE_control_cli"))
+        .arg("--base-url")
+        .arg(format!("http://{rest_addr}"))
+        .args(["screenshot", "--ansi", "--out"])
+        .arg(&ansi_path)
+        .output()?;
+    assert!(
+        cli.status.success(),
+        "ANSI screenshot CLI failed: {}\n{}\n{}",
+        cli.status,
+        String::from_utf8_lossy(&cli.stdout),
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&ansi_path)?,
+        ansi_body,
+        "the shipped CLI must save the exact ANSI bytes served for the rendered frame"
+    );
+
     control_runtime.shutdown()?;
     let final_owner = host.join()?;
     assert_eq!(final_owner.snapshot.world.tick, frames as u64);

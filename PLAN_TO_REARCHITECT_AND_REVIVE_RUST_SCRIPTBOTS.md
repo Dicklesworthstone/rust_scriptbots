@@ -2,6 +2,62 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Frame-export work queue (2026-11-01):** [Qualified increment — GentleDuck;
+original `bd-2z0.14.2.6` Currently In Progress; original acceptance retained]
+
+- [x] Read the ready/dependency graph; preserve existing uncommitted work and
+  reserve the terminal/export/API edit surface.
+- [x] Trace the presented-frame slot, `S` action, serializers and REST consumer.
+- [x] Identify a concrete serialization defect: Ratatui resets wide-glyph
+  continuation cells to spaces, while export assumes empty symbols; exported
+  emoji/CJK rows therefore gain columns. ANSI also drops several displayed styles.
+- [x] Add a regression using Ratatui's actual string-rendering path; observe it
+  fail before changing production serialization.
+- [x] Share width-aware row traversal between plain and ANSI serialization;
+  preserve combining marks, ordinary blanks, nonzero origins and narrow rows.
+- [x] Preserve displayed text modifiers and underline colors in ANSI exports.
+- [x] Expose the existing ANSI serializer through the presented-frame REST
+  endpoint with explicit format selection, preserving the default plain response.
+- [x] Exercise both formats, invalid selection and no-presented-frame behavior
+  through real endpoint requests, including nonempty Unicode and colored cells.
+- [x] Connect `control_cli screenshot --ansi`; reject combining ANSI and PNG.
+- [x] Extend the actual TestBackend renderer → REST journey through the real CLI;
+  assert saved ANSI bytes equal the served frame and decode to its plain export.
+- [x] Re-run the existing capability/theme failure and inspect differing cells
+  if it reproduces; preserve all golden fixtures and acceptance thresholds.
+- [x] Run focused tests, workspace all-target check, strict Clippy and formatting;
+  record actual executed tests and infrastructure refusals separately.
+- [x] Broaden to all terminal unit tests and the complete terminal E2E file;
+  retain failures and compare with untouched source rather than bless new goldens.
+- [x] Review the complete diff and original acceptance in a fresh self-review;
+  retain the original Bead's broader unresolved qualification.
+- [x] Update the Bead with final receipts, counterexamples and remaining work.
+- [ ] Commit only reviewed owned files through the existing shared-tree protocol;
+  preserve unrelated edits and release reservations. The Bead records the final
+  commit/release outcome after this execution record is frozen for review.
+
+Observed evidence: unchanged production fails both new serializer regressions
+(8 existing tests pass, 2 new tests fail). Candidate DSR quality passes all 11
+checks: 12 export tests, 4 screenshot API/schema tests, CLI parsing, the actual
+renderer/REST/CLI journey, and the historical capability/theme case; workspace
+all-target check, strict Clippy and formatting pass. No golden, gate or dependency
+changes. UBS remains nonzero with reviewed existing header heuristics; it is not
+a clean static-scan claim. Raw logs, source hashes and DSR receipts are under
+`/data/tmp/scriptbots-gentleduck-export-LC7psF`.
+
+Broader qualification remains open: the terminal unit lane is 225 passed / 1
+failed on both candidate and untouched `8f40873a`; the same headless frame has
+2,361 nonblank cells against 2,364 expected and hash `d7504e55c815f227`.
+Candidate PTY probes stop on missing build identity; source-stamped untouched
+baseline probes reach the checkpoint-positive capture and time out there.
+Neither failure is repaired or suppressed here. The earlier intermittent
+capability/theme mismatch did not recur and remains unexplained; full original
+headless-schema, capability and native acceptance is not claimed.
+
+Queue provenance/retirement: the user explicitly requested a granular TODO;
+the user and implementing agent consume this queue through the frame-export
+handoff, after which it retires as a bounded execution record.
+
 **Evidence date:** 2026-07-11
 
 **Compiler and target identity (2026-10-29/30):** [Qualified increment;
@@ -1369,6 +1425,14 @@ bounded audit remain in `REALITY_CHECK_2026-09-03.md`.
 **[Currently In Progress]** Original general recorded-input replay and all
 broader acceptance remain unchanged and open; this is not PTY/GPU, full Program
 scheduler, whole-workspace runtime, DSR or independent verification.
+
+**[Currently In Progress — observed agent-command event review, VioletTrout, 2026-11-01]**
+Original `bd-ji3a`: extend the existing isolated replay to consume bounded,
+actual owner observations of spawn/crossover/mutation commands. Require complete
+scientific-revision accounting and the unchanged captured-current digest.
+Configuration-mixed and other scientific command intervals remain unsupported;
+the original broader acceptance remains open. Detailed TODO/evidence is in the
+reality check.
 
 **[Currently In Progress — GPUI checkpoint/event review, VioletTrout, 2026-11-01]**
 Original `bd-ji3a`: the GPUI Timeline now consumes the existing verified

@@ -1121,7 +1121,7 @@ For an interactive run, ScriptBots parses the control environment and transactio
   - `GET /api/ticks/latest` → latest tick summary (JSON)
   - `GET /api/ticks/stream` → server-sent events stream of tick summaries (SSE)
   - `GET /api/ticks/ndjson` → newline-delimited JSON stream of tick summaries (NDJSON)
-  - `GET /api/screenshot/ascii` → ASCII snapshot of terminal mini-map (text/plain)
+  - `GET /api/screenshot/ascii` → the last presented terminal frame, including all panels (text/plain); `?format=ansi` preserves colors and text styles. Both formats return `x-scriptbots-frame-schema: scriptbots.terminal-frame.v1`, `x-scriptbots-frame-format`, `x-scriptbots-frame-tick`, and `x-scriptbots-frame-size` (`WIDTHxHEIGHT`). The default remains plain text; unknown formats return 400 and a process without a presented terminal frame returns 409.
   - `GET /api/screenshot/png` → offscreen PNG snapshot (requires GUI feature)
   - `GET /api/hydrology` → hydrology snapshot (flow directions, accumulation, basins) if available
   - `GET /api/events/tail` → recent events (birth/death/combat) ring buffer
@@ -1267,8 +1267,9 @@ curl -s -X POST http://127.0.0.1:8088/api/knobs/apply \
 # 6) Stream ticks as NDJSON (Ctrl+C to stop)
 curl -s http://127.0.0.1:8088/api/ticks/ndjson | head -n 5
 
-# 7) Take an ASCII screenshot (text) and a PNG (requires GUI feature)
+# 7) Save the presented terminal frame as text or ANSI; PNG requires the GUI feature
 curl -s http://127.0.0.1:8088/api/screenshot/ascii > frame.txt
+curl -f 'http://127.0.0.1:8088/api/screenshot/ascii?format=ansi' > frame.ans
 curl -s http://127.0.0.1:8088/api/screenshot/png > frame.png
 ```
 
@@ -1295,6 +1296,7 @@ cargo run -p scriptbots-app --bin control_cli -- export domain-events --db "$RUN
 cargo run -p scriptbots-app --bin control_cli -- presets
 cargo run -p scriptbots-app --bin control_cli -- apply-preset arctic
 cargo run -p scriptbots-app --bin control_cli -- screenshot --out screenshots/frame_0001.txt
+cargo run -p scriptbots-app --bin control_cli -- screenshot --ansi --out screenshots/frame_0001.ans
 cargo run -p scriptbots-app --bin control_cli -- screenshot --png --out screenshots/frame_0001.png
 cargo run -p scriptbots-app --bin control_cli -- hydrology
 ``` 

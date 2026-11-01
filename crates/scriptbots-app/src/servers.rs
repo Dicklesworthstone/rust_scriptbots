@@ -1515,6 +1515,7 @@ pub struct SpeedRequestBody {
             PresetList,
             PresetApplyRequest,
             ErrorResponse,
+            TerminalScreenshotFormat,
             EventEntry,
             NarrativeSearchHitDto,
             EventKind,
@@ -2118,7 +2119,23 @@ async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
     }
 }
 
-/// Return the exact terminal frame the user is looking at, as text.
+#[derive(Debug, Default, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+enum TerminalScreenshotFormat {
+    #[default]
+    Plain,
+    Ansi,
+}
+
+#[derive(Debug, Default, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+struct TerminalScreenshotQuery {
+    /// Preserve terminal colors and styles with `ansi`; defaults to plain text.
+    #[serde(default)]
+    format: TerminalScreenshotFormat,
+}
+
+/// Return the exact presented terminal frame as plain text or ANSI (`?format=ansi`).
 ///
 /// UPGRADED FIDELITY, SAME ENDPOINT (bd-2z0.14.2.6 item 2). This used to answer by
 /// calling `ascii_map()`, which re-rasterizes terrain and food into its own ≤96x48
@@ -2139,12 +2156,17 @@ async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
     get,
     path = "/api/screenshot/ascii",
     tag = "control",
+    params(TerminalScreenshotQuery),
     responses(
-        (status = 200, description = "The exact presented terminal frame as text", content_type = "text/plain"),
+        (status = 200, description = "The exact presented terminal frame as plain text or ANSI, identified by x-scriptbots-frame-format and x-scriptbots-frame-schema", content_type = "text/plain"),
+        (status = 400, description = "Unknown terminal frame format"),
         (status = 409, description = "no terminal frontend has presented a frame", body = ErrorResponse)
     )
 )]
-async fn screenshot_ascii(State(state): State<ApiState>) -> Result<Response, AppError> {
+async fn screenshot_ascii(
+    State(state): State<ApiState>,
+    axum::extract::Query(query): axum::extract::Query<TerminalScreenshotQuery>,
+) -> Result<Response, AppError> {
     let Some(frame) = state.presented_frame.load_full() else {
         return Err(AppError::conflict(
             "no terminal frame has been presented: this endpoint serves the exact \
@@ -2156,10 +2178,24 @@ async fn screenshot_ascii(State(state): State<ApiState>) -> Result<Response, App
     };
     // Serialization is pure CPU over a cloned buffer and touches no lock, so it
     // does not need the blocking pool the world-lock handlers use.
-    let text = crate::terminal::export::buffer_to_plain_text(&frame.buffer);
+    let (format, text) = match query.format {
+        TerminalScreenshotFormat::Plain => (
+            "plain",
+            crate::terminal::export::buffer_to_plain_text(&frame.buffer),
+        ),
+        TerminalScreenshotFormat::Ansi => (
+            "ansi",
+            crate::terminal::export::buffer_to_ansi(&frame.buffer),
+        ),
+    };
     Ok((
         StatusCode::OK,
         [
+            (
+                "x-scriptbots-frame-schema",
+                "scriptbots.terminal-frame.v1".to_string(),
+            ),
+            ("x-scriptbots-frame-format", format.to_string()),
             ("x-scriptbots-frame-tick", frame.tick.to_string()),
             (
                 "x-scriptbots-frame-size",
@@ -6012,7 +6048,12 @@ mod tests {
             scenario: None,
             presented_frame: std::sync::Arc::clone(&slot),
         };
-        let Ok(response) = screenshot_ascii(State(state)).await else {
+        let Ok(response) = screenshot_ascii(
+            State(state),
+            axum::extract::Query(TerminalScreenshotQuery::default()),
+        )
+        .await
+        else {
             panic!("a published frame must be served, not refused");
         };
         assert_eq!(response.status(), StatusCode::OK);
@@ -6065,7 +6106,12 @@ mod tests {
             scenario: None,
             presented_frame: empty_presented_frame(),
         };
-        let Err(error) = screenshot_ascii(State(state)).await else {
+        let Err(error) = screenshot_ascii(
+            State(state),
+            axum::extract::Query(TerminalScreenshotQuery::default()),
+        )
+        .await
+        else {
             panic!("an unpresented frame must refuse, not synthesize one");
         };
         assert_eq!(
@@ -6088,6 +6134,96 @@ mod tests {
              not restore the fallback as a convenience: {}",
             error.message
         );
+    }
+
+    #[test]
+    fn screenshot_formats_describe_the_same_presented_frame_over_http() {
+        let host = test_host();
+        let slot = empty_presented_frame();
+        let reservation = ControlServerReservation::prepare(ControlServerConfig {
+            rest_enabled: true,
+            rest_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            mcp_transport: McpTransportConfig::Disabled,
+            presented_frame: Arc::clone(&slot),
+            ..ControlServerConfig::default()
+        })
+        .expect("reserve screenshot server");
+        let address = reservation.rest_address().expect("reserved REST address");
+        let (runtime, _) = reservation
+            .launch(host.port.clone(), false)
+            .expect("start screenshot server");
+
+        let mut buffer = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 8, 2));
+        buffer.set_string(
+            0,
+            0,
+            "🌊xy",
+            ratatui::style::Style::default().fg(ratatui::style::Color::Rgb(12, 34, 56)),
+        );
+        buffer[(1, 1)].set_char('Z');
+        slot.store(Some(Arc::new(PresentedTerminalFrame {
+            tick: 42,
+            buffer: buffer.clone(),
+        })));
+
+        let expected_plain = "🌊xy    \n Z      \n";
+        for (query, format) in [
+            ("", "plain"),
+            ("?format=plain", "plain"),
+            ("?format=ansi", "ansi"),
+        ] {
+            let response = http_get(address, &format!("/api/screenshot/ascii{query}"));
+            let (headers, body) = response.split_once("\r\n\r\n").expect("HTTP response");
+            assert!(headers.starts_with("HTTP/1.1 200"), "{response}");
+            let headers = headers.to_ascii_lowercase();
+            assert!(headers.contains("x-scriptbots-frame-schema: scriptbots.terminal-frame.v1"));
+            assert!(headers.contains(&format!("x-scriptbots-frame-format: {format}")));
+            assert!(headers.contains("x-scriptbots-frame-tick: 42"));
+            assert!(headers.contains("x-scriptbots-frame-size: 8x2"));
+            if format == "ansi" {
+                assert_eq!(body, crate::terminal::export::buffer_to_ansi(&buffer));
+                assert!(body.contains("38;2;12;34;56"));
+                assert_eq!(crate::terminal::export::strip_ansi(body), expected_plain);
+            } else {
+                assert_eq!(body, expected_plain);
+                assert!(!body.contains('\x1b'));
+            }
+        }
+
+        slot.store(None);
+        for query in ["", "?format=ansi"] {
+            let response = http_get(address, &format!("/api/screenshot/ascii{query}"));
+            assert!(response.starts_with("HTTP/1.1 409"), "{response}");
+            assert!(response.contains("no terminal frame has been presented"));
+        }
+        let invalid = http_get(address, "/api/screenshot/ascii?format=html");
+        assert!(invalid.starts_with("HTTP/1.1 400"), "{invalid}");
+        assert!(invalid.contains("html"), "{invalid}");
+        runtime.shutdown().expect("stop screenshot server");
+    }
+
+    #[test]
+    fn screenshot_format_selection_is_published_in_openapi() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).expect("serialize OpenAPI");
+        let screenshot = &spec["paths"]["/api/screenshot/ascii"]["get"];
+        let parameters = screenshot["parameters"]
+            .as_array()
+            .expect("query parameters");
+        assert!(
+            parameters
+                .iter()
+                .any(|parameter| { parameter["name"] == "format" && parameter["in"] == "query" })
+        );
+        assert_eq!(
+            spec["components"]["schemas"]["TerminalScreenshotFormat"]["enum"],
+            json!(["plain", "ansi"])
+        );
+        for status in ["200", "400", "409"] {
+            assert!(
+                screenshot["responses"][status].is_object(),
+                "missing {status}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -116,14 +116,17 @@ enum Command {
         /// Preset name to apply (see `presets`).
         name: String,
     },
-    /// Request a one-off ASCII or PNG screenshot from the running app via REST.
+    /// Save the presented terminal frame (plain or ANSI), or a GUI PNG, via REST.
     Screenshot {
-        /// Output path for the screenshot; for PNG, must end with .png; otherwise ASCII .txt.
+        /// Output path, for example frame.txt, frame.ans, or frame.png.
         #[arg(long, value_name = "FILE")]
         out: PathBuf,
-        /// PNG image export (GUI renderer view). When false, writes ASCII map snapshot.
+        /// PNG image export (GUI renderer view).
         #[arg(long = "png", default_value_t = false)]
         png: bool,
+        /// Preserve the presented terminal frame's colors and text styles.
+        #[arg(long, conflicts_with = "png")]
+        ansi: bool,
     },
     /// Show hydrology metrics and raw layers.
     Hydrology,
@@ -369,8 +372,8 @@ async fn main() -> Result<()> {
                 Command::ApplyPreset { name } => {
                     presets_apply(&client, &cli.base_url, &name).await?
                 }
-                Command::Screenshot { out, png } => {
-                    screenshot_request(&client, &cli.base_url, out, png).await?
+                Command::Screenshot { out, png, ansi } => {
+                    screenshot_request(&client, &cli.base_url, out, png, ansi).await?
                 }
                 Command::Hydrology => hydrology_command(&client, &cli.base_url).await?,
                 Command::Pause => pause_command(&client, &cli.base_url, key).await?,
@@ -1824,9 +1827,12 @@ async fn screenshot_request(
     base_url: &str,
     out: PathBuf,
     png: bool,
+    ansi: bool,
 ) -> Result<()> {
     let url = if png {
         join_url(base_url, "/api/screenshot/png")
+    } else if ansi {
+        join_url(base_url, "/api/screenshot/ascii?format=ansi")
     } else {
         join_url(base_url, "/api/screenshot/ascii")
     };
@@ -1965,6 +1971,31 @@ fn value_to_string(value: &Value, max_len: usize) -> String {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn screenshot_accepts_ansi_and_rejects_conflicting_png() {
+        let parsed = Cli::try_parse_from(["control", "screenshot", "--out", "frame.ans", "--ansi"])
+            .expect("ANSI screenshot command");
+        assert!(matches!(
+            parsed.command,
+            Command::Screenshot {
+                ansi: true,
+                png: false,
+                ..
+            }
+        ));
+
+        let error = Cli::try_parse_from([
+            "control",
+            "screenshot",
+            "--out",
+            "frame.ans",
+            "--ansi",
+            "--png",
+        ])
+        .expect_err("terminal ANSI and GUI PNG cannot be combined");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
 
     #[test]
     fn map_generate_accepts_sample_and_refuses_conflicting_backends() {
