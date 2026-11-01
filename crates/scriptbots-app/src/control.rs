@@ -6358,8 +6358,24 @@ pub(crate) mod tests {
             )))
             .unwrap();
         host.wait_applied(&unsupported);
+        // Enqueue is not application: settle the intervention at a real tick before
+        // requiring a quiescent scientific cut and the unsupported-input refusal.
+        host.wait_applied(&handle.step().unwrap());
         assert!(
-            matches!(handle.event_canvas(later_oracle.tick.0), Err(ControlError::BadRequest(message)) if message.contains("scientific revisions"))
+            handle
+                .read_snapshot()
+                .unwrap()
+                .applied_interventions
+                .iter()
+                .any(|record| record.kind == "embargo" && !record.expired)
+        );
+        let refusal = handle
+            .event_canvas(later_oracle.tick.0)
+            .err()
+            .expect("an applied unsupported intervention must refuse event review");
+        assert!(
+            matches!(&refusal, ControlError::BadRequest(message) if message.contains("scientific revisions")),
+            "{refusal}"
         );
     }
 

@@ -6978,7 +6978,7 @@ mod tests {
             captured.scientific_revision
         );
         assert!(
-            matches!(captured.agent_commands[0].command(), ControlCommand::SpawnAgent { herbivore_tendency } if *herbivore_tendency == 0.5)
+            matches!(captured.agent_commands[0].command(), ControlCommand::SpawnAgent { herbivore_tendency } if herbivore_tendency.to_bits() == 0.5_f32.to_bits())
         );
         settle_continuation_command(
             &mut owner,
