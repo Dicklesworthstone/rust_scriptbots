@@ -515,6 +515,11 @@ pub mod world_compositor {
                 ) || name_lower.contains("llvmpipe")
                     || name_lower.contains("lavapipe")
                     || name_lower.contains("swiftshader");
+                #[cfg(test)]
+                eprintln!(
+                    "wgpu adapter observation: name={:?} type={:?} backend={:?} software={is_software} allow_software={}",
+                    info.name, info.device_type, info.backend, self.allow_software_adapter
+                );
                 if is_software && !self.allow_software_adapter {
                     let reason = format!(
                         "wgpu adapter \"{}\" (vendor {:#x}) is software-only; using CPU canvas",
@@ -1129,6 +1134,32 @@ pub mod world_compositor {
                 .render_snapshot(&minimal_snapshot(&tiles, &colors), (64, 64))
                 .expect_err("cached adapter failure must not masquerade as success");
             assert_eq!(error, ReadbackError::AdapterUnavailable);
+        }
+
+        #[test]
+        fn selected_adapter_requires_opt_in_only_when_it_is_software() {
+            let mut allowed = Compositor::new();
+            allowed.allow_software_adapter = true;
+            allowed
+                .ensure_renderer((64, 64))
+                .expect("policy probe requires a real allowed adapter");
+            let software = allowed.adapter_is_software();
+            let mut guarded = Compositor::new();
+            guarded.allow_software_adapter = false;
+            let result = guarded.ensure_renderer((64, 64));
+            eprintln!(
+                "wgpu policy observation: selected_software={software} without_opt_in_admitted={}",
+                result.is_ok()
+            );
+            if software {
+                assert_eq!(result, Err(ReadbackError::AdapterUnavailable));
+                assert!(
+                    guarded.adapter_failure().unwrap().contains("software-only"),
+                    "the negative must fail at the software policy guard"
+                );
+            } else {
+                result.expect("a non-software adapter needs no software opt-in");
+            }
         }
 
         #[test]
@@ -29225,8 +29256,11 @@ mod command_characterization_tests {
                 });
             }
             assert_eq!(host.port.scientific_digest_v1().unwrap(), unchanged);
-            click(&mut lab, "narrative-world-live");
             context.update(|app| {
+                // The real return button is exercised above. Observe its handler
+                // before GPUI can honor notify with a fresh World paint.
+                assert!(world.read(app).playback.displaying_history);
+                hud.update(app, |view, cx| view.return_world_to_live(cx));
                 world.update(app, |view, _| {
                     assert_eq!(view.playback.mode(), PlaybackMode::Live);
                     assert!(
