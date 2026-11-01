@@ -113,6 +113,35 @@ pub struct WorldDigestCut {
     pub config_revision: ConfigRevision,
     /// Total declared schedule inputs, including completed entries; an empty queue is zero.
     pub scheduled_input_count: u64,
+    /// Bounded successful agent-command observations from this live owner.
+    /// This is volatile application evidence, not journal durability or a complete history.
+    pub agent_commands: Vec<AppliedAgentCommand>,
+}
+
+/// One successfully applied spawn, crossover or mutation-rate command.
+///
+/// Only the owner constructs these observations, after the common core applier succeeds.
+/// Retention shares `HostCoreOptions::archived_command_capacity`; callers must prove that
+/// the retained suffix covers their requested interval. Host checkpoint restore starts an
+/// empty presentation history rather than claiming to recover discarded input evidence.
+#[derive(Debug, Clone)]
+pub struct AppliedAgentCommand {
+    boundary: AppliedCommand,
+    command: ControlCommand,
+}
+
+impl AppliedAgentCommand {
+    /// Actual tick and revisions after the command applied.
+    #[must_use]
+    pub const fn boundary(&self) -> AppliedCommand {
+        self.boundary
+    }
+
+    /// Exact small command passed to the scientific core.
+    #[must_use]
+    pub const fn command(&self) -> &ControlCommand {
+        &self.command
+    }
 }
 
 /// Capture, wire or continued-owner reconstruction refusal.
@@ -3019,6 +3048,7 @@ pub struct HostCore {
     last_published_intervention_seq: u64,
     latest_completed_summary: Option<TickSummary>,
     step_traces: VecDeque<WorldStepTrace>,
+    agent_commands: VecDeque<AppliedAgentCommand>,
     next_journal_sequence: u64,
     next_lifecycle_command_sequence: u64,
     active_command: Option<AdmittedEnvelope>,
@@ -3328,6 +3358,7 @@ impl HostCore {
             last_published_intervention_seq,
             latest_completed_summary,
             step_traces: VecDeque::new(),
+            agent_commands: VecDeque::new(),
             next_journal_sequence: 1,
             next_lifecycle_command_sequence: session_id.get(),
             active_command: None,
@@ -3802,6 +3833,7 @@ impl HostCore {
             scientific_revision: self.revisions.scientific,
             config_revision: self.revisions.config,
             scheduled_input_count: self.scheduled_input_count(),
+            agent_commands: self.agent_commands.iter().cloned().collect(),
         })
     }
 
@@ -5405,6 +5437,12 @@ impl HostCore {
                     .ok_or_else(|| protocol_violation("scientific revision exhausted"))
             })
             .transpose()?;
+        let retained_agent_command = match &command {
+            ControlCommand::AdjustAgentMutationRates { .. }
+            | ControlCommand::SpawnAgent { .. }
+            | ControlCommand::SpawnCrossover { .. } => Some(command.clone()),
+            _ => None,
+        };
         let is_apply_map = matches!(command, ControlCommand::ApplyMap { .. });
         match apply_control_command(&mut self.world, command) {
             Ok(ControlDisposition::WorldApplied) => {
@@ -5433,6 +5471,15 @@ impl HostCore {
         }
         let applied = self.applied_boundary();
         self.complete_applied_with(envelope.command_id, admission, applied)?;
+        if let Some(command) = retained_agent_command {
+            if self.agent_commands.len() >= self.options.archived_command_capacity {
+                self.agent_commands.pop_front();
+            }
+            self.agent_commands.push_back(AppliedAgentCommand {
+                boundary: applied,
+                command,
+            });
+        }
         let blocked = self.offer_journal(envelope, applied, None, None)?;
         Ok(ApplyResult::completed(blocked))
     }
@@ -6887,6 +6934,149 @@ mod tests {
                 &owner.scientific_digest_v1().unwrap()
             );
         }
+    }
+
+    #[test]
+    fn scientific_digest_cut_bounds_agent_history_and_preserves_older_cuts() {
+        let mut configured = options(true);
+        configured.archived_command_capacity = 2;
+        let mut owner = HostCore::new(HostSessionId::new(0xa6e7), world(0), configured).unwrap();
+        assert!(
+            owner
+                .scientific_digest_cut()
+                .unwrap()
+                .agent_commands
+                .is_empty()
+        );
+        for (id, tendency) in [(1_u128, 0.25), (2, 0.5), (3, 0.75)] {
+            settle_continuation_command(
+                &mut owner,
+                CommandEnvelope::new(
+                    CommandId::new(id),
+                    HostCommand::SpawnAgent {
+                        herbivore_tendency: tendency,
+                    },
+                ),
+                u64::try_from(id).unwrap(),
+            );
+        }
+        let captured = owner.scientific_digest_cut().unwrap();
+        assert_eq!(
+            captured.agent_commands.len(),
+            configured.archived_command_capacity
+        );
+        assert_eq!(
+            captured.agent_commands[0]
+                .boundary()
+                .revisions
+                .scientific
+                .get(),
+            2
+        );
+        assert_eq!(
+            captured.agent_commands[1].boundary().revisions.scientific,
+            captured.scientific_revision
+        );
+        assert!(
+            matches!(captured.agent_commands[0].command(), ControlCommand::SpawnAgent { herbivore_tendency } if *herbivore_tendency == 0.5)
+        );
+        settle_continuation_command(
+            &mut owner,
+            CommandEnvelope::new(
+                CommandId::new(4),
+                HostCommand::SpawnAgent {
+                    herbivore_tendency: 0.5,
+                },
+            ),
+            4,
+        );
+        let cut = owner.scientific_digest_cut().unwrap();
+        assert_eq!(
+            cut.agent_commands[0].boundary().revisions.scientific.get(),
+            3
+        );
+        assert_eq!(owner.world().agents().len(), 4);
+        assert_eq!(
+            captured.agent_commands[0]
+                .boundary()
+                .revisions
+                .scientific
+                .get(),
+            2,
+            "an older cut is immutable after retention evicts its input"
+        );
+    }
+
+    #[test]
+    fn scientific_digest_cut_excludes_failed_agent_commands_and_records_applied_noops() {
+        let mut owner = HostCore::new(HostSessionId::new(0xa6e8), world(0), options(true)).unwrap();
+        let mut port = owner.local_port();
+        assert!(
+            port.submit(CommandEnvelope::new(
+                CommandId::new(4),
+                HostCommand::SpawnAgent {
+                    herbivore_tendency: f32::NAN
+                }
+            ))
+            .is_err()
+        );
+        settle_continuation_command(
+            &mut owner,
+            CommandEnvelope::new(
+                CommandId::new(5),
+                HostCommand::SpawnCrossover {
+                    parent_a: AgentUid(900),
+                    parent_b: AgentUid(901),
+                },
+            ),
+            5,
+        );
+        assert!(matches!(
+            port.command_status(CommandId::new(5))
+                .unwrap()
+                .unwrap()
+                .application(),
+            ApplicationState::Failed(_)
+        ));
+        assert!(
+            owner
+                .scientific_digest_cut()
+                .unwrap()
+                .agent_commands
+                .is_empty()
+        );
+        let before_noop = owner.scientific_digest_v1().unwrap();
+        settle_continuation_command(
+            &mut owner,
+            CommandEnvelope::new(
+                CommandId::new(6),
+                HostCommand::AdjustAgentMutationRates {
+                    agent_uid: AgentUid(900),
+                    delta_primary: 0.1,
+                    delta_secondary: 0.1,
+                },
+            ),
+            6,
+        );
+        assert_eq!(owner.scientific_digest_v1().unwrap(), before_noop);
+        let publication = owner.latest_snapshot();
+        let journal = owner.next_journal_sequence;
+        let cut = owner.scientific_digest_cut().unwrap();
+        assert_eq!(cut.agent_commands.len(), 1);
+        assert_eq!(
+            cut.agent_commands[0].boundary().revisions.scientific.get(),
+            1
+        );
+        assert!(matches!(
+            cut.agent_commands[0].command(),
+            ControlCommand::AdjustAgentMutationRates {
+                agent_uid: AgentUid(900),
+                ..
+            }
+        ));
+        assert_eq!(owner.next_journal_sequence, journal);
+        assert!(Arc::ptr_eq(&publication, &owner.latest_snapshot()));
+        assert_eq!(cut.digest, before_noop);
     }
 
     #[test]

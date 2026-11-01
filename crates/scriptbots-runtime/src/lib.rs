@@ -91,12 +91,12 @@ pub use archipelago::{
     MAX_ISLANDS, MigrationBarrierReport, StepTopology, Topology,
 };
 pub use host_core::{
-    HOST_CHECKPOINT_V1_CODEC, HOST_CHECKPOINT_V1_CODEC_VERSION, HOST_CHECKPOINT_V1_SCHEMA,
-    HostCheckpointBusy, HostCheckpointError, HostCheckpointV1, HostCore, HostCoreBuildError,
-    HostCoreOptions, HostJournalCutV1, LocalHostPort, MAX_HOST_CHECKPOINT_BYTES,
-    MAX_VOLATILE_HOST_CHECKPOINT_BYTES, MigrationArrival, PreparedConfigPatchResolver,
-    VolatileHostCheckpointV1, VolatileJournal, VolatileJournalCheckpointV1, WorldCheckpointCut,
-    WorldDigestCut,
+    AppliedAgentCommand, HOST_CHECKPOINT_V1_CODEC, HOST_CHECKPOINT_V1_CODEC_VERSION,
+    HOST_CHECKPOINT_V1_SCHEMA, HostCheckpointBusy, HostCheckpointError, HostCheckpointV1, HostCore,
+    HostCoreBuildError, HostCoreOptions, HostJournalCutV1, LocalHostPort,
+    MAX_HOST_CHECKPOINT_BYTES, MAX_VOLATILE_HOST_CHECKPOINT_BYTES, MigrationArrival,
+    PreparedConfigPatchResolver, VolatileHostCheckpointV1, VolatileJournal,
+    VolatileJournalCheckpointV1, WorldCheckpointCut, WorldDigestCut,
 };
 pub use native::{FixedDeadlineHost, NativeDriveReceipt, NativeDriveTrigger, NativeScheduleError};
 

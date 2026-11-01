@@ -2992,7 +2992,8 @@ impl ControlHandle {
 
     /// Reconstruct an older event from ticks and a complete published config audit.
     /// Configuration schedules require their complete committed outcome history;
-    /// extra scientific revisions refuse before stepping. The atomic current digest
+    /// agent commands require their complete observed suffix without config edits.
+    /// Other scientific revisions refuse before stepping. The atomic current digest
     /// must also match before the reconstructed target is published.
     pub(crate) fn event_canvas(&self, target_tick: u64) -> Result<EventCanvasReview, ControlError> {
         let retained = self
@@ -3024,9 +3025,18 @@ impl ControlHandle {
         Self::validate_event_review_boundary(&retained, &current, target_tick)?;
         let published = self.read_snapshot()?;
         Self::validate_event_review_schedule(&retained, &current, &published)?;
+        let mut agent_commands = Vec::new();
         let config_audit = match Self::validate_event_review_span(&retained, &current, target_tick)
         {
             Ok(()) => Vec::new(),
+            Err(_)
+                if retained.source_config_revision == current.config_revision
+                    && current.config_revision.checked_next().is_some() =>
+            {
+                agent_commands =
+                    Self::event_review_agent_commands(&retained, &current, target_tick)?;
+                Vec::new()
+            }
             Err(error) => {
                 let span = Self::validate_event_review_boundary(&retained, &current, target_tick)?;
                 // Audit fallback requires a strictly increasing, nonsaturated config revision.
@@ -3053,6 +3063,7 @@ impl ControlHandle {
             &checkpoint,
             &current.digest,
             &config_audit,
+            &agent_commands,
             target_tick,
             retained.source_persistence_interval,
         )?;
@@ -3067,11 +3078,13 @@ impl ControlHandle {
         checkpoint: &scriptbots_core::WorldCheckpointV1,
         current: &scriptbots_core::WorldDigestV1,
         config_audit: &[ConfigAuditEntry],
+        agent_commands: &[scriptbots_runtime::AppliedAgentCommand],
         target_tick: u64,
         source_persistence_interval: u32,
     ) -> Result<WorldState, ControlError> {
         let mut world = Self::restore_canvas_world(checkpoint)?;
         let mut edits = config_audit.iter().peekable();
+        let mut commands = agent_commands.iter().peekable();
         let mut target = None;
         loop {
             while edits
@@ -3092,6 +3105,19 @@ impl ControlHandle {
                     ));
                 }
             }
+            while commands
+                .peek()
+                .is_some_and(|entry| entry.boundary().tick == world.tick())
+            {
+                let entry = commands.next().expect("peeked agent command");
+                if entry.boundary().revisions.config.get() != world.config_revision() {
+                    return Err(ControlError::InvalidPatch(
+                        "recorded agent command configuration differs".into(),
+                    ));
+                }
+                scriptbots_core::apply_control_command(&mut world, entry.command().clone())
+                    .map_err(|error| ControlError::InvalidPatch(error.to_string()))?;
+            }
             if world.tick().0 == target_tick {
                 target = Some(
                     world
@@ -3109,6 +3135,11 @@ impl ControlHandle {
         if edits.peek().is_some() {
             return Err(ControlError::InvalidPatch(
                 "event replay left recorded configuration edits unapplied".into(),
+            ));
+        }
+        if commands.peek().is_some() {
+            return Err(ControlError::InvalidPatch(
+                "event replay left recorded agent commands unapplied".into(),
             ));
         }
         if world
@@ -3232,6 +3263,71 @@ impl ControlHandle {
             ));
         }
         Ok(())
+    }
+
+    fn event_review_agent_commands(
+        retained: &RetainedCheckpoint,
+        current: &scriptbots_runtime::WorldDigestCut,
+        target_tick: u64,
+    ) -> Result<Vec<scriptbots_runtime::AppliedAgentCommand>, ControlError> {
+        let span = Self::validate_event_review_boundary(retained, current, target_tick)?;
+        let missing = || {
+            ControlError::BadRequest(
+            "event review needs complete recorded agent inputs for intervening scientific revisions, without configuration edits".into(),
+        )
+        };
+        if retained.source_config_revision != current.config_revision
+            || current.config_revision.checked_next().is_none()
+        {
+            return Err(missing());
+        }
+        let source_revision = retained.source_scientific_revision.get();
+        let current_revision = current.scientific_revision.get();
+        let commands: Vec<_> = current
+            .agent_commands
+            .iter()
+            .filter(|entry| {
+                entry.boundary().revisions.scientific > retained.source_scientific_revision
+                    && entry.boundary().revisions.scientific <= current.scientific_revision
+            })
+            .cloned()
+            .collect();
+        let mut previous_tick = retained.metadata.tick;
+        // A tick advances science once; each recorded agent command advances it once.
+        // Check every boundary, so an omitted or different scientific input leaves a gap.
+        for (index, entry) in commands.iter().enumerate() {
+            let boundary = entry.boundary();
+            let elapsed = boundary.tick.0.checked_sub(retained.metadata.tick);
+            let ordinal = u64::try_from(index)
+                .ok()
+                .and_then(|index| index.checked_add(1));
+            let expected = elapsed
+                .and_then(|ticks| source_revision.checked_add(ticks))
+                .and_then(|revision| ordinal.and_then(|ordinal| revision.checked_add(ordinal)));
+            if expected != Some(boundary.revisions.scientific.get())
+                || boundary.tick.0 < previous_tick
+                || boundary.tick > current.digest.tick
+                || boundary.revisions.config != retained.source_config_revision
+                || !matches!(
+                    entry.command(),
+                    ControlCommand::AdjustAgentMutationRates { .. }
+                        | ControlCommand::SpawnAgent { .. }
+                        | ControlCommand::SpawnCrossover { .. }
+                )
+            {
+                return Err(missing());
+            }
+            previous_tick = boundary.tick.0;
+        }
+        let expected_current = source_revision.checked_add(span).and_then(|revision| {
+            u64::try_from(commands.len())
+                .ok()
+                .and_then(|count| revision.checked_add(count))
+        });
+        if expected_current != Some(current_revision) {
+            return Err(missing());
+        }
+        Ok(commands)
     }
 
     fn event_review_config_audit(
@@ -5715,6 +5811,270 @@ pub(crate) mod tests {
         (handle, host)
     }
 
+    struct AgentCanvasJourney {
+        handle: ControlHandle,
+        host: TestHost,
+        directory: PathBuf,
+        checkpoint_id: String,
+        oracles: Vec<(Arc<RenderSnapshot>, scriptbots_core::WorldDigestV1)>,
+    }
+
+    fn agent_canvas_journey() -> AgentCanvasJourney {
+        let directory = tempfile::Builder::new()
+            .prefix("event-agent-canvas-")
+            .tempdir()
+            .unwrap()
+            .keep();
+        let mut world = WorldState::new(ScriptBotsConfig {
+            rng_seed: Some(42),
+            world_width: 120,
+            world_height: 120,
+            food_cell_size: 20,
+            persistence_interval: 0,
+            closed: true,
+            topography_enabled: false,
+            reproduction_energy_threshold: f32::MAX,
+            metabolism_drain: 0.0,
+            ..ScriptBotsConfig::default()
+        })
+        .unwrap();
+        let brains = crate::install_brains(&mut world, crate::BrainPreset::Mlp)
+            .unwrap()
+            .population;
+        crate::seed_founders(&mut world, &brains, crate::FounderRecipe::Spread).unwrap();
+        let host = TestHost::spawn(world);
+        let handle = host.handle().with_artifacts_dir(directory.clone()).unwrap();
+        let parents = handle
+            .read_snapshot()
+            .unwrap()
+            .world
+            .agents
+            .iter()
+            .take(2)
+            .map(|agent| agent.uid)
+            .collect::<Vec<_>>();
+        assert_eq!(parents.len(), 2);
+        let checkpoint = handle
+            .create_checkpoint(CheckpointCreateRequest::default())
+            .unwrap();
+        let submit = |id: u128, command| {
+            let mut port = host.port.clone();
+            let id = CommandId::new(id);
+            port.submit(CommandEnvelope::new(id, command)).unwrap();
+            assert_eq!(
+                host.wait_finished(&id.to_string()).application_state,
+                "applied"
+            );
+        };
+        let mut oracles = Vec::new();
+        for (id, command) in [
+            (
+                101,
+                HostCommand::SpawnAgent {
+                    herbivore_tendency: 0.25,
+                },
+            ),
+            (
+                102,
+                HostCommand::AdjustAgentMutationRates {
+                    agent_uid: parents[0],
+                    delta_primary: 0.1,
+                    delta_secondary: 0.05,
+                },
+            ),
+            (
+                103,
+                HostCommand::SpawnCrossover {
+                    parent_a: parents[0],
+                    parent_b: parents[1],
+                },
+            ),
+        ] {
+            submit(id, command);
+            host.wait_applied(&handle.step().unwrap());
+            oracles.push((
+                handle.read_snapshot().unwrap(),
+                host.port.scientific_digest_v1().unwrap(),
+            ));
+            host.wait_applied(&handle.step().unwrap());
+        }
+        for _ in 0..3 {
+            host.wait_applied(&handle.step().unwrap());
+        }
+        AgentCanvasJourney {
+            handle,
+            host,
+            directory,
+            checkpoint_id: checkpoint.checkpoint_id,
+            oracles,
+        }
+    }
+
+    #[test]
+    fn event_canvas_replays_actual_agent_commands_with_full_target_oracles() {
+        let AgentCanvasJourney {
+            handle,
+            host,
+            directory,
+            checkpoint_id,
+            oracles,
+        } = agent_canvas_journey();
+        let source = handle
+            .data_services
+            .checkpoint_retention
+            .lock()
+            .unwrap()
+            .requests
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        let saved = handle.verified_canvas_checkpoint(&checkpoint_id).unwrap();
+        let publication = handle.read_snapshot().unwrap();
+        let current = host.port.scientific_digest_cut().unwrap();
+        assert_eq!(current.agent_commands.len(), oracles.len());
+        for (oracle, digest) in &oracles {
+            let commands =
+                ControlHandle::event_review_agent_commands(&source, &current, oracle.world.tick)
+                    .unwrap();
+            let target = ControlHandle::replay_event_canvas_world(
+                &saved,
+                &current.digest,
+                &[],
+                &commands,
+                oracle.world.tick,
+                0,
+            )
+            .unwrap();
+            assert_eq!(
+                &target.world_digest_v1().unwrap(),
+                digest,
+                "full actual target oracle"
+            );
+            assert_ne!(*digest, current.digest);
+            let review = handle.event_canvas(oracle.world.tick).unwrap();
+            assert_eq!(review.snapshot.world.tick, oracle.world.tick);
+            assert_eq!(
+                review.snapshot.world.agents.len(),
+                oracle.world.agents.len()
+            );
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), current.digest);
+            assert!(Arc::ptr_eq(&handle.read_snapshot().unwrap(), &publication));
+            fs::write(
+                directory.join(format!("target-{}-digest.json", oracle.world.tick)),
+                serde_json::to_vec_pretty(digest).unwrap(),
+            )
+            .unwrap();
+        }
+        fs::write(
+            directory.join("current-digest.json"),
+            serde_json::to_vec_pretty(&current.digest).unwrap(),
+        )
+        .unwrap();
+        eprintln!(
+            "agent replay: targets={:?} live={} full current={} commands={}; {}",
+            oracles
+                .iter()
+                .map(|(snapshot, _)| snapshot.world.tick)
+                .collect::<Vec<_>>(),
+            current.digest.tick.0,
+            current.digest.overall,
+            current.agent_commands.len(),
+            directory.display()
+        );
+    }
+
+    #[test]
+    fn event_canvas_agent_commands_refuse_incomplete_history_and_mixed_inputs() {
+        let AgentCanvasJourney {
+            handle,
+            host,
+            checkpoint_id,
+            ..
+        } = agent_canvas_journey();
+        let source = handle
+            .data_services
+            .checkpoint_retention
+            .lock()
+            .unwrap()
+            .requests
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        let saved = handle.verified_canvas_checkpoint(&checkpoint_id).unwrap();
+        let publication = handle.read_snapshot().unwrap();
+        let current = host.port.scientific_digest_cut().unwrap();
+        for fault in [
+            "missing",
+            "order",
+            "duplicate",
+            "session",
+            "config",
+            "science",
+        ] {
+            let mut changed = current.clone();
+            match fault {
+                "missing" => {
+                    changed.agent_commands.remove(1);
+                }
+                "order" => changed.agent_commands.swap(0, 1),
+                "duplicate" => changed
+                    .agent_commands
+                    .insert(1, changed.agent_commands[0].clone()),
+                "session" => {
+                    changed.session_id =
+                        scriptbots_runtime::HostSessionId::new(current.session_id.get() ^ 1)
+                }
+                "config" => {
+                    changed.config_revision =
+                        scriptbots_runtime::ConfigRevision::new(current.config_revision.get() + 1)
+                }
+                "science" => {
+                    changed.scientific_revision = scriptbots_runtime::ScientificRevision::new(
+                        current.scientific_revision.get() + 1,
+                    )
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                ControlHandle::event_review_agent_commands(&source, &changed, 2).is_err(),
+                "{fault}"
+            );
+        }
+        let mut changed_digest = current.digest.clone();
+        changed_digest.overall = "0000000000000000".into();
+        assert!(
+            ControlHandle::replay_event_canvas_world(
+                &saved,
+                &changed_digest,
+                &[],
+                &current.agent_commands,
+                2,
+                0
+            )
+            .is_err()
+        );
+        let mut config = (*publication.config).clone();
+        config.food_growth_rate *= 0.5;
+        let mut port = host.port.clone();
+        let command_id = CommandId::new(104);
+        port.submit(CommandEnvelope::new(
+            command_id,
+            HostCommand::UpdateConfig(Box::new(config)),
+        ))
+        .unwrap();
+        assert_eq!(
+            host.wait_finished(&command_id.to_string())
+                .application_state,
+            "applied"
+        );
+        assert!(
+            handle.event_canvas(2).is_err(),
+            "mixed config and agent inputs remain unsupported"
+        );
+    }
+
     #[test]
     // Actual scheduled applications plus corrupt outcome/audit negatives share one owner.
     #[allow(clippy::too_many_lines)]
@@ -5802,6 +6162,7 @@ pub(crate) mod tests {
                 &saved,
                 &current.digest,
                 &audit,
+                &[],
                 oracle.world.tick,
                 0,
             )
@@ -5917,6 +6278,25 @@ pub(crate) mod tests {
             })
             .unwrap();
         host.wait_applied(&science);
+        let after_spawn = host.port.scientific_digest_v1().unwrap();
+        let review = handle.event_canvas(later_oracle.tick.0).unwrap();
+        assert_eq!(review.base_tick, later.tick);
+        assert_eq!(review.snapshot.world.tick, later_oracle.tick.0);
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), after_spawn);
+        // A different scientific command still has no replayable input in this suffix.
+        let unsupported = handle
+            .submit_control_command(ControlCommand::Intervention(Box::new(
+                scriptbots_core::interventions::InterventionCommand::new(
+                    scriptbots_core::Intervention::Embargo {
+                        region: scriptbots_core::Region::All,
+                        ticks: 2,
+                    },
+                    scriptbots_core::interventions::InterventionSurface::Script,
+                    "event-review-negative",
+                ),
+            )))
+            .unwrap();
+        host.wait_applied(&unsupported);
         assert!(
             matches!(handle.event_canvas(later_oracle.tick.0), Err(ControlError::BadRequest(message)) if message.contains("scientific revisions"))
         );
@@ -6028,6 +6408,7 @@ pub(crate) mod tests {
                 &saved,
                 &current.digest,
                 &audit,
+                &[],
                 oracle.world.tick,
                 source.source_persistence_interval,
             )
@@ -6072,6 +6453,7 @@ pub(crate) mod tests {
                         &saved,
                         &current.digest,
                         &changed,
+                        &[],
                         oracle.world.tick,
                         source.source_persistence_interval,
                     )
@@ -6343,10 +6725,18 @@ pub(crate) mod tests {
                         })
                         .unwrap(),
                 );
-                assert!(
-                    matches!(handle.event_canvas(target_tick), Err(ControlError::BadRequest(message))
-                    if message.contains("scientific revisions"))
+                let after_spawn = host.port.scientific_digest_v1().unwrap();
+                let after_spawn_publication = handle.read_snapshot().unwrap();
+                let replayed = handle.event_canvas(target_tick).unwrap();
+                assert_eq!(
+                    logical(serde_json::to_value(&replayed.snapshot.world).unwrap()),
+                    logical(serde_json::to_value(&oracle.world).unwrap())
                 );
+                assert_eq!(host.port.scientific_digest_v1().unwrap(), after_spawn);
+                assert!(Arc::ptr_eq(
+                    &handle.read_snapshot().unwrap(),
+                    &after_spawn_publication
+                ));
                 // Real config edits have their own revision domain, including a round trip.
                 let food_max = current.config.food_max;
                 host.wait_applied(
