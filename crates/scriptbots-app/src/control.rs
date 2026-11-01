@@ -6036,16 +6036,8 @@ pub(crate) mod tests {
             checkpoint_id,
             ..
         } = agent_canvas_journey();
-        let source = handle
-            .data_services
-            .checkpoint_retention
-            .lock()
-            .unwrap()
-            .requests
-            .values()
-            .next()
-            .unwrap()
-            .clone();
+        let retention = &handle.data_services.checkpoint_retention;
+        let source = retention.lock().unwrap().requests[&checkpoint_id].clone();
         let saved = handle.verified_canvas_checkpoint(&checkpoint_id).unwrap();
         let publication = handle.read_snapshot().unwrap();
         let current = host.port.scientific_digest_cut().unwrap();
