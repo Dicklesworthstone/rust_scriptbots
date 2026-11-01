@@ -8314,7 +8314,7 @@ impl SimulationView {
                 });
                 if applied == Some(true) {
                     format!(
-                        "Reconstructed World tick {tick} from checkpoint {checkpoint_id} at tick {base_tick}; live owner unchanged."
+                        "Reconstructed World tick {tick} from checkpoint {checkpoint_id} at tick {base_tick}; live controls remain current."
                     )
                 } else {
                     "World frame unavailable; view unchanged.".to_owned()
