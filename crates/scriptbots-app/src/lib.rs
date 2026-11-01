@@ -4132,7 +4132,6 @@ pub mod renderer {
         use scriptbots_render::{
             TimelineReviewRequest, TimelineReviewResponse, render_png_offscreen,
         };
-        use scriptbots_runtime::HostPort;
 
         #[test]
         // One real owner, retained artifact, historical oracle and refusal journey.
