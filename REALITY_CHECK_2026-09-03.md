@@ -1,5 +1,259 @@
 # Reality Check — rust_scriptbots — implementation continuation 2026-10-27
 
+## Active TODO — replay observed agent commands, VioletTrout, 2026-11-01
+
+Continue original `bd-ji3a`. Historical review currently rejects an interval
+containing even a recorded agent spawn. The durable command reader is restricted
+to finished files, and committed volatile envelopes are compacted. Add a bounded
+owner observation of successful spawn/crossover/mutation commands and consume it
+in the existing checkpoint replay. Mixed configuration edits, other scientific
+commands and missing/evicted inputs remain outside this bounded extension.
+Original acceptance and dependencies remain unchanged.
+
+This requested TODO is process: its consumer is the operator's handoff, its gate
+is this increment's completion claim, and it retires there. No new tracker or
+proof machinery. Raw evidence: `/data/tmp/scriptbots-narrative-journey-20261101T0628-violettrout/`.
+
+- [x] Refresh canonical triage and original scope; inspect actual journal producer/reader limits.
+- [x] Reserve exact paths and mark the original work in progress.
+- [x] Implement retention of successful small agent commands at their actual owner boundaries; producer runtime tests pass.
+- [x] Implement retention bounded by the existing owner command-archive capacity, without changing scientific state or snapshot schema; producer runtime tests pass.
+- [x] Include retained input observations in the atomic read-only digest cut; producer runtime tests pass.
+- [x] Prove input completeness from source/current revisions and completed ticks; new actual-owner guard case passes at `7d486794`.
+- [x] Replay through the same core command applier before target/current digest verification; full target/current oracle case passes at `7d486794`.
+- [ ] Preserve tick-only and configuration/schedule replay, with refusals for unsupported or incomplete inputs.
+- [x] Exercise producer success, failed/no-op commands, eviction and read-only capture at `7d486794`.
+- [x] Exercise actual spawn/crossover/mutation trajectories against full target/live digests at `7d486794`; retained targets 2/4/6 differ from live 10.
+- [x] Exercise missing/reordered/changed-session/config/mixed-input refusals in the new actual-owner case at `7d486794`.
+- [ ] Qualify the real applied-intervention negative after its required science tick at `ed4d6eee`.
+- [ ] Qualify the final explicit source-checkpoint lookup at `3f1f8fd3`; keep every existing guard and assertion.
+- [x] Complete the full runtime library at `7d486794`: 244 pass, 6 existing ignores, outer 0.
+- [ ] Complete the full app canvas selection at the final immutable source.
+- [x] Complete the full renderer library at `7d486794`: 197 pass, 3 existing ignores, outer 0; explicit CPU-software profile.
+- [x] Complete workspace/all-target compiler check at `7d486794`, outer 0.
+- [ ] Complete strict GUI-feature workspace/all-target Clippy.
+- [x] Complete formatting/diff checks and fresh UBS at `7d486794` (0 critical; warnings/info retained).
+- [ ] Review source and evidence, complete the bounded honesty inventory, update original Bead and docs.
+- [ ] Prepare reviewed publication and owned-lease handoff; final ref/lease observations belong to the session handoff.
+
+Source `4e7627e86cb9fa63a8581fa530c751a09d45e7c7`, tree
+`3d64b4b223563b1f83dfff9c41b929f2a66b5c70`, implements this bounded extension.
+Formatting/diff checks and fresh three-file UBS pass (0 critical, 3,575 warnings,
+749 informational findings; not clean). Initial formatting failures are retained
+and corrected manually. No native pass is claimed yet. Predeclared qualification
+is the complete app `canvas` selection (old 30 plus two new cases), full runtime
+and renderer library suites, required default workspace/all-target compiler
+check and strict GUI-feature workspace/all-target Clippy. Renderer shader cases
+use the existing explicit CPU-software profile; no physical GPU credit.
+
+Two existing blanket spawn refusals are intentionally changed to positive
+read-only reconstruction checks: the new owner observations supply their inputs.
+The tests retain an actual unsupported-embargo refusal case, alongside missing,
+reordered, duplicate, foreign-session, mixed-config and unexplained scientific revisions.
+The original config/schedule cases and current-digest anchor remain. No golden,
+test ignore, build-policy, testcase-deadline or feature-default changes. This is
+an extension of supported behavior, not a claim of general recorded-input or
+durable replay. The volatile cache starts empty after host restore; absent input
+evidence must refuse. Native runs will decide whether these source claims hold.
+
+At `4e7627e8`, the full app canvas selection actually fails **29 passed / 3
+failed / 0 ignored**, 59.49s, outer **101**. The new real journeys fail before
+their positive assertions; the scheduled late-checkpoint path also exposes an
+incorrect absolute configuration-revision comparison. The full runtime library
+actually fails **243 passed / 1 failed / 6 existing ignores**, 26.24s, outer
+**101**: a new test expects transport failure where the actual protocol returns
+a typed validation rejection. These raw runs remain intact. The initial cold
+Clippy build is cancelled through its exact owned wrapper after source/worker
+identity verification (outer 143); a remote source/target process scan observes
+zero matches. Cancellation is not a lint verdict.
+
+Corrected source `7d48679425c6c8ef12701b5c2bd2017e0e712407`, tree
+`864a860f64fa26e728be168a88ad786a8afe066b`, computes the owner configuration
+revision from the captured source base plus the restored world's observed
+revision delta. It is intended to admit a correct nonzero source base; the new
+negative requires a deliberately wrong base to fail at that exact guard. The
+test fixture advances beyond the checkpoint-sealed tick before arrivals,
+requires actual population and mutation-rate changes, and requires
+`Rejected(Validation)` with no admission
+for the malformed command. No assertion/ignore/deadline is dropped. Formatting
+and fresh three-file UBS pass (0 critical, 3,591 warnings, 749 informational
+findings). Corrected native qualification remains pending; the first warm-worker
+Clippy request refuses outer 103 before Cargo and has no lint result.
+
+The corrected runtime request also returns outer 103 before Cargo, so the two
+corrected-source refusals are infrastructure only. App and strict GUI Clippy
+are normally admitted on `vmi1153651` after the warmed workers become pressure
+blocked. The root app test runner drops DAC bypass capabilities, preserving
+the file-permission assertions. Compiler defaults, testcase deadlines, feature
+selection and pressure policy remain unchanged; no cleanup command is run.
+
+At `7d486794`, the required default workspace/all-target compiler check
+completes **outer 0**, Cargo **2m40s**, with an exact clean-overlay source/tree
+receipt. Normal admission recovered on `hz4`; its source/target lock then passes
+to the corrected full runtime suite. App/Clippy remain compiling on
+`vmi1153651`. Four independent source/lockfile hashes in both active worker
+archives match the immutable source blobs. No corrected runtime test or lint
+pass is inferred from this compiler result.
+
+The corrected full runtime library at `7d486794` completes **244 passed,
+0 failed, 6 existing ignored, 0 filtered**, 30.83s, actual outer **0**. Both new
+producer cases pass: actual application/failed-command/no-op distinctions,
+bounded eviction, older-cut immutability and read-only capture. The exact
+clean-overlay receipt names the source/tree above. This supersedes the first
+runtime failure without erasing it. The corrected app consumer and strict
+Clippy results remain pending; full renderer execution has not completed.
+
+The corrected full renderer library at `7d486794` completes **197 passed,
+0 failed, 3 existing ignored, 0 filtered**, 67.05s, actual outer **0**. Actual
+selection is **llvmpipe (LLVM 21.1.8, 256 bits), Cpu, Vulkan, software=true**;
+the explicit software opt-in reaches the compositor. The near-identical
+no-opt-in request observes `without_opt_in_admitted=false` and asserts the exact
+software-policy reason. This is CPU-surrogate shader-functional and headless
+GPUI component coverage, with zero physical-GPU, performance or native-window
+credit. The checkpoint-review journey still uses its disclosed controlled
+provider, not an actual checkpoint inside the GUI test. The source/tree receipt
+and all four source/lockfile hashes match. App consumer and strict Clippy remain
+pending; no broader acceptance is closed.
+
+The corrected app run at `7d486794` completes **31 passed / 1 failed / 0
+ignored / 661 filtered**, 73.75s, actual outer **101**. Both new cases pass.
+All old 30 names remain plus those two additions. The retained source checkpoint
+and full digest files contain targets **2/4/6** (`904ea12b52719514`,
+`123d8dc7348f808a`, `fee3e1042be3b9dc`) and live **10**
+(`d4400401cc7c37a7`), all distinct. The remaining failure is the scheduled-history
+unsupported-intervention assertion; it did not print the returned error. Source
+inspection shows that enqueue is not application and a pending intervention
+prevents a quiescent digest. Strict GUI Clippy actually fails **101** on
+`float_cmp` in the new runtime payload test. Neither run is called green.
+
+Test-only correction `ed4d6eee99974467cb3480b5a1db6015463dd4a4`, tree
+`e52214befe6b5278c6f4ed838a2aeb39831b4217`, advances a real tick, requires an
+observed non-expiry embargo record, then requires the same specific scientific
+revision refusal and prints the actual error on mismatch. The payload test uses
+exact float bits without a tolerance or lint suppression. Formatting and fresh
+three-file UBS pass (0 critical, 3,594 warnings, 749 informational findings).
+The native correction remains pending. Two final compiler-check requests refuse
+103 before Cargo on pressure-blocked `hz4`; one Clippy request times out before
+admission on `vmi1153651` (103). Check and Clippy are then submitted to normally
+available `vmi1152480`; the app remains on `vmi1153651`.
+
+During this continuation the local root filesystem has zero free space. Empty
+scanner/copy attempts fail, and a `/tmp` scanner attempt is explicitly incomplete
+(exit 2), not a zero-finding pass. Root free space later returns without a cleanup
+command from this agent. The complete scanner retry above passes. Artifact copy
+to separate `/tmp` succeeds; final receipts are retained at
+`/tmp/scriptbots-agent-replay-finish-20261101T1346-violettrout/` pending a durable
+copy into the original proof directory. No file deletion, ballast release,
+pressure-policy override or local compiler fallback is performed.
+
+Final source `3f1f8fd32194e15cb36e34f10d8f91b9f1e3595a`, tree
+`f50afbdd03f6a9609626cb827155386e443f1b3a`, additionally makes the new negative
+test select its actual checkpoint ID instead of the first map entry. This
+preserves every guard/assertion and keeps the test below the existing function
+length budget; no app length-lint result is claimed. Formatting and fresh UBS
+pass (0 critical, 3,595 warnings, 749 informational findings). The existing
+`ed4d6eee` native jobs are retained as bound evidence for that older pin; their
+results will not be relabelled as final-source qualification. Full runtime at
+the final pin is submitted on `vmi1152480` with the same DAC-dropping runner.
+
+### Bounded review — observed agent-command increment, app/lint results pending
+
+Creation worksheet: this existing report/TODO and raw execution receipts serve
+the operator-requested handoff and gate its completion claim. They address the
+observed unsupported replay path and real failed tests, and retire as active
+process at handoff. No new process product. The bounded command cache is product
+state: the existing historical review actually reads it. It does not affect
+forward scientific execution or earn durability credit.
+
+Real-work worksheet, window beginning 06:28 UTC: one USER capability candidate
+(three successful agent-command families connected to event review), one source
+correction, and pending documentation/tracker work. Zero Bead closures or new
+items. Tests belong to that same feature. The intended demonstration is save,
+apply commands, advance, review an older tick, and return live; no actual OS-window
+demonstration is claimed. Removing process leaves the feature unchanged but
+loses the requested tracking. Canonical triage still names original `bd-ji3a`
+as the timeline parent's blocker; the curated persistence test already exists.
+The bounded extension avoids inventing a live SQL reader from a finished-file
+contract. Broader replay/native acceptance stays on the original item. Verdict:
+USER work, **unqualified**; **DRIFTING** in cache-placement work. Cancelling the
+cold Clippy build did not secure warm capacity, which subsequently disappeared.
+Correction: finish admitted jobs without further infrastructure machinery.
+Waiting, compilation and these notes earn no capability credit.
+
+Honesty inventory (solo; provisional until corrected native results):
+
+1. Yes: two blanket post-checkpoint spawn refusals become positive checks for
+   the newly supported input evidence. They retain actual owner/projection
+   checks, and an actual unsupported embargo remains a negative case. No test
+   name or ignore is removed. The new NaN test now requires typed validation
+   rejection/no admission; no test deadline is relaxed. Source diffs and all
+   failed runs are retained. These expectation changes are part of the feature,
+   not incidental gate cleanup.
+2. Yes: a new test helper controls real MLP owners and freezes unrelated ecology.
+   It requires actual population/mutation effects, real checkpoint files and
+   full target/live digest comparisons. Cloned malformed cuts are isolated
+   guard probes, not live history. No mocked provider is introduced here.
+3. No (checked: source and tracked diff); no golden or snapshot regeneration.
+4. Yes: production replay validation is extended and its initial wrong absolute
+   revision check is corrected. The replacement uses captured base plus observed
+   restore delta and has a wrong-base negative at the same guard. No new lint or
+   scanner suppression, CI change, feature-default change, tolerance or testcase
+   timeout change. Existing per-job 10,800-second build allowances remain.
+5. No (checked: producer/consumer source); fixture IDs and frozen test ecology
+   do not enter production. Retention uses the existing declared command-archive
+   capacity, and completeness is computed from actual revisions/ticks/inputs.
+6. No (checked: raw exits/counts). The first app runs 32 cases and fails three;
+   runtime runs 244 plus six existing ignores and fails one. Corrected-source
+   runtime/Clippy 103 refusals are not native passes or failing test runs.
+7. No (checked: execution receipts, source hashes and current status prose);
+   no unrun test, benchmark or command is claimed executed in this increment.
+8. No (checked: proof labels). Source hashes do not become remote Git identity;
+   real-owner component tests do not become OS-window, physical GPU or DSR proof.
+   Corrected-source runtime producer evidence is 244 pass/6 existing ignores;
+   renderer evidence is 197 pass/3 existing ignores with explicit CPU-software
+   rendering. Both new app journeys pass at `7d486794`, with actual target/live
+   digest artifacts; its full selection still fails 31/1 and strict Clippy fails.
+   Final `3f1f8fd3` qualification remains pending.
+9. Yes: the initial scanner/trace/copy attempts during root exhaustion leave
+   empty files. Their nonzero returns are observed, and the direct verbose SCP
+   retry prints `No space left on device`. They are not usable scanner proof.
+   The incomplete `/tmp` scan (2), complete retry (0) and every native failure
+   remain retained. The earlier increment's lost refusal log is still disclosed
+   in its own record; no failure is relabelled as a pass.
+10. No (checked: command redirections); stdout/stderr are retained together or
+    in named separate files. The cancelled Clippy run is 143, not a lint result.
+11. No (checked: canonical JSONL); original status remains `in_progress`, no
+    closure or follow-up item. Only own notes/timestamp change; 719 other raw
+    rows remain unchanged.
+12. No (checked: original description/dependencies and plan diff); annotations
+    describe the bounded extension without reducing original acceptance.
+13. No (checked: session actions); no subagent or peer closure.
+14. No (checked: session actions); no delegated task or gaming brief.
+15. No (checked: provenance); no subagent report accepted as evidence.
+16. No (checked: source/graph); one positive feature, no refusal farming.
+17. No (checked: report); no agreement or self-review called independent.
+18. No (checked: declared selectors/raw counts); app is old 30 plus two new
+    names, runtime is the full library, renderer remains the full library.
+    No cherry-picked passing subset or speedup is claimed.
+19. Yes: failed fixture assumptions, the wrong revision-base comparison,
+    unsuccessful cache placement, the unobserved pending-intervention error,
+    float lint and empty disk-full logs need explanation. They are named above
+    and must not be hidden by a later green result. The explicit checkpoint
+    lookup is a source-review correction, not a claimed observed length-lint.
+20. Current strongest evidence is the exact-source compiler check, full runtime
+    and renderer results, the two passing actual-agent app journeys at
+    `7d486794`, retained source/target/live artifacts, matching worker hashes
+    and static checks. The full app result there is 31/1, strict Clippy fails,
+    and final `3f1f8fd3` results remain unknown. A skeptic can run the declared
+    exact-source lanes; actual exits must supersede this provisional status.
+    No independence,
+    general/durable input replay, real window, physical GPU or DSR acceptance.
+
+Disposition: retain the failed runs, keep supported-spawn expectation changes
+visible, require the replacement configuration guard's positive and negative,
+and leave the original broader acceptance open. Do not promote source/static
+evidence into a runtime pass while admitted builds are still running.
+
 ## Active TODO — GPUI checkpoint/event review, VioletTrout, 2026-11-01
 
 Continue original `bd-ji3a`: at the start, GPUI's cached-frame action did not

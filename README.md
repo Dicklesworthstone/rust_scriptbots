@@ -253,7 +253,13 @@ RUST_LOG=info cargo run -p scriptbots-app
   history; future, incomplete, failed or pruned schedules refuse review. Empty
   installed queues are supported. It checks the reconstructed current digest
   before showing the requested event as `CHECKPOINT REPLAY`; `g` returns live.
-  Other scientific/operator inputs still require general recorded-input replay. Loading,
+  Agent spawns, manual crossovers and mutation-rate edits also have an implemented
+  replay path when configuration stays unchanged throughout the interval and the
+  live owner's bounded command history is complete. That history is volatile;
+  eviction or host restore without the required inputs refuses review. Mixed
+  configuration/agent-command intervals, interventions, map replacements and
+  migrations still require general recorded-input replay. Native qualification
+  status is recorded in [the reality check](REALITY_CHECK_2026-09-03.md). Loading,
   duplicate bounds, cancellation and stale selection checks use the same worker
   slot as direct checkpoint review. Live controls continue to address the owner.
   Native-window/PTY
