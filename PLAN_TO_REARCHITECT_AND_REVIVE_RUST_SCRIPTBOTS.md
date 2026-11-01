@@ -1370,6 +1370,18 @@ bounded audit remain in `REALITY_CHECK_2026-09-03.md`.
 broader acceptance remain unchanged and open; this is not PTY/GPU, full Program
 scheduler, whole-workspace runtime, DSR or independent verification.
 
+**[Currently In Progress — GPUI checkpoint/event review, VioletTrout, 2026-11-01]**
+Original `bd-ji3a`: the GPUI Timeline now consumes the existing verified
+application checkpoint/event review after a visual-cache miss. Checkpoint save,
+bounded background reconstruction, cancellation, stale-selection/session guards
+and historical input isolation are implemented. At `0c2f193c`, all 30 app canvas
+tests and the full renderer library (197 pass, 3 existing ignores) pass; renderer
+shader coverage uses an explicitly admitted CPU software adapter. Headless
+component evidence preserves live-owner/control semantics. Required workspace
+compiler check, strict GUI-feature Clippy and formatting also pass. Native-window/GPU,
+general recorded-input replay and the original broader acceptance remain open.
+Detailed TODO and actual qualification outcomes belong in the reality check.
+
 **[Implemented — native component qualification, VioletTrout, 2026-10-31]**
 Original `bd-ji3a`: connect the immutable schedule's complete successful
 committed outcome history to the existing audit-based isolated event replay.

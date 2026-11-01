@@ -1,5 +1,462 @@
 # Reality Check — rust_scriptbots — implementation continuation 2026-10-27
 
+## Active TODO — GPUI checkpoint/event review, VioletTrout, 2026-11-01
+
+Continue original `bd-ji3a`: at the start, GPUI's cached-frame action did not
+consume the application's verified event reconstruction. This increment connects
+that existing capability.
+This operator-requested TODO gates this increment's handoff and retires there;
+it is process with zero capability credit. Raw evidence root:
+`/data/tmp/scriptbots-next-gap-20261101T0215-violettrout/`.
+
+- [x] Refresh authoritative graph, BR readiness, original scope and coordination.
+- [x] Trace the cache-only GPUI consumer and the existing application checkpoint/replay producer.
+- [x] Reserve exact paths and mark continuation on original `bd-ji3a`.
+- [x] Implement the application save/review actions through the GUI launch adapter; bounded native component checks pass.
+- [x] Implement Timeline checkpoint save and bounded background fallback for evicted events; bounded native component checks pass.
+- [x] Label reconstructed science distinctly and retain current controls, receipts and narrative in the projection; bounded native component checks pass.
+- [x] Implement cancelled/stale result discard without freeing the occupied worker slot early; bounded native component checks pass.
+- [x] Preserve the cache path and exercise historical picking/hover guards before and after live repaint.
+- [x] Exercise the real app provider with saved artifacts, matching target/review pixels and an unchanged live digest.
+- [x] Exercise GPUI consumer success, return-live, missing source, busy/cancel/stale/error behavior at `0c2f193c`.
+- [x] Complete the pinned app canvas selection: all 30 pass at `0c2f193c`, outer 0.
+- [x] Complete the entire pinned renderer library suite: 197 pass, 3 existing ignores; explicit CPU-software profile, default refusal verified separately.
+- [x] Complete the default workspace/all-target compiler check at `0c2f193c`, outer 0.
+- [x] Complete strict workspace/all-target GUI-feature Clippy at `0c2f193c` (outer 0); the earlier `536491b6` pass is separate.
+- [x] Verify formatting/diff checks and the fresh three-file source scan at `0c2f193c`.
+- [x] Review every source/metadata hunk, retain failures, and complete the bounded honesty inventory.
+- [x] Update original Bead evidence and user documentation; prepare publication and owned-lease handoff. Final ref/lease observations belong to the session handoff.
+
+Original general recorded-input replay and full native/DSR acceptance remain
+open. Component tests will be labelled separately from actual native windows;
+no closure or acceptance reduction is planned.
+
+Bounded native component qualification passes, including the required final
+default compiler check. Predeclared tests:
+the complete app `canvas` selection (expected previous 29 plus one real GUI
+provider journey), and the entire renderer library test suite, retaining every
+failure/ignore and requiring the outer exit. The app provider creates real
+artifacts, reconstructs across actual config edits, compares software-rendered
+pixels with an earlier owner publication and checks the live digest. The GPUI
+consumer test uses a controlled provider returning a genuine earlier publication;
+it exercises the actual UI worker, controls and projection, not real checkpoint
+persistence or a native window. Its nine planted protocol/staleness cases must
+match their expected notice classes. Production GUI dispatch additionally
+requires GUI-feature workspace Clippy; default workspace check remains required.
+No test-case deadline, assertion, feature default or performance gate is relaxed.
+
+The initial three-file UBS exits 1 with two pre-existing timestamp-as-credential
+false positives in the renderer's capture-test path helpers (the exact same
+lines are in base `b95dc91e`). Their consumers only form local image/directory
+paths; the default write-free capture guard is preserved. Two line-scoped
+`rust.security.non-crypto-random` annotations explain that role, with no runtime
+change. A mixed control in the same scanner invocation admits those path stamps
+and still reports the intentionally time-derived authentication token as the
+sole critical finding (outer 1). The control includes both an annotated benign
+stamp and an unannotated credential in the same file, so file/rule-wide masking
+would fail it. Raw `scanner-scope-negative.log` retains this win/lose split.
+This is a disclosed false-positive correction, not a security improvement or a
+clean-scan claim. The reviewed source-only rescan exits 0 with 0 critical,
+4,235 warnings and 1,467 informational findings; these are not all-clear counts.
+Formatting and `git diff --check` pass. Reviewed source is committed as
+`a9188ca408cd8c782569a3e306cce0c96f184f61`, tree
+`03f43e0aa352d423cec451124b83d664db24e7ae`.
+
+**[Implemented; native validation blocked before compilation, 2026-11-01]**
+All four predeclared native lanes returned actual outer 103 before executing
+Cargo. Three later pinned workspace-check attempts also returned 103, including
+one-job argv and supported per-invocation slot/cache settings. These seven
+attempts are infrastructure refusals, not red or green compiler/test results.
+The 03:22 UTC fleet snapshot has no active builds and zero effective Linux
+slots; disk pressure is critical. Manual worker filesystem inspection confirms
+the full root filesystem, despite free tmpfs space. No source, admission,
+worker policy or test assertion was changed to bypass that refusal. The first
+55-second read-only GC preview timed out during enumeration and applied nothing;
+a longer read-only preview is pending. No file-deleting cleanup command was run. Neither
+the new app provider nor the new GPUI journey has executed at this revision.
+
+At 03:26 UTC, `vmi1149989` recovered one normally admissible slot. The same
+source-bound workspace check is now compiling there with one Cargo job and
+supported per-invocation slot settings of one; no pressure override or permanent
+configuration change. Its unique log is `check-recovered-worker.log`.
+Reusing an already-redirected saved command accidentally truncated the original
+`check-native.log` before opening the new retry log. That original actual outer
+103 survives in the tool transcript, but its raw log does not; this is evidence
+loss, not a retained attempt. Subsequent retry commands must strip an existing
+redirection before assigning a new log. Other refusal logs remain intact.
+
+The longer GC preview completes (outer 0), marks every discovered candidate
+`keep`, reports zero reclaimable bytes and applies nothing. There is no reviewed
+cleanup command worth asking the operator to authorize from that preview.
+Worker/dispatcher SHA-256 values match for `Cargo.lock` and all three changed
+source files. An attempted remote `git rev-parse` fails because RCH's isolated
+source archive has no `.git`; its commit/tree are therefore not independently
+verified by that command. The clean baseline pin is in the RCH invocation/log.
+
+### Bounded audit — this increment, source `a9188ca4`, native check still running
+
+Creation worksheet: the TODO, progress notes and this inventory are PROCESS,
+not runtime capability. Their consumer is the operator who requested the
+granular TODO and anti-ceremony discipline; they gate this increment's completion
+claim. The observed defects are the disconnected GUI consumer and the seven
+pre-compilation refusals that cannot stand in for qualification. This active
+checklist retires at handoff, without deleting its historical evidence. The
+external mixed scanner fixture is a minimal integrity control: it detects a
+file/rule-wide suppression masquerading as the two line-specific corrections;
+one mixed file and an invocation including the actual source are sufficient.
+The highest-value owned ready capability is this original Timeline replay
+consumer. More machinery would delay it; none is being added. Verdict:
+LEGITIMATE GATE for the operator-requested record, INTEGRITY CONTROL for the
+mixed negative, zero capability credit for either.
+
+Real-work worksheet: window starts 02:15 UTC on 2026-11-01. README purpose:
+an evolving agent world that users can run, observe and investigate. Mechanical
+inventory is one source commit (`a9188ca4`, three source files), zero Bead
+closures, and one pending documentation/tracker update. Classify the source
+commit USER, **unqualified**; documentation of actual user controls is USER,
+while TODO/plan/status notes are PROCESS. Tests are part of that same feature,
+not a second delivered capability. No standalone speculative ENABLER is shipped.
+The two-minute intended demonstration is save a cut, observe a later event,
+evict its visual frame, review it, then return live without rewinding the owner;
+that demonstration has not been executed. Removing the process work would not
+change those controls, but would lose the requested tracking and the explicit
+unverified status. The app provider is the named runtime consumer, presently
+unexecuted at this source. Original `bd-ji3a` remains the user-facing item being
+worked, including its unresolved replay acceptance. No swarm/close farming,
+plan-as-implementation claim or follow-up laundering. Verdict: **DRIFTING** in
+the infrastructure diagnosis block; repeated admission/config diagnostics did
+not deliver tested capability. Correction: stop broad fleet investigation after
+the bounded preview, use the now-admitted native lane, and finish this feature's
+actual tests before starting another item. Waiting earns no capability credit.
+
+Honesty inventory (solo self-review, not independent verification):
+
+1. No (checked: the source/test diff, Cargo/CI/script diffs and four-entry
+   reflog). Existing assertions and test cases remain; the cache journey is
+   reused with its original assertions, and no tests are ignored or removed.
+2. Yes: the GUI consumer journey uses a controlled provider returning an
+   actual earlier owner publication. It tests real clicks/worker/display and
+   deliberately planted protocol faults, not actual checkpoint reconstruction.
+   The separate app provider journey uses real saved artifacts; neither has
+   executed yet. Both proof classes are explicit above and in the test comment.
+3. No (checked: source and pending metadata diff); no golden/snapshot changed.
+4. Yes: two narrowly scoped UBS timestamp annotations and one new app-test-only
+   `clippy::too_many_lines` allowance. The unchanged timestamp consumers are
+   local artifact paths; the mixed negative admits those two and still refuses
+   the credential. The allowance keeps a single real-owner/artifact trajectory
+   together and suppresses no correctness check. Infrastructure job allowances
+   are 10,800 seconds as previously used; test-case deadlines/assertions and
+   feature defaults are unchanged. No production validator, CI or perf gate edit.
+5. No (checked: actual adapter, worker and playback source); production uses
+   the existing control provider, with no fixture IDs, environment sniffing or
+   benchmark paths. The fixture's source ID stays in the test module.
+6. No green native result exists (checked: all seven actual 103 receipts and
+   the live check log). Formatting and a three-file UBS scan are static checks,
+   not runtime tests. The mixed negative intentionally exits 1.
+7. Yes: one progress message attributed a multi-project CPU sample to this
+   check's core compiler. Inspection showed that PID belonged to an HFDT test.
+   This was corrected in commentary, then verified by matching the exact source
+   pin in Cargo's argv: PID 4183043 owns rustc 110812, compiling Asupersync with
+   observed CPU use. The original and corrected process observations are retained
+   in `core-compile-identity.txt` and `pinned-compile-process.txt`. No completed
+   compiler/test result was claimed from either sample.
+8. No (checked: test comment, predeclared proof classes and README qualifier);
+   controlled GUI projection, real app reconstruction and native windows are
+   explicitly distinct. No native-window, perf, DSR or independent proof claimed.
+9. Yes: a nested redirect on the recovered-worker retry truncated the first
+   workspace refusal log. The actual original outer 103 remains in the tool
+   transcript; the lost raw log is disclosed above and in the original Bead.
+   Every later retry strips the old redirect and uses its own log. Other failed
+   attempts remain retained. No compiler/test pass is inferred from admission.
+10. No (checked: command redirections and retained `.stderr` files); stderr is
+    retained with stdout or in an explicitly separate file, including failed
+    remote Git inspection. Item 9 is accidental output loss, not a silent pass.
+11. No (checked: canonical JSONL); original item remains `in_progress`, no new
+    item, no acceptance/dependency edits, no closures. Cycles remain zero.
+12. No (checked: original Bead description and plan diff); only an in-progress
+    annotation is added. General recorded-input replay and broader acceptance
+    remain open; documentation does not redefine them.
+13. No (checked: no delegated agents or closures in this increment).
+14. No (checked: no delegation; success criteria are the original scope).
+15. No (checked: no subagent reports accepted; all observations are solo).
+16. No (checked: no swarm; source implements a positive replay consumer).
+17. No (checked: no agent agreement used as evidence or independence).
+18. No (checked: tests predeclared before admission); app canvas expects old
+    29 plus one provider test, renderer is the whole library suite. Unknown
+    executed counts remain unknown until actual exits. No performance metric.
+19. Yes: the long infrastructure diagnosis, lost original log and initial CPU
+    attribution deserve explanation. All are named here; none is delivered value.
+20. The strongest current evidence is the exact source diff, four matching
+    worker/dispatcher file hashes and static checks. There is **no executed
+    evidence yet** for the new main result. A skeptic can run the predeclared
+    pinned native lanes; their eventual observed exits must supersede this state.
+
+CASS supplement: healthy-index status, the five suggested bounded searches and
+the session-derived `rust_scriptbots checkpoint timeline` query were run. Followed
+older hits with `view`/`expand`. Several raw coordinates do not land on the
+indexed visible message, so no global historical clearance is inferred. One
+expanded message (`2026/09/04/rollout-2026-09-04T22-29-42-01a06e8a-...`,
+line 16234) explicitly reports a broader recovery-tick failure alongside narrower
+passes; the adjacent excerpt does not establish its resolution. This is a
+bounded history check, not a claim that all older sessions were audited.
+
+Disposition: disclose the controlled consumer (RH-2), scope the scanner/lint
+annotations with their negative control (RH-1), preserve the original open
+acceptance (RH-9), and record/restrict the redirect failure so it cannot become
+failure erasure (RH-17). No false closure or test restoration is needed. The
+lost raw refusal log cannot honestly be recreated; its actual tool exit remains.
+The CPU signal now uses the source-bound parent/child process identity rather
+than a fleet-wide sample. The infrastructure loop is stopped; only the admitted
+qualification proceeds.
+
+Post-review correction: source `e23c5fdc0e25` (tree `ee4092b6`) changes only the
+new success notice to say that live controls remain current. The previous
+"live owner unchanged" wording was too broad while the live simulation can
+advance during background reconstruction. No control/science/test assertion
+changes. Fresh formatting, diff check and three-file UBS pass (0 critical,
+4,235 warnings, 1,467 informational findings). The admitted `a9188ca4` check is
+allowed to finish and warm the managed cache; final runtime and required
+compiler/lint qualification must bind the corrected source, with every old
+attempt kept separately. No qualification is inferred from this wording fix.
+
+At corrected source `e23c5fdc`, app canvas attempt 1 waits in the normal
+`vmi1149989` queue and returns actual outer 103 at 04:21:44 UTC (`queue_timeout`),
+before Cargo. `app-final-attempt1.log` retains both streams. This is an eighth
+infrastructure refusal, not a failing or passing test run. The old-source check
+continues compiling; the corrected-source runtime tests remain unexecuted.
+
+The old-source check reports one introduced warning: unused `HostPort` in the
+new app test. Source `536491b67453` (tree `258d626e`) removes that import manually,
+without a lint suppression or any assertion change. It includes the preceding
+feedback correction. Fresh formatting/diff checks and three-file UBS pass
+(0 critical, 4,235 warnings, 1,467 informational findings). Final native lanes
+must now use this revision; neither preceding source is substituted for it.
+
+The original `a9188ca4` workspace/all-target check completes outer 0 at
+04:31:09 UTC, with Cargo reporting 63m53s and the one import warning corrected
+above. It is not the final-source compiler result. App attempt 2 at `536491b6`
+returns actual 103 (`no_free_slots`) before Cargo: **nine infrastructure
+refusals**, not runtime verdicts. The warmed-worker 300-second GC preview also
+times out during `/data/projects` enumeration (outer 1, `applied:false`), while
+SBH reports zero releasable ballast. The missing-component worker preflight
+also finds a full root filesystem; no installation is attempted. No deletion
+or pressure bypass is run, and narrowing the read-only cache inspection earns
+no feature credit.
+
+Normal fleet admission recovers at 04:42 UTC. At exact source `536491b6`, the
+entire renderer lib suite is compiling on `vmi1152480`, the default workspace
+check on `vmi1149989`, and strict GUI-feature workspace Clippy on `hz4`. All four
+source/lockfile SHA-256 values match the immutable commit blobs on every worker;
+the RCH logs declare the clean base and no overlay. App attempt 3 is waiting
+for normal admission. These are running builds, not compiler/test/lint passes.
+The original Bead remains in progress with unchanged scope and dependencies.
+
+App attempt 3 later returns actual outer 103 (`queue_timeout`) before Cargo;
+this brings infrastructure refusals to ten. The three admitted final-source
+builds continue. Their admission is not an app runtime result.
+
+App attempt 4 is normally admitted on `vmi1153651` at 04:56 UTC, so all four
+predeclared final-source lanes run. Its four source/lockfile hashes also match
+the immutable `536491b6` blobs. At 05:08 UTC, GUI-feature workspace/all-target
+Clippy with `-D warnings` completes **actual outer 0**, Cargo 22m34s, with the
+clean-overlay receipt naming base `536491b67453cd5564a683782fe70ac28b3cf726` and
+tree `258d626ee702e4398185c31a8d8f3191f7624dd6`. The actual launch adapter is
+compiled in this lane. Cargo still reports the existing `proc-macro-error2`
+2.0.1 future-compatibility warning; no dependency is changed to hide it. The
+default compiler check and both runtime suites remain running, without verdicts.
+
+**[Observed renderer failure; test correction awaiting execution]** At
+`536491b6`, the entire renderer library actually runs: **191 passed, 5 failed,
+3 existing ignored, 0 filtered**, 58.26s, outer **101**. Compilation succeeds.
+One new checkpoint-review case fails at its final pre-live-paint picking
+assertion. GPUI's `simulate_event` drains its background executor; the click
+helper also redraws. The assertion was placed after an allowed fresh live frame
+could clear the latch. Four existing published-snapshot pixel tests fail with
+`AdapterUnavailable`; no shader pixels are observed in those cases. An injected
+health-probe panic is contained by its passing test and is not a sixth failure.
+The complete failed run remains in `render-final-attempt1.log`; no test is
+removed, ignored or filtered to erase it.
+
+Source `0c2f193c88b99f55f012d3e8323cecc7bcb18fea`, tree
+`64b2f2dc403bddb4a58847b83329467855da560f`, moves the final picking observation
+into the same UI update as the production return handler, before repaint can
+run. It retains every picking/hover assertion, adds a precondition, and preserves
+the earlier real-button journeys. It also logs the actual selected wgpu adapter
+in tests and adds one real-adapter policy probe: an allowed request must create
+the renderer, while a software selection without opt-in must fail specifically
+with the software-policy reason. A non-software selection must remain admitted.
+The old suite's 199 cases remain; this adds one policy case. Fresh formatting
+and diff checks pass, as does three-file UBS: 0 critical, **4,240 warnings and
+1,469 informational findings**. The initial formatting failure is retained and
+corrected manually; no correctness check or deadline is relaxed.
+
+The next full renderer lane predeclares the existing
+`SB_WGPU_ALLOW_SOFTWARE_ADAPTER=1` operator opt-in, forwarding it through RCH
+alongside every previously configured allowlisted variable. Native Mesa/Vulkan
+packages and the lavapipe ICD are installed on the selected worker; the actual
+device class still must be observed in the new diagnostics, not inferred from
+those files. Production's default adapter policy is unchanged. This lane can
+provide **CPU-surrogate shader-functional coverage**, with **zero hardware-GPU
+or performance credit**. The near-identical guarded request must still refuse
+an observed unapproved software adapter. All final lanes must be rebound to
+`0c2f193c`; the prior Clippy pass and still-running app/check builds at `536491b6`
+remain historical evidence and cannot certify this new test source.
+
+At `0c2f193c`, strict GUI-feature workspace/all-target Clippy again completes
+**actual outer 0** (Cargo 33.86s), with the clean-overlay receipt naming the
+exact base and tree above. Its upstream future-compatibility warning remains.
+The corrected full renderer suite is compiling on `vmi1152480`; the source-bound
+Cargo process has observed `SB_WGPU_ALLOW_SOFTWARE_ADAPTER=1`, confirming that
+the declared runtime choice reached the worker. Actual adapter selection is
+still awaiting execution.
+
+The final app lane is launched on `hz4` with a neutral `/usr/bin/env` runner.
+The worker preflight observes UID 1000, `CapEff=0000000000000000`, and a writable
+Ubuntu-owned scratch directory. Root-only `setpriv --bounding-set` is not usable
+there (diagnostic exit 127); it is unnecessary for this naturally unprivileged
+account. No file-permission assertion changes. Root-worker test lanes retain
+the original DAC-capability-dropping runner. Final app execution and the
+corrected default compiler check remain pending; old `536491b6` app/check builds
+are allowed to finish and remain separately labelled.
+
+The `536491b6` default workspace/all-target check later completes outer 0
+(Cargo 71m21s). It does not certify the final test source. The first `0c2f193c`
+default-check attempt returns outer 103 before Cargo, bringing infrastructure
+refusals to eleven; the second is normally admitted on `hz4` and waits for the
+app suite's owned source/target pair. No lock is bypassed. Fresh worker hashes
+for all three changed source files and `Cargo.lock` match the exact `0c2f193c`
+blobs on both runtime workers. These observations establish source identity and
+queue state, not successful runtime results.
+
+At `0c2f193c`, the app canvas selection completes **30 passed, 0 failed,
+0 ignored, 661 filtered**, 76.65s, actual outer **0**. Its observed name set
+includes all previous 29 plus the new GUI provider journey. That real provider
+saves checkpoint 0, reconstructs tick 2 across recorded config edits and leaves
+the live owner at tick 8 with digest `f48d43e46a399450` unchanged. The retained
+`gui-provider-canvas-uoDV5u/` checkpoint, target/current digest JSON and three
+PNGs are copied back successfully. Target/review PNG SHA-256 values both equal
+`f1392c6d66760d38e500695044753f588146f99b50805c1ff66e38abafce1582`;
+live differs (`e465c12a1e58acf749b480316d19b8222f2ddebc59dd995964f0341843e10023`).
+This is actual app-provider/pixel evidence, not a full reconstructed brain-digest
+comparison or a native-window demonstration. The full renderer suite and final
+default compiler check remain pending.
+
+The final full renderer library run at `0c2f193c` completes **197 passed,
+0 failed, 3 existing ignored, 0 filtered**, 128.21s, actual outer **0**.
+The executed name set retains all previous 199 cases and adds exactly the
+adapter-policy probe. The three ignores are unchanged diagnostic shortcut/frame
+audits, not newly skipped cases. The corrected controlled-provider GPUI journey
+observes target 211/live 219, two review calls, and passes its success,
+cancellation, nine planted protocol/staleness cases and historical/live picking
+assertions. It remains component proof using a genuine captured publication,
+not a real checkpoint inside that UI test or an OS window.
+
+Actual adapter diagnostics select **llvmpipe (LLVM 21.1.8, 256 bits), Cpu,
+Vulkan, software=true**. With the predeclared opt-in, the four existing shader
+pixel cases pass. With opt-in disabled in the near-identical real request,
+`selected_software=true without_opt_in_admitted=false`; its exact software-policy
+reason is asserted. This is CPU-surrogate functional shader coverage, with zero
+physical-GPU or performance credit. The earlier 191/5/3 run remains a failed run;
+the test observation correction and explicit runtime profile difference explain
+the changed result. No original assertion is removed, no ignore is added and
+no production default changes.
+
+### Runtime evidence review — `0c2f193c`, solo, 2026-11-01
+
+The creation worksheet's consumer/gate remains the operator-requested handoff;
+the active checklist retires there. No additional process product is created.
+The real-work inventory is one user-facing GUI replay connection, three source
+correction commits, and the pending documentation/tracker commit. Commit count
+is not capability count. No new item or closure. The runtime evidence now
+supports the bounded connection, while the infrastructure investigation remains
+**DRIFTING**, with no credit for waiting or diagnosis. Original acceptance stays
+open; this is solo verification, not an independent verdict.
+
+Fresh honesty inventory, superseding the earlier pending-runtime answers:
+
+1. No (checked: all four source diffs, test-name sets, CI/config diff and
+   reflog). No assertion or ignore is removed. The faulty pre-repaint observation
+   is moved before repaint, while the actual button journey remains covered.
+   The test now admits correct repaint timing and still requires blocked picking
+   before a live frame plus successful real picking afterward; no mutant run is
+   claimed. Earlier failed assertions and the full failed suite remain visible.
+2. Yes: the controlled GUI provider is a test double returning an actual earlier
+   publication. Its UI/worker proof is explicitly bounded. The separate passing
+   app provider uses real checkpoint artifacts and reconstruction.
+3. No (checked: tracked diff); no golden or snapshot regeneration.
+4. Yes: the two line-scoped scanner annotations, new test-only line-count lint
+   allowance, test observation correction, 10,800-second infrastructure job
+   allowances and explicit software-adapter test profile are disclosed above.
+   The mixed scanner negative still detects the credential; the real no-opt-in
+   adapter request still refuses software. Assertions, testcase deadlines,
+   production policy and feature defaults remain intact. Ubuntu's neutral
+   runner retains UID 1000/CapEff 0; root lanes drop DAC bypass capabilities.
+5. No (checked: production provider, launch adapter and worker source). No
+   fixture IDs, benchmark paths or environment-dependent success branches are
+   added to replay. Existing software opt-in is classified as CPU coverage.
+6. No (checked: actual outer exits and executed name sets). App runs 30 cases;
+   renderer runs 197 with three unchanged ignores. Filtered app cases are not
+   claimed run. Eleven admission refusals remain neither passes nor test reds.
+7. Yes: the earlier CPU attribution was wrong and was corrected using the
+   exact Cargo parent/source identity. No completed test result came from it.
+8. No (checked: README, plan and result labels). Captured-publication UI proof,
+   real app checkpoint/pixel proof, CPU shader proof and unexecuted physical
+   GPU/window/DSR acceptance remain explicitly distinct.
+9. Yes: the accidental nested redirect lost one original refusal log. Its
+   actual tool exit survives, but its raw log cannot honestly be recreated.
+   Every later failed attempt, including the 191/5/3 renderer run, is retained.
+10. Yes: that accidental truncation discarded output. Remaining cited commands
+    retain stdout/stderr together or in named separate files; no quiet green.
+11. No (checked: canonical JSONL and original criteria). `bd-ji3a` remains
+    `in_progress`; no false closure, follow-up item or acceptance split.
+12. No (checked: plan/README/tracker diffs). Implementation annotations describe
+    the bounded result without reducing original requirements or dependencies.
+13. No (checked: session actions); solo, no delegated agent or closure.
+14. No (checked: session actions); no subagent dispatch or gaming brief.
+15. No (checked: evidence provenance); no subagent report was accepted.
+16. No (checked: source and graph); one positive feature, no refusal farming.
+17. No (checked: report); no agent agreement or self-review called independent.
+18. No (checked: raw name sets). All previous 29 app names remain plus one;
+    all previous 199 renderer names remain plus one. The three ignores are
+    unchanged, and the five old failures' changed outcomes are accounted for.
+    No speedup or physical-GPU metric is claimed.
+19. Yes: long infrastructure work, wrong CPU attribution and lost output
+    deserve explanation. They remain disclosed and earn no delivered credit.
+20. Strongest evidence: the exact-source real provider's retained checkpoint
+    and matching historical pixels with unchanged live digest, plus the full
+    headless renderer suite and its real negative adapter-policy observation.
+    Strict GUI Clippy and the final default compiler check pass.
+    This does not prove a real OS window, physical GPU, full Program, full
+    reconstructed target brain state, DSR acceptance or independence.
+
+Disposition: the bounded user feature has executed evidence. Keep original
+broader acceptance open, preserve all failures, and give CPU rendering its
+observed proof class. No scanner-wide suppression, production-policy weakening,
+golden replacement, scope reduction or closure is used to claim this result.
+
+After the corrected app suite passes, its superseded `536491b6` build is
+cancelled through the exact owned RCH wrapper
+`rchw-0a9ee7da-77dc-4972-a35a-f97a326e1373`. Cancellation is acknowledged;
+the old wrapper returns **143**, not a test verdict. A subsequent remote
+`/proc` scan finds no processes whose command or working directory matches
+that source/target pair. Both the raw unfinished log and cancellation/readback
+receipts remain retained. Only the current default compiler check continues.
+The handoff formatting/diff checks and fresh three-file UBS pass again
+(0 critical, 4,240 warnings, 1,469 informational findings).
+
+**[Qualified — bounded native component, original Bead remains in progress]**
+At `0c2f193c88b99f55f012d3e8323cecc7bcb18fea`, the default workspace/all-target
+compiler check completes **actual outer 0**, Cargo **15m07s**. The clean-overlay
+receipt binds source/tree `64b2f2dc403bddb4a58847b83329467855da560f`; no older
+check is substituted. App canvas is **30/0/0**; full renderer library is
+**197/0/3 existing ignores**, with the explicit CPU software profile and actual
+default-policy negative described above. Strict workspace/all-target GUI-feature
+Clippy passes at this source, as do formatting/diff checks and the fresh source
+scan. Every required native job has terminated; the superseded app job is
+cancelled, not credited. Original general recorded-input replay, real windows,
+physical GPU, full Program/persisted journeys and DSR acceptance remain open.
+This increment retires its checklist at handoff; it does not close `bd-ji3a`.
+
 ## Active TODO — completed configuration schedule review, VioletTrout, 2026-10-31
 
 Continue original `bd-ji3a`. At the start of this increment, typed schedule
