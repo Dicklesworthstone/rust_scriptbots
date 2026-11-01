@@ -4079,6 +4079,33 @@ pub mod renderer {
     use crate::{CommandSubmit, ControlRuntime, ScenarioIdentityV0, SharedAnalytics};
     use scriptbots_runtime::channel::ChannelHostPort;
 
+    /// Bridge the GUI to the same retained checkpoints and verified event replay
+    /// used by the terminal. The GUI invokes this on its bounded background worker.
+    #[cfg(any(feature = "gui", test))]
+    #[must_use]
+    pub fn timeline_review_submit(
+        control: crate::control::ControlHandle,
+    ) -> scriptbots_render::TimelineReviewSubmit {
+        use scriptbots_render::{TimelineReviewRequest, TimelineReviewResponse};
+        Arc::new(move |request| match request {
+            TimelineReviewRequest::SaveCheckpoint => control
+                .create_checkpoint(crate::control::CheckpointCreateRequest::default())
+                .map(|checkpoint| TimelineReviewResponse::CheckpointSaved {
+                    checkpoint_id: checkpoint.checkpoint_id,
+                    tick: checkpoint.tick,
+                })
+                .map_err(|error| error.to_string()),
+            TimelineReviewRequest::ReviewEvent { tick } => control
+                .event_canvas(tick)
+                .map(|review| TimelineReviewResponse::EventFrame {
+                    snapshot: review.snapshot,
+                    checkpoint_id: review.checkpoint_id,
+                    base_tick: review.base_tick,
+                })
+                .map_err(|error| error.to_string()),
+        })
+    }
+
     /// Shared context passed to renderer implementations.
     pub struct RendererContext<'a> {
         pub host: ChannelHostPort,
@@ -4095,6 +4122,145 @@ pub mod renderer {
 
         /// Launch the renderer; blocks until the rendering session completes.
         fn run(&self, ctx: RendererContext<'_>) -> Result<()>;
+    }
+
+    #[cfg(test)]
+    mod timeline_tests {
+        use super::*;
+        use crate::control::tests::TestHost;
+        use scriptbots_core::ScriptBotsConfig;
+        use scriptbots_render::{
+            TimelineReviewRequest, TimelineReviewResponse, render_png_offscreen,
+        };
+        use scriptbots_runtime::HostPort;
+
+        #[test]
+        // One real owner, retained artifact, historical oracle and refusal journey.
+        #[allow(clippy::too_many_lines)]
+        fn gui_timeline_canvas_provider_reconstructs_actual_pixels_without_changing_the_owner() {
+            let directory = tempfile::Builder::new()
+                .prefix("gui-provider-canvas-")
+                .tempdir()
+                .unwrap()
+                .keep();
+            let mut world = scriptbots_core::WorldState::new(ScriptBotsConfig {
+                rng_seed: Some(42),
+                world_width: 120,
+                world_height: 120,
+                food_cell_size: 20,
+                persistence_interval: 0,
+                closed: true,
+                topography_enabled: false,
+                initial_food: 0.0,
+                food_growth_rate: 0.001,
+                ..ScriptBotsConfig::default()
+            })
+            .unwrap();
+            let brains = crate::install_brains(&mut world, crate::BrainPreset::Mlp)
+                .unwrap()
+                .population;
+            crate::seed_founders(&mut world, &brains, crate::FounderRecipe::Spread).unwrap();
+            let host = TestHost::spawn(world);
+            let handle = host.handle().with_artifacts_dir(directory.clone()).unwrap();
+            let provider = timeline_review_submit(handle.clone());
+            assert!(provider(TimelineReviewRequest::ReviewEvent { tick: 0 }).is_err());
+            let (checkpoint_id, saved_tick) =
+                match provider(TimelineReviewRequest::SaveCheckpoint).unwrap() {
+                    TimelineReviewResponse::CheckpointSaved {
+                        checkpoint_id,
+                        tick,
+                    } => (checkpoint_id, tick),
+                    TimelineReviewResponse::EventFrame { .. } => panic!("save returned a frame"),
+                };
+            assert_eq!(saved_tick, 0);
+            assert_eq!(handle.get_checkpoint(&checkpoint_id).unwrap().tick, 0);
+            host.wait_applied(&handle.step().unwrap());
+            host.wait_applied(
+                &handle
+                    .apply_patch(serde_json::json!({"food_growth_rate":0.004}))
+                    .unwrap(),
+            );
+            host.wait_applied(&handle.step().unwrap());
+            let target = handle.read_snapshot().unwrap();
+            let target_digest = host.port.scientific_digest_v1().unwrap();
+            host.wait_applied(&handle.step().unwrap());
+            host.wait_applied(
+                &handle
+                    .apply_patch(serde_json::json!({"food_growth_rate":0.001}))
+                    .unwrap(),
+            );
+            for _ in 3..8 {
+                host.wait_applied(&handle.step().unwrap());
+            }
+            let current = handle.read_snapshot().unwrap();
+            let digest = host.port.scientific_digest_v1().unwrap();
+            let reviewed = match provider(TimelineReviewRequest::ReviewEvent {
+                tick: target.world.tick,
+            })
+            .unwrap()
+            {
+                TimelineReviewResponse::EventFrame {
+                    snapshot,
+                    checkpoint_id: source,
+                    base_tick,
+                } => {
+                    assert_eq!(source, checkpoint_id);
+                    assert_eq!(base_tick, saved_tick);
+                    snapshot
+                }
+                TimelineReviewResponse::CheckpointSaved { .. } => {
+                    panic!("review returned a save receipt")
+                }
+            };
+            assert_eq!(reviewed.world.tick, target.world.tick);
+            assert_eq!(
+                reviewed.config.food_growth_rate.to_bits(),
+                target.config.food_growth_rate.to_bits()
+            );
+            let target_pixels = render_png_offscreen(&target, 360, 360);
+            let live_pixels = render_png_offscreen(&current, 360, 360);
+            let reviewed_pixels = render_png_offscreen(&reviewed, 360, 360);
+            assert_ne!(
+                target_pixels, live_pixels,
+                "target/live visual oracles must differ"
+            );
+            assert_eq!(
+                reviewed_pixels, target_pixels,
+                "GUI provider must show the actual historical world"
+            );
+            assert!(
+                provider(TimelineReviewRequest::ReviewEvent {
+                    tick: current.world.tick + 1
+                })
+                .is_err()
+            );
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), digest);
+            assert!(Arc::ptr_eq(&handle.read_snapshot().unwrap(), &current));
+            for (name, bytes) in [
+                ("target.png", target_pixels),
+                ("live.png", live_pixels),
+                ("review.png", reviewed_pixels),
+            ] {
+                std::fs::write(directory.join(name), bytes).unwrap();
+            }
+            std::fs::write(
+                directory.join("target-digest.json"),
+                serde_json::to_vec_pretty(&target_digest).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(
+                directory.join("current-digest.json"),
+                serde_json::to_vec_pretty(&digest).unwrap(),
+            )
+            .unwrap();
+            eprintln!(
+                "GUI provider canvas: source={saved_tick} target={} live={} digest={}; {}",
+                target.world.tick,
+                current.world.tick,
+                digest.overall,
+                directory.display()
+            );
+        }
     }
 }
 

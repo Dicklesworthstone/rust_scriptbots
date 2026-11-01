@@ -58,7 +58,7 @@ use std::{
     f32::consts::{FRAC_PI_2, FRAC_PI_4, PI},
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicU64, Ordering as AtomicOrdering},
+        atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
     },
     time::{Duration, Instant},
 };
@@ -1021,6 +1021,7 @@ pub mod world_compositor {
         };
 
         fn unique_capture_dir(label: &str) -> std::path::PathBuf {
+            // ubs:ignore[rust.security.non-crypto-random] — test artifact path stamp; never a credential or authentication nonce.
             let nonce = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("system time must follow the Unix epoch")
@@ -1259,6 +1260,7 @@ mod wgpu_capture_test {
     }
 
     fn capture_target(label: &str) -> (std::path::PathBuf, String, std::path::PathBuf) {
+        // ubs:ignore[rust.security.non-crypto-random] — test PNG filename stamp; never a credential or authentication nonce.
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system time must follow the Unix epoch")
@@ -2622,6 +2624,8 @@ struct GuiSession {
     accessibility: Arc<Mutex<AccessibilitySettings>>,
     selection_projection: Arc<Mutex<Option<Vec<AgentId>>>>,
     selection_submission: Arc<Mutex<()>>,
+    timeline_submit: Option<TimelineReviewSubmit>,
+    timeline_cancelled: Arc<AtomicBool>,
 }
 
 impl GuiSession {
@@ -2655,6 +2659,8 @@ impl GuiSession {
             accessibility: Arc::new(Mutex::new(AccessibilitySettings::default())),
             selection_projection: Arc::new(Mutex::new(None)),
             selection_submission: Arc::new(Mutex::new(())),
+            timeline_submit: None,
+            timeline_cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -2672,6 +2678,10 @@ impl GuiSession {
         view.accessibility = Arc::clone(&self.accessibility);
         view.map_sandbox = Arc::clone(&self.map_sandbox);
         view.map_apply_submit = self.map_apply_submit.clone();
+        view.timeline_cancelled = Arc::clone(&self.timeline_cancelled);
+        if role == GuiViewRole::Hud {
+            view.timeline_submit = self.timeline_submit.clone();
+        }
         view.focus_handle = Some(focus_handle);
         if role == GuiViewRole::WorldCanvas {
             view.set_minimal_canvas_mode();
@@ -2760,12 +2770,45 @@ pub type MapApplySubmit = Arc<
         + Sync,
 >;
 
-/// Launch the two-window shell with shared controls and a guarded map editor.
+/// Application-owned checkpoint operations, executed on one background HUD worker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimelineReviewRequest {
+    SaveCheckpoint,
+    ReviewEvent { tick: u64 },
+}
+
+pub enum TimelineReviewResponse {
+    CheckpointSaved {
+        checkpoint_id: String,
+        tick: u64,
+    },
+    EventFrame {
+        snapshot: Arc<RenderSnapshot>,
+        checkpoint_id: String,
+        base_tick: u64,
+    },
+}
+
+pub type TimelineReviewSubmit = Arc<
+    dyn Fn(TimelineReviewRequest) -> std::result::Result<TimelineReviewResponse, String>
+        + Send
+        + Sync,
+>;
+
+struct TimelineReviewJob {
+    request: TimelineReviewRequest,
+    selection: Option<NarrativeEventRecord>,
+    session: scriptbots_runtime::HostSessionId,
+    result: std::sync::mpsc::Receiver<std::result::Result<TimelineReviewResponse, String>>,
+}
+
+/// Launch the two-window shell with shared controls, map editing and checkpoint review.
 pub fn run_demo(
     host: ChannelHostPort,
     analytics: AnalyticsSnapshotProvider,
     command_submit: Arc<dyn Fn(ControlCommand) -> Option<String> + Send + Sync + 'static>,
     map_apply_submit: MapApplySubmit,
+    timeline_submit: TimelineReviewSubmit,
     health_probe: GuiHealthProbe,
 ) -> Result<(), GuiRunError> {
     if let Ok(Some(snapshot)) = host.clone().snapshot_after(None)
@@ -2784,6 +2827,7 @@ pub fn run_demo(
     let host_snapshots = host.snapshot_hub();
     let mut session = GuiSession::new(host, analytics, command_submit);
     session.map_apply_submit = Some(map_apply_submit);
+    session.timeline_submit = Some(timeline_submit);
     let session = Arc::new(session);
     let session_for_app = Arc::clone(&session);
     let run_error = Arc::new(Mutex::new(None));
@@ -4547,6 +4591,9 @@ pub struct SimulationView {
     /// The Lab reviews frames in the actual World window, whose cache is independent.
     world_view: Option<gpui::WeakEntity<SimulationView>>,
     world_review_feedback: Option<String>,
+    timeline_submit: Option<TimelineReviewSubmit>,
+    timeline_job: Option<TimelineReviewJob>,
+    timeline_cancelled: Arc<AtomicBool>,
     perf: PerfStats,
     last_perf: PerfSnapshot,
     /// When set, `render` must NOT overwrite `last_perf` (bd-c7pg).
@@ -4673,6 +4720,9 @@ impl SimulationView {
             playback: PlaybackState::new(240),
             world_view: None,
             world_review_feedback: None,
+            timeline_submit: None,
+            timeline_job: None,
+            timeline_cancelled: Arc::new(AtomicBool::new(false)),
             perf: PerfStats::new(240),
             last_perf: PerfSnapshot::default(),
             forced_perf: None,
@@ -6382,6 +6432,9 @@ impl SimulationView {
     }
 
     fn update_selection_from_point(&mut self, position: Point<Pixels>, extend: bool) -> bool {
+        if self.playback.displaying_history || !matches!(self.playback.mode(), PlaybackMode::Live) {
+            return false;
+        }
         let Some(world_point) = self.canvas_to_world(position) else {
             if extend {
                 return false;
@@ -6515,6 +6568,9 @@ impl SimulationView {
     }
 
     fn update_hover_from_point(&mut self, position: Point<Pixels>) -> bool {
+        if self.playback.displaying_history || !matches!(self.playback.mode(), PlaybackMode::Live) {
+            return false;
+        }
         let hovered = if let Some(world_point) = self.canvas_to_world(position) {
             if let Ok(snapshot) = self.read_snapshot() {
                 let radius = self.selection_pick_radius(&snapshot);
@@ -6752,6 +6808,7 @@ impl SimulationView {
                 };
                 let listener = cx.listener(move |this, _event, _, cx| {
                     if this.dashboard_tab != tab {
+                        this.timeline_cancelled.store(true, AtomicOrdering::Release);
                         this.dashboard_tab = tab;
                         cx.notify();
                     }
@@ -6763,6 +6820,7 @@ impl SimulationView {
                         || key.trim().is_empty()
                     {
                         if this.dashboard_tab != tab {
+                            this.timeline_cancelled.store(true, AtomicOrdering::Release);
                             this.dashboard_tab = tab;
                             cx.notify();
                         }
@@ -7950,10 +8008,11 @@ impl SimulationView {
             div()
                 .text_xs()
                 .text_color(chrome::text_secondary())
-                .child("Timeline — run history · cached World review"),
+                .child("Timeline — run history · World review"),
         );
         let toggle_listener = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
             this.rail_visible = !this.rail_visible;
+            this.timeline_cancelled.store(true, AtomicOrdering::Release);
             cx.notify();
         });
         header_row = header_row.child(
@@ -7965,6 +8024,20 @@ impl SimulationView {
                 .on_mouse_down(MouseButton::Left, toggle_listener),
         );
         rail = rail.child(header_row);
+
+        let save = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
+            this.start_timeline_job(TimelineReviewRequest::SaveCheckpoint, None);
+            cx.notify();
+        });
+        rail = rail.child(
+            div()
+                .debug_selector(|| "narrative-save-checkpoint".to_owned())
+                .text_xs()
+                .text_color(chrome::accent())
+                .cursor_pointer()
+                .child("Save replay checkpoint before future events")
+                .on_mouse_down(MouseButton::Left, save),
+        );
 
         let return_live = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
             this.return_world_to_live(cx);
@@ -8037,8 +8110,9 @@ impl SimulationView {
         // Detail line: the selected event's full text, plus the honest markers.
         let selected_event = &events[selection];
         let tick = selected_event.tick.0;
+        let requested_event = selected_event.clone();
         let review = cx.listener(move |this, _event: &MouseDownEvent, _, cx| {
-            this.review_world_frame(tick, cx);
+            this.review_world_frame(&requested_event, cx);
         });
         rail = rail.child(
             div()
@@ -8077,7 +8151,28 @@ impl SimulationView {
         rail
     }
 
-    fn review_world_frame(&mut self, tick: u64, cx: &mut Context<Self>) {
+    fn review_world_frame(&mut self, event: &NarrativeEventRecord, cx: &mut Context<Self>) {
+        let tick = event.tick.0;
+        if self.timeline_job.is_some() {
+            self.world_review_feedback = Some("A Timeline request is still running.".to_owned());
+            cx.notify();
+            return;
+        }
+        // Pin the rendered event, including the implicit newest selection. A
+        // later publication must not silently move an in-flight review's intent.
+        let published = self.host.snapshot_hub().latest();
+        let index = self.rail_selection.map_or_else(
+            || published.narrative_events.len().saturating_sub(1),
+            |(index, _, _)| index,
+        );
+        if published.narrative_events.get(index) == Some(event) {
+            self.rail_selection = Some((index, tick, event.kind));
+        } else {
+            self.world_review_feedback =
+                Some("Timeline selection changed; select the event again.".to_owned());
+            cx.notify();
+            return;
+        }
         let reviewed = self.world_view.as_ref().and_then(|world| {
             world
                 .update(cx, |view, cx| {
@@ -8089,6 +8184,14 @@ impl SimulationView {
                 })
                 .ok()
         });
+        if reviewed == Some(false) && self.timeline_submit.is_some() {
+            self.start_timeline_job(
+                TimelineReviewRequest::ReviewEvent { tick },
+                Some(event.clone()),
+            );
+            cx.notify();
+            return;
+        }
         self.world_review_feedback = Some(match reviewed {
             Some(true) => {
                 format!("Selected cached World tick {tick}; simulation playback unchanged.")
@@ -8101,7 +8204,128 @@ impl SimulationView {
         cx.notify();
     }
 
+    fn start_timeline_job(
+        &mut self,
+        request: TimelineReviewRequest,
+        selection: Option<NarrativeEventRecord>,
+    ) {
+        if self.timeline_job.is_some() {
+            self.world_review_feedback = Some("A Timeline request is still running.".to_owned());
+            return;
+        }
+        let Some(submit) = self.timeline_submit.clone() else {
+            self.world_review_feedback =
+                Some("Checkpoint review services are unavailable.".to_owned());
+            return;
+        };
+        let (send, result) = std::sync::mpsc::sync_channel(1);
+        let session = self.host.snapshot_hub().latest().session_id;
+        self.timeline_cancelled
+            .store(false, AtomicOrdering::Release);
+        let worker = std::thread::Builder::new()
+            .name("scriptbots-gui-timeline".to_owned())
+            .spawn(move || {
+                let _ = send.send(submit(request));
+            });
+        match worker {
+            Ok(_) => {
+                self.timeline_job = Some(TimelineReviewJob {
+                    request,
+                    selection,
+                    session,
+                    result,
+                });
+                self.world_review_feedback = Some(match request {
+                    TimelineReviewRequest::SaveCheckpoint => "Saving replay checkpoint…".to_owned(),
+                    TimelineReviewRequest::ReviewEvent { tick } => {
+                        format!("Reconstructing World tick {tick}…")
+                    }
+                });
+            }
+            Err(error) => {
+                self.world_review_feedback = Some(format!("Timeline worker unavailable: {error}"));
+            }
+        }
+    }
+
+    fn poll_timeline_job(&mut self, cx: &mut Context<Self>) {
+        let Some(job) = &self.timeline_job else {
+            return;
+        };
+        let result = match job.result.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err("Timeline worker disconnected".to_owned())
+            }
+        };
+        let Some(job) = self.timeline_job.take() else {
+            return;
+        };
+        if matches!(job.request, TimelineReviewRequest::ReviewEvent { .. })
+            && (self.timeline_cancelled.load(AtomicOrdering::Acquire)
+                || self.dashboard_tab != DashboardTab::Timeline
+                || !self.rail_visible
+                || job.selection != self.selected_timeline_event()
+                || job.session != self.host.snapshot_hub().latest().session_id)
+        {
+            self.world_review_feedback =
+                Some("Timeline review cancelled; result discarded.".to_owned());
+            return;
+        }
+        self.world_review_feedback = Some(match (job.request, result) {
+            (_, Err(error)) => format!("Timeline request failed: {error}; World view unchanged."),
+            (
+                TimelineReviewRequest::SaveCheckpoint,
+                Ok(TimelineReviewResponse::CheckpointSaved {
+                    checkpoint_id,
+                    tick,
+                }),
+            ) if !checkpoint_id.is_empty() => format!(
+                "Saved checkpoint {checkpoint_id} at tick {tick}. Later events can be reviewed from this cut."
+            ),
+            (
+                TimelineReviewRequest::ReviewEvent { tick },
+                Ok(TimelineReviewResponse::EventFrame {
+                    snapshot,
+                    checkpoint_id,
+                    base_tick,
+                }),
+            ) if snapshot.world.tick == tick && base_tick <= tick && !checkpoint_id.is_empty() => {
+                let applied = self.world_view.as_ref().and_then(|world| {
+                    world
+                        .update(cx, |view, cx| {
+                            let palette = view.accessibility_snapshot().palette;
+                            let Some(frame) = HudSnapshot::from_checkpoint_canvas(
+                                &snapshot,
+                                checkpoint_id.clone(),
+                                base_tick,
+                                palette,
+                            ) else {
+                                return false;
+                            };
+                            view.playback.reconstructed = Some(frame);
+                            view.playback.mode = PlaybackMode::Paused;
+                            view.playback.displaying_history = true;
+                            cx.notify();
+                            true
+                        })
+                        .ok()
+                });
+                if applied == Some(true) {
+                    format!(
+                        "Reconstructed World tick {tick} from checkpoint {checkpoint_id} at tick {base_tick}; live owner unchanged."
+                    )
+                } else {
+                    "World frame unavailable; view unchanged.".to_owned()
+                }
+            }
+            _ => "Timeline response does not match its request; World view unchanged.".to_owned(),
+        });
+    }
+
     fn return_world_to_live(&mut self, cx: &mut Context<Self>) {
+        self.timeline_cancelled.store(true, AtomicOrdering::Release);
         let returned = self.world_view.as_ref().is_some_and(|world| {
             world
                 .update(cx, |view, cx| {
@@ -8118,6 +8342,22 @@ impl SimulationView {
         cx.notify();
     }
 
+    fn selected_timeline_event(&self) -> Option<NarrativeEventRecord> {
+        let published = self.host.snapshot_hub().latest();
+        let index = self.rail_selection.map_or_else(
+            || published.narrative_events.len().saturating_sub(1),
+            |(index, _, _)| index,
+        );
+        let event = published.narrative_events.get(index)?;
+        if self
+            .rail_selection
+            .is_some_and(|(_, tick, kind)| event.tick.0 != tick || event.kind != kind)
+        {
+            return None;
+        }
+        Some(event.clone())
+    }
+
     /// Select a rail event by index, clamped to the retained events. A fresh
     /// selection clears the aged-out marker (bd-16g.2.4).
     pub fn select_rail_event(&mut self, index: usize) {
@@ -8126,6 +8366,7 @@ impl SimulationView {
         };
         let events_len = snapshot.narrative_events.len();
         if events_len == 0 {
+            self.timeline_cancelled.store(true, AtomicOrdering::Release);
             self.rail_selection = None;
             return;
         }
@@ -8134,6 +8375,9 @@ impl SimulationView {
             let event = &snapshot.narrative_events[clamped];
             (event.tick.0, event.kind)
         };
+        if self.rail_selection != Some((clamped, tick, kind)) {
+            self.timeline_cancelled.store(true, AtomicOrdering::Release);
+        }
         self.rail_selection = Some((clamped, tick, kind));
         self.rail_selection_aged_out = false;
         self.rail_warned_aged_out = false;
@@ -8273,6 +8517,7 @@ impl SimulationView {
         if still_live {
             return;
         }
+        self.timeline_cancelled.store(true, AtomicOrdering::Release);
         if events.is_empty() {
             self.rail_selection = None;
         } else {
@@ -8428,11 +8673,17 @@ impl SimulationView {
                     .items_center()
                     .gap_2()
                     .text_xs()
-                    .child(
-                        div()
-                            .text_color(chrome::text_primary())
-                            .child(format!("Tick {}", snapshot.tick)),
-                    )
+                    .child(div().text_color(chrome::text_primary()).child(
+                        snapshot.checkpoint_review.as_ref().map_or_else(
+                            || format!("Tick {}", snapshot.tick),
+                            |(_, base)| {
+                                format!(
+                                    "CHECKPOINT REPLAY · tick {} · saved at {base}",
+                                    snapshot.tick
+                                )
+                            },
+                        ),
+                    ))
                     .child(
                         div()
                             .text_color(chrome::text_muted())
@@ -9666,6 +9917,7 @@ impl SimulationView {
         }
         self.playback.go_live();
         info!("Simulation single-step command enqueued");
+        self.timeline_cancelled.store(true, AtomicOrdering::Release);
         cx.notify();
     }
 
@@ -9840,26 +10092,31 @@ impl SimulationView {
     }
 
     fn playback_restart(&mut self, cx: &mut Context<Self>) {
+        self.timeline_cancelled.store(true, AtomicOrdering::Release);
         self.playback.restart();
         cx.notify();
     }
 
     fn playback_step_back(&mut self, cx: &mut Context<Self>) {
+        self.timeline_cancelled.store(true, AtomicOrdering::Release);
         self.playback.step_back();
         cx.notify();
     }
 
     fn playback_toggle(&mut self, cx: &mut Context<Self>) {
+        self.timeline_cancelled.store(true, AtomicOrdering::Release);
         self.playback.toggle_play();
         cx.notify();
     }
 
     fn playback_step_forward(&mut self, cx: &mut Context<Self>) {
+        self.timeline_cancelled.store(true, AtomicOrdering::Release);
         self.playback.step_forward();
         cx.notify();
     }
 
     fn playback_go_live(&mut self, cx: &mut Context<Self>) {
+        self.timeline_cancelled.store(true, AtomicOrdering::Release);
         self.playback.go_live();
         cx.notify();
     }
@@ -11551,7 +11808,12 @@ impl SimulationView {
         }
 
         let playback = self.playback.status();
-        if playback.total > 0 {
+        if let Some((_, base)) = &snapshot.checkpoint_review {
+            lines.push(format!(
+                "CHECKPOINT REPLAY · tick {} · saved at {base}",
+                snapshot.tick
+            ));
+        } else if playback.total > 0 {
             let mode_label = match playback.mode {
                 PlaybackMode::Live => "LIVE",
                 PlaybackMode::Paused => "PAUSED",
@@ -14391,11 +14653,12 @@ impl Render for SimulationView {
         self.perf.begin_frame();
 
         let live_snapshot = self.snapshot();
+        self.validate_rail_selection(&live_snapshot);
+        self.poll_timeline_job(cx);
         let snapshot = self.playback.snapshot_for_render(live_snapshot);
 
         // Update per-agent brain output history from the current inspector focus
         self.update_brain_history(&snapshot);
-        self.validate_rail_selection(&snapshot);
         self.maybe_log_rail_first_show(&snapshot);
 
         let mut content = if self.minimal_canvas_mode {
@@ -14689,6 +14952,29 @@ struct HudSnapshot {
     narrative_dropped: u64,
     /// The narrative ring's configured capacity.
     narrative_capacity: usize,
+    /// Reconstructed science, rather than an original cached host publication.
+    checkpoint_review: Option<(String, u64)>,
+}
+
+impl HudSnapshot {
+    fn from_checkpoint_canvas(
+        snapshot: &RenderSnapshot,
+        checkpoint_id: String,
+        base_tick: u64,
+        palette: ColorPaletteMode,
+    ) -> Option<Self> {
+        Some(Self {
+            tick: snapshot.world.tick,
+            epoch: snapshot.world.epoch,
+            is_closed: snapshot.world.world.closed,
+            world_size: (snapshot.config.world_width, snapshot.config.world_height),
+            history_capacity: snapshot.config.history_capacity,
+            agent_count: snapshot.world.agents.len(),
+            render_frame: Some(RenderFrame::from_snapshot(snapshot, palette)?),
+            checkpoint_review: Some((checkpoint_id, base_tick)),
+            ..Self::default()
+        })
+    }
 }
 
 #[derive(Default, Clone)]
@@ -17248,16 +17534,22 @@ struct PlaybackStatus {
 
 struct PlaybackState {
     timeline: VecDeque<HudSnapshot>,
+    reconstructed: Option<HudSnapshot>,
     max_frames: usize,
     mode: PlaybackMode,
+    /// The last returned frame was historical, even if playback just reached Live.
+    /// Returning live does not enable picking until a live frame is selected again.
+    displaying_history: bool,
     pointer: usize,
 }
 impl PlaybackState {
     fn new(max_frames: usize) -> Self {
         Self {
             timeline: VecDeque::with_capacity(max_frames),
+            reconstructed: None,
             max_frames: max_frames.max(1),
             mode: PlaybackMode::Live,
+            displaying_history: false,
             pointer: 0,
         }
     }
@@ -17284,11 +17576,18 @@ impl PlaybackState {
 
     fn snapshot_for_render(&mut self, live: HudSnapshot) -> HudSnapshot {
         let recorded = match self.mode {
-            PlaybackMode::Live => return live,
-            PlaybackMode::Paused => self.timeline.get(self.pointer).cloned(),
+            PlaybackMode::Live => {
+                self.displaying_history = false;
+                return live;
+            }
+            PlaybackMode::Paused => self
+                .reconstructed
+                .clone()
+                .or_else(|| self.timeline.get(self.pointer).cloned()),
             PlaybackMode::Playing => {
                 if self.timeline.is_empty() {
                     self.mode = PlaybackMode::Live;
+                    self.displaying_history = false;
                     return live;
                 }
                 let snapshot = self.timeline.get(self.pointer).cloned();
@@ -17302,8 +17601,10 @@ impl PlaybackState {
             }
         };
         let Some(mut snapshot) = recorded else {
+            self.displaying_history = false;
             return live;
         };
+        self.displaying_history = true;
         // History replays science and inspection, not the session's current
         // controls, health or receipts. In particular, a new owner rejection
         // must remain visible while the user inspects an earlier world frame.
@@ -17320,7 +17621,9 @@ impl PlaybackState {
     }
 
     fn restart(&mut self) {
+        self.reconstructed = None;
         if self.timeline.is_empty() {
+            self.go_live();
             return;
         }
         self.mode = PlaybackMode::Paused;
@@ -17339,12 +17642,16 @@ impl PlaybackState {
             return false;
         };
         self.pointer = index;
+        self.reconstructed = None;
+        self.displaying_history = true;
         self.mode = PlaybackMode::Paused;
         true
     }
 
     fn step_back(&mut self) {
+        self.reconstructed = None;
         if self.timeline.is_empty() {
+            self.go_live();
             return;
         }
         self.mode = PlaybackMode::Paused;
@@ -17354,7 +17661,9 @@ impl PlaybackState {
     }
 
     fn step_forward(&mut self) {
+        self.reconstructed = None;
         if self.timeline.is_empty() {
+            self.go_live();
             return;
         }
         if self.pointer + 1 < self.timeline.len() {
@@ -17366,6 +17675,11 @@ impl PlaybackState {
     }
 
     fn toggle_play(&mut self) {
+        self.reconstructed = None;
+        if self.timeline.is_empty() {
+            self.go_live();
+            return;
+        }
         match self.mode {
             PlaybackMode::Live => {
                 if !self.timeline.is_empty() {
@@ -17385,6 +17699,7 @@ impl PlaybackState {
     }
 
     fn go_live(&mut self) {
+        self.reconstructed = None;
         self.mode = PlaybackMode::Live;
         if !self.timeline.is_empty() {
             self.pointer = self.timeline.len().saturating_sub(1);
@@ -17392,7 +17707,11 @@ impl PlaybackState {
     }
 
     fn status(&self) -> PlaybackStatus {
-        let current_tick = self.timeline.get(self.pointer).map(|snap| snap.tick);
+        let current_tick = self
+            .reconstructed
+            .as_ref()
+            .or_else(|| self.timeline.get(self.pointer))
+            .map(|snap| snap.tick);
         PlaybackStatus {
             mode: self.mode,
             index: if self.timeline.is_empty() {
@@ -17421,6 +17740,52 @@ mod playback_state_tests {
         let live = snapshot(live_tick);
         playback.record(&live);
         playback.snapshot_for_render(live)
+    }
+
+    #[test]
+    fn narrative_checkpoint_playback_preserves_live_health_and_waits_for_a_live_frame() {
+        let mut playback = PlaybackState::new(2);
+        playback.record(&snapshot(20));
+        let mut reconstructed = snapshot(4);
+        reconstructed.checkpoint_review = Some(("saved-cut".to_owned(), 1));
+        reconstructed.agent_count = 7;
+        playback.reconstructed = Some(reconstructed);
+        playback.mode = PlaybackMode::Paused;
+        let mut live = snapshot(21);
+        live.agent_count = 9;
+        live.simulation_fault = Some("actual current failure".to_owned());
+        live.controls.paused = true;
+        let shown = playback.snapshot_for_render(live);
+        assert_eq!(shown.tick, 4);
+        assert_eq!(shown.agent_count, 7);
+        assert_eq!(
+            shown.simulation_fault.as_deref(),
+            Some("actual current failure")
+        );
+        assert!(shown.controls.paused);
+        assert!(playback.displaying_history);
+        assert_eq!(
+            playback.timeline.len(),
+            1,
+            "reconstruction does not overwrite the observed ring"
+        );
+        playback.go_live();
+        assert!(
+            playback.displaying_history,
+            "return-live alone cannot enable historical picking"
+        );
+        assert_eq!(paint(&mut playback, 22).tick, 22);
+        assert!(!playback.displaying_history);
+        playback.toggle_play();
+        assert_eq!(paint(&mut playback, 23).tick, 20);
+        assert_eq!(paint(&mut playback, 24).tick, 22);
+        assert_eq!(playback.mode(), PlaybackMode::Live);
+        assert!(
+            playback.displaying_history,
+            "the final playing frame is still historical"
+        );
+        assert_eq!(paint(&mut playback, 25).tick, 25);
+        assert!(!playback.displaying_history);
     }
 
     #[test]
@@ -28481,13 +28846,64 @@ mod command_characterization_tests {
 
     #[test]
     fn narrative_review_clicks_seek_exact_world_frames_without_changing_science() {
+        narrative_world_review_journey(false);
+    }
+
+    #[test]
+    fn narrative_checkpoint_review_worker_preserves_world_and_discards_stale_results() {
+        narrative_world_review_journey(true);
+    }
+
+    // The renderer provider below returns a genuine earlier owner publication.
+    // This is a GUI consumer component test; actual checkpoint persistence and
+    // reconstruction are exercised by the application's provider test.
+    fn narrative_world_review_journey(checkpoint_fallback: bool) {
         let host = TestHost::take(narrative_e2e_world(1));
         let initial_events = host.snapshot().narrative_events.len();
-        let session = Arc::new(GuiSession::new(
+        let mut session = GuiSession::new(
             host.port.clone(),
             AnalyticsSnapshotProvider::empty(),
             Arc::new(|_| panic!("frame review must not submit scientific commands")),
-        ));
+        );
+        let captured = Arc::new(Mutex::new(None::<Arc<RenderSnapshot>>));
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let review_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (started, did_start) = std::sync::mpsc::channel();
+        let source_tick = host.snapshot().world.tick;
+        if checkpoint_fallback {
+            let captured = Arc::clone(&captured);
+            let gate = Arc::clone(&gate);
+            let calls = Arc::clone(&review_calls);
+            session.timeline_submit = Some(Arc::new(move |request| match request {
+                TimelineReviewRequest::SaveCheckpoint => {
+                    Ok(TimelineReviewResponse::CheckpointSaved {
+                        checkpoint_id: "captured-owner-component".to_owned(),
+                        tick: source_tick,
+                    })
+                }
+                TimelineReviewRequest::ReviewEvent { tick } => {
+                    calls.fetch_add(1, AtomicOrdering::SeqCst);
+                    started.send(()).unwrap();
+                    let (lock, ready) = &*gate;
+                    let (allowed, _) = ready
+                        .wait_timeout_while(
+                            lock.lock().unwrap(),
+                            Duration::from_secs(5),
+                            |allowed| !*allowed,
+                        )
+                        .unwrap();
+                    assert!(*allowed, "component review gate was not released");
+                    let snapshot = captured.lock().unwrap().clone().unwrap();
+                    assert_eq!(tick, snapshot.world.tick);
+                    Ok(TimelineReviewResponse::EventFrame {
+                        snapshot,
+                        checkpoint_id: "captured-owner-component".to_owned(),
+                        base_tick: source_tick,
+                    })
+                }
+            }));
+        }
+        let session = Arc::new(session);
         let context = gpui::TestAppContext::single();
         let windows = context.update(|app| session.install(app)).unwrap();
         let world = context.update(|app| windows.canvas.root(app)).unwrap();
@@ -28502,12 +28918,46 @@ mod command_characterization_tests {
                 view.playback.restart();
             });
         });
+        if checkpoint_fallback {
+            context.update(|app| {
+                hud.update(app, |view, _| view.dashboard_tab = DashboardTab::Timeline)
+            });
+            let mut lab = gpui::VisualTestContext::from_window(windows.hud.into(), &context);
+            lab.simulate_resize(size(px(480.0), px(1400.0)));
+            lab.update(|window, app| {
+                window.refresh();
+                window.draw(app).clear();
+            });
+            let bounds = lab
+                .debug_bounds("narrative-save-checkpoint")
+                .expect("checkpoint save is visible");
+            lab.simulate_click(bounds.center(), gpui::Modifiers::default());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while context.update(|app| hud.read(app).timeline_job.is_some()) {
+                assert!(Instant::now() < deadline, "save component receipt missing");
+                lab.update(|window, app| {
+                    window.refresh();
+                    window.draw(app).clear();
+                });
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            context.update(|app| {
+                assert!(
+                    hud.read(app)
+                        .world_review_feedback
+                        .as_ref()
+                        .unwrap()
+                        .starts_with("Saved checkpoint")
+                )
+            });
+        }
         for _ in 0..20 {
             host.apply(scriptbots_runtime::HostCommand::SpawnAgent {
                 herbivore_tendency: 1.0,
             });
         }
         let mut event = None;
+        let mut publications = BTreeMap::new();
         for _ in 0..160 {
             host.apply(scriptbots_runtime::HostCommand::UpdateSimulation(
                 SimulationCommand {
@@ -28522,12 +28972,18 @@ mod command_characterization_tests {
                 });
             });
             let published = host.snapshot();
+            publications.insert(published.world.tick, Arc::clone(&published));
             if published.narrative_events.len() > initial_events {
                 event = published.narrative_events.last().cloned();
                 break;
             }
         }
         let event = event.expect("real population intervention must emit a narrative event");
+        let target_publication = publications
+            .get(&event.tick.0)
+            .expect("actual event-tick publication was observed")
+            .clone();
+        *captured.lock().unwrap() = Some(Arc::clone(&target_publication));
         let mut canvas = gpui::VisualTestContext::from_window(windows.canvas.into(), &context);
         let frame = context
             .update(|app| {
@@ -28572,7 +29028,7 @@ mod command_characterization_tests {
                 assert_eq!(view.playback.status().current_tick, Some(event.tick.0));
                 let live = view.snapshot();
                 let shown = view.playback.snapshot_for_render(live);
-                assert_eq!(shown.render_frame, Some(frame));
+                assert_eq!(shown.render_frame, Some(frame.clone()));
             });
             assert_eq!(hud.read(app).playback.mode(), PlaybackMode::Paused);
         });
@@ -28597,6 +29053,231 @@ mod command_characterization_tests {
             });
         }
         redraw(&mut lab);
+        if checkpoint_fallback {
+            // Make the live world visibly different from the captured target.
+            // This intervention belongs only to the renderer component fixture;
+            // the real app provider continues to refuse unsupported input spans.
+            host.apply(scriptbots_runtime::HostCommand::SpawnAgent {
+                herbivore_tendency: 1.0,
+            });
+            let unchanged = host.port.scientific_digest_v1().unwrap();
+            assert_ne!(
+                target_publication.world.agents.len(),
+                host.snapshot().world.agents.len()
+            );
+            assert_eq!(
+                review_calls.load(AtomicOrdering::SeqCst),
+                0,
+                "cached review must not call the replay provider"
+            );
+            click(&mut lab, "narrative-review-frame");
+            did_start
+                .recv_timeout(Duration::from_secs(5))
+                .expect("real component worker started");
+            click(&mut lab, "narrative-world-live");
+            click(&mut lab, "narrative-review-frame");
+            context.update(|app| {
+                assert!(
+                    hud.read(app).timeline_job.is_some(),
+                    "cancelled work must retain its slot"
+                )
+            });
+            *gate.0.lock().unwrap() = true;
+            gate.1.notify_all();
+            let drain = |lab: &mut gpui::VisualTestContext| {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while context.update(|app| hud.read(app).timeline_job.is_some()) {
+                    assert!(
+                        Instant::now() < deadline,
+                        "component review completion missing"
+                    );
+                    redraw(lab);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            };
+            drain(&mut lab);
+            context.update(|app| assert_eq!(world.read(app).playback.mode(), PlaybackMode::Live));
+            assert_eq!(review_calls.load(AtomicOrdering::SeqCst), 1);
+            click(&mut lab, "narrative-review-frame");
+            drain(&mut lab);
+            redraw(&mut canvas);
+            let palette = context.update(|app| world.read(app).accessibility_snapshot().palette);
+            let expected = RenderFrame::from_snapshot(&target_publication, palette).unwrap();
+            context.update(|app| {
+                world.update(app, |view, _| {
+                    assert_eq!(view.playback.mode(), PlaybackMode::Paused);
+                    let live = view.snapshot();
+                    let shown = view.playback.snapshot_for_render(live);
+                    assert_eq!(shown.tick, event.tick.0);
+                    assert_eq!(shown.render_frame, Some(expected.clone()));
+                    assert_eq!(
+                        shown.checkpoint_review,
+                        Some(("captured-owner-component".to_owned(), source_tick))
+                    );
+                    assert_eq!(
+                        shown.narrative.len(),
+                        host.snapshot().narrative_events.len()
+                    );
+                    let position = host.snapshot().world.agents[0].position;
+                    let (x, y) = view
+                        .world_to_screen_coords(Position::new(position[0], position[1]))
+                        .unwrap();
+                    assert!(!view.update_selection_from_point(point(px(x), px(y)), false));
+                    assert!(!view.update_hover_from_point(point(px(x), px(y))));
+                })
+            });
+            assert_eq!(review_calls.load(AtomicOrdering::SeqCst), 2);
+
+            // Planted protocol/staleness failures must retain the last shown frame.
+            for fault in [
+                "error",
+                "wrong_tick",
+                "wrong_kind",
+                "base_tick",
+                "selection",
+                "record",
+                "session",
+                "disconnected",
+                "navigation",
+            ] {
+                let (send, result) = std::sync::mpsc::sync_channel(1);
+                context.update(|app| {
+                    hud.update(app, |view, _| {
+                        view.timeline_cancelled
+                            .store(false, AtomicOrdering::Release);
+                        let mut selection = view.selected_timeline_event();
+                        if fault == "record" {
+                            selection
+                                .as_mut()
+                                .unwrap()
+                                .human_text
+                                .push_str(" (different record)");
+                        }
+                        view.timeline_job = Some(TimelineReviewJob {
+                            request: TimelineReviewRequest::ReviewEvent {
+                                tick: event.tick.0 + u64::from(fault == "wrong_tick"),
+                            },
+                            selection,
+                            session: if fault == "session" {
+                                HostSessionId::new(99)
+                            } else {
+                                host.snapshot().session_id
+                            },
+                            result,
+                        });
+                        if fault == "selection" {
+                            let original = view.rail_selection.unwrap().0;
+                            view.select_rail_event(0);
+                            view.select_rail_event(original);
+                        }
+                    })
+                });
+                if fault == "navigation" {
+                    click(&mut lab, "dashboard-tab-overview");
+                    click(&mut lab, "dashboard-tab-timeline");
+                }
+                if fault != "disconnected" {
+                    let response = match fault {
+                        "error" => Err("planted provider failure".to_owned()),
+                        "wrong_kind" => Ok(TimelineReviewResponse::CheckpointSaved {
+                            checkpoint_id: "wrong-kind".to_owned(),
+                            tick: event.tick.0,
+                        }),
+                        _ => Ok(TimelineReviewResponse::EventFrame {
+                            snapshot: Arc::clone(&target_publication),
+                            checkpoint_id: "captured-owner-component".to_owned(),
+                            base_tick: if fault == "base_tick" {
+                                event.tick.0 + 1
+                            } else {
+                                source_tick
+                            },
+                        }),
+                    };
+                    assert!(
+                        send.send(response).is_ok(),
+                        "component receiver closed: {fault}"
+                    );
+                }
+                drop(send);
+                drain(&mut lab);
+                context.update(|app| {
+                    let feedback = hud.read(app).world_review_feedback.as_ref().unwrap();
+                    let expected_notice = match fault {
+                        "error" => "Timeline request failed: planted provider failure",
+                        "disconnected" => "Timeline request failed: Timeline worker disconnected",
+                        "selection" | "record" | "session" | "navigation" => {
+                            "Timeline review cancelled; result discarded."
+                        }
+                        _ => "Timeline response does not match its request",
+                    };
+                    assert!(feedback.starts_with(expected_notice), "{fault}: {feedback}");
+                    assert_eq!(
+                        world
+                            .read(app)
+                            .playback
+                            .reconstructed
+                            .as_ref()
+                            .unwrap()
+                            .render_frame,
+                        Some(expected.clone()),
+                        "{fault}"
+                    );
+                });
+            }
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), unchanged);
+            click(&mut lab, "narrative-world-live");
+            context.update(|app| {
+                world.update(app, |view, _| {
+                    assert_eq!(view.playback.mode(), PlaybackMode::Live);
+                    assert!(
+                        view.playback.displaying_history,
+                        "live picking waits for the live frame"
+                    );
+                    let position = host.snapshot().world.agents[0].position;
+                    let (x, y) = view
+                        .world_to_screen_coords(Position::new(position[0], position[1]))
+                        .unwrap();
+                    assert!(!view.update_selection_from_point(point(px(x), px(y)), false));
+                    assert!(!view.update_hover_from_point(point(px(x), px(y))));
+                });
+            });
+            redraw(&mut canvas);
+            context.update(|app| assert!(!world.read(app).playback.displaying_history));
+            let live_host = Arc::clone(&host);
+            context.update(|app| {
+                world.update(app, |view, _| {
+                    view.command_submit = Arc::new(move |command| {
+                        let command = scriptbots_runtime::HostCommand::try_from(command).ok()?;
+                        Some(live_host.apply(command).command_id().to_string())
+                    });
+                    let position = host.snapshot().world.agents[0].position;
+                    let (x, y) = view
+                        .world_to_screen_coords(Position::new(position[0], position[1]))
+                        .unwrap();
+                    assert!(view.update_hover_from_point(point(px(x), px(y))));
+                    assert!(view.update_selection_from_point(point(px(x), px(y)), false));
+                })
+            });
+            let selected = host.snapshot();
+            assert!(
+                selected
+                    .world
+                    .agents
+                    .iter()
+                    .enumerate()
+                    .any(|(row, _)| matches!(
+                        selected.agent_selection(row),
+                        SelectionState::Selected
+                    ))
+            );
+            eprintln!(
+                "GPUI captured-publication component: target={} live={} review_calls={}",
+                event.tick.0,
+                host.snapshot().world.tick,
+                review_calls.load(AtomicOrdering::SeqCst)
+            );
+            return;
+        }
         let before_refusal = host.port.world_digests().unwrap();
         click(&mut lab, "narrative-review-frame");
         context.update(|app| {

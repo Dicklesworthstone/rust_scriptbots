@@ -5034,6 +5034,7 @@ impl Renderer for GuiRenderer {
             .control_runtime
             .control_handle()
             .ok_or_else(|| anyhow!("native map editor requires the owner control adapter"))?;
+        let timeline_submit = scriptbots_app::renderer::timeline_review_submit(map_control.clone());
         let map_apply: scriptbots_render::MapApplySubmit =
             Arc::new(move |artifact, policy, expected| {
                 map_control
@@ -5046,6 +5047,7 @@ impl Renderer for GuiRenderer {
             ctx.analytics.clone(),
             Arc::clone(&ctx.command_submit),
             map_apply,
+            timeline_submit,
             control_health,
         )
         .map_err(anyhow::Error::new)
