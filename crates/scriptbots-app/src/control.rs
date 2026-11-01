@@ -3066,6 +3066,7 @@ impl ControlHandle {
             &agent_commands,
             target_tick,
             retained.source_persistence_interval,
+            retained.source_config_revision,
         )?;
         Ok(EventCanvasReview {
             snapshot: self.project_canvas_world(world)?,
@@ -3081,8 +3082,10 @@ impl ControlHandle {
         agent_commands: &[scriptbots_runtime::AppliedAgentCommand],
         target_tick: u64,
         source_persistence_interval: u32,
+        source_config_revision: scriptbots_runtime::ConfigRevision,
     ) -> Result<WorldState, ControlError> {
         let mut world = Self::restore_canvas_world(checkpoint)?;
+        let restored_config_revision = world.config_revision();
         let mut edits = config_audit.iter().peekable();
         let mut commands = agent_commands.iter().peekable();
         let mut target = None;
@@ -3110,7 +3113,11 @@ impl ControlHandle {
                 .is_some_and(|entry| entry.boundary().tick == world.tick())
             {
                 let entry = commands.next().expect("peeked agent command");
-                if entry.boundary().revisions.config.get() != world.config_revision() {
+                let replayed_config_revision = world
+                    .config_revision()
+                    .checked_sub(restored_config_revision)
+                    .and_then(|delta| source_config_revision.get().checked_add(delta));
+                if replayed_config_revision != Some(entry.boundary().revisions.config.get()) {
                     return Err(ControlError::InvalidPatch(
                         "recorded agent command configuration differs".into(),
                     ));
@@ -5819,6 +5826,32 @@ pub(crate) mod tests {
         oracles: Vec<(Arc<RenderSnapshot>, scriptbots_core::WorldDigestV1)>,
     }
 
+    fn agent_canvas_commands(parents: [scriptbots_core::AgentUid; 2]) -> [(u128, HostCommand); 3] {
+        [
+            (
+                101,
+                HostCommand::SpawnAgent {
+                    herbivore_tendency: 0.25,
+                },
+            ),
+            (
+                102,
+                HostCommand::AdjustAgentMutationRates {
+                    agent_uid: parents[0],
+                    delta_primary: 0.1,
+                    delta_secondary: 0.05,
+                },
+            ),
+            (
+                103,
+                HostCommand::SpawnCrossover {
+                    parent_a: parents[0],
+                    parent_b: parents[1],
+                },
+            ),
+        ]
+    }
+
     fn agent_canvas_journey() -> AgentCanvasJourney {
         let directory = tempfile::Builder::new()
             .prefix("event-agent-canvas-")
@@ -5835,6 +5868,11 @@ pub(crate) mod tests {
             topography_enabled: false,
             reproduction_energy_threshold: f32::MAX,
             metabolism_drain: 0.0,
+            metabolism_ramp_rate: 0.0,
+            metabolism_boost_penalty: 0.0,
+            movement_drain: 0.0,
+            temperature_discomfort_rate: 0.0,
+            spike_damage: 0.0,
             ..ScriptBotsConfig::default()
         })
         .unwrap();
@@ -5863,34 +5901,39 @@ pub(crate) mod tests {
             port.submit(CommandEnvelope::new(id, command)).unwrap();
             assert_eq!(
                 host.wait_finished(&id.to_string()).application_state,
-                "applied"
+                "applied",
+                "actual command {id}: {:?}",
+                port.command_status(id).unwrap()
             );
         };
         let mut oracles = Vec::new();
-        for (id, command) in [
-            (
-                101,
-                HostCommand::SpawnAgent {
-                    herbivore_tendency: 0.25,
-                },
-            ),
-            (
-                102,
-                HostCommand::AdjustAgentMutationRates {
-                    agent_uid: parents[0],
-                    delta_primary: 0.1,
-                    delta_secondary: 0.05,
-                },
-            ),
-            (
-                103,
-                HostCommand::SpawnCrossover {
-                    parent_a: parents[0],
-                    parent_b: parents[1],
-                },
-            ),
-        ] {
+        // Checkpoint capture sealed tick zero. A real new tick opens arrivals again.
+        host.wait_applied(&handle.step().unwrap());
+        for (id, command) in agent_canvas_commands([parents[0], parents[1]]) {
+            let population = handle.read_snapshot().unwrap().world.agents.len();
+            let mutation = host
+                .port
+                .inspect_agent(parents[0], 0)
+                .unwrap()
+                .unwrap()
+                .mutation_rates;
+            let edits_mutation = matches!(&command, HostCommand::AdjustAgentMutationRates { .. });
             submit(id, command);
+            if edits_mutation {
+                let changed = host
+                    .port
+                    .inspect_agent(parents[0], 0)
+                    .unwrap()
+                    .unwrap()
+                    .mutation_rates;
+                assert_ne!(changed.primary.to_bits(), mutation.primary.to_bits());
+                assert_ne!(changed.secondary.to_bits(), mutation.secondary.to_bits());
+            } else {
+                assert_eq!(
+                    handle.read_snapshot().unwrap().world.agents.len(),
+                    population + 1
+                );
+            }
             host.wait_applied(&handle.step().unwrap());
             oracles.push((
                 handle.read_snapshot().unwrap(),
@@ -5944,6 +5987,7 @@ pub(crate) mod tests {
                 &commands,
                 oracle.world.tick,
                 0,
+                source.source_config_revision,
             )
             .unwrap();
             assert_eq!(
@@ -6051,9 +6095,25 @@ pub(crate) mod tests {
                 &[],
                 &current.agent_commands,
                 2,
-                0
+                0,
+                source.source_config_revision
             )
             .is_err()
+        );
+        assert!(
+            matches!(
+                ControlHandle::replay_event_canvas_world(
+                    &saved,
+                    &current.digest,
+                    &[],
+                    &current.agent_commands,
+                    2,
+                    0,
+                    source.source_config_revision.checked_next().unwrap()
+                ),
+                Err(ControlError::InvalidPatch(message)) if message.contains("command configuration")
+            ),
+            "a wrong absolute source revision must still fail at the command guard"
         );
         let mut config = (*publication.config).clone();
         config.food_growth_rate *= 0.5;
@@ -6165,6 +6225,7 @@ pub(crate) mod tests {
                 &[],
                 oracle.world.tick,
                 0,
+                retained.source_config_revision,
             )
             .unwrap();
             assert_eq!(
@@ -6411,6 +6472,7 @@ pub(crate) mod tests {
                 &[],
                 oracle.world.tick,
                 source.source_persistence_interval,
+                source.source_config_revision,
             )
             .unwrap();
             assert_eq!(
@@ -6456,6 +6518,7 @@ pub(crate) mod tests {
                         &[],
                         oracle.world.tick,
                         source.source_persistence_interval,
+                        source.source_config_revision,
                     )
                     .is_err(),
                     "{fault}"

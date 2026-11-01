@@ -7011,15 +7011,19 @@ mod tests {
     fn scientific_digest_cut_excludes_failed_agent_commands_and_records_applied_noops() {
         let mut owner = HostCore::new(HostSessionId::new(0xa6e8), world(0), options(true)).unwrap();
         let mut port = owner.local_port();
-        assert!(
-            port.submit(CommandEnvelope::new(
+        let rejected = port
+            .submit(CommandEnvelope::new(
                 CommandId::new(4),
                 HostCommand::SpawnAgent {
-                    herbivore_tendency: f32::NAN
-                }
+                    herbivore_tendency: f32::NAN,
+                },
             ))
-            .is_err()
-        );
+            .unwrap();
+        assert!(matches!(
+            rejected.application(),
+            ApplicationState::Rejected(RejectionReason::Validation { .. })
+        ));
+        assert_eq!(rejected.admission_sequence(), None);
         settle_continuation_command(
             &mut owner,
             CommandEnvelope::new(
