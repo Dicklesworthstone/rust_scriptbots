@@ -413,7 +413,10 @@ impl ScienceScreensState {
 // ---------------------------------------------------------------------------
 
 const SCIENCE_TABLE_ROWS: usize = 5;
-const CHECKPOINT_ID_COLUMNS: usize = 19;
+/// Columns reserved for a clipped checkpoint ID; the selected identity is shown in full below.
+pub const CHECKPOINT_ID_COLUMNS: usize = 19;
+/// Columns reserved for the checkpoint table's digest prefix.
+pub const CHECKPOINT_DIGEST_COLUMNS: usize = 12;
 
 fn first_visible_table_index(selected_index: usize, visible_rows: usize) -> usize {
     selected_index.saturating_sub(visible_rows.saturating_sub(1))
@@ -927,7 +930,7 @@ pub fn render_replay_screen(
                     };
                     let kb = cp.file_size_bytes / 1024;
                     let line = format!(
-                        " {} {:<id_width$.id_width$} {:<7} {:<7} {:<8}  {:.12}",
+                        " {} {:<id_width$.id_width$} {:<7} {:<7} {:<8}  {:.digest_width$}",
                         cursor,
                         cp.checkpoint_id,
                         cp.tick,
@@ -935,6 +938,7 @@ pub fn render_replay_screen(
                         kb,
                         cp.digest.as_deref().unwrap_or("unavailable"),
                         id_width = CHECKPOINT_ID_COLUMNS,
+                        digest_width = CHECKPOINT_DIGEST_COLUMNS,
                     );
                     print_text(frame, 4, row, &line);
                 }
@@ -1527,7 +1531,9 @@ mod tests {
             selected.tick,
             selected.agent_count.expect("measured population")
         )));
-        assert!(selected_row.contains(&selected.digest.as_ref().expect("measured digest")[..12]));
+        assert!(selected_row.contains(
+            &selected.digest.as_ref().expect("measured digest")[..CHECKPOINT_DIGEST_COLUMNS]
+        ));
         assert!(frame.contains(&format!("Selected: {}", selected.checkpoint_id)));
         assert!(frame.contains("No replay comparison recorded"));
         assert!(!frame.contains("Determinism verified"));

@@ -2,6 +2,46 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Checkpoint capture follow-through (2026-11-01):** [Currently In Progress —
+GentleDuck, original `bd-2z0.14.2.6`; acceptance unchanged]
+
+- [x] Recheck ready work and current ownership; continue the observed blocker
+  instead of starting another reporting subsystem.
+- [x] Decode retained actual PTY bytes and compare every checkpoint predicate:
+  creation, receipt, status and full selected identity are present; the test
+  wrongly demands the full generated ID in a deliberately clipped table column.
+- [x] Bind the PTY probe to the renderer's declared column widths; require the
+  exact row measurements and separate full selected identity.
+- [x] Prove the corrected oracle rejects missing/wrong rows, a colliding clipped
+  ID with the wrong full selection, and wrong checkpoint measurements/digest.
+- [x] Publish the old/new oracle win/lose split on retained actual frames; retain
+  the earlier failure and all identity, receipt-order, durability and lifecycle gates.
+- [x] Execute both existing actual PTY journeys through checkpoint creation,
+  experiments, resize/input and both exit paths; investigate any newly reached
+  failure without widening deadlines or dropping a predicate.
+- [x] Run required workspace check, strict Clippy, formatting and scoped static
+  review through the existing DSR execution path.
+- [ ] Recheck original acceptance in a fresh solo pass, update the original Bead
+  with exact evidence/limitations, and publish reviewed owned snapshots.
+
+Candidate evidence: DSR `checkpoint_capture_quality` passes all 10 checks on
+source hashes `7faf9421d519` (science screens) and `e45ccffc141c` (PTY file).
+The 12 science-screen tests, 32 rendering tests (including all four committed
+golden comparisons), and all five terminal E2E tests pass. Actual PTYs observe
+checkpoint creation/receipts, completed three-tick experiments, six resizes,
+keyboard/mouse navigation and terminal restoration; the Shutdown journey also
+reads its durable receipt from the file journal. Four retained actual frames
+change from false rejection to admission; 12 planted catalog errors still fail.
+UBS exits zero with 0 critical, 350 warnings and 111 informational findings,
+not a warning-clean claim. No golden, timeout, feature or acceptance changes.
+Clean committed-source repetition and final handoff remain pending at this
+execution snapshot. Raw evidence: `/data/tmp/scriptbots-checkpoint-capture-8GaYTH`.
+
+This requested granular queue is consumed by the user and implementing agent
+until this follow-through is handed off; it then becomes a bounded record.
+The prior implementation queue's landing action completed in `df64241a` and
+`14eb5143`; all eight leases were released, as recorded in Bead comment 2977.
+
 **Frame-export work queue (2026-11-01):** [Qualified increment — GentleDuck;
 original `bd-2z0.14.2.6` Currently In Progress; original acceptance retained]
 

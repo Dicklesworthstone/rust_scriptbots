@@ -36,6 +36,8 @@ fn live_frankentui_pty_routes_and_restores_terminal() -> Result<()> {
         .arg("quit")
         .arg(scriptbots_core::WORLD_DIGEST_V1_ALGORITHM)
         .arg(u64::BITS.to_string())
+        .arg(scriptbots_app::terminal::science_screens::CHECKPOINT_ID_COLUMNS.to_string())
+        .arg(scriptbots_app::terminal::science_screens::CHECKPOINT_DIGEST_COLUMNS.to_string())
         .output()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -206,6 +208,8 @@ fn live_palette_shutdown_serializes_its_durable_receipt_before_restoration() -> 
         .arg("shutdown")
         .arg(scriptbots_core::WORLD_DIGEST_V1_ALGORITHM)
         .arg(u64::BITS.to_string())
+        .arg(scriptbots_app::terminal::science_screens::CHECKPOINT_ID_COLUMNS.to_string())
+        .arg(scriptbots_app::terminal::science_screens::CHECKPOINT_DIGEST_COLUMNS.to_string())
         .output()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -281,14 +285,32 @@ import codecs, fcntl, hashlib, json, os, pathlib, pty, re, select, signal
 import socket, struct, subprocess, sys, tempfile, termios, time, urllib.error, urllib.request
 import unicodedata
 
-binary, source, exit_action, digest_algorithm, digest_bit_width = sys.argv[1:]
+HTTP_USER_AGENT = 'rust_scriptbots-agent (+https://github.com/Dicklesworthstone/rust_scriptbots)'
+
+binary, source, exit_action, digest_algorithm, digest_bit_width, checkpoint_id_columns, checkpoint_digest_columns = sys.argv[1:]
 assert exit_action in ('quit', 'shutdown'), 'undeclared terminal exit journey'
+checkpoint_id_columns, checkpoint_digest_columns = int(checkpoint_id_columns), int(checkpoint_digest_columns)
+assert checkpoint_id_columns > 0 and checkpoint_digest_columns > 0, 'checkpoint table columns must be nonempty'
 digest_bit_width = int(digest_bit_width)
 assert digest_algorithm == 'fnv1a' + str(digest_bit_width) + '-v0', 'digest algorithm disagrees with its Rust integer type'
 assert digest_bit_width > 0 and digest_bit_width % 4 == 0, 'digest cannot be represented by whole hexadecimal digits'
 digest_hex_digits = digest_bit_width // 4
 def experiment_digest_matches(value):
     return isinstance(value, str) and re.fullmatch(r'[0-9a-f]{' + str(digest_hex_digits) + '}', value) is not None
+
+def checkpoint_catalog_matches(text, checkpoint):
+    # The row deliberately clips IDs so measurements remain readable. Bind its
+    # prefix to the actual renderer declaration and require the full selected ID
+    # separately; accepting a prefix alone would hide identity collisions.
+    rows = [line.split() for line in text.splitlines()]
+    selected_rows = [row for row in rows if row and row[0] == '>']
+    selected_ids = [row for row in rows if row and row[0] == 'Selected:']
+    expected_row = ['>', checkpoint['checkpoint_id'][:checkpoint_id_columns],
+                    str(checkpoint['tick']), str(checkpoint['agent_count']),
+                    str(checkpoint['byte_size'] // 1024),
+                    checkpoint['world_digest_v1'][:checkpoint_digest_columns]]
+    return (selected_rows == [expected_row]
+            and selected_ids == [['Selected:', checkpoint['checkpoint_id']]])
 
 digest_accepted_cases = [
     {'case': 'zero', 'value': '0' * digest_hex_digits},
@@ -710,6 +732,32 @@ def check_parser_guards():
             pass
         else:
             raise AssertionError('receipt observer accepted negative control: ' + name)
+    # These synthetic table controls test only the oracle; the live journey
+    # below still has to create and observe a checkpoint through actual input.
+    checkpoint = {'checkpoint_id': 'ckpt-' + '1234567890abcdef' * 2 + '-t42',
+                  'tick': 42, 'agent_count': 17, 'byte_size': 4097,
+                  'world_digest_v1': 'abcdef0123456789'}
+    fields = ['>', checkpoint['checkpoint_id'][:checkpoint_id_columns], '42', '17', '4',
+              checkpoint['world_digest_v1'][:checkpoint_digest_columns]]
+    row = '  '.join(fields)
+    selection = 'Selected: ' + checkpoint['checkpoint_id']
+    table = row + '\n' + selection
+    assert checkpoint_catalog_matches(table, checkpoint), 'checkpoint oracle rejects its positive control'
+    accepted.append({'case': 'checkpoint_clipped_row_and_full_selected_identity'})
+    wrong_tables = [('empty-checkpoint-table', ''), ('missing-checkpoint-row', selection),
+                    ('missing-full-checkpoint-selection', row),
+                    ('colliding-checkpoint-prefix', row + '\n' + selection + '-different'),
+                    ('duplicate-checkpoint-row', row + '\n' + table),
+                    ('duplicate-full-checkpoint-selection', table + '\n' + selection)]
+    for index, (name, wrong_value) in enumerate([
+            ('checkpoint-cursor', ' '), ('checkpoint-row-id', 'other'), ('checkpoint-tick', '43'),
+            ('checkpoint-population', '18'), ('checkpoint-size', '5'), ('checkpoint-digest', '0')]):
+        wrong_fields = fields.copy()
+        wrong_fields[index] = wrong_value
+        wrong_tables.append((name, '  '.join(wrong_fields) + '\n' + selection))
+    for name, wrong_table in wrong_tables:
+        assert not checkpoint_catalog_matches(wrong_table, checkpoint), ('checkpoint oracle accepted negative', name)
+        rejected.append({'case': name, 'boundary': 'checkpoint_catalog'})
     return {'synthetic_parser_controls': True, 'valid_stream_byte_length': len(stream),
             'accepted_cases': accepted, 'rejected_cases': rejected}
 
@@ -872,7 +920,7 @@ for profile in profiles:
                     try:
                         request = urllib.request.Request(
                             'http://127.0.0.1:' + str(port) + '/api/screenshot/ascii',
-                            headers={'User-Agent': 'OpenAI File Downloader, XaiImageApiFetch/1.0'})
+                            headers={'User-Agent': HTTP_USER_AGENT})
                         with urllib.request.urlopen(
                                 request, timeout=0.2) as response:
                             body = response.read(200_000)
@@ -915,7 +963,7 @@ for profile in profiles:
                 def request_api(path, payload=None, allow_not_presented=False):
                     global http_log_bytes
                     request_body = None if payload is None else json.dumps(payload, sort_keys=True).encode()
-                    headers = {'User-Agent': 'OpenAI File Downloader, XaiImageApiFetch/1.0'}
+                    headers = {'User-Agent': HTTP_USER_AGENT}
                     if request_body is not None:
                         headers['Content-Type'] = 'application/json'
                     request = urllib.request.Request('http://127.0.0.1:' + str(port) + path,
@@ -1053,11 +1101,9 @@ for profile in profiles:
                 checkpoint_body = request_api('/api/v1/checkpoints/' + checkpoint['checkpoint_id'])
                 retain_response('checkpoint-metadata.json', checkpoint_body)
                 assert json.loads(checkpoint_body) == checkpoint, 'catalog and checkpoint lookup disagree'
-                checkpoint_row = re.compile(r'^\s*>\s+' + re.escape(checkpoint['checkpoint_id'])
-                                            + r'\s+' + str(checkpoint['tick']) + r'\s', re.MULTILINE)
                 checkpoint_status = 'Checkpoint ' + checkpoint['checkpoint_id'] + ' recorded at tick ' + str(checkpoint['tick'])
                 capture_provider('checkpoint-positive', replay_title,
-                                 lambda text: checkpoint_row.search(text) is not None
+                                 lambda text: checkpoint_catalog_matches(text, checkpoint)
                                  and checkpoint_receipt in text
                                  and checkpoint_status in text
                                  and 'applied' in checkpoint_watch.observations)
@@ -1149,7 +1195,7 @@ for profile in profiles:
             def interaction_api(path, payload=None):
                 global interaction_http_bytes
                 request_body = None if payload is None else json.dumps(payload, sort_keys=True).encode()
-                headers = {'User-Agent': 'OpenAI File Downloader, XaiImageApiFetch/1.0'}
+                headers = {'User-Agent': HTTP_USER_AGENT}
                 if request_body is not None:
                     headers['Content-Type'] = 'application/json'
                 request = urllib.request.Request('http://127.0.0.1:' + str(port) + path,
