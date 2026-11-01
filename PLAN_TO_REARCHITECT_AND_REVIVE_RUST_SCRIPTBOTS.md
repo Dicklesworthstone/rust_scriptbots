@@ -2,8 +2,8 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
-**Checkpoint capture follow-through (2026-11-01):** [Currently In Progress —
-GentleDuck, original `bd-2z0.14.2.6`; acceptance unchanged]
+**Checkpoint capture follow-through (2026-11-01):** [Qualified gate correction —
+GentleDuck; original `bd-2z0.14.2.6` Currently In Progress; acceptance unchanged]
 
 - [x] Recheck ready work and current ownership; continue the observed blocker
   instead of starting another reporting subsystem.
@@ -21,8 +21,8 @@ GentleDuck, original `bd-2z0.14.2.6`; acceptance unchanged]
   failure without widening deadlines or dropping a predicate.
 - [x] Run required workspace check, strict Clippy, formatting and scoped static
   review through the existing DSR execution path.
-- [ ] Recheck original acceptance in a fresh solo pass, update the original Bead
-  with exact evidence/limitations, and publish reviewed owned snapshots.
+- [x] Recheck original acceptance in a fresh solo pass, freeze reviewed source
+  and record final receipts/remaining scope in the original Bead.
 
 Candidate evidence: DSR `checkpoint_capture_quality` passes all 10 checks on
 source hashes `7faf9421d519` (science screens) and `e45ccffc141c` (PTY file).
@@ -34,8 +34,13 @@ reads its durable receipt from the file journal. Four retained actual frames
 change from false rejection to admission; 12 planted catalog errors still fail.
 UBS exits zero with 0 critical, 350 warnings and 111 informational findings,
 not a warning-clean claim. No golden, timeout, feature or acceptance changes.
-Clean committed-source repetition and final handoff remain pending at this
-execution snapshot. Raw evidence: `/data/tmp/scriptbots-checkpoint-capture-8GaYTH`.
+Clean-source DSR `checkpoint_capture_clean/20261101T214500-2139226` passes all
+four checks at committed source `0454e327585e`, with exact source identity and
+empty working-tree status before/after. All five E2E tests pass again; this adds
+no unique or independent test credit. The prior headless count/hash failure,
+unexplained historical theme mismatch and report-schema acceptance remain open.
+Final evidence and solo honesty audit are recorded in the original Bead.
+Raw evidence: `/data/tmp/scriptbots-checkpoint-capture-8GaYTH`.
 
 This requested granular queue is consumed by the user and implementing agent
 until this follow-through is handed off; it then becomes a bounded record.
@@ -72,7 +77,7 @@ original `bd-2z0.14.2.6` Currently In Progress; original acceptance retained]
 - [x] Review the complete diff and original acceptance in a fresh self-review;
   retain the original Bead's broader unresolved qualification.
 - [x] Update the Bead with final receipts, counterexamples and remaining work.
-- [ ] Commit only reviewed owned files through the existing shared-tree protocol;
+- [x] Commit only reviewed owned files through the existing shared-tree protocol;
   preserve unrelated edits and release reservations. The Bead records the final
   commit/release outcome after this execution record is frozen for review.
 
