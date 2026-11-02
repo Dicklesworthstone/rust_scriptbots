@@ -19067,6 +19067,11 @@ struct CachedFoodRaster {
     image: Arc<RenderImage>,
 }
 
+struct CachedFoodTexture {
+    dimensions: (u32, u32),
+    samples: Arc<[f32]>,
+}
+
 /// Bounded GPUI atlas ownership for a single [`SimulationView`].
 ///
 /// GPUI caches a render image by its generated ID and does not evict it when
@@ -19079,6 +19084,7 @@ struct WorldRasterCache {
     previous: Option<Arc<RenderImage>>,
     food_current: Option<CachedFoodRaster>,
     food_previous: Option<Arc<RenderImage>>,
+    food_texture: Option<CachedFoodTexture>,
 }
 
 impl WorldRasterCache {
@@ -19119,6 +19125,7 @@ impl WorldRasterCache {
     }
 
     fn drain(&mut self) -> Vec<Arc<RenderImage>> {
+        self.food_texture = None;
         let mut images = Vec::with_capacity(2);
         if let Some(entry) = self.current.take() {
             images.push(entry.image);
@@ -21722,9 +21729,7 @@ fn food_field_noise(x: f32, y: f32, period_x: u64, period_y: u64) -> f32 {
     top * (1.0 - ty) + bottom * ty
 }
 
-/// Render the food grid as a continuous density field. The field uses the
-/// simulation's values; the stable texture only modulates its presentation.
-fn rasterize_food_field(frame: &RenderFrame) -> Option<WorldRasterPixels> {
+fn food_raster_dimensions(frame: &RenderFrame) -> Option<(u32, u32)> {
     let (width, height) = frame.food_dimensions;
     let cells = (width as usize).checked_mul(height as usize)?;
     if width == 0 || height == 0 || frame.food_cells.len() < cells {
@@ -21737,6 +21742,40 @@ fn rasterize_food_field(frame: &RenderFrame) -> Option<WorldRasterPixels> {
         let scale = (MAX_WORLD_RASTER_TEXELS as f64 / texels as f64).sqrt();
         raster_width = ((f64::from(raster_width) * scale).floor() as u32).max(1);
         raster_height = ((f64::from(raster_height) * scale).floor() as u32).max(1);
+    }
+    Some((raster_width, raster_height))
+}
+
+/// Stable world-space texture can be reused while food values change.
+fn food_texture_samples(raster_width: u32, raster_height: u32) -> Arc<[f32]> {
+    let noise_width = u64::from((raster_width / 18).max(1));
+    let noise_height = u64::from((raster_height / 18).max(1));
+    let mut samples = Vec::with_capacity(raster_width as usize * raster_height as usize);
+    for y in 0..raster_height {
+        for x in 0..raster_width {
+            samples.push(food_field_noise(
+                (x as f32 + 0.5) / raster_width as f32 * noise_width as f32,
+                (y as f32 + 0.5) / raster_height as f32 * noise_height as f32,
+                noise_width,
+                noise_height,
+            ));
+        }
+    }
+    samples.into()
+}
+
+/// Render the food grid as a continuous density field. The field uses the
+/// simulation's values; the stable texture only modulates its presentation.
+fn rasterize_food_field_with_texture(
+    frame: &RenderFrame,
+    texture: Option<&[f32]>,
+) -> Option<WorldRasterPixels> {
+    let (width, height) = frame.food_dimensions;
+    let (raster_width, raster_height) = food_raster_dimensions(frame)?;
+    if texture
+        .is_some_and(|samples| samples.len() != raster_width as usize * raster_height as usize)
+    {
+        return None;
     }
     let max_food = frame.food_max.max(f32::EPSILON);
     let noise_width = u64::from((raster_width / 18).max(1));
@@ -21762,11 +21801,16 @@ fn rasterize_food_field(frame: &RenderFrame) -> Option<WorldRasterPixels> {
             if !matches!(frame.palette, ColorPaletteMode::Natural) {
                 color = apply_palette(color, frame.palette);
             }
-            let texture = food_field_noise(
-                (x as f32 + 0.5) / raster_width as f32 * noise_width as f32,
-                (y as f32 + 0.5) / raster_height as f32 * noise_height as f32,
-                noise_width,
-                noise_height,
+            let texture = texture.map_or_else(
+                || {
+                    food_field_noise(
+                        (x as f32 + 0.5) / raster_width as f32 * noise_width as f32,
+                        (y as f32 + 0.5) / raster_height as f32 * noise_height as f32,
+                        noise_width,
+                        noise_height,
+                    )
+                },
+                |samples| samples[y as usize * raster_width as usize + x as usize],
             );
             // Keep sparse food visible at fitted-world scale without inventing
             // food in empty cells. A smooth density falloff avoids hard square
@@ -21785,6 +21829,11 @@ fn rasterize_food_field(frame: &RenderFrame) -> Option<WorldRasterPixels> {
     })
 }
 
+#[cfg(test)]
+fn rasterize_food_field(frame: &RenderFrame) -> Option<WorldRasterPixels> {
+    rasterize_food_field_with_texture(frame, None)
+}
+
 fn paint_food_field(
     state: &CanvasState,
     offset_x: f32,
@@ -21801,7 +21850,32 @@ fn paint_food_field(
     let (image, newly_built) = if let Some(image) = cached {
         (image, false)
     } else {
-        let Some(image) = rasterize_food_field(frame).and_then(render_image_from_world_raster)
+        let Some(dimensions) = food_raster_dimensions(frame) else {
+            return false;
+        };
+        let texture = {
+            let cache = match state.world_raster_cache.lock() {
+                Ok(cache) => cache,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            cache.food_texture.as_ref().and_then(|entry| {
+                (entry.dimensions == dimensions).then(|| Arc::clone(&entry.samples))
+            })
+        };
+        let texture = texture.unwrap_or_else(|| {
+            let samples = food_texture_samples(dimensions.0, dimensions.1);
+            let mut cache = match state.world_raster_cache.lock() {
+                Ok(cache) => cache,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            cache.food_texture = Some(CachedFoodTexture {
+                dimensions,
+                samples: Arc::clone(&samples),
+            });
+            samples
+        });
+        let Some(image) = rasterize_food_field_with_texture(frame, Some(&texture))
+            .and_then(render_image_from_world_raster)
         else {
             return false;
         };
@@ -22224,6 +22298,31 @@ mod continuous_world_raster_tests {
             colors.len() > 8,
             "uniform terrain should retain visible material detail"
         );
+    }
+
+    #[test]
+    fn cached_food_texture_matches_direct_raster_across_food_and_palette_changes() {
+        let mut frame = frame(
+            (4, 3),
+            10,
+            vec![tile(TerrainKind::Grass); 12],
+            (4, 3),
+            10,
+            vec![0.0, 0.01, 0.2, 1.0, 0.8, 0.4, 0.1, 0.0, 0.5, 0.9, 0.3, 0.7],
+        );
+        let (width, height) = food_raster_dimensions(&frame).unwrap();
+        let texture = food_texture_samples(width, height);
+        for palette in ColorPaletteMode::ALL {
+            frame.palette = palette;
+            for tick in 0..3 {
+                frame.tick = tick;
+                frame.food_cells.rotate_left(1);
+                let direct = rasterize_food_field(&frame).unwrap();
+                let cached = rasterize_food_field_with_texture(&frame, Some(&texture)).unwrap();
+                assert_eq!(direct.bgra, cached.bgra, "palette {palette:?}, tick {tick}");
+            }
+        }
+        assert!(rasterize_food_field_with_texture(&frame, Some(&texture[1..])).is_none());
     }
 
     #[test]
