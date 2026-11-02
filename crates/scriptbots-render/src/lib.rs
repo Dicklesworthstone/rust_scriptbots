@@ -2924,6 +2924,18 @@ enum DashboardTab {
     Maps,
 }
 
+#[derive(Clone, Copy)]
+enum HudAction {
+    Run,
+    Pause,
+    Step,
+    Slower,
+    Faster,
+    ClearSelection,
+    SelectAll,
+    FocusFirst,
+}
+
 const MAP_SANDBOX_PREVIEW_SIDE: u32 = 32;
 const MAP_SANDBOX_MAX_CELLS: u64 = MAX_SAMPLE_OUTPUT_CELLS as u64;
 const MAP_DRAFT_MAX_BYTES: usize = 1_048_576;
@@ -10510,21 +10522,69 @@ impl SimulationView {
                     .child("Disabling stores the last interval for quick re-enable."),
             )
     }
+    fn activate_hud_action(&mut self, action: HudAction, cx: &mut Context<Self>) {
+        match action {
+            HudAction::Run => self.set_simulation_paused(false, cx),
+            HudAction::Pause => self.set_simulation_paused(true, cx),
+            HudAction::Step => self.step_simulation_once(cx),
+            HudAction::Slower => self.adjust_simulation_speed(-0.25, cx),
+            HudAction::Faster => self.adjust_simulation_speed(0.25, cx),
+            HudAction::ClearSelection => self.clear_selection(cx),
+            HudAction::SelectAll => self.select_all_agents(cx),
+            HudAction::FocusFirst => self.focus_first_selected(cx),
+        }
+    }
+
+    fn render_hud_action_button(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        accessible_label: &'static str,
+        action: HudAction,
+        active: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let button = div()
+            .id(id)
+            .focusable()
+            .tab_stop(true)
+            .role(Role::Button)
+            .aria_label(accessible_label)
+            .cursor_pointer()
+            .rounded_md()
+            .border_1()
+            .bg(chrome::surface_raised())
+            .px_2()
+            .py_1()
+            .text_xs()
+            .child(label)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| this.activate_hud_action(action, cx)),
+            )
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space" | " ") {
+                    this.activate_hud_action(action, cx);
+                    cx.stop_propagation();
+                }
+            }));
+        if active {
+            button
+                .border_color(chrome::accent())
+                .text_color(chrome::text_primary())
+        } else {
+            button
+                .border_color(chrome::border())
+                .text_color(chrome::text_secondary())
+                .hover(|style| style.border_color(chrome::text_muted()))
+        }
+    }
+
     fn render_selection_controls(
         &self,
         inspector: &InspectorSnapshot,
         cx: &mut Context<Self>,
     ) -> Div {
-        let clear = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
-            this.clear_selection(cx);
-        });
-        let select_all = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
-            this.select_all_agents(cx);
-        });
-        let focus_first = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
-            this.focus_first_selected(cx);
-        });
-
         let clear_binding = self
             .bindings
             .map
@@ -10544,46 +10604,30 @@ impl SimulationView {
             .cloned()
             .unwrap_or_default();
 
-        let style_action_button = |button: Div| {
-            button
-                .border_color(rgb(0x1e293b))
-                .bg(rgb(0x111b2b))
-                .text_color(rgb(0xcbd5f5))
-        };
-
-        let clear_button = {
-            let base = div()
-                .rounded_md()
-                .border_1()
-                .px_2()
-                .py_1()
-                .text_xs()
-                .child("Clear")
-                .on_mouse_down(MouseButton::Left, clear);
-            style_action_button(base)
-        };
-        let select_all_button = {
-            let base = div()
-                .rounded_md()
-                .border_1()
-                .px_2()
-                .py_1()
-                .text_xs()
-                .child("Select all")
-                .on_mouse_down(MouseButton::Left, select_all);
-            style_action_button(base)
-        };
-        let focus_button = {
-            let base = div()
-                .rounded_md()
-                .border_1()
-                .px_2()
-                .py_1()
-                .text_xs()
-                .child("Focus first")
-                .on_mouse_down(MouseButton::Left, focus_first);
-            style_action_button(base)
-        };
+        let clear_button = self.render_hud_action_button(
+            "selection-clear",
+            "Clear",
+            "Clear selection",
+            HudAction::ClearSelection,
+            false,
+            cx,
+        );
+        let select_all_button = self.render_hud_action_button(
+            "selection-all",
+            "Select all",
+            "Select all agents",
+            HudAction::SelectAll,
+            false,
+            cx,
+        );
+        let focus_button = self.render_hud_action_button(
+            "selection-focus-first",
+            "Focus first",
+            "Focus first selected agent",
+            HudAction::FocusFirst,
+            false,
+            cx,
+        );
 
         let hover_label = inspector
             .hovered
@@ -10868,21 +10912,6 @@ impl SimulationView {
     fn render_simulation_controls(&self, snapshot: &HudSnapshot, cx: &mut Context<Self>) -> Div {
         let controls = snapshot.controls;
 
-        let run_listener = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
-            this.set_simulation_paused(false, cx);
-        });
-        let pause_listener = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
-            this.set_simulation_paused(true, cx);
-        });
-        let slower_listener = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
-            this.adjust_simulation_speed(-0.25, cx);
-        });
-        let faster_listener = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
-            this.adjust_simulation_speed(0.25, cx);
-        });
-        let step_listener = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
-            this.step_simulation_once(cx);
-        });
         let spawn_crossover = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
             this.spawn_crossover_agent(cx);
         });
@@ -10928,20 +10957,46 @@ impl SimulationView {
             }
         };
 
-        let run_button = style_toggle(
-            base_button("Run".into()).on_mouse_down(MouseButton::Left, run_listener),
+        let run_button = self.render_hud_action_button(
+            "simulation-run",
+            "Run",
+            "Run simulation",
+            HudAction::Run,
             !controls.paused,
+            cx,
         );
-        let pause_button = style_toggle(
-            base_button("Pause".into()).on_mouse_down(MouseButton::Left, pause_listener),
+        let pause_button = self.render_hud_action_button(
+            "simulation-pause",
+            "Pause",
+            "Pause simulation",
+            HudAction::Pause,
             controls.paused,
+            cx,
         );
-        let step_button =
-            base_button("Step".into()).on_mouse_down(MouseButton::Left, step_listener);
-        let slower_button =
-            base_button("−".into()).on_mouse_down(MouseButton::Left, slower_listener);
-        let faster_button =
-            base_button("+".into()).on_mouse_down(MouseButton::Left, faster_listener);
+        let step_button = self.render_hud_action_button(
+            "simulation-step",
+            "Step",
+            "Step simulation once",
+            HudAction::Step,
+            false,
+            cx,
+        );
+        let slower_button = self.render_hud_action_button(
+            "simulation-slower",
+            "−",
+            "Decrease simulation speed",
+            HudAction::Slower,
+            false,
+            cx,
+        );
+        let faster_button = self.render_hud_action_button(
+            "simulation-faster",
+            "+",
+            "Increase simulation speed",
+            HudAction::Faster,
+            false,
+            cx,
+        );
 
         let spawn_row = div().flex().flex_wrap().gap_2().children(vec![
             base_button("Crossover".into()).on_mouse_down(MouseButton::Left, spawn_crossover),
