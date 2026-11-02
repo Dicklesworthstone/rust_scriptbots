@@ -5991,11 +5991,20 @@ impl SimulationView {
             .flex()
             .flex_col()
             .gap_3()
+            .rounded_lg()
+            .border_1()
+            .border_color(chrome::border())
+            .bg(chrome::surface())
+            .p_4()
             .text_color(chrome::text_primary())
-            .child(palette_controls)
-            .child(div().text_sm().child("Map sandbox"))
-            .child(div().text_xs().child(generator_label))
-            .child(div().text_xs().child(format!(
+            .child(
+                div()
+                    .text_lg()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child("Map sandbox"),
+            )
+            .child(div().text_sm().text_color(chrome::text_secondary()).child(generator_label))
+            .child(div().text_xs().text_color(chrome::text_muted()).child(format!(
                 "Seed {} · {} × {} cells · cell size {} · draft revision {}",
                 draft.state.seed,
                 draft.state.width,
@@ -6003,6 +6012,8 @@ impl SimulationView {
                 draft.state.cell_size,
                 draft.revision,
             )))
+            .child(palette_controls)
+            .child(div().text_xs().text_color(chrome::text_muted()).child("DRAFT & FILES"))
             .child(
                 div()
                     .flex()
@@ -6051,9 +6062,10 @@ impl SimulationView {
                         cx,
                     )),
             )
-            .child(div().text_xs().child(format!(
+            .child(div().text_xs().text_color(chrome::text_muted()).child(format!(
                 "Draft JSON limit {MAP_DRAFT_MAX_BYTES} bytes, {MAP_DRAFT_MAX_RULE_TILES} rule tiles. Copy, edit and paste generator/paint fields to author custom rules or samples. Switching selects a preset; Undo restores your prior configuration."
             )))
+            .child(div().text_xs().text_color(chrome::text_muted()).child("GENERATE A PREVIEW"))
             .child(
                 div()
                     .flex()
@@ -6148,9 +6160,10 @@ impl SimulationView {
                         ))
                     }),
             )
+            .child(div().text_xs().text_color(chrome::text_muted()).child("PAINT THE DRAFT"))
             .child(paint_controls)
-            .child(div().text_xs().child(paint_help))
-            .child(div().text_xs().child(sandbox.notice.clone()));
+            .child(div().text_xs().text_color(chrome::text_secondary()).child(paint_help))
+            .child(div().text_xs().text_color(chrome::accent()).child(sandbox.notice.clone()));
         let policy = match sandbox.policy {
             ExistingAgentPolicy::Retain => "retain existing agents",
             ExistingAgentPolicy::RepositionToSafeTile => "reposition to safe tiles",
@@ -7054,6 +7067,11 @@ impl SimulationView {
                         )
                         .child(
                             div()
+                                .id("narrative-show")
+                                .focusable()
+                                .tab_stop(true)
+                                .role(Role::Button)
+                                .aria_label("Show timeline")
                                 .cursor_pointer()
                                 .rounded_md()
                                 .border_1()
@@ -7062,7 +7080,17 @@ impl SimulationView {
                                 .py_2()
                                 .text_xs()
                                 .child("Show timeline")
-                                .on_mouse_down(MouseButton::Left, show),
+                                .on_mouse_down(MouseButton::Left, show)
+                                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                                    if matches!(
+                                        event.keystroke.key.as_str(),
+                                        "enter" | "space" | " "
+                                    ) {
+                                        this.rail_visible = true;
+                                        cx.notify();
+                                        cx.stop_propagation();
+                                    }
+                                })),
                         )
                 }
             }
@@ -7363,7 +7391,11 @@ impl SimulationView {
             ),
         ];
 
-        let trophic_row = div().grid().grid_cols(1).gap_2().children(trophic_cards);
+        let trophic_row = div().flex().flex_wrap().gap_2().children(
+            trophic_cards
+                .into_iter()
+                .map(|card| card.min_w(px(200.0)).flex_1()),
+        );
 
         let meta_bar = div()
             .flex()
@@ -7572,14 +7604,18 @@ impl SimulationView {
                 )
         };
 
-        let insights_row = div().grid().grid_cols(1).gap_2().children(vec![
-            resource_panel,
-            mutation_panel,
-            behavior_panel,
-            age_panel,
-            temperature_panel,
-            mortality_panel,
-        ]);
+        let insights_row = div().flex().flex_wrap().gap_2().children(
+            vec![
+                resource_panel,
+                mutation_panel,
+                behavior_panel,
+                age_panel,
+                temperature_panel,
+                mortality_panel,
+            ]
+            .into_iter()
+            .map(|panel| panel.min_w(px(260.0)).flex_1()),
+        );
 
         let mut brain_rows: Vec<Div> = Vec::new();
         brain_rows.push(
@@ -8037,18 +8073,19 @@ impl SimulationView {
         let mut rail = div()
             .flex()
             .flex_col()
-            .gap_1()
-            .p_2()
-            .rounded_md()
+            .gap_3()
+            .p_4()
+            .rounded_lg()
             .bg(chrome::surface())
             .border_1()
             .border_color(chrome::border());
 
         let mut header_row = div().flex().justify_between().items_center().child(
             div()
-                .text_xs()
-                .text_color(chrome::text_secondary())
-                .child("Timeline — run history · World review"),
+                .text_lg()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(chrome::text_primary())
+                .child("Timeline"),
         );
         let toggle_listener = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
             this.rail_visible = !this.rail_visible;
@@ -8057,11 +8094,24 @@ impl SimulationView {
         });
         header_row = header_row.child(
             div()
+                .id("narrative-hide")
+                .focusable()
+                .tab_stop(true)
+                .role(Role::Button)
+                .aria_label("Hide timeline")
                 .text_xs()
                 .text_color(chrome::accent())
                 .cursor_pointer()
-                .child("hide")
-                .on_mouse_down(MouseButton::Left, toggle_listener),
+                .child("Hide")
+                .on_mouse_down(MouseButton::Left, toggle_listener)
+                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                    if matches!(event.keystroke.key.as_str(), "enter" | "space" | " ") {
+                        this.rail_visible = false;
+                        this.timeline_cancelled.store(true, AtomicOrdering::Release);
+                        cx.notify();
+                        cx.stop_propagation();
+                    }
+                })),
         );
         rail = rail.child(header_row);
 
@@ -8069,27 +8119,66 @@ impl SimulationView {
             this.start_timeline_job(TimelineReviewRequest::SaveCheckpoint, None);
             cx.notify();
         });
-        rail = rail.child(
-            div()
-                .debug_selector(|| "narrative-save-checkpoint".to_owned())
-                .text_xs()
-                .text_color(chrome::accent())
-                .cursor_pointer()
-                .child("Save replay checkpoint before future events")
-                .on_mouse_down(MouseButton::Left, save),
-        );
+        let save_button = div()
+            .id("narrative-save")
+            .debug_selector(|| "narrative-save-checkpoint".to_owned())
+            .focusable()
+            .tab_stop(true)
+            .role(Role::Button)
+            .aria_label("Save replay checkpoint")
+            .rounded_md()
+            .border_1()
+            .border_color(chrome::border())
+            .bg(chrome::surface_raised())
+            .px_3()
+            .py_2()
+            .text_sm()
+            .text_color(chrome::text_primary())
+            .cursor_pointer()
+            .child("Save replay checkpoint")
+            .on_mouse_down(MouseButton::Left, save)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space" | " ") {
+                    this.start_timeline_job(TimelineReviewRequest::SaveCheckpoint, None);
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+            }));
 
         let return_live = cx.listener(|this, _event: &MouseDownEvent, _, cx| {
             this.return_world_to_live(cx);
         });
+        let return_live_button = div()
+            .id("narrative-live")
+            .debug_selector(|| "narrative-world-live".to_owned())
+            .focusable()
+            .tab_stop(true)
+            .role(Role::Button)
+            .aria_label("Return World to live")
+            .rounded_md()
+            .border_1()
+            .border_color(chrome::border())
+            .bg(chrome::surface_raised())
+            .px_3()
+            .py_2()
+            .text_sm()
+            .text_color(chrome::text_primary())
+            .cursor_pointer()
+            .child("Return World to live")
+            .on_mouse_down(MouseButton::Left, return_live)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space" | " ") {
+                    this.return_world_to_live(cx);
+                    cx.stop_propagation();
+                }
+            }));
         rail = rail.child(
             div()
-                .debug_selector(|| "narrative-world-live".to_owned())
-                .text_xs()
-                .text_color(chrome::accent())
-                .cursor_pointer()
-                .child("Return World to live")
-                .on_mouse_down(MouseButton::Left, return_live),
+                .flex()
+                .flex_wrap()
+                .gap_2()
+                .child(save_button)
+                .child(return_live_button),
         );
         if let Some(feedback) = &self.world_review_feedback {
             rail = rail.child(
@@ -8132,6 +8221,11 @@ impl SimulationView {
                 cx.notify();
             });
             let mut glyph = div()
+                .id(("narrative-event", index))
+                .focusable()
+                .tab_stop(true)
+                .role(Role::Button)
+                .aria_label(format!("{} at tick {}", event.kind.as_str(), event.tick.0))
                 .cursor_pointer()
                 .text_sm()
                 .text_color(rgb(color))
@@ -8143,7 +8237,17 @@ impl SimulationView {
                     .border_1()
                     .border_color(rgb(color));
             }
-            glyph_row = glyph_row.child(glyph.on_mouse_down(MouseButton::Left, listener));
+            glyph_row = glyph_row.child(
+                glyph
+                    .on_mouse_down(MouseButton::Left, listener)
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                        if matches!(event.keystroke.key.as_str(), "enter" | "space" | " ") {
+                            this.select_rail_event(index);
+                            cx.notify();
+                            cx.stop_propagation();
+                        }
+                    })),
+            );
         }
         rail = rail.child(glyph_row);
 
@@ -8151,17 +8255,37 @@ impl SimulationView {
         let selected_event = &events[selection];
         let tick = selected_event.tick.0;
         let requested_event = selected_event.clone();
+        let keyboard_requested_event = selected_event.clone();
         let review = cx.listener(move |this, _event: &MouseDownEvent, _, cx| {
             this.review_world_frame(&requested_event, cx);
         });
         rail = rail.child(
-            div()
-                .debug_selector(|| "narrative-review-frame".to_owned())
-                .text_xs()
-                .text_color(chrome::accent())
-                .cursor_pointer()
-                .child(format!("Review World frame at tick {tick}"))
-                .on_mouse_down(MouseButton::Left, review),
+            div().flex().child(
+                div()
+                    .id("narrative-review")
+                    .debug_selector(|| "narrative-review-frame".to_owned())
+                    .focusable()
+                    .tab_stop(true)
+                    .role(Role::Button)
+                    .aria_label(format!("Review World frame at tick {tick}"))
+                    .rounded_md()
+                    .border_1()
+                    .border_color(chrome::accent())
+                    .bg(chrome::surface_raised())
+                    .px_3()
+                    .py_2()
+                    .text_sm()
+                    .text_color(chrome::text_primary())
+                    .cursor_pointer()
+                    .child(format!("Review World frame at tick {tick}"))
+                    .on_mouse_down(MouseButton::Left, review)
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                        if matches!(event.keystroke.key.as_str(), "enter" | "space" | " ") {
+                            this.review_world_frame(&keyboard_requested_event, cx);
+                            cx.stop_propagation();
+                        }
+                    })),
+            ),
         );
         let aged_out = if self.rail_selection_aged_out {
             " | selected event aged out of the ring"
