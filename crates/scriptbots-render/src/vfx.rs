@@ -8,15 +8,12 @@
 
 use std::sync::Arc;
 
-use gpui::{PathBuilder, Window, point, px};
+use gpui::{Background, Bounds, PathBuilder, Window, fill, point, px, size};
 use scriptbots_core::visual::{VisualCue, VisualCueKind, WorldVisualEvent, visual_cue_for_event};
 use scriptbots_core::{AgentUid, Position};
 
 use crate::camera::CameraSnapshot;
-use crate::{
-    ColorPaletteMode, append_arc_polyline, append_circle_polygon, apply_palette,
-    rgba_from_triplet_with_alpha,
-};
+use crate::{ColorPaletteMode, append_arc_polyline, apply_palette, rgba_from_triplet_with_alpha};
 
 /// Maximum number of simultaneously retained presentation effects.
 ///
@@ -218,8 +215,8 @@ impl VfxFrame {
 ///
 /// Captures use this as a non-vacuity rail: a pixel delta must correspond to a
 /// production effect family, not an unrelated animation elsewhere in the frame.
-/// A pass records an effect only when at least one of its paths was built and
-/// painted. Test instrumentation merges the passes with a per-family maximum,
+/// A pass records an effect only when at least one of its shapes was painted.
+/// Test instrumentation merges the passes with a per-family maximum,
 /// so dual-pass birth/death effects are not counted twice. This is deliberately
 /// a conservative visibility rail rather than a scientific accounting stream.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -598,20 +595,20 @@ fn paint_disc(
     alpha: f32,
     palette: ColorPaletteMode,
 ) -> bool {
-    let mut disc = PathBuilder::fill();
-    append_circle_polygon(&mut disc, x, y, radius.max(1.0));
-    if let Ok(path) = disc.build() {
-        window.paint_path(
-            path,
-            apply_palette(
-                rgba_from_triplet_with_alpha(color, alpha.clamp(0.0, 1.0)),
-                palette,
-            ),
-        );
-        true
-    } else {
-        false
+    if !x.is_finite() || !y.is_finite() || !radius.is_finite() {
+        return false;
     }
+    let radius = radius.max(1.0);
+    let bounds = Bounds::new(
+        point(px(x - radius), px(y - radius)),
+        size(px(radius * 2.0), px(radius * 2.0)),
+    );
+    let color = apply_palette(
+        rgba_from_triplet_with_alpha(color, alpha.clamp(0.0, 1.0)),
+        palette,
+    );
+    window.paint_quad(fill(bounds, Background::from(color)).corner_radii(px(radius)));
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -812,6 +809,67 @@ fn normalized_direction(direction: [f32; 2]) -> [f32; 2] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn disc_paints_a_round_colored_effect_in_real_gpui_pixels() {
+        use gpui::{
+            AppContext as _, Context, HeadlessAppContext, IntoElement, ParentElement, Render,
+            Styled, Window, canvas, div, rgb,
+        };
+
+        struct DiscView;
+        impl Render for DiscView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().size_full().bg(rgb(0x000000)).child(
+                    canvas(
+                        |_, _, _| (),
+                        |_, _, window, _| {
+                            assert!(paint_disc(
+                                window,
+                                64.0,
+                                64.0,
+                                20.0,
+                                [1.0, 0.25, 0.5],
+                                1.0,
+                                ColorPaletteMode::Natural,
+                            ));
+                        },
+                    )
+                    .size_full(),
+                )
+            }
+        }
+
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            std::sync::Arc::new(()),
+            gpui_platform::current_headless_renderer,
+        );
+        let window = cx
+            .open_window(size(px(128.0), px(128.0)), |_, app| app.new(|_| DiscView))
+            .expect("open VFX capture window");
+        cx.run_until_parked();
+        cx.update_window(window.into(), |_, window, _| window.refresh())
+            .expect("refresh VFX capture");
+        cx.run_until_parked();
+        let image = cx
+            .capture_screenshot(window.into())
+            .expect("capture VFX disc");
+        let center = image.get_pixel(128, 128).0;
+        let corner = image.get_pixel(164, 164).0;
+        let outside = image.get_pixel(180, 128).0;
+        assert!(
+            center[0] > 180 && center[0] > center[1],
+            "center: {center:?}"
+        );
+        assert!(corner[0] < 20, "disc must not fill its corner: {corner:?}");
+        assert!(
+            outside[0] < 20,
+            "disc extends beyond its radius: {outside:?}"
+        );
+    }
 
     fn cue(kind: VisualCueKind, duration_ticks: u32) -> VisualCue {
         VisualCue {

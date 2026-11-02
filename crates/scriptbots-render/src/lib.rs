@@ -8924,7 +8924,7 @@ impl SimulationView {
         )
         .flex_1();
 
-        let canvas_stack = div()
+        let mut canvas_stack = div()
             .relative()
             .flex()
             .flex_col()
@@ -9022,9 +9022,26 @@ impl SimulationView {
             }))
             .child(canvas_element);
 
-        // The dedicated World window owns this entire flexible region. Diagnostic
-        // panels live in the separate Lab window, so overlap with the canvas is
-        // structurally impossible.
+        let focused_agent = self
+            .inspector
+            .lock()
+            .ok()
+            .and_then(|inspector| inspector.focused_agent);
+        if let Some(selected) = snapshot
+            .inspector
+            .selected
+            .iter()
+            .find(|entry| entry.is_focused && Some(entry.agent_id) == focused_agent)
+        {
+            canvas_stack = canvas_stack.child(self.render_world_agent_hud(
+                selected,
+                snapshot.inspector.focused.as_ref(),
+                cx,
+            ));
+        }
+
+        // The World owns the flexible viewport; the compact focus card floats
+        // over it while the full Inspector remains in the separate Lab window.
         let world_row = div()
             .flex()
             .flex_row()
@@ -9062,6 +9079,188 @@ impl SimulationView {
             .gap_2()
             .child(canvas_stack)
             .child(footer)
+    }
+
+    fn render_world_agent_hud(
+        &self,
+        selected: &AgentListEntry,
+        detail: Option<&AgentInspectorDetails>,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let label =
+            |text: &'static str| div().text_xs().text_color(chrome::text_muted()).child(text);
+        let metric = |name: &'static str, value: String| {
+            div()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(label(name))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(chrome::text_primary())
+                        .child(value),
+                )
+        };
+
+        let mut hud = div()
+            .absolute()
+            .top(px(12.0))
+            .left(px(12.0))
+            .right(px(12.0))
+            .max_w(px(300.0))
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(0x42645f))
+            .bg(rgb(0x101f22))
+            .shadow_lg()
+            .px_3()
+            .py_3()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, _, cx| cx.stop_propagation()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(label("SELECTED CREATURE"))
+                    .child(color_swatch(selected.color)),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(chrome::text_primary())
+                    .child(format!("Creature #{}", selected.uid.get())),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_3()
+                    .child(metric("ENERGY", format!("{:.2}", selected.energy)))
+                    .child(metric("HEALTH", format!("{:.2}", selected.health)))
+                    .child(metric("AGE", format!("{} ticks", selected.age))),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(chrome::text_secondary())
+                    .child(format!(
+                        "Gen {}  ·  Position {:.0}, {:.0}",
+                        selected.generation.0, selected.position.x, selected.position.y
+                    )),
+            );
+
+        if let Some(detail) = detail.filter(|detail| detail.agent_id == selected.agent_id) {
+            hud = hud
+                .child(div().h(px(1.0)).w_full().bg(chrome::border()))
+                .child(label("BRAIN & BEHAVIOR"))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(chrome::text_primary())
+                        .truncate()
+                        .child(detail.brain_descriptor.clone()),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(chrome::text_secondary())
+                        .child(format!(
+                            "Spike {:.1}  ·  Smell {:.2}  ·  Hearing {:.2}",
+                            detail.spike_length,
+                            detail.trait_modifiers.smell,
+                            detail.trait_modifiers.hearing
+                        )),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(chrome::text_secondary())
+                        .child(format!(
+                            "Eye {:.2}  ·  Blood {:.2}  ·  Sound {:.2}",
+                            detail.trait_modifiers.eye,
+                            detail.trait_modifiers.blood,
+                            detail.trait_modifiers.sound
+                        )),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(chrome::text_secondary())
+                        .child(format!(
+                            "Mutation {:.3} / {:.3}  ·  {} inputs / {} outputs",
+                            detail.mutation_rates.primary,
+                            detail.mutation_rates.secondary,
+                            detail.sensors.len(),
+                            detail.outputs.len()
+                        )),
+                );
+            let output = |channel: OutputChannel| detail.outputs.get(channel.index()).copied();
+            if detail.brain_bound
+                && let (Some(left), Some(right), Some(boost)) = (
+                    output(OutputChannel::WheelLeft),
+                    output(OutputChannel::WheelRight),
+                    output(OutputChannel::Boost),
+                )
+            {
+                hud = hud.child(div().text_xs().text_color(chrome::text_secondary()).child(
+                    format!("Wheels {left:.2} / {right:.2}  ·  Boost {boost:.2}"),
+                ));
+            } else if detail.brain_bound {
+                hud = hud.child(label("Actuator values unavailable"));
+            } else {
+                hud = hud.child(label("Brain unbound · outputs mirror sensors"));
+            }
+            let mut sensed: Vec<_> = SENSOR_LAYOUT
+                .iter()
+                .filter_map(|channel| {
+                    detail
+                        .sensors
+                        .get(channel.index)
+                        .copied()
+                        .filter(|value| value.is_finite())
+                        .map(|value| (channel.short, value))
+                })
+                .collect();
+            sensed.sort_by(|left, right| right.1.abs().total_cmp(&left.1.abs()));
+            if !sensed.is_empty() {
+                let strongest = sensed
+                    .iter()
+                    .take(2)
+                    .map(|(name, value)| format!("{name} {value:.2}"))
+                    .collect::<Vec<_>>()
+                    .join("  ·  ");
+                hud = hud.child(
+                    div()
+                        .text_xs()
+                        .text_color(chrome::text_secondary())
+                        .truncate()
+                        .child(format!("Top senses: {strongest}")),
+                );
+            } else {
+                hud = hud.child(label("Sensor values unavailable"));
+            }
+        } else {
+            // A matching inspection can be briefly unavailable while the host
+            // advances. Keep the card's geometry stable and never show stale
+            // neural values as if they belonged to the current snapshot.
+            hud = hud
+                .child(div().h(px(1.0)).w_full().bg(chrome::border()))
+                .child(label("BRAIN & BEHAVIOR"))
+                .child(label("Brain detail updating…"))
+                .child(label("Spike —  ·  Smell —  ·  Hearing —"))
+                .child(label("Eye —  ·  Blood —  ·  Sound —"))
+                .child(label("Mutation —  ·  Inputs / outputs —"))
+                .child(label("Actuator values unavailable"))
+                .child(label("Sensor values unavailable"));
+        }
+        hud
     }
 
     fn compute_follow_target(
@@ -17307,6 +17506,7 @@ fn format_keystroke(keystroke: &Keystroke) -> String {
 #[derive(Clone)]
 struct AgentListEntry {
     agent_id: AgentId,
+    uid: AgentUid,
     label: String,
     color: [f32; 3],
     energy: f32,
@@ -17322,6 +17522,7 @@ impl AgentListEntry {
         let agent_id = AgentId::from(slotmap::KeyData::from_ffi(agent.id));
         Self {
             agent_id,
+            uid: agent.uid,
             label: format!("#{row} · {:?} · Gen {}", agent_id, agent.generation.0),
             color: agent.color,
             energy: agent.energy,
@@ -17666,6 +17867,31 @@ fn generate_tone(frequency: f32, duration: f32, amplitude: f32) -> StaticSoundDa
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RenderDetail {
+    #[default]
+    Full,
+    Reduced,
+    Minimal,
+}
+
+impl RenderDetail {
+    fn for_fps(self, fps: f32) -> Self {
+        if !fps.is_finite() || fps <= 0.0 {
+            return self;
+        }
+        match self {
+            Self::Full if fps < 22.0 => Self::Minimal,
+            Self::Full if fps < 28.0 => Self::Reduced,
+            Self::Reduced if fps < 22.0 => Self::Minimal,
+            Self::Reduced if fps > 34.0 => Self::Full,
+            Self::Minimal if fps > 34.0 => Self::Full,
+            Self::Minimal if fps > 27.0 => Self::Reduced,
+            _ => self,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct PerfSnapshot {
     latest_ms: f32,
@@ -17674,6 +17900,7 @@ struct PerfSnapshot {
     max_ms: f32,
     sample_count: usize,
     fps: f32,
+    detail: RenderDetail,
 }
 
 impl Default for PerfSnapshot {
@@ -17685,6 +17912,7 @@ impl Default for PerfSnapshot {
             max_ms: 0.0,
             sample_count: 0,
             fps: 0.0,
+            detail: RenderDetail::Full,
         }
     }
 }
@@ -17693,6 +17921,8 @@ struct PerfStats {
     start: Option<Instant>,
     previous_start: Option<Instant>,
     interval_ms: f32,
+    intervals: VecDeque<f32>,
+    detail: RenderDetail,
     samples: VecDeque<f32>,
     capacity: usize,
 }
@@ -17704,6 +17934,8 @@ impl PerfStats {
             start: None,
             previous_start: None,
             interval_ms: 0.0,
+            intervals: VecDeque::with_capacity(cap.min(30)),
+            detail: RenderDetail::Full,
             samples: VecDeque::with_capacity(cap),
             capacity: cap,
         }
@@ -17713,6 +17945,10 @@ impl PerfStats {
         let now = Instant::now();
         if let Some(previous) = self.previous_start.replace(now) {
             self.interval_ms = now.duration_since(previous).as_secs_f32() * 1000.0;
+            self.intervals.push_back(self.interval_ms);
+            if self.intervals.len() > self.capacity.min(30) {
+                self.intervals.pop_front();
+            }
         }
         self.start = Some(now);
     }
@@ -17727,7 +17963,10 @@ impl PerfStats {
         if self.samples.len() > self.capacity {
             self.samples.pop_front();
         }
-        self.snapshot(elapsed_ms)
+        let mut snapshot = self.snapshot(elapsed_ms);
+        self.detail = self.detail.for_fps(snapshot.fps);
+        snapshot.detail = self.detail;
+        snapshot
     }
 
     fn snapshot(&self, latest: f32) -> PerfSnapshot {
@@ -17748,8 +17987,13 @@ impl PerfStats {
         }
         let count = self.samples.len();
         let avg = if count > 0 { sum / count as f32 } else { 0.0 };
-        let fps = if self.interval_ms > f32::EPSILON {
-            1000.0 / self.interval_ms
+        let interval_ms = if self.intervals.is_empty() {
+            self.interval_ms
+        } else {
+            self.intervals.iter().sum::<f32>() / self.intervals.len() as f32
+        };
+        let fps = if interval_ms > f32::EPSILON {
+            1000.0 / interval_ms
         } else {
             0.0
         };
@@ -17761,13 +18005,31 @@ impl PerfStats {
             max_ms: if max.is_finite() { max } else { 0.0 },
             sample_count: count,
             fps,
+            detail: self.detail,
         }
     }
 }
 
 #[cfg(test)]
 mod perf_presentation_tests {
-    use super::PerfStats;
+    use super::{PerfStats, Position, RenderDetail, bounded_follow_center};
+
+    #[test]
+    fn following_at_world_edges_does_not_reveal_empty_space() {
+        let target = Position { x: 10.0, y: 20.0 };
+        let fitted = bounded_follow_center(target, (1000.0, 500.0), (1000.0, 500.0), 1.0);
+        assert_eq!((fitted.x, fitted.y), (500.0, 250.0));
+
+        let near_edge = bounded_follow_center(target, (1000.0, 500.0), (500.0, 250.0), 1.0);
+        assert_eq!((near_edge.x, near_edge.y), (250.0, 125.0));
+        let middle = bounded_follow_center(
+            Position { x: 600.0, y: 300.0 },
+            (1000.0, 500.0),
+            (500.0, 250.0),
+            1.0,
+        );
+        assert_eq!((middle.x, middle.y), (600.0, 300.0));
+    }
 
     #[test]
     fn update_rate_uses_the_interval_between_updates() {
@@ -17777,6 +18039,33 @@ mod perf_presentation_tests {
         let snapshot = stats.snapshot(2.0);
         assert_eq!(snapshot.latest_ms, 2.0);
         assert_eq!(snapshot.fps, 50.0);
+    }
+
+    #[test]
+    fn rendering_detail_does_not_oscillate_at_frame_rate_boundaries() {
+        let mut detail = RenderDetail::Full;
+        for fps in [29.0, 28.0, 29.0, 30.0] {
+            detail = detail.for_fps(fps);
+            assert_eq!(detail, RenderDetail::Full);
+        }
+        detail = detail.for_fps(27.0);
+        assert_eq!(detail, RenderDetail::Reduced);
+        for fps in [29.0, 31.0, 33.0, 30.0] {
+            detail = detail.for_fps(fps);
+            assert_eq!(detail, RenderDetail::Reduced);
+        }
+        assert_eq!(detail.for_fps(35.0), RenderDetail::Full);
+        assert_eq!(detail.for_fps(20.0), RenderDetail::Minimal);
+        assert_eq!(RenderDetail::Minimal.for_fps(25.0), RenderDetail::Minimal);
+    }
+
+    #[test]
+    fn update_rate_averages_recent_intervals() {
+        let mut stats = PerfStats::new(4);
+        stats.samples.push_back(1.0);
+        stats.intervals.extend([20.0, 40.0, 20.0, 40.0]);
+        let fps = stats.snapshot(1.0).fps;
+        assert!((fps - 1000.0 / 30.0).abs() < 0.01);
     }
 }
 
@@ -18323,13 +18612,23 @@ struct TerrainTileVisual {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct WorldRasterKey {
     field_fingerprint: u64,
-    tick: u64,
     daylight_bits: u32,
     palette: ColorPaletteMode,
 }
 
 struct CachedWorldRaster {
     key: WorldRasterKey,
+    image: Arc<RenderImage>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FoodRasterKey {
+    fingerprint: u64,
+    palette: ColorPaletteMode,
+}
+
+struct CachedFoodRaster {
+    key: FoodRasterKey,
     image: Arc<RenderImage>,
 }
 
@@ -18343,6 +18642,8 @@ struct CachedWorldRaster {
 struct WorldRasterCache {
     current: Option<CachedWorldRaster>,
     previous: Option<Arc<RenderImage>>,
+    food_current: Option<CachedFoodRaster>,
+    food_previous: Option<Arc<RenderImage>>,
 }
 
 impl WorldRasterCache {
@@ -18362,12 +18663,40 @@ impl WorldRasterCache {
         retired
     }
 
+    fn food_image_for(&self, key: FoodRasterKey) -> Option<Arc<RenderImage>> {
+        self.food_current
+            .as_ref()
+            .filter(|entry| entry.key == key)
+            .map(|entry| Arc::clone(&entry.image))
+    }
+
+    fn commit_food(
+        &mut self,
+        key: FoodRasterKey,
+        image: Arc<RenderImage>,
+    ) -> Option<Arc<RenderImage>> {
+        let retired = self.food_previous.take();
+        self.food_previous = self
+            .food_current
+            .replace(CachedFoodRaster { key, image })
+            .map(|entry| entry.image);
+        retired
+    }
+
     fn drain(&mut self) -> Vec<Arc<RenderImage>> {
         let mut images = Vec::with_capacity(2);
         if let Some(entry) = self.current.take() {
             images.push(entry.image);
         }
         if let Some(previous) = self.previous.take()
+            && images.iter().all(|image| image.id != previous.id)
+        {
+            images.push(previous);
+        }
+        if let Some(entry) = self.food_current.take() {
+            images.push(entry.image);
+        }
+        if let Some(previous) = self.food_previous.take()
             && images.iter().all(|image| image.id != previous.id)
         {
             images.push(previous);
@@ -18749,7 +19078,11 @@ impl RenderFrame {
                     heading: agent.heading,
                     health: agent.health,
                     age: agent.age,
-                    boost: if visual.boost_engaged { 1.0 } else { 0.0 },
+                    boost: if visual.boost_output > scriptbots_core::BOOST_THRESHOLD {
+                        1.0
+                    } else {
+                        0.0
+                    },
                     wheel_left: visual.wheel_left,
                     wheel_right: visual.wheel_right,
                     herbivore_tendency: agent.herbivore_tendency.clamp(0.0, 1.0),
@@ -20707,7 +21040,6 @@ const MAX_WORLD_RASTER_TEXELS: u64 = 1_048_576;
 fn world_raster_key(frame: &RenderFrame, daylight: f32) -> WorldRasterKey {
     WorldRasterKey {
         field_fingerprint: world_field_fingerprint(frame),
-        tick: frame.tick,
         daylight_bits: daylight.to_bits(),
         palette: frame.palette,
     }
@@ -20732,6 +21064,9 @@ fn world_field_fingerprint(frame: &RenderFrame) -> u64 {
     ] {
         push(&mut hash, &value.to_le_bytes());
     }
+    for value in [frame.world_size.0, frame.world_size.1] {
+        push(&mut hash, &value.to_bits().to_le_bytes());
+    }
     for tile in &frame.terrain.tiles {
         push(&mut hash, &[terrain_kind_index(tile.kind) as u8]);
         for value in [
@@ -20741,6 +21076,7 @@ fn world_field_fingerprint(frame: &RenderFrame) -> u64 {
             tile.accent,
             tile.slope,
             tile.water_depth,
+            tile.temperature,
             tile.elevation_gradient[0],
             tile.elevation_gradient[1],
         ] {
@@ -20899,6 +21235,152 @@ fn rasterize_world_fields(frame: &RenderFrame, daylight: f32) -> Option<WorldRas
 fn render_image_from_world_raster(pixels: WorldRasterPixels) -> Option<Arc<RenderImage>> {
     let buffer = ImageBuffer::<ImgRgba<u8>, _>::from_raw(pixels.width, pixels.height, pixels.bgra)?;
     Some(Arc::new(RenderImage::new(vec![ImageFrame::new(buffer)])))
+}
+
+fn food_raster_key(frame: &RenderFrame) -> FoodRasterKey {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for word in [
+        frame.food_dimensions.0,
+        frame.food_dimensions.1,
+        frame.food_cell_size,
+        frame.food_max.to_bits(),
+    ]
+    .into_iter()
+    .chain(frame.food_cells.iter().map(|value| value.to_bits()))
+    {
+        for byte in word.to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    FoodRasterKey {
+        fingerprint: hash,
+        palette: frame.palette,
+    }
+}
+
+/// Smooth, deterministic variation used only to shade the resource field.
+fn food_field_noise(x: f32, y: f32, period_x: u64, period_y: u64) -> f32 {
+    let x0 = x.floor().max(0.0) as u64;
+    let y0 = y.floor().max(0.0) as u64;
+    let smooth = |v: f32| v * v * (3.0 - 2.0 * v);
+    let tx = smooth(x.fract());
+    let ty = smooth(y.fract());
+    let noise = |row: u64, col: u64| hashed_noise(0x464f_4f44, row % period_y, col % period_x);
+    let top = noise(y0, x0) * (1.0 - tx) + noise(y0, x0 + 1) * tx;
+    let bottom = noise(y0 + 1, x0) * (1.0 - tx) + noise(y0 + 1, x0 + 1) * tx;
+    top * (1.0 - ty) + bottom * ty
+}
+
+/// Render the food grid as a continuous density field. The field uses the
+/// simulation's values; the stable texture only modulates its presentation.
+fn rasterize_food_field(frame: &RenderFrame) -> Option<WorldRasterPixels> {
+    let (width, height) = frame.food_dimensions;
+    let cells = (width as usize).checked_mul(height as usize)?;
+    if width == 0 || height == 0 || frame.food_cells.len() < cells {
+        return None;
+    }
+    let mut raster_width = width.saturating_mul(4).max(1);
+    let mut raster_height = height.saturating_mul(4).max(1);
+    let texels = u64::from(raster_width) * u64::from(raster_height);
+    if texels > MAX_WORLD_RASTER_TEXELS {
+        let scale = (MAX_WORLD_RASTER_TEXELS as f64 / texels as f64).sqrt();
+        raster_width = ((f64::from(raster_width) * scale).floor() as u32).max(1);
+        raster_height = ((f64::from(raster_height) * scale).floor() as u32).max(1);
+    }
+    let max_food = frame.food_max.max(f32::EPSILON);
+    let noise_width = u64::from((raster_width / 18).max(1));
+    let noise_height = u64::from((raster_height / 18).max(1));
+    let mut bgra = Vec::with_capacity(raster_width as usize * raster_height as usize * 4);
+    let sample = |x: u32, y: u32| {
+        frame.food_cells[(y % height) as usize * width as usize + (x % width) as usize].max(0.0)
+    };
+    for y in 0..raster_height {
+        let fy = ((y as f32 + 0.5) * height as f32 / raster_height as f32 - 0.5)
+            .rem_euclid(height as f32);
+        let y0 = fy.floor() as u32;
+        let ty = fy.fract();
+        for x in 0..raster_width {
+            let fx = ((x as f32 + 0.5) * width as f32 / raster_width as f32 - 0.5)
+                .rem_euclid(width as f32);
+            let x0 = fx.floor() as u32;
+            let tx = fx.fract();
+            let top = sample(x0, y0) * (1.0 - tx) + sample(x0 + 1, y0) * tx;
+            let bottom = sample(x0, y0 + 1) * (1.0 - tx) + sample(x0 + 1, y0 + 1) * tx;
+            let density = ((top * (1.0 - ty) + bottom * ty) / max_food).clamp(0.0, 1.0);
+            let mut color = food_color(density);
+            if !matches!(frame.palette, ColorPaletteMode::Natural) {
+                color = apply_palette(color, frame.palette);
+            }
+            let texture = food_field_noise(
+                (x as f32 + 0.5) / raster_width as f32 * noise_width as f32,
+                (y as f32 + 0.5) / raster_height as f32 * noise_height as f32,
+                noise_width,
+                noise_height,
+            );
+            color.a *= density.sqrt() * (0.22 + texture * 0.20);
+            let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+            bgra.extend_from_slice(&[byte(color.b), byte(color.g), byte(color.r), byte(color.a)]);
+        }
+    }
+    Some(WorldRasterPixels {
+        width: raster_width,
+        height: raster_height,
+        bgra,
+    })
+}
+
+fn paint_food_field(
+    state: &CanvasState,
+    offset_x: f32,
+    offset_y: f32,
+    scale: f32,
+    window: &mut Window,
+) -> bool {
+    let frame = &state.frame;
+    let key = food_raster_key(frame);
+    let cached = match state.world_raster_cache.lock() {
+        Ok(cache) => cache.food_image_for(key),
+        Err(poisoned) => poisoned.into_inner().food_image_for(key),
+    };
+    let (image, newly_built) = if let Some(image) = cached {
+        (image, false)
+    } else {
+        let Some(image) = rasterize_food_field(frame).and_then(render_image_from_world_raster)
+        else {
+            return false;
+        };
+        (image, true)
+    };
+    let bounds = Bounds::new(
+        point(px(offset_x), px(offset_y)),
+        size(
+            px(frame.food_dimensions.0 as f32 * frame.food_cell_size as f32 * scale),
+            px(frame.food_dimensions.1 as f32 * frame.food_cell_size as f32 * scale),
+        ),
+    );
+    let result = window.paint_layer(bounds, |window| {
+        window.paint_image(bounds, Corners::default(), Arc::clone(&image), 0, false)
+    });
+    if let Err(error) = result {
+        if newly_built {
+            let _ = window.drop_image(image);
+        }
+        warn!(?error, "food field upload failed; using cell fallback");
+        return false;
+    }
+    if newly_built {
+        let retired = match state.world_raster_cache.lock() {
+            Ok(mut cache) => cache.commit_food(key, image),
+            Err(poisoned) => poisoned.into_inner().commit_food(key, image),
+        };
+        if let Some(retired) = retired
+            && let Err(error) = window.drop_image(retired)
+        {
+            debug!(?error, "could not evict retired food field image");
+        }
+    }
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -21221,6 +21703,70 @@ mod continuous_world_raster_tests {
         );
     }
 
+    #[test]
+    fn food_field_preserves_density_and_reuses_unchanged_inputs() {
+        assert_eq!(
+            food_field_noise(0.0, 1.25, 4, 3),
+            food_field_noise(4.0, 1.25, 4, 3),
+            "texture must wrap horizontally"
+        );
+        assert_eq!(
+            food_field_noise(2.25, 0.0, 4, 3),
+            food_field_noise(2.25, 3.0, 4, 3),
+            "texture must wrap vertically"
+        );
+        let mut frame = frame(
+            (2, 1),
+            10,
+            vec![tile(TerrainKind::Grass); 2],
+            (2, 1),
+            10,
+            vec![1.0, 0.0],
+        );
+        let initial = food_raster_key(&frame);
+        let populated = rasterize_food_field(&frame).expect("populated food field");
+        let alpha = |x: usize| populated.bgra[x * 4 + 3];
+        assert!(alpha(1) > alpha(5), "food density must remain visible");
+        frame.tick += 1;
+        assert_eq!(initial, food_raster_key(&frame));
+        assert_eq!(populated.bgra, rasterize_food_field(&frame).unwrap().bgra);
+        frame.food_cells.fill(0.0);
+        assert_ne!(initial, food_raster_key(&frame));
+        assert!(
+            rasterize_food_field(&frame)
+                .unwrap()
+                .bgra
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|pixel| pixel[3] == 0),
+            "an empty food grid must remain transparent"
+        );
+    }
+
+    #[test]
+    fn raster_key_tracks_visual_inputs_without_invalidating_on_tick_alone() {
+        let mut frame = frame(
+            (1, 1),
+            10,
+            vec![tile(TerrainKind::Grass)],
+            (1, 1),
+            10,
+            vec![0.0],
+        );
+        let daylight = visual::DAYLIGHT_STATIC;
+        let initial = world_raster_key(&frame, daylight);
+        frame.tick += 1;
+        assert_eq!(initial, world_raster_key(&frame, daylight));
+
+        frame.terrain.tiles[0].temperature = 0.95;
+        let warmer = world_raster_key(&frame, daylight);
+        assert_ne!(initial, warmer, "temperature changes the raster colors");
+        frame.world_size.0 += 10.0;
+        assert_ne!(warmer, world_raster_key(&frame, daylight));
+        assert_ne!(warmer, world_raster_key(&frame, daylight * 0.5));
+    }
+
     fn image(byte: u8) -> Arc<RenderImage> {
         render_image_from_world_raster(WorldRasterPixels {
             width: 1,
@@ -21233,7 +21779,6 @@ mod continuous_world_raster_tests {
     fn key(tick: u64) -> WorldRasterKey {
         WorldRasterKey {
             field_fingerprint: tick,
-            tick,
             daylight_bits: visual::DAYLIGHT_STATIC.to_bits(),
             palette: ColorPaletteMode::Natural,
         }
@@ -21976,6 +22521,32 @@ mod food_mote_presentation_tests {
     }
 }
 
+/// Keep the followed creature visible without exposing empty space beyond the
+/// world. At fit scale the entire world is already visible, so its center stays
+/// fixed; at higher zoom the camera follows until it reaches an edge.
+fn bounded_follow_center(
+    target: Position,
+    world_size: (f32, f32),
+    viewport_size: (f32, f32),
+    scale: f32,
+) -> Position {
+    fn axis(target: f32, world: f32, viewport: f32, scale: f32) -> f32 {
+        let half_visible = viewport / (2.0 * scale);
+        if half_visible * 2.0 >= world {
+            world * 0.5
+        } else {
+            target.clamp(half_visible, world - half_visible)
+        }
+    }
+    if !scale.is_finite() || scale <= f32::EPSILON {
+        return target;
+    }
+    Position {
+        x: axis(target.x, world_size.0, viewport_size.0, scale),
+        y: axis(target.y, world_size.1, viewport_size.1, scale),
+    }
+}
+
 fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window) {
     let frame = &state.frame;
     let camera = &state.camera;
@@ -21985,8 +22556,8 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
     let follow_target = state.follow_target;
     let origin = bounds.origin;
     let bounds_size = bounds.size;
-    let low_fps = state.perf.fps > 0.0 && state.perf.fps < 30.0;
-    let very_low_fps = state.perf.fps > 0.0 && state.perf.fps < 24.0;
+    let low_fps = state.perf.detail != RenderDetail::Full;
+    let very_low_fps = state.perf.detail == RenderDetail::Minimal;
     let palette_is_natural = matches!(frame.palette, ColorPaletteMode::Natural);
 
     let mut camera_guard = camera.lock().expect("camera lock poisoned");
@@ -22055,7 +22626,12 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
     if controls.follow_mode != FollowMode::Off
         && let Some(target) = follow_target
     {
-        camera_guard.center_on(target);
+        camera_guard.center_on(bounded_follow_center(
+            target,
+            frame.world_size,
+            (width_px, height_px),
+            layout.scale,
+        ));
         layout = camera_guard.layout(
             (origin_x, origin_y),
             (width_px, height_px),
@@ -22201,9 +22777,8 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
         );
     }
 
-    // Food remains a discrete emissive presentation layer above both terrain paths.
-    // Sampling it into the continuous terrain image removes the grid by erasing the
-    // very local contrast that makes resources legible against the substrate.
+    // The resource field is independent of terrain so its density remains
+    // visible and can be switched off without changing the substrate.
     let food_w = frame.food_dimensions.0 as usize;
     let food_h = frame.food_dimensions.1 as usize;
     let max_food = frame.food_max.max(f32::EPSILON);
@@ -22213,7 +22788,7 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
         0.0_f32
     };
 
-    if controls.draw_food {
+    if controls.draw_food && !paint_food_field(state, offset_x, offset_y, scale, window) {
         // Compute visible cell range to cull off-screen food cells
         let cell_world = frame.food_cell_size as f32;
         let cell_px = (cell_world * scale).max(1.0);
@@ -22233,7 +22808,7 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
 
         // Rounded quads keep per-cell color and occupy bounded instance records.
         // Batching thousands of circles into vector paths at low frame rates
-        // tessellated into tens of MiB and repeatedly grew the Metal buffer.
+        // can require a much larger Metal instance buffer after tessellation.
         for y in y_min as usize..=y_max as usize {
             for x in x_min as usize..=x_max as usize {
                 let idx = y * food_w + x;
@@ -22244,6 +22819,9 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                 let intensity: f32 = (value * inv_max_food).clamp(0.0_f32, 1.0_f32);
                 let food_visuals = visual::food_visual_params(intensity);
                 let mut color = food_color(intensity);
+                // Resource cells are present throughout a healthy world. Keep
+                // them legible without letting a uniform grid overwhelm agents.
+                color.a *= 0.68;
                 let shade_wave = visual::shimmer(frame.tick, x as u32, y as u32);
                 let gain =
                     food_visuals.emissive_gain / visual::visual_style().food.dense_emissive_gain;
@@ -22256,16 +22834,22 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                 let px_y = offset_y + (y as f32 * cell_world * scale);
                 let mote_px = (cell_px * food_visuals.relative_radius.min(1.0) * 0.72).max(1.0);
                 let (jitter_x, jitter_y) = food_mote_offset(x, y);
-                let inset = (cell_px - mote_px) * 0.5;
+                // Stable, cell-local variation breaks up the repeated round-dot
+                // pattern without moving food to a different simulation cell.
+                let mote_width = (mote_px * (0.72 + 0.28 * jitter_x.abs())).max(1.0);
+                let mote_height = (mote_px * (0.72 + 0.28 * jitter_y.abs())).max(1.0);
+                let inset_x = (cell_px - mote_width) * 0.5;
+                let inset_y = (cell_px - mote_height) * 0.5;
                 let cell_bounds = Bounds::new(
                     point(
-                        px(px_x + inset + inset * jitter_x),
-                        px(px_y + inset + inset * jitter_y),
+                        px(px_x + inset_x + inset_x * jitter_x),
+                        px(px_y + inset_y + inset_y * jitter_y),
                     ),
-                    size(px(mote_px), px(mote_px)),
+                    size(px(mote_width), px(mote_height)),
                 );
                 window.paint_quad(
-                    fill(cell_bounds, Background::from(color)).corner_radii(px(mote_px * 0.5)),
+                    fill(cell_bounds, Background::from(color))
+                        .corner_radii(px(mote_width.min(mote_height) * 0.5)),
                 );
             }
         }

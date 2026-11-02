@@ -53,6 +53,7 @@ struct CaptureOverrides {
     /// changing numbers, which is a plausible ~10k pixels of glyph difference.
     forced_perf: Option<crate::PerfSnapshot>,
     hovered_agent: Option<AgentId>,
+    focused_agent: Option<AgentId>,
     /// Capture the same composed window again with the World painter switched.
     compare_world_painter: bool,
     /// Keystrokes dispatched into the live window before the frame is captured.
@@ -89,6 +90,11 @@ fn apply_capture_overrides(view: &mut crate::SimulationView, overrides: CaptureO
         && let Ok(mut inspector) = view.inspector.lock()
     {
         inspector.hovered_agent = Some(hovered_agent);
+    }
+    if let Some(focused_agent) = overrides.focused_agent
+        && let Ok(mut inspector) = view.inspector.lock()
+    {
+        inspector.focused_agent = Some(focused_agent);
     }
 }
 
@@ -355,11 +361,15 @@ mod tests {
         };
         let without_food = capture(false);
         let with_food = capture(true);
+        let _ = save_probe(&with_food, "world-food-field.png");
         let (changed, _) = whole_frame_delta(&without_food, &with_food);
         assert!(changed > 1_000, "food layer changed only {changed} pixels");
         assert_eq!(
             digest_before,
-            world.port.scientific_digest_v1().expect("post-capture digest"),
+            world
+                .port
+                .scientific_digest_v1()
+                .expect("post-capture digest"),
             "food presentation must not change the simulation"
         );
     }
@@ -835,6 +845,7 @@ mod tests {
             max_ms: 16.0,
             sample_count: 128,
             fps,
+            detail: crate::RenderDetail::Full.for_fps(fps),
         }
     }
 
@@ -1439,6 +1450,79 @@ mod tests {
         continuous
             .save(probe_dir.join("after_continuous_fields_2560x1440.png"))
             .expect("write bd-1lls continuous-field probe");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn world_pixels_do_not_flip_when_frame_rate_jitters_near_30() {
+        let world = capture_agent_expression_world();
+        let capture = |fps| {
+            capture_view_with_overrides(
+                Arc::clone(&world),
+                GuiViewRole::WorldCanvas,
+                2560.0,
+                1440.0,
+                CaptureOverrides {
+                    forced_perf: Some(pinned_perf_at_fps(fps)),
+                    keystrokes: &["0"],
+                    ..CaptureOverrides::default()
+                },
+            )
+            .expect("capture World at controlled update rate")
+        };
+        let below = capture(29.0);
+        let above = capture(31.0);
+        assert_eq!(
+            below.as_raw(),
+            above.as_raw(),
+            "a one-frame FPS fluctuation must not swap the World presentation"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn focused_selection_adds_a_world_hud_without_changing_science() {
+        let world = capture_agent_expression_world();
+        let focused = AgentId::from(slotmap::KeyData::from_ffi(
+            world.snapshot().world.agents[12].id,
+        ));
+        let digest = world
+            .port
+            .scientific_digest_v1()
+            .expect("before HUD capture");
+        let capture = |focused_agent| {
+            capture_view_with_overrides(
+                Arc::clone(&world),
+                GuiViewRole::WorldCanvas,
+                2560.0,
+                1440.0,
+                CaptureOverrides {
+                    focused_agent,
+                    forced_perf: Some(pinned_perf()),
+                    keystrokes: &["0"],
+                    ..CaptureOverrides::default()
+                },
+            )
+            .expect("capture selected World")
+        };
+        let without_hud = capture(None);
+        let with_hud = capture(Some(focused));
+        let _ = save_probe(&with_hud, "focused-world-hud.png");
+        let changed = (140..500)
+            .flat_map(|y| (20..650).map(move |x| (x, y)))
+            .filter(|&(x, y)| without_hud.get_pixel(x, y) != with_hud.get_pixel(x, y))
+            .count();
+        assert!(
+            changed > 10_000,
+            "focused HUD changed only {changed} pixels"
+        );
+        assert_eq!(
+            digest,
+            world
+                .port
+                .scientific_digest_v1()
+                .expect("after HUD capture")
+        );
     }
 
     #[cfg(target_os = "macos")]

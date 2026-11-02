@@ -3701,9 +3701,9 @@ pub struct DynamicAgentVisuals {
     pub eye_direction: [f32; NUM_EYES],
     /// Per-eye field-of-view angle.
     pub eye_fov: [f32; NUM_EYES],
-    /// Whether the current actuator output commands boost, independently of the
-    /// historical agent column carried by `DynamicAgentSnapshot`.
-    pub boost_engaged: bool,
+    /// Raw boost actuator output, independently of the historical agent column
+    /// carried by `DynamicAgentSnapshot`.
+    pub boost_output: f32,
     /// Whether the brain is commanding an extended spike this tick.
     pub spike_extended: bool,
     /// Whether this agent landed a spike strike this tick.
@@ -3740,7 +3740,7 @@ impl DynamicAgentVisuals {
             trait_blood: runtime.trait_modifiers.blood,
             eye_direction: runtime.eye_direction,
             eye_fov: runtime.eye_fov,
-            boost_engaged: runtime.outputs.boost_engaged(),
+            boost_output: runtime.outputs.channel(OutputChannel::Boost),
             // The renderer has always read the COMMANDED spike channel rather
             // than the realized `spike_length` column, and this projection
             // preserves that exactly rather than substituting a similar-looking
