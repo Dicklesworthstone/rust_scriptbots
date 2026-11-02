@@ -4720,7 +4720,11 @@ pub(crate) mod tests {
     }
 
     fn pending_catalog_definition(root: &Path, id: &str) -> PathBuf {
-        let directory = root.join("experiments").join(id);
+        // Production DataServices canonicalizes its artifact root before it
+        // creates catalog entries. Match that boundary here: on macOS the
+        // system temporary directory commonly starts with /var, an alias of
+        // /private/var. Keep the catalog's own symlink checks intact.
+        let directory = root.canonicalize().unwrap().join("experiments").join(id);
         let runner = crate::experiment_runner::MatchedSeedExperimentRunner::new(
             id,
             crate::experiment_runner::MatchedSeedCohort {
