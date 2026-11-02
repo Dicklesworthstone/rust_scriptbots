@@ -2,6 +2,66 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Flat-map capability continuation (2026-11-02):** [Verified and Closed —
+GentleDuck; original `bd-2z0.14.2.6`; acceptance unchanged]
+
+The operator requested this granular TODO. It gates delivery and closure of the
+original screenshot capability; retire the active checklist when that delivery
+is verified. The observed gap is the capability golden's explicitly missing
+flat-map color axis, not a reason to create a second evidence system.
+
+- [x] Recheck authoritative JSONL triage, ready claims, ownership and original
+  acceptance; continue the unblocked P1 remainder already owned here.
+- [x] Read both palette and live presentation consumers; identify explicit
+  `NO_COLOR` as the only current final-buffer color suppression condition.
+- [x] Add a fresh-process, fixed-seed, nonempty flat-map color comparison using
+  real environment detection, preserving the existing headless palette pin.
+- [x] Observe failures before production changes; retain actual cells and the
+  exact snapshot identity, not merely process exit codes.
+- [x] Probe the live colorless-terminal case without `NO_COLOR` on a real PTY.
+- [x] Fix observed color-policy defects in the shared production path; retain
+  distinct truecolor, 256, 16 and colorless frames and glyph identity controls.
+- [x] Correct the observed non-idempotent xterm quantizer before applying the
+  final policy: `[95, 215, 255]` must survive another pass; cover the actual cube
+  and gray palette, midpoint boundaries, and the existing monotonicity gate.
+- [x] Review raw cells before deliberately adding missing golden rows: seven of
+  eight old rows remain byte-identical; the corrected 256-color canvas changes
+  only its world-map hash. Preserve regeneration refusal and re-execute without it.
+- [x] Run terminal/API/CLI/E2E checks, workspace check, strict Clippy, formatting
+  and scoped static review through DSR.
+- [x] Re-verify from committed source in a fresh solo pass against all original
+  criteria, close only if each criterion has evidence, then publish reviewed code
+  and tracker snapshots with the unresolved scope stated explicitly.
+- [x] Preserve concurrent renderer history when remote main advances; recheck the
+  exact integrated revision before closure. Source PR #8 merged without squash or
+  force push; the five reviewed files retain their verified byte identities.
+
+Evidence: `/data/tmp/scriptbots-flat-capability-zu8MydaM`. Candidate DSR
+`20261102T023418-4078087` passes all checks except the deliberately stale golden;
+post-promotion `flat_capability_verify/20261102T023949-4094893` passes all 333
+terminal tests without regeneration. The four new depth rows share tick-zero
+world digest `c0467ba257dce600`, three agents and one glyph digest; their whole
+frame hashes differ. The real colorless PTY emits no colors and uses keyboard
+navigation because its terminal profile advertises no mouse. Existing truecolor
+and `NO_COLOR` mouse gates remain mandatory. Native 16/256-color wire encoding
+is unqualified: the pinned presenter emits RGB SGR. No performance claim is made.
+
+Final source `fce761e377e814313e3bb3aeea88cc16fccbdffa` is merged via
+[PR #8](https://github.com/Dicklesworthstone/rust_scriptbots/pull/8), preserving
+the concurrent renderer changes at `b962253c`. The exact integrated source
+`184d08013ae7972f9a46c34706e80edd48df325f` passes all ten DSR checks at
+`flat_capability_integrated/20261102T030102-15236/receipt.json`, with identical
+clean source before/after: 333 terminal tests, four API tests, one CLI test, all
+five E2E tests, workspace all-target checking, strict Clippy and formatting.
+The first clean attempt ran in the shared tree and failed both cleanliness
+guards; it was rejected. Explicit `--work-dir` clean passes qualify the source
+and integrated revision. The original Bead closed on this fresh solo evidence;
+tracker/audit commit `63167e33` and source are published on both required refs.
+This supersedes the earlier flat-map remainder below. Independent review,
+native 16/256-color wire encoding, GPU/all-feature execution and the remaining
+project backlog are not claimed complete. The existing native-output Bead
+`bd-dkd9` remains open; no original acceptance was moved to a new follow-up.
+
 **Science screenshot and headless report increment (2026-11-02):** [Verified —
 GentleDuck; original `bd-2z0.14.2.6` remains In Progress; acceptance unchanged]
 
