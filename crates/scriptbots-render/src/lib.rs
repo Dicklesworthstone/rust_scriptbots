@@ -9144,7 +9144,7 @@ impl SimulationView {
                     .gap_3()
                     .child(metric("ENERGY", format!("{:.2}", selected.energy)))
                     .child(metric("HEALTH", format!("{:.2}", selected.health)))
-                    .child(metric("AGE", format!("{} ticks", selected.age))),
+                    .child(metric("AGE", format!("{} steps", selected.age))),
             )
             .child(
                 div()
