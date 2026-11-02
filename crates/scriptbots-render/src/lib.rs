@@ -2653,6 +2653,8 @@ struct GuiSession {
     /// Palette and narration are application accessibility settings. Both
     /// windows must render the same state even though World owns their toolbar.
     accessibility: Arc<Mutex<AccessibilitySettings>>,
+    /// Lab diagnostics describe the camera that actually paints the World.
+    world_camera: Arc<Mutex<Camera>>,
     selection_projection: Arc<Mutex<Option<Vec<AgentId>>>>,
     selection_submission: Arc<Mutex<()>>,
     timeline_submit: Option<TimelineReviewSubmit>,
@@ -2688,6 +2690,7 @@ impl GuiSession {
             recent_commands: Arc::new(Mutex::new(VecDeque::new())),
             inspector: Arc::new(Mutex::new(inspector_state)),
             accessibility: Arc::new(Mutex::new(AccessibilitySettings::default())),
+            world_camera: Arc::new(Mutex::new(Camera::default())),
             selection_projection: Arc::new(Mutex::new(None)),
             selection_submission: Arc::new(Mutex::new(())),
             timeline_submit: None,
@@ -2705,6 +2708,7 @@ impl GuiSession {
             Arc::clone(&self.selection_submission),
         );
         view.inspector = Arc::clone(&self.inspector);
+        view.camera = Arc::clone(&self.world_camera);
         view.recent_commands = Arc::clone(&self.recent_commands);
         view.accessibility = Arc::clone(&self.accessibility);
         view.map_sandbox = Arc::clone(&self.map_sandbox);
@@ -6196,7 +6200,10 @@ impl SimulationView {
             let artifact = &preview.artifact;
             let metadata = artifact.metadata();
             let seams = draft.check_seams(artifact);
-            panel = panel
+            let preview_details = div()
+                .flex()
+                .flex_col()
+                .gap_2()
                 .child(div().text_xs().child(format!(
                     "Preview revision {} · owner revision {} · {:?} {} / {:016x} · seed {}",
                     preview.draft_revision,
@@ -6212,8 +6219,7 @@ impl SimulationView {
                     seams.max_elevation_step_ew,
                     seams.seam_kind_discontinuities_ns,
                     seams.seam_kind_discontinuities_ew,
-                )))
-                .child(application_controls);
+                )));
             let palette = self.accessibility_snapshot().palette;
             let width = artifact.terrain().width();
             let height = artifact.terrain().height();
@@ -6269,7 +6275,9 @@ impl SimulationView {
                 grid = grid.child(row);
             }
             panel = panel
+                .child(application_controls)
                 .child(grid)
+                .child(preview_details)
                 .child(div().text_xs().child(format!(
                     "Terrain letters match the legend above when cells are at least {MAP_TERRAIN_MARKER_SIZE:.0} pixels wide. Smaller sampled cells retain named keyboard/screen-reader labels. Palette changes affect presentation only. Opposite edges join. Paint, then regenerate; undo changes only the draft.",
                 )))
@@ -7008,13 +7016,7 @@ impl SimulationView {
     fn render_dashboard_body(&self, snapshot: &HudSnapshot, cx: &mut Context<Self>) -> Div {
         let body = match self.dashboard_tab {
             DashboardTab::Overview => {
-                let mut overview = div()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .child(self.render_simulation_controls(snapshot, cx))
-                    .child(self.render_summary(snapshot))
-                    .child(self.render_dashboard_status(snapshot));
+                let mut overview = div().flex().flex_col().gap_3();
                 let disclosures = HudDisclosures {
                     any_open: self.hud.stats_open || self.hud.history_open || self.hud.perf_open,
                     stats_open: self.hud.stats_open,
@@ -7025,12 +7027,16 @@ impl SimulationView {
                 {
                     overview = overview.child(panel_stack);
                 }
-                overview.child(
-                    div()
-                        .text_xs()
-                        .text_color(chrome::text_muted())
-                        .child("Telemetry panels: 1 stats · 2 history · 3 performance"),
-                )
+                overview
+                    .child(self.render_simulation_controls(snapshot, cx))
+                    .child(self.render_summary(snapshot))
+                    .child(self.render_dashboard_status(snapshot))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(chrome::text_muted())
+                            .child("Telemetry panels: 1 stats · 2 history · 3 performance"),
+                    )
             }
             DashboardTab::Inspect => self.render_inspector(snapshot, cx),
             DashboardTab::Maps => self.render_map_sandbox(snapshot, cx),
@@ -7848,8 +7854,10 @@ impl SimulationView {
         let theme = hud_theme(self.accessibility_snapshot().palette);
         let header = div()
             .flex()
+            .flex_wrap()
             .justify_between()
             .items_center()
+            .gap_2()
             .child(
                 div()
                     .text_sm()
@@ -7891,7 +7899,7 @@ impl SimulationView {
                     let row_bg = if idx % 2 == 0 {
                         rgb(theme.card_bg)
                     } else {
-                        rgb(0x101a2e)
+                        rgb(0x172825)
                     };
                     let growth = entry.net_growth();
                     let growth_color = if growth >= 0 {
@@ -7907,8 +7915,10 @@ impl SimulationView {
 
                     div()
                         .flex()
+                        .flex_wrap()
                         .justify_between()
                         .items_center()
+                        .gap_2()
                         .rounded_lg()
                         .bg(row_bg)
                         .p_3()
@@ -7921,6 +7931,7 @@ impl SimulationView {
                         .child(
                             div()
                                 .flex()
+                                .flex_wrap()
                                 .gap_4()
                                 .items_center()
                                 .child(
@@ -8915,9 +8926,10 @@ impl SimulationView {
 
         let canvas_stack = div()
             .relative()
+            .flex()
+            .flex_col()
             .flex_1()
-            .h_full()
-            .flex_grow(1.0)
+            .min_h(px(0.0))
             .overflow_hidden()
             .on_mouse_down(
                 MouseButton::Left,
@@ -9017,7 +9029,7 @@ impl SimulationView {
             .flex()
             .flex_row()
             .flex_1()
-            .h_full()
+            .min_h(px(0.0))
             .gap_3()
             .child(canvas_stack);
 
@@ -12068,7 +12080,7 @@ impl SimulationView {
             lines.push("Playback LIVE · no frames".to_string());
         }
 
-        let mut container = div().flex().gap_3().items_start();
+        let mut container = div().flex().flex_wrap().gap_3().items_start();
 
         if let Some(vector_state) = VectorHudState::from_snapshot(snapshot) {
             let canvas_state = vector_state.clone();
@@ -12088,6 +12100,8 @@ impl SimulationView {
             let vector_card = div()
                 .flex()
                 .flex_col()
+                .flex_1()
+                .min_w(px(200.0))
                 .gap_2()
                 .rounded_md()
                 .border_1()
@@ -12118,6 +12132,8 @@ impl SimulationView {
         let text_column = div()
             .flex()
             .flex_col()
+            .flex_1()
+            .min_w(px(230.0))
             .gap_1()
             .children(lines.into_iter().map(|line| {
                 div()
@@ -18733,7 +18749,7 @@ impl RenderFrame {
                     heading: agent.heading,
                     health: agent.health,
                     age: agent.age,
-                    boost: if agent.boost { 1.0 } else { 0.0 },
+                    boost: if visual.boost_engaged { 1.0 } else { 0.0 },
                     wheel_left: visual.wheel_left,
                     wheel_right: visual.wheel_right,
                     herbivore_tendency: agent.herbivore_tendency.clamp(0.0, 1.0),
@@ -30637,6 +30653,22 @@ mod command_characterization_tests {
             world_focus, lab_focus,
             "World and Lab must read the same session-wide focused-agent state"
         );
+    }
+
+    #[test]
+    fn lab_reports_the_world_camera_after_panning() {
+        let mut fixture = ShortcutFixture::install();
+        fixture.read_world(|view| {
+            let mut camera = view.camera.lock().expect("camera lock");
+            camera.start_pan(gpui::point(gpui::px(0.0), gpui::px(0.0)));
+            camera.update_pan(gpui::point(gpui::px(64.0), gpui::px(48.0)));
+            camera.end_pan();
+        });
+        let world = fixture.read_world(|view| view.camera_snapshot());
+        let lab = fixture.read(|view| view.camera_snapshot());
+        assert_ne!(world.offset_px, (0.0, 0.0));
+        assert_eq!(lab.offset_px, world.offset_px);
+        assert_eq!(lab.zoom, world.zoom);
     }
 
     #[test]
