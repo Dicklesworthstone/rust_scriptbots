@@ -989,6 +989,14 @@ The interactive frontend runs FrankenTUI's `Program` and retains Ratatui widgets
 
 Keybinds: space (pause), +/- (speed), s (single-step), b (toggle metrics baseline), S (save the displayed frame), e (emoji), n (narrow symbols), x (expanded panels), ?/h (help), q/Esc (quit). The terminal HUD shows tick/agents/births/deaths/energy, Insights (rolling metrics), Mortality panel, Brains leaderboard, recent events log, and an emoji world mini-map. The layout is responsive and auto-expands panels on wider terminals; press `x` to toggle. `S` saves both ANSI (`.ans`) and plain text (`.txt`) under `screenshots/frame_<tick>_<pid>_<nonce>`, including science screens. The live footer reports completion or a write error.
 
+The live terminal applies its detected palette after every panel and overlay,
+before presentation and screenshot capture. RGB colors are quantized for 256- and
+16-color palettes. `NO_COLOR` and terminals reporting no color support (including
+`TERM=dumb`) suppress all color channels while preserving text and attributes.
+The pinned presenter still emits RGB SGR for colored cells; the buffer goldens
+qualify palette values, not native 16/256-color escape encoding. Headless reports
+keep their fixed evidence palette independently of the invoking terminal.
+
 ## Storage & analytics
 
 - **One embedded engine:** ScriptBots uses the public `fsqlite` facade from FrankenSQLite with `version = "=0.4.6"`, pinned to immutable revision `ad3f23ca94c0f1d38e3d6cbb919b0d095de0b4ee` at `https://github.com/Dicklesworthstone/frankensqlite`. Defaults remain disabled; `native`, `json`, `fts5`, `icu`, `misc`, and `rtree` preserve the previous native feature's implicit extension surface. Create-free existing-file open and expected-identity verification still precede recovery access. Native validation of this dependency migration is pending.

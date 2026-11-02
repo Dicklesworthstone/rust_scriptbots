@@ -534,8 +534,8 @@ pub enum ColorDepth {
 /// Quantize an RGB triple for a terminal color depth.
 ///
 /// `TrueColor` is the identity. `Ansi256` uses the standard xterm mapping
-/// (color cube index 16 + 36r + 6g + b, greys 232..255 when the color is
-/// near-neutral), with optional deterministic Bayer 2x2 dithering handled by
+/// (color cube index 16 + 36r + 6g + b, greys 232..255), choosing the closer
+/// cube or gray entry by weighted distance. Optional Bayer 2x2 dithering is handled by
 /// the caller via [`bayer_threshold`]. `Ansi16` picks the nearest of the 16
 /// standard colors by weighted euclidean distance.
 ///
@@ -563,14 +563,17 @@ const fn to_byte(v: f32) -> u8 {
 }
 
 /// xterm 6x6x6 cube level for one channel (0..5).
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_precision_loss
-)]
 fn cube_level(v: f32) -> u8 {
-    let scaled = v.clamp(0.0, 1.0).mul_add(5.0, 0.5) as u8;
-    scaled.min(5)
+    // The first interval is 95, not 51. Uniform v*5 rounding moved existing
+    // palette entries on every pass (95 -> 135 -> 175).
+    match to_byte(v) {
+        0..=47 => 0,
+        48..=114 => 1,
+        115..=154 => 2,
+        155..=194 => 3,
+        195..=234 => 4,
+        _ => 5,
+    }
 }
 
 /// The byte value of a cube level (the xterm ramp is 0, 95, 135, 175, 215, 255).
@@ -580,19 +583,29 @@ fn cube_byte(level: u8) -> u8 {
 }
 
 fn ansi256_bytes(rgb: [f32; 3]) -> [u8; 3] {
-    let mean = (rgb[0] + rgb[1] + rgb[2]) / 3.0;
-    let spread = (rgb[0] - mean).abs() + (rgb[1] - mean).abs() + (rgb[2] - mean).abs();
-    if spread < 0.06 {
-        // Near-neutral: use the 24-entry grey ramp (232..=255, 8..238 step 10).
-        let grey = grey_ramp_index(mean);
-        let v = 8 + grey * 10;
-        return [v, v, v];
-    }
-    [
+    let bytes = rgb.map(to_byte);
+    let cube = [
         cube_byte(cube_level(rgb[0])),
         cube_byte(cube_level(rgb[1])),
         cube_byte(cube_level(rgb[2])),
-    ]
+    ];
+    // A weighted mean minimizes the same distance used for the cube. Compare
+    // candidates rather than forcing neutral colors onto gray: cube grays
+    // such as 95/95/95 and black/white must survive another pass too.
+    let mean = (2.0 * f32::from(bytes[0]) + 4.0 * f32::from(bytes[1]) + 3.0 * f32::from(bytes[2]))
+        / (9.0 * 255.0);
+    let gray = [8 + grey_ramp_index(mean) * 10; 3];
+    let distance = |candidate: [u8; 3]| {
+        let dr = i32::from(bytes[0]) - i32::from(candidate[0]);
+        let dg = i32::from(bytes[1]) - i32::from(candidate[1]);
+        let db = i32::from(bytes[2]) - i32::from(candidate[2]);
+        2 * dr * dr + 4 * dg * dg + 3 * db * db
+    };
+    if distance(cube) <= distance(gray) {
+        cube
+    } else {
+        gray
+    }
 }
 
 /// Map a near-neutral mean into the xterm grey-ramp index (0..=23).
@@ -881,6 +894,35 @@ mod tests {
         assert_eq!(white, [255, 255, 255]);
         let black = quantize([0.0, 0.0, 0.0], ColorDepth::Ansi16);
         assert_eq!(black, [0, 0, 0]);
+    }
+
+    #[test]
+    fn ansi256_preserves_palette_colors_and_nearest_cube_levels() {
+        let apply = |bytes: [u8; 3]| {
+            quantize(
+                bytes.map(|value| f32::from(value) / 255.0),
+                ColorDepth::Ansi256,
+            )
+        };
+        assert_eq!(apply([95, 215, 255]), [95, 215, 255]);
+        // xterm's cube is not uniformly spaced: the first interval is 95,
+        // then intervals of 40. Values around its midpoint must choose opposite
+        // sides, and a second presentation pass must preserve either result.
+        assert_eq!(apply([47, 215, 255]), [0, 215, 255]);
+        assert_eq!(apply([48, 215, 255]), [95, 215, 255]);
+        let cube = [0, 95, 135, 175, 215, 255];
+        for r in cube {
+            for g in cube {
+                for b in cube {
+                    let color = [r, g, b];
+                    assert_eq!(apply(color), color, "cube color {color:?}");
+                }
+            }
+        }
+        for index in 0..24 {
+            let value = 8 + index * 10;
+            assert_eq!(apply([value; 3]), [value; 3], "gray palette entry {index}");
+        }
     }
 
     #[test]
