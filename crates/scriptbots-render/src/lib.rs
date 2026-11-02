@@ -9514,15 +9514,27 @@ impl SimulationView {
                     .w(px(164.0))
                     .flex()
                     .justify_between()
-                    .gap_1()
+                    .gap_2()
+                    .items_center()
+                    .rounded_md()
+                    .bg(rgb(0x1b3031))
+                    .px_2()
+                    .py_1()
                     .text_xs()
                     .child(
                         div()
+                            .flex_1()
+                            .min_w(px(0.0))
                             .text_color(chrome::text_muted())
                             .truncate()
-                            .child(name.to_owned()),
+                            .child(name.replace('_', " ")),
                     )
-                    .child(div().text_color(chrome::text_primary()).child(value))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(chrome::text_primary())
+                            .child(value),
+                    )
             };
             hud = hud
                 .child(div().h(px(1.0)).w_full().bg(chrome::border()))
@@ -9531,14 +9543,14 @@ impl SimulationView {
                     div()
                         .flex()
                         .flex_wrap()
-                        .gap_3()
+                        .gap_2()
                         .children(SENSOR_LAYOUT.iter().map(|channel| {
                             signal(channel.name, detail.sensors.get(channel.index).copied())
                         })),
                 )
                 .child(div().h(px(1.0)).w_full().bg(chrome::border()))
                 .child(label("BRAIN OUTPUTS · ALL CHANNELS"))
-                .child(div().flex().flex_wrap().gap_3().children(
+                .child(div().flex().flex_wrap().gap_2().children(
                     OutputChannel::ALL.into_iter().map(|channel| {
                         signal(channel.name(), detail.outputs.get(channel.index()).copied())
                     }),
