@@ -305,27 +305,17 @@ impl PixelEvidenceVerdict {
 
 /// Decide whether an adapter may certify pixels (bd-2z0.14.3.10 item 4).
 ///
-/// THE DECISION, and the evidence behind it. bd-2z0.14.3.4 scope item 4 made the
-/// llvmpipe/lavapipe software lane the PR gate and asserted the unmodified
-/// pipeline would pass on it. It does not. Measured on the Linux rch workers,
-/// both live capture tests failed with the typed error "offscreen capture
-/// produced a blank or uniform RGB frame".
+/// Earlier Linux worker builds returned blank frames despite reporting full
+/// Vulkan capability. That observation established the smoke-only policy; it
+/// was not a hardware impossibility proof. Later source-bound llvmpipe captures
+/// produced nonuniform honest and material-corrupted frames with identical
+/// world identity and unchanged background regions. Therefore neither this
+/// verdict nor its message may claim that all current software captures are blank.
 ///
-/// The failure is NOT an obvious capability wall, which is what makes the
-/// verdict "smoke only" rather than "abandon the lane". llvmpipe probes with
-/// full capability — Vulkan backend, `max_texture_2d` 16384, timestamp queries
-/// available — and `OffscreenCapture` configures a session on it successfully at
-/// tier Potato. Only the READBACK comes back uniform. That is the signature of
-/// bd-x6v6, which also looked like a hardware limit and turned out to be a
-/// camera-lifecycle bug, so the lane is worth one real investigation before it
-/// is written off (the capture session takes exactly two warmup frames before
-/// reading back, an assumption never validated against a rasterizer this slow).
-///
-/// Until that investigation succeeds, a software adapter may run the capture
-/// path as a smoke check and may NOT certify pixels. Gating goldens on a lane
-/// that returns uniform frames would either fail every PR or, if the blank guard
-/// were relaxed to accommodate it, certify blank images as evidence — which is
-/// precisely the bd-2z0.14.3.8 failure this harness exists to prevent.
+/// A successful diagnostic pair does not qualify the software lane's scene,
+/// tier and repeatability coverage. Until that separate qualification is
+/// reviewed, software may run diagnostics but cannot certify pixels. The
+/// nonblank guard and comparison thresholds remain unchanged.
 ///
 /// Scope note: `Virtual` and `Unknown` adapters stay admissible, preserving the
 /// behaviour this replaced rather than quietly widening the refusal. Neither has
@@ -343,12 +333,12 @@ pub fn pixel_evidence_verdict(gpu: Option<&scriptbots_core::GpuInfo>) -> PixelEv
         ),
         Some(info) if info.class == scriptbots_core::GpuClass::Software => {
             PixelEvidenceVerdict::SmokeOnly(format!(
-                "software rasterizer ({}) returns blank or uniform frames from this \
-                 capture path, so it may run as a smoke check but must not certify \
-                 pixels. It probes fully capable and configures a session, so the \
-                 blank readback is a candidate camera-lifecycle or warmup-frame bug \
-                 (bd-x6v6 shape), not a proven hardware limit — investigate before \
-                 demoting the lane permanently (bd-2z0.14.3.10 item 4)",
+                "software rasterizer ({}) may run as a smoke check but must not certify \
+                 pixels. Earlier builds returned blank frames; nonblank diagnostic \
+                 captures now exist, but the software lane remains unqualified; \
+                 investigate its scene, tier and repeatability coverage before \
+                 promoting pixel evidence; use an admissible GPU lane for qualification \
+                 (bd-2z0.14.3.10 item 4)",
                 info.name
             ))
         }
@@ -363,9 +353,9 @@ pub fn pixel_evidence_verdict(gpu: Option<&scriptbots_core::GpuInfo>) -> PixelEv
 /// uniform RGB frame" — which reads identically in two situations that call for
 /// opposite responses:
 ///
-/// * a software rasterizer, where a uniform frame is the KNOWN behaviour of a
-///   lane that was never able to certify pixels. Nothing is broken; the run
-///   asked the wrong lane for evidence.
+/// * a software rasterizer, where the observed blank is a failed diagnostic on
+///   a lane that is not qualified to certify pixels. Software rendering can
+///   produce content; its policy status does not excuse a blank result.
 /// * a discrete or integrated GPU, where a uniform frame means the pipeline
 ///   genuinely failed. Something IS broken, and reading it as a lane limitation
 ///   would file a real rendering bug as an environment quirk.
@@ -2531,17 +2521,10 @@ mod tests {
 
     /// Whether this host can produce trustworthy live GPU evidence.
     ///
-    /// A software rasterizer (llvmpipe/lavapipe/warp) is not GPU-accelerated in
-    /// any meaningful sense, and on this project's CI workers it returns blank
-    /// frames. Before bd-2z0.14.3.8 those blanks slipped past the production
-    /// blank guard and the live tests only failed when the honest frame
-    /// happened to be uniform enough for the ALARM test's stricter threshold to
-    /// notice — which read as flakiness and was really a dead pipeline being
-    /// admitted as evidence.
-    ///
-    /// Skipping here is the honest outcome: it says this host cannot verify
-    /// this, rather than passing on blank frames or failing on a defect that
-    /// is not in the code under test. Real GPU hosts still run these.
+    /// Software's historical blank captures established a smoke-only policy.
+    /// Newer nonblank diagnostics do not automatically qualify that lane. These
+    /// two tests require an admissible pixel lane, so their explicit early return
+    /// must be reported separately from tests that actually exercise rendering.
     fn live_gpu_evidence_available(label: &str) -> bool {
         // One authority for "may this lane certify pixels", shared with any
         // non-test consumer, rather than a second copy of the rule here.
@@ -2935,9 +2918,8 @@ mod tests {
     /// capture path but must never certify pixels.
     ///
     /// Full reported capability must NOT buy admissibility. llvmpipe advertises a
-    /// Vulkan backend, 16384 max texture size and timestamp queries, and still
-    /// returns uniform frames from this path — so a verdict keyed on capability
-    /// flags rather than device class would wave it straight through.
+    /// Vulkan backend, 16384 max texture size and timestamp queries. Capability
+    /// flags and successful diagnostic frames do not replace lane qualification.
     #[test]
     fn a_software_rasterizer_may_smoke_test_but_never_certify_pixels() {
         let verdict = pixel_evidence_verdict(Some(&gpu_info(
