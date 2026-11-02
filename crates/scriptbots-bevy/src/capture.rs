@@ -173,7 +173,7 @@ pub struct CaptureProvenance {
     /// two trees can depict the same world and render it differently.
     ///
     /// Read it as an identifier, not a reproducibility proof. Cargo re-runs the
-    /// build script when `.git/HEAD` moves, not on every source edit, so a
+    /// build script when Git's HEAD or active ref moves, not on every source edit, so a
     /// value without `-dirty` means the tree was clean when the script last
     /// ran — not that it is clean now. `-dirty` appearing is therefore
     /// conclusive; its absence is merely the best the build can honestly claim.

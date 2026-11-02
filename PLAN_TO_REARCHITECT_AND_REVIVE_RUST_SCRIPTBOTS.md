@@ -25,6 +25,9 @@ alarm without exercising terrain geometry or materials.
 - [x] Integrate upstream's `39a8532a` snapshot-producer repair for the pulled
   GPUI compile failure; retain its live-command semantics and verify opposite
   realized/commanded states through the real host snapshot plus its threshold.
+- [ ] Repair the observed stale source stamp: resolve real Git HEAD/active-ref
+  paths for Cargo reruns, then verify a normal same-worktree HEAD transition
+  without editing the build script, touching sources or cleaning the cache.
 - [ ] Re-execute committed source in a fresh solo pass, record the original
   acceptance disposition and remaining host limitations, and publish reviewed
   source/tracker records without closing an unmet positive pixel requirement.
@@ -53,6 +56,14 @@ nonzero for missing goldens; no golden was generated. That failed smoke receipt
 is not recolored green. The software policy remains smoke-only, but its old
 unqualified claim that current captures are blank must be corrected to name
 the historical observation. Hardware pixel acceptance remains open.
+
+The next capture pair, built at `d37ca100`, exposed a separate metadata bug:
+its provenance still named `b868d60e`. The explicit artifact readback assertion
+fails and is retained under `capture_provenance_before`; the 13-check source
+receipt alone cannot qualify that stale artifact identity. `build.rs` watched
+`.git/HEAD` as if `.git` were always a directory and did not watch an advancing
+symbolic branch ref. Correct the real Git metadata inputs and verify subsequent
+HEAD movement through ordinary incremental Cargo execution.
 
 Concurrent source was retained through `302d5657`. Required gates first exposed
 the missing `boost_engaged` producer, fixed upstream at `39a8532a`. A real host

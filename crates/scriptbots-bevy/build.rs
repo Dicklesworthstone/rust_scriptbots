@@ -54,6 +54,27 @@ fn git(root: &Path, args: &[&str]) -> Option<String> {
     if text.is_empty() { None } else { Some(text) }
 }
 
+/// Git resolves linked-worktree metadata and shared refs to different places.
+fn watch_git_metadata(root: &Path, name: &str, watch_parent_if_missing: bool) {
+    let Some(raw) = git(root, &["rev-parse", "--git-path", name]) else {
+        return;
+    };
+    let path = root.join(raw);
+    if !path.exists() && !watch_parent_if_missing {
+        return;
+    }
+    // A packed branch may have no loose ref yet. Watching its existing parent
+    // detects creation without Cargo treating a missing file as always changed.
+    let mut watched = path.as_path();
+    while !watched.exists() {
+        let Some(parent) = watched.parent() else {
+            return;
+        };
+        watched = parent;
+    }
+    println!("cargo:rerun-if-changed={}", watched.display());
+}
+
 fn main() {
     let manifest_dir = PathBuf::from(
         std::env::var("CARGO_MANIFEST_DIR").expect("cargo always sets CARGO_MANIFEST_DIR"),
@@ -106,14 +127,13 @@ fn main() {
         println!("cargo:rerun-if-changed={}", lock_path.display());
     }
 
-    // Re-run when the checked-out commit moves. This cannot observe every
-    // working-tree edit, which is precisely why the dirty marker is documented
-    // as best-effort rather than authoritative.
-    for head in ["HEAD", "ORIG_HEAD"] {
-        let path = workspace_root.join(".git").join(head);
-        if path.exists() {
-            println!("cargo:rerun-if-changed={}", path.display());
-        }
+    // A worktree has a .git FILE; an ordinary checkout's HEAD can remain the
+    // same symbolic ref while its branch advances. Observe Git's actual paths.
+    // Source edits alone still do not make the dirty marker authoritative.
+    watch_git_metadata(&workspace_root, "HEAD", false);
+    if let Some(reference) = git(&workspace_root, &["symbolic-ref", "-q", "HEAD"]) {
+        watch_git_metadata(&workspace_root, &reference, true);
     }
+    watch_git_metadata(&workspace_root, "packed-refs", false);
     println!("cargo:rerun-if-changed=build.rs");
 }
