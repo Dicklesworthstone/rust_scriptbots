@@ -21318,7 +21318,10 @@ fn rasterize_food_field(frame: &RenderFrame) -> Option<WorldRasterPixels> {
                 noise_width,
                 noise_height,
             );
-            color.a *= density.sqrt() * (0.22 + texture * 0.20);
+            // Keep sparse food visible at fitted-world scale without inventing
+            // food in empty cells. A smooth density falloff avoids hard square
+            // halos, and stable texture replaces per-tick shimmer.
+            color.a *= density.sqrt() * (0.85 + texture * 0.15);
             let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
             bgra.extend_from_slice(&[byte(color.b), byte(color.g), byte(color.r), byte(color.a)]);
         }
@@ -21741,6 +21744,17 @@ mod continuous_world_raster_tests {
                 .iter()
                 .all(|pixel| pixel[3] == 0),
             "an empty food grid must remain transparent"
+        );
+        frame.food_cells.fill(0.01);
+        let sparse = rasterize_food_field(&frame).expect("sparse food field");
+        assert!(
+            sparse
+                .bgra
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|pixel| pixel[3] >= 6),
+            "sparse food must remain visible against the substrate"
         );
     }
 
