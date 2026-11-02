@@ -2,8 +2,8 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
-**Capture corruption depth (2026-11-02):** [Currently In Progress — GentleDuck;
-original `bd-2z0.14.3.10`; all original acceptance retained]
+**Capture corruption depth (2026-11-02):** [Verified local increment — GentleDuck;
+original `bd-2z0.14.3.10` remains open for hardware qualification; acceptance retained]
 
 The operator-requested TODO gates this original capture remainder and retires
 as an active checklist after verified delivery. The observed defect is an
@@ -25,10 +25,10 @@ alarm without exercising terrain geometry or materials.
 - [x] Integrate upstream's `39a8532a` snapshot-producer repair for the pulled
   GPUI compile failure; retain its live-command semantics and verify opposite
   realized/commanded states through the real host snapshot plus its threshold.
-- [ ] Repair the observed stale source stamp: resolve real Git HEAD/active-ref
+- [x] Repair the observed stale source stamp: resolve real Git HEAD/active-ref
   paths for Cargo reruns, then verify a normal same-worktree HEAD transition
   without editing the build script, touching sources or cleaning the cache.
-- [ ] Re-execute committed source in a fresh solo pass, record the original
+- [x] Re-execute committed source in a fresh solo pass, record the original
   acceptance disposition and remaining host limitations, and publish reviewed
   source/tracker records without closing an unmet positive pixel requirement.
 - [ ] Qualify material-alarm pixels and repeatability on an admissible GPU lane;
@@ -53,17 +53,34 @@ digest `d4b358d33e596b89`, seed 424242, tick zero and world digest
 `a9ef0ee7e1f0ce00`. Images and provenance are retained under the existing
 evidence directory's `honest/` and `corrupt/` directories. CLI exits are both
 nonzero for missing goldens; no golden was generated. That failed smoke receipt
-is not recolored green. The software policy remains smoke-only, but its old
-unqualified claim that current captures are blank must be corrected to name
-the historical observation. Hardware pixel acceptance remains open.
+is not recolored green. The software policy remains smoke-only; its old
+unqualified claim that current captures are blank now names the historical
+observation instead. Hardware pixel acceptance remains open.
 
 The next capture pair, built at `d37ca100`, exposed a separate metadata bug:
 its provenance still named `b868d60e`. The explicit artifact readback assertion
 fails and is retained under `capture_provenance_before`; the 13-check source
 receipt alone cannot qualify that stale artifact identity. `build.rs` watched
 `.git/HEAD` as if `.git` were always a directory and did not watch an advancing
-symbolic branch ref. Correct the real Git metadata inputs and verify subsequent
-HEAD movement through ordinary incremental Cargo execution.
+symbolic branch ref. Source `c53b78160e0c08ecc083943cecab31b14bdc086e` resolves
+Git's actual metadata paths and passes all 13 checks in DSR
+`capture_provenance_fixed/20261102T182016-2197725`.
+
+The same clean worktree then advanced to metadata-only `fb715c8eba85`, with
+Rust sources, manifests, lockfile and build configuration unchanged. Ordinary
+Cargo execution, without a cache clean, file touch or build-script edit,
+rebuilt the CLI and its actual saved provenance names the new full HEAD.
+DSR `capture_provenance_head_transition/20261102T183249-2217642` retains all
+six check logs: source/config equality, build and artifact-identity checks
+pass; the CLI still exits one for its missing golden, leaving the overall
+receipt failed. This qualifies incremental linked-worktree HEAD tracking,
+not a hardware pixel comparison or an authoritative dirty-source digest.
+
+The operator selected `trj` for hardware qualification. A strict read-only
+SSH probe fails name resolution here; no matching SSH alias or Tailscale peer
+is configured. Its SSH address/user or DSR host configuration was requested.
+The original Bead retains the unmet hardware requirement; no duplicate task,
+golden promotion or software-admission change substitutes for it.
 
 Concurrent source was retained through `302d5657`. Required gates first exposed
 the missing `boost_engaged` producer, fixed upstream at `39a8532a`. A real host
