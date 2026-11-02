@@ -4683,6 +4683,7 @@ pub struct SimulationView {
         u64,
         BrainInspectorCapture,
     )>,
+    world_brain_error: Option<(scriptbots_runtime::HostSessionId, u64, AgentUid, String)>,
     world_brain_last_request: Option<Instant>,
     /// Last coherent focused-agent sample for the World card. The source tick
     /// remains visible when the host advances before the next inspection.
@@ -4821,6 +4822,7 @@ impl SimulationView {
             brain_inspection_cache: None,
             world_brain_job: None,
             world_brain_capture: None,
+            world_brain_error: None,
             world_brain_last_request: None,
             world_hud_detail_cache: None,
             rail_visible: true,
@@ -6704,6 +6706,17 @@ impl SimulationView {
     }
     fn poll_world_brain(&mut self, published: &RenderSnapshot, focused: Option<AgentUid>) {
         if self
+            .world_brain_error
+            .as_ref()
+            .is_some_and(|(session, epoch, uid, _)| {
+                *session != published.session_id
+                    || *epoch != published.world.epoch
+                    || Some(*uid) != focused
+            })
+        {
+            self.world_brain_error = None;
+        }
+        if self
             .world_brain_capture
             .as_ref()
             .is_some_and(|(session, epoch, capture)| {
@@ -6778,9 +6791,13 @@ impl SimulationView {
                             status,
                         },
                     ));
+                    self.world_brain_error = None;
                 }
                 Ok(_) => debug!("discarded mismatched or future World brain inspection"),
-                Err(error) => debug!(%error, "World brain inspection failed"),
+                Err(error) => {
+                    debug!(%error, "World brain inspection failed");
+                    self.world_brain_error = Some((job.session, job.epoch, job.uid, error));
+                }
             }
         }
 
@@ -6825,7 +6842,15 @@ impl SimulationView {
                     result,
                 });
             }
-            Err(error) => debug!(%error, "could not start World brain inspection worker"),
+            Err(error) => {
+                debug!(%error, "could not start World brain inspection worker");
+                self.world_brain_error = Some((
+                    published.session_id,
+                    published.world.epoch,
+                    uid,
+                    format!("worker unavailable: {error}"),
+                ));
+            }
         }
     }
 
@@ -6968,6 +6993,7 @@ impl SimulationView {
             self.poll_world_brain(&published, uid);
         } else if self.minimal_canvas_mode {
             self.world_brain_capture = None;
+            self.world_brain_error = None;
         }
         if brain_request_issued && let Some((_, revision)) = brain_request {
             self.brain_request_revision = revision;
@@ -9531,8 +9557,20 @@ impl SimulationView {
             None if !matches!(self.playback.mode(), PlaybackMode::Live) => {
                 hud.child(label("Neural activity is not recorded in replay frames"))
             }
+            None if self.world_brain_error.is_some() => hud,
             None => hud.child(label("Waiting for a neural sample…")),
         };
+        if let Some((_, _, uid, error)) = &self.world_brain_error
+            && *uid == selected.uid
+            && matches!(self.playback.mode(), PlaybackMode::Live)
+        {
+            hud = hud.child(
+                div()
+                    .text_xs()
+                    .text_color(chrome::text_muted())
+                    .child(format!("Latest neural request failed: {error}")),
+            );
+        }
         hud
     }
 
@@ -30969,6 +31007,26 @@ mod command_characterization_tests {
         }
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 3);
         let uid = captured.agent_uid;
+        let published = host.port.snapshot_hub().latest();
+        let (send, result) = std::sync::mpsc::sync_channel(1);
+        send.send(Err("owner unavailable".to_owned()))
+            .expect("queue failed response");
+        canvas.world_brain_job = Some(WorldBrainJob {
+            session: published.session_id,
+            epoch: published.world.epoch,
+            uid,
+            revision: BrainInspectionRevision::new(2),
+            result,
+        });
+        let _ = canvas.snapshot();
+        assert_eq!(
+            canvas
+                .world_brain_error
+                .as_ref()
+                .map(|error| error.3.as_str()),
+            Some("owner unavailable")
+        );
+        assert!(canvas.world_brain_capture.is_some());
         let revision = BrainInspectionRevision::new(999);
         let stale = host
             .port
@@ -30979,6 +31037,20 @@ mod command_characterization_tests {
             ))
             .expect("capture a real response before deselection");
         let published = host.port.snapshot_hub().latest();
+        let (send, result) = std::sync::mpsc::sync_channel(1);
+        send.send(Ok(stale.clone()))
+            .expect("queue successful retry");
+        canvas.world_brain_job = Some(WorldBrainJob {
+            session: published.session_id,
+            epoch: published.world.epoch,
+            uid,
+            revision,
+            result,
+        });
+        let _ = canvas.snapshot();
+        assert!(canvas.world_brain_error.is_none());
+        assert!(canvas.world_brain_capture.is_some());
+
         let (send, result) = std::sync::mpsc::sync_channel(1);
         send.send(Ok(stale)).expect("queue completed response");
         canvas.world_brain_job = Some(WorldBrainJob {
@@ -30994,6 +31066,7 @@ mod command_characterization_tests {
             .expect("canvas selection projection") = Some(Vec::new());
         let _ = canvas.snapshot();
         assert!(canvas.world_brain_capture.is_none());
+        assert!(canvas.world_brain_error.is_none());
         assert!(canvas.world_brain_job.is_none());
         assert_eq!(
             host.port
