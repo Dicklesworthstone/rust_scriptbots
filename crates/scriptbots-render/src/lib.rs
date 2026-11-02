@@ -21698,6 +21698,86 @@ fn blend_channels<const N: usize>(
     blended
 }
 
+// Image materials are appearance only; they never feed the simulation.
+fn natural_terrain_sample(image: &image::RgbImage, u: f32, v: f32) -> [f32; 3] {
+    let u = u.rem_euclid(1.0);
+    let v = v.rem_euclid(1.0);
+    let smooth = |t: f32| t * t * (3.0 - 2.0 * t);
+    let wx = smooth((2.0 * u - 1.0).abs());
+    let wy = smooth((2.0 * v - 1.0).abs());
+    let point = |x: f32, y: f32| {
+        let x = (x.rem_euclid(1.0) * image.width() as f32) as u32;
+        let y = (y.rem_euclid(1.0) * image.height() as f32) as u32;
+        image
+            .get_pixel(x, y)
+            .0
+            .map(|channel| f32::from(channel) / 255.0)
+    };
+    let a = point(u, v);
+    let b = point(u + 0.5, v);
+    let c = point(u, v + 0.5);
+    let d = point(u + 0.5, v + 0.5);
+    std::array::from_fn(|i| {
+        (a[i] * (1.0 - wx) + b[i] * wx) * (1.0 - wy) + (c[i] * (1.0 - wx) + d[i] * wx) * wy
+    })
+}
+
+type NaturalMaterialSamples = Arc<Vec<[[u8; 3]; 3]>>;
+type NaturalMaterialEntry = ((u32, u32), NaturalMaterialSamples);
+
+fn natural_terrain_materials(width: u32, height: u32) -> Option<NaturalMaterialSamples> {
+    static IMAGES: std::sync::OnceLock<Option<[image::RgbImage; 3]>> = std::sync::OnceLock::new();
+    static CACHE: std::sync::OnceLock<Mutex<Vec<NaturalMaterialEntry>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    {
+        let entries = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((_, samples)) = entries.iter().find(|(size, _)| *size == (width, height)) {
+            return Some(Arc::clone(samples));
+        }
+    }
+    let images = IMAGES
+        .get_or_init(|| {
+            Some([
+                image::load_from_memory(include_bytes!("terrain_grass.png"))
+                    .ok()?
+                    .to_rgb8(),
+                image::load_from_memory(include_bytes!("terrain_rock.png"))
+                    .ok()?
+                    .to_rgb8(),
+                image::load_from_memory(include_bytes!("terrain_water.png"))
+                    .ok()?
+                    .to_rgb8(),
+            ])
+        })
+        .as_ref()?;
+    let mut samples = Vec::with_capacity((width as usize).checked_mul(height as usize)?);
+    for y in 0..height {
+        for x in 0..width {
+            let u = (x as f32 + 0.5) / width as f32;
+            let v = (y as f32 + 0.5) / height as f32;
+            samples.push(std::array::from_fn(|i| {
+                natural_terrain_sample(&images[i], u, v)
+                    .map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8)
+            }));
+        }
+    }
+    let samples = Arc::new(samples);
+    let mut entries = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((_, existing)) = entries.iter().find(|(size, _)| *size == (width, height)) {
+        return Some(Arc::clone(existing));
+    }
+    if entries.len() >= 2 {
+        entries.remove(0);
+    }
+    entries.push(((width, height), Arc::clone(&samples)));
+    Some(samples)
+}
+
 struct TerrainRasterInput {
     terrain: TerrainFrame,
     world_size: (f32, f32),
@@ -21768,6 +21848,38 @@ fn rasterize_terrain_input_at_resolution(
         }));
     }
 
+    // Smooth the visual biome mixture across neighboring cells on this
+    // toroidal world. The scientific terrain itself is untouched.
+    let (tile_width, tile_height) = frame.terrain.dimensions;
+    if tile_width >= 3 && tile_height >= 3 {
+        let source = splats.clone();
+        for y in 0..tile_height {
+            for x in 0..tile_width {
+                let mut filtered = [0.0; visual::SPLAT_LAYERS];
+                for (dy, wy) in [(tile_height - 1, 1.0), (0, 2.0), (1, 1.0)] {
+                    for (dx, wx) in [(tile_width - 1, 1.0), (0, 2.0), (1, 1.0)] {
+                        let index = (((y + dy) % tile_height) * tile_width + (x + dx) % tile_width)
+                            as usize;
+                        for (out, value) in filtered.iter_mut().zip(source[index]) {
+                            *out += value * wx * wy / 16.0;
+                        }
+                    }
+                }
+                let index = (y * tile_width + x) as usize;
+                for (layer, averaged) in filtered.into_iter().enumerate() {
+                    splats[index][layer] = source[index][layer] * 0.35 + averaged * 0.65;
+                }
+            }
+        }
+    }
+    // A representative, low-frequency preview avoids waiting for texture
+    // decoding; full-resolution terrain uses the sampled material images.
+    let materials = if samples_per_cell == 1 {
+        None
+    } else {
+        natural_terrain_materials(raster_width, raster_height)
+    };
+
     let terrain_field = visual::TerrainFieldView {
         width: frame.terrain.dimensions.0,
         height: frame.terrain.dimensions.1,
@@ -21822,7 +21934,32 @@ fn rasterize_terrain_input_at_resolution(
                 (sampled_gradient[0] * -0.18 + sampled_gradient[1] * -0.26).clamp(-0.12, 0.12);
             let shade =
                 (0.72 + broad * 0.38 + detail * 0.26 + grain * 0.08 + relief).clamp(0.55, 1.30);
-            let display_rgb = display_rgb.map(|channel| channel * shade);
+            let mut display_rgb = display_rgb.map(|channel| channel * shade);
+            {
+                let samples = materials.as_ref().map_or(
+                    [[74, 75, 19], [87, 80, 73], [22, 59, 56]],
+                    |materials| {
+                        materials[raster_y as usize * raster_width as usize + raster_x as usize]
+                    },
+                );
+                let blend = [
+                    ((weights[3] + weights[4]) * 0.8).clamp(0.0, 0.8),
+                    (weights[5] * 0.8).clamp(0.0, 0.8),
+                    ((weights[0] + weights[1]) * 0.8).clamp(0.0, 0.8),
+                ];
+                for (sample, weight) in samples.into_iter().zip(blend) {
+                    let texel = visual::apply_accessibility_palette(
+                        sample.map(|channel| {
+                            f32::from(channel) / 255.0 * (0.45 + daylight.clamp(0.0, 1.0) * 0.55)
+                        }),
+                        accessibility_palette(frame.palette),
+                    );
+                    for channel in 0..3 {
+                        display_rgb[channel] =
+                            display_rgb[channel] * (1.0 - weight) + texel[channel] * weight;
+                    }
+                }
+            }
 
             let to_byte = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
             bgra.extend_from_slice(&[
@@ -22241,6 +22378,82 @@ mod continuous_world_raster_tests {
 
     fn rgb_distance(left: [f32; 3], right: [f32; 3]) -> f32 {
         (left[0] - right[0]).abs() + (left[1] - right[1]).abs() + (left[2] - right[2]).abs()
+    }
+
+    #[test]
+    fn natural_preview_matches_low_frequency_full_raster() {
+        let world = WorldState::new(ScriptBotsConfig {
+            rng_seed: Some(12345),
+            persistence_interval: 0,
+            ..ScriptBotsConfig::default()
+        })
+        .unwrap();
+        for palette in ColorPaletteMode::ALL {
+            let frame = RenderFrame::from_world(&world, palette).unwrap();
+            let input = TerrainRasterInput::from(&frame);
+            let day = visual::daylight_factor(
+                frame.tick,
+                frame.day_night_cycle_ticks,
+                frame.day_night_start_phase,
+            );
+            let preview = rasterize_terrain_input_at_resolution(&input, day, 1).unwrap();
+            let full = rasterize_terrain_input(&input, day).unwrap();
+            assert_eq!(
+                (full.width, full.height),
+                (preview.width * 8, preview.height * 8)
+            );
+            let mut errors = Vec::new();
+            for y in 0..preview.height {
+                for x in 0..preview.width {
+                    let p = (y as usize * preview.width as usize + x as usize) * 4;
+                    for channel in 0..3 {
+                        let mut sum = 0_u32;
+                        for dy in 0..8 {
+                            for dx in 0..8 {
+                                let f = ((y * 8 + dy) as usize * full.width as usize
+                                    + (x * 8 + dx) as usize)
+                                    * 4
+                                    + channel;
+                                sum += u32::from(full.bgra[f]);
+                            }
+                        }
+                        errors.push(
+                            (i32::from(preview.bgra[p + channel]) - (sum / 64) as i32)
+                                .unsigned_abs(),
+                        );
+                    }
+                }
+            }
+            errors.sort_unstable();
+            let mean = errors.iter().map(|&v| f64::from(v)).sum::<f64>() / errors.len() as f64;
+            let p95 = errors[errors.len() * 95 / 100];
+            eprintln!("{palette:?}: mean error={mean:.2}/255 p95={p95}/255");
+            assert!(
+                mean < 10.0 && p95 < 25,
+                "preview differs too much from the full image"
+            );
+        }
+    }
+
+    #[test]
+    fn natural_material_sampling_wraps_for_all_three_biomes() {
+        for bytes in [
+            include_bytes!("terrain_grass.png").as_slice(),
+            include_bytes!("terrain_rock.png").as_slice(),
+            include_bytes!("terrain_water.png").as_slice(),
+        ] {
+            let image = image::load_from_memory(bytes).unwrap().to_rgb8();
+            for p in [0.0, 0.17, 0.5, 0.93] {
+                assert_eq!(
+                    natural_terrain_sample(&image, 0.0, p),
+                    natural_terrain_sample(&image, 1.0, p)
+                );
+                assert_eq!(
+                    natural_terrain_sample(&image, p, 0.0),
+                    natural_terrain_sample(&image, p, 1.0)
+                );
+            }
+        }
     }
 
     #[test]
