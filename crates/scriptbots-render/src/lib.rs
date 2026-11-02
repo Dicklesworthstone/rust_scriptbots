@@ -6341,7 +6341,9 @@ impl SimulationView {
             .and_then(|camera| camera.world_to_screen((position.x, position.y)))
     }
 
-    fn fit_world_view(&self, cx: &mut Context<Self>) {
+    fn fit_world_view(&mut self, cx: &mut Context<Self>) {
+        // Following recenters on every frame and would immediately undo the fit.
+        self.controls.follow_mode = FollowMode::Off;
         if let Ok(mut camera) = self.camera.lock() {
             camera.cancel_initial_population_view();
             camera.fit_world();
@@ -6349,7 +6351,8 @@ impl SimulationView {
         cx.notify();
     }
 
-    fn fit_selection_view(&self, bounds: (Position, Position), cx: &mut Context<Self>) {
+    fn fit_selection_view(&mut self, bounds: (Position, Position), cx: &mut Context<Self>) {
+        self.controls.follow_mode = FollowMode::Off;
         if let Ok(mut camera) = self.camera.lock() {
             camera.cancel_initial_population_view();
             camera.fit_bounds(bounds.0, bounds.1, 120.0);
@@ -6838,8 +6841,6 @@ impl SimulationView {
             .p_1()
             .rounded_lg()
             .bg(chrome::surface())
-            .border_1()
-            .border_color(chrome::border())
             .children(tabs.into_iter().map(|(tab, label)| {
                 let active = self.dashboard_tab == tab;
                 let element_id = match tab {
@@ -6881,9 +6882,9 @@ impl SimulationView {
                     .flex_1()
                     .cursor_pointer()
                     .rounded_md()
-                    .px_2()
+                    .px_3()
                     .py_2()
-                    .text_xs()
+                    .text_sm()
                     .text_center()
                     .child(label)
                     .on_click(listener)
@@ -6892,7 +6893,7 @@ impl SimulationView {
                     button
                         .bg(chrome::surface_raised())
                         .border_1()
-                        .border_color(chrome::accent())
+                        .border_color(chrome::border())
                         .text_color(chrome::text_primary())
                 } else {
                     button
@@ -6919,10 +6920,7 @@ impl SimulationView {
         let perf = if snapshot.perf.sample_count == 0 {
             "Frame timing warming up".to_owned()
         } else {
-            format!(
-                "{:.1} fps · {:.2} ms frame",
-                snapshot.perf.fps, snapshot.perf.latest_ms
-            )
+            format!("{:.2} ms UI update", snapshot.perf.latest_ms)
         };
 
         div()
@@ -7001,6 +6999,7 @@ impl SimulationView {
                     .flex()
                     .flex_col()
                     .gap_3()
+                    .child(self.render_simulation_controls(snapshot, cx))
                     .child(self.render_summary(snapshot))
                     .child(self.render_dashboard_status(snapshot));
                 let disclosures = HudDisclosures {
@@ -7013,14 +7012,12 @@ impl SimulationView {
                 {
                     overview = overview.child(panel_stack);
                 }
-                overview
-                    .child(self.render_simulation_controls(snapshot, cx))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(chrome::text_muted())
-                            .child("Telemetry panels: 1 stats · 2 history · 3 performance"),
-                    )
+                overview.child(
+                    div()
+                        .text_xs()
+                        .text_color(chrome::text_muted())
+                        .child("Telemetry panels: 1 stats · 2 history · 3 performance"),
+                )
             }
             DashboardTab::Inspect => self.render_inspector(snapshot, cx),
             DashboardTab::Maps => self.render_map_sandbox(snapshot, cx),
@@ -7078,7 +7075,7 @@ impl SimulationView {
                 .overflow_y_scroll()
                 .scrollbar_width(px(8.0))
                 .pr_1()
-                .child(body),
+                .child(div().w_full().max_w(px(1040.0)).mx_auto().child(body)),
         )
     }
 
@@ -7147,8 +7144,11 @@ impl SimulationView {
 
         div()
             .flex()
-            .flex_col()
+            .flex_wrap()
+            .items_center()
+            .justify_between()
             .gap_3()
+            .py_2()
             .child(
                 div()
                     .flex()
@@ -7159,9 +7159,11 @@ impl SimulationView {
                         div()
                             .flex()
                             .flex_col()
+                            .gap_1()
                             .child(
                                 div()
                                     .text_xl()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
                                     .text_color(rgb(theme.text_primary))
                                     .child(self.title.clone()),
                             )
@@ -7174,15 +7176,6 @@ impl SimulationView {
                     ),
             )
             .child(chips_row)
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(chrome::text_muted())
-                    .child(format!(
-                        "World {}×{} · display controls stay with the World window",
-                        snapshot.world_size.0, snapshot.world_size.1
-                    )),
-            )
     }
     fn render_summary(&self, snapshot: &HudSnapshot) -> Div {
         let theme = hud_theme(self.accessibility_snapshot().palette);
@@ -7190,7 +7183,7 @@ impl SimulationView {
 
         if let Some(metrics) = snapshot.summary.as_ref() {
             let growth = metrics.net_growth();
-            let metric_accent = 0x38bdf8;
+            let metric_accent = 0x79ddbb;
             let growth_label = if growth >= 0 {
                 format!("Net +{}", growth)
             } else {
@@ -7207,7 +7200,7 @@ impl SimulationView {
                 &theme,
                 "Tick",
                 metrics.tick.to_string(),
-                0x38bdf8,
+                metric_accent,
                 Some(format!("Epoch {}", snapshot.epoch)),
                 None,
             ));
@@ -7272,7 +7265,11 @@ impl SimulationView {
             );
         }
 
-        div().grid().grid_cols(2).gap_2().children(cards)
+        div()
+            .flex()
+            .flex_wrap()
+            .gap_2()
+            .children(cards.into_iter().map(|card| card.min_w(px(180.0)).flex_1()))
     }
     fn render_analytics_panel(&self, snapshot: &HudSnapshot) -> Div {
         let theme = hud_theme(self.accessibility_snapshot().palette);
@@ -7517,7 +7514,7 @@ impl SimulationView {
             .child(
                 div()
                     .text_sm()
-                    .text_color(rgb(0x38bdf8))
+                    .text_color(rgb(0x79ddbb))
                     .child("Temperature"),
             )
             .child(
@@ -7634,7 +7631,7 @@ impl SimulationView {
             .child(
                 div()
                     .text_sm()
-                    .text_color(rgb(0x38bdf8))
+                    .text_color(rgb(0x79ddbb))
                     .child("Brain Share"),
             )
             .children(brain_rows);
@@ -7679,7 +7676,7 @@ impl SimulationView {
                     div()
                         .text_sm()
                         .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(rgb(0x94a3b8))
+                        .text_color(rgb(0xa7bdb2))
                         .child("Ecosystem Sankey Flow: no data for requested epoch"),
                 );
         };
@@ -7723,12 +7720,12 @@ impl SimulationView {
                 .map(|l| l.value)
                 .sum();
             let color = match node.class {
-                scriptbots_core::economy::NodeClass::ExternalSource => 0x38bdf8,
+                scriptbots_core::economy::NodeClass::ExternalSource => 0x79ddbb,
                 scriptbots_core::economy::NodeClass::FoodGrid => 0x4ade80,
                 scriptbots_core::economy::NodeClass::Herbivores => 0xa3e635,
                 scriptbots_core::economy::NodeClass::Omnivores => 0xfbbf24,
                 scriptbots_core::economy::NodeClass::Carnivores => 0xf87171,
-                scriptbots_core::economy::NodeClass::Sink => 0x94a3b8,
+                scriptbots_core::economy::NodeClass::Sink => 0xa7bdb2,
                 scriptbots_core::economy::NodeClass::Unaccounted => 0xe879f9,
             };
 
@@ -7752,7 +7749,7 @@ impl SimulationView {
                     .child(
                         div()
                             .text_xs()
-                            .text_color(rgb(0x94a3b8))
+                            .text_color(rgb(0xa7bdb2))
                             .child(format!("in: {:.2} · out: {:.2}", in_val, out_val)),
                     ),
             );
@@ -7776,7 +7773,7 @@ impl SimulationView {
                     .child(
                         div()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(rgb(0x38bdf8))
+                            .text_color(rgb(0x79ddbb))
                             .child(format!("{:.4}", link.value)),
                     ),
             );
@@ -7795,7 +7792,7 @@ impl SimulationView {
                 div()
                     .text_sm()
                     .font_weight(gpui::FontWeight::BOLD)
-                    .text_color(rgb(0x38bdf8))
+                    .text_color(rgb(0x79ddbb))
                     .child("Ecosystem Energy & Resource Flows (Sankey)"),
             )
             .child(div().flex().flex_wrap().gap_2().children(node_elements))
@@ -7806,7 +7803,7 @@ impl SimulationView {
                     .gap_1()
                     .p_2()
                     .rounded_md()
-                    .bg(rgb(0x0f172a))
+                    .bg(rgb(0x111d20))
                     .children(link_elements),
             )
     }
@@ -7905,7 +7902,7 @@ impl SimulationView {
                                 .child(
                                     div()
                                         .text_sm()
-                                        .text_color(rgb(0x38bdf8))
+                                        .text_color(rgb(0x79ddbb))
                                         .child(format!("Deaths {}", entry.deaths)),
                                 )
                                 .child(
@@ -8797,6 +8794,7 @@ impl SimulationView {
             .flex_1()
             .h_full()
             .flex_grow(1.0)
+            .overflow_hidden()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, _, cx| {
@@ -9863,9 +9861,9 @@ impl SimulationView {
             .px_4()
             .py_4()
             .rounded_lg()
-            .bg(rgb(0x0f172a))
+            .bg(rgb(0x111d20))
             .border_1()
-            .border_color(rgb(0x1e293b));
+            .border_color(rgb(0x304542));
 
         // ✨ SINGLE CENTRALIZED FILTERING LOOP - this replaces 60+ individual checks!
         for (label, value, desc) in params {
@@ -10213,7 +10211,7 @@ impl SimulationView {
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(0x94a3b8))
+                    .text_color(rgb(0xa7bdb2))
                     .child(format!("{} agents live", inspector.total_agents)),
             );
 
@@ -10223,12 +10221,12 @@ impl SimulationView {
                 .flex_col()
                 .gap_1()
                 .rounded_md()
-                .bg(rgb(0x111b2b))
+                .bg(rgb(0x18282b))
                 .border_1()
-                .border_color(rgb(0x1e3a8a))
+                .border_color(rgb(0x355d52))
                 .px_3()
                 .py_2()
-                .child(div().text_xs().text_color(rgb(0x38bdf8)).child("Hovered"))
+                .child(div().text_xs().text_color(rgb(0x79ddbb)).child("Hovered"))
                 .child(
                     div()
                         .flex()
@@ -10237,21 +10235,21 @@ impl SimulationView {
                         .child(color_swatch(entry.color))
                         .child(div().text_sm().child(entry.label.clone())),
                 )
-                .child(div().text_xs().text_color(rgb(0x94a3b8)).child(format!(
+                .child(div().text_xs().text_color(rgb(0xa7bdb2)).child(format!(
                     "E {:.2} · H {:.2} · Age {} · Gen {}",
                     entry.energy, entry.health, entry.age, entry.generation.0
                 )))
         } else {
             div()
                 .rounded_md()
-                .bg(rgb(0x111b2b))
+                .bg(rgb(0x18282b))
                 .border_1()
-                .border_color(rgb(0x1e293b))
+                .border_color(rgb(0x304542))
                 .px_3()
                 .py_2()
                 .text_xs()
-                .text_color(rgb(0x475569))
-                .child("Hover or select an agent in World to preview")
+                .text_color(chrome::text_muted())
+                .child("Hover over an agent in World for a quick preview")
         };
 
         let mut list_children: Vec<Div> = inspector
@@ -10264,11 +10262,11 @@ impl SimulationView {
             list_children.push(
                 div()
                     .text_xs()
-                    .text_color(rgb(0x475569))
+                    .text_color(rgb(0x91a9a0))
                     .rounded_md()
                     .border_1()
-                    .border_color(rgb(0x1e293b))
-                    .bg(rgb(0x0f172a))
+                    .border_color(rgb(0x304542))
+                    .bg(rgb(0x111d20))
                     .px_3()
                     .py_2()
                     .child("No agents selected"),
@@ -10287,11 +10285,11 @@ impl SimulationView {
             .unwrap_or_else(|| {
                 div()
                     .text_xs()
-                    .text_color(rgb(0x475569))
+                    .text_color(rgb(0x91a9a0))
                     .rounded_md()
                     .border_1()
-                    .border_color(rgb(0x1e293b))
-                    .bg(rgb(0x0f172a))
+                    .border_color(rgb(0x304542))
+                    .bg(rgb(0x111d20))
                     .px_3()
                     .py_3()
                     .child("Select an agent to inspect stats")
@@ -10309,7 +10307,7 @@ impl SimulationView {
             .rounded_xl()
             .p_3()
             .child(header)
-            .child(div().text_xs().text_color(rgb(0x94a3b8)).child(format!(
+            .child(div().text_xs().text_color(rgb(0xa7bdb2)).child(format!(
                         "Focused: {}",
                         inspector
                             .focus_id
@@ -10320,27 +10318,27 @@ impl SimulationView {
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(0x38bdf8))
+                    .text_color(rgb(0x79ddbb))
                     .child(format!("Selected agents: {}", inspector.selected.len())),
             )
             .child(self.render_selection_controls(inspector, cx))
+            .child(detail)
             .child(selection_list)
             .child(persistence_controls)
             .child(playback_controls)
-            .child(detail)
     }
 
     fn render_inspector_entry(&self, entry: &AgentListEntry, cx: &mut Context<Self>) -> Div {
         let agent_id = entry.agent_id;
         let highlight_bg = if entry.is_focused {
-            rgb(0x1d4ed8)
+            rgb(0x203e36)
         } else {
-            rgb(0x111b2b)
+            rgb(0x162427)
         };
         let border_color = if entry.is_focused {
-            rgb(0x38bdf8)
+            rgb(0x79ddbb)
         } else {
-            rgb(0x1e293b)
+            rgb(0x304542)
         };
 
         let focus_listener = cx.listener(move |this, _event: &MouseDownEvent, _, cx| {
@@ -10374,11 +10372,11 @@ impl SimulationView {
                     .child(
                         div()
                             .text_xs()
-                            .text_color(rgb(0xf8fafc))
+                            .text_color(rgb(0xe9f3ed))
                             .child(format!("E {:.2}", entry.energy)),
                     ),
             )
-            .child(div().text_xs().text_color(rgb(0x94a3b8)).child(format!(
+            .child(div().text_xs().text_color(rgb(0xb5c8be)).child(format!(
                 "H {:.2} · Age {} · Gen {}",
                 entry.health, entry.age, entry.generation.0
             )))
@@ -10390,7 +10388,7 @@ impl SimulationView {
                 } else {
                     world_text
                 };
-                div().text_xs().text_color(rgb(0x64748b)).child(line)
+                div().text_xs().text_color(rgb(0x91a9a0)).child(line)
             })
     }
 
@@ -10434,13 +10432,13 @@ impl SimulationView {
                 .child("On")
                 .on_mouse_down(MouseButton::Left, enable);
             if inspector.persistence_enabled {
-                base.border_color(rgb(0x38bdf8))
-                    .bg(rgb(0x1e3a8a))
+                base.border_color(rgb(0x79ddbb))
+                    .bg(rgb(0x355d52))
                     .text_color(rgb(0xe0f2fe))
             } else {
-                base.border_color(rgb(0x1e293b))
-                    .bg(rgb(0x111b2b))
-                    .text_color(rgb(0xcbd5f5))
+                base.border_color(rgb(0x304542))
+                    .bg(rgb(0x18282b))
+                    .text_color(rgb(0xc6d9ce))
             }
         };
 
@@ -10454,13 +10452,13 @@ impl SimulationView {
                 .child("Off")
                 .on_mouse_down(MouseButton::Left, disable);
             if !inspector.persistence_enabled {
-                base.border_color(rgb(0x38bdf8))
-                    .bg(rgb(0x1e3a8a))
+                base.border_color(rgb(0x79ddbb))
+                    .bg(rgb(0x355d52))
                     .text_color(rgb(0xe0f2fe))
             } else {
-                base.border_color(rgb(0x1e293b))
-                    .bg(rgb(0x111b2b))
-                    .text_color(rgb(0xcbd5f5))
+                base.border_color(rgb(0x304542))
+                    .bg(rgb(0x18282b))
+                    .text_color(rgb(0xc6d9ce))
             }
         };
 
@@ -10471,12 +10469,12 @@ impl SimulationView {
             div()
                 .rounded_md()
                 .border_1()
-                .border_color(rgb(0x1e293b))
-                .bg(rgb(0x111b2b))
+                .border_color(rgb(0x304542))
+                .bg(rgb(0x18282b))
                 .px_2()
                 .py_1()
                 .text_xs()
-                .text_color(rgb(0xcbd5f5))
+                .text_color(rgb(0xc6d9ce))
                 .child(label.to_string())
                 .on_mouse_down(MouseButton::Left, listener)
         }
@@ -10492,21 +10490,21 @@ impl SimulationView {
             .gap_2()
             .rounded_md()
             .border_1()
-            .border_color(rgb(0x1e293b))
-            .bg(rgb(0x0f172a))
+            .border_color(rgb(0x304542))
+            .bg(rgb(0x111d20))
             .px_3()
             .py_2()
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(0x94a3b8))
+                    .text_color(rgb(0xa7bdb2))
                     .child("Storage / Persistence"),
             )
             .child(div().flex().gap_2().children(vec![on_button, off_button]))
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(0xcbd5f5))
+                    .text_color(rgb(0xc6d9ce))
                     .child(format!("Interval {} ticks", display_interval)),
             )
             .child(div().flex().gap_1().children(vec![
@@ -10518,7 +10516,7 @@ impl SimulationView {
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(0x64748b))
+                    .text_color(rgb(0x91a9a0))
                     .child("Disabling stores the last interval for quick re-enable."),
             )
     }
@@ -10554,9 +10552,9 @@ impl SimulationView {
             .rounded_md()
             .border_1()
             .bg(chrome::surface_raised())
-            .px_2()
-            .py_1()
-            .text_xs()
+            .px_3()
+            .py_2()
+            .text_sm()
             .child(label)
             .on_mouse_down(
                 MouseButton::Left,
@@ -10571,6 +10569,7 @@ impl SimulationView {
         if active {
             button
                 .border_color(chrome::accent())
+                .bg(rgb(0x25473b))
                 .text_color(chrome::text_primary())
         } else {
             button
@@ -10645,17 +10644,17 @@ impl SimulationView {
             .gap_2()
             .rounded_md()
             .border_1()
-            .border_color(rgb(0x1e293b))
-            .bg(rgb(0x0f172a))
+            .border_color(rgb(0x304542))
+            .bg(rgb(0x111d20))
             .px_3()
             .py_2()
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(0x94a3b8))
+                    .text_color(rgb(0xa7bdb2))
                     .child("Selection tools"),
             )
-            .child(div().text_xs().text_color(rgb(0xcbd5f5)).child(format!(
+            .child(div().text_xs().text_color(rgb(0xc6d9ce)).child(format!(
                 "Selected {} · Hover {} · Focus {}",
                 inspector.selected.len(),
                 hover_label,
@@ -10666,7 +10665,7 @@ impl SimulationView {
                 select_all_button,
                 focus_button,
             ]))
-            .child(div().text_xs().text_color(rgb(0x64748b)).child(format!(
+            .child(div().text_xs().text_color(rgb(0x91a9a0)).child(format!(
                 "Shortcuts: Clear {} · Select all {} · Focus {}",
                 format_keystroke(&clear_binding),
                 format_keystroke(&select_all_binding),
@@ -10680,10 +10679,10 @@ impl SimulationView {
             items.push(
                 div()
                     .text_xs()
-                    .text_color(rgb(0x475569))
-                    .bg(rgb(0x0f172a))
+                    .text_color(rgb(0x91a9a0))
+                    .bg(rgb(0x111d20))
                     .border_1()
-                    .border_color(rgb(0x1e293b))
+                    .border_color(rgb(0x304542))
                     .rounded_md()
                     .px_2()
                     .py_2()
@@ -10704,13 +10703,13 @@ impl SimulationView {
 
                 items.push(
                     div()
-                        .bg(rgb(0x0f172a))
+                        .bg(rgb(0x111d20))
                         .border_1()
-                        .border_color(rgb(0x1e293b))
+                        .border_color(rgb(0x304542))
                         .rounded_md()
                         .px_2()
                         .py_2()
-                        .child(div().text_xs().text_color(rgb(0xcbd5f5)).child(format!(
+                        .child(div().text_xs().text_color(rgb(0xc6d9ce)).child(format!(
                             "Tick {} · {} · selected {}",
                             event.tick,
                             event.kind.label(),
@@ -10719,7 +10718,7 @@ impl SimulationView {
                         .child(
                             div()
                                 .text_xs()
-                                .text_color(rgb(0x64748b))
+                                .text_color(rgb(0x91a9a0))
                                 .child(format!("Sample [{}]", sample)),
                         ),
                 );
@@ -10732,14 +10731,14 @@ impl SimulationView {
             .gap_2()
             .rounded_md()
             .border_1()
-            .border_color(rgb(0x1e293b))
-            .bg(rgb(0x0f172a))
+            .border_color(rgb(0x304542))
+            .bg(rgb(0x111d20))
             .px_3()
             .py_2()
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(0x94a3b8))
+                    .text_color(rgb(0xa7bdb2))
                     .child("Selection history"),
             )
             .children(items)
@@ -10776,14 +10775,14 @@ impl SimulationView {
         let style_toggle = |button: Div, active: bool| {
             if active {
                 button
-                    .border_color(rgb(0x38bdf8))
-                    .bg(rgb(0x1e3a8a))
+                    .border_color(rgb(0x79ddbb))
+                    .bg(rgb(0x355d52))
                     .text_color(rgb(0xe0f2fe))
             } else {
                 button
-                    .border_color(rgb(0x1e293b))
-                    .bg(rgb(0x111b2b))
-                    .text_color(rgb(0xcbd5f5))
+                    .border_color(rgb(0x304542))
+                    .bg(rgb(0x18282b))
+                    .text_color(rgb(0xc6d9ce))
             }
         };
 
@@ -10860,14 +10859,14 @@ impl SimulationView {
             .gap_2()
             .rounded_md()
             .border_1()
-            .border_color(rgb(0x1e293b))
-            .bg(rgb(0x0f172a))
+            .border_color(rgb(0x304542))
+            .bg(rgb(0x111d20))
             .px_3()
             .py_2()
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(0x94a3b8))
+                    .text_color(rgb(0xa7bdb2))
                     .child("Debug overlays"),
             )
             .child(div().flex().gap_2().children(vec![overlay_on, overlay_off]))
@@ -10879,7 +10878,7 @@ impl SimulationView {
                     .child(
                         div()
                             .text_xs()
-                            .text_color(rgb(0xcbd5f5))
+                            .text_color(rgb(0xc6d9ce))
                             .child("Velocity arrows"),
                     )
                     .child(
@@ -10897,7 +10896,7 @@ impl SimulationView {
                     .child(
                         div()
                             .text_xs()
-                            .text_color(rgb(0xcbd5f5))
+                            .text_color(rgb(0xc6d9ce))
                             .child("Sense radius"),
                     )
                     .child(div().flex().gap_2().children(vec![sense_on, sense_off])),
@@ -10905,7 +10904,7 @@ impl SimulationView {
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(0x64748b))
+                    .text_color(rgb(0x91a9a0))
                     .child(format!("Shortcut {}", format_keystroke(&overlay_binding))),
             )
     }
@@ -11013,81 +11012,113 @@ impl SimulationView {
             snapshot.is_closed,
         );
 
+        let presets = {
+            let apply = |label: &'static str, preset: PresetKind| {
+                let listener = cx.listener(move |this, _e: &MouseDownEvent, _, cx| {
+                    if !this.apply_preset(preset, cx) {
+                        warn!(
+                            ?preset,
+                            "preset submission is unconfirmed; check the control log"
+                        );
+                    }
+                });
+                base_button(label.into()).on_mouse_down(MouseButton::Left, listener)
+            };
+            div().flex().flex_wrap().gap_2().children(vec![
+                apply("Arctic", PresetKind::Arctic),
+                apply("Boom–Bust", PresetKind::BoomBust),
+                apply("Closed World", PresetKind::ClosedWorld),
+            ])
+        };
+
         div()
             .flex()
             .flex_col()
-            .gap_2()
+            .gap_3()
             .rounded_lg()
             .border_1()
             .border_color(chrome::border())
             .bg(chrome::surface())
-            .px_3()
-            .py_3()
+            .p_4()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(chrome::text_primary())
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child("Simulation controls"),
+            )
             .child(
                 div()
                     .flex()
-                    .items_center()
-                    .justify_between()
+                    .flex_wrap()
+                    .gap_4()
                     .child(
                         div()
-                            .text_sm()
-                            .text_color(chrome::text_primary())
-                            .child("Run controls"),
+                            .min_w(px(230.0))
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(chrome::text_muted())
+                                    .child(format!("PLAYBACK · {:.2}×", controls.speed_multiplier)),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .gap_2()
+                                    .children(vec![run_button, pause_button, step_button])
+                                    .child(slower_button)
+                                    .child(faster_button),
+                            ),
                     )
                     .child(
                         div()
-                            .text_xs()
-                            .text_color(chrome::text_muted())
-                            .child(format!("{:.2}×", controls.speed_multiplier)),
+                            .min_w(px(200.0))
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(chrome::text_muted())
+                                    .child("ADD AGENTS"),
+                            )
+                            .child(spawn_row),
+                    )
+                    .child(
+                        div()
+                            .min_w(px(220.0))
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(chrome::text_muted())
+                                    .child("WORLD BOUNDARIES"),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .gap_2()
+                                    .children(vec![closed_off_button, closed_on_button]),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(chrome::text_muted())
+                                    .child("PRESETS"),
+                            )
+                            .child(presets),
                     ),
             )
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap_2()
-                    .children(vec![run_button, pause_button, step_button])
-                    .child(slower_button)
-                    .child(faster_button),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(chrome::text_muted())
-                    .child("Add agents"),
-            )
-            .child(spawn_row)
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap_2()
-                    .children(vec![closed_off_button, closed_on_button]),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(chrome::text_muted())
-                    .child("Presets"),
-            )
-            .child({
-                let apply = |label: &'static str, preset: PresetKind| {
-                    let listener = cx.listener(move |this, _e: &MouseDownEvent, _, cx| {
-                        if !this.apply_preset(preset, cx) {
-                            warn!(
-                                ?preset,
-                                "preset submission is unconfirmed; check the control log"
-                            );
-                        }
-                    });
-                    base_button(label.into()).on_mouse_down(MouseButton::Left, listener)
-                };
-                div().flex().flex_wrap().gap_2().children(vec![
-                    apply("Arctic", PresetKind::Arctic),
-                    apply("Boom–Bust", PresetKind::BoomBust),
-                    apply("Closed World", PresetKind::ClosedWorld),
-                ])
-            })
     }
 
     fn render_inspector_playback_controls(&self, cx: &mut Context<Self>) -> Div {
@@ -11118,14 +11149,14 @@ impl SimulationView {
         let style_button = |button: Div, active: bool| {
             if active {
                 button
-                    .border_color(rgb(0x38bdf8))
-                    .bg(rgb(0x1e3a8a))
+                    .border_color(rgb(0x79ddbb))
+                    .bg(rgb(0x355d52))
                     .text_color(rgb(0xe0f2fe))
             } else {
                 button
-                    .border_color(rgb(0x1e293b))
-                    .bg(rgb(0x111b2b))
-                    .text_color(rgb(0xcbd5f5))
+                    .border_color(rgb(0x304542))
+                    .bg(rgb(0x18282b))
+                    .text_color(rgb(0xc6d9ce))
             }
         };
 
@@ -11203,14 +11234,14 @@ impl SimulationView {
             .gap_2()
             .rounded_md()
             .border_1()
-            .border_color(rgb(0x1e293b))
-            .bg(rgb(0x0f172a))
+            .border_color(rgb(0x304542))
+            .bg(rgb(0x111d20))
             .px_3()
             .py_2()
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(0x94a3b8))
+                    .text_color(rgb(0xa7bdb2))
                     .child("Deterministic playback"),
             )
             .child(div().flex().gap_2().children(vec![
@@ -11223,7 +11254,7 @@ impl SimulationView {
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(0xcbd5f5))
+                    .text_color(rgb(0xc6d9ce))
                     .child(frame_summary),
             )
     }
@@ -11243,7 +11274,7 @@ impl SimulationView {
                     .h(px(8.0))
                     .rounded_md()
                     .border_1()
-                    .border_color(rgb(0x1e293b))
+                    .border_color(rgb(0x304542))
                     .bg(preview_color);
                 let base = div()
                     .rounded_md()
@@ -11258,13 +11289,13 @@ impl SimulationView {
                     .child(mode.label())
                     .on_mouse_down(MouseButton::Left, listener);
                 if active {
-                    base.border_color(rgb(0x38bdf8))
-                        .bg(rgb(0x1e3a8a))
+                    base.border_color(rgb(0x79ddbb))
+                        .bg(rgb(0x355d52))
                         .text_color(rgb(0xe0f2fe))
                 } else {
-                    base.border_color(rgb(0x1e293b))
-                        .bg(rgb(0x111b2b))
-                        .text_color(rgb(0xcbd5f5))
+                    base.border_color(rgb(0x304542))
+                        .bg(rgb(0x18282b))
+                        .text_color(rgb(0xc6d9ce))
                 }
             })
             .collect();
@@ -11286,13 +11317,13 @@ impl SimulationView {
                 })
                 .on_mouse_down(MouseButton::Left, listener);
             if accessibility.narration_enabled {
-                base.border_color(rgb(0x38bdf8))
-                    .bg(rgb(0x1e3a8a))
+                base.border_color(rgb(0x79ddbb))
+                    .bg(rgb(0x355d52))
                     .text_color(rgb(0xe0f2fe))
             } else {
-                base.border_color(rgb(0x1e293b))
-                    .bg(rgb(0x111b2b))
-                    .text_color(rgb(0xcbd5f5))
+                base.border_color(rgb(0x304542))
+                    .bg(rgb(0x18282b))
+                    .text_color(rgb(0xc6d9ce))
             }
         };
 
@@ -11302,24 +11333,24 @@ impl SimulationView {
             .gap_2()
             .rounded_md()
             .border_1()
-            .border_color(rgb(0x1e293b))
-            .bg(rgb(0x0f172a))
+            .border_color(rgb(0x304542))
+            .bg(rgb(0x111d20))
             .px_3()
             .py_2()
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(0x94a3b8))
+                    .text_color(rgb(0xa7bdb2))
                     .child("Accessibility"),
             )
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(0xcbd5f5))
+                    .text_color(rgb(0xc6d9ce))
                     .child("Color palette"),
             )
             .child(div().flex().gap_2().children(palette_buttons))
-            .child(div().text_xs().text_color(rgb(0xcbd5f5)).child("Narration"))
+            .child(div().text_xs().text_color(rgb(0xc6d9ce)).child("Narration"))
             .child(narration_button)
     }
 }
@@ -11371,8 +11402,8 @@ impl SimulationView {
             .gap_2()
             .rounded_md()
             .border_1()
-            .border_color(rgb(0x1e3a8a))
-            .bg(rgb(0x111b2b))
+            .border_color(rgb(0x355d52))
+            .bg(rgb(0x18282b))
             .px_3()
             .py_3()
             .child(
@@ -11383,11 +11414,7 @@ impl SimulationView {
                     .child(div().text_sm().child(detail.label.clone()))
                     .child(color_swatch(detail.color)),
             )
-            .child(div().text_xs().text_color(rgb(0x64748b)).child(format!(
-                "Agent {:?} · Gen {} · Age {}",
-                detail.agent_id, detail.generation.0, detail.age
-            )))
-            .child(div().text_xs().text_color(rgb(0xcbd5f5)).child(format!(
+            .child(div().text_xs().text_color(rgb(0xc6d9ce)).child(format!(
                 "Energy {:.2} · Health {:.2} · Spike {:.1}",
                 detail.energy, detail.health, detail.spike_length
             )))
@@ -11399,13 +11426,13 @@ impl SimulationView {
                 if let Some((sx, sy)) = self.world_to_screen_coords(detail.position) {
                     text.push_str(&format!(" · Screen ({:.0}, {:.0})", sx, sy));
                 }
-                div().text_xs().text_color(rgb(0x94a3b8)).child(text)
+                div().text_xs().text_color(rgb(0xa7bdb2)).child(text)
             })
-            .child(div().text_xs().text_color(rgb(0x94a3b8)).child(format!(
+            .child(div().text_xs().text_color(rgb(0xa7bdb2)).child(format!(
                 "Mutation rates p{:.3} s{:.3}",
                 detail.mutation_rates.primary, detail.mutation_rates.secondary
             )))
-            .child(div().text_xs().text_color(rgb(0x94a3b8)).child(format!(
+            .child(div().text_xs().text_color(rgb(0xa7bdb2)).child(format!(
                 "Traits smell {:.2} · sound {:.2} · hearing {:.2} · eye {:.2} · blood {:.2}",
                 detail.trait_modifiers.smell,
                 detail.trait_modifiers.sound,
@@ -11413,11 +11440,11 @@ impl SimulationView {
                 detail.trait_modifiers.eye,
                 detail.trait_modifiers.blood
             )))
-            .child(div().text_xs().text_color(rgb(0x94a3b8)).child("Sensors"))
+            .child(div().text_xs().text_color(rgb(0xa7bdb2)).child("Sensors"))
             .child(sensor_bars)
-            .child(self.render_inspector_sense_attribution(detail, cx))
-            .child(div().text_xs().text_color(rgb(0x94a3b8)).child("Outputs"))
+            .child(div().text_xs().text_color(rgb(0xa7bdb2)).child("Outputs"))
             .child(output_bars)
+            .child(self.render_inspector_sense_attribution(detail, cx))
             .child({
                 let provenance = match (
                     detail.brain_source_tick,
@@ -11456,7 +11483,7 @@ impl SimulationView {
                 };
                 div()
                     .text_xs()
-                    .text_color(rgb(0x64748b))
+                    .text_color(rgb(0x91a9a0))
                     .child(provenance)
             })
             .child(render_activation_heatmaps(&detail.brain_activations))
@@ -11488,7 +11515,7 @@ impl SimulationView {
             let maxv = h.max(o).max(c).max(1e-3);
             let mk = |label: &str, v: f32, color: Rgba| -> Div {
                 let w = (v / maxv).clamp(0.0, 1.0);
-                let track = div().w(px(120.0)).h(px(6.0)).bg(rgb(0x1e293b)).rounded_sm();
+                let track = div().w(px(120.0)).h(px(6.0)).bg(rgb(0x304542)).rounded_sm();
                 let fillw = 120.0 * w;
                 let fill = div().w(px(fillw)).h(px(6.0)).bg(color).rounded_sm();
                 div()
@@ -11498,14 +11525,14 @@ impl SimulationView {
                     .child(
                         div()
                             .text_xs()
-                            .text_color(rgb(0x94a3b8))
+                            .text_color(rgb(0xa7bdb2))
                             .child(label.to_string()),
                     )
                     .child(div().relative().child(track).child(fill))
                     .child(
                         div()
                             .text_xs()
-                            .text_color(rgb(0xcbd5f5))
+                            .text_color(rgb(0xc6d9ce))
                             .child(format!("{:.2}", v)),
                     )
             };
@@ -11516,7 +11543,7 @@ impl SimulationView {
             rows.push(
                 div()
                     .text_xs()
-                    .text_color(rgb(0x475569))
+                    .text_color(rgb(0x91a9a0))
                     .child("Diet gauges: analytics pending"),
             );
         }
@@ -11526,14 +11553,14 @@ impl SimulationView {
             .gap_1()
             .rounded_md()
             .border_1()
-            .border_color(rgb(0x1e293b))
-            .bg(rgb(0x0f172a))
+            .border_color(rgb(0x304542))
+            .bg(rgb(0x111d20))
             .px_3()
             .py_2()
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(0x94a3b8))
+                    .text_color(rgb(0xa7bdb2))
                     .child("Diet avg energy"),
             )
             .children(rows)
@@ -11565,48 +11592,48 @@ impl SimulationView {
         let primary_minus = div()
             .rounded_md()
             .border_1()
-            .border_color(rgb(0x1e293b))
-            .bg(rgb(0x111b2b))
+            .border_color(rgb(0x304542))
+            .bg(rgb(0x18282b))
             .px_2()
             .py_1()
             .text_xs()
-            .text_color(rgb(0xcbd5f5))
+            .text_color(rgb(0xc6d9ce))
             .child("-")
             .on_mouse_down(MouseButton::Left, dec_primary);
 
         let primary_plus = div()
             .rounded_md()
             .border_1()
-            .border_color(rgb(0x1e293b))
-            .bg(rgb(0x111b2b))
+            .border_color(rgb(0x304542))
+            .bg(rgb(0x18282b))
             .px_2()
             .py_1()
             .text_xs()
-            .text_color(rgb(0xcbd5f5))
+            .text_color(rgb(0xc6d9ce))
             .child("+")
             .on_mouse_down(MouseButton::Left, inc_primary);
 
         let secondary_minus = div()
             .rounded_md()
             .border_1()
-            .border_color(rgb(0x1e293b))
-            .bg(rgb(0x111b2b))
+            .border_color(rgb(0x304542))
+            .bg(rgb(0x18282b))
             .px_2()
             .py_1()
             .text_xs()
-            .text_color(rgb(0xcbd5f5))
+            .text_color(rgb(0xc6d9ce))
             .child("-")
             .on_mouse_down(MouseButton::Left, dec_secondary);
 
         let secondary_plus = div()
             .rounded_md()
             .border_1()
-            .border_color(rgb(0x1e293b))
-            .bg(rgb(0x111b2b))
+            .border_color(rgb(0x304542))
+            .bg(rgb(0x18282b))
             .px_2()
             .py_1()
             .text_xs()
-            .text_color(rgb(0xcbd5f5))
+            .text_color(rgb(0xc6d9ce))
             .child("+")
             .on_mouse_down(MouseButton::Left, inc_secondary);
 
@@ -11616,14 +11643,14 @@ impl SimulationView {
             .gap_2()
             .rounded_md()
             .border_1()
-            .border_color(rgb(0x1e293b))
-            .bg(rgb(0x0f172a))
+            .border_color(rgb(0x304542))
+            .bg(rgb(0x111d20))
             .px_3()
             .py_2()
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(0x94a3b8))
+                    .text_color(rgb(0xa7bdb2))
                     .child("Mutation controls"),
             )
             .child(
@@ -11634,7 +11661,7 @@ impl SimulationView {
                     .child(
                         div()
                             .text_xs()
-                            .text_color(rgb(0xcbd5f5))
+                            .text_color(rgb(0xc6d9ce))
                             .child(format!("Primary {:.4}", detail.mutation_rates.primary)),
                     )
                     .child(
@@ -11652,7 +11679,7 @@ impl SimulationView {
                     .child(
                         div()
                             .text_xs()
-                            .text_color(rgb(0xcbd5f5))
+                            .text_color(rgb(0xc6d9ce))
                             .child(format!("Secondary {:.3}", detail.mutation_rates.secondary)),
                     )
                     .child(
@@ -11665,7 +11692,7 @@ impl SimulationView {
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(0x64748b))
+                    .text_color(rgb(0x91a9a0))
                     .child("Adjusts focused agent mutation rates in ± steps."),
             )
     }
@@ -11997,7 +12024,7 @@ impl SimulationView {
             lines.push("Performance stats: collecting...".to_string());
         } else {
             lines.push(format!(
-                "Frame {:.2} ms ({:.1} fps)",
+                "UI update {:.2} ms · {:.1} updates/s",
                 stats.latest_ms, stats.fps
             ));
             lines.push(format!(
@@ -12042,7 +12069,7 @@ impl SimulationView {
                     .flex()
                     .gap_2()
                     .text_xs()
-                    .text_color(rgb(0xcbd5f5))
+                    .text_color(rgb(0xc6d9ce))
                     .child(legend_item(chrome::series_population().into(), "Agents"))
                     .child(legend_item(chrome::series_births().into(), "Births"))
                     .child(legend_item(chrome::series_deaths().into(), "Deaths"));
@@ -12073,7 +12100,7 @@ impl SimulationView {
                 .px_3()
                 .py_2()
                 .text_xs()
-                .text_color(rgb(0x94a3b8))
+                .text_color(rgb(0xa7bdb2))
                 .child("History chart pending data"),
         }
     }
@@ -12228,7 +12255,7 @@ impl SimulationView {
             .left(px(0.0))
             .bottom(px(0.0))
             .w(px(540.0))
-            .bg(rgb(0x0f172a))
+            .bg(rgb(0x111d20))
             .border_r_1()
             .border_color(rgb(0x334155))
             .shadow_xl()
@@ -12278,7 +12305,7 @@ impl SimulationView {
             .py_4()
             .border_b_1()
             .border_color(rgb(0x334155))
-            .bg(rgb(0x1e293b))
+            .bg(rgb(0x304542))
             .child(
                 div().flex().items_center().gap_3().child(
                     div()
@@ -12299,7 +12326,7 @@ impl SimulationView {
                                 .child(
                                     div()
                                         .text_sm()
-                                        .text_color(rgb(0x94a3b8))
+                                        .text_color(rgb(0xa7bdb2))
                                         .child("Simulation parameters & settings"),
                                 )
                                 .child(
@@ -12309,7 +12336,7 @@ impl SimulationView {
                                         .rounded_md()
                                         .bg(rgb(0x334155))
                                         .text_xs()
-                                        .text_color(rgb(0x94a3b8))
+                                        .text_color(rgb(0xa7bdb2))
                                         .child("Press , to toggle"),
                                 ),
                         ),
@@ -12320,11 +12347,11 @@ impl SimulationView {
                     .px_4()
                     .py_2()
                     .rounded_lg()
-                    .bg(rgb(0x475569))
+                    .bg(rgb(0x91a9a0))
                     .text_base()
                     .text_color(rgb(0xf1f5f9))
                     .cursor_pointer()
-                    .hover(|s| s.bg(rgb(0x64748b)))
+                    .hover(|s| s.bg(rgb(0x91a9a0)))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| {
@@ -12351,12 +12378,12 @@ impl SimulationView {
                     .px_4()
                     .py_3()
                     .rounded_lg()
-                    .bg(rgb(0x1e293b))
+                    .bg(rgb(0x304542))
                     .border_1()
                     .border_color(if has_search {
                         rgb(0x60a5fa)
                     } else {
-                        rgb(0x475569)
+                        rgb(0x91a9a0)
                     })
                     .child(
                         div()
@@ -12365,7 +12392,7 @@ impl SimulationView {
                             .text_color(if has_search {
                                 rgb(0xf1f5f9)
                             } else {
-                                rgb(0x94a3b8)
+                                rgb(0xa7bdb2)
                             })
                             .child(if has_search {
                                 search_query.clone()
@@ -12381,10 +12408,10 @@ impl SimulationView {
                                 .rounded_md()
                                 .bg(rgb(0x334155))
                                 .text_xs()
-                                .text_color(rgb(0x94a3b8))
+                                .text_color(rgb(0xa7bdb2))
                                 .cursor_pointer()
                                 .hover(|s: StyleRefinement| {
-                                    s.bg(rgb(0x475569)).text_color(rgb(0xf1f5f9))
+                                    s.bg(rgb(0x91a9a0)).text_color(rgb(0xf1f5f9))
                                 })
                                 .on_mouse_down(
                                     MouseButton::Left,
@@ -12444,11 +12471,11 @@ impl SimulationView {
                         .px_3()
                         .py_1()
                         .rounded_md()
-                        .bg(rgb(0x1e293b))
+                        .bg(rgb(0x304542))
                         .border_1()
-                        .border_color(rgb(0x475569))
+                        .border_color(rgb(0x91a9a0))
                         .text_xs()
-                        .text_color(rgb(0x94a3b8))
+                        .text_color(rgb(0xa7bdb2))
                         .child(format!(
                             "{:.0}%",
                             if max_scroll > 0.0 {
@@ -12502,11 +12529,11 @@ impl SimulationView {
                     .gap_3()
                     .py(px(64.0))
                     .child(div().text_3xl().child("🔍"))
-                    .child(div().text_base().text_color(rgb(0x94a3b8)).child(format!(
+                    .child(div().text_base().text_color(rgb(0xa7bdb2)).child(format!(
                         "No parameters match \"{}\"",
                         self.settings_panel.search_query
                     )))
-                    .child(div().text_sm().text_color(rgb(0x64748b)).child(
+                    .child(div().text_sm().text_color(rgb(0x91a9a0)).child(
                         "Try a different search term or clear the search to see all parameters",
                     )),
             );
@@ -12526,7 +12553,7 @@ impl SimulationView {
             .px_4()
             .py_3()
             .rounded_lg()
-            .bg(rgb(0x1e293b))
+            .bg(rgb(0x304542))
             .border_1()
             .border_color(rgb(0x334155))
             .hover(|s| s.bg(rgb(0x334155)))
@@ -12556,7 +12583,7 @@ impl SimulationView {
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(rgb(0x94a3b8))
+                                    .text_color(rgb(0xa7bdb2))
                                     .child(category.description()),
                             ),
                     ),
@@ -12570,8 +12597,8 @@ impl SimulationView {
                     .h_8()
                     .rounded_md()
                     .text_base()
-                    .text_color(rgb(0x94a3b8))
-                    .hover(|s| s.bg(rgb(0x475569)).text_color(rgb(0x60a5fa)))
+                    .text_color(rgb(0xa7bdb2))
+                    .hover(|s| s.bg(rgb(0x91a9a0)).text_color(rgb(0x60a5fa)))
                     .child(if is_collapsed { "▶" } else { "▼" }),
             );
 
@@ -13006,9 +13033,9 @@ impl SimulationView {
                     .px_4()
                     .py_4()
                     .rounded_lg()
-                    .bg(rgb(0x0f172a))
+                    .bg(rgb(0x111d20))
                     .border_1()
-                    .border_color(rgb(0x1e293b));
+                    .border_color(rgb(0x304542));
 
                 // Add toggle if it matches search filter
                 if self.matches_search("Enabled")
@@ -13136,7 +13163,7 @@ impl SimulationView {
             .child(
                 div()
                     .text_sm()
-                    .text_color(rgb(0x94a3b8))
+                    .text_color(rgb(0xa7bdb2))
                     .child(description_owned),
             )
     }
@@ -13180,7 +13207,7 @@ impl SimulationView {
             .child(
                 div()
                     .text_sm()
-                    .text_color(rgb(0x94a3b8))
+                    .text_color(rgb(0xa7bdb2))
                     .child(description_owned),
             )
     }
@@ -13217,10 +13244,10 @@ pub fn render_genome_browser_view(
         .child(
             div()
                 .text_xs()
-                .text_color(rgb(0x38bdf8))
+                .text_color(rgb(0x79ddbb))
                 .child(format!("Genome Browser · {}", browser.family_id.as_str())),
         )
-        .child(div().text_xs().text_color(rgb(0x94a3b8)).child(format!(
+        .child(div().text_xs().text_color(rgb(0xa7bdb2)).child(format!(
             "v{} · hash {:.8}",
             browser.schema_version, browser.genome_digest
         )));
@@ -13245,13 +13272,13 @@ pub fn render_genome_browser_view(
         .flex()
         .flex_col()
         .gap_1()
-        .child(div().text_xs().text_color(rgb(0x64748b)).child(paging_text));
+        .child(div().text_xs().text_color(rgb(0x91a9a0)).child(paging_text));
 
     // Mutation diff block
     let diff_block = match &browser.mutation_diff {
         MutationDiffStatus::FounderNoParent => div()
             .text_xs()
-            .text_color(rgb(0x94a3b8))
+            .text_color(rgb(0xa7bdb2))
             .child("Founder / Injected (no parent diff)"),
         MutationDiffStatus::Computed {
             parent_uid,
@@ -13296,7 +13323,7 @@ pub fn render_genome_browser_view(
                 d_div = d_div.child(
                     div()
                         .text_xs()
-                        .text_color(rgb(0xcbd5f5))
+                        .text_color(rgb(0xc6d9ce))
                         .child(format!("  • {desc}")),
                 );
             }
@@ -13333,7 +13360,7 @@ pub fn render_genome_browser_view(
             .damping
             .map_or(String::new(), |d| format!("damp {d:.2} "));
         let conn_count = node.connections.len();
-        node_list = node_list.child(div().text_xs().text_color(rgb(0x94a3b8)).child(format!(
+        node_list = node_list.child(div().text_xs().text_color(rgb(0xa7bdb2)).child(format!(
             "• Node {}: {bias_str}{damp_str}({conn_count} conns)",
             node.node_index
         )));
@@ -13350,10 +13377,10 @@ pub fn render_genome_browser_view(
                 .child(
                     div()
                         .text_xs()
-                        .text_color(rgb(0x38bdf8))
+                        .text_color(rgb(0x79ddbb))
                         .child(format!("Lineage Trace · {locus_name}")),
                 )
-                .child(div().text_xs().text_color(rgb(0x94a3b8)).child(format!(
+                .child(div().text_xs().text_color(rgb(0xa7bdb2)).child(format!(
                     "{} points · {} gaps",
                     plot.total_points, plot.gap_count
                 ))),
@@ -13403,7 +13430,7 @@ pub fn render_genome_browser_view(
             samples_preview = samples_preview.child(
                 div()
                     .text_xs()
-                    .text_color(rgb(0x94a3b8))
+                    .text_color(rgb(0xa7bdb2))
                     .child(format!("  • {sample_desc}")),
             );
         }
@@ -13411,7 +13438,7 @@ pub fn render_genome_browser_view(
     } else {
         div()
             .text_xs()
-            .text_color(rgb(0x64748b))
+            .text_color(rgb(0x91a9a0))
             .child("No locus selected for lineage tracing")
     };
 
@@ -13421,8 +13448,8 @@ pub fn render_genome_browser_view(
         .gap_2()
         .rounded_md()
         .border_1()
-        .border_color(rgb(0x1e3a8a))
-        .bg(rgb(0x0f172a))
+        .border_color(rgb(0x355d52))
+        .bg(rgb(0x111d20))
         .px_3()
         .py_2()
         .child(header)
@@ -13531,7 +13558,7 @@ fn render_sense_attribution_with_listeners(
         return container.child(
             div()
                 .text_xs()
-                .text_color(rgb(0x64748b))
+                .text_color(rgb(0x91a9a0))
                 .child("Sense attribution unavailable (agent vanished this frame)"),
         );
     };
@@ -13554,7 +13581,7 @@ fn render_sense_attribution_with_listeners(
             attribution.contributions.len(),
         )
     };
-    let mut panel = container.child(div().text_xs().text_color(rgb(0x94a3b8)).child(title));
+    let mut panel = container.child(div().text_xs().text_color(rgb(0xa7bdb2)).child(title));
 
     // True-angle strip: the agent's full [-180°, +180°] egocentric field
     // unrolled at 1px/degree. Each eye covers its real angular span at its
@@ -13607,7 +13634,7 @@ fn render_sense_attribution_with_listeners(
                 .rounded_sm()
                 .bg(rgb_from_triplet(tint));
             if is_selected {
-                cone_div = cone_div.border_1().border_color(rgb(0x38bdf8));
+                cone_div = cone_div.border_1().border_color(rgb(0x79ddbb));
             }
             if let Some(listener) = eye_listeners.and_then(|l| l.get(eye).cloned().flatten()) {
                 cone_div =
@@ -13648,7 +13675,7 @@ fn render_sense_attribution_with_listeners(
                 .top(px(0.0))
                 .w(px(1.0))
                 .h(px(16.0))
-                .bg(rgb(0x64748b)),
+                .bg(rgb(0x91a9a0)),
         );
         let legend = if detail.selected_eye.is_some() {
             "-180°       eye cones at true angles · highlighted cone active · click to toggle       +180°"
@@ -13657,7 +13684,7 @@ fn render_sense_attribution_with_listeners(
         };
         panel = panel
             .child(strip)
-            .child(div().text_xs().text_color(rgb(0x475569)).child(legend));
+            .child(div().text_xs().text_color(rgb(0x91a9a0)).child(legend));
     }
 
     for eye in 0..NUM_EYES {
@@ -13692,13 +13719,13 @@ fn render_sense_attribution_with_listeners(
             .rounded_sm()
             .px_1()
             .child(color_swatch(rgb_seen))
-            .child(div().text_xs().text_color(if is_selected { rgb(0x38bdf8) } else { rgb(0xcbd5f5) }).child(format!(
+            .child(div().text_xs().text_color(if is_selected { rgb(0x79ddbb) } else { rgb(0xc6d9ce) }).child(format!(
                 "eye{eye} ∠{direction:+.0}° fov {fov:.0}° · ρ{density:.2}{marker}{selected_suffix}"
             )));
         if is_selected {
             row_div = row_div
                 .border_1()
-                .border_color(rgb(0x38bdf8))
+                .border_color(rgb(0x79ddbb))
                 .bg(rgb(0x162a45));
         }
         if let Some(listener) = eye_listeners.and_then(|l| l.get(eye).cloned().flatten()) {
@@ -13715,12 +13742,12 @@ fn render_sense_attribution_with_listeners(
             } else {
                 String::new()
             };
-            panel = panel.child(div().text_xs().text_color(rgb(0x38bdf8)).child(format!(
+            panel = panel.child(div().text_xs().text_color(rgb(0x79ddbb)).child(format!(
                 "Eye {selected_eye} Cone Projection · {} in cone{truncation_note}",
                 cone.contributions.len()
             )));
             if cone.filtered_out > 0 {
-                panel = panel.child(div().text_xs().text_color(rgb(0x64748b)).child(format!(
+                panel = panel.child(div().text_xs().text_color(rgb(0x91a9a0)).child(format!(
                     "{} neighbours outside this cone",
                     cone.filtered_out
                 )));
@@ -13739,7 +13766,7 @@ fn render_sense_attribution_with_listeners(
                 div().flex().items_center().gap_2().child(eye_swatch).child(
                     div()
                         .text_xs()
-                        .text_color(rgb(0x94a3b8))
+                        .text_color(rgb(0xa7bdb2))
                         .child(channel_spans.trim_end().to_owned()),
                 ),
             );
@@ -13748,7 +13775,7 @@ fn render_sense_attribution_with_listeners(
                 panel = panel.child(
                     div()
                         .text_xs()
-                        .text_color(rgb(0x64748b))
+                        .text_color(rgb(0x91a9a0))
                         .child("nobody in this cone"),
                 );
             } else {
@@ -13763,7 +13790,7 @@ fn render_sense_attribution_with_listeners(
                             .items_center()
                             .gap_2()
                             .child(color_swatch(contribution.color))
-                            .child(div().text_xs().text_color(rgb(0xcbd5f5)).child(format!(
+                            .child(div().text_xs().text_color(rgb(0xc6d9ce)).child(format!(
                                 "#{} ∠{:+.0}° d{:.0} ρ{:.2} Σ{:.2}",
                                 contribution.source_uid.0,
                                 contribution.bearing.to_degrees(),
@@ -13781,7 +13808,7 @@ fn render_sense_attribution_with_listeners(
                     panel = panel.child(
                         div()
                             .text_xs()
-                            .text_color(rgb(0x64748b))
+                            .text_color(rgb(0x91a9a0))
                             .child(format!("… +{hidden} weaker contributors in cone")),
                     );
                 }
@@ -13813,7 +13840,7 @@ fn render_sense_attribution_with_listeners(
         panel = panel.child(
             div()
                 .text_xs()
-                .text_color(rgb(0x94a3b8))
+                .text_color(rgb(0xa7bdb2))
                 .child(scalar_line.trim_end().to_owned()),
         );
 
@@ -13821,7 +13848,7 @@ fn render_sense_attribution_with_listeners(
             panel = panel.child(
                 div()
                     .text_xs()
-                    .text_color(rgb(0x64748b))
+                    .text_color(rgb(0x91a9a0))
                     .child("no neighbours within sense radius (self/grid channels stay live)"),
             );
         } else {
@@ -13842,7 +13869,7 @@ fn render_sense_attribution_with_listeners(
                         .items_center()
                         .gap_2()
                         .child(color_swatch(contribution.color))
-                        .child(div().text_xs().text_color(rgb(0xcbd5f5)).child(format!(
+                        .child(div().text_xs().text_color(rgb(0xc6d9ce)).child(format!(
                             "#{} ∠{:+.0}° d{:.0} eye{} Σ{:.2}",
                             contribution.source_uid.0,
                             contribution.bearing.to_degrees(),
@@ -13860,7 +13887,7 @@ fn render_sense_attribution_with_listeners(
                 panel = panel.child(
                     div()
                         .text_xs()
-                        .text_color(rgb(0x64748b))
+                        .text_color(rgb(0x91a9a0))
                         .child(format!("… +{hidden} weaker contributors")),
                 );
             }
@@ -13908,7 +13935,7 @@ fn render_brain_bars(values: &[f32], is_sensor: bool) -> Div {
         let bar = div().w(px(120.0 * width)).h(px(8.0)).bg(color).rounded_sm();
         let label = div()
             .text_xs()
-            .text_color(rgb(0x94a3b8))
+            .text_color(rgb(0xa7bdb2))
             .w(px(84.0))
             .child(name);
         rows.push(
@@ -13921,12 +13948,16 @@ fn render_brain_bars(values: &[f32], is_sensor: bool) -> Div {
                 .child(
                     div()
                         .text_xs()
-                        .text_color(rgb(0xcbd5f5))
+                        .text_color(rgb(0xc6d9ce))
                         .child(format!("{v:.2}")),
                 ),
         );
     }
-    div().flex().flex_col().gap_1().children(rows)
+    div()
+        .flex()
+        .flex_wrap()
+        .gap_2()
+        .children(rows.into_iter().map(|row| row.min_w(px(260.0)).flex_1()))
 }
 /// Top-k attribution rows computed per output in the brain panel (bd-16g.4.3).
 const BRAIN_PANEL_TOP_K: usize = 3;
@@ -13941,7 +13972,7 @@ fn render_output_attributions(detail: &AgentInspectorDetails) -> Div {
     rows.push(
         div()
             .text_xs()
-            .text_color(rgb(0x94a3b8))
+            .text_color(rgb(0xa7bdb2))
             .child("Output attribution"),
     );
 
@@ -14031,7 +14062,7 @@ fn render_output_attributions(detail: &AgentInspectorDetails) -> Div {
                     div()
                         .w(px(90.0))
                         .text_xs()
-                        .text_color(rgb(0x94a3b8))
+                        .text_color(rgb(0xa7bdb2))
                         .child(effective),
                 )
                 .child(div().text_xs().text_color(rgb(0x7dd3fc)).child(drivers)),
@@ -14090,7 +14121,7 @@ fn render_activation_heatmaps(activations: &Option<BrainActivations>) -> Div {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .child(div().text_xs().text_color(rgb(0x94a3b8)).child(layer_name))
+                    .child(div().text_xs().text_color(rgb(0xa7bdb2)).child(layer_name))
                     .child(div().relative().child(canvas_el).child(edges_canvas)),
             );
         }
@@ -14104,7 +14135,7 @@ fn render_activation_heatmaps(activations: &Option<BrainActivations>) -> Div {
                 )));
             }
             for edge in act.connections.iter().take(8) {
-                lines.push(div().text_xs().text_color(rgb(0x64748b)).child(format!(
+                lines.push(div().text_xs().text_color(rgb(0x91a9a0)).child(format!(
                     "edge {}→{} w={:.2}",
                     edge.from, edge.to, edge.weight
                 )));
@@ -14121,7 +14152,7 @@ fn render_activation_heatmaps(activations: &Option<BrainActivations>) -> Div {
         rows.push(
             div()
                 .text_xs()
-                .text_color(rgb(0x475569))
+                .text_color(rgb(0x91a9a0))
                 .child("Activations: not available"),
         );
     }
@@ -14131,14 +14162,14 @@ fn render_activation_heatmaps(activations: &Option<BrainActivations>) -> Div {
         .gap_2()
         .rounded_md()
         .border_1()
-        .border_color(rgb(0x1e293b))
-        .bg(rgb(0x0f172a))
+        .border_color(rgb(0x304542))
+        .bg(rgb(0x111d20))
         .px_3()
         .py_2()
         .child(
             div()
                 .text_xs()
-                .text_color(rgb(0x94a3b8))
+                .text_color(rgb(0xa7bdb2))
                 .child("Brain activations"),
         )
         .children(rows)
@@ -14167,7 +14198,7 @@ fn paint_activation_grid(bounds: Bounds<Pixels>, layer: &ActivationLayer, window
                 .unwrap_or(0.0)
                 .clamp(0.0, 1.0);
             let color = lerp_rgba(
-                rgba_from_hex(0x1e293b, 0.95),
+                rgba_from_hex(0x304542, 0.95),
                 rgba_from_hex(0x22d3ee, 0.95),
                 v,
             );
@@ -14249,21 +14280,21 @@ fn render_brain_card(detail: &AgentInspectorDetails) -> Div {
         .gap_2()
         .rounded_md()
         .border_1()
-        .border_color(rgb(0x1e293b))
-        .bg(rgb(0x0f172a))
+        .border_color(rgb(0x304542))
+        .bg(rgb(0x111d20))
         .px_3()
         .py_2()
-        .child(div().text_xs().text_color(rgb(0x94a3b8)).child("Brain"))
+        .child(div().text_xs().text_color(rgb(0xa7bdb2)).child("Brain"))
         .child(
             div()
                 .text_sm()
-                .text_color(rgb(0xcbd5f5))
+                .text_color(rgb(0xc6d9ce))
                 .child(detail.brain_descriptor.clone()),
         )
         .child(
             div()
                 .text_xs()
-                .text_color(rgb(0x94a3b8))
+                .text_color(rgb(0xa7bdb2))
                 .child(format!("dominant o{} {:.2}", best_idx, best_val)),
         )
         .child(radar_canvas)
@@ -14306,7 +14337,7 @@ fn paint_brain_radar(
         let y0 = cy + radius * ring * ang0.sin();
         ring_path.line_to(point(px(x0), px(y0)));
         if let Ok(path) = ring_path.build() {
-            window.paint_path(path, rgba_from_hex(0x1e293b, 0.9));
+            window.paint_path(path, rgba_from_hex(0x304542, 0.9));
         }
     }
 
@@ -14319,7 +14350,7 @@ fn paint_brain_radar(
         spoke.move_to(point(px(cx), px(cy)));
         spoke.line_to(point(px(x), px(y)));
         if let Ok(path) = spoke.build() {
-            window.paint_path(path, rgba_from_hex(0x1e293b, 0.9));
+            window.paint_path(path, rgba_from_hex(0x304542, 0.9));
         }
     }
 
@@ -14772,10 +14803,24 @@ impl Render for SimulationView {
                 .flex_col()
                 .bg(chrome::backdrop())
                 .text_color(chrome::text_primary())
-                .p_3()
+                .px_4()
+                .pt_3()
+                .pb_4()
                 .gap_3()
-                .child(self.render_header(&snapshot, cx))
-                .child(self.render_dashboard_tabs(cx))
+                .child(
+                    div()
+                        .w_full()
+                        .max_w(px(1040.0))
+                        .mx_auto()
+                        .child(self.render_header(&snapshot, cx)),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .max_w(px(1040.0))
+                        .mx_auto()
+                        .child(self.render_dashboard_tabs(cx)),
+                )
                 .child(self.render_dashboard_body(&snapshot, cx))
         };
         if let Some(focus_handle) = &self.focus_handle {
@@ -15686,73 +15731,42 @@ struct InspectorSnapshot {
     selected_eye: Option<usize>,
 }
 
-/// HUD chrome system (bd-f4x0), derived from the bd-9pqz art direction.
-///
-/// Three rules, and they are the whole brief:
-///
-/// 1. NO INVENTED COLOUR. Every surface here traces to `visual.rs`. The HUD used a
-///    dozen unrelated hand-picked hexes (`0x0b1120`, `0x111b2b`, `0x0a1629`, three
-///    chart colours, four text greys) that matched neither each other nor the world.
-/// 2. SURFACES ARE THE SUBSTRATE, LIFTED. Chrome sits on the same near-black
-///    blue-violet as the world, one step lighter, so panels read as the same material
-///    rather than as pasted-on cards.
-/// 3. RESTRAINT. The world is the subject. Chrome carries exactly one accent — the
-///    herbivore cyan — and otherwise moves only in value.
+/// Shared palette for the simulator's native controls and data surfaces.
 mod chrome {
-    use super::rgb_from_triplet;
+    use super::{rgb, rgb_from_triplet};
     use gpui::Hsla;
-    use scriptbots_core::visual::{
-        BIOLUMINESCENT_DARK_FIELD_V1 as STYLE, CARNIVORE_RGB, FOOD_MID_RGB, HERBIVORE_RGB,
-    };
+    use scriptbots_core::visual::{CARNIVORE_RGB, FOOD_MID_RGB, HERBIVORE_RGB};
 
-    /// Lift a substrate value toward legibility without leaving the ramp: value only,
-    /// hue preserved, so chrome can never drift off the art direction.
-    fn lifted(base: [f32; 3], lift: f32) -> Hsla {
-        rgb_from_triplet([
-            (base[0] + lift).clamp(0.0, 1.0),
-            (base[1] + lift).clamp(0.0, 1.0),
-            (base[2] + lift).clamp(0.0, 1.0),
-        ])
-        .into()
-    }
-
-    /// Application backdrop. This is the unlifted world substrate, so the utility
-    /// window reads as part of the simulation instead of a separate navy dashboard.
+    /// A restrained ink-and-moss palette keeps the living world as the focal point.
     pub fn backdrop() -> Hsla {
-        rgb_from_triplet(STYLE.substrate.base_srgb).into()
+        rgb(0x0a1114).into()
     }
 
-    /// Panel fill. One surface for every docked panel — the old code had three.
     pub fn surface() -> Hsla {
-        lifted(STYLE.substrate.base_srgb, 0.010)
+        rgb(0x111d20).into()
     }
 
-    /// Raised surface for nested content, one value step above [`surface`].
     pub fn surface_raised() -> Hsla {
-        lifted(STYLE.substrate.depth_violet_srgb, 0.014)
+        rgb(0x1b2c2d).into()
     }
 
-    /// Hairline border. Deliberately close to the surface: a panel edge should be
-    /// felt, not read.
     pub fn border() -> Hsla {
-        lifted(STYLE.substrate.distant_haze_srgb, 0.020)
+        rgb(0x304542).into()
     }
 
-    /// Type scale, expressed as colour weight rather than size — a terminal-like HUD
-    /// has one usable size, so hierarchy has to come from value.
     pub fn text_primary() -> Hsla {
-        lifted(STYLE.substrate.distant_haze_srgb, 0.760)
+        rgb(0xe9f3ed).into()
     }
     pub fn text_secondary() -> Hsla {
-        lifted(STYLE.substrate.distant_haze_srgb, 0.520)
+        rgb(0xb5c8be).into()
     }
     pub fn text_muted() -> Hsla {
-        lifted(STYLE.substrate.distant_haze_srgb, 0.300)
+        rgb(0x91a9a0).into()
     }
 
     /// The single accent. One, so it still means something where it appears.
     pub fn accent() -> Hsla {
-        rgb_from_triplet(HERBIVORE_RGB).into()
+        rgb(0x79ddbb).into()
     }
 
     /// Chart series, on the same deliberate ramp as the world's agents and food
@@ -16770,17 +16784,17 @@ fn hud_theme(mode: ColorPaletteMode) -> HudTheme {
             chip_follow: 0xa855f7,
         },
         ColorPaletteMode::Natural => HudTheme {
-            card_bg: 0x0f172a,
-            card_border: 0x1f2a3d,
-            spark_bg: 0x0b1626,
-            spark_border: 0x1f2a3d,
-            text_primary: 0xf8fafc,
-            text_subtle: 0x94a3b8,
-            chip_running: 0x22c55e,
-            chip_paused: 0xf59e0b,
-            chip_open: 0x38bdf8,
-            chip_closed: 0xf97316,
-            chip_follow: 0x8b5cf6,
+            card_bg: 0x111d20,
+            card_border: 0x304542,
+            spark_bg: 0x111d20,
+            spark_border: 0x111d20,
+            text_primary: 0xe9f3ed,
+            text_subtle: 0xa7bdb2,
+            chip_running: 0x79ddbb,
+            chip_paused: 0xe8b66e,
+            chip_open: 0x88b4ca,
+            chip_closed: 0xe79d7a,
+            chip_follow: 0xada8db,
         },
     }
 }
@@ -17537,6 +17551,8 @@ impl Default for PerfSnapshot {
 
 struct PerfStats {
     start: Option<Instant>,
+    previous_start: Option<Instant>,
+    interval_ms: f32,
     samples: VecDeque<f32>,
     capacity: usize,
 }
@@ -17546,13 +17562,19 @@ impl PerfStats {
         let cap = capacity.max(1);
         Self {
             start: None,
+            previous_start: None,
+            interval_ms: 0.0,
             samples: VecDeque::with_capacity(cap),
             capacity: cap,
         }
     }
 
     fn begin_frame(&mut self) {
-        self.start = Some(Instant::now());
+        let now = Instant::now();
+        if let Some(previous) = self.previous_start.replace(now) {
+            self.interval_ms = now.duration_since(previous).as_secs_f32() * 1000.0;
+        }
+        self.start = Some(now);
     }
 
     fn end_frame(&mut self) -> PerfSnapshot {
@@ -17586,8 +17608,8 @@ impl PerfStats {
         }
         let count = self.samples.len();
         let avg = if count > 0 { sum / count as f32 } else { 0.0 };
-        let fps = if latest > f32::EPSILON {
-            1000.0 / latest
+        let fps = if self.interval_ms > f32::EPSILON {
+            1000.0 / self.interval_ms
         } else {
             0.0
         };
@@ -17600,6 +17622,21 @@ impl PerfStats {
             sample_count: count,
             fps,
         }
+    }
+}
+
+#[cfg(test)]
+mod perf_presentation_tests {
+    use super::PerfStats;
+
+    #[test]
+    fn update_rate_uses_the_interval_between_updates() {
+        let mut stats = PerfStats::new(4);
+        stats.samples.push_back(2.0);
+        stats.interval_ms = 20.0;
+        let snapshot = stats.snapshot(2.0);
+        assert_eq!(snapshot.latest_ms, 2.0);
+        assert_eq!(snapshot.fps, 50.0);
     }
 }
 
@@ -21760,6 +21797,45 @@ fn paint_debug_overlays(
     }
 }
 
+/// Keep each resource mote inside its simulation cell while avoiding a rigid dot grid.
+/// The position is stable across frames and does not change the underlying food field.
+fn food_mote_offset(x: usize, y: usize) -> (f32, f32) {
+    let hash = u32::try_from(x)
+        .unwrap_or(u32::MAX)
+        .wrapping_mul(0x9e37_79b1)
+        .wrapping_add(
+            u32::try_from(y)
+                .unwrap_or(u32::MAX)
+                .wrapping_mul(0x85eb_ca77),
+        )
+        .wrapping_add(0xc2b2_ae3d);
+    let hash = (hash ^ (hash >> 16)).wrapping_mul(0x7feb_352d);
+    let hash = hash ^ (hash >> 15);
+    let bytes = hash.to_le_bytes();
+    let component = |value: u8| (f32::from(value) / 255.0 - 0.5) * 1.7;
+    (component(bytes[0]), component(bytes[1]))
+}
+
+#[cfg(test)]
+mod food_mote_presentation_tests {
+    use super::food_mote_offset;
+
+    #[test]
+    fn offsets_are_stable_bounded_and_vary_between_cells() {
+        let first = food_mote_offset(0, 0);
+        assert_eq!(first, food_mote_offset(0, 0));
+        let mut varied = false;
+        for y in 0..32 {
+            for x in 0..32 {
+                let (dx, dy) = food_mote_offset(x, y);
+                assert!(dx.abs() <= 0.85 && dy.abs() <= 0.85);
+                varied |= (dx, dy) != first;
+            }
+        }
+        assert!(varied);
+    }
+}
+
 fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window) {
     let frame = &state.frame;
     let camera = &state.camera;
@@ -22078,11 +22154,14 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                     let px_y = offset_y + (y as f32 * cell_world * scale);
                     if let Some(builder) = builders[bin].as_mut() {
                         // Stable-hue motes shrink sparse food away from the cell edges.
-                        let mote_px = (cell_px * food_visuals.relative_radius.min(1.0)).max(1.0);
+                        let mote_px =
+                            (cell_px * food_visuals.relative_radius.min(1.0) * 0.72).max(1.0);
+                        let (jitter_x, jitter_y) = food_mote_offset(x, y);
+                        let inset = (cell_px - mote_px) * 0.5;
                         append_circle_polygon(
                             builder,
-                            px_x + cell_px * 0.5,
-                            px_y + cell_px * 0.5,
+                            px_x + cell_px * 0.5 + inset * jitter_x,
+                            px_y + cell_px * 0.5 + inset * jitter_y,
                             mote_px * 0.5,
                         );
                         builder.close();
@@ -22120,10 +22199,14 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                     }
                     let px_x = offset_x + (x as f32 * cell_world * scale);
                     let px_y = offset_y + (y as f32 * cell_world * scale);
-                    let mote_px = (cell_px * food_visuals.relative_radius.min(1.0)).max(1.0);
+                    let mote_px = (cell_px * food_visuals.relative_radius.min(1.0) * 0.72).max(1.0);
+                    let (jitter_x, jitter_y) = food_mote_offset(x, y);
                     let inset = (cell_px - mote_px) * 0.5;
                     let cell_bounds = Bounds::new(
-                        point(px(px_x + inset), px(px_y + inset)),
+                        point(
+                            px(px_x + inset + inset * jitter_x),
+                            px(px_y + inset + inset * jitter_y),
+                        ),
                         size(px(mote_px), px(mote_px)),
                     );
                     window.paint_quad(
@@ -30810,6 +30893,11 @@ mod command_characterization_tests {
     #[test]
     fn fit_world_returns_a_panned_camera_to_the_fitted_view() {
         let mut fixture = ShortcutFixture::install();
+        fixture.press_world("shift-s");
+        assert!(matches!(
+            fixture.read_world(|view| view.controls.follow_mode),
+            FollowMode::Selected
+        ));
 
         // fit_world is a no-op until a render has recorded a base scale, so an
         // unrecorded camera would make this test assert against the guard.
@@ -30831,6 +30919,10 @@ mod command_characterization_tests {
         );
 
         fixture.press_world("0");
+        assert!(matches!(
+            fixture.read_world(|view| view.controls.follow_mode),
+            FollowMode::Off
+        ));
         let after = fixture.read_world(|view| {
             let camera = view.camera.lock().expect("camera lock");
             (camera.zoom(), camera.offset())
