@@ -11925,6 +11925,7 @@ impl SimulationView {
                 let base = div()
                     .rounded_md()
                     .border_1()
+                    .flex_none()
                     .px_2()
                     .py_1()
                     .text_xs()
@@ -11995,7 +11996,7 @@ impl SimulationView {
                     .text_color(rgb(0xc6d9ce))
                     .child("Color palette"),
             )
-            .child(div().flex().gap_2().children(palette_buttons))
+            .child(div().flex().flex_wrap().gap_2().children(palette_buttons))
             .child(div().text_xs().text_color(rgb(0xc6d9ce)).child("Narration"))
             .child(narration_button)
     }
