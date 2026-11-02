@@ -8935,7 +8935,12 @@ impl SimulationView {
     /// These deliberately stay out of the companion Lab: each GPUI view owns its
     /// presentation camera and draw flags, so putting the buttons beside the pixels
     /// they affect keeps the interaction honest.
-    fn render_world_toolbar(&self, snapshot: &HudSnapshot, cx: &mut Context<Self>) -> Div {
+    fn render_world_toolbar(
+        &self,
+        snapshot: &HudSnapshot,
+        compact: bool,
+        cx: &mut Context<Self>,
+    ) -> Div {
         let controls = snapshot.controls;
         let accessibility = self.accessibility_snapshot();
         let toggle_agents = cx.listener(move |this, _event: &MouseDownEvent, _, cx| {
@@ -8974,6 +8979,7 @@ impl SimulationView {
 
         let base_button = |label: SharedString| {
             div()
+                .flex_none()
                 .cursor_pointer()
                 .rounded_md()
                 .border_1()
@@ -9021,12 +9027,73 @@ impl SimulationView {
             accessibility.narration_enabled,
         );
         let palette = base_button(format!("Palette: {}", accessibility.palette.label()).into())
+            .debug_selector(|| "world-toolbar-palette".to_owned())
             .on_mouse_down(MouseButton::Left, cycle_palette);
-        let settings =
-            base_button("Settings".into()).on_mouse_down(MouseButton::Left, open_settings);
+        let settings = base_button("Settings".into())
+            .debug_selector(|| "world-toolbar-settings".to_owned())
+            .on_mouse_down(MouseButton::Left, open_settings);
         let fit_selected = selection_bounds.map(|_| {
             base_button("Fit selected".into()).on_mouse_down(MouseButton::Left, fit_selection)
         });
+
+        if compact {
+            return div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .rounded_lg()
+                .border_1()
+                .border_color(chrome::border())
+                .bg(chrome::surface())
+                .px_2()
+                .py_1()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .truncate()
+                                .text_xs()
+                                .text_color(chrome::text_primary())
+                                .child(format!(
+                                    "{} {}  ·  {} agents",
+                                    if snapshot.checkpoint_review.is_some() {
+                                        "Replay · tick"
+                                    } else {
+                                        "Tick"
+                                    },
+                                    snapshot.tick,
+                                    snapshot.agent_count
+                                )),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(chrome::text_muted())
+                                .child("↔ More controls"),
+                        )
+                        .child(settings),
+                )
+                .child(
+                    div()
+                        .id("world-toolbar-controls")
+                        .debug_selector(|| "world-toolbar-controls".to_owned())
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .overflow_x_scroll()
+                        .children(vec![
+                            agents, food, outline, follow, fit, debug, narration, palette,
+                        ])
+                        .children(fit_selected),
+                );
+        }
 
         div()
             .flex()
@@ -9082,9 +9149,14 @@ impl SimulationView {
             )
     }
 
-    fn render_canvas(&self, snapshot: &HudSnapshot, cx: &mut Context<Self>) -> Div {
+    fn render_canvas(
+        &self,
+        snapshot: &HudSnapshot,
+        compact_hud: bool,
+        cx: &mut Context<Self>,
+    ) -> Div {
         if let Some(frame) = snapshot.render_frame.clone() {
-            self.render_canvas_world(snapshot, frame, cx)
+            self.render_canvas_world(snapshot, frame, compact_hud, cx)
         } else {
             self.render_canvas_placeholder(snapshot)
         }
@@ -9093,6 +9165,7 @@ impl SimulationView {
         &self,
         snapshot: &HudSnapshot,
         frame: RenderFrame,
+        compact_hud: bool,
         cx: &mut Context<Self>,
     ) -> Div {
         let follow_target = self.compute_follow_target(&frame, &snapshot.inspector);
@@ -9253,8 +9326,12 @@ impl SimulationView {
                     (matches!(self.playback.mode(), PlaybackMode::Live) && *uid == selected.uid)
                         .then_some((*tick, detail))
                 });
-            canvas_stack =
-                canvas_stack.child(self.render_world_agent_hud(selected, current.or(cached), cx));
+            canvas_stack = canvas_stack.child(self.render_world_agent_hud(
+                selected,
+                current.or(cached),
+                compact_hud,
+                cx,
+            ));
         }
 
         // The World owns the flexible viewport; the compact focus card floats
@@ -9302,6 +9379,7 @@ impl SimulationView {
         &self,
         selected: &AgentListEntry,
         detail: Option<(u64, &AgentInspectorDetails)>,
+        compact_hud: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let label =
@@ -9321,37 +9399,20 @@ impl SimulationView {
                 )
         };
 
-        let mut hud = div()
-            .id("world-creature-hud")
-            .absolute()
-            .top(px(12.0))
-            .bottom(px(12.0))
-            .left(px(12.0))
-            .right(px(12.0))
-            .max_w(px(380.0))
-            .max_h(px(680.0))
-            .overflow_y_scroll()
-            .scrollbar_width(px(5.0))
-            .rounded_lg()
-            .border_1()
-            .border_color(rgb(0x42645f))
-            .bg(rgb(0x101f22))
-            .shadow_lg()
-            .px_3()
-            .py_3()
+        // Keep the creature's identity and vitals in view while the longer
+        // physiological and neural details scroll underneath.
+        let header = div()
+            .debug_selector(|| "world-creature-hud-header".to_owned())
             .flex()
             .flex_col()
             .gap_1()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|_, _, _, cx| cx.stop_propagation()),
-            )
+            .pb_2()
             .child(
                 div()
                     .flex()
                     .items_center()
                     .justify_between()
-                    .child(label("SELECTED CREATURE · SCROLL FOR DETAILS"))
+                    .child(label("SELECTED CREATURE"))
                     .child(color_swatch(selected.color)),
             )
             .child(
@@ -9360,25 +9421,67 @@ impl SimulationView {
                     .text_color(chrome::text_primary())
                     .child(format!("Creature #{}", selected.uid.get())),
             )
-            .child(
-                div()
-                    .flex()
-                    .gap_3()
-                    .child(metric("ENERGY", format!("{:.2}", selected.energy)))
-                    .child(metric("HEALTH", format!("{:.2}", selected.health)))
-                    .child(metric("AGE", format!("{} steps", selected.age))),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(chrome::text_secondary())
-                    .child(format!(
-                        "Gen {}  ·  Position {:.0}, {:.0}",
-                        selected.generation.0, selected.position.x, selected.position.y
-                    )),
-            )
+            .when(compact_hud, |header| {
+                header.child(
+                    div()
+                        .text_xs()
+                        .text_color(chrome::text_secondary())
+                        .truncate()
+                        .child(format!(
+                            "Energy {:.2}  ·  Health {:.2}  ·  Age {}",
+                            selected.energy, selected.health, selected.age
+                        )),
+                )
+            })
+            .when(!compact_hud, |header| {
+                header
+                    .child(
+                        div()
+                            .flex()
+                            .gap_3()
+                            .child(metric("ENERGY", format!("{:.2}", selected.energy)))
+                            .child(metric("HEALTH", format!("{:.2}", selected.health)))
+                            .child(metric("AGE", format!("{} steps", selected.age))),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(chrome::text_secondary())
+                            .child(format!(
+                                "Gen {}  ·  Position {:.0}, {:.0}",
+                                selected.generation.0, selected.position.x, selected.position.y
+                            )),
+                    )
+            });
+
+        // Give each creature its own scroll identity so a new selection opens
+        // at its summary rather than inheriting another creature's scroll offset.
+        let mut hud = div()
+            .id(("world-creature-hud-scroll", selected.uid.get() as usize))
+            .debug_selector(|| "world-creature-hud-scroll".to_owned())
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.0))
+            .overflow_y_scroll()
+            .scrollbar_width(px(5.0))
+            .gap_1()
             .child(div().h(px(1.0)).w_full().bg(chrome::border()))
-            .child(label("MOTION & PHYSIOLOGY"))
+            .child(
+                label("MOTION & PHYSIOLOGY")
+                    .debug_selector(|| "world-creature-hud-motion".to_owned()),
+            )
+            .when(compact_hud, |body| {
+                body.child(
+                    div()
+                        .text_xs()
+                        .text_color(chrome::text_secondary())
+                        .child(format!(
+                            "Gen {}  ·  Position {:.0}, {:.0}",
+                            selected.generation.0, selected.position.x, selected.position.y
+                        )),
+                )
+            })
             .child(
                 div()
                     .text_xs()
@@ -9414,8 +9517,26 @@ impl SimulationView {
                         .text_xs()
                         .text_color(chrome::text_secondary())
                         .child(format!(
-                            "Sound {:.2}  ·  Sharing intent {:.2}",
-                            visual.sound_output, visual.reproduction_intent
+                            "Wheels {:+.2} / {:+.2}  ·  Boost cmd {:.2}",
+                            visual.wheel_left, visual.wheel_right, visual.boost_output
+                        )),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(chrome::text_secondary())
+                        .child(format!(
+                            "Sound cmd {:.2}  ·  Emitted {:.2}  ·  Scale {:.2}",
+                            visual.sound_level, visual.sound_output, visual.sound_multiplier
+                        )),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(chrome::text_secondary())
+                        .child(format!(
+                            "Sharing intent {:.2}  ·  Signal {:.2}",
+                            visual.reproduction_intent, visual.indicator.intensity
                         )),
                 )
                 .child(
@@ -9593,7 +9714,9 @@ impl SimulationView {
                 .child(label("Sensor values unavailable"));
         }
         hud = hud.child(div().h(px(1.0)).w_full().bg(chrome::border()));
-        hud = hud.child(label("NEURAL ACTIVITY"));
+        hud = hud.child(
+            label("NEURAL ACTIVITY").debug_selector(|| "world-creature-hud-neural".to_owned()),
+        );
         let capture = self
             .world_brain_capture
             .as_ref()
@@ -9642,7 +9765,31 @@ impl SimulationView {
                     .child(format!("Latest neural request failed: {error}")),
             );
         }
-        hud
+        div()
+            .id("world-creature-hud")
+            .absolute()
+            .top(px(12.0))
+            .bottom(px(12.0))
+            .left(px(12.0))
+            .right(px(12.0))
+            .max_w(px(380.0))
+            .max_h(px(680.0))
+            .overflow_hidden()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(0x42645f))
+            .bg(rgb(0x101f22))
+            .shadow_lg()
+            .px_3()
+            .py_3()
+            .flex()
+            .flex_col()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, _, cx| cx.stop_propagation()),
+            )
+            .child(header)
+            .child(hud)
     }
 
     fn compute_follow_target(
@@ -15511,8 +15658,17 @@ impl Render for SimulationView {
                 .text_color(chrome::text_primary())
                 .p_2()
                 .gap_2()
-                .child(self.render_world_toolbar(&snapshot, cx))
-                .child(self.render_canvas(&snapshot, cx))
+                .child(self.render_world_toolbar(
+                    &snapshot,
+                    window.viewport_size().width < px(500.0),
+                    cx,
+                ))
+                .child(self.render_canvas(
+                    &snapshot,
+                    window.viewport_size().width < px(500.0)
+                        || window.viewport_size().height < px(520.0),
+                    cx,
+                ))
         } else {
             // The companion Lab window is a narrow, sectioned utility surface. The
             // previous layout duplicated the world and mounted history, inspector,
@@ -32275,6 +32431,194 @@ mod command_characterization_tests {
                 .expect("production GUI root");
             self.app.read_entity(&hud, |view, _| probe(view))
         }
+    }
+
+    #[test]
+    fn world_creature_hud_keeps_vitals_fixed_and_resets_scroll_for_new_creature() {
+        let world = command_characterization_world();
+        let (first, second) = {
+            let mut world = world.lock().unwrap();
+            (
+                world.try_spawn_agent(AgentData::default()).unwrap(),
+                world.try_spawn_agent(AgentData::default()).unwrap(),
+            )
+        };
+        let host = TestHost::take(world);
+        let select = |id: AgentId| {
+            host.apply(
+                scriptbots_runtime::HostCommand::try_from(ControlCommand::UpdateSelection(
+                    SelectionUpdate {
+                        mode: SelectionMode::Replace,
+                        agent_ids: vec![id.raw()],
+                        state: SelectionState::Selected,
+                    },
+                ))
+                .unwrap(),
+            );
+        };
+        select(first);
+        let session = Arc::new(GuiSession::new(
+            host.port.clone(),
+            AnalyticsSnapshotProvider::empty(),
+            Arc::new(|_| None),
+        ));
+        let context = gpui::TestAppContext::single();
+        let windows = context.update(|app| session.install(app)).unwrap();
+        let set_focus = |id: AgentId| {
+            context.update(|app| {
+                let root = windows.canvas.root(app).unwrap();
+                root.update(app, |view, _| {
+                    view.inspector.lock().unwrap().focused_agent = Some(id)
+                });
+            })
+        };
+        set_focus(first);
+        let mut world = gpui::VisualTestContext::from_window(windows.canvas.into(), &context);
+        world.simulate_resize(size(px(1280.0), px(720.0)));
+        let redraw = |world: &mut gpui::VisualTestContext| {
+            world.update(|window, app| {
+                window.refresh();
+                window.draw(app).clear();
+            })
+        };
+        redraw(&mut world);
+        let header = world
+            .debug_bounds("world-creature-hud-header")
+            .expect("creature header laid out");
+        let body = world
+            .debug_bounds("world-creature-hud-scroll")
+            .expect("creature detail viewport laid out");
+        let motion = world
+            .debug_bounds("world-creature-hud-motion")
+            .expect("initial detail laid out");
+        assert!(
+            header.bottom() <= body.origin.y,
+            "header must not overlap details"
+        );
+        let zoom_before = context.update(|app| {
+            windows
+                .canvas
+                .root(app)
+                .unwrap()
+                .read(app)
+                .camera_snapshot()
+                .zoom
+        });
+        world.simulate_event(ScrollWheelEvent {
+            position: body.center(),
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-10000.0))),
+            modifiers: gpui::Modifiers::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        redraw(&mut world);
+        let after_header = world
+            .debug_bounds("world-creature-hud-header")
+            .expect("header stays present");
+        assert_eq!(
+            header, after_header,
+            "identity and vitals must stay fixed while details scroll"
+        );
+        let neural = world
+            .debug_bounds("world-creature-hud-neural")
+            .expect("neural section laid out");
+        assert!(
+            neural.origin.y >= body.origin.y && neural.bottom() <= body.bottom(),
+            "neural detail must be reachable inside the viewport: {neural:?} {body:?}"
+        );
+        let zoom_after = context.update(|app| {
+            windows
+                .canvas
+                .root(app)
+                .unwrap()
+                .read(app)
+                .camera_snapshot()
+                .zoom
+        });
+        assert_eq!(
+            zoom_before, zoom_after,
+            "scrolling the HUD must not zoom the world"
+        );
+        select(second);
+        set_focus(second);
+        redraw(&mut world);
+        let new_motion = world
+            .debug_bounds("world-creature-hud-motion")
+            .expect("new creature summary");
+        assert_eq!(
+            motion.origin.y, new_motion.origin.y,
+            "a newly selected creature must start at the top"
+        );
+        world.simulate_resize(size(px(400.0), px(400.0)));
+        redraw(&mut world);
+        let settings = world
+            .debug_bounds("world-toolbar-settings")
+            .expect("compact settings laid out");
+        assert!(
+            settings.right() <= px(400.0),
+            "settings must remain visible in compact toolbar"
+        );
+        let toolbar = world
+            .debug_bounds("world-toolbar-controls")
+            .expect("compact controls must remain available");
+        world.simulate_event(ScrollWheelEvent {
+            position: toolbar.center(),
+            delta: ScrollDelta::Pixels(point(px(-10000.0), px(0.0))),
+            modifiers: gpui::Modifiers::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        redraw(&mut world);
+        let palette = world
+            .debug_bounds("world-toolbar-palette")
+            .expect("palette remains available");
+        assert!(
+            palette.origin.x >= toolbar.origin.x && palette.right() <= toolbar.right(),
+            "horizontal controls must be reachable: palette {palette:?}, toolbar {toolbar:?}"
+        );
+        assert_eq!(
+            zoom_before,
+            context.update(|app| windows
+                .canvas
+                .root(app)
+                .unwrap()
+                .read(app)
+                .camera_snapshot()
+                .zoom)
+        );
+        let compact_header = world
+            .debug_bounds("world-creature-hud-header")
+            .expect("compact header laid out");
+        let compact_body = world
+            .debug_bounds("world-creature-hud-scroll")
+            .expect("compact detail viewport laid out");
+        assert!(
+            compact_header.bottom() <= compact_body.origin.y
+                && compact_body.size.height > px(100.0),
+            "small windows must leave room for detail scrolling: header {compact_header:?}, body {compact_body:?}"
+        );
+        assert!(
+            compact_header.right() <= px(400.0),
+            "header must fit the window"
+        );
+        world.simulate_event(ScrollWheelEvent {
+            position: compact_body.center(),
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-10000.0))),
+            modifiers: gpui::Modifiers::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        redraw(&mut world);
+        let compact_neural = world
+            .debug_bounds("world-creature-hud-neural")
+            .expect("compact neural section laid out");
+        assert!(
+            compact_neural.origin.y >= compact_body.origin.y
+                && compact_neural.bottom() <= compact_body.bottom(),
+            "neural detail must be reachable in a compact window: neural {compact_neural:?}, body {compact_body:?}"
+        );
+        assert_eq!(
+            compact_header,
+            world.debug_bounds("world-creature-hud-header").unwrap()
+        );
+        context.quit();
     }
 
     fn force_production_repaint(
