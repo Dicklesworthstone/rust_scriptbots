@@ -1,8 +1,9 @@
 //! Autonomous LLM lab assistant: canonical proposal -> validation -> matched-seed execution.
 
 use crate::experiment_runner::{
-    ExperimentBatchStatus, MatchedSeedCohort, MatchedSeedExperimentRunner, ScenarioVariant,
-    validate_scenario_arm,
+    ExperimentBatchStatus, MAX_BUNDLE_ARTIFACT_BYTES, MAX_BUNDLE_ARTIFACTS,
+    MAX_BUNDLE_TOTAL_ARTIFACT_BYTES, MatchedSeedCohort, MatchedSeedExperimentRunner,
+    ScenarioVariant, validate_scenario_arm,
 };
 use crate::lab::llm::{
     LlmClient, LlmError, LlmMessage, LlmRequest, PROPOSE_EXPERIMENT_TOOL_NAME, StopReason,
@@ -444,10 +445,9 @@ pub(crate) fn completed_run_summaries(
             RunBundleVerificationLimits {
                 max_manifest_bytes: u64::try_from(MAX_ANALYSIS_BUNDLE_MANIFEST_BYTES)
                     .unwrap_or(u64::MAX),
-                max_artifacts: 32,
-                max_artifact_bytes: u64::try_from(MAX_ANALYSIS_BUNDLE_MANIFEST_BYTES)
-                    .unwrap_or(u64::MAX),
-                max_total_artifact_bytes: 1_024 * 1_024,
+                max_artifacts: MAX_BUNDLE_ARTIFACTS,
+                max_artifact_bytes: MAX_BUNDLE_ARTIFACT_BYTES,
+                max_total_artifact_bytes: MAX_BUNDLE_TOTAL_ARTIFACT_BYTES,
             },
         )
         .map_err(|error| {
@@ -1512,6 +1512,9 @@ mod tests {
     #[test]
     fn real_matched_seed_pipeline_is_byte_stable_and_data_responsive() {
         let temp = tempfile::tempdir().expect("temporary experiment root");
+        // Notebook output rejects symlinked ancestors; macOS's default /var
+        // temporary path is an alias, so use the canonical fixture root.
+        let temp_root = temp.path().canonicalize().expect("canonical fixture root");
         let run_lab = |output_root: PathBuf| {
             // The provider response is an offline canonical tool fixture; validation, world
             // execution, bundle verification, statistics, and notebook materialization are real.
@@ -1538,7 +1541,7 @@ mod tests {
             }
             lab
         };
-        let first_lab = run_lab(temp.path().join("first"));
+        let first_lab = run_lab(temp_root.join("first"));
         assert_eq!(first_lab.runs_spent, 9);
         assert_eq!(first_lab.ticks_spent, 18);
         assert_eq!(first_lab.run_summaries.len(), 9);
@@ -1574,7 +1577,7 @@ mod tests {
             first.as_str()
         );
 
-        let repeated_lab = run_lab(temp.path().join("repeated"));
+        let repeated_lab = run_lab(temp_root.join("repeated"));
         assert_eq!(
             repeated_lab.rendered_notebook.as_ref(),
             Some(first),
@@ -1672,6 +1675,32 @@ mod tests {
             &fs::read(&status_path).expect("completed status remains readable"),
         )
         .expect("completed status schema");
+        let bundle_dir = PathBuf::from(
+            status.runs[0]
+                .bundle_path
+                .as_ref()
+                .expect("completed run bundle"),
+        );
+        let manifest_path = bundle_dir.join("bundle_manifest.json");
+        let manifest_bytes = fs::read(&manifest_path).expect("bundle manifest");
+        let mut manifest: RunBundleV1 =
+            serde_json::from_slice(&manifest_bytes).expect("bundle manifest schema");
+        let checkpoint = manifest
+            .artifacts
+            .iter_mut()
+            .find(|entry| entry.relative_path == "checkpoints/final.checkpoint")
+            .expect("final checkpoint entry");
+        assert!(checkpoint.bytes_len > 512 * 1_024);
+        checkpoint.bytes_len = MAX_BUNDLE_ARTIFACT_BYTES + 1;
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap())
+            .expect("write deliberately oversized declaration");
+        let error = completed_run_summaries(&validated.arms, &status)
+            .expect_err("an artifact above the producer limit must be refused");
+        assert!(
+            error.contains("artifact_bytes"),
+            "unexpected refusal: {error}"
+        );
+        fs::write(&manifest_path, &manifest_bytes).expect("restore original manifest");
         let summary_path = PathBuf::from(
             status.runs[0]
                 .bundle_path
