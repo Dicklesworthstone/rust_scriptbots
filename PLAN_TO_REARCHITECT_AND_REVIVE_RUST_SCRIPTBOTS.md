@@ -2,6 +2,32 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Biome atlas consumer (2026-11-02):** [Currently In Progress — GentleDuck;
+original `bd-hpt6`]
+
+The requested detailed TODO gates this original wire-or-retire decision and
+retires as an active checklist after verified delivery. The observed gap is an
+unconsumed atlas beside an existing generic roughness-detail material path.
+
+- [x] Recheck authoritative ready work, ownership, the atlas codec and the real
+  terrain material/capture consumers; retain the original generators and digest.
+- [x] Mark the original Bead and add a failing real material-path regression.
+- [x] Bake and verify the canonical atlas once before renderer/capture startup;
+  reject wrong length and corruption in every declared biome layer.
+- [x] Derive neutral roughness grain from atlas pixels, preserving vertex albedo,
+  accessibility palettes and material factors; identify this as chunk-dominant
+  biome detail rather than a new per-pixel albedo splat shader.
+- [x] Select the dominant biome from actual chunk tiles and include that selection
+  in render invalidation; bind the corresponding image to actual terrain materials.
+- [x] Keep cached image handles stable across quality changes and unchanged frames;
+  preserve filtered downsampling, complete mips and missing-asset recovery.
+- [ ] Remove the obsolete consumer exemption only after a production reader exists;
+  retain test-only-call rejection and scanner falsification cases.
+- [ ] Execute terrain/authority/capture boundary tests and required workspace
+  check, strict Clippy, formatting and scoped static review through DSR.
+- [ ] Re-execute committed source in a fresh solo pass, assess original acceptance,
+  close only on observed evidence, and publish reviewed source/tracker records.
+
 **Flat-map capability continuation (2026-11-02):** [Verified and Closed —
 GentleDuck; original `bd-2z0.14.2.6`; acceptance unchanged]
 

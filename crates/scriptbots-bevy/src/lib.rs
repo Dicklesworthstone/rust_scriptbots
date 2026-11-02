@@ -116,6 +116,53 @@ struct HostLifecycleMonitor {
     terminal_reported: bool,
 }
 
+/// Verified canonical grain, retained once per renderer rather than rebaked on
+/// quality changes. Albedo remains in the shared vertex-color authority; only
+/// the texture's brightness variation modulates the existing roughness channel.
+#[derive(Resource)]
+pub(crate) struct TerrainDetailSource {
+    layers: [Vec<u8>; visual::SPLAT_LAYERS],
+}
+
+impl TerrainDetailSource {
+    fn bake() -> Result<Self> {
+        Self::from_atlas(&visual::bake_canonical_biome_atlas()).map_err(Into::into)
+    }
+
+    fn from_atlas(atlas: &[u8]) -> std::result::Result<Self, visual::AtlasVerificationError> {
+        visual::verify_biome_atlas(atlas)?;
+        let side = visual::CANONICAL_BIOME_ATLAS_TILE_SIZE as usize;
+        let width = visual::CANONICAL_BIOME_ATLAS_WIDTH as usize;
+        let specs = visual::biome_texture_specs();
+        let layers = std::array::from_fn(|layer| {
+            let base = visual::TERRAIN_BASE_COLORS[layer];
+            // The brightest channel minimizes RGBA8 rounding error when
+            // recovering multiplicative grain from the baked albedo.
+            let channel = (0..base.len())
+                .max_by(|&a, &b| base[a].total_cmp(&base[b]))
+                .expect("RGB has channels");
+            let reference = base[channel] * 255.0;
+            let amplitude = reference * specs[layer].grain_amplitude;
+            let mut grain = Vec::with_capacity(side * side);
+            for y in 0..side {
+                for x in 0..side {
+                    let pixel = atlas[((y * width + layer * side + x) * 4) + channel];
+                    let variation = if amplitude > 0.0 {
+                        (f32::from(pixel) - reference) / amplitude
+                    } else {
+                        0.0
+                    };
+                    // Preserve the prior neutral [193,255] roughness range;
+                    // biome hue must not tint the vertex albedo a second time.
+                    grain.push((224.0 + 31.0 * variation).round().clamp(193.0, 255.0) as u8);
+                }
+            }
+            grain
+        });
+        Ok(Self { layers })
+    }
+}
+
 fn host_terminal_result(snapshot: &RenderSnapshot) -> Option<Result<(), String>> {
     // A fault remains a failure even if finalization also reached Stopped.
     if let Some(fault) = snapshot.health.fault() {
@@ -661,6 +708,8 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
             "no GPU adapter is available for the Bevy renderer; choose a non-GPU frontend"
         ));
     }
+    let terrain_detail_source =
+        TerrainDetailSource::bake().context("could not load the canonical biome detail atlas")?;
 
     let (snapshot_publisher, snapshot_inbox) = SnapshotInbox::pair();
     let (failure_tx, failure_rx) = mpsc::channel::<BevyLifecycleFailure>();
@@ -781,6 +830,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
     })
     .insert_resource(SnapshotState::default())
     .insert_resource(AgentRegistry::default())
+    .insert_resource(terrain_detail_source)
     .insert_resource(AgentMotionSettings {
         enabled: !initial_render_settings.reduced_motion.unwrap_or(false),
     })
@@ -2139,6 +2189,7 @@ impl TerrainChunkSignature {
         positions: &[[f32; 3]],
         colors: &[[f32; 4]],
         material_inputs: &[f32],
+        detail_layer: usize,
     ) -> Self {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"scriptbots.bevy-terrain-chunk.v1");
@@ -2158,6 +2209,7 @@ impl TerrainChunkSignature {
         for input in material_inputs {
             hasher.update(&input.to_bits().to_le_bytes());
         }
+        hasher.update(&(detail_layer as u64).to_le_bytes());
         Self(*hasher.finalize().as_bytes())
     }
 }
@@ -3893,11 +3945,9 @@ mod visual_authority_consumer_guard {
     /// a hand grep is a snapshot of one person's shell history, and this runs
     /// on every build.
     ///
-    /// The biome atlas is one unwired unit (bd-hpt6, succeeding bd-ikts.2). Since 275da42e
-    /// `bake_canonical_biome_atlas` calls `bake_biome_atlas` from production code, so the
-    /// latter now reads as consumed; the unit's unconsumed head is `verify_biome_atlas`, which
-    /// only tests call. That is where the exemption sits.
-    const EXEMPT: &[(&str, &str)] = &[("verify_biome_atlas", "bd-hpt6")];
+    /// The canonical atlas now feeds verified terrain roughness detail in both
+    /// live rendering and capture. No visual authority currently needs an exemption.
+    const EXEMPT: &[(&str, &str)] = &[];
 
     fn workspace_root() -> PathBuf {
         // crates/scriptbots-bevy -> crates -> workspace root
@@ -4247,11 +4297,12 @@ mod visual_authority_consumer_guard {
     #[test]
     fn test_only_call_sites_do_not_count_as_consumers() {
         let internal = visual_internal_production_uses(&workspace_root());
-        // verify_biome_atlas is called only from visual.rs's own tests (bd-hpt6).
+        // Bevy's production loader is external to visual.rs. Its real consumer
+        // must not turn visual.rs's own test calls into internal production uses.
         assert!(
             !internal.contains("verify_biome_atlas"),
-            "verify_biome_atlas is called only from tests, so it must not appear in \
-             the production-only sweep; if it does, the #[cfg(test)] split is wrong"
+            "visual.rs has no internal production call to verify_biome_atlas; \
+             its tests must not enter the production-only sweep"
         );
     }
 
@@ -4283,11 +4334,92 @@ mod visual_authority_consumer_guard {
 mod adaptive_governor_tests {
     use super::*;
 
+    const BIOMES: [TerrainKind; visual::SPLAT_LAYERS] = [
+        TerrainKind::DeepWater,
+        TerrainKind::ShallowWater,
+        TerrainKind::Sand,
+        TerrainKind::Grass,
+        TerrainKind::Bloom,
+        TerrainKind::Rock,
+    ];
+
+    #[test]
+    fn terrain_detail_source_rejects_corruption_before_building_textures() {
+        let atlas = visual::bake_canonical_biome_atlas();
+        assert!(TerrainDetailSource::from_atlas(&atlas).is_ok());
+        assert!(matches!(
+            TerrainDetailSource::from_atlas(&[]),
+            Err(visual::AtlasVerificationError::LengthMismatch { actual: 0, .. })
+        ));
+        for kind in BIOMES {
+            let layer = visual::terrain_kind_index(kind);
+            let offset = layer * visual::CANONICAL_BIOME_ATLAS_TILE_SIZE as usize * 4;
+            let mut damaged = atlas.clone();
+            // Alpha is not used to derive roughness. Corrupting it proves the
+            // full atlas verifier runs before the consumer reads selected RGB.
+            damaged[offset + 3] ^= 1;
+            assert!(
+                matches!(TerrainDetailSource::from_atlas(&damaged),
+                Err(visual::AtlasVerificationError::DigestMismatch { mismatch_layer, .. })
+                    if mismatch_layer == kind),
+                "{kind:?}: altered atlas must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn terrain_detail_grain_tracks_actual_canonical_atlas_pixels() {
+        let atlas = visual::bake_canonical_biome_atlas();
+        let source = TerrainDetailSource::from_atlas(&atlas).unwrap();
+        let side = visual::CANONICAL_BIOME_ATLAS_TILE_SIZE as usize;
+        let width = visual::CANONICAL_BIOME_ATLAS_WIDTH as usize;
+        for kind in BIOMES {
+            let layer = visual::terrain_kind_index(kind);
+            let base = visual::TERRAIN_BASE_COLORS[layer];
+            let channel = (0..base.len())
+                .max_by(|&a, &b| base[a].total_cmp(&base[b]))
+                .unwrap();
+            let mut by_source_value = std::collections::BTreeMap::<u8, HashSet<u8>>::new();
+            for y in 0..side {
+                for x in 0..side {
+                    let pixel = atlas[(y * width + layer * side + x) * 4 + channel];
+                    by_source_value
+                        .entry(pixel)
+                        .or_default()
+                        .insert(source.layers[layer][y * side + x]);
+                }
+            }
+            assert!(
+                by_source_value.len() > 1,
+                "{kind:?}: source must contain grain"
+            );
+            assert!(
+                by_source_value.values().all(|values| values.len() == 1),
+                "{kind:?}: equal atlas intensities must yield equal roughness"
+            );
+            let values: Vec<_> = by_source_value
+                .values()
+                .map(|v| *v.iter().next().unwrap())
+                .collect();
+            assert!(values.windows(2).all(|pair| pair[0] <= pair[1]));
+            assert!(
+                values.iter().collect::<HashSet<_>>().len() > 1,
+                "{kind:?}: constant or unrelated noise cannot stand in for atlas grain"
+            );
+        }
+    }
+
     #[test]
     fn terrain_detail_mips_are_complete_filtered_and_include_odd_edges() {
         use bevy::image::{ImageFilterMode, ImageSampler};
-        for divisor in [1, 2, 4, 86, 255] {
-            let image = terrain_detail_image(divisor);
+        let source = TerrainDetailSource::bake().unwrap();
+        let odd_divisor = TERRAIN_DETAIL_RESOLUTION.div_ceil(3) as u8;
+        for divisor in [1, 2, 4, odd_divisor, 255] {
+            let image = terrain_detail_image(
+                &source,
+                visual::terrain_kind_index(TerrainKind::Sand),
+                divisor,
+            );
             let width = image.texture_descriptor.size.width;
             assert_eq!(image.texture_descriptor.mip_level_count, width.ilog2() + 1);
             let ImageSampler::Descriptor(sampler) = &image.sampler else {
@@ -4373,7 +4505,9 @@ mod adaptive_governor_tests {
     #[test]
     fn terrain_detail_tiers_average_one_nonuniform_linear_roughness_pattern() {
         use bevy::render::render_resource::TextureFormat;
-        let full = terrain_detail_image(1);
+        let source = TerrainDetailSource::bake().unwrap();
+        let layer = visual::terrain_kind_index(TerrainKind::Sand);
+        let full = terrain_detail_image(&source, layer, 1);
         let pixels = full.data.as_ref().unwrap();
         let roughness: HashSet<_> = pixels.as_chunks::<4>().0.iter().map(|p| p[1]).collect();
         assert!(roughness.len() > 16, "texture must carry surface variation");
@@ -4383,7 +4517,7 @@ mod adaptive_governor_tests {
             assert!(pixel[1] >= 193);
         }
         for divisor in [2_u8, 4] {
-            let image = terrain_detail_image(divisor);
+            let image = terrain_detail_image(&source, layer, divisor);
             let side = image.texture_descriptor.size.width as usize;
             let d = usize::from(divisor);
             assert_eq!(side * d, TERRAIN_DETAIL_RESOLUTION as usize);
@@ -4411,22 +4545,42 @@ mod adaptive_governor_tests {
             }
         }
         assert_eq!(
-            terrain_detail_image(0).data,
+            terrain_detail_image(&source, layer, 0).data,
             full.data,
             "zero divisor is normalized"
         );
     }
 
-    #[test]
-    fn live_terrain_materials_follow_detail_tiers_without_asset_growth() {
+    fn terrain_detail_app() -> App {
         let mut app = App::new();
-        let world = WorldState::new(scriptbots_core::ScriptBotsConfig::default()).unwrap();
+        app.insert_resource(TerrainDetailSource::bake().unwrap());
+        let world = WorldState::new(scriptbots_core::ScriptBotsConfig {
+            world_width: 384,
+            world_height: 64,
+            food_cell_size: 32,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            persistence_interval: 0,
+            rng_seed: Some(42),
+            ..default()
+        })
+        .unwrap();
+        let mut snapshot = WorldSnapshot::from_world(&world).unwrap();
+        let kinds = BIOMES;
+        assert!(snapshot.terrain_height.kinds.len() >= kinds.len());
+        for (index, kind) in snapshot.terrain_height.kinds.iter_mut().enumerate() {
+            *kind = kinds[index % kinds.len()];
+        }
         app.insert_resource(SnapshotState {
-            latest: WorldSnapshot::from_world(&world),
+            latest: Some(snapshot),
             ..default()
         });
         app.insert_resource(AgentRegistry::default());
-        app.insert_resource(TerrainChunkRegistry::default());
+        app.insert_resource(TerrainChunkRegistry {
+            chunk_size: 1,
+            height_scale: TERRAIN_HEIGHT_SCALE,
+            ..default()
+        });
         app.insert_resource(AgentMeshes::default());
         app.insert_resource(Assets::<Mesh>::default());
         app.insert_resource(Assets::<StandardMaterial>::default());
@@ -4436,6 +4590,198 @@ mod adaptive_governor_tests {
         app.insert_resource(AccessibilityState::default());
         app.insert_resource(auto_launch(RenderQuality::High));
         app.add_systems(Update, (sync_world, apply_tier_to_terrain_detail).chain());
+        app
+    }
+
+    #[test]
+    fn live_terrain_materials_select_distinct_detail_for_every_biome() {
+        let mut app = terrain_detail_app();
+        app.update();
+        let snapshot = app
+            .world()
+            .resource::<SnapshotState>()
+            .latest
+            .as_ref()
+            .unwrap();
+        let registry = app.world().resource::<TerrainChunkRegistry>();
+        let materials = app.world().resource::<Assets<StandardMaterial>>();
+        let images = app.world().resource::<Assets<Image>>();
+        let mut per_kind = HashMap::new();
+        let mut patterns = HashSet::new();
+        for chunk in registry.chunks.values() {
+            let kind = snapshot
+                .terrain_height
+                .sample_tile(chunk.bounds.origin.x, chunk.bounds.origin.y)
+                .kind;
+            let material = materials.get(&chunk.material).unwrap();
+            let handle = material
+                .metallic_roughness_texture
+                .as_ref()
+                .expect("real material texture");
+            if let Some(previous) = per_kind.insert(kind, handle.id()) {
+                assert_eq!(
+                    previous,
+                    handle.id(),
+                    "same biome reuses its cached texture"
+                );
+            }
+            let image = images.get(handle).expect("bound texture exists");
+            patterns.insert(
+                blake3::hash(image.data.as_ref().unwrap())
+                    .to_hex()
+                    .to_string(),
+            );
+            assert_eq!(
+                material.base_color,
+                Color::WHITE,
+                "do not double-tint vertex albedo"
+            );
+            assert!(material.base_color_texture.is_none());
+        }
+        assert_eq!(
+            per_kind.len(),
+            visual::SPLAT_LAYERS,
+            "fixture must render every biome"
+        );
+        assert_eq!(
+            per_kind.values().collect::<HashSet<_>>().len(),
+            per_kind.len(),
+            "every actual biome material needs its own atlas-derived grain"
+        );
+        assert_eq!(
+            patterns.len(),
+            per_kind.len(),
+            "bindings must contain distinct pixel patterns"
+        );
+    }
+
+    #[test]
+    fn terrain_detail_dominance_counts_tiles_and_breaks_ties_in_canonical_order() {
+        let app = terrain_detail_app();
+        let mut snapshot = app
+            .world()
+            .resource::<SnapshotState>()
+            .latest
+            .clone()
+            .unwrap();
+        snapshot.terrain_height.kinds.fill(TerrainKind::Rock);
+        snapshot.terrain_height.kinds[0] = TerrainKind::Grass;
+        snapshot.terrain_height.kinds[1] = TerrainKind::Sand;
+        let build = |snapshot: &WorldSnapshot, width| {
+            build_chunk_mesh(
+                snapshot,
+                TerrainChunkBounds {
+                    origin: UVec2::ZERO,
+                    size: UVec2::new(width, 1),
+                },
+                TERRAIN_HEIGHT_SCALE,
+                ColorPaletteMode::Natural,
+            )
+        };
+        assert_eq!(
+            build(&snapshot, 2).stats.detail_layer,
+            visual::terrain_kind_index(TerrainKind::Sand),
+            "tie chooses the first canonical layer; surrounding Rock vertices do not vote"
+        );
+        snapshot.terrain_height.kinds[2] = TerrainKind::Grass;
+        assert_eq!(
+            build(&snapshot, 3).stats.detail_layer,
+            visual::terrain_kind_index(TerrainKind::Grass),
+            "majority of real chunk tiles wins"
+        );
+    }
+
+    #[test]
+    fn live_terrain_detail_rebinds_biome_changes_and_recovers_only_missing_images() {
+        let mut app = terrain_detail_app();
+        app.update();
+        let key = TerrainChunkKey { x: 0, y: 0 };
+        let other_key = TerrainChunkKey { x: 1, y: 0 };
+        let material = app.world().resource::<TerrainChunkRegistry>().chunks[&key]
+            .material
+            .clone();
+        let other_material = app.world().resource::<TerrainChunkRegistry>().chunks[&other_key]
+            .material
+            .clone();
+        let initial = app
+            .world()
+            .resource::<Assets<StandardMaterial>>()
+            .get(&material)
+            .unwrap()
+            .metallic_roughness_texture
+            .clone()
+            .unwrap();
+        let other_image = app
+            .world()
+            .resource::<Assets<StandardMaterial>>()
+            .get(&other_material)
+            .unwrap()
+            .metallic_roughness_texture
+            .clone()
+            .unwrap();
+        let image_count = app.world().resource::<Assets<Image>>().len();
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            let snapshot = state.latest.as_mut().unwrap();
+            snapshot.terrain_height.kinds[0] = TerrainKind::Rock;
+            snapshot.revision += 1;
+        }
+        app.update();
+        let changed = app
+            .world()
+            .resource::<Assets<StandardMaterial>>()
+            .get(&material)
+            .unwrap()
+            .metallic_roughness_texture
+            .clone()
+            .unwrap();
+        assert_ne!(
+            changed, initial,
+            "changed biome must reach the live material"
+        );
+        assert_eq!(
+            app.world().resource::<TerrainChunkRegistry>().chunks[&key]
+                .stats
+                .detail_layer,
+            visual::terrain_kind_index(TerrainKind::Rock)
+        );
+        assert_eq!(app.world().resource::<Assets<Image>>().len(), image_count);
+        app.world_mut()
+            .resource_mut::<Assets<Image>>()
+            .remove(&changed)
+            .unwrap();
+        app.update();
+        let repaired = app
+            .world()
+            .resource::<Assets<StandardMaterial>>()
+            .get(&material)
+            .unwrap()
+            .metallic_roughness_texture
+            .clone()
+            .unwrap();
+        assert_ne!(repaired, changed);
+        assert!(
+            app.world()
+                .resource::<Assets<Image>>()
+                .get(&repaired)
+                .is_some()
+        );
+        assert_eq!(app.world().resource::<Assets<Image>>().len(), image_count);
+        assert_eq!(
+            app.world()
+                .resource::<Assets<StandardMaterial>>()
+                .get(&other_material)
+                .unwrap()
+                .metallic_roughness_texture
+                .as_ref(),
+            Some(&other_image),
+            "repair must retain unrelated biome handles"
+        );
+    }
+
+    #[test]
+    fn live_terrain_materials_follow_detail_tiers_without_asset_growth() {
+        let mut app = terrain_detail_app();
         app.update();
         let registry = app.world().resource::<TerrainChunkRegistry>();
         let chunk = registry.chunks.values().next().expect("real terrain chunk");
@@ -7431,9 +7777,15 @@ fn create_chunk_material(stats: &TerrainChunkStats) -> StandardMaterial {
     }
 }
 
-const TERRAIN_DETAIL_RESOLUTION: u32 = 256;
+const TERRAIN_DETAIL_RESOLUTION: u32 = visual::CANONICAL_BIOME_ATLAS_TILE_SIZE;
 
-fn terrain_detail_image(divisor: u8) -> Image {
+#[derive(Default)]
+struct TerrainDetailTextures {
+    divisor: u8,
+    handles: Vec<Handle<Image>>,
+}
+
+fn terrain_detail_image(source: &TerrainDetailSource, layer: usize, divisor: u8) -> Image {
     use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
     let divisor = u32::from(divisor).max(1);
     let side = TERRAIN_DETAIL_RESOLUTION.div_ceil(divisor);
@@ -7446,12 +7798,9 @@ fn terrain_detail_image(divisor: u8) -> Image {
             // than resampling noise at a different frequency and aliasing it.
             for sy in y * divisor..((y + 1) * divisor).min(TERRAIN_DETAIL_RESOLUTION) {
                 for sx in x * divisor..((x + 1) * divisor).min(TERRAIN_DETAIL_RESOLUTION) {
-                    let noise = visual::value_noise_2d(
-                        0x0074_6572_7261_696e,
-                        sx as f32 * 0.25,
-                        sy as f32 * 0.25,
+                    sum += u32::from(
+                        source.layers[layer][(sy * TERRAIN_DETAIL_RESOLUTION + sx) as usize],
                     );
-                    sum += (224.0 + 31.0 * noise).round().clamp(193.0, 255.0) as u32;
                     count += 1;
                 }
             }
@@ -7510,35 +7859,37 @@ fn append_terrain_detail_mips(pixels: &mut Vec<u8>, side: u32) -> u32 {
 pub(crate) fn apply_tier_to_terrain_detail(
     effective: Res<EffectiveRenderSettings>,
     registry: Res<TerrainChunkRegistry>,
-    mut active: Local<Option<(u8, Handle<Image>)>>,
+    source: Res<TerrainDetailSource>,
+    mut active: Local<TerrainDetailTextures>,
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     let divisor = effective.features.terrain_detail_divisor.max(1);
-    let handle = match active.as_mut() {
-        Some((previous, handle)) => {
-            if *previous != divisor || images.get(&*handle).is_none() {
-                if let Some(image) = images.get_mut(&*handle) {
-                    *image = terrain_detail_image(divisor);
+    let changed = active.divisor != divisor;
+    for layer in 0..source.layers.len() {
+        if let Some(handle) = active.handles.get_mut(layer) {
+            if changed || images.get(&*handle).is_none() {
+                let image = terrain_detail_image(&source, layer, divisor);
+                if let Some(existing) = images.get_mut(&*handle) {
+                    *existing = image;
                 } else {
-                    *handle = images.add(terrain_detail_image(divisor));
+                    *handle = images.add(image);
                 }
-                *previous = divisor;
             }
-            handle.clone()
+        } else {
+            active
+                .handles
+                .push(images.add(terrain_detail_image(&source, layer, divisor)));
         }
-        None => {
-            let handle = images.add(terrain_detail_image(divisor));
-            *active = Some((divisor, handle.clone()));
-            handle
-        }
-    };
+    }
+    active.divisor = divisor;
     // New chunks also need binding when the tier has not changed. Existing
     // material parameters and vertex palette colors remain authoritative.
     for chunk in registry.chunks.values() {
+        let handle = &active.handles[chunk.stats.detail_layer];
         if materials
             .get(&chunk.material)
-            .is_some_and(|material| material.metallic_roughness_texture.as_ref() != Some(&handle))
+            .is_some_and(|material| material.metallic_roughness_texture.as_ref() != Some(handle))
             && let Some(material) = materials.get_mut(&chunk.material)
         {
             material.metallic_roughness_texture = Some(handle.clone());
@@ -7669,6 +8020,7 @@ struct TerrainChunkStats {
     height_factor: f32,
     max_height: f32,
     world_extent: Vec2,
+    detail_layer: usize,
     signature: TerrainChunkSignature,
 }
 
@@ -7693,6 +8045,7 @@ fn build_chunk_mesh(
     let mut sum_moisture = 0.0f64;
     let mut sum_slope = 0.0f64;
     let mut max_height = f32::MIN;
+    let mut biome_tiles = [0_usize; visual::SPLAT_LAYERS];
 
     for vz in 0..verts_z {
         for vx in 0..verts_x {
@@ -7713,6 +8066,9 @@ fn build_chunk_mesh(
             colors.push(color);
 
             let sample = terrain.sample_tile(global_x, global_z);
+            if vx < bounds.size.x && vz < bounds.size.y {
+                biome_tiles[visual::terrain_kind_index(sample.kind)] += 1;
+            }
             sum_moisture += sample.moisture as f64;
             let slope = compute_tile_slope(terrain, global_x, global_z);
             sum_slope += slope as f64;
@@ -7766,6 +8122,15 @@ fn build_chunk_mesh(
         bounds.size.x.max(1) as f32 * cell_size,
         bounds.size.y.max(1) as f32 * cell_size,
     );
+    // Count actual tiles, not the shared boundary vertices. Ties retain the
+    // first canonical layer, so hash-map traversal cannot change the texture.
+    let detail_layer = (0..biome_tiles.len()).fold(0, |best, layer| {
+        if biome_tiles[layer] > biome_tiles[best] {
+            layer
+        } else {
+            best
+        }
+    });
     let signature = TerrainChunkSignature::from_render_inputs(
         &positions,
         &colors,
@@ -7777,6 +8142,7 @@ fn build_chunk_mesh(
             world_extent.x,
             world_extent.y,
         ],
+        detail_layer,
     );
     let mut mesh = Mesh::new(
         PrimitiveTopology::TriangleList,
@@ -7794,6 +8160,7 @@ fn build_chunk_mesh(
         height_factor,
         max_height,
         world_extent,
+        detail_layer,
         signature,
     };
 
@@ -8564,8 +8931,8 @@ mod terrain_tests {
         let colors_b = [colors_a[1], colors_a[0]];
 
         assert_ne!(
-            TerrainChunkSignature::from_render_inputs(&positions_a, &colors_a, &[0.2]),
-            TerrainChunkSignature::from_render_inputs(&positions_b, &colors_b, &[0.2]),
+            TerrainChunkSignature::from_render_inputs(&positions_a, &colors_a, &[0.2], 0),
+            TerrainChunkSignature::from_render_inputs(&positions_b, &colors_b, &[0.2], 0),
             "equal height/color aggregates must not preserve a stale spatial mesh"
         );
     }
@@ -8575,9 +8942,14 @@ mod terrain_tests {
         let positions = [[0.0, 1.0, 0.0], [1.0, 1.0, 0.0]];
         let colors = [[0.8, 0.7, 0.2, 1.0]; 2];
         assert_ne!(
-            TerrainChunkSignature::from_render_inputs(&positions, &colors, &[0.1, 0.0]),
-            TerrainChunkSignature::from_render_inputs(&positions, &colors, &[0.9, 0.0]),
+            TerrainChunkSignature::from_render_inputs(&positions, &colors, &[0.1, 0.0], 0),
+            TerrainChunkSignature::from_render_inputs(&positions, &colors, &[0.9, 0.0], 0),
             "moisture/slope material changes must not preserve a stale PBR material"
+        );
+        assert_ne!(
+            TerrainChunkSignature::from_render_inputs(&positions, &colors, &[0.1, 0.0], 0),
+            TerrainChunkSignature::from_render_inputs(&positions, &colors, &[0.1, 0.0], 1),
+            "texture layer alone must invalidate a chunk even when other render inputs agree"
         );
     }
 
