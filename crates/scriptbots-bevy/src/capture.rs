@@ -173,7 +173,7 @@ pub struct CaptureProvenance {
     /// two trees can depict the same world and render it differently.
     ///
     /// Read it as an identifier, not a reproducibility proof. Cargo re-runs the
-    /// build script when `.git/HEAD` moves, not on every source edit, so a
+    /// build script when Git's HEAD or active ref moves, not on every source edit, so a
     /// value without `-dirty` means the tree was clean when the script last
     /// ran — not that it is clean now. `-dirty` appearing is therefore
     /// conclusive; its absence is merely the best the build can honestly claim.
@@ -305,27 +305,17 @@ impl PixelEvidenceVerdict {
 
 /// Decide whether an adapter may certify pixels (bd-2z0.14.3.10 item 4).
 ///
-/// THE DECISION, and the evidence behind it. bd-2z0.14.3.4 scope item 4 made the
-/// llvmpipe/lavapipe software lane the PR gate and asserted the unmodified
-/// pipeline would pass on it. It does not. Measured on the Linux rch workers,
-/// both live capture tests failed with the typed error "offscreen capture
-/// produced a blank or uniform RGB frame".
+/// Earlier Linux worker builds returned blank frames despite reporting full
+/// Vulkan capability. That observation established the smoke-only policy; it
+/// was not a hardware impossibility proof. Later source-bound llvmpipe captures
+/// produced nonuniform honest and material-corrupted frames with identical
+/// world identity and unchanged background regions. Therefore neither this
+/// verdict nor its message may claim that all current software captures are blank.
 ///
-/// The failure is NOT an obvious capability wall, which is what makes the
-/// verdict "smoke only" rather than "abandon the lane". llvmpipe probes with
-/// full capability — Vulkan backend, `max_texture_2d` 16384, timestamp queries
-/// available — and `OffscreenCapture` configures a session on it successfully at
-/// tier Potato. Only the READBACK comes back uniform. That is the signature of
-/// bd-x6v6, which also looked like a hardware limit and turned out to be a
-/// camera-lifecycle bug, so the lane is worth one real investigation before it
-/// is written off (the capture session takes exactly two warmup frames before
-/// reading back, an assumption never validated against a rasterizer this slow).
-///
-/// Until that investigation succeeds, a software adapter may run the capture
-/// path as a smoke check and may NOT certify pixels. Gating goldens on a lane
-/// that returns uniform frames would either fail every PR or, if the blank guard
-/// were relaxed to accommodate it, certify blank images as evidence — which is
-/// precisely the bd-2z0.14.3.8 failure this harness exists to prevent.
+/// A successful diagnostic pair does not qualify the software lane's scene,
+/// tier and repeatability coverage. Until that separate qualification is
+/// reviewed, software may run diagnostics but cannot certify pixels. The
+/// nonblank guard and comparison thresholds remain unchanged.
 ///
 /// Scope note: `Virtual` and `Unknown` adapters stay admissible, preserving the
 /// behaviour this replaced rather than quietly widening the refusal. Neither has
@@ -343,12 +333,12 @@ pub fn pixel_evidence_verdict(gpu: Option<&scriptbots_core::GpuInfo>) -> PixelEv
         ),
         Some(info) if info.class == scriptbots_core::GpuClass::Software => {
             PixelEvidenceVerdict::SmokeOnly(format!(
-                "software rasterizer ({}) returns blank or uniform frames from this \
-                 capture path, so it may run as a smoke check but must not certify \
-                 pixels. It probes fully capable and configures a session, so the \
-                 blank readback is a candidate camera-lifecycle or warmup-frame bug \
-                 (bd-x6v6 shape), not a proven hardware limit — investigate before \
-                 demoting the lane permanently (bd-2z0.14.3.10 item 4)",
+                "software rasterizer ({}) may run as a smoke check but must not certify \
+                 pixels. Earlier builds returned blank frames; nonblank diagnostic \
+                 captures now exist, but the software lane remains unqualified; \
+                 investigate its scene, tier and repeatability coverage before \
+                 promoting pixel evidence; use an admissible GPU lane for qualification \
+                 (bd-2z0.14.3.10 item 4)",
                 info.name
             ))
         }
@@ -363,9 +353,9 @@ pub fn pixel_evidence_verdict(gpu: Option<&scriptbots_core::GpuInfo>) -> PixelEv
 /// uniform RGB frame" — which reads identically in two situations that call for
 /// opposite responses:
 ///
-/// * a software rasterizer, where a uniform frame is the KNOWN behaviour of a
-///   lane that was never able to certify pixels. Nothing is broken; the run
-///   asked the wrong lane for evidence.
+/// * a software rasterizer, where the observed blank is a failed diagnostic on
+///   a lane that is not qualified to certify pixels. Software rendering can
+///   produce content; its policy status does not excuse a blank result.
 /// * a discrete or integrated GPU, where a uniform frame means the pipeline
 ///   genuinely failed. Something IS broken, and reading it as a lane limitation
 ///   would file a real rendering bug as an environment quirk.
@@ -688,8 +678,9 @@ pub struct OffscreenCaptureConfig {
     pub viewport: (u32, u32),
     /// Render settings (quality tier resolved against the probed adapter).
     pub render_settings: RenderSettings,
-    /// Alarm-test corruption: black out the sun and ambient light so the
-    /// frame provably differs from any honest capture.
+    /// Alarm-test corruption: bind a nonuniform emissive texture to terrain
+    /// materials. Background, lighting and camera inputs stay unchanged; a
+    /// difference requires the terrain render path to execute.
     pub corrupt: bool,
 }
 
@@ -799,11 +790,77 @@ struct CaptureTarget(Handle<Image>);
 struct CaptureCamera;
 
 /// Corruption flag resource (alarm tests).
-#[derive(Resource, Clone, Copy)]
-struct CaptureCorrupt(
-    // bd-tqpj: inserted at app build for the alarm-test corruption path; reading system is in-flight capture-harness work (minimal touch on active file).
-    #[allow(dead_code)] bool,
-);
+#[derive(Resource, Clone, Copy, Default)]
+struct CaptureCorrupt(bool);
+
+#[derive(Component)]
+struct CaptureMaterialBeforeCorruption {
+    emissive: LinearRgba,
+    texture: Option<Handle<Image>>,
+}
+
+fn apply_capture_corruption(
+    corrupt: Res<CaptureCorrupt>,
+    registry: Res<TerrainChunkRegistry>,
+    originals: Query<&CaptureMaterialBeforeCorruption>,
+    mut commands: Commands,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+    mut cached_texture: Local<Option<Handle<Image>>>,
+) {
+    if registry.chunks.is_empty() {
+        return;
+    }
+    let texture = corrupt.0.then(|| {
+        cached_texture
+            .get_or_insert_with(|| {
+                // Distinct emission colors avoid replacing one blank frame
+                // with another. Only rendered terrain can sample these pixels.
+                let mut image = Image::new_fill(
+                    Extent3d {
+                        width: 2,
+                        height: 2,
+                        depth_or_array_layers: 1,
+                    },
+                    TextureDimension::D2,
+                    &[
+                        255, 0, 255, 255, 0, 255, 0, 255, 0, 255, 0, 255, 255, 0, 255, 255,
+                    ],
+                    TextureFormat::Rgba8UnormSrgb,
+                    RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+                );
+                image.sampler = bevy::image::ImageSampler::nearest();
+                images.add(image)
+            })
+            .clone()
+    });
+    for chunk in registry.chunks.values() {
+        if texture.is_none() && originals.get(chunk.entity).is_err() {
+            continue;
+        }
+        let Some(material) = materials.get_mut(&chunk.material) else {
+            continue;
+        };
+        if let Some(texture) = &texture {
+            if originals.get(chunk.entity).is_err() {
+                commands
+                    .entity(chunk.entity)
+                    .insert(CaptureMaterialBeforeCorruption {
+                        emissive: material.emissive,
+                        texture: material.emissive_texture.clone(),
+                    });
+            }
+            material.emissive = LinearRgba::rgb(4.0, 4.0, 4.0);
+            material.emissive_texture = Some(texture.clone());
+        } else if let Ok(original) = originals.get(chunk.entity) {
+            material.emissive = original.emissive;
+            material.emissive_texture = original.texture.clone();
+            commands
+                .entity(chunk.entity)
+                .remove::<CaptureMaterialBeforeCorruption>();
+        }
+    }
+}
 
 /// Process-wide capture app. `bevy_render` keeps a process-global empty
 /// bind group layout, so constructing a second render App in one process
@@ -1279,6 +1336,7 @@ fn build_capture_app(config: &OffscreenCaptureConfig) -> Result<App> {
     let render_creation = initialize_capture_renderer()?;
     let mut app = App::new();
     app.insert_resource(terrain_detail_source);
+    app.insert_resource(CaptureCorrupt::default());
     app.insert_resource(AmbientLight {
         color: Color::srgb(0.45, 0.52, 0.65),
         brightness: 800.0,
@@ -1308,18 +1366,10 @@ fn build_capture_app(config: &OffscreenCaptureConfig) -> Result<App> {
             }),
     )
     .add_systems(
-        Update,
-        (
-            sync_world,
-            crate::apply_tier_to_reflection_probes,
-            crate::apply_tier_to_terrain_detail,
-        )
-            .chain(),
-    )
-    .add_systems(
         Startup,
         (setup_capture_rig, setup_capture_resources).chain(),
     );
+    add_capture_scene_systems(&mut app);
     // First session's render target: sRGB RGBA8, render attachment +
     // copy-src for the readback path. Later sessions create fresh targets
     // in configure_session and repoint this same camera.
@@ -1343,6 +1393,19 @@ fn build_capture_app(config: &OffscreenCaptureConfig) -> Result<App> {
         "process-wide offscreen capture app built"
     );
     Ok(app)
+}
+
+fn add_capture_scene_systems(app: &mut App) {
+    app.add_systems(
+        Update,
+        (
+            sync_world,
+            crate::apply_tier_to_reflection_probes,
+            crate::apply_tier_to_terrain_detail,
+            apply_capture_corruption,
+        )
+            .chain(),
+    );
 }
 
 /// Create the exact wgpu resources that Bevy will render with.
@@ -1555,32 +1618,7 @@ fn configure_session<'a>(
     config: &OffscreenCaptureConfig,
 ) -> Result<OffscreenCapture<'a>> {
     let (effective, actual_device_type) = resolve_capture_quality(app, config)?;
-    // Wipe scene content only. A blanket wipe of every entity kills
-    // plugin-owned startup entities the render path depends on (the wiped
-    // app then produces no ViewTargets and every capture reads back as the
-    // initial fill); the camera and sun are app-lifetime entities.
-    let scene_entities: Vec<Entity> = {
-        let world = app.world_mut();
-        let mut found = Vec::new();
-        let mut meshes = world.query_filtered::<Entity, With<Mesh3d>>();
-        found.extend(meshes.iter(world));
-        let mut probes = world.query_filtered::<Entity, Or<(
-            With<bevy::light::LightProbe>,
-            With<bevy::light::EnvironmentMapLight>,
-        )>>();
-        found.extend(probes.iter(world));
-        let mut readbacks =
-            world.query_filtered::<Entity, With<bevy::render::gpu_readback::Readback>>();
-        found.extend(readbacks.iter(world));
-        found
-    };
-    for entity in scene_entities {
-        let _ = app.world_mut().despawn(entity);
-    }
-    *app.world_mut().resource_mut::<SnapshotState>() = SnapshotState::default();
-    *app.world_mut().resource_mut::<AgentRegistry>() = AgentRegistry::default();
-    app.world_mut().resource_mut::<AmbientLight>().brightness =
-        if config.corrupt { 0.0 } else { 800.0 };
+    reset_capture_scene(app.world_mut());
     app.insert_resource(CaptureCorrupt(config.corrupt));
     app.insert_resource(effective.clone());
     configure_capture_camera_effects(
@@ -1596,26 +1634,10 @@ fn configure_session<'a>(
     configure_capture_ssao(app.world_mut(), effective.features.ssao);
 
     // Fresh render target; repoint the app-lifetime capture camera and
-    // retune the sun for tier/corrupt without respawning either.
+    // retune the sun for the tier without respawning either.
     let target = add_target_image(app, config.viewport);
     app.insert_resource(CaptureTarget(target.clone()));
-    {
-        let world = app.world_mut();
-        let mut cameras = world.query_filtered::<&mut Camera, With<CaptureCamera>>();
-        for mut camera in cameras.iter_mut(world) {
-            camera.target = RenderTarget::Image(target.clone().into());
-            camera.clear_color = ClearColorConfig::Custom(if config.corrupt {
-                Color::srgb(0.9, 0.0, 0.9)
-            } else {
-                Color::srgb(0.03, 0.05, 0.09)
-            });
-        }
-        let mut lights = world.query::<&mut DirectionalLight>();
-        for mut light in lights.iter_mut(world) {
-            light.illuminance = if config.corrupt { 0.0 } else { 9000.0 };
-            light.shadows_enabled = effective.features.shadows;
-        }
-    }
+    configure_capture_rig(app.world_mut(), &target, effective.features.shadows);
     // Refresh the mesh/registry/probe resources for the new scene.
     app.world_mut()
         .run_system_once(setup_capture_resources)
@@ -1649,6 +1671,44 @@ fn configure_session<'a>(
         corrupt: config.corrupt,
         next_snapshot_revision: 1,
     })
+}
+
+fn reset_capture_scene(world: &mut World) {
+    // Keep the camera, sun and plugin-owned entities. Removing those would
+    // prevent ViewTargets from being prepared and return initial-fill pixels.
+    let scene_entities: Vec<Entity> = {
+        let mut found = Vec::new();
+        let mut meshes = world.query_filtered::<Entity, With<Mesh3d>>();
+        found.extend(meshes.iter(world));
+        let mut probes = world.query_filtered::<Entity, Or<(
+            With<bevy::light::LightProbe>,
+            With<bevy::light::EnvironmentMapLight>,
+        )>>();
+        found.extend(probes.iter(world));
+        let mut readbacks =
+            world.query_filtered::<Entity, With<bevy::render::gpu_readback::Readback>>();
+        found.extend(readbacks.iter(world));
+        found
+    };
+    for entity in scene_entities {
+        let _ = world.despawn(entity);
+    }
+    *world.resource_mut::<SnapshotState>() = SnapshotState::default();
+    *world.resource_mut::<AgentRegistry>() = AgentRegistry::default();
+}
+
+fn configure_capture_rig(world: &mut World, target: &Handle<Image>, shadows: bool) {
+    world.resource_mut::<AmbientLight>().brightness = 800.0;
+    let mut cameras = world.query_filtered::<&mut Camera, With<CaptureCamera>>();
+    for mut camera in cameras.iter_mut(world) {
+        camera.target = RenderTarget::Image(target.clone().into());
+        camera.clear_color = ClearColorConfig::Custom(Color::srgb(0.03, 0.05, 0.09));
+    }
+    let mut lights = world.query::<&mut DirectionalLight>();
+    for mut light in lights.iter_mut(world) {
+        light.illuminance = 9000.0;
+        light.shadows_enabled = shadows;
+    }
 }
 
 /// Reset the persistent capture camera's tier fog between sessions.
@@ -1775,10 +1835,291 @@ fn setup_capture_resources(
 mod tests {
     use super::*;
 
+    fn corruption_app(corrupt: bool) -> App {
+        let mut app = App::new();
+        app.insert_resource(crate::TerrainDetailSource::bake().unwrap());
+        let world = WorldState::new(scriptbots_core::ScriptBotsConfig {
+            world_width: 2304,
+            world_height: 128,
+            food_cell_size: 32,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            persistence_interval: 0,
+            rng_seed: Some(42),
+            ..default()
+        })
+        .unwrap();
+        app.insert_resource(SnapshotState {
+            latest: WorldSnapshot::from_world(&world),
+            ..default()
+        });
+        app.insert_resource(AgentRegistry::default());
+        app.insert_resource(AccessibilityState::new());
+        app.insert_resource(Assets::<Mesh>::default());
+        app.insert_resource(Assets::<Image>::default());
+        app.insert_resource(Assets::<StandardMaterial>::default());
+        app.insert_resource(AmbientLight::default());
+        app.insert_resource(CaptureTarget(Handle::default()));
+        app.insert_resource(CaptureCorrupt(corrupt));
+        app.add_systems(
+            Startup,
+            (setup_capture_rig, setup_capture_resources).chain(),
+        );
+        add_capture_scene_systems(&mut app);
+        let effective =
+            crate::resolve_effective_render_settings_for_gpu(&RenderSettings::default(), None);
+        warmup_capture_app(&mut app, effective);
+        configure_capture_rig(app.world_mut(), &Handle::default(), false);
+        app
+    }
+
+    #[test]
+    fn capture_corruption_keeps_the_rig_identical() {
+        let mut honest = corruption_app(false);
+        let mut corrupt = corruption_app(true);
+        let rig = |app: &mut App| {
+            let world = app.world_mut();
+            let ambient = world.resource::<AmbientLight>().brightness;
+            let mut cameras = world.query_filtered::<
+                (&Camera, &Transform, &bevy::render::view::ColorGrading),
+                With<CaptureCamera>,
+            >();
+            let (camera, transform, grading) = cameras.single(world).unwrap();
+            let ClearColorConfig::Custom(background) = camera.clear_color else {
+                panic!("capture camera must declare its background");
+            };
+            let camera_inputs = (background, *transform, format!("{grading:?}"));
+            let mut lights = world.query::<&DirectionalLight>();
+            let light = lights.single(world).unwrap();
+            (
+                ambient,
+                camera_inputs,
+                light.illuminance,
+                light.shadows_enabled,
+            )
+        };
+        assert_eq!(
+            rig(&mut corrupt),
+            rig(&mut honest),
+            "the alarm must not fire from changed background, lights, exposure or camera"
+        );
+    }
+
+    #[test]
+    fn capture_corruption_binds_a_nonuniform_texture_to_real_terrain_materials() {
+        let honest = corruption_app(false);
+        let corrupt = corruption_app(true);
+        let honest_materials = honest.world().resource::<Assets<StandardMaterial>>();
+        let materials = corrupt.world().resource::<Assets<StandardMaterial>>();
+        let images = corrupt.world().resource::<Assets<Image>>();
+        let chunks = corrupt.world().resource::<TerrainChunkRegistry>();
+        assert!(
+            !chunks.chunks.is_empty(),
+            "the real scene must contain terrain"
+        );
+        for (key, chunk) in &chunks.chunks {
+            let honest_chunk = &honest.world().resource::<TerrainChunkRegistry>().chunks[key];
+            let original = honest_materials.get(&honest_chunk.material).unwrap();
+            assert!(original.emissive_texture.is_none());
+            let material = materials.get(&chunk.material).unwrap();
+            let texture = material
+                .emissive_texture
+                .as_ref()
+                .expect("corruption must reach the rendered material");
+            let image = images.get(texture).expect("bound corruption image exists");
+            let colors: std::collections::HashSet<_> = image
+                .data
+                .as_ref()
+                .unwrap()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .collect();
+            assert!(
+                colors.len() > 1,
+                "uniform blackout is not a structural alarm"
+            );
+            assert_ne!(material.emissive, original.emissive);
+            assert_eq!(material.base_color, original.base_color);
+            let original_images = honest.world().resource::<Assets<Image>>();
+            let original_detail = original_images
+                .get(original.metallic_roughness_texture.as_ref().unwrap())
+                .unwrap();
+            let detail = images
+                .get(material.metallic_roughness_texture.as_ref().unwrap())
+                .unwrap();
+            assert_eq!(detail.data, original_detail.data);
+        }
+    }
+
+    #[test]
+    fn capture_corruption_reuses_one_texture_and_restores_original_emission() {
+        let mut app = corruption_app(false);
+        let chunks = app.world().resource::<TerrainChunkRegistry>();
+        assert!(chunks.chunks.len() > 1, "exercise shared texture bindings");
+        let handles: Vec<_> = chunks
+            .chunks
+            .values()
+            .map(|chunk| chunk.material.clone())
+            .collect();
+        // Retain a genuine existing image as a preexisting emission texture,
+        // so restoration must preserve Some(handle) as well as None.
+        {
+            let mut materials = app.world_mut().resource_mut::<Assets<StandardMaterial>>();
+            let material = materials.get_mut(&handles[0]).unwrap();
+            material.emissive_texture = material.metallic_roughness_texture.clone();
+        }
+        let originals: Vec<_> = handles
+            .iter()
+            .map(|handle| {
+                let material = app
+                    .world()
+                    .resource::<Assets<StandardMaterial>>()
+                    .get(handle)
+                    .unwrap();
+                (material.emissive, material.emissive_texture.clone())
+            })
+            .collect();
+        let image_count = app.world().resource::<Assets<Image>>().len();
+        app.insert_resource(CaptureCorrupt(true));
+        app.update();
+        let texture = app
+            .world()
+            .resource::<Assets<StandardMaterial>>()
+            .get(&handles[0])
+            .unwrap()
+            .emissive_texture
+            .clone()
+            .unwrap();
+        for _ in 0..3 {
+            app.update();
+            assert_eq!(
+                app.world().resource::<Assets<Image>>().len(),
+                image_count + 1
+            );
+            for handle in &handles {
+                let material = app
+                    .world()
+                    .resource::<Assets<StandardMaterial>>()
+                    .get(handle)
+                    .unwrap();
+                assert_eq!(material.emissive_texture.as_ref(), Some(&texture));
+            }
+        }
+        app.insert_resource(CaptureCorrupt(false));
+        app.update();
+        for (handle, original) in handles.iter().zip(originals) {
+            let material = app
+                .world()
+                .resource::<Assets<StandardMaterial>>()
+                .get(handle)
+                .unwrap();
+            assert_eq!(
+                (material.emissive, material.emissive_texture.clone()),
+                original
+            );
+        }
+        let world = app.world_mut();
+        assert_eq!(
+            world
+                .query::<&CaptureMaterialBeforeCorruption>()
+                .iter(world)
+                .count(),
+            0
+        );
+        app.insert_resource(CaptureCorrupt(true));
+        app.update();
+        assert_eq!(
+            app.world().resource::<Assets<Image>>().len(),
+            image_count + 1
+        );
+        assert_eq!(
+            app.world()
+                .resource::<Assets<StandardMaterial>>()
+                .get(&handles[0])
+                .unwrap()
+                .emissive_texture
+                .as_ref(),
+            Some(&texture)
+        );
+    }
+
+    #[test]
+    fn capture_corruption_does_not_leak_into_a_replacement_scene() {
+        let mut app = corruption_app(true);
+        let snapshot = app
+            .world()
+            .resource::<SnapshotState>()
+            .latest
+            .clone()
+            .unwrap();
+        let old_chunk = app
+            .world()
+            .resource::<TerrainChunkRegistry>()
+            .chunks
+            .values()
+            .next()
+            .unwrap();
+        let old_entity = old_chunk.entity;
+        let cached = app
+            .world()
+            .resource::<Assets<StandardMaterial>>()
+            .get(&old_chunk.material)
+            .unwrap()
+            .emissive_texture
+            .clone()
+            .unwrap();
+        reset_capture_scene(app.world_mut());
+        assert!(app.world().get_entity(old_entity).is_err());
+        app.world_mut()
+            .run_system_once(setup_capture_resources)
+            .unwrap();
+        app.insert_resource(CaptureCorrupt(false));
+        app.world_mut().resource_mut::<SnapshotState>().latest = Some(snapshot);
+        app.update();
+        for chunk in app
+            .world()
+            .resource::<TerrainChunkRegistry>()
+            .chunks
+            .values()
+        {
+            assert_ne!(chunk.entity, old_entity);
+            let material = app
+                .world()
+                .resource::<Assets<StandardMaterial>>()
+                .get(&chunk.material)
+                .unwrap();
+            assert!(material.emissive_texture.is_none());
+            assert!(
+                app.world()
+                    .get::<CaptureMaterialBeforeCorruption>(chunk.entity)
+                    .is_none()
+            );
+        }
+        let count = app.world().resource::<Assets<Image>>().len();
+        app.insert_resource(CaptureCorrupt(true));
+        app.update();
+        assert_eq!(app.world().resource::<Assets<Image>>().len(), count);
+        for chunk in app
+            .world()
+            .resource::<TerrainChunkRegistry>()
+            .chunks
+            .values()
+        {
+            let material = app
+                .world()
+                .resource::<Assets<StandardMaterial>>()
+                .get(&chunk.material)
+                .unwrap();
+            assert_eq!(material.emissive_texture.as_ref(), Some(&cached));
+        }
+    }
+
     #[test]
     fn first_capture_warmup_initializes_tier_before_real_consumers_run() {
         let mut app = App::new();
         app.insert_resource(crate::TerrainDetailSource::bake().unwrap());
+        app.insert_resource(CaptureCorrupt::default());
         app.insert_resource(SnapshotState::default());
         app.insert_resource(AgentRegistry::default());
         app.insert_resource(AccessibilityState::new());
@@ -1786,15 +2127,7 @@ mod tests {
         app.insert_resource(Assets::<Image>::default());
         app.insert_resource(Assets::<StandardMaterial>::default());
         app.add_systems(Startup, setup_capture_resources);
-        app.add_systems(
-            Update,
-            (
-                sync_world,
-                crate::apply_tier_to_reflection_probes,
-                crate::apply_tier_to_terrain_detail,
-            )
-                .chain(),
-        );
+        add_capture_scene_systems(&mut app);
         assert!(
             !app.world()
                 .contains_resource::<crate::EffectiveRenderSettings>()
@@ -2188,17 +2521,10 @@ mod tests {
 
     /// Whether this host can produce trustworthy live GPU evidence.
     ///
-    /// A software rasterizer (llvmpipe/lavapipe/warp) is not GPU-accelerated in
-    /// any meaningful sense, and on this project's CI workers it returns blank
-    /// frames. Before bd-2z0.14.3.8 those blanks slipped past the production
-    /// blank guard and the live tests only failed when the honest frame
-    /// happened to be uniform enough for the ALARM test's stricter threshold to
-    /// notice — which read as flakiness and was really a dead pipeline being
-    /// admitted as evidence.
-    ///
-    /// Skipping here is the honest outcome: it says this host cannot verify
-    /// this, rather than passing on blank frames or failing on a defect that
-    /// is not in the code under test. Real GPU hosts still run these.
+    /// Software's historical blank captures established a smoke-only policy.
+    /// Newer nonblank diagnostics do not automatically qualify that lane. These
+    /// two tests require an admissible pixel lane, so their explicit early return
+    /// must be reported separately from tests that actually exercise rendering.
     fn live_gpu_evidence_available(label: &str) -> bool {
         // One authority for "may this lane certify pixels", shared with any
         // non-test consumer, rather than a second copy of the rule here.
@@ -2284,8 +2610,8 @@ mod tests {
         }
     }
 
-    /// The C4 alarm contract: a deliberately corrupted render (blackout sun +
-    /// crushed exposure) MUST fail the golden comparison against the honest
+    /// The C4 alarm contract: a deliberately corrupted terrain material
+    /// MUST fail the golden comparison against the honest
     /// capture — if it passes, the harness cannot see a broken pipeline.
     #[test]
     fn corrupted_capture_fails_comparison_against_honest_frame() {
@@ -2592,9 +2918,8 @@ mod tests {
     /// capture path but must never certify pixels.
     ///
     /// Full reported capability must NOT buy admissibility. llvmpipe advertises a
-    /// Vulkan backend, 16384 max texture size and timestamp queries, and still
-    /// returns uniform frames from this path — so a verdict keyed on capability
-    /// flags rather than device class would wave it straight through.
+    /// Vulkan backend, 16384 max texture size and timestamp queries. Capability
+    /// flags and successful diagnostic frames do not replace lane qualification.
     #[test]
     fn a_software_rasterizer_may_smoke_test_but_never_certify_pixels() {
         let verdict = pixel_evidence_verdict(Some(&gpu_info(

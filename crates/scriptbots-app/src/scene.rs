@@ -851,7 +851,7 @@ impl Default for BevyOffscreenDriver {
     }
 }
 
-/// Env flag enabling the alarm-test corruption mode (black frame).
+/// Env flag enabling the alarm-test terrain-material corruption mode.
 #[cfg(feature = "bevy_render")]
 const CAPTURE_CORRUPT_ENV: &str = "SCRIPTBOTS_CAPTURE_CORRUPT";
 

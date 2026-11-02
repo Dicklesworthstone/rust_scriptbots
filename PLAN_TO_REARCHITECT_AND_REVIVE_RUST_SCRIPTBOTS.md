@@ -2,6 +2,96 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Capture corruption depth (2026-11-02):** [Verified local increment — GentleDuck;
+original `bd-2z0.14.3.10` remains open for hardware qualification; acceptance retained]
+
+The operator-requested TODO gates this original capture remainder and retires
+as an active checklist after verified delivery. The observed defect is an
+unread corruption resource plus clear-color/light changes that can trigger the
+alarm without exercising terrain geometry or materials.
+
+- [x] Recheck ready work, original comments, startup/session boundaries and the
+  actual material/shader reader; retain the existing software-lane policy.
+- [x] Add a failing real ECS/material-path regression before production edits.
+- [x] Wire the existing corruption resource into terrain materials after scene
+  synchronization, with a cached nonuniform emissive texture and no background,
+  light, exposure or camera changes between honest and corrupt sessions.
+- [x] Verify positive material changes, unchanged honest frames, cached texture
+  reuse, scene replacement, corruption disablement and unchanged rig inputs.
+- [x] Attempt the actual capture path as a diagnostic on the available adapter;
+  retain images/provenance and distinguish smoke from admissible pixel evidence.
+- [x] Run relevant capture/terrain/authority tests, workspace all-target check,
+  strict Clippy, formatting and scoped static review through DSR.
+- [x] Integrate upstream's `39a8532a` snapshot-producer repair for the pulled
+  GPUI compile failure; retain its live-command semantics and verify opposite
+  realized/commanded states through the real host snapshot plus its threshold.
+- [x] Repair the observed stale source stamp: resolve real Git HEAD/active-ref
+  paths for Cargo reruns, then verify a normal same-worktree HEAD transition
+  without editing the build script, touching sources or cleaning the cache.
+- [x] Re-execute committed source in a fresh solo pass, record the original
+  acceptance disposition and remaining host limitations, and publish reviewed
+  source/tracker records without closing an unmet positive pixel requirement.
+- [ ] Qualify material-alarm pixels and repeatability on an admissible GPU lane;
+  retain this unmet original acceptance on `bd-2z0.14.3.10`.
+
+Candidate DSR `capture_corruption_validated/20261102T171619-1997823` passes
+all ten checks with unchanged source during execution. Capture's reported 42
+passes include two existing software-lane early returns: 40 tests actually
+exercise capture behavior, including four new material/rig cases. Terrain
+reports 30, authority guards seven, the three GPUI projections one each, and
+core visual capture two. Filters overlap; no unique-test total is inferred.
+Static review exits zero with no critical findings; its thousands of warnings
+across five large files are not claimed resolved.
+
+Clean source `b868d60ec4a55a769113ab144b2b39204d33361f` passes all 13 DSR
+checks, including the feature-enabled scene CLI build, at
+`/data/tmp/scriptbots-capture-corruption-IMLQ5mZ2/quality/capture_corruption_final/20261102T172443-2113156/receipt.json`.
+The actual Vulkan/llvmpipe driver produces two nonuniform 1280×720 frames:
+133,690 of 921,600 RGB pixels differ (14.5063%); all four sampled 128×72 corner
+regions remain identical. Both artifacts bind that exact clean source, lock
+digest `d4b358d33e596b89`, seed 424242, tick zero and world digest
+`a9ef0ee7e1f0ce00`. Images and provenance are retained under the existing
+evidence directory's `honest/` and `corrupt/` directories. CLI exits are both
+nonzero for missing goldens; no golden was generated. That failed smoke receipt
+is not recolored green. The software policy remains smoke-only; its old
+unqualified claim that current captures are blank now names the historical
+observation instead. Hardware pixel acceptance remains open.
+
+The next capture pair, built at `d37ca100`, exposed a separate metadata bug:
+its provenance still named `b868d60e`. The explicit artifact readback assertion
+fails and is retained under `capture_provenance_before`; the 13-check source
+receipt alone cannot qualify that stale artifact identity. `build.rs` watched
+`.git/HEAD` as if `.git` were always a directory and did not watch an advancing
+symbolic branch ref. Source `c53b78160e0c08ecc083943cecab31b14bdc086e` resolves
+Git's actual metadata paths and passes all 13 checks in DSR
+`capture_provenance_fixed/20261102T182016-2197725`.
+
+The same clean worktree then advanced to metadata-only `fb715c8eba85`, with
+Rust sources, manifests, lockfile and build configuration unchanged. Ordinary
+Cargo execution, without a cache clean, file touch or build-script edit,
+rebuilt the CLI and its actual saved provenance names the new full HEAD.
+DSR `capture_provenance_head_transition/20261102T183249-2217642` retains all
+six check logs: source/config equality, build and artifact-identity checks
+pass; the CLI still exits one for its missing golden, leaving the overall
+receipt failed. This qualifies incremental linked-worktree HEAD tracking,
+not a hardware pixel comparison or an authoritative dirty-source digest.
+
+The operator selected `trj` for hardware qualification. A strict read-only
+SSH probe fails name resolution here; no matching SSH alias or Tailscale peer
+is configured. Its SSH address/user or DSR host configuration was requested.
+The original Bead retains the unmet hardware requirement; no duplicate task,
+golden promotion or software-admission change substitutes for it.
+
+Concurrent source was retained through `302d5657`. Required gates first exposed
+the missing `boost_engaged` producer, fixed upstream at `39a8532a`. A real host
+regression rejects substituting the realized agent column for the command.
+Core's new fourth independent flag triggers Clippy's generic boolean-count
+heuristic; one item-scoped `expect` names the transport rationale, supported by
+simultaneous-command/event and threshold tests. This admits that one transport
+struct while retaining every workspace lint and strict-warning invocation;
+it does not alter scientific checks. The required formatter also wrapped one
+upstream HUD-capture expression, without changing its assertion or behavior.
+
 **Biome atlas consumer (2026-11-02):** [Verified and Closed — GentleDuck;
 original `bd-hpt6`; original decision unchanged]
 

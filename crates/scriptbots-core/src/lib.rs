@@ -3672,6 +3672,10 @@ pub struct DynamicAgentSnapshot {
 /// need it even when nothing is drawing. See `RenderSnapshot::agent_selection`.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "visual transport preserves independent boost/spike commands and attacker/victim events; all four can coexist"
+)]
 pub struct DynamicAgentVisuals {
     /// Commanded left wheel effort, raw actuator value.
     pub wheel_left: f32,
@@ -56132,6 +56136,21 @@ mod tests {
         );
     }
 
+    /// Independent command and event facts must not collapse into one mode.
+    #[test]
+    fn agent_visual_capture_preserves_independent_concurrent_flags() {
+        let mut runtime = AgentRuntime::default();
+        runtime.outputs[OutputChannel::Boost.index()] = 1.0;
+        runtime.outputs[OutputChannel::SpikeTarget.index()] = 1.0;
+        runtime.combat.spike_attacker = true;
+        runtime.spiked = true;
+        let visuals = DynamicAgentVisuals::capture(&runtime);
+        assert!(visuals.boost_engaged);
+        assert!(visuals.spike_extended);
+        assert!(visuals.spike_struck);
+        assert!(visuals.spike_victim);
+    }
+
     /// Visual capture reads the runtime row, not the dense columns.
     ///
     /// Every field asserted here is one a drawing frontend reaches through
@@ -56146,6 +56165,7 @@ mod tests {
         runtime.outputs[OutputChannel::WheelLeft.index()] = 0.25;
         runtime.outputs[OutputChannel::WheelRight.index()] = 0.75;
         runtime.outputs[OutputChannel::SoundLevel.index()] = 0.4;
+        runtime.outputs[OutputChannel::Boost.index()] = 0.9;
         runtime.outputs[OutputChannel::SpikeTarget.index()] = 0.9;
         runtime.eye_direction = [0.1, 0.2, 0.3, 0.4];
         runtime.eye_fov = [1.1, 1.2, 1.3, 1.4];
@@ -56171,6 +56191,10 @@ mod tests {
         assert!((visuals.wheel_left - 0.25).abs() < f32::EPSILON);
         assert!((visuals.wheel_right - 0.75).abs() < f32::EPSILON);
         assert!((visuals.sound_level - 0.4).abs() < f32::EPSILON);
+        assert!(
+            visuals.boost_engaged,
+            "the current boost command must survive capture"
+        );
         assert!((visuals.sound_output - 0.55).abs() < f32::EPSILON);
         assert!((visuals.sound_multiplier - 1.25).abs() < f32::EPSILON);
         assert!((visuals.temperature_preference - 0.6).abs() < f32::EPSILON);
@@ -56212,6 +56236,11 @@ mod tests {
         // The commanded channel, not the realized column: a brain commanding
         // nothing must not inherit the previous tick's extension.
         runtime.outputs[OutputChannel::SpikeTarget.index()] = 0.5;
+        runtime.outputs[OutputChannel::Boost.index()] = BOOST_THRESHOLD;
+        assert!(
+            !DynamicAgentVisuals::capture(&runtime).boost_engaged,
+            "boost at the declared engagement threshold remains disengaged"
+        );
         assert!(
             !DynamicAgentVisuals::capture(&runtime).spike_extended,
             "the spike threshold is strictly greater than 0.5"
