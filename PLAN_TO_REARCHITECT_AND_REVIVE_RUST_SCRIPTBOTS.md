@@ -2,8 +2,8 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
-**Persistence status on Diagnostics (2026-11-01):** [Currently In Progress —
-GentleDuck, `bd-bacf.1`; original UX/widget tasks remain unchanged]
+**Persistence status on Diagnostics (2026-11-01):** [Completed 2026-11-02 —
+GentleDuck, `bd-bacf.1`; fresh solo verification; original UX/widget tasks unchanged]
 
 - [x] Recheck ready tasks and consumers; identify the missing science-screen
   analytics refresh and batch IDs mislabeled as ticks/revisions.
@@ -24,9 +24,21 @@ GentleDuck, `bd-bacf.1`; original UX/widget tasks remain unchanged]
 - [x] Run widget (13), shell (28), Diagnostics (5), full terminal E2E (5),
   formatting and targeted static review through DSR. Diagnostics includes all
   five receipt-state full-frame fixtures and their existing corruption controls.
-- [ ] Complete default workspace check and strict Clippy through DSR/RCH.
-- [ ] Repeat the positive journey at a clean committed source; review all
+- [x] Complete default workspace check and strict Clippy through DSR. RCH's
+  later admission refusal is infrastructure; final checks use the pinned clean
+  source locally with two jobs and bounded CPU allocation.
+- [x] Repeat the positive journey at a clean committed source; review all
   original criteria in a fresh solo pass, update Beads and publish reviewed work.
+
+Published source: `fe68e9365ecca94cb4f75dabdfafeac5baa329d3`. Both clean-source
+DSR profiles have typed `passed` receipts with unchanged source before/after:
+`storage_status_clean/20261102T001550-3311418` (format and all five terminal E2E
+tests) and `storage_status_workspace_local/20261102T002835-3329025` (workspace
+all-target check and strict Clippy). The actual file PTY showed batch 1/1/1 after
+tick 1, matching the finished database. Other retained selectors: 12 science
+screen tests, 32 rendering tests and the fault-preservation test. Selectors
+overlap; their counts are not additive. No independent review or full workspace
+test-suite claim. The moving-tree diagnostic run is not final acceptance.
 
 Queue consumer/provenance: the user explicitly requested a granular TODO; the
 implementing agent and user consume it until this bug's handoff, when it retires
