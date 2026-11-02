@@ -4677,6 +4677,14 @@ pub struct SimulationView {
     brain_client_id: BrainInspectionClientId,
     brain_request_revision: BrainInspectionRevision,
     brain_inspection_cache: Option<BrainInspectorCapture>,
+    /// Last coherent focused-agent sample for the World card. The source tick
+    /// remains visible when the host advances before the next inspection.
+    world_hud_detail_cache: Option<(
+        scriptbots_runtime::HostSessionId,
+        AgentUid,
+        u64,
+        AgentInspectorDetails,
+    )>,
     /// Narrative rail visibility (bd-16g.2.4); toggled from the rail header.
     rail_visible: bool,
     /// Selected event index into the retained narrative, plus the selected event's
@@ -4804,6 +4812,7 @@ impl SimulationView {
             ),
             brain_request_revision: BrainInspectionRevision::new(0),
             brain_inspection_cache: None,
+            world_hud_detail_cache: None,
             rail_visible: true,
             rail_selection: None,
             rail_selection_aged_out: false,
@@ -6797,6 +6806,29 @@ impl SimulationView {
         };
 
         self.brain_inspection_cache = next_brain_inspection_cache;
+        if self.minimal_canvas_mode && matches!(self.playback.mode(), PlaybackMode::Live) {
+            let focused = snapshot
+                .inspector
+                .selected
+                .iter()
+                .find(|entry| entry.is_focused);
+            let uid = focused.map(|entry| entry.uid);
+            if self.world_hud_detail_cache.as_ref().is_some_and(|entry| {
+                entry.0 != published.session_id || Some(entry.1) != uid || entry.2 > snapshot.tick
+            }) {
+                self.world_hud_detail_cache = None;
+            }
+            if let (Some(entry), Some(detail)) = (focused, snapshot.inspector.focused.as_ref())
+                && entry.agent_id == detail.agent_id
+            {
+                self.world_hud_detail_cache = Some((
+                    published.session_id,
+                    entry.uid,
+                    snapshot.tick,
+                    detail.clone(),
+                ));
+            }
+        }
         if brain_request_issued && let Some((_, revision)) = brain_request {
             self.brain_request_revision = revision;
         }
@@ -9033,11 +9065,21 @@ impl SimulationView {
             .iter()
             .find(|entry| entry.is_focused && Some(entry.agent_id) == focused_agent)
         {
-            canvas_stack = canvas_stack.child(self.render_world_agent_hud(
-                selected,
-                snapshot.inspector.focused.as_ref(),
-                cx,
-            ));
+            let current = snapshot
+                .inspector
+                .focused
+                .as_ref()
+                .filter(|detail| detail.agent_id == selected.agent_id)
+                .map(|detail| (snapshot.tick, detail));
+            let cached = self
+                .world_hud_detail_cache
+                .as_ref()
+                .and_then(|(_, uid, tick, detail)| {
+                    (matches!(self.playback.mode(), PlaybackMode::Live) && *uid == selected.uid)
+                        .then_some((*tick, detail))
+                });
+            canvas_stack =
+                canvas_stack.child(self.render_world_agent_hud(selected, current.or(cached), cx));
         }
 
         // The World owns the flexible viewport; the compact focus card floats
@@ -9084,9 +9126,9 @@ impl SimulationView {
     fn render_world_agent_hud(
         &self,
         selected: &AgentListEntry,
-        detail: Option<&AgentInspectorDetails>,
+        detail: Option<(u64, &AgentInspectorDetails)>,
         cx: &mut Context<Self>,
-    ) -> Div {
+    ) -> impl IntoElement {
         let label =
             |text: &'static str| div().text_xs().text_color(chrome::text_muted()).child(text);
         let metric = |name: &'static str, value: String| {
@@ -9105,11 +9147,16 @@ impl SimulationView {
         };
 
         let mut hud = div()
+            .id("world-creature-hud")
             .absolute()
             .top(px(12.0))
+            .bottom(px(12.0))
             .left(px(12.0))
             .right(px(12.0))
-            .max_w(px(300.0))
+            .max_w(px(380.0))
+            .max_h(px(680.0))
+            .overflow_y_scroll()
+            .scrollbar_width(px(5.0))
             .rounded_lg()
             .border_1()
             .border_color(rgb(0x42645f))
@@ -9156,10 +9203,18 @@ impl SimulationView {
                     )),
             );
 
-        if let Some(detail) = detail.filter(|detail| detail.agent_id == selected.agent_id) {
+        if let Some((source_tick, detail)) =
+            detail.filter(|(_, detail)| detail.agent_id == selected.agent_id)
+        {
             hud = hud
                 .child(div().h(px(1.0)).w_full().bg(chrome::border()))
                 .child(label("BRAIN & BEHAVIOR"))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(chrome::text_muted())
+                        .child(format!("Sampled at tick {source_tick}")),
+                )
                 .child(
                     div()
                         .text_xs()
@@ -9217,35 +9272,60 @@ impl SimulationView {
             } else {
                 hud = hud.child(label("Brain unbound · outputs mirror sensors"));
             }
-            let mut sensed: Vec<_> = SENSOR_LAYOUT
-                .iter()
-                .filter_map(|channel| {
-                    detail
-                        .sensors
-                        .get(channel.index)
-                        .copied()
-                        .filter(|value| value.is_finite())
-                        .map(|value| (channel.short, value))
-                })
-                .collect();
-            sensed.sort_by(|left, right| right.1.abs().total_cmp(&left.1.abs()));
-            if !sensed.is_empty() {
-                let strongest = sensed
-                    .iter()
-                    .take(2)
-                    .map(|(name, value)| format!("{name} {value:.2}"))
-                    .collect::<Vec<_>>()
-                    .join("  ·  ");
-                hud = hud.child(
+            let signal = |name: &str, value: Option<f32>| {
+                let value = value
+                    .filter(|value| value.is_finite())
+                    .map_or_else(|| "—".to_owned(), |value| format!("{value:.2}"));
+                div()
+                    .w(px(164.0))
+                    .flex()
+                    .justify_between()
+                    .gap_1()
+                    .text_xs()
+                    .child(
+                        div()
+                            .text_color(chrome::text_muted())
+                            .truncate()
+                            .child(name.to_owned()),
+                    )
+                    .child(div().text_color(chrome::text_primary()).child(value))
+            };
+            hud = hud
+                .child(div().h(px(1.0)).w_full().bg(chrome::border()))
+                .child(label("SENSORS · ALL CHANNELS"))
+                .child(
                     div()
-                        .text_xs()
-                        .text_color(chrome::text_secondary())
-                        .truncate()
-                        .child(format!("Top senses: {strongest}")),
+                        .flex()
+                        .flex_wrap()
+                        .gap_1()
+                        .children(SENSOR_LAYOUT.iter().map(|channel| {
+                            signal(channel.name, detail.sensors.get(channel.index).copied())
+                        })),
+                )
+                .child(div().h(px(1.0)).w_full().bg(chrome::border()))
+                .child(label("BRAIN OUTPUTS · ALL CHANNELS"))
+                .child(div().flex().flex_wrap().gap_1().children(
+                    OutputChannel::ALL.into_iter().map(|channel| {
+                        signal(channel.name(), detail.outputs.get(channel.index()).copied())
+                    }),
+                ))
+                .child(label("EYE DIRECTION / FIELD OF VIEW · RADIANS"))
+                .child(
+                    div().flex().flex_wrap().gap_1().children(
+                        detail
+                            .eye_directions
+                            .iter()
+                            .zip(detail.eye_fovs)
+                            .enumerate()
+                            .map(|(eye, (direction, fov))| {
+                                div()
+                                    .w(px(164.0))
+                                    .text_xs()
+                                    .text_color(chrome::text_secondary())
+                                    .child(format!("Eye {}  {direction:.2} / {fov:.2}", eye + 1))
+                            }),
+                    ),
                 );
-            } else {
-                hud = hud.child(label("Sensor values unavailable"));
-            }
         } else {
             // A matching inspection can be briefly unavailable while the host
             // advances. Keep the card's geometry stable and never show stale
@@ -17923,6 +18003,8 @@ struct PerfStats {
     interval_ms: f32,
     intervals: VecDeque<f32>,
     detail: RenderDetail,
+    pending_detail: Option<RenderDetail>,
+    pending_detail_frames: u16,
     samples: VecDeque<f32>,
     capacity: usize,
 }
@@ -17936,6 +18018,8 @@ impl PerfStats {
             interval_ms: 0.0,
             intervals: VecDeque::with_capacity(cap.min(30)),
             detail: RenderDetail::Full,
+            pending_detail: None,
+            pending_detail_frames: 0,
             samples: VecDeque::with_capacity(cap),
             capacity: cap,
         }
@@ -17964,9 +18048,29 @@ impl PerfStats {
             self.samples.pop_front();
         }
         let mut snapshot = self.snapshot(elapsed_ms);
-        self.detail = self.detail.for_fps(snapshot.fps);
+        self.observe_detail(self.detail.for_fps(snapshot.fps));
         snapshot.detail = self.detail;
         snapshot
+    }
+
+    fn observe_detail(&mut self, desired: RenderDetail) {
+        const STABLE_FRAMES: u16 = 90;
+        if desired == self.detail {
+            self.pending_detail = None;
+            self.pending_detail_frames = 0;
+        } else {
+            if self.pending_detail == Some(desired) {
+                self.pending_detail_frames = self.pending_detail_frames.saturating_add(1);
+            } else {
+                self.pending_detail = Some(desired);
+                self.pending_detail_frames = 1;
+            }
+            if self.pending_detail_frames >= STABLE_FRAMES {
+                self.detail = desired;
+                self.pending_detail = None;
+                self.pending_detail_frames = 0;
+            }
+        }
     }
 
     fn snapshot(&self, latest: f32) -> PerfSnapshot {
@@ -18057,6 +18161,22 @@ mod perf_presentation_tests {
         assert_eq!(detail.for_fps(35.0), RenderDetail::Full);
         assert_eq!(detail.for_fps(20.0), RenderDetail::Minimal);
         assert_eq!(RenderDetail::Minimal.for_fps(25.0), RenderDetail::Minimal);
+    }
+
+    #[test]
+    fn detail_changes_require_a_sustained_rate_change() {
+        let mut stats = PerfStats::new(4);
+        for _ in 0..89 {
+            stats.observe_detail(RenderDetail::Reduced);
+            assert_eq!(stats.detail, RenderDetail::Full);
+        }
+        stats.observe_detail(RenderDetail::Full);
+        stats.observe_detail(RenderDetail::Reduced);
+        assert_eq!(stats.detail, RenderDetail::Full);
+        for _ in 0..89 {
+            stats.observe_detail(RenderDetail::Reduced);
+        }
+        assert_eq!(stats.detail, RenderDetail::Reduced);
     }
 
     #[test]
@@ -21034,7 +21154,7 @@ fn canonical_gpu_terrain_colors(frame: &RenderFrame) -> Vec<[f32; 4]> {
         .collect()
 }
 
-const WORLD_RASTER_SAMPLES_PER_TERRAIN_CELL: u32 = 4;
+const WORLD_RASTER_SAMPLES_PER_TERRAIN_CELL: u32 = 8;
 const MAX_WORLD_RASTER_TEXELS: u64 = 1_048_576;
 
 fn world_raster_key(frame: &RenderFrame, daylight: f32) -> WorldRasterKey {
@@ -21201,7 +21321,7 @@ fn rasterize_world_fields(frame: &RenderFrame, daylight: f32) -> Option<WorldRas
             let sampled_elevation = blend_scalar(&elevation, &corners);
             let sampled_slope = blend_scalar(&slope, &corners);
             let sampled_accent = blend_scalar(&accent, &corners);
-            let _sampled_gradient = blend_channels(&gradients, &corners);
+            let sampled_gradient = blend_channels(&gradients, &corners);
             let sampled_temperature = blend_scalar(&temperatures, &corners);
 
             let display_rgb = visual::terrain_surface_srgb(&TerrainSurfaceInput {
@@ -21214,6 +21334,20 @@ fn rasterize_world_fields(frame: &RenderFrame, daylight: f32) -> Option<WorldRas
                 accessibility: accessibility_palette(frame.palette),
                 temperature: sampled_temperature,
             });
+
+            // Stable, periodic surface detail follows the world rather than
+            // the screen or tick. It shades the canonical biome colors; it
+            // does not create terrain or resources in the simulation.
+            let u = (raster_x as f32 + 0.5) / raster_width as f32;
+            let v = (raster_y as f32 + 0.5) / raster_height as f32;
+            let broad = food_field_noise(u * 24.0, v * 12.0, 24, 12);
+            let detail = food_field_noise(u * 96.0, v * 48.0, 96, 48);
+            let grain = food_field_noise(u * 240.0, v * 120.0, 240, 120);
+            let relief =
+                (sampled_gradient[0] * -0.18 + sampled_gradient[1] * -0.26).clamp(-0.12, 0.12);
+            let shade =
+                (0.72 + broad * 0.38 + detail * 0.26 + grain * 0.08 + relief).clamp(0.55, 1.30);
+            let display_rgb = display_rgb.map(|channel| channel * shade);
 
             let to_byte = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
             bgra.extend_from_slice(&[
@@ -21321,7 +21455,8 @@ fn rasterize_food_field(frame: &RenderFrame) -> Option<WorldRasterPixels> {
             // Keep sparse food visible at fitted-world scale without inventing
             // food in empty cells. A smooth density falloff avoids hard square
             // halos, and stable texture replaces per-tick shimmer.
-            color.a *= density.sqrt() * (0.85 + texture * 0.15);
+            let clusters = ((texture - 0.22) * 2.2).clamp(0.0, 1.0);
+            color.a *= density.sqrt() * (0.24 + 0.76 * clusters);
             let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
             bgra.extend_from_slice(&[byte(color.b), byte(color.g), byte(color.r), byte(color.a)]);
         }
@@ -21396,7 +21531,10 @@ fn paint_continuous_world_fields(
     window: &mut Window,
 ) -> bool {
     let frame = &state.frame;
-    let key = world_raster_key(frame, daylight);
+    // A 1/512 daylight step is below one display byte for most terrain
+    // channels, and avoids rebuilding a full image for every simulation tick.
+    let raster_daylight = (daylight * 512.0).round() / 512.0;
+    let key = world_raster_key(frame, raster_daylight);
     let cached = match state.world_raster_cache.lock() {
         Ok(cache) => cache.image_for(key),
         Err(poisoned) => poisoned.into_inner().image_for(key),
@@ -21404,7 +21542,7 @@ fn paint_continuous_world_fields(
     let (image, newly_built) = if let Some(image) = cached {
         (image, false)
     } else {
-        let Some(pixels) = rasterize_world_fields(frame, daylight) else {
+        let Some(pixels) = rasterize_world_fields(frame, raster_daylight) else {
             return false;
         };
         let Some(image) = render_image_from_world_raster(pixels) else {
@@ -21668,10 +21806,13 @@ mod continuous_world_raster_tests {
         );
         let pixels = rasterize_world_fields(&frame, visual::DAYLIGHT_STATIC).expect("world raster");
 
-        let left = rgb_at(&pixels, 1, 1);
-        let right = rgb_at(&pixels, 5, 1);
-        let interior_step = rgb_distance(rgb_at(&pixels, 3, 1), rgb_at(&pixels, 4, 1));
-        let seam_step = rgb_distance(rgb_at(&pixels, 7, 1), rgb_at(&pixels, 0, 1));
+        let left = rgb_at(&pixels, pixels.width / 4, 1);
+        let right = rgb_at(&pixels, pixels.width * 3 / 4, 1);
+        let interior_step = rgb_distance(
+            rgb_at(&pixels, pixels.width / 2 - 1, 1),
+            rgb_at(&pixels, pixels.width / 2, 1),
+        );
+        let seam_step = rgb_distance(rgb_at(&pixels, pixels.width - 1, 1), rgb_at(&pixels, 0, 1));
         let endpoint_distance = rgb_distance(left, right);
 
         assert!(
@@ -21703,6 +21844,34 @@ mod continuous_world_raster_tests {
         assert_eq!(
             food_scene.bgra, empty_scene.bgra,
             "food belongs to the discrete emissive overlay, not the smoothed terrain image"
+        );
+    }
+
+    #[test]
+    fn terrain_material_detail_is_spatial_and_does_not_shimmer_with_tick() {
+        let mut frame = frame(
+            (8, 4),
+            20,
+            vec![tile(TerrainKind::Grass); 32],
+            (1, 1),
+            160,
+            vec![0.0],
+        );
+        let first = rasterize_world_fields(&frame, visual::DAYLIGHT_STATIC).unwrap();
+        frame.tick += 1;
+        let later = rasterize_world_fields(&frame, visual::DAYLIGHT_STATIC).unwrap();
+        assert_eq!(
+            first.bgra, later.bgra,
+            "material detail must not flash with tick"
+        );
+        let colors: std::collections::HashSet<_> = first
+            .bgra
+            .chunks_exact(4)
+            .map(|pixel| [pixel[0], pixel[1], pixel[2]])
+            .collect();
+        assert!(
+            colors.len() > 8,
+            "uniform terrain should retain visible material detail"
         );
     }
 
@@ -22284,9 +22453,11 @@ fn apply_post_processing(
                     }
                 }
             }
-            PostProcessPass::FilmGrain { strength, seed } => {
+            PostProcessPass::FilmGrain { strength, seed: _ } => {
                 if strength > 0.01 && !low_fps {
-                    paint_film_grain(bounds, seed, strength, palette, window);
+                    // Screen-space grain seeded from tick flashes across the
+                    // entire scene; keep this presentation texture stable.
+                    paint_film_grain(bounds, 0x5342_4752_4149_4e, strength, palette, window);
                 }
             }
         }
