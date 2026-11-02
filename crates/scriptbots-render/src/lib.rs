@@ -22231,128 +22231,42 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
         y_min = y_min.clamp(0, food_h as isize - 1);
         y_max = y_max.clamp(0, food_h as isize - 1);
 
-        if very_low_fps {
-            // Quantized batching: approximate per-cell shading by grouping into bins, reducing draw calls
-            const FOOD_BINS: usize = 24;
-            for y in y_min as usize..=y_max as usize {
-                let mut builders: [Option<PathBuilder>; FOOD_BINS] = [
-                    Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()),
-                    Some(PathBuilder::fill()),
-                ];
-                let mut colors: [Option<Rgba>; FOOD_BINS] = [None; FOOD_BINS];
-                for x in x_min as usize..=x_max as usize {
-                    let idx = y * food_w + x;
-                    let value = frame.food_cells.get(idx).copied().unwrap_or_default();
-                    if value <= 0.001 {
-                        continue;
-                    }
-                    let intensity: f32 = (value * inv_max_food).clamp(0.0_f32, 1.0_f32);
-                    let food_visuals = visual::food_visual_params(intensity);
-                    let mut color = food_color(intensity);
-                    let shade_wave = visual::shimmer(frame.tick, x as u32, y as u32);
-                    let gain = food_visuals.emissive_gain
-                        / visual::visual_style().food.dense_emissive_gain;
-                    let shade = (0.78 + 0.18 * shade_wave + 0.22 * gain).clamp(0.0, 1.3);
-                    color = scale_rgb(color, shade);
-                    if !palette_is_natural {
-                        color = apply_palette(color, frame.palette);
-                    }
-
-                    // Quantize based on luminance to group similar colors
-                    let luma = 0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b;
-                    let mut bin = ((luma * (FOOD_BINS as f32)) as isize)
-                        .clamp(0, (FOOD_BINS as isize) - 1)
-                        as usize;
-                    // Avoid bin 0 swallowing very dark but present cells when alpha is tiny
-                    if bin == 0 && luma > 0.0 {
-                        bin = 1;
-                    }
-
-                    let px_x = offset_x + (x as f32 * cell_world * scale);
-                    let px_y = offset_y + (y as f32 * cell_world * scale);
-                    if let Some(builder) = builders[bin].as_mut() {
-                        // Stable-hue motes shrink sparse food away from the cell edges.
-                        let mote_px =
-                            (cell_px * food_visuals.relative_radius.min(1.0) * 0.72).max(1.0);
-                        let (jitter_x, jitter_y) = food_mote_offset(x, y);
-                        let inset = (cell_px - mote_px) * 0.5;
-                        append_circle_polygon(
-                            builder,
-                            px_x + cell_px * 0.5 + inset * jitter_x,
-                            px_y + cell_px * 0.5 + inset * jitter_y,
-                            mote_px * 0.5,
-                        );
-                        builder.close();
-                    }
-                    if colors[bin].is_none() {
-                        colors[bin] = Some(color);
-                    }
+        // Rounded quads keep per-cell color and occupy bounded instance records.
+        // Batching thousands of circles into vector paths at low frame rates
+        // tessellated into tens of MiB and repeatedly grew the Metal buffer.
+        for y in y_min as usize..=y_max as usize {
+            for x in x_min as usize..=x_max as usize {
+                let idx = y * food_w + x;
+                let value = frame.food_cells.get(idx).copied().unwrap_or_default();
+                if value <= 0.001 {
+                    continue;
                 }
-                for b in 0..FOOD_BINS {
-                    if let (Some(builder), Some(col)) = (builders[b].take(), colors[b])
-                        && let Ok(path) = builder.build()
-                    {
-                        window.paint_path(path, col);
-                    }
+                let intensity: f32 = (value * inv_max_food).clamp(0.0_f32, 1.0_f32);
+                let food_visuals = visual::food_visual_params(intensity);
+                let mut color = food_color(intensity);
+                let shade_wave = visual::shimmer(frame.tick, x as u32, y as u32);
+                let gain =
+                    food_visuals.emissive_gain / visual::visual_style().food.dense_emissive_gain;
+                let shade = (0.78 + 0.18 * shade_wave + 0.22 * gain).clamp(0.0, 1.3);
+                color = scale_rgb(color, shade);
+                if !palette_is_natural {
+                    color = apply_palette(color, frame.palette);
                 }
-            }
-        } else {
-            for y in y_min as usize..=y_max as usize {
-                for x in x_min as usize..=x_max as usize {
-                    let idx = y * food_w + x;
-                    let value = frame.food_cells.get(idx).copied().unwrap_or_default();
-                    if value <= 0.001 {
-                        continue;
-                    }
-                    let intensity: f32 = (value * inv_max_food).clamp(0.0_f32, 1.0_f32);
-                    let food_visuals = visual::food_visual_params(intensity);
-                    let mut color = food_color(intensity);
-                    let shade_wave = visual::shimmer(frame.tick, x as u32, y as u32);
-                    let gain = food_visuals.emissive_gain
-                        / visual::visual_style().food.dense_emissive_gain;
-                    let shade = (0.78 + 0.18 * shade_wave + 0.22 * gain).clamp(0.0, 1.3);
-                    color = scale_rgb(color, shade);
-                    if !palette_is_natural {
-                        color = apply_palette(color, frame.palette);
-                    }
-                    let px_x = offset_x + (x as f32 * cell_world * scale);
-                    let px_y = offset_y + (y as f32 * cell_world * scale);
-                    let mote_px = (cell_px * food_visuals.relative_radius.min(1.0) * 0.72).max(1.0);
-                    let (jitter_x, jitter_y) = food_mote_offset(x, y);
-                    let inset = (cell_px - mote_px) * 0.5;
-                    let cell_bounds = Bounds::new(
-                        point(
-                            px(px_x + inset + inset * jitter_x),
-                            px(px_y + inset + inset * jitter_y),
-                        ),
-                        size(px(mote_px), px(mote_px)),
-                    );
-                    window.paint_quad(
-                        fill(cell_bounds, Background::from(color)).corner_radii(px(mote_px * 0.5)),
-                    );
-                }
+                let px_x = offset_x + (x as f32 * cell_world * scale);
+                let px_y = offset_y + (y as f32 * cell_world * scale);
+                let mote_px = (cell_px * food_visuals.relative_radius.min(1.0) * 0.72).max(1.0);
+                let (jitter_x, jitter_y) = food_mote_offset(x, y);
+                let inset = (cell_px - mote_px) * 0.5;
+                let cell_bounds = Bounds::new(
+                    point(
+                        px(px_x + inset + inset * jitter_x),
+                        px(px_y + inset + inset * jitter_y),
+                    ),
+                    size(px(mote_px), px(mote_px)),
+                );
+                window.paint_quad(
+                    fill(cell_bounds, Background::from(color)).corner_radii(px(mote_px * 0.5)),
+                );
             }
         }
     }
