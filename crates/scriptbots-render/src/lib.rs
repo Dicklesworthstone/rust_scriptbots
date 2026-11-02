@@ -4677,6 +4677,13 @@ pub struct SimulationView {
     brain_client_id: BrainInspectionClientId,
     brain_request_revision: BrainInspectionRevision,
     brain_inspection_cache: Option<BrainInspectorCapture>,
+    world_brain_job: Option<WorldBrainJob>,
+    world_brain_capture: Option<(
+        scriptbots_runtime::HostSessionId,
+        u64,
+        BrainInspectorCapture,
+    )>,
+    world_brain_last_request: Option<Instant>,
     /// Last coherent focused-agent sample for the World card. The source tick
     /// remains visible when the host advances before the next inspection.
     world_hud_detail_cache: Option<(
@@ -4812,6 +4819,9 @@ impl SimulationView {
             ),
             brain_request_revision: BrainInspectionRevision::new(0),
             brain_inspection_cache: None,
+            world_brain_job: None,
+            world_brain_capture: None,
+            world_brain_last_request: None,
             world_hud_detail_cache: None,
             rail_visible: true,
             rail_selection: None,
@@ -6692,6 +6702,133 @@ impl SimulationView {
 
         inspector_changed
     }
+    fn poll_world_brain(&mut self, published: &RenderSnapshot, focused: Option<AgentUid>) {
+        if self
+            .world_brain_capture
+            .as_ref()
+            .is_some_and(|(session, epoch, capture)| {
+                *session != published.session_id
+                    || *epoch != published.world.epoch
+                    || Some(capture.agent_uid) != focused
+                    || capture.source_tick > published.world.tick
+            })
+        {
+            self.world_brain_capture = None;
+        }
+
+        let completed = self
+            .world_brain_job
+            .as_ref()
+            .and_then(|job| match job.result.try_recv() {
+                Ok(result) => Some(result),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Some(Err("brain inspection worker disconnected".to_owned()))
+                }
+            });
+        if let Some(result) = completed
+            && let Some(job) = self.world_brain_job.take()
+            && job.session == published.session_id
+            && job.epoch == published.world.epoch
+            && Some(job.uid) == focused
+        {
+            match result {
+                Ok(response)
+                    if response.source.session_id == job.session
+                        && response.request.targets == [job.uid]
+                        && response.request.revision.get() == job.revision.get()
+                        && response.inspection.request_revision == job.revision
+                        && response.inspection.client_id == self.brain_client_id
+                        && response.inspection.source_tick == response.source.inspected_tick
+                        && response.source.inspected_tick.0 <= published.world.tick =>
+                {
+                    let inspection = response.inspection;
+                    let status = match inspection.telemetry.into_iter().next() {
+                        Some(SelectedBrainTelemetryOutcome::Ready { telemetry })
+                            if telemetry.agent_uid == job.uid =>
+                        {
+                            BrainInspectorCaptureStatus::Ready(telemetry.inspection.activations)
+                        }
+                        Some(SelectedBrainTelemetryOutcome::Unavailable { agent_uid, reason })
+                            if agent_uid == job.uid =>
+                        {
+                            BrainInspectorCaptureStatus::Unavailable(reason)
+                        }
+                        _ => BrainInspectorCaptureStatus::Refused(
+                            "inspection returned no matching creature".to_owned(),
+                        ),
+                    };
+                    let retained_payload_bytes = match &status {
+                        BrainInspectorCaptureStatus::Ready(_) => {
+                            inspection.build.retained_payload_bytes
+                        }
+                        _ => 0,
+                    };
+                    self.world_brain_capture = Some((
+                        job.session,
+                        job.epoch,
+                        BrainInspectorCapture {
+                            agent_uid: job.uid,
+                            source_tick: inspection.source_tick.0,
+                            // This independently sampled brain is not paired to
+                            // the currently displayed world snapshot.
+                            source_revision: None,
+                            request_revision: job.revision.get(),
+                            retained_payload_bytes,
+                            status,
+                        },
+                    ));
+                }
+                Ok(_) => debug!("discarded mismatched or future World brain inspection"),
+                Err(error) => debug!(%error, "World brain inspection failed"),
+            }
+        }
+
+        let Some(uid) = focused else { return };
+        if self.world_brain_job.is_some()
+            || self
+                .world_brain_last_request
+                .is_some_and(|last| last.elapsed() < Duration::from_millis(500))
+        {
+            return;
+        }
+        let revision = BrainInspectionRevision::new(
+            self.brain_request_revision
+                .get()
+                .checked_add(1)
+                .expect("GPUI brain-inspection revision exhausted"),
+        );
+        let request = scriptbots_runtime::BrainProjectionRequest::focused(
+            scriptbots_runtime::ProjectionClientId::new(self.brain_client_id.get()),
+            scriptbots_runtime::ProjectionRequestRevision::new(revision.get()),
+            uid,
+        );
+        let host = self.host.clone();
+        let (send, result) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::Builder::new()
+            .name("scriptbots-world-brain".to_owned())
+            .spawn(move || {
+                let reply = host
+                    .project_brain(&request)
+                    .map_err(|error| error.to_string());
+                let _ = send.send(reply);
+            });
+        self.world_brain_last_request = Some(Instant::now());
+        match worker {
+            Ok(_) => {
+                self.brain_request_revision = revision;
+                self.world_brain_job = Some(WorldBrainJob {
+                    session: published.session_id,
+                    epoch: published.world.epoch,
+                    uid,
+                    revision,
+                    result,
+                });
+            }
+            Err(error) => debug!(%error, "could not start World brain inspection worker"),
+        }
+    }
+
     fn snapshot(&mut self) -> HudSnapshot {
         let mut snapshot = HudSnapshot::default();
         if let Ok(recent) = self.recent_commands.lock() {
@@ -6828,6 +6965,9 @@ impl SimulationView {
                     detail.clone(),
                 ));
             }
+            self.poll_world_brain(&published, uid);
+        } else if self.minimal_canvas_mode {
+            self.world_brain_capture = None;
         }
         if brain_request_issued && let Some((_, revision)) = brain_request {
             self.brain_request_revision = revision;
@@ -9335,7 +9475,6 @@ impl SimulationView {
                             }),
                     ),
                 )
-                .child(label("NEURAL ACTIVITY · OPEN LAB INSPECTOR"))
                 .when_some(detail.genome_browser.as_ref(), |hud, browser| {
                     hud.child(render_genome_browser_view(browser))
                 });
@@ -9356,6 +9495,44 @@ impl SimulationView {
                 .child(label("Actuator values unavailable"))
                 .child(label("Sensor values unavailable"));
         }
+        hud = hud.child(div().h(px(1.0)).w_full().bg(chrome::border()));
+        hud = hud.child(label("NEURAL ACTIVITY"));
+        let capture = self
+            .world_brain_capture
+            .as_ref()
+            .and_then(|(_, _, capture)| {
+                (matches!(self.playback.mode(), PlaybackMode::Live)
+                    && capture.agent_uid == selected.uid)
+                    .then_some(capture)
+            });
+        hud = match capture {
+            Some(capture) => match &capture.status {
+                BrainInspectorCaptureStatus::Ready(activations) => hud
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(chrome::text_muted())
+                            .child(format!("Neural sample · tick {}", capture.source_tick)),
+                    )
+                    .child(render_activation_heatmaps(Some(activations))),
+                BrainInspectorCaptureStatus::Unavailable(reason) => hud.child(
+                    div()
+                        .text_xs()
+                        .text_color(chrome::text_muted())
+                        .child(format!("Neural activity unavailable: {reason:?}")),
+                ),
+                BrainInspectorCaptureStatus::Refused(reason) => hud.child(
+                    div()
+                        .text_xs()
+                        .text_color(chrome::text_muted())
+                        .child(format!("Neural inspection: {reason}")),
+                ),
+            },
+            None if !matches!(self.playback.mode(), PlaybackMode::Live) => {
+                hud.child(label("Neural activity is not recorded in replay frames"))
+            }
+            None => hud.child(label("Waiting for a neural sample…")),
+        };
         hud
     }
 
@@ -11917,7 +12094,7 @@ impl SimulationView {
                     .text_color(rgb(0x91a9a0))
                     .child(provenance)
             })
-            .child(render_activation_heatmaps(&detail.brain_activations))
+            .child(render_activation_heatmaps(detail.brain_activations.as_ref()))
             .child(render_output_attributions(detail))
             .child(self.render_output_sparklines_for(detail.agent_id))
             .child(self.render_diet_gauges())
@@ -14506,7 +14683,7 @@ fn render_output_attributions(detail: &AgentInspectorDetails) -> Div {
     div().flex().flex_col().gap_1().children(rows)
 }
 
-fn render_activation_heatmaps(activations: &Option<BrainActivations>) -> Div {
+fn render_activation_heatmaps(activations: Option<&BrainActivations>) -> Div {
     let mut rows: Vec<Div> = Vec::new();
     if let Some(act) = activations {
         if act.truncated {
@@ -17682,6 +17859,15 @@ pub struct BrainInspectorCapture {
     pub request_revision: u64,
     pub retained_payload_bytes: usize,
     pub status: BrainInspectorCaptureStatus,
+}
+
+/// At most one owner-thread inspection may be outstanding for the World view.
+struct WorldBrainJob {
+    session: scriptbots_runtime::HostSessionId,
+    epoch: u64,
+    uid: AgentUid,
+    revision: BrainInspectionRevision,
+    result: std::sync::mpsc::Receiver<Result<scriptbots_runtime::BrainProjection, String>>,
 }
 
 #[derive(Clone)]
@@ -30627,7 +30813,7 @@ mod command_characterization_tests {
     }
 
     #[test]
-    fn gpui_brain_pull_is_client_isolated_cached_and_suppressed_for_canvas() {
+    fn gpui_brain_pull_is_client_isolated_and_world_selection_is_async() {
         #[derive(Debug)]
         struct GuiInspectionBrain {
             calls: Arc<std::sync::atomic::AtomicUsize>,
@@ -30759,6 +30945,56 @@ mod command_characterization_tests {
             .focused_agent = Some(focused_agent);
         let _ = canvas.snapshot();
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+
+        *canvas
+            .selection_projection
+            .lock()
+            .expect("canvas selection projection") = Some(vec![focused_agent]);
+        let _ = canvas.snapshot();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while canvas.world_brain_capture.is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+            let _ = canvas.snapshot();
+        }
+        let (_, _, captured) = canvas
+            .world_brain_capture
+            .as_ref()
+            .expect("selected World creature receives a background brain sample");
+        match &captured.status {
+            BrainInspectorCaptureStatus::Ready(activations) => {
+                assert_eq!(activations.layers[0].values, vec![0.5]);
+                assert_eq!(captured.source_tick, 0);
+            }
+            _ => panic!("expected the selected creature's ready neural sample"),
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 3);
+        let uid = captured.agent_uid;
+        let revision = BrainInspectionRevision::new(999);
+        let stale = host
+            .port
+            .project_brain(&scriptbots_runtime::BrainProjectionRequest::focused(
+                scriptbots_runtime::ProjectionClientId::new(canvas.brain_client_id.get()),
+                scriptbots_runtime::ProjectionRequestRevision::new(revision.get()),
+                uid,
+            ))
+            .expect("capture a real response before deselection");
+        let published = host.port.snapshot_hub().latest();
+        let (send, result) = std::sync::mpsc::sync_channel(1);
+        send.send(Ok(stale)).expect("queue completed response");
+        canvas.world_brain_job = Some(WorldBrainJob {
+            session: published.session_id,
+            epoch: published.world.epoch,
+            uid,
+            revision,
+            result,
+        });
+        *canvas
+            .selection_projection
+            .lock()
+            .expect("canvas selection projection") = Some(Vec::new());
+        let _ = canvas.snapshot();
+        assert!(canvas.world_brain_capture.is_none());
+        assert!(canvas.world_brain_job.is_none());
         assert_eq!(
             host.port
                 .scientific_digest_v1()
