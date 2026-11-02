@@ -53,6 +53,8 @@ struct CaptureOverrides {
     /// changing numbers, which is a plausible ~10k pixels of glyph difference.
     forced_perf: Option<crate::PerfSnapshot>,
     hovered_agent: Option<AgentId>,
+    /// Capture the same composed window again with the World painter switched.
+    compare_world_painter: bool,
     /// Keystrokes dispatched into the live window before the frame is captured.
     ///
     /// Deliberately NOT a direct field poke like the overrides above. Panel state has
@@ -66,6 +68,8 @@ struct CaptureOverrides {
 struct CapturedView {
     image: RgbaImage,
     camera: CameraSnapshot,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    painter_ablation: Option<RgbaImage>,
 }
 
 fn apply_capture_overrides(view: &mut crate::SimulationView, overrides: CaptureOverrides) {
@@ -236,7 +240,30 @@ fn capture_view_with_overrides_and_camera(
     let image = cx
         .capture_screenshot(window.into())
         .map_err(|error| format!("read back headless GPUI frame: {error:?}"))?;
-    Ok(CapturedView { image, camera })
+    let painter_ablation = if overrides.compare_world_painter {
+        cx.update_window(window.into(), |root_view, window, app| {
+            let view = root_view
+                .downcast::<crate::SimulationView>()
+                .expect("headless root view type mismatch");
+            view.update(app, |view, _| {
+                view.force_legacy_world_painter = !overrides.force_legacy_world_painter;
+            });
+            window.refresh();
+        })
+        .map_err(|error| format!("refresh World-painter ablation: {error:?}"))?;
+        cx.run_until_parked();
+        Some(
+            cx.capture_screenshot(window.into())
+                .map_err(|error| format!("read World-painter ablation: {error:?}"))?,
+        )
+    } else {
+        None
+    };
+    Ok(CapturedView {
+        image,
+        camera,
+        painter_ablation,
+    })
 }
 
 #[cfg(test)]
@@ -257,6 +284,85 @@ mod tests {
     const WORLD_VIEWPORT: (f32, f32) = (1400.0, 768.0);
     #[cfg(target_os = "macos")]
     const LAB_VIEWPORTS: [(f32, f32); 2] = [(460.0, 768.0), (380.0, 600.0)];
+
+    /// The camera must lay out against the visible area between the toolbar and
+    /// footer, not against a synthetic full-window height later clipped by chrome.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn world_camera_uses_the_visible_canvas_bounds() {
+        let (width, height) = WORLD_VIEWPORT;
+        let capture = capture_view_with_overrides_and_camera(
+            capture_world(),
+            GuiViewRole::WorldCanvas,
+            width * HEADLESS_DEVICE_SCALE,
+            height * HEADLESS_DEVICE_SCALE,
+            CaptureOverrides {
+                forced_perf: Some(pinned_perf()),
+                ..CaptureOverrides::default()
+            },
+        )
+        .expect("World capture");
+        let camera = capture.camera;
+        let (x, y) = camera.last_canvas_origin;
+        let (canvas_width, canvas_height) = camera.last_canvas_size;
+        assert!(canvas_width > width * 0.8, "canvas too narrow: {camera:?}");
+        assert!(
+            canvas_height > height * 0.65,
+            "canvas too short: {camera:?}"
+        );
+        assert!(x >= 0.0 && y > 0.0, "canvas origin is invalid: {camera:?}");
+        assert!(
+            x + canvas_width <= width + 1.0 && y + canvas_height <= height + 1.0,
+            "camera bounds extend outside the World window: {camera:?} in {width}x{height}"
+        );
+        let top_left = camera.world_to_screen((0.0, 0.0)).expect("world origin");
+        let bottom_right = camera
+            .world_to_screen(camera.last_world_size)
+            .expect("world opposite corner");
+        let left_margin = top_left.0 - x;
+        let right_margin = x + canvas_width - bottom_right.0;
+        let top_margin = top_left.1 - y;
+        let bottom_margin = y + canvas_height - bottom_right.1;
+        assert!(
+            (left_margin - right_margin).abs() < 0.1 && (top_margin - bottom_margin).abs() < 0.1,
+            "fitted world margins are asymmetric: left={left_margin}, right={right_margin}, \
+             top={top_margin}, bottom={bottom_margin}"
+        );
+    }
+
+    /// Food remains a visible layer under the same low-update condition that
+    /// formerly switched to an oversized tessellated path batch.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn food_remains_visible_at_low_update_rates_without_mutating_science() {
+        let world = capture_visual_world();
+        let digest_before = world.port.scientific_digest_v1().expect("initial digest");
+        let capture = |draw_food| {
+            capture_view_with_overrides(
+                Arc::clone(&world),
+                GuiViewRole::WorldCanvas,
+                2560.0,
+                1440.0,
+                CaptureOverrides {
+                    draw_agents: Some(false),
+                    draw_food: Some(draw_food),
+                    forced_perf: Some(pinned_perf_at_fps(12.0)),
+                    keystrokes: &["0"],
+                    ..CaptureOverrides::default()
+                },
+            )
+            .expect("low-update World capture")
+        };
+        let without_food = capture(false);
+        let with_food = capture(true);
+        let (changed, _) = whole_frame_delta(&without_food, &with_food);
+        assert!(changed > 1_000, "food layer changed only {changed} pixels");
+        assert_eq!(
+            digest_before,
+            world.port.scientific_digest_v1().expect("post-capture digest"),
+            "food presentation must not change the simulation"
+        );
+    }
 
     fn capture_world() -> Arc<TestHost> {
         let config = ScriptBotsConfig {
@@ -675,13 +781,9 @@ mod tests {
         Some(path)
     }
 
-    /// Column span of the world canvas, found by colour diversity.
-    ///
-    /// The world raster is the only element that paints a continuously varying image;
-    /// every piece of chrome is a flat fill with text on it. So the canvas is the widest
-    /// run of adjacent columns that each carry many distinct colours. Returning a
-    /// measured span rather than a hardcoded rectangle keeps this honest when the layout
-    /// changes — which it just did, when the rail was hoisted.
+    /// Approximate the visible World raster's horizontal span by colour diversity.
+    /// This is a coverage check for the World, not a detector for the Lab: charts
+    /// and styled controls can also make many colours in adjacent columns.
     #[cfg(target_os = "macos")]
     fn world_canvas_columns(image: &RgbaImage) -> (u32, u32) {
         const DIVERSE: usize = 12;
@@ -992,10 +1094,11 @@ mod tests {
         let (lab_logical_w, lab_logical_h) = LAB_VIEWPORTS[0];
         let overrides = CaptureOverrides {
             forced_perf: Some(pinned_perf()),
+            compare_world_painter: true,
             ..CaptureOverrides::default()
         };
         let world = capture_world();
-        let world_image = capture_view_with_overrides(
+        let world_capture = capture_view_with_overrides_and_camera(
             Arc::clone(&world),
             GuiViewRole::WorldCanvas,
             world_logical_w * HEADLESS_DEVICE_SCALE,
@@ -1003,7 +1106,7 @@ mod tests {
             overrides,
         )
         .expect("World capture");
-        let lab_image = capture_view_with_overrides(
+        let lab_capture = capture_view_with_overrides_and_camera(
             world,
             GuiViewRole::Hud,
             lab_logical_w * HEADLESS_DEVICE_SCALE,
@@ -1011,33 +1114,49 @@ mod tests {
             overrides,
         )
         .expect("Lab capture");
+        let world_image = &world_capture.image;
+        let lab_image = &lab_capture.image;
 
-        let (world_lo, world_hi) = world_canvas_columns(&world_image);
-        let (lab_lo, lab_hi) = world_canvas_columns(&lab_image);
+        let (world_lo, world_hi) = world_canvas_columns(world_image);
         let world_span = world_hi.saturating_sub(world_lo);
-        let lab_span = lab_hi.saturating_sub(lab_lo);
         assert!(
             world_span >= world_image.width() * 3 / 5,
             "World raster occupies only {world_span}/{} device px; the visual subject \
              must own most of its dedicated window",
             world_image.width()
         );
+        // A diverse-column heuristic mistakes charts and styled panels for a world
+        // raster. Instead change the actual World painter on the same world. The
+        // World must react (positive control), while the Lab must be byte-identical.
+        let (world_changed, _) = whole_frame_delta(
+            world_image,
+            world_capture
+                .painter_ablation
+                .as_ref()
+                .expect("World ablation"),
+        );
+        let (lab_changed, _) = whole_frame_delta(
+            lab_image,
+            lab_capture.painter_ablation.as_ref().expect("Lab ablation"),
+        );
         assert!(
-            lab_span <= lab_image.width() / 3,
-            "Lab contains a raster-like span of {lab_span}/{} device px; the companion \
-             utility window must not duplicate the World canvas",
-            lab_image.width()
+            world_changed > (world_image.width() as usize * world_image.height() as usize) / 100,
+            "painter ablation must visibly change the World: {world_changed} pixels"
+        );
+        assert_eq!(
+            lab_changed, 0,
+            "changing the World painter changed {lab_changed} Lab pixels"
         );
 
         let _ = save_probe(
-            &world_image,
+            world_image,
             &format!(
                 "world_{}x{}.png",
                 world_logical_w as u32, world_logical_h as u32
             ),
         );
         let _ = save_probe(
-            &lab_image,
+            lab_image,
             &format!(
                 "lab_overview_{}x{}.png",
                 lab_logical_w as u32, lab_logical_h as u32
@@ -1095,19 +1214,21 @@ mod tests {
                     "3" => &["3"],
                     _ => unreachable!("fixed diagnostic shortcut table"),
                 };
-                let opened = capture_view_with_overrides(
+                let opened_capture = capture_view_with_overrides_and_camera(
                     Arc::clone(&world),
                     GuiViewRole::Hud,
                     width,
                     height,
                     CaptureOverrides {
                         forced_perf: Some(pinned_perf()),
+                        compare_world_painter: true,
                         keystrokes,
                         ..CaptureOverrides::default()
                     },
                 )
                 .unwrap_or_else(|error| panic!("open-{label} Lab capture failed: {error:#}"));
-                let (changed, mean_luma_delta) = whole_frame_delta(&neutral, &opened);
+                let opened = &opened_capture.image;
+                let (changed, mean_luma_delta) = whole_frame_delta(&neutral, opened);
                 assert!(
                     changed > negative_changed.saturating_add(500)
                         && mean_luma_delta > negative_luma_delta + 0.01,
@@ -1117,15 +1238,21 @@ mod tests {
                      {negative_luma_delta:.4}); the {label} disclosure is not causally \
                      visible through the production input path"
                 );
-                let (lab_lo, lab_hi) = world_canvas_columns(&opened);
-                assert!(
-                    lab_hi.saturating_sub(lab_lo) <= opened.width() / 3,
-                    "opening {label} at {logical_w}x{logical_h} reintroduced a \
-                     world-raster-like span into the Lab"
+                let (painter_changed, _) = whole_frame_delta(
+                    opened,
+                    opened_capture
+                        .painter_ablation
+                        .as_ref()
+                        .expect("Lab ablation"),
+                );
+                assert_eq!(
+                    painter_changed, 0,
+                    "opening {label} at {logical_w}x{logical_h} exposed \
+                     {painter_changed} pixels from the World painter"
                 );
 
                 let _ = save_probe(
-                    &opened,
+                    opened,
                     &format!("lab_{label}_{}x{}.png", logical_w as u32, logical_h as u32),
                 );
             }
@@ -1240,8 +1367,8 @@ mod tests {
         let legacy = capture_view_with_world_painter(
             Arc::clone(&world),
             GuiViewRole::WorldCanvas,
-            1280.0,
-            720.0,
+            2560.0,
+            1440.0,
             true,
         )
         .unwrap_or_else(|error| panic!("headless legacy world capture failed: {error:#}"));
@@ -1252,8 +1379,8 @@ mod tests {
         let continuous = capture_view_with_world_painter(
             Arc::clone(&world),
             GuiViewRole::WorldCanvas,
-            1280.0,
-            720.0,
+            2560.0,
+            1440.0,
             false,
         )
         .unwrap_or_else(|error| panic!("headless continuous world capture failed: {error:#}"));
@@ -1262,8 +1389,8 @@ mod tests {
             .scientific_digest_v1()
             .expect("post-continuous-capture world digest");
 
-        assert_eq!(legacy.dimensions(), (1280, 720));
-        assert_eq!(continuous.dimensions(), (1280, 720));
+        assert_eq!(legacy.dimensions(), (2560, 1440));
+        assert_eq!(continuous.dimensions(), (2560, 1440));
         assert_eq!(
             digest_before, digest_after_legacy,
             "legacy repaint mutated scientific state"
@@ -1307,10 +1434,10 @@ mod tests {
         );
 
         legacy
-            .save(probe_dir.join("before_per_cell_quads_1280x720.png"))
+            .save(probe_dir.join("before_per_cell_quads_2560x1440.png"))
             .expect("write bd-1lls baseline probe");
         continuous
-            .save(probe_dir.join("after_continuous_fields_1280x720.png"))
+            .save(probe_dir.join("after_continuous_fields_2560x1440.png"))
             .expect("write bd-1lls continuous-field probe");
     }
 
@@ -1338,13 +1465,14 @@ mod tests {
         let individual_hidden = capture_view_with_overrides_and_camera(
             Arc::clone(&world),
             GuiViewRole::WorldCanvas,
-            1280.0,
-            720.0,
+            2560.0,
+            1440.0,
             CaptureOverrides {
                 draw_agents: Some(false),
                 draw_food: Some(false),
                 forced_perf: Some(pinned_perf()),
                 hovered_agent: Some(hovered_agent),
+                keystrokes: &["0"],
                 ..CaptureOverrides::default()
             },
         )
@@ -1352,13 +1480,14 @@ mod tests {
         let individual = capture_view_with_overrides_and_camera(
             Arc::clone(&world),
             GuiViewRole::WorldCanvas,
-            1280.0,
-            720.0,
+            2560.0,
+            1440.0,
             CaptureOverrides {
                 draw_agents: Some(true),
                 draw_food: Some(false),
                 forced_perf: Some(pinned_perf()),
                 hovered_agent: Some(hovered_agent),
+                keystrokes: &["0"],
                 ..CaptureOverrides::default()
             },
         )
@@ -1366,13 +1495,14 @@ mod tests {
         let compact_hidden = capture_view_with_overrides_and_camera(
             Arc::clone(&world),
             GuiViewRole::WorldCanvas,
-            1280.0,
-            720.0,
+            2560.0,
+            1440.0,
             CaptureOverrides {
                 draw_agents: Some(false),
                 draw_food: Some(false),
                 forced_perf: Some(pinned_perf_at_fps(12.0)),
                 hovered_agent: Some(hovered_agent),
+                keystrokes: &["0"],
                 ..CaptureOverrides::default()
             },
         )
@@ -1380,13 +1510,14 @@ mod tests {
         let compact = capture_view_with_overrides_and_camera(
             Arc::clone(&world),
             GuiViewRole::WorldCanvas,
-            1280.0,
-            720.0,
+            2560.0,
+            1440.0,
             CaptureOverrides {
                 draw_agents: Some(true),
                 draw_food: Some(false),
                 forced_perf: Some(pinned_perf_at_fps(12.0)),
                 hovered_agent: Some(hovered_agent),
+                keystrokes: &["0"],
                 ..CaptureOverrides::default()
             },
         )
@@ -1396,10 +1527,10 @@ mod tests {
             .scientific_digest_v1()
             .expect("post-agent-capture world digest");
 
-        assert_eq!(individual_hidden.image.dimensions(), (1280, 720));
-        assert_eq!(individual.image.dimensions(), (1280, 720));
-        assert_eq!(compact_hidden.image.dimensions(), (1280, 720));
-        assert_eq!(compact.image.dimensions(), (1280, 720));
+        assert_eq!(individual_hidden.image.dimensions(), (2560, 1440));
+        assert_eq!(individual.image.dimensions(), (2560, 1440));
+        assert_eq!(compact_hidden.image.dimensions(), (2560, 1440));
+        assert_eq!(compact.image.dimensions(), (2560, 1440));
         assert_camera_transform_eq("individual", &individual_hidden.camera, &individual.camera);
         assert_camera_transform_eq("compact", &compact_hidden.camera, &compact.camera);
         assert_eq!(
@@ -1409,11 +1540,11 @@ mod tests {
 
         individual
             .image
-            .save(probe_dir.join("spike_health_entities_1280x720.png"))
+            .save(probe_dir.join("spike_health_entities_2560x1440.png"))
             .expect("write bd-ydym individual-agent probe");
         compact
             .image
-            .save(probe_dir.join("compact_lod_96_agents_1280x720.png"))
+            .save(probe_dir.join("compact_lod_96_agents_2560x1440.png"))
             .expect("write bd-ydym compact-agent probe");
 
         // Every comparison uses an agents-hidden frame at the SAME forced FPS.
@@ -1522,8 +1653,43 @@ mod tests {
                 "{label} age weathering is not visible: young={young_luma:.1}, old={old_luma:.1}"
             );
 
-            let boost_tail = (young_boost.0 - 18.0, young_boost.1);
-            let plain_tail = (young_plain.0 - 18.0, young_plain.1);
+            // Derive a point in the actual exhaust triangle at this camera scale.
+            // A fixed screen offset can fall inside the body after a resize and
+            // then count body pixels equally for both boosted and plain agents.
+            let frame = crate::RenderFrame::from_snapshot(
+                &world.snapshot(),
+                crate::ColorPaletteMode::Natural,
+            )
+            .expect("controlled render frame");
+            let boosted_id = AgentId::from(slotmap::KeyData::from_ffi(
+                world.snapshot().world.agents[sample_column].id,
+            ));
+            let boosted = frame
+                .agents
+                .iter()
+                .find(|agent| agent.agent_id == boosted_id)
+                .expect("controlled boosted agent");
+            let visuals = crate::resolve_agent_visual(boosted, frame.agent_reference_age);
+            let radius = crate::agent_screen_radius(&frame, boosted, camera.last_scale);
+            let silhouette = crate::agent_silhouette(
+                (0.0, 0.0),
+                radius * 2.0,
+                camera.last_scale,
+                &visuals,
+                boosted.boost,
+                boosted.sound_multiplier,
+            );
+            let triangle = silhouette.boost.expect("fixture boost exhaust");
+            let base = (
+                (triangle[0].0 + triangle[1].0) * 0.5,
+                (triangle[0].1 + triangle[1].1) * 0.5,
+            );
+            let tail_offset = (
+                (base.0 * 0.35 + triangle[2].0 * 0.65) * HEADLESS_DEVICE_SCALE,
+                (base.1 * 0.35 + triangle[2].1 * 0.65) * HEADLESS_DEVICE_SCALE,
+            );
+            let boost_tail = (young_boost.0 + tail_offset.0, young_boost.1 + tail_offset.1);
+            let plain_tail = (young_plain.0 + tail_offset.0, young_plain.1 + tail_offset.1);
             let boost_pixels = changed_pixels_in_disc(control, rendered, boost_tail, 7.0);
             let plain_pixels = changed_pixels_in_disc(control, rendered, plain_tail, 7.0);
             assert!(
