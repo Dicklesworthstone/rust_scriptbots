@@ -2,8 +2,8 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
-**Headless report contract and frame diagnosis (2026-11-02):** [Currently In
-Progress — GentleDuck, original `bd-2z0.14.2.6`; acceptance unchanged]
+**Science screenshot and headless report increment (2026-11-02):** [Verified —
+GentleDuck; original `bd-2z0.14.2.6` remains In Progress; acceptance unchanged]
 
 - [x] Recheck authoritative ready work and existing ownership; continue the
   observed headless/report remainder instead of creating another tracking system.
@@ -38,8 +38,17 @@ Progress — GentleDuck, original `bd-2z0.14.2.6`; acceptance unchanged]
   region corruption controls, resize/capability goldens and full terminal tests.
 - [x] Run workspace all-target check, strict Clippy, formatting and scoped static
   review via DSR, retaining failures and exact source identity.
-- [ ] Re-execute original acceptance in a fresh solo pass at committed source;
-  close only what is proven, publish reviewed changes and release reservations.
+- [x] Re-execute delivered paths at clean committed source and assess original
+  criteria in a fresh solo pass; publish reviewed source and retain unmet scope.
+
+Published source: `f9d4ed1919b13df45666de20d46420d4d83f8366`. DSR
+`headless_contract_clean/20261102T015615-3807060/receipt.json` passes all 10 checks
+with identical clean source before/after: 331 terminal tests, four screenshot API
+tests, one CLI parsing test, all five E2E tests, workspace all-target checking,
+strict Clippy and formatting. Native truecolor quit and file Shutdown each save
+the observed science frame and show its filename in the live footer. The
+no-color process proves its existing routes/input/restoration and zero-color
+conditions; it does not supply S/provider or flat-map golden evidence.
 
 Original remaining scope stays on `bd-2z0.14.2.6`: the capability golden explicitly
 does not cover the flat-map color-depth axis. Canvas depth fixtures and real
