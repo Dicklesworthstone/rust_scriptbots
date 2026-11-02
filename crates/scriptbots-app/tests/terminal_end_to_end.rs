@@ -54,8 +54,8 @@ fn live_frankentui_pty_routes_and_restores_terminal() -> Result<()> {
         .collect();
     assert_eq!(
         observations.len(),
-        2,
-        "both capability profiles must execute"
+        3,
+        "truecolor, NO_COLOR and colorless-terminal profiles must execute"
     );
     for observation in observations {
         assert_eq!(observation["schema"], "scriptbots.live-tui-pty.v1");
@@ -118,7 +118,7 @@ fn live_frankentui_pty_routes_and_restores_terminal() -> Result<()> {
         );
         assert_eq!(
             interaction["mouse_navigation"]["observed_sgr_capture"],
-            true
+            observation["capability_profile"] != "dumb"
         );
         assert!(
             observation["python_identity"]["executable_sha256"]
@@ -180,7 +180,7 @@ fn live_frankentui_pty_routes_and_restores_terminal() -> Result<()> {
                         .and_then(|tick| tick.checked_add(1))
                 );
             }
-            Some("no-color") => assert_eq!(observation["observed_color_sgr_count"], 0),
+            Some("no-color" | "dumb") => assert_eq!(observation["observed_color_sgr_count"], 0),
             // ubs:ignore[rust.ownership.panic-macro] — test requires a declared capability label.
             profile => panic!("unexpected capability profile: {profile:?}"),
         }
@@ -839,7 +839,7 @@ for module in (pty, termios, fcntl, codecs, unicodedata):
         'origin': spec.origin, 'code_carrier_kind': carrier,
         'path': str(module_path), 'sha256': hashlib.sha256(module_path.read_bytes()).hexdigest()}
 
-profiles = ('truecolor', 'no-color') if exit_action == 'quit' else ('truecolor',)
+profiles = ('truecolor', 'no-color', 'dumb') if exit_action == 'quit' else ('truecolor',)
 for profile in profiles:
     directory = pathlib.Path(tempfile.mkdtemp(prefix='live-tui-' + profile + '-'))
     master, slave = pty.openpty()
@@ -866,7 +866,13 @@ for profile in profiles:
         environment.pop('COLORTERM', None)
     else:
         environment.pop('NO_COLOR', None)
-        environment['COLORTERM'] = 'truecolor'
+        if profile == 'dumb':
+            environment['TERM'] = 'dumb'
+            environment.pop('COLORTERM', None)
+            for name in ('FORCE_COLOR', 'CLICOLOR_FORCE', 'IGNORE_IS_TERMINAL'):
+                environment.pop(name, None)
+        else:
+            environment['COLORTERM'] = 'truecolor'
     def controlling_terminal():
         os.setsid()
         fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
@@ -992,6 +998,8 @@ for profile in profiles:
                         pass
                     return False
                 pump_until(screenshot_matches, 'presented screenshot for ' + title)
+            if profile == 'dumb':
+                assert screen.color_count == 0, 'colorless TERM without NO_COLOR emitted colors'
             if profile == 'truecolor':
                 evidence_artifacts = []
                 http_log_bytes = 0
@@ -1511,18 +1519,24 @@ for profile in profiles:
             mouse_column, mouse_row = column + 4 + 1, row + 1
             capture_modes_before_input = sorted(screen.enabled_capture_modes)
             observed_sgr_capture = {1000, 1002, 1006}.issubset(screen.enabled_capture_modes)
-            assert observed_sgr_capture, 'actual SGR button capture was not enabled before mouse input'
+            assert observed_sgr_capture == (profile != 'dumb'), 'mouse capture must follow actual terminal capability'
             down_bytes = ('\x1b[<0;' + str(mouse_column) + ';' + str(mouse_row) + 'M').encode()
             up_bytes = ('\x1b[<0;' + str(mouse_column) + ';' + str(mouse_row) + 'm').encode()
-            send_terminal_input(down_bytes)
-            capture_interaction('palette-mouse-down', filtered_title, lambda text: target_label in text)
-            send_terminal_input(up_bytes)
+            if profile == 'dumb':
+                # This terminal advertises no mouse support. Exercise the same
+                # visible palette item using Enter; do not fabricate a click.
+                send_terminal_input(b'\r')
+            else:
+                send_terminal_input(down_bytes)
+                capture_interaction('palette-mouse-down', filtered_title, lambda text: target_label in text)
+                send_terminal_input(up_bytes)
             navigation_capture = capture_interaction('palette-mouse-navigation', routes[0][1],
                                                      lambda text: paused_header(text) and 'Command Palette' not in text)
-            mouse_navigation = {'protocol': 'SGR', 'column_one_based': mouse_column, 'row_one_based': mouse_row,
+            mouse_navigation = {'protocol': 'keyboard' if profile == 'dumb' else 'SGR', 'column_one_based': mouse_column, 'row_one_based': mouse_row,
                                 'observed_sgr_capture': observed_sgr_capture,
                                 'capture_modes_before_input': capture_modes_before_input,
-                                'visible_item': target_label, 'down_hex': down_bytes.hex(), 'up_hex': up_bytes.hex(),
+                                'visible_item': target_label, 'down_hex': None if profile == 'dumb' else down_bytes.hex(),
+                                'up_hex': None if profile == 'dumb' else up_bytes.hex(),
                                 'observed_route': 'Lineages', 'capture': navigation_capture}
             record_interaction('observed_mouse_navigation', **mouse_navigation)
             send_terminal_input(b'9')
@@ -1635,7 +1649,7 @@ for profile in profiles:
             if profile == 'truecolor':
                 assert screen.truecolor_count > 0, 'actual truecolor SGR was not emitted'
             else:
-                assert screen.color_count == 0, 'NO_COLOR emitted non-default SGR colors'
+                assert screen.color_count == 0, profile + ' emitted non-default SGR colors'
         finally:
             try:
                 if process.poll() is None:
