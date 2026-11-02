@@ -8956,13 +8956,11 @@ impl SimulationView {
         )
         .flex_1();
 
-        let mut canvas_stack = div()
-            .relative()
+        let canvas_interaction = div()
             .flex()
             .flex_col()
             .flex_1()
             .min_h(px(0.0))
-            .overflow_hidden()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, _, cx| {
@@ -9053,6 +9051,17 @@ impl SimulationView {
                 }
             }))
             .child(canvas_element);
+
+        // Keep the camera's wheel and drag handlers on the canvas sibling,
+        // so scrolling the floating inspector cannot also zoom the world.
+        let mut canvas_stack = div()
+            .relative()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.0))
+            .overflow_hidden()
+            .child(canvas_interaction);
 
         let focused_agent = self
             .inspector
@@ -9176,7 +9185,7 @@ impl SimulationView {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .child(label("SELECTED CREATURE"))
+                    .child(label("SELECTED CREATURE · SCROLL FOR DETAILS"))
                     .child(color_swatch(selected.color)),
             )
             .child(
@@ -9297,14 +9306,14 @@ impl SimulationView {
                     div()
                         .flex()
                         .flex_wrap()
-                        .gap_1()
+                        .gap_3()
                         .children(SENSOR_LAYOUT.iter().map(|channel| {
                             signal(channel.name, detail.sensors.get(channel.index).copied())
                         })),
                 )
                 .child(div().h(px(1.0)).w_full().bg(chrome::border()))
                 .child(label("BRAIN OUTPUTS · ALL CHANNELS"))
-                .child(div().flex().flex_wrap().gap_1().children(
+                .child(div().flex().flex_wrap().gap_3().children(
                     OutputChannel::ALL.into_iter().map(|channel| {
                         signal(channel.name(), detail.outputs.get(channel.index()).copied())
                     }),
@@ -21456,7 +21465,8 @@ fn rasterize_food_field(frame: &RenderFrame) -> Option<WorldRasterPixels> {
             // food in empty cells. A smooth density falloff avoids hard square
             // halos, and stable texture replaces per-tick shimmer.
             let clusters = ((texture - 0.22) * 2.2).clamp(0.0, 1.0);
-            color.a *= density.sqrt() * (0.24 + 0.76 * clusters);
+            let sparse_floor = 0.24 + 0.61 * (1.0 - density);
+            color.a *= density.sqrt() * (sparse_floor + (1.0 - sparse_floor) * clusters);
             let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
             bgra.extend_from_slice(&[byte(color.b), byte(color.g), byte(color.r), byte(color.a)]);
         }
