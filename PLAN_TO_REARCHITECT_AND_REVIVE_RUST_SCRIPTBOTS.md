@@ -2,6 +2,53 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Capture corruption depth (2026-11-02):** [Currently In Progress — GentleDuck;
+original `bd-2z0.14.3.10`; all original acceptance retained]
+
+The operator-requested TODO gates this original capture remainder and retires
+as an active checklist after verified delivery. The observed defect is an
+unread corruption resource plus clear-color/light changes that can trigger the
+alarm without exercising terrain geometry or materials.
+
+- [x] Recheck ready work, original comments, startup/session boundaries and the
+  actual material/shader reader; retain the existing software-lane policy.
+- [x] Add a failing real ECS/material-path regression before production edits.
+- [x] Wire the existing corruption resource into terrain materials after scene
+  synchronization, with a cached nonuniform emissive texture and no background,
+  light, exposure or camera changes between honest and corrupt sessions.
+- [x] Verify positive material changes, unchanged honest frames, cached texture
+  reuse, scene replacement, corruption disablement and unchanged rig inputs.
+- [ ] Attempt the actual capture path as a diagnostic on the available adapter;
+  retain images/provenance and distinguish smoke from admissible pixel evidence.
+- [x] Run relevant capture/terrain/authority tests, workspace all-target check,
+  strict Clippy, formatting and scoped static review through DSR.
+- [x] Integrate upstream's `39a8532a` snapshot-producer repair for the pulled
+  GPUI compile failure; retain its live-command semantics and verify opposite
+  realized/commanded states through the real host snapshot plus its threshold.
+- [ ] Re-execute committed source in a fresh solo pass, record the original
+  acceptance disposition and remaining host limitations, and publish reviewed
+  source/tracker records without closing an unmet positive pixel requirement.
+
+Candidate DSR `capture_corruption_validated/20261102T171619-1997823` passes
+all ten checks with unchanged source during execution. Capture's reported 42
+passes include two existing software-lane early returns: 40 tests actually
+exercise capture behavior, including four new material/rig cases. Terrain
+reports 30, authority guards seven, the three GPUI projections one each, and
+core visual capture two. Filters overlap; no unique-test total is inferred.
+Static review exits zero with no critical findings; its thousands of warnings
+across five large files are not claimed resolved. The original Bead remains
+in progress pending committed-source and actual-adapter execution.
+
+Concurrent source was retained through `302d5657`. Required gates first exposed
+the missing `boost_engaged` producer, fixed upstream at `39a8532a`. A real host
+regression rejects substituting the realized agent column for the command.
+Core's new fourth independent flag triggers Clippy's generic boolean-count
+heuristic; one item-scoped `expect` names the transport rationale, supported by
+simultaneous-command/event and threshold tests. This admits that one transport
+struct while retaining every workspace lint and strict-warning invocation;
+it does not alter scientific checks. The required formatter also wrapped one
+upstream HUD-capture expression, without changing its assertion or behavior.
+
 **Biome atlas consumer (2026-11-02):** [Verified and Closed — GentleDuck;
 original `bd-hpt6`; original decision unchanged]
 

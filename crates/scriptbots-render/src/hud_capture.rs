@@ -359,7 +359,10 @@ mod tests {
         assert!(changed > 1_000, "food layer changed only {changed} pixels");
         assert_eq!(
             digest_before,
-            world.port.scientific_digest_v1().expect("post-capture digest"),
+            world
+                .port
+                .scientific_digest_v1()
+                .expect("post-capture digest"),
             "food presentation must not change the simulation"
         );
     }

@@ -23444,6 +23444,56 @@ mod command_characterization_tests {
     }
 
     #[test]
+    fn published_boost_preserves_commanded_state_when_realized_boost_differs() {
+        use scriptbots_runtime::{HostCore, HostCoreOptions, HostSessionId};
+
+        for engaged in [false, true] {
+            let mut world = WorldState::new(ScriptBotsConfig {
+                world_width: 600,
+                world_height: 300,
+                food_cell_size: 50,
+                population_minimum: 0,
+                population_spawn_interval: 0,
+                persistence_interval: 0,
+                rng_seed: Some(77),
+                ..ScriptBotsConfig::default()
+            })
+            .unwrap();
+            world
+                .try_spawn_agent_with(
+                    AgentData {
+                        position: Position::new(120.0, 120.0),
+                        boost: !engaged,
+                        ..AgentData::default()
+                    },
+                    |runtime| runtime.outputs[OutputChannel::Boost.index()] = f32::from(engaged),
+                )
+                .unwrap();
+            let host = HostCore::new(
+                HostSessionId::new(77),
+                world,
+                HostCoreOptions {
+                    capture_agent_visuals: true,
+                    ..HostCoreOptions::default()
+                },
+            )
+            .unwrap();
+            let snapshot = host.snapshot_hub().latest();
+            assert_eq!(snapshot.world.agents.len(), 1);
+            assert_eq!(
+                snapshot.world.agents[0].boost, !engaged,
+                "fixture must distinguish realized from commanded boost"
+            );
+            let frame = RenderFrame::from_snapshot(&snapshot, ColorPaletteMode::Natural).unwrap();
+            assert_eq!(
+                frame.agents[0].boost,
+                f32::from(engaged),
+                "published visuals must preserve the live command, not substitute realized state"
+            );
+        }
+    }
+
+    #[test]
     fn render_frame_reads_live_boost_and_attacker_spike_state() {
         let config = ScriptBotsConfig {
             world_width: 600,
