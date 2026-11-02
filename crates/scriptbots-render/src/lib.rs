@@ -21906,6 +21906,40 @@ mod continuous_world_raster_tests {
     }
 
     #[test]
+    fn seeded_terrain_raster_preserves_science_and_can_be_inspected() {
+        let config = ScriptBotsConfig {
+            rng_seed: Some(12345),
+            persistence_interval: 0,
+            ..ScriptBotsConfig::default()
+        };
+        let world = WorldState::new(config).expect("seeded terrain world");
+        let before = world.world_digest_v1().expect("terrain world digest");
+        let frame = RenderFrame::from_world(&world, ColorPaletteMode::Natural)
+            .expect("seeded terrain frame");
+        let daylight = visual::daylight_factor(
+            frame.tick,
+            frame.day_night_cycle_ticks,
+            frame.day_night_start_phase,
+        );
+        let pixels = rasterize_world_fields(&frame, daylight).expect("seeded terrain raster");
+        assert!(pixels.width > 1 && pixels.height > 1);
+        assert_eq!(
+            before,
+            world.world_digest_v1().expect("post-raster world digest"),
+            "terrain presentation must not change the simulation"
+        );
+        if let Some(path) = std::env::var_os("SCRIPTBOTS_TERRAIN_PROBE") {
+            let mut rgba = pixels.bgra;
+            for pixel in rgba.chunks_exact_mut(4) {
+                pixel.swap(0, 2);
+            }
+            let image = image::RgbaImage::from_raw(pixels.width, pixels.height, rgba)
+                .expect("valid terrain pixel dimensions");
+            image.save(path).expect("write terrain probe");
+        }
+    }
+
+    #[test]
     fn canonical_gpu_terrain_colors_use_the_core_surface_oracle_for_every_palette() {
         let mut grass = tile(TerrainKind::Grass);
         grass.elevation = 0.91;
