@@ -287,6 +287,15 @@ RUST_LOG=info cargo run -p scriptbots-app
   cargo run -p scriptbots-app -- --storage memory --threads 2
   ```
   This renders offscreen for N frames and writes a JSON summary (frames, ticks, births/deaths, energy stats) to `terminal_report.json`.
+  The top-level `schema` is `"scriptbots.terminal-headless.v1"`; check it before
+  interpreting or comparing reports. `scenario.schema_version` describes the
+  scenario inputs and does not identify the report format. V1 keeps the existing
+  `scenario`, `initial`, `frames`, `summary`, `narrative_events` and
+  `narrative_dropped_events` fields. Each rendered frame's `buffer` records its
+  backend, capability profile, viewport, tick, cell counts, full-cell FNV-1a64
+  digest and layout-derived region evidence; the initial observation has no
+  rendered buffer. Older reports omitted the top-level tag. They are unversioned
+  evidence, and their scenario version must not be interpreted as report V1.
 
 ## Quick start (platform scripts)
 
@@ -978,7 +987,7 @@ The interactive frontend runs FrankenTUI's `Program` and retains Ratatui widgets
   - If emojis render as tofu/misaligned, install an emoji-capable font (e.g., Noto Color Emoji) or toggle off with `e`.
 - Narrow symbols mode: press `n` to switch to width-1 friendly symbols while keeping emoji colors off-background; helpful for strict terminals/alignment.
 
-Keybinds: space (pause), +/- (speed), s (single-step), b (toggle metrics baseline), S (save ASCII screenshot), e (emoji), n (narrow symbols), x (expanded panels), ?/h (help), q/Esc (quit). The terminal HUD shows tick/agents/births/deaths/energy, Insights (rolling metrics), Mortality panel, Brains leaderboard, recent events log, and an emoji world mini-map. The layout is responsive and auto-expands panels on wider terminals; press `x` to toggle. Screenshots saved via `S` are written under `screenshots/frame_<tick>.txt`.
+Keybinds: space (pause), +/- (speed), s (single-step), b (toggle metrics baseline), S (save the displayed frame), e (emoji), n (narrow symbols), x (expanded panels), ?/h (help), q/Esc (quit). The terminal HUD shows tick/agents/births/deaths/energy, Insights (rolling metrics), Mortality panel, Brains leaderboard, recent events log, and an emoji world mini-map. The layout is responsive and auto-expands panels on wider terminals; press `x` to toggle. `S` saves both ANSI (`.ans`) and plain text (`.txt`) under `screenshots/frame_<tick>_<pid>_<nonce>`, including science screens. The live footer reports completion or a write error.
 
 ## Storage & analytics
 

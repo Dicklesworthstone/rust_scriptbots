@@ -148,6 +148,9 @@ fn live_frankentui_pty_routes_and_restores_terminal() -> Result<()> {
                     "truecolor must be observed in actual terminal output"
                 );
                 let evidence = &observation["data_provider_evidence"];
+                assert_eq!(evidence["screenshot"]["displayed_plain_equal"], true);
+                assert_eq!(evidence["screenshot"]["served_ansi_equal"], true);
+                assert_eq!(evidence["screenshot"]["saved_receipt_observed"], true);
                 assert_eq!(evidence["checkpoint"]["new_catalog_entries"], 1);
                 let ordering = &evidence["checkpoint"]["receipt_stream_order"];
                 assert_eq!(ordering["observation_kind"], "decoded_terminal_cells");
@@ -1120,6 +1123,47 @@ for profile in profiles:
                                      and '[DURABLE_SYNCED]' not in text)
                     storage_evidence = {'state': 'no_batches', 'batch_ids': None, 'unit': 'persistence_batch_id'}
 
+                # Save an actual science view through the physical S key. Its
+                # lack of legacy dashboard panels must not turn a valid capture
+                # into a failed export after writing the files.
+                capture_provider('before-science-save', diagnostic_title, lambda text: True)
+                before_save_plain = (directory / 'before-science-save-screen.txt').read_bytes()
+                before_save_terminal = (directory / 'before-science-save-terminal.txt').read_text()
+                assert before_save_terminal.splitlines() == before_save_plain.decode().splitlines()
+                before_save_ansi = request_api('/api/screenshot/ascii?format=ansi')
+                retain_response('before-science-save.ans', before_save_ansi)
+                send_terminal_input(b'S')
+                screenshot_directory = directory / 'screenshots'
+                def saved_pair():
+                    ansi_files = list(screenshot_directory.glob('*.ans'))
+                    plain_files = list(screenshot_directory.glob('*.txt'))
+                    if not ansi_files or not plain_files:
+                        return False
+                    assert len(ansi_files) == len(plain_files) == 1, 'one S input must create one frame pair'
+                    assert ansi_files[0].stem == plain_files[0].stem, 'frame pair identities differ'
+                    if (ansi_files[0].read_bytes() != before_save_ansi
+                            or plain_files[0].read_bytes() != before_save_plain):
+                        return False
+                    saved_pair.paths = (ansi_files[0], plain_files[0])
+                    return True
+                pump_until(saved_pair, 'science screenshot file pair')
+                ansi_file, plain_file = saved_pair.paths
+                saved_plain = plain_file.read_text()
+                saved_ansi = ansi_file.read_bytes()
+                assert diagnostic_title in saved_plain and 'ScriptBots Terminal HUD' not in saved_plain
+                assert saved_plain.splitlines() == before_save_terminal.splitlines()
+                assert saved_ansi == before_save_ansi, 'saved science ANSI differs from the observed presented frame'
+                for path in (ansi_file, plain_file):
+                    evidence_artifacts.append({'file': str(path.relative_to(directory)),
+                                               'sha256': hashlib.sha256(path.read_bytes()).hexdigest()})
+                capture_provider('saved-science-receipt', diagnostic_title,
+                                 lambda text: 'Saved frame' in text and ansi_file.name in text
+                                 and 'Screenshot failed' not in text)
+                screenshot_evidence = {'displayed_plain_equal': True, 'served_ansi_equal': True,
+                                       'saved_receipt_observed': True, 'ansi_file': str(ansi_file),
+                                       'plain_file': str(plain_file), 'ansi_bytes': len(saved_ansi),
+                                       'text_bytes': plain_file.stat().st_size}
+
                 # A checkpoint is created only by k through the live service
                 # command. REST observes the resulting catalog; it never seeds it.
                 send_terminal_input(b'7')
@@ -1229,6 +1273,7 @@ for profile in profiles:
                                            'sha256': hashlib.sha256((directory / 'provider-http.jsonl').read_bytes()).hexdigest()})
                 data_provider_evidence = {
                     'storage': storage_evidence,
+                    'screenshot': screenshot_evidence,
                     'checkpoint': {'checkpoint_id': checkpoint['checkpoint_id'], 'tick': checkpoint['tick'],
                                    'byte_size': checkpoint['byte_size'], 'checksum_sha256': checkpoint['checksum_sha256'],
                                    'description': checkpoint['description'], 'new_catalog_entries': checkpoint_created.new_count,
@@ -1763,8 +1808,15 @@ struct ReportSummaryDto {
     avg_energy_max: f32,
 }
 
+#[derive(Debug, Deserialize, serde::Serialize)]
+enum HeadlessReportSchemaDto {
+    #[serde(rename = "scriptbots.terminal-headless.v1")]
+    V1,
+}
+
 #[derive(Debug, Deserialize)]
 struct HeadlessReportDto {
+    schema: HeadlessReportSchemaDto,
     initial: FrameStatsDto,
     frames: Vec<FrameStatsDto>,
     summary: ReportSummaryDto,
@@ -2020,6 +2072,26 @@ fn tui_evidence_e2e_serves_the_frame_the_renderer_published() -> Result<()> {
 
     let report_contents = std::fs::read_to_string(&report_path)?;
     let report: HeadlessReportDto = serde_json::from_str(&report_contents)?;
+    // Corrupt only the format tag on a real, otherwise complete report. Missing,
+    // unknown and wrongly typed schemas must not be accepted as V1 evidence.
+    let original: serde_json::Value = serde_json::from_str(&report_contents)?;
+    for schema in [
+        None,
+        Some(serde_json::json!("scriptbots.terminal-headless.v2")),
+        Some(serde_json::json!(37)),
+    ] {
+        let mut corrupt = original.clone();
+        let fields = corrupt.as_object_mut().expect("actual report object");
+        if let Some(schema) = schema {
+            fields.insert("schema".into(), schema);
+        } else {
+            fields.remove("schema");
+        }
+        assert!(
+            serde_json::from_value::<HeadlessReportDto>(corrupt).is_err(),
+            "an unsupported report format cannot inherit the scenario's version"
+        );
+    }
     let last = report
         .frames
         .last()
@@ -2117,8 +2189,9 @@ fn tui_evidence_e2e_serves_the_frame_the_renderer_published() -> Result<()> {
             )
         })
         .collect();
+    let report_schema = serde_json::to_string(&report.schema)?;
     println!(
-        "{{\"schema\":\"scriptbots.tui-evidence.v1\",\"seed\":{seed},\"frames\":{frames},\
+        "{{\"schema\":\"scriptbots.tui-evidence.v1\",\"report_schema\":{report_schema},\"seed\":{seed},\"frames\":{frames},\
          \"viewport\":\"{}x{}\",\"capability_profile\":\"{}\",\"backend\":\"{}\",\
          \"endpoint\":\"/api/screenshot/ascii\",\"endpoint_status\":{status},\
          \"report_path\":\"{}\",\"served_bytes\":{},\"served_lines\":{served_lines},\
