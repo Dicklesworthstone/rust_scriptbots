@@ -19038,7 +19038,7 @@ fn post_process_stack(
         passes.push(PostProcessPass::FilmGrain {
             strength: (0.14 + tension * 0.06).clamp(0.10, 0.24),
             // Keep screen-space grain stable as simulation ticks advance.
-            seed: 0x5342_4752_4149_4e,
+            seed: 0x0053_4247_5241_494e,
         });
     }
 

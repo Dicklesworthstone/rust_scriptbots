@@ -3672,10 +3672,6 @@ pub struct DynamicAgentSnapshot {
 /// need it even when nothing is drawing. See `RenderSnapshot::agent_selection`.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "visual transport preserves independent boost/spike commands and attacker/victim events; all four can coexist"
-)]
 pub struct DynamicAgentVisuals {
     /// Commanded left wheel effort, raw actuator value.
     pub wheel_left: f32,
