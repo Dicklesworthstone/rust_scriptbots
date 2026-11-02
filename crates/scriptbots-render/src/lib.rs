@@ -24687,10 +24687,19 @@ mod command_characterization_tests {
                 .world_to_screen((240.0, 240.0))
                 .expect("population median must remain visible");
             assert!(
-                (population_center.0 - viewport.0 * 0.5).abs() <= 1e-3
-                    && (population_center.1 - viewport.1 * 0.5).abs() <= 1e-3,
-                "{viewport:?} production layout must center population density, got \
+                population_center.0 >= 0.0
+                    && population_center.0 <= viewport.0
+                    && population_center.1 >= 0.0
+                    && population_center.1 <= viewport.1,
+                "{viewport:?} production layout must show the population, got \
                  {population_center:?}"
+            );
+            assert!(
+                layout.offset.0 <= 0.01
+                    && layout.offset.1 <= 0.01
+                    && layout.offset.0 + layout.render_size.0 >= viewport.0 - 0.01
+                    && layout.offset.1 + layout.render_size.1 >= viewport.1 - 0.01,
+                "{viewport:?} production world must cover the viewport: {layout:?}"
             );
         }
     }

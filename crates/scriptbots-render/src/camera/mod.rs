@@ -499,7 +499,22 @@ impl Camera {
         self.state.zoom_initialized = true;
         self.state.offset_px = (0.0, 0.0);
         self.record_render_metrics(canvas_origin, canvas_size, world_size, base_scale);
-        self.center_on(center);
+        // The canvas currently draws one copy of the world, even though the
+        // population median wraps at its edges. Centering a seam-adjacent
+        // cluster literally would leave much of the initial view empty.
+        let scale = base_scale * target_zoom;
+        let clamp_center = |coordinate: f32, viewport: f32, extent: f32| {
+            let half_visible = viewport / (2.0 * scale);
+            if half_visible * 2.0 >= extent {
+                extent * 0.5
+            } else {
+                coordinate.clamp(half_visible, extent - half_visible)
+            }
+        };
+        self.center_on(Position::new(
+            clamp_center(center.x, canvas_size.0, world_size.0),
+            clamp_center(center.y, canvas_size.1, world_size.1),
+        ));
         self.state.centered_once = true;
         self.state.initial_population_view_resolved = true;
         true
@@ -890,7 +905,7 @@ mod tests {
     }
 
     #[test]
-    fn initial_population_frame_is_density_centered_and_viewport_independent() {
+    fn initial_population_frame_keeps_the_world_on_screen_at_both_viewports() {
         let agent_radius = ScriptBotsConfig::default().bot_radius;
         let positions = clustered_population_with_one_outlier();
 
@@ -915,15 +930,38 @@ mod tests {
                 layout.scale * agent_radius
             );
 
-            let population_center = camera
-                .world_to_screen((240.0, 240.0))
-                .expect("population median is inside the world");
+            let population_center = camera.world_to_screen((240.0, 240.0)).unwrap();
             assert!(
-                approx_eq(population_center.0, viewport.0 * 0.5, 1e-3)
-                    && approx_eq(population_center.1, viewport.1 * 0.5, 1e-3),
-                "coordinate median must be centered despite the distant outlier: {population_center:?}"
+                population_center.0 >= 0.0
+                    && population_center.0 <= viewport.0
+                    && population_center.1 >= 0.0
+                    && population_center.1 <= viewport.1,
+                "the clustered population must remain visible: {population_center:?}"
+            );
+            assert!(
+                layout.offset.0 <= 0.01
+                    && layout.offset.1 <= 0.01
+                    && layout.offset.0 + layout.render_size.0 >= viewport.0 - 0.01
+                    && layout.offset.1 + layout.render_size.1 >= viewport.1 - 0.01,
+                "a zoomed world must cover the viewport: {layout:?}"
             );
         }
+    }
+
+    #[test]
+    fn initial_population_in_the_interior_remains_centered() {
+        let mut camera = Camera::default();
+        let position = Position::new(WORLD.0 * 0.5, WORLD.1 * 0.5);
+        camera.layout_with_initial_population(
+            (0.0, 0.0),
+            VIEWPORT,
+            WORLD,
+            ScriptBotsConfig::default().bot_radius,
+            [position],
+        );
+        let center = camera.world_to_screen((position.x, position.y)).unwrap();
+        assert!(approx_eq(center.0, VIEWPORT.0 * 0.5, 1e-3));
+        assert!(approx_eq(center.1, VIEWPORT.1 * 0.5, 1e-3));
     }
 
     #[test]
@@ -999,14 +1037,19 @@ mod tests {
             clustered_population_with_one_outlier(),
         );
 
-        let population_center = camera
-            .world_to_screen((240.0, 240.0))
-            .expect("population median is inside the world");
-        assert!(
-            approx_eq(population_center.0, VIEWPORT.0 * 0.5, 1e-3)
-                && approx_eq(population_center.1, VIEWPORT.1 * 0.5, 1e-3),
-            "an empty first render must not consume the one-shot population frame"
+        let mut immediate = Camera::default();
+        immediate.layout_with_initial_population(
+            (0.0, 0.0),
+            VIEWPORT,
+            WORLD,
+            agent_radius,
+            clustered_population_with_one_outlier(),
         );
+        let delayed = camera.snapshot();
+        let immediate = immediate.snapshot();
+        assert_eq!(delayed.zoom.to_bits(), immediate.zoom.to_bits());
+        assert!(approx_eq(delayed.offset_px.0, immediate.offset_px.0, 1e-3));
+        assert!(approx_eq(delayed.offset_px.1, immediate.offset_px.1, 1e-3));
     }
 
     #[test]
