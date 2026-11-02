@@ -838,7 +838,9 @@ pub const TERRAIN_BASE_COLORS: [Srgb; 6] = [
     BIOLUMINESCENT_DARK_FIELD_V1.terrain[5].albedo_srgb,
 ];
 
-const fn terrain_kind_index(kind: TerrainKind) -> usize {
+/// Layer index shared by canonical terrain materials, colors and biome textures.
+#[must_use]
+pub const fn terrain_kind_index(kind: TerrainKind) -> usize {
     match kind {
         TerrainKind::DeepWater => 0,
         TerrainKind::ShallowWater => 1,

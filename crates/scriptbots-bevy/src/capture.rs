@@ -1274,8 +1274,11 @@ fn validate_capture_seed(world_seed: u64, requested_seed: u64) -> Result<()> {
 /// stays initial-fill black (the bd-x6v6 root cause, isolated by the
 /// minimal upstream canary in `tests/hdr_probe.rs`).
 fn build_capture_app(config: &OffscreenCaptureConfig) -> Result<App> {
+    let terrain_detail_source = crate::TerrainDetailSource::bake()
+        .context("could not load the canonical biome detail atlas for capture")?;
     let render_creation = initialize_capture_renderer()?;
     let mut app = App::new();
+    app.insert_resource(terrain_detail_source);
     app.insert_resource(AmbientLight {
         color: Color::srgb(0.45, 0.52, 0.65),
         brightness: 800.0,
@@ -1775,6 +1778,7 @@ mod tests {
     #[test]
     fn first_capture_warmup_initializes_tier_before_real_consumers_run() {
         let mut app = App::new();
+        app.insert_resource(crate::TerrainDetailSource::bake().unwrap());
         app.insert_resource(SnapshotState::default());
         app.insert_resource(AgentRegistry::default());
         app.insert_resource(AccessibilityState::new());

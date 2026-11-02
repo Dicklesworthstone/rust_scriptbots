@@ -2,6 +2,70 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Biome atlas consumer (2026-11-02):** [Verified and Closed — GentleDuck;
+original `bd-hpt6`; original decision unchanged]
+
+The requested detailed TODO gates this original wire-or-retire decision and
+retires as an active checklist after verified delivery. The observed gap is an
+unconsumed atlas beside an existing generic roughness-detail material path.
+
+- [x] Recheck authoritative ready work, ownership, the atlas codec and the real
+  terrain material/capture consumers; retain the original generators and digest.
+- [x] Mark the original Bead and add a failing real material-path regression.
+- [x] Bake and verify the canonical atlas once before renderer/capture startup;
+  reject wrong length and corruption in every declared biome layer.
+- [x] Derive neutral roughness grain from atlas pixels, preserving vertex albedo,
+  accessibility palettes and material factors; identify this as chunk-dominant
+  biome detail rather than a new per-pixel albedo splat shader.
+- [x] Select the dominant biome from actual chunk tiles and include that selection
+  in render invalidation; bind the corresponding image to actual terrain materials.
+- [x] Keep cached image handles stable across quality changes and unchanged frames;
+  preserve filtered downsampling, complete mips and missing-asset recovery.
+- [x] Remove the obsolete consumer exemption only after a production reader exists;
+  retain test-only-call rejection and scanner falsification cases.
+- [x] Execute terrain/authority/capture boundary tests and required workspace
+  check, strict Clippy, formatting and scoped static review through DSR.
+- [x] Re-execute committed source in a fresh solo pass, assess original acceptance,
+  close only on observed evidence, and publish reviewed source/tracker records.
+
+Source `51ca4ee9b638256cfa66c90cd3e2611fb754e645` wires canonical atlas grain
+into the existing Bevy roughness-detail material path in native and capture
+startup. The atlas generator, seed and digest stay unchanged. Textures use the
+canonical 64×64 layers, with dominant-biome selection, stable image handles,
+filtered quality reductions and complete mips; vertex albedo remains shared.
+This is a real material consumer, not a per-pixel albedo splat shader.
+
+Fresh solo DSR proof:
+`/data/tmp/scriptbots-biome-detail-tkehu9O4/quality/biome_detail_final/20261102T044026-358974/receipt.json`.
+All nine checks executed and passed with identical clean source before/after:
+13 adaptive-rendering tests, seven authority guards, 29 terrain tests, one
+capture-startup test, workspace all-target checking, strict Clippy, formatting,
+and pinned clean-source guards. Test filters overlap; the counts are not a
+unique-test total. Tests distinguish all six biome images and bindings, reject
+wrong length and corruption in every layer, and exercise dominance/ties,
+render invalidation, rebinding, missing-image recovery and cache reuse.
+
+Failures remain in the evidence directory. The first remote negative test
+observed the old generic texture, but source edits during its run invalidated
+the remote post-execution source barrier; that failed receipt is not a bound
+negative proof. Capacity refusals (103) and a disk-full interruption are not
+test outcomes. The first candidate authority guard failed because its scanner
+cuts the remainder of `lib.rs` after its test module; moving the actual atlas
+resource beside the other resources made its real call visible without
+changing the scanner or assertions. The final seven guard tests pass with no
+exemptions. Raw UBS remains exit 1: one existing public terrain-cache fingerprint
+comparison is falsely classified as a secret comparison, plus 1,659 warnings
+and 573 informational findings across three large files. Changed-line findings
+were reviewed; no suppression was added and no warning-clean claim is made.
+
+The original Bead closes on this fresh self-verification, not independent
+review. Hardware image appearance, GPU pixel tests, all-feature execution,
+cross-backend atlas albedo and performance remain unqualified. No filesystem
+files were deleted. Root free space returned externally; it is not credited
+as cleanup performed here. The full real-work audit and 20-answer honesty
+inventory are retained in the original Bead comment. The other project work
+remains open, with no follow-up created to narrow this item's acceptance.
+
 **Flat-map capability continuation (2026-11-02):** [Verified and Closed —
 GentleDuck; original `bd-2z0.14.2.6`; acceptance unchanged]
 

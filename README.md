@@ -585,6 +585,12 @@ cargo build -p scriptbots-brain-ml --features candle # library tensor inference;
    - `--auto-pause-on-spike` (or `SCRIPTBOTS_AUTO_PAUSE_ON_SPIKE=true`) pauses on first spike hit event
 - `--brain {mixed|mlp|dwraon|assembly|ft|neuro}`: select which brain family(ies) to install for the run (default `mixed`). `mixed` registers MLP, DWRAON, and Assembly unconditionally; it additionally registers Frankentorch `FtBrain` only when the binary is built with `--features brain-ft`, and registers the optional NeuroFlow brain only when built with `--features neuro` (see `SCRIPTBOTS_NEUROFLOW_*` below for runtime toggles). `mlp`, `dwraon`, and `assembly` install only that single family. `neuro` explicitly selects the legacy NeuroFlow runner; registration in `mixed` does not admit it to mixed founding populations. `ft` installs only the Frankentorch family and **fails closed** with a typed error when the `brain-ft` feature is not enabled — it never silently substitutes another family. The flag is an application-layer CLI choice and is NOT a `ScriptBotsConfig` field, so `--config` files and `SCRIPTBOTS_CONFIG_OVERRIDES` cannot override it; precedence is `default → SCRIPTBOTS_BRAIN env var → --brain CLI flag`.
 
+Bevy terrain uses the verified canonical biome atlas for roughness detail in
+both the live renderer and offscreen scene capture. Each chunk selects its most
+common biome and shares that biome's cached texture; quality changes filter the
+same 64×64 source grain. Vertex colors still supply terrain hue and accessibility
+palettes. This detail path does not blend biome albedo textures per pixel.
+
 ### Environment variables (quick reference)
 - `RUST_LOG` — logging filter (e.g., `info`, `trace`, `scriptbots_core=debug`).
   Use `info,scriptbots_core::parallelism=debug` to observe the Rayon pool width inside each actual science step.
