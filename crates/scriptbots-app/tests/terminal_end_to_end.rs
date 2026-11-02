@@ -253,6 +253,42 @@ fn live_palette_shutdown_serializes_its_durable_receipt_before_restoration() -> 
     let sessions = reader.host_journal_sessions()?;
     assert_eq!(sessions.len(), 1);
     let record = reader.command_journal_record(sessions[0], id)?;
+    let persisted = reader.persistence_watermarks()?;
+    let displayed = &observation["data_provider_evidence"]["storage"]["batch_ids"];
+    assert!(
+        persisted.admitted.is_some(),
+        "the file journey must persist actual science batches"
+    );
+    for (name, value) in [
+        ("admitted", persisted.admitted),
+        ("applied", persisted.applied),
+        ("durable", persisted.durable),
+    ] {
+        assert_eq!(
+            displayed[name],
+            serde_json::json!(value.map(|batch| batch.get())),
+            "displayed {name} batch ID must match the actual finished database"
+        );
+    }
+    // Projection controls use real typed batch identities, but deliberately
+    // vary which frontiers are present. These are not live unfinished writes:
+    // they discriminate swapped/duplicated fields hidden by the synced cut.
+    let mut snapshot = scriptbots_storage::AnalyticsSnapshot {
+        run_id: Some(reader.run_id()),
+        watermarks: persisted,
+        ..scriptbots_storage::AnalyticsSnapshot::default()
+    };
+    let mut status = scriptbots_app::terminal::science_widgets::WatermarkStatusData::default();
+    for (applied, durable, expected) in [
+        (None, None, "[APPLY_PENDING]"),
+        (persisted.applied, None, "[NOT_DURABLE]"),
+        (persisted.applied, persisted.durable, "[DURABLE_SYNCED]"),
+    ] {
+        snapshot.watermarks.applied = applied;
+        snapshot.watermarks.durable = durable;
+        status.update(&snapshot);
+        assert!(status.format_strip(180).contains(expected));
+    }
     assert!(matches!(
         record.lifecycle.envelope().command,
         scriptbots_runtime::HostCommand::Shutdown
@@ -311,6 +347,10 @@ def checkpoint_catalog_matches(text, checkpoint):
                     checkpoint['world_digest_v1'][:checkpoint_digest_columns]]
     return (selected_rows == [expected_row]
             and selected_ids == [['Selected:', checkpoint['checkpoint_id']]])
+
+def storage_batch_ids(text):
+    match = re.search(r'Storage: Adm batch#(\d+) \| Applied batch#(\d+) \| Durable batch#(\d+)', text)
+    return None if match is None else dict(zip(('admitted', 'applied', 'durable'), map(int, match.groups())))
 
 digest_accepted_cases = [
     {'case': 'zero', 'value': '0' * digest_hex_digits},
@@ -862,7 +902,8 @@ for profile in profiles:
             [binary, '--storage', storage_mode, '--bootstrap-ticks', '0', '--threads', '1',
              '--set', 'world_width=100', '--set', 'world_height=100',
              '--set', 'food_cell_size=50', '--set', 'population_minimum=0',
-             '--set', 'persistence_interval=0', '--checkpoint-interval', '0'],
+             '--set', 'persistence_interval=' + ('1' if storage_mode == 'file' else '0'),
+             '--checkpoint-interval', '0'],
             stdin=slave, stdout=slave, stderr=log, cwd=directory, env=environment,
             preexec_fn=controlling_terminal)
         os.set_blocking(master, False)
@@ -1060,6 +1101,25 @@ for profile in profiles:
                 input_count_during_change = terminal_input_count - input_count_before
                 assert input_count_during_change == 0, 'terminal input masked the periodic refresh observation'
 
+                # The ordinary Diagnostics route must consume real storage
+                # publications even when the legacy dashboard is never drawn.
+                if storage_mode == 'file':
+                    def storage_synced(text):
+                        batches = storage_batch_ids(text)
+                        return (batches is not None and batches['admitted'] > 0
+                                and len(set(batches.values())) == 1 and '[DURABLE_SYNCED]' in text)
+                    capture_provider('storage-progress', diagnostic_title, storage_synced)
+                    batch_ids = storage_batch_ids(screen.text())
+                    presented_storage = (directory / 'storage-progress-screen.txt').read_text()
+                    assert batch_ids == storage_batch_ids(presented_storage), 'terminal/REST batch IDs disagree'
+                    storage_evidence = {'state': 'durable_synced', 'batch_ids': batch_ids,
+                                        'observed_world_tick': after['tick'], 'unit': 'persistence_batch_id'}
+                else:
+                    capture_provider('storage-empty', diagnostic_title,
+                                     lambda text: '[NO_BATCHES]' in text and 'Storage: Adm none | Applied none | Durable none' in text
+                                     and '[DURABLE_SYNCED]' not in text)
+                    storage_evidence = {'state': 'no_batches', 'batch_ids': None, 'unit': 'persistence_batch_id'}
+
                 # A checkpoint is created only by k through the live service
                 # command. REST observes the resulting catalog; it never seeds it.
                 send_terminal_input(b'7')
@@ -1168,6 +1228,7 @@ for profile in profiles:
                 evidence_artifacts.append({'file': 'provider-http.jsonl',
                                            'sha256': hashlib.sha256((directory / 'provider-http.jsonl').read_bytes()).hexdigest()})
                 data_provider_evidence = {
+                    'storage': storage_evidence,
                     'checkpoint': {'checkpoint_id': checkpoint['checkpoint_id'], 'tick': checkpoint['tick'],
                                    'byte_size': checkpoint['byte_size'], 'checksum_sha256': checkpoint['checksum_sha256'],
                                    'description': checkpoint['description'], 'new_catalog_entries': checkpoint_created.new_count,

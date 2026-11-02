@@ -9,14 +9,15 @@
 //!   event filtering by kind and subject UID, and canonical focus routing.
 //! - [`BrainActivationGridWidget`]: Real 2D per-layer activation grid, output sparklines,
 //!   top-k signed sensor attributions, and truthful provenance banner (uid, tick, rev, bytes, clipping).
-//! - [`WatermarkStatusStrip`]: Truthful persistence status showing admitted, applied,
-//!   and durable watermarks plus snapshot lag without optimistic acknowledgement.
+//! - [`WatermarkStatusData`]: Observed admitted, applied and durable persistence
+//!   batch identities, without inventing simulation ticks or acknowledgement.
 //! - [`AlignedScienceTables`]: Column-aligned formatters for Insights, Mortality (with theme-safe
 //!   proportional bars), Leaderboard, and Oldest agents (with diet chips).
 
 use ftui::render::cell::Cell;
 use ftui::render::frame::Frame;
 use ratatui::{buffer::Buffer, layout::Rect, style::Style};
+use scriptbots_storage::AnalyticsSnapshot;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
@@ -962,56 +963,73 @@ impl BrainActivationGridData {
 /// Truthful persistence watermark telemetry.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct WatermarkStatusData {
-    pub admitted_seq: u64,
-    pub admitted_control_revision: u64,
-    pub applied_scientific_revision: u64,
-    pub applied_tick: u64,
-    pub durable_storage_tick: Option<u64>,
-    pub durable_receipt_id: Option<String>,
+    pub storage_available: bool,
+    pub admitted_batch_id: Option<u64>,
+    pub applied_batch_id: Option<u64>,
+    pub durable_batch_id: Option<u64>,
     pub storage_error: Option<String>,
 }
 
 impl WatermarkStatusData {
-    pub fn update(&mut self, admitted: u64, applied: u64, durable: u64, err: Option<&str>) {
-        self.admitted_seq = admitted;
-        self.applied_tick = applied;
-        self.durable_storage_tick = Some(durable);
-        self.storage_error = err.map(Into::into);
-    }
-
-    pub fn snapshot_lag(&self) -> u64 {
-        self.applied_tick
-            .saturating_sub(self.durable_storage_tick.unwrap_or(0))
+    pub fn update(&mut self, snapshot: &AnalyticsSnapshot) {
+        self.storage_available = snapshot.run_id.is_some();
+        self.admitted_batch_id = snapshot.watermarks.admitted.map(|batch| batch.get());
+        self.applied_batch_id = snapshot.watermarks.applied.map(|batch| batch.get());
+        self.durable_batch_id = snapshot.watermarks.durable.map(|batch| batch.get());
+        self.storage_error = snapshot.last_error.as_deref().map(Into::into);
     }
 
     pub fn is_synced(&self) -> bool {
-        self.durable_storage_tick == Some(self.applied_tick) && self.storage_error.is_none()
+        self.storage_available
+            && self.admitted_batch_id.is_some_and(|id| id > 0)
+            && self.admitted_batch_id == self.applied_batch_id
+            && self.applied_batch_id == self.durable_batch_id
+            && self.storage_error.is_none()
     }
 
     pub fn format_strip(&self, width: usize) -> String {
-        let lag = self.snapshot_lag();
+        if width == 0 {
+            return String::new();
+        }
+        let admitted = self.admitted_batch_id.unwrap_or(0);
+        let applied = self.applied_batch_id.unwrap_or(0);
+        let durable = self.durable_batch_id.unwrap_or(0);
         let status_badge = if let Some(err) = &self.storage_error {
             format!("[STORAGE_ERR: {}]", err)
+        } else if !self.storage_available {
+            "[STORAGE_UNAVAILABLE]".to_string()
+        } else if durable > applied
+            || applied > admitted
+            || [
+                self.admitted_batch_id,
+                self.applied_batch_id,
+                self.durable_batch_id,
+            ]
+            .contains(&Some(0))
+        {
+            "[INVALID_PROGRESS]".to_string()
+        } else if self.admitted_batch_id.is_none() {
+            "[NO_BATCHES]".to_string()
         } else if self.is_synced() {
             "[DURABLE_SYNCED]".to_string()
-        } else if lag > 0 {
-            format!("[JOURNAL_LAG: {}t]", lag)
+        } else if applied < admitted {
+            "[APPLY_PENDING]".to_string()
         } else {
-            "[IN_FLIGHT]".to_string()
+            "[NOT_DURABLE]".to_string()
         };
-
-        let durable_str = self
-            .durable_storage_tick
-            .map_or("none".to_string(), |t| format!("t{}", t));
-
+        let batch = |value: Option<u64>| {
+            if self.storage_available {
+                value.map_or_else(|| "none".to_string(), |id| format!("batch#{id}"))
+            } else {
+                "unknown".to_string()
+            }
+        };
         let text = format!(
-            "{} | Storage: Adm s#{} r#{} | Applied t{} r#{} | Durable {}",
+            "{} | Storage: Adm {} | Applied {} | Durable {}",
             status_badge,
-            self.admitted_seq,
-            self.admitted_control_revision,
-            self.applied_tick,
-            self.applied_scientific_revision,
-            durable_str,
+            batch(self.admitted_batch_id),
+            batch(self.applied_batch_id),
+            batch(self.durable_batch_id),
         );
 
         if text.len() > width {
@@ -1362,27 +1380,96 @@ mod tests {
     }
 
     #[test]
+    fn watermarks_without_an_admitted_batch_do_not_claim_durable_sync() {
+        let mut status = WatermarkStatusData::default();
+        status.update(&AnalyticsSnapshot::default());
+        assert!(
+            !status.is_synced(),
+            "an unobserved or empty producer has no persisted batch to certify: {}",
+            status.format_strip(180)
+        );
+    }
+
+    #[test]
+    fn watermarks_with_admitted_work_ahead_of_application_are_not_synced() {
+        let status = WatermarkStatusData {
+            storage_available: true,
+            admitted_batch_id: Some(23),
+            applied_batch_id: Some(22),
+            durable_batch_id: Some(22),
+            storage_error: None,
+        };
+        assert!(
+            !status.is_synced(),
+            "batch 23 is still unapplied even though applied and durable agree: {}",
+            status.format_strip(180)
+        );
+    }
+
+    #[test]
+    fn watermarks_display_persistence_batch_ids_without_inventing_ticks_or_revisions() {
+        let status = WatermarkStatusData {
+            storage_available: true,
+            admitted_batch_id: Some(23),
+            applied_batch_id: Some(22),
+            durable_batch_id: Some(20),
+            storage_error: None,
+        };
+        let strip = status.format_strip(180);
+        assert!(strip.contains("Adm batch#23"), "{strip}");
+        assert!(strip.contains("Applied batch#22"), "{strip}");
+        assert!(strip.contains("Durable batch#20"), "{strip}");
+        assert!(!strip.contains(" r#"), "{strip}");
+        assert!(!strip.contains("Applied t"), "{strip}");
+    }
+
+    #[test]
+    fn watermarks_distinguish_unavailable_empty_and_volatile_storage() {
+        let mut status = WatermarkStatusData::default();
+        status.update(&AnalyticsSnapshot::default());
+        assert!(status.format_strip(180).contains("[STORAGE_UNAVAILABLE]"));
+        status.storage_available = true;
+        assert!(status.format_strip(180).contains("[NO_BATCHES]"));
+        assert!(!status.is_synced());
+
+        status.admitted_batch_id = Some(4);
+        status.applied_batch_id = Some(4);
+        assert!(status.format_strip(180).contains("[NOT_DURABLE]"));
+        assert!(!status.is_synced());
+        for width in 0..80 {
+            assert!(status.format_strip(width).chars().count() <= width);
+        }
+
+        status.durable_batch_id = Some(4);
+        assert!(status.is_synced());
+        status.applied_batch_id = Some(5);
+        assert!(!status.is_synced());
+        assert!(status.format_strip(180).contains("[INVALID_PROGRESS]"));
+        status.admitted_batch_id = Some(0);
+        status.applied_batch_id = Some(0);
+        status.durable_batch_id = Some(0);
+        assert!(!status.is_synced());
+        assert!(status.format_strip(180).contains("[INVALID_PROGRESS]"));
+    }
+
+    #[test]
     fn test_truthful_watermark_status_strip() {
         let mut status = WatermarkStatusData {
-            admitted_seq: 12,
-            admitted_control_revision: 3,
-            applied_scientific_revision: 10,
-            applied_tick: 50,
-            durable_storage_tick: Some(45),
-            durable_receipt_id: Some("rcpt-1".into()),
+            storage_available: true,
+            admitted_batch_id: Some(50),
+            applied_batch_id: Some(50),
+            durable_batch_id: Some(45),
             storage_error: None,
         };
 
-        assert_eq!(status.snapshot_lag(), 5);
         assert!(!status.is_synced());
-        let strip = status.format_strip(80);
-        assert!(strip.contains("[JOURNAL_LAG: 5t]"));
-        assert!(strip.contains("Applied t50"));
-        assert!(strip.contains("Durable t45"));
+        let strip = status.format_strip(180);
+        assert!(strip.contains("[NOT_DURABLE]"));
+        assert!(strip.contains("Applied batch#50"));
+        assert!(strip.contains("Durable batch#45"));
 
         // When durable caught up
-        status.durable_storage_tick = Some(50);
-        assert_eq!(status.snapshot_lag(), 0);
+        status.durable_batch_id = Some(50);
         assert!(status.is_synced());
         let synced_strip = status.format_strip(80);
         assert!(synced_strip.contains("[DURABLE_SYNCED]"));

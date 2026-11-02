@@ -2,6 +2,36 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Persistence status on Diagnostics (2026-11-01):** [Currently In Progress —
+GentleDuck, `bd-bacf.1`; original UX/widget tasks remain unchanged]
+
+- [x] Recheck ready tasks and consumers; identify the missing science-screen
+  analytics refresh and batch IDs mislabeled as ticks/revisions.
+- [x] Add three unchanged-production regressions for empty false sync, admitted
+  work ahead of application, and wrong display units; run them through DSR.
+- [x] Observe and retain their results before changing the implementation:
+  three failed on old production; two existing watermark tests passed.
+- [x] Project actual immutable analytics watermarks without converting absence
+  into zero or treating admitted work as applied/durable work.
+- [x] Distinguish unavailable, no batches, apply pending, not durable, synced and
+  error states; remove unused invented tick/revision fields from the widget.
+- [x] Refresh analytics on the science-screen path and display the existing
+  corrected status strip on normal Diagnostics, including reduced detail.
+- [x] Preserve existing observations and clipped/offset/tiny rendering behavior;
+  manually update only the five fixed frame rows affected by the added strip.
+- [x] Extend the actual file-backed PTY journey to persist science and compare
+  the displayed batch frontiers with the finished database's actual watermarks.
+- [x] Run widget (13), shell (28), Diagnostics (5), full terminal E2E (5),
+  formatting and targeted static review through DSR. Diagnostics includes all
+  five receipt-state full-frame fixtures and their existing corruption controls.
+- [ ] Complete default workspace check and strict Clippy through DSR/RCH.
+- [ ] Repeat the positive journey at a clean committed source; review all
+  original criteria in a fresh solo pass, update Beads and publish reviewed work.
+
+Queue consumer/provenance: the user explicitly requested a granular TODO; the
+implementing agent and user consume it until this bug's handoff, when it retires
+as an execution record. Raw evidence: `/data/tmp/scriptbots-storage-status-S8Oqoz`.
+
 **Checkpoint capture follow-through (2026-11-01):** [Qualified gate correction —
 GentleDuck; original `bd-2z0.14.2.6` Currently In Progress; acceptance unchanged]
 

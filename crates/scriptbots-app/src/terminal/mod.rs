@@ -3288,6 +3288,9 @@ impl<'a> TerminalApp<'a> {
         frame: &mut Frame<'_>,
         degradation: ftui::render::budget::DegradationLevel,
     ) {
+        // Science routes return before the legacy dashboard refresh. Read the
+        // same immutable provider here, including reduced-detail presentation.
+        self.maybe_refresh_analytics();
         // The old map is not on this screen: its hit regions must not select an
         // invisible agent or resize a nonexistent splitter after navigation.
         self.hit_regions = HitRegionMap::default();
@@ -3633,14 +3636,8 @@ impl<'a> TerminalApp<'a> {
         self.analytics_revision = Some(published.revision);
 
         let committed_tick = published.committed_tick.unwrap_or(self.snapshot.tick);
-        let admitted = published.watermarks.admitted.map_or(0, |b| b.get());
-        let applied = published.watermarks.applied.map_or(0, |b| b.get());
-        let durable = published.watermarks.durable.map_or(0, |b| b.get());
-        let err_str = published.last_error.as_deref();
-        self.watermark_status
-            .update(admitted, applied, durable, err_str);
-        self.frankentui
-            .update_watermarks(admitted, applied, durable, err_str);
+        self.watermark_status.update(&published);
+        self.frankentui.update_watermarks(&published);
 
         self.analytics_status = AnalyticsStatus {
             revision: published.revision,
@@ -19065,11 +19062,11 @@ for case in ('panic', 'subscription', 'renderer'):
         "    HOST & STORAGE PIPELINE HEALTH:",
         "      Admitted Command Queue:  0/8 (0% capacity)",
         "      Analytics Snapshot: Committed Tick 0       Uncommitted: unavailable",
+        "  [STORAGE_UNAVAILABLE] | Storage: Adm unknown | Applied unknown | Durable unknown",
         "      Introspection Neutrality: not measured",
         "",
         "    SIMULATION STAGE LATENCIES (ms):",
         "      fixture                0.25 ms",
-        "",
         "",
         "----------------------------------------------------------------------------------------------------",
         " ✓ OK: Command normal applied (rev 3)",
@@ -19085,11 +19082,11 @@ for case in ('panic', 'subscription', 'renderer'):
         "    HOST & STORAGE PIPELINE HEALTH:",
         "      Admitted Command Queue:  0/8 (0% capacity)",
         "      Analytics Snapshot: Committed Tick 0       Uncommitted: unavailable",
+        "  [STORAGE_UNAVAILABLE] | Storage: Adm unknown | Applied unknown | Durable unknown",
         "      Introspection Neutrality: not measured",
         "",
         "    SIMULATION STAGE LATENCIES (ms):",
         "      fixture                0.25 ms",
-        "",
         "",
         "----------------------------------------------------------------------------------------------------",
         " [REDUCED CAPABILITY] [REDUCED-CAPABILITY MODE ACTIVATED]",
@@ -19105,11 +19102,11 @@ for case in ('panic', 'subscription', 'renderer'):
         "    HOST & STORAGE PIPELINE HEALTH:",
         "      Admitted Command Queue:  0/8 (0% capacity)",
         "      Analytics Snapshot: Committed Tick 0       Uncommitted: unavailable",
+        "  [STORAGE_UNAVAILABLE] | Storage: Adm unknown | Applied unknown | Durable unknown",
         "      Introspection Neutrality: not measured",
         "",
         "    SIMULATION STAGE LATENCIES (ms):",
         "      fixture                0.25 ms",
-        "",
         "",
         "----------------------------------------------------------------------------------------------------",
         " ✗ REJECTED: Command rejected rejected: quota exceeded",
@@ -19125,11 +19122,11 @@ for case in ('panic', 'subscription', 'renderer'):
         "    HOST & STORAGE PIPELINE HEALTH:",
         "      Admitted Command Queue:  0/8 (0% capacity)",
         "      Analytics Snapshot: Committed Tick 0       Uncommitted: unavailable",
+        "  [STORAGE_UNAVAILABLE] | Storage: Adm unknown | Applied unknown | Durable unknown",
         "      Introspection Neutrality: not measured",
         "",
         "    SIMULATION STAGE LATENCIES (ms):",
         "      fixture                0.25 ms",
-        "",
         "",
         "----------------------------------------------------------------------------------------------------",
         " ⚠ STALE REVISION: Command stale expected rev 8 but observed 10",
@@ -19145,11 +19142,11 @@ for case in ('panic', 'subscription', 'renderer'):
         "    HOST & STORAGE PIPELINE HEALTH:",
         "      Admitted Command Queue:  0/8 (0% capacity)",
         "      Analytics Snapshot: Committed Tick 0       Uncommitted: unavailable",
+        "  [STORAGE_UNAVAILABLE] | Storage: Adm unknown | Applied unknown | Durable unknown",
         "      Introspection Neutrality: not measured",
         "",
         "    SIMULATION STAGE LATENCIES (ms):",
         "      fixture                0.25 ms",
-        "",
         "",
         "----------------------------------------------------------------------------------------------------",
         " ✗ FAILED: Command failed failed: speed must be positive",
@@ -23624,6 +23621,30 @@ for case in ('panic', 'subscription', 'renderer'):
         assert_eq!(applied.playback.speed_multiplier, 0.75);
         assert!(applied.revisions.control > before.revisions.control);
         assert_eq!(applied.revisions.scientific, before.revisions.scientific);
+    }
+
+    #[test]
+    fn diagnostics_refreshes_storage_even_in_reduced_detail() {
+        let host = TerminalTestHost::take(command_characterization_world());
+        let (runtime, _) = ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let mut app = TerminalApp::new(&renderer, host.context(&runtime));
+        app.navigate_route(frankentui_shell::ShellRoute::Diagnostics);
+        // A stale previously displayed failure must be replaced by the current
+        // immutable source, even when its revision is still zero.
+        app.frankentui.watermark_status.storage_error = Some("old failure".into());
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(160, 36))
+            .expect("real widget backend");
+        terminal
+            .draw(|frame| {
+                app.draw_shell_frame(frame, ftui::render::budget::DegradationLevel::EssentialOnly);
+            })
+            .expect("reduced-detail Diagnostics");
+        let text = export::buffer_to_plain_text(terminal.backend().buffer());
+        assert!(text.contains("[STORAGE_UNAVAILABLE]"));
+        assert!(!text.contains("old failure"));
+        assert!(!text.contains("[DURABLE_SYNCED]"));
+        assert_eq!(app.snapshot.tick, 0);
     }
 
     #[test]

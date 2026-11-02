@@ -1064,6 +1064,7 @@ pub fn render_environment_screen(
 pub fn render_diagnostics_screen(
     frame: &mut Frame,
     state: &ScreenDataState<DiagnosticsViewData>,
+    storage: &super::science_widgets::WatermarkStatusData,
     y_start: u16,
 ) {
     let y_start = u32::from(y_start);
@@ -1109,6 +1110,8 @@ pub fn render_diagnostics_screen(
                 observation_text(data.storage_uncommitted_records, |value| value.to_string())
             );
             print_text(frame, 2, y_start + 6, &storage_str);
+            let progress = storage.format_strip(usize::from(frame.width().saturating_sub(2)));
+            print_text(frame, 2, y_start + 7, &progress);
 
             let neutrality_str = match data.digest_neutrality_verified {
                 Some(true) => {
@@ -1119,9 +1122,9 @@ pub fn render_diagnostics_screen(
                 }
                 None => "    Introspection Neutrality: not measured",
             };
-            print_text(frame, 2, y_start + 7, neutrality_str);
+            print_text(frame, 2, y_start + 8, neutrality_str);
 
-            let timing_y = y_start + 9;
+            let timing_y = y_start + 10;
             print_text(frame, 2, timing_y, "  SIMULATION STAGE LATENCIES (ms):");
             let rows = timing_y.saturating_add(1)..u32::from(frame.height());
             for (row, (stage, ms)) in rows.zip(&data.snapshot_timings_ms) {
@@ -1226,6 +1229,7 @@ mod tests {
         render_diagnostics_screen(
             &mut frame,
             &ScreenDataState::Data(DiagnosticsViewData::default()),
+            &super::super::science_widgets::WatermarkStatusData::default(),
             u16::MAX,
         );
         assert!(frame.buffer.content_eq(&before));

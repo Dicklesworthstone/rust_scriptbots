@@ -606,17 +606,8 @@ impl FrankenTuiModel {
     }
 
     /// Update storage persistence watermarks.
-    pub fn update_watermarks(
-        &mut self,
-        admitted: u64,
-        applied: u64,
-        durable: u64,
-        err: Option<&str>,
-    ) {
-        self.watermark_status.admitted_seq = admitted;
-        self.watermark_status.applied_tick = applied;
-        self.watermark_status.durable_storage_tick = Some(durable);
-        self.watermark_status.storage_error = err.map(Into::into);
+    pub fn update_watermarks(&mut self, snapshot: &scriptbots_storage::AnalyticsSnapshot) {
+        self.watermark_status.update(snapshot);
     }
 
     pub fn latest_receipt(&self) -> Option<&CommandReceiptEntry> {
@@ -1553,6 +1544,7 @@ impl Model for FrankenTuiModel {
                         science_screens::render_diagnostics_screen(
                             frame,
                             &self.science.diagnostics,
+                            &self.watermark_status,
                             3,
                         );
                     }
@@ -2006,6 +1998,28 @@ mod tests {
     }
 
     #[test]
+    fn diagnostics_displays_the_observed_storage_batch_frontiers() {
+        let mut harness = FrankenTuiSimulatorHarness::new();
+        harness.init();
+        harness.dispatch(ShellMessage::SetDiagnosticsData(ScreenDataState::Data(
+            DiagnosticsViewData::default(),
+        )));
+        harness.dispatch(ShellMessage::UpdateWatermarkStatus(WatermarkStatusData {
+            storage_available: true,
+            admitted_batch_id: Some(23),
+            applied_batch_id: Some(22),
+            durable_batch_id: Some(20),
+            storage_error: None,
+        }));
+        harness.dispatch(ShellMessage::Navigate(ShellRoute::Diagnostics));
+        let frame = harness.capture_frame_str(160, 36);
+        assert!(frame.contains("[APPLY_PENDING]"));
+        assert!(frame.contains("Adm batch#23 | Applied batch#22 | Durable batch#20"));
+        assert!(!frame.contains("[DURABLE_SYNCED]"));
+        assert!(frame.contains("Introspection Neutrality: not measured"));
+    }
+
+    #[test]
     fn test_snapshot_does_not_invent_chart_measurements_or_storage_watermarks() {
         let mut model = FrankenTuiModel::new();
         model.ingest_chart_sample(
@@ -2018,7 +2032,13 @@ mod tests {
             },
             24,
         );
-        model.update_watermarks(23, 22, 20, None);
+        model.update(ShellMessage::UpdateWatermarkStatus(WatermarkStatusData {
+            storage_available: true,
+            admitted_batch_id: Some(23),
+            applied_batch_id: Some(22),
+            durable_batch_id: Some(20),
+            storage_error: None,
+        }));
         let chart = model.chart_data.clone();
         let watermarks = model.watermark_status.clone();
         model.update_from_snapshot(25, 1, 12, 40.0, 8, 25);
