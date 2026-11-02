@@ -19063,9 +19063,26 @@ struct WorldRasterKey {
     palette: ColorPaletteMode,
 }
 
+impl WorldRasterKey {
+    fn same_world(self, other: Self) -> bool {
+        self.field_fingerprint == other.field_fingerprint && self.palette == other.palette
+    }
+}
+
+enum WorldRasterMessage {
+    Preview(WorldRasterPixels),
+    Complete(Option<WorldRasterPixels>),
+}
+
+struct PendingWorldRaster {
+    key: WorldRasterKey,
+    receiver: std::sync::mpsc::Receiver<WorldRasterMessage>,
+}
+
 struct CachedWorldRaster {
     key: WorldRasterKey,
     image: Arc<RenderImage>,
+    final_quality: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -19093,6 +19110,8 @@ struct CachedFoodTexture {
 #[derive(Default)]
 struct WorldRasterCache {
     current: Option<CachedWorldRaster>,
+    pending: Option<PendingWorldRaster>,
+    last_failure: Option<(WorldRasterKey, std::time::Instant)>,
     previous: Option<Arc<RenderImage>>,
     food_current: Option<CachedFoodRaster>,
     food_previous: Option<Arc<RenderImage>>,
@@ -19103,15 +19122,106 @@ impl WorldRasterCache {
     fn image_for(&self, key: WorldRasterKey) -> Option<Arc<RenderImage>> {
         self.current
             .as_ref()
-            .filter(|entry| entry.key == key)
+            .filter(|entry| entry.key == key && entry.final_quality)
             .map(|entry| Arc::clone(&entry.image))
     }
 
-    fn commit(&mut self, key: WorldRasterKey, image: Arc<RenderImage>) -> Option<Arc<RenderImage>> {
+    // A slightly older daylight value is preferable to a blank or blocking frame,
+    // but never display pixels for a different world or accessibility palette.
+    fn compatible_image_for(&self, key: WorldRasterKey) -> Option<Arc<RenderImage>> {
+        self.current
+            .as_ref()
+            .filter(|entry| entry.key.same_world(key))
+            .map(|entry| Arc::clone(&entry.image))
+    }
+
+    fn take_completed(
+        &mut self,
+        desired: WorldRasterKey,
+    ) -> Option<(WorldRasterKey, WorldRasterPixels, bool)> {
+        let result = match self.pending.as_ref()?.receiver.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                let failed_key = self.pending.take()?.key;
+                self.last_failure = Some((failed_key, std::time::Instant::now()));
+                return None;
+            }
+        };
+        let key = self.pending.as_ref()?.key;
+        let (pixels, final_quality) = match result {
+            WorldRasterMessage::Preview(pixels) => (Some(pixels), false),
+            WorldRasterMessage::Complete(pixels) => {
+                self.pending = None;
+                self.last_failure = if pixels.is_none() {
+                    Some((key, std::time::Instant::now()))
+                } else {
+                    None
+                };
+                (pixels, true)
+            }
+        };
+        pixels
+            .filter(|_| key.same_world(desired))
+            .map(|pixels| (key, pixels, final_quality))
+    }
+
+    fn failed_for(&self, key: WorldRasterKey) -> bool {
+        self.last_failure
+            .is_some_and(|(failed, _)| failed.same_world(key))
+    }
+
+    fn start_world_raster(
+        &mut self,
+        key: WorldRasterKey,
+        input: TerrainRasterInput,
+        daylight: f32,
+        include_preview: bool,
+    ) {
+        if self.pending.is_some()
+            || self.last_failure.is_some_and(|(failed_key, at)| {
+                failed_key.same_world(key) && at.elapsed() < std::time::Duration::from_secs(1)
+            })
+        {
+            return;
+        }
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        match std::thread::Builder::new()
+            .name("scriptbots-terrain-raster".into())
+            .spawn(move || {
+                if include_preview
+                    && let Some(preview) =
+                        rasterize_terrain_input_at_resolution(&input, daylight, 1)
+                    && sender.send(WorldRasterMessage::Preview(preview)).is_err()
+                {
+                    return;
+                }
+                let _ = sender.send(WorldRasterMessage::Complete(rasterize_terrain_input(
+                    &input, daylight,
+                )));
+            }) {
+            Ok(_) => self.pending = Some(PendingWorldRaster { key, receiver }),
+            Err(error) => {
+                self.last_failure = Some((key, std::time::Instant::now()));
+                warn!(?error, "could not start terrain raster worker");
+            }
+        }
+    }
+
+    fn commit(
+        &mut self,
+        key: WorldRasterKey,
+        image: Arc<RenderImage>,
+        final_quality: bool,
+    ) -> Option<Arc<RenderImage>> {
         let retired = self.previous.take();
         self.previous = self
             .current
-            .replace(CachedWorldRaster { key, image })
+            .replace(CachedWorldRaster {
+                key,
+                image,
+                final_quality,
+            })
             .map(|entry| entry.image);
         retired
     }
@@ -21542,18 +21652,17 @@ fn world_field_fingerprint(frame: &RenderFrame) -> u64 {
 }
 
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-fn world_raster_dimensions(terrain: &TerrainFrame) -> Option<(u32, u32)> {
+fn world_raster_dimensions_at_resolution(
+    terrain: &TerrainFrame,
+    samples_per_cell: u32,
+) -> Option<(u32, u32)> {
     let (grid_width, grid_height) = terrain.dimensions;
     if grid_width == 0 || grid_height == 0 || terrain.tiles.is_empty() {
         return None;
     }
 
-    let mut width = grid_width
-        .saturating_mul(WORLD_RASTER_SAMPLES_PER_TERRAIN_CELL)
-        .max(1);
-    let mut height = grid_height
-        .saturating_mul(WORLD_RASTER_SAMPLES_PER_TERRAIN_CELL)
-        .max(1);
+    let mut width = grid_width.saturating_mul(samples_per_cell).max(1);
+    let mut height = grid_height.saturating_mul(samples_per_cell).max(1);
     let texels = u64::from(width).saturating_mul(u64::from(height));
     if texels > MAX_WORLD_RASTER_TEXELS {
         let scale = (MAX_WORLD_RASTER_TEXELS as f64 / texels as f64).sqrt();
@@ -21589,9 +21698,40 @@ fn blend_channels<const N: usize>(
     blended
 }
 
-#[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
+struct TerrainRasterInput {
+    terrain: TerrainFrame,
+    world_size: (f32, f32),
+    palette: ColorPaletteMode,
+}
+
+impl From<&RenderFrame> for TerrainRasterInput {
+    fn from(frame: &RenderFrame) -> Self {
+        Self {
+            terrain: frame.terrain.clone(),
+            world_size: frame.world_size,
+            palette: frame.palette,
+        }
+    }
+}
+
+#[cfg(test)]
 fn rasterize_world_fields(frame: &RenderFrame, daylight: f32) -> Option<WorldRasterPixels> {
-    let (raster_width, raster_height) = world_raster_dimensions(&frame.terrain)?;
+    rasterize_terrain_input(&TerrainRasterInput::from(frame), daylight)
+}
+
+#[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
+fn rasterize_terrain_input(frame: &TerrainRasterInput, daylight: f32) -> Option<WorldRasterPixels> {
+    rasterize_terrain_input_at_resolution(frame, daylight, WORLD_RASTER_SAMPLES_PER_TERRAIN_CELL)
+}
+
+#[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
+fn rasterize_terrain_input_at_resolution(
+    frame: &TerrainRasterInput,
+    daylight: f32,
+    samples_per_cell: u32,
+) -> Option<WorldRasterPixels> {
+    let (raster_width, raster_height) =
+        world_raster_dimensions_at_resolution(&frame.terrain, samples_per_cell)?;
     let expected_tiles =
         (frame.terrain.dimensions.0 as usize).saturating_mul(frame.terrain.dimensions.1 as usize);
     if frame.terrain.tiles.len() < expected_tiles {
@@ -21938,21 +22078,56 @@ fn paint_continuous_world_fields(
     // channels, and avoids rebuilding a full image for every simulation tick.
     let raster_daylight = (daylight * 512.0).round() / 512.0;
     let key = world_raster_key(frame, raster_daylight);
-    let cached = match state.world_raster_cache.lock() {
-        Ok(cache) => cache.image_for(key),
-        Err(poisoned) => poisoned.into_inner().image_for(key),
-    };
-    let (image, newly_built) = if let Some(image) = cached {
-        (image, false)
-    } else {
-        let Some(pixels) = rasterize_world_fields(frame, raster_daylight) else {
-            return false;
+    let (completed, cached, failed) = {
+        let mut cache = match state.world_raster_cache.lock() {
+            Ok(cache) => cache,
+            Err(poisoned) => poisoned.into_inner(),
         };
-        let Some(image) = render_image_from_world_raster(pixels) else {
-            return false;
-        };
-        (image, true)
+        let completed = cache.take_completed(key);
+        let cached = cache.compatible_image_for(key);
+        let completed_exact =
+            completed
+                .as_ref()
+                .is_some_and(|(completed_key, _, final_quality)| {
+                    *completed_key == key && *final_quality
+                });
+        if cache.pending.is_none() && cache.image_for(key).is_none() && !completed_exact {
+            cache.start_world_raster(
+                key,
+                TerrainRasterInput::from(frame),
+                raster_daylight,
+                cached.is_none(),
+            );
+        }
+        let failed = cache.failed_for(key);
+        (completed, cached, failed)
     };
+    let (image, newly_built, image_key, final_quality) =
+        if let Some((completed_key, pixels, final_quality)) = completed {
+            let Some(image) = render_image_from_world_raster(pixels) else {
+                return false;
+            };
+            (image, true, completed_key, final_quality)
+        } else if let Some(image) = cached {
+            (image, false, key, false)
+        } else {
+            if failed {
+                // A failed raster must not leave the world blank indefinitely.
+                return false;
+            }
+            // Avoid emitting thousands of fallback cell quads while the first
+            // image is being generated; a single calm substrate keeps the rest
+            // of the world, including its controls, responsive during startup.
+            let bounds = Bounds::new(
+                point(px(offset_x), px(offset_y)),
+                size(
+                    px((frame.world_size.0 * scale).max(1.0)),
+                    px((frame.world_size.1 * scale).max(1.0)),
+                ),
+            );
+            window.paint_quad(fill(bounds, Background::from(rgb(0x172e29))));
+            return true;
+        };
 
     let world_bounds = Bounds::new(
         point(px(offset_x), px(offset_y)),
@@ -21984,8 +22159,10 @@ fn paint_continuous_world_fields(
 
     if newly_built {
         let retired = match state.world_raster_cache.lock() {
-            Ok(mut cache) => cache.commit(key, image),
-            Err(poisoned) => poisoned.into_inner().commit(key, image),
+            Ok(mut cache) => cache.commit(image_key, image, final_quality),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .commit(image_key, image, final_quality),
         };
         if let Some(retired) = retired
             && let Err(error) = window.drop_image(retired)
@@ -22430,16 +22607,272 @@ mod continuous_world_raster_tests {
     }
 
     #[test]
+    fn background_worker_is_bounded_and_renders_identical_pixels() {
+        let frame = frame(
+            (2, 1),
+            20,
+            vec![tile(TerrainKind::Grass), tile(TerrainKind::DeepWater)],
+            (2, 1),
+            20,
+            vec![0.0, 0.0],
+        );
+        let expected =
+            rasterize_world_fields(&frame, visual::DAYLIGHT_STATIC).expect("reference raster");
+        let mut cache = WorldRasterCache::default();
+        cache.start_world_raster(
+            key(1),
+            TerrainRasterInput::from(&frame),
+            visual::DAYLIGHT_STATIC,
+            true,
+        );
+        cache.start_world_raster(
+            key(2),
+            TerrainRasterInput::from(&frame),
+            visual::DAYLIGHT_STATIC,
+            true,
+        );
+        let pending = cache.pending.take().expect("worker started");
+        assert_eq!(
+            pending.key,
+            key(1),
+            "a second request must not start another worker"
+        );
+        let preview = pending
+            .receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("preview delivered");
+        assert!(matches!(preview, WorldRasterMessage::Preview(_)));
+        let WorldRasterMessage::Complete(Some(actual)) = pending
+            .receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("worker finished")
+        else {
+            panic!("full raster missing")
+        };
+        assert_eq!(
+            (actual.width, actual.height),
+            (expected.width, expected.height)
+        );
+        assert_eq!(actual.bgra, expected.bgra);
+    }
+
+    #[test]
+    fn failed_worker_is_rate_limited_without_blocking_new_worlds() {
+        let frame = frame(
+            (2, 1),
+            20,
+            vec![tile(TerrainKind::Grass), tile(TerrainKind::DeepWater)],
+            (2, 1),
+            20,
+            vec![0.0, 0.0],
+        );
+        let mut cache = WorldRasterCache::default();
+        cache.last_failure = Some((key(1), std::time::Instant::now()));
+        assert!(cache.failed_for(key(1)));
+        assert!(!cache.failed_for(key(2)));
+        cache.start_world_raster(
+            key(1),
+            TerrainRasterInput::from(&frame),
+            visual::DAYLIGHT_STATIC,
+            false,
+        );
+        assert!(
+            cache.pending.is_none(),
+            "repeated failures must not start a worker every frame"
+        );
+        cache.start_world_raster(
+            key(2),
+            TerrainRasterInput::from(&frame),
+            visual::DAYLIGHT_STATIC,
+            false,
+        );
+        assert!(
+            cache.pending.is_some(),
+            "a different world should not be delayed"
+        );
+    }
+
+    #[test]
+    fn refresh_skips_preview_to_keep_existing_terrain_sharp() {
+        let frame = frame(
+            (2, 1),
+            20,
+            vec![tile(TerrainKind::Grass), tile(TerrainKind::DeepWater)],
+            (2, 1),
+            20,
+            vec![0.0, 0.0],
+        );
+        let mut cache = WorldRasterCache::default();
+        cache.start_world_raster(
+            key(1),
+            TerrainRasterInput::from(&frame),
+            visual::DAYLIGHT_STATIC,
+            false,
+        );
+        let pending = cache.pending.take().expect("worker started");
+        assert!(
+            matches!(
+                pending
+                    .receiver
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap(),
+                WorldRasterMessage::Complete(Some(_))
+            ),
+            "refresh must not replace the sharp image with a preview"
+        );
+    }
+
+    #[test]
+    fn preview_does_not_finish_or_suppress_full_quality_work() {
+        let mut cache = WorldRasterCache::default();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let wanted = key(1);
+        cache.pending = Some(PendingWorldRaster {
+            key: wanted,
+            receiver,
+        });
+        sender
+            .send(WorldRasterMessage::Preview(WorldRasterPixels {
+                width: 1,
+                height: 1,
+                bgra: vec![1, 2, 3, 255],
+            }))
+            .unwrap();
+        let (preview_key, pixels, final_quality) =
+            cache.take_completed(wanted).expect("preview ready");
+        assert!(!final_quality);
+        assert!(cache.pending.is_some());
+        let preview = render_image_from_world_raster(pixels).unwrap();
+        cache.commit(preview_key, Arc::clone(&preview), final_quality);
+        assert!(cache.image_for(wanted).is_none());
+        assert!(Arc::ptr_eq(
+            &cache.compatible_image_for(wanted).unwrap(),
+            &preview
+        ));
+        sender
+            .send(WorldRasterMessage::Complete(Some(WorldRasterPixels {
+                width: 1,
+                height: 1,
+                bgra: vec![4, 5, 6, 255],
+            })))
+            .unwrap();
+        let (final_key, pixels, final_quality) =
+            cache.take_completed(wanted).expect("full raster ready");
+        assert!(final_quality);
+        assert!(cache.pending.is_none());
+        cache.commit(
+            final_key,
+            render_image_from_world_raster(pixels).unwrap(),
+            final_quality,
+        );
+        assert!(cache.image_for(wanted).is_some());
+    }
+
+    #[test]
+    fn async_world_raster_accepts_older_daylight_and_rejects_other_worlds() {
+        let mut cache = WorldRasterCache::default();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let original = key(1);
+        let mut later = original;
+        later.daylight_bits = 0.75_f32.to_bits();
+        cache.pending = Some(PendingWorldRaster {
+            key: original,
+            receiver,
+        });
+        assert!(cache.take_completed(later).is_none());
+        assert!(
+            cache.pending.is_some(),
+            "unfinished worker must remain in flight"
+        );
+        sender
+            .send(WorldRasterMessage::Complete(Some(WorldRasterPixels {
+                width: 1,
+                height: 1,
+                bgra: vec![1, 2, 3, 255],
+            })))
+            .unwrap();
+        let (completed_key, pixels, final_quality) = cache
+            .take_completed(later)
+            .expect("compatible daylight result");
+        assert_eq!(completed_key, original);
+        assert!(final_quality);
+        assert_eq!(pixels.bgra, [1, 2, 3, 255]);
+        assert!(cache.pending.is_none());
+
+        for desired in [
+            key(2),
+            WorldRasterKey {
+                palette: ColorPaletteMode::HighContrast,
+                ..original
+            },
+        ] {
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            cache.pending = Some(PendingWorldRaster {
+                key: original,
+                receiver,
+            });
+            sender
+                .send(WorldRasterMessage::Complete(Some(WorldRasterPixels {
+                    width: 1,
+                    height: 1,
+                    bgra: vec![1, 2, 3, 255],
+                })))
+                .unwrap();
+            assert!(
+                cache.take_completed(desired).is_none(),
+                "obsolete pixels must never be presented"
+            );
+            assert!(cache.pending.is_none());
+        }
+    }
+
+    #[test]
+    fn async_world_raster_recovers_from_disconnected_worker_and_uses_only_compatible_cache() {
+        let mut cache = WorldRasterCache::default();
+        let original = key(1);
+        let image = image(1);
+        cache.commit(original, Arc::clone(&image), true);
+        let mut later = original;
+        later.daylight_bits = 0.5_f32.to_bits();
+        assert!(Arc::ptr_eq(
+            &cache.compatible_image_for(later).unwrap(),
+            &image
+        ));
+        assert!(cache.compatible_image_for(key(2)).is_none());
+        assert!(
+            cache
+                .compatible_image_for(WorldRasterKey {
+                    palette: ColorPaletteMode::HighContrast,
+                    ..original
+                })
+                .is_none()
+        );
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        cache.pending = Some(PendingWorldRaster {
+            key: original,
+            receiver,
+        });
+        drop(sender);
+        assert!(cache.take_completed(original).is_none());
+        assert!(
+            cache.pending.is_none(),
+            "a terminated worker must not block retries"
+        );
+    }
+
+    #[test]
     fn raster_cache_reuses_keys_and_retires_only_two_generations_old() {
         let mut cache = WorldRasterCache::default();
         let a = image(1);
         let b = image(2);
         let c = image(3);
 
-        assert!(cache.commit(key(1), Arc::clone(&a)).is_none());
+        assert!(cache.commit(key(1), Arc::clone(&a), true).is_none());
         assert!(Arc::ptr_eq(&cache.image_for(key(1)).expect("cached A"), &a));
-        assert!(cache.commit(key(2), Arc::clone(&b)).is_none());
-        let retired = cache.commit(key(3), Arc::clone(&c)).expect("retired A");
+        assert!(cache.commit(key(2), Arc::clone(&b), true).is_none());
+        let retired = cache
+            .commit(key(3), Arc::clone(&c), true)
+            .expect("retired A");
         assert!(Arc::ptr_eq(&retired, &a));
 
         let drained = cache.drain();
