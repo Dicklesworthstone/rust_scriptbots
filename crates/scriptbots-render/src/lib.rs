@@ -9376,7 +9376,66 @@ impl SimulationView {
                         "Gen {}  ·  Position {:.0}, {:.0}",
                         selected.generation.0, selected.position.x, selected.position.y
                     )),
+            )
+            .child(div().h(px(1.0)).w_full().bg(chrome::border()))
+            .child(label("MOTION & PHYSIOLOGY"))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(chrome::text_secondary())
+                    .child(format!(
+                        "Velocity {:+.2}, {:+.2}  ·  Heading {:.2} rad",
+                        selected.velocity[0], selected.velocity[1], selected.heading
+                    )),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(chrome::text_secondary())
+                    .child(format!(
+                        "Herbivory {:.2}  ·  Boost {}",
+                        selected.herbivore_tendency,
+                        if selected.boost { "active" } else { "off" }
+                    )),
             );
+        if let Some(visual) = selected.visual {
+            hud = hud
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(chrome::text_secondary())
+                        .child(format!(
+                            "Temp preference {:.2}  ·  Food Δ {:+.2}",
+                            visual.temperature_preference, visual.food_delta
+                        )),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(chrome::text_secondary())
+                        .child(format!(
+                            "Sound {:.2}  ·  Sharing intent {:.2}",
+                            visual.sound_output, visual.reproduction_intent
+                        )),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(chrome::text_secondary())
+                        .child(format!(
+                            "Spike {}  ·  Landed {}  ·  Received {}",
+                            if visual.spike_extended {
+                                "extended"
+                            } else {
+                                "retracted"
+                            },
+                            if visual.spike_struck { "yes" } else { "no" },
+                            if visual.spike_victim { "yes" } else { "no" }
+                        )),
+                );
+        } else {
+            hud = hud.child(label("Physiology detail unavailable"));
+        }
 
         if let Some((source_tick, detail)) =
             detail.filter(|(_, detail)| detail.agent_id == selected.agent_id)
@@ -17199,7 +17258,8 @@ impl InspectorSnapshot {
 
         for (row, agent) in published.world.agents.iter().enumerate() {
             let agent_id = AgentId::from(slotmap::KeyData::from_ffi(agent.id));
-            let entry = AgentListEntry::from_snapshot(row, agent);
+            let entry =
+                AgentListEntry::from_snapshot(row, agent, published.agent_visuals(row).copied());
             let is_selected = selection_projection.map_or_else(
                 || matches!(published.agent_selection(row), SelectionState::Selected),
                 |projected| projected.contains(&agent_id),
@@ -17827,10 +17887,19 @@ struct AgentListEntry {
     age: u32,
     is_focused: bool,
     position: Position,
+    velocity: [f32; 2],
+    heading: f32,
+    herbivore_tendency: f32,
+    boost: bool,
+    visual: Option<scriptbots_core::DynamicAgentVisuals>,
 }
 
 impl AgentListEntry {
-    fn from_snapshot(row: usize, agent: &scriptbots_core::DynamicAgentSnapshot) -> Self {
+    fn from_snapshot(
+        row: usize,
+        agent: &scriptbots_core::DynamicAgentSnapshot,
+        visual: Option<scriptbots_core::DynamicAgentVisuals>,
+    ) -> Self {
         let agent_id = AgentId::from(slotmap::KeyData::from_ffi(agent.id));
         Self {
             agent_id,
@@ -17843,6 +17912,11 @@ impl AgentListEntry {
             age: agent.age,
             is_focused: false,
             position: Position::new(agent.position[0], agent.position[1]),
+            velocity: agent.velocity,
+            heading: agent.heading,
+            herbivore_tendency: agent.herbivore_tendency,
+            boost: agent.boost,
+            visual,
         }
     }
 }
@@ -23974,6 +24048,17 @@ mod command_characterization_tests {
         )
         .expect("projection parity host");
         let snapshot = host.snapshot_hub().latest();
+        for (row, agent) in snapshot.world.agents.iter().enumerate() {
+            let entry =
+                AgentListEntry::from_snapshot(row, agent, snapshot.agent_visuals(row).copied());
+            assert_eq!(entry.uid, agent.uid);
+            assert_eq!(entry.velocity, agent.velocity);
+            assert_eq!(entry.heading, agent.heading);
+            assert_eq!(entry.herbivore_tendency, agent.herbivore_tendency);
+            assert_eq!(entry.boost, agent.boost);
+            let visual = entry.visual.expect("matching published physiology");
+            assert!((visual.food_delta - (0.13 + row as f32 * 0.07)).abs() < 0.0001);
+        }
         for (palette, expected) in ColorPaletteMode::ALL.into_iter().zip(expected) {
             let actual = RenderFrame::from_snapshot(&snapshot, palette).expect("published frame");
             assert_eq!(
@@ -23983,6 +24068,12 @@ mod command_characterization_tests {
         }
         let mut missing_visuals = snapshot.as_ref().clone();
         missing_visuals.agent_visuals = Arc::new(Vec::new());
+        let missing_entry = AgentListEntry::from_snapshot(
+            0,
+            &missing_visuals.world.agents[0],
+            missing_visuals.agent_visuals(0).copied(),
+        );
+        assert!(missing_entry.visual.is_none(), "never invent physiology");
         assert!(RenderFrame::from_snapshot(&missing_visuals, ColorPaletteMode::Natural).is_none());
     }
 
