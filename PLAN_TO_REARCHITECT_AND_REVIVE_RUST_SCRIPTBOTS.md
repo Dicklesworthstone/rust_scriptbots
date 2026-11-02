@@ -2,6 +2,54 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Headless report contract and frame diagnosis (2026-11-02):** [Currently In
+Progress — GentleDuck, original `bd-2z0.14.2.6`; acceptance unchanged]
+
+- [x] Recheck authoritative ready work and existing ownership; continue the
+  observed headless/report remainder instead of creating another tracking system.
+- [x] Diagnose repeated cold builds from root SBH's recorded 5.44 GB deletion
+  of the active target; protect that target and verify the root scanner excludes
+  it, retaining the original cleanup policy and deleting no files.
+- [x] Add and observe a missing-report-version regression before production edits:
+  actual serialization lacks the tag; both targeted baseline tests fail.
+- [x] Retain the current seeded frame failure and inspect its actual presented
+  cells against the history behind the reviewed counts and digest.
+- [x] Re-execute the historical source that introduced the current expectation
+  if its provenance cannot otherwise distinguish a stale fixture from a regression.
+- [x] Compare all 2,880 captured cells: only 48 timeline-title symbols differ;
+  all other native-cell fields and other regions are identical. The cached-canvas
+  feature shortened that title by three nonblank cells.
+- [x] Correct the two leftover fixed expectations and retain an obsolete-title
+  control that must reproduce the exact historical count/digest and move only
+  the rail region. Preserve every committed golden and regeneration safeguard.
+- [x] Resolve the cited four historical matrix failures against their full raw
+  candidates: all bytes already match the reviewed `238090e4` golden promotion.
+- [x] Version the serialized headless report independently of scenario metadata;
+  document the prior unversioned format and make actual report consumers check it.
+- [x] Reproduce the live screenshot writer rejecting an actually rendered
+  Diagnostics frame for lacking the legacy dashboard's Timeline marker.
+- [x] Separate screenshot identity from dashboard-only semantic diagnostics;
+  preserve empty-geometry refusal and every headless missing-panel guard.
+- [x] Wire the write result to the actual live footer; event-feed delivery alone
+  left the old command status visible after a successful capture.
+- [x] Drive the real S key on Diagnostics; match saved plain/ANSI bytes to the
+  displayed/served frame and observe the affirmative saved-frame feedback.
+- [x] Exercise nonempty reports, scenario/report-version discrimination, existing
+  region corruption controls, resize/capability goldens and full terminal tests.
+- [x] Run workspace all-target check, strict Clippy, formatting and scoped static
+  review via DSR, retaining failures and exact source identity.
+- [ ] Re-execute original acceptance in a fresh solo pass at committed source;
+  close only what is proven, publish reviewed changes and release reservations.
+
+Original remaining scope stays on `bd-2z0.14.2.6`: the capability golden explicitly
+does not cover the flat-map color-depth axis. Canvas depth fixtures and real
+truecolor/NO_COLOR PTYs are distinct evidence; no full-matrix closure follows.
+
+Requested queue consumer: the user and implementing agent until this handoff;
+gate/provenance: the user's explicit detailed-TODO request and the original
+Bead's observed missing report version and red frame evidence. Retire this queue
+to an execution record at handoff. Evidence: `/data/tmp/scriptbots-headless-contract-gbSK4J`.
+
 **Persistence status on Diagnostics (2026-11-01):** [Completed 2026-11-02 —
 GentleDuck, `bd-bacf.1`; fresh solo verification; original UX/widget tasks unchanged]
 

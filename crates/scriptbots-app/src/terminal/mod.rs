@@ -585,19 +585,19 @@ impl<'a> LiveTerminalModel<'a> {
             let frame = &presentation.frame;
             let tick = frame.tick;
             if app.export_requested() {
-                match app.write_frame_export(&frame.buffer, tick) {
-                    Ok((path, _, hash)) => app.push_event(
-                        tick,
-                        EventKind::Info,
-                        format!("Saved frame {} ({hash})", path.display()),
-                    ),
+                match app.write_frame_export(&frame.buffer, tick, Path::new("screenshots")) {
+                    Ok((path, _, hash)) => {
+                        let message = format!("Saved frame {} ({hash})", path.display());
+                        app.push_event(tick, EventKind::Info, message.clone());
+                        app.frankentui
+                            .update(frankentui_shell::ShellMessage::SetStatus(message));
+                    }
                     Err(error) => {
                         app.export_requested = false;
-                        app.push_event(
-                            tick,
-                            EventKind::Info,
-                            format!("Screenshot failed: {error}"),
-                        );
+                        let message = format!("Screenshot failed: {error}");
+                        app.push_event(tick, EventKind::Info, message.clone());
+                        app.frankentui
+                            .update(frankentui_shell::ShellMessage::SetStatus(message));
                     }
                 }
             }
@@ -7322,11 +7322,15 @@ impl<'a> TerminalApp<'a> {
         &mut self,
         buffer: &Buffer,
         tick: u64,
+        dir: &Path,
     ) -> Result<(PathBuf, PathBuf, String)> {
         use std::io::Write;
 
         self.export_requested = false;
-        let dir = std::path::Path::new("screenshots");
+        ensure!(
+            !buffer.area.is_empty(),
+            "cannot export an empty presented frame"
+        );
         fs::create_dir_all(dir)?;
 
         // ubs:ignore[rust.security.non-crypto-random] — filename only; create_new enforces exclusivity.
@@ -7342,20 +7346,28 @@ impl<'a> TerminalApp<'a> {
         File::create_new(&ansi_path)?.write_all(ansi.as_bytes())?;
         File::create_new(&text_path)?.write_all(plain.as_bytes())?;
 
+        let (hash, _) = HeadlessBufferEvidence::hash_cells(buffer, buffer.area);
+        // Every live route can be captured. The headless dashboard's semantic
+        // diagnostics describe only frames that actually contain those panels.
         let layout = self.frame_layout(buffer.area);
-        let evidence = HeadlessBufferEvidence::inspect(buffer, tick, &layout)?;
-        let hash = evidence.full_cell_fnv1a64.clone();
-        // Region hashes at debug! per the bead's logging contract, so an exported
-        // frame can be attributed to the panel that changed without re-rendering.
-        for region in &evidence.regions {
-            debug!(
-                region = region.name,
-                hash = %region.fnv1a64,
-                has_room = region.has_room,
-                non_blank = region.non_blank_cells,
-                "exported frame region"
-            );
-        }
+        let dashboard_regions = match HeadlessBufferEvidence::inspect(buffer, tick, &layout) {
+            Ok(evidence) => {
+                for region in &evidence.regions {
+                    debug!(
+                        region = region.name,
+                        hash = %region.fnv1a64,
+                        has_room = region.has_room,
+                        non_blank = region.non_blank_cells,
+                        "exported dashboard frame region"
+                    );
+                }
+                Some(evidence.regions.len())
+            }
+            Err(error) => {
+                debug!(%error, "legacy dashboard region evidence unavailable for exported frame");
+                None
+            }
+        };
         info!(
             ansi = %ansi_path.display(),
             text = %text_path.display(),
@@ -7364,7 +7376,7 @@ impl<'a> TerminalApp<'a> {
             width = buffer.area.width,
             height = buffer.area.height,
             hash = %hash,
-            regions = evidence.regions.len(),
+            legacy_dashboard_regions = ?dashboard_regions,
             "exported the displayed terminal frame"
         );
         Ok((ansi_path, text_path, hash))
@@ -8918,9 +8930,13 @@ impl Snapshot {
     }
 }
 
+/// Serialized report format; independent of the selected scenario's schema.
+pub const HEADLESS_REPORT_SCHEMA: &str = "scriptbots.terminal-headless.v1";
+
 #[derive(Debug, Clone, Serialize)]
 /// Observations from the terminal's bounded TestBackend execution path.
 pub struct HeadlessReport {
+    schema: &'static str,
     scenario: ScenarioSummary,
     initial: FrameStats,
     frames: Vec<FrameStats>,
@@ -8951,6 +8967,7 @@ impl From<&ScenarioIdentityV0> for ScenarioSummary {
 impl HeadlessReport {
     fn new(initial_snapshot: Snapshot, scenario: &ScenarioIdentityV0) -> Self {
         Self {
+            schema: HEADLESS_REPORT_SCHEMA,
             scenario: ScenarioSummary::from(scenario),
             initial: FrameStats::from_snapshot(&initial_snapshot, None),
             frames: Vec::new(),
@@ -21501,6 +21518,73 @@ for case in ('panic', 'subscription', 'renderer'):
     }
 
     #[test]
+    fn science_frame_export_accepts_the_presented_view_without_dashboard_markers() {
+        let host = TerminalTestHost::take(command_characterization_world());
+        let (runtime, _) = ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let mut app = TerminalApp::new(&renderer, host.context(&runtime));
+        app.navigate_route(frankentui_shell::ShellRoute::Diagnostics);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(160, 36))
+            .expect("actual Diagnostics widget backend");
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("render Diagnostics");
+        let buffer = terminal.backend().buffer();
+        let displayed = export::buffer_to_plain_text(buffer);
+        assert!(displayed.contains("SYSTEM DIAGNOSTICS"));
+        let tick = app.snapshot().tick;
+        assert!(
+            HeadlessBufferEvidence::inspect(buffer, tick, &app.frame_layout(buffer.area)).is_err()
+        );
+        let directory = tempfile::Builder::new()
+            .prefix("scriptbots-science-export-")
+            .tempdir()
+            .expect("isolated export destination")
+            .keep();
+        eprintln!("retained science export artifacts: {}", directory.display());
+        let (ansi_path, text_path, hash) = app
+            .write_frame_export(buffer, tick, &directory)
+            .expect("a presented science screen is a valid screenshot");
+        assert_eq!(
+            fs::read_to_string(text_path).expect("saved plain frame"),
+            displayed
+        );
+        assert_eq!(
+            fs::read_to_string(ansi_path).expect("saved ANSI frame"),
+            export::buffer_to_ansi(buffer)
+        );
+        assert_eq!(
+            hash,
+            HeadlessBufferEvidence::hash_cells(buffer, buffer.area).0
+        );
+        let files_before = fs::read_dir(&directory).expect("saved pair").count();
+        assert_eq!(files_before, 2);
+        assert!(
+            app.write_frame_export(&Buffer::empty(Rect::default()), tick, &directory)
+                .is_err()
+        );
+        assert_eq!(
+            fs::read_dir(directory)
+                .expect("unchanged saved pair")
+                .count(),
+            files_before
+        );
+    }
+
+    #[test]
+    fn headless_report_format_version_is_independent_of_scenario_version() {
+        let mut scenario = ScenarioIdentityV0::caller_seeded("report-format-test");
+        scenario.schema_version = 37;
+        let report = HeadlessReport::new(Snapshot::default(), &scenario);
+        let encoded = serde_json::to_value(report).expect("serialize actual report type");
+        assert_eq!(encoded["schema"], "scriptbots.terminal-headless.v1");
+        assert_eq!(encoded["scenario"]["schema_version"], 37);
+        assert!(encoded["initial"].is_object());
+        assert!(encoded["summary"].is_object());
+        assert!(encoded["frames"].is_array());
+    }
+
+    #[test]
     fn headless_test_backend_frame_proves_buffer_semantics_and_current_tick() {
         let world = command_characterization_world();
         let host = TerminalTestHost::take(world);
@@ -21519,6 +21603,11 @@ for case in ('panic', 'subscription', 'renderer'):
             .buffer
             .as_ref()
             .expect("a rendered TestBackend frame must carry buffer evidence");
+        let presented = runtime
+            .presented_frame_slot()
+            .load_full()
+            .expect("the headless frame must also be presented");
+        let rendered = export::buffer_to_plain_text(&presented.buffer);
         assert_eq!(evidence.viewport_width, 80);
         assert_eq!(evidence.viewport_height, 36);
         assert_eq!(evidence.current_tick, report.frames[0].tick);
@@ -21541,8 +21630,12 @@ for case in ('panic', 'subscription', 'renderer'):
             // the help hint into its top-right border title, so 80 columns show both. The
             // per-region evidence moves only `header` (non-blank 198 -> 195), and every
             // other region's hash is unchanged in the 80x36 capability golden.
-            (2364, 1544, 0, 0, 0),
-            "fixed-seed Ratatui TestBackend cell counts changed; inspect the rendered buffer before intentionally updating this reviewed evidence: {evidence:?}"
+            // Reviewed 2026-11-02: d546b65b's real cached-canvas review changed
+            // the rail title. Historical/current cell comparison finds exactly
+            // 48 changed symbols on that title row and no other cell fields.
+            // Its nonblank count drops 72 -> 69; all other regions are unchanged.
+            (2361, 1544, 0, 0, 0),
+            "fixed-seed Ratatui TestBackend cell counts changed; inspect the rendered buffer before intentionally updating this reviewed evidence: {evidence:?}\n{rendered}"
         );
         // Reviewed 2026-07-17 (bd-2z0.10.1): the header title now carries the scenario id
         // and bootstrap policy, shifting the pinned counts and full-cell digest below.
@@ -21566,10 +21659,42 @@ for case in ('panic', 'subscription', 'renderer'):
         // Reviewed 2026-10-04 (bd-bacf): header reorder, as detailed on the counts above.
         // Reviewed 2026-10-04 (bd-bacf): this paused frame now shows the speed it resumes at
         // ("x1.0", was "x0.0"); counts unchanged, only the `header` region hash moves.
+        // Reviewed 2026-11-02: the observed rail-title-only change above. The
+        // obsolete-title control below reproduces the prior full-frame golden.
         assert_eq!(
-            evidence.full_cell_fnv1a64, "81b067acc4e6c43a",
+            evidence.full_cell_fnv1a64, "d7504e55c815f227",
             "fixed-seed Ratatui TestBackend full-cell golden changed; this hashes coordinates, grapheme symbols, fg/bg/underline colors, modifiers, and diff/width directives. Inspect the rendered buffer before intentionally updating this reviewed digest: {evidence:?}"
         );
+        let rail = evidence
+            .regions
+            .iter()
+            .find(|region| region.name == "rail")
+            .expect("observed timeline region");
+        let mut obsolete = presented.buffer.clone();
+        ratatui::widgets::Widget::render(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Timeline — run history (select-only; rewind not yet available)"),
+            Rect::new(rail.x, rail.y, rail.width, rail.height),
+            &mut obsolete,
+        );
+        let (obsolete_hash, obsolete_nonblank) =
+            HeadlessBufferEvidence::hash_cells(&obsolete, obsolete.area);
+        assert_eq!(obsolete_nonblank, 2364);
+        assert_eq!(obsolete_hash, "81b067acc4e6c43a");
+        assert_ne!(obsolete_hash, evidence.full_cell_fnv1a64);
+        for region in &evidence.regions {
+            let (hash, _) = HeadlessBufferEvidence::hash_cells(
+                &obsolete,
+                Rect::new(region.x, region.y, region.width, region.height),
+            );
+            assert_eq!(
+                hash == region.fnv1a64,
+                region.name != "rail",
+                "only the intentionally stale rail title may move: {}",
+                region.name
+            );
+        }
         // SCHEMA CHANGE, bd-2z0.14.2.6: `semantic_regions` used to be the four
         // hand-listed needles the inspector searched the WHOLE FRAME for
         // (terminal_hud, current_tick, world_map, vital_stats). It is now the panel
