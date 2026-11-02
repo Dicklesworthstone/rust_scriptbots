@@ -897,16 +897,9 @@ impl Model for LiveTerminalModel<'_> {
                     receipt_visible = true;
                     app.exclude_pointer_overlay(overlay);
                 }
-                // The pinned presenter serializes explicit cell colors even
-                // when its capability probe reports NO_COLOR. Apply the user's
-                // opt-out after every widget/overlay, before capture and output.
-                if app.palette.no_color {
-                    for cell in &mut legacy.buffer_mut().content {
-                        cell.fg = Color::Reset;
-                        cell.bg = Color::Reset;
-                        cell.underline_color = Color::Reset;
-                    }
-                }
+                // Explicit widget colors bypass the presenter's capability
+                // probe. Resolve the final palette before capture and output.
+                app.palette.apply_color_policy(legacy.buffer_mut());
             })
             .unwrap_or_else(|never| match never {});
         let buffer = widgets.backend().buffer();
@@ -9974,6 +9967,7 @@ impl CuratedThemeId {
 
 struct Palette {
     level: Option<ColorLevel>,
+    /// Effective color suppression, including a probe reporting no support.
     no_color: bool,
     emoji: bool,
     emoji_narrow: bool,
@@ -10358,6 +10352,7 @@ impl Palette {
         } else {
             on_cached(Stream::Stdout)
         };
+        let no_color = no_color || level.is_none();
         let emoji = {
             if let Ok(raw) = std::env::var("SCRIPTBOTS_TERMINAL_EMOJI") {
                 let v = raw.to_ascii_lowercase();
@@ -10592,6 +10587,38 @@ impl Palette {
 
     fn has_color(&self) -> bool {
         self.level.is_some()
+    }
+
+    /// Constrain every panel and overlay at the same final-buffer boundary.
+    /// Keep symbols, widths and modifiers intact; export and presentation both
+    /// consume these exact cells. The fixed headless palette remains independent
+    /// of the controller's environment.
+    fn apply_color_policy(&self, buffer: &mut Buffer) {
+        if self.no_color {
+            for cell in &mut buffer.content {
+                cell.fg = Color::Reset;
+                cell.bg = Color::Reset;
+                cell.underline_color = Color::Reset;
+            }
+            return;
+        }
+        let Some(depth @ (ColorDepth::Ansi256 | ColorDepth::Ansi16)) =
+            ColorSupport::from_level(self.level).depth(false)
+        else {
+            return;
+        };
+        let constrain = |color: Color| match color {
+            Color::Rgb(_, _, _) => {
+                let [r, g, b] = quantize(color_channels(color), depth);
+                Color::Rgb(r, g, b)
+            }
+            _ => color,
+        };
+        for cell in &mut buffer.content {
+            cell.fg = constrain(cell.fg);
+            cell.bg = constrain(cell.bg);
+            cell.underline_color = constrain(cell.underline_color);
+        }
     }
 
     fn is_emoji(&self) -> bool {
@@ -11318,6 +11345,20 @@ impl ColorSupport {
             truecolor: level.has_16m,
         })
     }
+
+    const fn depth(self, no_color: bool) -> Option<ColorDepth> {
+        if no_color {
+            None
+        } else if self.truecolor {
+            Some(ColorDepth::TrueColor)
+        } else if self.ansi256 {
+            Some(ColorDepth::Ansi256)
+        } else if self.basic {
+            Some(ColorDepth::Ansi16)
+        } else {
+            None
+        }
+    }
 }
 
 /// What sub-cell tier this terminal can actually display.
@@ -11343,17 +11384,7 @@ impl CanvasCapability {
     ///
     /// `term` and `locale` are expected lowercased.
     fn detect(color: ColorSupport, term: &str, locale: &str, no_color: bool) -> Self {
-        let depth = if no_color {
-            None
-        } else if color.truecolor {
-            Some(ColorDepth::TrueColor)
-        } else if color.ansi256 {
-            Some(ColorDepth::Ansi256)
-        } else if color.basic {
-            Some(ColorDepth::Ansi16)
-        } else {
-            None
-        };
+        let depth = color.depth(no_color);
 
         // Every sub-cell vocabulary above ASCII is multi-byte UTF-8, so a
         // non-UTF-8 locale rules all of them out no matter how capable TERM is.
@@ -22243,8 +22274,9 @@ for case in ('panic', 'subscription', 'renderer'):
     /// exactly that.
     ///
     /// Not a full cross product: 4 depths x 4 modes x 3 emoji tiers is 48 frames to
-    /// review, and most would pin combinations a covered row already proves. These 9
-    /// cover every value of every axis at least once, each where it is observable.
+    /// review, and most would pin combinations a covered row already proves. These
+    /// rows cover the canvas and glyph axes where they are observable; the detected
+    /// flat-map color rows below exercise the real palette probe in fresh processes.
     fn capability_matrix_rows() -> Vec<CapabilityRow> {
         vec![
             // Canvas tiers: depth and sub-cell mode are what vary. Emoji is held
@@ -22310,26 +22342,10 @@ for case in ('panic', 'subscription', 'renderer'):
         ]
     }
 
-    /// The `depth: None` fallback decision, pinned directly rather than as a golden
-    /// row — and the reason it CANNOT be a distinguishable golden row is worth
-    /// recording, because it looks like a missing tier.
-    ///
-    /// `use_canvas()` declines to paint an uncoloured braille field (density without
-    /// colour is a regression, not a degradation), so a colourless braille terminal
-    /// falls back to the flat map. That decision is real and asserted here. What it
-    /// is NOT is visible as a distinct FRAME: the flat map takes its colour from
-    /// `Palette::level`, never from `CanvasCapability::depth`, and the deterministic
-    /// evidence palette has `level: None` — so "no-colour braille" and "truecolor
-    /// ascii" render byte-identically under test even though a real truecolor
-    /// terminal would colour that flat map.
-    ///
-    /// I found this by adding both as golden rows and having
-    /// `every_capability_tier_renders_differently` reject them as identical. Keeping
-    /// them both would have pinned one frame twice and called it two tiers of
-    /// coverage. The flat-map colour axis is not reachable from a unit test because
-    /// `supports_color::ColorLevel` has private fields (already documented at
-    /// `ColorSupport::from_level`), so proving it needs an env-driven integration
-    /// test — recorded on the bead as remaining work rather than faked here.
+    /// The no-color fallback decision, independent of the final palette policy.
+    /// A colored counterpart must use the canvas; otherwise a renderer that never
+    /// paints sub-cells would satisfy the negative half. Actual detected flat-map
+    /// colors are covered separately by fresh-process golden rows.
     #[test]
     fn a_colourless_terminal_falls_back_to_the_flat_map() {
         let colourless = CanvasCapability {
@@ -22378,6 +22394,16 @@ for case in ('panic', 'subscription', 'renderer'):
         width: u16,
         height: u16,
     ) -> (Buffer, FrameLayout, u64) {
+        capability_frame_with_palette(
+            capability_world(),
+            row,
+            theme,
+            (width, height),
+            Palette::test_backend_evidence(),
+        )
+    }
+
+    fn capability_world() -> SharedWorld {
         let world = command_characterization_world();
         // AGENTS ARE REQUIRED, not incidental. The flat map's terrain glyphs are
         // IDENTICAL between the emoji-narrow and no-emoji tiers by design (both use
@@ -22403,6 +22429,16 @@ for case in ('panic', 'subscription', 'renderer'):
                 );
             }
         }
+        world
+    }
+
+    fn capability_frame_with_palette(
+        world: SharedWorld,
+        row: &CapabilityRow,
+        theme: CuratedThemeId,
+        (width, height): (u16, u16),
+        palette: Palette,
+    ) -> (Buffer, FrameLayout, u64) {
         let host = TerminalTestHost::take(world);
         let (runtime, _) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
@@ -22410,7 +22446,7 @@ for case in ('panic', 'subscription', 'renderer'):
         // Freeze the running chrome exercised by this pure capability matrix;
         // the fixture owner remains paused so rendering cannot mutate its input.
         app.paused = false;
-        app.palette = Palette::test_backend_evidence();
+        app.palette = palette;
         app.palette.theme_id = theme;
         app.palette.emoji = row.emoji;
         app.palette.emoji_narrow = row.narrow;
@@ -22426,10 +22462,200 @@ for case in ('panic', 'subscription', 'renderer'):
 
         let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("test backend");
-        terminal.draw(|frame| app.draw(frame)).expect("draw frame");
+        terminal
+            .draw(|frame| {
+                app.draw(frame);
+                app.palette.apply_color_policy(frame.buffer_mut());
+            })
+            .expect("draw frame");
         let buffer = terminal.backend().buffer().clone();
         let layout = app.frame_layout(buffer.area);
         (buffer, layout, app.snapshot().tick)
+    }
+
+    /// A fresh child owns the color probe/cache and never mutates the parent's
+    /// environment. It renders the same seeded world as the existing matrix.
+    #[test]
+    fn flat_color_probe_child() {
+        let output = std::env::var_os("SCRIPTBOTS_TUI_FLAT_PROBE_OUTPUT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                tempfile::tempdir()
+                    .expect("standalone probe artifacts")
+                    .keep()
+            });
+        let palette = Palette::detect();
+        let capability = palette.canvas_capability();
+        let row = CapabilityRow {
+            label: "detected flat",
+            mode: capability.mode,
+            depth: capability.depth,
+            emoji: false,
+            narrow: false,
+        };
+        let world = capability_world();
+        let (digest, agents) = {
+            let guard = world.lock().expect("actual capability input");
+            (
+                format!("{:?}", guard.world_digest_v1().expect("input digest")),
+                guard.agent_count(),
+            )
+        };
+        assert!(agents > 0);
+        let (buffer, layout, tick) = capability_frame_with_palette(
+            world,
+            &row,
+            CuratedThemeId::default(),
+            CAPABILITY_GOLDEN_SIZE,
+            palette,
+        );
+        let mut evidence = HeadlessBufferEvidence::inspect(&buffer, tick, &layout)
+            .expect("nonempty flat capability frame");
+        evidence.capability_profile =
+            format!("detected_{:?}_{:?}", capability.mode, capability.depth);
+        let mut rgb_colors = std::collections::HashSet::new();
+        for cell in &buffer.content {
+            for color in [cell.fg, cell.bg, cell.underline_color] {
+                if let Some(depth) = capability.depth {
+                    if let Color::Rgb(r, g, b) = color {
+                        rgb_colors.insert((r, g, b));
+                        assert_eq!(
+                            quantize(color_channels(color), depth),
+                            [r, g, b],
+                            "every RGB channel must already belong to the detected palette"
+                        );
+                    }
+                } else {
+                    assert_eq!(
+                        color,
+                        Color::Reset,
+                        "no-color must clear all color channels"
+                    );
+                }
+            }
+        }
+        if capability.depth.is_some() {
+            assert!(
+                !rgb_colors.is_empty(),
+                "positive color path must draw real colors"
+            );
+        }
+        if capability.depth == Some(ColorDepth::Ansi16) {
+            assert!(
+                rgb_colors.len() <= 1 << 4,
+                "16-color frame exceeded its palette"
+            );
+        }
+        let mut golden_row = String::new();
+        append_frame_evidence(&mut golden_row, "capability detected flat", &evidence);
+        write_frame_cell_evidence(
+            std::path::Path::new(&output),
+            "frame",
+            serde_json::json!({
+                "detected_depth": format!("{:?}", capability.depth),
+                "detected_mode": format!("{:?}", capability.mode),
+                "input_digest": digest, "agents": agents,
+                "glyph_digest": frame_glyph_digest(&buffer),
+                "evidence": evidence, "golden_row": golden_row,
+            }),
+            &buffer,
+        );
+    }
+
+    fn render_detected_flat_matrix() -> String {
+        let root = tempfile::tempdir()
+            .expect("fresh-process capability artifacts")
+            .keep();
+        eprintln!("flat capability cell artifacts: {}", root.display());
+        let mut out = String::from(
+            "\n# Fresh-process flat-map palette depths; glyphs and scientific input are fixed.\n",
+        );
+        let mut frames = std::collections::HashSet::new();
+        let mut input = None;
+        let mut glyphs = None;
+        for (name, force, expected) in [
+            ("truecolor", "3", "Some(TrueColor)"),
+            ("256", "2", "Some(Ansi256)"),
+            ("16", "1", "Some(Ansi16)"),
+            ("no-color", "0", "None"),
+        ] {
+            let directory = root.join(name);
+            let mut child =
+                std::process::Command::new(std::env::current_exe().expect("test binary"));
+            child.args([
+                "--exact",
+                "terminal::tests::flat_color_probe_child",
+                "--nocapture",
+            ]);
+            for variable in [
+                "NO_COLOR",
+                "COLORTERM",
+                "CLICOLOR_FORCE",
+                "TERM_PROGRAM",
+                "IGNORE_IS_TERMINAL",
+                "RUST_REGEN_GOLDEN",
+            ] {
+                child.env_remove(variable);
+            }
+            child
+                .env("TERM", "xterm")
+                .env("LC_ALL", "C")
+                .env("FORCE_COLOR", force)
+                .env("SCRIPTBOTS_TERMINAL_EMOJI", "0")
+                .env("SCRIPTBOTS_TERMINAL_PALETTE", "natural")
+                .env("SCRIPTBOTS_TUI_FLAT_PROBE_OUTPUT", &directory);
+            if name == "no-color" {
+                child.env("NO_COLOR", "1");
+            }
+            let result = child.output().expect("execute real color detector");
+            assert!(
+                result.status.success(),
+                "{name}: {}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let artifact: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(directory.join("frame.json")).expect("observed child frame"),
+            )
+            .expect("actual child cells");
+            assert_eq!(artifact["detected_depth"], expected, "{name}: actual probe");
+            assert_eq!(
+                artifact["detected_mode"], "Ascii",
+                "actual locale must select the flat map"
+            );
+            assert!(artifact["agents"].as_u64().is_some_and(|count| count > 0));
+            if let Some(previous) = input.replace(artifact["input_digest"].clone()) {
+                assert_eq!(
+                    previous, artifact["input_digest"],
+                    "same science input at every depth"
+                );
+            }
+            if let Some(previous) = glyphs.replace(artifact["glyph_digest"].clone()) {
+                assert_eq!(
+                    previous, artifact["glyph_digest"],
+                    "color must not alter map vocabulary"
+                );
+            }
+            let hash = artifact["evidence"]["full_cell_fnv1a64"]
+                .as_str()
+                .expect("actual frame hash");
+            assert!(
+                frames.insert(hash.to_owned()),
+                "{name}: collapsed flat depth; raw cells retained at {}",
+                root.display()
+            );
+            out.push_str(
+                &artifact["golden_row"]
+                    .as_str()
+                    .expect("observed region row")
+                    .replacen(
+                        "capability detected flat ",
+                        &format!("capability detected flat/{name} "),
+                        1,
+                    ),
+            );
+        }
+        out
     }
 
     /// The capability matrix at the 80x36 evidence viewport, under the default theme.
@@ -22446,16 +22672,14 @@ for case in ('panic', 'subscription', 'renderer'):
              # the SAME seeded snapshot at the same 80x36 viewport, rendered at one\n\
              # capability tier. Rows must differ from each other: two tiers with the\n\
              # same hashes would mean the renderer ignored the probe, and this file\n\
-             # would be one frame repeated under eight names.\n\
+             # would be one frame repeated under multiple names.\n\
              #\n\
-             # WHY THE FLAT ROWS CARRY NO COLOUR-DEPTH TOKEN. The canvas rows honour\n\
-             # CanvasCapability::depth (it selects the quantizer), so truecolor/256/16\n\
-             # are real distinctions there. The FLAT map takes its colour from\n\
-             # Palette::level and never reads depth, so labelling a flat row\n\
-             # 'truecolor' would claim a property the frame does not have. The flat\n\
-             # colour axis is not covered here at all — see\n\
-             # a_colourless_terminal_falls_back_to_the_flat_map for what IS pinned and\n\
-             # why the rest needs an env-driven integration test.\n",
+             # Canvas and vocabulary rows retain the fixed evidence palette.\n\
+             # Detected flat rows use fresh process-local supports-color probes,\n\
+             # the same nonempty scientific input, and the final presentation\n\
+             # color policy. Their glyph digests must agree while full cell\n\
+             # digests differ. RGB values are constrained to the selected palette;\n\
+             # native 16/256-color wire encoding is not qualified by these buffers.\n",
         );
         for (index, row) in capability_matrix_rows().into_iter().enumerate() {
             let (buffer, layout, tick) = capability_frame(
@@ -22478,6 +22702,7 @@ for case in ('panic', 'subscription', 'renderer'):
             }
             append_frame_evidence(&mut out, &format!("capability {}", row.label), &evidence);
         }
+        out.push_str(&render_detected_flat_matrix());
         out
     }
 
@@ -22545,6 +22770,24 @@ for case in ('panic', 'subscription', 'renderer'):
     #[test]
     fn the_capability_matrix_matches_its_committed_golden() {
         let candidate = render_capability_matrix();
+
+        let mut hashes = std::collections::HashSet::new();
+        for header in candidate
+            .lines()
+            .filter(|line| line.starts_with("capability "))
+        {
+            let hash = header
+                .split(" frame=")
+                .nth(1)
+                .expect("actual frame header")
+                .split_whitespace()
+                .next()
+                .expect("actual frame hash");
+            assert!(
+                hashes.insert(hash),
+                "duplicate frame across capability groups: {header}"
+            );
+        }
 
         // Vacuity guards before comparison, same discipline as the ladder.
         for row in capability_matrix_rows() {
