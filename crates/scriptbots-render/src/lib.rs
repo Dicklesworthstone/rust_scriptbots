@@ -9334,7 +9334,14 @@ impl SimulationView {
                                     .child(format!("Eye {}  {direction:.2} / {fov:.2}", eye + 1))
                             }),
                     ),
-                );
+                )
+                .child(label("NEURAL ACTIVITY · OPEN LAB INSPECTOR"))
+                .when_some(detail.genome_browser.as_ref(), |hud, browser| {
+                    hud.child(render_genome_browser_view(browser))
+                });
+            if detail.genome_browser.is_none() {
+                hud = hud.child(label("Genome detail unavailable for this creature"));
+            }
         } else {
             // A matching inspection can be briefly unavailable while the host
             // advances. Keep the card's geometry stable and never show stale
@@ -19030,7 +19037,8 @@ fn post_process_stack(
         });
         passes.push(PostProcessPass::FilmGrain {
             strength: (0.14 + tension * 0.06).clamp(0.10, 0.24),
-            seed: tick,
+            // Keep screen-space grain stable as simulation ticks advance.
+            seed: 0x5342_4752_4149_4e,
         });
     }
 
@@ -22463,11 +22471,9 @@ fn apply_post_processing(
                     }
                 }
             }
-            PostProcessPass::FilmGrain { strength, seed: _ } => {
+            PostProcessPass::FilmGrain { strength, seed } => {
                 if strength > 0.01 && !low_fps {
-                    // Screen-space grain seeded from tick flashes across the
-                    // entire scene; keep this presentation texture stable.
-                    paint_film_grain(bounds, 0x5342_4752_4149_4e, strength, palette, window);
+                    paint_film_grain(bounds, seed, strength, palette, window);
                 }
             }
         }
@@ -24136,6 +24142,24 @@ mod command_characterization_tests {
             "smoothness widens actual production darkening: {narrow} -> {wide}"
         );
         eprintln!("production post RGB sums: {sums:?}; narrow_strip={narrow} wide_strip={wide}");
+    }
+
+    #[test]
+    fn film_grain_seed_stays_stable_across_simulation_ticks() {
+        let mut config = ScriptBotsConfig::default();
+        config.render.quality = Some(RenderQuality::High);
+        let seed_at = |tick| {
+            post_process_stack(tick, &config, false, 1, None, ColorPaletteMode::Natural)
+                .passes
+                .into_iter()
+                .find_map(|pass| match pass {
+                    PostProcessPass::FilmGrain { seed, .. } => Some(seed),
+                    _ => None,
+                })
+                .expect("high-quality rendering includes film grain")
+        };
+        assert_eq!(seed_at(1), seed_at(2));
+        assert_eq!(seed_at(1), seed_at(1_000));
     }
 
     #[test]
