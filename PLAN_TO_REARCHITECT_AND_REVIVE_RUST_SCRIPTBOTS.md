@@ -2,6 +2,62 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Loaded brain-family ownership (2026-11-03):** [Verified and Closed —
+GentleDuck; `bd-acpl`; fresh solo verification]
+
+The requested detailed TODO tracks the observed `Box::leak` in unknown
+`BrainKind` deserialization and three tournament conversions. Repeated input
+loads retain names after their records are dropped. This checklist retires
+after the source-bound loading and leak checks; it is not capability credit.
+
+- [x] Refresh native Beads readiness and current source; preserve existing
+  hardware-only capture qualification and concurrent rendering work.
+- [x] Trace dynamic labels through deserialization, runner naming, tournament
+  planning, ratings and leaderboard ingestion; reserve exact edit surfaces.
+- [x] Retain a pre-fix Valgrind control over real `BrainKind` deserialization
+  with declared label count/bytes and name-correctness assertions.
+- [x] Own dynamic labels, retain literal constructors and string wire semantics,
+  and update direct consumers without restricting pluggable family names.
+- [x] Exercise built-in/custom names, cloning, deterministic map keys, report
+  round-trips, runner cloning and tournament paths; remove all three dynamic
+  tournament leaks rather than merely moving allocation elsewhere.
+- [x] Run the same leak probe after the fix, relevant tests, workspace all-target
+  check, strict Clippy, formatting and scoped review through pinned DSR.
+- [x] Freshly recheck original acceptance, retain failed evidence, complete the
+  required honesty audit, update Beads and publish reviewed source/tracker.
+
+Source `334193d6663c` replaces leaked names with owned `Cow` strings, retains
+static literal identifiers, and updates the runner and tournament consumers.
+The unchanged 5,000-name, 1,024-byte workload loses 5,120,000 bytes in the
+clean pre-fix `ff038c90` loader and zero in the fixed loader. Both binaries
+run inside one comparison invocation, and every decoded name is checked;
+this is allocation-lifetime evidence, not an application-wide memory budget
+or a throughput claim.
+
+The first pinned DSR pass at `334193d6` passes 13 of 15 checks. Its full
+tournament test correctly refuses missing build-time source inputs, and
+strict Clippy identifies four existing raster/life-fixture diagnostics.
+All raw failures remain under `/data/tmp/scriptbots-brainkind-WJeBiVpL`.
+`717d74e241f9` fixes those four test-only diagnostics without suppressions;
+the corrected DSR profile derives source revision, clean status and status/diff
+digests from the actual pinned checkout before Cargo. The publication guard
+and every existing assertion remain intact.
+
+Clean pinned DSR `brainkind_repaired/20261103T041009-3341435` passes all 17
+executed checks at `717d74e241f994d5f9fd839d4807e25c07e9479a`, with unchanged
+source and independently recomputed raw-log hashes. Actual passed tests are
+brain 62, Neuroflow 15, tournament library 35, tournament integration 11, core
+capture two plus offspring failure one, and renderer raster 19 plus focused
+life projection one; no selected filter runs zero cases. Workspace all-target
+check, strict Clippy and formatting pass. The full three-family publication
+test passes with its provenance and reproduction barriers intact. The repeated
+Valgrind comparison again observes 5,120,000 bytes definitely lost before and
+zero definitely/indirectly/possibly lost after; 548 process-runtime bytes remain
+reachable. This does not qualify whole-application memory, all features, GPU
+pixels, throughput or the entire open program. Source and the closed tracker
+record are published through `22586dd2`; failed attempts and the written
+honesty disposition remain on the Bead. No independent verifier was available.
+
 **Capture corruption depth (2026-11-02):** [Verified local increment — GentleDuck;
 original `bd-2z0.14.3.10` remains open for hardware qualification; acceptance retained]
 
