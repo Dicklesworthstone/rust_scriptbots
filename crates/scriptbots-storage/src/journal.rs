@@ -1,4 +1,4 @@
-//! Nonblocking HostCore journal adapter and detached event-reader surface.
+//! Nonblocking `HostCore` journal adapter and detached event-reader surface.
 
 use super::{
     AdmissionState, CommandAuthorityRequest, DEFAULT_COMMAND_CAPACITY, ExistingStorageLease,
@@ -68,7 +68,7 @@ pub(super) fn unsupported_archive_version_reason(version: i64) -> String {
     format!("unsupported version {version}, expected {HOST_JOURNAL_ARCHIVE_VERSION}{writer}")
 }
 
-/// Bounded admission and catch-up limits for one HostCore journal adapter.
+/// Bounded admission and catch-up limits for one `HostCore` journal adapter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StorageJournalOptions {
     /// Most accepted batches that may await receipt polling.
@@ -317,7 +317,7 @@ pub struct CommandJournalPage {
     pub evidence: CommandJournalEvidence,
 }
 
-/// Successful result of the offline FrankenSQLite integrity conformance gate.
+/// Successful result of the offline `FrankenSQLite` integrity conformance gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorageIntegrityCheckResult {
     /// `PRAGMA integrity_check` returned exactly `ok`.
@@ -2842,7 +2842,7 @@ impl StorageEventJournalReader {
     ///
     /// This constructor performs bounded metadata I/O. The resulting cached range,
     /// identity, and retention queries remain nonblocking; only [`Self::read`] opens
-    /// a short-lived read-only FrankenSQLite connection.
+    /// a short-lived read-only `FrankenSQLite` connection.
     pub fn open_file(
         path: &str,
         run_id: RunId,

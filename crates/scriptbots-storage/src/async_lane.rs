@@ -20,16 +20,18 @@ const FSQLITE_PINNED_REVISION: &str = "ad3f23ca94c0f1d38e3d6cbb919b0d095de0b4ee"
 
 /// Uninhabited marker for the unavailable hard-bounded async SQL lane.
 ///
-/// There are deliberately no variants and therefore no constructible lane.
+/// Its private uninhabited field prevents constructing a lane.
 #[derive(Debug)]
-pub enum AsyncReadLane {}
+pub struct AsyncReadLane {
+    _uninhabited: std::convert::Infallible,
+}
 
 impl AsyncReadLane {
     /// Refuse a requested hard execution bound before touching `path`.
     ///
     /// The `_path` name is intentional: this fail-closed branch must not inspect,
     /// open, canonicalize, or otherwise access the supplied database path.
-    pub fn open(_path: &str, requested: Duration) -> Result<Self, StorageError> {
+    pub const fn open(_path: &str, requested: Duration) -> Result<Self, StorageError> {
         Err(StorageError::ReadExecutionBoundUnavailable {
             operation: "async_read_lane.open",
             requested,

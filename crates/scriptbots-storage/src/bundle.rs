@@ -18,83 +18,123 @@ fn current_timestamp() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |duration| duration.as_secs());
     format!("{secs}")
 }
 
+/// Failures while assembling or verifying a portable run bundle.
 #[derive(Debug, Error)]
 pub enum BundleError {
+    /// A filesystem operation failed.
     #[error("I/O error at {path}: {error}")]
     Io {
+        /// Path involved in the failed operation.
         path: PathBuf,
+        /// Original I/O failure.
         #[source]
         error: std::io::Error,
     },
+    /// Reading or validating the run database failed.
     #[error("Storage error: {0}")]
     Storage(#[from] StorageError),
+    /// Bundle JSON could not be encoded or decoded.
     #[error("Serialization error: {0}")]
     Json(#[from] serde_json::Error),
+    /// An artifact path is not a portable relative path.
     #[error("Invalid bundle path (must be relative and portable): {0}")]
     NonPortablePath(PathBuf),
+    /// The bundle manifest is missing or invalid.
     #[error("Bundle manifest missing or corrupted at {0}")]
     InvalidManifest(PathBuf),
+    /// An artifact's bytes disagree with its declared digest.
     #[error("Artifact hash mismatch for {path}: expected {expected}, calculated {actual}")]
     HashMismatch {
+        /// Artifact whose digest differs.
         path: PathBuf,
+        /// Digest declared by the manifest.
         expected: String,
+        /// Digest computed from the artifact.
         actual: String,
     },
+    /// An artifact named by the manifest was not found.
     #[error("Missing expected artifact in bundle: {0}")]
     MissingArtifact(PathBuf),
+    /// Bundle and database identify different runs.
     #[error("Run ID mismatch: manifest run_id {manifest_run_id} != database run_id {db_run_id}")]
     RunIdMismatch {
+        /// Run identifier declared by the bundle.
         manifest_run_id: String,
+        /// Run identifier read from the database.
         db_run_id: String,
     },
+    /// A configured verification byte or cardinality cap was exceeded.
     #[error(
         "bounded bundle verification limit `{resource}` exceeded at {path}: observed {observed}, limit {limit}"
     )]
     VerificationLimitExceeded {
+        /// Resource whose cap was exceeded.
         resource: &'static str,
+        /// Input at which the cap was exceeded.
         path: PathBuf,
+        /// Measured resource usage.
         observed: u64,
+        /// Configured maximum resource usage.
         limit: u64,
     },
+    /// Bounded verification encountered an input that is not a regular file.
     #[error("bounded bundle verification requires a regular file at {0}")]
     NonRegularFile(PathBuf),
+    /// The pinned engine cannot provide bounded database semantic verification.
     #[error(
         "bounded semantic verification of database-backed bundle {0} is unavailable: the pinned FrankenSQLite engine cannot interrupt a running statement; verify it in an isolated trusted workflow instead"
     )]
     BoundedDatabaseVerificationUnavailable(PathBuf),
+    /// The bundle's projected run identifier disagrees with its embedded manifest.
     #[error("bundle manifest projects run_id {projected_run_id}, but embeds {manifest_run_id}")]
     RunIdProjectionMismatch {
+        /// Run identifier in the digest projection.
         projected_run_id: String,
+        /// Run identifier in the embedded manifest.
         manifest_run_id: String,
     },
+    /// More than one entry names the same artifact path.
     #[error("bundle manifest lists artifact path more than once: {0}")]
     DuplicateArtifactPath(PathBuf),
+    /// Exported rows disagree with the corresponding database projection.
     #[error("bundle database disagrees with exported {0}")]
     DatabaseProjectionMismatch(&'static str),
 }
 
+/// Manifest identity, digest, and byte length for one bundled artifact.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RunBundleArtifactEntry {
+    /// Portable path relative to the bundle directory.
     pub relative_path: String,
+    /// Hexadecimal BLAKE3 digest of the artifact bytes.
     #[serde(alias = "sha256_hex")]
     pub blake3_hex: String,
+    /// Declared artifact size in bytes.
     pub bytes_len: u64,
+    /// Artifact category used by bundle verification.
     pub artifact_type: String,
 }
 
+/// Run provenance and database projection included in a bundle.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RunBundleDigests {
+    /// Source revision recorded for the run, when available.
     pub source_revision: Option<String>,
+    /// Lockfile digest recorded for the run, when available.
     pub lockfile_digest: Option<String>,
+    /// Canonical run identifier.
     pub run_id: String,
+    /// Greatest projected database tick, or the caller-supplied tick for a database-free bundle.
     pub max_tick: u64,
+    /// Number of persisted replay events in the database projection; zero without a database.
     pub event_count: u64,
+    /// Number of persisted checkpoints in the database projection; zero without a database.
     pub checkpoint_count: u64,
+    /// Independently read persistence prefixes for a database-backed bundle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persistence_watermarks: Option<RunBundleWatermarks>,
 }
@@ -102,8 +142,11 @@ pub struct RunBundleDigests {
 /// Batch prefixes independently read from a database-backed bundle.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RunBundleWatermarks {
+    /// Greatest batch admitted to the outbox.
     pub admitted: Option<u64>,
+    /// Greatest batch applied to scientific tables.
     pub applied: Option<u64>,
+    /// Greatest batch covered by the durable marker.
     pub durable: Option<u64>,
 }
 
@@ -117,32 +160,50 @@ impl From<PersistenceWatermarks> for RunBundleWatermarks {
     }
 }
 
+/// Portable bundle manifest containing provenance and artifact identities.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RunBundleV1 {
+    /// Bundle schema identifier.
     pub bundle_version: String,
+    /// Creation timestamp as a Unix-seconds string.
     pub created_at_utc: String,
+    /// Run manifest exported from storage or supplied by the caller.
     pub manifest: RunManifestRecord,
+    /// Run provenance and persisted-row projection.
     pub digests: RunBundleDigests,
+    /// Artifact entries to verify against bundle files.
     pub artifacts: Vec<RunBundleArtifactEntry>,
 }
 
+/// Observations returned after successful bundle verification.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RunBundleVerificationResult {
+    /// Verified bundle schema identifier.
     pub bundle_version: String,
+    /// Verified run identifier.
     pub run_id: String,
+    /// Maximum tick projected by the bundle.
     pub max_tick: u64,
+    /// Number of artifacts checked.
     pub total_artifacts_verified: usize,
+    /// Total artifact bytes checked.
     pub total_bytes_verified: u64,
+    /// Reproducibility flag from the embedded run manifest.
     pub reproducible: bool,
+    /// Verification timestamp as a Unix-seconds string.
     pub verified_at_utc: String,
 }
 
 /// Hard byte and cardinality caps for untrusted artifact-only bundle verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunBundleVerificationLimits {
+    /// Maximum bytes permitted in the bundle manifest.
     pub max_manifest_bytes: u64,
+    /// Maximum number of listed artifacts.
     pub max_artifacts: usize,
+    /// Maximum bytes permitted in one artifact.
     pub max_artifact_bytes: u64,
+    /// Maximum combined bytes permitted across artifacts.
     pub max_total_artifact_bytes: u64,
 }
 
@@ -226,6 +287,7 @@ fn write_bundle_manifest(bundle_dir: &Path, bundle: &RunBundleV1) -> Result<(), 
 }
 
 /// Export a finished, checkpointed run under one identity-bound lease.
+///
 /// Live writers, nonempty WAL/journal files and existing output directories are refused.
 /// Source files are never checkpointed or rewritten by this operation.
 pub fn create_run_bundle(
@@ -540,7 +602,7 @@ fn verify_database_projection(
 /// This entry point opens each file once, validates the opened handle, and streams
 /// at most the declared byte count plus one byte through BLAKE3. It never allocates
 /// from an artifact's declared size. Database-backed bundles are refused explicitly:
-/// the pinned FrankenSQLite engine cannot interrupt an already-running statement,
+/// the pinned `FrankenSQLite` engine cannot interrupt an already-running statement,
 /// so advertising that semantic database verification as bounded would be false.
 pub fn verify_run_bundle_bounded(
     bundle_dir: &Path,
@@ -727,7 +789,7 @@ fn hash_file_exact_bounded(path: &Path, expected_bytes: u64) -> Result<String, B
     let mut reader = file.take(expected_bytes.saturating_add(1));
     let mut hasher = blake3::Hasher::new();
     let mut observed = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024];
     loop {
         let read = reader.read(&mut buffer).map_err(|error| BundleError::Io {
             path: path.to_path_buf(),
