@@ -25,6 +25,7 @@
 use bytemuck::{Pod, Zeroable};
 use scriptbots_core::sense_fixed::{SENSE_FRAC_BITS, SENSE_GEOMETRY, SenseAccum};
 use std::sync::atomic::{AtomicU64, Ordering};
+use wgpu::util::DeviceExt;
 
 /// Workgroup size used in production compute sensing.
 pub const PRODUCTION_WORKGROUP_SIZE: u32 = 64;
@@ -33,7 +34,7 @@ pub const PRODUCTION_WORKGROUP_SIZE: u32 = 64;
 pub const FIXED_SCALE: f32 = 1_048_576.0;
 
 /// Shared WGSL shader code for the fixed-point sensor accumulation compute pass.
-pub const SENSE_COMPUTE_SHADER_WGSL: &str = r#"
+pub const SENSE_COMPUTE_SHADER_WGSL: &str = r"
 // Fixed-point sensor accumulation shader matching sense_fixed.rs
 const PI: f32 = 3.14159265;
 const BLOOD_HALF_FOV: f32 = 0.589048622548; // PI * 0.1875 (World.cpp legacy parity)
@@ -428,10 +429,10 @@ fn main(
         outputs[agent_idx] = out_res;
     }
 }
-"#;
+";
 
 /// WGSL shader for clearing binning counters.
-pub const BINNING_CLEAR_WGSL: &str = r#"
+pub const BINNING_CLEAR_WGSL: &str = r"
 @group(0) @binding(0) var<storage, read_write> cell_counts: array<atomic<u32>>;
 @group(0) @binding(1) var<storage, read_write> cell_inserted: array<atomic<u32>>;
 
@@ -443,10 +444,10 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         atomicStore(&cell_inserted[cell_idx], 0u);
     }
 }
-"#;
+";
 
 /// WGSL shader for counting agents per grid cell.
-pub const BINNING_COUNT_WGSL: &str = r#"
+pub const BINNING_COUNT_WGSL: &str = r"
 struct GridUniforms {
     world_width: f32,
     world_height: f32,
@@ -503,10 +504,10 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let cell_idx = cy * uniforms.cells_x + cx;
     atomicAdd(&cell_counts[cell_idx], 1u);
 }
-"#;
+";
 
 /// WGSL shader for single-workgroup exclusive prefix sum across grid cells.
-pub const BINNING_PREFIX_SUM_WGSL: &str = r#"
+pub const BINNING_PREFIX_SUM_WGSL: &str = r"
 @group(0) @binding(0) var<storage, read> cell_counts: array<u32>;
 @group(0) @binding(1) var<storage, read_write> cell_offsets: array<u32>;
 
@@ -522,10 +523,10 @@ fn main() {
     }
     cell_offsets[total_cells] = sum;
 }
-"#;
+";
 
 /// WGSL shader for placing agent indices into CSR cell buckets.
-pub const BINNING_PLACE_WGSL: &str = r#"
+pub const BINNING_PLACE_WGSL: &str = r"
 struct GridUniforms {
     world_width: f32,
     world_height: f32,
@@ -587,10 +588,10 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let base_offset = cell_offsets[cell_idx];
     cell_agents[base_offset + slot] = agent_idx;
 }
-"#;
+";
 
 /// Standalone compute shader to test emulated 64-bit integer carry logic against Rust reference i64.
-pub const STANDALONE_CARRY_WGSL: &str = r#"
+pub const STANDALONE_CARRY_WGSL: &str = r"
 struct CarryInputPair {
     a: vec2<u32>,
     b: vec2<u32>,
@@ -613,7 +614,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         outputs[idx] = i64_add(inputs[idx].a, inputs[idx].b);
     }
 }
-"#;
+";
 
 /// Uniform configuration sent to GPU compute pipelines.
 #[repr(C)]
@@ -634,6 +635,10 @@ pub struct GridUniforms {
     /// Active agent count for the dispatch.
     pub agent_count: u32,
     /// Memory alignment padding.
+    #[allow(
+        clippy::pub_underscore_fields,
+        reason = "The public padding field names the matching WGSL ABI slot."
+    )]
     pub _pad: u32,
 }
 
@@ -688,6 +693,10 @@ pub struct AgentGpuData {
     /// Current health of the agent.
     pub target_health: f32,
     /// Memory alignment padding.
+    #[allow(
+        clippy::pub_underscore_fields,
+        reason = "The public padding field names the matching WGSL ABI slot."
+    )]
     pub _pad: f32,
 }
 
@@ -750,7 +759,9 @@ impl GpuSenseOutput {
     /// Convert the GPU fixed-point output into the canonical [`SenseAccum`] struct.
     #[must_use]
     pub fn to_sense_accum(&self) -> SenseAccum {
-        let to_i64 = |p: [u32; 2]| (u64::from(p[0]) | (u64::from(p[1]) << 32)) as i64;
+        let to_i64 = |p: [u32; 2]| {
+            i64::from_ne_bytes((u64::from(p[0]) | (u64::from(p[1]) << 32)).to_ne_bytes())
+        };
         SenseAccum {
             density: [
                 to_i64(self.density_0),
@@ -799,6 +810,14 @@ pub struct CarryInputPair {
 /// Typed error classifications for GPU compute sensing.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum GpuSenseError {
+    /// A host count cannot be represented by the GPU's `u32` count ABI.
+    #[error("GPU count {name}={count} cannot be represented as u32")]
+    CountOverflow {
+        /// Name of the count being converted.
+        name: &'static str,
+        /// Rejected host-side value.
+        count: usize,
+    },
     /// No adapter satisfied the GPU request.
     #[error("no GPU adapter satisfied the request")]
     NoAdapter,
@@ -833,6 +852,96 @@ pub struct GpuSenseRunStats {
 }
 
 static PIPELINE_ID: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn gpu_count(name: &'static str, count: usize) -> Result<u32, GpuSenseError> {
+    u32::try_from(count).map_err(|_| GpuSenseError::CountOverflow { name, count })
+}
+
+fn grid_cell_count(cells_x: u32, cells_y: u32) -> Result<u32, GpuSenseError> {
+    cells_x.checked_mul(cells_y).ok_or_else(|| {
+        GpuSenseError::Validation("cell grid exceeds the u32 GPU count ABI".to_owned())
+    })
+}
+
+fn compute_pipeline(
+    device: &wgpu::Device,
+    shader_label: &str,
+    pipeline_label: &str,
+    source: &str,
+) -> wgpu::ComputePipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some(shader_label),
+        source: wgpu::ShaderSource::Wgsl(source.into()),
+    });
+    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some(pipeline_label),
+        layout: None,
+        module: &shader,
+        entry_point: Some("main"),
+        compilation_options: wgpu::PipelineCompilationOptions::default(),
+        cache: None,
+    })
+}
+
+fn gpu_buffer(
+    device: &wgpu::Device,
+    label: &str,
+    size: u64,
+    usage: wgpu::BufferUsages,
+) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size,
+        usage,
+        mapped_at_creation: false,
+    })
+}
+
+fn buffer_bind_group<const N: usize>(
+    device: &wgpu::Device,
+    label: &str,
+    layout: &wgpu::BindGroupLayout,
+    buffers: [(u32, &wgpu::Buffer); N],
+) -> wgpu::BindGroup {
+    let entries = buffers.map(|(binding, buffer)| wgpu::BindGroupEntry {
+        binding,
+        resource: buffer.as_entire_binding(),
+    });
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(label),
+        layout,
+        entries: &entries,
+    })
+}
+
+const fn sense_binding(binding: u32, ty: wgpu::BufferBindingType) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
+}
+
+fn encode_pass(
+    encoder: &mut wgpu::CommandEncoder,
+    label: &str,
+    pipeline: &wgpu::ComputePipeline,
+    bind_group: &wgpu::BindGroup,
+    workgroups: u32,
+) {
+    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some(label),
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, bind_group, &[]);
+    pass.dispatch_workgroups(workgroups, 1, 1);
+}
 
 /// Complete GPU compute sensing pipeline holding pipelines for binning and accumulation.
 pub struct GpuSensePipeline {
@@ -890,58 +999,30 @@ impl GpuSensePipeline {
             );
         }
 
-        let clear_sm = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("binning_clear"),
-            source: wgpu::ShaderSource::Wgsl(BINNING_CLEAR_WGSL.into()),
-        });
-        let clear_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("binning_clear_pipeline"),
-            layout: None,
-            module: &clear_sm,
-            entry_point: Some("main"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
-        });
-
-        let count_sm = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("binning_count"),
-            source: wgpu::ShaderSource::Wgsl(BINNING_COUNT_WGSL.into()),
-        });
-        let count_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("binning_count_pipeline"),
-            layout: None,
-            module: &count_sm,
-            entry_point: Some("main"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
-        });
-
-        let prefix_sum_sm = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("binning_prefix_sum"),
-            source: wgpu::ShaderSource::Wgsl(BINNING_PREFIX_SUM_WGSL.into()),
-        });
-        let prefix_sum_pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("binning_prefix_sum_pipeline"),
-                layout: None,
-                module: &prefix_sum_sm,
-                entry_point: Some("main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                cache: None,
-            });
-
-        let place_sm = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("binning_place"),
-            source: wgpu::ShaderSource::Wgsl(BINNING_PLACE_WGSL.into()),
-        });
-        let place_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("binning_place_pipeline"),
-            layout: None,
-            module: &place_sm,
-            entry_point: Some("main"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
-        });
+        let clear_pipeline = compute_pipeline(
+            device,
+            "binning_clear",
+            "binning_clear_pipeline",
+            BINNING_CLEAR_WGSL,
+        );
+        let count_pipeline = compute_pipeline(
+            device,
+            "binning_count",
+            "binning_count_pipeline",
+            BINNING_COUNT_WGSL,
+        );
+        let prefix_sum_pipeline = compute_pipeline(
+            device,
+            "binning_prefix_sum",
+            "binning_prefix_sum_pipeline",
+            BINNING_PREFIX_SUM_WGSL,
+        );
+        let place_pipeline = compute_pipeline(
+            device,
+            "binning_place",
+            "binning_place_pipeline",
+            BINNING_PLACE_WGSL,
+        );
 
         let sense_src = sense_shader_source(workgroup_size);
         let sense_sm = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -952,56 +1033,11 @@ impl GpuSensePipeline {
         let sense_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("sense_bgl"),
             entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
+                sense_binding(0, wgpu::BufferBindingType::Uniform),
+                sense_binding(1, wgpu::BufferBindingType::Storage { read_only: true }),
+                sense_binding(2, wgpu::BufferBindingType::Storage { read_only: true }),
+                sense_binding(3, wgpu::BufferBindingType::Storage { read_only: true }),
+                sense_binding(4, wgpu::BufferBindingType::Storage { read_only: false }),
             ],
         });
 
@@ -1043,14 +1079,14 @@ impl GpuSensePipeline {
         uniforms: GridUniforms,
     ) -> Result<Vec<GpuSenseOutput>, GpuSenseError> {
         let agent_count = agents.len();
+        let dispatch_agents = gpu_count("agents", agent_count)?;
         if agent_count == 0 {
             return Ok(Vec::new());
         }
 
-        let total_cells = (uniforms.cells_x * uniforms.cells_y) as usize;
-        let cell_buffer_len = total_cells.max(1);
-
-        use wgpu::util::DeviceExt;
+        let total_cells = grid_cell_count(uniforms.cells_x, uniforms.cells_y)?;
+        let dispatch_cells = total_cells.max(1);
+        let cell_buffer_len = dispatch_cells as usize;
 
         let uniforms_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("uniforms_buf"),
@@ -1064,222 +1100,198 @@ impl GpuSensePipeline {
             usage: wgpu::BufferUsages::STORAGE,
         });
 
-        let cell_counts_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("cell_counts_buf"),
-            size: (cell_buffer_len * std::mem::size_of::<u32>()) as u64,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-
-        let cell_inserted_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("cell_inserted_buf"),
-            size: (cell_buffer_len * std::mem::size_of::<u32>()) as u64,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-
-        let cell_offsets_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("cell_offsets_buf"),
-            size: ((cell_buffer_len + 1) * std::mem::size_of::<u32>()) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-
-        let cell_agents_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("cell_agents_buf"),
-            size: (agent_count * std::mem::size_of::<u32>()) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
+        let cell_counts_buf = gpu_buffer(
+            device,
+            "cell_counts_buf",
+            (cell_buffer_len * std::mem::size_of::<u32>()) as u64,
+            wgpu::BufferUsages::STORAGE,
+        );
+        let cell_inserted_buf = gpu_buffer(
+            device,
+            "cell_inserted_buf",
+            (cell_buffer_len * std::mem::size_of::<u32>()) as u64,
+            wgpu::BufferUsages::STORAGE,
+        );
+        let cell_offsets_buf = gpu_buffer(
+            device,
+            "cell_offsets_buf",
+            ((cell_buffer_len + 1) * std::mem::size_of::<u32>()) as u64,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        );
+        let cell_agents_buf = gpu_buffer(
+            device,
+            "cell_agents_buf",
+            (agent_count * std::mem::size_of::<u32>()) as u64,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        );
 
         let output_bytes = (agent_count * std::mem::size_of::<GpuSenseOutput>()) as u64;
-        let outputs_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("outputs_buf"),
-            size: output_bytes,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
+        let outputs_buf = gpu_buffer(
+            device,
+            "outputs_buf",
+            output_bytes,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        );
+        let staging_buf = gpu_buffer(
+            device,
+            "staging_outputs_buf",
+            output_bytes,
+            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        );
 
-        let staging_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("staging_outputs_buf"),
-            size: output_bytes,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        // 1. Clear bind group
-        let clear_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("clear_bg"),
-            layout: &self.clear_pipeline.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: cell_counts_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: cell_inserted_buf.as_entire_binding(),
-                },
+        let [clear_bg, count_bg, prefix_sum_bg, place_bg, sense_bg] = self.sense_bind_groups(
+            device,
+            [
+                &cell_counts_buf,
+                &cell_inserted_buf,
+                &uniforms_buf,
+                &agents_buf,
+                &cell_offsets_buf,
+                &cell_agents_buf,
+                &outputs_buf,
             ],
-        });
+        );
 
-        // 2. Count bind group
-        let count_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("count_bg"),
-            layout: &self.count_pipeline.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniforms_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: agents_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: cell_counts_buf.as_entire_binding(),
-                },
-            ],
-        });
-
-        // 3. Prefix sum bind group
-        let prefix_sum_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("prefix_sum_bg"),
-            layout: &self.prefix_sum_pipeline.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: cell_counts_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: cell_offsets_buf.as_entire_binding(),
-                },
-            ],
-        });
-
-        // 4. Place bind group
-        let place_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("place_bg"),
-            layout: &self.place_pipeline.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniforms_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: agents_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: cell_offsets_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: cell_inserted_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: cell_agents_buf.as_entire_binding(),
-                },
-            ],
-        });
-
-        // 5. Sense bind group
-        let sense_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("sense_bg"),
-            layout: &self.sense_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniforms_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: agents_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: cell_offsets_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: cell_agents_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: outputs_buf.as_entire_binding(),
-                },
-            ],
-        });
-
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("sense_compute_encoder"),
-        });
-
-        // Pass 1: Clear
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("clear_pass"),
-                timestamp_writes: None,
-            });
-            cpass.set_pipeline(&self.clear_pipeline);
-            cpass.set_bind_group(0, &clear_bg, &[]);
-            let workgroups = (cell_buffer_len as u32).div_ceil(64);
-            cpass.dispatch_workgroups(workgroups, 1, 1);
-        }
-
-        // Pass 2: Count
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("count_pass"),
-                timestamp_writes: None,
-            });
-            cpass.set_pipeline(&self.count_pipeline);
-            cpass.set_bind_group(0, &count_bg, &[]);
-            let workgroups = (agent_count as u32).div_ceil(64);
-            cpass.dispatch_workgroups(workgroups, 1, 1);
-        }
-
-        // Pass 3: Prefix sum
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("prefix_sum_pass"),
-                timestamp_writes: None,
-            });
-            cpass.set_pipeline(&self.prefix_sum_pipeline);
-            cpass.set_bind_group(0, &prefix_sum_bg, &[]);
-            cpass.dispatch_workgroups(1, 1, 1);
-        }
+        let mut encoder = self.begin_binning(
+            device,
+            "sense_compute_encoder",
+            [&clear_bg, &count_bg, &prefix_sum_bg],
+            (dispatch_cells, dispatch_agents),
+        );
 
         // Pass 4: Place
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("place_pass"),
-                timestamp_writes: None,
-            });
-            cpass.set_pipeline(&self.place_pipeline);
-            cpass.set_bind_group(0, &place_bg, &[]);
-            let workgroups = (agent_count as u32).div_ceil(64);
-            cpass.dispatch_workgroups(workgroups, 1, 1);
-        }
+        encode_pass(
+            &mut encoder,
+            "place_pass",
+            &self.place_pipeline,
+            &place_bg,
+            dispatch_agents.div_ceil(64),
+        );
 
         // Pass 5: Sense
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("sense_accum_pass"),
-                timestamp_writes: None,
-            });
-            cpass.set_pipeline(&self.sense_pipeline);
-            cpass.set_bind_group(0, &sense_bg, &[]);
-            cpass.dispatch_workgroups(agent_count as u32, 1, 1);
-        }
+        encode_pass(
+            &mut encoder,
+            "sense_accum_pass",
+            &self.sense_pipeline,
+            &sense_bg,
+            dispatch_agents,
+        );
 
         encoder.copy_buffer_to_buffer(&outputs_buf, 0, &staging_buf, 0, output_bytes);
         queue.submit(Some(encoder.finish()));
+        Self::read_sense_outputs(device, &staging_buf)
+    }
 
+    fn begin_binning(
+        &self,
+        device: &wgpu::Device,
+        label: &str,
+        groups: [&wgpu::BindGroup; 3],
+        counts: (u32, u32),
+    ) -> wgpu::CommandEncoder {
+        let [clear, count, prefix] = groups;
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) });
+        encode_pass(
+            &mut encoder,
+            "clear_pass",
+            &self.clear_pipeline,
+            clear,
+            counts.0.div_ceil(64),
+        );
+        encode_pass(
+            &mut encoder,
+            "count_pass",
+            &self.count_pipeline,
+            count,
+            counts.1.div_ceil(64),
+        );
+        encode_pass(
+            &mut encoder,
+            "prefix_sum_pass",
+            &self.prefix_sum_pipeline,
+            prefix,
+            1,
+        );
+        encoder
+    }
+
+    fn binning_bind_groups(
+        &self,
+        device: &wgpu::Device,
+        buffers: [&wgpu::Buffer; 6],
+    ) -> [wgpu::BindGroup; 4] {
+        let [counts, inserted, uniforms, agents, offsets, cell_agents] = buffers;
+        let clear = buffer_bind_group(
+            device,
+            "clear_bg",
+            &self.clear_pipeline.get_bind_group_layout(0),
+            [(0, counts), (1, inserted)],
+        );
+        let count = buffer_bind_group(
+            device,
+            "count_bg",
+            &self.count_pipeline.get_bind_group_layout(0),
+            [(0, uniforms), (1, agents), (2, counts)],
+        );
+        let prefix = buffer_bind_group(
+            device,
+            "prefix_sum_bg",
+            &self.prefix_sum_pipeline.get_bind_group_layout(0),
+            [(0, counts), (1, offsets)],
+        );
+        let place = buffer_bind_group(
+            device,
+            "place_bg",
+            &self.place_pipeline.get_bind_group_layout(0),
+            [
+                (0, uniforms),
+                (1, agents),
+                (2, offsets),
+                (3, inserted),
+                (4, cell_agents),
+            ],
+        );
+        [clear, count, prefix, place]
+    }
+
+    fn sense_bind_groups(
+        &self,
+        device: &wgpu::Device,
+        buffers: [&wgpu::Buffer; 7],
+    ) -> [wgpu::BindGroup; 5] {
+        let [
+            counts,
+            inserted,
+            uniforms,
+            agents,
+            offsets,
+            cell_agents,
+            outputs,
+        ] = buffers;
+        let [clear, count, prefix, place] = self.binning_bind_groups(
+            device,
+            [counts, inserted, uniforms, agents, offsets, cell_agents],
+        );
+        let sense = buffer_bind_group(
+            device,
+            "sense_bg",
+            &self.sense_bgl,
+            [
+                (0, uniforms),
+                (1, agents),
+                (2, offsets),
+                (3, cell_agents),
+                (4, outputs),
+            ],
+        );
+        [clear, count, prefix, place, sense]
+    }
+
+    fn read_sense_outputs(
+        device: &wgpu::Device,
+        staging_buf: &wgpu::Buffer,
+    ) -> Result<Vec<GpuSenseOutput>, GpuSenseError> {
         // Map and read back
         let buffer_slice = staging_buf.slice(..);
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -1320,10 +1332,10 @@ impl GpuSensePipeline {
         uniforms: GridUniforms,
     ) -> Result<(Vec<u32>, Vec<u32>), GpuSenseError> {
         let agent_count = agents.len();
-        let total_cells = (uniforms.cells_x * uniforms.cells_y) as usize;
-        let cell_buffer_len = total_cells.max(1);
-
-        use wgpu::util::DeviceExt;
+        let dispatch_agents = gpu_count("agents", agent_count)?;
+        let total_cells = grid_cell_count(uniforms.cells_x, uniforms.cells_y)?;
+        let dispatch_cells = total_cells.max(1);
+        let cell_buffer_len = dispatch_cells as usize;
 
         let uniforms_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("uniforms_buf"),
@@ -1337,171 +1349,74 @@ impl GpuSensePipeline {
             usage: wgpu::BufferUsages::STORAGE,
         });
 
-        let cell_counts_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("cell_counts_buf"),
-            size: (cell_buffer_len * std::mem::size_of::<u32>()) as u64,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-
-        let cell_inserted_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("cell_inserted_buf"),
-            size: (cell_buffer_len * std::mem::size_of::<u32>()) as u64,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
+        let cell_counts_buf = gpu_buffer(
+            device,
+            "cell_counts_buf",
+            (cell_buffer_len * std::mem::size_of::<u32>()) as u64,
+            wgpu::BufferUsages::STORAGE,
+        );
+        let cell_inserted_buf = gpu_buffer(
+            device,
+            "cell_inserted_buf",
+            (cell_buffer_len * std::mem::size_of::<u32>()) as u64,
+            wgpu::BufferUsages::STORAGE,
+        );
 
         let offsets_bytes = ((cell_buffer_len + 1) * std::mem::size_of::<u32>()) as u64;
-        let cell_offsets_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("cell_offsets_buf"),
-            size: offsets_bytes,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
+        let cell_offsets_buf = gpu_buffer(
+            device,
+            "cell_offsets_buf",
+            offsets_bytes,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        );
 
         let agents_bytes = (agent_count * std::mem::size_of::<u32>()).max(4) as u64;
-        let cell_agents_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("cell_agents_buf"),
-            size: agents_bytes,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
+        let cell_agents_buf = gpu_buffer(
+            device,
+            "cell_agents_buf",
+            agents_bytes,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        );
+        let staging_offsets = gpu_buffer(
+            device,
+            "staging_offsets",
+            offsets_bytes,
+            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        );
+        let staging_agents = gpu_buffer(
+            device,
+            "staging_agents",
+            agents_bytes,
+            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        );
 
-        let staging_offsets = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("staging_offsets"),
-            size: offsets_bytes,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let staging_agents = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("staging_agents"),
-            size: agents_bytes,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let clear_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("clear_bg"),
-            layout: &self.clear_pipeline.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: cell_counts_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: cell_inserted_buf.as_entire_binding(),
-                },
+        let [clear_bg, count_bg, prefix_sum_bg, place_bg] = self.binning_bind_groups(
+            device,
+            [
+                &cell_counts_buf,
+                &cell_inserted_buf,
+                &uniforms_buf,
+                &agents_buf,
+                &cell_offsets_buf,
+                &cell_agents_buf,
             ],
-        });
+        );
 
-        let count_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("count_bg"),
-            layout: &self.count_pipeline.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniforms_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: agents_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: cell_counts_buf.as_entire_binding(),
-                },
-            ],
-        });
-
-        let prefix_sum_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("prefix_sum_bg"),
-            layout: &self.prefix_sum_pipeline.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: cell_counts_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: cell_offsets_buf.as_entire_binding(),
-                },
-            ],
-        });
-
-        let place_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("place_bg"),
-            layout: &self.place_pipeline.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniforms_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: agents_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: cell_offsets_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: cell_inserted_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: cell_agents_buf.as_entire_binding(),
-                },
-            ],
-        });
-
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("binning_test_encoder"),
-        });
-
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("clear_pass"),
-                timestamp_writes: None,
-            });
-            cpass.set_pipeline(&self.clear_pipeline);
-            cpass.set_bind_group(0, &clear_bg, &[]);
-            let workgroups = (cell_buffer_len as u32).div_ceil(64);
-            cpass.dispatch_workgroups(workgroups, 1, 1);
-        }
-
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("count_pass"),
-                timestamp_writes: None,
-            });
-            cpass.set_pipeline(&self.count_pipeline);
-            cpass.set_bind_group(0, &count_bg, &[]);
-            let workgroups = (agent_count as u32).div_ceil(64);
-            cpass.dispatch_workgroups(workgroups, 1, 1);
-        }
-
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("prefix_sum_pass"),
-                timestamp_writes: None,
-            });
-            cpass.set_pipeline(&self.prefix_sum_pipeline);
-            cpass.set_bind_group(0, &prefix_sum_bg, &[]);
-            cpass.dispatch_workgroups(1, 1, 1);
-        }
+        let mut encoder = self.begin_binning(
+            device,
+            "binning_test_encoder",
+            [&clear_bg, &count_bg, &prefix_sum_bg],
+            (dispatch_cells, dispatch_agents),
+        );
 
         if agent_count > 0 {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("place_pass"),
-                timestamp_writes: None,
-            });
-            cpass.set_pipeline(&self.place_pipeline);
-            cpass.set_bind_group(0, &place_bg, &[]);
-            let workgroups = (agent_count as u32).div_ceil(64);
-            cpass.dispatch_workgroups(workgroups, 1, 1);
+            encode_pass(
+                &mut encoder,
+                "place_pass",
+                &self.place_pipeline,
+                &place_bg,
+                dispatch_agents.div_ceil(64),
+            );
         }
 
         encoder.copy_buffer_to_buffer(&cell_offsets_buf, 0, &staging_offsets, 0, offsets_bytes);
@@ -1516,6 +1431,15 @@ impl GpuSensePipeline {
         }
         queue.submit(Some(encoder.finish()));
 
+        Self::read_binning_outputs(device, &staging_offsets, &staging_agents, agent_count)
+    }
+
+    fn read_binning_outputs(
+        device: &wgpu::Device,
+        staging_offsets: &wgpu::Buffer,
+        staging_agents: &wgpu::Buffer,
+        agent_count: usize,
+    ) -> Result<(Vec<u32>, Vec<u32>), GpuSenseError> {
         // Read back offsets
         staging_offsets
             .slice(..)
@@ -1558,7 +1482,7 @@ impl GpuSensePipeline {
 
 /// Compute and return the SHA-256 hex digest of the canonical production sense shader.
 #[must_use]
-pub fn sense_shader_digest() -> &'static str {
+pub const fn sense_shader_digest() -> &'static str {
     // Computed over SENSE_COMPUTE_SHADER_WGSL source bytes.
     "01491cd61bca7ed0a474e6966a97da61403706509f6a131294dc431c22a84066"
 }
@@ -1611,6 +1535,36 @@ mod tests {
     use scriptbots_index::{NeighborhoodIndex, UniformGridIndex};
     use std::collections::BTreeSet;
 
+    #[test]
+    fn gpu_count_accepts_u32_boundary_and_rejects_the_next_host_count() {
+        assert_eq!(gpu_count("agents", 0), Ok(0));
+        assert_eq!(gpu_count("agents", u32::MAX as usize), Ok(u32::MAX));
+        if let Some(too_many) = (u32::MAX as usize).checked_add(1) {
+            assert_eq!(
+                gpu_count("agents", too_many),
+                Err(GpuSenseError::CountOverflow {
+                    name: "agents",
+                    count: too_many
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn grid_cell_count_rejects_u32_product_overflow() {
+        assert_eq!(grid_cell_count(0, u32::MAX), Ok(0));
+        assert_eq!(grid_cell_count(1, u32::MAX), Ok(u32::MAX));
+        assert_eq!(grid_cell_count(u32::MAX, 1), Ok(u32::MAX));
+        assert!(matches!(
+            grid_cell_count(2, u32::MAX),
+            Err(GpuSenseError::Validation(_))
+        ));
+        assert!(matches!(
+            grid_cell_count(u32::MAX, 2),
+            Err(GpuSenseError::Validation(_))
+        ));
+    }
+
     /// Verify that all WGSL shader sources parse and pass semantic validation.
     fn validate_sense_wgsl_shader() -> bool {
         let shaders = [
@@ -1650,7 +1604,7 @@ mod tests {
     )> {
         let guard = crate::GPU_TEST_MUTEX
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -1713,12 +1667,11 @@ mod tests {
         let inputs: Vec<CarryInputPair> = test_pairs
             .iter()
             .map(|&(a, b)| CarryInputPair {
-                a: [a as u32, (a >> 32) as u32],
-                b: [b as u32, (b >> 32) as u32],
+                a: carry_words(a),
+                b: carry_words(b),
             })
             .collect();
 
-        use wgpu::util::DeviceExt;
         let in_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("carry_in"),
             contents: bytemuck::cast_slice(&inputs),
@@ -1762,7 +1715,7 @@ mod tests {
             });
             cpass.set_pipeline(&pipeline);
             cpass.set_bind_group(0, &bg, &[]);
-            cpass.dispatch_workgroups((inputs.len() as u32).div_ceil(64), 1, 1);
+            cpass.dispatch_workgroups(u32::try_from(inputs.len()).unwrap().div_ceil(64), 1, 1);
         }
         encoder.copy_buffer_to_buffer(&out_buf, 0, &staging, 0, out_bytes);
         queue.submit(Some(encoder.finish()));
@@ -1790,6 +1743,13 @@ mod tests {
         }
     }
 
+    fn carry_words(value: u64) -> [u32; 2] {
+        [
+            u32::try_from(value & u64::from(u32::MAX)).unwrap(),
+            u32::try_from(value >> u32::BITS).unwrap(),
+        ]
+    }
+
     #[test]
     fn test_gpu_binning_parity_against_cpu_uniform_grid_index() {
         let Some((device, queue, info, _gpu_lock)) = get_test_device() else {
@@ -1810,7 +1770,7 @@ mod tests {
             sense_radius: 120.0,
             cells_x,
             cells_y,
-            agent_count: agent_count as u32,
+            agent_count: u32::try_from(agent_count).unwrap(),
             _pad: 0,
         };
 
@@ -1822,8 +1782,8 @@ mod tests {
             // Include agents directly on cell boundaries (e.g., multiples of 50.0)
             let (x, y) = if i < 50 {
                 (
-                    (i as f32 * 20.0).rem_euclid(world_w),
-                    (i as f32 * 25.0).rem_euclid(world_h),
+                    (crate::gpu_scalar(u32::try_from(i).unwrap()) * 20.0).rem_euclid(world_w),
+                    (crate::gpu_scalar(u32::try_from(i).unwrap()) * 25.0).rem_euclid(world_h),
                 )
             } else {
                 (
@@ -1875,10 +1835,26 @@ mod tests {
         let total_cells = (cells_x * cells_y) as usize;
         assert_eq!(cell_offsets.len(), total_cells + 1);
         assert_eq!(cell_agents.len(), agent_count);
+        assert_cpu_bins(
+            &cell_offsets,
+            &cell_agents,
+            &cpu_positions,
+            (cells_x, cells_y),
+            cell_size,
+        );
+    }
 
+    fn assert_cpu_bins(
+        cell_offsets: &[u32],
+        cell_agents: &[u32],
+        cpu_positions: &[(f32, f32)],
+        dims: (u32, u32),
+        cell_size: f32,
+    ) {
+        let (cells_x, cells_y) = dims;
         // Compare GPU bin contents vs CPU index buckets as sorted sets per cell
-        for cy in 0..cells_y as i32 {
-            for cx in 0..cells_x as i32 {
+        for cy in 0..cells_y {
+            for cx in 0..cells_x {
                 let cell = (cy as usize) * (cells_x as usize) + (cx as usize);
                 let start = cell_offsets[cell] as usize;
                 let end = cell_offsets[cell + 1] as usize;
@@ -1890,9 +1866,25 @@ mod tests {
                 // Query CPU index buckets around this cell
                 let mut cpu_set: BTreeSet<usize> = BTreeSet::new();
                 for (idx, &(px, py)) in cpu_positions.iter().enumerate() {
-                    let agent_cx = (px / cell_size).floor().clamp(0.0, (cells_x - 1) as f32) as i32;
-                    let agent_cy = (py / cell_size).floor().clamp(0.0, (cells_y - 1) as f32) as i32;
-                    if agent_cx == cx && agent_cy == cy {
+                    #[allow(
+                        clippy::cast_possible_truncation,
+                        clippy::cast_sign_loss,
+                        reason = "The CPU oracle floors and clamps into this fixture's nonnegative u32 cell range."
+                    )]
+                    let agent_col = (px / cell_size)
+                        .floor()
+                        .clamp(0.0, crate::gpu_scalar(cells_x - 1))
+                        as u32;
+                    #[allow(
+                        clippy::cast_possible_truncation,
+                        clippy::cast_sign_loss,
+                        reason = "The CPU oracle floors and clamps into this fixture's nonnegative u32 cell range."
+                    )]
+                    let agent_row = (py / cell_size)
+                        .floor()
+                        .clamp(0.0, crate::gpu_scalar(cells_y - 1))
+                        as u32;
+                    if agent_col == cx && agent_row == cy {
                         cpu_set.insert(idx);
                     }
                 }
@@ -1937,91 +1929,12 @@ mod tests {
                            neigh_pos: (f32, f32),
                            fov: f32,
                            color: [f32; 3]| {
-            let obs = AgentGpuData {
-                pos_x: obs_pos.0,
-                pos_y: obs_pos.1,
-                heading_unit_x: 1.0,
-                heading_unit_y: 0.0,
-                eye_unit_0_x: 1.0,
-                eye_unit_0_y: 0.0,
-                eye_unit_1_x: 0.0,
-                eye_unit_1_y: 1.0,
-                eye_unit_2_x: -1.0,
-                eye_unit_2_y: 0.0,
-                eye_unit_3_x: 0.0,
-                eye_unit_3_y: -1.0,
-                eye_fov_0: fov,
-                eye_fov_1: fov,
-                eye_fov_2: fov,
-                eye_fov_3: fov,
-                color_r: 0.1,
-                color_g: 0.2,
-                color_b: 0.3,
-                eye_sensitivity: 1.0,
-                wheel_effort: 0.6,
-                sound_emitter: 0.8,
-                target_health: 1.2,
-                _pad: 0.0,
-            };
-
-            let neigh = AgentGpuData {
-                pos_x: neigh_pos.0,
-                pos_y: neigh_pos.1,
-                heading_unit_x: 0.0,
-                heading_unit_y: 1.0,
-                eye_unit_0_x: 1.0,
-                eye_unit_0_y: 0.0,
-                eye_unit_1_x: 0.0,
-                eye_unit_1_y: 1.0,
-                eye_unit_2_x: -1.0,
-                eye_unit_2_y: 0.0,
-                eye_unit_3_x: 0.0,
-                eye_unit_3_y: -1.0,
-                eye_fov_0: fov,
-                eye_fov_1: fov,
-                eye_fov_2: fov,
-                eye_fov_3: fov,
-                color_r: color[0],
-                color_g: color[1],
-                color_b: color[2],
-                eye_sensitivity: 1.0,
-                wheel_effort: 0.7,
-                sound_emitter: 0.4,
-                target_health: 0.5,
-                _pad: 0.0,
-            };
+            let ([obs, neigh], observer_geom) =
+                hand_built_case(obs_pos, neigh_pos, fov, color, radius);
 
             // CPU reference calculation
-            let observer_geom = SenseObserverGeometry {
-                eye_units: [
-                    [obs.eye_unit_0_x, obs.eye_unit_0_y],
-                    [obs.eye_unit_1_x, obs.eye_unit_1_y],
-                    [obs.eye_unit_2_x, obs.eye_unit_2_y],
-                    [obs.eye_unit_3_x, obs.eye_unit_3_y],
-                ],
-                eye_fov: [fov; NUM_EYES],
-                heading_unit: [obs.heading_unit_x, obs.heading_unit_y],
-                eye_sensitivity: obs.eye_sensitivity,
-                radius,
-            };
-
-            let dx = toroidal_delta(neigh.pos_x, obs.pos_x, world_size);
-            let dy = toroidal_delta(neigh.pos_y, obs.pos_y, world_size);
-            let dsq = dx * dx + dy * dy;
-            let mut cpu_accum = SenseAccum::default();
-            if let Some((dist, dist_factor)) = sense_distance_terms(dsq, radius, radius * radius) {
-                let neighbor_inputs = SenseNeighborInputs {
-                    dx,
-                    dy,
-                    distance: dist,
-                    distance_factor: dist_factor,
-                    color,
-                    wheel_effort: neigh.wheel_effort,
-                    sound_emitter: neigh.sound_emitter,
-                    target_health: neigh.target_health,
-                };
-                cpu_accum.contribute(&fixed_sense_contribution(&observer_geom, neighbor_inputs));
-            }
+            let cpu_accum =
+                hand_built_cpu_accum(&[obs, neigh], &observer_geom, world_size, radius, color);
 
             // GPU calculation
             let outputs = pipeline
@@ -2092,7 +2005,15 @@ mod tests {
         // 7. Eye-cone edge: neighbor exactly at diff == fov (boundary in vs out)
         // At heading (1, 0), eye 0 is at (1, 0). Neighbor at angle theta = fov:
         let fov = 0.5f32;
+        #[allow(
+            clippy::suboptimal_flops,
+            reason = "Retain the exact eye-cone boundary fixture coordinates."
+        )]
         let nx = 500.0 + 40.0 * fov.cos();
+        #[allow(
+            clippy::suboptimal_flops,
+            reason = "Retain the exact eye-cone boundary fixture coordinates."
+        )]
         let ny = 500.0 + 40.0 * fov.sin();
         verify_case(
             "eye_cone_edge_diff_equals_fov",
@@ -2101,6 +2022,112 @@ mod tests {
             fov,
             [0.9, 0.1, 0.1],
         );
+    }
+
+    fn hand_built_cpu_accum(
+        agents: &[AgentGpuData; 2],
+        observer_geom: &SenseObserverGeometry,
+        world_size: f32,
+        radius: f32,
+        color: [f32; 3],
+    ) -> SenseAccum {
+        let [obs, neigh] = agents;
+        let dx = toroidal_delta(neigh.pos_x, obs.pos_x, world_size);
+        let dy = toroidal_delta(neigh.pos_y, obs.pos_y, world_size);
+        #[allow(
+            clippy::suboptimal_flops,
+            reason = "The CPU parity oracle must use the shader's separate multiply/add rounding."
+        )]
+        let dsq = dx * dx + dy * dy;
+        let mut cpu_accum = SenseAccum::default();
+        if let Some((dist, dist_factor)) = sense_distance_terms(dsq, radius, radius * radius) {
+            let neighbor_inputs = SenseNeighborInputs {
+                dx,
+                dy,
+                distance: dist,
+                distance_factor: dist_factor,
+                color,
+                wheel_effort: neigh.wheel_effort,
+                sound_emitter: neigh.sound_emitter,
+                target_health: neigh.target_health,
+            };
+            cpu_accum.contribute(&fixed_sense_contribution(observer_geom, neighbor_inputs));
+        }
+        cpu_accum
+    }
+
+    fn hand_built_case(
+        obs_pos: (f32, f32),
+        neigh_pos: (f32, f32),
+        fov: f32,
+        color: [f32; 3],
+        radius: f32,
+    ) -> ([AgentGpuData; 2], SenseObserverGeometry) {
+        let obs = AgentGpuData {
+            pos_x: obs_pos.0,
+            pos_y: obs_pos.1,
+            heading_unit_x: 1.0,
+            heading_unit_y: 0.0,
+            eye_unit_0_x: 1.0,
+            eye_unit_0_y: 0.0,
+            eye_unit_1_x: 0.0,
+            eye_unit_1_y: 1.0,
+            eye_unit_2_x: -1.0,
+            eye_unit_2_y: 0.0,
+            eye_unit_3_x: 0.0,
+            eye_unit_3_y: -1.0,
+            eye_fov_0: fov,
+            eye_fov_1: fov,
+            eye_fov_2: fov,
+            eye_fov_3: fov,
+            color_r: 0.1,
+            color_g: 0.2,
+            color_b: 0.3,
+            eye_sensitivity: 1.0,
+            wheel_effort: 0.6,
+            sound_emitter: 0.8,
+            target_health: 1.2,
+            _pad: 0.0,
+        };
+        let neigh = AgentGpuData {
+            pos_x: neigh_pos.0,
+            pos_y: neigh_pos.1,
+            heading_unit_x: 0.0,
+            heading_unit_y: 1.0,
+            eye_unit_0_x: 1.0,
+            eye_unit_0_y: 0.0,
+            eye_unit_1_x: 0.0,
+            eye_unit_1_y: 1.0,
+            eye_unit_2_x: -1.0,
+            eye_unit_2_y: 0.0,
+            eye_unit_3_x: 0.0,
+            eye_unit_3_y: -1.0,
+            eye_fov_0: fov,
+            eye_fov_1: fov,
+            eye_fov_2: fov,
+            eye_fov_3: fov,
+            color_r: color[0],
+            color_g: color[1],
+            color_b: color[2],
+            eye_sensitivity: 1.0,
+            wheel_effort: 0.7,
+            sound_emitter: 0.4,
+            target_health: 0.5,
+            _pad: 0.0,
+        };
+        let observer_geom = SenseObserverGeometry {
+            eye_units: [
+                [obs.eye_unit_0_x, obs.eye_unit_0_y],
+                [obs.eye_unit_1_x, obs.eye_unit_1_y],
+                [obs.eye_unit_2_x, obs.eye_unit_2_y],
+                [obs.eye_unit_3_x, obs.eye_unit_3_y],
+            ],
+            eye_fov: [fov; NUM_EYES],
+            heading_unit: [obs.heading_unit_x, obs.heading_unit_y],
+            eye_sensitivity: obs.eye_sensitivity,
+            radius,
+        };
+        ([obs, neigh], observer_geom)
     }
 
     #[test]
@@ -2174,7 +2201,7 @@ mod tests {
             sense_radius: 120.0,
             cells_x: 20,
             cells_y: 20,
-            agent_count: agent_count as u32,
+            agent_count: u32::try_from(agent_count).unwrap(),
             _pad: 0,
         };
 
@@ -2228,6 +2255,33 @@ mod tests {
         }
     }
 
+    const WORKGROUP_BOUNDARY_OBSERVER: AgentGpuData = AgentGpuData {
+        pos_x: 500.0,
+        pos_y: 500.0,
+        heading_unit_x: 1.0,
+        heading_unit_y: 0.0,
+        eye_unit_0_x: 1.0,
+        eye_unit_0_y: 0.0,
+        eye_unit_1_x: 0.0,
+        eye_unit_1_y: 1.0,
+        eye_unit_2_x: -1.0,
+        eye_unit_2_y: 0.0,
+        eye_unit_3_x: 0.0,
+        eye_unit_3_y: -1.0,
+        eye_fov_0: 1.0,
+        eye_fov_1: 1.0,
+        eye_fov_2: 1.0,
+        eye_fov_3: 1.0,
+        color_r: 0.1,
+        color_g: 0.2,
+        color_b: 0.3,
+        eye_sensitivity: 1.0,
+        wheel_effort: 0.5,
+        sound_emitter: 0.5,
+        target_health: 1.0,
+        _pad: 0.0,
+    };
+
     #[test]
     fn test_many_neighbors_crossing_workgroup_boundary_parity() {
         let Some((device, queue, info, _gpu_lock)) = get_test_device() else {
@@ -2244,38 +2298,13 @@ mod tests {
             sense_radius: radius,
             cells_x: 20,
             cells_y: 20,
-            agent_count: agent_count as u32,
+            agent_count: u32::try_from(agent_count).unwrap(),
             _pad: 0,
         };
 
         let mut agents = Vec::with_capacity(agent_count);
         // Agent 0 is observer at (500, 500)
-        agents.push(AgentGpuData {
-            pos_x: 500.0,
-            pos_y: 500.0,
-            heading_unit_x: 1.0,
-            heading_unit_y: 0.0,
-            eye_unit_0_x: 1.0,
-            eye_unit_0_y: 0.0,
-            eye_unit_1_x: 0.0,
-            eye_unit_1_y: 1.0,
-            eye_unit_2_x: -1.0,
-            eye_unit_2_y: 0.0,
-            eye_unit_3_x: 0.0,
-            eye_unit_3_y: -1.0,
-            eye_fov_0: 1.0,
-            eye_fov_1: 1.0,
-            eye_fov_2: 1.0,
-            eye_fov_3: 1.0,
-            color_r: 0.1,
-            color_g: 0.2,
-            color_b: 0.3,
-            eye_sensitivity: 1.0,
-            wheel_effort: 0.5,
-            sound_emitter: 0.5,
-            target_health: 1.0,
-            _pad: 0.0,
-        });
+        agents.push(WORKGROUP_BOUNDARY_OBSERVER);
 
         let mut rng = StdRng::seed_from_u64(0x5555_AAAA);
         for _ in 1..agent_count {
@@ -2326,6 +2355,10 @@ mod tests {
         for other in &agents[1..] {
             let dx = toroidal_delta(other.pos_x, agents[0].pos_x, 1000.0);
             let dy = toroidal_delta(other.pos_y, agents[0].pos_y, 1000.0);
+            #[allow(
+                clippy::suboptimal_flops,
+                reason = "The CPU parity oracle must use the shader's separate multiply/add rounding."
+            )]
             let dsq = dx * dx + dy * dy;
             if let Some((dist, dist_factor)) = sense_distance_terms(dsq, radius, radius * radius) {
                 let inputs = SenseNeighborInputs {
@@ -2382,6 +2415,10 @@ mod tests {
         sorted_terms.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let float_sorted: f32 = sorted_terms.iter().copied().sum();
 
+        #[allow(
+            clippy::float_cmp,
+            reason = "This negative proof requires exact inequality of finite sums under the retained distinct addition orders."
+        )]
         let diverged = float_forward != float_reversed || float_forward != float_sorted;
         assert!(
             diverged,
@@ -2389,14 +2426,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_negative_poly_acos_vs_driver_builtin_divergence() {
-        let Some((device, queue, info, _gpu_lock)) = get_test_device() else {
-            return;
-        };
-
+    fn acos_comparison_pipeline(device: &wgpu::Device) -> wgpu::ComputePipeline {
         // Compute shader evaluating poly_acos(x) vs driver builtin acos(x)
-        let shader_src = r#"
+        let shader_src = r"
         @group(0) @binding(0) var<storage, read> inputs: array<f32>;
         @group(0) @binding(1) var<storage, read_write> poly_outputs: array<f32>;
         @group(0) @binding(2) var<storage, read_write> builtin_outputs: array<f32>;
@@ -2442,29 +2474,40 @@ mod tests {
                 builtin_outputs[idx] = acos(clamp(x, -1.0, 1.0));
             }
         }
-        "#;
+        ";
 
         let sm = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("acos_comp"),
             source: wgpu::ShaderSource::Wgsl(shader_src.into()),
         });
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("acos_comp_pipeline"),
             layout: None,
             module: &sm,
             entry_point: Some("main"),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: None,
-        });
+        })
+    }
 
+    #[test]
+    fn test_negative_poly_acos_vs_driver_builtin_divergence() {
+        let Some((device, queue, info, _gpu_lock)) = get_test_device() else {
+            return;
+        };
+        let pipeline = acos_comparison_pipeline(&device);
         let count = 1000usize;
         let mut test_inputs = Vec::with_capacity(count);
         for i in 0..count {
-            let t = (i as f32) / (count as f32 - 1.0);
+            let t = crate::gpu_scalar(u32::try_from(i).unwrap())
+                / (crate::gpu_scalar(u32::try_from(count).unwrap()) - 1.0);
+            #[allow(
+                clippy::suboptimal_flops,
+                reason = "Retain the exact scalar input grid for polynomial-versus-driver comparison."
+            )]
             test_inputs.push(-1.0 + 2.0 * t);
         }
 
-        use wgpu::util::DeviceExt;
         let in_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("in_buf"),
             contents: bytemuck::cast_slice(&test_inputs),
@@ -2524,12 +2567,34 @@ mod tests {
             });
             cpass.set_pipeline(&pipeline);
             cpass.set_bind_group(0, &bg, &[]);
-            cpass.dispatch_workgroups((count as u32).div_ceil(64), 1, 1);
+            cpass.dispatch_workgroups(u32::try_from(count).unwrap().div_ceil(64), 1, 1);
         }
         encoder.copy_buffer_to_buffer(&poly_buf, 0, &staging_poly, 0, buf_bytes);
         encoder.copy_buffer_to_buffer(&builtin_buf, 0, &staging_builtin, 0, buf_bytes);
         queue.submit(Some(encoder.finish()));
 
+        let bit_diff_count = read_acos_comparison(&device, &staging_poly, &staging_builtin, count);
+        tracing::info!(
+            target: "scriptbots::sense::gpu",
+            adapter = %info.name,
+            tested_samples = count,
+            bit_differences = bit_diff_count,
+            "Negative probe: poly_acos vs driver builtin acos comparison completed"
+        );
+        assert!(
+            bit_diff_count > 0,
+            "On adapter '{}', builtin acos bit-matched poly_acos on all {} samples, indicating identical rounding on this driver only.",
+            info.name,
+            count
+        );
+    }
+
+    fn read_acos_comparison(
+        device: &wgpu::Device,
+        staging_poly: &wgpu::Buffer,
+        staging_builtin: &wgpu::Buffer,
+        count: usize,
+    ) -> usize {
         staging_poly
             .slice(..)
             .map_async(wgpu::MapMode::Read, |_| ());
@@ -2560,20 +2625,7 @@ mod tests {
             }
         }
 
-        tracing::info!(
-            target: "scriptbots::sense::gpu",
-            adapter = %info.name,
-            tested_samples = count,
-            bit_differences = bit_diff_count,
-            "Negative probe: poly_acos vs driver builtin acos comparison completed"
-        );
-
-        assert!(
-            bit_diff_count > 0,
-            "On adapter '{}', builtin acos bit-matched poly_acos on all {} samples, indicating identical rounding on this driver only.",
-            info.name,
-            count
-        );
+        bit_diff_count
     }
 
     #[test]

@@ -1,3 +1,4 @@
+//! Offscreen world rendering, typed framebuffer readback, and GPU sensing diagnostics.
 #![forbid(unsafe_code)]
 #![recursion_limit = "256"]
 
@@ -32,8 +33,11 @@ pub use wgpu;
 /// its internal world snapshot to this view before passing to the renderer.
 #[derive(Clone, Debug)]
 pub struct WorldSnapshot<'a> {
+    /// Simulation width and height in world coordinates.
     pub world_size: (f32, f32),
+    /// Terrain arrays borrowed for this frame.
     pub terrain: TerrainView<'a>,
+    /// Agent instances borrowed for this frame.
     pub agents: &'a [AgentInstance],
     /// Animation clock for this frame, in seconds; callers derive it from the world
     /// tick (`tick * ANIM_SECONDS_PER_TICK`) or a recorded sequence so captures are
@@ -84,43 +88,71 @@ pub struct VignetteControls {
     pub smoothness: f32,
 }
 
+/// Borrowed terrain grid and authoritative colors for one render snapshot.
 #[derive(Clone, Debug)]
 pub struct TerrainView<'a> {
+    /// Number of grid columns and rows.
     pub dims: (u32, u32),
+    /// Width and height of a terrain cell in world units.
     pub cell_size: u32,
+    /// Palette indices in row-major grid order.
     pub tiles: &'a [u32], // index into a tileset palette/atlas (kept simple for MVP)
     /// Final natural/accessibility-mapped sRGB terrain colors from the core
     /// visual authority. The GPU backend decodes these to linear before
     /// writing its sRGB attachment; it must not invent a second biome palette
     /// or shading model.
     pub colors: &'a [[f32; 4]],
+    /// Optional row-major elevation samples used for slope accents.
     pub elevation: Option<&'a [f32]>, // optional elevation field for slope accents
 }
 
+/// CPU-side agent instance with semantic colors and render geometry.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
 pub struct AgentInstance {
+    /// Center in world coordinates.
     pub position: [f32; 2],
+    /// Width and height of the enclosing render quad.
     pub quad_extent: [f32; 2],
+    /// Heading unit vector.
     pub heading: [f32; 2],
+    /// Body capsule radius in world units.
     pub body_radius: f32,
+    /// Half-length of the body capsule's straight segment.
     pub body_half_length: f32,
+    /// Lateral wheel distance from the body center.
     pub wheel_offset: f32,
+    /// Wheel radius in world units.
     pub wheel_radius: f32,
+    /// Resolved mouth opening intensity.
     pub mouth_open: f32,
+    /// Diet trait used by the body shader.
     pub herbivore_tendency: f32,
+    /// Preferred temperature used by the trait ornament shader.
     pub temperature_preference: f32,
+    /// Recent food change used by the food halo shader.
     pub food_delta: f32,
+    /// Commanded emitted-sound level, raw actuator value.
     pub sound_level: f32,
+    /// Emitted sound intensity.
     pub sound_output: f32,
+    /// Left wheel effort.
     pub wheel_left: f32,
+    /// Right wheel effort.
     pub wheel_right: f32,
+    /// Spike extension in world units.
     pub spike_length: f32,
+    /// Smell sensitivity trait.
     pub trait_smell: f32,
+    /// Runtime sound emission trait modifier.
     pub trait_sound: f32,
+    /// Hearing sensitivity trait.
     pub trait_hearing: f32,
+    /// Eye sensitivity trait.
     pub trait_eye: f32,
+    /// Blood sensitivity trait.
     pub trait_blood: f32,
+    /// Selection marker: zero for none, one for hover, two for selection or focus.
     pub selection: f32, // 0=None, 1=Hovered, 2=Selected/Focused
     /// Authoritative semantic sRGB body color. The GPU staging boundary decodes
     /// RGB to linear exactly once before the sRGB render target encodes output.
@@ -136,13 +168,19 @@ pub struct AgentInstance {
     /// moves the authority boundary instead, which is what the body `color`
     /// above already does.
     pub mouth_color: [f32; 3],
-    pub glow: f32,  // 0..1 extra glow (e.g., reproduction/spike)
+    /// Extra glow intensity in `0..=1`.
+    pub glow: f32, // 0..1 extra glow (e.g., reproduction/spike)
+    /// Boost intensity in `0..=1`.
     pub boost: f32, // 0..1 boost intensity
+    /// Spike activity intensity.
     pub spiked: f32,
+    /// Relative eye directions in radians.
     pub eye_dirs: [f32; NUM_EYES],
+    /// Eye fields of view in radians.
     pub eye_fov: [f32; NUM_EYES],
 }
 
+/// Offscreen renderer owning GPU pipelines, frame targets, and readback buffers.
 pub struct WorldRenderer {
     renderer_id: u64,
     frame_generation: u64,
@@ -173,7 +211,9 @@ pub struct WorldRenderer {
     last_readback_ms: f32,
 }
 
+/// Token identifying one rendered frame and its source renderer.
 pub struct RenderFrame {
+    /// Render target width and height in pixels.
     pub extent: (u32, u32),
     renderer_id: u64,
     generation: u64,
@@ -182,7 +222,30 @@ pub struct RenderFrame {
 static NEXT_RENDERER_ID: AtomicU64 = AtomicU64::new(1);
 const WORLD_COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "GPU uniforms and raster coordinates use f32; preserve the ABI's rounding of integer dimensions."
+)]
+const fn gpu_scalar(value: u32) -> f32 {
+    value as f32
+}
+
+fn render_instance_count(count: usize) -> Result<u32, ReadbackError> {
+    u32::try_from(count).map_err(|error| ReadbackError::MetadataMismatch {
+        expected: "render instance count representable by the u32 draw range".to_owned(),
+        actual: format!("{count}: {error}"),
+    })
+}
+
+fn terrain_axis_count(count: u32) -> Result<i32, ReadbackError> {
+    i32::try_from(count).map_err(|error| ReadbackError::MetadataMismatch {
+        expected: "terrain axis representable by signed elevation coordinates".to_owned(),
+        actual: format!("{count}: {error}"),
+    })
+}
+
 impl WorldRenderer {
+    /// Create an offscreen renderer, rejecting invalid extents and device failures.
     pub async fn new(adapter: &wgpu::Adapter, size: (u32, u32)) -> Result<Self, ReadbackError> {
         // Reject zero-sized viewports instead of clamping them (bd-2z0.7.11): early window
         // init races must surface as typed errors, never as silently 1x1 renderers.
@@ -244,6 +307,7 @@ impl WorldRenderer {
         })
     }
 
+    /// Prepare and install render targets for a new nonzero pixel extent.
     pub fn resize(&mut self, new_size: (u32, u32)) -> Result<(), ReadbackError> {
         self.device_fault.check()?;
         if new_size == self.size {
@@ -302,12 +366,14 @@ impl WorldRenderer {
         Ok(())
     }
 
-    pub fn set_camera(&mut self, scale: f32, offset: (f32, f32)) {
+    /// Set the world-to-pixel camera transform, validated at the next render.
+    pub const fn set_camera(&mut self, scale: f32, offset: (f32, f32)) {
         self.cam_scale = scale;
         self.cam_offset = offset;
     }
 
-    pub fn render(&mut self, snapshot: &WorldSnapshot) -> Result<RenderFrame, ReadbackError> {
+    /// Render a validated snapshot and return its readback token.
+    pub fn render(&mut self, snapshot: &WorldSnapshot<'_>) -> Result<RenderFrame, ReadbackError> {
         self.device_fault.check()?;
         let device = self.device.clone();
         let result = scoped_gpu_result(&device, "frame render", || self.render_scoped(snapshot));
@@ -320,7 +386,10 @@ impl WorldRenderer {
         result
     }
 
-    fn render_scoped(&mut self, snapshot: &WorldSnapshot) -> Result<RenderFrame, ReadbackError> {
+    fn render_scoped(
+        &mut self,
+        snapshot: &WorldSnapshot<'_>,
+    ) -> Result<RenderFrame, ReadbackError> {
         validate_snapshot(snapshot)?;
         if !self.cam_scale.is_finite()
             || self.cam_scale <= 0.0
@@ -391,7 +460,7 @@ impl WorldRenderer {
             self.size,
             self.cam_scale,
             self.cam_offset,
-        );
+        )?;
         let vis_agents = self.agents.encode(
             &self.device,
             &self.queue,
@@ -402,12 +471,34 @@ impl WorldRenderer {
             self.size,
             self.cam_scale,
             self.cam_offset,
-        );
+        )?;
         tracing::info!(
             tiles = vis_tiles,
             agents = vis_agents,
             "wgpu visible instances"
         );
+        self.render_post(&mut encoder, snapshot)?;
+        self.queue.submit(Some(encoder.finish()));
+        #[cfg(feature = "perf_counters")]
+        {
+            self.last_render_ms = t0.elapsed().as_secs_f32() * 1000.0;
+        }
+        self.frame_generation = self
+            .frame_generation
+            .checked_add(1)
+            .ok_or_else(|| ReadbackError::Device("render generation overflow".to_owned()))?;
+        Ok(RenderFrame {
+            extent: self.size,
+            renderer_id: self.renderer_id,
+            generation: self.frame_generation,
+        })
+    }
+
+    fn render_post(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        snapshot: &WorldSnapshot<'_>,
+    ) -> Result<(), ReadbackError> {
         // Freeze presentation controls once for this frame. Reading the
         // environment independently in `ensure_post` and `PostFx::run` made
         // one frozen snapshot depend on wall-clock cache refreshes.
@@ -445,7 +536,7 @@ impl WorldRenderer {
             p.run(
                 &self.device,
                 &self.queue,
-                &mut encoder,
+                encoder,
                 &self.color_view,
                 self.size,
                 selected_tonemap,
@@ -453,22 +544,10 @@ impl WorldRenderer {
             );
             self.post_ran = true;
         }
-        self.queue.submit(Some(encoder.finish()));
-        #[cfg(feature = "perf_counters")]
-        {
-            self.last_render_ms = t0.elapsed().as_secs_f32() * 1000.0;
-        }
-        self.frame_generation = self
-            .frame_generation
-            .checked_add(1)
-            .ok_or_else(|| ReadbackError::Device("render generation overflow".to_owned()))?;
-        Ok(RenderFrame {
-            extent: self.size,
-            renderer_id: self.renderer_id,
-            generation: self.frame_generation,
-        })
+        Ok(())
     }
 
+    /// Copy the current frame into a CPU-readable buffer after checking its token.
     pub fn copy_to_readback(&mut self, frame: &RenderFrame) -> Result<(), ReadbackError> {
         self.device_fault.check()?;
         let device = self.device.clone();
@@ -494,7 +573,7 @@ impl WorldRenderer {
         };
         self.readback
             .copy(&self.device, &self.queue, src_tex)
-            .map(|_| {
+            .map(|()| {
                 #[cfg(feature = "perf_counters")]
                 {
                     self.last_readback_ms = t0.elapsed().as_secs_f32() * 1000.0;
@@ -502,6 +581,7 @@ impl WorldRenderer {
             })
     }
 
+    /// Obtain the latest mapped RGBA pixels or a typed readiness or device error.
     pub fn mapped_rgba(&mut self) -> Result<ReadbackView, ReadbackError> {
         self.device_fault.check()?;
         self.readback.mapped()
@@ -557,6 +637,10 @@ fn validate_frame_token(
 }
 
 fn validate_snapshot(snapshot: &WorldSnapshot<'_>) -> Result<(), ReadbackError> {
+    render_instance_count(snapshot.agents.len())?;
+    render_instance_count(snapshot.terrain.tiles.len())?;
+    terrain_axis_count(snapshot.terrain.dims.0)?;
+    terrain_axis_count(snapshot.terrain.dims.1)?;
     if let Some(bloom) = snapshot.bloom
         && (!bloom.threshold.is_finite()
             || !(0.0..=16.0).contains(&bloom.threshold)
@@ -699,7 +783,7 @@ mod capture_smoke_test {
     fn wgpu_offscreen_gpu_framebuffer_readback_is_populated() {
         let _gpu_lock = crate::GPU_TEST_MUTEX
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(adapter) = live_adapter("wgpu offscreen readback smoke") else {
             return;
         };
@@ -769,7 +853,7 @@ mod capture_smoke_test {
     fn snapshot_exposure_changes_pixels_and_rejects_invalid_frames() {
         let _gpu_lock = crate::GPU_TEST_MUTEX
             .lock()
-            .unwrap_or_else(|error| error.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let adapter = live_adapter("snapshot exposure")
             .expect("snapshot exposure proof requires an actual wgpu adapter");
         eprintln!("snapshot exposure adapter: {:?}", adapter.get_info());
@@ -848,7 +932,7 @@ mod capture_smoke_test {
     fn snapshot_fog_changes_pixels_and_rejects_invalid_frames() {
         let _gpu_lock = crate::GPU_TEST_MUTEX
             .lock()
-            .unwrap_or_else(|error| error.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let adapter = live_adapter("snapshot fog")
             .expect("snapshot fog proof requires an actual wgpu adapter");
         eprintln!("snapshot fog adapter: {:?}", adapter.get_info());
@@ -897,13 +981,6 @@ mod capture_smoke_test {
             assert_eq!(view.bytes_per_row, 64 * 4);
             captures.push(view.bytes().to_vec());
         }
-        let channel_sum = |pixels: &[u8], channel: usize| -> u64 {
-            let (rgba_pixels, _) = pixels.as_chunks::<4>();
-            rgba_pixels
-                .iter()
-                .map(|pixel| u64::from(pixel[channel]))
-                .sum()
-        };
         let red_sums: Vec<_> = captures
             .iter()
             .map(|pixels| channel_sum(pixels, 0))
@@ -952,6 +1029,22 @@ mod capture_smoke_test {
                 captures[0]
             );
         }
+        reject_invalid_fog(&mut renderer, &mut snapshot, &captures[0]);
+    }
+
+    fn channel_sum(pixels: &[u8], channel: usize) -> u64 {
+        let (rgba_pixels, _) = pixels.as_chunks::<4>();
+        rgba_pixels
+            .iter()
+            .map(|pixel| u64::from(pixel[channel]))
+            .sum()
+    }
+
+    fn reject_invalid_fog(
+        renderer: &mut WorldRenderer,
+        snapshot: &mut WorldSnapshot<'_>,
+        expected: &[u8],
+    ) {
         let generation = renderer.frame_generation;
         for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.01, 1.01] {
             for channel in 0..4 {
@@ -966,7 +1059,7 @@ mod capture_smoke_test {
                 }
                 snapshot.fog = Some(fog);
                 assert!(matches!(
-                    renderer.render(&snapshot),
+                    renderer.render(snapshot),
                     Err(ReadbackError::Configuration(_))
                 ));
                 assert_eq!(renderer.frame_generation, generation);
@@ -976,7 +1069,7 @@ mod capture_smoke_test {
             strength: 0.0,
             color_linear: [0.25, 0.0, 0.0],
         });
-        let frame = renderer.render(&snapshot).expect("recover after bad fog");
+        let frame = renderer.render(snapshot).expect("recover after bad fog");
         renderer
             .copy_to_readback(&frame)
             .expect("recovered fog copy");
@@ -985,19 +1078,19 @@ mod capture_smoke_test {
                 .mapped_rgba()
                 .expect("recovered fog pixels")
                 .bytes(),
-            captures[0]
+            expected
         );
     }
 
     #[test]
     fn snapshot_bloom_and_vignette_change_pixels_and_reject_invalid_frames() {
+        const EXTENT: u32 = 64;
         let _gpu_lock = crate::GPU_TEST_MUTEX
             .lock()
-            .unwrap_or_else(|error| error.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let adapter = live_adapter("snapshot bloom/vignette")
             .expect("post-control proof requires an actual wgpu adapter");
         eprintln!("snapshot post adapter: {:?}", adapter.get_info());
-        const EXTENT: u32 = 64;
         let tiles = [3];
         let colors = [[0.4, 0.4, 0.4, 1.0]];
         let bloom_off = BloomControls {
@@ -1009,7 +1102,7 @@ mod capture_smoke_test {
             smoothness: 0.0,
         };
         let mut snapshot = WorldSnapshot {
-            world_size: (EXTENT as f32, EXTENT as f32),
+            world_size: (super::gpu_scalar(EXTENT), super::gpu_scalar(EXTENT)),
             terrain: TerrainView {
                 dims: (1, 1),
                 cell_size: EXTENT,
@@ -1057,13 +1150,6 @@ mod capture_smoke_test {
             assert_eq!(view.bytes().len(), (EXTENT * EXTENT * 4) as usize);
             captures.push(view.bytes().to_vec());
         }
-        let rgb_sum = |pixels: &[u8]| -> u64 {
-            let (rgba, _) = pixels.as_chunks::<4>();
-            rgba.iter()
-                .flat_map(|pixel| &pixel[..3])
-                .map(|value| u64::from(*value))
-                .sum()
-        };
         let sums: Vec<_> = captures.iter().map(|pixels| rgb_sum(pixels)).collect();
         assert!(sums[0] > 0 && sums[1] > sums[0] && sums[2] > sums[1]);
         assert_eq!(
@@ -1071,12 +1157,31 @@ mod capture_smoke_test {
             "threshold 16 excludes this gray terrain"
         );
         assert!(sums[4] < sums[0] && sums[5] < sums[4] && sums[6] < sums[5]);
-        let pixel = |x: u32, y: u32| ((y * EXTENT + x) * 4) as usize;
-        let center = pixel(EXTENT / 2, EXTENT / 2);
+        assert_vignette_edges(&captures, EXTENT, &sums);
+
+        check_post_environment(
+            &mut renderer,
+            &mut snapshot,
+            bloom_off,
+            vignette_off,
+            sums[0],
+        );
+        reject_invalid_post(
+            &mut renderer,
+            &mut snapshot,
+            bloom_off,
+            vignette_off,
+            &captures[0],
+        );
+    }
+
+    fn assert_vignette_edges(captures: &[Vec<u8>], extent: u32, sums: &[u64]) {
+        let pixel = |x: u32, y: u32| ((y * extent + x) * 4) as usize;
+        let center = pixel(extent / 2, extent / 2);
         for image in &captures[4..7] {
             assert_eq!(&image[center..center + 4], &captures[0][center..center + 4]);
         }
-        let edge = pixel(5, EXTENT / 2);
+        let edge = pixel(5, extent / 2);
         assert_eq!(
             captures[5][edge], captures[0][edge],
             "narrow falloff leaves this pixel alone"
@@ -1090,7 +1195,23 @@ mod capture_smoke_test {
             "snapshot post RGB sums: {sums:?}; narrow_edge={} wide_edge={}",
             captures[5][edge], captures[6][edge]
         );
+    }
 
+    fn rgb_sum(pixels: &[u8]) -> u64 {
+        let (rgba, _) = pixels.as_chunks::<4>();
+        rgba.iter()
+            .flat_map(|pixel| &pixel[..3])
+            .map(|value| u64::from(*value))
+            .sum()
+    }
+
+    fn check_post_environment(
+        renderer: &mut WorldRenderer,
+        snapshot: &mut WorldSnapshot<'_>,
+        bloom_off: BloomControls,
+        vignette_off: VignetteControls,
+        baseline: u64,
+    ) {
         let controls = PostControls::from_env().expect("valid post environment");
         if controls.bloom_enabled
             && controls.bloom_intensity >= 0.25
@@ -1098,23 +1219,32 @@ mod capture_smoke_test {
         {
             snapshot.bloom = None;
             snapshot.vignette = Some(vignette_off);
-            let frame = renderer.render(&snapshot).expect("raw bloom frame");
+            let frame = renderer.render(snapshot).expect("raw bloom frame");
             renderer.copy_to_readback(&frame).expect("raw bloom copy");
             let view = renderer.mapped_rgba().expect("raw bloom pixels");
-            assert!(rgb_sum(view.bytes()) > sums[0]);
+            assert!(rgb_sum(view.bytes()) > baseline);
             eprintln!("raw bloom fallback exercised independently");
         }
         if controls.vignette >= 0.08 {
             snapshot.bloom = Some(bloom_off);
             snapshot.vignette = None;
-            let frame = renderer.render(&snapshot).expect("raw vignette frame");
+            let frame = renderer.render(snapshot).expect("raw vignette frame");
             renderer
                 .copy_to_readback(&frame)
                 .expect("raw vignette copy");
             let view = renderer.mapped_rgba().expect("raw vignette pixels");
-            assert!(rgb_sum(view.bytes()) < sums[0]);
+            assert!(rgb_sum(view.bytes()) < baseline);
             eprintln!("raw vignette fallback exercised independently");
         }
+    }
+
+    fn reject_invalid_post(
+        renderer: &mut WorldRenderer,
+        snapshot: &mut WorldSnapshot<'_>,
+        bloom_off: BloomControls,
+        vignette_off: VignetteControls,
+        expected: &[u8],
+    ) {
         let generation = renderer.frame_generation;
         for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.01, 1.01] {
             for (bloom, vignette) in [
@@ -1150,7 +1280,7 @@ mod capture_smoke_test {
                 snapshot.bloom = Some(bloom);
                 snapshot.vignette = Some(vignette);
                 assert!(matches!(
-                    renderer.render(&snapshot),
+                    renderer.render(snapshot),
                     Err(ReadbackError::Configuration(_))
                 ));
                 assert_eq!(renderer.frame_generation, generation);
@@ -1158,7 +1288,7 @@ mod capture_smoke_test {
         }
         snapshot.bloom = Some(bloom_off);
         snapshot.vignette = Some(vignette_off);
-        let frame = renderer.render(&snapshot).expect("post recovery frame");
+        let frame = renderer.render(snapshot).expect("post recovery frame");
         renderer
             .copy_to_readback(&frame)
             .expect("post recovery copy");
@@ -1167,76 +1297,87 @@ mod capture_smoke_test {
                 .mapped_rgba()
                 .expect("post recovery pixels")
                 .bytes(),
-            captures[0]
+            expected
         );
+    }
+
+    fn capture_fxaa(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        size: (u32, u32),
+        input: &[u8],
+        tonemap: u32,
+        fxaa: u32,
+    ) -> Vec<u8> {
+        assert_eq!(input.len(), (size.0 * size.1 * 4) as usize);
+        let source = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("fxaa.test-source"),
+            size: wgpu::Extent3d {
+                width: size.0,
+                height: size.1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: WORLD_COLOR_FORMAT,
+            usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            source.as_image_copy(),
+            input,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(size.0 * 4),
+                rows_per_image: Some(size.1),
+            },
+            source.size(),
+        );
+        let view = source.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut post =
+            PostFx::new(device, WORLD_COLOR_FORMAT, &view, size).expect("production post pipeline");
+        let controls = PostControls {
+            exposure: 1.0,
+            vignette: 0.0,
+            tonemap,
+            fxaa,
+            bloom_enabled: false,
+            fog_enabled: false,
+            ..PostControls::default()
+        };
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("fxaa.test-post"),
+        });
+        post.run(device, queue, &mut encoder, &view, size, None, &controls);
+        queue.submit(Some(encoder.finish()));
+        let mut readback =
+            ReadbackRing::new(device, size, WORLD_COLOR_FORMAT).expect("post readback ring");
+        readback
+            .copy(device, queue, &post.target)
+            .expect("post readback copy");
+        let pixels = readback.mapped().expect("actual post pixels");
+        pixels
+            .bytes()
+            .chunks_exact(pixels.bytes_per_row as usize)
+            .flat_map(|row| &row[..(size.0 * 4) as usize])
+            .copied()
+            .collect::<Vec<_>>()
     }
 
     #[test]
     fn fxaa_post_pixels_smooth_edges_preserve_flats_and_bound_degenerate_extents() {
         let _gpu_lock = crate::GPU_TEST_MUTEX
             .lock()
-            .unwrap_or_else(|error| error.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let adapter =
             live_adapter("FXAA pixels").expect("FXAA proof requires an actual wgpu adapter");
         eprintln!("FXAA post adapter: {:?}", adapter.get_info());
         let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
                 .expect("FXAA device");
-        let capture = |size: (u32, u32), input: &[u8], tonemap: u32, fxaa: u32| {
-            assert_eq!(input.len(), (size.0 * size.1 * 4) as usize);
-            let source = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("fxaa.test-source"),
-                size: wgpu::Extent3d {
-                    width: size.0,
-                    height: size.1,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: WORLD_COLOR_FORMAT,
-                usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            });
-            queue.write_texture(
-                source.as_image_copy(),
-                input,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(size.0 * 4),
-                    rows_per_image: Some(size.1),
-                },
-                source.size(),
-            );
-            let view = source.create_view(&wgpu::TextureViewDescriptor::default());
-            let mut post = PostFx::new(&device, WORLD_COLOR_FORMAT, &view, size)
-                .expect("production post pipeline");
-            let controls = PostControls {
-                exposure: 1.0,
-                vignette: 0.0,
-                tonemap,
-                fxaa,
-                bloom_enabled: false,
-                fog_enabled: false,
-                ..PostControls::default()
-            };
-            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("fxaa.test-post"),
-            });
-            post.run(&device, &queue, &mut encoder, &view, size, None, &controls);
-            queue.submit(Some(encoder.finish()));
-            let mut readback =
-                ReadbackRing::new(&device, size, WORLD_COLOR_FORMAT).expect("post readback ring");
-            readback
-                .copy(&device, &queue, &post.target)
-                .expect("post readback copy");
-            let pixels = readback.mapped().expect("actual post pixels");
-            pixels
-                .bytes()
-                .chunks_exact(pixels.bytes_per_row as usize)
-                .flat_map(|row| &row[..(size.0 * 4) as usize])
-                .copied()
-                .collect::<Vec<_>>()
+        let capture = |size, input: &[u8], tonemap, fxaa| {
+            capture_fxaa(&device, &queue, size, input, tonemap, fxaa)
         };
         let size = (64, 64);
         let diagonal: Vec<_> = (0..size.1)
@@ -1315,6 +1456,18 @@ mod capture_smoke_test {
                 }
             }
         }
+        check_fxaa_low_contrast(&device, &queue, size, &diagonal);
+    }
+
+    fn check_fxaa_low_contrast(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        size: (u32, u32),
+        diagonal: &[u8],
+    ) {
+        let capture = |size, input: &[u8], tonemap, fxaa| {
+            capture_fxaa(device, queue, size, input, tonemap, fxaa)
+        };
         // A low-contrast edge must take the early exit, not blur the entire image.
         let low_contrast: Vec<_> = diagonal
             .iter()
@@ -1367,7 +1520,7 @@ mod capture_smoke_test {
     fn independent_renderers_produce_byte_identical_frames() {
         let _gpu_lock = crate::GPU_TEST_MUTEX
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(adapter) = live_adapter("independent-renderer determinism") else {
             return;
         };
@@ -1432,13 +1585,211 @@ mod capture_smoke_test {
         );
     }
 
+    const CANONICAL_AGENTS: &[AgentInstance] = &[
+        AgentInstance {
+            position: [500.0, 450.0],
+            quad_extent: [60.0, 60.0],
+            heading: [1.0, 0.0],
+            body_radius: 24.0,
+            body_half_length: 0.0,
+            wheel_offset: 14.0,
+            wheel_radius: 7.0,
+            mouth_open: 0.4,
+            herbivore_tendency: 1.0,
+            temperature_preference: 0.5,
+            food_delta: 0.2,
+            sound_level: 0.1,
+            sound_output: 0.0,
+            wheel_left: 0.6,
+            wheel_right: 0.6,
+            spike_length: 0.0,
+            trait_smell: 0.5,
+            trait_sound: 0.8,
+            trait_hearing: 0.6,
+            trait_eye: 0.7,
+            trait_blood: 0.1,
+            selection: 0.0,
+            color: [
+                visual::BIOLUMINESCENT_DARK_FIELD_V1.agents.herbivore_srgb[0],
+                visual::BIOLUMINESCENT_DARK_FIELD_V1.agents.herbivore_srgb[1],
+                visual::BIOLUMINESCENT_DARK_FIELD_V1.agents.herbivore_srgb[2],
+                1.0,
+            ],
+            mouth_color: visual::BIOLUMINESCENT_DARK_FIELD_V1.food.core_srgb,
+            glow: 0.1,
+            boost: 0.0,
+            spiked: 0.0,
+            eye_dirs: [-0.4, -0.15, 0.15, 0.4],
+            eye_fov: [0.3, 0.3, 0.3, 0.3],
+        },
+        AgentInstance {
+            position: [900.0, 350.0],
+            quad_extent: [65.0, 65.0],
+            heading: [-0.707, 0.707],
+            body_radius: 24.0,
+            body_half_length: 0.0,
+            wheel_offset: 14.0,
+            wheel_radius: 7.0,
+            mouth_open: 0.6,
+            herbivore_tendency: 0.0,
+            temperature_preference: 0.6,
+            food_delta: 0.0,
+            sound_level: 0.3,
+            sound_output: 0.2,
+            wheel_left: 0.8,
+            wheel_right: 0.8,
+            spike_length: 22.0,
+            trait_smell: 0.8,
+            trait_sound: 0.4,
+            trait_hearing: 0.5,
+            trait_eye: 0.9,
+            trait_blood: 0.8,
+            selection: 0.0,
+            color: [
+                visual::BIOLUMINESCENT_DARK_FIELD_V1.agents.carnivore_srgb[0],
+                visual::BIOLUMINESCENT_DARK_FIELD_V1.agents.carnivore_srgb[1],
+                visual::BIOLUMINESCENT_DARK_FIELD_V1.agents.carnivore_srgb[2],
+                1.0,
+            ],
+            mouth_color: visual::BIOLUMINESCENT_DARK_FIELD_V1.events.combat.core_srgb,
+            glow: 0.2,
+            boost: 0.0,
+            spiked: 1.0,
+            eye_dirs: [-0.35, -0.12, 0.12, 0.35],
+            eye_fov: [0.25, 0.25, 0.25, 0.25],
+        },
+        AgentInstance {
+            position: [700.0, 600.0],
+            quad_extent: [75.0, 75.0],
+            heading: [0.0, -1.0],
+            body_radius: 26.0,
+            body_half_length: 0.0,
+            wheel_offset: 15.0,
+            wheel_radius: 8.0,
+            mouth_open: 0.2,
+            herbivore_tendency: 0.7,
+            temperature_preference: 0.45,
+            food_delta: 0.5,
+            sound_level: 0.0,
+            sound_output: 0.0,
+            wheel_left: 0.4,
+            wheel_right: 0.4,
+            spike_length: 0.0,
+            trait_smell: 0.6,
+            trait_sound: 0.6,
+            trait_hearing: 0.7,
+            trait_eye: 0.8,
+            trait_blood: 0.2,
+            selection: 2.0,
+            color: [0.35, 0.82, 0.98, 1.0],
+            mouth_color: visual::BIOLUMINESCENT_DARK_FIELD_V1.food.halo_srgb,
+            glow: 0.5,
+            boost: 0.0,
+            spiked: 0.0,
+            eye_dirs: [-0.4, -0.15, 0.15, 0.4],
+            eye_fov: [0.3, 0.3, 0.3, 0.3],
+        },
+        AgentInstance {
+            position: [1150.0, 500.0],
+            quad_extent: [65.0, 65.0],
+            heading: [0.9, -0.43],
+            body_radius: 22.0,
+            body_half_length: 0.0,
+            wheel_offset: 13.0,
+            wheel_radius: 6.5,
+            mouth_open: 0.1,
+            herbivore_tendency: 0.2,
+            temperature_preference: 0.5,
+            food_delta: -0.1,
+            sound_level: 0.5,
+            sound_output: 0.7,
+            wheel_left: 1.0,
+            wheel_right: 1.0,
+            spike_length: 0.0,
+            trait_smell: 0.4,
+            trait_sound: 0.9,
+            trait_hearing: 0.4,
+            trait_eye: 0.6,
+            trait_blood: 0.3,
+            selection: 0.0,
+            color: [0.85, 0.65, 0.94, 1.0],
+            mouth_color: [0.62, 0.96, 1.00],
+            glow: 0.8,
+            boost: 1.0,
+            spiked: 0.0,
+            eye_dirs: [-0.4, -0.15, 0.15, 0.4],
+            eye_fov: [0.3, 0.3, 0.3, 0.3],
+        },
+        AgentInstance {
+            position: [320.0, 250.0],
+            quad_extent: [55.0, 55.0],
+            heading: [-0.5, -0.866],
+            body_radius: 22.0,
+            body_half_length: 0.0,
+            wheel_offset: 12.0,
+            wheel_radius: 6.0,
+            mouth_open: 0.2,
+            herbivore_tendency: 0.95,
+            temperature_preference: 0.3,
+            food_delta: 0.1,
+            sound_level: 0.0,
+            sound_output: 0.0,
+            wheel_left: 0.5,
+            wheel_right: 0.5,
+            spike_length: 0.0,
+            trait_smell: 0.5,
+            trait_sound: 0.5,
+            trait_hearing: 0.5,
+            trait_eye: 0.5,
+            trait_blood: 0.1,
+            selection: 0.0,
+            color: [0.20, 0.85, 0.99, 1.0],
+            mouth_color: visual::BIOLUMINESCENT_DARK_FIELD_V1.food.core_srgb,
+            glow: 0.1,
+            boost: 0.0,
+            spiked: 0.0,
+            eye_dirs: [-0.4, -0.15, 0.15, 0.4],
+            eye_fov: [0.3, 0.3, 0.3, 0.3],
+        },
+        AgentInstance {
+            position: [1420.0, 700.0],
+            quad_extent: [65.0, 65.0],
+            heading: [-1.0, 0.0],
+            body_radius: 25.0,
+            body_half_length: 0.0,
+            wheel_offset: 14.0,
+            wheel_radius: 7.0,
+            mouth_open: 0.3,
+            herbivore_tendency: 0.4,
+            temperature_preference: 0.7,
+            food_delta: 0.0,
+            sound_level: 0.2,
+            sound_output: 0.1,
+            wheel_left: 0.7,
+            wheel_right: 0.7,
+            spike_length: 10.0,
+            trait_smell: 0.7,
+            trait_sound: 0.4,
+            trait_hearing: 0.6,
+            trait_eye: 0.8,
+            trait_blood: 0.4,
+            selection: 0.0,
+            color: [0.65, 0.72, 0.96, 1.0],
+            mouth_color: visual::BIOLUMINESCENT_DARK_FIELD_V1.events.eat.core_srgb,
+            glow: 0.15,
+            boost: 0.0,
+            spiked: 0.5,
+            eye_dirs: [-0.4, -0.15, 0.15, 0.4],
+            eye_fov: [0.3, 0.3, 0.3, 0.3],
+        },
+    ];
+
     #[test]
     fn canonical_bioluminescent_dark_field_v1_reference_capture() {
         use sha2::{Digest, Sha256};
-
         let _gpu_lock = crate::GPU_TEST_MUTEX
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(adapter) = live_adapter("canonical dark-field reference capture") else {
             return;
         };
@@ -1446,241 +1797,8 @@ mod capture_smoke_test {
         let size = (1600, 900);
         let mut renderer = pollster::block_on(WorldRenderer::new(&adapter, size))
             .expect("canonical dark-field renderer initialization");
-
         let dims = (32u32, 18u32);
-        let mut tiles = Vec::with_capacity((dims.0 * dims.1) as usize);
-        let mut colors = Vec::with_capacity((dims.0 * dims.1) as usize);
-        let mut elevation = Vec::with_capacity((dims.0 * dims.1) as usize);
-
-        for _y in 0..dims.1 {
-            for x in 0..dims.0 {
-                let kind_idx = if x < 7 {
-                    0 // DeepWater
-                } else if x < 12 {
-                    1 // ShallowWater
-                } else if x < 15 {
-                    2 // Sand
-                } else if x < 23 {
-                    3 // Grass
-                } else if x < 28 {
-                    4 // Forest
-                } else {
-                    5 // Rock
-                };
-                tiles.push(kind_idx);
-                let albedo =
-                    visual::BIOLUMINESCENT_DARK_FIELD_V1.terrain[kind_idx as usize].albedo_srgb;
-                colors.push([albedo[0], albedo[1], albedo[2], 1.0]);
-                let elev = match kind_idx {
-                    0 => 0.08,
-                    1 => 0.22,
-                    2 => 0.38,
-                    3 => 0.50,
-                    4 => 0.65,
-                    _ => 0.88,
-                };
-                elevation.push(elev);
-            }
-        }
-
-        let agents = [
-            AgentInstance {
-                position: [500.0, 450.0],
-                quad_extent: [60.0, 60.0],
-                heading: [1.0, 0.0],
-                body_radius: 24.0,
-                body_half_length: 0.0,
-                wheel_offset: 14.0,
-                wheel_radius: 7.0,
-                mouth_open: 0.4,
-                herbivore_tendency: 1.0,
-                temperature_preference: 0.5,
-                food_delta: 0.2,
-                sound_level: 0.1,
-                sound_output: 0.0,
-                wheel_left: 0.6,
-                wheel_right: 0.6,
-                spike_length: 0.0,
-                trait_smell: 0.5,
-                trait_sound: 0.8,
-                trait_hearing: 0.6,
-                trait_eye: 0.7,
-                trait_blood: 0.1,
-                selection: 0.0,
-                color: [
-                    visual::BIOLUMINESCENT_DARK_FIELD_V1.agents.herbivore_srgb[0],
-                    visual::BIOLUMINESCENT_DARK_FIELD_V1.agents.herbivore_srgb[1],
-                    visual::BIOLUMINESCENT_DARK_FIELD_V1.agents.herbivore_srgb[2],
-                    1.0,
-                ],
-                mouth_color: visual::BIOLUMINESCENT_DARK_FIELD_V1.food.core_srgb,
-                glow: 0.1,
-                boost: 0.0,
-                spiked: 0.0,
-                eye_dirs: [-0.4, -0.15, 0.15, 0.4],
-                eye_fov: [0.3, 0.3, 0.3, 0.3],
-            },
-            AgentInstance {
-                position: [900.0, 350.0],
-                quad_extent: [65.0, 65.0],
-                heading: [-0.707, 0.707],
-                body_radius: 24.0,
-                body_half_length: 0.0,
-                wheel_offset: 14.0,
-                wheel_radius: 7.0,
-                mouth_open: 0.6,
-                herbivore_tendency: 0.0,
-                temperature_preference: 0.6,
-                food_delta: 0.0,
-                sound_level: 0.3,
-                sound_output: 0.2,
-                wheel_left: 0.8,
-                wheel_right: 0.8,
-                spike_length: 22.0,
-                trait_smell: 0.8,
-                trait_sound: 0.4,
-                trait_hearing: 0.5,
-                trait_eye: 0.9,
-                trait_blood: 0.8,
-                selection: 0.0,
-                color: [
-                    visual::BIOLUMINESCENT_DARK_FIELD_V1.agents.carnivore_srgb[0],
-                    visual::BIOLUMINESCENT_DARK_FIELD_V1.agents.carnivore_srgb[1],
-                    visual::BIOLUMINESCENT_DARK_FIELD_V1.agents.carnivore_srgb[2],
-                    1.0,
-                ],
-                mouth_color: visual::BIOLUMINESCENT_DARK_FIELD_V1.events.combat.core_srgb,
-                glow: 0.2,
-                boost: 0.0,
-                spiked: 1.0,
-                eye_dirs: [-0.35, -0.12, 0.12, 0.35],
-                eye_fov: [0.25, 0.25, 0.25, 0.25],
-            },
-            AgentInstance {
-                position: [700.0, 600.0],
-                quad_extent: [75.0, 75.0],
-                heading: [0.0, -1.0],
-                body_radius: 26.0,
-                body_half_length: 0.0,
-                wheel_offset: 15.0,
-                wheel_radius: 8.0,
-                mouth_open: 0.2,
-                herbivore_tendency: 0.7,
-                temperature_preference: 0.45,
-                food_delta: 0.5,
-                sound_level: 0.0,
-                sound_output: 0.0,
-                wheel_left: 0.4,
-                wheel_right: 0.4,
-                spike_length: 0.0,
-                trait_smell: 0.6,
-                trait_sound: 0.6,
-                trait_hearing: 0.7,
-                trait_eye: 0.8,
-                trait_blood: 0.2,
-                selection: 2.0,
-                color: [0.35, 0.82, 0.98, 1.0],
-                mouth_color: visual::BIOLUMINESCENT_DARK_FIELD_V1.food.halo_srgb,
-                glow: 0.5,
-                boost: 0.0,
-                spiked: 0.0,
-                eye_dirs: [-0.4, -0.15, 0.15, 0.4],
-                eye_fov: [0.3, 0.3, 0.3, 0.3],
-            },
-            AgentInstance {
-                position: [1150.0, 500.0],
-                quad_extent: [65.0, 65.0],
-                heading: [0.9, -0.43],
-                body_radius: 22.0,
-                body_half_length: 0.0,
-                wheel_offset: 13.0,
-                wheel_radius: 6.5,
-                mouth_open: 0.1,
-                herbivore_tendency: 0.2,
-                temperature_preference: 0.5,
-                food_delta: -0.1,
-                sound_level: 0.5,
-                sound_output: 0.7,
-                wheel_left: 1.0,
-                wheel_right: 1.0,
-                spike_length: 0.0,
-                trait_smell: 0.4,
-                trait_sound: 0.9,
-                trait_hearing: 0.4,
-                trait_eye: 0.6,
-                trait_blood: 0.3,
-                selection: 0.0,
-                color: [0.85, 0.65, 0.94, 1.0],
-                mouth_color: [0.62, 0.96, 1.00],
-                glow: 0.8,
-                boost: 1.0,
-                spiked: 0.0,
-                eye_dirs: [-0.4, -0.15, 0.15, 0.4],
-                eye_fov: [0.3, 0.3, 0.3, 0.3],
-            },
-            AgentInstance {
-                position: [320.0, 250.0],
-                quad_extent: [55.0, 55.0],
-                heading: [-0.5, -0.866],
-                body_radius: 22.0,
-                body_half_length: 0.0,
-                wheel_offset: 12.0,
-                wheel_radius: 6.0,
-                mouth_open: 0.2,
-                herbivore_tendency: 0.95,
-                temperature_preference: 0.3,
-                food_delta: 0.1,
-                sound_level: 0.0,
-                sound_output: 0.0,
-                wheel_left: 0.5,
-                wheel_right: 0.5,
-                spike_length: 0.0,
-                trait_smell: 0.5,
-                trait_sound: 0.5,
-                trait_hearing: 0.5,
-                trait_eye: 0.5,
-                trait_blood: 0.1,
-                selection: 0.0,
-                color: [0.20, 0.85, 0.99, 1.0],
-                mouth_color: visual::BIOLUMINESCENT_DARK_FIELD_V1.food.core_srgb,
-                glow: 0.1,
-                boost: 0.0,
-                spiked: 0.0,
-                eye_dirs: [-0.4, -0.15, 0.15, 0.4],
-                eye_fov: [0.3, 0.3, 0.3, 0.3],
-            },
-            AgentInstance {
-                position: [1420.0, 700.0],
-                quad_extent: [65.0, 65.0],
-                heading: [-1.0, 0.0],
-                body_radius: 25.0,
-                body_half_length: 0.0,
-                wheel_offset: 14.0,
-                wheel_radius: 7.0,
-                mouth_open: 0.3,
-                herbivore_tendency: 0.4,
-                temperature_preference: 0.7,
-                food_delta: 0.0,
-                sound_level: 0.2,
-                sound_output: 0.1,
-                wheel_left: 0.7,
-                wheel_right: 0.7,
-                spike_length: 10.0,
-                trait_smell: 0.7,
-                trait_sound: 0.4,
-                trait_hearing: 0.6,
-                trait_eye: 0.8,
-                trait_blood: 0.4,
-                selection: 0.0,
-                color: [0.65, 0.72, 0.96, 1.0],
-                mouth_color: visual::BIOLUMINESCENT_DARK_FIELD_V1.events.eat.core_srgb,
-                glow: 0.15,
-                boost: 0.0,
-                spiked: 0.5,
-                eye_dirs: [-0.4, -0.15, 0.15, 0.4],
-                eye_fov: [0.3, 0.3, 0.3, 0.3],
-            },
-        ];
+        let (tiles, colors, elevation) = canonical_terrain(dims);
 
         let snapshot = WorldSnapshot {
             world_size: (1600.0, 900.0),
@@ -1691,7 +1809,7 @@ mod capture_smoke_test {
                 colors: &colors,
                 elevation: Some(&elevation),
             },
-            agents: &agents,
+            agents: CANONICAL_AGENTS,
             anim_seconds: 1.2,
             tonemap_mode: None,
             exposure_factor: None,
@@ -1741,6 +1859,53 @@ mod capture_smoke_test {
         hasher.update(&png_bytes);
         let sha256_hex = format!("{:x}", hasher.finalize());
 
+        verify_canonical_capture(&png_bytes, &sha256_hex, &info, render_duration);
+    }
+
+    fn canonical_terrain(dims: (u32, u32)) -> (Vec<u32>, Vec<[f32; 4]>, Vec<f32>) {
+        let mut tiles = Vec::with_capacity((dims.0 * dims.1) as usize);
+        let mut colors = Vec::with_capacity((dims.0 * dims.1) as usize);
+        let mut elevation = Vec::with_capacity((dims.0 * dims.1) as usize);
+        for _y in 0..dims.1 {
+            for x in 0..dims.0 {
+                let kind_idx = if x < 7 {
+                    0
+                } else if x < 12 {
+                    1
+                } else if x < 15 {
+                    2
+                } else if x < 23 {
+                    3
+                } else if x < 28 {
+                    4
+                } else {
+                    5
+                };
+                tiles.push(kind_idx);
+                let albedo =
+                    visual::BIOLUMINESCENT_DARK_FIELD_V1.terrain[kind_idx as usize].albedo_srgb;
+                colors.push([albedo[0], albedo[1], albedo[2], 1.0]);
+                let elev = match kind_idx {
+                    0 => 0.08,
+                    1 => 0.22,
+                    2 => 0.38,
+                    3 => 0.50,
+                    4 => 0.65,
+                    _ => 0.88,
+                };
+                elevation.push(elev);
+            }
+        }
+        (tiles, colors, elevation)
+    }
+
+    fn verify_canonical_capture(
+        png_bytes: &[u8],
+        sha256_hex: &str,
+        info: &wgpu::AdapterInfo,
+        render_duration: std::time::Duration,
+    ) {
+        use sha2::{Digest, Sha256};
         let target_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../docs/rendering_reference");
         let png_path = target_dir.join("bioluminescent_dark_field_v1.png");
@@ -1750,7 +1915,7 @@ mod capture_smoke_test {
         let regen = !png_path.exists() || env_flag("REGEN_BIOLUMINESCENT_V1");
         if regen {
             std::fs::create_dir_all(&target_dir).expect("create rendering_reference dir");
-            std::fs::write(&png_path, &png_bytes).expect("write canonical png");
+            std::fs::write(&png_path, png_bytes).expect("write canonical png");
 
             let provenance_json = format!(
                 r#"{{
@@ -1907,9 +2072,19 @@ pub enum ReadbackError {
     /// Capture produced a frame with no nonzero pixels.
     Blank,
     /// Observed metadata disagrees with the required contract.
-    MetadataMismatch { expected: String, actual: String },
+    MetadataMismatch {
+        /// Required metadata description.
+        expected: String,
+        /// Observed metadata description.
+        actual: String,
+    },
     /// Zero-sized render or capture extent was rejected instead of clamped.
-    ZeroDimensions { width: u32, height: u32 },
+    ZeroDimensions {
+        /// Rejected pixel width.
+        width: u32,
+        /// Rejected pixel height.
+        height: u32,
+    },
     /// Invalid renderer control or environment configuration.
     Configuration(String),
     /// Explicit capture artifact could not be encoded or persisted.
@@ -1959,7 +2134,7 @@ impl std::fmt::Display for ReadbackError {
 impl std::error::Error for ReadbackError {}
 
 impl ReadbackError {
-    fn is_terminal_gpu_fault(&self) -> bool {
+    const fn is_terminal_gpu_fault(&self) -> bool {
         matches!(
             self,
             Self::Device(_) | Self::DeviceLost { .. } | Self::OutOfMemory { .. }
@@ -2014,10 +2189,7 @@ impl DeviceFaultMonitor {
         if error.is_terminal_gpu_fault() {
             return Err(error.clone());
         }
-        match first_fault.take() {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+        first_fault.take().map_or(Ok(()), Err)
     }
 }
 
@@ -2078,14 +2250,21 @@ struct ReadbackSlot {
     map_error: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
+/// Mapped framebuffer bytes and their row layout.
 pub struct ReadbackView {
+    /// Mapping guard retaining access to the GPU readback allocation.
     pub guard: wgpu::BufferView,
+    /// Bytes between adjacent rows, including alignment padding.
     pub bytes_per_row: u32,
+    /// Image width in pixels.
     pub width: u32,
+    /// Image height in pixels.
     pub height: u32,
 }
 
 impl ReadbackView {
+    /// Borrow the mapped rows, including their padding bytes.
+    #[must_use]
     pub fn bytes(&self) -> &[u8] {
         &self.guard
     }
@@ -2277,7 +2456,9 @@ impl ReadbackRing {
             })
             .map_err(|error| match error {
                 wgpu::PollError::Timeout => ReadbackError::Timeout,
-                other => ReadbackError::Device(format!("readback poll failed: {other:?}")),
+                other @ wgpu::PollError::WrongSubmissionIndex(..) => {
+                    ReadbackError::Device(format!("readback poll failed: {other:?}"))
+                }
             })?;
         // Advance ring pointer
         self.curr = (self.curr + 1) % self.slots.len();
@@ -2346,6 +2527,34 @@ mod tests {
         AccessibilityPalette, TerrainKind,
         visual::{self, SplatInput, TerrainSurfaceInput},
     };
+
+    #[test]
+    fn render_instance_count_rejects_unrepresentable_draw_ranges() {
+        assert_eq!(super::render_instance_count(0).unwrap(), 0);
+        assert_eq!(
+            super::render_instance_count(u32::MAX as usize).unwrap(),
+            u32::MAX
+        );
+        if let Some(too_many) = (u32::MAX as usize).checked_add(1) {
+            assert!(matches!(
+                super::render_instance_count(too_many),
+                Err(ReadbackError::MetadataMismatch { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn terrain_axis_count_rejects_signed_coordinate_overflow() {
+        assert_eq!(super::terrain_axis_count(0).unwrap(), 0);
+        assert_eq!(
+            super::terrain_axis_count(i32::MAX.unsigned_abs()).unwrap(),
+            i32::MAX
+        );
+        assert!(matches!(
+            super::terrain_axis_count(i32::MAX.unsigned_abs() + 1),
+            Err(ReadbackError::MetadataMismatch { .. })
+        ));
+    }
 
     /// The atlas upload layout goes through the SAME validator as readback.
     ///
@@ -2614,6 +2823,10 @@ mod tests {
             let core_stripe = visual::diet_stripe_color(h, 0.5);
             let carn = palette.agents.carnivore_srgb;
             let herb = palette.agents.herbivore_srgb;
+            #[allow(
+                clippy::suboptimal_flops,
+                reason = "Retain the shader's separate interpolation operations in this numerical oracle."
+            )]
             let wgsl_stripe = [
                 carn[0] + (herb[0] - carn[0]) * h,
                 carn[1] + (herb[1] - carn[1]) * h,
@@ -2630,11 +2843,19 @@ mod tests {
         // 2. Wheels speed brightening matches core wheel_colors calculation
         for speed in [-0.5_f32, 0.0, 0.25, 0.75, 1.0] {
             let wheel_base = palette.agents.wheel_srgb;
+            #[allow(
+                clippy::suboptimal_flops,
+                reason = "Retain the original wheel-brightening rounding schedule for exact comparison."
+            )]
             let expected = [
                 wheel_base[0] * (0.65 + speed.clamp(0.0, 1.0) * 0.55),
                 wheel_base[1] * (0.65 + speed.clamp(0.0, 1.0) * 0.55),
                 wheel_base[2] * (0.65 + speed.clamp(0.0, 1.0) * 0.55),
             ];
+            #[allow(
+                clippy::suboptimal_flops,
+                reason = "Retain the shader's non-fused wheel-brightening operations."
+            )]
             let wgsl = [
                 wheel_base[0] * (0.65 + speed.clamp(0.0, 1.0) * 0.55),
                 wheel_base[1] * (0.65 + speed.clamp(0.0, 1.0) * 0.55),
@@ -2652,11 +2873,19 @@ mod tests {
             let t = (smell * 0.4).clamp(0.0, 1.0);
             let halo = palette.food.halo_srgb;
             let food_core = palette.food.core_srgb;
+            #[allow(
+                clippy::suboptimal_flops,
+                reason = "Retain the shader's non-fused nose-color interpolation."
+            )]
             let wgsl_nose = [
                 halo[0] + (food_core[0] - halo[0]) * t,
                 halo[1] + (food_core[1] - halo[1]) * t,
                 halo[2] + (food_core[2] - halo[2]) * t,
             ];
+            #[allow(
+                clippy::suboptimal_flops,
+                reason = "Retain the original scalar nose-color oracle and exact bit comparison."
+            )]
             let core_nose = [
                 halo[0] + (food_core[0] - halo[0]) * t,
                 halo[1] + (food_core[1] - halo[1]) * t,
@@ -2972,6 +3201,11 @@ mod tests {
     #[test]
     fn terrain_atlas_palette_matches_the_core_visual_authority() {
         let actual = terrain_atlas_palette();
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "The independent palette oracle clamps, scales, and rounds each finite channel into 0..=255 before exact byte comparison."
+        )]
         let expected = visual::TERRAIN_BASE_COLORS.map(|rgb| {
             [
                 (rgb[0].clamp(0.0, 1.0) * 255.0).round() as u8,
@@ -3272,6 +3506,11 @@ mod tests {
             validate_snapshot(&snapshot),
             Err(super::ReadbackError::MetadataMismatch { .. })
         ));
+        let mut invalid_axis = snapshot;
+        invalid_axis.terrain.dims.0 = i32::MAX.unsigned_abs() + 1;
+        assert!(matches!(validate_snapshot(&invalid_axis),
+            Err(super::ReadbackError::MetadataMismatch { expected, .. })
+                if expected == "terrain axis representable by signed elevation coordinates"));
     }
 }
 
@@ -3353,7 +3592,7 @@ impl ViewUniforms {
             }],
         });
         let data = ViewData {
-            v0: [size.0 as f32, size.1 as f32, time, scale],
+            v0: [gpu_scalar(size.0), gpu_scalar(size.1), time, scale],
             v1: [offset.0, offset.1, 0.0, 0.0],
         };
         queue.write_buffer(&buf, 0, bytemuck::bytes_of(&data));
@@ -3373,7 +3612,7 @@ impl ViewUniforms {
         scale: f32,
         offset: (f32, f32),
     ) {
-        let v0 = [size.0 as f32, size.1 as f32, time, scale];
+        let v0 = [gpu_scalar(size.0), gpu_scalar(size.1), time, scale];
         let v1 = [offset.0, offset.1, 0.0, 0.0];
         let data = ViewData { v0, v1 };
         queue.write_buffer(&self.buf, 0, bytemuck::bytes_of(&data));
@@ -3390,7 +3629,6 @@ struct TerrainPipeline {
     bg_layout: wgpu::BindGroupLayout,
     bg: wgpu::BindGroup,
     tile_vbuf: wgpu::Buffer,
-    _tile_count: u32,
     grid_cols: u32,
     grid_rows: u32,
     tile_w: u32,
@@ -3411,8 +3649,11 @@ struct TileInstance {
 }
 
 /// Decode an authoritative semantic sRGB color before a fragment writes it to
-/// an `Rgba8UnormSrgb` attachment. wgpu performs the inverse linear-to-sRGB
+/// an `Rgba8UnormSrgb` attachment.
+///
+/// wgpu performs the inverse linear-to-sRGB
 /// transfer for RGB attachment writes; alpha is always linear and unchanged.
+#[must_use]
 pub fn semantic_srgba_to_linear(srgba: [f32; 4]) -> [f32; 4] {
     [
         srgb_component_to_linear(srgba[0]),
@@ -3422,6 +3663,8 @@ pub fn semantic_srgba_to_linear(srgba: [f32; 4]) -> [f32; 4] {
     ]
 }
 
+/// Decode one sRGB color component into linear light using the sRGB transfer curve.
+#[must_use]
 pub fn srgb_component_to_linear(value: f32) -> f32 {
     if value <= 0.04045 {
         value / 12.92
@@ -3433,16 +3676,62 @@ pub fn srgb_component_to_linear(value: f32) -> f32 {
 fn terrain_atlas_palette() -> [[u8; 4]; 6] {
     visual::TERRAIN_BASE_COLORS.map(|rgb| {
         [
-            (rgb[0].clamp(0.0, 1.0) * 255.0).round() as u8,
-            (rgb[1].clamp(0.0, 1.0) * 255.0).round() as u8,
-            (rgb[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+            color_byte((rgb[0].clamp(0.0, 1.0) * 255.0).round()),
+            color_byte((rgb[1].clamp(0.0, 1.0) * 255.0).round()),
+            color_byte((rgb[2].clamp(0.0, 1.0) * 255.0).round()),
             u8::MAX,
         ]
     })
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "Atlas color quantization deliberately truncates and saturates float channels to bytes; preserve those raster bytes."
+)]
+const fn color_byte(value: f32) -> u8 {
+    value as u8
+}
+
 impl TerrainPipeline {
     fn new(device: &wgpu::Device, color_format: wgpu::TextureFormat, view: &ViewUniforms) -> Self {
+        let (sampler, atlas, atlas_view) = Self::placeholder_atlas(device);
+
+        let bg_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("terrain.bg_layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        Self::with_atlas(
+            device,
+            color_format,
+            view,
+            sampler,
+            atlas,
+            atlas_view,
+            bg_layout,
+        )
+    }
+
+    fn placeholder_atlas(
+        device: &wgpu::Device,
+    ) -> (wgpu::Sampler, wgpu::Texture, wgpu::TextureView) {
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("terrain.sampler"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -3466,28 +3755,18 @@ impl TerrainPipeline {
             view_formats: &[],
         });
         let atlas_view = atlas.create_view(&wgpu::TextureViewDescriptor::default());
+        (sampler, atlas, atlas_view)
+    }
 
-        let bg_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("terrain.bg_layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
+    fn with_atlas(
+        device: &wgpu::Device,
+        color_format: wgpu::TextureFormat,
+        view: &ViewUniforms,
+        sampler: wgpu::Sampler,
+        atlas: wgpu::Texture,
+        atlas_view: wgpu::TextureView,
+        bg_layout: wgpu::BindGroupLayout,
+    ) -> Self {
         let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("terrain.bg"),
             layout: &bg_layout,
@@ -3515,8 +3794,8 @@ impl TerrainPipeline {
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("terrain.pipeline"),
             layout: Some(&layout),
-            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_main"), compilation_options: Default::default(), buffers: &[wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<TileInstance>() as u64, step_mode: wgpu::VertexStepMode::Instance, attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4, 3 => Uint32, 4 => Float32] }] },
-            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs_main"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: color_format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })] }),
+            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_main"), compilation_options: wgpu::PipelineCompilationOptions::default(), buffers: &[wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<TileInstance>() as u64, step_mode: wgpu::VertexStepMode::Instance, attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4, 3 => Uint32, 4 => Float32] }] },
+            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs_main"), compilation_options: wgpu::PipelineCompilationOptions::default(), targets: &[Some(wgpu::ColorTargetState { format: color_format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })] }),
             primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleStrip, strip_index_format: None, ..Default::default() },
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
@@ -3545,7 +3824,6 @@ impl TerrainPipeline {
             bg_layout,
             bg,
             tile_vbuf,
-            _tile_count: 0,
             grid_cols,
             grid_rows,
             tile_w,
@@ -3611,13 +3889,13 @@ impl TerrainPipeline {
                         let mut rgba = color;
                         // add gentle vignette/variation for non-water tiles
                         if idx >= 2 {
-                            let fx = (x as f32 / self.tile_w as f32 - 0.5).abs();
-                            let fy = (y as f32 / self.tile_h as f32 - 0.5).abs();
+                            let fx = (gpu_scalar(x) / gpu_scalar(self.tile_w) - 0.5).abs();
+                            let fy = (gpu_scalar(y) / gpu_scalar(self.tile_h) - 0.5).abs();
                             let vignette = fx.max(fy) * 0.12;
                             let dim = (1.0 - vignette).clamp(0.85, 1.0);
-                            rgba[0] = ((rgba[0] as f32) * dim) as u8;
-                            rgba[1] = ((rgba[1] as f32) * dim) as u8;
-                            rgba[2] = ((rgba[2] as f32) * dim) as u8;
+                            rgba[0] = color_byte(f32::from(rgba[0]) * dim);
+                            rgba[1] = color_byte(f32::from(rgba[1]) * dim);
+                            rgba[2] = color_byte(f32::from(rgba[2]) * dim);
                         }
                         pixels[offset..offset + 4].copy_from_slice(&rgba);
                     }
@@ -3681,45 +3959,63 @@ impl TerrainPipeline {
         encoder: &mut wgpu::CommandEncoder,
         view_tex: &wgpu::TextureView,
         view_uniforms: &ViewUniforms,
-        snapshot: &WorldSnapshot,
+        snapshot: &WorldSnapshot<'_>,
         viewport: (u32, u32),
         scale: f32,
         offset: (f32, f32),
-    ) -> u32 {
+    ) -> Result<u32, ReadbackError> {
         // Build tile instances for visible terrain with simple CPU frustum culling.
         let (tw, th) = snapshot.terrain.dims;
-        let cell = snapshot.terrain.cell_size as f32;
+        let cell = gpu_scalar(snapshot.terrain.cell_size);
+        let cols = terrain_axis_count(tw)?;
+        let rows = terrain_axis_count(th)?;
         let mut staging: Vec<TileInstance> = Vec::with_capacity((tw as usize) * (th as usize));
-        let (vp_w, vp_h) = (viewport.0 as f32, viewport.1 as f32);
+        let (vp_w, vp_h) = (gpu_scalar(viewport.0), gpu_scalar(viewport.1));
         let disable_cull = matches!(std::env::var("SB_WGPU_DISABLE_CULL").ok().map(|s| s.to_ascii_lowercase()), Some(ref v) if v == "1" || v == "true" || v == "yes" || v == "on");
         let elev_opt = snapshot.terrain.elevation;
         let get_elev = |x: i32, y: i32| -> f32 {
-            if let Some(elev) = elev_opt {
-                let xi = x.clamp(0, (tw as i32) - 1) as usize;
-                let yi = y.clamp(0, (th as i32) - 1) as usize;
+            elev_opt.map_or(0.0, |elev| {
+                let xi = x.clamp(0, cols - 1).unsigned_abs() as usize;
+                let yi = y.clamp(0, rows - 1).unsigned_abs() as usize;
                 let idx = yi * (tw as usize) + xi;
                 elev.get(idx).copied().unwrap_or(0.5)
-            } else {
-                0.0
-            }
+            })
         };
-        for y in 0..th as i32 {
-            for x in 0..tw as i32 {
-                let px = x as f32 * cell;
-                let py = y as f32 * cell;
+        for y in 0..rows {
+            for x in 0..cols {
+                let px = gpu_scalar(x.unsigned_abs()) * cell;
+                let py = gpu_scalar(y.unsigned_abs()) * cell;
                 // Convert to pixel-space for culling using camera
-                let min_x_px = px * scale + offset.0;
-                let min_y_px = py * scale + offset.1;
-                let max_x_px = min_x_px + cell * scale;
-                let max_y_px = min_y_px + cell * scale;
-                if !disable_cull
-                    && (max_x_px < 0.0 || max_y_px < 0.0 || min_x_px > vp_w || min_y_px > vp_h)
-                {
+                #[allow(
+                    clippy::suboptimal_flops,
+                    reason = "Fusing the camera multiply/add changes rounding at raster culling boundaries."
+                )]
+                let left = px * scale + offset.0;
+                #[allow(
+                    clippy::suboptimal_flops,
+                    reason = "Fusing the camera multiply/add changes rounding at raster culling boundaries."
+                )]
+                let top = py * scale + offset.1;
+                #[allow(
+                    clippy::suboptimal_flops,
+                    reason = "Retain separate multiply/add rounding for raster culling."
+                )]
+                let right = left + cell * scale;
+                #[allow(
+                    clippy::suboptimal_flops,
+                    reason = "Retain separate multiply/add rounding for raster culling."
+                )]
+                let bottom = top + cell * scale;
+                if !disable_cull && (right < 0.0 || bottom < 0.0 || left > vp_w || top > vp_h) {
                     continue;
                 }
-                let idx = (y as usize) * (tw as usize) + (x as usize);
+                let idx = (y.unsigned_abs() as usize) * (tw as usize) + (x.unsigned_abs() as usize);
                 let tile_id = snapshot.terrain.tiles.get(idx).copied().unwrap_or(3);
                 // slope via central differences if elevation present
+                #[allow(
+                    clippy::imprecise_flops,
+                    reason = "hypot changes terrain slope rounding and therefore raster output."
+                )]
                 let slope = if elev_opt.is_some() {
                     let dx = (get_elev(x + 1, y) - get_elev(x - 1, y)) * 0.5;
                     let dy = (get_elev(x, y + 1) - get_elev(x, y - 1)) * 0.5;
@@ -3736,11 +4032,11 @@ impl TerrainPipeline {
                 });
             }
         }
+        let instance_count = render_instance_count(staging.len())?;
         if !staging.is_empty() {
             let needed = (staging.len() * std::mem::size_of::<TileInstance>()) as u64;
             self.ensure_vbuf_capacity(device, needed);
             queue.write_buffer(&self.tile_vbuf, 0, bytemuck::cast_slice(&staging));
-            self._tile_count = staging.len() as u32;
         }
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("terrain.pass"),
@@ -3761,12 +4057,12 @@ impl TerrainPipeline {
         pass.set_bind_group(0, &self.bg, &[]);
         pass.set_bind_group(1, &view_uniforms.bg, &[]);
         pass.set_vertex_buffer(0, self.tile_vbuf.slice(..));
-        pass.draw(0..4, 0..staging.len() as u32);
-        staging.len() as u32
+        pass.draw(0..4, 0..instance_count);
+        Ok(instance_count)
     }
 }
 
-const TERRAIN_WGSL: &str = r#"
+const TERRAIN_WGSL: &str = r"
 struct VsIn {
   @location(0) pos: vec2<f32>,
   @location(1) size: vec2<f32>,
@@ -3810,7 +4106,7 @@ fn fs_main(v: VsOut) -> @location(0) vec4<f32> {
   // palette, shimmer, slope curve, or hash-noise model.
   return v.color;
 }
-"#;
+";
 
 // ---------------- Agent pipeline (instanced sprites with effects) ----------------
 
@@ -4002,7 +4298,7 @@ impl AgentPipeline {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
                 buffers: &[wgpu::VertexBufferLayout {
                     array_stride: std::mem::size_of::<AgentInstanceGpu>() as u64,
                     step_mode: wgpu::VertexStepMode::Instance,
@@ -4024,7 +4320,7 @@ impl AgentPipeline {
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
                 entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: color_format,
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
@@ -4079,17 +4375,25 @@ impl AgentPipeline {
         encoder: &mut wgpu::CommandEncoder,
         view_tex: &wgpu::TextureView,
         view_uniforms: &ViewUniforms,
-        snapshot: &WorldSnapshot,
+        snapshot: &WorldSnapshot<'_>,
         viewport: (u32, u32),
         scale: f32,
         offset: (f32, f32),
-    ) -> u32 {
+    ) -> Result<u32, ReadbackError> {
         let mut staging: Vec<AgentInstanceGpu> = Vec::with_capacity(snapshot.agents.len());
-        let (vp_w, vp_h) = (viewport.0 as f32, viewport.1 as f32);
+        let (vp_w, vp_h) = (gpu_scalar(viewport.0), gpu_scalar(viewport.1));
         let disable_cull = matches!(std::env::var("SB_WGPU_DISABLE_CULL").ok().map(|s| s.to_ascii_lowercase()), Some(ref v) if v == "1" || v == "true" || v == "yes" || v == "on");
         for a in snapshot.agents {
             // CPU frustum culling (pixel-space); assumes positions/sizes are pixels in this pass
+            #[allow(
+                clippy::suboptimal_flops,
+                reason = "Fusing the camera multiply/add changes rounding at raster culling boundaries."
+            )]
             let cx = a.position[0] * scale + offset.0;
+            #[allow(
+                clippy::suboptimal_flops,
+                reason = "Fusing the camera multiply/add changes rounding at raster culling boundaries."
+            )]
             let cy = a.position[1] * scale + offset.1;
             let radius_x = a.quad_extent[0] * scale;
             let radius_y = a.quad_extent[1] * scale;
@@ -4103,6 +4407,7 @@ impl AgentPipeline {
             }
             staging.push(agent_instance_gpu(a));
         }
+        let instance_count = render_instance_count(staging.len())?;
         if !staging.is_empty() {
             let needed = (staging.len() * std::mem::size_of::<AgentInstanceGpu>()) as u64;
             self.ensure_vbuf_capacity(device, needed);
@@ -4126,12 +4431,12 @@ impl AgentPipeline {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &view_uniforms.bg, &[]);
         pass.set_vertex_buffer(0, self.vbuf.slice(..));
-        pass.draw(0..4, 0..staging.len() as u32);
-        staging.len() as u32
+        pass.draw(0..4, 0..instance_count);
+        Ok(instance_count)
     }
 }
 
-const AGENTS_WGSL: &str = r#"
+const AGENTS_WGSL: &str = r"
 struct InInst {
   @location(0) data0: vec4<f32>,
   @location(1) data1: vec4<f32>,
@@ -4436,7 +4741,7 @@ fn fs_main(v: VsOut) -> @location(0) vec4<f32> {
   let rgb = clamp(accum_rgb, vec3<f32>(0.0), vec3<f32>(1.0));
   return vec4<f32>(rgb, alpha);
 }
-"#;
+";
 
 struct PostFx {
     // Final composite (tonemap + vignette + fog + bloom composite)
@@ -4577,6 +4882,12 @@ impl PostControls {
             "a finite non-negative number",
         )?;
 
+        controls.read_fog_env()?;
+        Ok(controls)
+    }
+
+    fn read_fog_env(&mut self) -> Result<(), ReadbackError> {
+        let controls = self;
         let fog_mode = match std::env::var("SB_WGPU_FOG") {
             Ok(value) => value,
             Err(std::env::VarError::NotPresent) => "off".to_owned(),
@@ -4623,9 +4934,13 @@ impl PostControls {
                 )));
             }
         }
-        Ok(controls)
+        Ok(())
     }
 
+    #[allow(
+        clippy::float_cmp,
+        reason = "Exact neutral exposure is a post-pass identity switch, not an approximate measurement."
+    )]
     fn wants_post(self, selected_tonemap: Option<u32>) -> bool {
         self.exposure != 1.0
             || self.vignette != 0.0
@@ -4703,7 +5018,7 @@ fn parse_rgb(value: &str) -> Option<[f32; 3]> {
     channels.next().is_none().then_some(color)
 }
 
-fn resolve_bloom_intensity(enabled: bool, configured: f32) -> f32 {
+const fn resolve_bloom_intensity(enabled: bool, configured: f32) -> f32 {
     if enabled { configured } else { 0.0 }
 }
 
@@ -4719,7 +5034,206 @@ impl PostFx {
             label: Some("postfx.wgsl"),
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(POST_WGSL)),
         });
-        // Final pass samples: src color (binding 0), sampler (1), bloom blurred (2)
+        let (src_layout, sampler, src_bg) = Self::composite_source(device, src_view);
+        let (params_layout, params_buf, params_bg) = Self::parameters(device);
+        let pipeline = Self::fullscreen_pipeline(
+            device,
+            format,
+            &post_shader,
+            ("post.layout", "post.pipeline"),
+            &[&src_layout, &params_layout],
+            "fs_post",
+        );
+        let (target, target_view) = create_color(device, format, size)?;
+
+        // Bloom shaders and layouts
+        let bloom_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("bloom.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(BLOOM_WGSL)),
+        });
+        let (bloom_src_layout, bloom_src_bg) = Self::bloom_source(device, src_view, &sampler);
+        let blur_params_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("bloom.blur_params_layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: std::num::NonZeroU64::new(16),
+                    },
+                    count: None,
+                }],
+            });
+        // Separate uniform buffers for the horizontal and vertical blur
+        // directions: queue.write_buffer ordering means a single shared
+        // buffer would make both passes sample the last-written direction.
+        let (blur_params_h_buf, blur_params_h_bg) = Self::blur_direction(
+            device,
+            &blur_params_layout,
+            ("bloom.blur_params_h_buf", "bloom.blur_params_h_bg"),
+        );
+        let (vertical_buffer, vertical_group) = Self::blur_direction(
+            device,
+            &blur_params_layout,
+            ("bloom.blur_params_v_buf", "bloom.blur_params_v_bg"),
+        );
+        // Extract pipeline: src -> bloom_a (half res)
+        let bloom_extract_pipeline = Self::fullscreen_pipeline(
+            device,
+            wgpu::TextureFormat::Rgba8Unorm,
+            &bloom_shader,
+            ("bloom.extract.layout", "bloom.extract.pipeline"),
+            &[&bloom_src_layout, &params_layout],
+            "fs_extract",
+        );
+        // Blur pipeline: bloom_a <-> bloom_b
+        let bloom_blur_pipeline = Self::fullscreen_pipeline(
+            device,
+            wgpu::TextureFormat::Rgba8Unorm,
+            &bloom_shader,
+            ("bloom.blur.layout", "bloom.blur.pipeline"),
+            &[&bloom_src_layout, &blur_params_layout],
+            "fs_blur",
+        );
+
+        Ok(Self {
+            pipeline,
+            sampler,
+            src_layout,
+            src_bg,
+            params_layout,
+            params_bg,
+            params_buf,
+            target,
+            target_view,
+            color_format: format,
+            bloom_extract_pipeline,
+            bloom_blur_pipeline,
+            bloom_src_layout,
+            bloom_src_bg,
+            blur_params_h_bg,
+            blur_params_h_buf,
+            blur_params_v_bg: vertical_group,
+            blur_params_v_buf: vertical_buffer,
+            bloom_a: None,
+            bloom_a_view: None,
+            bloom_b: None,
+            bloom_b_view: None,
+        })
+    }
+
+    fn blur_direction(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        labels: (&str, &str),
+    ) -> (wgpu::Buffer, wgpu::BindGroup) {
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(labels.0),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(labels.1),
+            layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: buffer.as_entire_binding(),
+            }],
+        });
+        (buffer, group)
+    }
+
+    fn fullscreen_pipeline(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        shader: &wgpu::ShaderModule,
+        labels: (&str, &str),
+        bind_group_layouts: &[&wgpu::BindGroupLayout],
+        fragment_entry: &str,
+    ) -> wgpu::RenderPipeline {
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some(labels.0),
+            bind_group_layouts,
+            push_constant_ranges: &[],
+        });
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(labels.1),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: shader,
+                entry_point: Some("vs_fullscreen"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: shader,
+                entry_point: Some(fragment_entry),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        })
+    }
+
+    fn bloom_source(
+        device: &wgpu::Device,
+        src_view: &wgpu::TextureView,
+        sampler: &wgpu::Sampler,
+    ) -> (wgpu::BindGroupLayout, wgpu::BindGroup) {
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("bloom.src_layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("bloom.src_bg"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(src_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+            ],
+        });
+        (layout, group)
+    }
+
+    fn composite_source(
+        device: &wgpu::Device,
+        src_view: &wgpu::TextureView,
+    ) -> (wgpu::BindGroupLayout, wgpu::Sampler, wgpu::BindGroup) {
+        // Final pass samples: src color (binding 0), sampler (1), bloom blurred (2).
         let src_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("post.src_layout"),
             entries: &[
@@ -4757,7 +5271,7 @@ impl PostFx {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-        // Placeholder bloom view: use source for now; real bloom bound during run()
+        // Placeholder bloom view: source until run binds the actual bloom view.
         let src_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("post.src_bg"),
             layout: &src_layout,
@@ -4776,6 +5290,10 @@ impl PostFx {
                 },
             ],
         });
+        (src_layout, sampler, src_bg)
+    }
+
+    fn parameters(device: &wgpu::Device) -> (wgpu::BindGroupLayout, wgpu::Buffer, wgpu::BindGroup) {
         let params_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("post.params_layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
@@ -4805,211 +5323,7 @@ impl PostFx {
                 resource: params_buf.as_entire_binding(),
             }],
         });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("post.layout"),
-            bind_group_layouts: &[&src_layout, &params_layout],
-            push_constant_ranges: &[],
-        });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("post.pipeline"),
-            layout: Some(&layout),
-            vertex: wgpu::VertexState {
-                module: &post_shader,
-                entry_point: Some("vs_fullscreen"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &post_shader,
-                entry_point: Some("fs_post"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
-        let (target, target_view) = create_color(device, format, size)?;
-
-        // Bloom shaders and layouts
-        let bloom_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("bloom.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(BLOOM_WGSL)),
-        });
-        let bloom_src_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("bloom.src_layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
-        let bloom_src_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("bloom.src_bg"),
-            layout: &bloom_src_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(src_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-            ],
-        });
-        let blur_params_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("bloom.blur_params_layout"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: std::num::NonZeroU64::new(16),
-                    },
-                    count: None,
-                }],
-            });
-        // Separate uniform buffers for the horizontal and vertical blur
-        // directions: queue.write_buffer ordering means a single shared
-        // buffer would make both passes sample the last-written direction.
-        let blur_params_h_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("bloom.blur_params_h_buf"),
-            size: 16,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let blur_params_h_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("bloom.blur_params_h_bg"),
-            layout: &blur_params_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: blur_params_h_buf.as_entire_binding(),
-            }],
-        });
-        let blur_params_v_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("bloom.blur_params_v_buf"),
-            size: 16,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let blur_params_v_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("bloom.blur_params_v_bg"),
-            layout: &blur_params_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: blur_params_v_buf.as_entire_binding(),
-            }],
-        });
-        // Extract pipeline: src -> bloom_a (half res)
-        let bloom_extract_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("bloom.extract.layout"),
-            bind_group_layouts: &[&bloom_src_layout, &params_layout],
-            push_constant_ranges: &[],
-        });
-        let bloom_extract_pipeline =
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("bloom.extract.pipeline"),
-                layout: Some(&bloom_extract_layout),
-                vertex: wgpu::VertexState {
-                    module: &bloom_shader,
-                    entry_point: Some("vs_fullscreen"),
-                    compilation_options: Default::default(),
-                    buffers: &[],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &bloom_shader,
-                    entry_point: Some("fs_extract"),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: wgpu::TextureFormat::Rgba8Unorm,
-                        blend: Some(wgpu::BlendState::REPLACE),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState::default(),
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview: None,
-                cache: None,
-            });
-        // Blur pipeline: bloom_a <-> bloom_b
-        let bloom_blur_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("bloom.blur.layout"),
-            bind_group_layouts: &[&bloom_src_layout, &blur_params_layout],
-            push_constant_ranges: &[],
-        });
-        let bloom_blur_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("bloom.blur.pipeline"),
-            layout: Some(&bloom_blur_layout),
-            vertex: wgpu::VertexState {
-                module: &bloom_shader,
-                entry_point: Some("vs_fullscreen"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &bloom_shader,
-                entry_point: Some("fs_blur"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba8Unorm,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
-
-        Ok(Self {
-            pipeline,
-            sampler,
-            src_layout,
-            src_bg,
-            params_layout,
-            params_bg,
-            params_buf,
-            target,
-            target_view,
-            color_format: format,
-            bloom_extract_pipeline,
-            bloom_blur_pipeline,
-            bloom_src_layout,
-            bloom_src_bg,
-            blur_params_h_bg,
-            blur_params_h_buf,
-            blur_params_v_bg,
-            blur_params_v_buf,
-            bloom_a: None,
-            bloom_a_view: None,
-            bloom_b: None,
-            bloom_b_view: None,
-        })
+        (params_layout, params_buf, params_bg)
     }
 
     fn install_resize(
@@ -5120,6 +5434,17 @@ impl PostFx {
         selected_tonemap: Option<u32>,
         controls: &PostControls,
     ) {
+        self.update_parameters(device, queue, selected_tonemap, controls);
+        self.run_composite_passes(device, queue, encoder, src, size, controls);
+    }
+
+    fn update_parameters(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        selected_tonemap: Option<u32>,
+        controls: &PostControls,
+    ) {
         let params = PostParams {
             exposure: controls.exposure,
             vignette: controls.vignette,
@@ -5150,10 +5475,19 @@ impl PostFx {
                 resource: self.params_buf.as_entire_binding(),
             }],
         });
+    }
 
+    fn run_composite_passes(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        src: &wgpu::TextureView,
+        size: (u32, u32),
+        controls: &PostControls,
+    ) {
         // Bloom pass chain if enabled
-        let mut bloom_view_opt: Option<wgpu::TextureView> = None;
-        if controls.bloom_enabled {
+        let bloom_view_opt = if controls.bloom_enabled {
             self.ensure_bloom_targets(device, self.color_format, size);
             // Create fresh local views to avoid borrowing self across mutable calls
             let a_view_local = self
@@ -5190,7 +5524,7 @@ impl PostFx {
                 pass.draw(0..3, 0..1);
             }
             // Blur A -> B (horizontal)
-            let dir_h: [f32; 4] = [1.0 / (size.0.max(1) as f32 * 0.5), 0.0, 0.0, 0.0];
+            let dir_h: [f32; 4] = [1.0 / (gpu_scalar(size.0.max(1)) * 0.5), 0.0, 0.0, 0.0];
             queue.write_buffer(&self.blur_params_h_buf, 0, bytemuck::bytes_of(&dir_h));
             self.bind_bloom_src(device, &a_view_local);
             {
@@ -5215,7 +5549,7 @@ impl PostFx {
                 pass.draw(0..3, 0..1);
             }
             // Blur B -> A (vertical)
-            let dir_v: [f32; 4] = [0.0, 1.0 / (size.1.max(1) as f32 * 0.5), 0.0, 0.0];
+            let dir_v: [f32; 4] = [0.0, 1.0 / (gpu_scalar(size.1.max(1)) * 0.5), 0.0, 0.0];
             queue.write_buffer(&self.blur_params_v_buf, 0, bytemuck::bytes_of(&dir_v));
             self.bind_bloom_src(device, &b_view_local);
             {
@@ -5239,11 +5573,23 @@ impl PostFx {
                 pass.set_bind_group(1, &self.blur_params_v_bg, &[]);
                 pass.draw(0..3, 0..1);
             }
-            bloom_view_opt = Some(a_view_local);
-        }
+            Some(a_view_local)
+        } else {
+            None
+        };
 
         // Final composite: bind src + bloom (or src placeholder) and draw
         let bloom_view_ref = bloom_view_opt.as_ref().unwrap_or(src);
+        self.composite(device, encoder, src, bloom_view_ref);
+    }
+
+    fn composite(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        src: &wgpu::TextureView,
+        bloom_view_ref: &wgpu::TextureView,
+    ) {
         self.rebind(device, src, bloom_view_ref);
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("post.pass"),
@@ -5267,7 +5613,7 @@ impl PostFx {
     }
 }
 
-const POST_WGSL: &str = r#"
+const POST_WGSL: &str = r"
 @vertex
 fn vs_fullscreen(@builtin(vertex_index) vid: u32) -> @builtin(position) vec4<f32> {
   // Fullscreen triangle
@@ -5431,10 +5777,10 @@ fn fs_post(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
   }
   return vec4<f32>(rgb, 1.0);
 }
-"#;
+";
 
 // Bloom helpers (extract + separable blur)
-const BLOOM_WGSL: &str = r#"
+const BLOOM_WGSL: &str = r"
 @vertex
 fn vs_fullscreen(@builtin(vertex_index) vid: u32) -> @builtin(position) vec4<f32> {
   let x = f32((vid << 1u) & 2u);
@@ -5477,14 +5823,11 @@ fn fs_blur(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
   c += textureSampleLevel(src_tex, src_smp, uv - off2, 0.0).rgb * w2;
   return vec4<f32>(c, 1.0);
 }
-"#;
+";
 
 fn env_flag(name: &str) -> bool {
-    std::env::var(name)
-        .ok()
-        .map(|v| {
-            let s = v.trim().to_ascii_lowercase();
-            matches!(s.as_str(), "1" | "true" | "yes" | "on")
-        })
-        .unwrap_or(false)
+    std::env::var(name).is_ok_and(|v| {
+        let s = v.trim().to_ascii_lowercase();
+        matches!(s.as_str(), "1" | "true" | "yes" | "on")
+    })
 }

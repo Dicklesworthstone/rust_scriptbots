@@ -1,5 +1,5 @@
-// Minimal wgpu window smoke test using winit 0.30 application model.
-// Run: `cargo run -p scriptbots-world-gfx --bin wgpu_clear`
+//! Minimal wgpu window smoke test using the winit 0.30 application model.
+//! Run: `cargo run -p scriptbots-world-gfx --bin wgpu_clear`
 
 use winit::{
     application::ApplicationHandler,
@@ -71,7 +71,7 @@ impl ApplicationHandler for ClearApp {
             .get_capabilities(&adapter)
             .formats
             .into_iter()
-            .find(|f| f.is_srgb())
+            .find(wgpu::TextureFormat::is_srgb)
             .unwrap_or(wgpu::TextureFormat::Bgra8UnormSrgb);
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -122,12 +122,12 @@ impl ApplicationHandler for ClearApp {
                     self.t = (self.t + 0.01) % 1.0;
                     let frame = match surface.get_current_texture() {
                         Ok(f) => f,
-                        Err(wgpu::SurfaceError::Lost) | Err(wgpu::SurfaceError::Outdated) => {
+                        Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                             surface.configure(device, cfg);
                             return;
                         }
                         Err(wgpu::SurfaceError::Timeout) => return,
-                        Err(wgpu::SurfaceError::OutOfMemory) | Err(wgpu::SurfaceError::Other) => {
+                        Err(wgpu::SurfaceError::OutOfMemory | wgpu::SurfaceError::Other) => {
                             event_loop.exit();
                             return;
                         }
@@ -140,6 +140,9 @@ impl ApplicationHandler for ClearApp {
                             label: Some("clear"),
                         });
                     {
+                        // Keep the original f32 product rounding before adding the base red.
+                        let red_step = 0.3 * self.t;
+                        let red = 0.1 + red_step;
                         let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                             label: Some("clear.pass"),
                             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -148,7 +151,7 @@ impl ApplicationHandler for ClearApp {
                                 resolve_target: None,
                                 ops: wgpu::Operations {
                                     load: wgpu::LoadOp::Clear(wgpu::Color {
-                                        r: (0.1 + 0.3 * self.t) as f64,
+                                        r: f64::from(red),
                                         g: 0.08,
                                         b: 0.18,
                                         a: 1.0,

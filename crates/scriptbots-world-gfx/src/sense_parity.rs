@@ -251,26 +251,41 @@ impl SenseLaneParityReport {
 }
 
 /// Compute grid uniforms from world state and active agent count.
-#[must_use]
-pub fn make_grid_uniforms(world: &WorldState, agent_count: usize) -> GridUniforms {
+///
+/// Returns [`GpuSenseError::CountOverflow`] when the agent count exceeds the GPU ABI.
+pub fn make_grid_uniforms(
+    world: &WorldState,
+    agent_count: usize,
+) -> Result<GridUniforms, GpuSenseError> {
+    let agent_count = crate::sense_wgsl::gpu_count("agents", agent_count)?;
     let cfg = world.config();
-    let world_width = cfg.world_width as f32;
-    let world_height = cfg.world_height as f32;
-    let cell_size = (cfg.food_cell_size as f32).max(1.0);
+    let world_width = crate::gpu_scalar(cfg.world_width);
+    let world_height = crate::gpu_scalar(cfg.world_height);
+    let cell_size = crate::gpu_scalar(cfg.food_cell_size).max(1.0);
     let sense_radius = cfg.sense_radius;
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "ceil and max produce nonnegative integral grid extents; retain the existing f32-to-u32 saturating ABI conversion."
+    )]
     let cells_x = (world_width / cell_size).ceil().max(1.0) as u32;
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "ceil and max produce nonnegative integral grid extents; retain the existing f32-to-u32 saturating ABI conversion."
+    )]
     let cells_y = (world_height / cell_size).ceil().max(1.0) as u32;
 
-    GridUniforms {
+    Ok(GridUniforms {
         world_width,
         world_height,
         cell_size,
         sense_radius,
         cells_x,
         cells_y,
-        agent_count: agent_count as u32,
+        agent_count,
         _pad: 0,
-    }
+    })
 }
 
 /// Pack simulation agent states into the 96-byte `AgentGpuData` layout.
@@ -402,7 +417,7 @@ impl GpuSenseProvider {
 
     /// Access the underlying pipeline.
     #[must_use]
-    pub fn pipeline(&self) -> &GpuSensePipeline {
+    pub const fn pipeline(&self) -> &GpuSensePipeline {
         &self.pipeline
     }
 }
@@ -416,8 +431,9 @@ impl SenseProvider for GpuSenseProvider {
         if handles.is_empty() {
             return Ok(Vec::new());
         }
+        let uniforms = make_grid_uniforms(world, handles.len())
+            .map_err(|error| SenseProviderError::Execution(error.to_string()))?;
         let agents = pack_agent_gpu_data(world, handles);
-        let uniforms = make_grid_uniforms(world, handles.len());
         let outputs = self
             .pipeline
             .execute_sense(&self.device, &self.queue, &agents, uniforms)
@@ -447,7 +463,7 @@ pub struct FaultInjectedGpuSenseProvider {
 impl FaultInjectedGpuSenseProvider {
     /// Create a new fault-injected provider with the specified mode.
     #[must_use]
-    pub fn new(provider: GpuSenseProvider, mode: FaultInjectionMode) -> Self {
+    pub const fn new(provider: GpuSenseProvider, mode: FaultInjectionMode) -> Self {
         Self { provider, mode }
     }
 }
@@ -480,7 +496,7 @@ impl SenseProvider for FaultInjectedGpuSenseProvider {
             }
             FaultInjectionMode::PerturbChannel => {
                 if let Some(first) = accumulators.first_mut() {
-                    first.sound = first.sound.saturating_add(104857); // ~0.1 in fixed-point
+                    first.sound = first.sound.saturating_add(104_857); // ~0.1 in fixed-point
                 }
             }
         }
@@ -506,13 +522,12 @@ pub fn probe_gpu_adapter() -> Option<wgpu::AdapterInfo> {
 /// Returns [`GpuSenseError::NoAdapter`] if no compatible adapter is found.
 pub fn init_gpu_sense_provider() -> Result<(GpuSenseProvider, wgpu::AdapterInfo), GpuSenseError> {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-    let adapter = match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+    let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
         compatible_surface: None,
         force_fallback_adapter: false,
-    })) {
-        Ok(adapter) => adapter,
-        Err(_) => return Err(GpuSenseError::NoAdapter),
+    })) else {
+        return Err(GpuSenseError::NoAdapter);
     };
 
     let (device, queue) =
@@ -532,7 +547,7 @@ pub fn init_gpu_sense_provider() -> Result<(GpuSenseProvider, wgpu::AdapterInfo)
 
 /// Verify whether an adapter is certified bit-exact against reference evidence.
 ///
-/// Software adapters (CPU device_type, e.g. llvmpipe, lavapipe) are NEVER certified
+/// Software adapters (CPU `device_type`, e.g. llvmpipe, lavapipe) are NEVER certified
 /// as exact hardware lanes regardless of parity report contents.
 #[must_use]
 pub fn is_adapter_certified_exact(
@@ -630,6 +645,10 @@ fn certified_report_evidence(
             && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
             && digest.bytes().any(|byte| byte != b'0')
     };
+    #[allow(
+        clippy::suspicious_operation_groupings,
+        reason = "The report's adapter wire field stores AdapterInfo::name; the other identity fields intentionally have matching names."
+    )]
     if adapter.device_type == wgpu::DeviceType::Cpu
         || report.is_software_adapter
         || adapter.name.trim().is_empty()
@@ -750,7 +769,9 @@ pub fn run_sense_parity_check(
     let start_time_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis() as u64;
+        .as_millis();
+    let start_time_ms = u64::try_from(start_time_ms)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
 
     let build = ParityBuildIdentity::current();
     let target = build
@@ -770,124 +791,43 @@ pub fn run_sense_parity_check(
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     let is_software = adapter_info.device_type == wgpu::DeviceType::Cpu;
 
-    // Structured start diagnostics
-    tracing::info!(
-        target: "scriptbots::sense::parity",
-        adapter = %adapter_info.name,
-        backend = ?adapter_info.backend,
-        ticks = options.tick_count,
-        population = options.population,
-        fault_injection = ?options.fault_injection,
-        is_software = is_software,
-        "Starting CPU-vs-GPU sense parity gate"
-    );
+    log_parity_start(options, adapter_info, is_software);
 
-    let config = ScriptBotsConfig {
-        rng_seed: Some(options.seed),
-        ..Default::default()
-    };
+    let ParityWorlds {
+        mut reference,
+        mut candidate,
+        completed_dispatches,
+    } = parity_worlds(options, device, queue, adapter_info)?;
 
-    let mut world_cpu =
-        WorldState::new(config.clone()).map_err(|e| SenseParityError::Simulation(e.to_string()))?;
-    let mut world_gpu =
-        WorldState::new(config).map_err(|e| SenseParityError::Simulation(e.to_string()))?;
-
-    // Spawn initial populations identically
-    for i in 0..options.population {
-        let x = 100.0 + (i as f32) * 25.0;
-        let y = 100.0 + (i as f32) * 20.0;
-        let agent = AgentData {
-            position: Position { x, y },
-            ..AgentData::default()
-        };
-        let _ = world_cpu
-            .try_spawn_agent(agent)
-            .map_err(|e| SenseParityError::Simulation(format!("{e:?}")))?;
-        let _ = world_gpu
-            .try_spawn_agent(agent)
-            .map_err(|e| SenseParityError::Simulation(format!("{e:?}")))?;
-    }
-
-    let pipeline = GpuSensePipeline::new(device, adapter_info, PRODUCTION_WORKGROUP_SIZE)?;
-    let base_gpu_provider = GpuSenseProvider::new(Arc::clone(device), Arc::clone(queue), pipeline);
-    let completed_dispatches = Arc::clone(&base_gpu_provider.completed_dispatches);
-
-    if let Some(fault) = options.fault_injection {
-        world_gpu.set_sense_provider(Box::new(FaultInjectedGpuSenseProvider::new(
-            base_gpu_provider,
-            fault,
-        )));
-    } else {
-        world_gpu.set_sense_provider(Box::new(base_gpu_provider));
-    }
-
-    let mut max_sensor_delta: f32 = 0.0;
-    let mut first_divergence: Option<SenseDivergenceCoordinates> = None;
-    let mut sensor_values_compared = 0_u64;
+    let mut comparison = SenseComparison::default();
 
     for tick in 0..options.tick_count {
-        world_cpu
+        reference
             .step()
             .map_err(|e| SenseParityError::Simulation(format!("{e:?}")))?;
-        world_gpu
+        candidate
             .step()
             .map_err(|e| SenseParityError::Simulation(format!("{e:?}")))?;
 
-        // Compare sensor arrays across all live agents
-        let handles: Vec<AgentId> = world_cpu.agents().iter_handles().collect();
-        for (agent_idx, handle) in handles.into_iter().enumerate() {
-            let cpu_rt = world_cpu.agent_runtime(handle);
-            let gpu_rt = world_gpu.agent_runtime(handle);
-
-            if let (Some(c_rt), Some(g_rt)) = (cpu_rt, gpu_rt) {
-                let uid = world_cpu.agent_uid(handle).map_or(0, |u| u.get());
-                for s in 0..scriptbots_core::INPUT_SIZE {
-                    sensor_values_compared = sensor_values_compared.saturating_add(1);
-                    let c_val = c_rt.sensors[s];
-                    let g_val = g_rt.sensors[s];
-                    let delta = (c_val - g_val).abs();
-                    if delta > max_sensor_delta {
-                        max_sensor_delta = delta;
-                    }
-                    if delta > 0.0 && first_divergence.is_none() {
-                        first_divergence = Some(SenseDivergenceCoordinates {
-                            tick,
-                            agent_uid: uid,
-                            agent_index: agent_idx,
-                            sensor_index: s,
-                            cpu_sensor_value: c_val,
-                            gpu_sensor_value: g_val,
-                            sensor_delta: delta,
-                            cpu_accumulator: None,
-                            gpu_accumulator: None,
-                        });
-                        tracing::warn!(
-                            target: "scriptbots::sense::parity",
-                            tick = tick,
-                            agent_uid = uid,
-                            sensor = s,
-                            cpu_value = c_val,
-                            gpu_value = g_val,
-                            delta = delta,
-                            "Observed first divergence between CPU and GPU sense lanes"
-                        );
-                    }
-                }
-            }
-        }
+        comparison.observe(&reference, &candidate, tick);
     }
+    let SenseComparison {
+        max_sensor_delta,
+        first_divergence,
+        sensor_values_compared,
+    } = comparison;
 
-    let cpu_digest = world_cpu
+    let cpu_digest = reference
         .world_digest_v1()
         .map_err(|error| SenseParityError::Simulation(format!("CPU digest unavailable: {error}")))?
         .overall;
-    let gpu_digest = world_gpu
+    let gpu_digest = candidate
         .world_digest_v1()
         .map_err(|error| SenseParityError::Simulation(format!("GPU digest unavailable: {error}")))?
         .overall;
 
     // Core exposes a lifetime total: adding it again after each tick double-counts.
-    let saturations = world_gpu.sense_saturations_total();
+    let saturations = candidate.sense_saturations_total();
     let dispatches = completed_dispatches.load(Ordering::Relaxed);
     let verdict = if first_divergence.is_none()
         && cpu_digest == gpu_digest
@@ -928,6 +868,28 @@ pub fn run_sense_parity_check(
     report.evidence_digest = compute_evidence_digest(&report)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
 
+    log_parity_report(&report, build.is_some());
+    Ok(report)
+}
+
+fn log_parity_start(
+    options: &SenseParityOptions,
+    adapter_info: &wgpu::AdapterInfo,
+    is_software: bool,
+) {
+    tracing::info!(
+        target: "scriptbots::sense::parity",
+        adapter = %adapter_info.name,
+        backend = ?adapter_info.backend,
+        ticks = options.tick_count,
+        population = options.population,
+        fault_injection = ?options.fault_injection,
+        is_software = is_software,
+        "Starting CPU-vs-GPU sense parity gate"
+    );
+}
+
+fn log_parity_report(report: &SenseLaneParityReport, build_provenance_available: bool) {
     tracing::info!(
         target: "scriptbots::sense::parity",
         verdict = ?report.verdict,
@@ -936,19 +898,141 @@ pub fn run_sense_parity_check(
         dispatches = report.dispatches,
         sensor_values_compared = report.sensor_values_compared,
         saturations = report.saturations,
-        build_provenance_available = build.is_some(),
+        build_provenance_available,
         cpu_digest = %report.cpu_digest,
         gpu_digest = %report.gpu_digest,
         "Completed CPU-vs-GPU sense parity run"
     );
+}
 
-    Ok(report)
+#[derive(Default)]
+struct SenseComparison {
+    max_sensor_delta: f32,
+    first_divergence: Option<SenseDivergenceCoordinates>,
+    sensor_values_compared: u64,
+}
+
+impl SenseComparison {
+    fn observe(&mut self, reference: &WorldState, candidate: &WorldState, tick: u64) {
+        for (agent_idx, handle) in reference.agents().iter_handles().enumerate() {
+            let cpu_rt = reference.agent_runtime(handle);
+            let gpu_rt = candidate.agent_runtime(handle);
+            if let (Some(c_rt), Some(g_rt)) = (cpu_rt, gpu_rt) {
+                let uid = reference
+                    .agent_uid(handle)
+                    .map_or(0, scriptbots_core::AgentUid::get);
+                for s in 0..scriptbots_core::INPUT_SIZE {
+                    self.sensor_values_compared = self.sensor_values_compared.saturating_add(1);
+                    let c_val = c_rt.sensors[s];
+                    let g_val = g_rt.sensors[s];
+                    let delta = (c_val - g_val).abs();
+                    if delta > self.max_sensor_delta {
+                        self.max_sensor_delta = delta;
+                    }
+                    if delta > 0.0 && self.first_divergence.is_none() {
+                        self.first_divergence = Some(SenseDivergenceCoordinates {
+                            tick,
+                            agent_uid: uid,
+                            agent_index: agent_idx,
+                            sensor_index: s,
+                            cpu_sensor_value: c_val,
+                            gpu_sensor_value: g_val,
+                            sensor_delta: delta,
+                            cpu_accumulator: None,
+                            gpu_accumulator: None,
+                        });
+                        tracing::warn!(
+                            target: "scriptbots::sense::parity", tick = tick, agent_uid = uid,
+                            sensor = s, cpu_value = c_val, gpu_value = g_val, delta = delta,
+                            "Observed first divergence between CPU and GPU sense lanes"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct ParityWorlds {
+    reference: WorldState,
+    candidate: WorldState,
+    completed_dispatches: Arc<AtomicU64>,
+}
+
+fn parity_worlds(
+    options: &SenseParityOptions,
+    device: &Arc<wgpu::Device>,
+    queue: &Arc<wgpu::Queue>,
+    adapter_info: &wgpu::AdapterInfo,
+) -> Result<ParityWorlds, SenseParityError> {
+    let population = crate::sense_wgsl::gpu_count("parity population", options.population)?;
+    let config = ScriptBotsConfig {
+        rng_seed: Some(options.seed),
+        ..Default::default()
+    };
+    let mut reference =
+        WorldState::new(config.clone()).map_err(|e| SenseParityError::Simulation(e.to_string()))?;
+    let mut candidate =
+        WorldState::new(config).map_err(|e| SenseParityError::Simulation(e.to_string()))?;
+    for i in 0..population {
+        #[allow(
+            clippy::suboptimal_flops,
+            reason = "Parity fixture coordinates must retain separate multiply/add rounding and the existing fixture digest."
+        )]
+        let x = 100.0 + crate::gpu_scalar(i) * 25.0;
+        #[allow(
+            clippy::suboptimal_flops,
+            reason = "Parity fixture coordinates must retain separate multiply/add rounding and the existing fixture digest."
+        )]
+        let y = 100.0 + crate::gpu_scalar(i) * 20.0;
+        let agent = AgentData {
+            position: Position { x, y },
+            ..AgentData::default()
+        };
+        let _ = reference
+            .try_spawn_agent(agent)
+            .map_err(|e| SenseParityError::Simulation(format!("{e:?}")))?;
+        let _ = candidate
+            .try_spawn_agent(agent)
+            .map_err(|e| SenseParityError::Simulation(format!("{e:?}")))?;
+    }
+    let pipeline = GpuSensePipeline::new(device, adapter_info, PRODUCTION_WORKGROUP_SIZE)?;
+    let base_gpu_provider = GpuSenseProvider::new(Arc::clone(device), Arc::clone(queue), pipeline);
+    let completed_dispatches = Arc::clone(&base_gpu_provider.completed_dispatches);
+    if let Some(fault) = options.fault_injection {
+        candidate.set_sense_provider(Box::new(FaultInjectedGpuSenseProvider::new(
+            base_gpu_provider,
+            fault,
+        )));
+    } else {
+        candidate.set_sense_provider(Box::new(base_gpu_provider));
+    }
+    Ok(ParityWorlds {
+        reference,
+        candidate,
+        completed_dispatches,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::GPU_TEST_MUTEX;
+
+    #[test]
+    fn grid_uniforms_accept_normal_count_and_reject_unrepresentable_count() {
+        let world = WorldState::new(ScriptBotsConfig::default()).expect("valid default world");
+        assert_eq!(make_grid_uniforms(&world, 3).unwrap().agent_count, 3);
+        if let Some(count) = (u32::MAX as usize).checked_add(1) {
+            assert_eq!(
+                make_grid_uniforms(&world, count),
+                Err(GpuSenseError::CountOverflow {
+                    name: "agents",
+                    count
+                })
+            );
+        }
+    }
 
     #[test]
     fn test_sense_report_serialization_roundtrip() {
@@ -965,7 +1049,7 @@ mod tests {
             toolchain_identity: "rustc 1.89".to_string(),
             fixture_digest: "blake3:fixture".to_string(),
             tick_count: 1000,
-            evidence_time_unix_ms: 1700000000000,
+            evidence_time_unix_ms: 1_700_000_000_000,
             evidence_digest: "fe1234".to_string(),
             cpu_digest: "cpu_dig".to_string(),
             gpu_digest: "gpu_dig".to_string(),
@@ -1007,7 +1091,7 @@ mod tests {
             toolchain_identity: "rustc 1.89".to_string(),
             fixture_digest: "blake3:fixture".to_string(),
             tick_count: 1000,
-            evidence_time_unix_ms: 1700000000000,
+            evidence_time_unix_ms: 1_700_000_000_000,
             evidence_digest: "fe1234".to_string(),
             cpu_digest: "cpu_dig".to_string(),
             gpu_digest: "gpu_dig".to_string(),
@@ -1051,27 +1135,23 @@ mod tests {
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-        let adapter =
-            match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        let Ok(adapter) =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: None,
                 force_fallback_adapter: false,
-            })) {
-                Ok(adapter) => adapter,
-                Err(_) => {
-                    eprintln!("Skipping GPU fault injection test: no wgpu adapter available");
-                    return;
-                }
-            };
+            }))
+        else {
+            eprintln!("Skipping GPU fault injection test: no wgpu adapter available");
+            return;
+        };
 
-        let (device, queue) =
-            match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())) {
-                Ok(pair) => pair,
-                Err(_) => {
-                    eprintln!("Skipping GPU fault injection test: request_device failed");
-                    return;
-                }
-            };
+        let Ok((device, queue)) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+        else {
+            eprintln!("Skipping GPU fault injection test: request_device failed");
+            return;
+        };
 
         let device = Arc::new(device);
         let queue = Arc::new(queue);
@@ -1249,6 +1329,7 @@ mod tests {
 
     #[test]
     fn certification_requires_matching_adapter_build_and_observed_exact_parity() {
+        type ReportMutation = (&'static str, fn(&mut SenseLaneParityReport));
         let (report, adapter, build) = exact_report_fixture();
         assert_eq!(
             certified_report_evidence(&report, &adapter, Some(&build)),
@@ -1279,7 +1360,6 @@ mod tests {
                 "equal missing {field} values do not establish an observed identity"
             );
         }
-        type ReportMutation = (&'static str, fn(&mut SenseLaneParityReport));
         let mutations: &[ReportMutation] = &[
             ("same vendor, other name", |r| r.adapter.push_str("-other")),
             ("same name, other vendor", |r| r.vendor += 1),
@@ -1306,12 +1386,12 @@ mod tests {
             ("missing timestamp", |r| r.evidence_time_unix_ms = 0),
             ("software report", |r| r.is_software_adapter = true),
             ("approximate verdict", |r| {
-                r.verdict = SenseDeterminism::Approximate
+                r.verdict = SenseDeterminism::Approximate;
             }),
             ("nonzero delta", |r| r.max_sensor_delta = 0.1),
             ("nonfinite delta", |r| r.max_sensor_delta = f32::NAN),
             ("unequal science", |r| {
-                r.gpu_digest = "abcdef1234567890".to_owned()
+                r.gpu_digest = "abcdef1234567890".to_owned();
             }),
             ("zero science", |r| {
                 r.cpu_digest = "0000000000000000".to_owned();
@@ -1332,7 +1412,7 @@ mod tests {
                     sensor_delta: 1.0,
                     cpu_accumulator: None,
                     gpu_accumulator: None,
-                })
+                });
             }),
         ];
         for (label, mutate) in mutations {
