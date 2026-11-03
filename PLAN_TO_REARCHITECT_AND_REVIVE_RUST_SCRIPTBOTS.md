@@ -2,11 +2,93 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Browser PNG export (2026-11-03):** [Verified contribution — GentleDuck;
+source `2e138b0c88acb79edf8c43a831ec43944a723577`]
+
+Original `bd-2z0.12.3` keeps its owner, open status, dependencies and complete
+acceptance. Remaining browser-matrix/hardware and tooling qualification stay open.
+
+- [x] Refresh ready Beads and inspect production snapshot/render/capture paths.
+- [x] Read actual HostCore publication/revision types and primary browser API
+  guidance; retain the earlier blank-copy limitation without assuming its cause.
+- [x] Restore Canvas as the default under the existing WebGPU reach decision;
+  the earlier automatic default lacked its required browser-matrix measurements.
+  Keep explicit WebGPU/automatic choices and require actual GPU tests to select it.
+- [x] Expose one atomic frame containing the existing world projection and
+  exact canonical host session/publication/control/science/config identities.
+  Preserve the positional postcard world schema; no synthesized tick-as-revision.
+- [x] Verify reads leave science/digests unchanged and distinguish control,
+  scientific and publication revisions, including exact large integer encoding.
+- [x] Add one bounded PNG request; serialize the canvas in the same callback
+  that accepts its frame, without awaiting GPU completion or pausing science.
+- [x] Tie filename/status to the captured frame/backend, retain only bounded
+  request state, and expose serialization errors or world changes explicitly.
+- [x] Avoid redundant paints of an unchanged paused publication; retain no
+  old world/snapshot in the cache, invalidate on world/backend/viewport changes,
+  and force a fresh paint for a waiting capture. Verify actual render-call counts.
+- [x] Decode actual Canvas and WebGPU downloads, compare known geometry and
+  canonical identity, and prove pending requests wait for real admission.
+- [x] Retain negative controls for false metadata, blank capture, delayed
+  serialization/reset and repeated requests; preserve existing clock/stats/fork
+  assertions and distinguish injected controls from actual package execution.
+- [x] Run required workspace gates, focused tests and UBS through DSR on
+  frozen source; review every changed source/test hunk and every gate change.
+- [x] Publish coherent source and repeat decisive browser checks with a fresh
+  package from the exact clean commit; record actual adapter and raw failures.
+- [x] Update original Beads evidence, finish the bounded honesty audit and
+  retire this requested checklist without claiming unobserved hardware proof.
+
+The consumer is a person saving the displayed world. PNG capture must name the
+frame actually rendered, not a later polled state or a canonical WorldDigest.
+
+Frozen final source passes ten of ten checks in
+`browser_export_publish/20261103T232641-3621852`: workspace check, strict Clippy,
+formatting, 31 native web tests plus one existing ignored fixture writer, real
+renderer/export controls, unchanged stats/fork modes, UBS and source binding.
+Committed patch SHA-256 is
+`33baaa1dc4082fd35f937627c00909d593a09264f5427f3dccaff0976af2c6b0`.
+UBS reports zero critical, 534 warning and 652 informational findings over four
+Rust/JS files; no suppression or warning-clean claim. Clean committed source
+passes six of six checks in
+`browser_export_clean_2e138b0c/20261103T232904-3653356`, including a fresh package
+and unchanged clean source before/after. Both required remote tips received it.
+
+Chromium 140.0.7339.16/SwiftShader produces actual 1280x720 PNGs with 8,999
+bright Canvas pixels and 9,344 WebGPU pixels, both at tick/science28 and
+publication12. A held callback keeps tick42/publication26 on the PNG while
+science reaches49/publication32. A busy GPU keeps one submission/stamp31 while
+science advances34 to42, then admits the latest frame. Known geometry PNG
+samples match actual renderer samples. Native read tests preserve the native
+scientific digest; browser checks preserve exported JSON, not WorldDigest.
+
+The old paused source makes 120 render calls for 120 unchanged callbacks;
+the candidate makes zero and redraws once for each resize/restore. This is
+maintenance/resource accounting, not a measured speedup. Initial retry checks
+fail when a native PNG callback arrives after 11.6644 seconds versus the
+unchanged ten-second deadline. Reuse then passes the retry; exact browser
+causality is unproven. Review also finds timeout cannot cancel native encoding:
+old source admits call7 before call6 is acknowledged; final source holds6 to6.
+The corrected contract refuses an unacknowledged retry, then requires actual
+PNG delivery after acknowledgement and ignores a duplicate stale callback.
+This explicitly changes the initially invented immediate-retry expectation;
+it strengthens the real native-work bound without widening a timeout.
+
+Retain initial formatter3/4, browser4/5, both retry diagnostics and both old
+source red controls. Null/throw/identity/reset/timeout/duplicate and pagehide
+cases are declared JS controls, separate from actual GPU device destruction.
+One generated URL remains; the dispatched pagehide control releases it.
+No golden, dependency, science default, skip or complete acceptance changed.
+Source, failed/raw logs, PNGs and the completed solo audit remain at
+`/data/tmp/scriptbots-browser-export-c4j26lUO`. Comments3019/3020 retain the
+original task's evidence. This requested checklist retires here; physical
+hardware, browser-matrix performance and independent verification are unclaimed.
+
 **Browser frame admission (2026-11-03):** [Verified contribution —
 GentleDuck; source `24322c9211525d33aaca9a174d0ab1492f4edeb8`]
 
 Original `bd-2z0.12.3` retains its owner, open status, dependencies and complete
-acceptance. Screenshot/revision export and tooling qualification remain open.
+acceptance. At that handoff screenshot/revision export and tooling qualification
+remained open; the PNG contribution above addresses the software export path.
 
 - [x] Inspect the production queue writer and submitted-snapshot reader:
   `render()` submits every callback without bounding outstanding GPU work;
