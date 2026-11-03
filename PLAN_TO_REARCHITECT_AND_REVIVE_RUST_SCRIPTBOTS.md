@@ -27,7 +27,14 @@ the compiler policy is an enabler, not a new simulation feature.
     integration-test repairs; optional ML inference is not qualified here.
   - [ ] Finish and qualify storage docs, conversions and function seams without
     changing SQL, migration order, transaction boundaries or receipt meanings.
-  - [ ] Finish and qualify world-gfx count validation and existing rendering math.
+  - [x] Finish and qualify world-gfx count validation and existing rendering
+    math in `2054b827ffe575edfdd246aaaafffa98d9d59146`. The initial ten library
+    findings and subsequent 92 unique test/bin findings are repaired. Fresh
+    clean-source DSR passes workspace check, strict all-target Clippy, formatting,
+    all 63 library tests with no ignores or skip messages, shader-payload
+    equality and post-test cleanliness. Five new tests plus a caller-level
+    snapshot negative cover the CPU boundaries; no oversized device execution
+    or hardware-GPU qualification is claimed. The actual adapter is llvmpipe CPU.
   - [ ] Finish and qualify GPUI rendering, Bevy and app consumers.
   - [x] Qualify browser lint inheritance and the observed numeric seed endpoint
     defect: `u64::MAX as f64` is 2^64, so the endpoint must be exclusive. Retain
@@ -60,9 +67,9 @@ the compiler policy is an enabler, not a new simulation feature.
   Initial opt-in is diagnostic work in progress. Publish only qualified coherent
   crate groups; the original task stays open until all 13 members pass. A frozen
   external candidate separates qualification from concurrent unfinished edits.
-  The five unqualified storage/render/world-gfx/app/Bevy manifest opt-ins were
-  diagnostic-only and are not included in the current eight-member candidate.
-  Their unfinished source repairs remain available for subsequent qualification.
+  The five storage/render/world-gfx/app/Bevy manifest opt-ins were initially
+  diagnostic-only and excluded from the eight-member group. World-gfx has
+  since qualified separately; storage/render/app/Bevy remain open.
 - [ ] Keep scientific arithmetic order, digests, codec representations and
   existing expectations unchanged; justify any narrowly retained operation.
 - [ ] Run relevant existing positive/negative tests for actual source changes;
@@ -87,15 +94,16 @@ the compiler policy is an enabler, not a new simulation feature.
     syntax, fresh WASM package, 30 native web tests plus one existing ignored
     fixture writer, both live four-case DOM reports and WASM strict Clippy.
   - [x] Publish the reviewed source on the canonical branch.
-  - [ ] Publish the separate reviewed tracker/TODO snapshot and verify the
+  - [x] Publish the separate reviewed tracker/TODO snapshot and verify the
     canonical and compatibility remote tips after publication.
 
 The first source group is committed as
 `92fb17d8f25030756117b842c1a6998c640e1a66`: eight of 13 members import the
 unchanged lint policy. The four added importers are brain, brain-ml, brain-neuro
 and web; storage, render, world-gfx, app and Bevy remain with this original open
-task. The storage/world-gfx working edits are frozen, unqualified work in
-progress, also retained as `unqualified-storage-gfx.patch` under the proof root.
+task. Those original working edits are retained as `unqualified-storage-gfx.patch`
+under the proof root. World-gfx is now delivered by the separate source above;
+the five storage source files remain unqualified, unpublished work in progress.
 
 Evidence is retained at `/data/tmp/scriptbots-lint-inheritance-rakxl2es`.
 `foundational_round2/20261103T140933-423974` passed all six DSR checks on the
@@ -138,6 +146,33 @@ simulation or performance credit. The original lint task remains open.
 The current read-only cleanup scan found only 32 KiB in two old cleanup-skill
 test fixtures. Those were preserved as evidence. No manual file deletion,
 process termination, VM tuning or disk-reclamation claim accompanies this work.
+
+**World-gfx completion and disk pressure (2026-11-03):** Source `2054b827` brings
+qualified inheritance to nine of 13 members; original `bd-6hb5` remains open.
+Fresh clean-commit DSR `world_gfx_clean_2054b827/20261103T174004-1146875` passes
+seven of seven checks. The precommit combined six-file snapshot also passed
+six of six; UBS reported zero criticals. Independent source review found no
+weakened assertions, changed seeds/goldens or widened certification admission.
+The canonical image check executed on Vulkan llvmpipe CPU. Ten library shader
+constants, the negative probe and triangle demo retain their raw payloads.
+
+The first combined run lost log writes when the filesystem filled and is
+invalid as qualification. Its complete RAM retry and fresh committed-source
+logs are retained in `/dev/shm/scriptbots-disk-pressure-h13w0Q/quality` and copied
+byte-for-byte under the durable proof root's `world-gfx-disk-pressure-evidence`.
+An optional raw-literal analysis initially matched ordinary-word suffixes;
+its corrected declaration-scoped check validates nonempty unchanged
+payloads and rejects every injected payload change. Its original failure stays.
+
+Disk pressure subsequently prevented the final Beads comment export. The last
+complete JSONL still parses and contains only the two expected progress comments
+on `bd-6hb5`; the partial export is preserved. No further BR write was retried.
+Cleanup approval is pending for the exact reviewed list of 49,131 Chromium-named
+temporary files, 24.6 GiB allocated, over 24 hours old and absent from the
+open-file/mapping scan. Selection and metadata are rechecked before deletion;
+this is a snapshot observation, not an atomic same-inode or still-closed
+guarantee. No deletion has run. The manifest and command are in the pending
+confirmation; broader source writes wait for disk headroom.
 
 **Archipelago duration lane (2026-11-03):** [Verified and Closed —
 GentleDuck; original `bd-t3ge`; fresh solo verification]
