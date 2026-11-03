@@ -55,7 +55,7 @@
 
         #sim-canvas {
             width: 100%;
-            height: 100%;
+            height: auto;
             display: block;
         }
 
@@ -121,6 +121,20 @@
 
         .controls input[type="range"] {
             width: 100%;
+        }
+
+        .controls select {
+            padding: 0.6rem;
+            border: 1px solid #334155;
+            border-radius: 0.4rem;
+            color: #e2e8f0;
+            background: #0f172a;
+        }
+
+        #renderer-status {
+            font-size: 0.75rem;
+            color: #94a3b8;
+            overflow-wrap: anywhere;
         }
 
         .controls button {
@@ -242,6 +256,13 @@
                     <dt>Avg Health</dt>
                     <dd id="metric-health">–</dd>
                 </dl>
+                <label for="renderer">Renderer</label>
+                <select id="renderer">
+                    <option value="auto">Automatic (prefer WebGPU)</option>
+                    <option value="canvas">Canvas 2D</option>
+                    <option value="webgpu">WebGPU</option>
+                </select>
+                <div id="renderer-status" role="status" aria-live="polite">Starting renderer…</div>
                 <label>
                     Simulation speed (0 pauses)
                     <input id="steps-per-frame" type="range" min="0" max="8" step="1" value="2" />

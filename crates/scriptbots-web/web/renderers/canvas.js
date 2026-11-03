@@ -2,6 +2,7 @@ export class CanvasRenderer {
   constructor(canvas) {
     this.canvas = canvas;
     this.ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
+    if (!this.ctx) throw new Error("Canvas 2D is unavailable");
     this.clearColor = "#0b1120";
   }
 

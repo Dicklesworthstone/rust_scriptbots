@@ -1,4 +1,6 @@
 import initWasm, * as wasm from "./pkg/scriptbots_web.js";
+import { CanvasRenderer } from "./renderers/canvas.js";
+import { WebGpuRenderer } from "./renderers/webgpu.js";
 
 const {
   init_sim,
@@ -12,8 +14,11 @@ const {
   check_build_match,
 } = wasm;
 
-const canvas = document.getElementById("sim-canvas");
-const ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
+let canvas = document.getElementById("sim-canvas");
+const rendererSelect = document.getElementById("renderer");
+const rendererStatus = document.getElementById("renderer-status");
+let renderer = null;
+let rendererGeneration = 0;
 const fpsEl = document.getElementById("metric-fps");
 const tpsEl = document.getElementById("metric-tps");
 const tickEl = document.getElementById("metric-tick");
@@ -110,35 +115,65 @@ function resetPerformanceWindows() {
   perfWindow.lastLog = now;
 }
 
-function scaleFactor(world) {
-  return {
-    x: canvas.width / world.width,
-    y: canvas.height / world.height,
-  };
+function reportRendererFailure(error) {
+  rendererStatus.textContent = `Rendering unavailable: ${error.message}`;
+  appendLog(rendererStatus.textContent);
 }
 
+async function selectRenderer(preference, fallbackReason = null) {
+  const generation = ++rendererGeneration;
+  // A canvas cannot switch context kinds. Prepare a replacement while the
+  // current renderer keeps presenting the latest snapshot.
+  let nextCanvas = canvas.cloneNode(false);
+  let nextRenderer = null;
+  let backend = "canvas";
+  if (preference !== "canvas") {
+    rendererStatus.textContent = `${rendererStatus.dataset.renderer === "webgpu" ? "WebGPU" : "Canvas 2D"} — starting WebGPU…`;
+    try {
+      nextRenderer = await WebGpuRenderer.create(nextCanvas, (reason) => {
+        if (renderer === nextRenderer) {
+          void selectRenderer("canvas", reason).catch(reportRendererFailure);
+        }
+      });
+      backend = "webgpu";
+    } catch (error) {
+      fallbackReason = `WebGPU unavailable: ${error.message}`;
+      // Creation may already have acquired a WebGPU context.
+      nextCanvas = canvas.cloneNode(false);
+    }
+  }
+  if (!nextRenderer) nextRenderer = new CanvasRenderer(nextCanvas);
+  if (generation !== rendererGeneration) {
+    nextRenderer.destroy();
+    return;
+  }
+  renderer?.destroy();
+  canvas.replaceWith(nextCanvas);
+  canvas = nextCanvas;
+  renderer = nextRenderer;
+  rendererStatus.dataset.renderer = backend;
+  delete rendererStatus.dataset.snapshotTick;
+  rendererStatus.textContent = backend === "webgpu" ? "WebGPU" : "Canvas 2D";
+  if (fallbackReason) {
+    rendererStatus.textContent += ` — ${fallbackReason}`;
+    appendLog(`Renderer fallback: ${fallbackReason}`);
+  }
+}
+
+rendererSelect.addEventListener("change", () => {
+  void selectRenderer(rendererSelect.value).catch(reportRendererFailure);
+});
+
 function drawSnapshot(snapshot) {
-  ctx.fillStyle = "#0b1120";
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-  const scale = scaleFactor(snapshot.world);
-
-  for (const agent of snapshot.agents) {
-    const px = agent.position[0] * scale.x;
-    const py = agent.position[1] * scale.y;
-    const radius = Math.max(1.5, 3.5 * Math.sqrt(agent.health + 0.15));
-
-    ctx.beginPath();
-    ctx.fillStyle = `rgba(${Math.round(agent.color[0] * 255)}, ${Math.round(agent.color[1] * 255)}, ${Math.round(agent.color[2] * 255)}, 0.9)`;
-    ctx.arc(px, py, radius, 0, Math.PI * 2);
-    ctx.fill();
-
-    if (agent.boost) {
-      ctx.beginPath();
-      ctx.strokeStyle = "rgba(30, 144, 255, 0.65)";
-      ctx.lineWidth = 1.2;
-      ctx.arc(px, py, radius + 2.0, 0, Math.PI * 2);
-      ctx.stroke();
+  if (!renderer) return;
+  try {
+    renderer.render(snapshot);
+    rendererStatus.dataset.snapshotTick = String(snapshot.tick);
+  } catch (error) {
+    if (rendererStatus.dataset.renderer === "webgpu") {
+      void selectRenderer("canvas", `WebGPU stopped: ${error.message}`).catch(reportRendererFailure);
+    } else {
+      throw error;
     }
   }
 }
@@ -248,48 +283,44 @@ function pumpSimulation() {
   simulationTimer = setTimeout(pumpSimulation, 1000 / 60);
 }
 
+function bannerLine(parent, text, className = "") {
+  const line = document.createElement("div");
+  line.className = className;
+  line.textContent = text;
+  parent.append(line);
+  return line;
+}
+
 function updateMismatchBanner(matchResult) {
   if (!mismatchBannerEl) return;
 
   if (!matchResult || matchResult.status === "exact") {
     mismatchBannerEl.className = "";
     mismatchBannerEl.style.display = "none";
-    mismatchBannerEl.innerHTML = "";
+    mismatchBannerEl.replaceChildren();
     return;
   }
 
-  if (matchResult.status === "compatible") {
-    mismatchBannerEl.className = "banner-compatible";
-    mismatchBannerEl.style.display = "block";
-    mismatchBannerEl.innerHTML = `
-            <div class="banner-title">
-                <span>&#9432;</span>
-                <span>Compatible Build Note</span>
-            </div>
-            <div>This world was recorded on a compatible build. Toolchain or lockfile differ, but core simulation digest matches.</div>
-            <div class="banner-details">
-                <div>Link Build: toolchain=${matchResult.link_toolchain_digest}, lockfile=${matchResult.link_lockfile_digest}, core=${matchResult.link_core_digest}</div>
-                <div>Running Build: toolchain=${matchResult.local_toolchain_digest}, lockfile=${matchResult.local_lockfile_digest}, core=${matchResult.local_core_digest}</div>
-            </div>
-        `;
-    return;
-  }
-
-  if (matchResult.status === "mismatch") {
-    mismatchBannerEl.className = "banner-mismatch";
-    mismatchBannerEl.style.display = "block";
-    mismatchBannerEl.innerHTML = `
-            <div class="banner-title">
-                <span>&#9888;</span>
-                <span>Build Mismatch Warning</span>
-            </div>
-            <div>This world was recorded on a different build (core digest ${matchResult.link_core_digest}). You are on build (core digest ${matchResult.local_core_digest}). Trajectories may diverge after tick 0.</div>
-            <div class="banner-details">
-                <div>Link Build: toolchain=${matchResult.link_toolchain_digest}, lockfile=${matchResult.link_lockfile_digest}, core=${matchResult.link_core_digest}</div>
-                <div>Running Build: toolchain=${matchResult.local_toolchain_digest}, lockfile=${matchResult.local_lockfile_digest}, core=${matchResult.local_core_digest}</div>
-                <div style="margin-top: 0.35rem; font-style: italic; opacity: 0.85;">Cross-target floating point equivalence between native and WebAssembly is an open research area (bd-2wj).</div>
-            </div>
-        `;
+  if (matchResult.status !== "compatible" && matchResult.status !== "mismatch") return;
+  const compatible = matchResult.status === "compatible";
+  mismatchBannerEl.replaceChildren();
+  mismatchBannerEl.className = compatible ? "banner-compatible" : "banner-mismatch";
+  mismatchBannerEl.style.display = "block";
+  const title = bannerLine(mismatchBannerEl, "", "banner-title");
+  const icon = document.createElement("span");
+  icon.textContent = compatible ? "ⓘ" : "⚠";
+  const titleText = document.createElement("span");
+  titleText.textContent = compatible ? "Compatible Build Note" : "Build Mismatch Warning";
+  title.append(icon, titleText);
+  bannerLine(mismatchBannerEl, compatible
+    ? "This world was recorded on a compatible build. Toolchain or lockfile differ, but core simulation digest matches."
+    : `This world was recorded on a different build (core digest ${matchResult.link_core_digest}). You are on build (core digest ${matchResult.local_core_digest}). Trajectories may diverge after tick 0.`);
+  const details = bannerLine(mismatchBannerEl, "", "banner-details");
+  bannerLine(details, `Link Build: toolchain=${matchResult.link_toolchain_digest}, lockfile=${matchResult.link_lockfile_digest}, core=${matchResult.link_core_digest}`);
+  bannerLine(details, `Running Build: toolchain=${matchResult.local_toolchain_digest}, lockfile=${matchResult.local_lockfile_digest}, core=${matchResult.local_core_digest}`);
+  if (!compatible) {
+    const note = bannerLine(details, "Cross-target floating point equivalence between native and WebAssembly is an open research area (bd-2wj).");
+    note.style.cssText = "margin-top: 0.35rem; font-style: italic; opacity: 0.85;";
   }
 }
 
@@ -575,6 +606,11 @@ async function resetSimulation(populationOverride) {
 async function bootstrap() {
   try {
     await initWasm();
+    // GPU initialization must not hold up science or the first visible frame.
+    await selectRenderer("canvas");
+    if (rendererSelect.value !== "canvas") {
+      void selectRenderer(rendererSelect.value).catch(reportRendererFailure);
+    }
     const tag = version ? version() : "unknown";
     if (versionEl) {
       versionEl.textContent = tag;

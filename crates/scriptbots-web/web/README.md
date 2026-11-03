@@ -1,6 +1,7 @@
 # ScriptBots Web Demo Harness
 
-Thin Canvas harness for exercising the `scriptbots-web` WASM bindings. The setup
+Browser harness for exercising the `scriptbots-web` WASM bindings with Canvas
+2D or WebGPU. The setup
 uses the produced browser package and a static server. It requires no bundler or
 package-manager installation.
 
@@ -47,14 +48,45 @@ The pinned DSR profile can select its provisioned Chrome binary with
   policy and logs actual skipped tick opportunities. This main-thread adapter
   cannot guarantee deadlines when the browser suspends or blocks JavaScript.
 - **Population**: select the spawn count used the next time you reset. The wander brain offers immediate motion for visual feedback.
-- The demo uses JSON snapshots and Canvas 2D. Binary bindings and the renderer
-  prototypes are separate from its current controls.
+- **Renderer**: Automatic prefers WebGPU and falls back to Canvas 2D. You can
+  also select either backend explicitly. Canvas presents immediately while
+  WebGPU initializes, so a delayed device cannot block simulation startup.
+  Missing support, adapter/device
+  creation failure and device loss fall back visibly to Canvas; the status and
+  log retain the reason. Changing renderer keeps the current simulation.
+  Both backends scale world positions to the canvas and draw circular agents
+  with boost rings. The canvas keeps its intrinsic aspect ratio when displayed
+  beside the controls. The demo consumes one latest JSON snapshot per paint;
+  binary bindings are separate from these controls.
 - **Reset Simulation**: reseeds with a fresh RNG seed and reuses the slider settings. A rolling 5-second performance log is appended to the console pane (`FPS`, `TPS`, population).
 - Runtime brain presets can be toggled programmatically via `registerBrain("wander" | "mlp" | "none")` on the `SimHandle`.
 
 Snapshots returned to JS follow the selected `snapshot_format` (defaults to JSON). To switch to binary snapshots (Postcard-encoded `Uint8Array`), pass `snapshot_format: "binary"` to `init_sim`.
 
 The log pane (bottom of the sidebar) captures bootstrap and performance events so that ad-hoc benchmarking runs can be recorded while iterating on the renderer.
+
+The renderer status exposes `data-snapshot-tick` for the snapshot submitted to
+the current backend. It is not a GPU presentation acknowledgement. The active
+backend is in `data-renderer`; the selector retains the user's preference when
+a device failure causes fallback.
+
+Inside a pinned DSR profile, the existing stats test can separately exercise
+real WebGPU/Canvas geometry, resizing, explicit capability failures and actual
+device destruction:
+
+```bash
+SCRIPTBOTS_WEB_RENDERER_TESTS=1 \
+  SCRIPTBOTS_WASM_PACKAGE_DIR=/absolute/fresh/scriptbots-web-package \
+  SCRIPTBOTS_WASM_PROOF_DIR=/absolute/existing/dsr-proof \
+  bun crates/scriptbots-web/web/tests/stats_dom.test.js
+```
+
+This lane requires WebGPU rather than skipping when it is unavailable. It uses
+Chromium's SwiftShader flags, records the actual adapter and retains screenshots.
+Known geometry is rendering proof; the same packaged app also checks that
+backend changes/device loss preserve its paused exported snapshot. This is
+software-adapter coverage, not hardware qualification or a performance result.
+The ordinary stats mode retains its separate four-case contract.
 
 For determinism validation, run the accompanying WASM parity test:
 

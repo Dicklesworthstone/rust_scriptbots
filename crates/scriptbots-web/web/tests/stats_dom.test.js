@@ -156,6 +156,9 @@ function createServer(packageInfo) {
     } else if (url.pathname === "/main.js") {
       res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8" });
       res.end(fs.readFileSync(path.join(webDir, "main.js")));
+    } else if (["/renderers/canvas.js", "/renderers/webgpu.js"].includes(url.pathname)) {
+      res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8" });
+      res.end(fs.readFileSync(path.join(webDir, url.pathname.slice(1))));
     } else if (url.pathname.startsWith("/pkg/")
         && (url.pathname === "/pkg/package.json" || Object.hasOwn(packageInfo.files, url.pathname.slice(5)))) {
       const file = url.pathname.slice(5);
@@ -179,6 +182,184 @@ async function installPausedClock(context) {
   await context.clock.pauseAt(epoch + 1_000);
 }
 
+async function runRendererTests(browser, baseUrl) {
+  const proof = fs.mkdtempSync(path.join(process.env.SCRIPTBOTS_WASM_PROOF_DIR || "/tmp", "renderer-"));
+  const paintedPixels = (page) => page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => {
+    const canvas = document.getElementById("sim-canvas");
+    const copy = document.createElement("canvas");
+    copy.width = canvas.width;
+    copy.height = canvas.height;
+    const ctx = copy.getContext("2d");
+    ctx.drawImage(canvas, 0, 0);
+    const bytes = ctx.getImageData(0, 0, copy.width, copy.height).data;
+    let colored = 0;
+    for (let offset = 0; offset < bytes.length; offset += 4) {
+      if (bytes[offset] > 30 || bytes[offset + 1] > 35 || bytes[offset + 2] > 50) colored += 1;
+    }
+    resolve(colored);
+  })));
+  const context = await browser.newContext();
+  const errors = [];
+  const page = await context.newPage();
+  page.on("pageerror", (error) => errors.push(error.message));
+  await context.addInitScript(() => {
+    if (typeof GPUAdapter === "undefined") throw new Error("Actual WebGPU is required for this lane");
+    const requestDevice = GPUAdapter.prototype.requestDevice;
+    GPUAdapter.prototype.requestDevice = async function (...args) {
+      window.__rendererAdapter = {
+        vendor: this.info.vendor, architecture: this.info.architecture,
+        device: this.info.device, description: this.info.description,
+      };
+      const device = await requestDevice.apply(this, args);
+      window.__rendererDevice = device;
+      return device;
+    };
+  });
+  await page.goto(baseUrl);
+  // Known render inputs exercise the actual production modules and real GPU;
+  // they are geometry fixtures, not simulation or hardware-qualification proof.
+  const geometry = await page.evaluate(async () => {
+    const { WebGpuRenderer } = await import("/renderers/webgpu.js");
+    const { CanvasRenderer } = await import("/renderers/canvas.js");
+    const results = {};
+    for (const backend of ["canvas", "webgpu"]) {
+      const canvas = document.createElement("canvas");
+      canvas.width = 1280;
+      canvas.height = 720;
+      const renderer = backend === "webgpu" ? await WebGpuRenderer.create(canvas) : new CanvasRenderer(canvas);
+      const snapshot = {
+        tick: 0, world: { width: 2560, height: 1440 },
+        agents: [
+          { position: [640, 360], health: 1, color: [0.2, 0.8, 0.2], boost: true },
+          { position: [1280, 720], health: 1, color: [0.9, 0.1, 0.1], boost: false },
+        ],
+      };
+      const read = async (input, points) => {
+        renderer.render(input);
+        if (renderer.device) await renderer.device.queue.onSubmittedWorkDone();
+        const copy = document.createElement("canvas");
+        copy.width = canvas.width;
+        copy.height = canvas.height;
+        const ctx = copy.getContext("2d");
+        ctx.drawImage(canvas, 0, 0);
+        return points.map(([x, y]) => Array.from(ctx.getImageData(x, y, 1, 1).data));
+      };
+      try {
+        const pixels = await read(snapshot, [[320, 180], [640, 360], [644, 364], [325, 180]]);
+        const [green, red, corner, ring] = pixels;
+        if (green[1] <= green[0] + 70 || red[0] <= red[1] + 70
+            || corner[0] > 15 || corner[1] > 22 || corner[2] > 38
+            || ring[2] <= ring[0] + 70) {
+          throw new Error(`${backend} failed world scaling, circular body or boost ring: ${JSON.stringify(pixels)}`);
+        }
+        const empty = await read({ ...snapshot, agents: [] }, [[320, 180]]);
+        if (empty[0][0] > 15 || empty[0][1] > 22 || empty[0][2] > 38 || empty[0][3] !== 255) {
+          throw new Error(`${backend} did not clear an empty frame: ${empty}`);
+        }
+        // Grow beyond both the initial256-agent and subsequent512-agent buffers.
+        await read({ ...snapshot, agents: Array(513).fill(snapshot.agents[0]) }, [[320, 180]]);
+        canvas.width = 512;
+        canvas.height = 256;
+        const resized = await read(snapshot, [[128, 64], [256, 128]]);
+        if (resized[0][1] <= resized[0][0] + 70 || resized[1][0] <= resized[1][1] + 70) {
+          throw new Error(`${backend} did not rescale after resize: ${resized}`);
+        }
+        let capacityError = null;
+        if (renderer.device) {
+          try { renderer.ensureAgentCapacity(Number.MAX_SAFE_INTEGER); }
+          catch (error) { capacityError = String(error); }
+          if (!capacityError?.includes("exceeds WebGPU capacity")) throw new Error("Missing host capacity refusal");
+        }
+        results[backend] = { pixels, empty, resized, growthAgents: 513, capacityError };
+      } finally {
+        renderer.destroy();
+      }
+    }
+    return results;
+  });
+  await page.waitForFunction(() => document.getElementById("renderer-status")?.dataset.renderer === "webgpu");
+  const aspect = await page.evaluate(() => {
+    const canvas = document.getElementById("sim-canvas");
+    const bounds = canvas.getBoundingClientRect();
+    return { displayed: bounds.width / bounds.height, intrinsic: canvas.width / canvas.height };
+  });
+  if (Math.abs(aspect.displayed - aspect.intrinsic) > 0.01) throw new Error(`Canvas CSS stretches the world: ${JSON.stringify(aspect)}`);
+  await page.evaluate(async () => {
+    const wasm = await import("/pkg/scriptbots_web.js");
+    const snapshot = wasm.SimHandle.prototype.snapshot;
+    wasm.SimHandle.prototype.snapshot = function () {
+      window.__rendererSim = this;
+      return snapshot.call(this);
+    };
+  });
+  await page.evaluate(() => {
+    const speed = document.getElementById("steps-per-frame");
+    speed.value = "0";
+    speed.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  await page.waitForFunction(() => !!document.getElementById("renderer-status").dataset.snapshotTick);
+  const pausedTick = await page.getAttribute("#renderer-status", "data-snapshot-tick");
+  const snapshotBefore = await page.evaluate(() => JSON.stringify(window.__rendererSim.snapshot()));
+  if (String(JSON.parse(snapshotBefore).tick) !== pausedTick) throw new Error("Renderer snapshot tick differs from live host");
+  await page.selectOption("#renderer", "canvas");
+  await page.waitForFunction(() => document.getElementById("renderer-status").dataset.renderer === "canvas"
+    && !!document.getElementById("renderer-status").dataset.snapshotTick);
+  await page.locator("#sim-canvas").screenshot({ path: path.join(proof, "main-canvas.png") });
+  if (await page.evaluate(() => JSON.stringify(window.__rendererSim.snapshot())) !== snapshotBefore) throw new Error("Canvas switch changed exported snapshot");
+  await page.selectOption("#renderer", "webgpu");
+  await page.waitForFunction(() => document.getElementById("renderer-status").dataset.renderer === "webgpu"
+    && !!document.getElementById("renderer-status").dataset.snapshotTick);
+  await page.locator("#sim-canvas").screenshot({ path: path.join(proof, "main-webgpu.png") });
+  const gpuPaintedPixels = await paintedPixels(page);
+  if (gpuPaintedPixels <= 0) throw new Error("Selected WebGPU backend painted no agents");
+  if (await page.evaluate(() => JSON.stringify(window.__rendererSim.snapshot())) !== snapshotBefore) throw new Error("GPU switch changed exported snapshot");
+  const adapter = await page.evaluate(() => window.__rendererAdapter);
+  await page.evaluate(async () => {
+    const device = window.__rendererDevice;
+    device.destroy();
+    await device.lost;
+  });
+  await page.waitForFunction(() => document.getElementById("renderer-status").dataset.renderer === "canvas"
+    && document.getElementById("renderer-status").textContent.includes("device lost")
+    && !!document.getElementById("renderer-status").dataset.snapshotTick);
+  await page.locator("#sim-canvas").screenshot({ path: path.join(proof, "main-device-lost.png") });
+  const lostPaintedPixels = await paintedPixels(page);
+  if (lostPaintedPixels <= 0) throw new Error("Device loss fallback painted no agents");
+  if (await page.evaluate(() => JSON.stringify(window.__rendererSim.snapshot())) !== snapshotBefore) throw new Error("Device loss changed exported snapshot");
+  await context.close();
+  const fallbacks = {};
+  for (const failure of ["unavailable", "adapter-null", "requestDevice-rejected", "requestDevice-pending"]) {
+    const fallbackContext = await browser.newContext();
+    const fallbackPage = await fallbackContext.newPage();
+    fallbackPage.on("pageerror", (error) => errors.push(error.message));
+    await fallbackContext.addInitScript((mode) => {
+      if (mode === "unavailable") Object.defineProperty(navigator, "gpu", { value: undefined });
+      else if (mode === "adapter-null") Object.defineProperty(navigator, "gpu", { value: { requestAdapter: async () => null } });
+      else if (mode === "requestDevice-pending") GPUAdapter.prototype.requestDevice = () => new Promise(() => {});
+      else GPUAdapter.prototype.requestDevice = async () => { throw new Error("intentional device creation refusal"); };
+    }, failure);
+    await fallbackPage.goto(baseUrl);
+    await fallbackPage.waitForFunction(() => document.getElementById("renderer-status").dataset.renderer === "canvas"
+      && Number(document.getElementById("renderer-status").dataset.snapshotTick) > 0);
+    const status = await fallbackPage.textContent("#renderer-status");
+    const expected = { unavailable: "not supported", "adapter-null": "Unable to acquire GPU adapter",
+      "requestDevice-rejected": "intentional device creation refusal", "requestDevice-pending": "starting WebGPU" }[failure];
+    if (!status.includes(expected)) throw new Error(`Fallback hid its cause: ${status}`);
+    const painting = await paintedPixels(fallbackPage);
+    if (painting <= 0) throw new Error(`Fallback had no painted agents: ${failure}`);
+    fallbacks[failure] = { status, paintedPixels: painting };
+    await fallbackPage.locator("#sim-canvas").screenshot({ path: path.join(proof, `${failure}.png`) });
+    await fallbackContext.close();
+  }
+  if (errors.length !== 0) throw new Error(`Renderer page errors: ${JSON.stringify(errors)}`);
+  const result = { schema: "scriptbots.browser-renderers.v1", status: "pass", browser: browser.version(), adapter,
+    geometry, aspect, pausedTick, exportedSnapshotSha256: createHash("sha256").update(snapshotBefore).digest("hex"),
+    gpuPaintedPixels, lostPaintedPixels, deviceLoss: "actual GPUDevice.destroy, followed by Canvas painting", fallbacks, errors, proof };
+  console.log(JSON.stringify(result));
+  return true;
+}
+
 async function runTests() {
   const observations = {
     camelCasePositive: null,
@@ -198,9 +379,12 @@ async function runTests() {
   const browser = await chromium.launch({
     headless: true,
     executablePath: process.env.SCRIPTBOTS_CHROMIUM_EXECUTABLE || undefined,
+    args: process.env.SCRIPTBOTS_WEB_RENDERER_TESTS === "1"
+      ? ["--enable-unsafe-webgpu", "--use-angle=swiftshader", "--enable-features=Vulkan", "--use-vulkan=swiftshader", "--disable-vulkan-surface"] : [],
   });
 
   try {
+    if (process.env.SCRIPTBOTS_WEB_RENDERER_TESTS === "1") return await runRendererTests(browser, baseUrl);
     // =========================================================================
     // Test 1: Production camelCase Contract & Multiple Window TPS Deltas
     // =========================================================================

@@ -2,14 +2,14 @@ const WGSL_SOURCE = /* wgsl */ `
 struct ViewUniforms {
     canvas : vec2<f32>,
     padding : vec2<f32>,
-};
+}
 
 struct Agent {
-    position : vec2<f32>;
-    radius : f32;
-    pad0 : f32;
-    color : vec4<f32>;
-};
+    position : vec2<f32>,
+    radius : f32,
+    pad0 : f32,
+    color : vec4<f32>,
+}
 
 @group(0) @binding(0)
 var<uniform> view : ViewUniforms;
@@ -18,9 +18,12 @@ var<uniform> view : ViewUniforms;
 var<storage, read> agents : array<Agent>;
 
 struct VertexOutput {
-    @builtin(position) position : vec4<f32>;
-    @location(0) color : vec3<f32>;
-};
+    @builtin(position) position : vec4<f32>,
+    @location(0) color : vec3<f32>,
+    @location(1) offset : vec2<f32>,
+    @location(2) @interpolate(flat) radius : f32,
+    @location(3) @interpolate(flat) boost : f32,
+}
 
 @vertex
 fn vs(@builtin(vertex_index) vertexIndex : u32,
@@ -36,20 +39,32 @@ fn vs(@builtin(vertex_index) vertexIndex : u32,
 
     let agent = agents[instanceIndex];
     let corner = positions[vertexIndex];
-    let radius = agent.radius;
-    let world = agent.position + corner * radius;
+    let extent = agent.radius + select(0.0, 2.6, agent.color.a > 0.5);
+    let offset = corner * extent;
+    let world = agent.position + offset;
     let clip_x = (world.x / view.canvas.x) * 2.0 - 1.0;
     let clip_y = 1.0 - (world.y / view.canvas.y) * 2.0;
 
     var output : VertexOutput;
     output.position = vec4<f32>(clip_x, clip_y, 0.0, 1.0);
     output.color = agent.color.rgb;
+    output.offset = offset;
+    output.radius = agent.radius;
+    output.boost = agent.color.a;
     return output;
 }
 
 @fragment
 fn fs(input : VertexOutput) -> @location(0) vec4<f32> {
-    return vec4<f32>(input.color, 0.95);
+    let distance = length(input.offset);
+    if (distance <= input.radius) {
+        return vec4<f32>(input.color, 0.9);
+    }
+    if (input.boost > 0.5 && abs(distance - input.radius - 2.0) <= 0.6) {
+        return vec4<f32>(30.0 / 255.0, 144.0 / 255.0, 1.0, 0.65);
+    }
+    discard;
+    return vec4<f32>(0.0);
 }
 `;
 
@@ -63,7 +78,7 @@ export class WebGpuRenderer {
     return typeof navigator !== "undefined" && navigator.gpu !== undefined;
   }
 
-  static async create(canvas) {
+  static async create(canvas, onFailure = () => {}) {
     if (!(await WebGpuRenderer.isSupported())) {
       throw new Error("WebGPU not supported in this environment");
     }
@@ -73,75 +88,85 @@ export class WebGpuRenderer {
       throw new Error("Unable to acquire GPU adapter");
     }
     const device = await adapter.requestDevice();
-    const context = canvas.getContext("webgpu");
-    if (!context) {
-      throw new Error("Failed to acquire WebGPU context");
-    }
+    let context = null;
+    try {
+      context = canvas.getContext("webgpu");
+      if (!context) throw new Error("Failed to acquire WebGPU context");
 
-    const format = navigator.gpu.getPreferredCanvasFormat();
-    context.configure({
-      device,
-      format,
-      alphaMode: "opaque",
-    });
+      const format = navigator.gpu.getPreferredCanvasFormat();
+      context.configure({ device, format, alphaMode: "opaque" });
 
-    const shaderModule = device.createShaderModule({ code: WGSL_SOURCE });
-    const pipeline = device.createRenderPipeline({
-      layout: "auto",
-      vertex: {
-        module: shaderModule,
-        entryPoint: "vs",
-      },
-      fragment: {
-        module: shaderModule,
-        entryPoint: "fs",
-        targets: [
-          {
-            format,
-            blend: {
-              color: {
-                srcFactor: "src-alpha",
-                dstFactor: "one-minus-src-alpha",
-                operation: "add",
-              },
-              alpha: {
-                srcFactor: "one",
-                dstFactor: "one-minus-src-alpha",
-                operation: "add",
+      const shaderModule = device.createShaderModule({ code: WGSL_SOURCE });
+      const compilation = await shaderModule.getCompilationInfo();
+      const shaderErrors = compilation.messages.filter((message) => message.type === "error");
+      if (shaderErrors.length > 0) {
+        const details = shaderErrors.map((message) => `${message.lineNum}:${message.linePos} ${message.message}`);
+        throw new Error(`WebGPU shader: ${details.join("; ")}`);
+      }
+      const pipeline = await device.createRenderPipelineAsync({
+        layout: "auto",
+        vertex: {
+          module: shaderModule,
+          entryPoint: "vs",
+        },
+        fragment: {
+          module: shaderModule,
+          entryPoint: "fs",
+          targets: [
+            {
+              format,
+              blend: {
+                color: {
+                  srcFactor: "src-alpha",
+                  dstFactor: "one-minus-src-alpha",
+                  operation: "add",
+                },
+                alpha: {
+                  srcFactor: "one",
+                  dstFactor: "one-minus-src-alpha",
+                  operation: "add",
+                },
               },
             },
-          },
-        ],
-      },
-      primitive: {
-        topology: "triangle-list",
-      },
-    });
+          ],
+        },
+        primitive: { topology: "triangle-list" },
+      });
 
-    const viewUniformBuffer = device.createBuffer({
-      size: 16,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
+      const viewUniformBuffer = device.createBuffer({
+        size: 16,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
 
-    const renderer = new WebGpuRenderer(
-      canvas,
-      device,
-      context,
-      pipeline,
-      viewUniformBuffer,
-      format,
-    );
-    renderer.updateViewUniform();
-    return renderer;
+      const renderer = new WebGpuRenderer(canvas, device, context, pipeline, viewUniformBuffer, format, onFailure);
+      renderer.updateViewUniform();
+      return renderer;
+    } catch (error) {
+      context?.unconfigure();
+      device.destroy();
+      throw error;
+    }
   }
 
-  constructor(canvas, device, context, pipeline, viewUniformBuffer, format) {
+  constructor(canvas, device, context, pipeline, viewUniformBuffer, format, onFailure) {
     this.canvas = canvas;
     this.device = device;
     this.context = context;
     this.pipeline = pipeline;
     this.viewUniformBuffer = viewUniformBuffer;
     this.format = format;
+    this.disposed = false;
+    this.failure = null;
+    const fail = (reason) => {
+      if (this.disposed || this.failure) return;
+      this.failure = reason;
+      onFailure(reason);
+    };
+    device.lost.then((info) => fail(`WebGPU device lost: ${info.message || info.reason}`));
+    device.addEventListener("uncapturederror", (event) => {
+      event.preventDefault();
+      fail(`WebGPU error: ${event.error.message}`);
+    });
 
     this.agentCapacity = 0;
     this.agentArray = new Float32Array();
@@ -161,26 +186,34 @@ export class WebGpuRenderer {
   }
 
   ensureAgentCapacity(count) {
-    if (count <= this.agentCapacity) {
-      return;
+    const maxAgents = Math.floor(Math.min(
+      this.device.limits.maxBufferSize,
+      this.device.limits.maxStorageBufferBindingSize,
+    ) / AGENT_STRIDE_ALIGNED);
+    if (!Number.isSafeInteger(count) || count < 0 || count > maxAgents) {
+      throw new RangeError(`Agent count ${count} exceeds WebGPU capacity ${maxAgents}`);
     }
-    let capacity = this.agentCapacity === 0 ? 256 : this.agentCapacity;
+    if (count <= this.agentCapacity) return;
+    let capacity = Math.min(maxAgents, this.agentCapacity === 0 ? 256 : this.agentCapacity);
     while (capacity < count) {
-      capacity *= 2;
+      capacity = Math.min(capacity * 2, maxAgents);
     }
     const bufferSize = capacity * AGENT_STRIDE_ALIGNED;
-    this.agentBuffer = this.device.createBuffer({
+    const agentBuffer = this.device.createBuffer({
       size: bufferSize,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     });
-    this.agentArray = new Float32Array((AGENT_STRIDE_ALIGNED / FLOAT_BYTES) * capacity);
-    this.bindGroup = this.device.createBindGroup({
+    const bindGroup = this.device.createBindGroup({
       layout: this.pipeline.getBindGroupLayout(0),
       entries: [
         { binding: 0, resource: { buffer: this.viewUniformBuffer } },
-        { binding: 1, resource: { buffer: this.agentBuffer } },
+        { binding: 1, resource: { buffer: agentBuffer } },
       ],
     });
+    this.agentBuffer?.destroy();
+    this.agentBuffer = agentBuffer;
+    this.agentArray = new Float32Array((AGENT_STRIDE_ALIGNED / FLOAT_BYTES) * capacity);
+    this.bindGroup = bindGroup;
     this.agentCapacity = capacity;
   }
 
@@ -188,6 +221,7 @@ export class WebGpuRenderer {
     if (!snapshot) {
       return;
     }
+    if (this.disposed || this.failure) throw new Error(this.failure || "Renderer was destroyed");
 
     this.updateViewUniform();
     const agents = snapshot.agents;
@@ -199,12 +233,14 @@ export class WebGpuRenderer {
     }
 
     const floatsPerAgent = AGENT_STRIDE_ALIGNED / FLOAT_BYTES;
+    const scaleX = this.canvas.width / snapshot.world.width;
+    const scaleY = this.canvas.height / snapshot.world.height;
     for (let i = 0; i < agents.length; i += 1) {
       const base = i * floatsPerAgent;
       const agent = agents[i];
       const radius = Math.max(1.5, Math.sqrt(agent.health + 0.15) * 3.5);
-      this.agentArray[base + 0] = agent.position[0];
-      this.agentArray[base + 1] = agent.position[1];
+      this.agentArray[base + 0] = agent.position[0] * scaleX;
+      this.agentArray[base + 1] = agent.position[1] * scaleY;
       this.agentArray[base + 2] = radius;
       this.agentArray[base + 3] = 0.0;
       this.agentArray[base + 4] = agent.color[0];
@@ -253,7 +289,11 @@ export class WebGpuRenderer {
   }
 
   destroy() {
+    if (this.disposed) return;
+    this.disposed = true;
     this.agentBuffer?.destroy();
     this.viewUniformBuffer.destroy();
+    this.context.unconfigure();
+    this.device.destroy();
   }
 }
