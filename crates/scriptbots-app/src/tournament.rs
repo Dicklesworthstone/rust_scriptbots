@@ -289,7 +289,7 @@ fn order_assignments(
                     families[rotation..]
                         .iter()
                         .chain(families[..rotation].iter())
-                        .copied()
+                        .cloned()
                         .collect()
                 })
                 .collect())
@@ -381,9 +381,9 @@ pub fn plan(spec: &TournamentSpec) -> Result<Vec<MatchPlan>, TournamentError> {
     }
     let total_matches = expected_order_count * spec.seeds.len();
 
-    let expected_families: BTreeSet<BrainKind> = spec.families.iter().copied().collect();
+    let expected_families: BTreeSet<BrainKind> = spec.families.iter().cloned().collect();
     for (index, order) in orders.iter().enumerate() {
-        let actual: BTreeSet<BrainKind> = order.iter().copied().collect();
+        let actual: BTreeSet<BrainKind> = order.iter().cloned().collect();
         if order.len() != family_count || actual != expected_families {
             return Err(TournamentError::UnbalancedOrders {
                 reason: format!(
@@ -396,11 +396,11 @@ pub fn plan(spec: &TournamentSpec) -> Result<Vec<MatchPlan>, TournamentError> {
         let mut counts: BTreeMap<BrainKind, usize> = spec
             .families
             .iter()
-            .copied()
+            .cloned()
             .map(|family| (family, 0))
             .collect();
         for order in &orders {
-            *counts.entry(order[position]).or_insert(0_usize) += 1;
+            *counts.entry(order[position].clone()).or_insert(0_usize) += 1;
         }
         let expected = counts.values().next().copied().unwrap_or(0);
         if counts.values().any(|count| *count != expected) {
@@ -457,7 +457,7 @@ pub fn plan(spec: &TournamentSpec) -> Result<Vec<MatchPlan>, TournamentError> {
                 cohort: spec
                     .families
                     .iter()
-                    .map(|family| (*family, per_family))
+                    .map(|family| (family.clone(), per_family))
                     .collect(),
                 world_seed: world_seed(*root_seed, match_index),
                 brain_seed: brain_seed(*root_seed, match_index),
@@ -486,6 +486,86 @@ mod planning_tests {
     const DWRAON: BrainKind = BrainKind::new("dwraon");
     const ASSEMBLY: BrainKind = BrainKind::new("assembly");
     const NEURO: BrainKind = BrainKind::new("neuro");
+
+    #[test]
+    fn loaded_custom_family_names_preserve_plans_and_report_wire_values() {
+        let names = ["plugin.🧠/alpha", "plugin.🧠/beta"];
+        let original = spec(
+            names
+                .iter()
+                .map(|name| BrainKind::from((*name).to_owned()))
+                .collect(),
+            vec![42],
+            4,
+        );
+        let wire = serde_json::to_string(&original).expect("serialize spec");
+        let value: serde_json::Value = serde_json::from_str(&wire).expect("JSON");
+        assert_eq!(value["families"], serde_json::json!(names));
+        let loaded: TournamentSpec = serde_json::from_str(&wire).expect("load custom labels");
+        drop(wire);
+        assert_eq!(loaded, original);
+        assert_eq!(
+            plan(&loaded).expect("loaded plan"),
+            plan(&original).expect("original plan")
+        );
+        for name in names {
+            assert_eq!(to_brain_kind(name).as_str(), name);
+        }
+        let outcomes: Vec<MatchOutcome> = plan(&loaded)
+            .expect("plans")
+            .into_iter()
+            .map(|p| MatchOutcome {
+                match_id: p.match_id,
+                seed: p.seed,
+                ticks_run: 10,
+                spawn_order_index: p.spawn_order_index,
+                spawn_order: p.spawn_order,
+                per_family: names
+                    .into_iter()
+                    .zip([0.75, 0.25])
+                    .map(|(name, share)| {
+                        (
+                            name.to_owned(),
+                            FamilyOutcome {
+                                survival_share: share,
+                                biomass_share: share,
+                                mean_lineage_depth: 1.0,
+                                max_lineage_depth: 1,
+                                extinct_at: None,
+                                novelty_coverage: None,
+                            },
+                        )
+                    })
+                    .collect(),
+                warnings: Vec::new(),
+            })
+            .collect();
+        let wire = serde_json::to_string(&outcomes).expect("report JSON");
+        let restored: Vec<MatchOutcome> = serde_json::from_str(&wire).expect("load reports");
+        drop(wire);
+        assert_eq!(restored, outcomes);
+        let pairs =
+            reduce_pairwise(&restored, RatingAxis::SurvivalShare).expect("custom-name pairs");
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].a.as_str(), names[0]);
+        assert_eq!(pairs[0].b.as_str(), names[1]);
+        assert_eq!(pairs[0].wins_a as usize, restored.len());
+        let ratings = rate_tournament(
+            &restored,
+            &RatingOptions {
+                bootstrap_replicates: 2,
+                min_seeds: 1,
+                ..RatingOptions::default()
+            },
+        )
+        .expect("custom-name ratings");
+        let survival = ratings
+            .axis(RatingAxis::SurvivalShare)
+            .expect("rated survival");
+        assert_eq!(survival.ratings.len(), names.len());
+        assert!(survival.ratings.contains_key(&to_brain_kind(names[0])));
+        assert!(survival.ratings.contains_key(&to_brain_kind(names[1])));
+    }
 
     fn spec(families: Vec<BrainKind>, seeds: Vec<u64>, cohort_size: usize) -> TournamentSpec {
         TournamentSpec {
@@ -811,7 +891,7 @@ pub mod execution {
                     key
                 }
             };
-            keys.insert(*family, key);
+            keys.insert(family.clone(), key);
         }
         Ok(keys)
     }
@@ -906,12 +986,12 @@ pub mod execution {
                 .iter()
                 .flatten()
                 .find_map(|parent| arm_by_uid.get(parent))
-                .copied();
+                .cloned();
             let registered_arm = runtime
                 .brain
                 .registry_key()
                 .and_then(|key| arm_by_registry_key.get(&key))
-                .copied()
+                .cloned()
                 .flatten();
             let Some(arm) = inherited_arm.or(registered_arm) else {
                 continue;
@@ -930,7 +1010,7 @@ pub mod execution {
                 continue;
             };
             if let Some(family) = arm_by_uid.get(&uid) {
-                *counts.entry(*family).or_insert(0) += 1;
+                *counts.entry(family.clone()).or_insert(0) += 1;
             }
         }
         counts
@@ -947,9 +1027,9 @@ pub mod execution {
             return Err(TournamentError::ZeroTicks);
         }
         let order_families: std::collections::BTreeSet<BrainKind> =
-            plan.spawn_order.iter().copied().collect();
+            plan.spawn_order.iter().cloned().collect();
         let cohort_families: std::collections::BTreeSet<BrainKind> =
-            plan.cohort.keys().copied().collect();
+            plan.cohort.keys().cloned().collect();
         let expected_cohort_members = plan.cohort.values().next().copied().unwrap_or(0);
         if plan.spawn_order.is_empty()
             || order_families.len() != plan.spawn_order.len()
@@ -994,7 +1074,7 @@ pub mod execution {
             arm_by_registry_key
                 .entry(*key)
                 .and_modify(|arm| *arm = None)
-                .or_insert(Some(*family));
+                .or_insert_with(|| Some(family.clone()));
         }
 
         let cohort_total = plan
@@ -1078,10 +1158,10 @@ pub mod execution {
                         reason: format!("founder genome serialization for {family_name}: {error}"),
                     })?;
                 initial_genome_digests
-                    .entry(*family)
+                    .entry(family.clone())
                     .or_insert_with(|| blake3::hash(&genome_bytes).to_hex().to_string());
                 initial_mutation_rates
-                    .entry(*family)
+                    .entry(family.clone())
                     .or_default()
                     .push(bound_runtime.mutation_rates);
                 let uid = world
@@ -1089,8 +1169,8 @@ pub mod execution {
                     .ok_or_else(|| TournamentError::UnbalancedOrders {
                         reason: format!("cohort agent at slot {slot} has no stable uid"),
                     })?;
-                arm_by_uid.insert(uid, *family);
-                first_uid_by_family.entry(*family).or_insert(uid);
+                arm_by_uid.insert(uid, family.clone());
+                first_uid_by_family.entry(family.clone()).or_insert(uid);
             }
         }
 
@@ -1135,7 +1215,7 @@ pub mod execution {
             let counts = arm_counts(&world, &arm_by_uid);
             for family in &plan.spawn_order {
                 if counts.get(family).copied().unwrap_or(0) == 0 {
-                    extinct_at.entry(*family).or_insert(tick);
+                    extinct_at.entry(family.clone()).or_insert(tick);
                 }
             }
         }
@@ -1163,8 +1243,8 @@ pub mod execution {
                 continue;
             };
             let energy = f64::from(runtime.energy.max(0.0));
-            *family_live.entry(*family).or_insert(0) += 1;
-            *family_energy.entry(*family).or_insert(0.0) += energy;
+            *family_live.entry(family.clone()).or_insert(0) += 1;
+            *family_energy.entry(family.clone()).or_insert(0.0) += energy;
             let generation =
                 generations
                     .get(idx)
@@ -1172,7 +1252,7 @@ pub mod execution {
                         reason: format!("agent column index {idx} has no generation"),
                     })?;
             family_generations
-                .entry(*family)
+                .entry(family.clone())
                 .or_default()
                 .push(generation.0);
         }
@@ -1199,7 +1279,7 @@ pub mod execution {
                 (mean, values.iter().copied().max().unwrap_or(0))
             });
             outcome.set_family(
-                *family,
+                family.clone(),
                 FamilyOutcome {
                     survival_share: if total_live == 0 {
                         0.0
@@ -1238,12 +1318,11 @@ pub mod execution {
         assert_no_cross_kind_mating(&world, &arm_by_uid)?;
 
         for family in &plan.spawn_order {
-            let family_outcome =
-                outcome
-                    .family(*family)
-                    .ok_or_else(|| TournamentError::UnbalancedOrders {
-                        reason: format!("family {} has no outcome row", family.as_str()),
-                    })?;
+            let family_outcome = outcome.family(family.clone()).ok_or_else(|| {
+                TournamentError::UnbalancedOrders {
+                    reason: format!("family {} has no outcome row", family.as_str()),
+                }
+            })?;
             tracing::info!(
                 target: "scriptbots::tournament",
                 match_id = plan.match_id.0,
@@ -1913,7 +1992,7 @@ pub mod rating {
         let family_to_idx: BTreeMap<BrainKind, usize> = families
             .iter()
             .enumerate()
-            .map(|(idx, kind)| (*kind, idx))
+            .map(|(idx, kind)| (kind.clone(), idx))
             .collect();
 
         let mut w = vec![vec![0.0_f64; k]; k];
@@ -2072,8 +2151,8 @@ pub mod rating {
         for (i, family) in families.iter().enumerate() {
             let anchored_theta = log_p[i] - mean_log_p;
             let elo_val = theta_to_elo(anchored_theta);
-            theta.insert(*family, anchored_theta);
-            elo.insert(*family, elo_val);
+            theta.insert(family.clone(), anchored_theta);
+            elo.insert(family.clone(), elo_val);
         }
 
         Ok(FitResult {
@@ -2102,8 +2181,8 @@ pub mod rating {
 
         for i in 0..families.len() {
             for j in (i + 1)..families.len() {
-                let a = families[i];
-                let b = families[j];
+                let a = families[i].clone();
+                let b = families[j].clone();
                 res_map.insert((a, b), PairwiseCounts::default());
             }
         }
@@ -2111,8 +2190,8 @@ pub mod rating {
         for m in matches {
             for i in 0..families.len() {
                 for j in (i + 1)..families.len() {
-                    let a = families[i];
-                    let b = families[j];
+                    let a = families[i].clone();
+                    let b = families[j].clone();
                     let outcome_a = m.per_family.get(a.as_str());
                     let outcome_b = m.per_family.get(b.as_str());
                     let (Some(oa), Some(ob)) = (outcome_a, outcome_b) else {
@@ -2164,10 +2243,10 @@ pub mod rating {
         let mut families_set = BTreeSet::new();
         for m in outcomes {
             for k in &m.spawn_order {
-                families_set.insert(*k);
+                families_set.insert(k.clone());
             }
             for k_str in m.per_family.keys() {
-                families_set.insert(BrainKind::new(k_str.clone().leak()));
+                families_set.insert(BrainKind::from(k_str.clone()));
             }
         }
         let families: Vec<BrainKind> = families_set.into_iter().collect();
@@ -2298,10 +2377,10 @@ pub mod rating {
         let mut families_set = BTreeSet::new();
         for m in outcomes {
             for k in &m.spawn_order {
-                families_set.insert(*k);
+                families_set.insert(k.clone());
             }
             for k_str in m.per_family.keys() {
-                families_set.insert(BrainKind::new(k_str.clone().leak()));
+                families_set.insert(BrainKind::from(k_str.clone()));
             }
         }
         let families: Vec<BrainKind> = families_set.into_iter().collect();
@@ -2348,7 +2427,7 @@ pub mod rating {
                         match extract_axis_value(outcome, *axis, m.ticks_run, family.as_str())? {
                             Some(v) => {
                                 all_vals.push(v);
-                                family_vals.entry(*family).or_default().push(v);
+                                family_vals.entry(family.clone()).or_default().push(v);
                             }
                             None => {
                                 any_missing = true;
@@ -2439,10 +2518,10 @@ pub mod rating {
             let mut family_wins: BTreeMap<BrainKind, f64> = BTreeMap::new();
             let mut family_losses: BTreeMap<BrainKind, f64> = BTreeMap::new();
             for p in &pairwise {
-                *family_wins.entry(p.a).or_default() += p.effective_wins_a();
-                *family_wins.entry(p.b).or_default() += p.effective_wins_b();
-                *family_losses.entry(p.a).or_default() += p.effective_wins_b();
-                *family_losses.entry(p.b).or_default() += p.effective_wins_a();
+                *family_wins.entry(p.a.clone()).or_default() += p.effective_wins_a();
+                *family_wins.entry(p.b.clone()).or_default() += p.effective_wins_b();
+                *family_losses.entry(p.a.clone()).or_default() += p.effective_wins_b();
+                *family_losses.entry(p.b.clone()).or_default() += p.effective_wins_a();
             }
             for f in &families {
                 let wins = family_wins.get(f).copied().unwrap_or(0.0);
@@ -2512,12 +2591,12 @@ pub mod rating {
             let mut rep_thetas: BTreeMap<BrainKind, Vec<f64>> = BTreeMap::new();
             let mut rep_diffs: BTreeMap<(BrainKind, BrainKind), Vec<f64>> = BTreeMap::new();
             for f in &families {
-                rep_thetas.insert(*f, Vec::with_capacity(options.bootstrap_replicates));
+                rep_thetas.insert(f.clone(), Vec::with_capacity(options.bootstrap_replicates));
             }
             for i in 0..families.len() {
                 for j in (i + 1)..families.len() {
                     rep_diffs.insert(
-                        (families[i], families[j]),
+                        (families[i].clone(), families[j].clone()),
                         Vec::with_capacity(options.bootstrap_replicates),
                     );
                 }
@@ -2547,13 +2626,13 @@ pub mod rating {
                 {
                     for f in &families {
                         if let Some(th) = fit_b.theta.get(f) {
-                            rep_thetas.entry(*f).or_default().push(*th);
+                            rep_thetas.entry(f.clone()).or_default().push(*th);
                         }
                     }
                     for i in 0..families.len() {
                         for j in (i + 1)..families.len() {
-                            let a = families[i];
-                            let b = families[j];
+                            let a = families[i].clone();
+                            let b = families[j].clone();
                             if let (Some(th_a), Some(th_b)) =
                                 (fit_b.theta.get(&a), fit_b.theta.get(&b))
                             {
@@ -2607,7 +2686,7 @@ pub mod rating {
                 let elo_ci95 = (theta_to_elo(ci95.0), theta_to_elo(ci95.1));
 
                 let fam_rating = FamilyRating {
-                    family: *f,
+                    family: f.clone(),
                     theta,
                     elo,
                     se,
@@ -2633,15 +2712,15 @@ pub mod rating {
                     "family rating on axis"
                 );
 
-                ratings_map.insert(*f, fam_rating);
+                ratings_map.insert(f.clone(), fam_rating);
             }
 
             // Compute pairwise comparisons
             let mut pairwise_comps = Vec::new();
             for i in 0..families.len() {
                 for j in (i + 1)..families.len() {
-                    let a = families[i];
-                    let b = families[j];
+                    let a = families[i].clone();
+                    let b = families[j].clone();
                     let theta_a = fit.theta.get(&a).copied().unwrap_or(0.0);
                     let theta_b = fit.theta.get(&b).copied().unwrap_or(0.0);
                     let theta_diff = theta_a - theta_b;
@@ -2658,7 +2737,7 @@ pub mod rating {
                         (0.0, 0.0)
                     };
 
-                    let ci95 = if let Some(diffs) = rep_diffs.get_mut(&(a, b)) {
+                    let ci95 = if let Some(diffs) = rep_diffs.get_mut(&(a.clone(), b.clone())) {
                         if diffs.len() > 1 {
                             diffs.sort_by(|x, y| x.total_cmp(y));
                             let low_idx = ((0.025 * diffs.len() as f64).floor() as usize)
@@ -2682,8 +2761,8 @@ pub mod rating {
                     };
 
                     let comp = PairwiseComparison {
-                        a,
-                        b,
+                        a: a.clone(),
+                        b: b.clone(),
                         theta_diff,
                         ci95,
                         verdict,
@@ -3090,7 +3169,7 @@ pub mod leaderboard {
             "dwraon" | "dwraon.baseline" => BrainKind::new("dwraon"),
             "assembly" | "assembly.experimental" => BrainKind::new("assembly"),
             "neuro" | "ml.neuroflow" => BrainKind::new("neuro"),
-            other => BrainKind::new(other.to_string().leak()),
+            other => BrainKind::from(other.to_owned()),
         }
     }
 
@@ -4650,13 +4729,13 @@ mod tests {
         let fam_a = BrainKind::new("fam-a");
         let fam_b = BrainKind::new("fam-b");
         let fam_c = BrainKind::new("fam-c");
-        let families = vec![fam_a, fam_b, fam_c];
+        let families = vec![fam_a.clone(), fam_b.clone(), fam_c.clone()];
 
         // A beats B 2:1, B beats C 2:1, A beats C 3:0
         let pairwise = vec![
             PairwiseResult {
-                a: fam_a,
-                b: fam_b,
+                a: fam_a.clone(),
+                b: fam_b.clone(),
                 axis: RatingAxis::SurvivalShare,
                 wins_a: 2,
                 wins_b: 1,
@@ -4664,8 +4743,8 @@ mod tests {
                 seed_of: vec![1, 2, 3],
             },
             PairwiseResult {
-                a: fam_b,
-                b: fam_c,
+                a: fam_b.clone(),
+                b: fam_c.clone(),
                 axis: RatingAxis::SurvivalShare,
                 wins_a: 2,
                 wins_b: 1,
@@ -4673,8 +4752,8 @@ mod tests {
                 seed_of: vec![4, 5, 6],
             },
             PairwiseResult {
-                a: fam_a,
-                b: fam_c,
+                a: fam_a.clone(),
+                b: fam_c.clone(),
                 axis: RatingAxis::SurvivalShare,
                 wins_a: 3,
                 wins_b: 0,
@@ -4720,12 +4799,12 @@ mod tests {
         let fam_a = BrainKind::new("fam-a");
         let fam_b = BrainKind::new("fam-b");
         let fam_c = BrainKind::new("fam-c");
-        let families = vec![fam_a, fam_b, fam_c];
+        let families = vec![fam_a.clone(), fam_b.clone(), fam_c.clone()];
 
         let pairwise = vec![
             PairwiseResult {
-                a: fam_a,
-                b: fam_b,
+                a: fam_a.clone(),
+                b: fam_b.clone(),
                 axis: RatingAxis::SurvivalShare,
                 wins_a: 1,
                 wins_b: 1,
@@ -4733,8 +4812,8 @@ mod tests {
                 seed_of: vec![1, 2],
             },
             PairwiseResult {
-                a: fam_b,
-                b: fam_c,
+                a: fam_b.clone(),
+                b: fam_c.clone(),
                 axis: RatingAxis::SurvivalShare,
                 wins_a: 1,
                 wins_b: 1,
@@ -4742,8 +4821,8 @@ mod tests {
                 seed_of: vec![3, 4],
             },
             PairwiseResult {
-                a: fam_a,
-                b: fam_c,
+                a: fam_a.clone(),
+                b: fam_c.clone(),
                 axis: RatingAxis::SurvivalShare,
                 wins_a: 1,
                 wins_b: 1,
@@ -4773,13 +4852,13 @@ mod tests {
         let fam_a = BrainKind::new("fam-a");
         let fam_b = BrainKind::new("fam-b");
         let fam_c = BrainKind::new("fam-c");
-        let families = vec![fam_a, fam_b, fam_c];
+        let families = vec![fam_a.clone(), fam_b.clone(), fam_c.clone()];
 
         // A wins every match (10 vs B, 10 vs C), B vs C is 1:1
         let pairwise = vec![
             PairwiseResult {
-                a: fam_a,
-                b: fam_b,
+                a: fam_a.clone(),
+                b: fam_b.clone(),
                 axis: RatingAxis::SurvivalShare,
                 wins_a: 10,
                 wins_b: 0,
@@ -4787,8 +4866,8 @@ mod tests {
                 seed_of: (1..=10).collect(),
             },
             PairwiseResult {
-                a: fam_a,
-                b: fam_c,
+                a: fam_a.clone(),
+                b: fam_c.clone(),
                 axis: RatingAxis::SurvivalShare,
                 wins_a: 10,
                 wins_b: 0,
@@ -4796,8 +4875,8 @@ mod tests {
                 seed_of: (11..=20).collect(),
             },
             PairwiseResult {
-                a: fam_b,
-                b: fam_c,
+                a: fam_b.clone(),
+                b: fam_c.clone(),
                 axis: RatingAxis::SurvivalShare,
                 wins_a: 1,
                 wins_b: 1,
@@ -4829,12 +4908,12 @@ mod tests {
         let fam_a = BrainKind::new("fam-a");
         let fam_b = BrainKind::new("fam-b");
         let fam_c = BrainKind::new("fam-c");
-        let families = vec![fam_a, fam_b, fam_c];
+        let families = vec![fam_a.clone(), fam_b.clone(), fam_c.clone()];
 
         let pairwise1 = vec![
             PairwiseResult {
-                a: fam_a,
-                b: fam_b,
+                a: fam_a.clone(),
+                b: fam_b.clone(),
                 axis: RatingAxis::SurvivalShare,
                 wins_a: 4,
                 wins_b: 2,
@@ -4842,8 +4921,8 @@ mod tests {
                 seed_of: vec![1, 2],
             },
             PairwiseResult {
-                a: fam_b,
-                b: fam_c,
+                a: fam_b.clone(),
+                b: fam_c.clone(),
                 axis: RatingAxis::SurvivalShare,
                 wins_a: 3,
                 wins_b: 1,
@@ -4851,8 +4930,8 @@ mod tests {
                 seed_of: vec![3, 4],
             },
             PairwiseResult {
-                a: fam_a,
-                b: fam_c,
+                a: fam_a.clone(),
+                b: fam_c.clone(),
                 axis: RatingAxis::SurvivalShare,
                 wins_a: 5,
                 wins_b: 1,
@@ -4885,11 +4964,11 @@ mod tests {
         let fam_x = BrainKind::new("fam-x");
         let fam_y = BrainKind::new("fam-y");
         let fam_z = BrainKind::new("fam-z");
-        let families_relabeled = vec![fam_x, fam_y, fam_z];
+        let families_relabeled = vec![fam_x.clone(), fam_y.clone(), fam_z.clone()];
         let pairwise_relabeled = vec![
             PairwiseResult {
-                a: fam_x,
-                b: fam_y,
+                a: fam_x.clone(),
+                b: fam_y.clone(),
                 axis: RatingAxis::SurvivalShare,
                 wins_a: 4,
                 wins_b: 2,
@@ -4897,8 +4976,8 @@ mod tests {
                 seed_of: vec![1, 2],
             },
             PairwiseResult {
-                a: fam_y,
-                b: fam_z,
+                a: fam_y.clone(),
+                b: fam_z.clone(),
                 axis: RatingAxis::SurvivalShare,
                 wins_a: 3,
                 wins_b: 1,
@@ -4906,8 +4985,8 @@ mod tests {
                 seed_of: vec![3, 4],
             },
             PairwiseResult {
-                a: fam_x,
-                b: fam_z,
+                a: fam_x.clone(),
+                b: fam_z.clone(),
                 axis: RatingAxis::SurvivalShare,
                 wins_a: 5,
                 wins_b: 1,
@@ -4969,9 +5048,9 @@ mod tests {
                     ticks_run: 1000,
                     spawn_order_index: ord,
                     spawn_order: if ord == 0 {
-                        vec![fam_a, fam_b]
+                        vec![fam_a.clone(), fam_b.clone()]
                     } else {
-                        vec![fam_b, fam_a]
+                        vec![fam_b.clone(), fam_a.clone()]
                     },
                     per_family,
                     warnings: Vec::new(),
@@ -5000,7 +5079,7 @@ mod tests {
         // the clustered bootstrap CI must be strictly wider than the naive match-level bootstrap CI.
         let fam_a = BrainKind::new("arm-a");
         let fam_b = BrainKind::new("arm-b");
-        let families = vec![fam_a, fam_b];
+        let families = vec![fam_a.clone(), fam_b.clone()];
 
         let n_seeds = 12;
         let matches_per_seed = 6;
@@ -5041,7 +5120,7 @@ mod tests {
                     seed,
                     ticks_run: 500,
                     spawn_order_index: (m_idx % 2) as u32,
-                    spawn_order: vec![fam_a, fam_b],
+                    spawn_order: vec![fam_a.clone(), fam_b.clone()],
                     per_family,
                     warnings: Vec::new(),
                 });
@@ -5141,7 +5220,7 @@ mod tests {
                         seed,
                         ticks_run: 500,
                         spawn_order_index: ord,
-                        spawn_order: vec![fam_a, fam_b],
+                        spawn_order: vec![fam_a.clone(), fam_b.clone()],
                         per_family,
                         warnings: Vec::new(),
                     });
@@ -5197,7 +5276,7 @@ mod tests {
             seed: 1,
             ticks_run: 500,
             spawn_order_index: 0,
-            spawn_order: vec![fam_a],
+            spawn_order: vec![fam_a.clone()],
             per_family: pf,
             warnings: Vec::new(),
         });
@@ -5236,7 +5315,7 @@ mod tests {
                 seed,
                 ticks_run: 500,
                 spawn_order_index: 0,
-                spawn_order: vec![fam_a, fam_b],
+                spawn_order: vec![fam_a.clone(), fam_b.clone()],
                 per_family: pf,
                 warnings: Vec::new(),
             });
@@ -5278,7 +5357,7 @@ mod tests {
             seed: 1,
             ticks_run: 500,
             spawn_order_index: 0,
-            spawn_order: vec![fam_a, fam_b],
+            spawn_order: vec![fam_a.clone(), fam_b.clone()],
             per_family: pf_nan,
             warnings: Vec::new(),
         });
@@ -5296,9 +5375,9 @@ mod tests {
         for seed in 1..=10 {
             for ord in 0..2 {
                 let (first, second) = if ord == 0 {
-                    (fam_a, fam_b)
+                    (fam_a.clone(), fam_b.clone())
                 } else {
-                    (fam_b, fam_a)
+                    (fam_b.clone(), fam_a.clone())
                 };
                 let mut pf = BTreeMap::new();
                 pf.insert(
@@ -5374,7 +5453,7 @@ mod tests {
                 seed,
                 ticks_run: 500,
                 spawn_order_index: 0,
-                spawn_order: vec![fam_a, fam_b],
+                spawn_order: vec![fam_a.clone(), fam_b.clone()],
                 per_family: pf,
                 warnings: Vec::new(),
             });
@@ -5434,7 +5513,7 @@ mod tests {
                 seed,
                 ticks_run: 1000,
                 spawn_order_index: 0,
-                spawn_order: vec![fam_a, fam_b],
+                spawn_order: vec![fam_a.clone(), fam_b.clone()],
                 per_family: pf,
                 warnings: Vec::new(),
             });

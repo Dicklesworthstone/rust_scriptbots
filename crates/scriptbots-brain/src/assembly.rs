@@ -54,7 +54,7 @@ pub struct AssemblyBrain {
 
 impl AssemblyBrain {
     /// Trait identifier for this brain.
-    pub const KIND: BrainKind = BrainKind::new("assembly.experimental");
+    pub const KIND: &BrainKind = &BrainKind::new("assembly.experimental");
 
     /// Construct a randomly initialized assembly brain.
     #[must_use]
@@ -723,7 +723,7 @@ fn invalid_payload(
 
 impl Brain for AssemblyBrain {
     fn kind(&self) -> BrainKind {
-        Self::KIND
+        Self::KIND.clone()
     }
 
     fn tick(&mut self, inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
@@ -745,7 +745,7 @@ impl Brain for AssemblyBrain {
     }
 
     fn crossover(&self, other: &dyn Brain, rng: &mut dyn RandomStream) -> Option<Box<dyn Brain>> {
-        if other.kind() != Self::KIND {
+        if &other.kind() != Self::KIND {
             return None;
         }
 
@@ -962,7 +962,7 @@ mod tests {
         let child = brain_a
             .crossover(&brain_b, &mut rng)
             .expect("matching kinds");
-        assert_eq!(child.kind(), AssemblyBrain::KIND);
+        assert_eq!(&child.kind(), AssemblyBrain::KIND);
     }
 
     #[test]

@@ -2575,8 +2575,8 @@ impl BrainBinding {
 
 /// Thin trait object used to drive brain evaluations without coupling to concrete brain crates.
 pub trait BrainRunner: Send + Sync {
-    /// Static identifier of the brain implementation.
-    fn kind(&self) -> &'static str;
+    /// Identifier of the brain implementation, borrowed from the runner.
+    fn kind(&self) -> &str;
 
     /// Evaluate outputs for the provided sensors.
     fn tick(&mut self, inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE];
@@ -42656,9 +42656,10 @@ mod tests {
 
             fn clone_runner(&self) -> Result<Option<Box<dyn BrainRunner>>, BrainSpawnError> {
                 match self.mode {
-                    FailureMode::Snapshot => {
-                        Err(BrainSpawnError::new(self.kind(), DeliberateHeritageFailure))
-                    }
+                    FailureMode::Snapshot => Err(BrainSpawnError::new(
+                        self.kind().to_owned(),
+                        DeliberateHeritageFailure,
+                    )),
                     FailureMode::Mutation => Ok(Some(Box::new(Self { mode: self.mode }))),
                 }
             }
@@ -42671,9 +42672,10 @@ mod tests {
             ) -> Result<(), BrainSpawnError> {
                 match self.mode {
                     FailureMode::Snapshot => Ok(()),
-                    FailureMode::Mutation => {
-                        Err(BrainSpawnError::new(self.kind(), DeliberateHeritageFailure))
-                    }
+                    FailureMode::Mutation => Err(BrainSpawnError::new(
+                        self.kind().to_owned(),
+                        DeliberateHeritageFailure,
+                    )),
                 }
             }
         }
@@ -56141,7 +56143,7 @@ mod tests {
         runtime.combat.spike_attacker = true;
         runtime.spiked = true;
         let visuals = DynamicAgentVisuals::capture(&runtime);
-        assert!(visuals.boost_engaged);
+        assert_eq!(visuals.boost_output.to_bits(), 1.0_f32.to_bits());
         assert!(visuals.spike_extended);
         assert!(visuals.spike_struck);
         assert!(visuals.spike_victim);
@@ -56161,7 +56163,7 @@ mod tests {
         runtime.outputs[OutputChannel::WheelLeft.index()] = 0.25;
         runtime.outputs[OutputChannel::WheelRight.index()] = 0.75;
         runtime.outputs[OutputChannel::SoundLevel.index()] = 0.4;
-        runtime.outputs[OutputChannel::Boost.index()] = 0.9;
+        runtime.outputs[OutputChannel::Boost.index()] = 0.8;
         runtime.outputs[OutputChannel::SpikeTarget.index()] = 0.9;
         runtime.eye_direction = [0.1, 0.2, 0.3, 0.4];
         runtime.eye_fov = [1.1, 1.2, 1.3, 1.4];
@@ -56188,9 +56190,10 @@ mod tests {
         assert!((visuals.wheel_right - 0.75).abs() < f32::EPSILON);
         assert!((visuals.sound_level - 0.4).abs() < f32::EPSILON);
         assert!(
-            visuals.boost_engaged,
+            visuals.boost_output > BOOST_THRESHOLD,
             "the current boost command must survive capture"
         );
+        assert_eq!(visuals.boost_output.to_bits(), 0.8_f32.to_bits());
         assert!((visuals.sound_output - 0.55).abs() < f32::EPSILON);
         assert!((visuals.sound_multiplier - 1.25).abs() < f32::EPSILON);
         assert!((visuals.temperature_preference - 0.6).abs() < f32::EPSILON);
@@ -56233,8 +56236,15 @@ mod tests {
         // nothing must not inherit the previous tick's extension.
         runtime.outputs[OutputChannel::SpikeTarget.index()] = 0.5;
         runtime.outputs[OutputChannel::Boost.index()] = BOOST_THRESHOLD;
+        assert_eq!(
+            DynamicAgentVisuals::capture(&runtime)
+                .boost_output
+                .to_bits(),
+            BOOST_THRESHOLD.to_bits(),
+            "the raw threshold value must survive capture without normalization"
+        );
         assert!(
-            !DynamicAgentVisuals::capture(&runtime).boost_engaged,
+            DynamicAgentVisuals::capture(&runtime).boost_output <= BOOST_THRESHOLD,
             "boost at the declared engagement threshold remains disengaged"
         );
         assert!(

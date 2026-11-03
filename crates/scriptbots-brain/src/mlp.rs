@@ -156,7 +156,7 @@ pub struct MlpBrain {
 
 impl MlpBrain {
     /// Trait identifier for this brain family.
-    pub const KIND: BrainKind = BrainKind::new("mlp.baseline");
+    pub const KIND: &BrainKind = &BrainKind::new("mlp.baseline");
 
     /// Construct a randomly initialized brain.
     #[must_use]
@@ -1012,7 +1012,7 @@ impl BrainFamilyCodec for MlpBrainFamily {
 
 impl Brain for MlpBrain {
     fn kind(&self) -> BrainKind {
-        Self::KIND
+        Self::KIND.clone()
     }
 
     fn tick(&mut self, inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
@@ -1086,7 +1086,7 @@ impl Brain for MlpBrain {
     }
 
     fn crossover(&self, other: &dyn Brain, rng: &mut dyn RandomStream) -> Option<Box<dyn Brain>> {
-        if other.kind() != Self::KIND {
+        if &other.kind() != Self::KIND {
             return None;
         }
         let other = other.as_any().downcast_ref::<Self>()?;
@@ -1344,7 +1344,7 @@ mod tests {
         let child = brain_a
             .crossover(&brain_b, &mut rng)
             .expect("crossover should succeed");
-        assert_eq!(child.kind(), MlpBrain::KIND);
+        assert_eq!(&child.kind(), MlpBrain::KIND);
     }
 
     #[test]

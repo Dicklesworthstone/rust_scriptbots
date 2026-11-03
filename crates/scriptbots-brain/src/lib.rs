@@ -5,7 +5,7 @@ use scriptbots_core::{
     BrainSpawnError, INPUT_SIZE, OUTPUT_SIZE, RandomStream, Tick,
 };
 use serde::{Deserialize, Serialize};
-use std::any::Any;
+use std::{any::Any, borrow::Cow};
 
 #[cfg(feature = "mlp")]
 pub mod mlp;
@@ -22,44 +22,49 @@ pub mod assembly;
 #[cfg(feature = "assembly")]
 pub use assembly::AssemblyBrain;
 
-/// Small newtype wrapper identifying brain families.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-pub struct BrainKind(&'static str);
+/// Brain-family name: literals borrow static text; loaded names own their storage.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct BrainKind(Cow<'static, str>);
 
 impl<'de> serde::Deserialize<'de> for BrainKind {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        let s = String::deserialize(deserializer)?;
-        let static_str: &'static str = match s.as_str() {
-            "mlp.baseline" => "mlp.baseline",
-            "dwraon.baseline" => "dwraon.baseline",
-            "assembly.experimental" => "assembly.experimental",
-            "ml.neuroflow" => "ml.neuroflow",
-            "ml.placeholder" => "ml.placeholder",
-            "echo" => "echo",
-            _ => Box::leak(s.into_boxed_str()),
-        };
-        Ok(BrainKind::new(static_str))
+        String::deserialize(deserializer).map(Self::from)
     }
 }
 
 impl BrainKind {
     #[must_use]
     pub const fn new(name: &'static str) -> Self {
-        Self(name)
+        Self(Cow::Borrowed(name))
     }
 
     #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        self.0
+    pub const fn as_str(&self) -> &str {
+        match &self.0 {
+            Cow::Borrowed(value) => value,
+            Cow::Owned(value) => value.as_str(),
+        }
     }
 }
 
 impl From<&'static str> for BrainKind {
     fn from(value: &'static str) -> Self {
         Self::new(value)
+    }
+}
+
+impl From<String> for BrainKind {
+    fn from(value: String) -> Self {
+        Self(Cow::Owned(value))
+    }
+}
+
+impl From<BrainKind> for Cow<'static, str> {
+    fn from(value: BrainKind) -> Self {
+        value.0
     }
 }
 
@@ -198,11 +203,11 @@ mod tests {
     use super::*;
 
     #[derive(Clone)]
-    struct EchoBrain;
+    struct EchoBrain(BrainKind);
 
     impl Brain for EchoBrain {
         fn kind(&self) -> BrainKind {
-            BrainKind::new("echo")
+            self.0.clone()
         }
 
         fn tick(&mut self, inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
@@ -235,8 +240,35 @@ mod tests {
     }
 
     #[test]
+    fn loaded_family_names_survive_source_and_runner_lifetimes() {
+        use serde::de::value::{Error, StringDeserializer, U64Deserializer};
+
+        for name in ["mlp.baseline", "plugin.🧠/arbitrary-name", ""] {
+            let loaded = BrainKind::deserialize(StringDeserializer::<Error>::new(name.to_owned()))
+                .expect("string family name");
+            assert_eq!(loaded.as_str(), name);
+            let mut keys = std::collections::BTreeMap::new();
+            keys.insert(loaded.clone(), 42);
+            assert_eq!(keys.get(&BrainKind::new(name)), Some(&42));
+
+            let runner = BrainRunnerAdapter::new(EchoBrain(loaded));
+            assert_eq!(runner.kind(), name);
+            let mut child = runner
+                .clone_runner()
+                .expect("clone succeeds")
+                .expect("clone is supported");
+            drop(runner);
+            assert_eq!(child.kind(), name);
+            let mut sensors = [0.0; INPUT_SIZE];
+            sensors[0] = 0.75;
+            assert_eq!(child.tick(&sensors)[0], 0.75);
+        }
+        assert!(BrainKind::deserialize(U64Deserializer::<Error>::new(42)).is_err());
+    }
+
+    #[test]
     fn adapter_forward_outputs() {
-        let mut runner = BrainRunnerAdapter::new(EchoBrain);
+        let mut runner = BrainRunnerAdapter::new(EchoBrain(BrainKind::new("echo")));
         let mut inputs = [0.0; INPUT_SIZE];
         inputs[0] = 1.0;
         inputs[1] = 2.0;
@@ -260,19 +292,24 @@ mod tests {
 /// produced as `Box<dyn Brain>`) stay heritable across generations.
 pub struct BrainRunnerAdapter {
     brain: Box<dyn Brain>,
+    kind: BrainKind,
 }
 
 impl BrainRunnerAdapter {
     #[must_use]
     pub fn new<B: Brain + 'static>(brain: B) -> Self {
         Self {
+            kind: brain.kind(),
             brain: Box::new(brain),
         }
     }
 
     #[must_use]
     pub fn from_boxed(brain: Box<dyn Brain>) -> Self {
-        Self { brain }
+        Self {
+            kind: brain.kind(),
+            brain,
+        }
     }
 
     #[must_use]
@@ -282,8 +319,8 @@ impl BrainRunnerAdapter {
 }
 
 impl BrainRunner for BrainRunnerAdapter {
-    fn kind(&self) -> &'static str {
-        self.brain.kind().as_str()
+    fn kind(&self) -> &str {
+        self.kind.as_str()
     }
 
     fn tick(&mut self, inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
@@ -302,12 +339,12 @@ impl BrainRunner for BrainRunnerAdapter {
     }
 
     fn clone_runner(&self) -> Result<Option<Box<dyn BrainRunner>>, BrainSpawnError> {
-        let kind = self.brain.kind().as_str();
+        let kind = self.brain.kind();
         let brain = self
             .brain
             .clone_box()
             .map_err(|source| BrainSpawnError::new(kind, source))?;
-        Ok(Some(Box::new(Self { brain })))
+        Ok(Some(Box::new(Self::from_boxed(brain))))
     }
 
     fn mutate(
@@ -316,7 +353,7 @@ impl BrainRunner for BrainRunnerAdapter {
         rate: f32,
         scale: f32,
     ) -> Result<(), BrainSpawnError> {
-        let kind = self.brain.kind().as_str();
+        let kind = self.brain.kind();
         self.brain
             .mutate(rng, rate, scale)
             .map_err(|source| BrainSpawnError::new(kind, source))
@@ -329,7 +366,7 @@ impl BrainRunner for BrainRunnerAdapter {
     ) -> Option<Box<dyn BrainRunner>> {
         let partner = partner.as_any()?.downcast_ref::<Self>()?;
         let child = self.brain.crossover(&*partner.brain, rng)?;
-        Some(Box::new(Self { brain: child }))
+        Some(Box::new(Self::from_boxed(child)))
     }
 
     fn as_any(&self) -> Option<&(dyn Any + Send + Sync)> {
