@@ -143,9 +143,10 @@ baseline and unannotated planted negatives still trigger both critical rules.
 `bd-h4n2` closes on this actual development-tool capability; it earns no
 simulation or performance credit. The original lint task remains open.
 
-The current read-only cleanup scan found only 32 KiB in two old cleanup-skill
-test fixtures. Those were preserved as evidence. No manual file deletion,
-process termination, VM tuning or disk-reclamation claim accompanies this work.
+The initial narrow read-only cleanup scan found only 32 KiB in two old
+cleanup-skill test fixtures. Those were preserved as evidence. The broader
+scan and subsequently approved cleanup are recorded below. No process
+termination or VM tuning accompanied this work.
 
 **World-gfx completion and disk pressure (2026-11-03):** Source `2054b827` brings
 qualified inheritance to nine of 13 members; original `bd-6hb5` remains open.
@@ -165,14 +166,40 @@ its corrected declaration-scoped check validates nonempty unchanged
 payloads and rejects every injected payload change. Its original failure stays.
 
 Disk pressure subsequently prevented the final Beads comment export. The last
-complete JSONL still parses and contains only the two expected progress comments
-on `bd-6hb5`; the partial export is preserved. No further BR write was retried.
-Cleanup approval is pending for the exact reviewed list of 49,131 Chromium-named
-temporary files, 24.6 GiB allocated, over 24 hours old and absent from the
-open-file/mapping scan. Selection and metadata are rechecked before deletion;
-this is a snapshot observation, not an atomic same-inode or still-closed
-guarantee. No deletion has run. The manifest and command are in the pending
-confirmation; broader source writes wait for disk headroom.
+complete JSONL remained intact; the partial export is preserved. Once disk
+headroom returned, a normal import succeeded and comment 3014 persisted the
+final graphics qualification and cleanup result. The original task stays open.
+
+**Approved disk cleanup (2026-11-03):** [Completed — GentleDuck]
+
+- [x] Review an exact inventory of 49,131 Chromium-named temporary files:
+  UID 1000, regular files, over 24 hours old and absent from the process
+  open-file/mapping scan. Chromium origin is inferred from their names.
+- [x] Obtain explicit authorization for the command and permanent deletion.
+  The operator's exact reply was: **"I APPROVE!!! DELETE THE JUNK!!!"**
+- [x] Verify the reviewed manifest and script hashes; recheck selection and
+  metadata during execution. These checks are snapshot observations, not an
+  atomic same-inode or still-closed guarantee.
+- [x] Execute the approved command, beginning at 18:49:22 UTC and completing
+  at 18:49:24 UTC:
+
+  ```bash
+  sudo -n python3 /dev/shm/scriptbots-disk-pressure-h13w0Q/inventory.py --apply 4b0607b6d02e6c2010f4abd106c4e1829233a9ad69bd7ffdd649fccfe74c9dae
+  ```
+
+- [x] Verify all 49,131 per-file receipt rows match the reviewed inventory
+  and all listed paths are absent. Reviewed allocation was 26,378,244,096
+  bytes (24.6 GiB). Filesystem availability afterward was 35,812,335,616
+  bytes (33.4 GiB); concurrent activity also contributed to that total delta.
+- [x] Preserve byte-identical manifest, script, per-file receipt, exact
+  authorization, command and execution timestamps under
+  `/data/tmp/scriptbots-lint-inheritance-rakxl2es/approved-cleanup-20261103T184922Z`.
+- [x] Resume the previously failed Beads update through BR. Source files,
+  databases, build caches, BR cache directories and the partial export were
+  outside the approved inventory and were preserved.
+
+This requested cleanup checklist retires here. It does not complete the
+original 13-member lint task or any hardware/performance qualification.
 
 **Archipelago duration lane (2026-11-03):** [Verified and Closed —
 GentleDuck; original `bd-t3ge`; fresh solo verification]
