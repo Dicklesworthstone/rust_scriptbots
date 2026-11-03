@@ -2,6 +2,93 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Browser frame admission (2026-11-03):** [Verified contribution —
+GentleDuck; source `24322c9211525d33aaca9a174d0ab1492f4edeb8`]
+
+Original `bd-2z0.12.3` retains its owner, open status, dependencies and complete
+acceptance. Screenshot/revision export and tooling qualification remain open.
+
+- [x] Inspect the production queue writer and submitted-snapshot reader:
+  `render()` submits every callback without bounding outstanding GPU work;
+  `main.js` updates the snapshot stamp after every call.
+- [x] Retain a failing actual-browser submission-count control on old source.
+- [x] Admit at most one frame until its queue completion is observed; refuse
+  intervening snapshots without retaining them or writing new GPU buffers.
+- [x] Apply the same admission lifecycle to empty-frame clears; retain
+  existing geometry, resizing, capacity refusals and device-loss behavior.
+- [x] Make Canvas/WebGPU return explicit admission and update the public
+  submitted-snapshot tick only when a frame was admitted.
+- [x] Hold real queue acknowledgements in the browser and count actual
+  submissions/writes; verify the next admitted frame consumes the newest input.
+- [x] In the real packaged app, show that science progresses while the
+  submitted-frame stamp stays fixed, then catches up after release.
+- [x] Exercise a rejected completion acknowledgement with a visible painted
+  Canvas fallback; label injected controls separately from actual device loss.
+- [x] Pass existing stats/fork/clock controls, required workspace gates and
+  UBS through DSR on frozen source, retaining every failure.
+- [x] Review/publish coherent source and repeat decisive checks with a fresh
+  package from the exact clean commit.
+- [x] Update original Beads evidence and this requested TODO, retaining the
+  original open acceptance and retiring this checklist at handoff.
+
+The concrete consumer is the existing production renderer. This bounds frame
+admission, not physical presentation latency, and makes no throughput claim.
+
+Browser controls retained at `/data/tmp/scriptbots-browser-backpressure-8bEmQGzp`
+observe 101 submissions on old source's populated-frame control. The candidate
+admits one submission and refuses 100 calls for both populated and empty
+initial frames. Refused calls issue no additional buffer writes; release
+admits the newest supplied
+geometry. A separate old-`main.js` control admits just one frame yet falsely
+advances its stamp from tick 11 to 18; the candidate instead advances science
+from 16 to 24 while the submitted tick stays 16, then catches up to 24.
+Presentation callbacks are explicitly held/invoked; science uses its real
+independent timer. The injected completion rejection is a JavaScript fault
+control, distinct from the retained actual `GPUDevice.destroy` check.
+
+Retain R1's screenshot-stability timeout, R2's zero canvas-copy observation
+despite visible agents in its retained PNG, and R3's RAF-polled clock wait
+timeout. Their exact causes are not established. The clock observation now
+uses timer polling and a controlled production presentation callback. The
+visible-frame guard now reads the compositor PNG: it rejects both transparent
+CSS-backed blank and opaque empty images, and detects exactly one bright
+control pixel. This admits visibly painted frames a later canvas-copy probe
+could misclassify; it does not qualify that separate copy/export boundary.
+The GPU report retains both observations. Screenshot pixel counts use displayed
+dimensions and cannot be compared with earlier intrinsic canvas-copy counts.
+No timeout was widened, test skipped, golden regenerated or assertion dropped
+from the ordinary four-case stats/fork modes. This is fresh solo software-GPU
+execution, not independent review, hardware qualification or a speedup claim.
+
+Frozen final source passes ten of ten DSR checks in
+`frame_admission_final/20261103T214339-2404462`: required workspace check,
+strict Clippy, formatting, 30 native web tests plus one existing ignored fixture
+writer, actual renderer controls, unchanged stats/fork modes, UBS and source
+binding before/after. Source `24322c9211525d33aaca9a174d0ab1492f4edeb8`
+matches patch SHA-256
+`a6693f9de924b71a4c905a38a6d622b79d75e7f7282986e29c273e9602f60084`.
+UBS reports zero critical, 134 warning and 415 informational findings over five
+JS files. Nine additional warning matches are in test DOM/prototype probes
+that intentionally fail if required controls disappear; no suppression added.
+The first qualification stops during Clippy with exit 143 and no receipt;
+retain it as incomplete. Its unchanged retry passes ten of ten, then fresh
+review catches a pixel helper that submits a second frame before inspection.
+The final source reads the first resumed frame without submitting again and
+asserts the submission count remains two; earlier pixels establish eventual
+output only. The final ten-check pass includes that stronger observation.
+
+Clean source then passes six of six checks in
+`frame_admission_clean_24322c92/20261103T214450-2407093`: expected clean commit,
+fresh package, actual renderer controls, stats/fork modes and unchanged clean
+post-state. Science advances 14 to 21 while submitted tick stays 14 with one
+submission, then catches up to 21. The compositor PNG has 5,014 bright pixels
+at displayed 1000 by 563; the separate canvas-copy count is zero. Actual device
+destruction produces a painted Canvas fallback with 12,958 colored pixels.
+This repeats the observed copy/export limitation rather than qualifying it.
+The source is published to both required remote tips. The requested execution
+checklist retires here; the original broader task stays open. Audit and all
+failed/successful raw receipts remain in the external evidence directory.
+
 **Browser renderer connection (2026-11-03):** [Verified contribution —
 GentleDuck; source `3373789b88949b817cddc642e139b25c93120308`]
 
