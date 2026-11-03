@@ -37,6 +37,9 @@ audio = ["kira"]
 world_wgpu = ["scriptbots-world-gfx", "pollster", "wgpu"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
+# GPUI has no desktop backend enabled by default. Without these features the
+# application builds successfully but panics when opening an X11 or Wayland window.
+gpui_platform = { workspace = true, features = ["wayland", "x11"] }
 wgpu = { version = "27", optional = true, default-features = false, features = ["vulkan", "wgsl"] }
 
 [target.'cfg(windows)'.dependencies]
