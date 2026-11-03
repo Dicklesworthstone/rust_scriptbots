@@ -1794,8 +1794,11 @@ fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &m
 
     let coverage_too_small =
         layout.render_size.0 < width_px * 0.25 || layout.render_size.1 < height_px * 0.25;
-    let coverage_too_large =
-        layout.render_size.0 > width_px * 6.0 || layout.render_size.1 > height_px * 6.0;
+    // A legitimate close-up may fill many viewport widths; only reject a
+    // scale beyond the camera's configured zoom range.
+    let max_coverage = camera_guard.max_zoom() * 1.01;
+    let coverage_too_large = layout.render_size.0 > width_px * max_coverage
+        || layout.render_size.1 > height_px * max_coverage;
     if coverage_too_small || coverage_too_large {
         camera_guard.fit_world();
         layout = camera_guard.layout(origin, (width_px, height_px), world_dims);
@@ -1804,7 +1807,12 @@ fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &m
     if state.controls.follow_mode != FollowMode::Off
         && let Some(target) = state.follow_target
     {
-        camera_guard.center_on(target);
+        camera_guard.center_on(bounded_follow_center(
+            target,
+            world_dims,
+            (width_px, height_px),
+            layout.scale,
+        ));
         layout = camera_guard.layout(origin, (width_px, height_px), world_dims);
         tracing::debug!(
             follow_mode = ?state.controls.follow_mode,
@@ -1819,8 +1827,8 @@ fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &m
 
         let follow_coverage_small =
             layout.render_size.0 < width_px * 0.25 || layout.render_size.1 < height_px * 0.25;
-        let follow_coverage_large =
-            layout.render_size.0 > width_px * 6.0 || layout.render_size.1 > height_px * 6.0;
+        let follow_coverage_large = layout.render_size.0 > width_px * max_coverage
+            || layout.render_size.1 > height_px * max_coverage;
         if follow_coverage_small || follow_coverage_large {
             camera_guard.fit_world();
             layout = camera_guard.layout(origin, (width_px, height_px), world_dims);
@@ -4687,12 +4695,9 @@ pub struct SimulationView {
     world_brain_last_request: Option<Instant>,
     /// Last coherent focused-agent sample for the World card. The source tick
     /// remains visible when the host advances before the next inspection.
-    world_hud_detail_cache: Option<(
-        scriptbots_runtime::HostSessionId,
-        AgentUid,
-        u64,
-        AgentInspectorDetails,
-    )>,
+    world_hud_detail_cache: Option<(WorldHudSampleSource, AgentInspectorDetails)>,
+    world_hud_job: Option<WorldHudJob>,
+    world_hud_last_request: Option<Instant>,
     /// Narrative rail visibility (bd-16g.2.4); toggled from the rail header.
     rail_visible: bool,
     /// Selected event index into the retained narrative, plus the selected event's
@@ -4825,6 +4830,8 @@ impl SimulationView {
             world_brain_error: None,
             world_brain_last_request: None,
             world_hud_detail_cache: None,
+            world_hud_job: None,
+            world_hud_last_request: None,
             rail_visible: true,
             rail_selection: None,
             rail_selection_aged_out: false,
@@ -6393,8 +6400,15 @@ impl SimulationView {
         cx.notify();
     }
 
-    fn fit_selection_view(&mut self, bounds: (Position, Position), cx: &mut Context<Self>) {
-        self.controls.follow_mode = FollowMode::Off;
+    fn fit_selection_view(
+        &mut self,
+        bounds: (Position, Position),
+        preserve_follow: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !preserve_follow {
+            self.controls.follow_mode = FollowMode::Off;
+        }
         if let Ok(mut camera) = self.camera.lock() {
             camera.cancel_initial_population_view();
             camera.fit_bounds(bounds.0, bounds.1, 120.0);
@@ -6420,7 +6434,9 @@ impl SimulationView {
         }
         if let Some(detail) = inspector.focused.as_ref() {
             push_pos(detail.position);
-        } else if let Some(hover) = inspector.hovered.as_ref() {
+        } else if inspector.selected.is_empty()
+            && let Some(hover) = inspector.hovered.as_ref()
+        {
             push_pos(hover.position);
         }
 
@@ -6704,6 +6720,135 @@ impl SimulationView {
 
         inspector_changed
     }
+    fn poll_world_hud_detail(
+        &mut self,
+        published: &Arc<RenderSnapshot>,
+        focused: Option<AgentUid>,
+        selected_eye: Option<usize>,
+    ) {
+        if self
+            .world_hud_detail_cache
+            .as_ref()
+            .is_some_and(|(source, _)| {
+                !source.matches(
+                    published.session_id,
+                    published.world.epoch,
+                    focused,
+                    published.world.tick,
+                )
+            })
+        {
+            self.world_hud_detail_cache = None;
+        }
+        if let Some(mut job) = self.world_hud_job.take() {
+            let still_targeted = job.session == published.session_id
+                && job.epoch == published.world.epoch
+                && Some(job.uid) == focused;
+            let ready = job.ready.take().map(|ready| Ok(Some(ready))).or_else(|| {
+                match job.result.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        Some(Err("World inspection worker disconnected".to_owned()))
+                    }
+                }
+            });
+            match ready {
+                None => self.world_hud_job = Some(job),
+                Some(Ok(Some((source, detail)))) if still_targeted => {
+                    if source.matches(
+                        published.session_id,
+                        published.world.epoch,
+                        focused,
+                        published.world.tick,
+                    ) {
+                        self.world_hud_detail_cache = Some((source, detail));
+                    } else if source.session == published.session_id
+                        && source.epoch == published.world.epoch
+                        && Some(source.uid) == focused
+                        && source.tick > published.world.tick
+                        && job
+                            .ready_since
+                            .is_none_or(|since| since.elapsed() < Duration::from_millis(500))
+                    {
+                        job.ready_since.get_or_insert_with(Instant::now);
+                        job.ready = Some((source, detail));
+                        self.world_hud_job = Some(job);
+                    }
+                }
+                Some(Err(error)) if still_targeted => debug!(%error, "World inspection failed"),
+                _ => {}
+            }
+        }
+        let Some(uid) = focused else { return };
+        if self.world_hud_job.is_some()
+            || self
+                .world_hud_last_request
+                .is_some_and(|at| at.elapsed() < Duration::from_millis(100))
+        {
+            return;
+        }
+        let host = self.host.clone();
+        let requested = Arc::clone(published);
+        let (send, result) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::Builder::new()
+            .name("scriptbots-world-inspector".into())
+            .spawn(move || {
+                let reply = host
+                    .inspect_agent_before(
+                        uid,
+                        SENSE_PROBE_MAX_CONTRIBUTORS,
+                        Instant::now() + Duration::from_millis(500),
+                    )
+                    .map_err(|error| error.to_string())
+                    .map(|detail| {
+                        let detail = detail?;
+                        let latest = host.snapshot_hub().latest();
+                        let source = if detail.source.matches_snapshot(&requested) {
+                            &requested
+                        } else if detail.source.matches_snapshot(&latest) {
+                            &latest
+                        } else {
+                            return None;
+                        };
+                        let agent = source.world.agents.iter().find(|agent| agent.uid == uid)?;
+                        let id = AgentId::from(slotmap::KeyData::from_ffi(agent.id));
+                        let detail = AgentInspectorDetails::from_snapshot(
+                            source,
+                            id,
+                            detail,
+                            None,
+                            selected_eye,
+                        )?;
+                        Some((
+                            WorldHudSampleSource {
+                                session: source.session_id,
+                                revision: source.revision,
+                                epoch: source.world.epoch,
+                                uid,
+                                tick: source.world.tick,
+                            },
+                            detail,
+                        ))
+                    });
+                let _ = send.send(reply);
+            });
+        self.world_hud_last_request = Some(Instant::now());
+        match worker {
+            Ok(_) => {
+                self.world_hud_job = Some(WorldHudJob {
+                    session: published.session_id,
+                    epoch: published.world.epoch,
+                    uid,
+                    result,
+                    ready: None,
+                    ready_since: None,
+                })
+            }
+            Err(error) => debug!(%error, "could not start World inspection worker"),
+        }
+    }
+
     fn poll_world_brain(&mut self, published: &RenderSnapshot, focused: Option<AgentUid>) {
         if self
             .world_brain_error
@@ -6898,6 +7043,7 @@ impl SimulationView {
         let (next_brain_inspection_cache, brain_request_issued) = {
             snapshot.tick = published.world.tick;
             snapshot.epoch = published.world.epoch;
+            snapshot.publication = Some((published.session_id, published.revision));
             snapshot.is_closed = published.world.world.closed;
             snapshot.agent_count = published.world.agents.len();
 
@@ -6962,6 +7108,7 @@ impl SimulationView {
                 selection_projection.as_deref(),
                 cached_brain_inspection.as_ref(),
                 brain_request,
+                !self.minimal_canvas_mode || !matches!(self.playback.mode(), PlaybackMode::Live),
             );
             snapshot.inspector = inspector;
             (cache, issued)
@@ -6975,20 +7122,14 @@ impl SimulationView {
                 .iter()
                 .find(|entry| entry.is_focused);
             let uid = focused.map(|entry| entry.uid);
-            if self.world_hud_detail_cache.as_ref().is_some_and(|entry| {
-                entry.0 != published.session_id || Some(entry.1) != uid || entry.2 > snapshot.tick
-            }) {
-                self.world_hud_detail_cache = None;
-            }
-            if let (Some(entry), Some(detail)) = (focused, snapshot.inspector.focused.as_ref())
-                && entry.agent_id == detail.agent_id
+            self.poll_world_hud_detail(&published, uid, inspector_state.selected_eye);
+            // Historical playback may only retain detail captured for this exact
+            // publication. Older cached detail remains a live, tick-labeled overlay.
+            if let Some((source, detail)) = self.world_hud_detail_cache.as_ref()
+                && source.revision == published.revision
+                && source.tick == snapshot.tick
             {
-                self.world_hud_detail_cache = Some((
-                    published.session_id,
-                    entry.uid,
-                    snapshot.tick,
-                    detail.clone(),
-                ));
+                snapshot.inspector.focused = Some(detail.clone());
             }
             self.poll_world_brain(&published, uid);
         } else if self.minimal_canvas_mode {
@@ -7013,6 +7154,17 @@ impl SimulationView {
         );
 
         self.playback.record(&snapshot);
+        // A detail request may finish after this tick was first recorded. Fill
+        // the existing entry only when it names the exact same publication.
+        if self.minimal_canvas_mode
+            && matches!(self.playback.mode(), PlaybackMode::Live)
+            && let Some(detail) = snapshot.inspector.focused.as_ref()
+            && let Some(recorded) = self.playback.timeline.back_mut()
+            && recorded.publication == snapshot.publication
+            && recorded.inspector.focus_id == Some(detail.agent_id)
+        {
+            recorded.inspector.focused = Some(detail.clone());
+        }
 
         snapshot
     }
@@ -8971,9 +9123,11 @@ impl SimulationView {
             this.toggle_settings(cx);
         });
         let selection_bounds = self.selection_bounds(&snapshot.inspector);
+        let preserve_follow = matches!(controls.follow_mode, FollowMode::Selected)
+            && snapshot.inspector.selected.len() == 1;
         let fit_selection = cx.listener(move |this, _event: &MouseDownEvent, _, cx| {
             if let Some(bounds) = selection_bounds {
-                this.fit_selection_view(bounds, cx);
+                this.fit_selection_view(bounds, preserve_follow, cx);
             }
         });
 
@@ -9033,7 +9187,9 @@ impl SimulationView {
             .debug_selector(|| "world-toolbar-settings".to_owned())
             .on_mouse_down(MouseButton::Left, open_settings);
         let fit_selected = selection_bounds.map(|_| {
-            base_button("Fit selected".into()).on_mouse_down(MouseButton::Left, fit_selection)
+            base_button("Fit selected".into())
+                .debug_selector(|| "world-toolbar-fit-selected".to_owned())
+                .on_mouse_down(MouseButton::Left, fit_selection)
         });
 
         if compact {
@@ -9322,9 +9478,10 @@ impl SimulationView {
             let cached = self
                 .world_hud_detail_cache
                 .as_ref()
-                .and_then(|(_, uid, tick, detail)| {
-                    (matches!(self.playback.mode(), PlaybackMode::Live) && *uid == selected.uid)
-                        .then_some((*tick, detail))
+                .and_then(|(source, detail)| {
+                    (matches!(self.playback.mode(), PlaybackMode::Live)
+                        && source.uid == selected.uid)
+                        .then_some((source.tick, detail))
                 });
             canvas_stack = canvas_stack.child(self.render_world_agent_hud(
                 selected,
@@ -9561,7 +9718,43 @@ impl SimulationView {
         if let Some((source_tick, detail)) =
             detail.filter(|(_, detail)| detail.agent_id == selected.agent_id)
         {
+            let life = &detail.life;
+            let parent = |uid: Option<AgentUid>| {
+                uid.map_or_else(|| "—".to_owned(), |uid| format!("#{}", uid.get()))
+            };
             hud = hud
+                .child(div().h(px(1.0)).w_full().bg(chrome::border()))
+                .child(label("LIFE & LINEAGE"))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(chrome::text_secondary())
+                        .child(format!(
+                            "Reproduction {:.2}  ·  Lifetime food {:+.2}",
+                            life.reproduction_counter, life.food_balance_total
+                        )),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(chrome::text_secondary())
+                        .child(format!(
+                            "Clock scales {:.2} / {:.2}  ·  Hybrid {}",
+                            life.clock_scales[0],
+                            life.clock_scales[1],
+                            if life.hybrid { "yes" } else { "no" }
+                        )),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(chrome::text_secondary())
+                        .child(format!(
+                            "Parents {} / {}",
+                            parent(life.lineage[0]),
+                            parent(life.lineage[1])
+                        )),
+                )
                 .child(div().h(px(1.0)).w_full().bg(chrome::border()))
                 .child(label("BRAIN & BEHAVIOR"))
                 .child(
@@ -9693,6 +9886,34 @@ impl SimulationView {
                             }),
                     ),
                 )
+                .child(div().h(px(1.0)).w_full().bg(chrome::border()))
+                .child(label("GENE CHANGE HISTORY"))
+                .when(life.mutation_log_total == 0, |hud| {
+                    hud.child(
+                        div()
+                            .text_xs()
+                            .text_color(chrome::text_muted())
+                            .child("No gene changes recorded"),
+                    )
+                })
+                .when(life.mutation_log_total > 0, |hud| {
+                    hud.child(
+                        div()
+                            .text_xs()
+                            .text_color(chrome::text_muted())
+                            .child(format!(
+                                "Showing {} of {} recorded changes · oldest first",
+                                life.mutation_log.len(),
+                                life.mutation_log_total
+                            )),
+                    )
+                    .children(life.mutation_log.iter().cloned().map(|entry| {
+                        div()
+                            .text_xs()
+                            .text_color(chrome::text_secondary())
+                            .child(entry)
+                    }))
+                })
                 .when_some(detail.genome_browser.as_ref(), |hud, browser| {
                     hud.child(render_genome_browser_view(browser))
                 });
@@ -15941,6 +16162,10 @@ fn paint_output_sparklines(
 struct HudSnapshot {
     tick: u64,
     epoch: u64,
+    publication: Option<(
+        scriptbots_runtime::HostSessionId,
+        scriptbots_runtime::SnapshotRevision,
+    )>,
     is_closed: bool,
     world_size: (u32, u32),
     history_capacity: usize,
@@ -17406,6 +17631,7 @@ impl InspectorSnapshot {
         selection_projection: Option<&[AgentId]>,
         cached_brain: Option<&BrainInspectorCapture>,
         brain_request: Option<(BrainInspectionClientId, BrainInspectionRevision)>,
+        inspect_detail: bool,
     ) -> (Self, Option<BrainInspectorCapture>, bool) {
         let mut snapshot = InspectorSnapshot {
             total_agents: published.world.agents.len(),
@@ -17533,7 +17759,7 @@ impl InspectorSnapshot {
                 status,
             })
         });
-        let focused = focus_id.and_then(|agent_id| {
+        let focused = focus_id.filter(|_| inspect_detail).and_then(|agent_id| {
             let agent = published
                 .world
                 .agents
@@ -18099,6 +18325,7 @@ pub struct AgentInspectorDetails {
     pub health: f32,
     pub age: u32,
     pub generation: Generation,
+    pub life: scriptbots_runtime::channel::AgentLifeData,
     pub brain_descriptor: String,
     pub mutation_rates: MutationRates,
     pub trait_modifiers: TraitModifiers,
@@ -18140,6 +18367,41 @@ pub struct BrainInspectorCapture {
     pub request_revision: u64,
     pub retained_payload_bytes: usize,
     pub status: BrainInspectorCaptureStatus,
+}
+
+/// Identity and time boundary of a retained World HUD sample.
+#[derive(Clone, Copy, Debug)]
+struct WorldHudSampleSource {
+    session: scriptbots_runtime::HostSessionId,
+    revision: scriptbots_runtime::SnapshotRevision,
+    epoch: u64,
+    uid: AgentUid,
+    tick: u64,
+}
+
+impl WorldHudSampleSource {
+    fn matches(
+        self,
+        session: scriptbots_runtime::HostSessionId,
+        epoch: u64,
+        uid: Option<AgentUid>,
+        tick: u64,
+    ) -> bool {
+        self.session == session && self.epoch == epoch && Some(self.uid) == uid && self.tick <= tick
+    }
+}
+
+/// One World detail request, including a completed response waiting for the
+/// displayed publication to catch up with its independently sampled tick.
+struct WorldHudJob {
+    session: scriptbots_runtime::HostSessionId,
+    epoch: u64,
+    uid: AgentUid,
+    result: std::sync::mpsc::Receiver<
+        Result<Option<(WorldHudSampleSource, AgentInspectorDetails)>, String>,
+    >,
+    ready: Option<(WorldHudSampleSource, AgentInspectorDetails)>,
+    ready_since: Option<Instant>,
 }
 
 /// At most one owner-thread inspection may be outstanding for the World view.
@@ -18210,6 +18472,7 @@ impl AgentInspectorDetails {
             health: agent.health,
             age: agent.age,
             generation: agent.generation,
+            life: detail.life,
             brain_descriptor: detail.brain_descriptor,
             mutation_rates: detail.mutation_rates,
             trait_modifiers: detail.trait_modifiers,
@@ -18339,6 +18602,7 @@ impl AgentInspectorDetails {
             health,
             age,
             generation,
+            life: scriptbots_runtime::channel::AgentLifeData::from(agent_runtime),
             brain_descriptor,
             mutation_rates: agent_runtime.mutation_rates,
             trait_modifiers: agent_runtime.trait_modifiers,
@@ -18626,6 +18890,55 @@ mod perf_presentation_tests {
         let snapshot = stats.snapshot(2.0);
         assert_eq!(snapshot.latest_ms, 2.0);
         assert_eq!(snapshot.fps, 50.0);
+    }
+
+    #[test]
+    fn small_populations_keep_individual_painters_under_load() {
+        let agent = super::AgentId::from(slotmap::KeyData::from_ffi(1));
+        for detail in [
+            RenderDetail::Full,
+            RenderDetail::Reduced,
+            RenderDetail::Minimal,
+        ] {
+            assert!(!super::agent_uses_batched_lod(detail, 20, agent, None));
+            assert!(!super::agent_uses_batched_lod(
+                detail,
+                super::STABLE_INDIVIDUAL_AGENT_LIMIT,
+                agent,
+                None
+            ));
+        }
+        assert!(super::agent_uses_batched_lod(
+            RenderDetail::Minimal,
+            super::STABLE_INDIVIDUAL_AGENT_LIMIT + 1,
+            agent,
+            None
+        ));
+    }
+
+    #[test]
+    fn selected_creature_keeps_its_individual_painter_under_load() {
+        let focused = super::AgentId::from(slotmap::KeyData::from_ffi(1));
+        let other = super::AgentId::from(slotmap::KeyData::from_ffi(2));
+        for detail in [
+            RenderDetail::Full,
+            RenderDetail::Reduced,
+            RenderDetail::Minimal,
+        ] {
+            assert!(
+                !super::agent_uses_batched_lod(detail, 100, focused, Some(focused)),
+                "the selected creature must keep the same painter at {detail:?}"
+            );
+            assert_eq!(
+                super::agent_uses_batched_lod(detail, 100, other, Some(focused)),
+                detail == RenderDetail::Minimal,
+                "other creatures use the population batch only in minimal mode"
+            );
+        }
+        assert!(
+            super::agent_uses_batched_lod(RenderDetail::Minimal, 100, focused, None),
+            "without a focus, minimal mode must batch all creatures"
+        );
     }
 
     #[test]
@@ -19765,7 +20078,6 @@ impl RenderFrame {
         })
     }
 
-    #[cfg(any(test, feature = "world_wgpu"))]
     fn from_snapshot(snapshot: &RenderSnapshot, palette: ColorPaletteMode) -> Option<Self> {
         Self::from_snapshot_with_vfx(snapshot, palette, None)
     }
@@ -21202,6 +21514,27 @@ fn paint_color_buckets<const N: usize>(
     }
 }
 
+// A small population can retain its complete appearance even when an unrelated
+// expensive pass temporarily lowers the frame rate. Keep the work bounded.
+const STABLE_INDIVIDUAL_AGENT_LIMIT: usize = 32;
+
+fn stable_individual_population(agent_count: usize) -> bool {
+    agent_count <= STABLE_INDIVIDUAL_AGENT_LIMIT
+}
+
+/// Keep focused and small-population creatures on the same painter at every
+/// quality level; large populations still batch in minimal mode.
+fn agent_uses_batched_lod(
+    detail: RenderDetail,
+    agent_count: usize,
+    id: AgentId,
+    focus: Option<AgentId>,
+) -> bool {
+    detail == RenderDetail::Minimal
+        && !stable_individual_population(agent_count)
+        && Some(id) != focus
+}
+
 #[allow(clippy::too_many_arguments)]
 fn paint_agent_lod_batches(
     window: &mut Window,
@@ -21244,6 +21577,14 @@ fn paint_agent_lod_batches(
     let mut marker_counts = [0_u32; 3];
 
     for agent in &frame.agents {
+        if !agent_uses_batched_lod(
+            RenderDetail::Minimal,
+            frame.agents.len(),
+            agent.agent_id,
+            focus_agent,
+        ) {
+            continue;
+        }
         let Some(projection) =
             project_agent_lod(frame, agent, view, focus_agent, palette_is_natural)
         else {
@@ -24051,8 +24392,10 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
 
     let coverage_too_small =
         layout.render_size.0 < width_px * 0.25 || layout.render_size.1 < height_px * 0.25;
-    let coverage_too_large =
-        layout.render_size.0 > width_px * 6.0 || layout.render_size.1 > height_px * 6.0;
+    // Allow close-ups up to the camera's configured zoom limit.
+    let max_coverage = camera_guard.max_zoom() * 1.01;
+    let coverage_too_large = layout.render_size.0 > width_px * max_coverage
+        || layout.render_size.1 > height_px * max_coverage;
 
     if coverage_too_small || coverage_too_large {
         camera_guard.fit_world();
@@ -24087,8 +24430,8 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
 
         let follow_coverage_small =
             layout.render_size.0 < width_px * 0.25 || layout.render_size.1 < height_px * 0.25;
-        let follow_coverage_large =
-            layout.render_size.0 > width_px * 6.0 || layout.render_size.1 > height_px * 6.0;
+        let follow_coverage_large = layout.render_size.0 > width_px * max_coverage
+            || layout.render_size.1 > height_px * max_coverage;
         if follow_coverage_small || follow_coverage_large {
             camera_guard.fit_world();
             layout = camera_guard.layout(
@@ -24269,7 +24612,10 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                 // Resource cells are present throughout a healthy world. Keep
                 // them legible without letting a uniform grid overwhelm agents.
                 color.a *= 0.68;
-                let shade_wave = visual::shimmer(frame.tick, x as u32, y as u32);
+                // The fallback must not flash when scientific time advances
+                // faster than display time. Preserve per-cell variation while
+                // holding its phase fixed, as in the continuous food field.
+                let shade_wave = visual::shimmer(0, x as u32, y as u32);
                 let gain =
                     food_visuals.emissive_gain / visual::visual_style().food.dense_emissive_gain;
                 let shade = (0.78 + 0.18 * shade_wave + 0.22 * gain).clamp(0.0, 1.3);
@@ -24307,7 +24653,8 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
     }
 
     if controls.draw_agents {
-        if very_low_fps {
+        let preserve_population = stable_individual_population(frame.agents.len());
+        if very_low_fps && !preserve_population {
             paint_agent_lod_batches(
                 window,
                 frame,
@@ -24321,8 +24668,18 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                 view_bottom,
                 palette_is_natural,
             );
-        } else {
+        }
+        if !very_low_fps || preserve_population || focus_agent.is_some() {
             for agent in &frame.agents {
+                if agent_uses_batched_lod(
+                    state.perf.detail,
+                    frame.agents.len(),
+                    agent.agent_id,
+                    focus_agent,
+                ) {
+                    continue;
+                }
+                let preserve_detail = preserve_population || Some(agent.agent_id) == focus_agent;
                 let px_x = offset_x + agent.position.x * scale;
                 let px_y = offset_y + agent.position.y * scale;
                 let half = agent_screen_radius(frame, agent, scale);
@@ -24338,7 +24695,7 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                 }
                 let visuals = resolve_agent_visual(agent, frame.agent_reference_age);
 
-                if !low_fps {
+                if !low_fps || preserve_detail {
                     let shadow_radius = half * 1.25;
                     let shadow_offset_x = scale.clamp(1.0, 6.0) * 0.6;
                     let shadow_offset_y = scale.clamp(1.0, 7.0) * 1.1;
@@ -24361,7 +24718,7 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                     }
                 }
                 // Inline highlights without allocating
-                if !very_low_fps {
+                if !very_low_fps || preserve_detail {
                     match agent.selection {
                         SelectionState::Selected => {
                             let factor = 1.85;
@@ -24419,7 +24776,7 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
 
                 // Defer agent outlines to a single batched pass below
 
-                if agent.indicator.intensity > 0.05 && !low_fps {
+                if agent.indicator.intensity > 0.05 && (!low_fps || preserve_detail) {
                     let effect = agent.indicator.intensity.clamp(0.0, 1.0);
                     let indicator_radius = half * (1.2 + effect * 1.4);
                     let indicator_color = apply_palette(
@@ -24433,7 +24790,7 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                     }
                 }
 
-                if agent.reproduction_intent > 0.2 && !low_fps {
+                if agent.reproduction_intent > 0.2 && (!low_fps || preserve_detail) {
                     let pulse = agent.reproduction_intent.clamp(0.0, 1.0);
                     let pulse_radius = half * (1.8 + pulse * 1.6);
                     let cue = visual::visual_cue_for_event(&WorldVisualEvent::Reproduce);
@@ -24475,7 +24832,7 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                     &visuals,
                     frame.palette,
                     palette_is_natural,
-                    very_low_fps,
+                    very_low_fps && !preserve_detail,
                 );
             }
         }
@@ -24497,10 +24854,18 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
         );
 
         // Batched agent outlines pass
-        if controls.agent_outline && !very_low_fps {
+        if controls.agent_outline {
             let mut outline_builder = PathBuilder::stroke(px(2.6));
 
             for agent in &frame.agents {
+                if agent_uses_batched_lod(
+                    state.perf.detail,
+                    frame.agents.len(),
+                    agent.agent_id,
+                    focus_agent,
+                ) {
+                    continue;
+                }
                 let Some((px_x, px_y)) =
                     camera_snapshot.world_to_screen((agent.position.x, agent.position.y))
                 else {
@@ -31899,6 +32264,263 @@ mod command_characterization_tests {
     }
 
     #[test]
+    fn world_hud_sample_never_crosses_identity_or_epoch_boundaries() {
+        let session = scriptbots_runtime::HostSessionId::new(7);
+        let creature = AgentUid(42);
+        let sample = WorldHudSampleSource {
+            session,
+            revision: scriptbots_runtime::SnapshotRevision::new(3),
+            epoch: 3,
+            uid: creature,
+            tick: 100,
+        };
+        assert!(
+            sample.matches(session, 3, Some(creature), 101),
+            "a recent sample may remain visible while a new one is pending"
+        );
+        assert!(
+            !sample.matches(session, 4, Some(creature), 101),
+            "epoch change must invalidate a retained sample"
+        );
+        assert!(!sample.matches(
+            scriptbots_runtime::HostSessionId::new(8),
+            3,
+            Some(creature),
+            101
+        ));
+        assert!(!sample.matches(session, 3, Some(AgentUid(43)), 101));
+        assert!(!sample.matches(session, 3, None, 101));
+        assert!(
+            !sample.matches(session, 3, Some(creature), 99),
+            "a sample from the future cannot be shown after a rewind"
+        );
+    }
+
+    #[test]
+    fn world_hud_detail_is_async_and_rejects_a_late_selection() {
+        let world = command_characterization_world();
+        let (first, second) = {
+            let mut world = world.lock().unwrap();
+            (
+                world.try_spawn_agent(AgentData::default()).unwrap(),
+                world.try_spawn_agent(AgentData::default()).unwrap(),
+            )
+        };
+        let host = TestHost::take(world);
+        let before = host.port.scientific_digest_v1().unwrap();
+        let published = host.port.snapshot_hub().latest();
+        let first_uid = published
+            .world
+            .agents
+            .iter()
+            .find(|row| row.id == first.raw())
+            .unwrap()
+            .uid;
+        let second_uid = published
+            .world
+            .agents
+            .iter()
+            .find(|row| row.id == second.raw())
+            .unwrap()
+            .uid;
+        let owner_detail = host.port.inspect_agent(first_uid, 0).unwrap().unwrap();
+        let detail =
+            AgentInspectorDetails::from_snapshot(&published, first, owner_detail, None, None)
+                .unwrap();
+        let source = WorldHudSampleSource {
+            session: published.session_id,
+            revision: published.revision,
+            epoch: published.world.epoch,
+            uid: first_uid,
+            tick: published.world.tick,
+        };
+        let mut canvas = host_view(Arc::clone(&host));
+        canvas.set_minimal_canvas_mode();
+        canvas.inspector.lock().unwrap().focused_agent = Some(first);
+        *canvas.selection_projection.lock().unwrap() = Some(vec![first]);
+        let (sender, result) = std::sync::mpsc::sync_channel(1);
+        canvas.world_hud_job = Some(WorldHudJob {
+            session: source.session,
+            epoch: source.epoch,
+            uid: first_uid,
+            result,
+            ready: None,
+            ready_since: None,
+        });
+        canvas.world_hud_last_request = Some(Instant::now());
+        let pending = canvas.snapshot();
+        assert!(
+            pending.inspector.focused.is_none(),
+            "World must not synchronously inspect the owner"
+        );
+        assert!(
+            canvas.world_hud_job.is_some(),
+            "an unfinished request must remain bounded to one worker"
+        );
+        sender.send(Ok(Some((source, detail.clone())))).unwrap();
+        let exact = canvas.snapshot();
+        assert!(
+            exact.inspector.focused.is_some(),
+            "an exact sample belongs in the current frame"
+        );
+        assert!(
+            canvas
+                .playback
+                .timeline
+                .back()
+                .unwrap()
+                .inspector
+                .focused
+                .is_some(),
+            "a late sample for the exact publication must enrich the recorded frame"
+        );
+        assert_eq!(
+            canvas.world_hud_detail_cache.as_ref().unwrap().0.uid,
+            first_uid
+        );
+        canvas.world_hud_detail_cache = Some((
+            WorldHudSampleSource {
+                revision: scriptbots_runtime::SnapshotRevision::new(source.revision.get() + 1),
+                ..source
+            },
+            detail.clone(),
+        ));
+        canvas.world_hud_last_request = Some(Instant::now());
+        canvas
+            .playback
+            .timeline
+            .back_mut()
+            .unwrap()
+            .inspector
+            .focused = None;
+        let different_revision = canvas.snapshot();
+        assert!(
+            different_revision.inspector.focused.is_none(),
+            "a same-tick sample from a different publication must not be recorded as exact"
+        );
+        assert!(
+            canvas
+                .playback
+                .timeline
+                .back()
+                .unwrap()
+                .inspector
+                .focused
+                .is_none(),
+            "a different publication must not enrich recorded history"
+        );
+
+        // A future sample can wait for publication, but cannot block new
+        // requests indefinitely after a rewind or a lost publication.
+        let (_sender, result) = std::sync::mpsc::sync_channel(1);
+        canvas.world_hud_job = Some(WorldHudJob {
+            session: source.session,
+            epoch: source.epoch,
+            uid: first_uid,
+            result,
+            ready: Some((
+                WorldHudSampleSource {
+                    tick: source.tick + 1,
+                    ..source
+                },
+                detail.clone(),
+            )),
+            ready_since: Some(Instant::now() - Duration::from_secs(1)),
+        });
+        canvas.world_hud_last_request = Some(Instant::now());
+        canvas.poll_world_hud_detail(&published, Some(first_uid), None);
+        assert!(
+            canvas.world_hud_job.is_none(),
+            "an obsolete future sample must not block retries"
+        );
+
+        let (sender, result) = std::sync::mpsc::sync_channel(1);
+        canvas.world_hud_job = Some(WorldHudJob {
+            session: source.session,
+            epoch: source.epoch,
+            uid: first_uid,
+            result,
+            ready: None,
+            ready_since: None,
+        });
+        canvas.world_hud_last_request = Some(Instant::now());
+        sender.send(Ok(Some((source, detail)))).unwrap();
+        canvas.inspector.lock().unwrap().focused_agent = Some(second);
+        *canvas.selection_projection.lock().unwrap() = Some(vec![second]);
+        let _ = canvas.snapshot();
+        assert!(
+            canvas.world_hud_detail_cache.is_none(),
+            "late data for the previous creature must be discarded"
+        );
+        canvas.world_hud_last_request = None;
+        let _ = canvas.snapshot();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while canvas.world_hud_detail_cache.is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+            let _ = canvas.snapshot();
+        }
+        let (observed, _) = canvas
+            .world_hud_detail_cache
+            .as_ref()
+            .expect("owner sample should arrive without blocking the World view");
+        assert_eq!(observed.uid, second_uid);
+        assert_eq!(observed.tick, host.port.snapshot_hub().latest().world.tick);
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+    }
+
+    #[test]
+    fn world_hud_sample_catches_up_after_owner_steps() {
+        let world = command_characterization_world();
+        let agent = world
+            .lock()
+            .unwrap()
+            .try_spawn_agent(AgentData::default())
+            .unwrap();
+        let host = TestHost::take(world);
+        let uid = host
+            .port
+            .snapshot_hub()
+            .latest()
+            .world
+            .agents
+            .iter()
+            .find(|row| row.id == agent.raw())
+            .unwrap()
+            .uid;
+        let mut canvas = host_view(Arc::clone(&host));
+        canvas.set_minimal_canvas_mode();
+        canvas.inspector.lock().unwrap().focused_agent = Some(agent);
+        *canvas.selection_projection.lock().unwrap() = Some(vec![agent]);
+        for _ in 0..3 {
+            // Start a sample before stepping, so an old response can race the new frame.
+            canvas.world_hud_last_request = None;
+            let _ = canvas.snapshot();
+            let previous_tick = host.port.snapshot_hub().latest().world.tick;
+            host.apply(scriptbots_runtime::HostCommand::Step);
+            let target_tick = host.port.snapshot_hub().latest().world.tick;
+            assert!(target_tick > previous_tick);
+            let digest = host.port.scientific_digest_v1().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let _ = canvas.snapshot();
+                if canvas
+                    .world_hud_detail_cache
+                    .as_ref()
+                    .is_some_and(|(source, _)| source.uid == uid && source.tick == target_tick)
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "World HUD did not catch up to tick {target_tick}"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), digest);
+        }
+    }
+
+    #[test]
     fn gpui_brain_pull_is_client_isolated_and_world_selection_is_async() {
         #[derive(Debug)]
         struct GuiInspectionBrain {
@@ -32431,6 +33053,170 @@ mod command_characterization_tests {
                 .expect("production GUI root");
             self.app.read_entity(&hud, |view, _| probe(view))
         }
+    }
+
+    #[test]
+    fn fit_selected_keeps_following_and_survives_close_up_paint() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 6000,
+            world_height: 3000,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            persistence_interval: 0,
+            ..ScriptBotsConfig::default()
+        })
+        .unwrap();
+        let agent = world
+            .try_spawn_agent(AgentData {
+                position: Position::new(3000.0, 1500.0),
+                ..AgentData::default()
+            })
+            .unwrap();
+        let other = world
+            .try_spawn_agent(AgentData {
+                position: Position::new(3300.0, 1600.0),
+                ..AgentData::default()
+            })
+            .unwrap();
+        let host = Arc::new(TestHost::new(world));
+        host.apply(
+            scriptbots_runtime::HostCommand::try_from(ControlCommand::UpdateSelection(
+                SelectionUpdate {
+                    mode: SelectionMode::Replace,
+                    agent_ids: vec![agent.raw()],
+                    state: SelectionState::Selected,
+                },
+            ))
+            .unwrap(),
+        );
+        let session = Arc::new(GuiSession::new(
+            host.port.clone(),
+            AnalyticsSnapshotProvider::empty(),
+            Arc::new(|_| None),
+        ));
+        let context = gpui::TestAppContext::single();
+        let windows = context.update(|app| session.install(app)).unwrap();
+        context.update(|app| {
+            windows.canvas.root(app).unwrap().update(app, |view, _| {
+                view.inspector.lock().unwrap().focused_agent = Some(agent);
+                view.controls.follow_mode = FollowMode::Selected;
+            })
+        });
+        let mut gui = gpui::VisualTestContext::from_window(windows.canvas.into(), &context);
+        gui.simulate_resize(size(px(1280.0), px(720.0)));
+        let redraw = |gui: &mut gpui::VisualTestContext| {
+            gui.update(|window, app| {
+                window.refresh();
+                window.draw(app).clear();
+            })
+        };
+        redraw(&mut gui);
+        let button = gui
+            .debug_bounds("world-toolbar-fit-selected")
+            .expect("fit selected control laid out");
+        gui.simulate_click(button.center(), gpui::Modifiers::default());
+        redraw(&mut gui);
+        context.update(|app| {
+            let root = windows.canvas.root(app).unwrap();
+            let view = root.read(app);
+            assert!(
+                matches!(view.controls.follow_mode, FollowMode::Selected),
+                "fitting a single selected creature must retain follow"
+            );
+            let camera = view.camera_snapshot();
+            assert!(
+                camera.zoom > 2.5,
+                "paint must retain a useful close-up instead of resetting to fit-world: {}",
+                camera.zoom
+            );
+            assert!(
+                camera.last_scale * ScriptBotsConfig::default().bot_radius * 2.0 >= DETAIL_MIN_PX,
+                "creature diameter must be large enough for detail"
+            );
+        });
+        host.apply(
+            scriptbots_runtime::HostCommand::try_from(ControlCommand::UpdateSelection(
+                SelectionUpdate {
+                    mode: SelectionMode::Replace,
+                    agent_ids: vec![agent.raw(), other.raw()],
+                    state: SelectionState::Selected,
+                },
+            ))
+            .unwrap(),
+        );
+        redraw(&mut gui);
+        let button = gui
+            .debug_bounds("world-toolbar-fit-selected")
+            .expect("group fit control laid out");
+        gui.simulate_click(button.center(), gpui::Modifiers::default());
+        redraw(&mut gui);
+        context.update(|app| {
+            let root = windows.canvas.root(app).unwrap();
+            assert!(
+                matches!(root.read(app).controls.follow_mode, FollowMode::Off),
+                "group fit must not be immediately recentered on one creature"
+            );
+        });
+        context.quit();
+    }
+
+    #[test]
+    fn focused_life_projection_matches_owner_without_changing_science() {
+        let world = command_characterization_world();
+        let (id, uid) = {
+            let mut world = world.lock().unwrap();
+            let id = world.try_spawn_agent(AgentData::default()).unwrap();
+            world
+                .try_update_agent(id, |_, runtime| {
+                    runtime.reproduction_counter = 12.5;
+                    runtime.clocks = [17.0, 42.0];
+                    runtime.food_balance_total = 37.25;
+                    runtime.hybrid = true;
+                    runtime.mutation_log = (0..40)
+                        .map(|index| {
+                            if index == 39 {
+                                "é".repeat(161)
+                            } else {
+                                format!("mutation {index}")
+                            }
+                        })
+                        .collect();
+                })
+                .unwrap();
+            (id, world.agent_uid(id).unwrap())
+        };
+        let host = TestHost::take(world);
+        let before = host.port.scientific_digest_v1().unwrap();
+        let detail = host.port.inspect_agent(uid, 0).unwrap().unwrap();
+        let mut recent_changes: Vec<_> = (8..39).map(|index| format!("mutation {index}")).collect();
+        recent_changes.push(format!("{}…", "é".repeat(160)));
+        let expected = scriptbots_runtime::channel::AgentLifeData {
+            reproduction_counter: 12.5,
+            clock_scales: [17.0, 42.0],
+            hybrid: true,
+            lineage: [None, None],
+            food_balance_total: 37.25,
+            mutation_log_total: 40,
+            mutation_log: recent_changes,
+        };
+        assert_eq!(detail.life, expected);
+        let mut parent_fixture = scriptbots_core::AgentRuntime::default();
+        parent_fixture.lineage = [Some(AgentUid(31)), Some(AgentUid(47))];
+        parent_fixture.hybrid = true;
+        let parent_life = scriptbots_runtime::channel::AgentLifeData::from(&parent_fixture);
+        assert_eq!(
+            parent_life.lineage,
+            [Some(AgentUid(31)), Some(AgentUid(47))]
+        );
+        assert!(parent_life.hybrid);
+        let model = AgentInspectorDetails::from_snapshot(&host.snapshot(), id, detail, None, None)
+            .expect("same-boundary life projection");
+        assert_eq!(model.life, expected);
+        assert_eq!(
+            host.port.scientific_digest_v1().unwrap(),
+            before,
+            "inspecting life state must not alter science"
+        );
     }
 
     #[test]
@@ -35360,6 +36146,7 @@ mod command_characterization_tests {
             health: 1.0,
             age: 50,
             generation: scriptbots_core::Generation(1),
+            life: scriptbots_runtime::channel::AgentLifeData::default(),
             brain_descriptor: "TestBrain".to_string(),
             mutation_rates: scriptbots_core::MutationRates::default(),
             trait_modifiers: scriptbots_core::TraitModifiers::default(),

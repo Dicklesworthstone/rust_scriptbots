@@ -15,7 +15,7 @@ impl Default for CameraConfig {
     fn default() -> Self {
         Self {
             min_zoom: 0.4,
-            max_zoom: 2.5,
+            max_zoom: 16.0,
         }
     }
 }
@@ -106,6 +106,11 @@ impl Camera {
     #[inline]
     pub fn zoom(&self) -> f32 {
         self.state.zoom
+    }
+
+    #[inline]
+    pub fn max_zoom(&self) -> f32 {
+        self.config.max_zoom
     }
 
     #[allow(dead_code)]
@@ -749,6 +754,47 @@ mod tests {
                 f32::EPSILON,
             ),
             "scroll must update the cached scale before the next repaint"
+        );
+    }
+
+    #[test]
+    fn fitting_one_creature_reaches_detail_scale_and_stays_centered() {
+        let mut camera = Camera::default();
+        let viewport = (1280.0, 720.0);
+        let world = (6000.0, 3000.0);
+        let target = Position::new(3000.0, 1500.0);
+        camera.layout((0.0, 0.0), viewport, world);
+        camera.fit_bounds(target, target, 120.0);
+        let layout = camera.layout((0.0, 0.0), viewport, world);
+        let screen = camera.world_to_screen((target.x, target.y)).unwrap();
+        assert!(
+            camera.zoom() > 2.5,
+            "single-creature fit must exceed the old overview-only limit"
+        );
+        assert!(
+            layout.scale * 10.0 >= 18.0,
+            "a typical creature must reach the detailed rendering scale"
+        );
+        assert!(
+            approx_eq(screen.0, viewport.0 / 2.0, 0.01)
+                && approx_eq(screen.1, viewport.1 / 2.0, 0.01)
+        );
+        let before = camera
+            .screen_to_world(Point {
+                x: px(900.0),
+                y: px(300.0),
+            })
+            .unwrap();
+        assert!(camera.apply_scroll(&scroll_event((900.0, 300.0), 1.0)));
+        let after = camera
+            .screen_to_world(Point {
+                x: px(900.0),
+                y: px(300.0),
+            })
+            .unwrap();
+        assert!(
+            approx_eq(before.0, after.0, 0.01) && approx_eq(before.1, after.1, 0.01),
+            "close zoom must preserve the world point under the cursor"
         );
     }
 

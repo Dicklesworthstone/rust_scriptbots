@@ -189,6 +189,54 @@ enum IngressMessage {
     Wake,
 }
 
+/// Bounded life-history values captured at the same owner boundary as the
+/// focused agent's sensor and actuator arrays.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct AgentLifeData {
+    /// Current progress toward reproduction.
+    pub reproduction_counter: f32,
+    /// The two inherited clock divisors used by the sensor equations.
+    pub clock_scales: [f32; 2],
+    /// Whether the individual has two parents.
+    pub hybrid: bool,
+    /// Up to two stable parent identities.
+    pub lineage: [Option<AgentUid>; 2],
+    /// Lifetime accumulated food intake.
+    pub food_balance_total: f32,
+    /// Total number of retained gene-change entries on the owner.
+    pub mutation_log_total: usize,
+    /// Most recent entries, in chronological order, bounded for the UI.
+    pub mutation_log: Vec<String>,
+}
+
+impl From<&scriptbots_core::AgentRuntime> for AgentLifeData {
+    fn from(runtime: &scriptbots_core::AgentRuntime) -> Self {
+        const MAX_ENTRIES: usize = 32;
+        const MAX_ENTRY_CHARS: usize = 160;
+        let start = runtime.mutation_log.len().saturating_sub(MAX_ENTRIES);
+        let mutation_log = runtime.mutation_log[start..]
+            .iter()
+            .map(|entry| {
+                let mut chars = entry.chars();
+                let mut bounded: String = chars.by_ref().take(MAX_ENTRY_CHARS).collect();
+                if chars.next().is_some() {
+                    bounded.push('…');
+                }
+                bounded
+            })
+            .collect();
+        Self {
+            reproduction_counter: runtime.reproduction_counter,
+            clock_scales: runtime.clocks,
+            hybrid: runtime.hybrid,
+            lineage: runtime.lineage,
+            food_balance_total: runtime.food_balance_total,
+            mutation_log_total: runtime.mutation_log.len(),
+            mutation_log,
+        }
+    }
+}
+
 /// On-demand focused-agent detail captured entirely on the scientific owner thread.
 /// Arrays have the core sensor/actuator widths; no evaluator or world handle crosses threads.
 #[derive(Debug, Clone)]
@@ -197,6 +245,8 @@ pub struct AgentInspectorData {
     pub source: BrainProjectionSource,
     /// Stable subject identity, independent of slot reuse.
     pub uid: AgentUid,
+    /// Life-history values read at the same scientific boundary.
+    pub life: AgentLifeData,
     /// Most recently recorded sensor inputs, in the core's declared input order.
     pub sensors: [f32; INPUT_SIZE],
     /// Most recently recorded brain outputs, in actuator order.
