@@ -3386,13 +3386,73 @@ mod tests {
         assert_eq!(digests.len(), 4, "islands must evolve distinct science");
     }
 
+    fn print_ring_long_setup(archipelago: &Archipelago, target_tick: u64) {
+        eprintln!(
+            "SCRIPTBOTS_RING_LONG {}",
+            serde_json::json!({
+                "schema": "scriptbots.ring-long.v1",
+                "kind": "setup",
+                "islands": archipelago.islands().collect::<Vec<_>>(),
+                "edges": archipelago.edges(),
+                "migration": archipelago.migration.as_ref().map(|policy| serde_json::json!({
+                    "interval_ticks": policy.interval_ticks,
+                    "emigrants_per_edge": policy.emigrants_per_edge,
+                    "selection_rule": policy.selection_rule,
+                })),
+                "root_seed": archipelago.master_seed().to_string(),
+                "barrier_interval": archipelago.barrier_interval().get(),
+                "target_tick": target_tick,
+                "expected_epochs": target_tick / archipelago.barrier_interval(),
+                "brain_kind": TEST_BRAIN_KIND,
+                "brain_factory_digest": TEST_BRAIN_FACTORY_DIGEST.to_string(),
+            })
+        );
+    }
+
+    fn print_ring_long_barrier(
+        archipelago: &Archipelago,
+        report: &BarrierReport,
+        migration: &MigrationBarrierReport,
+    ) {
+        eprintln!(
+            "SCRIPTBOTS_RING_LONG {}",
+            serde_json::json!({
+                "schema": "scriptbots.ring-long.v1",
+                "kind": "barrier",
+                "epoch": report.epoch,
+                "tick": report.barrier_tick.0,
+                "step_topology": report.step_topology,
+                "move_count": migration.moves.len(),
+                "rule": migration.rule,
+                "pop_before": migration.pop_before,
+                "pop_after": migration.pop_after,
+                "moves": migration.moves.iter().map(|m| serde_json::json!({
+                    "from": [m.from.island.0.to_string(), m.from.uid.0.to_string()],
+                    "to": [m.to.island.0.to_string(), m.to.uid.0.to_string()],
+                    "rank": m.rank,
+                    "key_value": m.key_value,
+                })).collect::<Vec<_>>(),
+                "census_before": migration.census_before.iter().map(|id|
+                    [id.island.0.to_string(), id.uid.0.to_string()]
+                ).collect::<Vec<_>>(),
+                "census_after": migration.census_after.iter().map(|id|
+                    [id.island.0.to_string(), id.uid.0.to_string()]
+                ).collect::<Vec<_>>(),
+                "latched": archipelago.latched(),
+            })
+        );
+    }
+
     /// DSR long lane: 8-island ring archipelago, 5k ticks, migration every 250 (bd-t3ge).
-    /// Asserts per barrier that migration runs, records moves, completes 20 barriers
-    /// without latching, and all 8 islands evolve distinct science digests.
+    /// Retains each barrier's migration witnesses and populations, requires positive moves
+    /// without latching, and checks final ticks, populations and distinct science digests.
+    /// Uses the existing heritable test brain with persistence disabled.
     #[test]
     #[ignore = "DSR long lane: 8-island ring archipelago, 5k ticks, migration every 250"]
     fn dsr_eight_island_ring_archipelago_five_thousand_ticks() {
-        let island_specs: Vec<IslandSpec> = (0..8)
+        const ISLAND_COUNT: u32 = 8;
+        const FINAL_TICK: u64 = 5_000;
+        let island_specs: Vec<IslandSpec> = (0..ISLAND_COUNT)
             .map(|id| {
                 let growth =
                     0.015f32.mul_add(f32::from(u16::try_from(id).expect("small id")), 0.02);
@@ -3409,13 +3469,17 @@ mod tests {
             })
             .collect();
         let arch_config = migrating_config(island_specs, 250, EmigrantSelectionRule::Fittest, 2);
+        let expected_epochs = FINAL_TICK / arch_config.barrier_interval;
+        assert!(FINAL_TICK.is_multiple_of(arch_config.barrier_interval.get()));
         let mut archipelago =
             populated_archipelago(arch_config).expect("8-island ring archipelago");
+        print_ring_long_setup(&archipelago, FINAL_TICK);
 
         let mut total_moves = 0;
-        let mut barrier_moves = Vec::with_capacity(20);
+        let mut barrier_moves =
+            Vec::with_capacity(usize::try_from(expected_epochs).expect("epoch count fits usize"));
 
-        for epoch in 1..=20 {
+        for epoch in 1..=expected_epochs {
             let report = archipelago.step_to_barrier().expect("step to barrier");
             assert_eq!(archipelago.epoch(), epoch);
             assert!(archipelago.latched().is_none());
@@ -3428,35 +3492,58 @@ mod tests {
             assert!(moves > 0, "epoch {epoch}: migration must produce moves");
             total_moves += moves;
             barrier_moves.push((epoch, archipelago.barrier_tick().0, moves));
+            print_ring_long_barrier(&archipelago, &report, migration);
         }
 
-        assert_eq!(archipelago.barrier_tick(), Tick(5_000));
-        assert!(total_moves >= 20);
-        assert_eq!(barrier_moves.len(), 20);
+        assert_eq!(archipelago.barrier_tick(), Tick(FINAL_TICK));
+        assert!(u64::try_from(total_moves).expect("move count fits u64") >= expected_epochs);
+        assert_eq!(
+            u64::try_from(barrier_moves.len()).expect("epoch count fits u64"),
+            expected_epochs
+        );
 
         let mut digests = Vec::new();
-        for id in 0..8_u32 {
+        let mut final_islands = Vec::new();
+        for id in 0..ISLAND_COUNT {
             let snapshot = archipelago
                 .island_snapshot(IslandId(id))
                 .expect("committed snapshot");
-            assert_eq!(snapshot.world.tick, 5_000, "island {id} tick count");
+            assert_eq!(snapshot.world.tick, FINAL_TICK, "island {id} tick count");
             assert!(
                 snapshot.world.summary.agent_count > 0,
                 "island {id} must remain populated"
             );
-            digests.push(
-                archipelago
-                    .island_digest(IslandId(id))
-                    .expect("island digest")
-                    .overall,
-            );
+            let digest = archipelago
+                .island_digest(IslandId(id))
+                .expect("island digest")
+                .overall;
+            digests.push(digest.clone());
+            final_islands.push(serde_json::json!({
+                "island": id,
+                "tick": snapshot.world.tick,
+                "population": snapshot.world.summary.agent_count,
+                "digest": digest,
+            }));
         }
         digests.sort_unstable();
         digests.dedup();
         assert_eq!(
             digests.len(),
-            8,
-            "all 8 islands must evolve distinct science"
+            usize::try_from(ISLAND_COUNT).expect("island count fits usize"),
+            "final island science digests must differ"
+        );
+        eprintln!(
+            "SCRIPTBOTS_RING_LONG {}",
+            serde_json::json!({
+                "schema": "scriptbots.ring-long.v1",
+                "kind": "complete",
+                "tick": archipelago.barrier_tick().0,
+                "epochs": archipelago.epoch(),
+                "total_moves": total_moves,
+                "barrier_moves": barrier_moves,
+                "islands": final_islands,
+                "latched": archipelago.latched(),
+            })
         );
     }
 

@@ -2,6 +2,147 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Archipelago duration lane (2026-11-03):** [Verified and Closed —
+GentleDuck; original `bd-t3ge`; fresh solo verification]
+
+The existing ignored eight-island/5,000-tick test now retains its actual
+per-barrier reports. The original duration task passed on clean pinned source;
+this operator-requested TODO retires here. No production migration or ecology
+behavior changed, and no new migration framework was built.
+
+- [x] Recheck BR readiness, original task, existing long test and production
+  conservation/latching path; claim the unowned task and reserve edit surfaces.
+- [x] Run the existing exact ignored test on clean pinned source; distinguish
+  actual execution from the ordinary suite's ignored-test result. The original
+  unoptimized run timed out at its declared 1,800-second execution bound;
+  it supplies no positive completion evidence.
+- [x] Retain actual setup, all 20 barrier reports and final island states from
+  the existing test, including move counts, population maps and identity witnesses.
+- [x] Derive expected epochs and island counts from the test configuration;
+  preserve original positive-migration, final-tick, non-latching and digest guards.
+- [x] Review and commit only the test's output retention and derived bounds:
+  `69369f86d0014f5697f56c59dfd6b28287b98494`. Extract two small printing helpers
+  to satisfy strict Clippy; retain both unsuccessful lint attempts.
+- [x] Bind a clean verification checkout to that exact source revision, keeping
+  the original island configurations, root seed, test-brain factory, selection,
+  interval and target tick. No production migration or ecology code changes.
+- [x] Pass clean-source workspace check, strict workspace Clippy, formatting
+  and UBS; pass the 44 fast archipelago tests with the two existing long ignores
+  disclosed. `quality/ring_long_final/20261103T050416-3443700` retains these
+  passing individual checks and its explicitly incomplete long-run failures.
+- [x] Retain incomplete scalar/native probes; enable existing parallel/SIMD/batch
+  features and optimize the full development profile with debug assertions and
+  overflow checks retained. No execution time or throughput improvement is claimed.
+- [x] Take a DSR stack sample: observe sensor work, not a deadlock; inspect the
+  existing `SCRIPTBOTS_PAR_MIN_SPLIT` reader. The local probe used grain 64 and
+  eight Rayon threads; it remained incomplete. The default-grain probe was
+  stopped after barrier 13 when the smaller-grain probe reached that barrier.
+- [x] Retain the invalid-affinity infrastructure failure, derive online CPUs
+  from the host (0–15), and use CPUs 4–11 for the local probe. Verify the
+  exact compiled test binary SHA-256:
+  `078998424d272ca83be70dd276f571502890993fae9b5116010ff179b8170cfa`.
+- [x] Discover the available CPU worker from existing RCH inventory; retain the
+  failed default SSH identity probe, then authenticate with the configured key.
+  Verify `hz3` resources before copying the exact test binary into a fresh
+  proof directory; do not change worker repos, services or cache policy.
+- [x] Execute the unchanged production path through DSR, retain raw logs/JSON,
+  verify every requested barrier and cite the test-brain/storage boundaries.
+  The worker run requested 32 Rayon threads and grain 64; the original
+  1,800-second bound, all scientific settings and all assertions were retained.
+- [x] Require all expected records and a successful exact ignored test;
+  exercise missing-output and missing-completion controls on retained raw logs.
+- [x] Finish the required three written worksheets with observed final results;
+  disclose fresh solo verification, avoidable probe cost and test-only scope.
+- [x] Close only the original proven duration task, publish source/tracker and
+  evidence references, and leave unrelated GPU/scaling/storage acceptance open.
+- [x] Verify both required remote refs at source/tracker publication
+  `05eb6d29493a75590481dfa5c3c4f7334e4bd64d`; confirm owned probes ended and
+  release the four completed source/tracker reservations. No cleanup deletion
+  was performed. Final plan publication and its last reservation release are
+  session teardown, recorded by the final Git/Agent Mail receipts.
+
+The positive receipt is
+`/data/tmp/scriptbots-ring-long-XJwVipla/quality/ring_long_remote/20261103T060244-3521918/receipt.json`:
+typed `passed`, all six checks executed/passed with zero exit codes, and identical
+clean source identities at `69369f86d0014f5697f56c59dfd6b28287b98494`. The exact
+ignored case ran one test (passed, no ignores); the fast lane ran 44 (passed,
+two existing long ignores). `ring-long.jsonl` retains 22 records, and
+`ring-long.summary.json` retains derived counts, live UID ranges and populations.
+Both incomplete-output controls actually rejected their input.
+
+All eight islands reached tick 5,000; every barrier moved 32 organisms, for 640
+moves total, without latching. All 20 migration phases retained equal per-island
+before/after populations. The final population was 66,357, with eight distinct
+final science digests. Largest-island share rose from 12.525% to 16.034%; this
+is observational, not a causal claim about Fittest. Maximum live UID rose from
+66 to 23,742, not a claimed allocator watermark. No empty-island event occurred,
+so its warning was not exercised; newborn-specific migration was not asserted.
+
+The scope is the existing heritable `archi-test-brain` with persistence disabled.
+It does not establish production neural-family ecology, database durability,
+GPU quality, outer-island parallelism, throughput or a cross-machine speedup.
+All failures and partial probes remain under the proof root: notably the local
+smaller-grain run timed out after 18 barriers/tick 4,500 and cannot qualify the
+task. The available CPU worker should have been used sooner. The written audit
+in `audit.txt` records DRIFTING execution cost, unchanged original guards and
+fresh solo verification; process artifacts earn no new product-capability credit.
+
+**Loaded brain-family ownership (2026-11-03):** [Verified and Closed —
+GentleDuck; `bd-acpl`; fresh solo verification]
+
+The requested detailed TODO tracks the observed `Box::leak` in unknown
+`BrainKind` deserialization and three tournament conversions. Repeated input
+loads retain names after their records are dropped. This checklist retires
+after the source-bound loading and leak checks; it is not capability credit.
+
+- [x] Refresh native Beads readiness and current source; preserve existing
+  hardware-only capture qualification and concurrent rendering work.
+- [x] Trace dynamic labels through deserialization, runner naming, tournament
+  planning, ratings and leaderboard ingestion; reserve exact edit surfaces.
+- [x] Retain a pre-fix Valgrind control over real `BrainKind` deserialization
+  with declared label count/bytes and name-correctness assertions.
+- [x] Own dynamic labels, retain literal constructors and string wire semantics,
+  and update direct consumers without restricting pluggable family names.
+- [x] Exercise built-in/custom names, cloning, deterministic map keys, report
+  round-trips, runner cloning and tournament paths; remove all three dynamic
+  tournament leaks rather than merely moving allocation elsewhere.
+- [x] Run the same leak probe after the fix, relevant tests, workspace all-target
+  check, strict Clippy, formatting and scoped review through pinned DSR.
+- [x] Freshly recheck original acceptance, retain failed evidence, complete the
+  required honesty audit, update Beads and publish reviewed source/tracker.
+
+Source `334193d6663c` replaces leaked names with owned `Cow` strings, retains
+static literal identifiers, and updates the runner and tournament consumers.
+The unchanged 5,000-name, 1,024-byte workload loses 5,120,000 bytes in the
+clean pre-fix `ff038c90` loader and zero in the fixed loader. Both binaries
+run inside one comparison invocation, and every decoded name is checked;
+this is allocation-lifetime evidence, not an application-wide memory budget
+or a throughput claim.
+
+The first pinned DSR pass at `334193d6` passes 13 of 15 checks. Its full
+tournament test correctly refuses missing build-time source inputs, and
+strict Clippy identifies four existing raster/life-fixture diagnostics.
+All raw failures remain under `/data/tmp/scriptbots-brainkind-WJeBiVpL`.
+`717d74e241f9` fixes those four test-only diagnostics without suppressions;
+the corrected DSR profile derives source revision, clean status and status/diff
+digests from the actual pinned checkout before Cargo. The publication guard
+and every existing assertion remain intact.
+
+Clean pinned DSR `brainkind_repaired/20261103T041009-3341435` passes all 17
+executed checks at `717d74e241f994d5f9fd839d4807e25c07e9479a`, with unchanged
+source and independently recomputed raw-log hashes. Actual passed tests are
+brain 62, Neuroflow 15, tournament library 35, tournament integration 11, core
+capture two plus offspring failure one, and renderer raster 19 plus focused
+life projection one; no selected filter runs zero cases. Workspace all-target
+check, strict Clippy and formatting pass. The full three-family publication
+test passes with its provenance and reproduction barriers intact. The repeated
+Valgrind comparison again observes 5,120,000 bytes definitely lost before and
+zero definitely/indirectly/possibly lost after; 548 process-runtime bytes remain
+reachable. This does not qualify whole-application memory, all features, GPU
+pixels, throughput or the entire open program. Source and the closed tracker
+record are published through `22586dd2`; failed attempts and the written
+honesty disposition remain on the Bead. No independent verifier was available.
+
 **Capture corruption depth (2026-11-02):** [Verified local increment — GentleDuck;
 original `bd-2z0.14.3.10` remains open for hardware qualification; acceptance retained]
 

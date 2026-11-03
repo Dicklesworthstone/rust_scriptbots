@@ -145,7 +145,7 @@ struct DecodedDwraonState {
 
 impl DwraonBrain {
     /// Trait identifier for this brain family.
-    pub const KIND: BrainKind = BrainKind::new("dwraon.baseline");
+    pub const KIND: &BrainKind = &BrainKind::new("dwraon.baseline");
 
     /// Construct a randomly initialized brain.
     #[must_use]
@@ -973,7 +973,7 @@ impl BrainFamilyCodec for DwraonFamilyAdapter {
 
 impl Brain for DwraonBrain {
     fn kind(&self) -> BrainKind {
-        Self::KIND
+        Self::KIND.clone()
     }
 
     fn tick(&mut self, inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
@@ -1054,7 +1054,7 @@ impl Brain for DwraonBrain {
     }
 
     fn crossover(&self, other: &dyn Brain, rng: &mut dyn RandomStream) -> Option<Box<dyn Brain>> {
-        if other.kind() != Self::KIND {
+        if &other.kind() != Self::KIND {
             return None;
         }
         let other = other.as_any().downcast_ref::<Self>()?;
@@ -1327,7 +1327,7 @@ mod tests {
         let brain_b = DwraonBrain::random(&mut rng);
         let mut rng = SmallRngStream::seed_from_u64(84);
         let child = brain_a.crossover(&brain_b, &mut rng).expect("same kind");
-        assert_eq!(child.kind(), DwraonBrain::KIND);
+        assert_eq!(&child.kind(), DwraonBrain::KIND);
     }
 
     #[test]

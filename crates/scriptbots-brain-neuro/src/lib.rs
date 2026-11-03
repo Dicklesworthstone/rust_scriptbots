@@ -403,7 +403,7 @@ impl std::fmt::Debug for NeuroflowBrain {
 
 impl NeuroflowBrain {
     /// Identifier for the brain registry.
-    pub const KIND: BrainKind = BrainKind::new("ml.neuroflow");
+    pub const KIND: &BrainKind = &BrainKind::new("ml.neuroflow");
 
     /// Construct a new brain with random weights using the supplied configuration.
     pub fn new(
@@ -898,7 +898,7 @@ impl NeuroflowBrain {
 
 impl Brain for NeuroflowBrain {
     fn kind(&self) -> BrainKind {
-        Self::KIND
+        Self::KIND.clone()
     }
 
     fn tick(&mut self, inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
