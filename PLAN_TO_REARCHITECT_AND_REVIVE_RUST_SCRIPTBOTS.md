@@ -2,6 +2,77 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Browser renderer connection (2026-11-03):** [Verified contribution —
+GentleDuck; source `3373789b88949b817cddc642e139b25c93120308`]
+
+Original `bd-2z0.12.3` retains its owner, dependencies and complete acceptance.
+This contribution connects the existing renderers; it does not close that
+broader task or its remaining screenshot/revision export acceptance.
+
+- [x] Refresh BR readiness and inspect actual browser producers/consumers.
+  At the start, renderer modules were unimported and production acquired
+  Canvas 2D directly. The WebGPU prototype had stale WGSL syntax and
+  world/canvas coordinate drift.
+- [x] Connect the existing Canvas renderer without changing its visible marks.
+- [x] Repair WebGPU shader validation, scaled positions, circular bodies and
+  boost rings; retain empty-frame drawing and bounded buffer growth.
+- [x] Add an accessible renderer selector and report the active backend.
+- [x] Fall back visibly to Canvas on unavailable capability, creation/render
+  failure or actual device loss; release replaced GPU resources.
+- [x] Keep one latest snapshot and the existing independent science timer;
+  backend switching must not initialize, reset or advance a simulation.
+- [x] Exercise actual browser rendering with known geometry, nonmatching world
+  and canvas sizes, empty input, resizing, and unchanged paused science ticks.
+- [x] Exercise unavailable capability, rejected GPU creation and actual device
+  destruction; require observable Canvas painting after fallback.
+- [x] Retain baseline failures and actual adapter identity. Software GPU tests
+  qualify their actual path only, with no hardware or performance claim.
+- [x] Pass the existing four-case stats controls with the real generated
+  package and the four-case injected fork controls; preserve their assertions
+  and reports. The injected controls are DOM proof, not simulation proof.
+- [x] Qualify frozen source through DSR, review every changed source hunk,
+  publish coherent source, and repeat decisive checks on clean committed bytes.
+- [x] Update original Beads evidence and this TODO on actual results. Leave
+  the broad original task open if any acceptance/dependency remains unmet.
+
+The operator requested this execution checklist; it retires here. No new
+renderer framework, dependency or tracking item was added.
+
+Frozen qualification on `45d2f29d` plus the exact seven-file browser patch
+passes nine of nine DSR checks in
+`renderer_qualify/20261103T204743-2012139`: workspace check, strict Clippy,
+formatting, 30 native web tests with one existing ignored fixture writer,
+actual renderer controls, the existing stats/fork controls and UBS. The
+committed patch SHA-256 is
+`4650861ed6691c09c62272160b8453f21fa6292ede0fc8b3290705185c47520b`.
+Clean `3373789b` then passes six of six checks in
+`renderer_clean_3373789b/20261103T205335-2104332`: expected clean source,
+fresh package, renderer/stats/fork controls and unchanged clean post-state.
+
+The actual browser is Chromium 140.0.7339.16 with SwiftShader. The clean run
+observes 9,955 colored pixels through the selected WebGPU renderer and 12,109
+after actual device destruction and Canvas fallback. Separate controls cover
+missing API, absent adapter, rejected device creation and indefinitely pending
+device creation; all keep painting and advance beyond tick zero. Backend
+switching/loss preserves the full paused exported snapshot at tick 104. Its
+SHA-256 describes that exported JSON, not a canonical `WorldDigest` or GPU
+presentation receipt. `data-snapshot-tick` names the submitted snapshot.
+
+Screenshot inspection exposed a stretched canvas; intrinsic aspect ratio is
+now preserved and checked. Build-banner values now use text nodes. The new
+hostile-markup DOM fixture fails on old source and passes on both banner
+branches. Actual WASM formats these values from u64; no exploitable permalink
+claim is made. UBS reports zero criticals, 125 warnings and 301 informational
+findings across the five scanned JS files, with no suppressions.
+
+Retain the original black-frame failure, the missing shader return failure,
+the earlier 8/9 UBS result and the 7/9 result caused by a wrongly injected
+compatible-banner fixture. The fixture input was corrected; its assertion
+was preserved. Existing stats/fork case counts, science clock guards, seeds
+and goldens were retained. Evidence and the completed bounded audit are at
+`/data/tmp/scriptbots-browser-renderer-GKmUgHsZ`. This is fresh solo execution
+on a software adapter, with no hardware or performance qualification claim.
+
 **Workspace lint inheritance (2026-11-03):** [Currently In Progress —
 GentleDuck; original `bd-6hb5`]
 
@@ -103,7 +174,10 @@ unchanged lint policy. The four added importers are brain, brain-ml, brain-neuro
 and web; storage, render, world-gfx, app and Bevy remain with this original open
 task. Those original working edits are retained as `unqualified-storage-gfx.patch`
 under the proof root. World-gfx is now delivered by the separate source above;
-the five storage source files remain unqualified, unpublished work in progress.
+the five storage source files were then unqualified, unpublished work in
+progress. Another writer has since published those preparatory changes in
+`45d2f29d`; the browser qualification above includes that source. Storage lint
+inheritance and the original all-13 acceptance remain open.
 
 Evidence is retained at `/data/tmp/scriptbots-lint-inheritance-rakxl2es`.
 `foundational_round2/20261103T140933-423974` passed all six DSR checks on the
