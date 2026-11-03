@@ -19,6 +19,11 @@ Review the complete diff it prints, then copy its token into:
 The second command commits exactly the reviewed Git tree, not the then-current
 working tree. A short repository mutex serializes HEAD changes, and a
 pre-commit plugin rejects commits that did not come through this protocol.
+
+For a conflict-free merge, review with ``--merge-parent COMMIT`` and name every
+path changed from HEAD by the merge. The frozen tree must exactly match Git's
+clean merge result. Conflicted merges and unrelated in-progress operations
+remain unsupported; ordinary reviews still create single-parent commits.
 """
 
 from __future__ import annotations
@@ -43,7 +48,7 @@ from typing import Iterator, NoReturn, Sequence
 PROTOCOL_VERSION = 1
 STATE_DIR_NAME = "scriptbots-shared-commit"
 HOOK_PLUGIN_NAME = "10-shared-tree-commit"
-TOKEN_ENV = "SCRIPTBOTS_SHARED_COMMIT_REVIEW"
+TOKEN_ENV = "SCRIPTBOTS_SHARED_COMMIT_REVIEW"  # ubs:ignore[py.security.hardcoded-secrets] - environment variable name, not a credential
 MANIFEST_ENV = "SCRIPTBOTS_SHARED_COMMIT_MANIFEST"
 DEFAULT_LOCK_TIMEOUT_SECONDS = 30.0
 
@@ -76,7 +81,7 @@ def run(
     capture: bool = True,
     input_bytes: bytes | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
-    process = subprocess.run(
+    process = subprocess.run(  # ubs:ignore[python.taint.command] - internal callers choose the executable; user values remain shell-free argv elements
         list(argv),
         cwd=cwd,
         env=env,
@@ -170,7 +175,10 @@ def private_env(index: Path, token: str, manifest_path: Path) -> dict[str, str]:
     return env
 
 
-def reject_in_progress_git_operation(repo: Repo) -> None:
+def reject_in_progress_git_operation(
+    repo: Repo, *, reviewed_merge_parent: str | None = None,
+    merge_identity: tuple[int, int] | None = None,
+) -> None:
     sentinels = (
         "MERGE_HEAD",
         "CHERRY_PICK_HEAD",
@@ -185,6 +193,15 @@ def reject_in_progress_git_operation(repo: Repo) -> None:
         if not candidate.is_absolute():
             candidate = repo.root / candidate
         if candidate.exists():
+            if (
+                name == "MERGE_HEAD"
+                and reviewed_merge_parent is not None
+                and candidate.is_file()
+                and not candidate.is_symlink()
+                and merge_identity == (candidate.stat().st_dev, candidate.stat().st_ino)
+                and candidate.read_bytes() == f"{reviewed_merge_parent}\n".encode()
+            ):
+                continue
             active.append(name)
     if active:
         fail(
@@ -327,7 +344,7 @@ def candidate_diff(repo: Repo, base: str, tree: str) -> bytes:
 
 
 def identity_payload(manifest: dict[str, object]) -> dict[str, object]:
-    return {
+    payload = {
         "version": manifest["version"],
         "repository": manifest["repository"],
         "agent": manifest["agent"],
@@ -337,6 +354,66 @@ def identity_payload(manifest: dict[str, object]) -> dict[str, object]:
         "message": manifest["message"],
         "nonce": manifest["nonce"],
     }
+    # Keep existing single-parent tokens valid; bind the new parent whenever
+    # merge mode is explicitly requested, including during hook validation.
+    if "merge_parent" in manifest:
+        payload["merge_parent"] = manifest["merge_parent"]
+    return payload
+
+
+def canonical_merge_tree(repo: Repo, base: str, parent: str) -> str:
+    resolved = git_text(repo, ["rev-parse", "--verify", f"{parent}^{{commit}}"])
+    if resolved != parent or parent == base:
+        fail("merge parent must be a distinct pinned commit")
+    result = git(repo, ["merge-tree", "--write-tree", base, parent], check=False)
+    if result.returncode != 0:
+        detail = (result.stdout + result.stderr).decode("utf-8", "replace").strip()
+        fail(f"only conflict-free merges can be reviewed:\n{detail}")
+    return result.stdout.decode("ascii", "strict").strip()
+
+
+def validate_merge_tree(repo: Repo, manifest: dict[str, object]) -> None:
+    if "merge_parent" not in manifest:
+        return
+    parent = manifest["merge_parent"]
+    if not isinstance(parent, str):
+        fail("review manifest merge_parent has the wrong type")
+    expected = canonical_merge_tree(repo, str(manifest["base"]), parent)
+    if manifest["tree"] != expected:
+        fail("reviewed tree must equal the complete conflict-free merge result")
+
+
+def merge_head_path(repo: Repo) -> Path:
+    path = Path(git_text(repo, ["rev-parse", "--git-path", "MERGE_HEAD"]))
+    return path if path.is_absolute() else repo.root / path
+
+
+def merge_attempt_path(repo: Repo, token: str) -> Path:
+    return repo.state_dir / f"merge-attempt-{token}.json"
+
+
+def validate_merge_attempt(
+    repo: Repo, manifest: dict[str, object], token: str
+) -> tuple[int, int]:
+    path = merge_head_path(repo)
+    if not path.is_file() or path.is_symlink():
+        fail("reviewed merge is missing its pinned MERGE_HEAD")
+    attempt = merge_attempt_path(repo, token)
+    if not attempt.is_file() or attempt.is_symlink():
+        fail("active MERGE_HEAD is not owned by this review; preserve it and inspect")
+    try:
+        record = json.loads(attempt.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        fail(f"merge attempt record is unreadable; preserve active state: {error}")
+    observed = path.stat()
+    identity = (observed.st_dev, observed.st_ino)
+    expected = {
+        "base": manifest["base"], "parent": manifest["merge_parent"],
+        "token": token, "device": identity[0], "inode": identity[1],
+    }
+    if record != expected or path.read_bytes() != f"{manifest['merge_parent']}\n".encode():
+        fail("merge metadata changed; preserve active state and inspect")
+    return identity
 
 
 def token_for(manifest: dict[str, object]) -> str:
@@ -465,6 +542,7 @@ def validate_manifest(
     actual_diff_hash = hashlib.sha256(diff).hexdigest()
     if actual_diff_hash != manifest["diff_sha256"]:
         fail("candidate diff bytes no longer match the reviewed diff")
+    validate_merge_tree(repo, manifest)
     return index
 
 
@@ -490,7 +568,12 @@ def review_candidate(args: argparse.Namespace) -> int:
     index = (indexes_dir / f"{safe_agent}-{nonce}.index").resolve()
 
     with commit_mutex(repo, args.lock_timeout):
+        reject_in_progress_git_operation(repo)
         base = git_text(repo, ["rev-parse", "HEAD"])
+        merge_parent = (
+            git_text(repo, ["rev-parse", "--verify", f"{args.merge_parent}^{{commit}}"])
+            if args.merge_parent else None
+        )
         git(repo, ["read-tree", base], index=index)
         index.chmod(0o600)
         git(repo, ["add", "-A", "--", *paths], index=index)
@@ -526,6 +609,9 @@ def review_candidate(args: argparse.Namespace) -> int:
         "diff_sha256": hashlib.sha256(diff).hexdigest(),
         "created_unix_ns": time.time_ns(),
     }
+    if merge_parent is not None:
+        manifest["merge_parent"] = merge_parent
+        validate_merge_tree(repo, manifest)
     token = token_for(manifest)
     manifest["token"] = token
     manifest_path = reviews_dir / f"{token}.json"
@@ -539,6 +625,8 @@ def review_candidate(args: argparse.Namespace) -> int:
     print("shared-tree-commit: immutable candidate ready")
     print(f"  agent:   {agent}")
     print(f"  base:    {base}")
+    if merge_parent is not None:
+        print(f"  merge:   {merge_parent}")
     print(f"  tree:    {tree}")
     print(f"  message: {message}")
     print("  paths:")
@@ -583,7 +671,6 @@ def reconcile_default_index(repo: Repo, paths: Sequence[str], new_head: str) -> 
 
 def commit_review(args: argparse.Namespace) -> int:
     repo = discover_repo()
-    reject_in_progress_git_operation(repo)
     manifest_path, manifest = load_manifest(repo, args.review)
 
     with commit_mutex(repo, args.lock_timeout):
@@ -599,6 +686,31 @@ def commit_review(args: argparse.Namespace) -> int:
         message = str(manifest["message"])
 
         env = private_env(index, args.review, manifest_path)
+        merge_parent = manifest.get("merge_parent")
+        merge_path = merge_head_path(repo)
+        merge_identity = None
+        if merge_parent is not None and merge_path.exists():
+            merge_identity = validate_merge_attempt(repo, manifest, args.review)
+        reject_in_progress_git_operation(
+            repo, reviewed_merge_parent=merge_parent, merge_identity=merge_identity,
+        )
+        if merge_parent is not None:
+            if merge_identity is None:
+                # Never remove or rename active Git metadata. A failed hook
+                # leaves this exact file for a token-bound retry; partial writes
+                # or lost/replaced state fail closed for manual inspection.
+                attempt_path = merge_attempt_path(repo, args.review)
+                if attempt_path.exists():
+                    fail("merge attempt lost its active state; preserve the record and inspect")
+                with merge_path.open("xb") as handle:
+                    observed = os.fstat(handle.fileno())
+                    write_manifest(attempt_path, {
+                        "base": base, "parent": merge_parent, "token": args.review,
+                        "device": observed.st_dev, "inode": observed.st_ino,
+                    })
+                    handle.write(f"{merge_parent}\n".encode())
+                    handle.flush()
+                    os.fsync(handle.fileno())
         process = run(
             ["git", "commit", "-m", message],
             cwd=repo.root,
@@ -616,10 +728,13 @@ def commit_review(args: argparse.Namespace) -> int:
         new_head = git_text(repo, ["rev-parse", "HEAD"])
         parent_line = git_text(repo, ["rev-list", "--parents", "-n", "1", new_head])
         parent_parts = parent_line.split()
-        if parent_parts != [new_head, base]:
+        expected_parents = [new_head, base]
+        if merge_parent is not None:
+            expected_parents.append(str(merge_parent))
+        if parent_parts != expected_parents:
             fail(
                 "commit landed with an unexpected parent set; stop and inspect "
-                f"{new_head}. Expected sole parent {base}."
+                f"{new_head}. Expected parents {expected_parents[1:]}."
             )
         committed_tree = git_text(repo, ["show", "-s", "--format=%T", new_head])
         if committed_tree != tree:
@@ -671,6 +786,13 @@ def hook_check() -> int:
         manifest,
         expected_token=token,
         require_current_head=True,
+    )
+    reject_in_progress_git_operation(
+        repo, reviewed_merge_parent=manifest.get("merge_parent"),
+        merge_identity=(
+            validate_merge_attempt(repo, manifest, token)
+            if "merge_parent" in manifest else None
+        ),
     )
     current_index = os.environ.get("GIT_INDEX_FILE", "").strip()
     if not current_index or Path(current_index).resolve() != index:
@@ -743,7 +865,8 @@ def self_test() -> int:
     hook.write_text(
         "#!/usr/bin/env bash\n"
         f"{shlex.quote(sys.executable)} {shlex.quote(str(script))} hook || exit $?\n"
-        'git diff --cached --name-only -z >"$PWD/.git/hook-seen"\n',
+        'git diff --cached --name-only -z >"$PWD/.git/hook-seen"\n'
+        'test ! -f "$PWD/.git/reject-reviewed-merge"\n',
         encoding="utf-8",
     )
     hook.chmod(0o755)
@@ -766,8 +889,14 @@ def self_test() -> int:
             fail("self-test expected protocol refusal, but command succeeded")
         return result
 
-    def reviewed_token(path: str, message: str) -> str:
-        result = protocol(["review", "-m", message, "--", path])
+    def reviewed_token(
+        paths: str | Sequence[str], message: str, *, merge_parent: str | None = None
+    ) -> str:
+        arguments = ["review", "-m", message]
+        if merge_parent is not None:
+            arguments.extend(["--merge-parent", merge_parent])
+        arguments.extend(["--", *([paths] if isinstance(paths, str) else paths)])
+        result = protocol(arguments)
         output = result.stdout.decode("utf-8", "replace")
         match = re.search(r"^REVIEW TOKEN: ([0-9a-f]{64})$", output, re.MULTILINE)
         if not match:
@@ -848,6 +977,144 @@ def self_test() -> int:
         )
     print("  ok: candidate tree tampering invalidates approval")
 
+    # Construct an actual divergent peer history. Clone hooks are intentionally
+    # absent in this isolated peer; the repository under test retains its hook.
+    peer = Path(tempfile.mkdtemp(prefix="bd-h4n2-merge-peer-"))
+    fixture_git(fixture, ["clone", "--local", str(fixture), str(peer)])
+    fixture_git(peer, ["config", "user.name", "Merge Peer"])
+    fixture_git(peer, ["config", "user.email", "merge-peer@example.invalid"])
+    fixture_write(peer, "a.txt", "A-from-peer\n")
+    fixture_write(peer, "d.txt", "D-from-peer\n")
+    fixture_git(peer, ["add", "a.txt", "d.txt"])
+    fixture_git(peer, ["commit", "-m", "peer A and D"])
+    fixture_git(fixture, ["fetch", str(peer), "main"])
+    parent = fixture_git(fixture, ["rev-parse", "FETCH_HEAD"]).stdout.decode().strip()
+    fixture_write(fixture, "c.txt", "C-local-divergence\n")
+    protocol(["commit", "--review", reviewed_token("c.txt", "test: local divergence")])
+
+    fixture_write(fixture, "a.txt", "A-from-peer\n")
+    partial = protocol(
+        ["review", "--merge-parent", parent, "-m", "incomplete merge", "--", "a.txt"],
+        expect_ok=False,
+    )
+    if b"complete conflict-free merge result" not in partial.stderr:
+        fail("self-test: omitted peer path was not rejected as an incomplete merge")
+    print("  ok: merge review rejects an omitted incoming path")
+
+    fixture_write(fixture, "d.txt", "D-from-peer\n")
+    token_merge = reviewed_token(["a.txt", "d.txt"], "test: merge", merge_parent=parent)
+    merge_manifest_path, merge_manifest = load_manifest(repo, token_merge)
+    original_manifest = merge_manifest_path.read_bytes()
+    changed_parent = dict(merge_manifest)
+    changed_parent["merge_parent"] = str(merge_manifest["base"])
+    merge_manifest_path.write_text(json.dumps(changed_parent), encoding="utf-8")
+    wrong_parent = protocol(["commit", "--review", token_merge], expect_ok=False)
+    merge_manifest_path.write_bytes(original_manifest)
+    if b"token does not match" not in wrong_parent.stderr:
+        fail("self-test: changing the approved second parent did not invalidate its token")
+    print("  ok: merge token binds the exact second parent")
+
+    merge_index = validated_index_path(repo, merge_manifest)
+    # private_env inherits this process's identity, whereas protocol() sets the
+    # fixture identity explicitly. Bind it before exercising the hook directly.
+    hook_env = private_env(merge_index, token_merge, merge_manifest_path)
+    hook_env["AGENT_NAME"] = "TestFalcon"
+    missing_head = run(
+        [sys.executable, str(script), "hook"], cwd=fixture, env=hook_env, check=False,
+    )
+    if missing_head.returncode == 0 or b"missing its pinned MERGE_HEAD" not in missing_head.stderr:
+        fail("self-test: merge hook accepted a missing second-parent sentinel")
+
+    merge_head = fixture / ".git" / "MERGE_HEAD"
+    merge_head.write_text(f"{merge_manifest['base']}\n", encoding="ascii")
+    foreign = protocol(["commit", "--review", token_merge], expect_ok=False)
+    foreign_hook = run(
+        [sys.executable, str(script), "hook"], cwd=fixture, env=hook_env, check=False,
+    )
+    if (
+        b"not owned by this review" not in foreign.stderr
+        or foreign_hook.returncode == 0
+        or b"not owned by this review" not in foreign_hook.stderr
+        or merge_head.read_text() != f"{merge_manifest['base']}\n"
+    ):
+        fail("self-test: foreign merge state was accepted or disturbed")
+    merge_head.rename(fixture / ".git" / "foreign-merge-retained")
+    print("  ok: merge hook and command reject missing/foreign merge state")
+
+    fixture_write(fixture, "c.txt", "C-advanced-before-merge\n")
+    protocol(["commit", "--review", reviewed_token("c.txt", "test: advance merge base")])
+    stale_merge = protocol(["commit", "--review", token_merge], expect_ok=False)
+    if b"HEAD moved after review" not in stale_merge.stderr:
+        fail("self-test: stale merge candidate was not rejected")
+    print("  ok: merge review cannot overwrite an advanced local base")
+
+    token_merge = reviewed_token(["a.txt", "d.txt"], "test: merge", merge_parent=parent)
+    before_merge = fixture_git(fixture, ["rev-parse", "HEAD"]).stdout.decode().strip()
+    expected_tree = canonical_merge_tree(repo, before_merge, parent)
+    fixture_write(fixture, "b.txt", "B-peer-staged-again\n")
+    fixture_git(fixture, ["add", "b.txt"])
+    fixture_write(fixture, "c.txt", "C-next-unreviewed-edit\n")
+    normal_pending = reviewed_token("c.txt", "test: normal commit blocked during merge")
+    fixture_write(fixture, "a.txt", "A-later-unreviewed-merge-edit\n")
+    reject_flag = fixture / ".git" / "reject-reviewed-merge"
+    reject_flag.write_text("exercise the real subsequent hook\n", encoding="ascii")
+    rejected = protocol(["commit", "--review", token_merge], expect_ok=False)
+    if (
+        b"Git refused the reviewed commit" not in rejected.stderr
+        or fixture_git(fixture, ["rev-parse", "HEAD"]).stdout.decode().strip() != before_merge
+        or merge_head.read_bytes() != f"{parent}\n".encode()
+        or not merge_attempt_path(repo, token_merge).is_file()
+    ):
+        fail("self-test: rejected merge did not retain its candidate and owned merge state")
+    normal_during_merge = protocol(["commit", "--review", normal_pending], expect_ok=False)
+    if b"in-progress Git operation" not in normal_during_merge.stderr:
+        fail("self-test: a normal token was accepted while a reviewed merge is pending")
+    owned_head = fixture / ".git" / "owned-merge-head-retained"
+    merge_head.rename(owned_head)
+    merge_head.write_text(f"{parent}\n", encoding="ascii")
+    replaced = protocol(["commit", "--review", token_merge], expect_ok=False)
+    if b"merge metadata changed" not in replaced.stderr:
+        fail("self-test: same-content replacement MERGE_HEAD reused another file's ownership")
+    merge_head.rename(fixture / ".git" / "replaced-merge-head-retained")
+    owned_head.rename(merge_head)
+    reject_flag.rename(fixture / ".git" / "rejected-merge-control-retained")
+    protocol(["commit", "--review", token_merge])
+    merged = fixture_git(fixture, ["rev-parse", "HEAD"]).stdout.decode().strip()
+    if (
+        fixture_git(fixture, ["rev-list", "--parents", "-n", "1", merged]).stdout.decode().split()
+        != [merged, before_merge, parent]
+        or fixture_git(fixture, ["rev-parse", "HEAD^{tree}"]).stdout.decode().strip() != expected_tree
+        or fixture_git(fixture, ["show", "HEAD:a.txt"]).stdout != b"A-from-peer\n"
+        or fixture_git(fixture, ["show", "HEAD:c.txt"]).stdout != b"C-advanced-before-merge\n"
+        or fixture_git(fixture, ["show", "HEAD:d.txt"]).stdout != b"D-from-peer\n"
+        or fixture_git(fixture, ["show", "HEAD:b.txt"]).stdout != b"B0\n"
+        or fixture_git(fixture, ["diff", "--cached", "--name-only", "-z"]).stdout != b"b.txt\0"
+        or fixture_git(fixture, ["show", ":b.txt"]).stdout != b"B-peer-staged-again\n"
+        or (fixture / "a.txt").read_bytes() != b"A-later-unreviewed-merge-edit\n"
+        or (fixture / "c.txt").read_bytes() != b"C-next-unreviewed-edit\n"
+        or (fixture / ".git" / "hook-seen").read_bytes() != b"a.txt\0d.txt\0"
+        or merge_head.exists()
+    ):
+        fail("self-test: merge lost its canonical tree, exact parents, hook, or peer edits")
+    print("  ok: real two-parent merge runs hooks, preserves peer staging/edits, and retries safely")
+    print("  ok: pending merge blocks normal commits and refuses replacement metadata")
+
+    fixture_write(peer, "c.txt", "C-peer-conflict\n")
+    fixture_git(peer, ["add", "c.txt"])
+    fixture_git(peer, ["commit", "-m", "peer conflicts with local C"])
+    fixture_git(fixture, ["fetch", str(peer), "main"])
+    conflicting_parent = fixture_git(fixture, ["rev-parse", "FETCH_HEAD"]).stdout.decode().strip()
+    conflict = protocol(
+        ["review", "--merge-parent", conflicting_parent, "-m", "conflicted merge", "--", "a.txt"],
+        expect_ok=False,
+    )
+    if b"only conflict-free merges can be reviewed" not in conflict.stderr:
+        fail("self-test: conflicted history was not refused by the canonical merge calculation")
+    if fixture_git(fixture, ["rev-parse", "HEAD"]).stdout.decode().strip() != merged or merge_head.exists():
+        fail("self-test: conflict refusal disturbed HEAD or created active merge state")
+    print("  ok: conflicted history is rejected without changing HEAD or active Git state")
+    print(f"merge peer fixture retained at {peer}")
+
     print("self-test: all shared-tree commit invariants passed")
     return 0
 
@@ -862,6 +1129,10 @@ def parser() -> argparse.ArgumentParser:
         "review", help="freeze and print an exact candidate diff"
     )
     review.add_argument("-m", "--message", required=True)
+    review.add_argument(
+        "--merge-parent",
+        help="pin a second parent and require Git's exact conflict-free merge tree",
+    )
     review.add_argument(
         "--lock-timeout",
         type=float,
