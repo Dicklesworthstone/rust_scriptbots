@@ -75,6 +75,14 @@ const camelCaseWasmModule = `
         return { scientific_steps: steps, automatic_steps_skipped: 0 };
       },
       snapshot() { return this.tick(0); },
+      frame() {
+        const snapshot = this.snapshot();
+        return { schema: "scriptbots.browser-frame.v1", snapshot, identity: {
+          sessionId: "1001", publicationRevision: String(snapshot.tick + 400),
+          scientificRevision: String(snapshot.tick + 100), controlRevision: "20",
+          configRevision: "10", tick: String(snapshot.tick)
+        } };
+      },
       tick(steps) {
         tick += steps;
         const pop = 200 + tick;
@@ -124,6 +132,14 @@ const snakeCaseWasmModule = `
         return { scientific_steps: steps, automatic_steps_skipped: 0 };
       },
       snapshot() { return this.tick(0); },
+      frame() {
+        const snapshot = this.snapshot();
+        return { schema: "scriptbots.browser-frame.v1", snapshot, identity: {
+          sessionId: "1002", publicationRevision: String(snapshot.tick + 400),
+          scientificRevision: String(snapshot.tick + 100), controlRevision: "20",
+          configRevision: "10", tick: String(snapshot.tick)
+        } };
+      },
       tick(steps) {
         tick += steps;
         return {
@@ -223,11 +239,82 @@ async function runRendererTests(browser, baseUrl) {
     }
     resolve(colored);
   })));
+  const exports = {};
+  const retainDownload = async (page, download, label, expected) => {
+    const file = path.join(proof, `${label}-download.png`);
+    await download.saveAs(file);
+    if (await download.failure()) throw new Error(`PNG download failed: ${await download.failure()}`);
+    await page.waitForFunction(() => document.getElementById("capture-status").dataset.state === "ready");
+    const status = await page.evaluate(() => ({ ...document.getElementById("capture-status").dataset }));
+    for (const [key, value] of Object.entries(expected)) {
+      if (status[key] !== value) throw new Error(`PNG ${key} differs from its canonical frame: ${JSON.stringify({ expected, status })}`);
+    }
+    const filename = download.suggestedFilename();
+    const match = /^scriptbots-session-(\d+)-p(\d+)-s(\d+)-c(\d+)-g(\d+)-t(\d+)-(canvas|webgpu)\.png$/.exec(filename);
+    const names = ["sessionId", "publicationRevision", "scientificRevision", "controlRevision", "configRevision", "tick", "renderer"];
+    if (!match || names.some((key, index) => status[key] !== match[index + 1]) || status.filename !== filename) {
+      throw new Error(`PNG filename/status disagree: ${JSON.stringify({ filename, status })}`);
+    }
+    const bytes = fs.readFileSync(file);
+    const image = await inspectScreenshot(page, bytes);
+    const size = await page.evaluate(() => {
+      const canvas = document.getElementById("sim-canvas");
+      return { width: canvas.width, height: canvas.height };
+    });
+    if (image.width !== size.width || image.height !== size.height || image.brightPixels <= 0) {
+      throw new Error(`PNG is empty or has incorrect dimensions: ${JSON.stringify({ image, size })}`);
+    }
+    return { filename, status, image, sha256: createHash("sha256").update(bytes).digest("hex"), file };
+  };
+  const saveFrame = async (page, label) => {
+    const expected = await page.evaluate(() => window.__rendererSim.frame().identity);
+    try {
+      const [download] = await Promise.all([page.waitForEvent("download"), page.click("#capture-btn")]);
+      return await retainDownload(page, download, label, expected);
+    } catch (error) {
+      console.error("PNG download failure state", JSON.stringify({ label, expected,
+        observed: await page.evaluate(() => ({ hidden: document.hidden,
+          capture: { ...document.getElementById("capture-status").dataset },
+          message: document.getElementById("capture-status").textContent,
+          disabled: document.getElementById("capture-btn").disabled,
+          renderer: document.getElementById("renderer-status").textContent,
+          identity: window.__rendererSim.frame().identity,
+          serializer: document.getElementById("sim-canvas").toBlob.toString(),
+          serializationCalls: window.__nativePngCalls,
+          anchorClicks: window.__pngAnchorClicks,
+          log: document.getElementById("log").textContent })), errors }));
+      throw error;
+    }
+  };
   const context = await browser.newContext({ deviceScaleFactor: 1 });
   const errors = [];
   const page = await context.newPage();
+  let downloadCount = 0;
+  page.on("download", () => { downloadCount += 1; });
   page.on("pageerror", (error) => errors.push(error.message));
   await context.addInitScript(() => {
+    window.__nativePngCalls = [];
+    window.__pngAnchorClicks = [];
+    const toBlob = HTMLCanvasElement.prototype.toBlob;
+    HTMLCanvasElement.prototype.toBlob = function (callback, ...args) {
+      if (this.id !== "sim-canvas") return toBlob.call(this, callback, ...args);
+      const call = { startedAt: performance.now(), width: this.width, height: this.height };
+      window.__nativePngCalls.push(call);
+      return toBlob.call(this, (blob) => {
+        call.deliveredAt = performance.now();
+        call.type = blob?.type;
+        callback(blob);
+        call.returnedAt = performance.now();
+      }, ...args);
+    };
+    const click = HTMLAnchorElement.prototype.click;
+    HTMLAnchorElement.prototype.click = function () {
+      const call = { filename: this.download, startedAt: performance.now(), userActivation: navigator.userActivation.isActive };
+      window.__pngAnchorClicks.push(call);
+      const result = click.call(this);
+      call.returnedAt = performance.now();
+      return result;
+    };
     const presentation = { hold: false, pending: null, native: window.requestAnimationFrame.bind(window) };
     window.requestAnimationFrame = (callback) => {
       if (presentation.hold) {
@@ -251,6 +338,9 @@ async function runRendererTests(browser, baseUrl) {
     };
   });
   await page.goto(baseUrl);
+  await page.waitForFunction(() => document.getElementById("renderer-status").dataset.renderer === "canvas");
+  if (await page.inputValue("#renderer") !== "canvas") throw new Error("Unmeasured WebGPU became the default renderer");
+  await page.selectOption("#renderer", "webgpu");
   await page.waitForFunction(() => Number(document.getElementById("renderer-status").dataset.snapshotTick) > 0);
   await page.evaluate(() => {
     const speed = document.getElementById("steps-per-frame");
@@ -309,15 +399,34 @@ async function runRendererTests(browser, baseUrl) {
           { position: [1280, 720], health: 1, color: [0.9, 0.1, 0.1], boost: false },
         ],
       };
+      let capturedPixels = null;
       const read = async (input, points) => {
         if (input) renderer.render(input);
+        const pendingPng = capturedPixels === null && input
+          ? new Promise((resolve) => canvas.toBlob(resolve, "image/png")) : null;
         if (renderer.device) await renderer.device.queue.onSubmittedWorkDone();
         const copy = document.createElement("canvas");
         copy.width = canvas.width;
         copy.height = canvas.height;
         const ctx = copy.getContext("2d");
         ctx.drawImage(canvas, 0, 0);
-        return points.map(([x, y]) => Array.from(ctx.getImageData(x, y, 1, 1).data));
+        const pixels = points.map(([x, y]) => Array.from(ctx.getImageData(x, y, 1, 1).data));
+        if (pendingPng) {
+          const png = await pendingPng;
+          if (!png || png.type !== "image/png") throw new Error(`${backend} did not serialize a PNG`);
+          const bitmap = await createImageBitmap(png);
+          try {
+            ctx.clearRect(0, 0, copy.width, copy.height);
+            ctx.drawImage(bitmap, 0, 0);
+            capturedPixels = points.map(([x, y]) => Array.from(ctx.getImageData(x, y, 1, 1).data));
+            if (JSON.stringify(capturedPixels) !== JSON.stringify(pixels)) {
+              throw new Error(`${backend} PNG differs from the submitted geometry: ${JSON.stringify({ capturedPixels, pixels })}`);
+            }
+          } finally {
+            bitmap.close();
+          }
+        }
+        return pixels;
       };
       try {
         const pixels = await read(snapshot, [[320, 180], [640, 360], [644, 364], [325, 180]]);
@@ -403,7 +512,7 @@ async function runRendererTests(browser, baseUrl) {
             queue.writeBuffer = writeBuffer;
           }
         }
-        results[backend] = { pixels, empty, resized, growthAgents: 513, capacityError, admission };
+        results[backend] = { pixels, capturedPixels, empty, resized, growthAgents: 513, capacityError, admission };
       } finally {
         renderer.destroy();
       }
@@ -420,10 +529,17 @@ async function runRendererTests(browser, baseUrl) {
   if (Math.abs(aspect.displayed - aspect.intrinsic) > 0.01) throw new Error(`Canvas CSS stretches the world: ${JSON.stringify(aspect)}`);
   await page.evaluate(async () => {
     const wasm = await import("/pkg/scriptbots_web.js");
-    const snapshot = wasm.SimHandle.prototype.snapshot;
-    wasm.SimHandle.prototype.snapshot = function () {
+    const { CanvasRenderer } = await import("/renderers/canvas.js");
+    const render = CanvasRenderer.prototype.render;
+    window.__canvasRenderCalls = 0;
+    CanvasRenderer.prototype.render = function (snapshot) {
+      if (this.canvas.id === "sim-canvas") window.__canvasRenderCalls += 1;
+      return render.call(this, snapshot);
+    };
+    const frame = wasm.SimHandle.prototype.frame;
+    wasm.SimHandle.prototype.frame = function () {
       window.__rendererSim = this;
-      return snapshot.call(this);
+      return frame.call(this);
     };
     const drive = wasm.SimHandle.prototype.drive;
     wasm.SimHandle.prototype.drive = function (now) {
@@ -436,6 +552,18 @@ async function runRendererTests(browser, baseUrl) {
       const receipt = setSpeed.call(this, value);
       window.__lastRendererSpeed = { value, receipt };
       return receipt;
+    };
+    window.__captureUrls = new Set();
+    const create = URL.createObjectURL.bind(URL);
+    const revoke = URL.revokeObjectURL.bind(URL);
+    URL.createObjectURL = (blob) => {
+      const url = create(blob);
+      window.__captureUrls.add(url);
+      return url;
+    };
+    URL.revokeObjectURL = (url) => {
+      window.__captureUrls.delete(url);
+      return revoke(url);
     };
   });
   await page.evaluate(() => {
@@ -451,7 +579,40 @@ async function runRendererTests(browser, baseUrl) {
   await page.selectOption("#renderer", "canvas");
   await page.waitForFunction(() => document.getElementById("renderer-status").dataset.renderer === "canvas"
     && !!document.getElementById("renderer-status").dataset.snapshotTick);
+  await page.evaluate(() => { window.__presentationControl.hold = true; });
+  await page.waitForFunction(() => !!window.__presentationControl.pending, undefined, { polling: 50 });
+  const pausedPaints = await page.evaluate(() => {
+    const presentation = window.__presentationControl;
+    const invoke = () => {
+      const callback = presentation.pending;
+      presentation.pending = null;
+      callback(performance.now());
+    };
+    const before = window.__canvasRenderCalls;
+    const snapshot = JSON.stringify(window.__rendererSim.snapshot());
+    const repetitions = 120;
+    const canvas = document.getElementById("sim-canvas");
+    const width = canvas.width;
+    for (let index = 0; index < repetitions; index += 1) invoke();
+    const afterUnchanged = window.__canvasRenderCalls;
+    canvas.width = width + 1;
+    invoke();
+    const afterResize = window.__canvasRenderCalls;
+    canvas.width = width;
+    invoke();
+    const afterRestore = window.__canvasRenderCalls;
+    presentation.hold = false;
+    const next = presentation.pending;
+    presentation.pending = null;
+    presentation.native(next);
+    return { repetitions, unchangedCalls: afterUnchanged - before,
+      resizeCalls: afterResize - afterUnchanged, restoreCalls: afterRestore - afterResize,
+      unchangedState: snapshot === JSON.stringify(window.__rendererSim.snapshot()) };
+  });
+  if (pausedPaints.unchangedCalls !== 0 || pausedPaints.resizeCalls !== 1 || pausedPaints.restoreCalls !== 1
+      || !pausedPaints.unchangedState) throw new Error(`Paused publication was repainted or resize ignored: ${JSON.stringify(pausedPaints)}`);
   await page.locator("#sim-canvas").screenshot({ path: path.join(proof, "main-canvas.png") });
+  exports.canvas = await saveFrame(page, "canvas");
   if (await page.evaluate(() => JSON.stringify(window.__rendererSim.snapshot())) !== snapshotBefore) throw new Error("Canvas switch changed exported snapshot");
   await page.selectOption("#renderer", "webgpu");
   await page.waitForFunction(() => document.getElementById("renderer-status").dataset.renderer === "webgpu"
@@ -472,6 +633,7 @@ async function runRendererTests(browser, baseUrl) {
   if (gpuScreenshot.brightPixels <= 0) throw new Error("Selected WebGPU screenshot has no bright agent pixels");
   if (await page.evaluate(() => JSON.stringify(window.__rendererSim.snapshot())) !== snapshotBefore) throw new Error("GPU switch changed exported snapshot");
   const adapter = await page.evaluate(() => window.__rendererAdapter);
+  exports.webgpu = await saveFrame(page, "webgpu");
   await page.evaluate(async () => {
     const device = window.__rendererDevice;
     device.destroy();
@@ -504,14 +666,31 @@ async function runRendererTests(browser, baseUrl) {
       return hold.completion;
     };
     window.__frameHold = hold;
+    const speed = document.getElementById("steps-per-frame");
+    speed.value = "1";
+    speed.dispatchEvent(new Event("input", { bubbles: true }));
   });
   await page.waitForFunction(() => !!window.__frameHold.release, undefined, { polling: 50 });
-  await page.evaluate(() => { window.__presentationControl.hold = true; });
+  await page.evaluate(() => {
+    const speed = document.getElementById("steps-per-frame");
+    speed.value = "0";
+    speed.dispatchEvent(new Event("input", { bubbles: true }));
+    window.__presentationControl.hold = true;
+  });
   await page.waitForFunction(() => !!window.__presentationControl.pending, undefined, { polling: 50 });
   const beforeHold = await page.evaluate(() => ({
     tick: window.__rendererSim.snapshot().tick,
     submittedTick: Number(document.getElementById("renderer-status").dataset.snapshotTick),
   }));
+  const beforeHeldDownloads = downloadCount;
+  await page.evaluate(() => {
+    const button = document.getElementById("capture-btn");
+    button.click();
+    button.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    if (!button.disabled || document.getElementById("capture-status").dataset.state !== "waiting") {
+      throw new Error("PNG request was not bounded while GPU admission was held");
+    }
+  });
   await page.evaluate(() => {
     const speed = document.getElementById("steps-per-frame");
     speed.value = "2";
@@ -542,9 +721,12 @@ async function runRendererTests(browser, baseUrl) {
       submissions: window.__frameHold.submissions };
   });
   if (duringHold.tick <= beforeHold.tick || duringHold.submittedTick !== beforeHold.submittedTick
-      || duringHold.submissions !== 1) {
+      || duringHold.submissions !== 1 || downloadCount !== beforeHeldDownloads
+      || await page.getAttribute("#capture-status", "data-state") !== "waiting") {
     throw new Error(`GPU backlog or false snapshot stamp: ${JSON.stringify({ beforeHold, duringHold })}`);
   }
+  const heldIdentity = await page.evaluate(() => window.__rendererSim.frame().identity);
+  const heldDownload = page.waitForEvent("download");
   await page.evaluate(async () => {
     const hold = window.__frameHold;
     hold.restore();
@@ -561,16 +743,141 @@ async function runRendererTests(browser, baseUrl) {
   });
   await page.waitForFunction((tick) => Number(document.getElementById("renderer-status").dataset.snapshotTick) === tick, duringHold.tick);
   const afterHold = Number(await page.getAttribute("#renderer-status", "data-snapshot-tick"));
+  exports.afterHeldAdmission = await retainDownload(page, await heldDownload, "after-held-admission", heldIdentity);
   const completionSnapshot = await page.evaluate(() => JSON.stringify(window.__rendererSim.snapshot()));
   await page.evaluate(() => {
     window.__rendererDevice.queue.onSubmittedWorkDone = () => Promise.reject(new Error("intentional completion acknowledgement refusal"));
+    document.getElementById("sim-canvas").width += 1;
   });
   await page.waitForFunction(() => document.getElementById("renderer-status").dataset.renderer === "canvas"
     && document.getElementById("renderer-status").textContent.includes("intentional completion acknowledgement refusal")
     && !!document.getElementById("renderer-status").dataset.snapshotTick);
+  await page.evaluate(() => { document.getElementById("sim-canvas").width -= 1; });
   const rejectedCompletionPixels = await paintedPixels(page);
   if (rejectedCompletionPixels <= 0 || await page.evaluate(() => JSON.stringify(window.__rendererSim.snapshot())) !== completionSnapshot) {
     throw new Error("Injected completion rejection failed to retain a painted, unchanged paused snapshot");
+  }
+  // Hold delivery of a real serialization callback, not its pixel production.
+  const holdSerialization = () => page.evaluate(() => {
+    const canvas = document.getElementById("sim-canvas");
+    const original = canvas.toBlob;
+    window.__releasePng = null;
+    window.__restorePng = () => { canvas.toBlob = original; };
+    canvas.toBlob = function (callback, type) {
+      return original.call(this, (blob) => { window.__releasePng = () => callback(blob); }, type);
+    };
+  });
+  const beforeEncoding = await page.evaluate(() => window.__rendererSim.frame().identity);
+  await holdSerialization();
+  await page.click("#capture-btn");
+  await page.waitForFunction(() => !!window.__releasePng);
+  await page.evaluate(() => {
+    const speed = document.getElementById("steps-per-frame");
+    speed.value = "2";
+    speed.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await page.waitForFunction((tick) => window.__rendererSim.snapshot().tick > tick + 2, Number(beforeEncoding.tick), { polling: 50 });
+  await page.evaluate(() => {
+    const speed = document.getElementById("steps-per-frame");
+    speed.value = "0";
+    speed.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  const afterEncoding = await page.evaluate(() => window.__rendererSim.frame().identity);
+  const movedDownload = page.waitForEvent("download");
+  await page.evaluate(() => { window.__restorePng(); window.__releasePng(); });
+  exports.whileScienceMoves = await retainDownload(page, await movedDownload, "while-science-moves", beforeEncoding);
+  exports.whileScienceMoves.laterIdentity = afterEncoding;
+  if (beforeEncoding.tick === afterEncoding.tick || beforeEncoding.publicationRevision === afterEncoding.publicationRevision) {
+    throw new Error("PNG callback test did not observe a later science publication");
+  }
+  const captureFailuresSnapshot = await page.evaluate(() => JSON.stringify(window.__rendererSim.snapshot()));
+  const captureFailures = {};
+  for (const mode of ["null", "throw", "identity"]) {
+    const before = downloadCount;
+    await page.evaluate(async (mode) => {
+      const canvas = document.getElementById("sim-canvas");
+      const wasm = await import("/pkg/scriptbots_web.js");
+      const originalBlob = canvas.toBlob;
+      const originalFrame = wasm.SimHandle.prototype.frame;
+      window.__restoreCaptureFault = () => {
+        canvas.toBlob = originalBlob;
+        wasm.SimHandle.prototype.frame = originalFrame;
+      };
+      if (mode === "null") canvas.toBlob = (callback) => callback(null);
+      if (mode === "throw") canvas.toBlob = () => { throw new DOMException("intentional PNG serialization refusal", "SecurityError"); };
+      if (mode === "identity") wasm.SimHandle.prototype.frame = function () {
+        const frame = originalFrame.call(this);
+        frame.identity.tick = String(frame.snapshot.tick + 1);
+        return frame;
+      };
+    }, mode);
+    await page.click("#capture-btn");
+    await page.waitForFunction(() => document.getElementById("capture-status").dataset.state === "error");
+    const failure = await page.textContent("#capture-status");
+    await page.evaluate(() => window.__restoreCaptureFault());
+    if (downloadCount !== before || await page.isDisabled("#capture-btn")
+        || await page.evaluate(() => JSON.stringify(window.__rendererSim.snapshot())) !== captureFailuresSnapshot) {
+      throw new Error(`PNG ${mode} refusal downloaded or changed paused science`);
+    }
+    captureFailures[mode] = { injected: true, failure, downloads: downloadCount - before };
+  }
+
+  await holdSerialization();
+  await page.click("#capture-btn");
+  await page.waitForFunction(() => !!window.__releasePng);
+  const beforeResetDownloads = downloadCount;
+  await page.evaluate(() => {
+    window.__beforeResetSim = window.__rendererSim;
+    document.getElementById("reset-btn").click();
+  });
+  await page.waitForFunction(() => window.__rendererSim !== window.__beforeResetSim);
+  const resetSnapshot = await page.evaluate(() => JSON.stringify(window.__rendererSim.snapshot()));
+  await page.evaluate(() => { window.__restorePng(); window.__releasePng(); });
+  await page.waitForFunction(() => document.getElementById("capture-status").dataset.state === "error");
+  captureFailures.resetDuringEncoding = { injectedCallbackHold: true, failure: await page.textContent("#capture-status") };
+  if (downloadCount !== beforeResetDownloads
+      || await page.evaluate(() => JSON.stringify(window.__rendererSim.snapshot())) !== resetSnapshot) {
+    throw new Error("Old-world PNG completed after reset or changed the new paused world");
+  }
+  await holdSerialization();
+  await page.click("#capture-btn");
+  await page.waitForFunction(() => !!window.__releasePng);
+  const beforeTimeoutDownloads = downloadCount;
+  await page.waitForFunction(() => document.getElementById("capture-status").dataset.state === "error");
+  captureFailures.timeout = { injectedCallbackHold: true, failure: await page.textContent("#capture-status") };
+  if (!captureFailures.timeout.failure.includes("10 seconds") || downloadCount !== beforeTimeoutDownloads) {
+    throw new Error("PNG serialization deadline did not refuse the held callback");
+  }
+  const indeterminateEncoder = await page.evaluate(() => {
+    const callsBefore = window.__nativePngCalls.length;
+    const button = document.getElementById("capture-btn");
+    const disabled = button.disabled;
+    button.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    return { callsBefore, disabled };
+  });
+  await page.evaluate(() => new Promise(requestAnimationFrame));
+  indeterminateEncoder.callsAfter = await page.evaluate(() => window.__nativePngCalls.length);
+  if (!indeterminateEncoder.disabled || indeterminateEncoder.callsBefore !== indeterminateEncoder.callsAfter) {
+    throw new Error(`Retry started another encoder before the prior callback returned: ${JSON.stringify(indeterminateEncoder)}`);
+  }
+  captureFailures.timeout.indeterminateEncoder = indeterminateEncoder;
+  await page.evaluate(() => { window.__restorePng(); window.__releasePng(); });
+  await page.waitForFunction(() => !document.getElementById("capture-btn").disabled);
+  exports.afterTimeout = await saveFrame(page, "after-timeout");
+  const afterTimeoutDownloads = downloadCount;
+  await page.evaluate(() => window.__releasePng());
+  if (downloadCount !== afterTimeoutDownloads
+      || await page.getAttribute("#capture-status", "data-filename") !== exports.afterTimeout.filename) {
+    throw new Error("Duplicate stale PNG callback replaced the successful retry");
+  }
+  captureFailures.timeout.duplicateCallbackInjected = true;
+  const urlLifecycle = await page.evaluate(() => {
+    const retained = window.__captureUrls.size;
+    window.dispatchEvent(new PageTransitionEvent("pagehide"));
+    return { retained, afterPagehideSignal: window.__captureUrls.size, control: "injected pagehide event" };
+  });
+  if (urlLifecycle.retained !== 1 || urlLifecycle.afterPagehideSignal !== 0) {
+    throw new Error(`PNG object URLs are unbounded or not released: ${JSON.stringify(urlLifecycle)}`);
   }
   await context.close();
   const fallbacks = {};
@@ -585,6 +892,7 @@ async function runRendererTests(browser, baseUrl) {
       else GPUAdapter.prototype.requestDevice = async () => { throw new Error("intentional device creation refusal"); };
     }, failure);
     await fallbackPage.goto(baseUrl);
+    await fallbackPage.selectOption("#renderer", "webgpu");
     await fallbackPage.waitForFunction(() => document.getElementById("renderer-status").dataset.renderer === "canvas"
       && Number(document.getElementById("renderer-status").dataset.snapshotTick) > 0);
     const status = await fallbackPage.textContent("#renderer-status");
@@ -599,12 +907,12 @@ async function runRendererTests(browser, baseUrl) {
   }
   if (errors.length !== 0) throw new Error(`Renderer page errors: ${JSON.stringify(errors)}`);
   const result = { schema: "scriptbots.browser-renderers.v2", status: "pass", browser: browser.version(), adapter,
-    geometry, aspect, pausedTick, exportedSnapshotSha256: createHash("sha256").update(snapshotBefore).digest("hex"),
+    geometry, aspect, pausedTick, pausedPaints, exportedSnapshotSha256: createHash("sha256").update(snapshotBefore).digest("hex"),
     backpressure: { beforeHold, duringHold, afterHold,
       presentationControl: "one producer callback retained and invoked explicitly; real independent timer" },
     injectedCompletionRejection: { paintedPixels: rejectedCompletionPixels,
       exportedSnapshotSha256: createHash("sha256").update(completionSnapshot).digest("hex") },
-    screenshotControls: { transparentBlank, emptyFrame, knownMarker }, gpuCanvasCopyPixels, gpuScreenshot,
+    exports, captureFailures, urlLifecycle, screenshotControls: { transparentBlank, emptyFrame, knownMarker }, gpuCanvasCopyPixels, gpuScreenshot,
     lostPaintedPixels, deviceLoss: "actual GPUDevice.destroy, followed by Canvas painting", fallbacks, errors, proof };
   console.log(JSON.stringify(result));
   return true;
@@ -1074,10 +1382,10 @@ async function runTests() {
       await clockPage.waitForFunction((version) => document.getElementById("version").textContent === version, expectedVersion);
       await clockPage.evaluate(async () => {
         const wasm = await import("/pkg/scriptbots_web.js");
-        const snapshot = wasm.SimHandle.prototype.snapshot;
-        wasm.SimHandle.prototype.snapshot = function () {
+        const frame = wasm.SimHandle.prototype.frame;
+        wasm.SimHandle.prototype.frame = function () {
           window.__clockHandle = this;
-          return snapshot.call(this);
+          return frame.call(this);
         };
         wasm.SimHandle.prototype.tick = function () {
           throw new Error("RAF attempted to authorize scientific work");

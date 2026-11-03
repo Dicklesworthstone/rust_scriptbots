@@ -44,6 +44,7 @@ use wasm_bindgen::prelude::*;
 use scriptbots_runtime::{
     ApplicationState, CommandStatus, DriveReceipt, HostCommand, HostCore, HostCoreOptions,
     HostSessionId, LocalHostPort, ManualHostDriver, ManualInstant, NullFrontend, PlaybackSnapshot,
+    RenderSnapshot,
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -143,6 +144,44 @@ struct SimSpec {
     default_brain: Option<BrainPreset>,
     permalink: Option<Permalink>,
     preserve_population_config: bool,
+}
+
+/// Browser-only envelope; the positional world snapshot wire format is unchanged.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserFrame<'a> {
+    schema: &'static str,
+    identity: BrowserFrameIdentity,
+    snapshot: &'a SimulationSnapshot,
+}
+
+/// Decimal strings preserve every host identity bit across the JavaScript boundary.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserFrameIdentity {
+    session_id: String,
+    publication_revision: String,
+    scientific_revision: String,
+    control_revision: String,
+    config_revision: String,
+    tick: String,
+}
+
+impl<'a> BrowserFrame<'a> {
+    fn new(publication: &'a RenderSnapshot) -> Self {
+        Self {
+            schema: "scriptbots.browser-frame.v1",
+            identity: BrowserFrameIdentity {
+                session_id: publication.session_id.get().to_string(),
+                publication_revision: publication.revision.get().to_string(),
+                scientific_revision: publication.revisions.scientific.get().to_string(),
+                control_revision: publication.revisions.control.get().to_string(),
+                config_revision: publication.revisions.config.get().to_string(),
+                tick: publication.world.tick.to_string(),
+            },
+            snapshot: &publication.world,
+        }
+    }
 }
 
 impl SimSpec {
@@ -444,6 +483,15 @@ impl SimHandle {
         let simulation = self.inner.borrow();
         let snapshot = simulation.snapshot();
         encode_snapshot(&snapshot, simulation.spec.snapshot_format)
+    }
+
+    /// Read one immutable host publication as a JSON frame with exact identities.
+    /// This does not advance science and is independent of the snapshot codec option.
+    #[wasm_bindgen(js_name = frame)]
+    pub fn frame_js(&self) -> Result<JsValue, JsValue> {
+        let simulation = self.inner.borrow();
+        let publication = simulation.core.latest_snapshot();
+        to_value(&BrowserFrame::new(&publication)).map_err(js_error)
     }
 
     /// Rebuild the simulation with an optional nonnegative numeric seed.
@@ -1752,6 +1800,13 @@ mod tests {
             let before = observed.core.scientific_digest_v1().expect("before reads");
             for _ in 0..boundary {
                 assert_eq!(observed.snapshot().tick, observed.core.world_tick().0);
+                let publication = observed.core.latest_snapshot();
+                let frame = BrowserFrame::new(&publication);
+                assert_eq!(frame.identity.tick, observed.snapshot().tick.to_string());
+                assert_eq!(
+                    serde_json::to_value(&frame).expect("browser frame JSON")["snapshot"],
+                    serde_json::to_value(observed.snapshot()).expect("existing projection JSON")
+                );
             }
             assert_eq!(
                 observed.core.scientific_digest_v1().expect("after reads"),
@@ -1778,6 +1833,72 @@ mod tests {
                 .expect("repeated digest"),
             final_digest
         );
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_frame_names_independent_host_revisions_exactly() {
+        let mut simulation = browser_clock_simulation();
+        let initial = simulation.core.latest_snapshot();
+        let initial_identity = BrowserFrame::new(&initial).identity;
+        simulation.set_speed(0.0).expect("pause through host");
+        let paused = simulation.core.latest_snapshot();
+        let paused_identity = BrowserFrame::new(&paused).identity;
+        assert_eq!(paused_identity.tick, initial_identity.tick);
+        assert_eq!(
+            paused_identity.scientific_revision,
+            initial_identity.scientific_revision
+        );
+        assert_ne!(
+            paused_identity.control_revision,
+            initial_identity.control_revision
+        );
+        assert_ne!(
+            paused_identity.publication_revision,
+            initial_identity.publication_revision
+        );
+        simulation.tick(1).expect("one manual science tick");
+        let stepped = simulation.core.latest_snapshot();
+        let stepped_identity = BrowserFrame::new(&stepped).identity;
+        assert_ne!(
+            stepped_identity.scientific_revision,
+            paused_identity.scientific_revision
+        );
+        assert_ne!(stepped_identity.tick, paused_identity.tick);
+        assert_eq!(
+            stepped_identity.config_revision,
+            paused_identity.config_revision
+        );
+
+        // A declared wire fixture checks full-width identities, not a host that
+        // has actually executed u64::MAX scientific steps.
+        let mut wide = (*stepped).clone();
+        wide.session_id = HostSessionId::new(u64::MAX);
+        wide.revision = scriptbots_runtime::SnapshotRevision::new(u64::MAX - 1);
+        wide.revisions.scientific = scriptbots_runtime::ScientificRevision::new(u64::MAX - 2);
+        wide.revisions.control = scriptbots_runtime::ControlRevision::new(u64::MAX - 3);
+        wide.revisions.config = scriptbots_runtime::ConfigRevision::new(u64::MAX - 4);
+        wide.world.tick = u64::MAX - 5;
+        let identity = BrowserFrame::new(&wide).identity;
+        let encoded = serde_json::to_value(&identity).expect("exact decimal identity JSON");
+        assert_eq!(encoded["sessionId"], wide.session_id.get().to_string());
+        assert_eq!(
+            encoded["publicationRevision"],
+            wide.revision.get().to_string()
+        );
+        assert_eq!(
+            encoded["scientificRevision"],
+            wide.revisions.scientific.get().to_string()
+        );
+        assert_eq!(
+            encoded["controlRevision"],
+            wide.revisions.control.get().to_string()
+        );
+        assert_eq!(
+            encoded["configRevision"],
+            wide.revisions.config.get().to_string()
+        );
+        assert_eq!(encoded["tick"], wide.world.tick.to_string());
     }
 
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]

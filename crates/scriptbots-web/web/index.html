@@ -259,10 +259,12 @@
                 <label for="renderer">Renderer</label>
                 <select id="renderer">
                     <option value="auto">Automatic (prefer WebGPU)</option>
-                    <option value="canvas">Canvas 2D</option>
+                    <option value="canvas" selected>Canvas 2D</option>
                     <option value="webgpu">WebGPU</option>
                 </select>
                 <div id="renderer-status" role="status" aria-live="polite">Starting renderer…</div>
+                <button id="capture-btn" type="button" disabled>Save Frame as PNG</button>
+                <div id="capture-status" role="status" aria-live="polite"></div>
                 <label>
                     Simulation speed (0 pauses)
                     <input id="steps-per-frame" type="range" min="0" max="8" step="1" value="2" />

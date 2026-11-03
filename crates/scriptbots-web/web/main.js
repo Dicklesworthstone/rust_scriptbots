@@ -17,8 +17,14 @@ const {
 let canvas = document.getElementById("sim-canvas");
 const rendererSelect = document.getElementById("renderer");
 const rendererStatus = document.getElementById("renderer-status");
+const captureButton = document.getElementById("capture-btn");
+const captureStatus = document.getElementById("capture-status");
+let captureRequest = null;
+let encodingRequest = null;
+let captureUrl = null;
 let renderer = null;
 let rendererGeneration = 0;
+let lastPaintedFrame = null;
 const fpsEl = document.getElementById("metric-fps");
 const tpsEl = document.getElementById("metric-tps");
 const tickEl = document.getElementById("metric-tick");
@@ -69,6 +75,7 @@ const perfWindow = {
 };
 
 let simHandle = null;
+let simulationGeneration = 0;
 let speedMultiplier = Number(stepsSlider.value);
 let simulationStartedAt = null;
 let simulationTimer = null;
@@ -151,8 +158,11 @@ async function selectRenderer(preference, fallbackReason = null) {
   canvas.replaceWith(nextCanvas);
   canvas = nextCanvas;
   renderer = nextRenderer;
+  lastPaintedFrame = null;
   rendererStatus.dataset.renderer = backend;
-  delete rendererStatus.dataset.snapshotTick;
+  for (const key of Object.keys(rendererStatus.dataset)) {
+    if (key !== "renderer") delete rendererStatus.dataset[key];
+  }
   rendererStatus.textContent = backend === "webgpu" ? "WebGPU" : "Canvas 2D";
   if (fallbackReason) {
     rendererStatus.textContent += ` — ${fallbackReason}`;
@@ -164,11 +174,41 @@ rendererSelect.addEventListener("change", () => {
   void selectRenderer(rendererSelect.value).catch(reportRendererFailure);
 });
 
-function drawSnapshot(snapshot) {
+function validateFrameIdentity(frame) {
+  const identity = frame?.identity;
+  if (frame?.schema !== "scriptbots.browser-frame.v1"
+      || !Number.isSafeInteger(frame.snapshot.tick) || identity?.tick !== String(frame.snapshot.tick)
+      || ![identity.sessionId, identity.publicationRevision, identity.scientificRevision,
+        identity.controlRevision, identity.configRevision, identity.tick]
+        .every((value) => typeof value === "string" && /^(0|[1-9][0-9]*)$/.test(value))) {
+    throw new Error("Frame identity does not match the rendered snapshot");
+  }
+}
+
+function drawSnapshot(frame) {
   if (!renderer) return;
   try {
-    if (renderer.render(snapshot)) {
-      rendererStatus.dataset.snapshotTick = String(snapshot.tick);
+    validateFrameIdentity(frame);
+  } catch (error) {
+    if (captureRequest) finishCapture(captureRequest, error);
+    else showCaptureError(`Frame refused: ${error.message}`);
+    return;
+  }
+  if (lastPaintedFrame?.simulationGeneration === simulationGeneration
+      && lastPaintedFrame.publicationRevision === frame.identity.publicationRevision
+      && lastPaintedFrame.sessionId === frame.identity.sessionId
+      && lastPaintedFrame.width === canvas.width && lastPaintedFrame.height === canvas.height
+      && (!captureRequest || captureRequest.encoding)) {
+    return;
+  }
+  try {
+    if (renderer.render(frame.snapshot)) {
+      lastPaintedFrame = { simulationGeneration, publicationRevision: frame.identity.publicationRevision,
+        sessionId: frame.identity.sessionId, width: canvas.width, height: canvas.height };
+      for (const [key, value] of Object.entries(frame.identity)) {
+        rendererStatus.dataset[key === "tick" ? "snapshotTick" : key] = value;
+      }
+      captureAdmittedFrame(frame.identity);
     }
   } catch (error) {
     if (rendererStatus.dataset.renderer === "webgpu") {
@@ -178,6 +218,88 @@ function drawSnapshot(snapshot) {
     }
   }
 }
+
+function showCaptureError(message) {
+  for (const key of Object.keys(captureStatus.dataset)) delete captureStatus.dataset[key];
+  captureStatus.dataset.state = "error";
+  if (captureStatus.textContent !== message) appendLog(message);
+  captureStatus.textContent = message;
+}
+
+function finishCapture(request, error = null) {
+  if (captureRequest !== request) return;
+  clearTimeout(request.timeout);
+  captureRequest = null;
+  captureButton.disabled = !simHandle || !!encodingRequest;
+  if (error) {
+    showCaptureError(`PNG export failed: ${error.message}`);
+  }
+}
+
+captureButton.addEventListener("click", () => {
+  if (!simHandle || captureRequest || encodingRequest) return;
+  const request = { simulationGeneration, encoding: false, timeout: null };
+  request.timeout = setTimeout(() => finishCapture(request, new Error(encodingRequest === request
+    ? "No PNG completed within 10 seconds; encoding is still finishing"
+    : "No frame admitted within 10 seconds; try again")), 10_000);
+  captureRequest = request;
+  captureButton.disabled = true;
+  for (const key of Object.keys(captureStatus.dataset)) delete captureStatus.dataset[key];
+  captureStatus.dataset.state = "waiting";
+  captureStatus.textContent = "Waiting for the next rendered frame…";
+});
+
+function captureAdmittedFrame(frameIdentity) {
+  const request = captureRequest;
+  if (!request || request.encoding) return;
+  try {
+    if (request.simulationGeneration !== simulationGeneration) throw new Error("World changed before capture; try again");
+    const identity = { ...frameIdentity };
+    const backend = rendererStatus.dataset.renderer;
+    const filename = `scriptbots-session-${identity.sessionId}-p${identity.publicationRevision}-s${identity.scientificRevision}-c${identity.controlRevision}-g${identity.configRevision}-t${identity.tick}-${backend}.png`;
+    request.encoding = true;
+    encodingRequest = request;
+    captureStatus.dataset.state = "encoding";
+    captureStatus.textContent = `Encoding tick ${identity.tick}…`;
+    // Invoke serialization in the submitting callback, before another frame
+    // can replace the drawing buffer. The callback retains identity, not agents.
+    canvas.toBlob((blob) => {
+      const completedEncoding = encodingRequest === request;
+      if (completedEncoding) encodingRequest = null;
+      if (captureRequest !== request) {
+        if (completedEncoding && !captureRequest) {
+          showCaptureError("PNG encoding finished after its request expired; try again");
+        }
+        captureButton.disabled = !simHandle || !!captureRequest || !!encodingRequest;
+        return;
+      }
+      try {
+        if (request.simulationGeneration !== simulationGeneration) throw new Error("World changed during capture; try again");
+        if (!blob || blob.type !== "image/png") throw new Error("The browser did not produce a PNG");
+        if (captureUrl) URL.revokeObjectURL(captureUrl);
+        captureUrl = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = captureUrl;
+        link.download = filename;
+        link.click();
+        Object.assign(captureStatus.dataset, identity, { renderer: backend, state: "ready", filename });
+        captureStatus.textContent = `PNG ready — tick ${identity.tick}, science revision ${identity.scientificRevision}, publication ${identity.publicationRevision} (${backend === "webgpu" ? "WebGPU" : "Canvas 2D"})`;
+        finishCapture(request);
+      } catch (error) {
+        finishCapture(request, error);
+      }
+    }, "image/png");
+  } catch (error) {
+    if (encodingRequest === request) encodingRequest = null;
+    finishCapture(request, error);
+  }
+}
+
+window.addEventListener("pagehide", () => {
+  if (captureRequest) finishCapture(captureRequest, new Error("Page left during capture"));
+  if (captureUrl) URL.revokeObjectURL(captureUrl);
+  captureUrl = null;
+});
 
 function updateStats(snapshot, now) {
   const frameDt = now - metrics.lastFrameTs;
@@ -232,9 +354,9 @@ function presentSimulation(now) {
     return;
   }
 
-  const snapshot = simHandle.snapshot();
-  drawSnapshot(snapshot);
-  updateStats(snapshot, now);
+  const frame = simHandle.frame();
+  drawSnapshot(frame);
+  updateStats(frame.snapshot, now);
   requestAnimationFrame(presentSimulation);
 }
 
@@ -257,8 +379,10 @@ function applyPlaybackSpeed() {
 }
 
 function startSimulationClock() {
+  simulationGeneration += 1;
   simulationStartedAt = performance.now();
   simHandle.setSpeed(document.hidden ? 0 : speedMultiplier);
+  captureButton.disabled = !!captureRequest || !!encodingRequest;
 }
 
 function pumpSimulation() {

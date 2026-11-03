@@ -94,6 +94,14 @@ const mockWasmModule = `
         return { scientific_steps: Math.max(0, steps), automatic_steps_skipped: 0 };
       },
       snapshot() { return this.tick(0); },
+      frame() {
+        const snapshot = this.snapshot();
+        return { schema: "scriptbots.browser-frame.v1", snapshot, identity: {
+          sessionId: "2001", publicationRevision: String(snapshot.tick + 400),
+          scientificRevision: String(snapshot.tick + 100), controlRevision: "20",
+          configRevision: "10", tick: String(snapshot.tick)
+        } };
+      },
       tick(steps) {
         tick += steps;
         return {
@@ -132,6 +140,14 @@ const mockWasmModule = `
         return { scientific_steps: Math.max(0, steps), automatic_steps_skipped: 0 };
       },
       snapshot() { return this.tick(0); },
+      frame() {
+        const snapshot = this.snapshot();
+        return { schema: "scriptbots.browser-frame.v1", snapshot, identity: {
+          sessionId: "2002", publicationRevision: String(snapshot.tick + 400),
+          scientificRevision: String(snapshot.tick + 100), controlRevision: "20",
+          configRevision: "10", tick: String(snapshot.tick)
+        } };
+      },
       tick(steps) {
         tick += steps;
         return {
