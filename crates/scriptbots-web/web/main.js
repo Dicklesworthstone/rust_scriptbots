@@ -167,8 +167,9 @@ rendererSelect.addEventListener("change", () => {
 function drawSnapshot(snapshot) {
   if (!renderer) return;
   try {
-    renderer.render(snapshot);
-    rendererStatus.dataset.snapshotTick = String(snapshot.tick);
+    if (renderer.render(snapshot)) {
+      rendererStatus.dataset.snapshotTick = String(snapshot.tick);
+    }
   } catch (error) {
     if (rendererStatus.dataset.renderer === "webgpu") {
       void selectRenderer("canvas", `WebGPU stopped: ${error.message}`).catch(reportRendererFailure);

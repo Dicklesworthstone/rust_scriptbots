@@ -74,6 +74,9 @@ const AGENT_STRIDE_BYTES = AGENT_STRIDE_FLOATS * FLOAT_BYTES;
 const AGENT_STRIDE_ALIGNED = Math.ceil(AGENT_STRIDE_BYTES / 16) * 16;
 
 export class WebGpuRenderer {
+  #pendingFrame = null;
+  #reportFailure;
+
   static async isSupported() {
     return typeof navigator !== "undefined" && navigator.gpu !== undefined;
   }
@@ -162,6 +165,7 @@ export class WebGpuRenderer {
       this.failure = reason;
       onFailure(reason);
     };
+    this.#reportFailure = fail;
     device.lost.then((info) => fail(`WebGPU device lost: ${info.message || info.reason}`));
     device.addEventListener("uncapturederror", (event) => {
       event.preventDefault();
@@ -219,17 +223,20 @@ export class WebGpuRenderer {
 
   render(snapshot) {
     if (!snapshot) {
-      return;
+      return false;
     }
     if (this.disposed || this.failure) throw new Error(this.failure || "Renderer was destroyed");
+    // Refused snapshots are never retained or uploaded. The next callback
+    // supplies the then-current snapshot after the existing frame completes.
+    if (this.#pendingFrame) return false;
 
     this.updateViewUniform();
     const agents = snapshot.agents;
     this.ensureAgentCapacity(Math.max(agents.length, 1));
 
     if (agents.length === 0) {
-      this.clearFrame();
-      return;
+      this.#clearFrame();
+      return true;
     }
 
     const floatsPerAgent = AGENT_STRIDE_ALIGNED / FLOAT_BYTES;
@@ -268,10 +275,23 @@ export class WebGpuRenderer {
     pass.setBindGroup(0, this.bindGroup);
     pass.draw(6, agents.length, 0, 0);
     pass.end();
-    this.device.queue.submit([encoder.finish()]);
+    this.#submitFrame(encoder.finish());
+    return true;
   }
 
-  clearFrame() {
+  #submitFrame(commandBuffer) {
+    this.device.queue.submit([commandBuffer]);
+    this.#pendingFrame = this.device.queue.onSubmittedWorkDone();
+    this.#pendingFrame.then(
+      () => { this.#pendingFrame = null; },
+      (error) => {
+        this.#pendingFrame = null;
+        this.#reportFailure(`WebGPU completion failed: ${error.message}`);
+      },
+    );
+  }
+
+  #clearFrame() {
     const textureView = this.context.getCurrentTexture().createView();
     const encoder = this.device.createCommandEncoder();
     const pass = encoder.beginRenderPass({
@@ -285,7 +305,7 @@ export class WebGpuRenderer {
       ],
     });
     pass.end();
-    this.device.queue.submit([encoder.finish()]);
+    this.#submitFrame(encoder.finish());
   }
 
   destroy() {

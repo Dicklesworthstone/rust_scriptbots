@@ -66,13 +66,20 @@ Snapshots returned to JS follow the selected `snapshot_format` (defaults to JSON
 The log pane (bottom of the sidebar) captures bootstrap and performance events so that ad-hoc benchmarking runs can be recorded while iterating on the renderer.
 
 The renderer status exposes `data-snapshot-tick` for the snapshot submitted to
-the current backend. It is not a GPU presentation acknowledgement. The active
+the current backend. WebGPU admits one outstanding frame and refuses later
+snapshots until its queue completion is observed. Refused snapshots are neither
+retained nor uploaded; the next admitted paint uses the latest snapshot. The
+status tick stays on the last admitted frame while science and live metrics
+continue. Queue completion is not a GPU presentation acknowledgement. The active
 backend is in `data-renderer`; the selector retains the user's preference when
 a device failure causes fallback.
 
 Inside a pinned DSR profile, the existing stats test can separately exercise
 real WebGPU/Canvas geometry, resizing, explicit capability failures and actual
-device destruction:
+device destruction. It also holds delivery of real queue completions to check
+submission/write counts, latest-input admission and the submitted-snapshot stamp
+while the actual WASM science timer advances. This is a controlled producer
+test, not a measurement of physical GPU latency:
 
 ```bash
 SCRIPTBOTS_WEB_RENDERER_TESTS=1 \
@@ -86,6 +93,9 @@ Chromium's SwiftShader flags, records the actual adapter and retains screenshots
 Known geometry is rendering proof; the same packaged app also checks that
 backend changes/device loss preserve its paused exported snapshot. This is
 software-adapter coverage, not hardware qualification or a performance result.
+The visible-frame guard inspects compositor PNG pixels, with transparent and
+opaque empty-frame negatives and a one-pixel positive control. A separate
+canvas-copy count is diagnostic; it does not qualify GPU image export.
 The ordinary stats mode retains its separate four-case contract.
 
 For determinism validation, run the accompanying WASM parity test:

@@ -8,7 +8,7 @@ export class CanvasRenderer {
 
   render(snapshot) {
     if (!this.ctx || !snapshot) {
-      return;
+      return false;
     }
     const ctx = this.ctx;
     const canvas = this.canvas;
@@ -36,6 +36,7 @@ export class CanvasRenderer {
         ctx.stroke();
       }
     }
+    return true;
   }
 
   destroy() {

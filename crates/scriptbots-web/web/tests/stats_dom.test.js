@@ -184,6 +184,31 @@ async function installPausedClock(context) {
 
 async function runRendererTests(browser, baseUrl) {
   const proof = fs.mkdtempSync(path.join(process.env.SCRIPTBOTS_WASM_PROOF_DIR || "/tmp", "renderer-"));
+  // The compositor PNG is the visible-frame observation. A later GPU-canvas
+  // drawImage read can be blank even when this retained screenshot is not.
+  // The actual backdrop and gradient are below80; controls below reject both.
+  const brightThreshold = 80;
+  const inspectScreenshot = (page, png) => page.evaluate(async ({ bytes, threshold }) => {
+    const bitmap = await createImageBitmap(new Blob([new Uint8Array(bytes)], { type: "image/png" }));
+    try {
+      const canvas = document.createElement("canvas");
+      canvas.width = bitmap.width;
+      canvas.height = bitmap.height;
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(bitmap, 0, 0);
+      const pixels = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+      let brightPixels = 0;
+      let maxChannel = 0;
+      for (let offset = 0; offset < pixels.length; offset += 4) {
+        const max = Math.max(pixels[offset], pixels[offset + 1], pixels[offset + 2]);
+        if (max > threshold) brightPixels += 1;
+        maxChannel = Math.max(maxChannel, max);
+      }
+      return { width: canvas.width, height: canvas.height, threshold, brightPixels, maxChannel };
+    } finally {
+      bitmap.close();
+    }
+  }, { bytes: Array.from(png), threshold: brightThreshold });
   const paintedPixels = (page) => page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => {
     const canvas = document.getElementById("sim-canvas");
     const copy = document.createElement("canvas");
@@ -198,11 +223,21 @@ async function runRendererTests(browser, baseUrl) {
     }
     resolve(colored);
   })));
-  const context = await browser.newContext();
+  const context = await browser.newContext({ deviceScaleFactor: 1 });
   const errors = [];
   const page = await context.newPage();
   page.on("pageerror", (error) => errors.push(error.message));
   await context.addInitScript(() => {
+    const presentation = { hold: false, pending: null, native: window.requestAnimationFrame.bind(window) };
+    window.requestAnimationFrame = (callback) => {
+      if (presentation.hold) {
+        if (presentation.pending) throw new Error("More than one presentation callback retained");
+        presentation.pending = callback;
+        return 0;
+      }
+      return presentation.native(callback);
+    };
+    window.__presentationControl = presentation;
     if (typeof GPUAdapter === "undefined") throw new Error("Actual WebGPU is required for this lane");
     const requestDevice = GPUAdapter.prototype.requestDevice;
     GPUAdapter.prototype.requestDevice = async function (...args) {
@@ -216,6 +251,46 @@ async function runRendererTests(browser, baseUrl) {
     };
   });
   await page.goto(baseUrl);
+  await page.waitForFunction(() => Number(document.getElementById("renderer-status").dataset.snapshotTick) > 0);
+  await page.evaluate(() => {
+    const speed = document.getElementById("steps-per-frame");
+    speed.value = "0";
+    speed.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  const screenshotControl = await page.evaluate(() => {
+    const canvas = document.createElement("canvas");
+    canvas.id = "screenshot-control";
+    canvas.width = 64;
+    canvas.height = 64;
+    canvas.style.cssText = "position:fixed;top:0;right:0;z-index:1;";
+    canvas.style.width = `${canvas.width}px`;
+    canvas.style.height = `${canvas.height}px`;
+    canvas.style.backgroundColor = getComputedStyle(document.documentElement).backgroundColor;
+    canvas.style.backgroundImage = getComputedStyle(document.getElementById("sim-container")).backgroundImage;
+    canvas.getContext("2d");
+    document.body.append(canvas);
+    return { width: canvas.width, height: canvas.height, marker: { x: 16, y: 16, width: 1, height: 1 } };
+  });
+  const transparentBlank = await inspectScreenshot(page, await page.locator("#screenshot-control").screenshot());
+  await page.evaluate(async () => {
+    const { CanvasRenderer } = await import("/renderers/canvas.js");
+    new CanvasRenderer(document.getElementById("screenshot-control"))
+      .render({ world: { width: 64, height: 64 }, agents: [] });
+  });
+  const emptyFrame = await inspectScreenshot(page, await page.locator("#screenshot-control").screenshot());
+  await page.evaluate((marker) => {
+    const ctx = document.getElementById("screenshot-control").getContext("2d");
+    ctx.fillStyle = "#ff0000";
+    ctx.fillRect(marker.x, marker.y, marker.width, marker.height);
+  }, screenshotControl.marker);
+  const knownMarker = await inspectScreenshot(page, await page.locator("#screenshot-control").screenshot());
+  const markerArea = screenshotControl.marker.width * screenshotControl.marker.height;
+  if (transparentBlank.brightPixels !== 0 || emptyFrame.brightPixels !== 0
+      || knownMarker.brightPixels !== markerArea || knownMarker.width !== screenshotControl.width
+      || knownMarker.height !== screenshotControl.height) {
+    throw new Error(`Invalid screenshot blank guard: ${JSON.stringify({ transparentBlank, emptyFrame, knownMarker })}`);
+  }
+  await page.evaluate(() => document.getElementById("screenshot-control").remove());
   // Known render inputs exercise the actual production modules and real GPU;
   // they are geometry fixtures, not simulation or hardware-qualification proof.
   const geometry = await page.evaluate(async () => {
@@ -235,7 +310,7 @@ async function runRendererTests(browser, baseUrl) {
         ],
       };
       const read = async (input, points) => {
-        renderer.render(input);
+        if (input) renderer.render(input);
         if (renderer.device) await renderer.device.queue.onSubmittedWorkDone();
         const copy = document.createElement("canvas");
         copy.width = canvas.width;
@@ -270,13 +345,72 @@ async function runRendererTests(browser, baseUrl) {
           catch (error) { capacityError = String(error); }
           if (!capacityError?.includes("exceeds WebGPU capacity")) throw new Error("Missing host capacity refusal");
         }
-        results[backend] = { pixels, empty, resized, growthAgents: 513, capacityError };
+        let admission = null;
+        if (renderer.device) {
+          admission = [];
+          const queue = renderer.device.queue;
+          const workDone = queue.onSubmittedWorkDone.bind(queue);
+          const submit = queue.submit.bind(queue);
+          const writeBuffer = queue.writeBuffer.bind(queue);
+          let submissions = 0;
+          let writes = 0;
+          let heldCompletion;
+          let release;
+          queue.submit = (...args) => { submissions += 1; return submit(...args); };
+          queue.writeBuffer = (...args) => { writes += 1; return writeBuffer(...args); };
+          try {
+            for (const initial of [snapshot, { ...snapshot, agents: [] }]) {
+              submissions = 0;
+              writes = 0;
+              release = null;
+              queue.onSubmittedWorkDone = () => {
+                const actual = workDone();
+                heldCompletion = new Promise((resolve, reject) => {
+                  release = () => actual.then(resolve, reject);
+                });
+                return heldCompletion;
+              };
+              const first = renderer.render(initial);
+              const firstWrites = writes;
+              const refused = Array.from({ length: 100 }, () => renderer.render({ ...snapshot, agents: [] }));
+              const blockedSubmissions = submissions;
+              const blockedWrites = writes;
+              if (first !== true || !refused.every((value) => value === false)
+                  || submissions !== 1 || writes !== firstWrites || !release) {
+                throw new Error(`Unbounded GPU admission: ${JSON.stringify({ first, refused, submissions, writes, firstWrites })}`);
+              }
+              queue.onSubmittedWorkDone = workDone;
+              release();
+              await heldCompletion;
+              const newest = { ...snapshot, agents: [snapshot.agents[1]] };
+              const admitted = renderer.render(newest);
+              await workDone();
+              if (admitted !== true || submissions !== 2) throw new Error("GPU admission did not resume after completion");
+              const newestPixels = await read(null, [[128, 64], [256, 128]]);
+              if (submissions !== 2 || newestPixels[0][0] > 15 || newestPixels[0][1] > 22 || newestPixels[0][2] > 38
+                  || newestPixels[1][0] <= newestPixels[1][1] + 70) {
+                throw new Error(`GPU resumed with stale input: ${JSON.stringify(newestPixels)}`);
+              }
+              const observed = [first, ...refused];
+              admission.push({ initialAgents: initial.agents.length, attempts: observed.length,
+                refused: observed.filter((value) => value === false).length,
+                admitted: observed.filter((value) => value === true).length,
+                blockedSubmissions, blockedWrites, newestPixels });
+            }
+          } finally {
+            queue.onSubmittedWorkDone = workDone;
+            queue.submit = submit;
+            queue.writeBuffer = writeBuffer;
+          }
+        }
+        results[backend] = { pixels, empty, resized, growthAgents: 513, capacityError, admission };
       } finally {
         renderer.destroy();
       }
     }
     return results;
   });
+  console.log(JSON.stringify({ schema: "scriptbots.browser-frame-admission-geometry.v1", observation: geometry }));
   await page.waitForFunction(() => document.getElementById("renderer-status")?.dataset.renderer === "webgpu");
   const aspect = await page.evaluate(() => {
     const canvas = document.getElementById("sim-canvas");
@@ -290,6 +424,18 @@ async function runRendererTests(browser, baseUrl) {
     wasm.SimHandle.prototype.snapshot = function () {
       window.__rendererSim = this;
       return snapshot.call(this);
+    };
+    const drive = wasm.SimHandle.prototype.drive;
+    wasm.SimHandle.prototype.drive = function (now) {
+      const receipt = drive.call(this, now);
+      window.__lastRendererDrive = { now, receipt };
+      return receipt;
+    };
+    const setSpeed = wasm.SimHandle.prototype.setSpeed;
+    wasm.SimHandle.prototype.setSpeed = function (value) {
+      const receipt = setSpeed.call(this, value);
+      window.__lastRendererSpeed = { value, receipt };
+      return receipt;
     };
   });
   await page.evaluate(() => {
@@ -310,9 +456,20 @@ async function runRendererTests(browser, baseUrl) {
   await page.selectOption("#renderer", "webgpu");
   await page.waitForFunction(() => document.getElementById("renderer-status").dataset.renderer === "webgpu"
     && !!document.getElementById("renderer-status").dataset.snapshotTick);
-  await page.locator("#sim-canvas").screenshot({ path: path.join(proof, "main-webgpu.png") });
-  const gpuPaintedPixels = await paintedPixels(page);
-  if (gpuPaintedPixels <= 0) throw new Error("Selected WebGPU backend painted no agents");
+  const beforeScreenshot = await page.locator("#sim-canvas").boundingBox();
+  let gpuPng;
+  try {
+    gpuPng = await page.locator("#sim-canvas").screenshot({ path: path.join(proof, "main-webgpu.png") });
+  } catch (error) {
+    console.error("WebGPU screenshot failure state", JSON.stringify({ beforeScreenshot,
+      afterScreenshot: await page.locator("#sim-canvas").boundingBox(),
+      page: await page.evaluate(() => ({ hidden: document.hidden, status: document.getElementById("renderer-status").textContent,
+        tick: window.__rendererSim.snapshot().tick, log: document.getElementById("log").textContent })), errors }));
+    throw error;
+  }
+  const gpuCanvasCopyPixels = await paintedPixels(page);
+  const gpuScreenshot = await inspectScreenshot(page, gpuPng);
+  if (gpuScreenshot.brightPixels <= 0) throw new Error("Selected WebGPU screenshot has no bright agent pixels");
   if (await page.evaluate(() => JSON.stringify(window.__rendererSim.snapshot())) !== snapshotBefore) throw new Error("GPU switch changed exported snapshot");
   const adapter = await page.evaluate(() => window.__rendererAdapter);
   await page.evaluate(async () => {
@@ -327,6 +484,94 @@ async function runRendererTests(browser, baseUrl) {
   const lostPaintedPixels = await paintedPixels(page);
   if (lostPaintedPixels <= 0) throw new Error("Device loss fallback painted no agents");
   if (await page.evaluate(() => JSON.stringify(window.__rendererSim.snapshot())) !== snapshotBefore) throw new Error("Device loss changed exported snapshot");
+
+  // Acknowledge real GPU work only after the app has advanced science. This
+  // controls delivery of completion, not whether the submitted work executes.
+  await page.selectOption("#renderer", "canvas");
+  await page.selectOption("#renderer", "webgpu");
+  await page.waitForFunction(() => document.getElementById("renderer-status").dataset.renderer === "webgpu"
+    && !!document.getElementById("renderer-status").dataset.snapshotTick);
+  await page.evaluate(() => {
+    const queue = window.__rendererDevice.queue;
+    const done = queue.onSubmittedWorkDone.bind(queue);
+    const submit = queue.submit.bind(queue);
+    const hold = { submissions: 0, release: null, completion: null };
+    hold.restore = () => { queue.onSubmittedWorkDone = done; queue.submit = submit; };
+    queue.submit = (...args) => { hold.submissions += 1; return submit(...args); };
+    queue.onSubmittedWorkDone = () => {
+      const actual = done();
+      hold.completion = new Promise((resolve, reject) => { hold.release = () => actual.then(resolve, reject); });
+      return hold.completion;
+    };
+    window.__frameHold = hold;
+  });
+  await page.waitForFunction(() => !!window.__frameHold.release, undefined, { polling: 50 });
+  await page.evaluate(() => { window.__presentationControl.hold = true; });
+  await page.waitForFunction(() => !!window.__presentationControl.pending, undefined, { polling: 50 });
+  const beforeHold = await page.evaluate(() => ({
+    tick: window.__rendererSim.snapshot().tick,
+    submittedTick: Number(document.getElementById("renderer-status").dataset.snapshotTick),
+  }));
+  await page.evaluate(() => {
+    const speed = document.getElementById("steps-per-frame");
+    speed.value = "2";
+    speed.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  try {
+    await page.waitForFunction((tick) => window.__rendererSim.snapshot().tick > tick + 2, beforeHold.tick, { polling: 50 });
+  } catch (error) {
+    console.error("Independent clock failure state", JSON.stringify({ beforeHold,
+      observed: await page.evaluate(() => ({ hidden: document.hidden, tick: window.__rendererSim.snapshot().tick,
+        population: window.__rendererSim.snapshot().agents.length, drive: window.__lastRendererDrive,
+        speed: window.__lastRendererSpeed, status: document.getElementById("renderer-status").textContent,
+        log: document.getElementById("log").textContent })), errors }));
+    throw error;
+  }
+  const duringHold = await page.evaluate(() => {
+    const speed = document.getElementById("steps-per-frame");
+    speed.value = "0";
+    speed.dispatchEvent(new Event("input", { bubbles: true }));
+    const beforePresentation = JSON.stringify(window.__rendererSim.snapshot());
+    const presentation = window.__presentationControl;
+    const callback = presentation.pending;
+    presentation.pending = null;
+    callback(performance.now());
+    if (JSON.stringify(window.__rendererSim.snapshot()) !== beforePresentation) throw new Error("Presentation changed exported state");
+    return { tick: window.__rendererSim.snapshot().tick,
+      submittedTick: Number(document.getElementById("renderer-status").dataset.snapshotTick),
+      submissions: window.__frameHold.submissions };
+  });
+  if (duringHold.tick <= beforeHold.tick || duringHold.submittedTick !== beforeHold.submittedTick
+      || duringHold.submissions !== 1) {
+    throw new Error(`GPU backlog or false snapshot stamp: ${JSON.stringify({ beforeHold, duringHold })}`);
+  }
+  await page.evaluate(async () => {
+    const hold = window.__frameHold;
+    hold.restore();
+    hold.release();
+    await hold.completion;
+    const presentation = window.__presentationControl;
+    const callback = presentation.pending;
+    presentation.pending = null;
+    callback(performance.now());
+    presentation.hold = false;
+    const next = presentation.pending;
+    presentation.pending = null;
+    presentation.native(next);
+  });
+  await page.waitForFunction((tick) => Number(document.getElementById("renderer-status").dataset.snapshotTick) === tick, duringHold.tick);
+  const afterHold = Number(await page.getAttribute("#renderer-status", "data-snapshot-tick"));
+  const completionSnapshot = await page.evaluate(() => JSON.stringify(window.__rendererSim.snapshot()));
+  await page.evaluate(() => {
+    window.__rendererDevice.queue.onSubmittedWorkDone = () => Promise.reject(new Error("intentional completion acknowledgement refusal"));
+  });
+  await page.waitForFunction(() => document.getElementById("renderer-status").dataset.renderer === "canvas"
+    && document.getElementById("renderer-status").textContent.includes("intentional completion acknowledgement refusal")
+    && !!document.getElementById("renderer-status").dataset.snapshotTick);
+  const rejectedCompletionPixels = await paintedPixels(page);
+  if (rejectedCompletionPixels <= 0 || await page.evaluate(() => JSON.stringify(window.__rendererSim.snapshot())) !== completionSnapshot) {
+    throw new Error("Injected completion rejection failed to retain a painted, unchanged paused snapshot");
+  }
   await context.close();
   const fallbacks = {};
   for (const failure of ["unavailable", "adapter-null", "requestDevice-rejected", "requestDevice-pending"]) {
@@ -353,9 +598,14 @@ async function runRendererTests(browser, baseUrl) {
     await fallbackContext.close();
   }
   if (errors.length !== 0) throw new Error(`Renderer page errors: ${JSON.stringify(errors)}`);
-  const result = { schema: "scriptbots.browser-renderers.v1", status: "pass", browser: browser.version(), adapter,
+  const result = { schema: "scriptbots.browser-renderers.v2", status: "pass", browser: browser.version(), adapter,
     geometry, aspect, pausedTick, exportedSnapshotSha256: createHash("sha256").update(snapshotBefore).digest("hex"),
-    gpuPaintedPixels, lostPaintedPixels, deviceLoss: "actual GPUDevice.destroy, followed by Canvas painting", fallbacks, errors, proof };
+    backpressure: { beforeHold, duringHold, afterHold,
+      presentationControl: "one producer callback retained and invoked explicitly; real independent timer" },
+    injectedCompletionRejection: { paintedPixels: rejectedCompletionPixels,
+      exportedSnapshotSha256: createHash("sha256").update(completionSnapshot).digest("hex") },
+    screenshotControls: { transparentBlank, emptyFrame, knownMarker }, gpuCanvasCopyPixels, gpuScreenshot,
+    lostPaintedPixels, deviceLoss: "actual GPUDevice.destroy, followed by Canvas painting", fallbacks, errors, proof };
   console.log(JSON.stringify(result));
   return true;
 }
