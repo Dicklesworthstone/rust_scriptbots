@@ -26,7 +26,11 @@ generated_dir="$package_dir.wasm-pack"
 mkdir -- "$package_dir" "$generated_dir"
 
 cd "$repo_root"
-wasm-pack build crates/scriptbots-web --target web --out-dir "$generated_dir" -- --locked
+cargo_args=(--locked)
+if [[ -n "${CARGO_BUILD_JOBS:-}" ]]; then
+  cargo_args+=(--jobs "$CARGO_BUILD_JOBS")
+fi
+wasm-pack build crates/scriptbots-web --target web --out-dir "$generated_dir" -- "${cargo_args[@]}"
 
 generated_manifest="$generated_dir/package.json"
 jq -e '

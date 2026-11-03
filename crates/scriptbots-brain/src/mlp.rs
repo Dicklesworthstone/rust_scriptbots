@@ -1,4 +1,4 @@
-//! Multi-layer perceptron brain mirroring the legacy ScriptBots baseline.
+//! Multi-layer perceptron brain mirroring the legacy `ScriptBots` baseline.
 
 use rand::Rng;
 use scriptbots_core::{
@@ -67,7 +67,7 @@ impl SynapseKind {
         }
     }
 
-    fn flip(self) -> Self {
+    const fn flip(self) -> Self {
         match self {
             Self::Regular => Self::ChangeSensitive,
             Self::ChangeSensitive => Self::Regular,
@@ -143,7 +143,7 @@ impl Default for NodeState {
     }
 }
 
-/// Baseline ScriptBots MLP brain.
+/// Baseline `ScriptBots` MLP brain.
 ///
 /// Persistence deliberately goes through [`MlpBrainFamily`]'s bounded, versioned protocol
 /// envelopes. Raw serde would bypass topology validation and the binding between a checkpointed
@@ -200,6 +200,8 @@ impl MlpBrain {
         (-2.0 * u1.ln()).sqrt() * (TWO_PI * u2).cos()
     }
 
+    // Separate multiply/add rounding is part of the checkpoint continuation contract.
+    #[allow(clippy::suboptimal_flops)]
     fn apply_damping(output: f32, target: f32, damping: f32) -> f32 {
         output + (target - output) * damping
     }
@@ -215,24 +217,36 @@ impl MlpBrain {
             if rng.random::<f32>() < rate {
                 let deviate = Self::gaussian(rng);
                 if apply_continuous_step {
-                    params.bias += deviate * sigma;
+                    // Preserve the mutation kernel's separately rounded product and sum.
+                    #[allow(clippy::suboptimal_flops)]
+                    let bias = params.bias + deviate * sigma;
+                    params.bias = bias;
                 }
             }
             if rng.random::<f32>() < rate {
-                params.damping = (params.damping + Self::gaussian(rng) * sigma)
+                // Clamp the existing separately rounded mutation, without introducing FMA.
+                #[allow(clippy::suboptimal_flops)]
+                let damping = (params.damping + Self::gaussian(rng) * sigma)
                     .clamp(MUTATED_DAMPING_MIN, MUTATED_DAMPING_MAX);
+                params.damping = damping;
             }
             if rng.random::<f32>() < rate {
                 let deviate = Self::gaussian(rng);
                 if apply_continuous_step {
-                    params.gain = (params.gain + deviate * sigma).max(0.0);
+                    // Preserve genome bits produced by the established mutation kernel.
+                    #[allow(clippy::suboptimal_flops)]
+                    let gain = (params.gain + deviate * sigma).max(0.0);
+                    params.gain = gain;
                 }
             }
             if rng.random::<f32>() < rate {
                 let idx = rng.random_range(0..CONNECTIONS);
                 let deviate = Self::gaussian(rng);
                 if apply_continuous_step {
-                    params.weights[idx] += deviate * sigma;
+                    // Preserve genome bits produced by the established mutation kernel.
+                    #[allow(clippy::suboptimal_flops)]
+                    let weight = params.weights[idx] + deviate * sigma;
+                    params.weights[idx] = weight;
                 }
             }
             if rng.random::<f32>() < rate {
@@ -349,6 +363,9 @@ struct DecodedMlpState {
 
 impl MlpBrainFamily {
     /// Construct the canonical MLP family adapter.
+    ///
+    /// # Panics
+    /// Panics if the built-in family name no longer passes family identifier validation.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -555,66 +572,69 @@ impl MlpBrainFamily {
 
         let mut nodes = Vec::with_capacity(BRAIN_SIZE);
         for node_index in 0..BRAIN_SIZE {
-            let mut weights = [0.0; CONNECTIONS];
-            for weight in &mut weights {
-                *weight = f32::from_bits(u32::from_le_bytes(self.read::<4>(
-                    &mut reader,
-                    BrainEnvelopeKind::Genome,
-                    "weight",
-                )?));
-            }
-            let mut targets = [0; CONNECTIONS];
-            for target in &mut targets {
-                *target = usize::from(u16::from_le_bytes(self.read::<2>(
-                    &mut reader,
-                    BrainEnvelopeKind::Genome,
-                    "target",
-                )?));
-            }
-            let mut kinds = [SynapseKind::Regular; CONNECTIONS];
-            for kind in &mut kinds {
-                *kind = match self.read::<1>(
-                    &mut reader,
-                    BrainEnvelopeKind::Genome,
-                    "synapse kind",
-                )?[0]
-                {
-                    0 => SynapseKind::Regular,
-                    1 => SynapseKind::ChangeSensitive,
-                    value => {
-                        return Err(self.invalid(
-                            BrainEnvelopeKind::Genome,
-                            format!("node {node_index} has unsupported synapse kind {value}"),
-                        ));
-                    }
-                };
-            }
-            let gain = f32::from_bits(u32::from_le_bytes(self.read::<4>(
-                &mut reader,
-                BrainEnvelopeKind::Genome,
-                "gain",
-            )?));
-            let damping = f32::from_bits(u32::from_le_bytes(self.read::<4>(
-                &mut reader,
-                BrainEnvelopeKind::Genome,
-                "damping",
-            )?));
-            let bias = f32::from_bits(u32::from_le_bytes(self.read::<4>(
-                &mut reader,
-                BrainEnvelopeKind::Genome,
-                "bias",
-            )?));
-            nodes.push(NodeParams {
-                weights,
-                targets,
-                kinds,
-                gain,
-                damping,
-                bias,
-            });
+            nodes.push(self.decode_node(&mut reader, node_index)?);
         }
         self.validate_nodes(&nodes)?;
         Ok(nodes)
+    }
+
+    fn decode_node(
+        &self,
+        reader: &mut PayloadReader<'_>,
+        node_index: usize,
+    ) -> Result<NodeParams, BrainProtocolError> {
+        let mut weights = [0.0; CONNECTIONS];
+        for weight in &mut weights {
+            *weight = f32::from_bits(u32::from_le_bytes(self.read::<4>(
+                reader,
+                BrainEnvelopeKind::Genome,
+                "weight",
+            )?));
+        }
+        let mut targets = [0; CONNECTIONS];
+        for target in &mut targets {
+            *target = usize::from(u16::from_le_bytes(self.read::<2>(
+                reader,
+                BrainEnvelopeKind::Genome,
+                "target",
+            )?));
+        }
+        let mut kinds = [SynapseKind::Regular; CONNECTIONS];
+        for kind in &mut kinds {
+            *kind = match self.read::<1>(reader, BrainEnvelopeKind::Genome, "synapse kind")?[0] {
+                0 => SynapseKind::Regular,
+                1 => SynapseKind::ChangeSensitive,
+                value => {
+                    return Err(self.invalid(
+                        BrainEnvelopeKind::Genome,
+                        format!("node {node_index} has unsupported synapse kind {value}"),
+                    ));
+                }
+            };
+        }
+        let gain = f32::from_bits(u32::from_le_bytes(self.read::<4>(
+            reader,
+            BrainEnvelopeKind::Genome,
+            "gain",
+        )?));
+        let damping = f32::from_bits(u32::from_le_bytes(self.read::<4>(
+            reader,
+            BrainEnvelopeKind::Genome,
+            "damping",
+        )?));
+        let bias = f32::from_bits(u32::from_le_bytes(self.read::<4>(
+            reader,
+            BrainEnvelopeKind::Genome,
+            "bias",
+        )?));
+        Ok(NodeParams {
+            weights,
+            targets,
+            kinds,
+            gain,
+            damping,
+            bias,
+        })
     }
 
     fn encode_state_payload(
@@ -760,7 +780,7 @@ impl MlpBrainFamily {
     }
 }
 
-fn genome_digest(genome: &BrainGenomeEnvelope) -> [u8; GENOME_DIGEST_BYTES] {
+const fn genome_digest(genome: &BrainGenomeEnvelope) -> [u8; GENOME_DIGEST_BYTES] {
     *genome.material_hash().as_bytes()
 }
 
@@ -885,7 +905,7 @@ impl BrainFamilyCodec for MlpBrainFamily {
         let nodes = self.decode_genome(genome)?;
         let mut loci = Vec::with_capacity(nodes.len() * (3 + CONNECTIONS * 3));
         for (node_index, node) in nodes.iter().enumerate() {
-            let node_index = node_index as u32;
+            let node_index = u32::try_from(node_index).expect("validated MLP node index fits u32");
             loci.push((Locus::NodeBias(node_index), LocusValue::Scalar(node.bias)));
             loci.push((
                 Locus::NodeDamping(node_index),
@@ -893,7 +913,7 @@ impl BrainFamilyCodec for MlpBrainFamily {
             ));
             loci.push((Locus::NodeGain(node_index), LocusValue::Scalar(node.gain)));
             for conn in 0..CONNECTIONS {
-                let conn_u8 = conn as u8;
+                let conn_u8 = u8::try_from(conn).expect("MLP connection index fits u8");
                 loci.push((
                     Locus::NodeWeight {
                         node: node_index,
@@ -913,7 +933,10 @@ impl BrainFamilyCodec for MlpBrainFamily {
                         node: node_index,
                         conn: conn_u8,
                     },
-                    LocusValue::Target(node.targets[conn] as u32),
+                    LocusValue::Target(
+                        u32::try_from(node.targets[conn])
+                            .expect("validated MLP target index fits u32"),
+                    ),
                 ));
             }
         }
@@ -1027,23 +1050,21 @@ impl Brain for MlpBrain {
             let mut acc = 0.0_f32;
             for conn in 0..CONNECTIONS {
                 let target_idx = params.targets[conn];
-                let source = self
-                    .state
-                    .get(target_idx)
-                    .map(|node| node.output)
-                    .unwrap_or(0.0);
+                let source = self.state.get(target_idx).map_or(0.0, |node| node.output);
                 let delta = match params.kinds[conn] {
                     SynapseKind::Regular => source,
                     SynapseKind::ChangeSensitive => {
                         let previous = self
                             .state
                             .get(target_idx)
-                            .map(|node| node.previous_output)
-                            .unwrap_or(0.0);
+                            .map_or(0.0, |node| node.previous_output);
                         (source - previous) * 10.0
                     }
                 };
-                acc += delta * params.weights[conn];
+                // Checkpoint continuation depends on the existing per-synapse rounding.
+                #[allow(clippy::suboptimal_flops)]
+                let next_acc = acc + delta * params.weights[conn];
+                acc = next_acc;
             }
 
             acc *= params.gain;
@@ -1247,6 +1268,8 @@ mod tests {
                     ],
                     gain: scalar * 0.03125,
                     damping: if index % 3 == 0 { 1.1 } else { 0.75 },
+                    // These separate-rounding fixture bits are pinned by the codec digest.
+                    #[allow(clippy::suboptimal_flops)]
                     bias: scalar * -0.0625 + 1.25,
                 }
             })
@@ -1260,6 +1283,8 @@ mod tests {
                 NodeState {
                     output: scalar * 0.01,
                     previous_output: scalar * -0.02,
+                    // Preserve the fixture's historical state bits and digest.
+                    #[allow(clippy::suboptimal_flops)]
                     target: scalar * 0.005 + 0.125,
                 }
             })
@@ -1281,7 +1306,7 @@ mod tests {
 
     #[test]
     fn random_brain_has_expected_structure() {
-        let mut rng = SmallRngStream::seed_from_u64(0xDEADBEEF);
+        let mut rng = SmallRngStream::seed_from_u64(0xDEAD_BEEF);
         let brain = MlpBrain::random(&mut rng);
         assert_eq!(brain.nodes.len(), BRAIN_SIZE);
         assert_eq!(brain.state.len(), BRAIN_SIZE);
@@ -1325,6 +1350,22 @@ mod tests {
     }
 
     #[test]
+    fn damping_preserves_separate_product_and_sum_rounding() {
+        let output = -1.0;
+        let target = f32::from_bits(0x3400_0000); // 2^-23
+        let damping = f32::from_bits(0x3f7f_fffe); // 1 - 2^-23
+        // The exact product is 1 - 2^-46, which rounds to one before adding -1.
+        assert_eq!(
+            MlpBrain::apply_damping(output, target, damping).to_bits(),
+            0
+        );
+        assert_eq!(
+            (target - output).mul_add(damping, output).to_bits(),
+            0xa880_0000, // -2^-46: FMA would change the recurrent state.
+        );
+    }
+
+    #[test]
     fn mutate_changes_parameters() {
         let mut rng = SmallRngStream::seed_from_u64(456);
         let mut brain = MlpBrain::random(&mut rng);
@@ -1340,7 +1381,7 @@ mod tests {
         let mut rng = SmallRngStream::seed_from_u64(789);
         let brain_a = MlpBrain::random(&mut rng);
         let brain_b = MlpBrain::random(&mut rng);
-        let mut rng = SmallRngStream::seed_from_u64(101112);
+        let mut rng = SmallRngStream::seed_from_u64(101_112);
         let child = brain_a
             .crossover(&brain_b, &mut rng)
             .expect("crossover should succeed");
@@ -1414,9 +1455,11 @@ mod tests {
                 .nodes
                 .iter()
                 .zip(&dynamic_state)
-                .all(|(decoded, original)| decoded.output == original.output
-                    && decoded.previous_output == original.previous_output
-                    && decoded.target == 0.0)
+                .all(
+                    |(decoded, original)| decoded.output.to_bits() == original.output.to_bits()
+                        && decoded.previous_output.to_bits() == original.previous_output.to_bits()
+                        && decoded.target.to_bits() == 0.0_f32.to_bits()
+                )
         );
         assert_eq!(
             family
@@ -1794,9 +1837,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn protocol_mutation_crossover_and_reset_touch_only_declared_fields() {
-        let family = MlpBrainFamily::new();
+    fn contrasting_nodes() -> (Vec<NodeParams>, Vec<NodeParams>) {
         let left_nodes = fixture_nodes();
         let mut right_nodes = fixture_nodes();
         for node in &mut right_nodes {
@@ -1813,13 +1854,18 @@ mod tests {
             node.damping = 0.5;
             node.bias -= 2.0;
         }
-        let left_provenance = fixture_provenance(4);
-        let right_provenance = fixture_provenance(6);
+        (left_nodes, right_nodes)
+    }
+
+    #[test]
+    fn protocol_mutation_crossover_and_reset_touch_only_declared_fields() {
+        let family = MlpBrainFamily::new();
+        let (left_nodes, right_nodes) = contrasting_nodes();
         let left = family
-            .genome(&left_nodes, left_provenance.clone())
+            .genome(&left_nodes, fixture_provenance(4))
             .expect("left genome");
         let right = family
-            .genome(&right_nodes, right_provenance)
+            .genome(&right_nodes, fixture_provenance(6))
             .expect("right genome");
 
         let mut mutation_rng = SmallRngStream::seed_from_u64(0xA11C_E5E5);
@@ -1850,7 +1896,7 @@ mod tests {
                     .weights
                     .iter()
                     .zip(after.weights)
-                    .filter(|(left, right)| left != &right)
+                    .filter(|(left, right)| left.to_bits() != right.to_bits())
                     .count()
                     <= 1
             );
@@ -1944,8 +1990,11 @@ mod tests {
 
         let mut next_inputs = [0.0; INPUT_SIZE];
         for (index, value) in next_inputs.iter_mut().enumerate() {
-            *value =
-                f32::from(u16::try_from(index).expect("input index fits u16")) * -0.015625 + 0.75;
+            // Preserve the continuation fixture's original multiply-then-add input bits.
+            #[allow(clippy::suboptimal_flops)]
+            let sensor =
+                f32::from(u16::try_from(index).expect("input index fits u16")) * -0.015_625 + 0.75;
+            *value = sensor;
         }
         assert_eq!(
             evaluator.evaluate(&next_inputs).expect("continued output"),
@@ -2018,7 +2067,7 @@ mod tests {
         assert!(inspection.build.retained_values <= limits.max_values());
         assert!(inspection.build.retained_payload_bytes <= limits.max_payload_bytes());
         assert!(inspection.build.truncated);
-        assert!(inspection.activations.layers.is_empty());
+        assert_eq!(inspection.activations.layers, [] as [ActivationLayer; 0]);
         assert!(inspection.activations.truncated);
         assert_eq!(
             family

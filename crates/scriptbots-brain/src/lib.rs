@@ -1,4 +1,4 @@
-//! Traits and adapters for ScriptBots brain implementations.
+//! Traits and adapters for `ScriptBots` brain implementations.
 
 use scriptbots_core::{
     AgentUid, BrainInspection, BrainInspectionError, BrainInspectionSnapshot, BrainRunner,
@@ -36,11 +36,13 @@ impl<'de> serde::Deserialize<'de> for BrainKind {
 }
 
 impl BrainKind {
+    /// Borrow a static brain-family name without allocating.
     #[must_use]
     pub const fn new(name: &'static str) -> Self {
         Self(Cow::Borrowed(name))
     }
 
+    /// Return the family name, whether borrowed or loaded into owned storage.
     #[must_use]
     pub const fn as_str(&self) -> &str {
         match &self.0 {
@@ -81,6 +83,7 @@ pub struct BrainMutationError {
 }
 
 impl BrainMutationError {
+    /// Retain the concrete mutation failure as this error's source.
     #[must_use]
     pub fn new<E>(source: E) -> Self
     where
@@ -105,6 +108,7 @@ impl std::error::Error for BrainMutationError {
 }
 
 impl BrainCloneError {
+    /// Retain the concrete snapshot failure as this error's source.
     #[must_use]
     pub fn new<E>(source: E) -> Self
     where
@@ -189,11 +193,14 @@ pub trait Brain: Send + Sync + Any {
     }
 }
 
-/// Summary emitted after each brain evaluation.
+/// Serializable fields for reporting a brain evaluation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BrainTelemetry {
+    /// Agent associated with the reported evaluation.
     pub agent: AgentUid,
+    /// Simulation tick associated with the reported evaluation.
     pub tick: Tick,
+    /// Reported energy cost; this data type does not calculate the cost.
     pub energy_spent: f32,
 }
 
@@ -296,6 +303,7 @@ pub struct BrainRunnerAdapter {
 }
 
 impl BrainRunnerAdapter {
+    /// Box a concrete brain and retain its family name for registry queries.
     #[must_use]
     pub fn new<B: Brain + 'static>(brain: B) -> Self {
         Self {
@@ -304,6 +312,7 @@ impl BrainRunnerAdapter {
         }
     }
 
+    /// Wrap an existing boxed brain and retain its family name for registry queries.
     #[must_use]
     pub fn from_boxed(brain: Box<dyn Brain>) -> Self {
         Self {
@@ -312,6 +321,7 @@ impl BrainRunnerAdapter {
         }
     }
 
+    /// Consume the adapter and return its brain, including its current state.
     #[must_use]
     pub fn into_inner(self) -> Box<dyn Brain> {
         self.brain

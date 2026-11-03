@@ -171,6 +171,14 @@ function createServer(packageInfo) {
   });
 }
 
+async function installPausedClock(context) {
+  // Freeze before app navigation so neither page loading nor evaluate() can
+  // advance the first 500 ms stats window outside the declared runFor() steps.
+  const epoch = Date.UTC(2026, 0, 1);
+  await context.clock.install({ time: epoch });
+  await context.clock.pauseAt(epoch + 1_000);
+}
+
 async function runTests() {
   const observations = {
     camelCasePositive: null,
@@ -198,7 +206,7 @@ async function runTests() {
     // =========================================================================
     {
       const context = await browser.newContext();
-      await context.clock.install();
+      await installPausedClock(context);
       const page = await context.newPage();
 
       const pageLogs = [];
@@ -355,7 +363,7 @@ async function runTests() {
     // =========================================================================
     {
       const context = await browser.newContext();
-      await context.clock.install();
+      await installPausedClock(context);
       const page = await context.newPage();
 
       const pageErrors = [];
@@ -384,7 +392,7 @@ async function runTests() {
 
       // Expect an unhandled TypeError because agentCount is undefined:
       // snapshot.summary.agentCount.toLocaleString() throws TypeError
-      const hasExpectedTypeError = allErrors.some(
+      const expectedTypeError = allErrors.find(
         (err) =>
           err.includes("Cannot read properties of undefined (reading 'toLocaleString')") ||
           err.includes(
@@ -392,7 +400,7 @@ async function runTests() {
           ),
       );
 
-      if (!hasExpectedTypeError) {
+      if (!expectedTypeError) {
         throw new Error(
           `Snake_case negative control failed to catch contract violation! Errors: ${JSON.stringify(allErrors)}`,
         );
@@ -417,7 +425,7 @@ async function runTests() {
 
       observations.snakeCaseNegative = {
         passed: true,
-        caughtError: pageErrors[0],
+        caughtError: expectedTypeError,
         popRemainedPlaceholder: popAfterCrash === "–",
         loopFrozen: tickBefore === tickAfter,
       };
@@ -430,7 +438,7 @@ async function runTests() {
     // =========================================================================
     {
       const context = await browser.newContext();
-      await context.clock.install();
+      await installPausedClock(context);
       const page = await context.newPage();
 
       await page.route("**/pkg/scriptbots_web.js", (route) =>
@@ -576,6 +584,17 @@ async function runTests() {
               || handle.drive(20_000).scientific_steps !== 0) {
             throw new Error("Packaged host did not retain bounded catch-up and same-time idempotence");
           }
+          let backwardsTimeError = null;
+          try {
+            handle.drive(19_999);
+          } catch (error) {
+            backwardsTimeError = String(error);
+          }
+          if (!backwardsTimeError?.includes("browser elapsed time moved backwards")
+              || handle.snapshot().tick !== afterLate.tick
+              || handle.drive(20_000).scientific_steps !== 0) {
+            throw new Error("Packaged host admitted a clock rewind or changed science after refusal");
+          }
           let invalidGeometryError = null;
           try {
             const invalid = wasm.init_sim({ ...options, world_width: initial.world.width + 1 });
@@ -594,7 +613,7 @@ async function runTests() {
             initial: { tick: initial.tick, summary: initial.summary, agentCount: initial.agents.length },
             advanced: { tick: advanced.tick, summary: advanced.summary, agentCount: advanced.agents.length },
             reset: { tick: reset.tick, summary: reset.summary, agentCount: reset.agents.length },
-            boundedCatchUp: { receipt: late, observedTick: afterLate.tick, unrepresentableTimeError },
+            boundedCatchUp: { receipt: late, observedTick: afterLate.tick, unrepresentableTimeError, backwardsTimeError },
             invalidGeometryError,
           };
         } finally {
@@ -609,7 +628,7 @@ async function runTests() {
       // Real package and production main.js, with RAF held by the browser test.
       // No simulation/module replacement: a render-authorized tick throws.
       const clockContext = await browser.newContext();
-      await clockContext.clock.install();
+      await installPausedClock(clockContext);
       await clockContext.addInitScript(() => {
         window.__heldFrames = [];
         window.requestAnimationFrame = (callback) => window.__heldFrames.push(callback);
@@ -628,6 +647,21 @@ async function runTests() {
         };
         wasm.SimHandle.prototype.tick = function () {
           throw new Error("RAF attempted to authorize scientific work");
+        };
+        const setSpeed = wasm.SimHandle.prototype.setSpeed;
+        window.__clockSpeedCommands = [];
+        wasm.SimHandle.prototype.setSpeed = function (speed) {
+          const status = setSpeed.call(this, speed);
+          window.__clockSpeedCommands.push({ now: performance.now(), speed, status });
+          return status;
+        };
+        const drive = wasm.SimHandle.prototype.drive;
+        window.__clockDrives = [];
+        wasm.SimHandle.prototype.drive = function (now) {
+          const receipt = drive.call(this, now);
+          window.__clockDrives.push({ now, receipt });
+          if (window.__clockDrives.length > 8) window.__clockDrives.shift();
+          return receipt;
         };
       });
       await clockContext.clock.runFor(600);
@@ -675,7 +709,15 @@ async function runTests() {
       await clockContext.clock.runFor(100);
       const resumedTick = await clockPage.evaluate(() => window.__clockHandle.snapshot().tick);
       if (resumedTick <= hiddenTick || clockErrors.length !== 0) {
-        throw new Error(`Independent browser clock did not resume cleanly: ${JSON.stringify({ hiddenTick, resumedTick, clockErrors })}`);
+        const clockState = await clockPage.evaluate(() => ({
+          now: performance.now(),
+          hidden: document.hidden,
+          speed: document.getElementById("steps-per-frame").value,
+          commands: window.__clockSpeedCommands,
+          drives: window.__clockDrives,
+          log: document.getElementById("log").textContent,
+        }));
+        throw new Error(`Independent browser clock did not resume cleanly: ${JSON.stringify({ hiddenTick, resumedTick, clockErrors, clockState })}`);
       }
       await clockContext.close();
 
