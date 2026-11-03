@@ -2,6 +2,143 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Workspace lint inheritance (2026-11-03):** [Currently In Progress —
+GentleDuck; original `bd-6hb5`]
+
+Cargo declares the lint policy centrally, but only four of the 13 workspace
+members consumed it at the start of this task. This requested TODO retires
+after the original task's exact-source qualification and publication. Wiring
+the compiler policy is an enabler, not a new simulation feature.
+
+- [x] Refresh native BR readiness, task criteria and ownership; derive all
+  workspace members and current inheritance from their Cargo declarations.
+- [x] Claim `bd-6hb5`, reserve the nine manifests and tracking surfaces, and
+  diagnostically opt the nine missing members into the existing policy. Keep
+  only the four qualified importers in the first committed group.
+- [x] Retain an initial strict diagnostic failure and collect all newly exposed
+  diagnostics through DSR; do not label warning-only collection a passing gate.
+  The strict command exited 101; the warning collector exited zero. The enclosing
+  receipt is `invalidated-moving-source` because helpers edited the shared tree,
+  so it supplies diagnostics only, not source qualification. Deduplicating by lint,
+  primary file/line/column and message yields 7,519 entries in that initial pass.
+- [ ] Repair foundational brain crates, then storage/rendering adapters and app/
+  browser consumers in dependency order, using disjoint manual editing clusters.
+  - [x] Finish and qualify the default-feature brain/ML/Neuro source and
+    integration-test repairs; optional ML inference is not qualified here.
+  - [ ] Finish and qualify storage docs, conversions and function seams without
+    changing SQL, migration order, transaction boundaries or receipt meanings.
+  - [ ] Finish and qualify world-gfx count validation and existing rendering math.
+  - [ ] Finish and qualify GPUI rendering, Bevy and app consumers.
+  - [x] Qualify browser lint inheritance and the observed numeric seed endpoint
+    defect: `u64::MAX as f64` is 2^64, so the endpoint must be exclusive. Retain
+    native/WASM boundary guards, existing parity assertions and postcard golden.
+  - [x] Reconnect the native browser consumer to the producer's existing four-case
+    contract. Independently review the stale three-case assertion, require each
+    named observation and reject forged/missing/multiple reports. Parser fixtures
+    are parser proof only; the existing fresh-package browser gate must execute.
+  - [x] Retain the native run's actual 28 passes, one missing-package failure and
+    one existing ignored fixture writer. Keep historical missing-tool early returns
+    separate from positive live browser evidence; never skip the package failure.
+  - [x] Diagnose the real package's apparent visibility failure using actual
+    speed-command receipts and drive timestamps. The production rewind guard
+    correctly rejected an older injected timestamp; `main.js` needed no change.
+  - [x] Freeze the four manually advanced Playwright contexts before app loading;
+    preserve the original early-stats, RAF, pause, hidden and resume assertions.
+    Keep the ordinary real-time package context unpaused. Add a live rewind
+    refusal that preserves the world tick and same-time idempotence.
+  - [x] Retain the actual validated snake-case exception in JSON, including
+    direct timer rejections that do not generate a `pageerror` event.
+  - [x] Forward an existing Cargo job budget explicitly through `wasm-pack`.
+    Retain the unsupported RCH adapter attempt: it built a native library and
+    lost the expected Cargo artifact stream; it is not WASM package proof.
+  - [x] Build the real package through DSR with one low-priority local job and
+    RAM output; run the actual Chromium package/DOM controls without installing
+    JS dependencies. Preserve originals and all generated package file bytes.
+  - [x] Confirm the cleanup daemon removed active dependency links from its
+    decision ledger; restore cached runtime files and protect the proof root.
+    No manual cleanup deletion or disk-reclamation credit is claimed.
+  Initial opt-in is diagnostic work in progress. Publish only qualified coherent
+  crate groups; the original task stays open until all 13 members pass. A frozen
+  external candidate separates qualification from concurrent unfinished edits.
+  The five unqualified storage/render/world-gfx/app/Bevy manifest opt-ins were
+  diagnostic-only and are not included in the current eight-member candidate.
+  Their unfinished source repairs remain available for subsequent qualification.
+- [ ] Keep scientific arithmetic order, digests, codec representations and
+  existing expectations unchanged; justify any narrowly retained operation.
+- [ ] Run relevant existing positive/negative tests for actual source changes;
+  preserve all failed output and verify that selected tests really execute.
+- [ ] Run workspace all-target check, strict Clippy and formatting through DSR;
+  derive final package inheritance and prove the compiler consumes the policy.
+- [x] Correct the historical all-13 inheritance claim on `bd-tqpj` explicitly,
+  preserving that completed task's original core-only implementation credit.
+- [ ] Complete the required bounded audit, freshly verify the original criteria
+  against pinned source, and close only `bd-6hb5` on cited positive evidence.
+- [ ] Publish reviewed source, separate tracker state and completed TODO; retain
+  unrelated hardware and performance acceptance without promoting this proof.
+  - [x] Finish the exact clean `92fb17d8` workspace check on hz4 after the
+    admission refusals; the DSR receipt passes both source binding and check.
+  - [x] Integrate incoming `06e772cc` Linux GPUI backends while preserving local
+    ancestry and all unfinished edits. `bd-h4n2` tracks the required commit
+    tool's explicit, immutable conflict-free merge support. Require normal
+    hooks, canonical merged bytes and parent-bound tokens; keep ordinary
+    single-parent reviews unchanged.
+  - [x] Requalify integrated source `84811b6280efefc41c5c2cafdc738747c0e046bd`:
+    clean workspace check, strict Clippy, 96 brain tests, formatting, shell
+    syntax, fresh WASM package, 30 native web tests plus one existing ignored
+    fixture writer, both live four-case DOM reports and WASM strict Clippy.
+  - [x] Publish the reviewed source on the canonical branch.
+  - [ ] Publish the separate reviewed tracker/TODO snapshot and verify the
+    canonical and compatibility remote tips after publication.
+
+The first source group is committed as
+`92fb17d8f25030756117b842c1a6998c640e1a66`: eight of 13 members import the
+unchanged lint policy. The four added importers are brain, brain-ml, brain-neuro
+and web; storage, render, world-gfx, app and Bevy remain with this original open
+task. The storage/world-gfx working edits are frozen, unqualified work in
+progress, also retained as `unqualified-storage-gfx.patch` under the proof root.
+
+Evidence is retained at `/data/tmp/scriptbots-lint-inheritance-rakxl2es`.
+`foundational_round2/20261103T140933-423974` passed all six DSR checks on the
+frozen input: workspace check, strict Clippy, formatting, shell syntax and 96
+brain test executions. A fresh clean checkout of `92fb17d8` separately passes
+strict native Clippy, those brain tests, formatting, package generation and
+WASM-target all-target Clippy. Its initial native check received infrastructure
+exit 103; `published_workspace_check/20261103T151119-698263` subsequently passed
+on hz4 with the exact clean source and a stable receipt identity.
+The protected-runtime retry passes all 30 native web tests with one existing
+ignored fixture writer and no missing-tool early returns, plus the existing
+four-case stats and four-case fork DOM reports. All previous failures remain.
+The native parity fixture still matches fresh native generation; this block
+does not claim new cross-architecture parity, full packaging/Vite acceptance,
+hardware-GPU qualification, performance-budget proof or optional ML inference.
+The written audit records DRIFTING scope/cost, the corrected premature product
+diagnosis and fresh solo execution; peer review here is source review only.
+
+Final integration retains both the tested group and the incoming Linux GPUI
+backend feature repair. `integrated_native_local/20261103T160959-868344` passes
+all four DSR checks on clean `84811b62`; `integrated_browser/20261103T160805-860749`
+passes all six. The preceding remote attempt retains three admission-103
+refusals: all hz workers were quarantined for low disk space. The final native
+lane was explicitly local DSR with one low-priority job and RAM build output;
+it was neither silent fallback nor a performance qualification.
+
+The mandatory commit tool now supports an explicitly pinned conflict-free
+second parent (`a71502eb`); the actual merge is `84811b62`. Fresh Git fixtures
+exercise the positive two-parent hook-inspected merge and incomplete-tree,
+conflict, stale-base, changed-parent, foreign/replaced-state and hook-failure
+negatives. Failed hooks retain exact-token/file-identity-bound merge state for
+retry; incomplete initialization requires inspection. Normal single-parent
+guards remain. Independent source review found and corrected a proposed
+cleanup race and a pathname-only staged-content assertion. Two line-specific
+UBS false-positive annotations retain the timeout warning; the original
+baseline and unannotated planted negatives still trigger both critical rules.
+`bd-h4n2` closes on this actual development-tool capability; it earns no
+simulation or performance credit. The original lint task remains open.
+
+The current read-only cleanup scan found only 32 KiB in two old cleanup-skill
+test fixtures. Those were preserved as evidence. No manual file deletion,
+process termination, VM tuning or disk-reclamation claim accompanies this work.
+
 **Archipelago duration lane (2026-11-03):** [Verified and Closed —
 GentleDuck; original `bd-t3ge`; fresh solo verification]
 
