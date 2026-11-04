@@ -2,12 +2,13 @@ export class CanvasRenderer {
   constructor(canvas) {
     this.canvas = canvas;
     this.ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
+    if (!this.ctx) throw new Error("Canvas 2D is unavailable");
     this.clearColor = "#0b1120";
   }
 
   render(snapshot) {
     if (!this.ctx || !snapshot) {
-      return;
+      return false;
     }
     const ctx = this.ctx;
     const canvas = this.canvas;
@@ -35,6 +36,7 @@ export class CanvasRenderer {
         ctx.stroke();
       }
     }
+    return true;
   }
 
   destroy() {

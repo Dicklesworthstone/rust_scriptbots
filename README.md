@@ -926,6 +926,15 @@ Deterministic, staged tick pipeline (six seeded, domain-separated RNG streams; e
 ### Renderer abstraction
 - The app selects GPUI, Bevy, or terminal renderers via `--mode {auto|gui|bevy|terminal}` (subject to build features); `--mode server` runs without a renderer. Each mode connects to the same sole-owner host through `ChannelHostPort`. Full client interaction and native cutover acceptance remain open; selecting a renderer does not create another scientific owner.
 
+The Bevy HUD shows the four most recent native command identities with separately
+observed application and journal outcomes. An admitted command can still be
+pending, rejected, or failed; an applied command can still have a pending or
+failed journal. When an identity leaves the published status mirror, the HUD
+keeps its last observation and labels it as such. Missing acknowledgements remain
+unconfirmed. Paused and single-step snapshots settle agent positions, headings,
+spikes, and idle-body deformation immediately at their recorded poses; camera
+navigation remains available while paused.
+
 ### Keyboard shortcuts (GUI)
 
 Simulation controls and retained-history playback are separate. The unmodified `S` shortcut returns the invoking view to live and queues one scientific step; when that isolated step succeeds, it advances exactly once and leaves the simulation paused. `space`, `G`, and `1`/`2`/`3` apply in Lab. Canvas presentation shortcuts (`N`, `Ctrl+P`, `D`, `F`, `Ctrl+Shift+O`, `Shift+S`, `O`, `Shift+F`, `0`, and `,`) apply in World. Simulation and canonical selection commands work from either window.
@@ -1052,6 +1061,50 @@ order by kind;
 
 JSON replay payloads are validated by ScriptBots and stored as ordinary `TEXT`. Integer flags are decoded at the storage boundary into Rust booleans.
 
+### Offline narrative timelines
+
+Use the finished database printed by the application to read the actual emergent-event
+explanations, including their stable identities, subjects, detection windows and numeric
+evidence:
+
+```bash
+sb-analyze runs/example.sqlite run narrative-timeline --params limit=100 --json narrative.json --md narrative.md
+sb-analyze runs/example.sqlite run replay-timeline --params limit=100 --json replay.json
+```
+
+`narrative-timeline` uses report schema **2** and reads the typed `run_events` stream.
+Each JSON event contains `identity` and the complete `record`; `run_id` identifies the
+selected run. Its newest bounded page is returned in canonical chronological order.
+`event_counts_scope: "returned_page"` makes the kind-count coverage explicit, and
+`truncated_to` is set only after an additional stored event was observed. The default
+limit is 1,024; the maximum is 4,095, leaving one SQL row for that truncation check.
+An empty stream and an explicitly requested zero-length page are reported separately.
+
+The former low-level replay payload remains available through `replay-timeline` at
+schema **1**, including whole-run replay-kind counts and individual replay records.
+This is the schema migration for the narrative timeline; unrelated reports retain
+their existing versions. Both reports use the create-free finished-reader lease.
+For a multi-run database, select its canonical ID with `--run-id`.
+
+To reconstruct the narrative independently from the complete recorded detector
+inputs, use:
+
+```bash
+sb-analyze runs/example.sqlite run narrative-reconstruct --params limit=100 --json reconstruction.json --md reconstruction.md
+```
+
+`narrative-reconstruct` replays every input through the production detector in
+bounded pages, preserves the recorded cadence and history, and returns the newest
+events in canonical order. Its event counts cover the complete run, including
+events evicted from the live event ring. The default output limit is 1,024 and the
+maximum is 4,096; `limit=0` still validates and reconstructs the entire input stream.
+The JSON includes input provenance, coverage, output truncation and eviction counts.
+Missing or corrupt inputs are refused, so older databases without canonical detector
+inputs cannot use this report. Changes to detector interval, history capacity or
+event capacity during a run are also refused; unrelated authenticated configuration
+revisions are supported. The report does not use saved narrative outputs to supply
+its reconstructed events.
+
 ### Pipeline and maintenance
 
 - A persistence transaction either commits the entire accepted batch or rolls it back; a failed statement may not leave the connection in an active transaction.
@@ -1155,7 +1208,7 @@ For an interactive run, ScriptBots parses the control environment and transactio
   - `POST /api/presets/apply` → apply preset by name
   - `GET /api/config/audit` → recent config patches (audit ring buffer)
   - `GET /api/scenario` → the launch scenario identity bound to this run
-  - `GET /api/ws/stream` → WebSocket stream of tick summaries
+  - `GET /api/ws/stream` → negotiated binary telemetry, canvas and narrative subscriptions with acknowledged JSON controls
   - `GET /api/narrative/search` → search the recent birth/death/combat narrative
   - `POST /api/v1/experiments` → start a matched-seed batch (`variants` × `seeds`, `ticks_per_run`) that executes on a
     background worker; `GET /api/v1/experiments/{id}` reports per-run state, final digest and bundle path;
@@ -1163,13 +1216,158 @@ For an interactive run, ScriptBots parses the control environment and transactio
     `POST .../resume` continues pending runs and
     unfinished runs from validated owner/journal cuts, and recovers verified completed
     bundles saved before their final status write. Missing or incompatible cuts are refused.
+    Arms support MLP, DWRAON and Assembly; builds with `--features brain-ft` additionally
+    accept `ft` or `frankentorch`, recorded canonically as `ft`. The same compiled
+    adapter restores continuation cuts and independently verifies the final bundle state.
+    A build without `brain-ft` refuses these arms before starting a worker or writing files.
   - `POST /api/v1/checkpoints` → capture a `WorldCheckpointV1` and record it in the run database (usable by
     `--checkpoint-start`); `GET /api/v1/checkpoints`, `/api/v1/artifacts`
-  - Playback (fire-and-forget acknowledgement): `POST /api/pause`, `POST /api/resume`,
+  - Playback aliases (two-axis command status): `POST /api/pause`, `POST /api/resume`,
     `POST /api/step`, `POST /api/speed`, and `GET /api/status`
   - Playback (two-axis command status): `POST /api/control/pause`, `POST /api/control/resume`,
     `POST /api/control/step`, `POST /api/control/speed`, `POST /api/control/shutdown`,
     and `GET /api/control/status/{command_id}`
+
+WebSocket control protocol version 1 accepts JSON text such as:
+
+```json
+{"protocol_version":1,"request_id":"my-step-42","command":"step"}
+```
+
+Commands are `pause`, `resume`, `step`, `speed` (with a finite nonnegative `speed`),
+and `status` (with the returned `command_id`). Replies contain `protocol_version`,
+`request_id`, and either `type: "receipt"` with the canonical two-axis `receipt`,
+or `type: "error"` with an HTTP-style `status` and diagnostic `message`.
+Admission does not establish application or durability. Use `status` or the REST
+command-status endpoint to observe those independent outcomes.
+
+For mutating commands, `request_id` is the host's idempotency key. Reuse the same
+ID and command after a lost response or reconnect to the same host session: a
+step is applied at most once while its identity remains in the host ledger.
+Reusing an ID with a different command returns 409. IDs share the canonical
+HTTP/MCP key namespace and must contain 1–1,024 bytes after trimming. A new host
+session has a new identity namespace; this is not cross-session deduplication.
+Plain `pause`, `resume`, and `step`, and unkeyed JSON controls remain available;
+each unkeyed submission is a new command. An omitted version means version 1.
+
+Inbound control messages and frames are limited to 16 KiB. Invalid JSON, unsupported
+versions, unknown commands and unrelated fields are refused before admission;
+invalid input cannot silently become a step. A malformed request has a null
+reply ID because no validated identity was admitted. Client binary control frames
+receive an explicit refusal. Before a subscription is negotiated, the server sends
+Postcard-encoded `TickSummaryDto` values at a 50 ms sampling cadence.
+
+#### Remote browser viewing and stream subscriptions
+
+The web demo's **Remote Server** controls connect its existing Canvas 2D or WebGPU
+renderer to a native server. Enter the server's WebSocket URL, then choose
+**Connect to Server**. The browser freezes its local simulation while displaying
+the remote world; **Return to Local Simulation** explicitly resumes that saved
+local owner. Server pause, resume and single-step commands have retry identities,
+and the UI displays the application and journal states actually returned in their
+receipts. **Refresh Command Outcome** observes later settlement; **Retry Last
+Command with Same ID** recovers a lost receipt without inventing a new step.
+PNG export uses the displayed remote frame's exact host and revision identity.
+Build the WASM package from the same source as the viewer and server.
+
+Browser origin checks also apply to WebSocket upgrades. If the static demo is
+served from a different origin, include that exact origin in
+`SCRIPTBOTS_CONTROL_ALLOWED_ORIGINS`; use `wss://` when the browser's HTTPS policy
+requires it. Existing Host/origin validation remains in force.
+
+Send a subscription as JSON text:
+
+```json
+{"protocol_version":1,"request_id":"viewer-1","command":"subscribe","channels":["canvas","telemetry","events"],"max_fps":60}
+```
+
+The server acknowledges with `type: "subscribed"`, the correlation `request_id`,
+`protocol_version: 1`, `stream_protocol_version: 1`, decimal-string `session_id`,
+selected `channels`, and `max_fps`. Ignore any initial binary summaries until
+that acknowledgment. Every subsequent binary message begins with ASCII `SBWS`,
+a little-endian `u16` version (`1`), and exactly one Postcard `RemoteFrame` from
+`scriptbots_runtime::remote`. Its identity contains the actual host session,
+publication, scientific, control and configuration revisions, and completed tick.
+Every frame also carries observed playback state and `coalesced_publications`.
+The WASM `decode_remote_frame_binary` export validates this envelope and exposes
+all identity/cursor integers as decimal strings under
+`schema: "scriptbots.remote-frame.v1"`. The dynamic canvas payload preserves the
+existing world-v2 schema used by both renderers.
+
+| Channel | Payload and delivery behavior |
+| --- | --- |
+| `telemetry` | Canonical `TickSummaryDto` from one host publication; latest value only. |
+| `canvas` | Complete dynamic-world snapshot from that same publication; latest value only, including paused control changes. |
+| `events` | Up to 64 canonical narrative records, oldest first, with session-bound sequence numbers and an exact missing-prefix gap when retention overtakes a reader. Backlogged pages drain even while science is paused. |
+
+Subscriptions contain one through three unique channels. Omitted channels do no
+projection work. `max_fps` defaults to 60 and accepts 1–120; it bounds sampling
+frequency, not simulation speed. Binary frames are capped at 8 MiB, canvas frames
+at 65,536 agents, and narrative pages at 64 records with bounded text. An
+unrepresentable source is refused instead of silently truncated. The shared
+decoder rejects unknown versions, trailing data, invalid lengths, non-finite
+presentation values, mismatched ticks and noncontiguous event pages.
+
+Each channel has one consumption credit. After consuming a frame, acknowledge its
+exact identity before another frame in that channel can be sent:
+
+```json
+{"protocol_version":1,"command":"stream_ack","session_id":"891","channel":"canvas","publication_revision":"42"}
+```
+
+For `events`, also include `after_event` as a decimal string: the last record's
+sequence, the declared gap's last missing ordinal if the page has no records, or
+the page's unchanged cursor if it is empty. Canvas and telemetry acknowledgments
+must omit that field. The supplied browser client sends this acknowledgment only
+after synchronous validation and consumption. A wrong, duplicate or expired
+acknowledgment closes the stream; it never releases another channel's credit.
+Subscription replacement requires all outstanding frames to be acknowledged.
+
+Each connection prepares at most one frame per selected channel from an immutable
+publication and has one socket write in flight. Until the browser consumes that
+frame, newer publications coalesce in the host's latest-value slot. This also
+bounds traffic entering a browser whose main thread has fallen behind. No per-tick
+snapshot queue or simulation lock is retained. Projection, socket writes and
+consumption acknowledgments each have a five-second deadline; expired credit is
+checked at the next sampling boundary. Queued blocking preparation is cancelled
+when the connection closes or its preparation deadline expires. Missed timer
+intervals are skipped. Preparation/write work or observed consumption round trips
+exceeding the current sample interval back sampling off to twice the observed
+duration, capped at one second. Eight cheap samples permit a 25% recovery toward
+the requested rate. A `stream_rate`
+JSON notice reports the requested/effective intervals in microseconds and the
+`slow_consumer` or `recovering` decision. Snapshot frames report skipped revisions;
+narrative frames preserve contiguous records or explicitly declare retention loss.
+
+For reconnect, retain only frames successfully consumed by the client and send
+their session-bound cursors:
+
+```json
+{"protocol_version":1,"request_id":"viewer-resume","command":"subscribe","channels":["canvas","events"],"max_fps":60,"resume":{"session_id":"891","after_revision":"42","after_event":"7"}}
+```
+
+Use the minimum last-consumed revision across enabled latest-value channels.
+Foreign sessions or future cursors return 409 and leave an existing subscription
+unchanged. Narrative pages report `after_event`, `earliest_retained`, `latest_event`,
+optional `gap`, and sequenced records; accepting a gap explicitly advances past
+that unavailable prefix. The browser reconnects only on request, retains exact
+cursors, and never silently retries a command or discards a changed host session.
+A fresh **Connect to Server** is the explicit choice to start without old cursors.
+
+This provides the functional versioned transport and browser consumer under
+`bd-ac4l`. It samples the latest publication; event-driven sub-16 ms delivery,
+multi-client soak/latency measurements and the full original DSR/hardware
+acceptance remain open. A requested 60 Hz rate is not measured latency evidence.
+
+The REST step routes (`/api/step` and `/api/control/step`) accept an
+`Idempotency-Key` header, and MCP `step` accepts `idempotency_key`. For `count: 1`
+(the default), the same key returns the same host receipt even when retrying
+through a different transport, including WebSocket. Counts must be integers in
+1–100,000; malformed counts or unknown step fields are refused before admission.
+A key with `count > 1` is refused because a batch still consists of independent
+commands and has no atomic retry identity. For retryable batches, submit one
+step per distinct key. Unkeyed batches remain available and return only the
+last step's receipt, which does not establish the outcome of the whole batch.
 
 `GET /api/v1/checkpoints` also reports actual file/SQL usage, observed file high-water counts,
 pending request identities, retained directory leases and their limit, and inventory/query errors. Checkpoint quota exhaustion returns
@@ -1196,6 +1394,18 @@ direct status access to a healthy companion remains available. Older directories
 without a definition require explicit reconciliation. Checksums detect corruption
 and do not authenticate an artifact's author. Complete resource/fault/platform
 qualification remains open under `bd-2z0.5.11`; see the current reality check.
+
+Resume also recovers a complete interrupted status publication when it is the
+exact initial state or the valid immediate successor of the committed status.
+Any claimed completion is verified against its bundle and restored owner cut
+before publication. Exports are assembled in `<run_id>.bundle.tmp`, verified
+against the exact final checkpoint, synchronized, and renamed to the final
+directory. A complete staged export can be promoted; one incomplete export is
+retained as `<run_id>.bundle.interrupted` and rebuilt from that final checkpoint
+without rerunning ticks. A second partial incident, unsafe paths, conflicting
+status, or an invalid checkpoint produces a refusal and preserves the evidence.
+Existing final bundle directories are never overwritten; legacy incomplete
+final directories still require explicit reconciliation.
 
 Completed experiment files also reappear through artifact list/get/download after
 restart, using their original IDs. A first request verifies the saved scientific
@@ -1328,6 +1538,10 @@ cargo run -p scriptbots-app --bin control_cli -- hydrology
 separate application and journal states. Follow the printed `lookup-status`
 command against the same server; use `get` to inspect the resulting configuration.
 An admission receipt alone does not prove application or durable storage.
+Configuration patches carry the revision of the configuration they were merged
+against. If another client changes it before application, the owner returns
+`config_revision_conflict`; read the current configuration and submit a fresh patch
+to retain the intervening edit. Playback-only changes do not invalidate that guard.
 
 Interactive dashboard:
 ```bash
@@ -1356,11 +1570,13 @@ digest evidence within its window.
   - Configuration: `list_knobs` → array of knob entries; `get_config` → full config snapshot;
     `apply_updates` → accepts `{ updates: [{ path, value }, ...] }`; `apply_patch` → accepts `{ patch: { ... } }`
   - Scenarios: `list_presets` → available scenario presets; `apply_preset` → accepts `{ name }`; `intervene` → scheduled intervention
-  - Playback: `pause`, `resume`, `step` (accepts `{ count }`), `set_speed`, `shutdown`
+  - Playback: `pause`, `resume`, `step` (accepts `{ count, idempotency_key }`), `set_speed`, `shutdown`.
+    The first four expose optional `idempotency_key` in tool discovery; a keyed step requires `count: 1`.
   - Observation: `get_status` → current simulation status; `get_command_status` → two-axis status by command ID;
     `narrative_search`, `narrative_around` → narrative events; `get_version`, `get_schema`
   - Maps: `map_generate` → procedural sandbox map generation; `map_apply` → apply map artifact to running simulation
-  - Experiments: `experiment_create` runs a real matched-seed batch (MLP/DWRAON/Assembly arms × seeds) on a
+  - Experiments: `experiment_create` runs a real matched-seed batch (MLP/DWRAON/Assembly arms × seeds,
+    plus FtBrain when built with `brain-ft`) on a
     background worker and writes a verified run bundle per run; `experiment_status`, `experiment_list`,
     `experiment_cancel` (stops active runs between durable ticks), `experiment_resume` (continues pending runs
     and unfinished runs from validated owner/journal cuts, and recovers verified completed

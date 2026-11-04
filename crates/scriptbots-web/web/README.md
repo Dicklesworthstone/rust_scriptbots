@@ -1,6 +1,7 @@
 # ScriptBots Web Demo Harness
 
-Thin Canvas harness for exercising the `scriptbots-web` WASM bindings. The setup
+Browser harness for exercising the `scriptbots-web` WASM bindings with Canvas
+2D or WebGPU. The setup
 uses the produced browser package and a static server. It requires no bundler or
 package-manager installation.
 
@@ -37,6 +38,32 @@ under bd-azi3 until actual qualification; this setup does not implement Vite.
 The pinned DSR profile can select its provisioned Chrome binary with
 `SCRIPTBOTS_CHROMIUM_EXECUTABLE`; the smoke records the actual browser version.
 
+The same test has a live remote mode. Inside a source-pinned DSR profile, build
+the native `scriptbots-app` binary and the WASM package from that source, then run:
+
+```bash
+SCRIPTBOTS_WEB_REMOTE_TESTS=1 \
+  SCRIPTBOTS_APP_BINARY=/absolute/source-bound/scriptbots-app \
+  SCRIPTBOTS_WASM_PACKAGE_DIR=/absolute/fresh/scriptbots-web-package \
+  SCRIPTBOTS_WASM_PROOF_DIR=/absolute/existing/dsr-proof \
+  bun crates/scriptbots-web/web/tests/stats_dom.test.js
+```
+
+This starts the production server with a fresh file-backed run, one simulation
+thread and the static server's exact allowed Origin. It checks actual native
+binary frames through the packaged WASM decoder, per-channel credits, browser
+pause/step/resume controls against independent HTTP reads, durable command
+receipts, same-ID retry after a deliberately dropped receipt and cursor reconnect,
+Canvas/software-WebGPU remote PNG pixels/identity and saved
+local-owner freeze/return. Truncated/version-mismatched native frames and an
+unlisted browser Origin must fail. The test retains the database, native log,
+wire samples, PNG and structured observations; it requests owner shutdown on
+exit. This bounded software journey does not qualify hardware, stream latency,
+saturation, long-run persistence or the complete remote/browser acceptance. The
+initial event subscription records how many native narrative records were
+observed and verifies their displayed text. An empty page qualifies only empty
+history/credit handling; nonempty narrative delivery requires observed records.
+
 ### Controls & metrics
 
 - **Simulation speed**: choose the host playback multiplier (default `2×`;
@@ -47,14 +74,91 @@ The pinned DSR profile can select its provisioned Chrome binary with
   policy and logs actual skipped tick opportunities. This main-thread adapter
   cannot guarantee deadlines when the browser suspends or blocks JavaScript.
 - **Population**: select the spawn count used the next time you reset. The wander brain offers immediate motion for visual feedback.
-- The demo uses JSON snapshots and Canvas 2D. Binary bindings and the renderer
-  prototypes are separate from its current controls.
+- **Renderer**: Automatic prefers WebGPU and falls back to Canvas 2D. You can
+  also select either backend explicitly. Canvas presents immediately while
+  WebGPU initializes, so a delayed device cannot block simulation startup.
+  Missing support, adapter/device
+  creation failure and device loss fall back visibly to Canvas; the status and
+  log retain the reason. Changing renderer keeps the current simulation.
+  Both backends scale world positions to the canvas and draw circular agents
+  with boost rings. The canvas keeps its intrinsic aspect ratio when displayed
+  beside the controls. The demo consumes one latest JSON snapshot per paint;
+  binary bindings are separate from these controls.
 - **Reset Simulation**: reseeds with a fresh RNG seed and reuses the slider settings. A rolling 5-second performance log is appended to the console pane (`FPS`, `TPS`, population).
 - Runtime brain presets can be toggled programmatically via `registerBrain("wander" | "mlp" | "none")` on the `SimHandle`.
 
 Snapshots returned to JS follow the selected `snapshot_format` (defaults to JSON). To switch to binary snapshots (Postcard-encoded `Uint8Array`), pass `snapshot_format: "binary"` to `init_sim`.
 
 The log pane (bottom of the sidebar) captures bootstrap and performance events so that ad-hoc benchmarking runs can be recorded while iterating on the renderer.
+
+The renderer status exposes `data-snapshot-tick` for the snapshot submitted to
+the current backend. Canvas remains the default under the committed browser
+renderer decision; WebGPU and automatic preference are explicit choices until
+the required browser-matrix measurements justify promotion. WebGPU admits one
+outstanding frame and refuses later
+snapshots until its queue completion is observed. Refused snapshots are neither
+retained nor uploaded; the next admitted paint uses the latest snapshot. The
+status tick stays on the last admitted frame while science and live metrics
+continue. Queue completion is not a GPU presentation acknowledgement. The active
+backend is in `data-renderer`; the selector retains the user's preference when
+a device failure causes fallback.
+
+`SimHandle.frame()` returns `scriptbots.browser-frame.v1`: the existing JSON
+world projection in `snapshot`, and an `identity` from the same immutable
+HostCore publication. Session, publication, scientific, control and config
+revisions and tick are decimal strings, preserving all integer bits. This
+read does not advance science. The separate `snapshot()` JSON/postcard codec
+and its positional world schema are unchanged. Renderer status publishes the
+identity only when that frame is admitted; publication/science/control
+revisions are distinct and must not be inferred from tick.
+
+**Save Frame as PNG** waits for the next admitted frame and invokes canvas
+serialization in that submitting callback. The filename contains its session,
+publication/science/control/config revisions, tick and actual renderer. The
+ready status describes that captured frame even if live science has since
+advanced. Identity is in the filename/status, not embedded PNG metadata, and
+is not a canonical `WorldDigest` or a GPU presentation acknowledgement.
+The browser controls the final filesystem save; “PNG ready” means the download
+was offered, not that a disk write was observed.
+
+Only one request may wait or encode. Its wait times out after ten seconds;
+that cannot cancel the browser's encoder. If encoding is still pending, the
+save button remains disabled until its callback returns, so retry cannot
+accumulate native encoders. Late callbacks cannot trigger a stale download.
+A reset before serialization
+completes refuses the old-world export. Serialization failure stays visible
+and permits retry. At most one generated object URL is retained, released on
+replacement or page exit. Capture never submits a science command or changes
+playback speed.
+Unchanged publications reuse their painted frame rather than repeatedly drawing
+a paused world. Renderer replacement, a new simulation or canvas resize
+invalidates that reuse; a waiting capture always requests a fresh paint. The
+cache retains only revision/session/size/generation metadata, not agent snapshots
+or a previous simulation handle.
+
+Inside a pinned DSR profile, the existing stats test can separately exercise
+real WebGPU/Canvas geometry, resizing, explicit capability failures and actual
+device destruction. It also holds delivery of real queue completions to check
+submission/write counts, latest-input admission and the submitted-snapshot stamp
+while the actual WASM science timer advances. This is a controlled producer
+test, not a measurement of physical GPU latency:
+
+```bash
+SCRIPTBOTS_WEB_RENDERER_TESTS=1 \
+  SCRIPTBOTS_WASM_PACKAGE_DIR=/absolute/fresh/scriptbots-web-package \
+  SCRIPTBOTS_WASM_PROOF_DIR=/absolute/existing/dsr-proof \
+  bun crates/scriptbots-web/web/tests/stats_dom.test.js
+```
+
+This lane requires WebGPU rather than skipping when it is unavailable. It uses
+Chromium's SwiftShader flags, records the actual adapter and retains screenshots.
+Known geometry is rendering proof; the same packaged app also checks that
+backend changes/device loss preserve its paused exported snapshot. This is
+software-adapter coverage, not hardware qualification or a performance result.
+The visible-frame guard inspects compositor PNG pixels, with transparent and
+opaque empty-frame negatives and a one-pixel positive control. A separate
+canvas-copy count is diagnostic; it does not qualify GPU image export.
+The ordinary stats mode retains its separate four-case contract.
 
 For determinism validation, run the accompanying WASM parity test:
 

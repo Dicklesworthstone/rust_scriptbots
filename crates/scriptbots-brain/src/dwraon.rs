@@ -64,7 +64,7 @@ impl NodeKind {
         }
     }
 
-    fn toggle(self) -> Self {
+    const fn toggle(self) -> Self {
         match self {
             Self::And => Self::Or,
             Self::Or => Self::And,
@@ -489,7 +489,7 @@ fn decode_genome_payload(payload: &[u8]) -> Result<Vec<NodeParams>, BrainProtoco
     Ok(nodes)
 }
 
-fn decode_f32(payload: &[u8], offset: usize) -> f32 {
+const fn decode_f32(payload: &[u8], offset: usize) -> f32 {
     f32::from_bits(u32::from_le_bytes([
         payload[offset],
         payload[offset + 1],
@@ -609,7 +609,7 @@ fn state_envelope(
     )
 }
 
-fn genome_digest(genome: &BrainGenomeEnvelope) -> [u8; GENOME_DIGEST_BYTES] {
+const fn genome_digest(genome: &BrainGenomeEnvelope) -> [u8; GENOME_DIGEST_BYTES] {
     *genome.material_hash().as_bytes()
 }
 
@@ -650,7 +650,10 @@ fn mutate_nodes(nodes: &mut [NodeParams], rng: &mut dyn RandomStream, rate: f32,
         if rng.random::<f32>() < rate * 3.0 {
             let gaussian = DwraonBrain::gaussian(rng);
             if apply_continuous_step {
-                params.bias += gaussian * scale;
+                // Preserve the mutation kernel's separately rounded product and sum.
+                #[allow(clippy::suboptimal_flops)]
+                let bias = params.bias + gaussian * scale;
+                params.bias = bias;
             }
         }
         // Legacy contains a permanently disabled damping mutation branch; do
@@ -659,6 +662,8 @@ fn mutate_nodes(nodes: &mut [NodeParams], rng: &mut dyn RandomStream, rate: f32,
             let index = rng.random_range(0..CONNECTIONS);
             let gaussian = DwraonBrain::gaussian(rng);
             if apply_continuous_step {
+                // Preserve the genome bits before the existing minimum-weight clamp.
+                #[allow(clippy::suboptimal_flops)]
                 let weight = params.weights[index] + gaussian * scale;
                 params.weights[index] = weight.max(0.01);
             }
@@ -839,7 +844,8 @@ impl BrainFamilyCodec for DwraonFamilyAdapter {
         let nodes = decode_genome(genome)?;
         let mut loci = Vec::with_capacity(nodes.len() * (3 + CONNECTIONS * 3 + 1));
         for (node_index, node) in nodes.iter().enumerate() {
-            let node_index = node_index as u32;
+            let node_index =
+                u32::try_from(node_index).expect("validated DWRAON node index fits u32");
             loci.push((Locus::NodeBias(node_index), LocusValue::Scalar(node.bias)));
             loci.push((
                 Locus::NodeDamping(node_index),
@@ -851,12 +857,12 @@ impl BrainFamilyCodec for DwraonFamilyAdapter {
             loci.push((
                 Locus::NodeKind {
                     node: node_index,
-                    conn: CONNECTIONS as u8,
+                    conn: u8::try_from(CONNECTIONS).expect("DWRAON connection count fits u8"),
                 },
                 LocusValue::Kind(node.kind as u8),
             ));
             for conn in 0..CONNECTIONS {
-                let conn_u8 = conn as u8;
+                let conn_u8 = u8::try_from(conn).expect("DWRAON connection index fits u8");
                 loci.push((
                     Locus::NodeWeight {
                         node: node_index,
@@ -869,7 +875,10 @@ impl BrainFamilyCodec for DwraonFamilyAdapter {
                         node: node_index,
                         conn: conn_u8,
                     },
-                    LocusValue::Target(node.sources[conn] as u32),
+                    LocusValue::Target(
+                        u32::try_from(node.sources[conn])
+                            .expect("validated DWRAON source index fits u32"),
+                    ),
                 ));
                 loci.push((
                     Locus::NodeKind {
@@ -1011,7 +1020,10 @@ impl Brain for DwraonBrain {
                         if params.inverted[conn] {
                             value = 1.0 - value;
                         }
-                        sum += value.clamp(0.0, 1.0) * params.weights[conn];
+                        // Preserve the recurrent evaluator's per-connection rounding.
+                        #[allow(clippy::suboptimal_flops)]
+                        let next_sum = sum + value.clamp(0.0, 1.0) * params.weights[conn];
+                        sum = next_sum;
                     }
                     sum + params.bias
                 }
@@ -1027,7 +1039,10 @@ impl Brain for DwraonBrain {
             let params = &self.nodes[idx];
             if let Some(node) = self.state.get_mut(idx) {
                 let delta = node.target - node.output;
-                node.output += delta * params.damping.clamp(0.01, 1.0);
+                // Separate product/sum rounding is part of checkpoint continuation.
+                #[allow(clippy::suboptimal_flops)]
+                let output = node.output + delta * params.damping.clamp(0.01, 1.0);
+                node.output = output;
                 node.output = node.output.clamp(0.0, 1.0);
             }
         }
@@ -1252,8 +1267,12 @@ mod tests {
                     } else {
                         NodeKind::Or
                     },
+                    // Preserve separate-rounding fixture bits pinned by the codec digest.
+                    #[allow(clippy::suboptimal_flops)]
                     damping: 0.1 + scalar * 0.001,
+                    #[allow(clippy::suboptimal_flops)]
                     bias: scalar * -0.03125 + 2.0,
+                    #[allow(clippy::suboptimal_flops)]
                     weights: [
                         scalar + 0.01,
                         scalar * 0.125 + 0.02,
@@ -1280,7 +1299,7 @@ mod tests {
 
     #[test]
     fn random_brain_builds_expected_layout() {
-        let mut rng = SmallRngStream::seed_from_u64(0x5A5A5A5A);
+        let mut rng = SmallRngStream::seed_from_u64(0x5A5A_5A5A);
         let brain = DwraonBrain::random(&mut rng);
         assert_eq!(brain.nodes.len(), BRAIN_SIZE);
         assert_eq!(brain.state.len(), BRAIN_SIZE);
@@ -1412,9 +1431,52 @@ mod tests {
                 .nodes
                 .iter()
                 .zip(&dynamic_state)
-                .all(|(decoded, original)| decoded.output == original.output
-                    && decoded.target == 0.0)
+                .all(
+                    |(decoded, original)| decoded.output.to_bits() == original.output.to_bits()
+                        && decoded.target.to_bits() == 0.0_f32.to_bits()
+                )
         );
+    }
+
+    fn assert_genome_state_binding(
+        family: &DwraonFamilyAdapter,
+        genome: &BrainGenomeEnvelope,
+        state: &BrainEvaluatorStateEnvelope,
+    ) {
+        let genome_nodes = decode_genome(genome).expect("decode valid genome");
+        let provenance_only_genome = protocol_genome(
+            &genome_nodes,
+            BrainProvenance {
+                parents: [Some(AgentUid(91)), None],
+                parent_genome_hashes: [Some(genome.material_hash()), None],
+                created_at: Tick(37),
+                derivation: BrainGenomeDerivation::Clone,
+            },
+        );
+        assert_eq!(
+            genome_digest(&provenance_only_genome),
+            genome_digest(genome),
+            "state binding deliberately excludes lineage provenance"
+        );
+        family
+            .evaluator(&provenance_only_genome, state)
+            .expect("the same genome material with different provenance remains compatible");
+
+        let mut different_nodes = genome_nodes;
+        different_nodes[0].bias = if different_nodes[0].bias == 0.0 {
+            0.25
+        } else {
+            -different_nodes[0].bias
+        };
+        let different_genome = protocol_genome(&different_nodes, BrainProvenance::default());
+        assert_ne!(genome_digest(&different_genome), genome_digest(genome));
+        assert!(matches!(
+            family.evaluator(&different_genome, state),
+            Err(BrainProtocolError::InvalidPayload {
+                kind: BrainEnvelopeKind::EvaluatorState,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -1427,8 +1489,11 @@ mod tests {
 
         let mut invalid_source_payload = genome.payload().to_vec();
         let first_source = GENOME_HEADER_BYTES + 1 + 4 + 4 + 4;
-        invalid_source_payload[first_source..first_source + 2]
-            .copy_from_slice(&(BRAIN_SIZE as u16).to_le_bytes());
+        invalid_source_payload[first_source..first_source + 2].copy_from_slice(
+            &u16::try_from(BRAIN_SIZE)
+                .expect("DWRAON brain size fits u16")
+                .to_le_bytes(),
+        );
         let invalid_source = BrainGenomeEnvelope::new(
             DWRAON_FAMILY_ID.clone(),
             GENOME_SCHEMA_VERSION,
@@ -1475,41 +1540,7 @@ mod tests {
         let state = family
             .initial_state(&genome, &mut rng)
             .expect("valid initial state");
-
-        let genome_nodes = decode_genome(&genome).expect("decode valid genome");
-        let provenance_only_genome = protocol_genome(
-            &genome_nodes,
-            BrainProvenance {
-                parents: [Some(AgentUid(91)), None],
-                parent_genome_hashes: [Some(genome.material_hash()), None],
-                created_at: Tick(37),
-                derivation: BrainGenomeDerivation::Clone,
-            },
-        );
-        assert_eq!(
-            genome_digest(&provenance_only_genome),
-            genome_digest(&genome),
-            "state binding deliberately excludes lineage provenance"
-        );
-        family
-            .evaluator(&provenance_only_genome, &state)
-            .expect("the same genome material with different provenance remains compatible");
-
-        let mut different_nodes = genome_nodes;
-        different_nodes[0].bias = if different_nodes[0].bias == 0.0 {
-            0.25
-        } else {
-            -different_nodes[0].bias
-        };
-        let different_genome = protocol_genome(&different_nodes, BrainProvenance::default());
-        assert_ne!(genome_digest(&different_genome), genome_digest(&genome));
-        assert!(matches!(
-            family.evaluator(&different_genome, &state),
-            Err(BrainProtocolError::InvalidPayload {
-                kind: BrainEnvelopeKind::EvaluatorState,
-                ..
-            })
-        ));
+        assert_genome_state_binding(&family, &genome, &state);
 
         let mut nonfinite_state_payload = state.payload().to_vec();
         nonfinite_state_payload[STATE_HEADER_BYTES..STATE_HEADER_BYTES + 4]
@@ -1537,8 +1568,15 @@ mod tests {
         ));
 
         let mut evaluator = family.evaluator(&genome, &state).expect("valid evaluator");
+        assert_rejected_sensor_frames_leave_state(&family, evaluator.as_mut());
+    }
+
+    fn assert_rejected_sensor_frames_leave_state(
+        family: &DwraonFamilyAdapter,
+        evaluator: &mut dyn BrainEvaluator,
+    ) {
         let before = family
-            .checkpoint_evaluator(evaluator.as_ref())
+            .checkpoint_evaluator(evaluator)
             .expect("checkpoint before rejected input");
         for nonfinite in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             let mut nonfinite_sensors = [0.0; INPUT_SIZE];
@@ -1552,7 +1590,7 @@ mod tests {
             ));
             assert_eq!(
                 family
-                    .checkpoint_evaluator(evaluator.as_ref())
+                    .checkpoint_evaluator(evaluator)
                     .expect("checkpoint after rejected input"),
                 before,
                 "a rejected sensor frame must not partially advance recurrent state"
@@ -1843,8 +1881,9 @@ mod tests {
         assert!(selected_left && selected_right);
         assert_eq!(child_nodes, expected);
         assert!(child_nodes.iter().any(|node| {
-            node.bias == left_nodes[0].bias && node.kind == right_nodes[0].kind
-                || node.bias == right_nodes[0].bias && node.kind == left_nodes[0].kind
+            node.bias.to_bits() == left_nodes[0].bias.to_bits() && node.kind == right_nodes[0].kind
+                || node.bias.to_bits() == right_nodes[0].bias.to_bits()
+                    && node.kind == left_nodes[0].kind
         }));
         assert_eq!(child.provenance(), &child_provenance);
         family
@@ -1877,7 +1916,8 @@ mod tests {
             .expect("original evaluator");
         let mut warmup = [0.0; INPUT_SIZE];
         for (index, sensor) in warmup.iter_mut().enumerate() {
-            *sensor = index as f32 / INPUT_SIZE as f32;
+            *sensor = f32::from(u16::try_from(index).expect("sensor index fits u16"))
+                / f32::from(u16::try_from(INPUT_SIZE).expect("sensor count fits u16"));
         }
         for _ in 0..5 {
             original.evaluate(&warmup).expect("warmup evaluation");
@@ -1959,7 +1999,7 @@ mod tests {
         assert!(inspection.build.retained_values <= limits.max_values());
         assert!(inspection.build.retained_payload_bytes <= limits.max_payload_bytes());
         assert!(inspection.build.truncated);
-        assert!(inspection.activations.layers.is_empty());
+        assert_eq!(inspection.activations.layers, [] as [ActivationLayer; 0]);
         assert!(inspection.activations.truncated);
         assert_eq!(
             family
@@ -2024,7 +2064,13 @@ mod tests {
         let baseline = brain
             .state_digest()
             .expect("legacy DWRAON must expose complete digest coverage");
-        assert_eq!(brain.clone().state_digest(), Some(baseline));
+        assert_eq!(
+            brain
+                .clone_box()
+                .expect("exact DWRAON clone")
+                .state_digest(),
+            Some(baseline)
+        );
         assert_eq!(into_runner(brain.clone()).state_digest(), Some(baseline));
 
         let mut changed_genome = brain.clone();
@@ -2035,7 +2081,7 @@ mod tests {
             "signed-zero genome bits must affect identity"
         );
 
-        let mut changed_recurrent_state = brain.clone();
+        let mut changed_recurrent_state = brain;
         changed_recurrent_state.state[INPUT_SIZE].output = 0.25;
         assert_ne!(
             changed_recurrent_state.state_digest(),

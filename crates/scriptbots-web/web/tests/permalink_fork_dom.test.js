@@ -31,9 +31,9 @@ const mockWasmModule = `
     if (link.includes("mismatch")) {
       return {
         status: "mismatch",
-        link_toolchain_digest: "0xaaaaaaaaaaaaaaaa",
+        link_toolchain_digest: link.includes("markup") ? "<img src=x onerror=window.__bannerExecuted=true>" : "0xaaaaaaaaaaaaaaaa",
         link_lockfile_digest: "0xbbbbbbbbbbbbbbbb",
-        link_core_digest: "0xcccccccccccccccc",
+        link_core_digest: link.includes("markup") ? "<img src=x onerror=window.__bannerExecuted=true>" : "0xcccccccccccccccc",
         local_toolchain_digest: "0x1111111111111111",
         local_lockfile_digest: "0x2222222222222222",
         local_core_digest: "0x3333333333333333"
@@ -42,7 +42,7 @@ const mockWasmModule = `
     if (link.includes("compatible")) {
       return {
         status: "compatible",
-        link_toolchain_digest: "0xaaaaaaaaaaaaaaaa",
+        link_toolchain_digest: link.includes("markup") ? "<img src=x onerror=window.__bannerExecuted=true>" : "0xaaaaaaaaaaaaaaaa",
         link_lockfile_digest: "0xbbbbbbbbbbbbbbbb",
         link_core_digest: "0x3333333333333333",
         local_toolchain_digest: "0x1111111111111111",
@@ -94,6 +94,14 @@ const mockWasmModule = `
         return { scientific_steps: Math.max(0, steps), automatic_steps_skipped: 0 };
       },
       snapshot() { return this.tick(0); },
+      frame() {
+        const snapshot = this.snapshot();
+        return { schema: "scriptbots.browser-frame.v1", snapshot, identity: {
+          sessionId: "2001", publicationRevision: String(snapshot.tick + 400),
+          scientificRevision: String(snapshot.tick + 100), controlRevision: "20",
+          configRevision: "10", tick: String(snapshot.tick)
+        } };
+      },
       tick(steps) {
         tick += steps;
         return {
@@ -132,6 +140,14 @@ const mockWasmModule = `
         return { scientific_steps: Math.max(0, steps), automatic_steps_skipped: 0 };
       },
       snapshot() { return this.tick(0); },
+      frame() {
+        const snapshot = this.snapshot();
+        return { schema: "scriptbots.browser-frame.v1", snapshot, identity: {
+          sessionId: "2002", publicationRevision: String(snapshot.tick + 400),
+          scientificRevision: String(snapshot.tick + 100), controlRevision: "20",
+          configRevision: "10", tick: String(snapshot.tick)
+        } };
+      },
       tick(steps) {
         tick += steps;
         return {
@@ -161,6 +177,9 @@ function createServer() {
     } else if (url.pathname === "/main.js") {
       res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8" });
       res.end(fs.readFileSync(path.join(webDir, "main.js")));
+    } else if (["/remote.js", "/renderers/canvas.js", "/renderers/webgpu.js"].includes(url.pathname)) {
+      res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8" });
+      res.end(fs.readFileSync(path.join(webDir, url.pathname.slice(1))));
     } else {
       res.writeHead(404);
       res.end("Not found");
@@ -223,6 +242,19 @@ async function runTests() {
       const tickText = await page.textContent("#metric-tick");
       if (tickText === "–" || tickText === "0") {
         throw new Error(`Simulation should still run despite mismatch, got tick: ${tickText}`);
+      }
+
+      // DOM-boundary fixture: actual WASM formats these digests from u64, so
+      // this proves safe text rendering, not an exploitable permalink path.
+      for (const kind of ["mismatch", "compatible"]) {
+        await page.fill("#permalink-input", `sbw1.${kind}_markup`);
+        await page.click("#load-permalink-btn");
+        const literal = await page.textContent("#mismatch-banner");
+        if (!literal.includes("<img src=x onerror=window.__bannerExecuted=true>")
+            || await page.locator("#mismatch-banner img").count() !== 0
+            || await page.evaluate(() => !!window.__bannerExecuted)) {
+          throw new Error(`${kind} banner interpreted build details as HTML`);
+        }
       }
 
       await context.close();

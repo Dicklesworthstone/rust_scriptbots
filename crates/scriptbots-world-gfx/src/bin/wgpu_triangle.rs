@@ -49,6 +49,44 @@ impl TriangleApp {
             start: std::time::Instant::now(),
         }
     }
+
+    fn create_pipeline(
+        device: &wgpu::Device,
+        shader: &wgpu::ShaderModule,
+        layout: &wgpu::BindGroupLayout,
+        format: wgpu::TextureFormat,
+    ) -> wgpu::RenderPipeline {
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("triangle.layout"),
+            bind_group_layouts: &[layout],
+            push_constant_ranges: &[],
+        });
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("triangle.pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: shader,
+                entry_point: Some("vs"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: shader,
+                entry_point: Some("fs"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        })
+    }
 }
 
 impl ApplicationHandler for TriangleApp {
@@ -80,7 +118,7 @@ impl ApplicationHandler for TriangleApp {
             .get_capabilities(&adapter)
             .formats
             .into_iter()
-            .find(|f| f.is_srgb())
+            .find(wgpu::TextureFormat::is_srgb)
             .unwrap_or(wgpu::TextureFormat::Bgra8UnormSrgb);
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -94,7 +132,7 @@ impl ApplicationHandler for TriangleApp {
         };
         surface.configure(&device, &config);
 
-        let shader_src = r#"
+        let shader_src = r"
 @vertex
 fn vs(@builtin(vertex_index) vid: u32) -> @builtin(position) vec4<f32> {
   var pos = array<vec2<f32>,3>(
@@ -115,7 +153,7 @@ fn fs() -> @location(0) vec4<f32> {
   let b = 0.7 + fract(time * 0.11) * 0.3;
   return vec4<f32>(r, g, b, 1.0);
 }
-"#;
+";
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("triangle.wgsl"),
@@ -150,36 +188,7 @@ fn fs() -> @location(0) vec4<f32> {
             }],
         });
 
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("triangle.layout"),
-            bind_group_layouts: &[&layout],
-            push_constant_ranges: &[],
-        });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("triangle.pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
+        let pipeline = Self::create_pipeline(&device, &shader, &layout, format);
 
         self.window = Some(window);
         self.surface = Some(surface);
@@ -235,12 +244,12 @@ fn fs() -> @location(0) vec4<f32> {
 
                     let frame = match surface.get_current_texture() {
                         Ok(f) => f,
-                        Err(wgpu::SurfaceError::Lost) | Err(wgpu::SurfaceError::Outdated) => {
+                        Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                             surface.configure(device, cfg);
                             return;
                         }
                         Err(wgpu::SurfaceError::Timeout) => return,
-                        Err(wgpu::SurfaceError::OutOfMemory) | Err(wgpu::SurfaceError::Other) => {
+                        Err(wgpu::SurfaceError::OutOfMemory | wgpu::SurfaceError::Other) => {
                             event_loop.exit();
                             return;
                         }

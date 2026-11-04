@@ -22,7 +22,7 @@ use fastmcp_rust::{
     Content, Cx, JsonRpcRequest, McpError, McpErrorCode, McpResult, NotificationSender,
     PendingRequests, RequestSender, Session, ToolHandler,
 };
-use fastmcp_server::{Server, ServerBuilder};
+use fastmcp_server::{Middleware, MiddlewareDecision, Server, ServerBuilder};
 use futures_util::stream::{Stream, StreamExt};
 use scriptbots_core::PresetKind;
 use serde::{Deserialize, Serialize};
@@ -42,8 +42,8 @@ use crate::control::{
     ConfigSnapshot, ControlError, ControlHandle, DietClassDto, EventEntry, EventKind,
     ExperimentBatchStatusDto, ExperimentCreateRequest, ExperimentExecutionCapacityDto,
     ExperimentRunRecordDto, ExperimentSummaryDto, ExperimentVariantDto, HydrologySnapshot,
-    InterveneRequestBody, InterventionsPollDto, KnobEntry, KnobUpdate, MapApplyAgentPolicy,
-    MapApplyRequestBody, MapGenerateRequestBody, PaginatedArtifactsResponse,
+    InterveneRequestBody, InterventionsPollDto, KnobEntry, KnobUpdate, MAX_STEP_BATCH,
+    MapApplyAgentPolicy, MapApplyRequestBody, MapGenerateRequestBody, PaginatedArtifactsResponse,
     PaginatedCheckpointsResponse, PaginatedExperimentsResponse, Scoreboard, SelectionModeDto,
     SelectionSnapshotDto, SelectionStateDto, SimulationStatusDto, SpeedRequest,
     parse_intervention_command, parse_map_artifact,
@@ -55,6 +55,11 @@ use scriptbots_core::{
 };
 use scriptbots_runtime::RenderSnapshot;
 use scriptbots_runtime::channel::ChannelHostPort;
+use scriptbots_runtime::remote::{REMOTE_PROTOCOL_VERSION, RemoteFrame, encode_remote_frame};
+use scriptbots_runtime::remote_subscription::{
+    REMOTE_MAX_REQUEST_BYTES, RemoteChannel, RemoteDeliveryWindow, RemoteFrameAck,
+    RemoteSubscription, RemoteSubscriptionError, RemoteSubscriptionRequest,
+};
 // keep image out of servers unless needed
 
 /// Default loopback address for the REST control surface.
@@ -70,6 +75,9 @@ const CONTROL_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const CONTROL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// Stack for every control-runtime worker and blocking thread (bd-6sgk).
 const CONTROL_RUNTIME_THREAD_STACK_BYTES: usize = 32 * 1024 * 1024;
+const WS_CONTROL_PROTOCOL_VERSION: u16 = 1;
+const MAX_WS_CONTROL_MESSAGE_BYTES: usize = REMOTE_MAX_REQUEST_BYTES;
+const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Return the control CLI's default REST base URL from the server's socket authority.
 #[must_use]
@@ -554,7 +562,7 @@ async fn enforce_control_http_policy(
         next.run(request).await
     };
     if let Some(origin) = origin {
-        response
+        response // ubs:ignore -- policy.check above admits only one configured Origin.
             .headers_mut()
             .insert(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
         response.headers_mut().append(
@@ -809,34 +817,53 @@ impl ControlRuntime {
         // and the REST state hold THE SAME slot rather than two empty ones.
         let presented_frame = reservation.config.presented_frame.clone();
         let control_handle = Some(handle.clone());
+        let experiment_services = Arc::clone(handle.data_services());
 
         let thread = thread::Builder::new()
             .name("scriptbots-control".into())
             .spawn(move || -> Result<()> {
-                let result = match tokio::runtime::Builder::new_multi_thread()
-                    .thread_name("scriptbots-control-rt")
-                    // Handlers open StorageReaders, which run FrankenSQLite futures synchronously
-                    // on the calling thread; in debug builds that overflowed tokio's default 2 MiB
-                    // and aborted the whole server on the first narrative search (bd-6sgk). Same
-                    // budget as the storage worker. Also applies to spawn_blocking threads.
-                    .thread_stack_size(CONTROL_RUNTIME_THREAD_STACK_BYTES)
-                    .enable_all()
-                    .build()
-                {
-                    Ok(runtime) => runtime.block_on(run_control_servers(
-                        handle,
-                        reservation,
-                        shutdown_for_thread,
-                        shutdown_rx,
-                        startup_tx,
-                        status_for_thread.clone(),
-                        initial_resume,
-                    )),
-                    Err(source) => {
-                        let error =
-                            anyhow!("failed to build Tokio runtime for control servers: {source}");
-                        let _ = startup_tx.send(ControlStartupSignal::Failed(format!("{error:#}")));
-                        Err(error)
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    match tokio::runtime::Builder::new_multi_thread()
+                        .thread_name("scriptbots-control-rt")
+                        // Handlers open StorageReaders, which run FrankenSQLite futures synchronously
+                        // on the calling thread; in debug builds that overflowed tokio's default 2 MiB
+                        // and aborted the whole server on the first narrative search (bd-6sgk). Same
+                        // budget as the storage worker. Also applies to spawn_blocking threads.
+                        .thread_stack_size(CONTROL_RUNTIME_THREAD_STACK_BYTES)
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(runtime) => runtime.block_on(run_control_servers(
+                            handle,
+                            reservation,
+                            shutdown_for_thread,
+                            shutdown_rx,
+                            startup_tx,
+                            status_for_thread.clone(),
+                            initial_resume,
+                        )),
+                        Err(source) => {
+                            let error = anyhow!(
+                                "failed to build Tokio runtime for control servers: {source}"
+                            );
+                            let _ =
+                                startup_tx.send(ControlStartupSignal::Failed(format!("{error:#}")));
+                            Err(error)
+                        }
+                    }
+                }))
+                .unwrap_or_else(|panic| Err(anyhow!("control runtime panicked: {panic:?}")));
+                // Batch workers are native threads, not Tokio children. Drain them
+                // on every exit before publishing the final result, including
+                // startup failures, unwinding, and the Drop/reaper paths.
+                let cleanup = experiment_services
+                    .shutdown_experiments()
+                    .context("experiment worker shutdown failed");
+                let result = match (result, cleanup) {
+                    (Ok(()), cleanup) => cleanup,
+                    (Err(error), Ok(())) => Err(error),
+                    (Err(error), Err(cleanup)) => {
+                        Err(error).context(format!("experiment cleanup also failed: {cleanup:#}"))
                     }
                 };
                 publish_control_runtime_result(&status_for_thread, &result);
@@ -943,7 +970,7 @@ fn publish_control_runtime_result(
     status: &watch::Sender<ControlRuntimeStatus>,
     result: &Result<()>,
 ) {
-    if matches!(*status.borrow(), ControlRuntimeStatus::Disabled) {
+    if result.is_ok() && matches!(*status.borrow(), ControlRuntimeStatus::Disabled) {
         return;
     }
     let final_status = match result {
@@ -1433,6 +1460,7 @@ impl From<ConfigAuditEntry> for ConfigAuditEntryView {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct StepRequestBody {
     #[serde(default = "default_step_count")]
     pub count: u64,
@@ -1654,6 +1682,10 @@ fn require_json_content_type(headers: &HeaderMap, bytes: &[u8]) -> Result<(), Ap
 impl From<ControlError> for AppError {
     fn from(err: ControlError) -> Self {
         match err {
+            ControlError::ExperimentShuttingDown => {
+                Self::service_unavailable(ControlError::ExperimentShuttingDown.to_string())
+            }
+            ControlError::ExperimentWorkerFailed(message) => Self::internal(message),
             capacity @ ControlError::ExperimentCapacity(_) => {
                 Self::service_unavailable(capacity.to_string())
             }
@@ -1674,6 +1706,9 @@ impl From<ControlError> for AppError {
             ControlError::InvalidPatch(msg) => Self::bad_request(msg),
             ControlError::Serialization(msg) => Self::internal(msg),
             ControlError::Lock => Self::service_unavailable("world state is currently unavailable"),
+            ControlError::Host(
+                error @ scriptbots_runtime::HostAccessError::CommandIdCollision { .. },
+            ) => Self::conflict(error.to_string()),
             ControlError::Host(error) => Self::service_unavailable(error.to_string()),
             ControlError::CommandQueueFull => {
                 Self::service_unavailable("command queue is full; retry shortly")
@@ -2044,50 +2079,393 @@ async fn stream_ticks_sse(
     get,
     path = "/api/ws/stream",
     tag = "control",
-    responses((status = 101, description = "WebSocket upgrade for tick & event stream"))
+    responses((status = 101, description = "Send a version-1 subscribe request with telemetry/canvas/events channels to negotiate bounded SBWS binary frames, session-bound resume cursors and acknowledged JSON controls; initial tick-summary stream remains available before negotiation"))
 )]
 async fn stream_ticks_ws(ws: WebSocketUpgrade, State(state): State<ApiState>) -> Response {
-    ws.on_upgrade(move |socket| handle_ws_stream(socket, state))
+    ws.max_message_size(MAX_WS_CONTROL_MESSAGE_BYTES)
+        .max_frame_size(MAX_WS_CONTROL_MESSAGE_BYTES)
+        .on_upgrade(move |socket| handle_ws_stream(socket, state))
 }
 
-async fn apply_ws_control_message(
-    handle: ControlHandle,
-    text: String,
-) -> Result<Option<CommandStatusDto>, AppError> {
-    run_control(move || {
-        let text = text.trim();
-        let outcome = if text.eq_ignore_ascii_case("pause") {
-            Some(handle.pause(None))
-        } else if text.eq_ignore_ascii_case("resume") {
-            Some(handle.resume(None))
-        } else if text.eq_ignore_ascii_case("step") {
-            Some(handle.step())
-        } else if let Ok(json) = serde_json::from_str::<Value>(text) {
-            match json.get("command").and_then(|command| command.as_str()) {
-                Some("speed") => json
-                    .get("speed")
-                    .and_then(Value::as_f64)
-                    .map(|speed| handle.set_speed(speed as f32, None)),
-                _ => None,
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WsControlRequest {
+    #[serde(default = "ws_control_protocol_version")]
+    protocol_version: u16,
+    /// Also the canonical host idempotency key for a mutating command.
+    #[serde(default)]
+    request_id: Option<String>,
+    command: String,
+    #[serde(default)]
+    speed: Option<f32>,
+    #[serde(default)]
+    command_id: Option<String>,
+}
+
+const fn ws_control_protocol_version() -> u16 {
+    WS_CONTROL_PROTOCOL_VERSION
+}
+
+#[derive(Debug, Serialize)]
+struct WsControlReply {
+    protocol_version: u16,
+    request_id: Option<String>,
+    #[serde(flatten)]
+    outcome: WsControlOutcome,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum WsControlOutcome {
+    Receipt { receipt: CommandStatusDto },
+    Error { status: u16, message: String },
+}
+
+impl WsControlReply {
+    fn error(request_id: Option<String>, error: AppError) -> Self {
+        Self {
+            protocol_version: WS_CONTROL_PROTOCOL_VERSION,
+            request_id,
+            outcome: WsControlOutcome::Error {
+                status: error.status.as_u16(),
+                message: error.message,
+            },
+        }
+    }
+}
+
+fn parse_ws_control_message(text: &str) -> Result<WsControlRequest, AppError> {
+    if text.len() > MAX_WS_CONTROL_MESSAGE_BYTES {
+        return Err(AppError::payload_too_large(
+            "WebSocket control message exceeds 16 KiB",
+        ));
+    }
+    let text = text.trim();
+    let mut request = if ["pause", "resume", "step"]
+        .iter()
+        .any(|command| text.eq_ignore_ascii_case(command))
+    {
+        WsControlRequest {
+            protocol_version: WS_CONTROL_PROTOCOL_VERSION,
+            request_id: None,
+            command: text.to_ascii_lowercase(),
+            speed: None,
+            command_id: None,
+        }
+    } else {
+        serde_json::from_str::<WsControlRequest>(text).map_err(|error| {
+            AppError::bad_request(format!("invalid WebSocket control request: {error}"))
+        })?
+    };
+    if request.protocol_version != WS_CONTROL_PROTOCOL_VERSION {
+        return Err(AppError::bad_request(format!(
+            "unsupported WebSocket control protocol {}; expected {WS_CONTROL_PROTOCOL_VERSION}",
+            request.protocol_version,
+        )));
+    }
+    if let Some(request_id) = &mut request.request_id {
+        *request_id = request_id.trim().to_owned();
+        if request_id.is_empty() || request_id.len() > 1024 {
+            return Err(AppError::bad_request(
+                "request_id must contain 1..=1024 bytes",
+            ));
+        }
+    }
+    let valid_shape = match request.command.as_str() {
+        "pause" | "resume" | "step" => request.speed.is_none() && request.command_id.is_none(),
+        "speed" => {
+            request
+                .speed
+                .is_some_and(|speed| speed.is_finite() && speed >= 0.0)
+                && request.command_id.is_none()
+        }
+        "status" => {
+            request.speed.is_none()
+                && request
+                    .command_id
+                    .as_ref()
+                    .is_some_and(|id| !id.is_empty() && id.len() <= 128)
+        }
+        _ => false,
+    };
+    if !valid_shape {
+        return Err(AppError::bad_request(
+            "expected pause, resume, step, speed with a finite nonnegative speed, or status with command_id; unrelated command fields are refused",
+        ));
+    }
+    Ok(request)
+}
+
+async fn apply_ws_control_message(handle: ControlHandle, text: String) -> WsControlReply {
+    let request = match parse_ws_control_message(&text) {
+        Ok(request) => request,
+        Err(error) => return WsControlReply::error(None, error),
+    };
+    let request_id = request.request_id.clone();
+    let outcome = run_control(move || {
+        use scriptbots_core::ControlCommand;
+        let command = match request.command.as_str() {
+            "pause" => ControlCommand::Pause,
+            "resume" => ControlCommand::Resume,
+            "step" => ControlCommand::Step,
+            "speed" => ControlCommand::SetSpeed(request.speed.expect("validated speed")),
+            "status" => {
+                let command_id = request.command_id.as_deref().expect("validated command id");
+                return handle.command_status(command_id)?.ok_or_else(|| {
+                    ControlError::NotFound(format!("command '{command_id}' is not retained"))
+                });
             }
-        } else {
-            None
+            _ => unreachable!("validated WebSocket command"),
         };
-        outcome.transpose()
+        // The host owns retry identity and conflicting-payload refusal. A reconnect
+        // must not create a second Step after the first receipt was lost.
+        handle.submit_command(command, request.request_id.as_deref())
     })
-    .await
+    .await;
+    match outcome {
+        Ok(receipt) => WsControlReply {
+            protocol_version: WS_CONTROL_PROTOCOL_VERSION,
+            request_id,
+            outcome: WsControlOutcome::Receipt { receipt },
+        },
+        Err(error) => WsControlReply::error(request_id, error),
+    }
+}
+
+async fn send_ws_message(socket: &mut WebSocket, message: WsMessage) -> bool {
+    // There is one write in flight per connection, no producer queue. A client
+    // that stops reading relinquishes its connection after this bounded wait.
+    matches!(
+        tokio::time::timeout(WS_WRITE_TIMEOUT, socket.send(message)).await,
+        Ok(Ok(()))
+    )
+}
+
+fn remote_subscription_error(error: RemoteSubscriptionError) -> AppError {
+    match error {
+        RemoteSubscriptionError::SessionChanged { .. }
+        | RemoteSubscriptionError::CursorAhead { .. } => AppError::conflict(error.to_string()),
+        RemoteSubscriptionError::ProjectionLimit(_) => {
+            AppError::payload_too_large(error.to_string())
+        }
+        RemoteSubscriptionError::Request(_) => AppError::bad_request(error.to_string()),
+        RemoteSubscriptionError::DeliveryMismatch | RemoteSubscriptionError::Protocol(_) => {
+            AppError::internal(error.to_string())
+        }
+    }
+}
+
+async fn send_ws_error(
+    socket: &mut WebSocket,
+    request_id: Option<String>,
+    error: AppError,
+) -> bool {
+    let reply = WsControlReply::error(request_id, error);
+    let Ok(text) = serde_json::to_string(&reply) else {
+        return false;
+    };
+    send_ws_message(socket, WsMessage::Text(text.into())).await
+}
+
+/// A bounded projection batch runs away from async workers and holds only an
+/// immutable publication. No owner command, world mutex or storage read is used.
+struct PreparedRemoteFrame {
+    frame: RemoteFrame,
+    bytes: Vec<u8>,
+    delivered_subscription: RemoteSubscription,
+}
+
+async fn prepare_remote_frames(
+    mut subscription: RemoteSubscription,
+    snapshot: Arc<RenderSnapshot>,
+    awaiting_channels: Vec<RemoteChannel>,
+) -> Result<Vec<PreparedRemoteFrame>, AppError> {
+    struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+    impl<T> Drop for AbortOnDrop<T> {
+        fn drop(&mut self) {
+            // Cancels queued blocking work if this connection closes or times
+            // out. A job already running has only the bounded projection to finish.
+            self.0.abort();
+        }
+    }
+    let mut projection = AbortOnDrop(tokio::task::spawn_blocking(move || {
+        let mut frames = Vec::with_capacity(subscription.channels().len());
+        for channel in subscription.channels().to_vec() {
+            if awaiting_channels.contains(&channel) {
+                continue;
+            }
+            if let Some(frame) = subscription.next_frame(channel, &snapshot)? {
+                let bytes = encode_remote_frame(&frame)?;
+                // Validation walks the full canvas. Compute the next cursor
+                // here as well; the async worker installs it only after send.
+                subscription.delivered(&frame)?;
+                frames.push(PreparedRemoteFrame {
+                    frame,
+                    bytes,
+                    delivered_subscription: subscription.clone(),
+                });
+            }
+        }
+        Ok::<_, RemoteSubscriptionError>(frames)
+    }));
+    tokio::time::timeout(WS_WRITE_TIMEOUT, &mut projection.0)
+        .await
+        .map_err(|_| {
+            AppError::service_unavailable(
+                "remote projection deadline exceeded; reconnect with the last consumed cursors",
+            )
+        })?
+        .map_err(|error| AppError::internal(format!("remote projection task failed: {error}")))?
+        .map_err(remote_subscription_error)
+}
+
+/// Deterministic backoff given observed work duration. The requested rate is an
+/// upper bound, not a latency promise; eight cheap samples permit gradual recovery.
+#[derive(Debug)]
+struct WsStreamCadence {
+    requested: Duration,
+    current: Duration,
+    cheap_samples: u8,
+}
+
+impl WsStreamCadence {
+    fn new(requested: Duration) -> Self {
+        Self {
+            requested,
+            current: requested,
+            cheap_samples: 0,
+        }
+    }
+
+    fn observe(&mut self, elapsed: Duration) -> Option<&'static str> {
+        let previous = self.current;
+        let reason = if elapsed > self.current {
+            self.cheap_samples = 0;
+            self.current = elapsed
+                .saturating_mul(2)
+                .min(Duration::from_secs(1))
+                .max(self.requested);
+            "slow_consumer"
+        } else if elapsed.saturating_mul(4) < self.current && self.current > self.requested {
+            self.cheap_samples += 1;
+            if self.cheap_samples == 8 {
+                self.current = (self.current.saturating_mul(3) / 4).max(self.requested);
+                self.cheap_samples = 0;
+            }
+            "recovering"
+        } else {
+            self.cheap_samples = 0;
+            return None;
+        };
+        (previous != self.current).then_some(reason)
+    }
+}
+
+fn ws_interval(period: Duration) -> tokio::time::Interval {
+    let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval
+}
+
+async fn send_ws_cadence(
+    socket: &mut WebSocket,
+    cadence: &WsStreamCadence,
+    reason: &str,
+    connection_id: u64,
+) -> bool {
+    let notice = json!({
+        "type": "stream_rate", "protocol_version": WS_CONTROL_PROTOCOL_VERSION,
+        "requested_interval_us": cadence.requested.as_micros(),
+        "effective_interval_us": cadence.current.as_micros(), "reason": reason,
+    });
+    debug!(
+        connection_id,
+        reason,
+        interval_us = cadence.current.as_micros(),
+        "remote sampling cadence changed"
+    );
+    send_ws_message(socket, WsMessage::Text(notice.to_string().into())).await
 }
 
 async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
+    static NEXT_CONNECTION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let connection_id = NEXT_CONNECTION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let handle = state.handle.clone();
-    let mut interval = tokio::time::interval(Duration::from_millis(50));
+    let mut interval = ws_interval(Duration::from_millis(50));
+    let mut subscription: Option<RemoteSubscription> = None;
+    let mut delivery: Option<RemoteDeliveryWindow> = None;
+    let mut cadence = WsStreamCadence::new(Duration::from_millis(50));
+    let connected_at = tokio::time::Instant::now();
+    debug!(connection_id, "WebSocket connected");
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                if let Ok(summary) = read_latest_tick_summary(handle.clone()).await {
+                if let Some(stream) = &mut subscription {
+                    let started = tokio::time::Instant::now();
+                    let window = delivery.as_mut().expect("negotiation installs a delivery window");
+                    if window.expired(connected_at.elapsed()) {
+                        send_ws_error(&mut socket, None, AppError::service_unavailable(
+                            "remote frame acknowledgement deadline exceeded; reconnect with the last consumed cursors",
+                        )).await;
+                        break;
+                    }
+                    let awaiting_channels = window.awaiting_channels();
+                    if awaiting_channels.len() == stream.channels().len() {
+                        continue;
+                    }
+                    let snapshot = match handle.read_snapshot() {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => {
+                            send_ws_error(&mut socket, None, AppError::from(error)).await;
+                            break;
+                        }
+                    };
+                    let frames = match prepare_remote_frames(stream.clone(), snapshot, awaiting_channels).await {
+                        Ok(frames) => frames,
+                        Err(error) => {
+                            warn!(connection_id, message = %error.message, "remote stream refused a projection");
+                            send_ws_error(&mut socket, None, error).await;
+                            break;
+                        }
+                    };
+                    let mut write_failed = false;
+                    for PreparedRemoteFrame { frame, bytes, delivered_subscription } in frames {
+                        let bytes_len = bytes.len();
+                        if !send_ws_message(&mut socket, WsMessage::Binary(bytes.into())).await {
+                            write_failed = true;
+                            break;
+                        }
+                        if let Err(error) = window.mark_sent(&frame, connected_at.elapsed()) {
+                            send_ws_error(&mut socket, None, remote_subscription_error(error)).await;
+                            write_failed = true;
+                            break;
+                        }
+                        *stream = delivered_subscription;
+                        let kind = match frame.payload {
+                            scriptbots_runtime::remote::RemoteFramePayload::Telemetry(_) => "telemetry",
+                            scriptbots_runtime::remote::RemoteFramePayload::Canvas(_) => "canvas",
+                            scriptbots_runtime::remote::RemoteFramePayload::Events(_) => "events",
+                        };
+                        debug!(connection_id, kind, revision = frame.identity.publication_revision,
+                            tick = frame.identity.tick, bytes = bytes_len,
+                            coalesced = frame.coalesced_publications, queue_depth = 0,
+                            awaiting_ack = window.awaiting_channels().len(),
+                            "remote frame delivered to socket");
+                    }
+                    if write_failed {
+                        debug!(connection_id, "remote stream closed after failed or timed-out write");
+                        break;
+                    }
+                    if let Some(reason) = cadence.observe(started.elapsed()) {
+                        interval = ws_interval(cadence.current);
+                        if !send_ws_cadence(&mut socket, &cadence, reason, connection_id).await {
+                            break;
+                        }
+                    }
+                } else if let Ok(summary) = read_latest_tick_summary(handle.clone()).await {
                     let dto = TickSummaryDto::from(summary);
                     if let Ok(bytes) = postcard::to_stdvec(&dto)
-                        && socket.send(WsMessage::Binary(bytes.into())).await.is_err()
+                        && !send_ws_message(&mut socket, WsMessage::Binary(bytes.into())).await
                     {
                         break;
                     }
@@ -2096,18 +2474,89 @@ async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
             msg = socket.recv() => {
                 match msg {
                     Some(Ok(WsMessage::Text(text))) => {
-                        // Owner admission can wait. Use the blocking pool and
-                        // return its receipt or error for every recognized command.
-                        let outcome = apply_ws_control_message(handle.clone(), text.to_string()).await;
-                        let payload = match outcome {
-                            Ok(Some(status)) => Some(serde_json::json!({"receipt": status})),
-                            Ok(None) => None,
-                            Err(error) => Some(serde_json::json!({"error": error.message})),
-                        };
-                        if let Some(payload) = payload
-                            && let Ok(text) = serde_json::to_string(&payload)
-                            && socket.send(WsMessage::Text(text.into())).await.is_err()
+                        let json_request = serde_json::from_str::<Value>(&text).ok();
+                        if json_request.as_ref().and_then(|value| value.get("command"))
+                            .and_then(Value::as_str) == Some("stream_ack")
                         {
+                            let consumed = (|| {
+                                let ack = RemoteFrameAck::parse(&text).map_err(remote_subscription_error)?;
+                                let window = delivery.as_mut().ok_or_else(|| AppError::bad_request(
+                                    "negotiate a subscription before acknowledging frames",
+                                ))?;
+                                window.acknowledge(&ack, connected_at.elapsed()).map_err(|error| {
+                                    AppError::conflict(format!("remote frame acknowledgement refused: {error}"))
+                                })
+                            })();
+                            match consumed {
+                                Ok(elapsed) => {
+                                    if let Some(reason) = cadence.observe(elapsed) {
+                                        interval = ws_interval(cadence.current);
+                                        if !send_ws_cadence(&mut socket, &cadence, reason, connection_id).await { break; }
+                                    }
+                                }
+                                Err(error) => {
+                                    send_ws_error(&mut socket, None, error).await;
+                                    break;
+                                }
+                            }
+                            continue;
+                        }
+                        if json_request.as_ref().and_then(|value| value.get("command"))
+                            .and_then(Value::as_str) == Some("subscribe")
+                        {
+                            let request_id = json_request.as_ref()
+                                .and_then(|value| value.get("request_id")).and_then(Value::as_str)
+                                .map(str::trim).filter(|id| !id.is_empty() && id.len() <= 1024).map(str::to_owned);
+                            let prepared = (|| {
+                                let request = RemoteSubscriptionRequest::parse(&text).map_err(remote_subscription_error)?;
+                                if delivery.as_ref().is_some_and(|window| !window.is_empty()) {
+                                    return Err(AppError::conflict("acknowledge outstanding frames before replacing a subscription"));
+                                }
+                                let snapshot = handle.read_snapshot().map_err(AppError::from)?;
+                                let stream = RemoteSubscription::new(&request, &snapshot).map_err(remote_subscription_error)?;
+                                let window = RemoteDeliveryWindow::new(u128::from(snapshot.session_id.get()), WS_WRITE_TIMEOUT);
+                                let ack = json!({
+                                    "type": "subscribed", "protocol_version": WS_CONTROL_PROTOCOL_VERSION,
+                                    "stream_protocol_version": REMOTE_PROTOCOL_VERSION,
+                                    "request_id": request.request_id,
+                                    "session_id": snapshot.session_id.get().to_string(),
+                                    "channels": request.channels, "max_fps": request.max_fps,
+                                });
+                                Ok::<_, AppError>((stream, window, ack))
+                            })();
+                            match prepared {
+                                Ok((stream, window, ack)) => {
+                                    if !send_ws_message(&mut socket, WsMessage::Text(ack.to_string().into())).await {
+                                        break;
+                                    }
+                                    debug!(connection_id, channels = ?stream.channels(), "remote subscription accepted");
+                                    cadence = WsStreamCadence::new(stream.interval());
+                                    interval = ws_interval(cadence.current);
+                                    subscription = Some(stream);
+                                    delivery = Some(window);
+                                }
+                                Err(error) => {
+                                    if !send_ws_error(&mut socket, request_id, error).await { break; }
+                                }
+                            }
+                            continue;
+                        }
+                        let reply = apply_ws_control_message(handle.clone(), text.to_string()).await;
+                        let Ok(text) = serde_json::to_string(&reply) else {
+                            break;
+                        };
+                        if !send_ws_message(&mut socket, WsMessage::Text(text.into())).await {
+                            break;
+                        }
+                    }
+                    Some(Ok(WsMessage::Binary(_))) => {
+                        let reply = WsControlReply::error(None, AppError::bad_request(
+                            "requests must be JSON text; binary frames carry server presentation data",
+                        ));
+                        let Ok(text) = serde_json::to_string(&reply) else {
+                            break;
+                        };
+                        if !send_ws_message(&mut socket, WsMessage::Text(text.into())).await {
                             break;
                         }
                     }
@@ -2117,6 +2566,7 @@ async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
             }
         }
     }
+    debug!(connection_id, "WebSocket disconnected");
 }
 
 #[derive(Debug, Default, Deserialize, ToSchema)]
@@ -2703,7 +3153,8 @@ async fn post_control_step(
         })?;
         body.count
     };
-    let status = run_control(move || state.handle.step_count(count)).await?;
+    let key = idempotency_key(&headers);
+    let status = run_control(move || state.handle.step_count(count, key.as_deref())).await?;
     Ok(Json(status))
 }
 
@@ -2939,7 +3390,8 @@ async fn post_step(
     // reported id therefore identifies the final step, not the batch; a caller
     // polling it learns about that one command. Saying so beats implying the
     // receipt covers all of them.
-    let status = run_control(move || state.handle.step_count(count)).await?;
+    let key = idempotency_key(&headers);
+    let status = run_control(move || state.handle.step_count(count, key.as_deref())).await?;
     Ok(Json(status))
 }
 
@@ -3451,7 +3903,7 @@ async fn prepare_mcp_server(
 /// does not exist. That is the same silent drift that removed eight routes from the
 /// published OpenAPI document (bd-01dg), so `mcp_tool_roster_is_complete` pins it.
 fn register_control_tools(builder: ServerBuilder, handle: ControlHandle) -> ServerBuilder {
-    let mut builder = builder;
+    let mut builder = builder.middleware(StepArgumentsMiddleware);
 
     builder = register_tool(
         builder,
@@ -3541,7 +3993,11 @@ fn register_control_tools(builder: ServerBuilder, handle: ControlHandle) -> Serv
         builder,
         "pause",
         "Pause the simulation",
-        json!({"type": "object", "additionalProperties": false}),
+        json!({
+            "type": "object",
+            "properties": {"idempotency_key": {"type": "string", "minLength": 1, "maxLength": 1024}},
+            "additionalProperties": false
+        }),
         ControlToolKind::Pause,
         handle.clone(),
     );
@@ -3550,7 +4006,11 @@ fn register_control_tools(builder: ServerBuilder, handle: ControlHandle) -> Serv
         builder,
         "resume",
         "Resume the simulation",
-        json!({"type": "object", "additionalProperties": false}),
+        json!({
+            "type": "object",
+            "properties": {"idempotency_key": {"type": "string", "minLength": 1, "maxLength": 1024}},
+            "additionalProperties": false
+        }),
         ControlToolKind::Resume,
         handle.clone(),
     );
@@ -3558,11 +4018,12 @@ fn register_control_tools(builder: ServerBuilder, handle: ControlHandle) -> Serv
     builder = register_tool(
         builder,
         "step",
-        "Step the simulation by N ticks",
+        "Step the simulation by N ticks; an idempotency key requires count=1",
         json!({
             "type": "object",
             "properties": {
-                "count": {"type": "integer", "minimum": 1}
+                "count": {"type": "integer", "minimum": 1, "maximum": MAX_STEP_BATCH},
+                "idempotency_key": {"type": "string", "minLength": 1, "maxLength": 1024}
             },
             "additionalProperties": false
         }),
@@ -3577,7 +4038,8 @@ fn register_control_tools(builder: ServerBuilder, handle: ControlHandle) -> Serv
         json!({
             "type": "object",
             "properties": {
-                "speed": {"type": "number"}
+                "speed": {"type": "number"},
+                "idempotency_key": {"type": "string", "minLength": 1, "maxLength": 1024}
             },
             "required": ["speed"],
             "additionalProperties": false
@@ -3953,6 +4415,32 @@ fn register_control_tools(builder: ServerBuilder, handle: ControlHandle) -> Serv
     builder
 }
 
+/// FastMCP's optional argument decoder treats explicit null as absence. Reject
+/// malformed step arguments before that normalization can turn them into a tick.
+struct StepArgumentsMiddleware;
+
+impl Middleware for StepArgumentsMiddleware {
+    fn on_request(
+        &self,
+        _ctx: &fastmcp_rust::McpContext,
+        request: &JsonRpcRequest,
+    ) -> McpResult<MiddlewareDecision> {
+        if request.method == "tools/call"
+            && let Some(params) = request.params.as_ref().and_then(Value::as_object)
+            && params.get("name").and_then(Value::as_str) == Some("step")
+            && params
+                .get("arguments")
+                .is_some_and(|value| !value.is_object())
+        {
+            return Err(McpError::new(
+                McpErrorCode::InvalidParams,
+                "step arguments must be a JSON object",
+            ));
+        }
+        Ok(MiddlewareDecision::Continue)
+    }
+}
+
 fn register_tool(
     builder: ServerBuilder,
     name: &str,
@@ -4185,6 +4673,12 @@ impl ToolHandler for ControlTool {
     }
 
     fn call(&self, _ctx: &fastmcp_rust::McpContext, arguments: Value) -> McpResult<Vec<Content>> {
+        if matches!(self.kind, ControlToolKind::Step) && !arguments.is_object() {
+            return Err(McpError::new(
+                McpErrorCode::InvalidParams,
+                "step arguments must be a JSON object",
+            ));
+        }
         let arguments = arguments.as_object().cloned().unwrap_or_default();
         match self.kind {
             ControlToolKind::ListPresets => {
@@ -4276,9 +4770,39 @@ impl ToolHandler for ControlTool {
                 make_tool_result(status)
             }
             ControlToolKind::Step => {
-                let count = arguments.get("count").and_then(|v| v.as_u64()).unwrap_or(1);
+                if arguments
+                    .keys()
+                    .any(|key| key != "count" && key != "idempotency_key")
+                {
+                    return Err(McpError::new(
+                        McpErrorCode::InvalidParams,
+                        "step accepts only count and idempotency_key",
+                    ));
+                }
+                let count = match arguments.get("count") {
+                    None => 1,
+                    Some(value) => value.as_u64().ok_or_else(|| {
+                        McpError::new(
+                            McpErrorCode::InvalidParams,
+                            "count must be a positive integer",
+                        )
+                    })?,
+                };
+                if let Some(value) = arguments.get("idempotency_key")
+                    && !value.as_str().is_some_and(|key| {
+                        let key = key.trim();
+                        !key.is_empty() && key.len() <= 1024
+                    })
+                {
+                    return Err(McpError::new(
+                        McpErrorCode::InvalidParams,
+                        "idempotency_key must contain 1..=1024 bytes",
+                    ));
+                }
+                let key = mcp_idempotency_key(&arguments);
                 let handle = self.handle.clone();
-                let status = run_control_mcp_sync(move || handle.step_count(count))?;
+                let status =
+                    run_control_mcp_sync(move || handle.step_count(count, key.as_deref()))?;
                 make_tool_result(status)
             }
             ControlToolKind::SetSpeed => {
@@ -4658,6 +5182,13 @@ where
 fn map_control_error(err: ControlError) -> McpError {
     tracing::warn!(error = %err, "MCP control operation failed");
     match err {
+        ControlError::ExperimentShuttingDown => McpError::new(
+            McpErrorCode::ToolExecutionError,
+            ControlError::ExperimentShuttingDown.to_string(),
+        ),
+        ControlError::ExperimentWorkerFailed(message) => {
+            McpError::new(McpErrorCode::ToolExecutionError, message)
+        }
         capacity @ ControlError::ExperimentCapacity(_) => {
             // Capacity is a retryable tool execution failure. FastMCP returns
             // its actionable text with isError=true, while InternalError would
@@ -4678,6 +5209,9 @@ fn map_control_error(err: ControlError) -> McpError {
         ),
         ControlError::InvalidPatch(msg) => McpError::new(McpErrorCode::InvalidParams, msg),
         ControlError::Serialization(msg) => McpError::new(McpErrorCode::InternalError, msg),
+        ControlError::Host(
+            error @ scriptbots_runtime::HostAccessError::CommandIdCollision { .. },
+        ) => McpError::new(McpErrorCode::InvalidParams, error.to_string()),
         ControlError::Host(error) => McpError::new(McpErrorCode::InternalError, error.to_string()),
         ControlError::Lock => {
             McpError::new(McpErrorCode::InternalError, "world state is unavailable")
@@ -4979,7 +5513,7 @@ mod tests {
                 .check(&headers, &uri, Version::HTTP_11)
                 .expect("CLI without Origin");
             for origin in [own_origin, "https://lab.example"] {
-                headers.insert("origin", origin.parse().expect("Origin"));
+                headers.insert("origin", origin.parse().expect("Origin")); // ubs:ignore -- test request, not response
                 policy
                     .check(&headers, &uri, Version::HTTP_11)
                     .expect("allowed browser");
@@ -4992,7 +5526,7 @@ mod tests {
                 "http://localhost:1",
                 "https://lab.example https://other.example",
             ] {
-                headers.insert("origin", origin.parse().expect("negative Origin"));
+                headers.insert("origin", origin.parse().expect("negative Origin")); // ubs:ignore -- test request, not response
                 assert!(
                     policy.check(&headers, &uri, Version::HTTP_11).is_err(),
                     "{origin}"
@@ -5289,6 +5823,26 @@ mod tests {
         assert!(format!("{error:#}").contains("initial resume admission"));
         let listener = TcpListener::bind(address).expect("failed launch releases reservation");
         drop(listener);
+    }
+
+    #[test]
+    fn experiment_shutdown_failure_is_visible_for_disabled_control_surfaces() {
+        let (status, observed) = watch::channel(ControlRuntimeStatus::Disabled);
+        publish_control_runtime_result(&status, &Err(anyhow!("experiment worker failed")));
+        assert!(matches!(
+            &*observed.borrow(),
+            ControlRuntimeStatus::Failed(reason) if reason.contains("experiment worker failed")
+        ));
+    }
+
+    #[test]
+    fn experiment_shutdown_refusal_maps_to_service_unavailable() {
+        let error = AppError::from(ControlError::ExperimentShuttingDown);
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(error.message.contains("resume retained work"));
+        let mcp = map_control_error(ControlError::ExperimentShuttingDown);
+        assert_eq!(mcp.code, McpErrorCode::ToolExecutionError);
+        assert!(mcp.message.contains("resume retained work"));
     }
 
     #[test]
@@ -7251,6 +7805,269 @@ mod tests {
         assert_eq!(missing.status, StatusCode::NOT_FOUND);
     }
 
+    #[tokio::test]
+    async fn single_step_retries_share_identity_across_rest_mcp_and_websocket() {
+        let host = crate::control::tests::TestHost::spawn(
+            WorldState::new(ScriptBotsConfig {
+                world_width: 64,
+                world_height: 64,
+                food_cell_size: 16,
+                rng_seed: Some(42),
+                persistence_interval: 0,
+                closed: true,
+                ..ScriptBotsConfig::default()
+            })
+            .expect("small paused world"),
+        );
+        let handle = host.handle();
+        let state = ApiState {
+            handle: handle.clone(),
+            scenario: None,
+            presented_frame: empty_presented_frame(),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("Content-Type", "application/json".parse().unwrap());
+        headers.insert("Idempotency-Key", "shared-step".parse().unwrap());
+        let Json(first) = post_control_step(
+            State(state.clone()),
+            headers.clone(),
+            axum::body::Bytes::from_static(br#"{"count":1}"#),
+        )
+        .await
+        .expect("keyed step admission");
+        host.wait_applied(&first);
+        assert_eq!(handle.status().unwrap().tick, 1);
+
+        let Json(alias) = post_step(
+            State(state.clone()),
+            headers.clone(),
+            axum::body::Bytes::new(),
+        )
+        .await
+        .expect("legacy REST retry");
+        assert_eq!(alias.command_id, first.command_id);
+        assert_eq!(alias.admission_sequence, first.admission_sequence);
+
+        let mcp = mcp_http_test_state(handle.clone(), ServerBuilder::new("step-retry", "0"));
+        let initialized = map_policy_mcp_request(
+            &mcp,
+            json!({
+                "jsonrpc":"2.0", "id":1, "method":"initialize",
+                "params":{"protocolVersion":"2024-11-05", "capabilities":{},
+                    "clientInfo":{"name":"step-retry", "version":"0"}}
+            }),
+        )
+        .await;
+        assert!(initialized.get("error").is_none(), "{initialized}");
+        let listed = map_policy_mcp_request(
+            &mcp,
+            json!({"jsonrpc":"2.0", "id":2, "method":"tools/list", "params":{}}),
+        )
+        .await;
+        let tools = listed["result"]["tools"]
+            .as_array()
+            .expect("tool discovery");
+        for name in ["pause", "resume", "step", "set_speed"] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .expect("control tool");
+            assert_eq!(
+                tool["inputSchema"]["properties"]["idempotency_key"]["type"],
+                "string"
+            );
+        }
+        let retried = map_policy_mcp_request(
+            &mcp,
+            json!({
+                "jsonrpc":"2.0", "id":3, "method":"tools/call",
+                "params":{"name":"step", "arguments":{"count":1, "idempotency_key":"shared-step"}}
+            }),
+        )
+        .await;
+        assert!(retried.get("error").is_none(), "{retried}");
+        let retried: CommandStatusDto = serde_json::from_str(
+            retried["result"]["content"][0]["text"]
+                .as_str()
+                .expect("MCP receipt"),
+        )
+        .expect("canonical owner receipt");
+        assert_eq!(retried.command_id, first.command_id);
+        assert_eq!(retried.admission_sequence, first.admission_sequence);
+        assert_eq!(retried.application_state, "applied");
+
+        let conflict = map_policy_mcp_request(
+            &mcp,
+            json!({
+                "jsonrpc":"2.0", "id":4, "method":"tools/call",
+                "params":{"name":"resume", "arguments":{"idempotency_key":"shared-step"}}
+            }),
+        )
+        .await;
+        assert_eq!(
+            conflict["error"]["code"],
+            i32::from(McpErrorCode::InvalidParams),
+            "{conflict}"
+        );
+
+        let websocket = websocket_receipt(
+            apply_ws_control_message(
+                handle.clone(),
+                json!({"command":"step", "request_id":"shared-step"}).to_string(),
+            )
+            .await,
+        );
+        assert_eq!(websocket.command_id, first.command_id);
+        assert_eq!(websocket.admission_sequence, first.admission_sequence);
+        assert_eq!(
+            handle.status().unwrap().tick,
+            1,
+            "transport retries must not step again"
+        );
+        let conflict = post_control_resume(State(state.clone()), headers)
+            .await
+            .unwrap_err();
+        assert_eq!(conflict.status, StatusCode::CONFLICT);
+        assert!(handle.status().unwrap().paused);
+
+        let mut unkeyed = HeaderMap::new();
+        unkeyed.insert("Content-Type", "application/json".parse().unwrap());
+        let Json(batch) = post_step(
+            State(state),
+            unkeyed,
+            axum::body::Bytes::from_static(br#"{"count":2}"#),
+        )
+        .await
+        .expect("existing unkeyed batch");
+        host.wait_applied(&batch);
+        assert_eq!(handle.status().unwrap().tick, 3);
+    }
+
+    #[tokio::test]
+    async fn step_requests_refuse_malformed_counts_without_admission() {
+        let (handle, host) = handle();
+        let state = ApiState {
+            handle: handle.clone(),
+            scenario: None,
+            presented_frame: empty_presented_frame(),
+        };
+        let before = handle.read_snapshot().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("Content-Type", "application/json".parse().unwrap());
+        headers.insert("Idempotency-Key", "refused-step".parse().unwrap());
+        for value in [
+            json!({"count":0}),
+            json!({"count":-1}),
+            json!({"count":1.5}),
+            json!({"count":"2"}),
+            json!({"count":null}),
+            json!({"count":false}),
+            json!({"count":u64::MAX}),
+            json!({"count":2}),
+            json!({"cout":2}),
+            json!([]),
+            json!(null),
+        ] {
+            let body = axum::body::Bytes::from(serde_json::to_vec(&value).unwrap());
+            let control = post_control_step(State(state.clone()), headers.clone(), body.clone())
+                .await
+                .expect_err("invalid canonical step must be refused");
+            assert_eq!(control.status, StatusCode::BAD_REQUEST, "{value}");
+            let alias = post_step(State(state.clone()), headers.clone(), body)
+                .await
+                .expect_err("invalid legacy step must be refused");
+            assert_eq!(alias.status, StatusCode::BAD_REQUEST, "{value}");
+        }
+        let tool = ControlTool {
+            handle: handle.clone(),
+            kind: ControlToolKind::Step,
+            name: "step".to_owned(),
+            description: "Step the simulation".to_owned(),
+            schema: json!({"type":"object"}),
+        };
+        let runtime = mcp_context_test_runtime();
+        let cx = runtime.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        let ctx = fastmcp_rust::McpContext::new(cx, 1);
+        let mcp = mcp_http_test_state(handle.clone(), ServerBuilder::new("step-refusal", "0"));
+        let initialized = map_policy_mcp_request(
+            &mcp,
+            json!({
+                "jsonrpc":"2.0", "id":1, "method":"initialize",
+                "params":{"protocolVersion":"2024-11-05", "capabilities":{},
+                    "clientInfo":{"name":"step-refusal", "version":"0"}}
+            }),
+        )
+        .await;
+        assert!(initialized.get("error").is_none(), "{initialized}");
+        for (index, arguments) in [
+            json!({"count":0}),
+            json!({"count":-1}),
+            json!({"count":1.5}),
+            json!({"count":"2"}),
+            json!({"count":null}),
+            json!({"count":true}),
+            json!({"count":u64::MAX}),
+            json!({"count":2, "idempotency_key":"refused-step"}),
+            json!({"cout":2}),
+            json!({"idempotency_key":7}),
+            json!({"idempotency_key":" "}),
+            json!({"idempotency_key":"k".repeat(1025)}),
+            json!([]),
+            json!(null),
+            json!(false),
+            json!("step"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(tool.call(&ctx, arguments.clone()).is_err(), "{arguments}");
+            let response = map_policy_mcp_request(
+                &mcp,
+                json!({
+                    "jsonrpc":"2.0", "id":index + 2, "method":"tools/call",
+                    "params":{"name":"step", "arguments":arguments}
+                }),
+            )
+            .await;
+            assert_eq!(
+                response["error"]["code"],
+                i32::from(McpErrorCode::InvalidParams),
+                "{arguments}: {response}"
+            );
+        }
+        let after = host.handle().read_snapshot().unwrap();
+        assert_eq!(after.world, before.world);
+        assert_eq!(after.revisions, before.revisions);
+        assert_eq!(after.last_applied_command, before.last_applied_command);
+        assert_eq!(after.command_queue_depth, 0);
+        // A subsequent admitted command is an owner barrier: none of the
+        // refused inputs may have consumed an identity or left a delayed step.
+        let barrier = handle.pause(Some("refusal-observation")).unwrap();
+        assert_eq!(barrier.admission_sequence, Some(1));
+        host.wait_applied(&barrier);
+        let observed = handle.read_snapshot().unwrap();
+        assert_eq!(observed.world, before.world);
+        assert_eq!(observed.revisions.scientific, before.revisions.scientific);
+        assert_eq!(observed.revisions.config, before.revisions.config);
+
+        // Absence remains the documented default; unlike an explicit null it
+        // still requests one step through the actual MCP router.
+        let defaulted = map_policy_mcp_request(
+            &mcp,
+            json!({"jsonrpc":"2.0", "id":100, "method":"tools/call", "params":{"name":"step"}}),
+        )
+        .await;
+        assert!(defaulted.get("error").is_none(), "{defaulted}");
+        let receipt: CommandStatusDto = serde_json::from_str(
+            defaulted["result"]["content"][0]["text"]
+                .as_str()
+                .expect("default step receipt"),
+        )
+        .expect("owner receipt");
+        host.wait_applied(&receipt);
+        assert_eq!(handle.status().unwrap().tick, before.world.tick + 1);
+    }
+
     /// The MCP roster README documents and that `ControlToolKind` dispatches.
     ///
     /// Registration is hand-written per tool, so a `ControlToolKind` variant can be
@@ -7662,11 +8479,11 @@ mod tests {
             "the population-dependent initial read must use the occupied pool"
         );
         assert_eq!(initial_summary, initial_expected);
-        let receipt = runtime
-            .block_on(websocket_command)
-            .expect("WebSocket command task joined")
-            .expect("WebSocket command dispatch")
-            .expect("recognized pause command");
+        let receipt = websocket_receipt(
+            runtime
+                .block_on(websocket_command)
+                .expect("WebSocket command task joined"),
+        );
         assert!(
             websocket_wait.is_err(),
             "WebSocket owner admission must use the occupied pool"
@@ -7700,6 +8517,16 @@ mod tests {
         assert_eq!(summary, expected);
     }
 
+    fn websocket_receipt(reply: WsControlReply) -> CommandStatusDto {
+        assert_eq!(reply.protocol_version, WS_CONTROL_PROTOCOL_VERSION);
+        match reply.outcome {
+            WsControlOutcome::Receipt { receipt } => receipt,
+            WsControlOutcome::Error { status, message } => {
+                panic!("expected owner receipt, got {status}: {message}")
+            }
+        }
+    }
+
     #[test]
     fn websocket_control_messages_return_owner_receipts() {
         let world = WorldState::new(ScriptBotsConfig {
@@ -7726,10 +8553,9 @@ mod tests {
             "resume",
             "pause",
         ] {
-            let receipt = runtime
-                .block_on(apply_ws_control_message(handle.clone(), message.to_owned()))
-                .expect("WebSocket command dispatch")
-                .expect("recognized command");
+            let receipt = websocket_receipt(
+                runtime.block_on(apply_ws_control_message(handle.clone(), message.to_owned())),
+            );
             let applied = owner.wait_applied(&receipt);
             assert_eq!(applied.command_id, receipt.command_id);
             let snapshot = handle.read_snapshot().expect("applied publication");
@@ -7740,22 +8566,33 @@ mod tests {
                 _ => assert_eq!(snapshot.playback.speed_multiplier, 2.0),
             }
         }
-        for message in ["unknown", "{", "{\"command\":\"speed\"}"] {
+        let before = handle.read_snapshot().expect("before invalid commands");
+        for message in [
+            "unknown",
+            "{",
+            "{\"command\":\"speed\"}",
+            r#"{"command":"speed","speed":-1}"#,
+            r#"{"command":"speed","speed":1e100}"#,
+            r#"{"command":"step","protocol_version":2}"#,
+            r#"{"command":"step","request_id":"  "}"#,
+            r#"{"command":"step","speed":2}"#,
+            r#"{"command":"step","count":2}"#,
+            r#"{"command":"status"}"#,
+        ] {
+            let reply =
+                runtime.block_on(apply_ws_control_message(handle.clone(), message.to_owned()));
+            let wire = serde_json::to_value(&reply).expect("error reply JSON");
+            assert_eq!(wire["type"], "error", "{message}: {wire}");
+            assert_eq!(wire["status"], 400, "{message}: {wire}");
             assert!(
-                runtime
-                    .block_on(apply_ws_control_message(handle.clone(), message.to_owned()))
-                    .expect("unrecognized message is ignored")
-                    .is_none()
+                wire["message"]
+                    .as_str()
+                    .is_some_and(|message| !message.is_empty())
             );
         }
-        let error = runtime
-            .block_on(apply_ws_control_message(
-                handle.clone(),
-                "{\"command\":\"speed\",\"speed\":-1}".to_owned(),
-            ))
-            .expect_err("invalid speed is rejected");
-        assert_eq!(error.status, StatusCode::BAD_REQUEST);
-        assert_eq!(error.message, "invalid speed multiplier");
+        let after = handle.read_snapshot().expect("after invalid commands");
+        assert_eq!(after.world, before.world);
+        assert_eq!(after.revisions, before.revisions);
         assert_eq!(
             handle
                 .read_snapshot()
@@ -7764,6 +8601,542 @@ mod tests {
                 .speed_multiplier,
             2.0
         );
+    }
+
+    #[test]
+    fn websocket_control_bounds_apply_before_parsing_or_dispatch() {
+        let message = r#"{"command":"step","protocol_version":1,"request_id":"bounded"}"#;
+        for len in [
+            MAX_WS_CONTROL_MESSAGE_BYTES - 1,
+            MAX_WS_CONTROL_MESSAGE_BYTES,
+        ] {
+            let padded = format!("{message}{}", " ".repeat(len - message.len()));
+            assert!(parse_ws_control_message(&padded).is_ok());
+        }
+        let oversized = format!(
+            "{message}{}",
+            " ".repeat(MAX_WS_CONTROL_MESSAGE_BYTES + 1 - message.len())
+        );
+        assert_eq!(
+            parse_ws_control_message(&oversized).unwrap_err().status,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        for len in [1023, 1024, 1025] {
+            let message = json!({"command":"step", "request_id":"k".repeat(len)}).to_string();
+            assert_eq!(parse_ws_control_message(&message).is_ok(), len <= 1024);
+        }
+        // Same normalization as keyed HTTP/MCP commands; no generated identity
+        // is introduced for a client that did not supply one.
+        assert_eq!(parse_ws_control_message("step").unwrap().request_id, None);
+        assert_eq!(
+            parse_ws_control_message(r#"{"command":"step","request_id":" retry "}"#)
+                .unwrap()
+                .request_id
+                .as_deref(),
+            Some("retry")
+        );
+    }
+
+    fn connect_websocket(address: SocketAddr) -> TcpStream {
+        let mut socket = TcpStream::connect(address).expect("connect WebSocket client");
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("WebSocket read bound");
+        socket
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("WebSocket write bound");
+        write!(socket,
+            "GET /api/ws/stream HTTP/1.1\r\nHost: {address}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+        ).expect("write real upgrade");
+        let mut header = Vec::new();
+        while !header.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            socket.read_exact(&mut byte).expect("read upgrade response");
+            header.push(byte[0]);
+            assert!(header.len() <= 4096, "bounded upgrade header");
+        }
+        assert!(
+            String::from_utf8(header)
+                .unwrap()
+                .starts_with("HTTP/1.1 101")
+        );
+        socket
+    }
+
+    fn send_websocket_text(socket: &mut TcpStream, text: &str) {
+        let mask = [0x12, 0x34, 0x56, 0x78];
+        let mut frame = vec![0x81];
+        let len = text.len();
+        if len < 126 {
+            frame.push(0x80 | u8::try_from(len).unwrap());
+        } else {
+            frame.push(0x80 | 126);
+            frame.extend_from_slice(
+                &u16::try_from(len)
+                    .expect("bounded test message")
+                    .to_be_bytes(),
+            );
+        }
+        frame.extend_from_slice(&mask);
+        frame.extend(
+            text.bytes()
+                .enumerate()
+                .map(|(index, byte)| byte ^ mask[index % 4]),
+        );
+        socket.write_all(&frame).expect("write masked client frame");
+    }
+
+    fn read_remote_websocket_message(socket: &mut TcpStream) -> (u8, Vec<u8>) {
+        let mut header = [0; 2];
+        socket
+            .read_exact(&mut header)
+            .expect("actual server frame header");
+        assert_eq!(header[0] & 0x80, 0x80);
+        assert_eq!(header[1] & 0x80, 0);
+        let len = match header[1] & 0x7f {
+            126 => {
+                let mut length = [0; 2];
+                socket.read_exact(&mut length).unwrap();
+                usize::from(u16::from_be_bytes(length))
+            }
+            127 => {
+                let mut length = [0; 8];
+                socket.read_exact(&mut length).unwrap();
+                usize::try_from(u64::from_be_bytes(length)).unwrap()
+            }
+            len => usize::from(len),
+        };
+        assert!(len <= scriptbots_runtime::remote::REMOTE_MAX_FRAME_BYTES);
+        let mut payload = vec![0; len];
+        socket
+            .read_exact(&mut payload)
+            .expect("actual server frame payload");
+        (header[0] & 0x0f, payload)
+    }
+
+    fn read_remote_json(socket: &mut TcpStream, negotiated: bool) -> Value {
+        for _ in 0..16 {
+            let (opcode, payload) = read_remote_websocket_message(socket);
+            if opcode == 1 {
+                let json: Value = serde_json::from_slice(&payload).unwrap();
+                if json["type"] != "stream_rate" {
+                    return json;
+                }
+            } else {
+                assert_eq!(opcode, 2);
+                if negotiated {
+                    let frame = scriptbots_runtime::remote::decode_remote_frame(&payload)
+                        .expect("negotiated binary frame");
+                    acknowledge_remote_frame(socket, &frame);
+                } else {
+                    postcard::from_bytes::<TickSummaryDto>(&payload)
+                        .expect("only initial legacy telemetry before acknowledgment");
+                }
+            }
+        }
+        panic!("no JSON response in bounded frame count");
+    }
+
+    fn read_remote_binary(socket: &mut TcpStream) -> RemoteFrame {
+        for _ in 0..16 {
+            let (opcode, payload) = read_remote_websocket_message(socket);
+            if opcode == 2 {
+                let frame = scriptbots_runtime::remote::decode_remote_frame(&payload)
+                    .expect("actual SBWS frame");
+                acknowledge_remote_frame(socket, &frame);
+                return frame;
+            }
+            assert_eq!(opcode, 1);
+            let notice: Value = serde_json::from_slice(&payload).unwrap();
+            assert_eq!(notice["type"], "stream_rate", "unexpected JSON {notice}");
+        }
+        panic!("no binary frame in bounded frame count");
+    }
+
+    fn acknowledge_remote_frame(socket: &mut TcpStream, frame: &RemoteFrame) {
+        let channel = match &frame.payload {
+            scriptbots_runtime::remote::RemoteFramePayload::Canvas(_) => "canvas",
+            scriptbots_runtime::remote::RemoteFramePayload::Telemetry(_) => "telemetry",
+            scriptbots_runtime::remote::RemoteFramePayload::Events(_) => "events",
+        };
+        let mut ack = json!({
+            "protocol_version":1, "command":"stream_ack", "channel":channel,
+            "session_id":frame.identity.session_id.to_string(),
+            "publication_revision":frame.identity.publication_revision.to_string(),
+        });
+        if let scriptbots_runtime::remote::RemoteFramePayload::Events(page) = &frame.payload {
+            ack["after_event"] = json!(page.next_after_event().to_string());
+        }
+        send_websocket_text(socket, &ack.to_string());
+    }
+
+    #[test]
+    fn websocket_subscriptions_deliver_independent_channels_and_session_bound_resume() {
+        use scriptbots_runtime::remote::{RemoteFramePayload, RemoteSequencedEvent};
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 64,
+            world_height: 64,
+            food_cell_size: 16,
+            persistence_interval: 0,
+            rng_seed: Some(42),
+            closed: true,
+            ..ScriptBotsConfig::default()
+        })
+        .unwrap();
+        world
+            .try_spawn_agent(scriptbots_core::AgentData::default())
+            .unwrap();
+        let owner = crate::control::tests::TestHost::spawn(world);
+        let reservation = ControlServerReservation::prepare(ControlServerConfig {
+            rest_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            mcp_transport: McpTransportConfig::Disabled,
+            ..ControlServerConfig::default()
+        })
+        .unwrap();
+        let address = reservation.rest_address().unwrap();
+        let (server, _) = reservation.launch(owner.port.clone(), false).unwrap();
+        let handle = server.control_handle().unwrap();
+        let initial = handle.read_snapshot().unwrap();
+
+        let mut telemetry = connect_websocket(address);
+        let mut canvas = connect_websocket(address);
+        let mut stalled = connect_websocket(address);
+        for (socket, id, channels) in [
+            (&mut telemetry, "telemetry-viewer", json!(["telemetry"])),
+            (&mut canvas, "canvas-viewer", json!(["canvas", "events"])),
+        ] {
+            send_websocket_text(
+                socket,
+                &json!({
+                    "protocol_version":1, "request_id":id, "command":"subscribe",
+                    "channels":channels, "max_fps":60,
+                })
+                .to_string(),
+            );
+            let ack = read_remote_json(socket, false);
+            assert_eq!(ack["type"], "subscribed");
+            assert_eq!(ack["request_id"], id);
+            assert_eq!(ack["channels"], channels);
+            assert_eq!(ack["stream_protocol_version"], 1);
+            assert_eq!(ack["session_id"], initial.session_id.get().to_string());
+        }
+        send_websocket_text(
+            &mut stalled,
+            r#"{"protocol_version":1,"command":"subscribe","channels":["canvas","events"],"max_fps":120}"#,
+        );
+        // This client withholds its consumption credits. The other clients and
+        // the real owner must still complete their own work.
+        let summary = read_remote_binary(&mut telemetry);
+        assert!(matches!(summary.payload, RemoteFramePayload::Telemetry(_)));
+        let image = read_remote_binary(&mut canvas);
+        let RemoteFramePayload::Canvas(world) = image.payload else {
+            panic!("canvas channel")
+        };
+        assert_eq!(world, initial.world);
+        let events = read_remote_binary(&mut canvas);
+        let RemoteFramePayload::Events(page) = events.payload else {
+            panic!("events channel")
+        };
+        assert_eq!(page.events, Vec::<RemoteSequencedEvent>::new());
+        assert_eq!(
+            handle.status().unwrap().tick,
+            0,
+            "subscribing never advances science"
+        );
+        assert_eq!(read_remote_json(&mut stalled, false)["type"], "subscribed");
+        let mut withheld = Vec::new();
+        for _ in 0..2 {
+            let (opcode, payload) = read_remote_websocket_message(&mut stalled);
+            assert_eq!(opcode, 2);
+            withheld.push(scriptbots_runtime::remote::decode_remote_frame(&payload).unwrap());
+        }
+
+        send_websocket_text(
+            &mut canvas,
+            r#"{"protocol_version":1,"request_id":"remote-step","command":"step"}"#,
+        );
+        let response = read_remote_json(&mut canvas, true);
+        let receipt: CommandStatusDto =
+            serde_json::from_value(response["receipt"].clone()).unwrap();
+        owner.wait_applied(&receipt);
+        let advanced = read_remote_binary(&mut telemetry);
+        let RemoteFramePayload::Telemetry(summary) = &advanced.payload else {
+            panic!("mask must remain telemetry-only")
+        };
+        assert_eq!(summary.tick, 1);
+        assert_eq!(advanced.identity.tick, 1);
+        assert_eq!(
+            advanced.identity.session_id,
+            u128::from(initial.session_id.get())
+        );
+
+        // A malformed replacement cannot remove the current valid subscription.
+        send_websocket_text(
+            &mut telemetry,
+            r#"{"protocol_version":2,"request_id":"bad-version","command":"subscribe","channels":["canvas"]}"#,
+        );
+        let refused = read_remote_json(&mut telemetry, true);
+        assert_eq!(refused["status"], 400);
+        assert_eq!(refused["request_id"], "bad-version");
+        drop(telemetry);
+        let mut reconnected = connect_websocket(address);
+        send_websocket_text(&mut reconnected, &json!({
+            "protocol_version":1, "request_id":"resume-view", "command":"subscribe",
+            "channels":["canvas","events"], "max_fps":60,
+            "resume": {"session_id":advanced.identity.session_id.to_string(),
+                "after_revision":advanced.identity.publication_revision.to_string(), "after_event":"0"},
+        }).to_string());
+        assert_eq!(
+            read_remote_json(&mut reconnected, false)["type"],
+            "subscribed"
+        );
+        // A resumed event lane confirms its cursor even if no narratives occurred.
+        let mut confirmation = read_remote_binary(&mut reconnected);
+        if matches!(confirmation.payload, RemoteFramePayload::Canvas(_)) {
+            // Journal-state publication may have followed the telemetry sample
+            // used as the resume cursor; that newer canvas is valid as well.
+            confirmation = read_remote_binary(&mut reconnected);
+        }
+        assert!(matches!(
+            confirmation.payload,
+            RemoteFramePayload::Events(_)
+        ));
+        let applied = handle
+            .submit_command(
+                scriptbots_core::ControlCommand::SetSpeed(2.0),
+                Some("remote-paused-speed"),
+            )
+            .unwrap();
+        owner.wait_applied(&applied);
+        let changed = read_remote_binary(&mut reconnected);
+        assert!(matches!(changed.payload, RemoteFramePayload::Canvas(_)));
+        assert_eq!(
+            changed.identity.tick, 1,
+            "a paused control publication must reach viewers without a scientific tick"
+        );
+        assert_eq!(changed.playback.speed_multiplier, 2.0);
+        assert!(changed.identity.publication_revision > advanced.identity.publication_revision);
+
+        send_websocket_text(
+            &mut stalled,
+            &json!({
+                "protocol_version":1, "command":"status", "request_id":"stalled-control",
+                "command_id":applied.command_id,
+            })
+            .to_string(),
+        );
+        let mut observed_control = false;
+        for _ in 0..16 {
+            let (opcode, payload) = read_remote_websocket_message(&mut stalled);
+            assert_eq!(
+                opcode, 1,
+                "no second binary frame may queue before its channel is acknowledged"
+            );
+            let reply: Value = serde_json::from_slice(&payload).unwrap();
+            if reply["type"] == "stream_rate" {
+                continue;
+            }
+            assert_eq!(reply["request_id"], "stalled-control");
+            assert_eq!(reply["receipt"]["application_state"], "applied");
+            observed_control = true;
+            break;
+        }
+        assert!(
+            observed_control,
+            "withheld display credit must not block controls"
+        );
+        for frame in &withheld {
+            acknowledge_remote_frame(&mut stalled, frame);
+        }
+        let caught_up = read_remote_binary(&mut stalled);
+        assert!(matches!(caught_up.payload, RemoteFramePayload::Canvas(_)));
+        assert_eq!(caught_up.identity.tick, 1);
+        assert_eq!(caught_up.playback.speed_multiplier, 2.0);
+        assert!(
+            caught_up.coalesced_publications > 0,
+            "released credit catches up from the newest publication"
+        );
+
+        send_websocket_text(&mut reconnected, &json!({
+            "protocol_version":1,"request_id":"foreign-session","command":"subscribe","channels":["canvas"],
+            "resume":{"session_id":(initial.session_id.get() ^ 1).to_string(),"after_revision":"0"},
+        }).to_string());
+        assert_eq!(read_remote_json(&mut reconnected, true)["status"], 409);
+        assert_eq!(handle.status().unwrap().tick, 1);
+        drop(reconnected);
+        drop(canvas);
+        drop(stalled);
+        server.shutdown().unwrap();
+    }
+
+    #[test]
+    fn websocket_cadence_backs_off_and_recovers_without_exceeding_requested_rate() {
+        let requested = Duration::from_nanos(1_000_000_000 / 60);
+        let mut cadence = WsStreamCadence::new(requested);
+        assert_eq!(
+            cadence.observe(Duration::from_millis(80)),
+            Some("slow_consumer")
+        );
+        assert_eq!(cadence.current, Duration::from_millis(160));
+        for _ in 0..7 {
+            assert_eq!(cadence.observe(Duration::from_millis(1)), None);
+        }
+        assert_eq!(
+            cadence.observe(Duration::from_millis(1)),
+            Some("recovering")
+        );
+        assert_eq!(cadence.current, Duration::from_millis(120));
+        for _ in 0..128 {
+            cadence.observe(Duration::from_millis(1));
+        }
+        assert_eq!(cadence.current, requested);
+        assert_eq!(
+            cadence.observe(Duration::from_secs(4)),
+            Some("slow_consumer")
+        );
+        assert_eq!(cadence.current, Duration::from_secs(1));
+    }
+
+    fn read_websocket_reply(socket: &mut TcpStream) -> Value {
+        for _ in 0..64 {
+            let mut header = [0; 2];
+            socket
+                .read_exact(&mut header)
+                .expect("read server frame header");
+            assert_eq!(header[0] & 0x80, 0x80, "small server frames are complete");
+            assert_eq!(header[1] & 0x80, 0, "server frames are unmasked");
+            let len = match header[1] & 0x7f {
+                126 => {
+                    let mut length = [0; 2];
+                    socket.read_exact(&mut length).unwrap();
+                    usize::from(u16::from_be_bytes(length))
+                }
+                127 => panic!("unexpected oversized server frame"),
+                len => usize::from(len),
+            };
+            assert!(len <= MAX_WS_CONTROL_MESSAGE_BYTES);
+            let mut payload = vec![0; len];
+            socket
+                .read_exact(&mut payload)
+                .expect("read server payload");
+            match header[0] & 0x0f {
+                1 => return serde_json::from_slice(&payload).expect("typed control reply"),
+                2 => {
+                    let _: TickSummaryDto = postcard::from_bytes(&payload)
+                        .expect("real binary tick stream remains available");
+                }
+                opcode => panic!("unexpected opcode {opcode}"),
+            }
+        }
+        panic!("no control reply within bounded frame count");
+    }
+
+    #[test]
+    fn websocket_reconnect_retries_step_once_and_recovers_its_owner_receipt() {
+        let world = WorldState::new(ScriptBotsConfig {
+            world_width: 64,
+            world_height: 64,
+            food_cell_size: 16,
+            persistence_interval: 0,
+            rng_seed: Some(42),
+            closed: true,
+            ..ScriptBotsConfig::default()
+        })
+        .expect("WebSocket real host");
+        let owner = crate::control::tests::TestHost::spawn(world);
+        let reservation = ControlServerReservation::prepare(ControlServerConfig {
+            rest_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            mcp_transport: McpTransportConfig::Disabled,
+            ..ControlServerConfig::default()
+        })
+        .expect("reserve WebSocket listener");
+        let address = reservation.rest_address().unwrap();
+        let (server, _) = reservation
+            .launch(owner.port.clone(), false)
+            .expect("launch real Axum server");
+        let handle = server.control_handle().unwrap();
+        let request = r#"{"protocol_version":1,"request_id":"ws-step-once","command":"step"}"#;
+        let mut first = connect_websocket(address);
+        send_websocket_text(&mut first, request);
+        let reply = read_websocket_reply(&mut first);
+        assert_eq!(reply["protocol_version"], 1);
+        assert_eq!(reply["request_id"], "ws-step-once");
+        assert_eq!(reply["type"], "receipt", "{reply}");
+        let receipt: CommandStatusDto = serde_json::from_value(reply["receipt"].clone()).unwrap();
+        owner.wait_applied(&receipt);
+        drop(first);
+
+        // A second connection shares only the owner's ledger, not a socket cache.
+        let mut second = connect_websocket(address);
+        send_websocket_text(&mut second, request);
+        let retry = read_websocket_reply(&mut second);
+        assert_eq!(retry["receipt"]["command_id"], receipt.command_id);
+        assert_eq!(
+            retry["receipt"]["admission_sequence"],
+            serde_json::to_value(receipt.admission_sequence).unwrap()
+        );
+        assert_eq!(
+            handle.status().unwrap().tick,
+            1,
+            "retry must not advance a second tick"
+        );
+
+        send_websocket_text(&mut second, &json!({
+            "protocol_version":1, "request_id":"receipt-lookup", "command":"status", "command_id":receipt.command_id,
+        }).to_string());
+        let observed = read_websocket_reply(&mut second);
+        assert_eq!(observed["request_id"], "receipt-lookup");
+        assert_eq!(observed["receipt"]["application_state"], "applied");
+
+        send_websocket_text(
+            &mut second,
+            r#"{"protocol_version":1,"request_id":"ws-step-once","command":"resume"}"#,
+        );
+        let conflict = read_websocket_reply(&mut second);
+        assert_eq!(conflict["type"], "error");
+        assert_eq!(conflict["status"], 409);
+        assert_eq!(conflict["request_id"], "ws-step-once");
+        let after = handle.status().unwrap();
+        assert_eq!(after.tick, 1);
+        assert!(after.paused);
+
+        send_websocket_text(
+            &mut second,
+            r#"{"protocol_version":2,"request_id":"foreign-version","command":"step"}"#,
+        );
+        let refused = read_websocket_reply(&mut second);
+        assert_eq!(refused["type"], "error");
+        assert_eq!(refused["status"], 400);
+        assert_eq!(handle.status().unwrap().tick, 1);
+        drop(second);
+
+        // Discard the actual response before reading it, then retry only after
+        // independently observing that its scientific step really happened.
+        let lost_request =
+            r#"{"protocol_version":1,"request_id":"lost-step-receipt","command":"step"}"#;
+        let mut lost = connect_websocket(address);
+        send_websocket_text(&mut lost, lost_request);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while handle.status().unwrap().tick != 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "first lost-receipt step never applied"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        drop(lost);
+        let mut recovered = connect_websocket(address);
+        send_websocket_text(&mut recovered, lost_request);
+        let recovered_reply = read_websocket_reply(&mut recovered);
+        assert_eq!(recovered_reply["request_id"], "lost-step-receipt");
+        assert_eq!(recovered_reply["receipt"]["application_state"], "applied");
+        assert_eq!(
+            handle.status().unwrap().tick,
+            2,
+            "lost receipt must not double-step"
+        );
+        drop(recovered);
+        server.shutdown().expect("WebSocket server shutdown");
     }
 
     #[test]

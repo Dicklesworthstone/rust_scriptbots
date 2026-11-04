@@ -20,7 +20,7 @@ use scriptbots_analytics::dataframe::{
     AnalyticsExportFormat, export_database_table, read_parquet_batch,
 };
 use scriptbots_analytics::{ReaderCtx, Registry, ReportParams};
-use scriptbots_core::narrative::{EventKind, EventRecord};
+use scriptbots_core::narrative::{EventKind, EventRecord, NarrativeInputRecordV1};
 use scriptbots_core::{
     AgentData, AgentIdentity, AgentRuntime, AgentState, AgentUid, BirthOrigin, BirthRecord,
     BrainBinding, Generation, INTERACTION_EVENTS_OBSERVED_KIND, INTERACTION_EVENTS_PERSISTED_KIND,
@@ -34,6 +34,8 @@ use serde::{Deserialize, Serialize};
 const REQUIRED_REPORT_NAMES: &[&str] = &[
     "run-summary",
     "narrative-timeline",
+    "narrative-reconstruct",
+    "replay-timeline",
     "metric-summary",
     "metric-changepoints",
     "compare-runs",
@@ -158,6 +160,7 @@ fn empty_summary(tick: u64, pop: usize, births: usize) -> TickSummary {
 fn populate_seeded_fixture(dir: &Path) -> (String, String) {
     let run_path = dir.join("run.sqlite").display().to_string();
     let mut storage = Storage::create_unattributed_file(&run_path).expect("create run db");
+    let narrative_config = scriptbots_core::ScriptBotsConfig::default();
 
     let wobble = |tick: u64| -> f64 {
         let phase = u32::try_from(tick % 5).expect("fit");
@@ -289,6 +292,18 @@ fn populate_seeded_fixture(dir: &Path) -> (String, String) {
             narrative_events: Vec::new(),
             genomes: Vec::new(),
         };
+
+        if tick > 0 {
+            let record = NarrativeInputRecordV1::from_summary(&batch.summary, 0, &narrative_config)
+                .expect("complete detector input fixture");
+            batch.replay_events.push(ReplayEvent {
+                agent_uid: None,
+                position: None,
+                counterpart: None,
+                counterpart_position: None,
+                kind: ReplayEventKind::NarrativeInputV1 { record },
+            });
+        }
 
         if tick == 100 {
             // Planted regime change event
@@ -495,17 +510,39 @@ fn test_analytics_e2e_full_pipeline_and_invariants() {
         status: "pass".to_string(),
     });
 
-    // Invariant 2: narrative-timeline carries interaction replay events
+    // Invariant 2: both independently persisted streams reach their own timeline.
     let timeline = &report_machines["narrative-timeline"];
     let timeline_events = timeline["events"].as_array().expect("timeline events");
+    assert_eq!(timeline_events.len(), 2, "both planted narrative records");
+    assert_eq!(timeline_events[0]["record"]["tick"], 100);
+    assert_eq!(timeline_events[0]["record"]["kind"], "energy_collapse");
+    assert_eq!(timeline_events[1]["record"]["tick"], 100);
+    assert_eq!(timeline_events[1]["record"]["kind"], "population_crash");
+    invariants.push(InvariantRecord {
+        invariant: "narrative_timeline_typed_records_present".to_string(),
+        expected: serde_json::json!({ "events_count": 2 }),
+        observed: serde_json::json!({ "events_count": timeline_events.len() }),
+        status: "pass".to_string(),
+    });
+    let replay_events = report_machines["replay-timeline"]["events"]
+        .as_array()
+        .expect("replay events");
     assert!(
-        !timeline_events.is_empty(),
-        "narrative-timeline must contain replay events"
+        !replay_events.is_empty(),
+        "replay-timeline must contain interaction replay events"
+    );
+    let replay_interactions = replay_events
+        .iter()
+        .filter(|event| event["event"]["kind"]["Interaction"].is_object())
+        .count();
+    assert_eq!(
+        replay_interactions, 40,
+        "canonical detector inputs must not mask missing interaction evidence"
     );
     invariants.push(InvariantRecord {
-        invariant: "narrative_timeline_replay_events_present".to_string(),
-        expected: serde_json::json!({ "events_non_empty": true }),
-        observed: serde_json::json!({ "events_count": timeline_events.len() }),
+        invariant: "replay_timeline_replay_events_present".to_string(),
+        expected: serde_json::json!({ "events_non_empty": true, "interaction_count": 40 }),
+        observed: serde_json::json!({ "events_count": replay_events.len(), "interaction_count": replay_interactions }),
         status: "pass".to_string(),
     });
 

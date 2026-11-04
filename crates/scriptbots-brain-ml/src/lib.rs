@@ -1,3 +1,6 @@
+//! Optional ML adapters: Candle evaluation, a versioned Frankentorch family, and
+//! sensor-copy placeholders when no Candle backend is selected.
+
 #[cfg(feature = "candle")]
 pub mod candle;
 
@@ -14,12 +17,16 @@ use scriptbots_brain::{Brain, BrainCloneError, BrainKind, BrainMutationError, in
 use scriptbots_core::{BrainRunner, INPUT_SIZE, OUTPUT_SIZE, RandomStream};
 use std::any::Any;
 
-/// Supported ML backends selected at build time.
+/// ML backend labels selected at build time.
 #[derive(Debug, Clone, Copy, Default)]
 pub enum MlBackendKind {
+    /// Candle dense-network evaluator when the `candle` feature is enabled.
     Candle,
+    /// Tract dependency selection; the unified adapter currently copies sensors.
     Tract,
+    /// Tch dependency selection; the unified adapter currently copies sensors.
     Tch,
+    /// No ML dependency selected; the unified adapter copies sensors.
     #[default]
     None,
 }
@@ -40,26 +47,27 @@ impl Default for MlBrain {
 
 impl MlBrain {
     /// Construct a new ML brain instance using the active backend feature.
+    #[cfg(feature = "candle")]
     #[must_use]
     pub fn new() -> Self {
-        #[cfg(feature = "candle")]
-        {
-            Self {
-                kind: MlBackendKind::Candle,
-                candle: Some(CandleBrain::new()),
-            }
+        Self {
+            kind: MlBackendKind::Candle,
+            candle: Some(CandleBrain::new()),
         }
-        #[cfg(not(feature = "candle"))]
-        {
-            let kind = if cfg!(feature = "tract") {
-                MlBackendKind::Tract
-            } else if cfg!(feature = "tch") {
-                MlBackendKind::Tch
-            } else {
-                MlBackendKind::None
-            };
-            Self { kind }
-        }
+    }
+
+    /// Construct a sensor-copy placeholder labelled with the selected dependency.
+    #[cfg(not(feature = "candle"))]
+    #[must_use]
+    pub const fn new() -> Self {
+        let kind = if cfg!(feature = "tract") {
+            MlBackendKind::Tract
+        } else if cfg!(feature = "tch") {
+            MlBackendKind::Tch
+        } else {
+            MlBackendKind::None
+        };
+        Self { kind }
     }
 
     /// Returns which backend is active.

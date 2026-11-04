@@ -1,3 +1,5 @@
+//! Deterministic headless-world integration for the `NeuroFlow` adapter.
+
 use scriptbots_brain_neuro::{NeuroflowBrain, NeuroflowBrainConfig};
 use scriptbots_core::{AgentData, ScriptBotsConfig, WorldState};
 
@@ -11,7 +13,7 @@ fn neuroflow_only_world_is_deterministic() {
     config.world_height = 200;
     config.food_cell_size = 20;
     config.initial_food = 0.25;
-    config.rng_seed = Some(0xA1B2C3);
+    config.rng_seed = Some(0x00A1_B2C3);
 
     let mut world_a = WorldState::new(config.clone()).expect("world_a");
     let mut world_b = WorldState::new(config).expect("world_b");

@@ -9,6 +9,9 @@ description = "High-performance wgpu-based world renderer for ScriptBots with of
 name = "scriptbots_world_gfx"
 path = "src/lib.rs"
 
+[lints]
+workspace = true
+
 [dependencies]
 bytemuck = { version = "1.16", features = ["derive"] }
 tracing = { workspace = true }

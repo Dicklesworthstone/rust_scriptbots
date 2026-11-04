@@ -1,6 +1,6 @@
 #![cfg_attr(windows, feature(windows_by_handle))]
 
-//! FrankenSQLite-backed persistence layer for ScriptBots.
+//! `FrankenSQLite`-backed persistence layer for `ScriptBots`.
 
 mod journal;
 
@@ -55,14 +55,17 @@ pub use fsqlite::{
 
 const DEFAULT_ERROR_PUBLICATION_ATTEMPTS: usize = 16;
 
+/// Same-thread blocking facade over a `FrankenSQLite` connection.
+///
+/// The underlying connection remains `!Send + !Sync`; futures run on the caller's thread.
 #[derive(Debug)]
 pub struct Connection {
     inner: AsyncConnection,
 }
 
-/// Drive one fsqlite future to completion on the calling thread, with its file I/O inline.
+/// Drive one `fsqlite` future to completion on the calling thread, with its file I/O inline.
 ///
-/// fsqlite's unix VFS routes every read, write and sync through
+/// `fsqlite`'s unix VFS routes every read, write and sync through
 /// `asupersync::runtime::spawn_blocking_io`. With no ambient `Cx` that falls back to
 /// spawning a brand-new OS thread per operation, which under host load made single
 /// statements take ~0.5 s and commits ~0.8 s and let journal commits run past their
@@ -76,28 +79,35 @@ fn block_on_inline<T>(future: impl std::future::Future<Output = T>) -> T {
 }
 
 impl Connection {
-    pub fn new(inner: AsyncConnection) -> Self {
+    /// Wrap an existing connection without moving execution to another thread.
+    pub const fn new(inner: AsyncConnection) -> Self {
         Self { inner }
     }
 
-    pub fn inner(&self) -> &AsyncConnection {
+    /// Borrow the underlying asynchronous connection.
+    #[must_use]
+    pub const fn inner(&self) -> &AsyncConnection {
         &self.inner
     }
 
-    pub fn inner_mut(&mut self) -> &mut AsyncConnection {
+    /// Mutably borrow the underlying asynchronous connection.
+    pub const fn inner_mut(&mut self) -> &mut AsyncConnection {
         &mut self.inner
     }
 
+    /// Open a database using the engine's default creation policy.
     pub fn open(path: impl Into<String>) -> Result<Self, FrankenError> {
         let conn = block_on_inline(Box::pin(AsyncConnection::open(path)))?;
         Ok(Self { inner: conn })
     }
 
+    /// Open an existing database without creating a missing file.
     pub fn open_existing(path: impl Into<String>) -> Result<Self, FrankenError> {
         let conn = block_on_inline(Box::pin(AsyncConnection::open_existing(path)))?;
         Ok(Self { inner: conn })
     }
 
+    /// Open an existing database only with the expected descriptor identity.
     pub fn open_existing_with_expected_identity(
         path: impl Into<String>,
         expected_identity: FileIdentity,
@@ -108,16 +118,19 @@ impl Connection {
         Ok(Self { inner: conn })
     }
 
+    /// Open with the engine's strict multi-process policy.
     pub fn open_strict_multi_process(path: impl Into<String>) -> Result<Self, FrankenError> {
         let conn = block_on_inline(Box::pin(AsyncConnection::open_strict_multi_process(path)))?;
         Ok(Self { inner: conn })
     }
 
+    /// Execute one statement and return its affected-row count.
     pub fn execute(&self, sql: &str) -> Result<usize, FrankenError> {
         let fut = self.inner.execute(sql);
         block_on_inline(Box::pin(fut))
     }
 
+    /// Execute one statement with positional parameters.
     pub fn execute_with_params(
         &self,
         sql: &str,
@@ -127,16 +140,19 @@ impl Connection {
         block_on_inline(Box::pin(fut))
     }
 
+    /// Execute a batch of SQL statements on the calling thread.
     pub fn execute_batch(&self, sql: &str) -> Result<(), FrankenError> {
         let fut = self.inner.execute_batch(sql);
         block_on_inline(Box::pin(fut))
     }
 
+    /// Collect all rows returned by a query.
     pub fn query(&self, sql: &str) -> Result<Vec<Row>, FrankenError> {
         let fut = self.inner.query(sql);
         block_on_inline(Box::pin(fut))
     }
 
+    /// Collect all rows returned by a parameterized query.
     pub fn query_with_params(
         &self,
         sql: &str,
@@ -146,11 +162,13 @@ impl Connection {
         block_on_inline(Box::pin(fut))
     }
 
+    /// Query one row using the engine's single-row contract.
     pub fn query_row(&self, sql: &str) -> Result<Row, FrankenError> {
         let fut = self.inner.query_row(sql);
         block_on_inline(Box::pin(fut))
     }
 
+    /// Query one row with positional parameters.
     pub fn query_row_with_params(
         &self,
         sql: &str,
@@ -160,72 +178,87 @@ impl Connection {
         block_on_inline(Box::pin(fut))
     }
 
+    /// Report whether the connection currently has an active transaction.
+    #[must_use]
     pub fn in_transaction(&self) -> bool {
         self.inner.in_transaction()
     }
 
+    /// Begin a transaction on this connection.
     pub fn begin_transaction(&self) -> Result<(), FrankenError> {
         let fut = self.inner.begin_transaction();
         block_on_inline(Box::pin(fut))
     }
 
+    /// Commit the connection's current transaction.
     pub fn commit_transaction(&self) -> Result<(), FrankenError> {
         let fut = self.inner.commit_transaction();
         block_on_inline(Box::pin(fut))
     }
 
+    /// Roll back the connection's current transaction.
     pub fn rollback_transaction(&self) -> Result<(), FrankenError> {
         let fut = self.inner.rollback_transaction();
         block_on_inline(Box::pin(fut))
     }
 
+    /// Begin a scoped transaction borrowing this connection.
     pub fn transaction(&self) -> Result<Transaction<'_>, FrankenError> {
         let fut = self.inner.transaction();
         let tx = block_on_inline(Box::pin(fut))?;
         Ok(Transaction { inner: tx })
     }
 
+    /// Read the underlying file identity, if this is a file-backed connection.
     pub fn file_identity(&self) -> Result<Option<FileIdentity>, FrankenError> {
         let fut = self.inner.file_identity();
         block_on_inline(Box::pin(fut))
     }
 
+    /// Close the connection with the engine's checkpointing close path.
     pub fn close(self) -> Result<(), FrankenError> {
         let fut = self.inner.close();
         block_on_inline(Box::pin(fut))
     }
 
+    /// Attempt to close in place without returning the close error.
     pub fn close_best_effort_in_place(&mut self) {
         let fut = self.inner.close_best_effort_in_place();
         block_on_inline(Box::pin(fut));
     }
 
+    /// Close without checkpointing the database.
     pub fn close_without_checkpoint(self) -> Result<(), FrankenError> {
         let fut = self.inner.close_without_checkpoint();
         block_on_inline(Box::pin(fut))
     }
 }
 
+/// Same-thread blocking facade for a borrowed `FrankenSQLite` transaction.
 pub struct Transaction<'a> {
     inner: AsyncTransaction<'a>,
 }
 
-impl<'a> Transaction<'a> {
+impl Transaction<'_> {
+    /// Commit this transaction on its connection-owning thread.
     pub fn commit(&mut self) -> Result<(), FrankenError> {
         let fut = self.inner.commit();
         block_on_inline(Box::pin(fut))
     }
 
+    /// Roll back this transaction on its connection-owning thread.
     pub fn rollback(&mut self) -> Result<(), FrankenError> {
         let fut = self.inner.rollback();
         block_on_inline(Box::pin(fut))
     }
 
+    /// Execute a statement within this transaction.
     pub fn execute(&self, sql: &str) -> Result<usize, FrankenError> {
         let fut = self.inner.execute(sql);
         block_on_inline(Box::pin(fut))
     }
 
+    /// Execute a parameterized statement within this transaction.
     pub fn execute_with_params(
         &self,
         sql: &str,
@@ -235,16 +268,19 @@ impl<'a> Transaction<'a> {
         block_on_inline(Box::pin(fut))
     }
 
+    /// Execute a SQL batch within this transaction.
     pub fn execute_batch(&self, sql: &str) -> Result<(), FrankenError> {
         let fut = self.inner.execute_batch(sql);
         block_on_inline(Box::pin(fut))
     }
 
+    /// Collect all query rows within this transaction.
     pub fn query(&self, sql: &str) -> Result<Vec<Row>, FrankenError> {
         let fut = self.inner.query(sql);
         block_on_inline(Box::pin(fut))
     }
 
+    /// Collect all parameterized-query rows within this transaction.
     pub fn query_with_params(
         &self,
         sql: &str,
@@ -254,11 +290,13 @@ impl<'a> Transaction<'a> {
         block_on_inline(Box::pin(fut))
     }
 
+    /// Query one row within this transaction.
     pub fn query_row(&self, sql: &str) -> Result<Row, FrankenError> {
         let fut = self.inner.query_row(sql);
         block_on_inline(Box::pin(fut))
     }
 
+    /// Query one row with positional parameters within this transaction.
     pub fn query_row_with_params(
         &self,
         sql: &str,
@@ -316,13 +354,23 @@ fn rowid_of(
     }
 }
 
+/// Ordered migration declarations executed synchronously on one connection.
 #[derive(Clone, Debug)]
 pub struct MigrationRunner {
     inner: AsyncMigrationRunner,
     migrations: Vec<(i64, &'static str, &'static str)>,
 }
 
+fn recorded_migration_version(conn: &Connection) -> Result<i64, FrankenError> {
+    let rows = conn.query("SELECT MAX(version) FROM _schema_migrations;")?;
+    Ok(rows.first().map_or(0, |row| match row.get(0) {
+        Some(SqliteValue::Integer(version)) => *version,
+        _ => 0,
+    }))
+}
+
 impl MigrationRunner {
+    /// Construct an empty migration runner.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -331,6 +379,7 @@ impl MigrationRunner {
         }
     }
 
+    /// Append one versioned SQL migration to the execution order.
     #[must_use]
     pub fn add(mut self, version: i64, name: &'static str, up_sql: &'static str) -> Self {
         self.inner = self.inner.add(version, name, up_sql);
@@ -338,6 +387,12 @@ impl MigrationRunner {
         self
     }
 
+    /// Apply migrations not already recorded by the connection.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a migration classified as an insert-from-select has no SELECT token,
+    /// or the internal failure marker is set without retaining its error.
     pub fn run(&self, conn: &Connection) -> Result<MigrationResult, FrankenError> {
         conn.execute(
             "CREATE TABLE IF NOT EXISTS _schema_migrations (
@@ -346,15 +401,7 @@ impl MigrationRunner {
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );",
         )?;
-        let rows = conn.query("SELECT MAX(version) FROM _schema_migrations;")?;
-        let initial_version = if let Some(row) = rows.first() {
-            match row.get(0) {
-                Some(SqliteValue::Integer(v)) => *v,
-                _ => 0,
-            }
-        } else {
-            0
-        };
+        let initial_version = recorded_migration_version(conn)?;
         let was_fresh = initial_version == 0;
         let mut applied = Vec::new();
 
@@ -437,15 +484,7 @@ impl MigrationRunner {
             applied.push(version);
         }
 
-        let final_rows = conn.query("SELECT MAX(version) FROM _schema_migrations;")?;
-        let current_version = if let Some(row) = final_rows.first() {
-            match row.get(0) {
-                Some(SqliteValue::Integer(v)) => *v,
-                _ => 0,
-            }
-        } else {
-            0
-        };
+        let current_version = recorded_migration_version(conn)?;
 
         Ok(MigrationResult {
             applied,
@@ -461,6 +500,7 @@ impl Default for MigrationRunner {
     }
 }
 
+/// Open a connection with explicit engine flags on the calling thread.
 pub fn open_with_flags<P: AsRef<std::path::Path>>(
     path: P,
     flags: OpenFlags,
@@ -535,8 +575,9 @@ const MAX_STORAGE_WAIT_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_TRANSACTION_ATTEMPTS: u8 = 4;
 const MAX_STORAGE_QUERY_PAGE: usize = 4_096;
 const MAX_NARRATIVE_QUERY_BYTES: usize = 1_024;
-/// Largest single host-journal archive, and so the largest page limit a journal reader may ask
-/// for. A command's archive carries its batch's whole persistence payload, so a reader that must
+/// Largest single host-journal archive and largest accepted journal-page byte limit.
+///
+/// A command's archive carries its batch's whole persistence payload, so a reader that must
 /// accept every recorded command passes this rather than a smaller guess.
 pub const MAX_HOST_JOURNAL_ARCHIVE_BYTES: usize = 256 << 20;
 // A command is control-plane input, not a scientific snapshot. Keeping its canonical durable
@@ -642,7 +683,7 @@ fn fail_at_host_journal_transaction_fault(
     Ok(())
 }
 
-/// Files FrankenSQLite may create beside its primary database.
+/// Files `FrankenSQLite` may create beside its primary database.
 pub const STORAGE_SIDECAR_SUFFIXES: [&str; 7] = [
     "-wal",
     "-shm",
@@ -668,7 +709,7 @@ const SCRIPTBOTS_SCHEMA_V16_VERSION: i64 = 16;
 pub const SCRIPTBOTS_SCHEMA_V17_VERSION: i64 = 17;
 const SCRIPTBOTS_SCHEMA_V18_VERSION: i64 = 18;
 
-/// Current schema version for new ScriptBots run databases.
+/// Current schema version for new `ScriptBots` run databases.
 pub const SCRIPTBOTS_SCHEMA_VERSION: i64 = 19;
 
 /// Historical schema migration alias for MAP-Elites behavioral archive (bd-16g.6.1).
@@ -834,7 +875,7 @@ impl ArchipelagoBarrierSink {
 /// the storage boundary rather than truncated on readback.
 ///
 /// IT IS `u32`, NOT `u16`, AND THE DISTINCTION IS LOAD-BEARING. bd-8djh's description said
-/// island_id was `u16` in memory and this constant was first written as `u16::MAX`, which would
+/// `island_id` was `u16` in memory and this constant was first written as `u16::MAX`, which would
 /// have refused every island above 65535 that the canonical type permits. bd-cxcf had already
 /// converged three competing `IslandId` declarations onto the `u32` newtype and deleted the
 /// `u16` one (29c6d6edfa) — the bead text was simply older than the type. A storage bound
@@ -843,7 +884,7 @@ impl ArchipelagoBarrierSink {
 /// trip at the boundary.
 pub const SCRIPTBOTS_MAX_ISLAND_ID: i64 = u32::MAX as i64;
 
-/// Frozen canonical V6 bootstrap DDL for the run-scoped ScriptBots persistence schema.
+/// Frozen canonical V6 bootstrap DDL for the run-scoped `ScriptBots` persistence schema.
 ///
 /// Run identifiers, explicitly lossless manifest scalars, opaque identifiers, canonical JSON,
 /// and digests use text. Scientific counters retain the existing checked signed-integer boundary.
@@ -851,7 +892,7 @@ pub const SCRIPTBOTS_MAX_ISLAND_ID: i64 = u32::MAX as i64;
 /// export/import migration rather than an in-place rewrite.
 ///
 /// Fresh installs apply this bootstrap before the additive V7 and V8 migrations. This DDL is
-/// exported for read-only schema inspection and FrankenSQLite conformance probes. It is not a
+/// exported for read-only schema inspection and `FrankenSQLite` conformance probes. It is not a
 /// supported file-writer API; production scientific writes must use [`StoragePipeline`].
 pub const SCRIPTBOTS_SCHEMA_V6: &str = r#"
     CREATE TABLE runs (
@@ -1695,7 +1736,7 @@ const SCRIPTBOTS_SCHEMA_V10: &str = r#"
 
 /// V11 migration: retire the unwritten external-content FTS declaration.
 ///
-/// Pinned FrankenSQLite rejects dropping and recreating a live virtual table under the same
+/// Pinned `FrankenSQLite` rejects dropping and recreating a live virtual table under the same
 /// name inside one transaction. `MigrationRunner` gives every migration its own transaction,
 /// so the replacement is intentionally split across V11 and V12. A crash after this migration
 /// leaves an explicit V11 database with no search table; rerunning the chain creates and
@@ -1733,7 +1774,7 @@ const SCRIPTBOTS_SCHEMA_V12: &str = r#"
 ///
 /// The normalized terminal projection is intentionally not the first owner of a `CommandId`: it
 /// is written only after application. This claim table is populated atomically on the storage
-/// worker before a cache-miss submission may enter HostCore, closing the absence/admission race
+/// worker before a cache-miss submission may enter `HostCore`, closing the absence/admission race
 /// and leaving an honest indeterminate claim after a crash before terminal archival.
 const SCRIPTBOTS_SCHEMA_V13: &str = r#"
     CREATE TABLE host_command_claims (
@@ -2835,13 +2876,21 @@ pub struct RunManifestRecord {
 /// Bounded run-browser row used to discover an explicit [`RunId`] without bypassing storage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunCatalogEntry {
+    /// Canonical run identifier.
     pub run_id: RunId,
+    /// Version of the canonical manifest schema.
     pub manifest_schema_version: u16,
+    /// Optional experiment grouping key.
     pub experiment_id: Option<String>,
+    /// Optional variant key within an experiment.
     pub variant_id: Option<String>,
+    /// Scenario preset identifier.
     pub scenario_id: String,
+    /// Scenario schema version.
     pub scenario_version: u16,
+    /// Recorded start time in milliseconds since the Unix epoch.
     pub started_at_unix_ms: u64,
+    /// Reproducibility flag declared by the run manifest.
     pub reproducible: bool,
 }
 
@@ -4280,20 +4329,50 @@ fn manifest_projection_error(reason: impl Into<String>) -> StorageError {
 /// a human message. Database/corruption failures remain separate [`StorageError`] variants.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum NarrativeQueryError {
+    /// The query contains no searchable input.
     #[error("narrative query is empty")]
     Empty,
+    /// The query exceeds the allowed byte length.
     #[error("narrative query is {bytes} bytes; maximum is {max}")]
-    TooLong { bytes: usize, max: usize },
+    TooLong {
+        /// Supplied query length in bytes.
+        bytes: usize,
+        /// Maximum query length in bytes.
+        max: usize,
+    },
+    /// The query includes a forbidden NUL character.
     #[error("narrative query contains a NUL character")]
     ContainsNul,
+    /// The half-open tick interval is empty or reversed.
     #[error("narrative tick range must be non-empty and half-open, found [{start}, {end})")]
-    InvalidTickRange { start: u64, end: u64 },
+    InvalidTickRange {
+        /// Inclusive interval start.
+        start: u64,
+        /// Exclusive interval end.
+        end: u64,
+    },
+    /// A tick cannot be represented by storage's signed integer type.
     #[error("{field} tick {value} exceeds the i64 range supported by storage")]
-    TickOutOfRange { field: &'static str, value: u64 },
+    TickOutOfRange {
+        /// Input field containing the tick.
+        field: &'static str,
+        /// Supplied tick value.
+        value: u64,
+    },
+    /// The requested result count exceeds the query cap.
     #[error("narrative result limit {limit} exceeds the bounded maximum {max}")]
-    LimitTooLarge { limit: usize, max: usize },
+    LimitTooLarge {
+        /// Requested result count.
+        limit: usize,
+        /// Maximum permitted result count.
+        max: usize,
+    },
+    /// A tick window contains too many rows for bounded retrieval.
     #[error("narrative tick window exceeds the bounded maximum of {max} rows")]
-    AroundWindowTooDense { max: usize },
+    AroundWindowTooDense {
+        /// Maximum permitted row count.
+        max: usize,
+    },
 }
 
 /// Stable refusals from the complete persisted narrative-input stream.
@@ -4303,84 +4382,164 @@ pub enum NarrativeQueryError {
 /// a contract drift.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum NarrativeInputStreamError {
+    /// Requested page size is outside the permitted range.
     #[error("narrative input page size {limit} is outside 1..={max}")]
-    InvalidPageSize { limit: usize, max: usize },
+    InvalidPageSize {
+        /// Requested number of rows.
+        limit: usize,
+        /// Largest accepted page size.
+        max: usize,
+    },
+    /// Complete paging requires a reader with a finished-run lease.
     #[error("complete narrative input paging requires a finished-run reader")]
     FinishedReaderRequired,
+    /// Required narrative evidence is absent.
     #[error("run has no narrative input evidence at tick {first_offending_tick}")]
-    MissingEvidence { first_offending_tick: u64 },
+    MissingEvidence {
+        /// First tick lacking the required evidence.
+        first_offending_tick: u64,
+    },
+    /// Persisted evidence does not cover the required run interval.
     #[error(
         "narrative input stream is truncated at tick {first_offending_tick}: terminal tick {terminal_tick}, rows={rows}, min={minimum_tick:?}, max={maximum_tick:?}"
     )]
     Truncated {
+        /// First tick at which continuity fails.
         first_offending_tick: u64,
+        /// Expected terminal simulation tick.
         terminal_tick: u64,
+        /// Number of persisted input rows observed.
         rows: u64,
+        /// Smallest persisted input tick, if any.
         minimum_tick: Option<u64>,
+        /// Greatest persisted input tick, if any.
         maximum_tick: Option<u64>,
     },
+    /// More than one input row names the same tick.
     #[error("narrative input repeats tick {tick}")]
-    DuplicateTick { tick: u64 },
+    DuplicateTick {
+        /// Repeated tick.
+        tick: u64,
+    },
+    /// Input tick ordering moved backwards.
     #[error("narrative input tick {current} follows newer tick {previous}")]
-    OutOfOrder { previous: u64, current: u64 },
+    OutOfOrder {
+        /// Tick of the preceding row.
+        previous: u64,
+        /// Tick of the offending row.
+        current: u64,
+    },
+    /// Consecutive persisted inputs omit an expected tick.
     #[error(
         "narrative input stream has a gap after tick {previous}: expected {expected}, found {actual}"
     )]
     TickGap {
+        /// Tick before the gap.
         previous: u64,
+        /// Expected next tick.
         expected: u64,
+        /// Next tick actually observed.
         actual: u64,
     },
+    /// A row changes the expected record or input schema version.
     #[error(
         "narrative input contract changed at tick {tick}: expected record/input schemas {expected_record}/{expected_input}, found {actual_record}/{actual_input}"
     )]
     MixedVersion {
+        /// Tick carrying the inconsistent versions.
         tick: u64,
+        /// Expected record schema version.
         expected_record: u32,
+        /// Observed record schema version.
         actual_record: u32,
+        /// Expected detector input schema version.
         expected_input: u32,
+        /// Observed detector input schema version.
         actual_input: u32,
     },
+    /// A row changes the expected configuration revision.
     #[error(
         "narrative configuration revision changed at tick {tick}: expected {expected}, found {actual}"
     )]
     MixedConfiguration {
+        /// Tick carrying the inconsistent revision.
         tick: u64,
+        /// Expected configuration revision.
         expected: u64,
+        /// Observed configuration revision.
         actual: u64,
     },
+    /// A row changes the expected detector policy.
     #[error("narrative detector policy changed at tick {tick}")]
-    MixedPolicy { tick: u64 },
+    MixedPolicy {
+        /// Tick carrying the inconsistent policy.
+        tick: u64,
+    },
+    /// Retained detector history cannot satisfy the requested analysis.
     #[error(
         "narrative detector history is insufficient at tick {first_offending_tick}: available {available}, required {required}"
     )]
     InsufficientHistory {
+        /// First tick without sufficient history.
         first_offending_tick: u64,
+        /// Number of available history entries.
         available: u64,
+        /// Number of history entries required.
         required: u64,
     },
+    /// The cursor names a different run.
     #[error("narrative cursor belongs to run {actual}, expected {expected}")]
-    CursorRunMismatch { expected: RunId, actual: RunId },
+    CursorRunMismatch {
+        /// Reader's selected run.
+        expected: RunId,
+        /// Run named by the cursor.
+        actual: RunId,
+    },
+    /// The cursor's configuration digest disagrees with the selected run.
     #[error("narrative cursor config digest does not match the selected run at tick {tick}")]
-    CursorConfigDigestMismatch { tick: u64 },
+    CursorConfigDigestMismatch {
+        /// Cursor tick.
+        tick: u64,
+    },
+    /// The cursor's build or manifest digest disagrees with the selected run.
     #[error(
         "narrative cursor build/manifest digest does not match the selected run at tick {tick}"
     )]
-    CursorBuildDigestMismatch { tick: u64 },
+    CursorBuildDigestMismatch {
+        /// Cursor tick.
+        tick: u64,
+    },
+    /// The cursor's stream contract disagrees with the selected run.
     #[error("narrative cursor contract does not match the selected run at tick {tick}")]
-    CursorContractMismatch { tick: u64 },
+    CursorContractMismatch {
+        /// Cursor tick.
+        tick: u64,
+    },
+    /// The cursor does not identify an exact persisted input.
     #[error("narrative cursor does not name one exact persisted input at tick {tick}")]
-    CursorNotFound { tick: u64 },
+    CursorNotFound {
+        /// Cursor tick.
+        tick: u64,
+    },
+    /// A stored input row cannot satisfy the typed input contract.
     #[error("invalid narrative input record at tick {tick}: {reason}")]
-    InvalidRecord { tick: u64, reason: String },
+    InvalidRecord {
+        /// Offending input tick.
+        tick: u64,
+        /// Validation failure.
+        reason: String,
+    },
 }
 
 /// Fixed-width narrative detector policy bound to a persisted stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NarrativeInputPolicyV1 {
+    /// Tick cadence of narrative detection.
     pub narrative_interval: u32,
+    /// Maximum retained detector history entries.
     pub history_capacity: u64,
+    /// Maximum retained narrative events.
     pub event_capacity: u64,
 }
 
@@ -4424,21 +4583,29 @@ impl NarrativeInputPolicyV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NarrativeInputBindingV1 {
+    /// Run selected for the stream.
     pub run_id: RunId,
+    /// Persisted narrative input record schema version.
     pub record_schema_version: u32,
+    /// Detector input schema version.
     pub input_schema_version: u32,
     /// Configuration revision of the stream's first record. Later transitions
     /// are authenticated against the owner journal during binding validation.
     pub config_revision: u64,
+    /// Digest of the stream's run configuration.
     pub config_digest: String,
+    /// Digest binding the stream to its run manifest.
     pub manifest_digest: String,
     /// Detector policy of the first record; each returned record and cursor
     /// carries its own authenticated policy.
     pub policy: NarrativeInputPolicyV1,
     /// Smallest retained detector-history capacity observed across authenticated policies.
     pub minimum_history_capacity: u64,
+    /// First tick in the validated stream.
     pub first_tick: u64,
+    /// Terminal tick of the finished run.
     pub terminal_tick: u64,
+    /// Total number of input rows covered by the binding.
     pub input_count: u64,
 }
 
@@ -4446,13 +4613,21 @@ pub struct NarrativeInputBindingV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NarrativeInputCursorV1 {
+    /// Run containing the cursor's input row.
     pub run_id: RunId,
+    /// Tick of the cursor's input row.
     pub tick: u64,
+    /// Input record schema version at the cursor.
     pub record_schema_version: u32,
+    /// Detector input schema version at the cursor.
     pub input_schema_version: u32,
+    /// Authenticated configuration revision at the cursor.
     pub config_revision: u64,
+    /// Digest of the selected run's configuration.
     pub config_digest: String,
+    /// Digest of the selected run's manifest.
     pub manifest_digest: String,
+    /// Authenticated detector policy at the cursor.
     pub policy: NarrativeInputPolicyV1,
 }
 
@@ -4460,23 +4635,33 @@ pub struct NarrativeInputCursorV1 {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NarrativeInputPageV1 {
+    /// Shared validated stream provenance and continuity evidence.
     pub binding: NarrativeInputBindingV1,
+    /// Canonically ordered input records in this page.
     pub inputs: Vec<NarrativeInputRecordV1>,
+    /// Exclusive cursor for the next page, if another page remains.
     pub next_after: Option<NarrativeInputCursorV1>,
 }
 
 /// Storage error wrapper.
 #[derive(Debug, Error)]
 pub enum StorageError {
+    /// A checkpoint would exceed retention limits; existing checkpoints remain intact.
     #[error(
         "checkpoint retention exhausted for {scope}: retained {count} rows / {bytes} bytes, requested {requested_bytes} bytes, limits {max_count} rows / {max_bytes} bytes; existing checkpoints are preserved"
     )]
     CheckpointCapacityExceeded {
+        /// Checkpoint retention scope.
         scope: &'static str,
+        /// Number of retained checkpoint rows.
         count: u64,
+        /// Bytes occupied by retained checkpoints.
         bytes: u64,
+        /// Bytes requested by the new checkpoint.
         requested_bytes: u64,
+        /// Maximum retained checkpoint count.
         max_count: u64,
+        /// Maximum retained checkpoint bytes.
         max_bytes: u64,
     },
     /// The batch was refused BEFORE it was prepared, because it is too large.
@@ -4553,6 +4738,7 @@ pub enum StorageError {
         /// Underlying failure reason.
         reason: String,
     },
+    /// The underlying database engine returned an error.
     #[error("FrankenSQLite error: {0}")]
     Database(#[from] FrankenError),
     /// A caller requested a hard wall-clock bound that the pinned read facade cannot supply.
@@ -4573,18 +4759,25 @@ pub enum StorageError {
         /// Exact immutable source revision against which the refusal was established.
         engine_revision: &'static str,
     },
+    /// A transaction failed with an explicit commit-state classification.
     #[error(
         "FrankenSQLite transaction failed after {attempts} attempt(s) (transient={transient}, commit_state={commit_state:?}): {source}"
     )]
     Transaction {
+        /// Number of transaction attempts performed.
         attempts: u8,
+        /// Whether the engine failure was classified as transient.
         transient: bool,
+        /// Whether the failed operation could have committed.
         commit_state: FailureCommitState,
+        /// Original typed engine cause.
         #[source]
         source: FrankenError,
     },
+    /// The requested operation requires a connection that has already closed.
     #[error("storage is already closed")]
     Closed,
+    /// A terminal transaction failure prevents replaying buffered rows.
     #[error("storage transaction is terminally failed; buffered rows will not be replayed")]
     TerminallyFailed,
     /// A narrative search caller supplied invalid or too-dense bounded input.
@@ -4596,32 +4789,62 @@ pub enum StorageError {
     /// A narrative event failed its versioned typed persistence contract.
     #[error(transparent)]
     RunEvent(#[from] RunEventDecodeError),
+    /// Data failed validation at a named storage boundary.
     #[error("invalid storage data in {context}: {reason}")]
     InvalidData {
+        /// Boundary or field that rejected the data.
         context: &'static str,
+        /// Validation failure.
         reason: String,
     },
     /// A caller-declared evidence requirement was evaluated honestly and found no qualifying rows.
     #[error("no storage evidence in {context}: {reason}")]
     NoEvidence {
+        /// Evidence query or contract being evaluated.
         context: &'static str,
+        /// Why the required evidence was absent.
         reason: String,
     },
+    /// A requested storage path violates the target contract.
     #[error("invalid storage target {path:?}: {reason}")]
-    InvalidTarget { path: String, reason: String },
+    InvalidTarget {
+        /// Requested path.
+        path: String,
+        /// Target validation failure.
+        reason: String,
+    },
+    /// An operation on a storage file or directory failed.
     #[error("failed to {operation} storage path {path:?}: {source}")]
     Filesystem {
+        /// Filesystem operation attempted.
         operation: &'static str,
+        /// Path involved in the operation.
         path: PathBuf,
+        /// Original I/O cause.
         #[source]
         source: io::Error,
     },
+    /// Another writer holds the database's operating-system lease.
     #[error("another ScriptBots writer owns database {path} through OS lease {lock_path}")]
-    WriterLeaseHeld { path: String, lock_path: String },
+    WriterLeaseHeld {
+        /// Database path.
+        path: String,
+        /// Companion path carrying the writer lease.
+        lock_path: String,
+    },
+    /// The storage worker failed or did not return its required acknowledgement.
     #[error(transparent)]
     Worker(#[from] StorageWorkerError),
+    /// A persisted replay event cannot be decoded.
     #[error("invalid replay event at tick {tick}, seq {seq}: {reason}")]
-    ReplayParse { tick: i64, seq: i64, reason: String },
+    ReplayParse {
+        /// Tick stored in the replay row.
+        tick: i64,
+        /// Sequence stored in the replay row.
+        seq: i64,
+        /// Decode failure.
+        reason: String,
+    },
     /// Genome persistence and readback errors.
     #[error(transparent)]
     Genome(#[from] GenomeStorageError),
@@ -4633,43 +4856,82 @@ pub enum StorageError {
 /// Versioned genome persistence and readback errors.
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum GenomeStorageError {
+    /// No genome matched the requested agent and tick.
     #[error("genome not found for agent {agent_uid:?} at tick {tick:?}")]
     NotFound {
+        /// Agent filter, when supplied.
         agent_uid: Option<AgentUid>,
+        /// Tick filter, when supplied.
         tick: Option<Tick>,
     },
+    /// A stored genome payload failed decoding or validation.
     #[error("corrupt genome payload for genome {genome_id}: {reason}")]
-    CorruptPayload { genome_id: String, reason: String },
+    CorruptPayload {
+        /// Identifier of the corrupt genome.
+        genome_id: String,
+        /// Payload validation failure.
+        reason: String,
+    },
+    /// The stored genome uses an unsupported schema version.
     #[error("unsupported genome schema version {version} for genome {genome_id}")]
-    UnsupportedSchema { genome_id: String, version: u32 },
+    UnsupportedSchema {
+        /// Identifier of the affected genome.
+        genome_id: String,
+        /// Unsupported schema version.
+        version: u32,
+    },
+    /// The stored payload's digest disagrees with its declared identity.
     #[error(
         "genome digest mismatch for genome {genome_id}: expected {expected}, computed {computed}"
     )]
     DigestMismatch {
+        /// Identifier of the affected genome.
         genome_id: String,
+        /// Declared payload digest.
         expected: String,
+        /// Digest computed from the payload.
         computed: String,
     },
+    /// The stored genome belongs to a different run.
     #[error("genome belongs to run {found} instead of expected run {expected}")]
-    RunMismatch { expected: String, found: String },
+    RunMismatch {
+        /// Selected run identifier.
+        expected: String,
+        /// Run identifier stored with the genome.
+        found: String,
+    },
 }
 
 /// Version-1 narrative-event fields named by strict decoder errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunEventField {
+    /// Event schema version.
     SchemaVersion,
+    /// Event tick.
     Tick,
+    /// Narrative event kind.
     Kind,
+    /// Event severity.
     Severity,
+    /// Event magnitude.
     Magnitude,
+    /// Inclusive analysis-window start.
     WindowStart,
+    /// Analysis-window end.
     WindowEnd,
+    /// Metric named by the event.
     Metric,
+    /// Metric observation before the event.
     Before,
+    /// Metric observation after the event.
     After,
+    /// Detector score.
     Score,
+    /// Event subject.
     Subject,
+    /// Human-readable event text.
     HumanText,
+    /// Canonical event identity ordering.
     IdentityOrder,
 }
 
@@ -4680,19 +4942,32 @@ pub enum RunEventDecodeError {
     #[error(
         "unsupported narrative event schema version {found}; this binary supports version {supported}"
     )]
-    UnsupportedSchemaVersion { found: u32, supported: u32 },
+    UnsupportedSchemaVersion {
+        /// Version declared by the row.
+        found: u32,
+        /// Version supported by this decoder.
+        supported: u32,
+    },
     /// One version-1 field cannot be interpreted without inventing data.
     #[error("invalid narrative event field {field:?}: {reason}")]
     InvalidField {
+        /// Versioned event field that failed decoding.
         field: RunEventField,
+        /// Why the field was rejected.
         reason: String,
     },
     /// The same canonical identity appeared more than once with identical evidence.
     #[error("duplicate narrative event identity {identity}")]
-    DuplicateIdentity { identity: RunEventIdentity },
+    DuplicateIdentity {
+        /// Canonical identity of both copies.
+        identity: RunEventIdentity,
+    },
     /// The same canonical identity appeared with different evidence.
     #[error("conflicting narrative event identity {identity}")]
-    ConflictingIdentity { identity: RunEventIdentity },
+    ConflictingIdentity {
+        /// Canonical identity shared by the conflicting rows.
+        identity: RunEventIdentity,
+    },
 }
 
 #[derive(Debug)]
@@ -4886,14 +5161,23 @@ fn reserve_new_file(path: &str) -> Result<StorageTarget, StorageError> {
 /// Worker operation associated with a structured persistence failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorageOperation {
+    /// Initialize the storage worker and connection.
     Startup,
+    /// Validate and replay an existing persistence outbox.
     Recovery,
+    /// Admit an exact batch payload to the outbox.
     Admit,
+    /// Apply scientific rows from an admitted batch.
     Persist,
+    /// Drain pending admitted batches through a flush barrier.
     Flush,
+    /// Establish the durable persistence marker.
     Durability,
+    /// Complete the ordered shutdown barrier.
     Shutdown,
+    /// Close the connection on its owning thread.
     Close,
+    /// Join the storage worker thread.
     Join,
 }
 
@@ -4905,18 +5189,26 @@ pub enum StorageOperation {
 /// ledger states and admitted/applied/durable watermarks to observe that earlier outer commitment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureCommitState {
+    /// The affected operation was definitely not admitted.
     NotAdmitted,
+    /// The affected transaction rolled back.
     RolledBack,
+    /// Available observations cannot establish whether commitment occurred.
     Indeterminate,
+    /// The affected transaction committed.
     Committed,
 }
 
 /// Controller-side wait phase that exhausted its configured deadline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorageWaitPhase {
+    /// Measure, reserve, serialize, or validate the caller's payload.
     Preparation,
+    /// Acquire the admission gate.
     AdmissionGate,
+    /// Send a command through the bounded worker channel.
     CommandEnqueue,
+    /// Wait for the worker's operation receipt.
     Acknowledgement,
 }
 
@@ -5060,58 +5352,91 @@ where
 /// Structured error crossing the storage worker boundary.
 #[derive(Debug, Clone, Error)]
 pub enum StorageWorkerError {
+    /// A database operation failed with the original shared typed cause.
     #[error(
         "storage {operation:?} failed at {path} (tick={tick:?}, attempt={attempt}, transient={transient}, commit_state={commit_state:?}): {source}"
     )]
     Database {
+        /// Worker operation that failed.
         operation: StorageOperation,
+        /// Storage target path.
         path: String,
+        /// Batch tick, when the operation concerns one batch.
         tick: Option<u64>,
+        /// Transaction attempt number.
         attempt: u8,
+        /// Whether the engine classified the cause as transient.
         transient: bool,
+        /// Observed state of the affected transaction's commitment.
         commit_state: FailureCommitState,
+        /// Shared original engine error retained across terminal observations.
         #[source]
         source: Arc<FrankenError>,
     },
+    /// A controller wait exhausted its deadline without cancelling executing SQL.
     #[error(
         "storage {operation:?} timed out during {phase:?} at {path} after {waited:?} (tick={tick:?}, commit_state={commit_state:?})"
     )]
     Timeout {
+        /// Operation whose controller wait expired.
         operation: StorageOperation,
+        /// Controller wait phase that expired.
         phase: StorageWaitPhase,
+        /// Storage target path.
         path: String,
+        /// Batch tick, when applicable.
         tick: Option<u64>,
+        /// Configured wait allowance.
         waited: Duration,
+        /// Commitment knowledge when the wait expired.
         commit_state: FailureCommitState,
     },
+    /// Communication with the storage worker failed.
     #[error(
         "storage {operation:?} channel failed at {path} (tick={tick:?}, commit_state={commit_state:?}): {detail}"
     )]
     Channel {
+        /// Operation using the failed channel.
         operation: StorageOperation,
+        /// Storage target path.
         path: String,
+        /// Batch tick, when applicable.
         tick: Option<u64>,
+        /// Commitment knowledge at channel failure.
         commit_state: FailureCommitState,
+        /// Channel failure description.
         detail: String,
     },
+    /// A non-database worker invariant or operation failed.
     #[error(
         "storage {operation:?} failed at {path} (tick={tick:?}, commit_state={commit_state:?}): {detail}"
     )]
     Internal {
+        /// Operation that failed.
         operation: StorageOperation,
+        /// Storage target path.
         path: String,
+        /// Batch tick, when applicable.
         tick: Option<u64>,
+        /// Commitment knowledge at failure.
         commit_state: FailureCommitState,
+        /// Internal failure description.
         detail: String,
     },
+    /// Another writer holds the required operating-system lease.
     #[error(
         "storage {operation:?} refused a second writer for {path}; OS lease {lock_path} is held (tick={tick:?}, commit_state={commit_state:?})"
     )]
     WriterLeaseHeld {
+        /// Operation requiring the lease.
         operation: StorageOperation,
+        /// Database path.
         path: String,
+        /// Companion path carrying the writer lease.
         lock_path: String,
+        /// Batch tick, when applicable.
         tick: Option<u64>,
+        /// Commitment knowledge when the writer was refused.
         commit_state: FailureCommitState,
     },
 }
@@ -5119,26 +5444,39 @@ pub enum StorageWorkerError {
 /// Cloneable structured failure state published to frontends and host supervision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageFailureStatus {
+    /// Stable failure category.
     pub kind: StorageFailureKind,
+    /// Failed worker operation.
     pub operation: StorageOperation,
+    /// Storage target path, when known.
     pub path: Option<String>,
+    /// Affected batch tick, when known.
     pub tick: Option<u64>,
+    /// Transaction attempt number, or zero for non-database failures.
     pub attempt: u8,
+    /// Whether the failure was classified as transient.
     pub transient: bool,
+    /// Knowledge of the affected transaction's commitment.
     pub commit_state: FailureCommitState,
+    /// Human-readable cause.
     pub detail: String,
 }
 
 /// Stable failure category used to preserve the most informative terminal cause.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum StorageFailureKind {
+    /// Worker command or receipt channel failure.
     Channel,
+    /// Controller wait deadline expired.
     Timeout,
+    /// Internal operation or invariant failure.
     Internal,
+    /// Typed database engine failure.
     Database,
 }
 
 impl StorageWorkerError {
+    /// Project this error into the immutable frontend failure status.
     #[must_use]
     pub fn status(&self) -> StorageFailureStatus {
         match self {
@@ -5375,16 +5713,22 @@ struct RunEventRow {
 /// Latest metric reading fetched for analytics displays.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MetricReading {
+    /// Tick recorded by storage.
     pub tick: i64,
+    /// Metric name.
     pub name: String,
+    /// Recorded metric value.
     pub value: f64,
 }
 
 /// Historical metric row returned by the read-only storage API.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PersistedMetric {
+    /// Validated nonnegative simulation tick.
     pub tick: u64,
+    /// Metric name.
     pub name: String,
+    /// Recorded metric value.
     pub value: f64,
 }
 
@@ -5412,21 +5756,25 @@ impl RunEventIdentity {
         }
     }
 
+    /// Island containing the event.
     #[must_use]
     pub const fn island(&self) -> IslandId {
         self.island
     }
 
+    /// Simulation tick of the event.
     #[must_use]
     pub const fn tick(&self) -> Tick {
         self.tick
     }
 
+    /// Narrative event kind.
     #[must_use]
     pub const fn kind(&self) -> EventKind {
         self.kind
     }
 
+    /// Metric named by the event.
     #[must_use]
     pub fn metric(&self) -> &str {
         &self.metric
@@ -5471,16 +5819,19 @@ pub struct PersistedRunEvent {
 }
 
 impl PersistedRunEvent {
+    /// Canonical identity of the persisted event.
     #[must_use]
     pub const fn identity(&self) -> &RunEventIdentity {
         &self.identity
     }
 
+    /// Complete decoded event record.
     #[must_use]
     pub const fn record(&self) -> &EventRecord {
         &self.record
     }
 
+    /// Consume this event into its identity and complete record.
     #[must_use]
     pub fn into_parts(self) -> (RunEventIdentity, EventRecord) {
         (self.identity, self.record)
@@ -5500,26 +5851,31 @@ pub struct NarrativeHit {
 }
 
 impl NarrativeHit {
+    /// Complete typed event returned by the query.
     #[must_use]
     pub const fn event(&self) -> &PersistedRunEvent {
         &self.event
     }
 
+    /// Simulation tick of the hit.
     #[must_use]
     pub const fn tick(&self) -> Tick {
         self.event.record.tick
     }
 
+    /// Narrative event kind of the hit.
     #[must_use]
     pub const fn kind(&self) -> EventKind {
         self.event.record.kind
     }
 
+    /// Severity recorded by the event detector.
     #[must_use]
     pub const fn severity(&self) -> f32 {
         self.event.record.severity
     }
 
+    /// Human-readable event explanation.
     #[must_use]
     pub fn human_text(&self) -> &str {
         &self.event.record.human_text
@@ -5531,6 +5887,7 @@ impl NarrativeHit {
         self.rank
     }
 
+    /// Consume the hit into its complete event and optional relevance score.
     #[must_use]
     pub fn into_parts(self) -> (PersistedRunEvent, Option<f64>) {
         (self.event, self.rank)
@@ -5540,14 +5897,23 @@ impl NarrativeHit {
 /// Tick ledger row exposed to storage consumers without leaking SQL details.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PersistedTick {
+    /// Simulation tick.
     pub tick: u64,
+    /// Recorded simulation epoch.
     pub epoch: u64,
+    /// Whether this tick's ledger entry is closed.
     pub closed: bool,
+    /// Agent count recorded at this tick.
     pub agent_count: usize,
+    /// Biological births recorded at this tick.
     pub births: usize,
+    /// Deaths recorded at this tick.
     pub deaths: usize,
+    /// Sum of agent energy recorded at this tick.
     pub total_energy: f64,
+    /// Average agent energy recorded at this tick.
     pub average_energy: f64,
+    /// Average agent health recorded at this tick.
     pub average_health: f64,
 }
 
@@ -5577,12 +5943,17 @@ pub struct AudioTimeline {
 /// Cross-table lifecycle totals for validating and summarizing a completed run.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunLedgerSummary {
+    /// Number of persisted tick ledger entries.
     pub tick_count: u64,
+    /// Latest persisted tick ledger entry, if any.
     pub latest_tick: Option<PersistedTick>,
     /// Demographic reproduction rows only (`origin = 'born'`).
     pub birth_records: u64,
+    /// Number of demographic death rows.
     pub death_records: u64,
+    /// Number of birth replay events.
     pub birth_events: u64,
+    /// Number of death replay events.
     pub death_events: u64,
 }
 
@@ -5664,28 +6035,41 @@ impl PersistenceWatermarks {
 /// Durable ledger state for one admitted persistence batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatchPersistenceState {
+    /// Exact payload has entered the outbox.
     Admitted,
+    /// Scientific rows have been atomically applied.
     Applied,
+    /// The batch is covered by the durable marker.
     Durable,
 }
 
 /// Query result for one batch in the compact persistence ledger.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistedBatchStatus {
+    /// Run owning the batch.
     pub run_id: RunId,
+    /// Stable outbox batch identity.
     pub batch_id: PersistenceBatchId,
+    /// Scientific tick carried by the batch.
     pub tick: u64,
+    /// BLAKE3 identity of the exact payload.
     pub payload_digest: String,
+    /// Observed ledger state.
     pub state: BatchPersistenceState,
 }
 
 /// Synchronous proof that the exact batch payload entered the worker outbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AdmissionReceipt {
+    /// Run that admitted the payload.
     pub run_id: RunId,
+    /// Stable identity assigned to the admitted payload.
     pub batch_id: PersistenceBatchId,
+    /// Scientific tick carried by the batch.
     pub tick: u64,
+    /// Outbox commitment boundary established by admission.
     pub guarantee: PersistenceGuarantee,
+    /// Independently tracked admission, application, and durable prefixes.
     pub watermarks: PersistenceWatermarks,
 }
 
@@ -5713,25 +6097,40 @@ pub struct IslandSnapshot {
 /// Migration movement between two islands published in [`AnalyticsSnapshot`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MigrationSnapshotArc {
+    /// Source island identifier.
     pub from_island: u32,
+    /// Destination island identifier.
     pub to_island: u32,
+    /// Number of migrating agents represented by the arc.
     pub count: usize,
 }
 
 /// Immutable, lock-free read model published after successful storage commits.
 #[derive(Debug, Clone)]
 pub struct AnalyticsSnapshot {
+    /// Run bound to the snapshot, if initialized.
     pub run_id: Option<RunId>,
+    /// Monotonic snapshot publication revision.
     pub revision: u64,
+    /// Latest scientific tick published after commitment.
     pub committed_tick: Option<u64>,
+    /// Agent count associated with the published committed tick.
     pub committed_agent_count: Option<usize>,
+    /// Observed admission, application, and durable prefixes.
     pub watermarks: PersistenceWatermarks,
+    /// Latest metric readings.
     pub readings: Arc<[MetricReading]>,
+    /// Per-island analytics observations.
     pub islands: Arc<[IslandSnapshot]>,
+    /// Migration movements represented by the current snapshot.
     pub migration_arcs: Arc<[MigrationSnapshotArc]>,
+    /// Latest archipelago barrier epoch, if available.
     pub barrier_epoch: Option<u64>,
+    /// Published human-readable failure, if any.
     pub last_error: Option<Arc<str>>,
+    /// Published typed failure status, if any.
     pub last_failure: Option<Arc<StorageFailureStatus>>,
+    /// Whether the storage worker has stopped publishing progress.
     pub stopped: bool,
 }
 
@@ -5761,6 +6160,7 @@ pub struct AnalyticsSnapshotProvider {
 }
 
 impl AnalyticsSnapshotProvider {
+    /// Construct an unbound provider with an empty initial snapshot.
     #[must_use]
     pub fn empty() -> Self {
         Self {
@@ -5801,6 +6201,7 @@ impl AnalyticsSnapshotProvider {
         });
     }
 
+    /// Load the latest immutable snapshot without issuing SQL.
     #[must_use]
     pub fn snapshot(&self) -> Arc<AnalyticsSnapshot> {
         self.inner.load_full()
@@ -6498,7 +6899,9 @@ struct MigrationRow {
 /// Aggregate event count grouped by replay event type.
 #[derive(Debug, Clone)]
 pub struct ReplayEventCount {
+    /// Replay event type label.
     pub event_type: String,
+    /// Number of rows with that event type.
     pub count: u64,
 }
 
@@ -6569,7 +6972,7 @@ pub struct IslandConservationBreach {
     pub tick: u64,
     /// Reconstructed expected population.
     pub expected_population: i64,
-    /// Actual agent count recorded in tick_summaries.
+    /// Actual agent count recorded in `tick_summaries`.
     pub recorded_population: i64,
     /// Biological births recorded at this tick (origin = 'born').
     pub births: i64,
@@ -6744,8 +7147,11 @@ pub fn trace_locus<C: BrainFamilyCodec>(
 /// Replay event reconstructed from persisted storage.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PersistedReplayEvent {
+    /// Simulation tick of the event.
     pub tick: u64,
+    /// Sequence within the tick.
     pub seq: u64,
+    /// Complete decoded replay event.
     pub event: ReplayEvent,
 }
 
@@ -6757,10 +7163,15 @@ pub struct PersistedReplayEvent {
 /// verbatim so a new pairwise event kind becomes queryable without a storage change.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PersistedInteraction {
+    /// Simulation tick of the interaction.
     pub tick: u64,
+    /// Canonical event sequence within the tick.
     pub seq: u64,
+    /// Stored interaction kind label.
     pub kind: String,
+    /// Agent that acted.
     pub actor: AgentUid,
+    /// Agent affected by the action.
     pub target: AgentUid,
     /// Magnitude of the interaction -- damage dealt, energy transferred.
     ///
@@ -6779,10 +7190,15 @@ pub struct PersistedInteraction {
 /// deliberately excluded so a small graph request cannot load large replay blobs.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct InteractionGraphEvent {
+    /// Simulation tick of the interaction.
     pub tick: u64,
+    /// Canonical event sequence within the tick.
     pub seq: u64,
+    /// Source agent of the directed edge.
     pub actor: AgentUid,
+    /// Target agent of the directed edge.
     pub target: AgentUid,
+    /// Interaction magnitude, when recorded by the emitter.
     pub magnitude: Option<f64>,
 }
 
@@ -6792,15 +7208,22 @@ pub struct InteractionGraphEvent {
 pub enum InteractionGraphSelection {
     /// Newest events, returned in ascending tick/sequence order.
     RecentPage,
-    /// All persisted events in [start_tick, end_tick); overflow is an error.
-    CompleteWindow { start_tick: u64, end_tick: u64 },
+    /// All persisted events in `[start_tick, end_tick)`; overflow is an error.
+    CompleteWindow {
+        /// Inclusive tick-window start.
+        start_tick: u64,
+        /// Exclusive tick-window end.
+        end_tick: u64,
+    },
 }
 
 /// Bounds on materialized graph input, including one overflow sentinel row.
 /// These do not bound SQL execution time or the database engine's working memory.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InteractionGraphBudget {
+    /// Maximum returned graph-event count.
     pub max_rows: usize,
+    /// Maximum materialized bytes, including the overflow sentinel row.
     pub max_projected_bytes: usize,
 }
 
@@ -6817,8 +7240,11 @@ impl Default for InteractionGraphBudget {
 /// A bounded canonical selection, with explicit evidence of page truncation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InteractionGraphPage {
+    /// Canonically ordered interaction graph inputs.
     pub events: Vec<InteractionGraphEvent>,
+    /// Whether older rows were omitted by the selected page.
     pub omitted_older_rows: bool,
+    /// Total persisted interaction rows in the selected run.
     pub run_persisted_rows: u64,
 }
 
@@ -6835,14 +7261,19 @@ pub struct PersistedAgentObservation {
     pub agent_uid: AgentUid,
     /// World-space velocity components.
     pub velocity_x: f64,
+    /// Vertical world-space velocity component.
     pub velocity_y: f64,
     /// Persisted diet genotype/trait proxy. This is not a realized diet measure.
     pub herbivore_tendency: f64,
     /// Persisted sensing trait modifiers. These are not realized sensor readings.
     pub trait_smell: f64,
+    /// Persisted sound trait modifier, rather than a sensor reading.
     pub trait_sound: f64,
+    /// Persisted hearing trait modifier, rather than a sensor reading.
     pub trait_hearing: f64,
+    /// Persisted eye trait modifier, rather than a sensor reading.
     pub trait_eye: f64,
+    /// Persisted blood-sensing trait modifier, rather than a sensor reading.
     pub trait_blood: f64,
 }
 
@@ -6870,21 +7301,32 @@ impl PersistedInteractionCapture {
 /// Checkpoint record reconstructed from persisted storage.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PersistedCheckpointRecord {
+    /// Checkpoint identifier assigned by the caller.
     pub checkpoint_id: String,
+    /// Simulation tick represented by the checkpoint.
     pub tick: u64,
+    /// Run-local monotonic checkpoint ordinal.
     pub checkpoint_ordinal: u64,
+    /// Versioned checkpoint encoding identifier.
     pub format: String,
+    /// Encoded immutable checkpoint payload.
     pub payload: String,
+    /// Digest of the encoded checkpoint payload.
     pub payload_digest: String,
+    /// Caller-supplied metadata as JSON.
     pub metadata_json: String,
 }
 
 /// Readback from the connection owner after a complete host artifact is recorded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostCheckpointReceipt {
+    /// Run containing the recorded host checkpoint.
     pub run_id: RunId,
+    /// Exact checkpoint row read back by the connection owner.
     pub record: PersistedCheckpointRecord,
+    /// Persistence prefixes observed for the checkpoint readback.
     pub watermarks: PersistenceWatermarks,
+    /// Host journal boundary bound to the checkpoint.
     pub journal_cut: scriptbots_runtime::HostJournalCutV1,
 }
 
@@ -6903,7 +7345,9 @@ struct HostCheckpointStorageCut {
 /// SQL accounting includes every retained UTF-8 field, including the hex payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckpointRetentionLimits {
+    /// Maximum number of retained immutable checkpoints.
     pub max_count: u64,
+    /// Maximum retained UTF-8 bytes across checkpoint fields.
     pub max_bytes: u64,
 }
 
@@ -6916,9 +7360,12 @@ impl Default for CheckpointRetentionLimits {
     }
 }
 
+/// Current immutable-checkpoint retention usage measured by storage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckpointRetentionUsage {
+    /// Number of retained checkpoints.
     pub count: u64,
+    /// Retained UTF-8 bytes across checkpoint fields.
     pub bytes: u64,
 }
 
@@ -7166,6 +7613,10 @@ impl Default for PayloadBudget {
 /// and conservative for every variable-size field copied by preparation. Every
 /// addition and multiplication saturates so a pathological shape becomes an
 /// oversized refusal instead of wrapping below a cap.
+///
+/// # Panics
+///
+/// Panics if the unbounded preparation observer unexpectedly rejects an estimate.
 #[must_use]
 pub fn estimate_batch_size(payload: &PersistenceBatch) -> (usize, usize) {
     let mut observer = UnboundedPreparation;
@@ -7358,6 +7809,10 @@ where
 ///
 /// The same per-record and string multipliers are used, so the two estimates stay
 /// comparable and equally conservative; only the pool they are charged against differs.
+///
+/// # Panics
+///
+/// Panics if the unbounded preparation observer unexpectedly rejects an estimate.
 #[must_use]
 pub fn estimate_narrative_size(payload: &PersistenceBatch) -> (usize, usize) {
     let mut observer = UnboundedPreparation;
@@ -9695,10 +10150,10 @@ pub(crate) struct FinishedRunReaderLease {
     _identity: ExistingStorageLease,
 }
 
-/// Read-only view over an existing ScriptBots database.
+/// Read-only view over an existing `ScriptBots` database.
 ///
 /// "Bounded" reader methods bound result cardinality and allocation only; they do not
-/// impose a hard wall-clock bound on FrankenSQLite execution. This synchronous reader is
+/// impose a hard wall-clock bound on `FrankenSQLite` execution. This synchronous reader is
 /// for offline/reporting work where waiting is acceptable. Frontend latest-value paths use
 /// [`AnalyticsSnapshotProvider::snapshot`] instead of issuing SQL.
 pub struct StorageReader {
@@ -9780,7 +10235,7 @@ impl StorageReader {
         Ok(entries)
     }
 
-    /// Open a single-run ScriptBots database read-only without creating or migrating it.
+    /// Open a single-run `ScriptBots` database read-only without creating or migrating it.
     ///
     /// A database containing more than one run is intentionally ambiguous and must be opened
     /// with [`Self::open_for_run`]. Once constructed, every query on this handle is run-scoped.
@@ -9788,7 +10243,7 @@ impl StorageReader {
         Self::open_selected(path, None)
     }
 
-    /// Open one explicitly selected run from an existing ScriptBots database.
+    /// Open one explicitly selected run from an existing `ScriptBots` database.
     pub fn open_for_run(path: &str, run_id: RunId) -> Result<Self, StorageError> {
         Self::open_selected(path, Some(run_id))
     }
@@ -9805,7 +10260,7 @@ impl StorageReader {
         })
     }
 
-    /// Open a finished ScriptBots run under an exclusive, identity-bound read lease.
+    /// Open a finished `ScriptBots` run under an exclusive, identity-bound read lease.
     ///
     /// Unlike [`Self::open`], this rejects a live writer before validating the exact
     /// migration set, structural schema, persistence invariants, and the selected run's
@@ -9957,10 +10412,10 @@ impl StorageReader {
         Ok(())
     }
 
-    /// FrankenSQLite TRUNCATE retains the new generation's header. A valid header
+    /// `FrankenSQLite` TRUNCATE retains the new generation's header. A valid header
     /// without any frame carries no database changes. Validate the SQLite wire
     /// format and checksum, rather than accepting an arbitrary nonempty sidecar.
-    /// Format: https://www.sqlite.org/fileformat2.html#wal_header_format
+    /// Format: <https://www.sqlite.org/fileformat2.html#wal_header_format>
     fn wal_has_valid_header_without_frames(path: &Path) -> Result<bool, StorageError> {
         use std::io::Read as _;
 
@@ -12275,7 +12730,7 @@ impl StorageReader {
     /// - [`StorageError::Genome(GenomeStorageError::NotFound)`] if no genome row matches the query.
     /// - [`StorageError::Genome(GenomeStorageError::CorruptPayload)`] if the JSON cannot be parsed.
     /// - [`StorageError::Genome(GenomeStorageError::DigestMismatch)`] if the envelope digest does not match the stored hash.
-    /// - [`StorageError::Genome(GenomeStorageError::RunMismatch)`] if the stored run_id does not match this reader.
+    /// - [`StorageError::Genome(GenomeStorageError::RunMismatch)`] if the stored `run_id` does not match this reader.
     pub fn read_agent_genome(
         &self,
         island: IslandId,
@@ -13256,6 +13711,7 @@ impl StorageReader {
         Ok(hits)
     }
 
+    /// Read up to `limit` recent metric rows for the selected run.
     pub fn recent_metrics(&self, limit: usize) -> Result<Vec<PersistedMetric>, StorageError> {
         if limit == 0 {
             return Ok(Vec::new());
@@ -13997,6 +14453,7 @@ impl std::fmt::Debug for ArtifactDirectoryLease {
 }
 
 impl ArtifactDirectoryLease {
+    /// Acquire the directory's writer lease and verify its filesystem identity.
     pub fn acquire(path: &Path) -> Result<Self, StorageError> {
         let path_text = path.to_str().ok_or(StorageError::InvalidData {
             context: "checkpoint.artifact_directory",
@@ -14024,6 +14481,7 @@ impl ArtifactDirectoryLease {
         Ok(lease)
     }
 
+    /// Revalidate the leased directory and companion writer-lock identities.
     pub fn verify(&self) -> Result<(), StorageError> {
         let current =
             fs::symlink_metadata(&self.path).map_err(|source| StorageError::Filesystem {
@@ -15109,10 +15567,12 @@ impl Storage {
         })
     }
 
+    /// Measure retained checkpoint count and bytes across this database.
     pub fn checkpoint_retention_usage(&self) -> Result<CheckpointRetentionUsage, StorageError> {
         Self::checkpoint_retention_usage_for(self.connection()?, None)
     }
 
+    /// Set limits applied to subsequent checkpoint retention checks.
     pub fn set_checkpoint_retention_limits(&mut self, limits: CheckpointRetentionLimits) {
         self.checkpoint_limits = limits;
     }
@@ -21831,7 +22291,7 @@ impl Storage {
         Ok(())
     }
 
-    /// Apply one science batch with FrankenSQLite's foreign-key enforcement suspended for exactly
+    /// Apply one science batch with `FrankenSQLite`'s foreign-key enforcement suspended for exactly
     /// that transaction (bd-50bg).
     ///
     /// With `PRAGMA foreign_keys = ON`, the pinned engine routes every multi-row
@@ -22448,7 +22908,7 @@ impl Storage {
         Ok(())
     }
 
-    /// Flush, checkpoint, and explicitly close the FrankenSQLite connection.
+    /// Flush, checkpoint, and explicitly close the `FrankenSQLite` connection.
     pub fn close(mut self) -> Result<(), StorageError> {
         self.flush()?;
         self.finalize_applied_outbox()?;
@@ -22836,9 +23296,13 @@ impl Drop for Storage {
 /// Aggregated predator statistics used for analytics.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PredatorStats {
+    /// Agent whose persisted observations were aggregated.
     pub agent_uid: u64,
+    /// Mean recorded energy for the agent.
     pub avg_energy: f64,
+    /// Greatest recorded spike length for the agent.
     pub max_spike_length: f64,
+    /// Latest tick contributing an observation.
     pub last_tick: i64,
 }
 
@@ -22988,18 +23452,26 @@ pub enum PersistenceGuarantee {
 /// Proof that every persistence command admitted before a flush has committed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FlushReceipt {
+    /// Latest scientific tick committed before the barrier.
     pub committed_tick: Option<u64>,
+    /// Persistence strength established by this flush.
     pub guarantee: PersistenceGuarantee,
+    /// Admission, application, and durable prefixes observed at the barrier.
     pub watermarks: PersistenceWatermarks,
+    /// Analytics publication revision associated with this receipt.
     pub analytics_revision: u64,
 }
 
 /// Proof that the worker flushed, closed, and joined with an explicit persistence guarantee.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShutdownReceipt {
+    /// Latest scientific tick committed before shutdown.
     pub committed_tick: Option<u64>,
+    /// Persistence strength established before the connection closed.
     pub guarantee: PersistenceGuarantee,
+    /// Final admission, application, and durable prefixes.
     pub watermarks: PersistenceWatermarks,
+    /// Analytics publication revision associated with this receipt.
     pub analytics_revision: u64,
 }
 
@@ -23044,17 +23516,22 @@ struct StorageThresholds {
 
 /// Bounded controller waits around the synchronous storage worker.
 ///
-/// A deadline bounds the caller; it cannot cancel a FrankenSQLite call already executing on the
+/// A deadline bounds the caller; it cannot cancel a `FrankenSQLite` call already executing on the
 /// connection-owning worker thread. Timed-out admissions therefore remain retryable with their
 /// exact payload, while timed-out shutdowns retain worker ownership for retry or supervised reap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StorageDeadlines {
+    /// Maximum controller wait for worker startup acknowledgement.
     pub startup_ack: Duration,
     /// Maximum controller time spent measuring and materializing a borrowed payload.
     pub preparation: Duration,
+    /// Maximum controller wait to enqueue a worker command.
     pub command_enqueue: Duration,
+    /// Maximum controller wait for outbox admission acknowledgement.
     pub admission_ack: Duration,
+    /// Maximum controller wait for a flush receipt.
     pub flush_ack: Duration,
+    /// Maximum controller wait for a shutdown receipt.
     pub shutdown_ack: Duration,
 }
 
@@ -23100,6 +23577,7 @@ struct AdmissionState {
 }
 
 /// Cloneable persistence sink that never owns or transports a database connection.
+///
 /// Clonable handle that stores a core science checkpoint through the storage worker, so the
 /// control plane never opens a second connection to the run database.
 #[derive(Clone)]
@@ -23228,6 +23706,7 @@ impl StorageCheckpointWriter {
         }
     }
 
+    /// Ask the connection owner to apply checkpoint retention limits.
     pub fn configure_retention(
         &self,
         limits: CheckpointRetentionLimits,
@@ -23250,6 +23729,7 @@ impl StorageCheckpointWriter {
             })?
     }
 
+    /// Read checkpoint retention usage through the connection owner.
     pub fn retention_usage(&self) -> Result<CheckpointRetentionUsage, StorageError> {
         let (reply, receiver) = xchan::bounded(1);
         self.tx
@@ -23270,6 +23750,7 @@ impl StorageCheckpointWriter {
     }
 }
 
+/// Cloneable bounded admission handle that never transports a database connection.
 #[derive(Clone)]
 pub struct StorageSink {
     run_id: RunId,
@@ -23798,7 +24279,7 @@ pub enum ReaperReceiptState {
 /// Reason for falling back to synchronous execution on the caller thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReaperFallbackReason {
-    /// The number of concurrent reapers has reached MAX_CONCURRENT_REAPERS.
+    /// The number of concurrent reapers has reached `MAX_CONCURRENT_REAPERS`.
     Saturation,
     /// The OS refused to spawn a new reaper thread.
     SpawnFailure,
@@ -23820,29 +24301,57 @@ pub enum ReaperJoinOutcome {
 /// Exact receipt for a storage reap request, guaranteeing exactly-once accounting.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReaperRequestReceipt {
+    /// Unique reap request identity.
     pub request_id: u64,
+    /// Storage target associated with the worker.
     pub path: String,
+    /// Current supervisor accounting state.
     pub state: ReaperReceiptState,
+    /// Reason for synchronous fallback, when used.
     pub fallback_reason: Option<ReaperFallbackReason>,
+    /// Terminal worker join outcome, when observed.
     pub join_outcome: Option<ReaperJoinOutcome>,
+    /// Receipt observation time in milliseconds since the Unix epoch.
     pub timestamp_epoch_ms: u64,
 }
 
 /// Structured diagnostic errors returned by the reaper accounting ledger audit.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ReaperAccountingError {
+    /// A request was registered but never drained or joined.
     #[error(
         "stranded reap request: request_id={request_id} path={path} was never drained or joined"
     )]
-    StrandedRequest { request_id: u64, path: String },
+    StrandedRequest {
+        /// Stranded request identity.
+        request_id: u64,
+        /// Storage target path.
+        path: String,
+    },
+    /// More than one consumer retired the same request.
     #[error("double consumption: request_id={request_id} path={path} was consumed multiple times")]
-    DoubleConsumption { request_id: u64, path: String },
+    DoubleConsumption {
+        /// Multiply consumed request identity.
+        request_id: u64,
+        /// Storage target path.
+        path: String,
+    },
+    /// A request has no retained accounting receipt.
     #[error("missing receipt: request_id={request_id} path={path} has no recorded receipt")]
-    MissingReceipt { request_id: u64, path: String },
+    MissingReceipt {
+        /// Request lacking a receipt.
+        request_id: u64,
+        /// Storage target path.
+        path: String,
+    },
+    /// A request remains in an active accounting state.
     #[error("unretired request: request_id={request_id} path={path} state={state:?} still active")]
     UnretiredRequest {
+        /// Request that remains active.
         request_id: u64,
+        /// Storage target path.
         path: String,
+        /// Active state observed by the accounting audit.
         state: ReaperReceiptState,
     },
 }
@@ -24090,7 +24599,7 @@ pub struct ReaperStats {
     pub coalesced: u64,
     /// Handoffs that fell back to running synchronously on the caller thread.
     pub synchronous: u64,
-    /// Active reapers considered hung (elapsed >= hung_threshold).
+    /// Active reapers considered hung (`elapsed >= hung_threshold`).
     pub hung: usize,
     /// Age of the oldest active reaper thread, if any.
     pub oldest_active_age: Option<Duration>,
@@ -25168,6 +25677,7 @@ impl StoragePipeline {
         self.sink.inflight_narrative_bytes.load(Ordering::SeqCst)
     }
 
+    /// Admit a persistence batch through the bounded worker sink.
     pub fn submit(&self, payload: &PersistenceBatch) -> Result<(), StorageError> {
         self.sink.submit(payload)
     }
@@ -25348,6 +25858,10 @@ impl StoragePipeline {
     }
 
     /// Flush, close, and join the worker, returning an explicit shutdown receipt.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal pending-shutdown receiver is absent after its presence check.
     pub fn shutdown(&mut self) -> Result<ShutdownReceipt, StorageError> {
         if self.handle.is_none() {
             return Err(StorageError::Worker(StorageWorkerError::Internal {
@@ -26040,6 +26554,15 @@ fn storage_worker(
                             storage.abandon_after_error();
                             return Some(worker_error);
                         }
+                        // Journal completion can flush ordinary Persist batches that were
+                        // buffered before the owner acquired its journal. Reconcile that
+                        // finalized prefix before publishing this journal's newer analytics;
+                        // otherwise its permits stay charged and a later flush republishes
+                        // the older tick. A control-only journal leaves unapplied permits held.
+                        if !state.pending_analytics.is_empty() {
+                            publish_committed_state(&mut state, &analytics);
+                        }
+                        release_finalized_permits(&mut state);
                         if let Some(pending) = pending {
                             state.admitted_tick = Some(
                                 state
@@ -29165,6 +29688,194 @@ mod tests {
         shared
             .cache_terminal(third, &JournalReceiptState::Durable)
             .expect("acknowledged terminal prefix is reclaimed before the capacity check");
+    }
+
+    fn assert_journal_completion_reconciles_buffered_persistence(
+        pipeline: &mut StoragePipeline,
+        guarantee: PersistenceGuarantee,
+    ) -> ShutdownReceipt {
+        let analytics = pipeline.analytics_provider();
+        let mut world = journal_fault_world_with_interval(1);
+        let mut persistence = world
+            .bind_persistence(Box::new(pipeline.sink()))
+            .expect("bind the ordinary storage sink before ownership transfer");
+        persistence
+            .step(&mut world)
+            .expect("ordinary science tick one");
+        pipeline
+            .checkpoint_writer()
+            .retention_usage()
+            .expect("non-flushing worker barrier after ordinary admission");
+        let buffered_bytes = pipeline.inflight_bytes();
+        assert!(
+            buffered_bytes > 0,
+            "ordinary data must still hold its permit"
+        );
+        let admitted = PersistenceWatermarks {
+            admitted: Some(PersistenceBatchId::new(1).expect("first batch identity")),
+            ..PersistenceWatermarks::default()
+        };
+        assert_eq!(analytics.snapshot().watermarks, admitted);
+        assert_eq!(analytics.snapshot().committed_tick, None);
+
+        let session_id = HostSessionId::new(0x407);
+        let journal = pipeline
+            .journal_port(session_id, StorageJournalOptions::default())
+            .expect("attach the actual storage journal to the existing world");
+        let mut core = HostCore::with_journal_and_persistence(
+            session_id,
+            world,
+            journal_fault_host_options(),
+            Box::new(journal),
+            persistence,
+        )
+        .expect("transfer the same world and its one-shot persistence session");
+        let mut frontend = NullFrontend::new(core.local_port(), session_id.get() ^ 0xfeed);
+        let terminal_journal = match guarantee {
+            PersistenceGuarantee::Durable => JournalState::Durable,
+            PersistenceGuarantee::CommittedVolatile => JournalState::CommittedVolatile,
+        };
+        let second = PersistenceBatchId::new(2).expect("second batch identity");
+        let finalized = PersistenceWatermarks {
+            admitted: Some(second),
+            applied: Some(second),
+            durable: (guarantee == PersistenceGuarantee::Durable).then_some(second),
+        };
+        let mut next_nanos = 0;
+        for (command, tick) in [(HostCommand::Pause, 1), (HostCommand::Step, 2)] {
+            let submitted =
+                submit_fault_command(&mut frontend, &mut core, command, &mut next_nanos);
+            let status = drive_journal_command_to_terminal(
+                &mut frontend,
+                &mut core,
+                submitted.command_id(),
+                &mut next_nanos,
+            );
+            assert_eq!(status.journal(), &terminal_journal);
+            assert_eq!(core.world().tick().0, tick);
+            pipeline
+                .checkpoint_writer()
+                .retention_usage()
+                .expect("observe the completed journal without forcing an ordinary flush");
+            let snapshot = analytics.snapshot();
+            if tick == 1 {
+                assert_eq!(pipeline.inflight_bytes(), buffered_bytes);
+                assert_eq!(snapshot.watermarks, admitted);
+                assert_eq!(snapshot.committed_tick, None);
+            } else {
+                assert_eq!(
+                    pipeline.inflight_bytes(),
+                    0,
+                    "journal finalization releases ordinary bytes"
+                );
+                assert_eq!(snapshot.watermarks, finalized);
+                assert_eq!(snapshot.committed_tick, Some(2));
+            }
+        }
+
+        assert_mixed_persistence_flush_and_shutdown(
+            pipeline, core, frontend, guarantee, finalized, next_nanos,
+        )
+    }
+
+    fn assert_mixed_persistence_flush_and_shutdown(
+        pipeline: &mut StoragePipeline,
+        mut core: HostCore,
+        mut frontend: NullFrontend<LocalHostPort>,
+        guarantee: PersistenceGuarantee,
+        finalized: PersistenceWatermarks,
+        mut next_nanos: u64,
+    ) -> ShutdownReceipt {
+        let analytics = pipeline.analytics_provider();
+        let newest = analytics.snapshot();
+        let flush = pipeline
+            .flush_and_wait()
+            .expect("flush after journal completion");
+        assert_eq!(
+            flush.committed_tick,
+            Some(2),
+            "an older pending observation must not reappear"
+        );
+        assert_eq!(flush.watermarks, finalized);
+        assert_eq!(analytics.snapshot().committed_tick, Some(2));
+        assert!(Arc::ptr_eq(
+            &analytics.snapshot().readings,
+            &newest.readings
+        ));
+
+        let shutdown = submit_fault_command(
+            &mut frontend,
+            &mut core,
+            HostCommand::Shutdown,
+            &mut next_nanos,
+        );
+        let status = drive_journal_command_to_terminal(
+            &mut frontend,
+            &mut core,
+            shutdown.command_id(),
+            &mut next_nanos,
+        );
+        assert_eq!(
+            status.journal(),
+            &match guarantee {
+                PersistenceGuarantee::Durable => JournalState::Durable,
+                PersistenceGuarantee::CommittedVolatile => JournalState::CommittedVolatile,
+            }
+        );
+        assert_eq!(core.world().tick().0, 2);
+        drop(frontend);
+        drop(core);
+        let receipt = pipeline.shutdown().expect("ordered storage shutdown");
+        assert_eq!(receipt.guarantee, guarantee);
+        assert_eq!(receipt.committed_tick, Some(2));
+        assert_eq!(receipt.watermarks, finalized);
+        assert_eq!(analytics.snapshot().committed_tick, Some(2));
+        assert!(Arc::ptr_eq(
+            &analytics.snapshot().readings,
+            &newest.readings
+        ));
+        assert!(analytics.snapshot().stopped);
+        receipt
+    }
+
+    #[test]
+    fn journal_completion_reconciles_buffered_file_persistence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("journal-buffered-file-reconciliation");
+        let path = path.to_str().expect("UTF-8 test path");
+        let mut pipeline = StoragePipeline::create_unattributed_file_with_thresholds(
+            path,
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+        )?;
+        let run_id = pipeline.run_id();
+        let receipt = assert_journal_completion_reconciles_buffered_persistence(
+            &mut pipeline,
+            PersistenceGuarantee::Durable,
+        );
+        let reader = StorageReader::open_finished_for_run(path, run_id)?;
+        assert_eq!(reader.summary_ticks()?, vec![1, 2]);
+        assert_eq!(reader.persistence_watermarks()?, receipt.watermarks);
+        assert_eq!(reader.run_ledger_summary()?.tick_count, 2);
+        reader.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn journal_completion_reconciles_buffered_volatile_persistence() {
+        let mut pipeline = StoragePipeline::unattributed_memory_with_thresholds(
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+        )
+        .expect("real volatile storage worker");
+        assert_journal_completion_reconciles_buffered_persistence(
+            &mut pipeline,
+            PersistenceGuarantee::CommittedVolatile,
+        );
     }
 
     #[test]

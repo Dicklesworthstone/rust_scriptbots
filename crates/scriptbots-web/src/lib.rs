@@ -1,4 +1,12 @@
+#![cfg_attr(
+    not(any(target_arch = "wasm32", test)),
+    allow(
+        missing_docs,
+        reason = "the cfg-disabled native library is empty, including its crate docs; wasm and test artifacts enforce documentation"
+    )
+)]
 #![cfg(any(target_arch = "wasm32", test))]
+//! Browser simulation controls, snapshots, and shareable world configuration.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -33,9 +41,14 @@ use serde::{Deserialize, Serialize};
 use serde_wasm_bindgen::{from_value, to_value};
 use wasm_bindgen::prelude::*;
 
+use scriptbots_runtime::remote::{
+    RemoteEventPage, RemoteEventRecord, RemoteFrame, RemoteFrameIdentity, RemoteFramePayload,
+    decode_remote_frame,
+};
 use scriptbots_runtime::{
     ApplicationState, CommandStatus, DriveReceipt, HostCommand, HostCore, HostCoreOptions,
     HostSessionId, LocalHostPort, ManualHostDriver, ManualInstant, NullFrontend, PlaybackSnapshot,
+    RenderSnapshot,
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -90,6 +103,7 @@ pub struct DiffRow {
 }
 
 #[wasm_bindgen]
+/// A browser-owned simulation and its fixed-deadline host.
 pub struct SimHandle {
     inner: Rc<RefCell<Simulation>>,
 }
@@ -136,8 +150,310 @@ struct SimSpec {
     preserve_population_config: bool,
 }
 
+/// Browser-only envelope; the positional world snapshot wire format is unchanged.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserFrame<'a> {
+    schema: &'static str,
+    identity: BrowserFrameIdentity,
+    snapshot: &'a SimulationSnapshot,
+}
+
+/// Decimal strings preserve every host identity bit across the JavaScript boundary.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserFrameIdentity {
+    session_id: String,
+    publication_revision: String,
+    scientific_revision: String,
+    control_revision: String,
+    config_revision: String,
+    tick: String,
+}
+
+impl<'a> BrowserFrame<'a> {
+    fn new(publication: &'a RenderSnapshot) -> Self {
+        Self {
+            schema: "scriptbots.browser-frame.v1",
+            identity: RemoteFrameIdentity::from(publication).into(),
+            snapshot: &publication.world,
+        }
+    }
+}
+
+impl From<RemoteFrameIdentity> for BrowserFrameIdentity {
+    fn from(identity: RemoteFrameIdentity) -> Self {
+        Self {
+            session_id: identity.session_id.to_string(),
+            publication_revision: identity.publication_revision.to_string(),
+            scientific_revision: identity.scientific_revision.to_string(),
+            control_revision: identity.control_revision.to_string(),
+            config_revision: identity.config_revision.to_string(),
+            tick: identity.tick.to_string(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserRemoteFrame<'a> {
+    schema: &'static str,
+    kind: &'static str,
+    identity: BrowserFrameIdentity,
+    playback: BrowserRemotePlayback,
+    coalesced_publications: String,
+    payload: BrowserRemotePayload<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserRemotePlayback {
+    paused: bool,
+    speed_multiplier: f32,
+}
+
+// This is only the JavaScript object projection, not the positional wire codec.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum BrowserRemotePayload<'a> {
+    Telemetry(&'a scriptbots_core::TickSummaryDto),
+    Canvas(&'a SimulationSnapshot),
+    Events(BrowserRemoteEventPage<'a>),
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserRemoteEventPage<'a> {
+    after_event: String,
+    earliest_retained: String,
+    latest_event: String,
+    gap: Option<BrowserRemoteEventGap>,
+    events: Vec<BrowserRemoteSequencedEvent<'a>>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserRemoteEventGap {
+    first_missing: String,
+    last_missing: String,
+}
+
+#[derive(Serialize)]
+struct BrowserRemoteSequencedEvent<'a> {
+    sequence: String,
+    record: BrowserRemoteEventRecord<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserRemoteEventRecord<'a> {
+    schema_version: u32,
+    tick: String,
+    kind: scriptbots_core::narrative::EventKind,
+    severity: f32,
+    magnitude: f64,
+    window: [String; 2],
+    metric: &'a str,
+    before: f64,
+    after: f64,
+    score: f64,
+    subject: Option<&'a str>,
+    human_text: &'a str,
+}
+
+impl<'a> From<&'a RemoteEventRecord> for BrowserRemoteEventRecord<'a> {
+    fn from(record: &'a RemoteEventRecord) -> Self {
+        Self {
+            schema_version: record.schema_version,
+            tick: record.tick.to_string(),
+            kind: record.kind,
+            severity: record.severity,
+            magnitude: record.magnitude,
+            window: [record.window.0.to_string(), record.window.1.to_string()],
+            metric: &record.metric,
+            before: record.before,
+            after: record.after,
+            score: record.score,
+            subject: record.subject.as_deref(),
+            human_text: &record.human_text,
+        }
+    }
+}
+
+impl<'a> From<&'a RemoteEventPage> for BrowserRemoteEventPage<'a> {
+    fn from(page: &'a RemoteEventPage) -> Self {
+        Self {
+            after_event: page.after_event.to_string(),
+            earliest_retained: page.earliest_retained.to_string(),
+            latest_event: page.latest_event.to_string(),
+            gap: page.gap.map(|gap| BrowserRemoteEventGap {
+                first_missing: gap.first_missing.to_string(),
+                last_missing: gap.last_missing.to_string(),
+            }),
+            events: page
+                .events
+                .iter()
+                .map(|event| BrowserRemoteSequencedEvent {
+                    sequence: event.sequence.to_string(),
+                    record: (&event.record).into(),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl<'a> From<&'a RemoteFrame> for BrowserRemoteFrame<'a> {
+    fn from(frame: &'a RemoteFrame) -> Self {
+        let (kind, payload) = match &frame.payload {
+            RemoteFramePayload::Telemetry(summary) => {
+                ("telemetry", BrowserRemotePayload::Telemetry(summary))
+            }
+            RemoteFramePayload::Canvas(snapshot) => {
+                ("canvas", BrowserRemotePayload::Canvas(snapshot))
+            }
+            RemoteFramePayload::Events(page) => {
+                ("events", BrowserRemotePayload::Events(page.into()))
+            }
+        };
+        Self {
+            schema: "scriptbots.remote-frame.v1",
+            kind,
+            identity: frame.identity.into(),
+            playback: BrowserRemotePlayback {
+                paused: frame.playback.paused,
+                speed_multiplier: frame.playback.speed_multiplier,
+            },
+            coalesced_publications: frame.coalesced_publications.to_string(),
+            payload,
+        }
+    }
+}
+
+#[cfg(test)]
+mod remote_frame_tests {
+    use super::*;
+    use scriptbots_runtime::remote::{RemoteEventPage, RemoteSequencedEvent, encode_remote_frame};
+
+    #[test]
+    fn remote_frame_canvas_keeps_the_existing_renderer_contract_and_exact_identities() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            rng_seed: Some(17),
+            world_width: 80,
+            world_height: 80,
+            food_cell_size: 40,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            persistence_interval: 0,
+            ..ScriptBotsConfig::default()
+        })
+        .unwrap();
+        world.try_spawn_agent(AgentData::default()).unwrap();
+        let host =
+            HostCore::new(HostSessionId::new(17), world, HostCoreOptions::default()).unwrap();
+        let publication = host.latest_snapshot();
+        let mut frame = RemoteFrame {
+            identity: RemoteFrameIdentity::from(publication.as_ref()),
+            playback: publication.playback,
+            coalesced_publications: 0,
+            payload: RemoteFramePayload::Canvas(publication.world.clone()),
+        };
+        let bytes = encode_remote_frame(&frame).unwrap();
+        let decoded = decode_remote_frame(&bytes).unwrap();
+        let browser = serde_json::to_value(BrowserRemoteFrame::from(&decoded)).unwrap();
+        let local = serde_json::to_value(BrowserFrame::new(&publication)).unwrap();
+        assert_eq!(browser["payload"], local["snapshot"]);
+        assert_eq!(browser["identity"], local["identity"]);
+        assert_eq!(browser["kind"], "canvas");
+        assert_eq!(browser["schema"], "scriptbots.remote-frame.v1");
+        assert_eq!(browser["playback"]["paused"], publication.playback.paused);
+        assert_eq!(
+            browser["playback"]["speedMultiplier"],
+            publication.playback.speed_multiplier
+        );
+
+        // JS numeric identities cannot represent these values. Their decimal
+        // strings must survive the actual wire and the same JS projection.
+        frame.identity.session_id = u128::MAX;
+        frame.identity.publication_revision = u64::MAX;
+        frame.identity.scientific_revision = u64::MAX - 1;
+        frame.coalesced_publications = u64::MAX - 2;
+        let decoded = decode_remote_frame(&encode_remote_frame(&frame).unwrap()).unwrap();
+        let browser = serde_json::to_value(BrowserRemoteFrame::from(&decoded)).unwrap();
+        assert_eq!(browser["identity"]["sessionId"], u128::MAX.to_string());
+        assert_eq!(
+            browser["identity"]["publicationRevision"],
+            u64::MAX.to_string()
+        );
+        assert_eq!(
+            browser["identity"]["scientificRevision"],
+            (u64::MAX - 1).to_string()
+        );
+        assert_eq!(browser["coalescedPublications"], (u64::MAX - 2).to_string());
+    }
+
+    #[test]
+    fn remote_frame_events_preserve_large_cursors_and_canonical_prose() {
+        let record = RemoteEventRecord {
+            schema_version: 1,
+            tick: 0,
+            kind: scriptbots_core::narrative::EventKind::PopulationBoom,
+            severity: 0.5,
+            magnitude: 1.0,
+            window: (0, 0),
+            metric: "population".to_owned(),
+            before: 1.0,
+            after: 2.0,
+            score: 3.0,
+            subject: Some(format!("agent:{}", u64::MAX)),
+            human_text: "canonical prose".to_owned(),
+        };
+        let frame = RemoteFrame {
+            identity: RemoteFrameIdentity {
+                session_id: u128::MAX,
+                publication_revision: 1,
+                scientific_revision: 0,
+                control_revision: 0,
+                config_revision: 0,
+                tick: 0,
+            },
+            playback: PlaybackSnapshot {
+                paused: true,
+                speed_multiplier: 2.0,
+            },
+            coalesced_publications: 0,
+            payload: RemoteFramePayload::Events(RemoteEventPage {
+                after_event: u64::MAX - 1,
+                earliest_retained: u64::MAX,
+                latest_event: u64::MAX,
+                gap: None,
+                events: vec![RemoteSequencedEvent {
+                    sequence: u64::MAX,
+                    record,
+                }],
+            }),
+        };
+        let decoded = decode_remote_frame(&encode_remote_frame(&frame).unwrap()).unwrap();
+        let browser = serde_json::to_value(BrowserRemoteFrame::from(&decoded)).unwrap();
+        assert_eq!(browser["payload"]["afterEvent"], (u64::MAX - 1).to_string());
+        assert_eq!(browser["payload"]["latestEvent"], u64::MAX.to_string());
+        assert_eq!(
+            browser["payload"]["events"][0]["sequence"],
+            u64::MAX.to_string()
+        );
+        assert_eq!(browser["payload"]["events"][0]["record"]["tick"], "0");
+        assert_eq!(
+            browser["payload"]["events"][0]["record"]["subject"],
+            format!("agent:{}", u64::MAX)
+        );
+        assert_eq!(
+            browser["payload"]["events"][0]["record"]["humanText"],
+            "canonical prose"
+        );
+    }
+}
+
 impl SimSpec {
-    fn new(
+    const fn new(
         base_config: ScriptBotsConfig,
         initial_population: usize,
         seed: Option<u64>,
@@ -157,7 +473,7 @@ impl SimSpec {
         }
     }
 
-    fn from_permalink(permalink: Permalink, config: ScriptBotsConfig) -> Self {
+    const fn from_permalink(permalink: Permalink, config: ScriptBotsConfig) -> Self {
         let seed = permalink.seed;
         Self {
             base_config: config,
@@ -292,7 +608,7 @@ impl Simulation {
             .context("browser elapsed milliseconds must be finite and nonnegative")?;
         let now_nanos = u64::try_from(duration.as_nanos())
             .context("browser elapsed milliseconds exceed the host clock range")?;
-        let max_safe_nanos = js_sys::Number::MAX_SAFE_INTEGER as u64;
+        let max_safe_nanos = (1_u64 << f64::MANTISSA_DIGITS) - 1;
         ensure!(
             now_nanos <= max_safe_nanos,
             "browser elapsed time exceeds JavaScript's exact nanosecond range ({max_safe_nanos}ns)"
@@ -396,6 +712,7 @@ impl InitOptions {
 
 #[wasm_bindgen]
 impl SimHandle {
+    /// Advance exactly the requested number of scientific steps and encode the snapshot.
     #[wasm_bindgen(js_name = tick)]
     pub fn tick_js(&self, steps: u32) -> Result<JsValue, JsValue> {
         let mut simulation = self.inner.borrow_mut();
@@ -428,6 +745,7 @@ impl SimHandle {
         to_value(&status).map_err(js_error)
     }
 
+    /// Encode the latest snapshot without advancing scientific time.
     #[wasm_bindgen(js_name = snapshot)]
     pub fn snapshot_js(&self) -> Result<JsValue, JsValue> {
         let simulation = self.inner.borrow();
@@ -435,6 +753,16 @@ impl SimHandle {
         encode_snapshot(&snapshot, simulation.spec.snapshot_format)
     }
 
+    /// Read one immutable host publication as a JSON frame with exact identities.
+    /// This does not advance science and is independent of the snapshot codec option.
+    #[wasm_bindgen(js_name = frame)]
+    pub fn frame_js(&self) -> Result<JsValue, JsValue> {
+        let simulation = self.inner.borrow();
+        let publication = simulation.core.latest_snapshot();
+        to_value(&BrowserFrame::new(&publication)).map_err(js_error)
+    }
+
+    /// Rebuild the simulation with an optional nonnegative numeric seed.
     #[wasm_bindgen(js_name = reset)]
     pub fn reset_js(&self, seed: Option<f64>) -> Result<(), JsValue> {
         let seed = normalize_seed(seed).map_err(js_error)?;
@@ -442,10 +770,11 @@ impl SimHandle {
         simulation.reset(seed).map_err(js_error)
     }
 
+    /// Rebuild the simulation using the named MLP, wander, or unbound brain preset.
     #[wasm_bindgen(js_name = registerBrain)]
-    pub fn register_brain_js(&self, kind: String) -> Result<(), JsValue> {
+    pub fn register_brain_js(&self, kind: &str) -> Result<(), JsValue> {
         let mut simulation = self.inner.borrow_mut();
-        match kind.as_str() {
+        match kind {
             "mlp" => {
                 simulation.spec.default_brain = Some(BrainPreset::Mlp);
                 simulation.spec.seed_strategy = SeedStrategy::None;
@@ -471,6 +800,7 @@ impl SimHandle {
         }
     }
 
+    /// Encode the current configured world as a shareable permalink.
     #[wasm_bindgen(js_name = permalinkOf)]
     pub fn permalink_of(&self) -> Result<String, JsValue> {
         let sim = self.inner.borrow();
@@ -490,6 +820,7 @@ impl SimHandle {
         Ok(link.to_url_string())
     }
 
+    /// Return a child permalink with validated configuration knob assignments.
     #[wasm_bindgen]
     pub fn fork(&self, knob_patch: JsValue) -> Result<String, JsValue> {
         let patch_entries = parse_knob_patch(knob_patch)?;
@@ -504,7 +835,7 @@ impl SimHandle {
         simulation.tick(steps)
     }
 
-    /// Fork this world with an explicit slice of knob assignments without converting to JsValue.
+    /// Fork this world with an explicit slice of knob assignments without converting to `JsValue`.
     pub fn fork_patch(&self, patch: &[(String, f64)]) -> Result<String, String> {
         let sim = self.inner.borrow();
         let parent_link = if let Some(ref link) = sim.spec.permalink {
@@ -559,6 +890,7 @@ impl SimHandle {
     }
 }
 
+/// Initialize a browser simulation from options, or defaults for null/undefined.
 #[wasm_bindgen]
 pub fn init_sim(config: JsValue) -> Result<SimHandle, JsValue> {
     ensure_panic_hook_installed();
@@ -592,19 +924,21 @@ fn seed_agents(
         return Ok(());
     }
 
+    // Agent positions and the population RNG use the core's f32 coordinate domain.
+    #[allow(clippy::cast_precision_loss)]
     let world_width = world.config().world_width as f32;
+    #[allow(clippy::cast_precision_loss)]
     let world_height = world.config().world_height as f32;
 
     let mlp_key = if matches!(default_brain, Some(BrainPreset::Mlp)) {
-        Some(match mlp_key_cache {
-            Some(key) => *key,
-            None => {
-                let key = world
-                    .register_brain_family(MlpBrain::KIND.as_str(), Box::new(MlpBrainFamily::new()))
-                    .context("failed to register the versioned MLP brain family")?;
-                *mlp_key_cache = Some(key);
-                key
-            }
+        Some(if let Some(key) = mlp_key_cache {
+            *key
+        } else {
+            let key = world
+                .register_brain_family(MlpBrain::KIND.as_str(), Box::new(MlpBrainFamily::new()))
+                .context("failed to register the versioned MLP brain family")?;
+            *mlp_key_cache = Some(key);
+            key
         })
     } else {
         None
@@ -663,10 +997,15 @@ fn normalize_seed(seed: Option<f64>) -> Result<Option<u64>> {
     ensure!(value.is_finite(), "seed must be a finite number");
     ensure!(value >= 0.0, "seed must be non-negative");
     let truncated = value.floor();
+    // u64::MAX rounds upward to 2^64 in f64. That endpoint is exclusive.
+    #[allow(clippy::cast_precision_loss)]
+    let exclusive_upper = u64::MAX as f64;
     ensure!(
-        truncated <= u64::MAX as f64,
+        truncated < exclusive_upper,
         "seed must be representable as u64"
     );
+    // The guards above establish a finite, nonnegative, integral value below 2^64.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     Ok(Some(truncated as u64))
 }
 
@@ -695,21 +1034,36 @@ fn encode_snapshot(
     }
 }
 
+/// Return the package name and version of this browser module.
+#[must_use]
 #[wasm_bindgen]
 pub fn version() -> String {
     format!("scriptbots-web {}", env!("CARGO_PKG_VERSION"))
 }
 
+/// Encode the default browser initialization options.
 #[wasm_bindgen]
 pub fn default_init_options() -> Result<JsValue, JsValue> {
     to_value(&InitOptions::default()).map_err(js_error)
 }
 
+/// Decode a postcard world snapshot and expose its JavaScript representation.
 #[wasm_bindgen]
 pub fn decode_snapshot_binary(bytes: &[u8]) -> Result<JsValue, JsValue> {
     let snapshot: SimulationSnapshot =
         from_bytes(bytes).map_err(|err| js_error(format!("postcard decode failed: {err}")))?;
     to_value(&snapshot).map_err(js_error)
+}
+
+/// Decode a negotiated server frame using the shared bounded Postcard protocol.
+///
+/// Identity and event-cursor integers are decimal strings at the JS boundary.
+/// Canvas payloads retain the existing camelCase dynamic-world snapshot shape.
+/// This function never creates, drives, or mutates a local simulation.
+#[wasm_bindgen]
+pub fn decode_remote_frame_binary(bytes: &[u8]) -> Result<JsValue, JsValue> {
+    let frame = decode_remote_frame(bytes).map_err(js_error)?;
+    to_value(&BrowserRemoteFrame::from(&frame)).map_err(js_error)
 }
 
 /// Initialize a simulation from a shareable permalink string (`sbw1...`).
@@ -852,8 +1206,11 @@ pub fn permalink_diff(link: &str) -> Result<JsValue, JsValue> {
 /// Information about the running build identity.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BuildIdentityResult {
+    /// Hexadecimal digest of the running toolchain identity.
     pub toolchain_digest: String,
+    /// Hexadecimal digest of the running dependency lockfile.
     pub lockfile_digest: String,
+    /// Hexadecimal digest of the running simulation core.
     pub core_digest: String,
 }
 
@@ -872,12 +1229,19 @@ pub fn build_identity() -> Result<JsValue, JsValue> {
 /// Structured build match assessment result.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BuildMatchResult {
+    /// Exact, compatible, or mismatched build assessment.
     pub status: String,
+    /// Simulation core digest encoded in the permalink.
     pub link_core_digest: String,
+    /// Simulation core digest of this module.
     pub local_core_digest: String,
+    /// Toolchain digest encoded in the permalink.
     pub link_toolchain_digest: String,
+    /// Toolchain digest of this module.
     pub local_toolchain_digest: String,
+    /// Dependency lockfile digest encoded in the permalink.
     pub link_lockfile_digest: String,
+    /// Dependency lockfile digest of this module.
     pub local_lockfile_digest: String,
 }
 
@@ -926,10 +1290,19 @@ fn extract_json_number(value: &serde_json::Value, path: &str) -> Option<f64> {
     for part in parts {
         current = current.get(part)?;
     }
-    current
+    // Knob comparison rows deliberately expose f64, including integer config fields.
+    #[allow(clippy::cast_precision_loss)]
+    let number = current
         .as_f64()
         .or_else(|| current.as_i64().map(|i| i as f64))
-        .or_else(|| current.as_u64().map(|u| u as f64))
+        .or_else(|| current.as_u64().map(|u| u as f64));
+    number
+}
+
+#[derive(Deserialize)]
+struct PatchItem {
+    knob: String,
+    value: f64,
 }
 
 fn parse_knob_patch(patch_val: JsValue) -> Result<Vec<(String, f64)>, JsValue> {
@@ -944,11 +1317,6 @@ fn parse_knob_patch(patch_val: JsValue) -> Result<Vec<(String, f64)>, JsValue> {
         if let Ok(map) = serde_json::from_str::<BTreeMap<String, f64>>(trimmed) {
             return Ok(map.into_iter().collect());
         }
-        #[derive(Deserialize)]
-        struct PatchItem {
-            knob: String,
-            value: f64,
-        }
         if let Ok(list) = serde_json::from_str::<Vec<PatchItem>>(trimmed) {
             return Ok(list
                 .into_iter()
@@ -961,11 +1329,6 @@ fn parse_knob_patch(patch_val: JsValue) -> Result<Vec<(String, f64)>, JsValue> {
     }
     if let Ok(map) = serde_wasm_bindgen::from_value::<BTreeMap<String, f64>>(patch_val.clone()) {
         return Ok(map.into_iter().collect());
-    }
-    #[derive(Deserialize)]
-    struct PatchItem {
-        knob: String,
-        value: f64,
     }
     if let Ok(list) = serde_wasm_bindgen::from_value::<Vec<PatchItem>>(patch_val.clone()) {
         return Ok(list
@@ -982,13 +1345,14 @@ fn parse_knob_patch(patch_val: JsValue) -> Result<Vec<(String, f64)>, JsValue> {
 }
 
 fn bind_wander_brain(world: &mut WorldState, agent: AgentId, seed: u64) -> Result<()> {
-    match world.try_update_agent_runtime(agent, |runtime| {
+    if world.try_update_agent_runtime(agent, |runtime| {
         runtime.brain = BrainBinding::with_runner(Box::new(WanderBrain::new(seed)));
     })? {
-        true => Ok(()),
-        false => Err(anyhow::anyhow!(
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
             "agent runtime missing while binding wander brain"
-        )),
+        ))
     }
 }
 
@@ -1009,6 +1373,10 @@ impl BrainRunner for WanderBrain {
         "wasm.wander"
     }
 
+    #[allow(
+        clippy::suboptimal_flops,
+        reason = "the wander brain's separately rounded f32 operations are part of seeded native/WASM snapshot parity; FMA changes those bits"
+    )]
     fn tick(&mut self, inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
         let mut outputs = [0.0; OUTPUT_SIZE];
         let left_eye = sensor(inputs, 0);
@@ -1038,7 +1406,7 @@ fn sensor(inputs: &[f32; INPUT_SIZE], idx: usize) -> f32 {
     inputs.get(idx).copied().unwrap_or_default()
 }
 
-fn clamp01(value: f32) -> f32 {
+const fn clamp01(value: f32) -> f32 {
     value.clamp(0.0, 1.0)
 }
 
@@ -1053,6 +1421,31 @@ mod tests {
     use wasm_bindgen_test::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn numeric_seed_rejects_the_rounded_u64_upper_endpoint() {
+        let upper = 2.0_f64.powi(i32::try_from(u64::BITS).expect("u64 width fits i32"));
+        let last_representable = upper.next_down();
+        let rounded_gap = (1_u64 << (u64::BITS - f64::MANTISSA_DIGITS)) - 1;
+        assert_eq!(
+            normalize_seed(Some(last_representable)).expect("last f64 below 2^64"),
+            Some(u64::MAX - rounded_gap)
+        );
+        for invalid in [
+            upper,
+            upper.next_up(),
+            -0.1,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
+            assert!(normalize_seed(Some(invalid)).is_err(), "accepted {invalid}");
+        }
+        assert_eq!(normalize_seed(None).expect("omitted seed"), None);
+        assert_eq!(normalize_seed(Some(0.0)).expect("zero seed"), Some(0));
+        assert_eq!(normalize_seed(Some(1.9)).expect("fractional seed"), Some(1));
+    }
 
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
     #[cfg_attr(not(target_arch = "wasm32"), test)]
@@ -1174,6 +1567,113 @@ mod tests {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
+    fn validate_stats_dom_report(stdout: &str) -> Result<()> {
+        let mut reports = stdout
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|value| value["schema"] == "scriptbots.browser-stats-dom.v1");
+        let report = reports
+            .next()
+            .context("browser emitted no stats DOM report")?;
+        ensure!(
+            reports.next().is_none(),
+            "browser emitted multiple stats DOM reports"
+        );
+        ensure!(report["status"] == "pass", "browser report did not pass");
+        ensure!(
+            report["cases_failed"].as_u64() == Some(0),
+            "browser failed-case count is missing, invalid, or nonzero"
+        );
+        let required_cases = [
+            "camelCasePositive",
+            "snakeCaseNegative",
+            "schedulingNegative",
+            "realPackage",
+        ];
+        ensure!(
+            report["cases_passed"].as_u64()
+                == Some(u64::try_from(required_cases.len()).expect("case count fits u64")),
+            "browser case count disagrees with the required observations"
+        );
+        for name in required_cases {
+            ensure!(
+                report["observations"][name]["passed"] == true,
+                "browser case {name} has no successful observation"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn stats_dom_report_validation_rejects_incomplete_and_forged_observations() {
+        // These are parser inputs only; live browser evidence comes from the DOM test.
+        let report = serde_json::json!({
+            "schema": "scriptbots.browser-stats-dom.v1",
+            "status": "pass",
+            "cases_passed": 4,
+            "cases_failed": 0,
+            "observations": {
+                "camelCasePositive": { "passed": true },
+                "snakeCaseNegative": { "passed": true },
+                "schedulingNegative": { "passed": true },
+                "realPackage": { "passed": true }
+            }
+        });
+        validate_stats_dom_report(&format!("browser diagnostic\n{report}\n"))
+            .expect("complete four-case report");
+        for count in [0, 3, 5, 30] {
+            let mut invalid = report.clone();
+            invalid["cases_passed"] = count.into();
+            assert!(validate_stats_dom_report(&invalid.to_string()).is_err());
+        }
+        for name in [
+            "camelCasePositive",
+            "snakeCaseNegative",
+            "schedulingNegative",
+            "realPackage",
+        ] {
+            let mut failed = report.clone();
+            failed["observations"][name]["passed"] = false.into();
+            assert!(
+                validate_stats_dom_report(&failed.to_string()).is_err(),
+                "accepted failed {name}"
+            );
+            let mut missing = report.clone();
+            missing["observations"]
+                .as_object_mut()
+                .expect("case map")
+                .remove(name);
+            assert!(
+                validate_stats_dom_report(&missing.to_string()).is_err(),
+                "accepted missing {name}"
+            );
+        }
+        let mut failed = report.clone();
+        failed["cases_failed"] = 1.into();
+        assert!(validate_stats_dom_report(&failed.to_string()).is_err());
+        failed = report.clone();
+        failed["status"] = "fail".into();
+        assert!(validate_stats_dom_report(&failed.to_string()).is_err());
+        for (field, value) in [
+            ("schema", serde_json::json!("wrong-schema")),
+            ("cases_passed", serde_json::json!(4.0)),
+            ("cases_passed", serde_json::json!("4")),
+            ("cases_failed", serde_json::json!(0.0)),
+        ] {
+            let mut invalid = report.clone();
+            invalid[field] = value;
+            assert!(validate_stats_dom_report(&invalid.to_string()).is_err());
+        }
+        let mut mistyped = report.clone();
+        mistyped["observations"]["realPackage"]["passed"] = "true".into();
+        assert!(validate_stats_dom_report(&mistyped.to_string()).is_err());
+        assert!(validate_stats_dom_report(&format!("{report}\n{report}")).is_err());
+        assert!(validate_stats_dom_report("{}").is_err());
+        assert!(validate_stats_dom_report("{not-json").is_err());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn browser_demo_executes_stats_refresh_through_real_dom() {
         // Execute the real-browser DOM stats refresh regression proof (bd-2z0.12.6).
@@ -1228,27 +1728,12 @@ mod tests {
 
         assert!(
             output.status.success(),
-            "real browser DOM execution failed (exit code {:?}):\nSTDOUT:\n{}\nSTDERR:\n{}",
-            output.status.code(),
-            stdout,
-            stderr
+            "real browser DOM execution failed (exit code {:?}):\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}",
+            output.status.code()
         );
 
-        assert!(
-            stdout.contains("\"schema\":\"scriptbots.browser-stats-dom.v1\""),
-            "DOM test must emit structured scriptbots.browser-stats-dom.v1 evidence: {}",
-            stdout
-        );
-        assert!(
-            stdout.contains("\"status\":\"pass\""),
-            "DOM test must report passing status: {}",
-            stdout
-        );
-        assert!(
-            stdout.contains("\"cases_passed\":3"),
-            "DOM test must pass all 3 cases (camelCase, snake_case negative control, scheduling negative control): {}",
-            stdout
-        );
+        validate_stats_dom_report(&stdout)
+            .unwrap_or_else(|error| panic!("invalid browser stats report: {error:#}\n{stdout}"));
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -1306,26 +1791,21 @@ mod tests {
 
         assert!(
             output.status.success(),
-            "real browser DOM fork execution failed (exit code {:?}):\nSTDOUT:\n{}\nSTDERR:\n{}",
-            output.status.code(),
-            stdout,
-            stderr
+            "real browser DOM fork execution failed (exit code {:?}):\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}",
+            output.status.code()
         );
 
         assert!(
             stdout.contains("\"schema\":\"scriptbots.browser-permalink-fork-dom.v1\""),
-            "DOM test must emit structured scriptbots.browser-permalink-fork-dom.v1 evidence: {}",
-            stdout
+            "DOM test must emit structured scriptbots.browser-permalink-fork-dom.v1 evidence: {stdout}"
         );
         assert!(
             stdout.contains("\"status\":\"pass\""),
-            "DOM test must report passing status: {}",
-            stdout
+            "DOM test must report passing status: {stdout}"
         );
         assert!(
             stdout.contains("\"cases_passed\":4"),
-            "DOM test must pass all 4 cases (mismatch warning, parent-diff, fork, negative poison control): {}",
-            stdout
+            "DOM test must pass all 4 cases (mismatch warning, parent-diff, fork, negative poison control): {stdout}"
         );
     }
 
@@ -1599,6 +2079,13 @@ mod tests {
             let before = observed.core.scientific_digest_v1().expect("before reads");
             for _ in 0..boundary {
                 assert_eq!(observed.snapshot().tick, observed.core.world_tick().0);
+                let publication = observed.core.latest_snapshot();
+                let frame = BrowserFrame::new(&publication);
+                assert_eq!(frame.identity.tick, observed.snapshot().tick.to_string());
+                assert_eq!(
+                    serde_json::to_value(&frame).expect("browser frame JSON")["snapshot"],
+                    serde_json::to_value(observed.snapshot()).expect("existing projection JSON")
+                );
             }
             assert_eq!(
                 observed.core.scientific_digest_v1().expect("after reads"),
@@ -1625,6 +2112,72 @@ mod tests {
                 .expect("repeated digest"),
             final_digest
         );
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_frame_names_independent_host_revisions_exactly() {
+        let mut simulation = browser_clock_simulation();
+        let initial = simulation.core.latest_snapshot();
+        let initial_identity = BrowserFrame::new(&initial).identity;
+        simulation.set_speed(0.0).expect("pause through host");
+        let paused = simulation.core.latest_snapshot();
+        let paused_identity = BrowserFrame::new(&paused).identity;
+        assert_eq!(paused_identity.tick, initial_identity.tick);
+        assert_eq!(
+            paused_identity.scientific_revision,
+            initial_identity.scientific_revision
+        );
+        assert_ne!(
+            paused_identity.control_revision,
+            initial_identity.control_revision
+        );
+        assert_ne!(
+            paused_identity.publication_revision,
+            initial_identity.publication_revision
+        );
+        simulation.tick(1).expect("one manual science tick");
+        let stepped = simulation.core.latest_snapshot();
+        let stepped_identity = BrowserFrame::new(&stepped).identity;
+        assert_ne!(
+            stepped_identity.scientific_revision,
+            paused_identity.scientific_revision
+        );
+        assert_ne!(stepped_identity.tick, paused_identity.tick);
+        assert_eq!(
+            stepped_identity.config_revision,
+            paused_identity.config_revision
+        );
+
+        // A declared wire fixture checks full-width identities, not a host that
+        // has actually executed u64::MAX scientific steps.
+        let mut wide = (*stepped).clone();
+        wide.session_id = HostSessionId::new(u64::MAX);
+        wide.revision = scriptbots_runtime::SnapshotRevision::new(u64::MAX - 1);
+        wide.revisions.scientific = scriptbots_runtime::ScientificRevision::new(u64::MAX - 2);
+        wide.revisions.control = scriptbots_runtime::ControlRevision::new(u64::MAX - 3);
+        wide.revisions.config = scriptbots_runtime::ConfigRevision::new(u64::MAX - 4);
+        wide.world.tick = u64::MAX - 5;
+        let identity = BrowserFrame::new(&wide).identity;
+        let encoded = serde_json::to_value(&identity).expect("exact decimal identity JSON");
+        assert_eq!(encoded["sessionId"], wide.session_id.get().to_string());
+        assert_eq!(
+            encoded["publicationRevision"],
+            wide.revision.get().to_string()
+        );
+        assert_eq!(
+            encoded["scientificRevision"],
+            wide.revisions.scientific.get().to_string()
+        );
+        assert_eq!(
+            encoded["controlRevision"],
+            wide.revisions.control.get().to_string()
+        );
+        assert_eq!(
+            encoded["configRevision"],
+            wide.revisions.config.get().to_string()
+        );
+        assert_eq!(encoded["tick"], wide.world.tick.to_string());
     }
 
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
@@ -1775,7 +2328,7 @@ mod tests {
             .drive(safe_ms)
             .expect("representable late boundary");
         assert_eq!(safe.scientific_steps, max_steps);
-        assert!(safe.now.as_nanos() <= js_sys::Number::MAX_SAFE_INTEGER as u64);
+        assert!(safe.now.as_nanos() < (1_u64 << f64::MANTISSA_DIGITS));
     }
 
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
@@ -2287,7 +2840,8 @@ mod tests {
             expected.agents[0].position[0],
             expected.agents[0].position[0],
         );
-        actual.agents[0].position[0] += position_tolerance * 2.0;
+        let injected_delta = position_tolerance * 2.0;
+        actual.agents[0].position[0] += injected_delta;
 
         let error = compare_snapshots(config_hash, 0, &expected, &actual)
             .expect_err("injected position divergence must fail");
@@ -2315,7 +2869,7 @@ mod tests {
     /// runtime runs this test; true native-vs-wasm parity is the committed-fixture
     /// test below. (Renamed from `wasm_harness_matches_native_world`, which claimed
     /// parity this structure cannot prove while its reference side ALSO ran a
-    /// different scenario: a raw config whose default population_spawn_interval=100
+    /// different scenario: a raw config whose default `population_spawn_interval=100`
     /// never fired under the old <=64-tick cases, while the harness zeroed it.)
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
     #[cfg_attr(not(target_arch = "wasm32"), test)]
@@ -2883,7 +3437,7 @@ mod tests {
     fn reconstruction_parity_native_and_wasm() {
         let link_str = make_test_permalink(
             "meadow",
-            20260717,
+            20_260_717,
             vec![
                 ("food_growth_rate".to_string(), 0.02),
                 ("population_minimum".to_string(), 30.0),
@@ -3019,6 +3573,7 @@ mod tests {
     reason = "a wasm_bindgen export takes the terrain inputs as flat scalars so JavaScript can call it without constructing a struct"
 )]
 #[wasm_bindgen]
+#[must_use]
 pub fn evaluate_terrain_surface_srgb(
     kind: u8,
     elevation: f32,

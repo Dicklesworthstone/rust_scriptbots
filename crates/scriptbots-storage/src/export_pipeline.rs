@@ -1,3 +1,5 @@
+//! Typed storage exports, canonical schemas, and completion-receipt verification.
+
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::time::SystemTime;
@@ -69,7 +71,7 @@ pub enum ExportTable {
 }
 
 impl ExportTable {
-    /// Stable snake_case name used in artifacts and filenames.
+    /// Stable `snake_case` name used in artifacts and filenames.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -193,27 +195,34 @@ pub const fn compare_schema(expected: SchemaId, found: SchemaId) -> DigestCompar
 /// Export format for run analytics data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExportFormat {
+    /// Comma-separated values encoding.
     Csv,
+    /// JSON objects separated by newline delimiters.
     JsonLines,
 }
 
 /// Provenance metadata embedded in exported artifacts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportProvenance {
+    /// Identifier of the exported run.
     pub run_id: String,
+    /// Run seed recorded for the export.
     pub seed: u64,
     /// Digest of the normalized run configuration (the conservation verdict's
     /// `config_digest` is the canonical source for this value).
     pub config_digest: String,
     /// Exact source revision/tree that produced the run or rendered artifact.
     pub source_revision: String,
+    /// Digest of the source tree that produced the run or artifact.
     pub source_tree_digest: String,
     /// Decisions that affect interpretation of the exported rows (for example,
     /// authority/recovery outcomes or conservation verdict status).
     pub authority_decisions: Vec<String>,
     /// Serialized tolerance policy when a conservation verdict was part of the run.
     pub conservation_tolerances: Option<serde_json::Value>,
+    /// Schema version declared for the exported artifact.
     pub schema_version: u32,
+    /// UTC timestamp at export time.
     pub exported_at_utc: String,
 }
 
@@ -224,65 +233,105 @@ pub struct ExportProvenance {
 /// Canonical row for the `run` export table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunExportRow {
+    /// Canonical run identifier.
     pub run_id: String,
+    /// Version of the stored run manifest schema.
     pub manifest_schema_version: u32,
+    /// Scenario preset identifier.
     pub scenario_id: String,
+    /// Version of the scenario preset.
     pub scenario_version: u32,
+    /// Digest of the canonical run configuration.
     pub config_digest: String,
+    /// Hexadecimal root seed representation.
     pub root_seed_hex: String,
+    /// Source revision, when recorded.
     pub source_revision: Option<String>,
+    /// Source tree digest, when recorded.
     pub source_tree_digest: Option<String>,
+    /// Run start time in milliseconds since the Unix epoch.
     pub started_at_unix_ms: u64,
+    /// Reproducibility flag recorded in the run manifest.
     pub reproducible: bool,
 }
 
 /// Canonical row for the `agent` export table.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentExportRow {
+    /// Run containing this observation.
     pub run_id: String,
+    /// Simulation tick of the observation.
     pub tick: u64,
+    /// Stable agent identifier.
     pub agent_uid: u64,
+    /// Agent generation.
     pub generation: u32,
+    /// Agent age at the observation.
     pub age: u32,
+    /// Horizontal world position.
     pub pos_x: f32,
+    /// Vertical world position.
     pub pos_y: f32,
+    /// Horizontal velocity component.
     pub vel_x: f32,
+    /// Vertical velocity component.
     pub vel_y: f32,
+    /// Agent heading in radians.
     pub heading: f32,
+    /// Observed health.
     pub health: f32,
+    /// Observed energy.
     pub energy: f32,
+    /// Genome's herbivore tendency.
     pub herbivore_tendency: f32,
+    /// Serialized brain binding.
     pub brain_binding: String,
 }
 
 /// Canonical row for the `lineage` export table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LineageExportRow {
+    /// Run containing this lineage edge.
     pub run_id: String,
+    /// Child agent identifier.
     pub child_agent_uid: u64,
+    /// Parent agent identifier.
     pub parent_agent_uid: u64,
+    /// Parent's ordinal among the child's parents.
     pub parent_ordinal: u32,
+    /// Relationship label recorded for the edge.
     pub relationship: String,
+    /// Simulation tick of the child's birth.
     pub birth_tick: u64,
 }
 
 /// Canonical row for the `event` export table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventExportRow {
+    /// Run containing this event.
     pub run_id: String,
+    /// Simulation tick of the event.
     pub tick: u64,
+    /// Event sequence number.
     pub seq: u64,
+    /// Stable event identifier.
     pub event_id: String,
+    /// Event kind label.
     pub kind: String,
+    /// Serialized event payload.
     pub payload: String,
 }
 
 /// Canonical row for the `metric` export table.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MetricExportRow {
+    /// Run containing this metric sample.
     pub run_id: String,
+    /// Simulation tick of the sample.
     pub tick: u64,
+    /// Metric name.
     pub name: String,
+    /// Sampled numerical value.
     pub value: f64,
 }
 
@@ -293,21 +342,32 @@ pub struct MetricExportRow {
 /// Logical data type for canonical Arrow/Parquet table export mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ArrowDataType {
+    /// UTF-8 string.
     Utf8,
+    /// Unsigned 32-bit integer.
     UInt32,
+    /// Unsigned 64-bit integer.
     UInt64,
+    /// IEEE-754 single-precision float.
     Float32,
+    /// IEEE-754 double-precision float.
     Float64,
+    /// Boolean value.
     Boolean,
 }
 
 /// Specification for a single column in an Arrow/Parquet export table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArrowColumnSpec {
+    /// Canonical column name.
     pub name: &'static str,
+    /// Logical Arrow data type.
     pub data_type: ArrowDataType,
+    /// Whether the column permits null values.
     pub nullable: bool,
+    /// Units or semantic category of the value.
     pub units: &'static str,
+    /// Human-readable description of the column.
     pub doc: &'static str,
 }
 
@@ -616,6 +676,7 @@ pub const METRIC_ARROW_SCHEMA: &[ArrowColumnSpec] = &[
 // ============================================================================
 
 /// RFC 4180 CSV escaping: quotes fields containing commas, double-quotes, or newlines.
+#[must_use]
 pub fn csv_escape(s: &str) -> String {
     if s.contains(['"', ',', '\r', '\n']) {
         let mut out = String::with_capacity(s.len() + 4);
@@ -636,6 +697,7 @@ pub fn csv_escape(s: &str) -> String {
 }
 
 /// Simple RFC 4180 CSV line parser handling double-quoted fields.
+#[must_use]
 pub fn parse_csv_line(line: &str) -> Vec<String> {
     let mut fields = Vec::new();
     let mut current = String::new();
@@ -667,6 +729,7 @@ pub fn parse_csv_line(line: &str) -> Vec<String> {
 }
 
 /// Format f32 for CSV under the explicit IEEE-754 policy (NaN, Infinity, -Infinity).
+#[must_use]
 pub fn format_f32_csv(val: f32) -> String {
     if val.is_nan() {
         "NaN".to_string()
@@ -682,6 +745,7 @@ pub fn format_f32_csv(val: f32) -> String {
 }
 
 /// Format f64 for CSV under the explicit IEEE-754 policy.
+#[must_use]
 pub fn format_f64_csv(val: f64) -> String {
     if val.is_nan() {
         "NaN".to_string()
@@ -717,33 +781,47 @@ pub fn parse_f64_csv(s: &str) -> Result<f64, std::num::ParseFloatError> {
 }
 
 /// Deterministic calendar conversion for ISO 8601 UTC timestamp string without third-party crates.
+#[must_use]
 pub fn format_unix_timestamp_iso8601(secs: u64) -> String {
+    // Even u64::MAX / 86_400 fits in i64; preserve the calendar's integer representation.
+    #[allow(clippy::cast_possible_wrap)]
     let days = (secs / 86400) as i64;
     let rem_secs = (secs % 86400) as u32;
     let hours = rem_secs / 3600;
     let mins = (rem_secs % 3600) / 60;
-    let s = rem_secs % 60;
+    let seconds = rem_secs % 60;
 
-    let z = days + 719468;
-    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
-    let doe = (z - era * 146097) as u32;
-    let yoe = (doe - doe / 1020 + doe / 1460 - doe / 146096) / 365;
-    let y = (yoe as i64) + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
+    let civil_days = days + 719_468;
+    let era = (if civil_days >= 0 {
+        civil_days
+    } else {
+        civil_days - 146_096
+    }) / 146_097;
+    // Euclidean era decomposition leaves a nonnegative remainder below 146_097.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let day_of_era = (civil_days - era * 146_097) as u32;
+    let year_of_era =
+        (day_of_era - day_of_era / 1020 + day_of_era / 1460 - day_of_era / 146_096) / 365;
+    let year = i64::from(year_of_era) + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_phase = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_phase + 2) / 5 + 1;
+    let month = if month_phase < 10 {
+        month_phase + 3
+    } else {
+        month_phase - 9
+    };
+    let year = if month <= 2 { year + 1 } else { year };
 
-    format!("{y:04}-{m:02}-{d:02}T{hours:02}:{mins:02}:{s:02}Z")
+    format!("{year:04}-{month:02}-{day:02}T{hours:02}:{mins:02}:{seconds:02}Z")
 }
 
 /// Current UTC ISO 8601 string from system time.
+#[must_use]
 pub fn current_utc_iso8601() -> String {
     let secs = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |duration| duration.as_secs());
     format_unix_timestamp_iso8601(secs)
 }
 
@@ -754,29 +832,51 @@ pub fn current_utc_iso8601() -> String {
 /// Proof of atomic completion stamped at the end of an export artifact.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExportReceipt {
+    /// Table whose data rows the receipt covers.
     pub table: ExportTable,
+    /// Encoding used for those rows.
     pub format: ExportFormat,
+    /// Number of data rows written.
     pub row_count: u64,
+    /// BLAKE3 digest of encoded rows, including their newline delimiters.
     pub checksum_blake3: String,
+    /// UTC timestamp when the completion receipt was created.
     pub completed_at_utc: String,
 }
 
 /// Failures detected when verifying an exported artifact's integrity receipt.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ExportVerificationError {
+    /// No trailing completion receipt was found.
     #[error(
         "export artifact is missing the trailing completion receipt (interrupted or truncated stream)"
     )]
     MissingReceipt,
+    /// The receipt names a different table than the caller requested.
     #[error("export artifact receipt table {found:?} does not match expected {expected:?}")]
     TableMismatch {
+        /// Table requested by the verifier's caller.
         expected: ExportTable,
+        /// Table named by the artifact receipt.
         found: ExportTable,
     },
+    /// The receipt's data row count disagrees with the stream.
     #[error("export artifact reported {reported} rows but contained {counted} rows")]
-    RowCountMismatch { reported: u64, counted: u64 },
+    RowCountMismatch {
+        /// Data row count declared by the receipt.
+        reported: u64,
+        /// Data row count observed in the stream.
+        counted: u64,
+    },
+    /// The receipt's digest disagrees with the stream's data rows.
     #[error("export artifact reported checksum {reported} but computed checksum was {computed}")]
-    ChecksumMismatch { reported: String, computed: String },
+    ChecksumMismatch {
+        /// Digest declared by the receipt.
+        reported: String,
+        /// Digest computed from the stream.
+        computed: String,
+    },
+    /// The completion receipt could not be parsed.
     #[error("malformed receipt format: {0}")]
     MalformedReceipt(String),
 }
@@ -941,7 +1041,7 @@ fn parse_csv_receipt(s: &str) -> Result<ExportReceipt, ExportVerificationError> 
 // STREAMING CORE TABLE EXPORT WRITER (bd-2z0.5.6)
 // ============================================================================
 
-/// Canonical streaming export writer supporting bounded CSV and JSONLines
+/// Canonical streaming export writer supporting bounded CSV and `JSONLines`
 /// output across all 5 core tables with atomic integrity receipts.
 pub struct CoreTableExportWriter<W: Write> {
     writer: W,
@@ -952,7 +1052,7 @@ pub struct CoreTableExportWriter<W: Write> {
 }
 
 impl<W: Write> CoreTableExportWriter<W> {
-    /// Create a new writer defaulting to JSONLines format for backward compatibility.
+    /// Create a new writer defaulting to `JSONLines` format for backward compatibility.
     pub fn new(writer: W) -> Self {
         Self::new_with_format(writer, ExportFormat::JsonLines)
     }
@@ -1008,7 +1108,7 @@ impl<W: Write> CoreTableExportWriter<W> {
 
     /// Write one canonical `RunExportRow`.
     pub fn write_run_row(&mut self, row: &RunExportRow) -> std::io::Result<()> {
-        match self.format {
+        let line = match self.format {
             ExportFormat::Csv => {
                 if !self.header_written {
                     writeln!(
@@ -1017,7 +1117,7 @@ impl<W: Write> CoreTableExportWriter<W> {
                     )?;
                     self.header_written = true;
                 }
-                let line = format!(
+                format!(
                     "{},{},{},{},{},{},{},{},{},{}",
                     csv_escape(&row.run_id),
                     row.manifest_schema_version,
@@ -1035,28 +1135,23 @@ impl<W: Write> CoreTableExportWriter<W> {
                         .unwrap_or_default(),
                     row.started_at_unix_ms,
                     row.reproducible
-                );
-                writeln!(self.writer, "{line}")?;
-                self.hasher.update(line.as_bytes());
-                self.hasher.update(b"\n");
-                self.row_count += 1;
-                Ok(())
+                )
             }
             ExportFormat::JsonLines => {
                 let json = serde_json::to_string(row).unwrap_or_default();
-                let line = format!("{{\"table\":\"run\",\"row\":{json}}}");
-                writeln!(self.writer, "{line}")?;
-                self.hasher.update(line.as_bytes());
-                self.hasher.update(b"\n");
-                self.row_count += 1;
-                Ok(())
+                format!("{{\"table\":\"run\",\"row\":{json}}}")
             }
-        }
+        };
+        writeln!(self.writer, "{line}")?;
+        self.hasher.update(line.as_bytes());
+        self.hasher.update(b"\n");
+        self.row_count += 1;
+        Ok(())
     }
 
     /// Write one canonical `AgentExportRow`.
     pub fn write_agent_row(&mut self, row: &AgentExportRow) -> std::io::Result<()> {
-        match self.format {
+        let line = match self.format {
             ExportFormat::Csv => {
                 if !self.header_written {
                     writeln!(
@@ -1065,7 +1160,7 @@ impl<W: Write> CoreTableExportWriter<W> {
                     )?;
                     self.header_written = true;
                 }
-                let line = format!(
+                format!(
                     "{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
                     csv_escape(&row.run_id),
                     row.tick,
@@ -1081,28 +1176,23 @@ impl<W: Write> CoreTableExportWriter<W> {
                     format_f32_csv(row.energy),
                     format_f32_csv(row.herbivore_tendency),
                     csv_escape(&row.brain_binding)
-                );
-                writeln!(self.writer, "{line}")?;
-                self.hasher.update(line.as_bytes());
-                self.hasher.update(b"\n");
-                self.row_count += 1;
-                Ok(())
+                )
             }
             ExportFormat::JsonLines => {
                 let json = serde_json::to_string(row).unwrap_or_default();
-                let line = format!("{{\"table\":\"agent\",\"row\":{json}}}");
-                writeln!(self.writer, "{line}")?;
-                self.hasher.update(line.as_bytes());
-                self.hasher.update(b"\n");
-                self.row_count += 1;
-                Ok(())
+                format!("{{\"table\":\"agent\",\"row\":{json}}}")
             }
-        }
+        };
+        writeln!(self.writer, "{line}")?;
+        self.hasher.update(line.as_bytes());
+        self.hasher.update(b"\n");
+        self.row_count += 1;
+        Ok(())
     }
 
     /// Write one canonical `LineageExportRow`.
     pub fn write_lineage_row(&mut self, row: &LineageExportRow) -> std::io::Result<()> {
-        match self.format {
+        let line = match self.format {
             ExportFormat::Csv => {
                 if !self.header_written {
                     writeln!(
@@ -1111,7 +1201,7 @@ impl<W: Write> CoreTableExportWriter<W> {
                     )?;
                     self.header_written = true;
                 }
-                let line = format!(
+                format!(
                     "{},{},{},{},{},{}",
                     csv_escape(&row.run_id),
                     row.child_agent_uid,
@@ -1119,34 +1209,29 @@ impl<W: Write> CoreTableExportWriter<W> {
                     row.parent_ordinal,
                     csv_escape(&row.relationship),
                     row.birth_tick
-                );
-                writeln!(self.writer, "{line}")?;
-                self.hasher.update(line.as_bytes());
-                self.hasher.update(b"\n");
-                self.row_count += 1;
-                Ok(())
+                )
             }
             ExportFormat::JsonLines => {
                 let json = serde_json::to_string(row).unwrap_or_default();
-                let line = format!("{{\"table\":\"lineage\",\"row\":{json}}}");
-                writeln!(self.writer, "{line}")?;
-                self.hasher.update(line.as_bytes());
-                self.hasher.update(b"\n");
-                self.row_count += 1;
-                Ok(())
+                format!("{{\"table\":\"lineage\",\"row\":{json}}}")
             }
-        }
+        };
+        writeln!(self.writer, "{line}")?;
+        self.hasher.update(line.as_bytes());
+        self.hasher.update(b"\n");
+        self.row_count += 1;
+        Ok(())
     }
 
     /// Write one canonical `EventExportRow`.
     pub fn write_event_row(&mut self, row: &EventExportRow) -> std::io::Result<()> {
-        match self.format {
+        let line = match self.format {
             ExportFormat::Csv => {
                 if !self.header_written {
                     writeln!(self.writer, "run_id,tick,seq,event_id,kind,payload")?;
                     self.header_written = true;
                 }
-                let line = format!(
+                format!(
                     "{},{},{},{},{},{}",
                     csv_escape(&row.run_id),
                     row.tick,
@@ -1154,56 +1239,46 @@ impl<W: Write> CoreTableExportWriter<W> {
                     csv_escape(&row.event_id),
                     csv_escape(&row.kind),
                     csv_escape(&row.payload)
-                );
-                writeln!(self.writer, "{line}")?;
-                self.hasher.update(line.as_bytes());
-                self.hasher.update(b"\n");
-                self.row_count += 1;
-                Ok(())
+                )
             }
             ExportFormat::JsonLines => {
                 let json = serde_json::to_string(row).unwrap_or_default();
-                let line = format!("{{\"table\":\"event\",\"row\":{json}}}");
-                writeln!(self.writer, "{line}")?;
-                self.hasher.update(line.as_bytes());
-                self.hasher.update(b"\n");
-                self.row_count += 1;
-                Ok(())
+                format!("{{\"table\":\"event\",\"row\":{json}}}")
             }
-        }
+        };
+        writeln!(self.writer, "{line}")?;
+        self.hasher.update(line.as_bytes());
+        self.hasher.update(b"\n");
+        self.row_count += 1;
+        Ok(())
     }
 
     /// Write one canonical `MetricExportRow`.
     pub fn write_metric_row(&mut self, row: &MetricExportRow) -> std::io::Result<()> {
-        match self.format {
+        let line = match self.format {
             ExportFormat::Csv => {
                 if !self.header_written {
                     writeln!(self.writer, "run_id,tick,name,value")?;
                     self.header_written = true;
                 }
-                let line = format!(
+                format!(
                     "{},{},{},{}",
                     csv_escape(&row.run_id),
                     row.tick,
                     csv_escape(&row.name),
                     format_f64_csv(row.value)
-                );
-                writeln!(self.writer, "{line}")?;
-                self.hasher.update(line.as_bytes());
-                self.hasher.update(b"\n");
-                self.row_count += 1;
-                Ok(())
+                )
             }
             ExportFormat::JsonLines => {
                 let json = serde_json::to_string(row).unwrap_or_default();
-                let line = format!("{{\"table\":\"metric\",\"row\":{json}}}");
-                writeln!(self.writer, "{line}")?;
-                self.hasher.update(line.as_bytes());
-                self.hasher.update(b"\n");
-                self.row_count += 1;
-                Ok(())
+                format!("{{\"table\":\"metric\",\"row\":{json}}}")
             }
-        }
+        };
+        writeln!(self.writer, "{line}")?;
+        self.hasher.update(line.as_bytes());
+        self.hasher.update(b"\n");
+        self.row_count += 1;
+        Ok(())
     }
 
     /// Backward-compatible generic JSON row writer.
@@ -1281,10 +1356,12 @@ pub struct EventExportWriter<W: Write> {
 }
 
 impl<W: Write> EventExportWriter<W> {
-    pub fn new(writer: W, format: ExportFormat) -> Self {
+    /// Construct an event writer with the chosen format.
+    pub const fn new(writer: W, format: ExportFormat) -> Self {
         Self { writer, format }
     }
 
+    /// Write the provenance header in the selected format.
     pub fn write_provenance(&mut self, prov: &ExportProvenance) -> std::io::Result<()> {
         let json = serde_json::to_string(prov).unwrap_or_default();
         match self.format {
@@ -1293,6 +1370,7 @@ impl<W: Write> EventExportWriter<W> {
         }
     }
 
+    /// Write an event using this writer's legacy column layout.
     pub fn write_event_row(
         &mut self,
         event_id: &str,
@@ -1316,7 +1394,7 @@ impl<W: Write> EventExportWriter<W> {
     }
 }
 
-/// Legacy export writer for streaming CSV and JSONLines metrics tables.
+/// Legacy export writer for streaming CSV and `JSONLines` metrics tables.
 pub struct MetricExportWriter<W: Write> {
     writer: W,
     format: ExportFormat,
@@ -1324,7 +1402,8 @@ pub struct MetricExportWriter<W: Write> {
 }
 
 impl<W: Write> MetricExportWriter<W> {
-    pub fn new(writer: W, format: ExportFormat) -> Self {
+    /// Construct a metric writer with the chosen format.
+    pub const fn new(writer: W, format: ExportFormat) -> Self {
         Self {
             writer,
             format,
@@ -1332,6 +1411,7 @@ impl<W: Write> MetricExportWriter<W> {
         }
     }
 
+    /// Write the provenance header in the selected format.
     pub fn write_provenance(&mut self, prov: &ExportProvenance) -> std::io::Result<()> {
         match self.format {
             ExportFormat::Csv => {
@@ -1355,6 +1435,7 @@ impl<W: Write> MetricExportWriter<W> {
         }
     }
 
+    /// Write a metric sample using this writer's legacy column layout.
     pub fn write_metric_row(
         &mut self,
         tick: u64,

@@ -61,14 +61,17 @@ impl AssemblyBrain {
     pub fn random(rng: &mut dyn RandomStream) -> Self {
         let mut cells = [0.0; BRAIN_SIZE];
         for cell in &mut cells {
-            let mut value = rng.random_range(-3.0..3.0);
-            if rng.random::<f32>() < 0.1 {
-                value = rng.random_range(0.0..0.5);
-            }
-            if rng.random::<f32>() < 0.1 {
-                value = rng.random_range(0.8..1.0);
-            }
-            *cell = value;
+            let initial = rng.random_range(-3.0..3.0);
+            let value = if rng.random::<f32>() < 0.1 {
+                rng.random_range(0.0..0.5)
+            } else {
+                initial
+            };
+            *cell = if rng.random::<f32>() < 0.1 {
+                rng.random_range(0.8..1.0)
+            } else {
+                value
+            };
         }
 
         Self { cells }
@@ -86,8 +89,13 @@ impl AssemblyBrain {
         }
         let abs_value = value.abs();
         let fractional = abs_value - abs_value.floor();
-        let idx = (fractional * BRAIN_SIZE as f32).floor() as isize;
-        idx.clamp(0, (BRAIN_SIZE - 1) as isize) as usize
+        let brain_size = u16::try_from(BRAIN_SIZE).expect("Assembly brain size fits u16");
+        // The interpreter maps a fractional cell operand to its floored integer address.
+        // Keep that conversion and its existing floating-point rounding unchanged.
+        #[allow(clippy::cast_possible_truncation)]
+        let idx = (fractional * f32::from(brain_size)).floor() as isize;
+        let last_index = isize::try_from(BRAIN_SIZE - 1).expect("Assembly brain index fits isize");
+        usize::try_from(idx.clamp(0, last_index)).expect("clamped Assembly index is nonnegative")
     }
 
     fn clamp_cells(cells: &mut [f32]) {
@@ -96,9 +104,9 @@ impl AssemblyBrain {
         }
     }
 
-    fn from_cells(cells: [f32; BRAIN_SIZE]) -> Result<Self, BrainProtocolError> {
-        validate_cells(&cells, BrainEnvelopeKind::EvaluatorState)?;
-        Ok(Self { cells })
+    fn from_cells(cells: &[f32; BRAIN_SIZE]) -> Result<Self, BrainProtocolError> {
+        validate_cells(cells, BrainEnvelopeKind::EvaluatorState)?;
+        Ok(Self { cells: *cells })
     }
 
     /// Read the self-modifying working cells without inventing neural edges.
@@ -542,7 +550,7 @@ impl BrainFamilyCodec for AssemblyFamilyAdapter {
         Ok(Box::new(AssemblyProtocolEvaluator {
             family_id: self.family_id.clone(),
             genome_digest: expected_digest,
-            brain: AssemblyBrain::from_cells(state.cells)?,
+            brain: AssemblyBrain::from_cells(&state.cells)?,
         }))
     }
 }
@@ -576,7 +584,7 @@ fn decode_cells(
         ));
     }
     let (encoded_cells, remainder) = payload.as_chunks::<ASSEMBLY_CELL_BYTES>();
-    debug_assert!(remainder.is_empty());
+    debug_assert_eq!(remainder, b"");
     let cells =
         std::array::from_fn(|index| f32::from_bits(u32::from_le_bytes(encoded_cells[index])));
     validate_cells_for_family(&cells, kind, family_id)?;
@@ -636,7 +644,7 @@ fn decode_state_payload(
     })
 }
 
-fn genome_digest(genome: &BrainGenomeEnvelope) -> [u8; ASSEMBLY_GENOME_DIGEST_BYTES] {
+const fn genome_digest(genome: &BrainGenomeEnvelope) -> [u8; ASSEMBLY_GENOME_DIGEST_BYTES] {
     *genome.material_hash().as_bytes()
 }
 
@@ -788,8 +796,8 @@ mod tests {
     use super::*;
     use rand::RngCore;
     use scriptbots_core::{
-        AgentData, AgentUid, BrainBinding, BrainFamilyAdapter, BrainGenomeDerivation, DeathCause,
-        Position, ScriptBotsConfig, SmallRngStream, Tick, WorldState,
+        AgentData, AgentId, AgentUid, BrainBinding, BrainFamilyAdapter, BrainGenomeDerivation,
+        DeathCause, Position, ScriptBotsConfig, SmallRngStream, Tick, WorldState,
     };
 
     #[test]
@@ -847,15 +855,22 @@ mod tests {
     #[derive(Clone, Debug, Default)]
     struct AlternatingThresholdStream {
         sample_index: usize,
+        prefix: Vec<u64>,
     }
 
     impl AlternatingThresholdStream {
         fn next_scripted_u64(&mut self) -> u64 {
-            let sample = if self.sample_index.is_multiple_of(2) {
-                0
-            } else {
-                u64::MAX
-            };
+            let sample = self
+                .prefix
+                .get(self.sample_index)
+                .copied()
+                .unwrap_or_else(|| {
+                    if self.sample_index.is_multiple_of(2) {
+                        0
+                    } else {
+                        u64::MAX
+                    }
+                });
             self.sample_index += 1;
             sample
         }
@@ -863,7 +878,8 @@ mod tests {
 
     impl RngCore for AlternatingThresholdStream {
         fn next_u32(&mut self) -> u32 {
-            self.next_scripted_u64() as u32
+            let [a, b, c, d, ..] = self.next_scripted_u64().to_le_bytes();
+            u32::from_le_bytes([a, b, c, d])
         }
 
         fn next_u64(&mut self) -> u64 {
@@ -931,6 +947,84 @@ mod tests {
         let mut rng = SmallRngStream::seed_from_u64(0xABCD);
         let brain = AssemblyBrain::random(&mut rng);
         assert_eq!(brain.cells.len(), BRAIN_SIZE);
+    }
+
+    #[test]
+    fn founder_constructor_preserves_conditional_draw_order() {
+        let mut prefix = Vec::new();
+        let mut expected = Vec::new();
+        for index in 0..BRAIN_SIZE {
+            // 0xe000_0000 samples 0.875, mapping the first draw to opcode 2.25.
+            // The four cases force neither override, first only, both, and second only.
+            let (draws, cell): (&[u64], f32) = match index % 4 {
+                0 => (&[0xe000_0000, 0xffff_ffff, 0xffff_ffff], 2.25),
+                1 => (&[0xe000_0000, 0, 0, 0xffff_ffff], 0.0),
+                2 => (&[0xe000_0000, 0, 0, 0, 0], 0.8),
+                _ => (&[0xe000_0000, 0xffff_ffff, 0, 0], 0.8),
+            };
+            prefix.extend_from_slice(draws);
+            expected.push(cell.to_bits());
+        }
+        let expected_draws = prefix.len();
+        prefix.push(0x1234_5678_9abc_def0);
+        let mut rng = AlternatingThresholdStream {
+            sample_index: 0,
+            prefix,
+        };
+        let brain = AssemblyBrain::random(&mut rng);
+        assert_eq!(brain.cells.map(f32::to_bits).as_slice(), expected);
+        assert_eq!(rng.sample_index, expected_draws);
+        assert_eq!(rng.next_u64(), 0x1234_5678_9abc_def0);
+    }
+
+    #[test]
+    fn mutation_draws_one_gate_per_cell_and_replacements_only_when_selected() {
+        let mut prefix = Vec::new();
+        for index in 0..BRAIN_SIZE {
+            if index.is_multiple_of(2) {
+                prefix.extend_from_slice(&[0, 0xe000_0000]);
+            } else {
+                prefix.push(0xffff_ffff);
+            }
+        }
+        let expected_draws = prefix.len();
+        prefix.push(0x1234_5678_9abc_def0);
+        let mut rng = AlternatingThresholdStream {
+            sample_index: 0,
+            prefix,
+        };
+        let mut brain = AssemblyBrain {
+            cells: [7.0; BRAIN_SIZE],
+        };
+        brain.mutate(&mut rng, 0.5, 0.0).expect("Assembly mutation");
+        let expected: [u32; BRAIN_SIZE] = std::array::from_fn(|index| {
+            if index.is_multiple_of(2) {
+                2.25_f32.to_bits()
+            } else {
+                7.0_f32.to_bits()
+            }
+        });
+        assert_eq!(brain.cells.map(f32::to_bits), expected);
+        assert_eq!(rng.sample_index, expected_draws);
+        assert_eq!(rng.next_u64(), 0x1234_5678_9abc_def0);
+    }
+
+    #[test]
+    fn cell_addresses_use_absolute_fractional_parts_and_remain_bounded() {
+        for (value, expected) in [
+            (0.0, 0),
+            (-0.0, 0),
+            (0.25, BRAIN_SIZE / 4),
+            (-1.25, BRAIN_SIZE / 4),
+            (0.5, BRAIN_SIZE / 2),
+            (f32::from_bits(0x3f7f_ffff), BRAIN_SIZE - 1),
+            (f32::MAX, 0),
+            (f32::INFINITY, 0),
+            (f32::NEG_INFINITY, 0),
+            (f32::NAN, 0),
+        ] {
+            assert_eq!(AssemblyBrain::clamp_index(value), expected, "{value:?}");
+        }
     }
 
     #[test]
@@ -1038,7 +1132,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             before
         );
-        assert!(full.activations.connections.is_empty());
+        assert_eq!(
+            full.activations.connections,
+            [] as [scriptbots_core::ActivationEdge; 0]
+        );
         let no_layers = BrainInspectionLimits::tightened(
             0,
             hard.max_name_bytes(),
@@ -1050,8 +1147,8 @@ mod tests {
         let clipped = brain.inspect_cells(no_layers).expect("clipped view");
         assert_eq!(clipped.build.source_scalars, brain.cells.len());
         assert_eq!(clipped.build.retained_values, 0);
-        assert!(clipped.activations.layers.is_empty());
-        assert!(clipped.activations.output_slots.is_empty());
+        assert_eq!(clipped.activations.layers, [] as [ActivationLayer; 0]);
+        assert_eq!(clipped.activations.output_slots, [] as [usize; 0]);
         assert!(clipped.build.truncated);
         assert!(clipped.build.retained_payload_bytes <= no_layers.max_payload_bytes());
         let undersized_source = BrainInspectionLimits::tightened(
@@ -1090,14 +1187,14 @@ mod tests {
         assert_eq!(inspection.build.source_scalars, BRAIN_SIZE);
         assert_eq!(inspection.build.retained_values, BRAIN_SIZE);
         assert!(!inspection.build.truncated);
-        assert!(inspection.activations.connections.is_empty());
+        assert_eq!(
+            inspection.activations.connections,
+            [] as [scriptbots_core::ActivationEdge; 0]
+        );
         let observed_cells = &inspection.activations.layers[0].values;
         let (checkpoint_cells, remainder) =
             checkpoint.payload()[ASSEMBLY_STATE_HEADER_BYTES..].as_chunks::<ASSEMBLY_CELL_BYTES>();
-        assert!(
-            remainder.is_empty(),
-            "checkpoint cells use the declared width"
-        );
+        assert_eq!(remainder, b"", "checkpoint cells use the declared width");
         let checkpoint_cells = checkpoint_cells
             .iter()
             .map(|cell| u32::from_le_bytes(*cell))
@@ -1313,7 +1410,9 @@ mod tests {
             .expect("field-wise crossover");
         assert_eq!(child.provenance(), &child_provenance);
         let child_cells = family.decode_genome(&child).expect("child cells");
-        assert!(child_cells.iter().all(|cell| *cell == -1.0 || *cell == 1.0));
+        assert!(child_cells.iter().all(|cell| {
+            cell.to_bits() == (-1.0_f32).to_bits() || cell.to_bits() == 1.0_f32.to_bits()
+        }));
         assert!(child_cells.contains(&-1.0));
         assert!(child_cells.contains(&1.0));
 
@@ -1385,8 +1484,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn protocol_rejects_invalid_shapes_nonfinite_cells_rates_and_inputs_transactionally() {
+    fn assert_invalid_assembly_genomes_and_rates() -> (AssemblyFamilyAdapter, BrainGenomeEnvelope) {
         let family = AssemblyFamilyAdapter::new().expect("canonical Assembly family");
         let genome = family
             .genome(&fixture_cells(), fixture_provenance())
@@ -1465,6 +1563,12 @@ mod tests {
             );
         }
 
+        (family, genome)
+    }
+
+    #[test]
+    fn protocol_rejects_invalid_shapes_nonfinite_cells_rates_and_inputs_transactionally() {
+        let (family, genome) = assert_invalid_assembly_genomes_and_rates();
         let mut rng = SmallRngStream::seed_from_u64(2);
         let state = family
             .initial_state(&genome, &mut rng)
@@ -1558,8 +1662,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn bound_assembly_execution_fault_removes_only_failed_agents_and_continues() {
+    fn assembly_fault_world() -> (WorldState, Vec<AgentId>, u64) {
         let mut world = WorldState::new(ScriptBotsConfig {
             world_width: 200,
             world_height: 200,
@@ -1593,12 +1696,13 @@ mod tests {
         let mut rng = SmallRngStream::seed_from_u64(1);
         let mut agents = Vec::new();
         for (ordinal, cells) in [overflow, finite, overflow].into_iter().enumerate() {
+            // Preserve the existing real-world fixture's multiply-then-add positions.
+            #[allow(clippy::suboptimal_flops)]
+            let position_x =
+                40.0 + 40.0 * f32::from(u16::try_from(ordinal).expect("fixture ordinal"));
             let agent = world
                 .try_spawn_agent(AgentData {
-                    position: Position::new(
-                        40.0 + 40.0 * f32::from(u16::try_from(ordinal).expect("fixture ordinal")),
-                        100.0,
-                    ),
+                    position: Position::new(position_x, 100.0),
                     ..AgentData::default()
                 })
                 .expect("spawn real agent");
@@ -1624,6 +1728,12 @@ mod tests {
             );
             agents.push(agent);
         }
+        (world, agents, key)
+    }
+
+    #[test]
+    fn bound_assembly_execution_fault_removes_only_failed_agents_and_continues() {
+        let (mut world, agents, key) = assembly_fault_world();
         let failed_uids = [agents[0], agents[2]].map(|agent| world.agent_uid(agent).expect("uid"));
         let healthy = agents[1];
         let healthy_position = world
@@ -1683,7 +1793,10 @@ mod tests {
         for tick in 2..=8 {
             let completion = world.step_outcome().expect("continued healthy transition");
             assert!(completion.fault.is_none());
-            assert!(completion.outcome.deaths.is_empty());
+            assert_eq!(
+                completion.outcome.deaths,
+                [] as [scriptbots_core::DeathRecord; 0]
+            );
             assert_eq!(completion.outcome.events.tick, Tick(tick));
             assert!(world.agents().contains(healthy));
             assert!(
@@ -1720,7 +1833,7 @@ mod tests {
         cells[INPUT_SIZE + 7] = 0.995; // output cell 199
 
         let mut arithmetic_probe =
-            AssemblyBrain::from_cells(cells).expect("finite arithmetic-overflow program");
+            AssemblyBrain::from_cells(&cells).expect("finite arithmetic-overflow program");
         let raw_outputs = arithmetic_probe.tick(&[0.0; INPUT_SIZE]);
         assert!(
             arithmetic_probe.cells[BRAIN_SIZE - 1].is_nan(),
@@ -1772,7 +1885,8 @@ mod tests {
 
     #[test]
     fn legacy_runner_preserves_nonfinite_sensors_like_the_cpp_oracle() {
-        let mut brain = AssemblyBrain::from_cells([0.0; BRAIN_SIZE]).expect("finite empty program");
+        let mut brain =
+            AssemblyBrain::from_cells(&[0.0; BRAIN_SIZE]).expect("finite empty program");
         let mut inputs = [0.0; INPUT_SIZE];
         inputs[0] = f32::NAN;
 
@@ -1806,7 +1920,7 @@ mod tests {
             cells[100] = -1.0;
             cells[150] = 1.0;
 
-            let mut brain = AssemblyBrain::from_cells(cells).expect("finite opcode fixture");
+            let mut brain = AssemblyBrain::from_cells(&cells).expect("finite opcode fixture");
             let (_, scanned) = brain.tick_with_budget(&[0.0; INPUT_SIZE]);
             assert_eq!(scanned, ASSEMBLY_INSTRUCTION_BUDGET, "{name}");
             assert_eq!(
@@ -1823,7 +1937,7 @@ mod tests {
         cells[INPUT_SIZE] = 3.5;
         cells[INPUT_SIZE + 1] = -7.0;
         cells[BRAIN_SIZE - 1] = 0.75;
-        let mut brain = AssemblyBrain::from_cells(cells).expect("valid finite program");
+        let mut brain = AssemblyBrain::from_cells(&cells).expect("valid finite program");
         let (outputs, scanned) = brain.tick_with_budget(&[0.0; INPUT_SIZE]);
         assert_eq!(scanned, ASSEMBLY_INSTRUCTION_BUDGET);
         assert_eq!(outputs[0].to_bits(), 0.75_f32.to_bits());

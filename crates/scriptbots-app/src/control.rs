@@ -182,6 +182,10 @@ pub struct KnobUpdate {
 pub enum ControlError {
     #[error("experiment execution capacity exhausted: {0}")]
     ExperimentCapacity(String),
+    #[error("experiment service is shutting down; resume retained work in a new control runtime")]
+    ExperimentShuttingDown,
+    #[error("experiment worker failed: {0}")]
+    ExperimentWorkerFailed(String),
     #[error("checkpoint retention exhausted: {0}")]
     CheckpointCapacity(String),
     #[error("checkpoint retention unavailable: {0}")]
@@ -1076,6 +1080,8 @@ struct ExperimentJob {
     created_at_utc: String,
     artifact_root: PathBuf,
     artifact_generation: Mutex<Option<u64>>,
+    /// Retain ownership until restart or control-runtime shutdown joins this worker.
+    worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl std::fmt::Debug for ExperimentJob {
@@ -1088,6 +1094,23 @@ impl std::fmt::Debug for ExperimentJob {
 }
 
 impl ExperimentJob {
+    fn join_worker(&mut self) -> Result<(), String> {
+        if let Some(worker) = self.worker.take()
+            && let Err(panic) = worker.join()
+        {
+            let message = format!(
+                "experiment '{}' worker panicked: {panic:?}",
+                self.runner.experiment_id
+            );
+            *self
+                .last_error
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(message.clone());
+            return Err(message);
+        }
+        Ok(())
+    }
+
     fn recover_artifacts(&self, services: &DataServices) -> Result<(), ControlError> {
         let status = self
             .runner
@@ -1111,11 +1134,13 @@ impl ExperimentJob {
     /// Start (or restart) the batch worker. `running` is raised before the
     /// thread exists so a status read can never observe a false idle gap.
     fn start(
-        &self,
+        &mut self,
         services: std::sync::Arc<DataServices>,
         mut reservation: ExperimentExecutionReservation,
     ) {
         use std::sync::atomic::Ordering;
+        // New jobs have no worker; resume reaps the previous worker before admission.
+        debug_assert!(self.worker.is_none());
         self.running.store(true, Ordering::Release);
         reservation.running = Some(std::sync::Arc::clone(&self.running));
         let runner = std::sync::Arc::clone(&self.runner);
@@ -1144,11 +1169,14 @@ impl ExperimentJob {
                     }
                 }
             });
-        if let Err(error) = spawned {
-            if let Ok(mut slot) = self.last_error.lock() {
-                *slot = Some(format!("cannot spawn experiment worker: {error}"));
+        match spawned {
+            Ok(worker) => self.worker = Some(worker),
+            Err(error) => {
+                if let Ok(mut slot) = self.last_error.lock() {
+                    *slot = Some(format!("cannot spawn experiment worker: {error}"));
+                }
+                self.running.store(false, Ordering::Release);
             }
-            self.running.store(false, Ordering::Release);
         }
     }
 
@@ -1233,6 +1261,8 @@ impl ExperimentJob {
 #[derive(Debug)]
 pub struct DataServices {
     experiments: Mutex<BTreeMap<String, ExperimentJob>>,
+    /// Once closed, retained handles may inspect work but cannot start or resume it.
+    experiment_shutdown_requested: std::sync::atomic::AtomicBool,
     execution_capacity: Arc<Mutex<ExperimentExecutionCapacityDto>>,
     checkpoints: Mutex<BTreeMap<String, CheckpointMetadataDto>>,
     artifacts: Mutex<BTreeMap<String, RetainedArtifact>>,
@@ -1437,6 +1467,7 @@ impl DataServices {
         };
         Self {
             experiments: Mutex::new(BTreeMap::new()),
+            experiment_shutdown_requested: std::sync::atomic::AtomicBool::new(false),
             execution_capacity: Arc::new(Mutex::new(ExperimentExecutionCapacityDto {
                 max_run_slots: crate::experiment_runner::MAX_CONCURRENT_RUNS,
                 reserved_run_slots: 0,
@@ -1572,6 +1603,7 @@ impl DataServices {
                 created_at_utc: definition.created_at_utc,
                 artifact_root: root,
                 artifact_generation: Mutex::new(None),
+                worker: None,
             },
         );
         Ok(())
@@ -1788,6 +1820,12 @@ impl DataServices {
         experiment_id: &str,
         run_slots: usize,
     ) -> Result<ExperimentExecutionReservation, ControlError> {
+        if self
+            .experiment_shutdown_requested
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(ControlError::ExperimentShuttingDown);
+        }
         if run_slots == 0 {
             return Err(ControlError::BadRequest(
                 "experiment execution must reserve at least one run slot".to_owned(),
@@ -1827,6 +1865,41 @@ impl DataServices {
             "experiment execution capacity reserved"
         );
         Ok(reservation)
+    }
+
+    /// Close experiment admission, cancel every active batch, and join all workers.
+    ///
+    /// The existing runner finishes its current durable tick before stopping.
+    /// This waits for that work and filesystem operations; it is not a hard
+    /// shutdown deadline. Retained continuation artifacts remain resumable by a
+    /// fresh service. The registry lock serializes admission and repeated shutdown
+    /// calls; workers never acquire it while finishing or publishing artifacts.
+    pub(crate) fn shutdown_experiments(&self) -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+        self.experiment_shutdown_requested
+            .store(true, Ordering::Release);
+        let (mut jobs, poisoned) = match self.experiments.lock() {
+            Ok(jobs) => (jobs, false),
+            Err(error) => (error.into_inner(), true),
+        };
+        for job in jobs.values() {
+            job.cancel.store(true, Ordering::Release);
+        }
+        let mut failures = Vec::new();
+        if poisoned {
+            failures.push("experiment registry was poisoned before shutdown".to_owned());
+        }
+        for job in jobs.values_mut() {
+            if let Err(error) = job.join_worker() {
+                tracing::error!(%error, "experiment worker failed during shutdown");
+                failures.push(error);
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(failures.join("; ")))
+        }
     }
 }
 
@@ -1961,6 +2034,8 @@ impl ControlHandle {
                 "gui".into(),
                 #[cfg(feature = "ml")]
                 "ml".into(),
+                #[cfg(feature = "brain-ft")]
+                "brain-ft".into(),
                 #[cfg(feature = "neuro")]
                 "neuro".into(),
                 "fastmcp".into(),
@@ -2090,20 +2165,8 @@ impl ControlHandle {
                 )));
             }
             let fam = v.brain_family.trim().to_lowercase();
-            if !matches!(
-                fam.as_str(),
-                "mlp"
-                    | "mlp.baseline"
-                    | "dwraon"
-                    | "dwraon.baseline"
-                    | "assembly"
-                    | "assembly.experimental"
-            ) {
-                return Err(ControlError::BadRequest(format!(
-                    "unknown brain family '{}': must be mlp, dwraon, or assembly",
-                    v.brain_family
-                )));
-            }
+            crate::experiment_runner::validate_experiment_brain_family(trimmed_id, &fam)
+                .map_err(|error| ControlError::BadRequest(error.to_string()))?;
         }
         if request.seeds.is_empty() {
             return Err(ControlError::BadRequest("seeds cannot be empty".into()));
@@ -2246,7 +2309,7 @@ impl ControlHandle {
             created_at_utc: secs.to_string(),
             request_identity: request_identity.clone(),
         };
-        let job = ExperimentJob {
+        let mut job = ExperimentJob {
             runner: std::sync::Arc::new(runner),
             state_file: output_dir.join("status.json"),
             cancel: std::sync::Arc::default(),
@@ -2255,6 +2318,7 @@ impl ControlHandle {
             created_at_utc: format!("{secs}"),
             artifact_root,
             artifact_generation: Mutex::new(None),
+            worker: None,
         };
         {
             let mut lock = self
@@ -2331,12 +2395,12 @@ impl ControlHandle {
         experiment_id: &str,
     ) -> Result<ExperimentBatchStatusDto, ControlError> {
         self.data_services.recover_experiment(experiment_id)?;
-        let lock = self
+        let mut lock = self
             .data_services
             .experiments
             .lock()
             .map_err(|_| ControlError::Lock)?;
-        let job = lock.get(experiment_id).ok_or_else(|| {
+        let job = lock.get_mut(experiment_id).ok_or_else(|| {
             ControlError::NotFound(format!("experiment '{experiment_id}' not found"))
         })?;
         let current = job.status_dto()?;
@@ -2365,6 +2429,10 @@ impl ControlHandle {
             .filter(|run| matches!(run.state.as_str(), "pending" | "running"))
             .count()
             .min(job.runner.max_concurrency);
+        // A cleared running flag can also mean unwind. Observe the old exit
+        // before clearing diagnostics, cancellation or reserving a new wave.
+        job.join_worker()
+            .map_err(ControlError::ExperimentWorkerFailed)?;
         let reservation = self
             .data_services
             .reserve_experiment_execution(experiment_id, run_slots)?;
@@ -3519,7 +3587,15 @@ impl ControlHandle {
     }
 
     /// Enqueue step commands for the simulation driver to advance `count` ticks.
-    pub fn step_count(&self, count: u64) -> Result<CommandStatusDto, ControlError> {
+    ///
+    /// A single step shares the host's retry identity across transports. A batch
+    /// still contains independent commands and returns only the last receipt;
+    /// refuse a keyed batch rather than silently discard its retry guarantee.
+    pub fn step_count(
+        &self,
+        count: u64,
+        idempotency_key: Option<&str>,
+    ) -> Result<CommandStatusDto, ControlError> {
         // Each step is a separately journalled command submitted in a loop, so an
         // unbounded request count (e.g. u64::MAX) would pin a worker thread forever and
         // grow the command journal without limit.
@@ -3528,9 +3604,22 @@ impl ControlHandle {
                 "step count {count} exceeds the per-request limit of {MAX_STEP_BATCH}"
             )));
         }
-        let iterations = count.max(1);
+        if count == 0 {
+            return Err(ControlError::InvalidPatch(
+                "step count must be at least 1".to_owned(),
+            ));
+        }
+        if count == 1 {
+            return self.submit_control_command_with_key(ControlCommand::Step, idempotency_key);
+        }
+        if idempotency_key.is_some() {
+            return Err(ControlError::InvalidPatch(
+                "idempotency keys require count=1; submit individually keyed steps for retryable batches"
+                    .to_owned(),
+            ));
+        }
         let mut last_status = None;
-        for _ in 0..iterations {
+        for _ in 0..count {
             last_status = Some(self.submit_control_command(ControlCommand::Step)?);
         }
         Ok(last_status.expect("at least one iteration"))
@@ -3833,8 +3922,21 @@ impl ControlHandle {
         })
     }
 
-    /// Apply a structured JSON patch object onto the configuration.
+    /// Apply a structured JSON patch object onto the observed configuration.
+    ///
+    /// The host rejects the command if another configuration change wins before
+    /// application. The returned command status exposes that conflict so callers
+    /// can read the new configuration before choosing to submit another patch.
     pub fn apply_patch(&self, patch: Value) -> Result<CommandStatusDto, ControlError> {
+        let envelope = self.prepare_config_patch(patch)?;
+        let status = self.host.clone().submit(envelope)?;
+        let receipt = self.status_dto(status)?;
+        *lock_cache(&self.knobs_cache) = None;
+        Ok(receipt)
+    }
+
+    /// Bind the complete replacement to the same publication used for the merge.
+    fn prepare_config_patch(&self, patch: Value) -> Result<CommandEnvelope, ControlError> {
         if !patch.is_object() {
             return Err(ControlError::InvalidPatch(
                 "configuration patch must be a JSON object".into(),
@@ -3903,27 +4005,14 @@ impl ControlHandle {
                     .into(),
             ));
         }
-        // No explicit drop is needed any more: the borrow ended at the seam
-        // above, so the submit below - which reads tick and revision under the
-        // same non-reentrant mutex - cannot deadlock against a guard this
-        // function is still holding.
-        // Return the receipt, not a projection. This used to build a
-        // ConfigSnapshot from the REQUESTED config and hand it back as though
-        // it were current, so a client was told the new configuration was in
-        // effect when the command had only been admitted to a bounded queue. It
-        // was worse than a plain projection: the requested config was stamped
-        // with `current_tick`, the tick at which those values were NOT in
-        // effect, making the response a chimera of a config that had not been
-        // applied and a tick at which it had not been applied (bd-k7nq).
-        //
-        // Acceptance criterion 4 of the migration is explicit that reads use
-        // immutable snapshots and never project future config, so the caller
-        // now gets a command id it can poll and reads the configuration back
-        // through /api/config when it wants the applied truth.
-        let status =
-            self.submit_control_command(ControlCommand::UpdateConfig(Box::new(new_config)))?;
-        *lock_cache(&self.knobs_cache) = None;
-        Ok(status)
+        // A patch becomes a full UpdateConfig command. Without this guard, two
+        // clients merging disjoint fields from the same publication would both
+        // apply and the later replacement would silently undo the first edit.
+        // Keep the observed revision with the immutable config that produced it;
+        // a fresh revision read here would authorize precisely that stale write.
+        Ok(self
+            .prepare_control_command(ControlCommand::UpdateConfig(Box::new(new_config)), None)?
+            .expecting_config_revision(snapshot.revisions.config))
     }
 
     /// Apply a list of knob updates by path.
@@ -4757,6 +4846,249 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn control_runtime_shutdown_and_drop_join_active_experiments() {
+        use std::time::{Duration, Instant};
+
+        for explicit_shutdown in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let (_unused_handle, host) = handle();
+            let (runtime, _submit) = crate::ControlRuntime::launch(
+                host.port.clone(),
+                crate::ControlServerConfig {
+                    rest_enabled: false,
+                    mcp_transport: crate::servers::McpTransportConfig::Disabled,
+                    ..crate::ControlServerConfig::default()
+                },
+            )
+            .unwrap();
+            let retained = runtime
+                .control_handle()
+                .unwrap()
+                .with_artifacts_dir(root.path().to_path_buf())
+                .unwrap();
+            let mut request = experiment_creation_request();
+            request.experiment_id = Some("shutdown-active".into());
+            request.idempotency_key = Some("shutdown-active-key".into());
+            request.seeds = vec![7, 9];
+            request.max_concurrency = Some(2);
+            request.ticks_per_run = Some(10_000);
+            let created = retained.create_experiment(request.clone()).unwrap();
+            let directory = root.path().join("experiments/shutdown-active");
+            let mut cuts = created
+                .runs
+                .iter()
+                .map(|run| {
+                    (
+                        directory.join(format!("{}.checkpoint", run.run_id)),
+                        std::collections::BTreeSet::new(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while cuts.iter().any(|(_, seen)| seen.len() < 2) {
+                for (path, seen) in &mut cuts {
+                    if let Ok(bytes) = fs::read(path)
+                        && let Some(end) = bytes.len().checked_sub(blake3::OUT_LEN)
+                        && blake3::hash(&bytes[..end]).as_bytes() == &bytes[end..]
+                    {
+                        seen.insert(compute_blake3(&bytes));
+                    }
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "both experiment owners must advance"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+
+            if explicit_shutdown {
+                runtime.shutdown().unwrap();
+            } else {
+                drop(runtime);
+            }
+            let stopped = retained.get_experiment("shutdown-active").unwrap();
+            assert_eq!(stopped.status, "cancelled");
+            // Cancelled records retain the resumable state; progress is in the
+            // distinct, checksummed continuation cuts observed above.
+            assert!(
+                stopped
+                    .runs
+                    .iter()
+                    .all(|run| run.state == "running" && run.total_ticks == 0)
+            );
+            let capacity = retained
+                .list_experiments(None, None)
+                .unwrap()
+                .execution_capacity;
+            assert_eq!(capacity.reserved_run_slots, 0);
+            assert_eq!(capacity.reserved_batches, 0);
+            assert!(
+                retained
+                    .data_services
+                    .experiments
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .all(|job| job.worker.is_none())
+            );
+
+            let saved_status = fs::read(directory.join("status.json")).unwrap();
+            let saved_cuts = cuts
+                .iter()
+                .map(|(path, _)| (path.clone(), fs::read(path).unwrap()))
+                .collect::<Vec<_>>();
+            assert!(matches!(
+                retained.resume_experiment("shutdown-active"),
+                Err(ControlError::ExperimentShuttingDown)
+            ));
+            // An exact creation retry remains a read of the admitted identity.
+            assert_eq!(
+                retained
+                    .create_experiment(request.clone())
+                    .unwrap()
+                    .experiment_id,
+                created.experiment_id
+            );
+            request.experiment_id = Some("after-shutdown".into());
+            request.idempotency_key = Some("after-shutdown-key".into());
+            assert!(matches!(
+                retained.create_experiment(request),
+                Err(ControlError::ExperimentShuttingDown)
+            ));
+            assert!(!root.path().join("experiments/after-shutdown").exists());
+            retained.data_services.shutdown_experiments().unwrap();
+            assert_eq!(
+                fs::read(directory.join("status.json")).unwrap(),
+                saved_status
+            );
+            for (path, bytes) in saved_cuts {
+                assert_eq!(fs::read(path).unwrap(), bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn experiment_shutdown_joins_siblings_after_an_injected_worker_panic() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+
+        let root = tempfile::tempdir().unwrap();
+        let services = DataServices::new(root.path().to_path_buf());
+        for id in ["a-panic", "z-sibling"] {
+            pending_catalog_definition(root.path(), id);
+            services.recover_experiment(id).unwrap();
+        }
+        let sibling_finished = Arc::new(AtomicBool::new(false));
+        let observed_all_cancellations = Arc::new(AtomicUsize::new(0));
+        {
+            let mut jobs = services.experiments.lock().unwrap();
+            let cancellation = jobs
+                .values()
+                .map(|job| Arc::clone(&job.cancel))
+                .collect::<Vec<_>>();
+            for (index, job) in jobs.values_mut().enumerate() {
+                let flags = cancellation.clone();
+                let finished = Arc::clone(&sibling_finished);
+                let observed = Arc::clone(&observed_all_cancellations);
+                let mut reservation = services
+                    .reserve_experiment_execution(&job.runner.experiment_id, 1)
+                    .unwrap();
+                job.running.store(true, Ordering::Release);
+                reservation.running = Some(Arc::clone(&job.running));
+                // Inject thread lifecycle behavior only; the test above runs real science.
+                job.worker = Some(std::thread::spawn(move || {
+                    let _reservation = reservation;
+                    let deadline = Instant::now() + Duration::from_secs(30);
+                    while !flags.iter().all(|flag| flag.load(Ordering::Acquire)) {
+                        assert!(
+                            Instant::now() < deadline,
+                            "all jobs must be cancelled before joining"
+                        );
+                        std::thread::yield_now();
+                    }
+                    observed.fetch_add(1, Ordering::AcqRel);
+                    assert_ne!(index, 0, "injected experiment worker panic");
+                    finished.store(true, Ordering::Release);
+                }));
+            }
+        }
+        let error = services.shutdown_experiments().unwrap_err().to_string();
+        assert!(error.contains("a-panic"), "{error}");
+        assert!(sibling_finished.load(Ordering::Acquire));
+        assert_eq!(observed_all_cancellations.load(Ordering::Acquire), 2);
+        let jobs = services.experiments.lock().unwrap();
+        assert!(jobs.values().all(|job| job.worker.is_none()));
+        assert!(
+            jobs.values()
+                .all(|job| !job.running.load(Ordering::Acquire))
+        );
+        assert!(jobs["a-panic"].last_error.lock().unwrap().is_some());
+        drop(jobs);
+        let capacity = *services.execution_capacity.lock().unwrap();
+        assert_eq!(capacity.reserved_run_slots, 0);
+        assert_eq!(capacity.reserved_batches, 0);
+        assert!(matches!(
+            services.reserve_experiment_execution("new", 1),
+            Err(ControlError::ExperimentShuttingDown)
+        ));
+    }
+
+    #[test]
+    fn experiment_shutdown_reports_registry_poison() {
+        let root = tempfile::tempdir().unwrap();
+        let services = DataServices::new(root.path().to_path_buf());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _jobs = services.experiments.lock().unwrap();
+                panic!("injected registry-owner panic");
+            }))
+            .is_err()
+        );
+        let error = services.shutdown_experiments().unwrap_err().to_string();
+        assert!(error.contains("registry was poisoned"), "{error}");
+        assert!(matches!(
+            services.reserve_experiment_execution("new", 1),
+            Err(ControlError::ExperimentShuttingDown)
+        ));
+    }
+
+    #[test]
+    fn experiment_resume_reports_a_prior_worker_panic_before_admission() {
+        let root = tempfile::tempdir().unwrap();
+        let (handle, _host) = handle();
+        let handle = handle
+            .with_artifacts_dir(root.path().to_path_buf())
+            .unwrap();
+        pending_catalog_definition(root.path(), "failed-worker");
+        handle
+            .data_services
+            .recover_experiment("failed-worker")
+            .unwrap();
+        {
+            let mut jobs = handle.data_services.experiments.lock().unwrap();
+            jobs.get_mut("failed-worker").unwrap().worker = Some(std::thread::spawn(|| {
+                panic!("injected prior worker panic");
+            }));
+        }
+        assert!(matches!(
+            handle.resume_experiment("failed-worker"),
+            Err(ControlError::ExperimentWorkerFailed(message)) if message.contains("failed-worker")
+        ));
+        let capacity = *handle.data_services.execution_capacity.lock().unwrap();
+        assert_eq!(capacity.reserved_run_slots, 0);
+        assert_eq!(capacity.reserved_batches, 0);
+        assert!(
+            !root
+                .path()
+                .join("experiments/failed-worker/status.json")
+                .exists()
+        );
+        let jobs = handle.data_services.experiments.lock().unwrap();
+        assert!(jobs["failed-worker"].worker.is_none());
+        assert!(jobs["failed-worker"].last_error.lock().unwrap().is_some());
+    }
+
+    #[test]
     fn experiment_execution_capacity_is_shared_released_and_retryable() {
         use std::sync::atomic::Ordering;
         use std::time::{Duration, Instant};
@@ -5170,6 +5502,141 @@ pub(crate) mod tests {
         assert_eq!(fs::read(&temporary).unwrap(), b"partial");
         assert!(services.recover_experiment("../outside").is_err());
         assert!(services.experiments.lock().unwrap().is_empty());
+    }
+
+    #[cfg(feature = "brain-ft")]
+    #[test]
+    fn experiment_creation_accepts_frankentorch_alias_and_exports_restorable_ft_bundle() {
+        let root = tempfile::tempdir().unwrap();
+        let (_unused_handle, host) = handle();
+        // This guard joins experiment workers before the temporary root is dropped,
+        // including when an assertion fails.
+        let (runtime, _submit) = crate::ControlRuntime::launch(
+            host.port.clone(),
+            crate::ControlServerConfig {
+                rest_enabled: false,
+                mcp_transport: crate::servers::McpTransportConfig::Disabled,
+                ..crate::ControlServerConfig::default()
+            },
+        )
+        .unwrap();
+        let handle = runtime
+            .control_handle()
+            .unwrap()
+            .with_artifacts_dir(root.path().to_path_buf())
+            .unwrap();
+        let live_digest = host.port.scientific_digest_v1().unwrap();
+        let live_snapshot = handle.read_snapshot().unwrap();
+        assert!(handle.version().features.iter().any(|f| f == "brain-ft"));
+
+        let mut request = experiment_creation_request();
+        request.experiment_id = Some("ft-api-run".into());
+        request.idempotency_key = Some("ft-api-run-key".into());
+        request.variants[0].brain_family = " FrAnKeNtOrCh ".into();
+        let expected_runs = request.variants.len() * request.seeds.len();
+        let expected_seed = request.seeds[0];
+        let expected_ticks = request.ticks_per_run.unwrap();
+        let created = handle.create_experiment(request).expect("admit Ft alias");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let completed = loop {
+            let status = handle.get_experiment(&created.experiment_id).unwrap();
+            if status.status == "completed" {
+                break status;
+            }
+            assert_ne!(status.status, "failed", "{status:?}");
+            assert!(std::time::Instant::now() < deadline, "{status:?}");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        assert_eq!(completed.total_runs, expected_runs);
+        assert_eq!(completed.completed_runs, expected_runs);
+        assert_eq!(completed.failed_runs, 0);
+        assert_eq!(completed.runs.len(), expected_runs);
+        let run = &completed.runs[0];
+        assert_eq!(run.brain_family, "ft");
+        assert_eq!(run.state, "completed");
+        assert_eq!(run.seed, expected_seed);
+        assert_eq!(run.total_ticks, expected_ticks);
+        let bundle_dir = Path::new(run.bundle_path.as_ref().expect("published Ft bundle"));
+        let verified = crate::experiment_runner::verify_portable_run_bundle(bundle_dir)
+            .expect("restore the actual Ft checkpoint from its portable bundle");
+        let final_state = verified.final_state.expect("observed Ft final science");
+        assert_eq!(final_state.run_id, run.run_id);
+        assert_eq!(final_state.tick, expected_ticks);
+        assert_eq!(
+            Some(final_state.scientific_digest.as_str()),
+            run.final_digest.as_deref()
+        );
+        let bundle: scriptbots_storage::RunBundleV1 =
+            serde_json::from_slice(&fs::read(bundle_dir.join("bundle_manifest.json")).unwrap())
+                .unwrap();
+        let manifest: crate::RunManifestV3 =
+            serde_json::from_str(&bundle.manifest.manifest_json).unwrap();
+        assert_eq!(manifest.brain_roster.len(), 1);
+        assert_eq!(manifest.brain_roster[0].kind, "ft");
+        assert_eq!(manifest.root_seed, expected_seed);
+        assert_eq!(
+            manifest.identity.requested_tick_budget,
+            Some(expected_ticks)
+        );
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), live_digest);
+        let after = handle.read_snapshot().unwrap();
+        assert_eq!(after.config, live_snapshot.config);
+        assert_eq!(after.world.tick, live_snapshot.world.tick);
+        runtime.shutdown().expect("join Ft experiment worker");
+    }
+
+    #[cfg(not(feature = "brain-ft"))]
+    #[test]
+    fn experiment_creation_refuses_ft_aliases_before_admission_without_feature() {
+        let root = tempfile::tempdir().unwrap();
+        let (_unused_handle, host) = handle();
+        let (runtime, _submit) = crate::ControlRuntime::launch(
+            host.port.clone(),
+            crate::ControlServerConfig {
+                rest_enabled: false,
+                mcp_transport: crate::servers::McpTransportConfig::Disabled,
+                ..crate::ControlServerConfig::default()
+            },
+        )
+        .unwrap();
+        let handle = runtime
+            .control_handle()
+            .unwrap()
+            .with_artifacts_dir(root.path().to_path_buf())
+            .unwrap()
+            .with_experiment_run_capacity(1)
+            .unwrap();
+        let live_digest = host.port.scientific_digest_v1().unwrap();
+        let capacity = handle
+            .list_experiments(None, None)
+            .unwrap()
+            .execution_capacity;
+        assert_eq!(capacity.reserved_run_slots, 0);
+        assert_eq!(capacity.reserved_batches, 0);
+        assert!(!handle.version().features.iter().any(|f| f == "brain-ft"));
+
+        for alias in [" Ft ", " FrAnKeNtOrCh "] {
+            let mut request = experiment_creation_request();
+            request.experiment_id = Some("unavailable-ft".into());
+            request.variants[0].brain_family = alias.into();
+            let error = handle
+                .create_experiment(request)
+                .expect_err("disabled Ft must fail before any experiment side effects");
+            assert!(matches!(
+                error,
+                ControlError::BadRequest(reason) if reason.contains("brain-ft")
+            ));
+            assert!(!root.path().join("experiments").exists());
+            assert!(handle.data_services.experiments.lock().unwrap().is_empty());
+            assert!(handle.data_services.idempotency.lock().unwrap().is_empty());
+            let listed = handle.list_experiments(None, None).unwrap();
+            assert_eq!(listed.total, 0);
+            assert_eq!(listed.execution_capacity, capacity);
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), live_digest);
+        }
+        runtime
+            .shutdown()
+            .expect("join any unexpected experiment worker");
     }
 
     #[test]
@@ -7885,6 +8352,144 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn concurrent_disjoint_patches_reject_stale_replacement_and_preserve_both_on_retry() {
+        let world = WorldState::new(ScriptBotsConfig {
+            world_width: 40,
+            world_height: 40,
+            food_cell_size: 10,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            persistence_interval: 0,
+            closed: false,
+            rng_seed: Some(42),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("paused patch world");
+        let host = TestHost::spawn(world);
+        let clients = [host.handle(), host.handle()];
+        let before = clients[0].read_snapshot().expect("shared publication");
+        let patches = [
+            serde_json::json!({"closed": true}),
+            serde_json::json!({"food_max": 0.75}),
+        ];
+
+        // Both requests finish the production read/validate/merge before either
+        // is submitted. This deterministically reproduces concurrent clients
+        // observing one publication, without depending on thread timing.
+        let first = clients[0]
+            .prepare_config_patch(patches[0].clone())
+            .expect("first prepared patch");
+        let second = clients[1]
+            .prepare_config_patch(patches[1].clone())
+            .expect("second prepared patch");
+        let start = std::sync::Barrier::new(3);
+        let submitted = std::thread::scope(|scope| {
+            let pending = [
+                (clients[0].host.clone(), first),
+                (clients[1].host.clone(), second),
+            ]
+            .map(|(mut port, envelope)| {
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    port.submit(envelope).expect("real host admission")
+                })
+            });
+            start.wait();
+            pending.map(|worker| worker.join().expect("patch submitter joined"))
+        });
+        let outcomes = submitted.map(|status| host.wait_finished(&status.command_id().to_string()));
+        let (winner, stale) = match (
+            outcomes[0].application_state.as_str(),
+            outcomes[1].application_state.as_str(),
+        ) {
+            ("applied", "rejected") => (0, 1),
+            ("rejected", "applied") => (1, 0),
+            other => panic!("one competing patch must win and the other conflict: {other:?}"),
+        };
+        assert!(
+            outcomes[winner].admission_sequence.expect("winning order")
+                < outcomes[stale]
+                    .admission_sequence
+                    .expect("conflicting order")
+        );
+        assert_eq!(
+            outcomes[stale].rejection_reason,
+            Some(serde_json::json!({
+                "kind": "config_revision_conflict",
+                "expected": before.revisions.config.get(),
+                "actual": before.revisions.config.get() + 1,
+            }))
+        );
+        let after = clients[0].read_snapshot().expect("resolved owner config");
+        let mut expected = before.config.as_ref().clone();
+        if winner == 0 {
+            expected.closed = true;
+        } else {
+            expected.food_max = 0.75;
+        }
+        assert_eq!(after.config.as_ref(), &expected);
+        assert_eq!(
+            after.revisions.config.get(),
+            before.revisions.config.get() + 1
+        );
+        assert_eq!(after.world.tick, before.world.tick);
+        assert_eq!(
+            after.last_applied_command.map(|id| id.to_string()),
+            Some(outcomes[winner].command_id.clone())
+        );
+
+        // A new public request merges against the winning publication. It must
+        // retain the peer's edit and obtain its own observable application.
+        let retry = clients[stale]
+            .apply_patch(patches[stale].clone())
+            .expect("fresh patch after observed conflict");
+        assert_ne!(retry.command_id, outcomes[stale].command_id);
+        host.wait_applied(&retry);
+        expected.closed = true;
+        expected.food_max = 0.75;
+        let final_snapshot = clients[0].read_snapshot().expect("both edits applied");
+        assert_eq!(final_snapshot.config.as_ref(), &expected);
+        assert_eq!(
+            final_snapshot.revisions.config.get(),
+            before.revisions.config.get() + 2
+        );
+        assert_eq!(final_snapshot.world.tick, before.world.tick);
+    }
+
+    #[test]
+    fn prepared_config_patch_survives_unrelated_playback_revision() {
+        let (handle, host) = handle();
+        let before = handle.read_snapshot().expect("original publication");
+        let envelope = handle
+            .prepare_config_patch(serde_json::json!({"food_max": 0.75}))
+            .expect("prepared configuration");
+        let playback = handle.set_speed(2.0, None).expect("speed command");
+        host.wait_applied(&playback);
+        let after_playback = handle.read_snapshot().expect("applied playback");
+        assert!(after_playback.revisions.control > before.revisions.control);
+        assert_eq!(after_playback.revisions.config, before.revisions.config);
+
+        let submitted = handle
+            .host
+            .clone()
+            .submit(envelope)
+            .expect("patch admission");
+        let receipt = handle.status_dto(submitted).expect("patch receipt");
+        host.wait_applied(&receipt);
+        let after = handle.read_snapshot().expect("applied config");
+        let mut expected = before.config.as_ref().clone();
+        expected.food_max = 0.75;
+        assert_eq!(after.config.as_ref(), &expected);
+        assert_eq!(after.playback, after_playback.playback);
+        assert_eq!(after.world.tick, before.world.tick);
+        assert_eq!(
+            after.revisions.config.get(),
+            before.revisions.config.get() + 1
+        );
+    }
+
+    #[test]
     fn patch_render_quality_and_post_stack_round_trip() {
         let (handle, receiver) = handle();
         let snapshot = handle
@@ -9070,7 +9675,7 @@ pub(crate) mod tests {
     fn oversized_step_and_map_requests_are_refused_before_work() {
         let (handle, _receiver) = handle();
         let err = handle
-            .step_count(u64::MAX)
+            .step_count(u64::MAX, None)
             .expect_err("an unbounded step batch must be refused");
         assert!(err.to_string().contains("per-request limit"), "{err}");
         let err = handle

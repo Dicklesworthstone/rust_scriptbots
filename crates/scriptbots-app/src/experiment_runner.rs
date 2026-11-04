@@ -8,6 +8,8 @@ use scriptbots_brain::{
     AssemblyBrain, DwraonBrain, MlpBrain, assembly::AssemblyFamilyAdapter,
     dwraon::DwraonFamilyAdapter, mlp::MlpBrainFamily,
 };
+#[cfg(feature = "brain-ft")]
+use scriptbots_brain_ml::{FT_BRAIN_KIND, FtBrainFamily};
 use scriptbots_core::{
     BrainFamilyAdapter, BrainRegistry, NullPersistence, ScriptBotsConfig, WorldState, knob_range,
 };
@@ -73,7 +75,7 @@ pub enum ExperimentRunnerError {
     /// A previously written status file is malformed or contradicts the current plan.
     #[error("invalid experiment status at {path}: {reason}")]
     InvalidStatus { path: PathBuf, reason: String },
-    /// A prior write stopped after creating the temporary status file.
+    /// A prior write left a temporary status file that cannot be safely promoted.
     #[error(
         "interrupted experiment status write left {temporary}; inspect it against {committed} before recovery"
     )]
@@ -213,6 +215,8 @@ enum ResolvedBrainFamily {
     Mlp,
     Dwraon,
     Assembly,
+    #[cfg(feature = "brain-ft")]
+    FrankenTorch,
 }
 
 impl ResolvedBrainFamily {
@@ -221,7 +225,16 @@ impl ResolvedBrainFamily {
             "mlp" | "mlp.baseline" => Ok(Self::Mlp),
             "dwraon" | "dwraon.baseline" => Ok(Self::Dwraon),
             "assembly" | "assembly.experimental" => Ok(Self::Assembly),
-            "neuroflow" | "ft" | "frankentorch" => {
+            #[cfg(feature = "brain-ft")]
+            "ft" | "frankentorch" => Ok(Self::FrankenTorch),
+            #[cfg(not(feature = "brain-ft"))]
+            "ft" | "frankentorch" => Err(ExperimentRunnerError::UnavailableBrainFamily {
+                variant_id: variant.variant_id.clone(),
+                brain_family: variant.brain_family.clone(),
+                reason: "FrankenTorch experiments require a build with the brain-ft feature"
+                    .to_owned(),
+            }),
+            "neuroflow" => {
                 Err(ExperimentRunnerError::UnavailableBrainFamily {
                     variant_id: variant.variant_id.clone(),
                     brain_family: variant.brain_family.clone(),
@@ -240,6 +253,8 @@ impl ResolvedBrainFamily {
             Self::Mlp => MlpBrain::KIND.as_str(),
             Self::Dwraon => DwraonBrain::KIND.as_str(),
             Self::Assembly => AssemblyBrain::KIND.as_str(),
+            #[cfg(feature = "brain-ft")]
+            Self::FrankenTorch => FT_BRAIN_KIND,
         }
     }
 
@@ -256,6 +271,8 @@ impl ResolvedBrainFamily {
                 })?;
                 Box::new(adapter)
             }
+            #[cfg(feature = "brain-ft")]
+            Self::FrankenTorch => Box::new(FtBrainFamily::default()),
         })
     }
 
@@ -983,8 +1000,9 @@ impl MatchedSeedExperimentRunner {
     ///
     /// # Errors
     ///
-    /// Refuses malformed, stale, interrupted, or plan-incompatible state. A
-    /// malformed status is never treated as permission to start again at tick zero.
+    /// Recovers a complete interrupted publication only when it is the exact
+    /// initial plan or a valid immediate successor of the committed generation.
+    /// Malformed, stale, or plan-incompatible state never permits a tick-zero restart.
     pub fn load_or_create_status(
         &self,
         state_file: &Path,
@@ -1053,11 +1071,16 @@ impl MatchedSeedExperimentRunner {
         plan: &ValidatedPlan,
     ) -> Result<ExperimentBatchStatus, ExperimentRunnerError> {
         let temporary = status_temporary_path(state_file)?;
-        if temporary.exists() {
-            return Err(ExperimentRunnerError::InterruptedStatusWrite {
-                temporary,
-                committed: state_file.to_path_buf(),
-            });
+        match fs::symlink_metadata(&temporary) {
+            Ok(_) => return self.recover_status_publication_locked(state_file, &temporary, plan),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(ExperimentRunnerError::Io {
+                    operation: "inspect interrupted status publication",
+                    path: temporary,
+                    source,
+                });
+            }
         }
 
         if state_file.exists() {
@@ -1067,6 +1090,100 @@ impl MatchedSeedExperimentRunner {
         let status = self.initial_status(plan);
         self.write_status_atomically(state_file, &status, plan)?;
         Ok(status)
+    }
+
+    /// Recover only a complete writer-produced successor while holding the status lease.
+    fn recover_status_publication_locked(
+        &self,
+        state_file: &Path,
+        temporary: &Path,
+        plan: &ValidatedPlan,
+    ) -> Result<ExperimentBatchStatus, ExperimentRunnerError> {
+        let interrupted = || ExperimentRunnerError::InterruptedStatusWrite {
+            temporary: temporary.to_path_buf(),
+            committed: state_file.to_path_buf(),
+        };
+        let bytes = read_experiment_file_bounded(temporary, MAX_STATUS_BYTES)?;
+        let candidate =
+            serde_json::from_slice::<ExperimentBatchStatus>(&bytes).map_err(|_| interrupted())?;
+        self.validate_status(temporary, &candidate, plan)?;
+        if canonical_status_bytes(&candidate)? != bytes {
+            return Err(interrupted());
+        }
+
+        let committed_bytes = match fs::symlink_metadata(state_file) {
+            Ok(_) => Some(read_experiment_file_bounded(state_file, MAX_STATUS_BYTES)?),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(source) => {
+                return Err(ExperimentRunnerError::Io {
+                    operation: "inspect committed status for recovery",
+                    path: state_file.to_path_buf(),
+                    source,
+                });
+            }
+        };
+        if let Some(bytes) = &committed_bytes {
+            let committed = self.decode_status(state_file, bytes, plan)?;
+            if committed.generation.checked_add(1) != Some(candidate.generation) {
+                return Err(interrupted());
+            }
+            self.validate_status_transition(state_file, &committed, &candidate)?;
+        } else if candidate != self.initial_status(plan) {
+            return Err(interrupted());
+        }
+
+        // Completion is scientific evidence, not merely a monotonic enum transition.
+        // Verify the actual bundle and restored owner cut before publishing success.
+        for record in candidate
+            .runs
+            .iter()
+            .filter(|record| record.state == RunState::Completed)
+        {
+            let (variant, family) = &plan.variants[&record.variant_id];
+            self.verify_completed_bundle(record, variant, *family, &plan.digest)?;
+        }
+
+        // A cooperating writer cannot change these paths under our lease. Refuse
+        // external replacement too, rather than overwriting evidence read above.
+        if read_experiment_file_bounded(temporary, MAX_STATUS_BYTES)? != bytes {
+            return Err(interrupted());
+        }
+        match (&committed_bytes, fs::symlink_metadata(state_file)) {
+            (Some(expected), Ok(_)) => {
+                if read_experiment_file_bounded(state_file, MAX_STATUS_BYTES)? != *expected {
+                    return Err(interrupted());
+                }
+            }
+            (None, Err(error)) if error.kind() == io::ErrorKind::NotFound => {}
+            _ => return Err(interrupted()),
+        }
+        let mut options = OpenOptions::new();
+        options.read(true).write(cfg!(windows));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        options
+            .open(temporary)
+            .and_then(|file| file.sync_all())
+            .map_err(|source| ExperimentRunnerError::Io {
+                operation: "sync recovered experiment status",
+                path: temporary.to_path_buf(),
+                source,
+            })?;
+        fs::rename(temporary, state_file).map_err(|source| ExperimentRunnerError::Io {
+            operation: "promote recovered experiment status",
+            path: state_file.to_path_buf(),
+            source,
+        })?;
+        sync_parent_directory(
+            state_file
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new(".")),
+        )?;
+        Ok(candidate)
     }
 
     /// Atomically and durably flushes a validated status update to disk.
@@ -1684,7 +1801,16 @@ impl MatchedSeedExperimentRunner {
         plan: &ValidatedPlan,
     ) -> Result<ExperimentBatchStatus, ExperimentRunnerError> {
         let bytes = read_bounded_file(state_file, MAX_STATUS_BYTES, "read experiment status")?;
-        let status = serde_json::from_slice::<ExperimentBatchStatus>(&bytes).map_err(|source| {
+        self.decode_status(state_file, &bytes, plan)
+    }
+
+    fn decode_status(
+        &self,
+        state_file: &Path,
+        bytes: &[u8],
+        plan: &ValidatedPlan,
+    ) -> Result<ExperimentBatchStatus, ExperimentRunnerError> {
+        let status = serde_json::from_slice::<ExperimentBatchStatus>(bytes).map_err(|source| {
             ExperimentRunnerError::InvalidStatus {
                 path: state_file.to_path_buf(),
                 reason: format!("status JSON does not match the versioned schema: {source}"),
@@ -1770,12 +1896,7 @@ impl MatchedSeedExperimentRunner {
             path: parent.to_path_buf(),
             source,
         })?;
-        let mut bytes =
-            serde_json::to_vec_pretty(status).map_err(|source| ExperimentRunnerError::Json {
-                operation: "serialize experiment status",
-                source,
-            })?;
-        bytes.push(b'\n');
+        let bytes = canonical_status_bytes(status)?;
         if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_STATUS_BYTES {
             return Err(ExperimentRunnerError::InvalidStatus {
                 path: state_file.to_path_buf(),
@@ -2121,6 +2242,16 @@ impl MatchedSeedExperimentRunner {
                 run_id: run_id.to_owned(),
                 completed_ticks: 0,
             })?;
+        if experiment_path_exists(
+            &self.staged_bundle_path(run_id),
+            "inspect bundle staging before continuation",
+        )? && checkpoint.owner.host_checkpoint().tick().0 != self.max_ticks
+        {
+            return Err(invalid_checkpoint(
+                &path,
+                "bundle staging exists without a sealed final owner cut; replaying ticks is refused",
+            ));
+        }
         let mut parent_digest = blake3::hash(&checkpoint.encode(&path)?)
             .to_hex()
             .to_string();
@@ -2285,16 +2416,23 @@ impl MatchedSeedExperimentRunner {
         // owner-journal state. Reporting its digest alone is not portable state.
         let final_checkpoint_bytes = checkpoint.encode(&path)?;
         let bundle_dir = self.output_dir.join(run_id);
-        if bundle_dir.exists() {
-            return Err(ExperimentRunnerError::BundleAlreadyExists {
-                run_id: run_id.to_owned(),
-                path: bundle_dir,
-            });
-        }
-        create_run_bundle_from_artifacts(
-            &bundle_dir,
+        let completed = RunRecord {
+            run_id: run_id.to_owned(),
+            variant_id: variant.variant_id.clone(),
+            brain_family: family.canonical_name().to_owned(),
+            seed,
+            state: RunState::Completed,
+            total_ticks: self.max_ticks,
+            final_digest: Some(digest_hex),
+            bundle_path: Some(bundle_dir.to_string_lossy().into_owned()),
+            error_reason: None,
+        };
+        self.publish_completed_bundle(
+            &completed,
+            variant,
+            family,
+            plan_digest,
             manifest_record,
-            self.max_ticks,
             &[
                 (
                     "exports/summary.csv",
@@ -2312,25 +2450,142 @@ impl MatchedSeedExperimentRunner {
                     &final_checkpoint_bytes,
                 ),
             ],
-        )
-        .map_err(|source| ExperimentRunnerError::Bundle {
-            run_id: run_id.to_owned(),
-            reason: format!("assembly failed: {source}"),
-        })?;
-
-        let completed = RunRecord {
-            run_id: run_id.to_owned(),
-            variant_id: variant.variant_id.clone(),
-            brain_family: family.canonical_name().to_owned(),
-            seed,
-            state: RunState::Completed,
-            total_ticks: self.max_ticks,
-            final_digest: Some(digest_hex),
-            bundle_path: Some(bundle_dir.to_string_lossy().into_owned()),
-            error_reason: None,
-        };
+        )?;
         self.verify_completed_bundle(&completed, variant, family, plan_digest)?;
         Ok(completed)
+    }
+
+    fn staged_bundle_path(&self, run_id: &str) -> PathBuf {
+        self.output_dir.join(format!("{run_id}.bundle.tmp"))
+    }
+
+    /// Publish only verified output from the final sealed owner cut. The caller holds
+    /// the run's writer lease across restore, execution and this directory handoff.
+    fn publish_completed_bundle(
+        &self,
+        record: &RunRecord,
+        variant: &ScenarioVariant,
+        family: ResolvedBrainFamily,
+        plan_digest: &str,
+        manifest: scriptbots_storage::RunManifestRecord,
+        artifacts: &[(&str, &str, &[u8])],
+    ) -> Result<(), ExperimentRunnerError> {
+        let bundle_dir = self.output_dir.join(&record.run_id);
+        if experiment_path_exists(&bundle_dir, "inspect final experiment bundle")? {
+            return Err(ExperimentRunnerError::BundleAlreadyExists {
+                run_id: record.run_id.clone(),
+                path: bundle_dir,
+            });
+        }
+        let staged = self.staged_bundle_path(&record.run_id);
+        let verify_staged = || -> Result<(), ExperimentRunnerError> {
+            self.verify_completed_bundle_at(&staged, record, variant, family, plan_digest)?;
+            for (relative, _, expected) in artifacts {
+                let path = staged.join(relative);
+                if read_experiment_file_bounded(&path, MAX_BUNDLE_ARTIFACT_BYTES)?.as_slice()
+                    != *expected
+                {
+                    return Err(ExperimentRunnerError::Bundle {
+                        run_id: record.run_id.clone(),
+                        reason: format!(
+                            "staged artifact {} differs from the exact sealed final owner cut",
+                            path.display()
+                        ),
+                    });
+                }
+            }
+            Ok(())
+        };
+        let mut ready = false;
+        if experiment_path_exists(&staged, "inspect staged experiment bundle")? {
+            validate_staged_bundle_layout(&staged, &record.run_id)?;
+            match verify_staged() {
+                Ok(()) => ready = true,
+                Err(error) => {
+                    // Only uncommitted staging can be regenerated. Preserve one
+                    // bounded incident instead of deleting or overwriting evidence.
+                    let retained = self
+                        .output_dir
+                        .join(format!("{}.bundle.interrupted", record.run_id));
+                    if experiment_path_exists(&retained, "inspect retained bundle incident")? {
+                        return Err(ExperimentRunnerError::Bundle {
+                            run_id: record.run_id.clone(),
+                            reason: format!(
+                                "staging is incomplete or invalid ({error}); prior incident at {} must be inspected before another recovery",
+                                retained.display()
+                            ),
+                        });
+                    }
+                    fs::rename(&staged, &retained).map_err(|source| ExperimentRunnerError::Io {
+                        operation: "retain interrupted bundle staging",
+                        path: staged.clone(),
+                        source,
+                    })?;
+                    sync_parent_directory(&self.output_dir)?;
+                    info!(
+                        run_id = %record.run_id,
+                        retained_path = %retained.display(),
+                        error = %error,
+                        "retained interrupted staging; rebuilding from the verified final owner cut"
+                    );
+                }
+            }
+        }
+        if !ready {
+            fs::create_dir(&staged).map_err(|source| ExperimentRunnerError::Io {
+                operation: "reserve experiment bundle staging",
+                path: staged.clone(),
+                source,
+            })?;
+            create_run_bundle_from_artifacts(&staged, manifest, self.max_ticks, artifacts)
+                .map_err(|source| ExperimentRunnerError::Bundle {
+                    run_id: record.run_id.clone(),
+                    reason: format!("staged assembly failed: {source}"),
+                })?;
+            validate_staged_bundle_layout(&staged, &record.run_id)?;
+            verify_staged()?;
+        }
+
+        // File contents and nested directory entries must precede publication of
+        // the final directory name, including recovery of a pre-rename crash.
+        for relative in REQUIRED_EXPERIMENT_ARTIFACTS
+            .iter()
+            .map(|(path, _)| *path)
+            .chain(std::iter::once("bundle_manifest.json"))
+        {
+            let path = staged.join(relative);
+            let mut options = OpenOptions::new();
+            options.read(true).write(cfg!(windows));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+            }
+            options
+                .open(&path)
+                .and_then(|file| file.sync_all())
+                .map_err(|source| ExperimentRunnerError::Io {
+                    operation: "sync staged experiment artifact",
+                    path: path.clone(),
+                    source,
+                })?;
+            if let Some(parent) = path.parent() {
+                sync_parent_directory(parent)?;
+            }
+        }
+        sync_parent_directory(&staged)?;
+        if experiment_path_exists(&bundle_dir, "reinspect final experiment bundle")? {
+            return Err(ExperimentRunnerError::BundleAlreadyExists {
+                run_id: record.run_id.clone(),
+                path: bundle_dir,
+            });
+        }
+        fs::rename(&staged, &bundle_dir).map_err(|source| ExperimentRunnerError::Io {
+            operation: "publish verified experiment bundle",
+            path: bundle_dir,
+            source,
+        })?;
+        sync_parent_directory(&self.output_dir)
     }
 
     /// Recover only the bundle/status commit gap; never replay an unfinished run.
@@ -2385,8 +2640,19 @@ impl MatchedSeedExperimentRunner {
         plan_digest: &str,
     ) -> Result<(), ExperimentRunnerError> {
         let bundle_dir = self.output_dir.join(&record.run_id);
+        self.verify_completed_bundle_at(&bundle_dir, record, variant, family, plan_digest)
+    }
+
+    fn verify_completed_bundle_at(
+        &self,
+        bundle_dir: &Path,
+        record: &RunRecord,
+        variant: &ScenarioVariant,
+        family: ResolvedBrainFamily,
+        plan_digest: &str,
+    ) -> Result<(), ExperimentRunnerError> {
         verify_run_bundle_bounded(
-            &bundle_dir,
+            bundle_dir,
             RunBundleVerificationLimits {
                 max_manifest_bytes: MAX_STATUS_BYTES,
                 max_artifacts: MAX_BUNDLE_ARTIFACTS,
@@ -2533,7 +2799,7 @@ impl MatchedSeedExperimentRunner {
                 plan_digest,
             )?;
             verify_restored_final_checkpoint(
-                &bundle_dir,
+                bundle_dir,
                 &checkpoint,
                 &full_manifest,
                 &evidence,
@@ -2547,6 +2813,101 @@ impl MatchedSeedExperimentRunner {
         })?;
         Ok(())
     }
+}
+
+fn experiment_path_exists(
+    path: &Path,
+    operation: &'static str,
+) -> Result<bool, ExperimentRunnerError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(ExperimentRunnerError::Io {
+            operation,
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+/// Inspect the bounded writer-owned layout before any staged file is opened or moved.
+/// Missing files are expected after an interruption; aliases and unrelated files are not.
+fn validate_staged_bundle_layout(staged: &Path, run_id: &str) -> Result<(), ExperimentRunnerError> {
+    let invalid = |path: &Path, reason: &str| ExperimentRunnerError::Bundle {
+        run_id: run_id.to_owned(),
+        reason: format!("invalid bundle staging at {}: {reason}", path.display()),
+    };
+    let files = REQUIRED_EXPERIMENT_ARTIFACTS
+        .iter()
+        .map(|(path, _)| PathBuf::from(path))
+        .chain(std::iter::once(PathBuf::from("bundle_manifest.json")))
+        .collect::<BTreeSet<_>>();
+    let directories = files
+        .iter()
+        .flat_map(|path| path.ancestors().skip(1))
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .collect::<BTreeSet<_>>();
+    let mut pending = vec![PathBuf::new()];
+    let mut artifact_bytes = 0_u64;
+    while let Some(relative) = pending.pop() {
+        let directory = staged.join(&relative);
+        let metadata =
+            fs::symlink_metadata(&directory).map_err(|source| ExperimentRunnerError::Io {
+                operation: "inspect bundle staging directory",
+                path: directory.clone(),
+                source,
+            })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(invalid(&directory, "expected a non-symlink directory"));
+        }
+        let entries = fs::read_dir(&directory).map_err(|source| ExperimentRunnerError::Io {
+            operation: "list bundle staging directory",
+            path: directory.clone(),
+            source,
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|source| ExperimentRunnerError::Io {
+                operation: "read bundle staging directory entry",
+                path: directory.clone(),
+                source,
+            })?;
+            let relative_path = relative.join(entry.file_name());
+            let path = entry.path();
+            let metadata =
+                fs::symlink_metadata(&path).map_err(|source| ExperimentRunnerError::Io {
+                    operation: "inspect bundle staging entry",
+                    path: path.clone(),
+                    source,
+                })?;
+            if metadata.file_type().is_symlink() {
+                return Err(invalid(&path, "symlinks are refused"));
+            }
+            if directories.contains(&relative_path) && metadata.is_dir() {
+                pending.push(relative_path);
+            } else if files.contains(&relative_path) && metadata.is_file() {
+                if !same_status_file_identity(&metadata, &metadata) {
+                    return Err(invalid(&path, "multiply linked files are refused"));
+                }
+                if relative_path == Path::new("bundle_manifest.json") {
+                    if metadata.len() > MAX_STATUS_BYTES {
+                        return Err(invalid(&path, "manifest exceeds its byte cap"));
+                    }
+                } else {
+                    if metadata.len() > MAX_BUNDLE_ARTIFACT_BYTES {
+                        return Err(invalid(&path, "artifact exceeds its byte cap"));
+                    }
+                    artifact_bytes = artifact_bytes
+                        .checked_add(metadata.len())
+                        .filter(|total| *total <= MAX_BUNDLE_TOTAL_ARTIFACT_BYTES)
+                        .ok_or_else(|| invalid(staged, "artifacts exceed their total byte cap"))?;
+                }
+            } else {
+                return Err(invalid(&path, "unexpected path or non-regular artifact"));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_path_component(label: &str, value: &str) -> Result<(), ExperimentRunnerError> {
@@ -2579,6 +2940,18 @@ fn status_temporary_path(state_file: &Path) -> Result<PathBuf, ExperimentRunnerE
     let mut temporary_name = file_name.to_os_string();
     temporary_name.push(".tmp");
     Ok(state_file.with_file_name(temporary_name))
+}
+
+fn canonical_status_bytes(
+    status: &ExperimentBatchStatus,
+) -> Result<Vec<u8>, ExperimentRunnerError> {
+    let mut bytes =
+        serde_json::to_vec_pretty(status).map_err(|source| ExperimentRunnerError::Json {
+            operation: "serialize experiment status",
+            source,
+        })?;
+    bytes.push(b'\n');
+    Ok(bytes)
 }
 
 fn status_lock_path(state_file: &Path) -> Result<PathBuf, ExperimentRunnerError> {
@@ -2816,6 +3189,22 @@ pub fn validate_scenario_arm(
     config_for_run(overrides, 0).map(|_| ())
 }
 
+/// Validate a requested experiment family against the adapters in this build.
+///
+/// Control-plane admission and checkpoint/bundle reconstruction use the same
+/// resolver so a compiled optional family cannot be admitted by only one path.
+pub(crate) fn validate_experiment_brain_family(
+    variant_id: &str,
+    brain_family: &str,
+) -> Result<(), ExperimentRunnerError> {
+    ResolvedBrainFamily::resolve(&ScenarioVariant {
+        variant_id: variant_id.to_owned(),
+        brain_family: brain_family.to_owned(),
+        config_overrides: BTreeMap::new(),
+    })
+    .map(|_| ())
+}
+
 pub(crate) fn config_for_run(
     overrides: &BTreeMap<String, serde_json::Value>,
     seed: u64,
@@ -3022,6 +3411,67 @@ mod tests {
     }
 
     #[test]
+    fn frankentorch_arm_admission_matches_the_compiled_family() {
+        let directory = tempfile::tempdir().unwrap();
+        for requested_family in ["ft", "frankentorch"] {
+            let variant = ScenarioVariant {
+                variant_id: "torch".into(),
+                brain_family: requested_family.into(),
+                config_overrides: BTreeMap::new(),
+            };
+            let runner = MatchedSeedExperimentRunner::new(
+                "torch-plan",
+                MatchedSeedCohort {
+                    cohort_id: "cohort".into(),
+                    seeds: vec![71],
+                },
+                vec![variant.clone()],
+                2,
+                1,
+                directory.path().join("bundles"),
+            );
+            #[cfg(feature = "brain-ft")]
+            {
+                validate_experiment_brain_family(&variant.variant_id, requested_family)
+                    .expect("compiled family is admitted by the control plane");
+                let plan = runner.plan_batch().expect("compiled family is executable");
+                assert_eq!(plan[0].brain_family, "ft");
+
+                let duplicate = MatchedSeedExperimentRunner {
+                    variants: vec![
+                        variant,
+                        ScenarioVariant {
+                            variant_id: "same-science".into(),
+                            brain_family: "ft".into(),
+                            config_overrides: BTreeMap::new(),
+                        },
+                    ],
+                    ..runner
+                };
+                assert!(matches!(
+                    duplicate.plan_batch(),
+                    Err(ExperimentRunnerError::InvalidPlan { .. })
+                ));
+            }
+            #[cfg(not(feature = "brain-ft"))]
+            {
+                for result in [
+                    validate_experiment_brain_family(&variant.variant_id, requested_family),
+                    runner.plan_batch().map(|_| ()),
+                ] {
+                    let error = result.expect_err("missing family must not silently fall back");
+                    assert!(matches!(
+                        error,
+                        ExperimentRunnerError::UnavailableBrainFamily { .. }
+                    ));
+                    assert!(error.to_string().contains("brain-ft"));
+                }
+            }
+        }
+        assert!(directory.path().read_dir().unwrap().next().is_none());
+    }
+
+    #[test]
     fn single_run_refuses_an_arm_changed_after_plan_validation() {
         let planned_variant = ScenarioVariant {
             variant_id: "mlp_base".into(),
@@ -3192,6 +3642,509 @@ mod tests {
         ));
     }
 
+    fn interrupted_status_runner(directory: &Path) -> MatchedSeedExperimentRunner {
+        MatchedSeedExperimentRunner::new(
+            "exp-status-recovery",
+            MatchedSeedCohort {
+                cohort_id: "cohort".into(),
+                seeds: vec![7],
+            },
+            vec![ScenarioVariant {
+                variant_id: "mlp".into(),
+                brain_family: "mlp".into(),
+                config_overrides: BTreeMap::new(),
+            }],
+            3,
+            1,
+            directory.join("bundles"),
+        )
+    }
+
+    #[test]
+    fn interrupted_status_publication_recovers_initial_and_running_generations() {
+        let directory = tempfile::tempdir().unwrap();
+        let runner = interrupted_status_runner(directory.path());
+        let state_file = directory.path().join("status.json");
+        let temporary = status_temporary_path(&state_file).unwrap();
+        let plan = runner.validated_plan().unwrap();
+        let initial = runner.initial_status(&plan);
+        let initial_bytes = canonical_status_bytes(&initial).unwrap();
+        fs::write(&temporary, &initial_bytes).unwrap();
+
+        assert_eq!(runner.load_or_create_status(&state_file).unwrap(), initial);
+        assert_eq!(fs::read(&state_file).unwrap(), initial_bytes);
+        assert!(!temporary.exists());
+
+        let record = &initial.runs[0];
+        let (variant, family) = &plan.variants[&record.variant_id];
+        runner
+            .prepare_run_checkpoint(variant, *family, record.seed, &record.run_id, &plan.digest)
+            .unwrap();
+        let checkpoint_path = runner.run_checkpoint_path(&record.run_id);
+        let initial_cut = fs::read(&checkpoint_path).unwrap();
+        let mut running = initial;
+        running.generation += 1;
+        running.runs[0].state = RunState::Running;
+        let running_bytes = canonical_status_bytes(&running).unwrap();
+        fs::write(&temporary, &running_bytes).unwrap();
+
+        assert_eq!(runner.load_or_create_status(&state_file).unwrap(), running);
+        assert_eq!(fs::read(&state_file).unwrap(), running_bytes);
+        assert_eq!(fs::read(&checkpoint_path).unwrap(), initial_cut);
+        assert!(!temporary.exists());
+
+        let completed = runner.execute_batch(&state_file).unwrap();
+        assert_eq!(completed.completed_runs, 1, "{completed:?}");
+        assert_eq!(completed.failed_runs, 0);
+        assert_eq!(completed.runs[0].total_ticks, runner.max_ticks);
+        let final_cut = read_optional_run_checkpoint(&checkpoint_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(final_cut.owner.host_checkpoint().tick().0, runner.max_ticks);
+        assert_ne!(fs::read(&checkpoint_path).unwrap(), initial_cut);
+    }
+
+    #[test]
+    fn interrupted_status_publication_verifies_completion_before_promoting_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let runner = interrupted_status_runner(directory.path());
+        let state_file = directory.path().join("status.json");
+        let temporary = status_temporary_path(&state_file).unwrap();
+        let mut running = runner.load_or_create_status(&state_file).unwrap();
+        running.runs[0].state = RunState::Running;
+        runner.save_status(&state_file, &mut running).unwrap();
+        let record = runner
+            .execute_single_run(&runner.variants[0], runner.cohort.seeds[0])
+            .unwrap();
+        let checkpoint_path = runner.run_checkpoint_path(&record.run_id);
+        let sealed_cut = fs::read(&checkpoint_path).unwrap();
+        let bundle_dir = runner.output_dir.join(&record.run_id);
+        let summary_path = bundle_dir.join("exports/summary.csv");
+        let summary = fs::read(&summary_path).unwrap();
+        let mut completed = running;
+        completed.generation += 1;
+        completed.runs[0] = record;
+        recompute_status_counts(&mut completed);
+        let completed_bytes = canonical_status_bytes(&completed).unwrap();
+        fs::write(&temporary, &completed_bytes).unwrap();
+        let committed_bytes = fs::read(&state_file).unwrap();
+
+        fs::write(&summary_path, b"forged summary\n").unwrap();
+        assert!(matches!(
+            runner.load_or_create_status(&state_file),
+            Err(ExperimentRunnerError::Bundle { .. })
+        ));
+        assert_eq!(fs::read(&state_file).unwrap(), committed_bytes);
+        assert_eq!(fs::read(&temporary).unwrap(), completed_bytes);
+        assert_eq!(fs::read(&checkpoint_path).unwrap(), sealed_cut);
+
+        fs::write(&summary_path, &summary).unwrap();
+        // An already finished run is recovered without another owner execution
+        // or status generation. Its original continuation artifact stays exact.
+        assert_eq!(runner.execute_batch(&state_file).unwrap(), completed);
+        assert_eq!(fs::read(&state_file).unwrap(), completed_bytes);
+        assert_eq!(fs::read(&checkpoint_path).unwrap(), sealed_cut);
+        assert_eq!(fs::read(&summary_path).unwrap(), summary);
+        assert!(!temporary.exists());
+    }
+
+    #[test]
+    fn interrupted_status_publication_refuses_conflicts_and_retains_both_files() {
+        for case in [
+            "stale",
+            "skipped",
+            "changed-plan",
+            "changed-run",
+            "regressed",
+            "forged-success",
+            "partial",
+            "noncanonical",
+            "generation-overflow",
+            "missing-initial",
+            "nonzero-initial",
+            "corrupt-committed",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let runner = interrupted_status_runner(directory.path());
+            let state_file = directory.path().join("status.json");
+            let temporary = status_temporary_path(&state_file).unwrap();
+            let plan = runner.validated_plan().unwrap();
+            let mut committed = runner.initial_status(&plan);
+            committed.generation = 1;
+            committed.runs[0].state = RunState::Running;
+            let mut candidate = committed.clone();
+            candidate.generation = 2;
+            let has_committed = !matches!(case, "missing-initial" | "nonzero-initial");
+            match case {
+                "stale" => candidate.generation = committed.generation,
+                "skipped" => candidate.generation += 1,
+                "changed-plan" => candidate.plan_digest = "0".repeat(64),
+                "changed-run" => candidate.runs[0].seed += 1,
+                "regressed" => candidate.runs[0].state = RunState::Pending,
+                "forged-success" => {
+                    let record = &mut candidate.runs[0];
+                    record.state = RunState::Completed;
+                    record.total_ticks = runner.max_ticks;
+                    record.final_digest = Some("0".repeat(16));
+                    record.bundle_path = Some(
+                        runner
+                            .output_dir
+                            .join(&record.run_id)
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                    recompute_status_counts(&mut candidate);
+                }
+                "generation-overflow" => {
+                    committed.generation = u64::MAX;
+                    candidate.generation = 0;
+                }
+                "missing-initial" => candidate.generation = 0,
+                "nonzero-initial" => {
+                    candidate = runner.initial_status(&plan);
+                    candidate.generation = 1;
+                }
+                _ => {}
+            }
+            let mut committed_bytes = canonical_status_bytes(&committed).unwrap();
+            if case == "corrupt-committed" {
+                committed_bytes.truncate(committed_bytes.len() / 2);
+            }
+            if has_committed {
+                fs::write(&state_file, &committed_bytes).unwrap();
+            }
+            let mut candidate_bytes = canonical_status_bytes(&candidate).unwrap();
+            if case == "partial" {
+                candidate_bytes.truncate(candidate_bytes.len() / 2);
+            } else if case == "noncanonical" {
+                candidate_bytes.pop();
+            }
+            fs::write(&temporary, &candidate_bytes).unwrap();
+
+            assert!(runner.load_or_create_status(&state_file).is_err(), "{case}");
+            if has_committed {
+                assert_eq!(fs::read(&state_file).unwrap(), committed_bytes, "{case}");
+            } else {
+                assert!(!state_file.exists(), "{case}");
+            }
+            assert_eq!(fs::read(&temporary).unwrap(), candidate_bytes, "{case}");
+            assert!(!runner.output_dir.exists(), "{case}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interrupted_status_publication_refuses_linked_files() {
+        use std::os::unix::fs::symlink;
+
+        for (link_temporary, hard_link) in [(true, false), (false, false), (true, true)] {
+            let directory = tempfile::tempdir().unwrap();
+            let runner = interrupted_status_runner(directory.path());
+            let state_file = directory.path().join("status.json");
+            let temporary = status_temporary_path(&state_file).unwrap();
+            let target = directory.path().join("linked-status.json");
+            let plan = runner.validated_plan().unwrap();
+            let committed = runner.initial_status(&plan);
+            let mut candidate = committed.clone();
+            candidate.generation = 1;
+            candidate.runs[0].state = RunState::Running;
+            let committed_bytes = canonical_status_bytes(&committed).unwrap();
+            let candidate_bytes = canonical_status_bytes(&candidate).unwrap();
+            let (link_path, target_bytes) = if link_temporary {
+                fs::write(&state_file, &committed_bytes).unwrap();
+                (&temporary, &candidate_bytes)
+            } else {
+                fs::write(&temporary, &candidate_bytes).unwrap();
+                (&state_file, &committed_bytes)
+            };
+            fs::write(&target, target_bytes).unwrap();
+            if hard_link {
+                fs::hard_link(&target, link_path).unwrap();
+            } else {
+                symlink(&target, link_path).unwrap();
+            }
+
+            assert!(runner.load_or_create_status(&state_file).is_err());
+            assert_eq!(fs::read(&state_file).unwrap(), committed_bytes);
+            assert_eq!(fs::read(&temporary).unwrap(), candidate_bytes);
+            assert_eq!(fs::read(&target).unwrap(), *target_bytes);
+        }
+    }
+
+    #[test]
+    fn staged_bundle_publication_recovers_a_complete_bundle_without_replaying_ticks() {
+        let directory = tempfile::tempdir().unwrap();
+        let runner = interrupted_status_runner(directory.path());
+        let state_file = directory.path().join("status.json");
+        let mut running = runner.load_or_create_status(&state_file).unwrap();
+        running.runs[0].state = RunState::Running;
+        runner.save_status(&state_file, &mut running).unwrap();
+        let completed = runner
+            .execute_single_run(&runner.variants[0], runner.cohort.seeds[0])
+            .unwrap();
+        let checkpoint_path = runner.run_checkpoint_path(&completed.run_id);
+        let original_cut = fs::read(&checkpoint_path).unwrap();
+        let bundle_dir = runner.output_dir.join(&completed.run_id);
+        let original_bundle = fs::read(bundle_dir.join("bundle_manifest.json")).unwrap();
+        let staged = runner.staged_bundle_path(&completed.run_id);
+        // A complete real bundle models the crash after staging verification,
+        // before the single directory rename and final status publication.
+        fs::rename(&bundle_dir, &staged).unwrap();
+
+        let recovered = runner.execute_batch(&state_file).unwrap();
+        assert_eq!(recovered.completed_runs, 1, "{recovered:?}");
+        assert_eq!(recovered.failed_runs, 0);
+        assert_eq!(recovered.runs[0], completed);
+        assert_eq!(fs::read(&checkpoint_path).unwrap(), original_cut);
+        assert_eq!(
+            fs::read(bundle_dir.join("bundle_manifest.json")).unwrap(),
+            original_bundle
+        );
+        assert!(!staged.exists());
+        assert!(
+            !runner
+                .output_dir
+                .join(format!("{}.bundle.interrupted", completed.run_id))
+                .exists()
+        );
+    }
+
+    #[test]
+    fn staged_bundle_publication_retains_each_partial_write_and_uses_the_final_cut() {
+        let reference_dir = tempfile::tempdir().unwrap();
+        let reference = interrupted_status_runner(reference_dir.path());
+        let expected = reference
+            .execute_single_run(&reference.variants[0], reference.cohort.seeds[0])
+            .unwrap();
+        let original_cut = fs::read(reference.run_checkpoint_path(&expected.run_id)).unwrap();
+        let bundle_dir = reference.output_dir.join(&expected.run_id);
+        let artifacts = REQUIRED_EXPERIMENT_ARTIFACTS
+            .iter()
+            .map(|(path, _)| *path)
+            .chain(std::iter::once("bundle_manifest.json"))
+            .map(|path| (path, fs::read(bundle_dir.join(path)).unwrap()))
+            .collect::<Vec<_>>();
+
+        // Empty staging, then a power loss during each actual file's write.
+        for partial_file in std::iter::once(None).chain((0..artifacts.len()).map(Some)) {
+            let directory = tempfile::tempdir().unwrap();
+            let runner = interrupted_status_runner(directory.path());
+            let state_file = directory.path().join("status.json");
+            let mut running = runner.load_or_create_status(&state_file).unwrap();
+            running.runs[0].state = RunState::Running;
+            runner.save_status(&state_file, &mut running).unwrap();
+            fs::create_dir_all(&runner.output_dir).unwrap();
+            let checkpoint_path = runner.run_checkpoint_path(&expected.run_id);
+            fs::write(&checkpoint_path, &original_cut).unwrap();
+            let staged = runner.staged_bundle_path(&expected.run_id);
+            fs::create_dir(&staged).unwrap();
+            let mut interrupted_files = Vec::new();
+            if let Some(last) = partial_file {
+                for (index, (path, bytes)) in artifacts.iter().enumerate().take(last + 1) {
+                    let bytes = if index == last {
+                        &bytes[..bytes.len() / 2]
+                    } else {
+                        bytes.as_slice()
+                    };
+                    let destination = staged.join(path);
+                    fs::create_dir_all(destination.parent().unwrap()).unwrap();
+                    fs::write(&destination, bytes).unwrap();
+                    interrupted_files.push((*path, bytes.to_vec()));
+                }
+            }
+
+            let recovered = runner.execute_batch(&state_file).unwrap();
+            assert_eq!(
+                recovered.completed_runs, 1,
+                "{partial_file:?}: {recovered:?}"
+            );
+            assert_eq!(recovered.failed_runs, 0);
+            assert_eq!(recovered.runs[0].final_digest, expected.final_digest);
+            assert_eq!(recovered.runs[0].total_ticks, expected.total_ticks);
+            assert_eq!(fs::read(&checkpoint_path).unwrap(), original_cut);
+            assert!(!staged.exists());
+            let retained = runner
+                .output_dir
+                .join(format!("{}.bundle.interrupted", expected.run_id));
+            assert!(retained.is_dir());
+            for (path, bytes) in &interrupted_files {
+                assert_eq!(fs::read(retained.join(path)).unwrap(), *bytes);
+            }
+            for (path, _) in artifacts.iter().skip(interrupted_files.len()) {
+                assert!(!retained.join(path).exists());
+            }
+            for (path, bytes) in &artifacts[..REQUIRED_EXPERIMENT_ARTIFACTS.len()] {
+                assert_eq!(
+                    fs::read(runner.output_dir.join(&expected.run_id).join(path)).unwrap(),
+                    *bytes
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn staged_bundle_publication_refuses_unsafe_recovery_and_preserves_evidence() {
+        let reference_dir = tempfile::tempdir().unwrap();
+        let reference = interrupted_status_runner(reference_dir.path());
+        let expected = reference
+            .execute_single_run(&reference.variants[0], reference.cohort.seeds[0])
+            .unwrap();
+        let final_cut = fs::read(reference.run_checkpoint_path(&expected.run_id)).unwrap();
+        for case in [
+            "prior-incident",
+            "nonfinal-cut",
+            "corrupt-cut",
+            "oversized",
+            "unrelated-file",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let runner = interrupted_status_runner(directory.path());
+            let state_file = directory.path().join("status.json");
+            let mut running = runner.load_or_create_status(&state_file).unwrap();
+            running.runs[0].state = RunState::Running;
+            runner.save_status(&state_file, &mut running).unwrap();
+            let plan = runner.validated_plan().unwrap();
+            let record = &plan.runs[0];
+            let (variant, family) = &plan.variants[&record.variant_id];
+            runner
+                .prepare_run_checkpoint(variant, *family, record.seed, &record.run_id, &plan.digest)
+                .unwrap();
+            let checkpoint_path = runner.run_checkpoint_path(&record.run_id);
+            if case != "nonfinal-cut" {
+                let mut bytes = final_cut.clone();
+                if case == "corrupt-cut" {
+                    bytes[0] ^= 1;
+                }
+                fs::write(&checkpoint_path, bytes).unwrap();
+            }
+            let original_cut = fs::read(&checkpoint_path).unwrap();
+            let staged = runner.staged_bundle_path(&record.run_id);
+            fs::create_dir(&staged).unwrap();
+            let staged_file = if case == "unrelated-file" {
+                staged.join("unrelated.txt")
+            } else {
+                let exports = staged.join("exports");
+                fs::create_dir(&exports).unwrap();
+                exports.join("summary.csv")
+            };
+            fs::write(&staged_file, b"partial").unwrap();
+            if case == "oversized" {
+                OpenOptions::new()
+                    .write(true)
+                    .open(&staged_file)
+                    .unwrap()
+                    .set_len(MAX_BUNDLE_ARTIFACT_BYTES + 1)
+                    .unwrap();
+            }
+            let retained = runner
+                .output_dir
+                .join(format!("{}.bundle.interrupted", record.run_id));
+            if case == "prior-incident" {
+                fs::create_dir(&retained).unwrap();
+                fs::write(retained.join("original-incident"), b"keep this evidence").unwrap();
+            }
+
+            let result = runner.execute_batch(&state_file);
+            if case == "corrupt-cut" {
+                assert!(matches!(
+                    result,
+                    Err(ExperimentRunnerError::InvalidCheckpoint { .. })
+                ));
+            } else {
+                let status = result.unwrap();
+                assert_eq!(status.completed_runs, 0, "{case}: {status:?}");
+                assert_eq!(status.failed_runs, 1, "{case}: {status:?}");
+                assert!(status.runs[0].error_reason.is_some());
+            }
+            assert_eq!(fs::read(&checkpoint_path).unwrap(), original_cut, "{case}");
+            assert!(!runner.output_dir.join(&record.run_id).exists(), "{case}");
+            assert!(staged.is_dir(), "{case}");
+            if case == "oversized" {
+                assert_eq!(
+                    fs::metadata(&staged_file).unwrap().len(),
+                    MAX_BUNDLE_ARTIFACT_BYTES + 1
+                );
+            } else {
+                assert_eq!(fs::read(&staged_file).unwrap(), b"partial", "{case}");
+            }
+            if case == "prior-incident" {
+                assert_eq!(
+                    fs::read(retained.join("original-incident")).unwrap(),
+                    b"keep this evidence"
+                );
+            } else {
+                assert!(!retained.exists(), "{case}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_bundle_publication_refuses_symlink_and_hard_link_aliases() {
+        use std::os::unix::fs::symlink;
+
+        let reference_dir = tempfile::tempdir().unwrap();
+        let reference = interrupted_status_runner(reference_dir.path());
+        let expected = reference
+            .execute_single_run(&reference.variants[0], reference.cohort.seeds[0])
+            .unwrap();
+        let final_cut = fs::read(reference.run_checkpoint_path(&expected.run_id)).unwrap();
+        for case in [
+            "root-symlink",
+            "directory-symlink",
+            "file-symlink",
+            "file-hard-link",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let runner = interrupted_status_runner(directory.path());
+            let state_file = directory.path().join("status.json");
+            let mut running = runner.load_or_create_status(&state_file).unwrap();
+            running.runs[0].state = RunState::Running;
+            runner.save_status(&state_file, &mut running).unwrap();
+            fs::create_dir_all(&runner.output_dir).unwrap();
+            let checkpoint_path = runner.run_checkpoint_path(&expected.run_id);
+            fs::write(&checkpoint_path, &final_cut).unwrap();
+            let staged = runner.staged_bundle_path(&expected.run_id);
+            let external = directory.path().join("external");
+            fs::create_dir(&external).unwrap();
+            fs::write(external.join("summary.csv"), b"external evidence").unwrap();
+            if case == "root-symlink" {
+                symlink(&external, &staged).unwrap();
+            } else {
+                fs::create_dir(&staged).unwrap();
+                let exports = staged.join("exports");
+                if case == "directory-symlink" {
+                    symlink(&external, &exports).unwrap();
+                } else {
+                    fs::create_dir(&exports).unwrap();
+                    if case == "file-symlink" {
+                        symlink(external.join("summary.csv"), exports.join("summary.csv")).unwrap();
+                    } else {
+                        fs::hard_link(external.join("summary.csv"), exports.join("summary.csv"))
+                            .unwrap();
+                    }
+                }
+            }
+
+            let status = runner.execute_batch(&state_file).unwrap();
+            assert_eq!(status.completed_runs, 0, "{case}: {status:?}");
+            assert_eq!(status.failed_runs, 1, "{case}: {status:?}");
+            assert_eq!(fs::read(&checkpoint_path).unwrap(), final_cut);
+            assert_eq!(
+                fs::read(external.join("summary.csv")).unwrap(),
+                b"external evidence"
+            );
+            assert!(fs::symlink_metadata(&staged).is_ok());
+            assert!(!runner.output_dir.join(&expected.run_id).exists());
+            assert!(
+                !runner
+                    .output_dir
+                    .join(format!("{}.bundle.interrupted", expected.run_id))
+                    .exists()
+            );
+        }
+    }
+
     #[test]
     fn running_status_refuses_tick_zero_replay_without_composite_checkpoint() {
         let temp_dir = tempfile::tempdir().expect("temporary status directory");
@@ -3230,7 +4183,12 @@ mod tests {
 
     #[test]
     fn running_checkpoint_continues_real_families_and_retains_original_owner_cut() {
-        for family_name in ["mlp", "dwraon"] {
+        for family_name in [
+            "mlp",
+            "dwraon",
+            #[cfg(feature = "brain-ft")]
+            "ft",
+        ] {
             for completed_ticks in [0_u64, 2, 4] {
                 let directory = tempfile::tempdir().expect("continuation directory");
                 let runner = MatchedSeedExperimentRunner::new(
@@ -3491,13 +4449,18 @@ mod tests {
     fn recorded_matched_cohort_keeps_exact_science_at_concurrency_one_and_two() {
         let directory = tempfile::tempdir().unwrap();
         let seeds = vec![53, 71];
-        let variants = ["mlp", "dwraon"]
-            .map(|family| ScenarioVariant {
-                variant_id: family.into(),
-                brain_family: family.into(),
-                config_overrides: BTreeMap::new(),
-            })
-            .to_vec();
+        let variants = [
+            "mlp",
+            "dwraon",
+            #[cfg(feature = "brain-ft")]
+            "ft",
+        ]
+        .map(|family| ScenarioVariant {
+            variant_id: family.into(),
+            brain_family: family.into(),
+            config_overrides: BTreeMap::new(),
+        })
+        .to_vec();
         let mut outcomes = Vec::new();
         for concurrency in [1, 2] {
             let output = directory.path().join(format!("concurrency-{concurrency}"));
@@ -3538,7 +4501,7 @@ mod tests {
             );
         }
         assert_eq!(outcomes[0], outcomes[1]);
-        // All four treatment/seed cells must exist and differ. A collapsed
+        // All treatment/seed cells must exist and differ. A collapsed
         // registry or seed schedule cannot masquerade as schedule independence.
         assert_eq!(outcomes[0].len(), variants.len() * seeds.len());
         assert_eq!(
@@ -4574,18 +5537,28 @@ mod tests {
                 brain_family: "assembly".into(),
                 config_overrides: BTreeMap::new(),
             },
+            #[cfg(feature = "brain-ft")]
+            ScenarioVariant {
+                variant_id: "variant_d".into(),
+                brain_family: "frankentorch".into(),
+                config_overrides: BTreeMap::new(),
+            },
         ];
+
+        let expected_runs = variants.len() * cohort.seeds.len();
 
         let runner =
             MatchedSeedExperimentRunner::new("exp-matched", cohort, variants, 2, 2, &output_dir);
 
         let status = runner.execute_batch(&state_file).unwrap();
-        assert_eq!(status.completed_runs, 3);
+        assert_eq!(status.completed_runs, expected_runs);
         assert_eq!(status.failed_runs, 0);
         assert!(status.is_finished());
         assert_eq!(status.runs[0].brain_family, "mlp.baseline");
         assert_eq!(status.runs[1].brain_family, "dwraon.baseline");
         assert_eq!(status.runs[2].brain_family, "assembly.experimental");
+        #[cfg(feature = "brain-ft")]
+        assert_eq!(status.runs[3].brain_family, "ft");
         assert_ne!(
             status.runs[0].final_digest, status.runs[1].final_digest,
             "real distinct family registries must produce distinct full world digests"
@@ -4593,6 +5566,16 @@ mod tests {
         assert_ne!(
             status.runs[0].final_digest, status.runs[2].final_digest,
             "real distinct family registries must produce distinct full world digests"
+        );
+        assert_eq!(
+            status
+                .runs
+                .iter()
+                .map(|run| run.final_digest.as_ref().unwrap())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            expected_runs,
+            "every requested family must execute its own scientific state"
         );
 
         for run in &status.runs {
@@ -4641,7 +5624,7 @@ mod tests {
         // than trusting status JSON, depending on the external continuation cuts,
         // or executing duplicate runs.
         let resumed_status = runner.execute_batch(&state_file).unwrap();
-        assert_eq!(resumed_status.completed_runs, 3);
+        assert_eq!(resumed_status.completed_runs, expected_runs);
         assert_eq!(resumed_status.failed_runs, 0);
         assert_eq!(resumed_status, status);
 

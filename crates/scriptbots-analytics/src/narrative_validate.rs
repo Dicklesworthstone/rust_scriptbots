@@ -25,6 +25,13 @@ const METRIC_READ_ROW_LIMIT: usize = 4_096;
 /// Default event limit when not explicitly overridden via parameters.
 const DEFAULT_EVENT_LIMIT: usize = 1_000;
 
+/// Hard ceiling for one narrative-validation request.
+///
+/// Validation is an offline statistical operation whose cost scales with both
+/// events and resampling counts. Keep a single request bounded and aligned with
+/// the storage reader's bounded narrative-page contract.
+const MAX_EVENT_LIMIT: usize = 4_095;
+
 /// `narrative-validate`: offline statistical certification of detected narrative events.
 #[derive(Debug, Default)]
 pub struct NarrativeValidate;
@@ -144,6 +151,15 @@ fn render_narrative_validate_markdown(machine: &NarrativeValidateMachine) -> Str
 }
 
 fn parse_params(params: &ReportParams) -> Result<(CertificationParams, usize), AnalyticsError> {
+    params.validate_keys(&[
+        "window",
+        "fdr",
+        "resamples",
+        "permutations",
+        "block_len",
+        "limit",
+    ])?;
+
     let window = params.get_usize("window")?.unwrap_or(30);
     if window == 0 {
         return Err(AnalyticsError::BadParam {
@@ -161,11 +177,41 @@ fn parse_params(params: &ReportParams) -> Result<(CertificationParams, usize), A
             reason: e.to_string(),
         })?
         .unwrap_or(0.05);
+    if !(fdr.is_finite() && 0.0 < fdr && fdr <= 1.0) {
+        return Err(AnalyticsError::BadParam {
+            name: "fdr".to_owned(),
+            reason: "must be finite and in (0, 1]".to_owned(),
+        });
+    }
 
     let n_resamples = params.get_usize("resamples")?.unwrap_or(2000);
+    if n_resamples == 0 {
+        return Err(AnalyticsError::BadParam {
+            name: "resamples".to_owned(),
+            reason: "must be at least 1".to_owned(),
+        });
+    }
     let n_permutations = params.get_usize("permutations")?.unwrap_or(2000);
+    if n_permutations == 0 {
+        return Err(AnalyticsError::BadParam {
+            name: "permutations".to_owned(),
+            reason: "must be at least 1".to_owned(),
+        });
+    }
     let block_len = params.get_usize("block_len")?.unwrap_or(5);
+    if block_len == 0 {
+        return Err(AnalyticsError::BadParam {
+            name: "block_len".to_owned(),
+            reason: "must be at least 1".to_owned(),
+        });
+    }
     let limit = params.get_usize("limit")?.unwrap_or(DEFAULT_EVENT_LIMIT);
+    if limit > MAX_EVENT_LIMIT {
+        return Err(AnalyticsError::BadParam {
+            name: "limit".to_owned(),
+            reason: format!("must be at most {MAX_EVENT_LIMIT}"),
+        });
+    }
 
     Ok((
         CertificationParams {
@@ -192,6 +238,12 @@ fn group_metrics_by_name(readings: Vec<PersistedMetric>) -> BTreeMap<String, Vec
     by_metric
 }
 
+fn exact_event_index(series: &[(u64, f64)], event_tick: u64) -> Option<usize> {
+    series
+        .binary_search_by_key(&event_tick, |entry| entry.0)
+        .ok()
+}
+
 fn evaluate_events(
     persisted_events: &[scriptbots_storage::PersistedRunEvent],
     by_metric: &BTreeMap<String, Vec<(u64, f64)>>,
@@ -210,18 +262,11 @@ fn evaluate_events(
             continue;
         };
 
-        let event_idx = series
-            .iter()
-            .position(|entry| entry.0 == event_tick)
-            .or_else(|| {
-                series
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, entry)| entry.0.abs_diff(event_tick))
-                    .map(|(i, _)| i)
-            });
-
-        let Some(idx) = event_idx else {
+        // Scientific certification must use evidence from the event's exact
+        // simulation tick. Falling back to the nearest persisted sample can
+        // shift a window across an intervention or regime boundary and turn a
+        // missing observation into a confident but false certification.
+        let Some(idx) = exact_event_index(series, event_tick) else {
             skipped += 1;
             continue;
         };
@@ -328,5 +373,59 @@ impl Report for NarrativeValidate {
         )?;
         log_report_stage("render", &render_started, output.row_count);
         Ok(output)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_event_index_never_substitutes_a_neighboring_tick() {
+        let series = vec![(10, 1.0), (12, 2.0), (14, 3.0)];
+        assert_eq!(exact_event_index(&series, 12), Some(1));
+        assert_eq!(exact_event_index(&series, 11), None);
+        assert_eq!(exact_event_index(&series, 13), None);
+    }
+
+    #[test]
+    fn certification_params_fail_closed_on_invalid_statistical_controls() {
+        for raw in [
+            "window=0",
+            "fdr=0",
+            "fdr=1.1",
+            "fdr=NaN",
+            "resamples=0",
+            "permutations=0",
+            "block_len=0",
+            "limit=4096",
+            "windwo=30",
+        ] {
+            let params = ReportParams::from_pairs([raw.to_owned()]).expect("key=value syntax");
+            assert!(
+                matches!(parse_params(&params), Err(AnalyticsError::BadParam { .. })),
+                "invalid control was accepted: {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn certification_params_accept_the_bounded_public_surface() {
+        let params = ReportParams::from_pairs([
+            "window=20".to_owned(),
+            "fdr=0.1".to_owned(),
+            "resamples=100".to_owned(),
+            "permutations=100".to_owned(),
+            "block_len=4".to_owned(),
+            "limit=4095".to_owned(),
+        ])
+        .expect("params");
+        let (cert, limit) = parse_params(&params).expect("valid controls");
+        assert_eq!(cert.window, 20);
+        assert_eq!(cert.fdr, 0.1);
+        assert_eq!(cert.n_resamples, 100);
+        assert_eq!(cert.n_permutations, 100);
+        assert_eq!(cert.block_len, 4);
+        assert_eq!(limit, 4095);
     }
 }

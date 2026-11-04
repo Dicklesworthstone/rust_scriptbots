@@ -33,3 +33,6 @@ brain-ft = [
     "dep:ft-nn",
     "dep:ft-optim",
 ]
+
+[lints]
+workspace = true

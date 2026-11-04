@@ -1,7 +1,7 @@
 //! NeuroFlow-backed brain implementation gated behind an opt-in feature.
 //!
 //! This module wraps the `neuroflow` crate’s [`FeedForward`] network so that it can participate in
-//! the ScriptBots brain registry. The integration intentionally keeps configuration minimal while
+//! the `ScriptBots` brain registry. The integration intentionally keeps configuration minimal while
 //! remaining forward-compatible with richer training workflows. The implementation focuses on
 //! inference; mutation perturbs inherited weights while explicit regeneration rebuilds the recorded
 //! architecture through the same validated constructor.
@@ -33,7 +33,7 @@ const MAX_LAYER_NEURONS: usize = 65_536;
 /// Defensive ceiling on the total deterministic weight matrix.
 const MAX_NETWORK_WEIGHTS: usize = 1_048_576;
 
-/// Activation families supported by NeuroFlow.
+/// Activation families supported by `NeuroFlow`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
 pub enum NeuroflowActivation {
     /// Hyperbolic tangent activation.
@@ -41,12 +41,12 @@ pub enum NeuroflowActivation {
     Tanh,
     /// Logistic sigmoid activation.
     Sigmoid,
-    /// Rectified linear unit (ReLU).
+    /// Rectified linear unit (`ReLU`).
     Relu,
 }
 
 impl NeuroflowActivation {
-    fn to_type(self) -> Type {
+    const fn to_type(self) -> Type {
         match self {
             Self::Tanh => Type::Tanh,
             Self::Sigmoid => Type::Custom,
@@ -54,7 +54,7 @@ impl NeuroflowActivation {
         }
     }
 
-    fn matches_type(self, activation_type: &Type) -> bool {
+    const fn matches_type(self, activation_type: &Type) -> bool {
         matches!(
             (self, activation_type),
             (Self::Tanh, Type::Tanh) | (Self::Sigmoid, Type::Custom) | (Self::Relu, Type::Relu)
@@ -67,49 +67,78 @@ impl NeuroflowActivation {
 pub struct NeuroflowBrainConfig {
     /// Sizes of hidden layers between the fixed input/output layers.
     pub hidden_layers: Vec<usize>,
-    /// Activation supplied to NeuroFlow (non-final layers, or the sole direct-output layer).
+    /// Activation supplied to `NeuroFlow` (non-final layers, or the sole direct-output layer).
     pub activation: NeuroflowActivation,
     /// Learning rate baked into the network (relevant if online learning is enabled later).
     pub learning_rate: f64,
-    /// Momentum factor used by NeuroFlow’s trainer.
+    /// Momentum factor used by `NeuroFlow`’s trainer.
     pub momentum: f64,
 }
 
-/// Failure while validating or constructing a NeuroFlow-backed brain.
+/// Failure while validating or constructing a `NeuroFlow`-backed brain.
 #[derive(Debug)]
 pub enum NeuroflowBrainError {
     /// The world rejected registry mutation at an unresolved persistence boundary.
     ScientificState(ScientificStateError),
     /// A public floating-point field was NaN or infinite.
-    NonFinite { field: &'static str, value: f64 },
-    /// A layer dimension cannot be represented by NeuroFlow or is zero.
+    NonFinite {
+        /// Configuration field that failed validation.
+        field: &'static str,
+        /// Non-finite value supplied by the caller.
+        value: f64,
+    },
+    /// A layer dimension cannot be represented by `NeuroFlow` or is zero.
     InvalidDimension {
+        /// Dimension or aggregate bound that failed validation.
         field: String,
+        /// Rejected dimension value.
         value: usize,
+        /// Constraint the dimension must satisfy.
         requirement: &'static str,
     },
     /// Architecture arithmetic overflowed before allocation or library construction.
-    ArchitectureOverflow { context: &'static str },
+    ArchitectureOverflow {
+        /// Architecture calculation that overflowed.
+        context: &'static str,
+    },
     /// Rust could not reserve storage for the validated architecture.
     Allocation {
+        /// Architecture allocation that failed.
         context: String,
+        /// Allocation failure returned by the collection.
         source: std::collections::TryReserveError,
     },
     /// The deterministic RNG produced a weight outside the promised finite interval.
     InvalidGeneratedWeight {
+        /// Layer containing the rejected weight.
         layer: usize,
+        /// Neuron containing the rejected weight.
         neuron: usize,
+        /// Weight index within the neuron.
         weight: usize,
+        /// Rejected generated or mutated weight value.
         value: f64,
     },
     /// The validated deterministic seed could not be encoded.
-    SeedSerialization { source: serde_json::Error },
-    /// A serialized live network no longer matched the pinned NeuroFlow snapshot schema.
-    NetworkSnapshot { source: serde_json::Error },
+    SeedSerialization {
+        /// Failure while encoding the network seed.
+        source: serde_json::Error,
+    },
+    /// A serialized live network no longer matched the pinned `NeuroFlow` snapshot schema.
+    NetworkSnapshot {
+        /// Failure while decoding the pinned network representation.
+        source: serde_json::Error,
+    },
     /// A decoded live network snapshot violated the configured architecture.
-    InvalidNetworkSnapshot { detail: String },
-    /// NeuroFlow rejected the validated deterministic seed representation.
-    NetworkConstruction { source: serde_json::Error },
+    InvalidNetworkSnapshot {
+        /// Architecture or value invariant violated by the snapshot.
+        detail: String,
+    },
+    /// `NeuroFlow` rejected the validated deterministic seed representation.
+    NetworkConstruction {
+        /// Failure while materializing the network from its seed.
+        source: serde_json::Error,
+    },
 }
 
 impl NeuroflowBrainError {
@@ -199,11 +228,12 @@ impl From<ScientificStateError> for NeuroflowBrainError {
 }
 
 impl NeuroflowBrainConfig {
+    /// Copy nonempty hidden-layer settings and the configured activation into adapter defaults.
     #[must_use]
     pub fn from_settings(settings: &NeuroflowSettings) -> Self {
         let mut config = Self::default();
         if !settings.hidden_layers.is_empty() {
-            config.hidden_layers = settings.hidden_layers.clone();
+            config.hidden_layers.clone_from(&settings.hidden_layers);
         }
         config.activation = match settings.activation {
             NeuroflowActivationKind::Tanh => NeuroflowActivation::Tanh,
@@ -213,7 +243,7 @@ impl NeuroflowBrainConfig {
         config
     }
 
-    /// Validate the complete adapter boundary before invoking NeuroFlow.
+    /// Validate the complete adapter boundary before invoking `NeuroFlow`.
     pub fn validate(&self) -> Result<(), NeuroflowBrainError> {
         for (field, value) in [
             ("learning_rate", self.learning_rate),
@@ -310,15 +340,15 @@ impl NeuroflowBrainConfig {
         Ok(())
     }
 
-    /// Number of numeric scalars NeuroFlow's JSON inspection must traverse.
+    /// Number of numeric scalars `NeuroFlow`'s JSON inspection must traverse.
     ///
     /// This is derived solely from the validated architecture, so an inspection request can be
-    /// refused before serializing the live NeuroFlow network. Every layer contains four
+    /// refused before serializing the live `NeuroFlow` network. Every layer contains four
     /// per-neuron state arrays (`v`, `y`, `delta`, and `prev_delta`) plus one bias-inclusive weight
     /// row per output neuron. The network also serializes learning rate, momentum, and error.
     fn inspection_source_scalars(&self) -> Result<usize, NeuroflowBrainError> {
-        self.validate()?;
         const NETWORK_SCALARS: usize = 3;
+        self.validate()?;
         let mut previous = INPUT_SIZE;
         let mut total = NETWORK_SCALARS;
         for outputs in self
@@ -365,7 +395,7 @@ impl Default for NeuroflowBrainConfig {
     }
 }
 
-/// Runtime brain leveraging NeuroFlow's feed-forward network.
+/// Runtime brain using `NeuroFlow`'s feed-forward network.
 pub struct NeuroflowBrain {
     network: FeedForward,
     config: NeuroflowBrainConfig,
@@ -430,7 +460,7 @@ impl NeuroflowBrain {
         Self::new(config, rng).map(into_runner)
     }
 
-    /// Register a NeuroFlow brain into the world registry and return its key.
+    /// Register a `NeuroFlow` brain into the world registry and return its key.
     pub fn register(
         world: &mut WorldState,
         config: NeuroflowBrainConfig,
@@ -464,41 +494,7 @@ impl NeuroflowBrain {
         rng: &mut dyn RandomStream,
     ) -> Result<FeedForward, NeuroflowBrainError> {
         config.validate()?;
-        let architecture_len = config.hidden_layers.len().checked_add(2).ok_or(
-            NeuroflowBrainError::ArchitectureOverflow {
-                context: "layer count",
-            },
-        )?;
-        let mut architecture: Vec<i32> = Vec::new();
-        architecture
-            .try_reserve_exact(architecture_len)
-            .map_err(|source| NeuroflowBrainError::Allocation {
-                context: "architecture".to_owned(),
-                source,
-            })?;
-        architecture.push(i32::try_from(INPUT_SIZE).map_err(|_| {
-            NeuroflowBrainError::InvalidDimension {
-                field: "input_size".to_owned(),
-                value: INPUT_SIZE,
-                requirement: "input size must fit NeuroFlow's positive i32 domain",
-            }
-        })?);
-        for (index, &layer) in config.hidden_layers.iter().enumerate() {
-            architecture.push(i32::try_from(layer).map_err(|_| {
-                NeuroflowBrainError::InvalidDimension {
-                    field: format!("hidden_layers[{index}]"),
-                    value: layer,
-                    requirement: "layer sizes must fit NeuroFlow's positive i32 domain",
-                }
-            })?);
-        }
-        architecture.push(i32::try_from(OUTPUT_SIZE).map_err(|_| {
-            NeuroflowBrainError::InvalidDimension {
-                field: "output_size".to_owned(),
-                value: OUTPUT_SIZE,
-                requirement: "output size must fit NeuroFlow's positive i32 domain",
-            }
-        })?);
+        let architecture = Self::network_architecture(config)?;
 
         let layer_count =
             architecture
@@ -584,6 +580,47 @@ impl NeuroflowBrain {
             .map_err(|source| NeuroflowBrainError::NetworkConstruction { source })?;
         Self::configure_network(&mut network, config);
         Ok(network)
+    }
+
+    fn network_architecture(
+        config: &NeuroflowBrainConfig,
+    ) -> Result<Vec<i32>, NeuroflowBrainError> {
+        let architecture_len = config.hidden_layers.len().checked_add(2).ok_or(
+            NeuroflowBrainError::ArchitectureOverflow {
+                context: "layer count",
+            },
+        )?;
+        let mut architecture: Vec<i32> = Vec::new();
+        architecture
+            .try_reserve_exact(architecture_len)
+            .map_err(|source| NeuroflowBrainError::Allocation {
+                context: "architecture".to_owned(),
+                source,
+            })?;
+        architecture.push(i32::try_from(INPUT_SIZE).map_err(|_| {
+            NeuroflowBrainError::InvalidDimension {
+                field: "input_size".to_owned(),
+                value: INPUT_SIZE,
+                requirement: "input size must fit NeuroFlow's positive i32 domain",
+            }
+        })?);
+        for (index, &layer) in config.hidden_layers.iter().enumerate() {
+            architecture.push(i32::try_from(layer).map_err(|_| {
+                NeuroflowBrainError::InvalidDimension {
+                    field: format!("hidden_layers[{index}]"),
+                    value: layer,
+                    requirement: "layer sizes must fit NeuroFlow's positive i32 domain",
+                }
+            })?);
+        }
+        architecture.push(i32::try_from(OUTPUT_SIZE).map_err(|_| {
+            NeuroflowBrainError::InvalidDimension {
+                field: "output_size".to_owned(),
+                value: OUTPUT_SIZE,
+                requirement: "output size must fit NeuroFlow's positive i32 domain",
+            }
+        })?);
+        Ok(architecture)
     }
 
     fn logistic_sigmoid(value: f64) -> f64 {
@@ -759,7 +796,7 @@ impl NeuroflowBrain {
         }
     }
 
-    fn decimal_digits(mut value: usize) -> usize {
+    const fn decimal_digits(mut value: usize) -> usize {
         let mut digits = 1;
         while value >= 10 {
             value /= 10;
@@ -836,43 +873,7 @@ impl NeuroflowBrain {
 
         let mut layers = Vec::with_capacity(retained_layers);
         for (layer_index, layer) in source_layers.iter().take(retained_layers).enumerate() {
-            let source_values = layer
-                .get("y")
-                .and_then(serde_json::Value::as_array)
-                .ok_or_else(|| {
-                    Self::inspection_error(format!(
-                        "serialized layer {layer_index} has no `y` array"
-                    ))
-                })?;
-            let mut values = Vec::with_capacity(source_values.len());
-            for (value_index, value) in source_values.iter().enumerate() {
-                let value = value.as_f64().ok_or_else(|| {
-                    Self::inspection_error(format!(
-                        "serialized layer {layer_index} activation {value_index} is not numeric"
-                    ))
-                })? as f32;
-                if !value.is_finite() {
-                    return Err(Self::inspection_error(format!(
-                        "serialized layer {layer_index} activation {value_index} is not finite"
-                    )));
-                }
-                values.push(value);
-            }
-            let values = values.into_boxed_slice().into_vec();
-            let width = (values.len() as f32).sqrt().ceil() as usize;
-            let height = if width == 0 {
-                0
-            } else {
-                values.len().div_ceil(width)
-            };
-            layers.push(ActivationLayer {
-                name: format!("nf.layer.{layer_index}")
-                    .into_boxed_str()
-                    .into_string(),
-                width,
-                height,
-                values,
-            });
+            layers.push(Self::inspection_layer(layer_index, layer)?);
         }
 
         let activations = BrainActivations {
@@ -894,6 +895,56 @@ impl NeuroflowBrain {
         snapshot.build.truncated = snapshot.activations.truncated;
         Ok(snapshot)
     }
+
+    fn inspection_layer(
+        layer_index: usize,
+        layer: &serde_json::Value,
+    ) -> Result<ActivationLayer, BrainInspectionError> {
+        let source_values = layer
+            .get("y")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| {
+                Self::inspection_error(format!("serialized layer {layer_index} has no `y` array"))
+            })?;
+        let mut values = Vec::with_capacity(source_values.len());
+        for (value_index, value) in source_values.iter().enumerate() {
+            // Inspection exposes f32 activations; retain the established f64-to-f32 boundary.
+            #[allow(clippy::cast_possible_truncation)]
+            let value = value.as_f64().ok_or_else(|| {
+                Self::inspection_error(format!(
+                    "serialized layer {layer_index} activation {value_index} is not numeric"
+                ))
+            })? as f32;
+            if !value.is_finite() {
+                return Err(Self::inspection_error(format!(
+                    "serialized layer {layer_index} activation {value_index} is not finite"
+                )));
+            }
+            values.push(value);
+        }
+        let values = values.into_boxed_slice().into_vec();
+        // Validated layers have at most MAX_LAYER_NEURONS entries. Keep the existing
+        // f32 square-root layout rounding; its nonnegative ceiling is a bounded index.
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
+        let width = (values.len() as f32).sqrt().ceil() as usize;
+        let height = if width == 0 {
+            0
+        } else {
+            values.len().div_ceil(width)
+        };
+        Ok(ActivationLayer {
+            name: format!("nf.layer.{layer_index}")
+                .into_boxed_str()
+                .into_string(),
+            width,
+            height,
+            values,
+        })
+    }
 }
 
 impl Brain for NeuroflowBrain {
@@ -903,12 +954,15 @@ impl Brain for NeuroflowBrain {
 
     fn tick(&mut self, inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
         for (slot, value) in self.inputs.iter_mut().zip(inputs.iter()) {
-            *slot = (*value) as f64;
+            *slot = f64::from(*value);
         }
         let outputs = self.network.calc(&self.inputs);
         let mut result = [0.0; OUTPUT_SIZE];
         for (dst, src) in result.iter_mut().zip(outputs.iter()) {
-            *dst = (*src) as f32;
+            // The simulation consumes f32 actuation channels; retain the adapter's narrowing.
+            #[allow(clippy::cast_possible_truncation)]
+            let output = (*src) as f32;
+            *dst = output;
         }
         result
     }
@@ -936,6 +990,8 @@ impl Brain for NeuroflowBrain {
                         if sigma == 0.0 {
                             continue;
                         }
+                        // Preserve inherited f64 weight bits from the existing mutation kernel.
+                        #[allow(clippy::suboptimal_flops)]
                         let next = *weight + gaussian * sigma;
                         if !next.is_finite() {
                             return Err(BrainMutationError::new(
@@ -1033,7 +1089,10 @@ mod tests {
         assert_eq!(snapshot.activations.layers.len(), 1);
         assert_eq!(snapshot.activations.layers[0].name, "nf.layer.0");
         assert_eq!(snapshot.activations.layers[0].values.len(), 2);
-        assert!(snapshot.activations.connections.is_empty());
+        assert_eq!(
+            snapshot.activations.connections,
+            [] as [scriptbots_core::ActivationEdge; 0]
+        );
         assert!(snapshot.activations.truncated);
         assert_eq!(snapshot.build.source_layers, 3);
         assert_eq!(snapshot.build.source_values, 2 + 3 + OUTPUT_SIZE);
@@ -1052,7 +1111,7 @@ mod tests {
 
     #[test]
     fn source_scalar_refusal_happens_before_json_conversion() {
-        let mut rng = SmallRngStream::seed_from_u64(0xB0D6E7);
+        let mut rng = SmallRngStream::seed_from_u64(0x00B0_D6E7);
         let brain = NeuroflowBrain::new(NeuroflowBrainConfig::default(), &mut rng)
             .expect("default NeuroFlow brain");
         let required = brain.inspection_source_scalars;
@@ -1107,7 +1166,11 @@ mod tests {
             .expect("default NeuroFlow brain");
         let mut primer = [0.0; INPUT_SIZE];
         for (index, value) in primer.iter_mut().enumerate() {
-            *value = index as f32 * 0.03125 - 0.25;
+            // Keep the existing sensor fixture's separately rounded product and difference.
+            #[allow(clippy::suboptimal_flops)]
+            let sensor =
+                f32::from(u16::try_from(index).expect("sensor index fits u16")) * 0.03125 - 0.25;
+            *value = sensor;
         }
         inspected.tick(&primer);
         let mut control = inspected
@@ -1182,9 +1245,11 @@ mod tests {
             .expect("decode constructed sigmoid network");
         let constructed_bias = constructed_snapshot.layers[0].w[0][0];
         let constructed_output = brain.tick(&[0.0; INPUT_SIZE])[0];
+        // Match the production adapter's f64-network to f32-actuation boundary exactly.
+        #[allow(clippy::cast_possible_truncation)]
+        let expected_output = NeuroflowBrain::logistic_sigmoid(constructed_bias) as f32;
         assert!(
-            (constructed_output - NeuroflowBrain::logistic_sigmoid(constructed_bias) as f32).abs()
-                < 1.0e-6,
+            (constructed_output - expected_output).abs() < 1.0e-6,
             "construction must install the corrected logistic activation"
         );
 

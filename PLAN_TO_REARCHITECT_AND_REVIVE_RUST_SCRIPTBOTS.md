@@ -2,6 +2,609 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Concurrent controls, experiment families and offline reconstruction (2026-11-04):**
+[Source implemented — Codex; `bd-2z0.12.2`, `bd-2z0.5.11`, `bd-2z0.3.12.6`,
+`bd-16g.2.9`; original ownership and full acceptance remain open]
+Merged configuration updates now carry the exact observed host configuration
+revision, so concurrent clients receive an explicit conflict instead of silently
+overwriting each other's changes. The optional FrankenTorch protocol family is
+connected to matched-seed planning, execution, checkpoint continuation and portable
+bundle verification under the existing `brain-ft` feature gate. Control API
+admission uses the same family resolver and advertises that compiled capability.
+The `narrative-reconstruct` report traverses the complete recorded detector input
+stream in bounded pages and reconstructs events through the production kernel,
+independently of persisted narrative outputs and live-ring retention. Output limits
+preserve full-run coverage and counts; missing/corrupt evidence and unsupported
+detector-policy transitions are explicit refusals. Targeted regressions cover real
+host concurrency, enabled/disabled family admission, continuation/bundle recovery,
+and a multipage real-run narrative with event eviction. These additions do not
+close broader native, multi-seed, performance or long-horizon acceptance.
+
+**Actual remote browser qualification (2026-11-04):** [Qualified software
+journey — GentleDuck contribution to original `bd-ac4l` and `bd-2z0.12.3`;
+original ownership, dependencies and complete acceptance remain open/unchanged]
+
+- [x] Refresh Beads and identify newly delivered native/browser streaming code
+  at `0ca7ff1f`, whose actual WASM packaging/browser execution remains open.
+- [x] Reserve exact consumer/test/tracker paths and freeze that source for DSR.
+- [x] Build the real WASM package and native production server through DSR;
+  retain all failures and bind successful binaries/packages to exact source.
+- [x] Extend the existing browser test with a live native server journey and
+  its explicit allowed browser origin; preserve the authority/Origin guard.
+- [x] Observe actual decoded canvas/telemetry/event frames, consumed credits,
+  connection status and canonical remote identity; reject fabricated local data.
+- [x] Pause and step the remote owner through real browser controls; compare
+  receipts and published tick/revisions with independent native HTTP reads.
+- [x] Save an actual remote PNG, verify pixels/identity, reconnect with consumed
+  cursors, and prove the saved local owner remains frozen until explicit return.
+- [x] Preserve existing browser stats/fork/clock/export guards and execute
+  meaningful source-bound negative controls for any repair found by the run.
+- [x] Pass required workspace/native/browser/UBS gates on the final frozen
+  patch, review exact source, publish and repeat decisive clean-build checks.
+- [x] Record original Beads evidence, complete the bounded honesty audit and
+  retire this requested checklist without inflating software proof to hardware,
+  performance or full storage/durability acceptance.
+
+Consumer: a user connecting this browser to a real native simulation. Existing
+consumer-state fixtures and native codec tests do not establish that boundary.
+
+Source `01115bf75ed9e520ae21ff934be1f020733f2144` is committed and pushed to
+both required remote tips. Clean-commit DSR
+`remote_browser_clean_01115bf7/20261104T074136-3256949` passed **7/7** with
+the expected clean source before and after fresh native/WASM builds. Its real
+file-backed server, seed 17, one simulation thread and Chromium 140/SwiftShader
+journey retained the same Step command/admission identity at tick 1 after a
+lost receipt and reconnect. Both 1280×720 PNGs identify publication 5 and show
+all 15 qualifying visible native-agent centers (Canvas 821/WebGPU 747 bright
+pixels). Remote metrics report 20 agents; the saved local owner stays frozen
+until explicit return in its original session. Actual unlisted browser Origin,
+truncated/version-mismatched native bytes and exited-server negatives refuse;
+normal owner shutdown exits 0. The observed event page is **empty**.
+
+Workspace check, strict Clippy, formatting, 33 web tests (plus one existing
+ignored fixture writer), 14 remote protocol tests, three analytics tests, the
+real-socket subscriber/reconnect test, the HTTP policy test, 13 consumer-state
+cases and separate stats/fork/renderer browser modes passed. These are targeted
+lanes and repeated solo observations, not independent review or a full workspace
+test run. The original runtime integration came from `0ca7ff1f`; this contribution
+adds actual boundary qualification and strict-gate maintenance.
+
+The consolidated frozen run was **18/19**, not 19/19: its full five-file UBS scan
+reported three unchanged header false positives. The guarded allowlist response
+and two test-request maps now have justified inline annotations. Supplemental
+DSR `remote_browser_scanner_review/20261104T073630-3149141` passed **7/7**:
+strict Clippy/format, policy tests and reviewed UBS, with an unchecked-header
+scanner negative still failing with one critical finding. Published scanner
+split: 3 critical/1,358 warnings/933 informational before; 0 critical/1,354
+warnings/933 informational after. The four collateral omissions are inspected
+constant-fixture Host/Origin parse warnings. No scanner category was disabled;
+raw failed/interrupted reports and the explicit acceptance split remain retained.
+
+Protected evidence: `/data/tmp/scriptbots-remote-browser-sVP2sXBm/`, especially
+`remote-aUmLaF/result.json`, the clean/scanner-review DSR receipts and `audit.txt`.
+Original Beads evidence comments **3021–3023** preserve status, ownership,
+dependencies and acceptance; no new follow-up closes away unmet requirements.
+This requested checklist is retired. Hardware/browser-matrix, nonempty narrative,
+sub-16 ms nonpolling push, 60 TPS multi-client soak, long-run storage and physical
+durability qualification remain with their original open acceptance.
+
+**Remote browser streaming and mixed persistence reconciliation:**
+[Functional contribution — Codex; original `bd-ac4l` and persistence acceptance remain open]
+The native WebSocket surface now negotiates bounded, versioned telemetry, dynamic
+canvas and canonical narrative frames from immutable host publications. Shared
+native/WASM decoding preserves exact session and revision identities, and explicit
+consumer credits bound each channel while a slow browser catches up. Narrative
+pages retain canonical records and declare exact retention gaps. The browser's
+existing renderers, metrics, command receipts and PNG capture consume the remote
+owner; its local simulation is frozen until the user explicitly returns to it.
+Reconnects retain consumed cursors and refuse foreign sessions.
+
+Journal completion also reconciles earlier ordinary persistence batches covered
+by its real watermarks. Finalized byte permits are released before publishing the
+newer journal analytics, preventing later flush/shutdown from reintroducing the
+older tick. Real file and volatile worker regressions cover that handoff.
+These changes do not close long-run storage probes, event-driven sub-16 ms push,
+the full browser/hardware matrix, or the original clean-source DSR soak criteria.
+
+**Experiment recovery, retryable controls, and native feedback (2026-11-04):**
+[Source implemented; original acceptance remains open — Codex; `bd-2z0.5.11`, `bd-ac4l`,
+`bd-k7nq`, `bd-2z0.7.14`, `bd-2z0.14.1.9.1`]
+Recover a fully validated interrupted experiment-status publication under the
+existing writer lease, and stage complete run bundles for atomic publication,
+preserving conflicting or corrupt evidence. Give remote WebSocket controls
+bounded, versioned requests with canonical retry identities and observable
+refusals; carry single-step identities through REST and MCP. Show independently
+observed application and journal outcomes in the native HUD, and make paused
+publications settle agent presentation at the authoritative pose.
+These are functional contributions under the original beads; complete crash,
+transport, native-GPU, performance, and DSR acceptance remain with those beads.
+
+**Runtime reliability contribution (2026-11-04):**
+[Source implemented; execution validation pending — Codex; `bd-16g.15.3`,
+`bd-2z0.5.11`]
+
+Automatic GPU sensing now certifies the initialized adapter independently of the
+preliminary probe and retains that adapter's evidence. Uncertified initialized
+devices fall back to CPU even when approximate sensing was permitted. Source
+`24a9be9756588561a1540db94fb55cba930b70ef` adds four selection-control tests;
+they do not establish hardware parity.
+
+Control-runtime shutdown now closes experiment admission, cancels all active
+batches, and joins every retained worker before returning from shutdown or
+reporting a successful stop. Runtime drop, startup errors and control-thread
+unwinding use the same cleanup; early failure notifications remain immediate.
+A prior worker panic is observed before resume clears diagnostics or reserves
+capacity; one failed join does not skip sibling cleanup. Cancellation preserves
+the runner's existing durable continuation cuts. Joins wait for the current tick
+and filesystem work; no hard shutdown-time bound is claimed.
+
+Added regressions cover real experiment progress before explicit shutdown/drop,
+retained-handle create/resume refusal, exact creation retry, unchanged stopped
+artifacts, injected worker panic with sibling cleanup, registry poison, prior
+panic on resume, disabled-surface failure reporting and transport error mapping.
+These are source additions, not observed passing executions.
+
+Validation remains open: real DSR 0.2.3 refused host-capacity admission before
+starting its backend because this environment's PID namespace did not match
+`/proc`. Authentic isolated namespace setup was unavailable. Workspace access
+briefly recovered after an outage, but a fresh selector probe reproduced the
+same refusal before the workspace became unavailable again. No compiler,
+formatter, Clippy, UBS, runtime test or GPU proof is claimed for this contribution.
+The GPU diff passed the earlier whitespace check and its recovered GitHub blob
+matches the reviewed local blob.
+Source review also checked the experiment registry/artifact/capacity lock order.
+Original task owners, status, dependencies and full acceptance remain unchanged.
+
+**Offline narrative reconstruction and smooth presentation (2026-11-03):**
+[Currently In Progress — Codex; `bd-16g.2.9`, `bd-2z0.14.1.9.1`]
+Connect the persisted canonical detector inputs to an independently reconstructed
+offline narrative report, expose the real typed narrative timeline, and interpolate
+Bevy presentation between compatible committed snapshots using stable identities
+and toroidal motion. Keep science immutable and preserve the original beads' full
+scenario-budget, recovery, and hardware-GPU acceptance requirements.
+
+**Browser PNG export (2026-11-03):** [Verified contribution — GentleDuck;
+source `2e138b0c88acb79edf8c43a831ec43944a723577`]
+
+Original `bd-2z0.12.3` keeps its owner, open status, dependencies and complete
+acceptance. Remaining browser-matrix/hardware and tooling qualification stay open.
+
+- [x] Refresh ready Beads and inspect production snapshot/render/capture paths.
+- [x] Read actual HostCore publication/revision types and primary browser API
+  guidance; retain the earlier blank-copy limitation without assuming its cause.
+- [x] Restore Canvas as the default under the existing WebGPU reach decision;
+  the earlier automatic default lacked its required browser-matrix measurements.
+  Keep explicit WebGPU/automatic choices and require actual GPU tests to select it.
+- [x] Expose one atomic frame containing the existing world projection and
+  exact canonical host session/publication/control/science/config identities.
+  Preserve the positional postcard world schema; no synthesized tick-as-revision.
+- [x] Verify reads leave science/digests unchanged and distinguish control,
+  scientific and publication revisions, including exact large integer encoding.
+- [x] Add one bounded PNG request; serialize the canvas in the same callback
+  that accepts its frame, without awaiting GPU completion or pausing science.
+- [x] Tie filename/status to the captured frame/backend, retain only bounded
+  request state, and expose serialization errors or world changes explicitly.
+- [x] Avoid redundant paints of an unchanged paused publication; retain no
+  old world/snapshot in the cache, invalidate on world/backend/viewport changes,
+  and force a fresh paint for a waiting capture. Verify actual render-call counts.
+- [x] Decode actual Canvas and WebGPU downloads, compare known geometry and
+  canonical identity, and prove pending requests wait for real admission.
+- [x] Retain negative controls for false metadata, blank capture, delayed
+  serialization/reset and repeated requests; preserve existing clock/stats/fork
+  assertions and distinguish injected controls from actual package execution.
+- [x] Run required workspace gates, focused tests and UBS through DSR on
+  frozen source; review every changed source/test hunk and every gate change.
+- [x] Publish coherent source and repeat decisive browser checks with a fresh
+  package from the exact clean commit; record actual adapter and raw failures.
+- [x] Update original Beads evidence, finish the bounded honesty audit and
+  retire this requested checklist without claiming unobserved hardware proof.
+
+The consumer is a person saving the displayed world. PNG capture must name the
+frame actually rendered, not a later polled state or a canonical WorldDigest.
+
+Frozen final source passes ten of ten checks in
+`browser_export_publish/20261103T232641-3621852`: workspace check, strict Clippy,
+formatting, 31 native web tests plus one existing ignored fixture writer, real
+renderer/export controls, unchanged stats/fork modes, UBS and source binding.
+Committed patch SHA-256 is
+`33baaa1dc4082fd35f937627c00909d593a09264f5427f3dccaff0976af2c6b0`.
+UBS reports zero critical, 534 warning and 652 informational findings over four
+Rust/JS files; no suppression or warning-clean claim. Clean committed source
+passes six of six checks in
+`browser_export_clean_2e138b0c/20261103T232904-3653356`, including a fresh package
+and unchanged clean source before/after. Both required remote tips received it.
+
+Chromium 140.0.7339.16/SwiftShader produces actual 1280x720 PNGs with 8,999
+bright Canvas pixels and 9,344 WebGPU pixels, both at tick/science28 and
+publication12. A held callback keeps tick42/publication26 on the PNG while
+science reaches49/publication32. A busy GPU keeps one submission/stamp31 while
+science advances34 to42, then admits the latest frame. Known geometry PNG
+samples match actual renderer samples. Native read tests preserve the native
+scientific digest; browser checks preserve exported JSON, not WorldDigest.
+
+The old paused source makes 120 render calls for 120 unchanged callbacks;
+the candidate makes zero and redraws once for each resize/restore. This is
+maintenance/resource accounting, not a measured speedup. Initial retry checks
+fail when a native PNG callback arrives after 11.6644 seconds versus the
+unchanged ten-second deadline. Reuse then passes the retry; exact browser
+causality is unproven. Review also finds timeout cannot cancel native encoding:
+old source admits call7 before call6 is acknowledged; final source holds6 to6.
+The corrected contract refuses an unacknowledged retry, then requires actual
+PNG delivery after acknowledgement and ignores a duplicate stale callback.
+This explicitly changes the initially invented immediate-retry expectation;
+it strengthens the real native-work bound without widening a timeout.
+
+Retain initial formatter3/4, browser4/5, both retry diagnostics and both old
+source red controls. Null/throw/identity/reset/timeout/duplicate and pagehide
+cases are declared JS controls, separate from actual GPU device destruction.
+One generated URL remains; the dispatched pagehide control releases it.
+No golden, dependency, science default, skip or complete acceptance changed.
+Source, failed/raw logs, PNGs and the completed solo audit remain at
+`/data/tmp/scriptbots-browser-export-c4j26lUO`. Comments3019/3020 retain the
+original task's evidence. This requested checklist retires here; physical
+hardware, browser-matrix performance and independent verification are unclaimed.
+
+**Browser frame admission (2026-11-03):** [Verified contribution —
+GentleDuck; source `24322c9211525d33aaca9a174d0ab1492f4edeb8`]
+
+Original `bd-2z0.12.3` retains its owner, open status, dependencies and complete
+acceptance. At that handoff screenshot/revision export and tooling qualification
+remained open; the PNG contribution above addresses the software export path.
+
+- [x] Inspect the production queue writer and submitted-snapshot reader:
+  `render()` submits every callback without bounding outstanding GPU work;
+  `main.js` updates the snapshot stamp after every call.
+- [x] Retain a failing actual-browser submission-count control on old source.
+- [x] Admit at most one frame until its queue completion is observed; refuse
+  intervening snapshots without retaining them or writing new GPU buffers.
+- [x] Apply the same admission lifecycle to empty-frame clears; retain
+  existing geometry, resizing, capacity refusals and device-loss behavior.
+- [x] Make Canvas/WebGPU return explicit admission and update the public
+  submitted-snapshot tick only when a frame was admitted.
+- [x] Hold real queue acknowledgements in the browser and count actual
+  submissions/writes; verify the next admitted frame consumes the newest input.
+- [x] In the real packaged app, show that science progresses while the
+  submitted-frame stamp stays fixed, then catches up after release.
+- [x] Exercise a rejected completion acknowledgement with a visible painted
+  Canvas fallback; label injected controls separately from actual device loss.
+- [x] Pass existing stats/fork/clock controls, required workspace gates and
+  UBS through DSR on frozen source, retaining every failure.
+- [x] Review/publish coherent source and repeat decisive checks with a fresh
+  package from the exact clean commit.
+- [x] Update original Beads evidence and this requested TODO, retaining the
+  original open acceptance and retiring this checklist at handoff.
+
+The concrete consumer is the existing production renderer. This bounds frame
+admission, not physical presentation latency, and makes no throughput claim.
+
+Browser controls retained at `/data/tmp/scriptbots-browser-backpressure-8bEmQGzp`
+observe 101 submissions on old source's populated-frame control. The candidate
+admits one submission and refuses 100 calls for both populated and empty
+initial frames. Refused calls issue no additional buffer writes; release
+admits the newest supplied
+geometry. A separate old-`main.js` control admits just one frame yet falsely
+advances its stamp from tick 11 to 18; the candidate instead advances science
+from 16 to 24 while the submitted tick stays 16, then catches up to 24.
+Presentation callbacks are explicitly held/invoked; science uses its real
+independent timer. The injected completion rejection is a JavaScript fault
+control, distinct from the retained actual `GPUDevice.destroy` check.
+
+Retain R1's screenshot-stability timeout, R2's zero canvas-copy observation
+despite visible agents in its retained PNG, and R3's RAF-polled clock wait
+timeout. Their exact causes are not established. The clock observation now
+uses timer polling and a controlled production presentation callback. The
+visible-frame guard now reads the compositor PNG: it rejects both transparent
+CSS-backed blank and opaque empty images, and detects exactly one bright
+control pixel. This admits visibly painted frames a later canvas-copy probe
+could misclassify; it does not qualify that separate copy/export boundary.
+The GPU report retains both observations. Screenshot pixel counts use displayed
+dimensions and cannot be compared with earlier intrinsic canvas-copy counts.
+No timeout was widened, test skipped, golden regenerated or assertion dropped
+from the ordinary four-case stats/fork modes. This is fresh solo software-GPU
+execution, not independent review, hardware qualification or a speedup claim.
+
+Frozen final source passes ten of ten DSR checks in
+`frame_admission_final/20261103T214339-2404462`: required workspace check,
+strict Clippy, formatting, 30 native web tests plus one existing ignored fixture
+writer, actual renderer controls, unchanged stats/fork modes, UBS and source
+binding before/after. Source `24322c9211525d33aaca9a174d0ab1492f4edeb8`
+matches patch SHA-256
+`a6693f9de924b71a4c905a38a6d622b79d75e7f7282986e29c273e9602f60084`.
+UBS reports zero critical, 134 warning and 415 informational findings over five
+JS files. Nine additional warning matches are in test DOM/prototype probes
+that intentionally fail if required controls disappear; no suppression added.
+The first qualification stops during Clippy with exit 143 and no receipt;
+retain it as incomplete. Its unchanged retry passes ten of ten, then fresh
+review catches a pixel helper that submits a second frame before inspection.
+The final source reads the first resumed frame without submitting again and
+asserts the submission count remains two; earlier pixels establish eventual
+output only. The final ten-check pass includes that stronger observation.
+
+Clean source then passes six of six checks in
+`frame_admission_clean_24322c92/20261103T214450-2407093`: expected clean commit,
+fresh package, actual renderer controls, stats/fork modes and unchanged clean
+post-state. Science advances 14 to 21 while submitted tick stays 14 with one
+submission, then catches up to 21. The compositor PNG has 5,014 bright pixels
+at displayed 1000 by 563; the separate canvas-copy count is zero. Actual device
+destruction produces a painted Canvas fallback with 12,958 colored pixels.
+This repeats the observed copy/export limitation rather than qualifying it.
+The source is published to both required remote tips. The requested execution
+checklist retires here; the original broader task stays open. Audit and all
+failed/successful raw receipts remain in the external evidence directory.
+
+**Browser renderer connection (2026-11-03):** [Verified contribution —
+GentleDuck; source `3373789b88949b817cddc642e139b25c93120308`]
+
+Original `bd-2z0.12.3` retains its owner, dependencies and complete acceptance.
+This contribution connects the existing renderers; it does not close that
+broader task or its remaining screenshot/revision export acceptance.
+
+- [x] Refresh BR readiness and inspect actual browser producers/consumers.
+  At the start, renderer modules were unimported and production acquired
+  Canvas 2D directly. The WebGPU prototype had stale WGSL syntax and
+  world/canvas coordinate drift.
+- [x] Connect the existing Canvas renderer without changing its visible marks.
+- [x] Repair WebGPU shader validation, scaled positions, circular bodies and
+  boost rings; retain empty-frame drawing and bounded buffer growth.
+- [x] Add an accessible renderer selector and report the active backend.
+- [x] Fall back visibly to Canvas on unavailable capability, creation/render
+  failure or actual device loss; release replaced GPU resources.
+- [x] Keep one latest snapshot and the existing independent science timer;
+  backend switching must not initialize, reset or advance a simulation.
+- [x] Exercise actual browser rendering with known geometry, nonmatching world
+  and canvas sizes, empty input, resizing, and unchanged paused science ticks.
+- [x] Exercise unavailable capability, rejected GPU creation and actual device
+  destruction; require observable Canvas painting after fallback.
+- [x] Retain baseline failures and actual adapter identity. Software GPU tests
+  qualify their actual path only, with no hardware or performance claim.
+- [x] Pass the existing four-case stats controls with the real generated
+  package and the four-case injected fork controls; preserve their assertions
+  and reports. The injected controls are DOM proof, not simulation proof.
+- [x] Qualify frozen source through DSR, review every changed source hunk,
+  publish coherent source, and repeat decisive checks on clean committed bytes.
+- [x] Update original Beads evidence and this TODO on actual results. Leave
+  the broad original task open if any acceptance/dependency remains unmet.
+
+The operator requested this execution checklist; it retires here. No new
+renderer framework, dependency or tracking item was added.
+
+Frozen qualification on `45d2f29d` plus the exact seven-file browser patch
+passes nine of nine DSR checks in
+`renderer_qualify/20261103T204743-2012139`: workspace check, strict Clippy,
+formatting, 30 native web tests with one existing ignored fixture writer,
+actual renderer controls, the existing stats/fork controls and UBS. The
+committed patch SHA-256 is
+`4650861ed6691c09c62272160b8453f21fa6292ede0fc8b3290705185c47520b`.
+Clean `3373789b` then passes six of six checks in
+`renderer_clean_3373789b/20261103T205335-2104332`: expected clean source,
+fresh package, renderer/stats/fork controls and unchanged clean post-state.
+
+The actual browser is Chromium 140.0.7339.16 with SwiftShader. The clean run
+observes 9,955 colored pixels through the selected WebGPU renderer and 12,109
+after actual device destruction and Canvas fallback. Separate controls cover
+missing API, absent adapter, rejected device creation and indefinitely pending
+device creation; all keep painting and advance beyond tick zero. Backend
+switching/loss preserves the full paused exported snapshot at tick 104. Its
+SHA-256 describes that exported JSON, not a canonical `WorldDigest` or GPU
+presentation receipt. `data-snapshot-tick` names the submitted snapshot.
+
+Screenshot inspection exposed a stretched canvas; intrinsic aspect ratio is
+now preserved and checked. Build-banner values now use text nodes. The new
+hostile-markup DOM fixture fails on old source and passes on both banner
+branches. Actual WASM formats these values from u64; no exploitable permalink
+claim is made. UBS reports zero criticals, 125 warnings and 301 informational
+findings across the five scanned JS files, with no suppressions.
+
+Retain the original black-frame failure, the missing shader return failure,
+the earlier 8/9 UBS result and the 7/9 result caused by a wrongly injected
+compatible-banner fixture. The fixture input was corrected; its assertion
+was preserved. Existing stats/fork case counts, science clock guards, seeds
+and goldens were retained. Evidence and the completed bounded audit are at
+`/data/tmp/scriptbots-browser-renderer-GKmUgHsZ`. This is fresh solo execution
+on a software adapter, with no hardware or performance qualification claim.
+
+**Workspace lint inheritance (2026-11-03):** [Currently In Progress —
+GentleDuck; original `bd-6hb5`]
+
+Cargo declares the lint policy centrally, but only four of the 13 workspace
+members consumed it at the start of this task. This requested TODO retires
+after the original task's exact-source qualification and publication. Wiring
+the compiler policy is an enabler, not a new simulation feature.
+
+- [x] Refresh native BR readiness, task criteria and ownership; derive all
+  workspace members and current inheritance from their Cargo declarations.
+- [x] Claim `bd-6hb5`, reserve the nine manifests and tracking surfaces, and
+  diagnostically opt the nine missing members into the existing policy. Keep
+  only the four qualified importers in the first committed group.
+- [x] Retain an initial strict diagnostic failure and collect all newly exposed
+  diagnostics through DSR; do not label warning-only collection a passing gate.
+  The strict command exited 101; the warning collector exited zero. The enclosing
+  receipt is `invalidated-moving-source` because helpers edited the shared tree,
+  so it supplies diagnostics only, not source qualification. Deduplicating by lint,
+  primary file/line/column and message yields 7,519 entries in that initial pass.
+- [ ] Repair foundational brain crates, then storage/rendering adapters and app/
+  browser consumers in dependency order, using disjoint manual editing clusters.
+  - [x] Finish and qualify the default-feature brain/ML/Neuro source and
+    integration-test repairs; optional ML inference is not qualified here.
+  - [ ] Finish and qualify storage docs, conversions and function seams without
+    changing SQL, migration order, transaction boundaries or receipt meanings.
+  - [x] Finish and qualify world-gfx count validation and existing rendering
+    math in `2054b827ffe575edfdd246aaaafffa98d9d59146`. The initial ten library
+    findings and subsequent 92 unique test/bin findings are repaired. Fresh
+    clean-source DSR passes workspace check, strict all-target Clippy, formatting,
+    all 63 library tests with no ignores or skip messages, shader-payload
+    equality and post-test cleanliness. Five new tests plus a caller-level
+    snapshot negative cover the CPU boundaries; no oversized device execution
+    or hardware-GPU qualification is claimed. The actual adapter is llvmpipe CPU.
+  - [ ] Finish and qualify GPUI rendering, Bevy and app consumers.
+  - [x] Qualify browser lint inheritance and the observed numeric seed endpoint
+    defect: `u64::MAX as f64` is 2^64, so the endpoint must be exclusive. Retain
+    native/WASM boundary guards, existing parity assertions and postcard golden.
+  - [x] Reconnect the native browser consumer to the producer's existing four-case
+    contract. Independently review the stale three-case assertion, require each
+    named observation and reject forged/missing/multiple reports. Parser fixtures
+    are parser proof only; the existing fresh-package browser gate must execute.
+  - [x] Retain the native run's actual 28 passes, one missing-package failure and
+    one existing ignored fixture writer. Keep historical missing-tool early returns
+    separate from positive live browser evidence; never skip the package failure.
+  - [x] Diagnose the real package's apparent visibility failure using actual
+    speed-command receipts and drive timestamps. The production rewind guard
+    correctly rejected an older injected timestamp; `main.js` needed no change.
+  - [x] Freeze the four manually advanced Playwright contexts before app loading;
+    preserve the original early-stats, RAF, pause, hidden and resume assertions.
+    Keep the ordinary real-time package context unpaused. Add a live rewind
+    refusal that preserves the world tick and same-time idempotence.
+  - [x] Retain the actual validated snake-case exception in JSON, including
+    direct timer rejections that do not generate a `pageerror` event.
+  - [x] Forward an existing Cargo job budget explicitly through `wasm-pack`.
+    Retain the unsupported RCH adapter attempt: it built a native library and
+    lost the expected Cargo artifact stream; it is not WASM package proof.
+  - [x] Build the real package through DSR with one low-priority local job and
+    RAM output; run the actual Chromium package/DOM controls without installing
+    JS dependencies. Preserve originals and all generated package file bytes.
+  - [x] Confirm the cleanup daemon removed active dependency links from its
+    decision ledger; restore cached runtime files and protect the proof root.
+    No manual cleanup deletion or disk-reclamation credit is claimed.
+  Initial opt-in is diagnostic work in progress. Publish only qualified coherent
+  crate groups; the original task stays open until all 13 members pass. A frozen
+  external candidate separates qualification from concurrent unfinished edits.
+  The five storage/render/world-gfx/app/Bevy manifest opt-ins were initially
+  diagnostic-only and excluded from the eight-member group. World-gfx has
+  since qualified separately; storage/render/app/Bevy remain open.
+- [ ] Keep scientific arithmetic order, digests, codec representations and
+  existing expectations unchanged; justify any narrowly retained operation.
+- [ ] Run relevant existing positive/negative tests for actual source changes;
+  preserve all failed output and verify that selected tests really execute.
+- [ ] Run workspace all-target check, strict Clippy and formatting through DSR;
+  derive final package inheritance and prove the compiler consumes the policy.
+- [x] Correct the historical all-13 inheritance claim on `bd-tqpj` explicitly,
+  preserving that completed task's original core-only implementation credit.
+- [ ] Complete the required bounded audit, freshly verify the original criteria
+  against pinned source, and close only `bd-6hb5` on cited positive evidence.
+- [ ] Publish reviewed source, separate tracker state and completed TODO; retain
+  unrelated hardware and performance acceptance without promoting this proof.
+  - [x] Finish the exact clean `92fb17d8` workspace check on hz4 after the
+    admission refusals; the DSR receipt passes both source binding and check.
+  - [x] Integrate incoming `06e772cc` Linux GPUI backends while preserving local
+    ancestry and all unfinished edits. `bd-h4n2` tracks the required commit
+    tool's explicit, immutable conflict-free merge support. Require normal
+    hooks, canonical merged bytes and parent-bound tokens; keep ordinary
+    single-parent reviews unchanged.
+  - [x] Requalify integrated source `84811b6280efefc41c5c2cafdc738747c0e046bd`:
+    clean workspace check, strict Clippy, 96 brain tests, formatting, shell
+    syntax, fresh WASM package, 30 native web tests plus one existing ignored
+    fixture writer, both live four-case DOM reports and WASM strict Clippy.
+  - [x] Publish the reviewed source on the canonical branch.
+  - [x] Publish the separate reviewed tracker/TODO snapshot and verify the
+    canonical and compatibility remote tips after publication.
+
+The first source group is committed as
+`92fb17d8f25030756117b842c1a6998c640e1a66`: eight of 13 members import the
+unchanged lint policy. The four added importers are brain, brain-ml, brain-neuro
+and web; storage, render, world-gfx, app and Bevy remain with this original open
+task. Those original working edits are retained as `unqualified-storage-gfx.patch`
+under the proof root. World-gfx is now delivered by the separate source above;
+the five storage source files were then unqualified, unpublished work in
+progress. Another writer has since published those preparatory changes in
+`45d2f29d`; the browser qualification above includes that source. Storage lint
+inheritance and the original all-13 acceptance remain open.
+
+Evidence is retained at `/data/tmp/scriptbots-lint-inheritance-rakxl2es`.
+`foundational_round2/20261103T140933-423974` passed all six DSR checks on the
+frozen input: workspace check, strict Clippy, formatting, shell syntax and 96
+brain test executions. A fresh clean checkout of `92fb17d8` separately passes
+strict native Clippy, those brain tests, formatting, package generation and
+WASM-target all-target Clippy. Its initial native check received infrastructure
+exit 103; `published_workspace_check/20261103T151119-698263` subsequently passed
+on hz4 with the exact clean source and a stable receipt identity.
+The protected-runtime retry passes all 30 native web tests with one existing
+ignored fixture writer and no missing-tool early returns, plus the existing
+four-case stats and four-case fork DOM reports. All previous failures remain.
+The native parity fixture still matches fresh native generation; this block
+does not claim new cross-architecture parity, full packaging/Vite acceptance,
+hardware-GPU qualification, performance-budget proof or optional ML inference.
+The written audit records DRIFTING scope/cost, the corrected premature product
+diagnosis and fresh solo execution; peer review here is source review only.
+
+Final integration retains both the tested group and the incoming Linux GPUI
+backend feature repair. `integrated_native_local/20261103T160959-868344` passes
+all four DSR checks on clean `84811b62`; `integrated_browser/20261103T160805-860749`
+passes all six. The preceding remote attempt retains three admission-103
+refusals: all hz workers were quarantined for low disk space. The final native
+lane was explicitly local DSR with one low-priority job and RAM build output;
+it was neither silent fallback nor a performance qualification.
+
+The mandatory commit tool now supports an explicitly pinned conflict-free
+second parent (`a71502eb`); the actual merge is `84811b62`. Fresh Git fixtures
+exercise the positive two-parent hook-inspected merge and incomplete-tree,
+conflict, stale-base, changed-parent, foreign/replaced-state and hook-failure
+negatives. Failed hooks retain exact-token/file-identity-bound merge state for
+retry; incomplete initialization requires inspection. Normal single-parent
+guards remain. Independent source review found and corrected a proposed
+cleanup race and a pathname-only staged-content assertion. Two line-specific
+UBS false-positive annotations retain the timeout warning; the original
+baseline and unannotated planted negatives still trigger both critical rules.
+`bd-h4n2` closes on this actual development-tool capability; it earns no
+simulation or performance credit. The original lint task remains open.
+
+The initial narrow read-only cleanup scan found only 32 KiB in two old
+cleanup-skill test fixtures. Those were preserved as evidence. The broader
+scan and subsequently approved cleanup are recorded below. No process
+termination or VM tuning accompanied this work.
+
+**World-gfx completion and disk pressure (2026-11-03):** Source `2054b827` brings
+qualified inheritance to nine of 13 members; original `bd-6hb5` remains open.
+Fresh clean-commit DSR `world_gfx_clean_2054b827/20261103T174004-1146875` passes
+seven of seven checks. The precommit combined six-file snapshot also passed
+six of six; UBS reported zero criticals. Independent source review found no
+weakened assertions, changed seeds/goldens or widened certification admission.
+The canonical image check executed on Vulkan llvmpipe CPU. Ten library shader
+constants, the negative probe and triangle demo retain their raw payloads.
+
+The first combined run lost log writes when the filesystem filled and is
+invalid as qualification. Its complete RAM retry and fresh committed-source
+logs are retained in `/dev/shm/scriptbots-disk-pressure-h13w0Q/quality` and copied
+byte-for-byte under the durable proof root's `world-gfx-disk-pressure-evidence`.
+An optional raw-literal analysis initially matched ordinary-word suffixes;
+its corrected declaration-scoped check validates nonempty unchanged
+payloads and rejects every injected payload change. Its original failure stays.
+
+Disk pressure subsequently prevented the final Beads comment export. The last
+complete JSONL remained intact; the partial export is preserved. Once disk
+headroom returned, a normal import succeeded and comment 3014 persisted the
+final graphics qualification and cleanup result. The original task stays open.
+
+**Approved disk cleanup (2026-11-03):** [Completed — GentleDuck]
+
+- [x] Review an exact inventory of 49,131 Chromium-named temporary files:
+  UID 1000, regular files, over 24 hours old and absent from the process
+  open-file/mapping scan. Chromium origin is inferred from their names.
+- [x] Obtain explicit authorization for the command and permanent deletion.
+  The operator's exact reply was: **"I APPROVE!!! DELETE THE JUNK!!!"**
+- [x] Verify the reviewed manifest and script hashes; recheck selection and
+  metadata during execution. These checks are snapshot observations, not an
+  atomic same-inode or still-closed guarantee.
+- [x] Execute the approved command, beginning at 18:49:22 UTC and completing
+  at 18:49:24 UTC:
+
+  ```bash
+  sudo -n python3 /dev/shm/scriptbots-disk-pressure-h13w0Q/inventory.py --apply 4b0607b6d02e6c2010f4abd106c4e1829233a9ad69bd7ffdd649fccfe74c9dae
+  ```
+
+- [x] Verify all 49,131 per-file receipt rows match the reviewed inventory
+  and all listed paths are absent. Reviewed allocation was 26,378,244,096
+  bytes (24.6 GiB). Filesystem availability afterward was 35,812,335,616
+  bytes (33.4 GiB); concurrent activity also contributed to that total delta.
+- [x] Preserve byte-identical manifest, script, per-file receipt, exact
+  authorization, command and execution timestamps under
+  `/data/tmp/scriptbots-lint-inheritance-rakxl2es/approved-cleanup-20261103T184922Z`.
+- [x] Resume the previously failed Beads update through BR. Source files,
+  databases, build caches, BR cache directories and the partial export were
+  outside the approved inventory and were preserved.
+
+This requested cleanup checklist retires here. It does not complete the
+original 13-member lint task or any hardware/performance qualification.
+
 **Archipelago duration lane (2026-11-03):** [Verified and Closed —
 GentleDuck; original `bd-t3ge`; fresh solo verification]
 

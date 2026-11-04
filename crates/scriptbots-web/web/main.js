@@ -1,4 +1,7 @@
 import initWasm, * as wasm from "./pkg/scriptbots_web.js";
+import { CanvasRenderer } from "./renderers/canvas.js";
+import { WebGpuRenderer } from "./renderers/webgpu.js";
+import { RemoteStreamClient } from "./remote.js";
 
 const {
   init_sim,
@@ -12,8 +15,17 @@ const {
   check_build_match,
 } = wasm;
 
-const canvas = document.getElementById("sim-canvas");
-const ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
+let canvas = document.getElementById("sim-canvas");
+const rendererSelect = document.getElementById("renderer");
+const rendererStatus = document.getElementById("renderer-status");
+const captureButton = document.getElementById("capture-btn");
+const captureStatus = document.getElementById("capture-status");
+let captureRequest = null;
+let encodingRequest = null;
+let captureUrl = null;
+let renderer = null;
+let rendererGeneration = 0;
+let lastPaintedFrame = null;
 const fpsEl = document.getElementById("metric-fps");
 const tpsEl = document.getElementById("metric-tps");
 const tickEl = document.getElementById("metric-tick");
@@ -27,6 +39,20 @@ const stepsSlider = document.getElementById("steps-per-frame");
 const populationSlider = document.getElementById("population");
 const logView = document.getElementById("log");
 const versionEl = document.getElementById("version");
+const remoteUrl = document.getElementById("remote-url");
+const remoteConnect = document.getElementById("remote-connect");
+const remoteReconnect = document.getElementById("remote-reconnect");
+const remoteLocal = document.getElementById("remote-local");
+const remoteStatus = document.getElementById("remote-status");
+const remotePlayback = document.getElementById("remote-playback");
+const remoteReceipt = document.getElementById("remote-receipt");
+const remoteEvents = document.getElementById("remote-events");
+const remoteOverlay = document.getElementById("remote-overlay");
+const remotePause = document.getElementById("remote-pause");
+const remoteResume = document.getElementById("remote-resume");
+const remoteStep = document.getElementById("remote-step");
+const remoteRefresh = document.getElementById("remote-refresh");
+const remoteRetry = document.getElementById("remote-retry");
 
 const mismatchBannerEl = document.getElementById("mismatch-banner");
 const permalinkInput = document.getElementById("permalink-input");
@@ -64,13 +90,22 @@ const perfWindow = {
 };
 
 let simHandle = null;
+let simulationGeneration = 0;
 let speedMultiplier = Number(stepsSlider.value);
 let simulationStartedAt = null;
 let simulationTimer = null;
 let queuedReset = false;
 let population = Number(populationSlider.value);
+let remoteMode = false;
+let remoteClient = null;
+let remoteFrame = null;
+let remoteConnected = false;
+let lastRemoteRequestId = null;
+let lastRemoteCommandId = null;
+let lastRemoteStatusRequestId = null;
 
 stepsSlider.addEventListener("input", () => {
+  if (remoteMode) return;
   speedMultiplier = Number(stepsSlider.value);
   applyPlaybackSpeed();
   appendLog(`Simulation speed set to ${speedMultiplier}×`);
@@ -83,6 +118,7 @@ populationSlider.addEventListener("input", () => {
 });
 
 resetButton.addEventListener("click", () => {
+  if (remoteMode) return;
   queuedReset = true;
   if (permalinkStatus) {
     permalinkStatus.textContent = "";
@@ -96,11 +132,192 @@ function appendLog(message) {
   logView.textContent = `${line}\n${logView.textContent}`.slice(0, 4096);
 }
 
+function hasPresentationFrame() {
+  return remoteMode ? remoteFrame !== null : simHandle !== null;
+}
+
+function updateRemoteControls() {
+  for (const input of [stepsSlider, populationSlider, resetButton, permalinkInput,
+    loadPermalinkBtn, copyPermalinkBtn, forkPatchInput, forkBtn, loadForkedBtn, copyForkBtn]) {
+    if (input) input.disabled = remoteMode;
+  }
+  remoteLocal.disabled = !remoteMode;
+  remoteReconnect.disabled = !remoteMode || !remoteClient || remoteConnected;
+  for (const button of [remotePause, remoteResume, remoteStep]) button.disabled = !remoteConnected;
+  remoteRefresh.disabled = !remoteConnected || !lastRemoteCommandId;
+  remoteRetry.disabled = !remoteConnected || !lastRemoteRequestId;
+  captureButton.disabled = !hasPresentationFrame() || !!captureRequest || !!encodingRequest;
+  remoteOverlay.hidden = !remoteMode || !!remoteFrame;
+}
+
+function remoteEventLine(text) {
+  const item = document.createElement("li");
+  item.textContent = text;
+  remoteEvents.append(item);
+  while (remoteEvents.children.length > 48) remoteEvents.firstElementChild.remove();
+  remoteEvents.scrollTop = remoteEvents.scrollHeight;
+}
+
+function receiveRemoteFrame(frame) {
+  if (!remoteMode) return;
+  remotePlayback.textContent = `Observed server: ${frame.playback.paused ? "paused" : "running"}, ${frame.playback.speedMultiplier}× — tick ${frame.identity.tick}`;
+  if (frame.kind === "canvas") {
+    const browserFrame = { schema: "scriptbots.browser-frame.v1", identity: frame.identity, snapshot: frame.payload };
+    validateFrameIdentity(browserFrame);
+    remoteFrame = browserFrame;
+    if (frame.coalescedPublications !== "0") {
+      remoteStatus.textContent = `Connected — latest publication ${frame.identity.publicationRevision}; skipped ${frame.coalescedPublications} intermediate publications.`;
+    }
+    updateRemoteControls();
+  } else if (frame.kind === "events") {
+    const page = frame.payload;
+    if (page.gap) {
+      remoteEventLine(`History gap: narrative events ${page.gap.firstMissing}–${page.gap.lastMissing} are no longer retained by this server.`);
+    }
+    for (const event of page.events) {
+      remoteEventLine(`#${event.sequence} · tick ${event.record.tick}: ${event.record.humanText}`);
+    }
+  }
+}
+
+function receiveRemoteState(state) {
+  if (!remoteMode) return;
+  remoteConnected = state.state === "connected";
+  remoteStatus.dataset.state = state.state;
+  remoteStatus.textContent = state.message || state.state;
+  if (["disconnected", "error", "session_changed"].includes(state.state) && remoteFrame) {
+    remoteStatus.textContent += " Showing the last received frame.";
+  }
+  if (state.state === "session_changed") {
+    remoteStatus.textContent += " Connect to Server starts a fresh subscription; old cursors are not reused.";
+  }
+  updateRemoteControls();
+}
+
+function receiveRemoteReceipt(reply) {
+  if (!remoteMode) return;
+  if (reply.request_id !== lastRemoteRequestId && reply.request_id !== lastRemoteStatusRequestId) {
+    appendLog(`Earlier remote request ${reply.request_id}: ${reply.type === "receipt"
+      ? `${reply.receipt.application_state}; journal ${reply.receipt.journal_state}`
+      : `${reply.status}: ${reply.message}`}`);
+    return;
+  }
+  if (reply.type === "receipt") {
+    const receipt = reply.receipt;
+    lastRemoteCommandId = receipt.command_id;
+    remoteReceipt.textContent = `Command ${receipt.command_id}: application ${receipt.application_state}; journal ${receipt.journal_state}.`;
+    if (receipt.rejection_reason) remoteReceipt.textContent += ` ${JSON.stringify(receipt.rejection_reason)}`;
+  } else {
+    remoteReceipt.textContent = `Command response ${reply.status}: ${reply.message}`;
+  }
+  appendLog(remoteReceipt.textContent);
+  updateRemoteControls();
+}
+
+function connectRemote() {
+  try {
+    // Freeze local science before changing the active source. The saved local
+    // owner is resumed only by the user's explicit Return to Local action.
+    if (!remoteMode && simHandle) {
+      driveSimulation();
+      simHandle.setSpeed(0);
+    }
+    if (simulationTimer !== null) clearTimeout(simulationTimer);
+    simulationTimer = null;
+    queuedReset = false;
+    remoteClient?.disconnect();
+    remoteClient = null;
+    remoteMode = true;
+    remoteConnected = false;
+    remoteFrame = null;
+    lastRemoteRequestId = null;
+    lastRemoteCommandId = null;
+    lastRemoteStatusRequestId = null;
+    simulationGeneration += 1;
+    lastPaintedFrame = null;
+    if (captureRequest) finishCapture(captureRequest, new Error("Presentation source changed"));
+    remoteEvents.replaceChildren();
+    remoteReceipt.textContent = "";
+    remotePlayback.textContent = "Waiting for observed server state…";
+    remoteClient = new RemoteStreamClient({
+      url: remoteUrl.value.trim(),
+      decodeFrame: wasm.decode_remote_frame_binary,
+      channels: ["canvas", "telemetry", "events"],
+      maxFps: 60,
+      onFrame: receiveRemoteFrame,
+      onState: receiveRemoteState,
+      onReceipt: receiveRemoteReceipt,
+    });
+    updateMismatchBanner(null);
+    resetPerformanceWindows();
+    updateRemoteControls();
+    remoteClient.connect();
+  } catch (error) {
+    receiveRemoteState({ state: "error", message: `Connection failed: ${error.message}` });
+  }
+}
+
+remoteConnect.addEventListener("click", connectRemote);
+remoteReconnect.addEventListener("click", () => {
+  try { remoteClient?.reconnect(); }
+  catch (error) { receiveRemoteState({ state: "error", message: error.message }); }
+});
+remoteLocal.addEventListener("click", () => {
+  remoteClient?.disconnect();
+  remoteMode = false;
+  remoteConnected = false;
+  remoteClient = null;
+  remoteFrame = null;
+  simulationGeneration += 1;
+  lastPaintedFrame = null;
+  if (captureRequest) finishCapture(captureRequest, new Error("Presentation source changed"));
+  remoteStatus.textContent = "Running locally in this browser.";
+  remoteStatus.dataset.state = "local";
+  remotePlayback.textContent = "";
+  remoteReceipt.textContent = "";
+  resetPerformanceWindows();
+  updateRemoteControls();
+  applyPlaybackSpeed();
+  if (simulationTimer === null) pumpSimulation();
+});
+
+function sendRemoteControl(command) {
+  try {
+    lastRemoteCommandId = null;
+    lastRemoteStatusRequestId = null;
+    lastRemoteRequestId = remoteClient.sendControl(command);
+    remoteReceipt.textContent = `Sent ${command} (${lastRemoteRequestId}); awaiting the server's receipt.`;
+    updateRemoteControls();
+  } catch (error) {
+    if (error.requestId) {
+      lastRemoteRequestId = error.requestId;
+      remoteReceipt.textContent = `Command delivery unconfirmed (${error.requestId}): ${error.message}. Reconnect and retry with the same ID.`;
+    } else {
+      remoteReceipt.textContent = `Command was not sent: ${error.message}`;
+    }
+    updateRemoteControls();
+  }
+}
+
+remotePause.addEventListener("click", () => sendRemoteControl("pause"));
+remoteResume.addEventListener("click", () => sendRemoteControl("resume"));
+remoteStep.addEventListener("click", () => sendRemoteControl("step"));
+remoteRefresh.addEventListener("click", () => {
+  try { lastRemoteStatusRequestId = remoteClient.sendControl("status", { commandId: lastRemoteCommandId }); }
+  catch (error) { remoteReceipt.textContent = `Outcome lookup failed: ${error.message}`; }
+});
+remoteRetry.addEventListener("click", () => {
+  try {
+    remoteClient.retryControl(lastRemoteRequestId);
+    remoteReceipt.textContent = `Retried the same command identity (${lastRemoteRequestId}); awaiting the server's receipt.`;
+  } catch (error) { remoteReceipt.textContent = `Retry failed: ${error.message}`; }
+});
+
 function resetPerformanceWindows() {
   const now = performance.now();
   metrics.lastFrameTs = now;
   metrics.lastStatsTs = now;
-  metrics.previousTick = simHandle ? simHandle.snapshot().tick : null;
+  metrics.previousTick = remoteMode ? remoteFrame?.snapshot.tick ?? null : simHandle ? simHandle.snapshot().tick : null;
   metrics.fps = 0;
   metrics.tps = 0;
   metrics.tick = 0;
@@ -110,38 +327,185 @@ function resetPerformanceWindows() {
   perfWindow.lastLog = now;
 }
 
-function scaleFactor(world) {
-  return {
-    x: canvas.width / world.width,
-    y: canvas.height / world.height,
-  };
+function reportRendererFailure(error) {
+  rendererStatus.textContent = `Rendering unavailable: ${error.message}`;
+  appendLog(rendererStatus.textContent);
 }
 
-function drawSnapshot(snapshot) {
-  ctx.fillStyle = "#0b1120";
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
+async function selectRenderer(preference, fallbackReason = null) {
+  const generation = ++rendererGeneration;
+  // A canvas cannot switch context kinds. Prepare a replacement while the
+  // current renderer keeps presenting the latest snapshot.
+  let nextCanvas = canvas.cloneNode(false);
+  let nextRenderer = null;
+  let backend = "canvas";
+  if (preference !== "canvas") {
+    rendererStatus.textContent = `${rendererStatus.dataset.renderer === "webgpu" ? "WebGPU" : "Canvas 2D"} — starting WebGPU…`;
+    try {
+      nextRenderer = await WebGpuRenderer.create(nextCanvas, (reason) => {
+        if (renderer === nextRenderer) {
+          void selectRenderer("canvas", reason).catch(reportRendererFailure);
+        }
+      });
+      backend = "webgpu";
+    } catch (error) {
+      fallbackReason = `WebGPU unavailable: ${error.message}`;
+      // Creation may already have acquired a WebGPU context.
+      nextCanvas = canvas.cloneNode(false);
+    }
+  }
+  if (!nextRenderer) nextRenderer = new CanvasRenderer(nextCanvas);
+  if (generation !== rendererGeneration) {
+    nextRenderer.destroy();
+    return;
+  }
+  renderer?.destroy();
+  canvas.replaceWith(nextCanvas);
+  canvas = nextCanvas;
+  renderer = nextRenderer;
+  lastPaintedFrame = null;
+  rendererStatus.dataset.renderer = backend;
+  for (const key of Object.keys(rendererStatus.dataset)) {
+    if (key !== "renderer") delete rendererStatus.dataset[key];
+  }
+  rendererStatus.textContent = backend === "webgpu" ? "WebGPU" : "Canvas 2D";
+  if (fallbackReason) {
+    rendererStatus.textContent += ` — ${fallbackReason}`;
+    appendLog(`Renderer fallback: ${fallbackReason}`);
+  }
+}
 
-  const scale = scaleFactor(snapshot.world);
+rendererSelect.addEventListener("change", () => {
+  void selectRenderer(rendererSelect.value).catch(reportRendererFailure);
+});
 
-  for (const agent of snapshot.agents) {
-    const px = agent.position[0] * scale.x;
-    const py = agent.position[1] * scale.y;
-    const radius = Math.max(1.5, 3.5 * Math.sqrt(agent.health + 0.15));
+function validateFrameIdentity(frame) {
+  const identity = frame?.identity;
+  if (frame?.schema !== "scriptbots.browser-frame.v1"
+      || !Number.isSafeInteger(frame.snapshot.tick) || identity?.tick !== String(frame.snapshot.tick)
+      || ![identity.sessionId, identity.publicationRevision, identity.scientificRevision,
+        identity.controlRevision, identity.configRevision, identity.tick]
+        .every((value) => typeof value === "string" && /^(0|[1-9][0-9]*)$/.test(value))) {
+    throw new Error("Frame identity does not match the rendered snapshot");
+  }
+}
 
-    ctx.beginPath();
-    ctx.fillStyle = `rgba(${Math.round(agent.color[0] * 255)}, ${Math.round(agent.color[1] * 255)}, ${Math.round(agent.color[2] * 255)}, 0.9)`;
-    ctx.arc(px, py, radius, 0, Math.PI * 2);
-    ctx.fill();
-
-    if (agent.boost) {
-      ctx.beginPath();
-      ctx.strokeStyle = "rgba(30, 144, 255, 0.65)";
-      ctx.lineWidth = 1.2;
-      ctx.arc(px, py, radius + 2.0, 0, Math.PI * 2);
-      ctx.stroke();
+function drawSnapshot(frame) {
+  if (!renderer) return;
+  try {
+    validateFrameIdentity(frame);
+  } catch (error) {
+    if (captureRequest) finishCapture(captureRequest, error);
+    else showCaptureError(`Frame refused: ${error.message}`);
+    return;
+  }
+  if (lastPaintedFrame?.simulationGeneration === simulationGeneration
+      && lastPaintedFrame.publicationRevision === frame.identity.publicationRevision
+      && lastPaintedFrame.sessionId === frame.identity.sessionId
+      && lastPaintedFrame.width === canvas.width && lastPaintedFrame.height === canvas.height
+      && (!captureRequest || captureRequest.encoding)) {
+    return;
+  }
+  try {
+    if (renderer.render(frame.snapshot)) {
+      lastPaintedFrame = { simulationGeneration, publicationRevision: frame.identity.publicationRevision,
+        sessionId: frame.identity.sessionId, width: canvas.width, height: canvas.height };
+      for (const [key, value] of Object.entries(frame.identity)) {
+        rendererStatus.dataset[key === "tick" ? "snapshotTick" : key] = value;
+      }
+      captureAdmittedFrame(frame.identity);
+    }
+  } catch (error) {
+    if (rendererStatus.dataset.renderer === "webgpu") {
+      void selectRenderer("canvas", `WebGPU stopped: ${error.message}`).catch(reportRendererFailure);
+    } else {
+      throw error;
     }
   }
 }
+
+function showCaptureError(message) {
+  for (const key of Object.keys(captureStatus.dataset)) delete captureStatus.dataset[key];
+  captureStatus.dataset.state = "error";
+  if (captureStatus.textContent !== message) appendLog(message);
+  captureStatus.textContent = message;
+}
+
+function finishCapture(request, error = null) {
+  if (captureRequest !== request) return;
+  clearTimeout(request.timeout);
+  captureRequest = null;
+  captureButton.disabled = !hasPresentationFrame() || !!encodingRequest;
+  if (error) {
+    showCaptureError(`PNG export failed: ${error.message}`);
+  }
+}
+
+captureButton.addEventListener("click", () => {
+  if (!hasPresentationFrame() || captureRequest || encodingRequest) return;
+  const request = { simulationGeneration, encoding: false, timeout: null };
+  request.timeout = setTimeout(() => finishCapture(request, new Error(encodingRequest === request
+    ? "No PNG completed within 10 seconds; encoding is still finishing"
+    : "No frame admitted within 10 seconds; try again")), 10_000);
+  captureRequest = request;
+  captureButton.disabled = true;
+  for (const key of Object.keys(captureStatus.dataset)) delete captureStatus.dataset[key];
+  captureStatus.dataset.state = "waiting";
+  captureStatus.textContent = "Waiting for the next rendered frame…";
+});
+
+function captureAdmittedFrame(frameIdentity) {
+  const request = captureRequest;
+  if (!request || request.encoding) return;
+  try {
+    if (request.simulationGeneration !== simulationGeneration) throw new Error("World changed before capture; try again");
+    const identity = { ...frameIdentity };
+    const backend = rendererStatus.dataset.renderer;
+    const filename = `scriptbots-session-${identity.sessionId}-p${identity.publicationRevision}-s${identity.scientificRevision}-c${identity.controlRevision}-g${identity.configRevision}-t${identity.tick}-${backend}.png`;
+    request.encoding = true;
+    encodingRequest = request;
+    captureStatus.dataset.state = "encoding";
+    captureStatus.textContent = `Encoding tick ${identity.tick}…`;
+    // Invoke serialization in the submitting callback, before another frame
+    // can replace the drawing buffer. The callback retains identity, not agents.
+    canvas.toBlob((blob) => {
+      const completedEncoding = encodingRequest === request;
+      if (completedEncoding) encodingRequest = null;
+      if (captureRequest !== request) {
+        if (completedEncoding && !captureRequest) {
+          showCaptureError("PNG encoding finished after its request expired; try again");
+        }
+        captureButton.disabled = !hasPresentationFrame() || !!captureRequest || !!encodingRequest;
+        return;
+      }
+      try {
+        if (request.simulationGeneration !== simulationGeneration) throw new Error("World changed during capture; try again");
+        if (!blob || blob.type !== "image/png") throw new Error("The browser did not produce a PNG");
+        if (captureUrl) URL.revokeObjectURL(captureUrl);
+        captureUrl = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = captureUrl;
+        link.download = filename;
+        link.click();
+        Object.assign(captureStatus.dataset, identity, { renderer: backend, state: "ready", filename });
+        captureStatus.textContent = `PNG ready — tick ${identity.tick}, science revision ${identity.scientificRevision}, publication ${identity.publicationRevision} (${backend === "webgpu" ? "WebGPU" : "Canvas 2D"})`;
+        finishCapture(request);
+      } catch (error) {
+        finishCapture(request, error);
+      }
+    }, "image/png");
+  } catch (error) {
+    if (encodingRequest === request) encodingRequest = null;
+    finishCapture(request, error);
+  }
+}
+
+window.addEventListener("pagehide", () => {
+  remoteClient?.disconnect();
+  if (captureRequest) finishCapture(captureRequest, new Error("Page left during capture"));
+  if (captureUrl) URL.revokeObjectURL(captureUrl);
+  captureUrl = null;
+});
 
 function updateStats(snapshot, now) {
   const frameDt = now - metrics.lastFrameTs;
@@ -191,19 +555,19 @@ function updateStats(snapshot, now) {
 }
 
 function presentSimulation(now) {
-  if (!simHandle) {
+  if (!hasPresentationFrame()) {
     requestAnimationFrame(presentSimulation);
     return;
   }
 
-  const snapshot = simHandle.snapshot();
-  drawSnapshot(snapshot);
-  updateStats(snapshot, now);
+  const frame = remoteMode ? remoteFrame : simHandle.frame();
+  drawSnapshot(frame);
+  updateStats(frame.snapshot, now);
   requestAnimationFrame(presentSimulation);
 }
 
 function driveSimulation() {
-  if (!simHandle || simulationStartedAt === null) return;
+  if (remoteMode || !simHandle || simulationStartedAt === null) return;
   const receipt = simHandle.drive(performance.now() - simulationStartedAt);
   if (receipt.automatic_steps_skipped > 0) {
     appendLog(
@@ -213,7 +577,7 @@ function driveSimulation() {
 }
 
 function applyPlaybackSpeed() {
-  if (!simHandle) return;
+  if (remoteMode || !simHandle) return;
   // Settle the prior speed up to this input boundary before applying the new
   // canonical command. Resuming never accrues science for a hidden interval.
   driveSimulation();
@@ -221,12 +585,15 @@ function applyPlaybackSpeed() {
 }
 
 function startSimulationClock() {
+  simulationGeneration += 1;
   simulationStartedAt = performance.now();
   simHandle.setSpeed(document.hidden ? 0 : speedMultiplier);
+  captureButton.disabled = !!captureRequest || !!encodingRequest;
 }
 
 function pumpSimulation() {
   simulationTimer = null;
+  if (remoteMode) return;
 
   if (queuedReset) {
     resetSimulation(population).catch((err) => {
@@ -248,48 +615,44 @@ function pumpSimulation() {
   simulationTimer = setTimeout(pumpSimulation, 1000 / 60);
 }
 
+function bannerLine(parent, text, className = "") {
+  const line = document.createElement("div");
+  line.className = className;
+  line.textContent = text;
+  parent.append(line);
+  return line;
+}
+
 function updateMismatchBanner(matchResult) {
   if (!mismatchBannerEl) return;
 
   if (!matchResult || matchResult.status === "exact") {
     mismatchBannerEl.className = "";
     mismatchBannerEl.style.display = "none";
-    mismatchBannerEl.innerHTML = "";
+    mismatchBannerEl.replaceChildren();
     return;
   }
 
-  if (matchResult.status === "compatible") {
-    mismatchBannerEl.className = "banner-compatible";
-    mismatchBannerEl.style.display = "block";
-    mismatchBannerEl.innerHTML = `
-            <div class="banner-title">
-                <span>&#9432;</span>
-                <span>Compatible Build Note</span>
-            </div>
-            <div>This world was recorded on a compatible build. Toolchain or lockfile differ, but core simulation digest matches.</div>
-            <div class="banner-details">
-                <div>Link Build: toolchain=${matchResult.link_toolchain_digest}, lockfile=${matchResult.link_lockfile_digest}, core=${matchResult.link_core_digest}</div>
-                <div>Running Build: toolchain=${matchResult.local_toolchain_digest}, lockfile=${matchResult.local_lockfile_digest}, core=${matchResult.local_core_digest}</div>
-            </div>
-        `;
-    return;
-  }
-
-  if (matchResult.status === "mismatch") {
-    mismatchBannerEl.className = "banner-mismatch";
-    mismatchBannerEl.style.display = "block";
-    mismatchBannerEl.innerHTML = `
-            <div class="banner-title">
-                <span>&#9888;</span>
-                <span>Build Mismatch Warning</span>
-            </div>
-            <div>This world was recorded on a different build (core digest ${matchResult.link_core_digest}). You are on build (core digest ${matchResult.local_core_digest}). Trajectories may diverge after tick 0.</div>
-            <div class="banner-details">
-                <div>Link Build: toolchain=${matchResult.link_toolchain_digest}, lockfile=${matchResult.link_lockfile_digest}, core=${matchResult.link_core_digest}</div>
-                <div>Running Build: toolchain=${matchResult.local_toolchain_digest}, lockfile=${matchResult.local_lockfile_digest}, core=${matchResult.local_core_digest}</div>
-                <div style="margin-top: 0.35rem; font-style: italic; opacity: 0.85;">Cross-target floating point equivalence between native and WebAssembly is an open research area (bd-2wj).</div>
-            </div>
-        `;
+  if (matchResult.status !== "compatible" && matchResult.status !== "mismatch") return;
+  const compatible = matchResult.status === "compatible";
+  mismatchBannerEl.replaceChildren();
+  mismatchBannerEl.className = compatible ? "banner-compatible" : "banner-mismatch";
+  mismatchBannerEl.style.display = "block";
+  const title = bannerLine(mismatchBannerEl, "", "banner-title");
+  const icon = document.createElement("span");
+  icon.textContent = compatible ? "ⓘ" : "⚠";
+  const titleText = document.createElement("span");
+  titleText.textContent = compatible ? "Compatible Build Note" : "Build Mismatch Warning";
+  title.append(icon, titleText);
+  bannerLine(mismatchBannerEl, compatible
+    ? "This world was recorded on a compatible build. Toolchain or lockfile differ, but core simulation digest matches."
+    : `This world was recorded on a different build (core digest ${matchResult.link_core_digest}). You are on build (core digest ${matchResult.local_core_digest}). Trajectories may diverge after tick 0.`);
+  const details = bannerLine(mismatchBannerEl, "", "banner-details");
+  bannerLine(details, `Link Build: toolchain=${matchResult.link_toolchain_digest}, lockfile=${matchResult.link_lockfile_digest}, core=${matchResult.link_core_digest}`);
+  bannerLine(details, `Running Build: toolchain=${matchResult.local_toolchain_digest}, lockfile=${matchResult.local_lockfile_digest}, core=${matchResult.local_core_digest}`);
+  if (!compatible) {
+    const note = bannerLine(details, "Cross-target floating point equivalence between native and WebAssembly is an open research area (bd-2wj).");
+    note.style.cssText = "margin-top: 0.35rem; font-style: italic; opacity: 0.85;";
   }
 }
 
@@ -350,7 +713,7 @@ function updateDiffTable(linkStr) {
 }
 
 async function loadWorldFromPermalink(linkStr) {
-  if (!linkStr) return;
+  if (remoteMode || !linkStr) return;
   try {
     if (permalinkStatus) {
       permalinkStatus.textContent = "Loading permalink...";
@@ -412,7 +775,7 @@ async function loadWorldFromPermalink(linkStr) {
 }
 
 async function handleFork() {
-  if (!simHandle) {
+  if (remoteMode || !simHandle) {
     appendLog("Cannot fork: simulation not running");
     return;
   }
@@ -475,6 +838,7 @@ if (loadPermalinkBtn) {
 
 if (copyPermalinkBtn) {
   copyPermalinkBtn.addEventListener("click", () => {
+    if (remoteMode) return;
     if (!currentPermalink && simHandle) {
       try {
         if (permalink_of) {
@@ -528,6 +892,7 @@ if (copyForkBtn) {
 }
 
 async function resetSimulation(populationOverride) {
+  if (remoteMode) return;
   const defaults = default_init_options ? default_init_options() : {};
   const seed = Math.floor(Math.random() * 1_000_000);
   const options = {
@@ -575,6 +940,11 @@ async function resetSimulation(populationOverride) {
 async function bootstrap() {
   try {
     await initWasm();
+    // GPU initialization must not hold up science or the first visible frame.
+    await selectRenderer("canvas");
+    if (rendererSelect.value !== "canvas") {
+      void selectRenderer(rendererSelect.value).catch(reportRendererFailure);
+    }
     const tag = version ? version() : "unknown";
     if (versionEl) {
       versionEl.textContent = tag;
@@ -590,6 +960,7 @@ async function bootstrap() {
     }
 
     if (simulationTimer === null) pumpSimulation();
+    remoteConnect.disabled = false;
     requestAnimationFrame(presentSimulation);
   } catch (err) {
     console.error("Failed to initialise wasm module", err);

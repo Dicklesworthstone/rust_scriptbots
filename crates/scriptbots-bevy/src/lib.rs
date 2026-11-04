@@ -35,8 +35,8 @@ use bevy_post_process::auto_exposure::{AutoExposure, AutoExposurePlugin};
 use bevy_post_process::bloom::Bloom;
 use image::{ImageBuffer, Rgba as ImgRgba};
 use scriptbots_core::{
-    AccessibilityPalette, AgentId, BrainInspectionLimits, ControlCommand, GpuClass, GpuInfo,
-    IndicatorState, NUM_EYES, OutputChannel, OutputsExt, RenderGovernor, RenderQuality,
+    AccessibilityPalette, AgentId, AgentUid, BrainInspectionLimits, ControlCommand, GpuClass,
+    GpuInfo, IndicatorState, NUM_EYES, OutputChannel, OutputsExt, RenderGovernor, RenderQuality,
     RenderSettings, RenderTonemapMode, SelectedBrainTelemetryOutcome, SelectionMode,
     SelectionState, SelectionUpdate, SimulationCommand, TerrainKind, TickSummary, TierFeatures,
     TraitModifiers, WorldState, initial_tier_for, tier_features, toroidal_delta,
@@ -47,11 +47,13 @@ use scriptbots_core::{
 #[cfg(test)]
 use scriptbots_core::{BrainInspectionClientId, BrainInspectionRequest, BrainInspectionRevision};
 use scriptbots_runtime::{
-    HostAccessError, HostClient, HostPort, RenderSnapshot, channel::ChannelHostPort,
+    ApplicationState, CommandId, CommandStatus, HostAccessError, HostClient, HostPort,
+    JournalState, RejectionReason, RenderSnapshot, channel::ChannelHostPort,
 };
+use serde::Deserialize;
 use slotmap::Key;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     env,
     io::Cursor,
     sync::{
@@ -67,9 +69,8 @@ use tracing::{error, info, warn};
 /// Launch context supplied by the ScriptBots application shell.
 /// Submit a command and receive the identity it was admitted under.
 ///
-/// `None` is a refusal. `Some(id)` names the submission, which is what a bare
-/// `bool` could never do — and why every acknowledgement fix in this file could
-/// only ever reach `admitted` (bd-k7nq).
+/// `None` means no usable acknowledgement was received. `Some(id)` names the
+/// submission; its application and journal outcomes must be observed separately.
 pub type CommandSubmitFn = Arc<dyn Fn(ControlCommand) -> Option<String> + Send + Sync>;
 pub type ControlHealthFn = Arc<dyn Fn() -> std::result::Result<(), String> + Send + Sync>;
 
@@ -738,9 +739,8 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
     let first_worker_failure = Arc::new(Mutex::new(None));
     let running = Arc::new(AtomicBool::new(true));
     let worker_flag = Arc::clone(&running);
-    let submitter_resource = CommandSubmitter {
-        submit: command_submit.clone(),
-    };
+    let (submitter_resource, command_feedback) =
+        CommandSubmitter::observed(command_submit, host.clone());
     let controls_resource = SimulationControl::new();
     let controls_for_thread = controls_resource.clone();
     let snapshot_failures = failure_tx.clone();
@@ -833,6 +833,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
         affects_lightmapped_meshes: true,
     })
     .insert_resource(submitter_resource)
+    .insert_resource(command_feedback)
     .insert_resource(controls_resource)
     // Built from the resolved settings, so it engages only for Auto launches
     // (bd-2z0.14.3.3).
@@ -1052,7 +1053,10 @@ pub(crate) struct SnapshotState {
 
 #[derive(Default, Resource)]
 pub(crate) struct AgentRegistry {
-    records: HashMap<AgentId, AgentRecord>,
+    // Stable scientific identity is the presentation continuity key. AgentId
+    // is a generational arena handle and may be recycled after a death; using
+    // it here could make a newborn inherit the departed agent's smoothed pose.
+    records: HashMap<AgentUid, AgentRecord>,
 }
 
 #[derive(Resource, Clone)]
@@ -1168,6 +1172,15 @@ struct AgentMotionSettings {
     enabled: bool,
 }
 
+fn smooth_toroidal_axis(current: f32, target: f32, extent: f32, blend: f32) -> f32 {
+    if !extent.is_finite() || extent <= 0.0 {
+        return current + (target - current) * blend;
+    }
+    let half = extent * 0.5;
+    let delta = toroidal_delta(target, current, extent);
+    (current + delta * blend + half).rem_euclid(extent) - half
+}
+
 fn smooth_agent_poses(
     time: Res<Time>,
     state: Res<SnapshotState>,
@@ -1181,18 +1194,38 @@ fn smooth_agent_poses(
     )>,
 ) {
     let blend = -(-time.delta_secs() * AGENT_POSE_RESPONSE).exp_m1();
+    let paused = state
+        .latest
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.paused);
     for (target, mut display, mut transform, footprint) in &mut agents {
-        let delta = target.translation - display.previous_target.translation;
-        let wrapped = (state.world_size.x > 0.0 && delta.x.abs() > state.world_size.x * 0.5)
-            || (state.world_size.y > 0.0 && delta.z.abs() > state.world_size.y * 0.5);
-        if settings.as_ref().is_some_and(|settings| !settings.enabled)
+        if paused
+            || settings.as_ref().is_some_and(|settings| !settings.enabled)
             || target.tick < display.previous_target.tick
-            || wrapped
         {
+            // A committed pause (including a paused single step) presents the
+            // exact observed pose immediately. It must not keep converging
+            // while the inspector reports a stationary scientific tick.
             display.translation = target.translation;
             display.rotation = target.rotation;
         } else {
-            display.translation = display.translation.lerp(target.translation, blend);
+            // X/Z are toroidal world axes. Ease along their shortest wrapped
+            // displacement so crossing a seam does not teleport an otherwise
+            // continuously moving stable agent across the whole viewport.
+            let mut translation = display.translation.lerp(target.translation, blend);
+            translation.x = smooth_toroidal_axis(
+                display.translation.x,
+                target.translation.x,
+                state.world_size.x,
+                blend,
+            );
+            translation.z = smooth_toroidal_axis(
+                display.translation.z,
+                target.translation.z,
+                state.world_size.y,
+                blend,
+            );
+            display.translation = translation;
             display.rotation = display.rotation.slerp(target.rotation, blend);
         }
         if let (Some(snapshot), Some(footprint)) = (&state.latest, footprint) {
@@ -1287,6 +1320,7 @@ struct SpikeDisplayPose {
 fn smooth_spike_poses(
     mut commands: Commands,
     time: Res<Time>,
+    state: Option<Res<SnapshotState>>,
     settings: Option<Res<AgentMotionSettings>>,
     mut spikes: Query<(
         Entity,
@@ -1296,6 +1330,10 @@ fn smooth_spike_poses(
     )>,
 ) {
     let blend = -(-time.delta_secs() * AGENT_POSE_RESPONSE).exp_m1();
+    let paused = state
+        .as_ref()
+        .and_then(|state| state.latest.as_ref())
+        .is_some_and(|snapshot| snapshot.paused);
     for (entity, target, display, mut transform) in &mut spikes {
         let Some(mut display) = display else {
             // First native frame starts at the exact snapshot pose. Capture
@@ -1307,7 +1345,9 @@ fn smooth_spike_poses(
             });
             continue;
         };
-        if settings.as_ref().is_some_and(|settings| !settings.enabled) || target.tick < display.tick
+        if paused
+            || settings.as_ref().is_some_and(|settings| !settings.enabled)
+            || target.tick < display.tick
         {
             display.transform = target.transform;
         } else {
@@ -1334,15 +1374,21 @@ const BODY_IDLE_AMPLITUDE: f32 = 0.008;
 
 fn animate_idle_bodies(
     time: Res<Time>,
+    state: Option<Res<SnapshotState>>,
     motion: Option<Res<AgentMotionSettings>>,
     mut bodies: Query<(&IdleBodyTarget, &mut Transform)>,
 ) {
     let phase = (time.elapsed_secs_f64().rem_euclid(BODY_IDLE_PERIOD) / BODY_IDLE_PERIOD) as f32
         * std::f32::consts::TAU;
-    let enabled = motion.as_ref().is_none_or(|settings| settings.enabled);
+    let paused = state
+        .as_ref()
+        .and_then(|state| state.latest.as_ref())
+        .is_some_and(|snapshot| snapshot.paused);
+    let enabled = !paused && motion.as_ref().is_none_or(|settings| settings.enabled);
     for (target, mut transform) in &mut bodies {
         // Always start from the snapshot base: repeated paints cannot compound
-        // the deformation, and reduced motion restores the exact base at once.
+        // the deformation. Pause and reduced motion restore the exact base at
+        // once, so paused inspection does not depend on elapsed render time.
         *transform = target.transform;
         if enabled {
             transform.scale *= 1.0 + BODY_IDLE_AMPLITUDE * (phase + target.phase).sin();
@@ -1639,6 +1685,42 @@ impl CommandSubmitter {
         Self { submit }
     }
 
+    /// Observe every native input path, including handlers that invoke `submit`
+    /// directly. The returned identity is preserved exactly for existing callers.
+    fn observed(submit: CommandSubmitFn, host: ChannelHostPort) -> (Self, NativeCommandFeedback) {
+        let requests = Arc::new(Mutex::new(VecDeque::with_capacity(NATIVE_RECENT_COMMANDS)));
+        let writer = Arc::clone(&requests);
+        let submitter = Self::new(Arc::new(move |command| {
+            let label = native_command_label(&command);
+            let receipt = submit(command);
+            let submission = match receipt.as_deref() {
+                Some(encoded) => {
+                    let deserializer =
+                        serde::de::value::StrDeserializer::<serde::de::value::Error>::new(encoded);
+                    match CommandId::deserialize(deserializer) {
+                        Ok(command_id) => NativeCommandSubmission::Identified(command_id),
+                        Err(_) => NativeCommandSubmission::Uncorrelated,
+                    }
+                }
+                None => NativeCommandSubmission::Unconfirmed,
+            };
+            // Submission never holds this lock across a control call. Paints use
+            // try_lock, so recording a request cannot stall a render frame.
+            if let Ok(mut requests) = writer.lock() {
+                if requests.len() == NATIVE_RECENT_COMMANDS {
+                    requests.pop_front();
+                }
+                requests.push_back(NativeCommandRequest {
+                    label,
+                    submission,
+                    last_observed: None,
+                });
+            }
+            receipt
+        }));
+        (submitter, NativeCommandFeedback { host, requests })
+    }
+
     pub fn submit_command(&self, command: ControlCommand) -> Option<String> {
         (self.submit)(command)
     }
@@ -1649,6 +1731,556 @@ impl CommandSubmitter {
 
     pub fn submit_selection(&self, update: SelectionUpdate) -> Option<String> {
         self.submit_command(ControlCommand::UpdateSelection(update))
+    }
+}
+
+const NATIVE_RECENT_COMMANDS: usize = 4;
+const NATIVE_COMMAND_DETAIL_CHARS: usize = 160;
+
+#[derive(Clone, Copy)]
+enum NativeCommandSubmission {
+    Identified(CommandId),
+    Uncorrelated,
+    Unconfirmed,
+}
+
+struct NativeCommandRequest {
+    label: &'static str,
+    submission: NativeCommandSubmission,
+    // Retain bounded display text, not arbitrary host diagnostic allocations.
+    // A transient status-board miss must not erase an observed outcome.
+    last_observed: Option<String>,
+}
+
+#[derive(Resource)]
+struct NativeCommandFeedback {
+    host: ChannelHostPort,
+    requests: Arc<Mutex<VecDeque<NativeCommandRequest>>>,
+}
+
+impl NativeCommandFeedback {
+    /// A paint may only read the published mirror. Never call command_status:
+    /// its authoritative fallback sends ingress and waits for the owner.
+    fn text(&self) -> Option<String> {
+        let mut requests = match self.requests.try_lock() {
+            Ok(requests) => requests,
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Some("Commands: feedback unavailable".to_owned());
+            }
+        };
+        if requests.is_empty() {
+            return Some("Commands: no requests".to_owned());
+        }
+        let mut lines = Vec::with_capacity(requests.len());
+        for request in requests.iter_mut().rev() {
+            let command_id = match request.submission {
+                NativeCommandSubmission::Identified(id) => id,
+                NativeCommandSubmission::Uncorrelated => {
+                    lines.push(format!(
+                        "{}: invalid receipt identity • Application not observed • Journal not observed",
+                        request.label
+                    ));
+                    continue;
+                }
+                NativeCommandSubmission::Unconfirmed => {
+                    lines.push(format!(
+                        "{}: submission unconfirmed • Application not observed • Journal not observed",
+                        request.label
+                    ));
+                    continue;
+                }
+            };
+            let outcome = match self.host.try_published_command_status(command_id) {
+                Ok(Some(status)) => {
+                    let text = native_command_outcome(&status);
+                    request.last_observed = Some(text.clone());
+                    text
+                }
+                observation => {
+                    let availability = match observation {
+                        Ok(None) => "status not observed locally".to_owned(),
+                        Err(error) => format!(
+                            "status unavailable: {}",
+                            bounded_command_detail(&error.to_string())
+                        ),
+                        Ok(Some(_)) => unreachable!("handled observed status above"),
+                    };
+                    match &request.last_observed {
+                        Some(previous) => format!("Last observed: {previous} • {availability}"),
+                        None => format!(
+                            "{availability} • Application not observed • Journal not observed"
+                        ),
+                    }
+                }
+            };
+            lines.push(format!("{} [{command_id}]: {outcome}", request.label));
+        }
+        Some(lines.join("\n"))
+    }
+}
+
+fn native_command_label(command: &ControlCommand) -> &'static str {
+    match command {
+        ControlCommand::UpdateConfig(_) => "Configuration",
+        ControlCommand::UpdateSelection(_) => "Selection",
+        ControlCommand::AdjustAgentMutationRates { .. } => "Mutation rates",
+        ControlCommand::SpawnAgent { .. } => "Add agent",
+        ControlCommand::SpawnCrossover { .. } => "Crossover",
+        ControlCommand::UpdateSimulation(update) => {
+            if update.step_once {
+                "Step"
+            } else if update.paused.is_some() && update.speed_multiplier.is_some() {
+                "Playback"
+            } else if let Some(paused) = update.paused {
+                if paused { "Pause" } else { "Resume" }
+            } else if update.speed_multiplier.is_some() {
+                "Speed"
+            } else {
+                "Playback"
+            }
+        }
+        ControlCommand::Pause => "Pause",
+        ControlCommand::Resume => "Resume",
+        ControlCommand::Step => "Step",
+        ControlCommand::SetSpeed(_) => "Speed",
+        ControlCommand::Shutdown => "Shutdown",
+        ControlCommand::ApplyMap { .. } => "Map",
+        ControlCommand::Intervention(_) => "Intervention",
+    }
+}
+
+fn bounded_command_detail(detail: &str) -> String {
+    let mut chars = detail.chars();
+    let mut bounded: String = chars
+        .by_ref()
+        .take(NATIVE_COMMAND_DETAIL_CHARS)
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
+    if chars.next().is_some() {
+        bounded.push('…');
+    }
+    bounded
+}
+
+fn native_command_outcome(status: &CommandStatus) -> String {
+    let application = match status.application() {
+        ApplicationState::Admitted => "Admitted • awaiting application".to_owned(),
+        ApplicationState::Applied(boundary) => format!(
+            "Applied • tick {} • science revision {}",
+            boundary.tick.0,
+            boundary.revisions.scientific.get()
+        ),
+        ApplicationState::Rejected(reason) => {
+            let reason = match reason {
+                RejectionReason::Validation { message } => bounded_command_detail(message),
+                RejectionReason::ControlRevisionConflict { expected, actual } => format!(
+                    "control revision: expected {}, current {}",
+                    expected.get(),
+                    actual.get()
+                ),
+                RejectionReason::ScientificRevisionConflict { expected, actual } => format!(
+                    "science revision: expected {}, current {}",
+                    expected.get(),
+                    actual.get()
+                ),
+                RejectionReason::ConfigRevisionConflict { expected, actual } => format!(
+                    "config revision: expected {}, current {}",
+                    expected.get(),
+                    actual.get()
+                ),
+                RejectionReason::Overloaded { capacity } => {
+                    format!("command capacity {capacity} reached")
+                }
+                RejectionReason::HostStopping => "host is stopping".to_owned(),
+            };
+            format!("Rejected • {reason}")
+        }
+        ApplicationState::Failed(failure) => format!(
+            "Application failed • {} • {}",
+            bounded_command_detail(&failure.code),
+            bounded_command_detail(&failure.message)
+        ),
+    };
+    let journal = match status.journal() {
+        JournalState::NotRequired => "Journal • no record observed".to_owned(),
+        JournalState::Pending => "Journal • pending".to_owned(),
+        JournalState::CommittedVolatile => "Journal • committed in memory".to_owned(),
+        JournalState::Durable => "Journal • durable".to_owned(),
+        JournalState::Failed(failure) => format!(
+            "Journal failed • {} • {}",
+            bounded_command_detail(&failure.code),
+            bounded_command_detail(&failure.message)
+        ),
+    };
+    format!("{application} • {journal}")
+}
+
+#[cfg(test)]
+mod native_command_feedback_tests {
+    use super::*;
+    use scriptbots_core::{ScriptBotsConfig, Tick};
+    use scriptbots_runtime::{
+        AdmissionSequence, ApplicationFailure, AppliedCommand, CommandEnvelope, ConfigRevision,
+        ControlRevision, FixedDeadlineHost, HostCommand, HostCore, HostCoreOptions, HostRevisions,
+        HostSessionId, JournalFailure, ManualInstant, PlaybackSnapshot, ScientificRevision,
+        channel::{ChannelHostDriver, ChannelHostOptions},
+    };
+    use std::sync::atomic::AtomicU64;
+    use std::time::Instant;
+
+    fn host_pair(status_capacity: usize) -> (ChannelHostDriver, ChannelHostPort) {
+        let world = WorldState::new(ScriptBotsConfig {
+            rng_seed: Some(44),
+            world_width: 80,
+            world_height: 80,
+            food_cell_size: 40,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            persistence_interval: 0,
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+        let core = HostCore::new(
+            HostSessionId::new(44),
+            world,
+            HostCoreOptions {
+                initial_playback: PlaybackSnapshot {
+                    paused: true,
+                    speed_multiplier: 1.0,
+                },
+                capture_agent_visuals: true,
+                ..HostCoreOptions::default()
+            },
+        )
+        .expect("host");
+        ChannelHostDriver::new(
+            FixedDeadlineHost::new(core),
+            ChannelHostOptions {
+                status_board_capacity: status_capacity,
+                maintenance_period: Duration::from_millis(1),
+                ..ChannelHostOptions::default()
+            },
+        )
+        .expect("channel host")
+    }
+
+    #[test]
+    fn native_feedback_keeps_application_and_journal_outcomes_independent() {
+        let applied = ApplicationState::Applied(AppliedCommand {
+            tick: Tick(17),
+            revisions: HostRevisions {
+                scientific: ScientificRevision::new(23),
+                ..HostRevisions::default()
+            },
+        });
+        for (journal, expected) in [
+            (JournalState::NotRequired, "Journal • no record observed"),
+            (JournalState::Pending, "Journal • pending"),
+            (
+                JournalState::CommittedVolatile,
+                "Journal • committed in memory",
+            ),
+            (JournalState::Durable, "Journal • durable"),
+            (
+                JournalState::Failed(JournalFailure {
+                    code: "disk_full".to_owned(),
+                    message: "retry after freeing space".to_owned(),
+                }),
+                "Journal failed • disk_full • retry after freeing space",
+            ),
+        ] {
+            let status = CommandStatus::try_new(
+                CommandId::new(1),
+                Some(AdmissionSequence::new(1)),
+                applied.clone(),
+                journal,
+            )
+            .unwrap();
+            let text = native_command_outcome(&status);
+            assert!(
+                text.contains("Applied • tick 17 • science revision 23"),
+                "{text}"
+            );
+            assert!(text.contains(expected), "{text}");
+            if expected != "Journal • durable" {
+                assert!(!text.contains("durable"), "{text}");
+            }
+        }
+        let admitted = CommandStatus::try_new(
+            CommandId::new(2),
+            Some(AdmissionSequence::new(2)),
+            ApplicationState::Admitted,
+            JournalState::Pending,
+        )
+        .unwrap();
+        assert_eq!(
+            native_command_outcome(&admitted),
+            "Admitted • awaiting application • Journal • pending"
+        );
+        let failed = CommandStatus::try_new(
+            CommandId::new(3),
+            Some(AdmissionSequence::new(3)),
+            ApplicationState::Failed(ApplicationFailure {
+                code: "invalid_state".to_owned(),
+                message: "agent unavailable".to_owned(),
+            }),
+            JournalState::Durable,
+        )
+        .unwrap();
+        assert_eq!(
+            native_command_outcome(&failed),
+            "Application failed • invalid_state • agent unavailable • Journal • durable"
+        );
+
+        for (reason, detail) in [
+            (
+                RejectionReason::Validation {
+                    message: "invalid speed".to_owned(),
+                },
+                "invalid speed",
+            ),
+            (
+                RejectionReason::ControlRevisionConflict {
+                    expected: ControlRevision::new(1),
+                    actual: ControlRevision::new(2),
+                },
+                "control revision: expected 1, current 2",
+            ),
+            (
+                RejectionReason::ScientificRevisionConflict {
+                    expected: ScientificRevision::new(3),
+                    actual: ScientificRevision::new(4),
+                },
+                "science revision: expected 3, current 4",
+            ),
+            (
+                RejectionReason::ConfigRevisionConflict {
+                    expected: ConfigRevision::new(5),
+                    actual: ConfigRevision::new(6),
+                },
+                "config revision: expected 5, current 6",
+            ),
+            (
+                RejectionReason::Overloaded { capacity: 8 },
+                "command capacity 8 reached",
+            ),
+            (RejectionReason::HostStopping, "host is stopping"),
+        ] {
+            let admission = match &reason {
+                RejectionReason::ControlRevisionConflict { .. }
+                | RejectionReason::ScientificRevisionConflict { .. }
+                | RejectionReason::ConfigRevisionConflict { .. } => Some(AdmissionSequence::new(4)),
+                _ => None,
+            };
+            let status = CommandStatus::try_new(
+                CommandId::new(4),
+                admission,
+                ApplicationState::Rejected(reason),
+                JournalState::Pending,
+            )
+            .unwrap();
+            assert_eq!(
+                native_command_outcome(&status),
+                format!("Rejected • {detail} • Journal • pending")
+            );
+        }
+        let message = bounded_command_detail(&format!("failure\n{}", "é".repeat(200)));
+        assert_eq!(message.chars().count(), NATIVE_COMMAND_DETAIL_CHARS + 1);
+        assert!(!message.contains('\n'));
+        assert!(message.ends_with('…'));
+    }
+
+    #[test]
+    fn native_feedback_retains_unconfirmed_requests_without_inventing_outcomes() {
+        // No owner is driven: a paint must read its local mirror and return,
+        // including when a syntactically valid identity is absent from it.
+        let (_driver, port) = host_pair(1);
+        let sequence = AtomicU64::new(0);
+        let raw: CommandSubmitFn =
+            Arc::new(move |_| match sequence.fetch_add(1, Ordering::Relaxed) {
+                0 => None,
+                1 => Some("not-an-id".to_owned()),
+                n => Some(CommandId::new(u128::from(n)).to_string()),
+            });
+        let (submitter, feedback) = CommandSubmitter::observed(raw, port);
+        assert_eq!(feedback.text().as_deref(), Some("Commands: no requests"));
+        assert_eq!(submitter.submit_command(ControlCommand::Pause), None);
+        assert_eq!(
+            submitter.submit_command(ControlCommand::Step),
+            Some("not-an-id".to_owned())
+        );
+        assert_eq!(
+            submitter.submit_command(ControlCommand::SetSpeed(2.0)),
+            Some(CommandId::new(2).to_string())
+        );
+        let text = feedback.text().unwrap();
+        assert!(text.contains("Pause: submission unconfirmed"), "{text}");
+        assert!(text.contains("Step: invalid receipt identity"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "Speed [{}]: status not observed locally",
+                CommandId::new(2)
+            )),
+            "{text}"
+        );
+        for invented in ["Applied", "Rejected", "durable", "committed"] {
+            assert!(!text.contains(invented), "{text}");
+        }
+        let guard = feedback.requests.lock().unwrap();
+        assert!(
+            feedback.text().is_none(),
+            "paint must not wait behind a submission recorder"
+        );
+        drop(guard);
+        for _ in 0..8 {
+            assert!(submitter.submit_command(ControlCommand::Pause).is_some());
+        }
+        assert_eq!(
+            feedback.requests.lock().unwrap().len(),
+            NATIVE_RECENT_COMMANDS
+        );
+        assert_eq!(
+            feedback.text().unwrap().lines().count(),
+            NATIVE_RECENT_COMMANDS
+        );
+    }
+
+    #[test]
+    fn native_shortcuts_and_buttons_show_real_host_receipts_and_survive_mirror_eviction() {
+        let (sender, receiver) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let (mut driver, port) = host_pair(1);
+            sender.send(port).unwrap();
+            let start = Instant::now();
+            driver
+                .run(|| ManualInstant::from_nanos(start.elapsed().as_nanos() as u64))
+                .expect("real host driver")
+        });
+        let port = receiver.recv().unwrap();
+        let submit_port = port.clone();
+        let sequence = AtomicU64::new(1);
+        let raw: CommandSubmitFn = Arc::new(move |command| {
+            let id =
+                CommandId::from_client_sequence(0xBE17, sequence.fetch_add(1, Ordering::Relaxed));
+            let command = HostCommand::try_from(command).expect("native command mapping");
+            let receipt = submit_port
+                .clone()
+                .submit(CommandEnvelope::new(id, command))
+                .expect("real host admission");
+            Some(receipt.command_id().to_string())
+        });
+        let (submitter, feedback) = CommandSubmitter::observed(raw, port.clone());
+        let controls = SimulationControl::new();
+        controls.update(|state| state.paused = true);
+        let snapshot = WorldSnapshot::from_snapshot(&port.snapshot_hub().latest()).unwrap();
+        let mut app = App::new();
+        app.insert_resource(submitter)
+            .insert_resource(feedback)
+            .insert_resource(controls)
+            .insert_resource(SnapshotState {
+                latest: Some(snapshot),
+                ..default()
+            })
+            .init_resource::<CameraRig>()
+            .init_resource::<TonemappingState>()
+            .init_resource::<AccessibilityState>()
+            .insert_resource(Time::<()>::default())
+            .init_resource::<ButtonInput<KeyCode>>()
+            .add_systems(
+                Update,
+                (
+                    handle_playback_shortcuts,
+                    handle_playback_buttons,
+                    update_hud,
+                )
+                    .chain(),
+            );
+        let label = app.world_mut().spawn(Text::default()).id();
+        app.insert_resource(HudElements {
+            tick: Entity::PLACEHOLDER,
+            agents: Entity::PLACEHOLDER,
+            selection: Entity::PLACEHOLDER,
+            follow: Entity::PLACEHOLDER,
+            camera: Entity::PLACEHOLDER,
+            playback: Entity::PLACEHOLDER,
+            command_feedback: label,
+            fps: Entity::PLACEHOLDER,
+            world: Entity::PLACEHOLDER,
+            tonemap: Entity::PLACEHOLDER,
+            palette: Entity::PLACEHOLDER,
+            events: Entity::PLACEHOLDER,
+            inspector: Entity::PLACEHOLDER,
+            history: Entity::PLACEHOLDER,
+            brain: Entity::PLACEHOLDER,
+        });
+        for tick in 1..=5 {
+            app.world_mut()
+                .resource_mut::<ButtonInput<KeyCode>>()
+                .press(KeyCode::KeyN);
+            app.update();
+            app.world_mut()
+                .resource_mut::<ButtonInput<KeyCode>>()
+                .reset_all();
+            wait_for_hud_receipt(&mut app, label, tick, tick, "Step");
+            let published = port.snapshot_hub().latest();
+            assert_eq!(published.world.tick, tick);
+            assert!(published.playback.paused);
+        }
+        let feedback = app.world().resource::<NativeCommandFeedback>();
+        assert_eq!(
+            feedback.requests.lock().unwrap().len(),
+            NATIVE_RECENT_COMMANDS
+        );
+        let text = feedback.text().unwrap();
+        assert!(
+            text.contains("Last observed: Applied"),
+            "evicted observations must remain truthful: {text}"
+        );
+        assert!(text.contains("status not observed locally"), "{text}");
+        assert!(!text.contains(&CommandId::from_client_sequence(0xBE17, 1).to_string()));
+
+        let button = app
+            .world_mut()
+            .spawn((
+                Button,
+                PlaybackButton {
+                    action: PlaybackAction::Pause,
+                },
+                Interaction::Pressed,
+            ))
+            .id();
+        app.update();
+        app.world_mut().entity_mut(button).insert(Interaction::None);
+        wait_for_hud_receipt(&mut app, label, 6, 5, "Pause");
+        assert_eq!(port.snapshot_hub().latest().world.tick, 5);
+
+        drop(app);
+        drop(port);
+        let _receipt = worker
+            .join()
+            .expect("host thread joins after clients disconnect");
+    }
+
+    fn wait_for_hud_receipt(app: &mut App, label: Entity, sequence: u64, tick: u64, action: &str) {
+        let id = CommandId::from_client_sequence(0xBE17, sequence);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            app.update();
+            let text = app.world().get::<Text>(label).unwrap().as_str();
+            let latest = text.lines().next().unwrap();
+            assert!(latest.starts_with(&format!("{action} [{id}]:")), "{text}");
+            if latest.contains(&format!("Applied • tick {tick} •"))
+                && latest.contains("Journal • committed in memory")
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "host receipt never reached the HUD: {text}"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 }
 
@@ -1752,10 +2384,8 @@ fn apply_auto_pause_to_state(state: &mut SimControlData, reason: &str) {
 }
 
 fn submit_simulation_command(submitter: &CommandSubmitter, command: SimulationCommand) -> bool {
-    // The identity is logged rather than returned: every caller here gates on a
-    // yes/no, and widening them all is the receipt-plumbing slice, not this one.
-    // Naming it in the log is still strictly more than the bool carried before
-    // (bd-k7nq).
+    // The wrapped native submitter retains the exact identity for HUD receipt
+    // observation. This boolean only gates the local optimistic playback edit.
     match (submitter.submit)(ControlCommand::UpdateSimulation(command)) {
         Some(command_id) => {
             debug!(%command_id, "simulation control command enqueued");
@@ -2020,6 +2650,7 @@ struct HudElements {
     follow: Entity,
     camera: Entity,
     playback: Entity,
+    command_feedback: Entity,
     fps: Entity,
     world: Entity,
     tonemap: Entity,
@@ -2780,7 +3411,10 @@ impl HudEvent {
 
 #[derive(Clone, PartialEq)]
 struct AgentVisual {
+    /// Transient live-control handle.
     id: AgentId,
+    /// Stable scientific identity used for presentation continuity.
+    uid: AgentUid,
     position: Vec2,
     velocity: Vec2,
     heading: f32,
@@ -2860,6 +3494,7 @@ impl WorldSnapshot {
             let visual = snapshot.agent_visuals(index)?;
             agents.push(AgentVisual {
                 id: AgentId::from(slotmap::KeyData::from_ffi(agent.id)),
+                uid: agent.uid,
                 position: Vec2::from_array(agent.position),
                 velocity: Vec2::from_array(agent.velocity),
                 heading: agent.heading,
@@ -3047,6 +3682,7 @@ impl WorldSnapshot {
                 });
             agents.push(AgentVisual {
                 id: agent_id,
+                uid: world.agent_uid(agent_id)?,
                 position: Vec2::new(positions[idx].x, positions[idx].y),
                 velocity: Vec2::new(velocities[idx].vx, velocities[idx].vy),
                 heading: headings[idx],
@@ -3306,6 +3942,7 @@ fn setup_scene(
     let mut follow = Entity::PLACEHOLDER;
     let mut camera = Entity::PLACEHOLDER;
     let mut playback = Entity::PLACEHOLDER;
+    let mut command_feedback = Entity::PLACEHOLDER;
     let mut fps = Entity::PLACEHOLDER;
     let mut world = Entity::PLACEHOLDER;
     let mut tonemap = Entity::PLACEHOLDER;
@@ -3356,6 +3993,17 @@ fn setup_scene(
                 Text::new("Playback: --"),
                 secondary_font.clone(),
                 TextColor(secondary_text_color),
+            ))
+            .id();
+        command_feedback = parent
+            .spawn((
+                Text::new("Commands: no requests"),
+                secondary_font.clone(),
+                TextColor(secondary_text_color),
+                Node {
+                    max_width: Val::Px(760.0),
+                    ..default()
+                },
             ))
             .id();
         fps = parent
@@ -3618,6 +4266,7 @@ fn setup_scene(
         follow,
         camera,
         playback,
+        command_feedback,
         fps,
         world,
         tonemap,
@@ -3766,6 +4415,7 @@ fn update_hud(
     hud: Option<Res<HudElements>>,
     time: Res<Time>,
     controls: Res<SimulationControl>,
+    command_feedback: Option<Res<NativeCommandFeedback>>,
     tonemap_state: Res<TonemappingState>,
     accessibility: Res<AccessibilityState>,
     mut texts: Query<&mut Text>,
@@ -3913,6 +4563,15 @@ fn update_hud(
             }
             set_hud_text_if_changed(&mut text, message);
         }
+        if let Ok(mut text) = texts.get_mut(hud_elements.command_feedback) {
+            if let Some(feedback) = &command_feedback {
+                if let Some(message) = feedback.text() {
+                    **text = message;
+                }
+            } else {
+                **text = "Commands: feedback unavailable".to_owned();
+            }
+        }
         if let Ok(mut text) = texts.get_mut(hud_elements.fps) {
             let delta_seconds = time.delta_secs();
             let fps = if delta_seconds > f32::EPSILON {
@@ -4025,6 +4684,7 @@ mod hud_inspector_tests {
     fn sample_agent_visual_for_inspector() -> AgentVisual {
         AgentVisual {
             id: AgentId::null(),
+            uid: AgentUid(1),
             position: Vec2::new(10.0, 20.0),
             velocity: Vec2::ZERO,
             heading: 0.0,
@@ -7054,7 +7714,7 @@ fn handle_selection_input(
     for agent in &snapshot.agents {
         let display = registry
             .as_ref()
-            .and_then(|registry| registry.records.get(&agent.id))
+            .and_then(|registry| registry.records.get(&agent.uid))
             .and_then(|record| display_poses.get(record.root).ok());
         let position = displayed_agent_position(agent.position, display, world_size);
         let height = display.map_or_else(
@@ -8932,6 +9592,7 @@ mod terrain_tests {
     fn sample_agent_visual() -> AgentVisual {
         AgentVisual {
             id: AgentId::from(KeyData::from_ffi(1)),
+            uid: AgentUid(1),
             position: Vec2::new(50.0, 50.0),
             velocity: Vec2::ZERO,
             heading: 0.75,
@@ -9029,6 +9690,156 @@ mod terrain_tests {
             history: HudHistory::default(),
             brain: BrainOverlay::default(),
         }
+    }
+
+    fn presentation_test_app() -> App {
+        let mut app = App::new();
+        let mut time = Time::<()>::default();
+        time.advance_by(Duration::from_secs_f32(1.0 / 60.0));
+        let mut images = Assets::<Image>::default();
+        app.insert_resource(ReflectionProbeAssets::fallback(&mut images))
+            .insert_resource(images)
+            .insert_resource(time)
+            .init_resource::<SnapshotState>()
+            .init_resource::<AgentRegistry>()
+            .init_resource::<TerrainChunkRegistry>()
+            .init_resource::<AgentMeshes>()
+            .init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<StandardMaterial>>()
+            .init_resource::<AccessibilityState>()
+            .insert_resource(AgentMotionSettings { enabled: true });
+        app
+    }
+
+    #[test]
+    fn paused_snapshots_settle_native_poses_and_single_steps_without_idle_motion() {
+        let mut app = presentation_test_app();
+        let (publisher, inbox) = SnapshotInbox::pair();
+        app.insert_non_send_resource(inbox).add_systems(
+            Update,
+            (
+                poll_snapshots,
+                sync_world,
+                smooth_agent_poses,
+                smooth_spike_poses,
+                animate_idle_bodies,
+            )
+                .chain(),
+        );
+        let mut snapshot = sample_world_snapshot();
+        snapshot.world_size = Vec2::splat(1000.0);
+        snapshot.agents.push(sample_agent_visual());
+        assert!(publisher.publish(snapshot.clone()));
+        app.update();
+        let record = &app.world().resource::<AgentRegistry>().records[&AgentUid(1)];
+        let (root, spike, body) = (record.root, record.spike.entity, record.body.entity);
+
+        snapshot.revision += 1;
+        snapshot.tick += 1;
+        snapshot.agents[0].position.x += 100.0;
+        snapshot.agents[0].heading += 0.5;
+        snapshot.agents[0].spike_length += 10.0;
+        assert!(publisher.publish(snapshot.clone()));
+        app.update();
+        let root_target = app.world().entity(root).get::<AgentPoseTarget>().unwrap();
+        assert_ne!(
+            app.world()
+                .entity(root)
+                .get::<Transform>()
+                .unwrap()
+                .translation,
+            root_target.translation
+        );
+        let spike_target = app.world().entity(spike).get::<SpikePoseTarget>().unwrap();
+        assert_ne!(
+            *app.world().entity(spike).get::<Transform>().unwrap(),
+            spike_target.transform
+        );
+
+        // Pause arrives as a distinct publication at the same science tick.
+        // A paused single step then replaces the exact target without easing.
+        snapshot.paused = true;
+        for step in 0..2 {
+            snapshot.revision += 1;
+            snapshot.tick += step;
+            snapshot.agents[0].position.y += 30.0 * step as f32;
+            snapshot.agents[0].spike_length += 3.0 * step as f32;
+            assert!(publisher.publish(snapshot.clone()));
+            app.update();
+            assert!(
+                app.world().resource::<AgentMotionSettings>().enabled,
+                "pause must not silently enable the reduced-motion camera policy"
+            );
+            let root_target = app.world().entity(root).get::<AgentPoseTarget>().unwrap();
+            let root_pose = *app.world().entity(root).get::<Transform>().unwrap();
+            assert_eq!(root_pose.translation, root_target.translation);
+            assert_eq!(root_pose.rotation, root_target.rotation);
+            let spike_pose = *app.world().entity(spike).get::<Transform>().unwrap();
+            assert_eq!(
+                spike_pose,
+                app.world()
+                    .entity(spike)
+                    .get::<SpikePoseTarget>()
+                    .unwrap()
+                    .transform
+            );
+            let body_pose = *app.world().entity(body).get::<Transform>().unwrap();
+            assert_eq!(
+                body_pose,
+                app.world()
+                    .entity(body)
+                    .get::<IdleBodyTarget>()
+                    .unwrap()
+                    .transform
+            );
+            for delay in [
+                Duration::from_millis(17),
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+            ] {
+                app.world_mut().resource_mut::<Time>().advance_by(delay);
+                app.update();
+                for (entity, pose) in [(root, root_pose), (spike, spike_pose), (body, body_pose)] {
+                    assert_eq!(
+                        *app.world().entity(entity).get::<Transform>().unwrap(),
+                        pose
+                    );
+                }
+                assert!(
+                    app.world()
+                        .resource::<SnapshotState>()
+                        .latest
+                        .as_ref()
+                        .unwrap()
+                        .same_render_content(&snapshot)
+                );
+            }
+        }
+
+        snapshot.revision += 1;
+        snapshot.tick += 1;
+        snapshot.paused = false;
+        snapshot.agents[0].position.x += 80.0;
+        snapshot.agents[0].spike_length += 5.0;
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(Duration::from_secs_f32(1.0 / 60.0));
+        assert!(publisher.publish(snapshot));
+        app.update();
+        let root_target = app.world().entity(root).get::<AgentPoseTarget>().unwrap();
+        assert_ne!(
+            app.world()
+                .entity(root)
+                .get::<Transform>()
+                .unwrap()
+                .translation,
+            root_target.translation
+        );
+        let spike_target = app.world().entity(spike).get::<SpikePoseTarget>().unwrap();
+        assert_ne!(
+            *app.world().entity(spike).get::<Transform>().unwrap(),
+            spike_target.transform
+        );
     }
 
     #[test]
@@ -11233,7 +12044,7 @@ fn apply_agent_visuals(
     commands.entity(record.body.entity).insert(IdleBodyTarget {
         transform: body_transform,
         // Stable, distributed phases keep agents from breathing in lockstep.
-        phase: (agent.id.data().as_ffi().wrapping_mul(2_654_435_761) % 1024) as f32
+        phase: (agent.uid.0.wrapping_mul(2_654_435_761) % 1024) as f32
             * (std::f32::consts::TAU / 1024.0),
     });
     update_part_colors(materials, &record.body, body_color, body_emissive);
@@ -11615,20 +12426,20 @@ fn sync_agents(
     materials: &mut Assets<StandardMaterial>,
     palette: ColorPaletteMode,
 ) {
-    let mut seen: HashSet<AgentId> = HashSet::with_capacity(snapshot.agents.len());
+    let mut seen: HashSet<AgentUid> = HashSet::with_capacity(snapshot.agents.len());
     for agent in &snapshot.agents {
-        seen.insert(agent.id);
-        if let Some(record) = registry.records.get_mut(&agent.id) {
+        seen.insert(agent.uid);
+        if let Some(record) = registry.records.get_mut(&agent.uid) {
             update_agent_entity(
                 record, agent, snapshot, commands, materials, meshes, palette,
             );
         } else {
             let record = spawn_agent_entity(agent, snapshot, commands, meshes, materials, palette);
-            registry.records.insert(agent.id, record);
+            registry.records.insert(agent.uid, record);
         }
     }
 
-    let stale: Vec<AgentId> = registry
+    let stale: Vec<AgentUid> = registry
         .records
         .keys()
         .copied()
@@ -13416,6 +14227,7 @@ mod tests {
             follow: spawn_label(&mut app),
             camera: spawn_label(&mut app),
             playback: spawn_label(&mut app),
+            command_feedback: spawn_label(&mut app),
             fps: spawn_label(&mut app),
             world: spawn_label(&mut app),
             tonemap: spawn_label(&mut app),
@@ -13747,9 +14559,11 @@ mod tests {
     }
 
     #[test]
-    fn agent_pose_discontinuities_snap_and_picking_uses_displayed_pose() {
+    fn agent_pose_wraps_smoothly_but_rewinds_snap_and_picking_uses_displayed_pose() {
         let mut app = App::new();
-        app.insert_resource(Time::<()>::default());
+        let mut time = Time::<()>::default();
+        time.advance_by(Duration::from_secs_f32(1.0 / 60.0));
+        app.insert_resource(time);
         app.insert_resource(SnapshotState {
             world_size: Vec2::splat(1000.0),
             ..Default::default()
@@ -13778,13 +14592,24 @@ mod tests {
             ))
             .id();
         app.update();
+        let seam_pose = app
+            .world()
+            .entity(entity)
+            .get::<Transform>()
+            .unwrap()
+            .translation;
+        assert!(
+            seam_pose.x > 490.0 && seam_pose.x < 500.0,
+            "seam crossing should ease along the short +20-unit toroidal path, got {seam_pose:?}"
+        );
+        assert!(
+            (seam_pose.x - target.translation.x).abs() > 900.0,
+            "the first eased frame must not snap directly to the wrapped target"
+        );
         assert_eq!(
-            app.world()
-                .entity(entity)
-                .get::<Transform>()
-                .unwrap()
-                .translation,
-            target.translation
+            smooth_toroidal_axis(499.0, -499.0, 1000.0, 0.75),
+            -499.5,
+            "crossing the centered boundary wraps only after following the short path"
         );
         let rewind = AgentPoseTarget {
             translation: Vec3::ZERO,
@@ -14780,7 +15605,7 @@ mod tests {
         let mut world = WorldState::new(ScriptBotsConfig::default())?;
         world.try_spawn_agent(scriptbots_core::AgentData::default())?;
         let snapshot = WorldSnapshot::from_world(&world).expect("visible diagnostic agent");
-        let id = snapshot.agents[0].id;
+        let uid = snapshot.agents[0].uid;
         let mut app = App::new();
         app.insert_resource(SnapshotState {
             latest: Some(snapshot),
@@ -14817,7 +15642,7 @@ mod tests {
             snapshot.revision += 1;
             snapshot.agent_radius = radius;
             app.update();
-            let record = &app.world().resource::<AgentRegistry>().records[&id];
+            let record = &app.world().resource::<AgentRegistry>().records[&uid];
             let entity = app.world().entity(record.body.entity);
             assert_eq!(entity.get::<Mesh3d>().unwrap().0, body);
             let transform = entity.get::<Transform>().unwrap();
@@ -14880,7 +15705,7 @@ mod tests {
             snapshot.agents[0].boost = strength;
             app.update();
 
-            let record = &app.world().resource::<AgentRegistry>().records[&id];
+            let record = &app.world().resource::<AgentRegistry>().records[&uid];
             let entity = app.world().entity(record.boost.entity);
             assert_eq!(entity.get::<Mesh3d>().unwrap().0, quad);
             assert_eq!(
@@ -14915,7 +15740,7 @@ mod tests {
         snapshot.revision += 1;
         snapshot.agents[0].boost = 0.0;
         app.update();
-        let boost = app.world().resource::<AgentRegistry>().records[&id]
+        let boost = app.world().resource::<AgentRegistry>().records[&uid]
             .boost
             .entity;
         assert_eq!(
@@ -14989,7 +15814,7 @@ mod tests {
         let snapshot = state.latest.as_ref().unwrap();
         assert!(!snapshot.agents.is_empty());
         for agent in &snapshot.agents {
-            let root = app.world().resource::<AgentRegistry>().records[&agent.id].root;
+            let root = app.world().resource::<AgentRegistry>().records[&agent.uid].root;
             let transform = app.world().entity(root).get::<Transform>().unwrap();
             assert_eq!(transform.translation, agent_translation(snapshot, agent));
             assert_eq!(transform.rotation, agent_surface_pose(snapshot, agent).1);
@@ -15020,7 +15845,7 @@ mod tests {
         );
         let previous_spike = {
             let agent = &state.latest.as_ref().unwrap().agents[0];
-            let spike = app.world().resource::<AgentRegistry>().records[&agent.id]
+            let spike = app.world().resource::<AgentRegistry>().records[&agent.uid]
                 .spike
                 .entity;
             *app.world().entity(spike).get::<Transform>().unwrap()
@@ -15041,7 +15866,7 @@ mod tests {
             .as_ref()
             .unwrap();
         let agent = &snapshot.agents[0];
-        let root = app.world().resource::<AgentRegistry>().records[&agent.id].root;
+        let root = app.world().resource::<AgentRegistry>().records[&agent.uid].root;
         let entity = app.world().entity(root);
         let expected = agent_translation(snapshot, agent);
         assert_eq!(entity.get::<Transform>().unwrap().translation, expected);
@@ -15050,7 +15875,7 @@ mod tests {
             expected,
             "shared sync must publish the exact new pose even without advancing the native display state"
         );
-        let spike = app.world().resource::<AgentRegistry>().records[&agent.id]
+        let spike = app.world().resource::<AgentRegistry>().records[&agent.uid]
             .spike
             .entity;
         let entity = app.world().entity(spike);
@@ -15077,7 +15902,7 @@ mod tests {
             entity.get::<SpikeDisplayPose>().is_none(),
             "capture does not install native easing"
         );
-        let body = app.world().resource::<AgentRegistry>().records[&agent.id]
+        let body = app.world().resource::<AgentRegistry>().records[&agent.uid]
             .body
             .entity;
         let body = app.world().entity(body);
@@ -15124,6 +15949,38 @@ mod tests {
             app.world().resource::<SnapshotState>().selected_lead,
             expected_lead * 0.5,
             "a stationary selected peer halves the group lead"
+        );
+
+        // AgentId is only a generational arena handle. Reusing that handle for
+        // a different stable UID must create fresh presentation state rather
+        // than continuing the departed agent's interpolation history.
+        let (recycled_handle, old_uid, old_root) = {
+            let state = app.world().resource::<SnapshotState>();
+            let agent = &state.latest.as_ref().unwrap().agents[0];
+            (
+                agent.id,
+                agent.uid,
+                app.world().resource::<AgentRegistry>().records[&agent.uid].root,
+            )
+        };
+        let replacement_uid = AgentUid(old_uid.0.saturating_add(1_000_000));
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            let snapshot = state.latest.as_mut().unwrap();
+            snapshot.revision += 1;
+            snapshot.agents[0].uid = replacement_uid;
+            assert_eq!(snapshot.agents[0].id, recycled_handle);
+        }
+        app.update();
+        let registry = app.world().resource::<AgentRegistry>();
+        assert!(
+            !registry.records.contains_key(&old_uid),
+            "departed stable identity must be removed even when its arena handle is reused"
+        );
+        let new_root = registry.records[&replacement_uid].root;
+        assert_ne!(
+            new_root, old_root,
+            "a replacement stable identity must start with fresh presentation state"
         );
 
         Ok(())
