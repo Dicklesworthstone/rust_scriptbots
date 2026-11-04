@@ -1935,6 +1935,9 @@ struct HudElements {
     brain: Entity,
 }
 
+#[derive(Component)]
+struct HudControlDock;
+
 /// The sun light whose shadow state follows the resolved quality tier.
 ///
 /// Marked so [`apply_tier_to_sun_light`] can re-apply on a runtime tier change
@@ -3173,7 +3176,7 @@ fn setup_scene(
                 top: Val::Px(12.0),
                 left: Val::Px(12.0),
                 width: Val::Px(560.0),
-                max_width: Val::Percent(90.0),
+                max_width: Val::Percent(45.0),
                 padding: UiRect::all(Val::Px(10.0)),
                 flex_direction: FlexDirection::Column,
                 row_gap: Val::Px(4.0),
@@ -3299,7 +3302,32 @@ fn setup_scene(
                 TextColor(secondary_text_color),
             ))
             .id();
+    });
 
+    // Keep controls in a stable place as event and inspector text changes.
+    // The separate interactive root also prevents clicks and scrolling in the
+    // dock's padding from reaching the world camera or selection handler.
+    let controls_root = commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                bottom: Val::Px(12.0),
+                right: Val::Px(12.0),
+                width: Val::Px(560.0),
+                max_width: Val::Percent(45.0),
+                padding: UiRect::all(Val::Px(10.0)),
+                flex_direction: FlexDirection::Column,
+                row_gap: Val::Px(4.0),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.07, 0.11, 0.18, 0.82)),
+            Interaction::default(),
+            FocusPolicy::Pass,
+            HudControlDock,
+        ))
+        .id();
+
+    commands.entity(controls_root).with_children(|parent| {
         let playback_buttons = [
             (PlaybackAction::Play, "Run (Space)"),
             (PlaybackAction::Pause, "Pause"),
@@ -5058,6 +5086,45 @@ mod adaptive_governor_tests {
         assert!(
             matches!(hud_camera.clear_color, ClearColorConfig::None),
             "HUD camera must not clear the already rendered world"
+        );
+    }
+
+    #[test]
+    fn control_dock_keeps_all_actions_in_an_interactive_fixed_position() {
+        let mut app = App::new();
+        app.insert_resource(Assets::<Mesh>::default())
+            .insert_resource(Assets::<Image>::default())
+            .insert_resource(auto_launch(RenderQuality::High))
+            .add_systems(Update, setup_scene);
+        app.update();
+
+        let world = app.world_mut();
+        let (node, interaction) = world
+            .query_filtered::<(&Node, &Interaction), With<HudControlDock>>()
+            .single(world)
+            .expect("one interactive control dock");
+        assert_eq!(node.position_type, PositionType::Absolute);
+        assert_eq!(node.bottom, Val::Px(12.0));
+        assert_eq!(node.right, Val::Px(12.0));
+        assert_eq!(*interaction, Interaction::None);
+        assert_eq!(world.query::<&PlaybackButton>().iter(world).count(), 5);
+        assert_eq!(world.query::<&FollowButton>().iter(world).count(), 3);
+        assert_eq!(
+            world.query::<&ClearSelectionButton>().iter(world).count(),
+            1
+        );
+        assert_eq!(world.query::<&TonemapButton>().iter(world).count(), 3);
+        assert_eq!(
+            world
+                .query::<&AutoExposureToggleButton>()
+                .iter(world)
+                .count(),
+            1
+        );
+        assert_eq!(world.query::<&QualityTierButton>().iter(world).count(), 1);
+        assert_eq!(
+            world.query::<&ExposureAdjustButton>().iter(world).count(),
+            2
         );
     }
 
