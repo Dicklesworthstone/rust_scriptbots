@@ -26554,6 +26554,15 @@ fn storage_worker(
                             storage.abandon_after_error();
                             return Some(worker_error);
                         }
+                        // Journal completion can flush ordinary Persist batches that were
+                        // buffered before the owner acquired its journal. Reconcile that
+                        // finalized prefix before publishing this journal's newer analytics;
+                        // otherwise its permits stay charged and a later flush republishes
+                        // the older tick. A control-only journal leaves unapplied permits held.
+                        if !state.pending_analytics.is_empty() {
+                            publish_committed_state(&mut state, &analytics);
+                        }
+                        release_finalized_permits(&mut state);
                         if let Some(pending) = pending {
                             state.admitted_tick = Some(
                                 state
@@ -29679,6 +29688,194 @@ mod tests {
         shared
             .cache_terminal(third, &JournalReceiptState::Durable)
             .expect("acknowledged terminal prefix is reclaimed before the capacity check");
+    }
+
+    fn assert_journal_completion_reconciles_buffered_persistence(
+        pipeline: &mut StoragePipeline,
+        guarantee: PersistenceGuarantee,
+    ) -> ShutdownReceipt {
+        let analytics = pipeline.analytics_provider();
+        let mut world = journal_fault_world_with_interval(1);
+        let mut persistence = world
+            .bind_persistence(Box::new(pipeline.sink()))
+            .expect("bind the ordinary storage sink before ownership transfer");
+        persistence
+            .step(&mut world)
+            .expect("ordinary science tick one");
+        pipeline
+            .checkpoint_writer()
+            .retention_usage()
+            .expect("non-flushing worker barrier after ordinary admission");
+        let buffered_bytes = pipeline.inflight_bytes();
+        assert!(
+            buffered_bytes > 0,
+            "ordinary data must still hold its permit"
+        );
+        let admitted = PersistenceWatermarks {
+            admitted: Some(PersistenceBatchId::new(1).expect("first batch identity")),
+            ..PersistenceWatermarks::default()
+        };
+        assert_eq!(analytics.snapshot().watermarks, admitted);
+        assert_eq!(analytics.snapshot().committed_tick, None);
+
+        let session_id = HostSessionId::new(0x407);
+        let journal = pipeline
+            .journal_port(session_id, StorageJournalOptions::default())
+            .expect("attach the actual storage journal to the existing world");
+        let mut core = HostCore::with_journal_and_persistence(
+            session_id,
+            world,
+            journal_fault_host_options(),
+            Box::new(journal),
+            persistence,
+        )
+        .expect("transfer the same world and its one-shot persistence session");
+        let mut frontend = NullFrontend::new(core.local_port(), session_id.get() ^ 0xfeed);
+        let terminal_journal = match guarantee {
+            PersistenceGuarantee::Durable => JournalState::Durable,
+            PersistenceGuarantee::CommittedVolatile => JournalState::CommittedVolatile,
+        };
+        let second = PersistenceBatchId::new(2).expect("second batch identity");
+        let finalized = PersistenceWatermarks {
+            admitted: Some(second),
+            applied: Some(second),
+            durable: (guarantee == PersistenceGuarantee::Durable).then_some(second),
+        };
+        let mut next_nanos = 0;
+        for (command, tick) in [(HostCommand::Pause, 1), (HostCommand::Step, 2)] {
+            let submitted =
+                submit_fault_command(&mut frontend, &mut core, command, &mut next_nanos);
+            let status = drive_journal_command_to_terminal(
+                &mut frontend,
+                &mut core,
+                submitted.command_id(),
+                &mut next_nanos,
+            );
+            assert_eq!(status.journal(), &terminal_journal);
+            assert_eq!(core.world().tick().0, tick);
+            pipeline
+                .checkpoint_writer()
+                .retention_usage()
+                .expect("observe the completed journal without forcing an ordinary flush");
+            let snapshot = analytics.snapshot();
+            if tick == 1 {
+                assert_eq!(pipeline.inflight_bytes(), buffered_bytes);
+                assert_eq!(snapshot.watermarks, admitted);
+                assert_eq!(snapshot.committed_tick, None);
+            } else {
+                assert_eq!(
+                    pipeline.inflight_bytes(),
+                    0,
+                    "journal finalization releases ordinary bytes"
+                );
+                assert_eq!(snapshot.watermarks, finalized);
+                assert_eq!(snapshot.committed_tick, Some(2));
+            }
+        }
+
+        assert_mixed_persistence_flush_and_shutdown(
+            pipeline, core, frontend, guarantee, finalized, next_nanos,
+        )
+    }
+
+    fn assert_mixed_persistence_flush_and_shutdown(
+        pipeline: &mut StoragePipeline,
+        mut core: HostCore,
+        mut frontend: NullFrontend<LocalHostPort>,
+        guarantee: PersistenceGuarantee,
+        finalized: PersistenceWatermarks,
+        mut next_nanos: u64,
+    ) -> ShutdownReceipt {
+        let analytics = pipeline.analytics_provider();
+        let newest = analytics.snapshot();
+        let flush = pipeline
+            .flush_and_wait()
+            .expect("flush after journal completion");
+        assert_eq!(
+            flush.committed_tick,
+            Some(2),
+            "an older pending observation must not reappear"
+        );
+        assert_eq!(flush.watermarks, finalized);
+        assert_eq!(analytics.snapshot().committed_tick, Some(2));
+        assert!(Arc::ptr_eq(
+            &analytics.snapshot().readings,
+            &newest.readings
+        ));
+
+        let shutdown = submit_fault_command(
+            &mut frontend,
+            &mut core,
+            HostCommand::Shutdown,
+            &mut next_nanos,
+        );
+        let status = drive_journal_command_to_terminal(
+            &mut frontend,
+            &mut core,
+            shutdown.command_id(),
+            &mut next_nanos,
+        );
+        assert_eq!(
+            status.journal(),
+            &match guarantee {
+                PersistenceGuarantee::Durable => JournalState::Durable,
+                PersistenceGuarantee::CommittedVolatile => JournalState::CommittedVolatile,
+            }
+        );
+        assert_eq!(core.world().tick().0, 2);
+        drop(frontend);
+        drop(core);
+        let receipt = pipeline.shutdown().expect("ordered storage shutdown");
+        assert_eq!(receipt.guarantee, guarantee);
+        assert_eq!(receipt.committed_tick, Some(2));
+        assert_eq!(receipt.watermarks, finalized);
+        assert_eq!(analytics.snapshot().committed_tick, Some(2));
+        assert!(Arc::ptr_eq(
+            &analytics.snapshot().readings,
+            &newest.readings
+        ));
+        assert!(analytics.snapshot().stopped);
+        receipt
+    }
+
+    #[test]
+    fn journal_completion_reconciles_buffered_file_persistence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("journal-buffered-file-reconciliation");
+        let path = path.to_str().expect("UTF-8 test path");
+        let mut pipeline = StoragePipeline::create_unattributed_file_with_thresholds(
+            path,
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+        )?;
+        let run_id = pipeline.run_id();
+        let receipt = assert_journal_completion_reconciles_buffered_persistence(
+            &mut pipeline,
+            PersistenceGuarantee::Durable,
+        );
+        let reader = StorageReader::open_finished_for_run(path, run_id)?;
+        assert_eq!(reader.summary_ticks()?, vec![1, 2]);
+        assert_eq!(reader.persistence_watermarks()?, receipt.watermarks);
+        assert_eq!(reader.run_ledger_summary()?.tick_count, 2);
+        reader.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn journal_completion_reconciles_buffered_volatile_persistence() {
+        let mut pipeline = StoragePipeline::unattributed_memory_with_thresholds(
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+        )
+        .expect("real volatile storage worker");
+        assert_journal_completion_reconciles_buffered_persistence(
+            &mut pipeline,
+            PersistenceGuarantee::CommittedVolatile,
+        );
     }
 
     #[test]
