@@ -1052,6 +1052,31 @@ order by kind;
 
 JSON replay payloads are validated by ScriptBots and stored as ordinary `TEXT`. Integer flags are decoded at the storage boundary into Rust booleans.
 
+### Offline narrative timelines
+
+Use the finished database printed by the application to read the actual emergent-event
+explanations, including their stable identities, subjects, detection windows and numeric
+evidence:
+
+```bash
+sb-analyze runs/example.sqlite run narrative-timeline --params limit=100 --json narrative.json --md narrative.md
+sb-analyze runs/example.sqlite run replay-timeline --params limit=100 --json replay.json
+```
+
+`narrative-timeline` uses report schema **2** and reads the typed `run_events` stream.
+Each JSON event contains `identity` and the complete `record`; `run_id` identifies the
+selected run. Its newest bounded page is returned in canonical chronological order.
+`event_counts_scope: "returned_page"` makes the kind-count coverage explicit, and
+`truncated_to` is set only after an additional stored event was observed. The default
+limit is 1,024; the maximum is 4,095, leaving one SQL row for that truncation check.
+An empty stream and an explicitly requested zero-length page are reported separately.
+
+The former low-level replay payload remains available through `replay-timeline` at
+schema **1**, including whole-run replay-kind counts and individual replay records.
+This is the schema migration for the narrative timeline; unrelated reports retain
+their existing versions. Both reports use the create-free finished-reader lease.
+For a multi-run database, select its canonical ID with `--run-id`.
+
 ### Pipeline and maintenance
 
 - A persistence transaction either commits the entire accepted batch or rolls it back; a failed statement may not leave the connection in an active transaction.

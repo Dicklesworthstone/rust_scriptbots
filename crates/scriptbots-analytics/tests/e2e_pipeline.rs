@@ -34,6 +34,7 @@ use serde::{Deserialize, Serialize};
 const REQUIRED_REPORT_NAMES: &[&str] = &[
     "run-summary",
     "narrative-timeline",
+    "replay-timeline",
     "metric-summary",
     "metric-changepoints",
     "compare-runs",
@@ -495,17 +496,31 @@ fn test_analytics_e2e_full_pipeline_and_invariants() {
         status: "pass".to_string(),
     });
 
-    // Invariant 2: narrative-timeline carries interaction replay events
+    // Invariant 2: both independently persisted streams reach their own timeline.
     let timeline = &report_machines["narrative-timeline"];
     let timeline_events = timeline["events"].as_array().expect("timeline events");
+    assert_eq!(timeline_events.len(), 2, "both planted narrative records");
+    assert_eq!(timeline_events[0]["record"]["tick"], 100);
+    assert_eq!(timeline_events[0]["record"]["kind"], "energy_collapse");
+    assert_eq!(timeline_events[1]["record"]["tick"], 100);
+    assert_eq!(timeline_events[1]["record"]["kind"], "population_crash");
+    invariants.push(InvariantRecord {
+        invariant: "narrative_timeline_typed_records_present".to_string(),
+        expected: serde_json::json!({ "events_count": 2 }),
+        observed: serde_json::json!({ "events_count": timeline_events.len() }),
+        status: "pass".to_string(),
+    });
+    let replay_events = report_machines["replay-timeline"]["events"]
+        .as_array()
+        .expect("replay events");
     assert!(
-        !timeline_events.is_empty(),
-        "narrative-timeline must contain replay events"
+        !replay_events.is_empty(),
+        "replay-timeline must contain interaction replay events"
     );
     invariants.push(InvariantRecord {
-        invariant: "narrative_timeline_replay_events_present".to_string(),
+        invariant: "replay_timeline_replay_events_present".to_string(),
         expected: serde_json::json!({ "events_non_empty": true }),
-        observed: serde_json::json!({ "events_count": timeline_events.len() }),
+        observed: serde_json::json!({ "events_count": replay_events.len() }),
         status: "pass".to_string(),
     });
 

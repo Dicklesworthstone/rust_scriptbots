@@ -11,10 +11,13 @@
 use std::process::Command;
 
 use scriptbots_analytics::{
-    AnalyticsError, REPORT_SCHEMA_VERSION, ReaderCtx, Registry, ReportParams,
+    AnalyticsError, NARRATIVE_TIMELINE_SCHEMA_VERSION, REPORT_SCHEMA_VERSION, ReaderCtx, Registry,
+    ReportParams,
 };
+use scriptbots_core::narrative::{EventKind, EventRecord, SubjectRef};
 use scriptbots_core::{
-    MetricSample, PersistenceBatch, ReplayEvent, ReplayEventKind, ReplayRngScope, Tick, TickSummary,
+    AgentUid, MetricSample, PersistenceBatch, ReplayEvent, ReplayEventKind, ReplayRngScope, Tick,
+    TickSummary,
 };
 use scriptbots_storage::Storage;
 use serde_json::json;
@@ -53,10 +56,31 @@ fn batch(tick: u64, agent_count: usize, energy: f32) -> PersistenceBatch {
 
 /// Builds a three-tick run database and returns its path.
 fn synth_db(dir: &tempfile::TempDir) -> String {
-    synth_db_with_replay(dir, false)
+    synth_db_with_events(dir, false, false)
 }
 
-fn synth_db_with_replay(dir: &tempfile::TempDir, include_replay: bool) -> String {
+fn narrative_event(tick: u64, kind: EventKind, metric: &str) -> EventRecord {
+    EventRecord {
+        schema_version: 1,
+        tick: Tick(tick),
+        kind,
+        severity: 0.75,
+        magnitude: 20.0,
+        window: (0, tick),
+        metric: metric.to_owned(),
+        before: 10.0,
+        after: 30.0,
+        score: 2.5,
+        subject: Some(SubjectRef::Agent(AgentUid(9_007_199_254_740_993))),
+        human_text: "recovered | after <rain>\nagain".to_owned(),
+    }
+}
+
+fn synth_db_with_events(
+    dir: &tempfile::TempDir,
+    include_replay: bool,
+    include_narrative: bool,
+) -> String {
     let path = dir.path().join("run.sqlite").display().to_string();
     let mut storage = Storage::create_unattributed_file(&path).expect("create synth run db");
     for (tick, pop, energy) in [(1u64, 10usize, 100.0f32), (2, 12, 130.0), (3, 8, 90.0)] {
@@ -85,6 +109,22 @@ fn synth_db_with_replay(dir: &tempfile::TempDir, include_replay: bool) -> String
                     outputs: vec![0.5, -0.25],
                 },
             });
+        }
+        if include_narrative && (tick == 1 || tick == 3) {
+            tick_batch.narrative_events.push(narrative_event(
+                tick,
+                EventKind::PopulationBoom,
+                "population",
+            ));
+        }
+        if include_narrative && tick == 3 {
+            // Persist reverse kind order; the report must use canonical identity
+            // order, not the producer vector order or the replay-event sequence.
+            tick_batch.narrative_events.push(narrative_event(
+                tick,
+                EventKind::EnergyRecovery,
+                "average_energy",
+            ));
         }
         storage.persist(&tick_batch).expect("persist batch");
     }
@@ -157,7 +197,7 @@ fn run_summary_reports_trajectory_and_ledger() {
 }
 
 #[test]
-fn narrative_timeline_handles_empty_stream_and_limit_param() {
+fn replay_timeline_handles_empty_stream_and_limit_param() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = synth_db(&dir);
 
@@ -165,7 +205,7 @@ fn narrative_timeline_handles_empty_stream_and_limit_param() {
     let registry = Registry::builtin();
 
     let out = registry
-        .run("narrative-timeline", &cx, &ReportParams::default())
+        .run("replay-timeline", &cx, &ReportParams::default())
         .expect("timeline");
     assert_eq!(out.schema_version, REPORT_SCHEMA_VERSION);
     assert_eq!(out.row_count, 0);
@@ -179,7 +219,7 @@ fn narrative_timeline_handles_empty_stream_and_limit_param() {
         serde_json::to_value(&out).expect("serialize timeline envelope"),
         json!({
             "schema_version": 1,
-            "report": "narrative-timeline",
+            "report": "replay-timeline",
             "db_path": path,
             "latest_tick": 3,
             "row_count": 0,
@@ -195,10 +235,10 @@ fn narrative_timeline_handles_empty_stream_and_limit_param() {
     // limit param parses; bad param is a typed error, not a panic.
     let params = ReportParams::from_pairs(["limit=5".to_owned()]).expect("params");
     registry
-        .run("narrative-timeline", &cx, &params)
+        .run("replay-timeline", &cx, &params)
         .expect("timeline with limit");
     let bad = ReportParams::from_pairs(["limit=banana".to_owned()])
-        .and_then(|p| registry.run("narrative-timeline", &cx, &p));
+        .and_then(|p| registry.run("replay-timeline", &cx, &p));
     assert!(
         matches!(bad, Err(AnalyticsError::BadParam { .. })),
         "typed error: {bad:?}"
@@ -214,14 +254,14 @@ fn narrative_timeline_handles_empty_stream_and_limit_param() {
 }
 
 #[test]
-fn narrative_timeline_orders_serializes_and_limits_replay_events() {
+fn replay_timeline_orders_serializes_and_limits_replay_events() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let path = synth_db_with_replay(&dir, true);
+    let path = synth_db_with_events(&dir, true, true);
     let cx = ReaderCtx::open(&path).expect("open reader");
     let registry = Registry::builtin();
 
     let out = registry
-        .run("narrative-timeline", &cx, &ReportParams::default())
+        .run("replay-timeline", &cx, &ReportParams::default())
         .expect("full timeline");
     assert_eq!(out.row_count, 2);
     assert_eq!(
@@ -268,7 +308,7 @@ fn narrative_timeline_orders_serializes_and_limits_replay_events() {
 
     let limited = registry
         .run(
-            "narrative-timeline",
+            "replay-timeline",
             &cx,
             &ReportParams::from_pairs(["limit=1".to_owned()]).expect("limit param"),
         )
@@ -280,6 +320,137 @@ fn narrative_timeline_orders_serializes_and_limits_replay_events() {
         "a bounded timeline page must retain the newest event, not the oldest prefix"
     );
     assert_eq!(limited.machine["truncated_to"], 1);
+}
+
+#[test]
+fn narrative_timeline_preserves_complete_typed_evidence_and_canonical_order() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = synth_db_with_events(&dir, true, true);
+    let cx = ReaderCtx::open(&path).expect("open reader");
+    let registry = Registry::builtin();
+    let output = registry
+        .run("narrative-timeline", &cx, &ReportParams::default())
+        .expect("typed narrative timeline");
+    assert_eq!(output.schema_version, NARRATIVE_TIMELINE_SCHEMA_VERSION);
+    assert_eq!(output.row_count, 3, "replay records are a separate stream");
+    assert_eq!(output.machine["run_id"], cx.reader.run_id().to_string());
+    assert_eq!(output.machine["event_counts_scope"], "returned_page");
+    assert_eq!(
+        output.machine["event_counts"],
+        json!([["energy_recovery", 1], ["population_boom", 2]])
+    );
+    let expected = [
+        narrative_event(1, EventKind::PopulationBoom, "population"),
+        narrative_event(3, EventKind::EnergyRecovery, "average_energy"),
+        narrative_event(3, EventKind::PopulationBoom, "population"),
+    ];
+    for (row, record) in output.machine["events"]
+        .as_array()
+        .expect("event array")
+        .iter()
+        .zip(&expected)
+    {
+        assert_eq!(row["record"], serde_json::to_value(record).expect("record"));
+        assert_eq!(
+            row["identity"],
+            json!({
+                "tick": record.tick.0,
+                "kind": record.kind.as_str(),
+                "metric": record.metric,
+                "island": 0
+            })
+        );
+    }
+    assert_eq!(output.machine["truncated_to"], serde_json::Value::Null);
+    assert!(
+        output
+            .human_md
+            .contains("recovered \\| after &lt;rain&gt; again")
+    );
+
+    let limited = registry
+        .run(
+            "narrative-timeline",
+            &cx,
+            &ReportParams::from_pairs(["limit=1".to_owned()]).expect("params"),
+        )
+        .expect("limited narrative");
+    assert_eq!(limited.row_count, 1);
+    assert_eq!(limited.machine["events"][0]["identity"]["tick"], 3);
+    assert_eq!(
+        limited.machine["events"][0]["identity"]["kind"],
+        "population_boom"
+    );
+    assert_eq!(
+        limited.machine["event_counts"],
+        json!([["population_boom", 1]])
+    );
+    assert_eq!(limited.machine["truncated_to"], 1);
+
+    let exact = registry
+        .run(
+            "narrative-timeline",
+            &cx,
+            &ReportParams::from_pairs(["limit=3".to_owned()]).expect("params"),
+        )
+        .expect("exact boundary");
+    assert_eq!(exact.row_count, 3);
+    assert!(exact.machine["truncated_to"].is_null());
+
+    let zero = registry
+        .run(
+            "narrative-timeline",
+            &cx,
+            &ReportParams::from_pairs(["limit=0".to_owned()]).expect("params"),
+        )
+        .expect("zero requested");
+    assert_eq!(zero.row_count, 0);
+    assert_eq!(zero.machine["truncated_to"], 0);
+    assert!(zero.human_md.contains("events are present"));
+}
+
+#[test]
+fn narrative_timeline_distinguishes_empty_evidence_and_rejects_bad_limits() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = synth_db_with_events(&dir, true, false);
+    let cx = ReaderCtx::open(&path).expect("open reader");
+    let registry = Registry::builtin();
+    let output = registry
+        .run("narrative-timeline", &cx, &ReportParams::default())
+        .expect("empty narrative stream");
+    assert_eq!(
+        serde_json::to_value(&output).expect("schema"),
+        json!({
+            "schema_version": 2,
+            "report": "narrative-timeline",
+            "db_path": path,
+            "latest_tick": 3,
+            "row_count": 0,
+            "machine": {
+                "run_id": cx.reader.run_id().to_string(),
+                "event_counts_scope": "returned_page",
+                "event_counts": [],
+                "events": [],
+                "truncated_to": null
+            }
+        })
+    );
+    assert!(output.human_md.contains("No narrative events"));
+    for invalid in [
+        "limit=4096",
+        "limit=18446744073709551615",
+        "limit=banana",
+        "limt=1",
+    ] {
+        let params = ReportParams::from_pairs([invalid.to_owned()]).expect("parameter pair");
+        assert!(
+            matches!(
+                registry.run("narrative-timeline", &cx, &params),
+                Err(AnalyticsError::BadParam { .. })
+            ),
+            "invalid parameter was accepted: {invalid}"
+        );
+    }
 }
 
 #[test]
@@ -348,6 +519,7 @@ fn registry_lists_builtin_reports_with_descriptions() {
         vec![
             "run-summary",
             "narrative-timeline",
+            "replay-timeline",
             "metric-summary",
             "metric-changepoints",
             "compare-runs",

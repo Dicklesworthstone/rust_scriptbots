@@ -27,7 +27,7 @@ use std::time::Instant;
 use scriptbots_core::{AgentUid, Tick};
 use scriptbots_storage::{
     PersistedAgentObservation, PersistedInteraction, PersistedInteractionCapture, PersistedMetric,
-    PersistenceBatchId, StorageError, StorageReader,
+    PersistedRunEvent, PersistenceBatchId, StorageError, StorageReader,
 };
 use serde::Serialize;
 
@@ -96,11 +96,20 @@ pub use lineage::{
     LineageRunReconciliation,
 };
 
-/// Schema version stamped into every machine-readable report payload.
+/// Default schema version for unchanged machine-readable report payloads.
 ///
 /// Bump ONLY with a migration note in the owning Bead/release evidence. Full
 /// envelope goldens assert the value so an accidental schema change is loud.
+/// Reports with a changed payload use their own explicit version, such as
+/// [`NARRATIVE_TIMELINE_SCHEMA_VERSION`], without relabeling unrelated reports.
 pub const REPORT_SCHEMA_VERSION: u32 = 1;
+
+/// Typed narrative timeline schema; v1 exposed low-level replay records instead.
+///
+/// V2 preserves complete narrative identities and records, identifies the selected
+/// run, and explicitly scopes kind counts to the returned page. The original
+/// replay-record shape remains available as the `replay-timeline` report at v1.
+pub const NARRATIVE_TIMELINE_SCHEMA_VERSION: u32 = 2;
 
 /// Maximum metric rows sampled by `metric-summary` in one bounded SQL page.
 ///
@@ -111,11 +120,14 @@ const METRIC_SUMMARY_ROW_LIMIT: usize = 4_096;
 /// Maximum recent tick summaries sampled by `run-summary` in one bounded SQL page.
 const RUN_SUMMARY_TICK_LIMIT: usize = 4_096;
 
-/// Default number of recent replay events rendered by `narrative-timeline`.
+/// Default number of recent events rendered by either timeline report.
 const NARRATIVE_TIMELINE_DEFAULT_LIMIT: usize = 1_024;
 
-/// Hard ceiling for a caller-selected `narrative-timeline` SQL page.
+/// Hard ceiling for a caller-selected replay timeline SQL page.
 const NARRATIVE_TIMELINE_MAX_LIMIT: usize = 4_096;
+
+/// Reserve one row of the bounded SQL page to observe narrative truncation.
+const NARRATIVE_TIMELINE_EVENT_LIMIT: usize = NARRATIVE_TIMELINE_MAX_LIMIT - 1;
 
 /// Stable schema identifier shared by reports and downstream behavior consumers.
 pub const PHENOTYPE_FEATURE_SCHEMA_ID_V1: &str = "scriptbots.phenotype-features.v1";
@@ -1568,6 +1580,7 @@ impl Registry {
             reports: vec![
                 Box::new(RunSummary),
                 Box::new(NarrativeTimeline),
+                Box::new(ReplayTimeline),
                 Box::new(MetricSummary),
                 Box::new(MetricChangepoints),
                 Box::new(RunComparison),
@@ -2677,15 +2690,114 @@ impl Report for RunSummary {
     }
 }
 
-/// `narrative-timeline`: bounded page of the latest events for a finished run.
-///
-/// v1 renders aggregate kind counts plus a newest-first SQL page returned in
-/// chronological order. When the
-/// typed narrative tables land (bd-16g.2.2) and FTS search (bd-16g.2.6),
-/// this report upgrades to the `run_events` stream + BM25 search parameters
-/// WITHOUT changing its registry name; the machine schema will bump
-/// [`REPORT_SCHEMA_VERSION`] per the documented migration policy.
+/// `narrative-timeline`: complete typed explanations in canonical identity order.
 struct NarrativeTimeline;
+
+#[derive(Debug, Serialize)]
+struct NarrativeTimelineMachine {
+    run_id: String,
+    event_counts_scope: &'static str,
+    event_counts: Vec<(String, u64)>,
+    events: Vec<PersistedRunEvent>,
+    truncated_to: Option<usize>,
+}
+
+impl Report for NarrativeTimeline {
+    fn name(&self) -> &'static str {
+        "narrative-timeline"
+    }
+
+    fn description(&self) -> &'static str {
+        "Typed narrative events with canonical identities, subjects, evidence, and explanations"
+    }
+
+    fn run(&self, cx: &ReaderCtx, params: &ReportParams) -> Result<ReportOutput, AnalyticsError> {
+        let limit = timeline_limit(params, NARRATIVE_TIMELINE_EVENT_LIMIT)?;
+        let read_started = Instant::now();
+        let mut events = cx.reader.recent_run_events(limit + 1)?;
+        let truncated_to = (events.len() > limit).then_some(limit);
+        if truncated_to.is_some() {
+            // The reader returns the newest window chronologically, so the
+            // extra look-ahead row is the oldest, not the newest narrative.
+            events.remove(0);
+        }
+        log_report_stage("read", &read_started, events.len());
+
+        let render_started = Instant::now();
+        let mut counts = BTreeMap::new();
+        for event in &events {
+            *counts.entry(event.record().kind.as_str()).or_insert(0_u64) += 1;
+        }
+        let machine = NarrativeTimelineMachine {
+            run_id: cx.reader.run_id().to_string(),
+            event_counts_scope: "returned_page",
+            event_counts: counts
+                .into_iter()
+                .map(|(kind, count)| (kind.to_owned(), count))
+                .collect(),
+            events,
+            truncated_to,
+        };
+        let mut md = String::from("# Narrative timeline\n\n");
+        let _ = writeln!(md, "Run: `{}`\n", machine.run_id);
+        if machine.events.is_empty() {
+            let message = if machine.truncated_to.is_some() {
+                "_Narrative events are present; limit=0 requested an empty page._"
+            } else {
+                "_No narrative events persisted in this run._"
+            };
+            let _ = writeln!(md, "{message}");
+        } else {
+            let _ = writeln!(
+                md,
+                "| tick | island | kind | severity | metric | narrative |"
+            );
+            let _ = writeln!(md, "|---|---|---|---|---|---|");
+            for event in &machine.events {
+                let record = event.record();
+                let _ = writeln!(
+                    md,
+                    "| {} | {} | {} | {:.3} | {} | {} |",
+                    record.tick.0,
+                    event.identity().island().0,
+                    record.kind.as_str(),
+                    record.severity,
+                    timeline_markdown_cell(&record.metric),
+                    timeline_markdown_cell(&record.human_text),
+                );
+            }
+        }
+        if let Some(count) = machine.truncated_to {
+            let _ = writeln!(
+                md,
+                "\n_Showing the newest {count} events; older events are omitted. Kind counts describe this page only._"
+            );
+        }
+        let mut output = base_output(
+            self.name(),
+            cx,
+            machine.events.len(),
+            serde_json::to_value(&machine)?,
+            md,
+        )?;
+        output.schema_version = NARRATIVE_TIMELINE_SCHEMA_VERSION;
+        log_report_stage("render", &render_started, output.row_count);
+        Ok(output)
+    }
+}
+
+fn timeline_markdown_cell(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('\\', "\\\\")
+        .replace('|', "\\|")
+        .replace(['\r', '\n'], " ")
+}
+
+/// `replay-timeline`: bounded low-level replay records and whole-run kind counts.
+struct ReplayTimeline;
 
 #[derive(Debug, Serialize)]
 struct TimelineMachine {
@@ -2701,17 +2813,17 @@ struct TimelineRow {
     event: serde_json::Value,
 }
 
-impl Report for NarrativeTimeline {
+impl Report for ReplayTimeline {
     fn name(&self) -> &'static str {
-        "narrative-timeline"
+        "replay-timeline"
     }
 
     fn description(&self) -> &'static str {
-        "Chronological replay-event timeline (upgrades to typed narrative events when bd-16g.2.2 lands)"
+        "Chronological low-level replay events and whole-run replay-kind counts"
     }
 
     fn run(&self, cx: &ReaderCtx, params: &ReportParams) -> Result<ReportOutput, AnalyticsError> {
-        let limit = narrative_timeline_limit(params)?;
+        let limit = timeline_limit(params, NARRATIVE_TIMELINE_MAX_LIMIT)?;
         let read_started = Instant::now();
         let counts = cx.reader.replay_event_counts()?;
         let events = cx.reader.recent_replay_events(limit)?;
@@ -2742,7 +2854,7 @@ impl Report for NarrativeTimeline {
         let mut md = String::new();
         let _ = writeln!(
             md,
-            "# Narrative timeline (latest bounded replay-event page, v1)\n"
+            "# Replay timeline (latest bounded replay-event page, v1)\n"
         );
         if machine.events.is_empty() {
             let _ = writeln!(md, "_No replay events persisted in this run._");
@@ -2769,14 +2881,15 @@ impl Report for NarrativeTimeline {
     }
 }
 
-fn narrative_timeline_limit(params: &ReportParams) -> Result<usize, AnalyticsError> {
+fn timeline_limit(params: &ReportParams, maximum: usize) -> Result<usize, AnalyticsError> {
+    params.validate_keys(&["limit"])?;
     let limit = params
         .get_usize("limit")?
         .unwrap_or(NARRATIVE_TIMELINE_DEFAULT_LIMIT);
-    if limit > NARRATIVE_TIMELINE_MAX_LIMIT {
+    if limit > maximum {
         return Err(AnalyticsError::BadParam {
             name: "limit".to_owned(),
-            reason: format!("must be at most {NARRATIVE_TIMELINE_MAX_LIMIT}"),
+            reason: format!("must be at most {maximum}"),
         });
     }
     Ok(limit)

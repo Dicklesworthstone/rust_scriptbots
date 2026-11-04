@@ -2,6 +2,14 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Offline narrative reconstruction and smooth presentation (2026-11-03):**
+[Currently In Progress — Codex; `bd-16g.2.9`, `bd-2z0.14.1.9.1`]
+Connect the persisted canonical detector inputs to an independently reconstructed
+offline narrative report, expose the real typed narrative timeline, and interpolate
+Bevy presentation between compatible committed snapshots using stable identities
+and toroidal motion. Keep science immutable and preserve the original beads' full
+scenario-budget, recovery, and hardware-GPU acceptance requirements.
+
 **Browser PNG export (2026-11-03):** [Verified contribution — GentleDuck;
 source `2e138b0c88acb79edf8c43a831ec43944a723577`]
 
