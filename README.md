@@ -926,6 +926,15 @@ Deterministic, staged tick pipeline (six seeded, domain-separated RNG streams; e
 ### Renderer abstraction
 - The app selects GPUI, Bevy, or terminal renderers via `--mode {auto|gui|bevy|terminal}` (subject to build features); `--mode server` runs without a renderer. Each mode connects to the same sole-owner host through `ChannelHostPort`. Full client interaction and native cutover acceptance remain open; selecting a renderer does not create another scientific owner.
 
+The Bevy HUD shows the four most recent native command identities with separately
+observed application and journal outcomes. An admitted command can still be
+pending, rejected, or failed; an applied command can still have a pending or
+failed journal. When an identity leaves the published status mirror, the HUD
+keeps its last observation and labels it as such. Missing acknowledgements remain
+unconfirmed. Paused and single-step snapshots settle agent positions, headings,
+spikes, and idle-body deformation immediately at their recorded poses; camera
+navigation remains available while paused.
+
 ### Keyboard shortcuts (GUI)
 
 Simulation controls and retained-history playback are separate. The unmodified `S` shortcut returns the invoking view to live and queues one scientific step; when that isolated step succeeds, it advances exactly once and leaves the simulation paused. `space`, `G`, and `1`/`2`/`3` apply in Lab. Canvas presentation shortcuts (`N`, `Ctrl+P`, `D`, `F`, `Ctrl+Shift+O`, `Shift+S`, `O`, `Shift+F`, `0`, and `,`) apply in World. Simulation and canonical selection commands work from either window.
@@ -1190,7 +1199,7 @@ For an interactive run, ScriptBots parses the control environment and transactio
     bundles saved before their final status write. Missing or incompatible cuts are refused.
   - `POST /api/v1/checkpoints` → capture a `WorldCheckpointV1` and record it in the run database (usable by
     `--checkpoint-start`); `GET /api/v1/checkpoints`, `/api/v1/artifacts`
-  - Playback (fire-and-forget acknowledgement): `POST /api/pause`, `POST /api/resume`,
+  - Playback aliases (two-axis command status): `POST /api/pause`, `POST /api/resume`,
     `POST /api/step`, `POST /api/speed`, and `GET /api/status`
   - Playback (two-axis command status): `POST /api/control/pause`, `POST /api/control/resume`,
     `POST /api/control/step`, `POST /api/control/speed`, `POST /api/control/shutdown`,
@@ -1228,6 +1237,16 @@ has one write in flight with a five-second write timeout, and missed timer
 intervals are skipped. This is not the complete versioned canvas/event transport
 or a measured sub-16 ms latency claim; those remain under `bd-ac4l`.
 
+The REST step routes (`/api/step` and `/api/control/step`) accept an
+`Idempotency-Key` header, and MCP `step` accepts `idempotency_key`. For `count: 1`
+(the default), the same key returns the same host receipt even when retrying
+through a different transport, including WebSocket. Counts must be integers in
+1–100,000; malformed counts or unknown step fields are refused before admission.
+A key with `count > 1` is refused because a batch still consists of independent
+commands and has no atomic retry identity. For retryable batches, submit one
+step per distinct key. Unkeyed batches remain available and return only the
+last step's receipt, which does not establish the outcome of the whole batch.
+
 `GET /api/v1/checkpoints` also reports actual file/SQL usage, observed file high-water counts,
 pending request identities, retained directory leases and their limit, and inventory/query errors. Checkpoint quota exhaustion returns
 HTTP 507; an unconfirmed file/storage receipt returns HTTP 503 and retains the exact request
@@ -1253,6 +1272,18 @@ direct status access to a healthy companion remains available. Older directories
 without a definition require explicit reconciliation. Checksums detect corruption
 and do not authenticate an artifact's author. Complete resource/fault/platform
 qualification remains open under `bd-2z0.5.11`; see the current reality check.
+
+Resume also recovers a complete interrupted status publication when it is the
+exact initial state or the valid immediate successor of the committed status.
+Any claimed completion is verified against its bundle and restored owner cut
+before publication. Exports are assembled in `<run_id>.bundle.tmp`, verified
+against the exact final checkpoint, synchronized, and renamed to the final
+directory. A complete staged export can be promoted; one incomplete export is
+retained as `<run_id>.bundle.interrupted` and rebuilt from that final checkpoint
+without rerunning ticks. A second partial incident, unsafe paths, conflicting
+status, or an invalid checkpoint produces a refusal and preserves the evidence.
+Existing final bundle directories are never overwritten; legacy incomplete
+final directories still require explicit reconciliation.
 
 Completed experiment files also reappear through artifact list/get/download after
 restart, using their original IDs. A first request verifies the saved scientific
@@ -1413,7 +1444,8 @@ digest evidence within its window.
   - Configuration: `list_knobs` → array of knob entries; `get_config` → full config snapshot;
     `apply_updates` → accepts `{ updates: [{ path, value }, ...] }`; `apply_patch` → accepts `{ patch: { ... } }`
   - Scenarios: `list_presets` → available scenario presets; `apply_preset` → accepts `{ name }`; `intervene` → scheduled intervention
-  - Playback: `pause`, `resume`, `step` (accepts `{ count }`), `set_speed`, `shutdown`
+  - Playback: `pause`, `resume`, `step` (accepts `{ count, idempotency_key }`), `set_speed`, `shutdown`.
+    The first four expose optional `idempotency_key` in tool discovery; a keyed step requires `count: 1`.
   - Observation: `get_status` → current simulation status; `get_command_status` → two-axis status by command ID;
     `narrative_search`, `narrative_around` → narrative events; `get_version`, `get_schema`
   - Maps: `map_generate` → procedural sandbox map generation; `map_apply` → apply map artifact to running simulation

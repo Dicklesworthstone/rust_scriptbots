@@ -2,6 +2,19 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Experiment recovery, retryable controls, and native feedback (2026-11-04):**
+[Source implemented; original acceptance remains open — Codex; `bd-2z0.5.11`, `bd-ac4l`,
+`bd-k7nq`, `bd-2z0.7.14`, `bd-2z0.14.1.9.1`]
+Recover a fully validated interrupted experiment-status publication under the
+existing writer lease, and stage complete run bundles for atomic publication,
+preserving conflicting or corrupt evidence. Give remote WebSocket controls
+bounded, versioned requests with canonical retry identities and observable
+refusals; carry single-step identities through REST and MCP. Show independently
+observed application and journal outcomes in the native HUD, and make paused
+publications settle agent presentation at the authoritative pose.
+These are functional contributions under the original beads; complete crash,
+transport, native-GPU, performance, and DSR acceptance remain with those beads.
+
 **Runtime reliability contribution (2026-11-04):**
 [Source implemented; execution validation pending — Codex; `bd-16g.15.3`,
 `bd-2z0.5.11`]

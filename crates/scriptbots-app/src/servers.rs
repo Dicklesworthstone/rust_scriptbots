@@ -22,7 +22,7 @@ use fastmcp_rust::{
     Content, Cx, JsonRpcRequest, McpError, McpErrorCode, McpResult, NotificationSender,
     PendingRequests, RequestSender, Session, ToolHandler,
 };
-use fastmcp_server::{Server, ServerBuilder};
+use fastmcp_server::{Middleware, MiddlewareDecision, Server, ServerBuilder};
 use futures_util::stream::{Stream, StreamExt};
 use scriptbots_core::PresetKind;
 use serde::{Deserialize, Serialize};
@@ -42,8 +42,8 @@ use crate::control::{
     ConfigSnapshot, ControlError, ControlHandle, DietClassDto, EventEntry, EventKind,
     ExperimentBatchStatusDto, ExperimentCreateRequest, ExperimentExecutionCapacityDto,
     ExperimentRunRecordDto, ExperimentSummaryDto, ExperimentVariantDto, HydrologySnapshot,
-    InterveneRequestBody, InterventionsPollDto, KnobEntry, KnobUpdate, MapApplyAgentPolicy,
-    MapApplyRequestBody, MapGenerateRequestBody, PaginatedArtifactsResponse,
+    InterveneRequestBody, InterventionsPollDto, KnobEntry, KnobUpdate, MAX_STEP_BATCH,
+    MapApplyAgentPolicy, MapApplyRequestBody, MapGenerateRequestBody, PaginatedArtifactsResponse,
     PaginatedCheckpointsResponse, PaginatedExperimentsResponse, Scoreboard, SelectionModeDto,
     SelectionSnapshotDto, SelectionStateDto, SimulationStatusDto, SpeedRequest,
     parse_intervention_command, parse_map_artifact,
@@ -1455,6 +1455,7 @@ impl From<ConfigAuditEntry> for ConfigAuditEntryView {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct StepRequestBody {
     #[serde(default = "default_step_count")]
     pub count: u64,
@@ -2865,7 +2866,8 @@ async fn post_control_step(
         })?;
         body.count
     };
-    let status = run_control(move || state.handle.step_count(count)).await?;
+    let key = idempotency_key(&headers);
+    let status = run_control(move || state.handle.step_count(count, key.as_deref())).await?;
     Ok(Json(status))
 }
 
@@ -3101,7 +3103,8 @@ async fn post_step(
     // reported id therefore identifies the final step, not the batch; a caller
     // polling it learns about that one command. Saying so beats implying the
     // receipt covers all of them.
-    let status = run_control(move || state.handle.step_count(count)).await?;
+    let key = idempotency_key(&headers);
+    let status = run_control(move || state.handle.step_count(count, key.as_deref())).await?;
     Ok(Json(status))
 }
 
@@ -3613,7 +3616,7 @@ async fn prepare_mcp_server(
 /// does not exist. That is the same silent drift that removed eight routes from the
 /// published OpenAPI document (bd-01dg), so `mcp_tool_roster_is_complete` pins it.
 fn register_control_tools(builder: ServerBuilder, handle: ControlHandle) -> ServerBuilder {
-    let mut builder = builder;
+    let mut builder = builder.middleware(StepArgumentsMiddleware);
 
     builder = register_tool(
         builder,
@@ -3703,7 +3706,11 @@ fn register_control_tools(builder: ServerBuilder, handle: ControlHandle) -> Serv
         builder,
         "pause",
         "Pause the simulation",
-        json!({"type": "object", "additionalProperties": false}),
+        json!({
+            "type": "object",
+            "properties": {"idempotency_key": {"type": "string", "minLength": 1, "maxLength": 1024}},
+            "additionalProperties": false
+        }),
         ControlToolKind::Pause,
         handle.clone(),
     );
@@ -3712,7 +3719,11 @@ fn register_control_tools(builder: ServerBuilder, handle: ControlHandle) -> Serv
         builder,
         "resume",
         "Resume the simulation",
-        json!({"type": "object", "additionalProperties": false}),
+        json!({
+            "type": "object",
+            "properties": {"idempotency_key": {"type": "string", "minLength": 1, "maxLength": 1024}},
+            "additionalProperties": false
+        }),
         ControlToolKind::Resume,
         handle.clone(),
     );
@@ -3720,11 +3731,12 @@ fn register_control_tools(builder: ServerBuilder, handle: ControlHandle) -> Serv
     builder = register_tool(
         builder,
         "step",
-        "Step the simulation by N ticks",
+        "Step the simulation by N ticks; an idempotency key requires count=1",
         json!({
             "type": "object",
             "properties": {
-                "count": {"type": "integer", "minimum": 1}
+                "count": {"type": "integer", "minimum": 1, "maximum": MAX_STEP_BATCH},
+                "idempotency_key": {"type": "string", "minLength": 1, "maxLength": 1024}
             },
             "additionalProperties": false
         }),
@@ -3739,7 +3751,8 @@ fn register_control_tools(builder: ServerBuilder, handle: ControlHandle) -> Serv
         json!({
             "type": "object",
             "properties": {
-                "speed": {"type": "number"}
+                "speed": {"type": "number"},
+                "idempotency_key": {"type": "string", "minLength": 1, "maxLength": 1024}
             },
             "required": ["speed"],
             "additionalProperties": false
@@ -4115,6 +4128,32 @@ fn register_control_tools(builder: ServerBuilder, handle: ControlHandle) -> Serv
     builder
 }
 
+/// FastMCP's optional argument decoder treats explicit null as absence. Reject
+/// malformed step arguments before that normalization can turn them into a tick.
+struct StepArgumentsMiddleware;
+
+impl Middleware for StepArgumentsMiddleware {
+    fn on_request(
+        &self,
+        _ctx: &fastmcp_rust::McpContext,
+        request: &JsonRpcRequest,
+    ) -> McpResult<MiddlewareDecision> {
+        if request.method == "tools/call"
+            && let Some(params) = request.params.as_ref().and_then(Value::as_object)
+            && params.get("name").and_then(Value::as_str) == Some("step")
+            && params
+                .get("arguments")
+                .is_some_and(|value| !value.is_object())
+        {
+            return Err(McpError::new(
+                McpErrorCode::InvalidParams,
+                "step arguments must be a JSON object",
+            ));
+        }
+        Ok(MiddlewareDecision::Continue)
+    }
+}
+
 fn register_tool(
     builder: ServerBuilder,
     name: &str,
@@ -4347,6 +4386,12 @@ impl ToolHandler for ControlTool {
     }
 
     fn call(&self, _ctx: &fastmcp_rust::McpContext, arguments: Value) -> McpResult<Vec<Content>> {
+        if matches!(self.kind, ControlToolKind::Step) && !arguments.is_object() {
+            return Err(McpError::new(
+                McpErrorCode::InvalidParams,
+                "step arguments must be a JSON object",
+            ));
+        }
         let arguments = arguments.as_object().cloned().unwrap_or_default();
         match self.kind {
             ControlToolKind::ListPresets => {
@@ -4438,9 +4483,39 @@ impl ToolHandler for ControlTool {
                 make_tool_result(status)
             }
             ControlToolKind::Step => {
-                let count = arguments.get("count").and_then(|v| v.as_u64()).unwrap_or(1);
+                if arguments
+                    .keys()
+                    .any(|key| key != "count" && key != "idempotency_key")
+                {
+                    return Err(McpError::new(
+                        McpErrorCode::InvalidParams,
+                        "step accepts only count and idempotency_key",
+                    ));
+                }
+                let count = match arguments.get("count") {
+                    None => 1,
+                    Some(value) => value.as_u64().ok_or_else(|| {
+                        McpError::new(
+                            McpErrorCode::InvalidParams,
+                            "count must be a positive integer",
+                        )
+                    })?,
+                };
+                if let Some(value) = arguments.get("idempotency_key")
+                    && !value.as_str().is_some_and(|key| {
+                        let key = key.trim();
+                        !key.is_empty() && key.len() <= 1024
+                    })
+                {
+                    return Err(McpError::new(
+                        McpErrorCode::InvalidParams,
+                        "idempotency_key must contain 1..=1024 bytes",
+                    ));
+                }
+                let key = mcp_idempotency_key(&arguments);
                 let handle = self.handle.clone();
-                let status = run_control_mcp_sync(move || handle.step_count(count))?;
+                let status =
+                    run_control_mcp_sync(move || handle.step_count(count, key.as_deref()))?;
                 make_tool_result(status)
             }
             ControlToolKind::SetSpeed => {
@@ -4847,6 +4922,9 @@ fn map_control_error(err: ControlError) -> McpError {
         ),
         ControlError::InvalidPatch(msg) => McpError::new(McpErrorCode::InvalidParams, msg),
         ControlError::Serialization(msg) => McpError::new(McpErrorCode::InternalError, msg),
+        ControlError::Host(
+            error @ scriptbots_runtime::HostAccessError::CommandIdCollision { .. },
+        ) => McpError::new(McpErrorCode::InvalidParams, error.to_string()),
         ControlError::Host(error) => McpError::new(McpErrorCode::InternalError, error.to_string()),
         ControlError::Lock => {
             McpError::new(McpErrorCode::InternalError, "world state is unavailable")
@@ -7438,6 +7516,269 @@ mod tests {
         .await
         .expect_err("unknown command id must return 404 not found");
         assert_eq!(missing.status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn single_step_retries_share_identity_across_rest_mcp_and_websocket() {
+        let host = crate::control::tests::TestHost::spawn(
+            WorldState::new(ScriptBotsConfig {
+                world_width: 64,
+                world_height: 64,
+                food_cell_size: 16,
+                rng_seed: Some(42),
+                persistence_interval: 0,
+                closed: true,
+                ..ScriptBotsConfig::default()
+            })
+            .expect("small paused world"),
+        );
+        let handle = host.handle();
+        let state = ApiState {
+            handle: handle.clone(),
+            scenario: None,
+            presented_frame: empty_presented_frame(),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("Content-Type", "application/json".parse().unwrap());
+        headers.insert("Idempotency-Key", "shared-step".parse().unwrap());
+        let Json(first) = post_control_step(
+            State(state.clone()),
+            headers.clone(),
+            axum::body::Bytes::from_static(br#"{"count":1}"#),
+        )
+        .await
+        .expect("keyed step admission");
+        host.wait_applied(&first);
+        assert_eq!(handle.status().unwrap().tick, 1);
+
+        let Json(alias) = post_step(
+            State(state.clone()),
+            headers.clone(),
+            axum::body::Bytes::new(),
+        )
+        .await
+        .expect("legacy REST retry");
+        assert_eq!(alias.command_id, first.command_id);
+        assert_eq!(alias.admission_sequence, first.admission_sequence);
+
+        let mcp = mcp_http_test_state(handle.clone(), ServerBuilder::new("step-retry", "0"));
+        let initialized = map_policy_mcp_request(
+            &mcp,
+            json!({
+                "jsonrpc":"2.0", "id":1, "method":"initialize",
+                "params":{"protocolVersion":"2024-11-05", "capabilities":{},
+                    "clientInfo":{"name":"step-retry", "version":"0"}}
+            }),
+        )
+        .await;
+        assert!(initialized.get("error").is_none(), "{initialized}");
+        let listed = map_policy_mcp_request(
+            &mcp,
+            json!({"jsonrpc":"2.0", "id":2, "method":"tools/list", "params":{}}),
+        )
+        .await;
+        let tools = listed["result"]["tools"]
+            .as_array()
+            .expect("tool discovery");
+        for name in ["pause", "resume", "step", "set_speed"] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .expect("control tool");
+            assert_eq!(
+                tool["inputSchema"]["properties"]["idempotency_key"]["type"],
+                "string"
+            );
+        }
+        let retried = map_policy_mcp_request(
+            &mcp,
+            json!({
+                "jsonrpc":"2.0", "id":3, "method":"tools/call",
+                "params":{"name":"step", "arguments":{"count":1, "idempotency_key":"shared-step"}}
+            }),
+        )
+        .await;
+        assert!(retried.get("error").is_none(), "{retried}");
+        let retried: CommandStatusDto = serde_json::from_str(
+            retried["result"]["content"][0]["text"]
+                .as_str()
+                .expect("MCP receipt"),
+        )
+        .expect("canonical owner receipt");
+        assert_eq!(retried.command_id, first.command_id);
+        assert_eq!(retried.admission_sequence, first.admission_sequence);
+        assert_eq!(retried.application_state, "applied");
+
+        let conflict = map_policy_mcp_request(
+            &mcp,
+            json!({
+                "jsonrpc":"2.0", "id":4, "method":"tools/call",
+                "params":{"name":"resume", "arguments":{"idempotency_key":"shared-step"}}
+            }),
+        )
+        .await;
+        assert_eq!(
+            conflict["error"]["code"],
+            i32::from(McpErrorCode::InvalidParams),
+            "{conflict}"
+        );
+
+        let websocket = websocket_receipt(
+            apply_ws_control_message(
+                handle.clone(),
+                json!({"command":"step", "request_id":"shared-step"}).to_string(),
+            )
+            .await,
+        );
+        assert_eq!(websocket.command_id, first.command_id);
+        assert_eq!(websocket.admission_sequence, first.admission_sequence);
+        assert_eq!(
+            handle.status().unwrap().tick,
+            1,
+            "transport retries must not step again"
+        );
+        let conflict = post_control_resume(State(state.clone()), headers)
+            .await
+            .unwrap_err();
+        assert_eq!(conflict.status, StatusCode::CONFLICT);
+        assert!(handle.status().unwrap().paused);
+
+        let mut unkeyed = HeaderMap::new();
+        unkeyed.insert("Content-Type", "application/json".parse().unwrap());
+        let Json(batch) = post_step(
+            State(state),
+            unkeyed,
+            axum::body::Bytes::from_static(br#"{"count":2}"#),
+        )
+        .await
+        .expect("existing unkeyed batch");
+        host.wait_applied(&batch);
+        assert_eq!(handle.status().unwrap().tick, 3);
+    }
+
+    #[tokio::test]
+    async fn step_requests_refuse_malformed_counts_without_admission() {
+        let (handle, host) = handle();
+        let state = ApiState {
+            handle: handle.clone(),
+            scenario: None,
+            presented_frame: empty_presented_frame(),
+        };
+        let before = handle.read_snapshot().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("Content-Type", "application/json".parse().unwrap());
+        headers.insert("Idempotency-Key", "refused-step".parse().unwrap());
+        for value in [
+            json!({"count":0}),
+            json!({"count":-1}),
+            json!({"count":1.5}),
+            json!({"count":"2"}),
+            json!({"count":null}),
+            json!({"count":false}),
+            json!({"count":u64::MAX}),
+            json!({"count":2}),
+            json!({"cout":2}),
+            json!([]),
+            json!(null),
+        ] {
+            let body = axum::body::Bytes::from(serde_json::to_vec(&value).unwrap());
+            let control = post_control_step(State(state.clone()), headers.clone(), body.clone())
+                .await
+                .expect_err("invalid canonical step must be refused");
+            assert_eq!(control.status, StatusCode::BAD_REQUEST, "{value}");
+            let alias = post_step(State(state.clone()), headers.clone(), body)
+                .await
+                .expect_err("invalid legacy step must be refused");
+            assert_eq!(alias.status, StatusCode::BAD_REQUEST, "{value}");
+        }
+        let tool = ControlTool {
+            handle: handle.clone(),
+            kind: ControlToolKind::Step,
+            name: "step".to_owned(),
+            description: "Step the simulation".to_owned(),
+            schema: json!({"type":"object"}),
+        };
+        let runtime = mcp_context_test_runtime();
+        let cx = runtime.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        let ctx = fastmcp_rust::McpContext::new(cx, 1);
+        let mcp = mcp_http_test_state(handle.clone(), ServerBuilder::new("step-refusal", "0"));
+        let initialized = map_policy_mcp_request(
+            &mcp,
+            json!({
+                "jsonrpc":"2.0", "id":1, "method":"initialize",
+                "params":{"protocolVersion":"2024-11-05", "capabilities":{},
+                    "clientInfo":{"name":"step-refusal", "version":"0"}}
+            }),
+        )
+        .await;
+        assert!(initialized.get("error").is_none(), "{initialized}");
+        for (index, arguments) in [
+            json!({"count":0}),
+            json!({"count":-1}),
+            json!({"count":1.5}),
+            json!({"count":"2"}),
+            json!({"count":null}),
+            json!({"count":true}),
+            json!({"count":u64::MAX}),
+            json!({"count":2, "idempotency_key":"refused-step"}),
+            json!({"cout":2}),
+            json!({"idempotency_key":7}),
+            json!({"idempotency_key":" "}),
+            json!({"idempotency_key":"k".repeat(1025)}),
+            json!([]),
+            json!(null),
+            json!(false),
+            json!("step"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(tool.call(&ctx, arguments.clone()).is_err(), "{arguments}");
+            let response = map_policy_mcp_request(
+                &mcp,
+                json!({
+                    "jsonrpc":"2.0", "id":index + 2, "method":"tools/call",
+                    "params":{"name":"step", "arguments":arguments}
+                }),
+            )
+            .await;
+            assert_eq!(
+                response["error"]["code"],
+                i32::from(McpErrorCode::InvalidParams),
+                "{arguments}: {response}"
+            );
+        }
+        let after = host.handle().read_snapshot().unwrap();
+        assert_eq!(after.world, before.world);
+        assert_eq!(after.revisions, before.revisions);
+        assert_eq!(after.last_applied_command, before.last_applied_command);
+        assert_eq!(after.command_queue_depth, 0);
+        // A subsequent admitted command is an owner barrier: none of the
+        // refused inputs may have consumed an identity or left a delayed step.
+        let barrier = handle.pause(Some("refusal-observation")).unwrap();
+        assert_eq!(barrier.admission_sequence, Some(1));
+        host.wait_applied(&barrier);
+        let observed = handle.read_snapshot().unwrap();
+        assert_eq!(observed.world, before.world);
+        assert_eq!(observed.revisions.scientific, before.revisions.scientific);
+        assert_eq!(observed.revisions.config, before.revisions.config);
+
+        // Absence remains the documented default; unlike an explicit null it
+        // still requests one step through the actual MCP router.
+        let defaulted = map_policy_mcp_request(
+            &mcp,
+            json!({"jsonrpc":"2.0", "id":100, "method":"tools/call", "params":{"name":"step"}}),
+        )
+        .await;
+        assert!(defaulted.get("error").is_none(), "{defaulted}");
+        let receipt: CommandStatusDto = serde_json::from_str(
+            defaulted["result"]["content"][0]["text"]
+                .as_str()
+                .expect("default step receipt"),
+        )
+        .expect("owner receipt");
+        host.wait_applied(&receipt);
+        assert_eq!(handle.status().unwrap().tick, before.world.tick + 1);
     }
 
     /// The MCP roster README documents and that `ControlToolKind` dispatches.

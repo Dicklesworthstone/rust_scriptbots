@@ -1102,8 +1102,10 @@ impl ExperimentJob {
                 "experiment '{}' worker panicked: {panic:?}",
                 self.runner.experiment_id
             );
-            *self.last_error.lock().unwrap_or_else(PoisonError::into_inner) =
-                Some(message.clone());
+            *self
+                .last_error
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(message.clone());
             return Err(message);
         }
         Ok(())
@@ -1874,7 +1876,8 @@ impl DataServices {
     /// calls; workers never acquire it while finishing or publishing artifacts.
     pub(crate) fn shutdown_experiments(&self) -> anyhow::Result<()> {
         use std::sync::atomic::Ordering;
-        self.experiment_shutdown_requested.store(true, Ordering::Release);
+        self.experiment_shutdown_requested
+            .store(true, Ordering::Release);
         let (mut jobs, poisoned) = match self.experiments.lock() {
             Ok(jobs) => (jobs, false),
             Err(error) => (error.into_inner(), true),
@@ -3594,7 +3597,15 @@ impl ControlHandle {
     }
 
     /// Enqueue step commands for the simulation driver to advance `count` ticks.
-    pub fn step_count(&self, count: u64) -> Result<CommandStatusDto, ControlError> {
+    ///
+    /// A single step shares the host's retry identity across transports. A batch
+    /// still contains independent commands and returns only the last receipt;
+    /// refuse a keyed batch rather than silently discard its retry guarantee.
+    pub fn step_count(
+        &self,
+        count: u64,
+        idempotency_key: Option<&str>,
+    ) -> Result<CommandStatusDto, ControlError> {
         // Each step is a separately journalled command submitted in a loop, so an
         // unbounded request count (e.g. u64::MAX) would pin a worker thread forever and
         // grow the command journal without limit.
@@ -3603,9 +3614,22 @@ impl ControlHandle {
                 "step count {count} exceeds the per-request limit of {MAX_STEP_BATCH}"
             )));
         }
-        let iterations = count.max(1);
+        if count == 0 {
+            return Err(ControlError::InvalidPatch(
+                "step count must be at least 1".to_owned(),
+            ));
+        }
+        if count == 1 {
+            return self.submit_control_command_with_key(ControlCommand::Step, idempotency_key);
+        }
+        if idempotency_key.is_some() {
+            return Err(ControlError::InvalidPatch(
+                "idempotency keys require count=1; submit individually keyed steps for retryable batches"
+                    .to_owned(),
+            ));
+        }
         let mut last_status = None;
-        for _ in 0..iterations {
+        for _ in 0..count {
             last_status = Some(self.submit_control_command(ControlCommand::Step)?);
         }
         Ok(last_status.expect("at least one iteration"))
@@ -4943,7 +4967,10 @@ pub(crate) mod tests {
             ));
             assert!(!root.path().join("experiments/after-shutdown").exists());
             retained.data_services.shutdown_experiments().unwrap();
-            assert_eq!(fs::read(directory.join("status.json")).unwrap(), saved_status);
+            assert_eq!(
+                fs::read(directory.join("status.json")).unwrap(),
+                saved_status
+            );
             for (path, bytes) in saved_cuts {
                 assert_eq!(fs::read(path).unwrap(), bytes);
             }
@@ -5001,7 +5028,10 @@ pub(crate) mod tests {
         assert_eq!(observed_all_cancellations.load(Ordering::Acquire), 2);
         let jobs = services.experiments.lock().unwrap();
         assert!(jobs.values().all(|job| job.worker.is_none()));
-        assert!(jobs.values().all(|job| !job.running.load(Ordering::Acquire)));
+        assert!(
+            jobs.values()
+                .all(|job| !job.running.load(Ordering::Acquire))
+        );
         assert!(jobs["a-panic"].last_error.lock().unwrap().is_some());
         drop(jobs);
         let capacity = *services.execution_capacity.lock().unwrap();
@@ -5036,9 +5066,14 @@ pub(crate) mod tests {
     fn experiment_resume_reports_a_prior_worker_panic_before_admission() {
         let root = tempfile::tempdir().unwrap();
         let (handle, _host) = handle();
-        let handle = handle.with_artifacts_dir(root.path().to_path_buf()).unwrap();
+        let handle = handle
+            .with_artifacts_dir(root.path().to_path_buf())
+            .unwrap();
         pending_catalog_definition(root.path(), "failed-worker");
-        handle.data_services.recover_experiment("failed-worker").unwrap();
+        handle
+            .data_services
+            .recover_experiment("failed-worker")
+            .unwrap();
         {
             let mut jobs = handle.data_services.experiments.lock().unwrap();
             jobs.get_mut("failed-worker").unwrap().worker = Some(std::thread::spawn(|| {
@@ -5052,7 +5087,12 @@ pub(crate) mod tests {
         let capacity = *handle.data_services.execution_capacity.lock().unwrap();
         assert_eq!(capacity.reserved_run_slots, 0);
         assert_eq!(capacity.reserved_batches, 0);
-        assert!(!root.path().join("experiments/failed-worker/status.json").exists());
+        assert!(
+            !root
+                .path()
+                .join("experiments/failed-worker/status.json")
+                .exists()
+        );
         let jobs = handle.data_services.experiments.lock().unwrap();
         assert!(jobs["failed-worker"].worker.is_none());
         assert!(jobs["failed-worker"].last_error.lock().unwrap().is_some());
@@ -9372,7 +9412,7 @@ pub(crate) mod tests {
     fn oversized_step_and_map_requests_are_refused_before_work() {
         let (handle, _receiver) = handle();
         let err = handle
-            .step_count(u64::MAX)
+            .step_count(u64::MAX, None)
             .expect_err("an unbounded step batch must be refused");
         assert!(err.to_string().contains("per-request limit"), "{err}");
         let err = handle
