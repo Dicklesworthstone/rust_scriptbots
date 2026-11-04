@@ -35,7 +35,7 @@ use bevy_post_process::auto_exposure::{AutoExposure, AutoExposurePlugin};
 use bevy_post_process::bloom::Bloom;
 use image::{ImageBuffer, Rgba as ImgRgba};
 use scriptbots_core::{
-    AccessibilityPalette, AgentId, BrainInspectionLimits, ControlCommand, GpuClass, GpuInfo,
+    AccessibilityPalette, AgentId, AgentUid, BrainInspectionLimits, ControlCommand, GpuClass, GpuInfo,
     IndicatorState, NUM_EYES, OutputChannel, OutputsExt, RenderGovernor, RenderQuality,
     RenderSettings, RenderTonemapMode, SelectedBrainTelemetryOutcome, SelectionMode,
     SelectionState, SelectionUpdate, SimulationCommand, TerrainKind, TickSummary, TierFeatures,
@@ -1036,7 +1036,10 @@ pub(crate) struct SnapshotState {
 
 #[derive(Default, Resource)]
 pub(crate) struct AgentRegistry {
-    records: HashMap<AgentId, AgentRecord>,
+    // Stable scientific identity is the presentation continuity key. AgentId
+    // is a generational arena handle and may be recycled after a death; using
+    // it here could make a newborn inherit the departed agent's smoothed pose.
+    records: HashMap<AgentUid, AgentRecord>,
 }
 
 #[derive(Resource, Clone)]
@@ -2644,7 +2647,10 @@ impl HudEvent {
 
 #[derive(Clone, PartialEq)]
 struct AgentVisual {
+    /// Transient live-control handle.
     id: AgentId,
+    /// Stable scientific identity used for presentation continuity.
+    uid: AgentUid,
     position: Vec2,
     velocity: Vec2,
     heading: f32,
@@ -2724,6 +2730,7 @@ impl WorldSnapshot {
             let visual = snapshot.agent_visuals(index)?;
             agents.push(AgentVisual {
                 id: AgentId::from(slotmap::KeyData::from_ffi(agent.id)),
+                uid: agent.uid,
                 position: Vec2::from_array(agent.position),
                 velocity: Vec2::from_array(agent.velocity),
                 heading: agent.heading,
@@ -2911,6 +2918,7 @@ impl WorldSnapshot {
                 });
             agents.push(AgentVisual {
                 id: agent_id,
+                uid: world.agent_uid(agent_id)?,
                 position: Vec2::new(positions[idx].x, positions[idx].y),
                 velocity: Vec2::new(velocities[idx].vx, velocities[idx].vy),
                 heading: headings[idx],
@@ -3775,6 +3783,7 @@ mod hud_inspector_tests {
     fn sample_agent_visual_for_inspector() -> AgentVisual {
         AgentVisual {
             id: AgentId::null(),
+            uid: AgentUid(1),
             position: Vec2::new(10.0, 20.0),
             velocity: Vec2::ZERO,
             heading: 0.0,
@@ -6583,7 +6592,7 @@ fn handle_selection_input(
     for agent in &snapshot.agents {
         let display = registry
             .as_ref()
-            .and_then(|registry| registry.records.get(&agent.id))
+            .and_then(|registry| registry.records.get(&agent.uid))
             .and_then(|record| display_poses.get(record.root).ok());
         let position = displayed_agent_position(agent.position, display, world_size);
         // Argument order swapped versus the removed private copy: that computed
@@ -8284,6 +8293,7 @@ mod terrain_tests {
     fn sample_agent_visual() -> AgentVisual {
         AgentVisual {
             id: AgentId::from(KeyData::from_ffi(1)),
+            uid: AgentUid(1),
             position: Vec2::new(50.0, 50.0),
             velocity: Vec2::ZERO,
             heading: 0.75,
@@ -10150,20 +10160,20 @@ fn sync_agents(
     materials: &mut Assets<StandardMaterial>,
     palette: ColorPaletteMode,
 ) {
-    let mut seen: HashSet<AgentId> = HashSet::with_capacity(snapshot.agents.len());
+    let mut seen: HashSet<AgentUid> = HashSet::with_capacity(snapshot.agents.len());
     for agent in &snapshot.agents {
-        seen.insert(agent.id);
-        if let Some(record) = registry.records.get_mut(&agent.id) {
+        seen.insert(agent.uid);
+        if let Some(record) = registry.records.get_mut(&agent.uid) {
             update_agent_entity(
                 record, agent, snapshot, commands, materials, meshes, palette,
             );
         } else {
             let record = spawn_agent_entity(agent, snapshot, commands, meshes, materials, palette);
-            registry.records.insert(agent.id, record);
+            registry.records.insert(agent.uid, record);
         }
     }
 
-    let stale: Vec<AgentId> = registry
+    let stale: Vec<AgentUid> = registry
         .records
         .keys()
         .copied()
@@ -12683,7 +12693,7 @@ mod tests {
         let mut world = WorldState::new(ScriptBotsConfig::default())?;
         world.try_spawn_agent(scriptbots_core::AgentData::default())?;
         let snapshot = WorldSnapshot::from_world(&world).expect("visible diagnostic agent");
-        let id = snapshot.agents[0].id;
+        let uid = snapshot.agents[0].uid;
         let mut app = App::new();
         app.insert_resource(SnapshotState {
             latest: Some(snapshot),
@@ -12720,7 +12730,7 @@ mod tests {
             snapshot.revision += 1;
             snapshot.agent_radius = radius;
             app.update();
-            let record = &app.world().resource::<AgentRegistry>().records[&id];
+            let record = &app.world().resource::<AgentRegistry>().records[&uid];
             let entity = app.world().entity(record.body.entity);
             assert_eq!(entity.get::<Mesh3d>().unwrap().0, body);
             let transform = entity.get::<Transform>().unwrap();
@@ -12760,7 +12770,7 @@ mod tests {
             snapshot.agents[0].boost = strength;
             app.update();
 
-            let record = &app.world().resource::<AgentRegistry>().records[&id];
+            let record = &app.world().resource::<AgentRegistry>().records[&uid];
             let entity = app.world().entity(record.boost.entity);
             assert_eq!(entity.get::<Mesh3d>().unwrap().0, quad);
             assert_eq!(
@@ -12795,7 +12805,7 @@ mod tests {
         snapshot.revision += 1;
         snapshot.agents[0].boost = 0.0;
         app.update();
-        let boost = app.world().resource::<AgentRegistry>().records[&id]
+        let boost = app.world().resource::<AgentRegistry>().records[&uid]
             .boost
             .entity;
         assert_eq!(
@@ -12869,7 +12879,7 @@ mod tests {
         let snapshot = state.latest.as_ref().unwrap();
         assert!(!snapshot.agents.is_empty());
         for agent in &snapshot.agents {
-            let root = app.world().resource::<AgentRegistry>().records[&agent.id].root;
+            let root = app.world().resource::<AgentRegistry>().records[&agent.uid].root;
             let transform = app.world().entity(root).get::<Transform>().unwrap();
             assert_eq!(transform.translation, agent_translation(snapshot, agent));
             assert!(
@@ -12905,7 +12915,7 @@ mod tests {
         );
         let previous_spike = {
             let agent = &state.latest.as_ref().unwrap().agents[0];
-            let spike = app.world().resource::<AgentRegistry>().records[&agent.id]
+            let spike = app.world().resource::<AgentRegistry>().records[&agent.uid]
                 .spike
                 .entity;
             *app.world().entity(spike).get::<Transform>().unwrap()
@@ -12926,7 +12936,7 @@ mod tests {
             .as_ref()
             .unwrap();
         let agent = &snapshot.agents[0];
-        let root = app.world().resource::<AgentRegistry>().records[&agent.id].root;
+        let root = app.world().resource::<AgentRegistry>().records[&agent.uid].root;
         let entity = app.world().entity(root);
         let expected = agent_translation(snapshot, agent);
         assert_eq!(entity.get::<Transform>().unwrap().translation, expected);
@@ -12935,7 +12945,7 @@ mod tests {
             expected,
             "shared sync must publish the exact new pose even without advancing the native display state"
         );
-        let spike = app.world().resource::<AgentRegistry>().records[&agent.id]
+        let spike = app.world().resource::<AgentRegistry>().records[&agent.uid]
             .spike
             .entity;
         let entity = app.world().entity(spike);
@@ -12962,7 +12972,7 @@ mod tests {
             entity.get::<SpikeDisplayPose>().is_none(),
             "capture does not install native easing"
         );
-        let body = app.world().resource::<AgentRegistry>().records[&agent.id]
+        let body = app.world().resource::<AgentRegistry>().records[&agent.uid]
             .body
             .entity;
         let body = app.world().entity(body);
@@ -13009,6 +13019,38 @@ mod tests {
             app.world().resource::<SnapshotState>().selected_lead,
             expected_lead * 0.5,
             "a stationary selected peer halves the group lead"
+        );
+
+        // AgentId is only a generational arena handle. Reusing that handle for
+        // a different stable UID must create fresh presentation state rather
+        // than continuing the departed agent's interpolation history.
+        let (recycled_handle, old_uid, old_root) = {
+            let state = app.world().resource::<SnapshotState>();
+            let agent = &state.latest.as_ref().unwrap().agents[0];
+            (
+                agent.id,
+                agent.uid,
+                app.world().resource::<AgentRegistry>().records[&agent.uid].root,
+            )
+        };
+        let replacement_uid = AgentUid(old_uid.0.saturating_add(1_000_000));
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            let snapshot = state.latest.as_mut().unwrap();
+            snapshot.revision += 1;
+            snapshot.agents[0].uid = replacement_uid;
+            assert_eq!(snapshot.agents[0].id, recycled_handle);
+        }
+        app.update();
+        let registry = app.world().resource::<AgentRegistry>();
+        assert!(
+            !registry.records.contains_key(&old_uid),
+            "departed stable identity must be removed even when its arena handle is reused"
+        );
+        let new_root = registry.records[&replacement_uid].root;
+        assert_ne!(
+            new_root, old_root,
+            "a replacement stable identity must start with fresh presentation state"
         );
 
         Ok(())
