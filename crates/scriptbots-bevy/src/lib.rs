@@ -403,6 +403,8 @@ pub struct EffectiveRenderSettings {
     pub features: TierFeatures,
     /// Launch fog overrides, retained when the governor changes tiers.
     pub fog_settings: Option<scriptbots_core::RenderFogSettings>,
+    /// Launch bloom overrides, retained when the governor changes tiers.
+    pub bloom_settings: Option<scriptbots_core::RenderBloomSettings>,
     /// Adapter probe (None when probing found no adapter).
     pub gpu: Option<GpuInfo>,
     /// The tier the operator actually asked for, retained after Auto-resolution.
@@ -545,24 +547,27 @@ pub(crate) fn resolve_effective_render_settings_for_gpu(
             warn!("no GPU adapter detected; the Bevy renderer is unavailable");
         }
     }
+    let resolved = EffectiveRenderSettings {
+        tier,
+        features,
+        fog_settings: settings.post.as_ref().and_then(|post| post.fog.clone()),
+        bloom_settings: settings.post.as_ref().and_then(|post| post.bloom.clone()),
+        gpu,
+        requested,
+    };
     info!(
         requested = ?requested,
         effective = ?tier,
         shadows = features.shadows,
         shadow_cascades = features.shadow_cascades,
-        bloom = features.bloom,
+        bloom = effective_bloom(&resolved).is_some(),
+        tier_bloom = features.bloom,
         ssao = features.ssao,
         aa = ?features.anti_aliasing,
         particles_max = features.particles_max,
         "render quality tier resolved"
     );
-    EffectiveRenderSettings {
-        tier,
-        features,
-        fog_settings: settings.post.as_ref().and_then(|post| post.fog.clone()),
-        gpu,
-        requested,
-    }
+    resolved
 }
 
 /// Frame budget the adaptive governor holds the renderer to: 60 fps.
@@ -684,9 +689,26 @@ fn drive_adaptive_quality(
         adapter = effective.gpu.as_ref().map_or("<none>", |info| info.name.as_str()),
         shadows = effective.features.shadows,
         ssao = effective.features.ssao,
-        bloom = effective.features.bloom,
+        bloom = effective_bloom(&effective).is_some(),
+        tier_bloom = effective.features.bloom,
         "adaptive render governor changed the quality tier"
     );
+}
+
+fn renderer_plugins() -> bevy::app::PluginGroupBuilder {
+    // This renderer does not play audio. Bevy's default audio plugin opens an
+    // output stream eagerly, which can repeatedly report device failures even
+    // when no sound is requested. Enable it deliberately when audio is added.
+    DefaultPlugins
+        .set(WindowPlugin {
+            primary_window: Some(Window {
+                title: "ScriptBots • Bevy Renderer".to_string(),
+                present_mode: PresentMode::AutoVsync,
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .disable::<bevy::audio::AudioPlugin>()
 }
 
 pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
@@ -839,14 +861,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
         &initial_render_settings,
     ))
     .insert_resource(effective_render_settings)
-    .add_plugins(DefaultPlugins.set(WindowPlugin {
-        primary_window: Some(Window {
-            title: "ScriptBots • Bevy Renderer".to_string(),
-            present_mode: PresentMode::AutoVsync,
-            ..Default::default()
-        }),
-        ..Default::default()
-    }))
+    .add_plugins(renderer_plugins())
     .add_plugins(AutoExposurePlugin)
     .add_systems(Startup, (initialize_ssao_support, setup_scene).chain())
     .add_systems(
@@ -856,6 +871,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
             (
                 sync_world,
                 smooth_agent_poses,
+                conform_agent_wheels,
                 smooth_spike_poses,
                 animate_idle_bodies,
             )
@@ -1134,6 +1150,14 @@ struct AgentDisplayPose {
 struct AgentGroundFootprint {
     radius: f32,
     spike_extension: f32,
+    spike: Option<Entity>,
+}
+
+/// A wheel may extend independently below the chassis to follow uneven ground.
+#[derive(Component)]
+struct WheelGroundContact {
+    root: Entity,
+    side: f32,
 }
 
 // Approximately 95% convergence in 100 ms, independent of render frame rate.
@@ -1148,6 +1172,7 @@ fn smooth_agent_poses(
     time: Res<Time>,
     state: Res<SnapshotState>,
     settings: Option<Res<AgentMotionSettings>>,
+    spikes: Query<(&SpikePoseTarget, Option<&SpikeDisplayPose>)>,
     mut agents: Query<(
         &AgentPoseTarget,
         &mut AgentDisplayPose,
@@ -1171,6 +1196,22 @@ fn smooth_agent_poses(
             display.rotation = display.rotation.slerp(target.rotation, blend);
         }
         if let (Some(snapshot), Some(footprint)) = (&state.latest, footprint) {
+            let mut footprint = *footprint;
+            if let Some((spike_target, spike_display)) =
+                footprint.spike.and_then(|spike| spikes.get(spike).ok())
+            {
+                let length = spike_display.map_or(spike_target.transform.scale.y, |display| {
+                    if settings.as_ref().is_some_and(|settings| !settings.enabled)
+                        || spike_target.tick < display.tick
+                    {
+                        spike_target.transform.scale.y
+                    } else {
+                        display.transform.scale.y
+                            + (spike_target.transform.scale.y - display.transform.scale.y) * blend
+                    }
+                });
+                footprint.spike_extension = (length - 0.65 * footprint.radius).max(0.0);
+            }
             let world_position = Vec2::new(
                 display.translation.x + snapshot.world_size.x * 0.5,
                 snapshot.world_size.y * 0.5 - display.translation.z,
@@ -1187,7 +1228,7 @@ fn smooth_agent_poses(
                 &snapshot.terrain_height,
                 world_position,
                 display.rotation,
-                *footprint,
+                footprint,
             );
         }
         display.previous_target = *target;
@@ -1839,6 +1880,10 @@ fn follow_active_color() -> Color {
 }
 pub(crate) const TERRAIN_CHUNK_SIZE: u32 = 64;
 pub(crate) const TERRAIN_HEIGHT_SCALE: f32 = 180.0;
+// Bevy's 150-unit default ends before even the closest 300-unit camera view.
+// Keep a stable range around the close creature view so shadows do not pop
+// as the camera eases, without spending the shadow map on the entire world.
+const CREATURE_SHADOW_DISTANCE: f32 = 1200.0;
 // The horizontal capsule extends 0.88 agent radii below its center. Keep the
 // body above a flat surface, with a small clearance for presentation motion.
 const AGENT_GROUND_OFFSET_FACTOR: f32 = 0.90;
@@ -1899,6 +1944,14 @@ struct CameraRig {
     // World-space anchor for manual panning; never refreshed by agent motion.
     free_focus: Option<Vec2>,
     focus_smoothed: Vec2,
+    // The last image-plane framing shift, expressed in world coordinates.
+    // Transfer it to the free-camera anchor when follow is disengaged.
+    framing_offset: Vec2,
+    // Preserve the optical center's height when that anchor crosses a slope.
+    free_height_bias: f32,
+    // A framed view can begin just beyond the world edge. Permit that anchor
+    // when leaving follow, without allowing panning any farther outward.
+    free_edge_anchor: Option<Vec2>,
     follow_mode: FollowMode,
     pending_fit: Option<FitCommand>,
     recenter_now: bool,
@@ -1915,6 +1968,9 @@ impl Default for CameraRig {
             pan_velocity: Vec2::ZERO,
             free_focus: None,
             focus_smoothed: Vec2::ZERO,
+            framing_offset: Vec2::ZERO,
+            free_height_bias: 0.0,
+            free_edge_anchor: None,
             follow_mode: FollowMode::Selected,
             pending_fit: None,
             recenter_now: true,
@@ -1924,8 +1980,16 @@ impl Default for CameraRig {
 
 impl CameraRig {
     fn toggle_follow_mode(&mut self, mode: FollowMode) {
-        if self.follow_mode == mode {
+        if mode == FollowMode::Off && self.follow_mode == FollowMode::Off {
+            return;
+        }
+        if self.follow_mode == mode || mode == FollowMode::Off {
             self.follow_mode = FollowMode::Off;
+            // Leaving follow should retain the current optical position. A
+            // previously requested fit still takes precedence over that handoff.
+            if self.pending_fit.is_none() {
+                self.recenter_now = false;
+            }
         } else {
             self.follow_mode = mode;
             self.pan = Vec2::ZERO;
@@ -1968,6 +2032,10 @@ struct HudElements {
 
 #[derive(Component)]
 struct HudControlDock;
+
+/// The left-hand panel that covers part of the follow camera's view.
+#[derive(Component)]
+struct HudScenePanel;
 
 /// The sun light whose shadow state follows the resolved quality tier.
 ///
@@ -2246,15 +2314,22 @@ struct TerrainChunkSignature([u8; 32]);
 impl TerrainChunkSignature {
     fn from_render_inputs(
         positions: &[[f32; 3]],
+        normals: &[[f32; 3]],
         colors: &[[f32; 4]],
         material_inputs: &[f32],
         detail_layer: usize,
     ) -> Self {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"scriptbots.bevy-terrain-chunk.v1");
+        hasher.update(b"scriptbots.bevy-terrain-chunk.v2");
         hasher.update(&(positions.len() as u64).to_le_bytes());
         for position in positions {
             for channel in position {
+                hasher.update(&channel.to_bits().to_le_bytes());
+            }
+        }
+        hasher.update(&(normals.len() as u64).to_le_bytes());
+        for normal in normals {
+            for channel in normal {
                 hasher.update(&channel.to_bits().to_le_bytes());
             }
         }
@@ -3051,6 +3126,11 @@ fn assign_presentation_revision(
     Ok(true)
 }
 
+fn terrain_sky_color() -> Color {
+    let [r, g, b] = visual::visual_style().atmosphere.fog_srgb;
+    Color::srgb(r, g, b)
+}
+
 fn setup_scene(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -3062,7 +3142,7 @@ fn setup_scene(
         .spawn((
             Camera3d::default(),
             Camera {
-                clear_color: ClearColorConfig::Custom(Color::srgb(0.03, 0.05, 0.09)),
+                clear_color: ClearColorConfig::Custom(terrain_sky_color()),
                 ..default()
             },
             camera_transform,
@@ -3078,8 +3158,8 @@ fn setup_scene(
     // Inserted separately rather than in the tuple because it is CONDITIONAL:
     // the component's presence is the on/off switch, so an unconditional insert
     // would make every tier bloom (bd-2z0.14.3.3).
-    if effective.features.bloom {
-        commands.entity(camera).insert(Bloom::NATURAL);
+    if let Some(bloom) = effective_bloom(&effective) {
+        commands.entity(camera).insert(bloom);
     }
     if let Some(fog) = tier_distance_fog(effective.features.fog, effective.fog_settings.as_ref()) {
         commands.entity(camera).insert(fog);
@@ -3216,6 +3296,7 @@ fn setup_scene(
             BackgroundColor(Color::srgba(0.07, 0.11, 0.18, 0.72)),
             Interaction::default(),
             FocusPolicy::Pass,
+            HudScenePanel,
         ))
         .id();
 
@@ -3887,6 +3968,19 @@ fn update_hud(
 }
 
 #[cfg(test)]
+mod renderer_plugins_tests {
+    use super::*;
+
+    #[test]
+    fn renderer_keeps_graphics_without_opening_unused_audio() {
+        let plugins = renderer_plugins();
+        assert!(plugins.enabled::<WindowPlugin>());
+        assert!(plugins.enabled::<bevy::render::RenderPlugin>());
+        assert!(!plugins.enabled::<bevy::audio::AudioPlugin>());
+    }
+}
+
+#[cfg(test)]
 mod hud_inspector_tests {
     use super::*;
 
@@ -4023,15 +4117,75 @@ mod hud_inspector_tests {
         assert_eq!(d.diet(), "carnivore");
     }
 
-    /// A spike that landed a hit must be visibly distinct from one merely
-    /// extended, since that is the difference between threat and posture.
+    /// The flag is the victim channel, not the attacker's strike channel.
     #[test]
     fn spike_hit_is_called_out() {
         let mut d = detail();
         d.spiked = true;
-        assert!(format_inspector(Some(d)).contains("HIT"));
+        assert!(format_inspector(Some(d)).contains("HIT RECEIVED"));
         d.spiked = false;
         assert!(!format_inspector(Some(d)).contains("HIT"));
+    }
+
+    #[test]
+    fn inspector_distinguishes_sharing_from_reproduction_and_receiving_from_landing_a_hit() {
+        use scriptbots_runtime::{
+            HostSessionId,
+            host_core::{HostCore, HostCoreOptions},
+        };
+
+        let mut world = WorldState::new(scriptbots_core::ScriptBotsConfig {
+            rng_seed: Some(42),
+            population_minimum: 0,
+            ..default()
+        })
+        .expect("seeded world");
+        let id = world
+            .try_inject_agent(scriptbots_core::AgentData::default())
+            .expect("agent");
+        let host = HostCore::new(
+            HostSessionId::new(87),
+            world,
+            HostCoreOptions {
+                capture_agent_visuals: true,
+                ..default()
+            },
+        )
+        .expect("drawing host");
+        let mut published = (*host.latest_snapshot()).clone();
+        let index = published
+            .world
+            .agents
+            .iter()
+            .position(|agent| agent.id == id.data().as_ffi())
+            .expect("injected agent in snapshot");
+        let mut runtime = scriptbots_core::AgentRuntime {
+            give_intent: 0.73,
+            reproduction_counter: 0.19,
+            combat: scriptbots_core::CombatEventFlags {
+                spike_attacker: true,
+                ..default()
+            },
+            ..default()
+        };
+        Arc::make_mut(&mut published.agent_visuals)[index] =
+            scriptbots_core::DynamicAgentVisuals::capture(&runtime);
+
+        let render = |snapshot: &RenderSnapshot| {
+            let visual = WorldSnapshot::from_snapshot(snapshot).expect("render snapshot");
+            format_inspector(Some(InspectorDetail::from_agent(&visual.agents[index], 0)))
+        };
+        let landed = render(&published);
+        assert!(landed.contains("Share 0.73"), "{landed}");
+        assert!(!landed.contains("Repro"), "{landed}");
+        assert!(!landed.contains("HIT RECEIVED"), "{landed}");
+
+        runtime.spiked = true;
+        runtime.combat.spike_attacker = false;
+        Arc::make_mut(&mut published.agent_visuals)[index] =
+            scriptbots_core::DynamicAgentVisuals::capture(&runtime);
+        let received = render(&published);
+        assert!(received.contains("HIT RECEIVED"), "{received}");
     }
 
     /// Multi-select reports the remainder, and a lone selection says nothing
@@ -5086,6 +5240,7 @@ mod adaptive_governor_tests {
             tier,
             features: tier_features(tier),
             fog_settings: None,
+            bloom_settings: None,
             gpu: None,
             requested: RenderQuality::Auto,
         }
@@ -5245,6 +5400,7 @@ mod adaptive_governor_tests {
             tier: RenderQuality::High,
             features: tier_features(RenderQuality::High),
             fog_settings: None,
+            bloom_settings: None,
             gpu: None,
             requested: RenderQuality::High,
         };
@@ -5766,6 +5922,43 @@ mod quality_tier_consumer_tests {
         );
     }
 
+    #[test]
+    fn shadows_cover_the_near_creature_view_across_tier_changes() {
+        let effective = EffectiveRenderSettings {
+            tier: RenderQuality::Ultra,
+            features: tier_features(RenderQuality::Ultra),
+            fog_settings: None,
+            bloom_settings: None,
+            gpu: None,
+            requested: RenderQuality::Ultra,
+        };
+        let mut app = App::new();
+        app.insert_resource(effective)
+            .add_systems(Update, apply_tier_to_sun_light);
+        // Ultra has the default number of cascades, so this also checks that
+        // the range is fixed even when the cascade count already matches.
+        let light = app
+            .world_mut()
+            .spawn((DirectionalLight::default(), TierDrivenSunLight))
+            .id();
+        app.update();
+        let cascades = app.world().get::<CascadeShadowConfig>(light).unwrap();
+        assert_eq!(
+            cascades.bounds.len(),
+            usize::from(tier_features(RenderQuality::Ultra).shadow_cascades)
+        );
+        assert!(cascades.bounds.last().copied().unwrap() >= CAMERA_MIN_DISTANCE * 2.0);
+        assert!((cascades.bounds.last().copied().unwrap() - CREATURE_SHADOW_DISTANCE).abs() < 0.01);
+
+        let mut settings = app.world_mut().resource_mut::<EffectiveRenderSettings>();
+        settings.tier = RenderQuality::Low;
+        settings.features = tier_features(RenderQuality::Low);
+        app.update();
+        let cascades = app.world().get::<CascadeShadowConfig>(light).unwrap();
+        assert_eq!(cascades.bounds.len(), 1);
+        assert!((cascades.bounds.last().copied().unwrap() - CREATURE_SHADOW_DISTANCE).abs() < 0.01);
+    }
+
     /// A tier transition must not panic when the shadow-map resource is absent.
     ///
     /// This is the transition-FAILURE path. `DirectionalLightShadowMap` only
@@ -5781,6 +5974,7 @@ mod quality_tier_consumer_tests {
             tier: RenderQuality::Ultra,
             features: tier_features(RenderQuality::Ultra),
             fog_settings: None,
+            bloom_settings: None,
             gpu: None,
             requested: RenderQuality::Ultra,
         };
@@ -6181,42 +6375,78 @@ mod quality_tier_consumer_tests {
         assert!(app.world().get::<DistanceFog>(camera).is_none());
     }
 
-    /// `features.bloom` must have a real consumer, not just a log line.
-    ///
-    /// Before bd-2z0.14.3.3 this crate never attached a `Bloom` component to any
-    /// camera. The field was logged at startup and on every tier change, so the
-    /// governor could announce Potato -> Ultra while the post stack stayed
-    /// identical — a tier that reports moving without moving anything. Shadows
-    /// were the only feature with a live consumer.
     #[test]
-    fn the_bloom_tier_feature_has_a_live_consumer() {
-        let source = include_str!("lib.rs");
-        // Deliberately NOT the split-at-the-test-module trick the sibling test
-        // uses. Production code in this file continues well past that module —
-        // `apply_tier_to_bloom` lives ~1000 lines after it — so slicing at the
-        // boundary silently hides the very consumer this asserts on, and the
-        // test fails while the code is correct.
-        //
-        // Instead match the CALL form — leading dot, trailing semicolon — and
-        // require MORE THAN ONE occurrence. Each needle necessarily matches the
-        // string literal in the assertion that names it, so `contains` alone
-        // would still hold after the production code was deleted: the test would
-        // be quoting itself and calling that proof. Counting makes the extra
-        // occurrence, the real call site, the thing being asserted.
-        let sites = |needle: &str| source.matches(needle).count();
-        assert!(
-            sites("effective.features.bloom") > 1,
-            "the bloom tier feature must be read by production code, not only logged"
+    fn bloom_overrides_survive_tier_changes_and_software_disables_bloom() {
+        use scriptbots_core::{RenderBloomSettings, RenderPostSettings};
+
+        let settings = RenderSettings {
+            quality: Some(RenderQuality::Medium),
+            post: Some(RenderPostSettings {
+                bloom: Some(RenderBloomSettings {
+                    enabled: false,
+                    threshold: Some(2.0),
+                    intensity: Some(0.4),
+                }),
+                ..default()
+            }),
+            ..default()
+        };
+        let mut app = App::new();
+        app.insert_resource(resolve_effective_render_settings_for_gpu(
+            &settings,
+            Some(gpu_info("hardware", GpuClass::Discrete)),
+        ))
+        .add_systems(Update, apply_tier_to_bloom);
+        let camera = app.world_mut().spawn((PrimaryCamera, Bloom::NATURAL)).id();
+        let unrelated = app.world_mut().spawn(Bloom::NATURAL).id();
+        app.update();
+        assert!(app.world().get::<Bloom>(camera).is_none());
+        {
+            let mut effective = app.world_mut().resource_mut::<EffectiveRenderSettings>();
+            effective.tier = RenderQuality::Low;
+            effective.features = tier_features(RenderQuality::Low);
+            effective.bloom_settings.as_mut().unwrap().enabled = true;
+        }
+        app.update();
+        let bloom = app.world().get::<Bloom>(camera).unwrap();
+        assert_eq!(bloom.intensity, 0.4);
+        assert_eq!(bloom.prefilter.threshold, 2.0);
+        assert!(app.world().get::<Bloom>(unrelated).is_some());
+        {
+            let mut effective = app.world_mut().resource_mut::<EffectiveRenderSettings>();
+            let bloom = effective.bloom_settings.as_mut().unwrap();
+            bloom.intensity = Some(4.0);
+            bloom.threshold = Some(-2.0);
+        }
+        app.update();
+        let bloom = app.world().get::<Bloom>(camera).unwrap();
+        assert_eq!(bloom.intensity, 1.0);
+        assert_eq!(bloom.prefilter.threshold, 0.0);
+        {
+            let mut effective = app.world_mut().resource_mut::<EffectiveRenderSettings>();
+            effective.bloom_settings = None;
+            effective.tier = RenderQuality::Medium;
+            effective.features = tier_features(RenderQuality::Medium);
+        }
+        app.update();
+        let bloom = app.world().get::<Bloom>(camera).unwrap();
+        assert_eq!(bloom.intensity, Bloom::NATURAL.intensity);
+        assert_eq!(
+            bloom.prefilter.threshold,
+            Bloom::NATURAL.prefilter.threshold
         );
-        assert!(
-            sites(".insert(Bloom::NATURAL);") > 1,
-            "reading the flag is not enough; a Bloom component must actually be attached"
-        );
-        assert!(
-            sites(".remove::<Bloom>();") > 1,
-            "a tier step DOWN must be able to take bloom away again, or the effect \
-             is one-way and the tier still does not describe the frame"
-        );
+        app.insert_resource(resolve_effective_render_settings_for_gpu(
+            &settings,
+            Some(gpu_info("software", GpuClass::Software)),
+        ));
+        app.world_mut()
+            .resource_mut::<EffectiveRenderSettings>()
+            .bloom_settings
+            .as_mut()
+            .unwrap()
+            .enabled = true;
+        app.update();
+        assert!(app.world().get::<Bloom>(camera).is_none());
     }
 
     /// Cycling must always move, and must never land on Auto.
@@ -6642,14 +6872,14 @@ fn format_inspector(detail: Option<InspectorDetail>) -> String {
         String::new()
     };
     let spike = if d.spiked {
-        format!("{:.2} HIT", d.spike_length)
+        format!("{:.2} HIT RECEIVED", d.spike_length)
     } else {
         format!("{:.2}", d.spike_length)
     };
     let t = &d.trait_modifiers;
     format!(
         "Inspector: {:?}{}\n  Energy {:>5.2} | Health {:>5.2} | Age {:>5} | Gen {}\n  \
-         Diet {} ({:.2}) | Temp pref {:.2} | Repro {:.2}\n  \
+         Diet {} ({:.2}) | Temp pref {:.2} | Share {:.2}\n  \
          Spike {} | Boost {:.2}\n  \
          Traits smell {:.2} sound {:.2} hearing {:.2} eye {:.2} blood {:.2}",
         d.id,
@@ -7184,7 +7414,8 @@ fn handle_quality_tier_button(
                 tier = ?next,
                 shadows = effective.features.shadows,
                 ssao = effective.features.ssao,
-                bloom = effective.features.bloom,
+                bloom = effective_bloom(&effective).is_some(),
+                tier_bloom = effective.features.bloom,
                 "Bevy quality tier changed at runtime"
             );
         }
@@ -7212,16 +7443,20 @@ fn apply_tier_to_sun_light(
         // that moved resolution but not cascades still rendered Low and Ultra
         // with the same blocky near-field (bd-2z0.14.3.3 item 2).
         //
-        // Only `num_cascades` is overridden. `CascadeShadowConfig::default()`
-        // IS `CascadeShadowConfigBuilder::default().into()`, so rebuilding from
-        // the builder with everything else defaulted changes the cascade count
-        // and nothing about the near/far distances — this must not quietly
-        // become a shadow-range change while claiming to be a quality one.
+        // The app's closest creature camera is farther away than Bevy's
+        // default 150-unit shadow range. Keep that range fixed while the
+        // camera moves, and use the tier to control cascade count.
         if effective.features.shadows && effective.features.shadow_cascades > 0 {
             let num_cascades = usize::from(effective.features.shadow_cascades);
-            if cascades.bounds.len() != num_cascades {
+            if cascades.bounds.len() != num_cascades
+                || cascades
+                    .bounds
+                    .last()
+                    .is_none_or(|far| (*far - CREATURE_SHADOW_DISTANCE).abs() > 0.01)
+            {
                 *cascades = CascadeShadowConfigBuilder {
                     num_cascades,
+                    maximum_distance: CREATURE_SHADOW_DISTANCE,
                     ..default()
                 }
                 .build();
@@ -7286,6 +7521,34 @@ fn apply_tier_to_sun_light(
 /// already carries, and `BloomPlugin` ships inside `PostProcessPlugin` via
 /// `DefaultPlugins`, so the inserted component is genuinely rendered rather
 /// than silently inert.
+/// Resolve explicit post settings after the tier, while keeping the software
+/// renderer's no-bloom safety limit. Invalid numeric overrides are ignored.
+fn effective_bloom(effective: &EffectiveRenderSettings) -> Option<Bloom> {
+    if effective
+        .gpu
+        .as_ref()
+        .is_some_and(|gpu| gpu.class == GpuClass::Software)
+    {
+        return None;
+    }
+    let settings = effective.bloom_settings.as_ref();
+    if !settings.map_or(effective.features.bloom, |settings| settings.enabled) {
+        return None;
+    }
+    let mut bloom = Bloom::NATURAL;
+    if let Some(intensity) = settings.and_then(|settings| settings.intensity)
+        && intensity.is_finite()
+    {
+        bloom.intensity = intensity.clamp(0.0, 1.0);
+    }
+    if let Some(threshold) = settings.and_then(|settings| settings.threshold)
+        && threshold.is_finite()
+    {
+        bloom.prefilter.threshold = threshold.clamp(0.0, 16.0);
+    }
+    Some(bloom)
+}
+
 fn apply_tier_to_bloom(
     mut commands: Commands,
     effective: Res<EffectiveRenderSettings>,
@@ -7294,17 +7557,19 @@ fn apply_tier_to_bloom(
     if !effective.is_changed() {
         return;
     }
+    let desired = effective_bloom(&effective);
     for (entity, current) in &cameras {
-        match (effective.features.bloom, current.is_some()) {
-            (true, false) => {
-                commands.entity(entity).insert(Bloom::NATURAL);
+        match (&desired, current) {
+            (Some(bloom), Some(current))
+                if current.intensity == bloom.intensity
+                    && current.prefilter.threshold == bloom.prefilter.threshold => {}
+            (Some(bloom), _) => {
+                commands.entity(entity).insert(bloom.clone());
             }
-            (false, true) => {
+            (None, Some(_)) => {
                 commands.entity(entity).remove::<Bloom>();
             }
-            // Already in the requested state; touching it would churn the
-            // render world for no reason.
-            _ => {}
+            (None, None) => {}
         }
     }
 }
@@ -7614,19 +7879,37 @@ fn control_camera(
     time: Res<Time>,
     mut rig: ResMut<CameraRig>,
     state: Res<SnapshotState>,
+    mut observed_selection: Local<bool>,
     motion: Option<Res<AgentMotionSettings>>,
     buttons: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
     mut mouse_motion: MessageReader<MouseMotion>,
     mut mouse_wheel: MessageReader<MouseWheel>,
     ui_interactions: Query<&Interaction, With<Node>>,
-    mut camera_query: Query<&mut Transform, With<PrimaryCamera>>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    panels: Query<(&ComputedNode, &Visibility), With<HudScenePanel>>,
+    mut camera_query: Query<(&mut Transform, Option<&Projection>), With<PrimaryCamera>>,
 ) {
-    let Ok(mut transform) = camera_query.single_mut() else {
+    let Ok((mut transform, projection)) = camera_query.single_mut() else {
         mouse_motion.clear();
         mouse_wheel.clear();
         return;
     };
+
+    // A selected agent can disappear between snapshots, for example when it
+    // dies. Keep the current view instead of silently following the first
+    // unrelated agent under the "Selected" label. A pending recenter can be
+    // a newly submitted selection whose snapshot has not arrived yet.
+    let has_selection = state.selection_center.is_some();
+    if state.latest.is_some()
+        && *observed_selection
+        && !has_selection
+        && rig.follow_mode == FollowMode::Selected
+        && !rig.recenter_now
+    {
+        rig.toggle_follow_mode(FollowMode::Off);
+    }
+    *observed_selection = has_selection;
 
     let ctrl_held = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
     let shift_held = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
@@ -7779,6 +8062,30 @@ fn control_camera(
         rig.pending_fit = None;
     }
 
+    if rig.follow_mode != FollowMode::Off || rig.recenter_now || focus_override.is_some() {
+        rig.free_height_bias = 0.0;
+        rig.free_edge_anchor = None;
+    }
+    if rig.follow_mode == FollowMode::Off
+        && rig.free_focus.is_none()
+        && !rig.recenter_now
+        && focus_override.is_none()
+    {
+        let framing_offset = rig.framing_offset;
+        let previous_focus = rig.focus_smoothed;
+        let next_focus = previous_focus + framing_offset;
+        rig.free_height_bias = state.latest.as_ref().map_or(0.0, |snapshot| {
+            sample_height_world(
+                &snapshot.terrain_height,
+                previous_focus,
+                TERRAIN_HEIGHT_SCALE,
+            ) - sample_height_world(&snapshot.terrain_height, next_focus, TERRAIN_HEIGHT_SCALE)
+        });
+        rig.focus_smoothed += framing_offset;
+        rig.free_focus = Some(rig.focus_smoothed);
+        rig.free_edge_anchor = Some(rig.focus_smoothed);
+    }
+
     let follow_target = match rig.follow_mode {
         FollowMode::Off => None,
         FollowMode::Selected => state.selection_center.or(state.first_agent_position),
@@ -7821,7 +8128,15 @@ fn control_camera(
     }
     let world_size = state.world_size;
     if world_size.x > 0.0 && world_size.y > 0.0 {
-        let bounded = target_focus.clamp(Vec2::ZERO, world_size);
+        let (minimum, maximum) = if rig.follow_mode == FollowMode::Off {
+            rig.free_edge_anchor
+                .map_or((Vec2::ZERO, world_size), |anchor| {
+                    (Vec2::ZERO.min(anchor), world_size.max(anchor))
+                })
+        } else {
+            (Vec2::ZERO, world_size)
+        };
+        let bounded = target_focus.clamp(minimum, maximum);
         if bounded.x != target_focus.x {
             rig.pan_velocity.x = 0.0;
         }
@@ -7871,8 +8186,8 @@ fn control_camera(
             rig.focus_smoothed,
             TERRAIN_HEIGHT_SCALE,
         ) + snapshot.agent_radius * AGENT_GROUND_OFFSET_FACTOR
-    });
-    let center = Vec3::new(
+    }) + rig.free_height_bias;
+    let mut center = Vec3::new(
         rig.focus_smoothed.x - world_size.x * 0.5,
         focus_height,
         world_size.y * 0.5 - rig.focus_smoothed.y,
@@ -7884,6 +8199,32 @@ fn control_camera(
         yaw.sin() * pitch.cos(),
     );
     let mut camera_position = center + dir * distance;
+    let mut framing_offset = Vec2::ZERO;
+    // Center a followed creature in the unobscured portion of the window.
+    // Shift the entire camera parallel to its image plane so the projection,
+    // picking rays, orbit direction, and the simulation's focus stay coherent.
+    // Free camera and explicit fit commands retain their existing framing.
+    if rig.follow_mode != FollowMode::Off
+        && follow_target.is_some()
+        && focus_override.is_none()
+        && let (Ok(window), Ok((panel, visibility)), Some(Projection::Perspective(perspective))) =
+            (windows.single(), panels.single(), projection)
+        && *visibility != Visibility::Hidden
+        && panel.size().x > 0.0
+        && window.physical_width() > 0
+        && window.physical_height() > 0
+    {
+        let viewport_width = window.physical_width() as f32;
+        let viewport_height = window.physical_height() as f32;
+        let covered = (12.0 * window.scale_factor() + panel.size().x).clamp(0.0, viewport_width);
+        let shift = distance * (perspective.fov * 0.5).tan() * covered / viewport_height;
+        let camera_right = (-dir).cross(Vec3::Y).normalize_or_zero();
+        let offset = -camera_right * shift;
+        framing_offset = Vec2::new(offset.x, -offset.z);
+        center += offset;
+        camera_position += offset;
+    }
+    rig.framing_offset = framing_offset;
     if let Some(snapshot) = &state.latest {
         let camera_world = Vec2::new(
             camera_position.x + world_size.x * 0.5,
@@ -8297,6 +8638,42 @@ struct TerrainChunkStats {
     signature: TerrainChunkSignature,
 }
 
+/// Area-weight the incident rendered triangles using global cell coordinates.
+/// A shared chunk-edge vertex must see the same faces from either chunk.
+fn terrain_vertex_normal(
+    terrain: &TerrainHeightSnapshot,
+    vertex: UVec2,
+    height_scale: f32,
+) -> Vec3 {
+    if terrain.dims.x == 0 || terrain.dims.y == 0 {
+        return Vec3::Y;
+    }
+    let cell = (terrain.cell_size as f32).max(1.0);
+    let height = |x: u32, y: u32| {
+        let index = terrain.index(x.min(terrain.dims.x - 1), y.min(terrain.dims.y - 1));
+        terrain.elevation[index] * height_scale
+    };
+    let mut sum = Vec3::ZERO;
+    for y in vertex.y.saturating_sub(1)..=vertex.y.min(terrain.dims.y - 1) {
+        for x in vertex.x.saturating_sub(1)..=vertex.x.min(terrain.dims.x - 1) {
+            let h00 = height(x, y);
+            let h10 = height(x + 1, y);
+            let h01 = height(x, y + 1);
+            let h11 = height(x + 1, y + 1);
+            let upper = Vec3::new(-cell * (h10 - h00), cell * cell, cell * (h01 - h00));
+            let lower = Vec3::new(-cell * (h11 - h01), cell * cell, cell * (h11 - h10));
+            let local = vertex - UVec2::new(x, y);
+            if local != UVec2::ONE {
+                sum += upper;
+            }
+            if local != UVec2::ZERO {
+                sum += lower;
+            }
+        }
+    }
+    sum.try_normalize().unwrap_or(Vec3::Y)
+}
+
 fn build_chunk_mesh(
     snapshot: &WorldSnapshot,
     bounds: TerrainChunkBounds,
@@ -8312,7 +8689,7 @@ fn build_chunk_mesh(
     let vertex_count = (verts_x * verts_z) as usize;
 
     let mut positions = Vec::with_capacity(vertex_count);
-    let mut normals = vec![Vec3::ZERO; vertex_count];
+    let mut normals = Vec::with_capacity(vertex_count);
     let mut uvs = Vec::with_capacity(vertex_count);
     let mut colors = Vec::with_capacity(vertex_count);
     let mut sum_moisture = 0.0f64;
@@ -8329,6 +8706,10 @@ fn build_chunk_mesh(
             let world_x = global_x as f32 * cell_size - half.x;
             let world_z = half.y - global_z as f32 * cell_size;
             positions.push([world_x, height, world_z]);
+            normals.push(
+                terrain_vertex_normal(terrain, UVec2::new(global_x, global_z), height_scale)
+                    .to_array(),
+            );
             max_height = max_height.max(height);
 
             let uv_x = global_x as f32 / terrain.dims.x.max(1) as f32;
@@ -8362,31 +8743,6 @@ fn build_chunk_mesh(
         }
     }
 
-    for &[ia, ib, ic] in indices.as_chunks::<3>().0 {
-        let ia = ia as usize;
-        let ib = ib as usize;
-        let ic = ic as usize;
-        let a = Vec3::from_array(positions[ia]);
-        let b = Vec3::from_array(positions[ib]);
-        let c = Vec3::from_array(positions[ic]);
-        let normal = (b - a).cross(c - a);
-        normals[ia] += normal;
-        normals[ib] += normal;
-        normals[ic] += normal;
-    }
-
-    let normals: Vec<[f32; 3]> = normals
-        .into_iter()
-        .map(|n| {
-            let n = if n.length_squared() > 1e-6 {
-                n.normalize()
-            } else {
-                Vec3::Y
-            };
-            [n.x, n.y, n.z]
-        })
-        .collect();
-
     let vertex_total = vertex_count as f64;
     let mean_moisture = (sum_moisture / vertex_total) as f32;
     let mean_slope = (sum_slope / vertex_total) as f32;
@@ -8406,6 +8762,7 @@ fn build_chunk_mesh(
     });
     let signature = TerrainChunkSignature::from_render_inputs(
         &positions,
+        &normals,
         &colors,
         &[
             mean_moisture,
@@ -8804,6 +9161,265 @@ mod terrain_tests {
             assert_eq!(camera_motion_lead(Vec2::ONE, radius, world), Vec2::ZERO);
         }
         assert_eq!(camera_motion_lead(Vec2::ONE, 12.0, Vec2::ZERO), Vec2::ZERO);
+    }
+
+    #[test]
+    fn follow_camera_frames_the_target_beside_the_inspector() {
+        use bevy::camera::PerspectiveProjection;
+        use bevy::window::WindowResolution;
+
+        for (width, height, panel_width, scale, yaw, mode, visible, fit, slope, edge) in [
+            (
+                1280,
+                720,
+                560.0,
+                1.0,
+                -0.6,
+                FollowMode::Selected,
+                true,
+                false,
+                false,
+                false,
+            ),
+            (
+                800,
+                600,
+                360.0,
+                1.0,
+                1.3,
+                FollowMode::Oldest,
+                true,
+                false,
+                false,
+                false,
+            ),
+            (
+                1600,
+                1200,
+                720.0,
+                2.0,
+                0.8,
+                FollowMode::Selected,
+                true,
+                false,
+                false,
+                false,
+            ),
+            (
+                1280,
+                720,
+                560.0,
+                1.0,
+                -0.6,
+                FollowMode::Off,
+                true,
+                false,
+                false,
+                false,
+            ),
+            (
+                1280,
+                720,
+                560.0,
+                1.0,
+                -0.6,
+                FollowMode::Selected,
+                false,
+                false,
+                false,
+                false,
+            ),
+            (
+                1280,
+                720,
+                560.0,
+                1.0,
+                -0.6,
+                FollowMode::Selected,
+                true,
+                true,
+                false,
+                false,
+            ),
+            (
+                1280,
+                720,
+                560.0,
+                1.0,
+                -0.6,
+                FollowMode::Selected,
+                true,
+                false,
+                true,
+                false,
+            ),
+            (
+                1280,
+                720,
+                560.0,
+                1.0,
+                -0.6,
+                FollowMode::Selected,
+                true,
+                false,
+                false,
+                true,
+            ),
+            (
+                1280,
+                720,
+                560.0,
+                1.0,
+                -0.6,
+                FollowMode::Selected,
+                true,
+                false,
+                true,
+                true,
+            ),
+        ] {
+            let mut app = App::new();
+            app.insert_resource(Time::<()>::default());
+            app.insert_resource(ButtonInput::<KeyCode>::default());
+            app.insert_resource(ButtonInput::<MouseButton>::default());
+            app.add_message::<MouseMotion>();
+            app.add_message::<MouseWheel>();
+            let focus = if edge {
+                Vec2::new(995.0, 5.0)
+            } else {
+                Vec2::splat(500.0)
+            };
+            let mut snapshot = (fit || slope).then(sample_world_snapshot);
+            if let Some(snapshot) = snapshot.as_mut().filter(|_| slope) {
+                snapshot.terrain_height.dims = UVec2::splat(3);
+                snapshot.terrain_height.cell_size = 500;
+                snapshot.terrain_height.elevation =
+                    vec![0.0, 0.1, 0.2, 0.0, 0.1, 0.2, 0.0, 0.1, 0.2];
+            }
+            let focus_height = snapshot.as_ref().map_or(0.0, |snapshot| {
+                sample_height_world(&snapshot.terrain_height, focus, TERRAIN_HEIGHT_SCALE)
+                    + snapshot.agent_radius * AGENT_GROUND_OFFSET_FACTOR
+            });
+            app.insert_resource(SnapshotState {
+                latest: snapshot,
+                world_size: Vec2::splat(1000.0),
+                world_center: focus,
+                focus_point: focus,
+                selection_center: Some(focus),
+                oldest_position: Some(focus),
+                ..default()
+            });
+            app.insert_resource(CameraRig {
+                yaw,
+                follow_mode: mode,
+                focus_smoothed: focus,
+                distance: 300.0,
+                distance_smoothed: 300.0,
+                pending_fit: fit.then_some(FitCommand::World),
+                ..default()
+            });
+            app.world_mut().spawn((
+                Window {
+                    resolution: WindowResolution::new(width, height)
+                        .with_scale_factor_override(scale),
+                    ..default()
+                },
+                PrimaryWindow,
+            ));
+            app.world_mut().spawn((
+                HudScenePanel,
+                ComputedNode {
+                    size: Vec2::new(panel_width, 400.0),
+                    ..default()
+                },
+                if visible {
+                    Visibility::Visible
+                } else {
+                    Visibility::Hidden
+                },
+            ));
+            let fov = PerspectiveProjection::default().fov;
+            let camera = app
+                .world_mut()
+                .spawn((
+                    PrimaryCamera,
+                    Transform::default(),
+                    Projection::Perspective(PerspectiveProjection {
+                        fov,
+                        aspect_ratio: width as f32 / height as f32,
+                        ..default()
+                    }),
+                ))
+                .id();
+            let follow_off_button = app
+                .world_mut()
+                .spawn((
+                    Button,
+                    FollowButton {
+                        mode: FollowMode::Off,
+                    },
+                    Interaction::None,
+                ))
+                .id();
+            app.add_systems(
+                Update,
+                (handle_follow_button_interactions, control_camera).chain(),
+            );
+            app.update();
+
+            let transform = app.world().get::<Transform>(camera).unwrap();
+            let target = Vec3::new(focus.x - 500.0, focus_height, 500.0 - focus.y);
+            let point = transform.rotation.inverse() * (target - transform.translation);
+            let half_width = -point.z * (fov * 0.5).tan() * width as f32 / height as f32;
+            let screen_x = (point.x / half_width + 1.0) * width as f32 * 0.5;
+            let expected = if visible && mode != FollowMode::Off && !fit {
+                (width as f32 + 12.0 * scale + panel_width) * 0.5
+            } else {
+                width as f32 * 0.5
+            };
+            assert!(
+                (screen_x - expected).abs() < 0.1,
+                "target at {screen_x}, expected {expected}, mode {mode:?}"
+            );
+            if visible && mode != FollowMode::Off && !fit {
+                let before = *transform;
+                *app.world_mut()
+                    .get_mut::<Interaction>(follow_off_button)
+                    .unwrap() = Interaction::Pressed;
+                app.world_mut()
+                    .resource_mut::<Time>()
+                    .advance_by(Duration::from_millis(16));
+                app.update();
+                let after = app.world().get::<Transform>(camera).unwrap();
+                if slope {
+                    assert!(app.world().resource::<CameraRig>().free_height_bias.abs() > 0.1);
+                }
+                if edge {
+                    let anchor = app
+                        .world()
+                        .resource::<CameraRig>()
+                        .free_edge_anchor
+                        .unwrap();
+                    assert!(anchor.x > 1000.0 || anchor.y < 0.0);
+                }
+                assert!(
+                    before.translation.distance(after.translation) < 0.001,
+                    "leaving follow must not jump sideways"
+                );
+                assert!(before.rotation.dot(after.rotation).abs() > 0.999_999);
+                app.update();
+                let settled = app.world().get::<Transform>(camera).unwrap();
+                assert!(before.translation.distance(settled.translation) < 0.001);
+                if edge {
+                    app.world_mut().resource_mut::<CameraRig>().pan = Vec2::new(100.0, -100.0);
+                    app.update();
+                    let rig = app.world().resource::<CameraRig>();
+                    assert!(rig.pan.length() < 0.001, "cannot pan farther outside");
+                    let bounded = app.world().get::<Transform>(camera).unwrap();
+                    assert!(before.translation.distance(bounded.translation) < 0.001);
+                }
+            }
+        }
     }
 
     #[test]
@@ -9231,8 +9847,8 @@ mod terrain_tests {
         let colors_b = [colors_a[1], colors_a[0]];
 
         assert_ne!(
-            TerrainChunkSignature::from_render_inputs(&positions_a, &colors_a, &[0.2], 0),
-            TerrainChunkSignature::from_render_inputs(&positions_b, &colors_b, &[0.2], 0),
+            TerrainChunkSignature::from_render_inputs(&positions_a, &[], &colors_a, &[0.2], 0),
+            TerrainChunkSignature::from_render_inputs(&positions_b, &[], &colors_b, &[0.2], 0),
             "equal height/color aggregates must not preserve a stale spatial mesh"
         );
     }
@@ -9242,14 +9858,31 @@ mod terrain_tests {
         let positions = [[0.0, 1.0, 0.0], [1.0, 1.0, 0.0]];
         let colors = [[0.8, 0.7, 0.2, 1.0]; 2];
         assert_ne!(
-            TerrainChunkSignature::from_render_inputs(&positions, &colors, &[0.1, 0.0], 0),
-            TerrainChunkSignature::from_render_inputs(&positions, &colors, &[0.9, 0.0], 0),
+            TerrainChunkSignature::from_render_inputs(&positions, &[], &colors, &[0.1, 0.0], 0),
+            TerrainChunkSignature::from_render_inputs(&positions, &[], &colors, &[0.9, 0.0], 0),
             "moisture/slope material changes must not preserve a stale PBR material"
         );
         assert_ne!(
-            TerrainChunkSignature::from_render_inputs(&positions, &colors, &[0.1, 0.0], 0),
-            TerrainChunkSignature::from_render_inputs(&positions, &colors, &[0.1, 0.0], 1),
+            TerrainChunkSignature::from_render_inputs(&positions, &[], &colors, &[0.1, 0.0], 0),
+            TerrainChunkSignature::from_render_inputs(&positions, &[], &colors, &[0.1, 0.0], 1),
             "texture layer alone must invalidate a chunk even when other render inputs agree"
+        );
+        assert_ne!(
+            TerrainChunkSignature::from_render_inputs(
+                &positions,
+                &[[0.0, 1.0, 0.0]],
+                &colors,
+                &[0.1, 0.0],
+                0,
+            ),
+            TerrainChunkSignature::from_render_inputs(
+                &positions,
+                &[[0.1, 0.99, 0.0]],
+                &colors,
+                &[0.1, 0.0],
+                0,
+            ),
+            "neighboring height changes must invalidate edge normals"
         );
     }
 
@@ -9693,6 +10326,67 @@ mod terrain_tests {
     }
 
     #[test]
+    fn terrain_normals_match_across_chunk_edges_and_rendered_faces() {
+        let mut snapshot = sample_world_snapshot();
+        snapshot.terrain_height.dims = UVec2::splat(4);
+        snapshot.terrain_height.cell_size = 100;
+        snapshot.terrain_height.elevation = vec![
+            0.1, 0.2, 0.1, 0.2, 0.3, 0.6, 0.2, 0.4, 0.1, 0.4, 0.8, 0.3, 0.2, 0.1, 0.4, 0.2,
+        ];
+        snapshot.terrain_height.moisture = vec![0.3; 16];
+        snapshot.terrain_height.accent = vec![0.1; 16];
+        snapshot.terrain_height.water_depth = vec![0.0; 16];
+        snapshot.terrain_height.fertility = vec![0.0; 16];
+        snapshot.terrain_height.temperature = vec![0.0; 16];
+        snapshot.terrain_height.kinds = vec![TerrainKind::Grass; 16];
+        let build = |origin, size| {
+            build_chunk_mesh(
+                &snapshot,
+                TerrainChunkBounds { origin, size },
+                TERRAIN_HEIGHT_SCALE,
+                ColorPaletteMode::Natural,
+            )
+            .mesh
+        };
+        let full = build(UVec2::ZERO, UVec2::splat(4));
+        let left = build(UVec2::ZERO, UVec2::splat(2));
+        let right = build(UVec2::new(2, 0), UVec2::splat(2));
+        let below = build(UVec2::new(0, 2), UVec2::splat(2));
+        let normals = |mesh: &Mesh| match mesh.attribute(Mesh::ATTRIBUTE_NORMAL).unwrap() {
+            VertexAttributeValues::Float32x3(values) => values.clone(),
+            _ => panic!("expected normals"),
+        };
+        let left_normals = normals(&left);
+        let right_normals = normals(&right);
+        let below_normals = normals(&below);
+        for index in 0..=2 {
+            assert_eq!(left_normals[index * 3 + 2], right_normals[index * 3]);
+            assert_eq!(left_normals[6 + index], below_normals[index]);
+        }
+        let positions = match full.attribute(Mesh::ATTRIBUTE_POSITION).unwrap() {
+            VertexAttributeValues::Float32x3(values) => values,
+            _ => panic!("expected positions"),
+        };
+        let Indices::U32(indices) = full.indices().unwrap() else {
+            panic!("expected indices");
+        };
+        let mut expected = vec![Vec3::ZERO; positions.len()];
+        for &[a, b, c] in indices.as_chunks::<3>().0 {
+            let [a, b, c] = [a as usize, b as usize, c as usize];
+            let [pa, pb, pc] = [a, b, c].map(|i| Vec3::from_array(positions[i]));
+            let face = (pb - pa).cross(pc - pa);
+            for vertex in [a, b, c] {
+                expected[vertex] += face;
+            }
+        }
+        for (actual, sum) in normals(&full).iter().zip(expected) {
+            let actual = Vec3::from_array(*actual);
+            assert!(actual.y > 0.0 && actual.is_finite());
+            assert!(actual.distance(sum.normalize()) < 1e-6);
+        }
+    }
+
+    #[test]
     fn agent_translation_respects_terrain_height() {
         let mut snapshot = sample_world_snapshot();
         snapshot.terrain_height.elevation.fill(0.5);
@@ -9759,6 +10453,189 @@ mod terrain_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn wheel_suspension_closes_ground_gap_without_accumulating_or_penetrating() {
+        let mut snapshot = sample_world_snapshot();
+        snapshot.agent_radius = 10.0;
+        snapshot.terrain_height.elevation.fill(0.0);
+        let agent = sample_agent_visual();
+        let footprint = agent_ground_footprint(&snapshot, &agent);
+        let world = snapshot.world_size;
+        let mut app = App::new();
+        app.insert_resource(SnapshotState {
+            latest: Some(snapshot),
+            ..default()
+        });
+        app.add_systems(Update, conform_agent_wheels);
+        let root_pose = AgentPoseTarget {
+            translation: Vec3::new(0.0, 12.1, 0.0),
+            rotation: Quat::IDENTITY,
+            tick: 1,
+        };
+        let root = app
+            .world_mut()
+            .spawn((
+                Transform::from_translation(root_pose.translation),
+                footprint,
+                AgentDisplayPose {
+                    translation: root_pose.translation,
+                    rotation: root_pose.rotation,
+                    previous_target: root_pose,
+                },
+            ))
+            .id();
+        let wheel = app
+            .world_mut()
+            .spawn((Transform::default(), WheelGroundContact { root, side: 1.0 }))
+            .id();
+        app.update();
+        let first = *app.world().get::<Transform>(wheel).unwrap();
+        assert!(
+            (first.translation.y + 7.6).abs() < 0.01,
+            "wheel should extend three units"
+        );
+        app.update();
+        assert_eq!(*app.world().get::<Transform>(wheel).unwrap(), first);
+        let mesh = ground_mesh_samples();
+        let terrain = &app
+            .world()
+            .resource::<SnapshotState>()
+            .latest
+            .as_ref()
+            .unwrap()
+            .terrain_height;
+        for point in &mesh.wheel.vertices {
+            let offset = first.translation + *point * footprint.radius;
+            let p = world * 0.5 + Vec2::new(offset.x, -offset.z);
+            assert!(
+                root_pose.translation.y + offset.y
+                    >= sample_height_world(terrain, p, TERRAIN_HEIGHT_SCALE) - 0.01
+            );
+        }
+        app.world_mut()
+            .get_mut::<Transform>(root)
+            .unwrap()
+            .translation
+            .y = 30.0;
+        app.update();
+        let limited = app.world().get::<Transform>(wheel).unwrap();
+        assert!((limited.translation.y - (-4.6 - 6.5)).abs() < 0.001);
+    }
+
+    #[test]
+    fn wheel_suspension_tracks_uneven_terrain_without_sampled_intersections() {
+        let mut snapshot = sample_world_snapshot();
+        snapshot.world_size = Vec2::splat(300.0);
+        snapshot.agent_radius = 10.0;
+        snapshot.terrain_height.dims = UVec2::splat(4);
+        snapshot.terrain_height.cell_size = 100;
+        snapshot.terrain_height.elevation = vec![
+            0.1, 0.2, 0.1, 0.2, 0.3, 0.6, 0.2, 0.4, 0.1, 0.4, 0.8, 0.3, 0.2, 0.1, 0.4, 0.2,
+        ];
+        let mut agent = sample_agent_visual();
+        agent.spike_length = 0.0;
+        let footprint = agent_ground_footprint(&snapshot, &agent);
+        let initial = AgentPoseTarget {
+            translation: Vec3::ZERO,
+            rotation: Quat::IDENTITY,
+            tick: 1,
+        };
+        let mut app = App::new();
+        app.insert_resource(SnapshotState {
+            latest: Some(snapshot.clone()),
+            ..default()
+        })
+        .add_systems(Update, conform_agent_wheels);
+        let root = app
+            .world_mut()
+            .spawn((
+                Transform::default(),
+                footprint,
+                AgentDisplayPose {
+                    translation: initial.translation,
+                    rotation: initial.rotation,
+                    previous_target: initial,
+                },
+            ))
+            .id();
+        let wheels = [-1.0, 1.0].map(|side| {
+            app.world_mut()
+                .spawn((
+                    Transform {
+                        translation: Vec3::new(0.0, -4.6, side * 9.856),
+                        rotation: Quat::from_rotation_x(std::f32::consts::FRAC_PI_2),
+                        scale: Vec3::new(7.5, 4.0, 7.5),
+                    },
+                    WheelGroundContact { root, side },
+                ))
+                .id()
+        });
+        let rendered_mesh = Mesh::from(Torus::new(0.3, 0.6));
+        let VertexAttributeValues::Float32x3(vertices) = rendered_mesh
+            .attribute(Mesh::ATTRIBUTE_POSITION)
+            .expect("wheel positions")
+        else {
+            panic!("expected wheel positions");
+        };
+        let indices: Vec<usize> = match rendered_mesh.indices().expect("wheel indices") {
+            Indices::U16(values) => values.iter().map(|&value| usize::from(value)).collect(),
+            Indices::U32(values) => values.iter().map(|&value| value as usize).collect(),
+        };
+        let mut saw_suspension = false;
+        for position in [
+            Vec2::new(95.0, 100.0),
+            Vec2::new(100.0, 95.0),
+            Vec2::new(105.0, 100.0),
+            Vec2::new(195.0, 200.0),
+            Vec2::new(205.0, 195.0),
+        ] {
+            for heading in [0.0, 0.8, -1.7] {
+                agent.position = position;
+                agent.heading = heading;
+                let (translation, rotation) = agent_surface_pose(&snapshot, &agent);
+                *app.world_mut().get_mut::<Transform>(root).unwrap() =
+                    Transform::from_translation(translation).with_rotation(rotation);
+                app.update();
+                for (side, wheel) in [-1.0, 1.0].into_iter().zip(wheels) {
+                    let wheel = app.world().get::<Transform>(wheel).unwrap();
+                    let center = Vec3::new(0.0, -4.6, side * 9.856);
+                    let travel = rotation * (center - wheel.translation);
+                    assert!(travel.x.abs() < 1e-4 && travel.z.abs() < 1e-4);
+                    assert!((0.0..=6.501).contains(&travel.y));
+                    saw_suspension |= travel.y > 0.05;
+                    let check = |point: Vec3| {
+                        let offset = rotation * wheel.transform_point(point);
+                        let ground = sample_height_world(
+                            &snapshot.terrain_height,
+                            position + Vec2::new(offset.x, -offset.z),
+                            TERRAIN_HEIGHT_SCALE,
+                        );
+                        assert!(
+                            translation.y + offset.y >= ground - 0.01,
+                            "wheel penetrates by {} at {position:?}, heading {heading}",
+                            ground - translation.y - offset.y
+                        );
+                    };
+                    for &[a, b, c] in indices.as_chunks::<3>().0 {
+                        let [a, b, c] = [a, b, c].map(|index| Vec3::from_array(vertices[index]));
+                        for point in [
+                            a,
+                            b,
+                            c,
+                            (a + b) * 0.5,
+                            (b + c) * 0.5,
+                            (c + a) * 0.5,
+                            (a + b + c) / 3.0,
+                        ] {
+                            check(point);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(saw_suspension, "fixture must exercise nonzero wheel travel");
     }
 
     #[test]
@@ -9883,6 +10760,103 @@ mod terrain_tests {
             }
         }
     }
+
+    #[test]
+    fn retracting_displayed_spike_clears_terrain() {
+        let mut snapshot = sample_world_snapshot();
+        snapshot.world_size = Vec2::splat(300.0);
+        snapshot.agent_radius = 10.0;
+        snapshot.terrain_height.dims = UVec2::new(4, 4);
+        snapshot.terrain_height.cell_size = 100;
+        snapshot.terrain_height.elevation = vec![
+            0.1, 0.2, 0.1, 0.2, 0.3, 0.6, 0.2, 0.4, 0.1, 0.4, 0.8, 0.3, 0.2, 0.1, 0.4, 0.2,
+        ];
+        let mut agent = sample_agent_visual();
+        agent.position = Vec2::new(195.0, 100.0);
+        agent.heading = 0.8;
+        agent.spike_length = 0.0;
+        let (translation, rotation) = agent_surface_pose(&snapshot, &agent);
+        let target = AgentPoseTarget {
+            translation,
+            rotation,
+            tick: 2,
+        };
+        let spike_transform = |extension: f32| {
+            let length = 6.5 + extension;
+            Transform {
+                translation: Vec3::new(16.45 + length * 0.5, 0.6, 0.0),
+                rotation: Quat::from_rotation_z(-std::f32::consts::FRAC_PI_2),
+                scale: Vec3::new(4.8, length, 4.8),
+            }
+        };
+        let mut app = App::new();
+        let mut time = Time::<()>::default();
+        time.advance_by(std::time::Duration::from_secs_f32(1.0 / 60.0));
+        app.insert_resource(time)
+            .insert_resource(SnapshotState {
+                world_size: snapshot.world_size,
+                latest: Some(snapshot.clone()),
+                ..default()
+            })
+            .add_systems(Update, (smooth_agent_poses, smooth_spike_poses).chain());
+        let spike = app
+            .world_mut()
+            .spawn((
+                spike_transform(9.0),
+                SpikeDisplayPose {
+                    transform: spike_transform(9.0),
+                    tick: 1,
+                },
+                SpikePoseTarget {
+                    transform: spike_transform(0.0),
+                    tick: 2,
+                },
+            ))
+            .id();
+        let root = app
+            .world_mut()
+            .spawn((
+                Transform::from_translation(translation).with_rotation(rotation),
+                target,
+                AgentDisplayPose {
+                    translation,
+                    rotation,
+                    previous_target: target,
+                },
+                AgentGroundFootprint {
+                    spike: Some(spike),
+                    ..agent_ground_footprint(&snapshot, &agent)
+                },
+            ))
+            .id();
+        app.update();
+        let root = *app.world().get::<Transform>(root).unwrap();
+        let spike = *app.world().get::<Transform>(spike).unwrap();
+        assert!(
+            spike.scale.y > 6.5,
+            "the displayed spike must still be retracting"
+        );
+        let mesh = Mesh::from(Cone {
+            radius: 0.45,
+            height: 1.0,
+        });
+        let VertexAttributeValues::Float32x3(points) =
+            mesh.attribute(Mesh::ATTRIBUTE_POSITION).unwrap()
+        else {
+            panic!("expected 3D mesh positions");
+        };
+        for &point in points {
+            let offset = root.rotation * spike.transform_point(Vec3::from_array(point));
+            let position = agent.position + Vec2::new(offset.x, -offset.z);
+            let ground =
+                sample_height_world(&snapshot.terrain_height, position, TERRAIN_HEIGHT_SCALE);
+            assert!(
+                root.translation.y + offset.y >= ground - 0.01,
+                "retracting spike penetrates terrain by {}",
+                ground - root.translation.y - offset.y
+            );
+        }
+    }
 }
 
 fn compute_tile_slope(terrain: &TerrainHeightSnapshot, x: u32, z: u32) -> f32 {
@@ -9978,6 +10952,9 @@ fn spawn_agent_entity(
         Transform::IDENTITY,
     );
     commands.entity(root).add_child(wheel_left.entity);
+    commands
+        .entity(wheel_left.entity)
+        .insert(WheelGroundContact { root, side: 1.0 });
 
     let wheel_right = spawn_part(
         commands,
@@ -9991,6 +10968,9 @@ fn spawn_agent_entity(
         Transform::IDENTITY,
     );
     commands.entity(root).add_child(wheel_right.entity);
+    commands
+        .entity(wheel_right.entity)
+        .insert(WheelGroundContact { root, side: -1.0 });
 
     let mouth = spawn_part(
         commands,
@@ -10220,9 +11200,11 @@ fn apply_agent_visuals(
 
     let visuals = canonical_agent_visual_params(agent);
     let (translation, rotation) = agent_surface_pose(snapshot, agent);
+    let mut footprint = agent_ground_footprint(snapshot, agent);
+    footprint.spike = Some(record.spike.entity);
     commands.entity(record.root).insert((
         Transform::from_translation(translation).with_rotation(rotation),
-        agent_ground_footprint(snapshot, agent),
+        footprint,
         AgentPoseTarget {
             translation,
             rotation,
@@ -10665,6 +11647,7 @@ fn agent_ground_footprint(snapshot: &WorldSnapshot, agent: &AgentVisual) -> Agen
     AgentGroundFootprint {
         radius: snapshot.agent_radius.clamp(0.2, 1024.0),
         spike_extension: agent.spike_length.max(0.0),
+        spike: None,
     }
 }
 
@@ -10793,54 +11776,29 @@ fn include_ground_mesh(
     mut include: impl FnMut(Vec3),
 ) {
     let cell = terrain.cell_size.max(1) as f32;
-    let local: Vec<Vec3> = mesh
+    let offsets: Vec<Vec3> = mesh
         .vertices
         .iter()
-        .map(|&point| transform.transform_point(point))
+        .map(|&point| rotation * transform.transform_point(point))
         .collect();
-    let grid: Vec<Vec2> = local
+    let grid: Vec<Vec2> = offsets
         .iter()
-        .map(|&point| {
-            let offset = rotation * point;
-            (position + Vec2::new(offset.x, -offset.z)) / cell
-        })
+        .map(|&offset| (position + Vec2::new(offset.x, -offset.z)) / cell)
         .collect();
+    for &point in &offsets {
+        include(point);
+    }
     // A triangle is convex. If all projected mesh vertices lie in one
     // terrain triangle, every mesh face does too, and vertex support is exact
     // for this planar patch. Keep the full overlay path across any boundary.
-    if let Some((x, y, lower)) = grid
+    if let Some(first) = grid
         .first()
         .and_then(|&point| terrain_triangle_at(point, terrain.dims))
         && grid
             .iter()
-            .all(|&point| terrain_triangle_at(point, terrain.dims) == Some((x, y, lower)))
+            .all(|&point| terrain_triangle_at(point, terrain.dims) == Some(first))
     {
-        // The height difference is linear across the patch. Compute its
-        // maximum over the mesh vertices using one plane instead of querying
-        // the heightfield for every vertex.
-        let h00 = terrain.elevation[terrain.index(x, y)] * TERRAIN_HEIGHT_SCALE;
-        let h10 = terrain.elevation[terrain.index(x + 1, y)] * TERRAIN_HEIGHT_SCALE;
-        let h01 = terrain.elevation[terrain.index(x, y + 1)] * TERRAIN_HEIGHT_SCALE;
-        let h11 = terrain.elevation[terrain.index(x + 1, y + 1)] * TERRAIN_HEIGHT_SCALE;
-        let (base, dx, dy) = if lower {
-            (h00, h10 - h00, h01 - h00)
-        } else {
-            (h01 + h10 - h11, h11 - h01, h11 - h10)
-        };
-        let origin = Vec2::new(x as f32, y as f32);
-        let mut best = (f32::NEG_INFINITY, Vec3::ZERO);
-        for (&point, &projected) in local.iter().zip(&grid) {
-            let within = projected - origin;
-            let height = base + dx * within.x + dy * within.y - (rotation * point).y;
-            if height > best.0 {
-                best = (height, point);
-            }
-        }
-        include(best.1);
         return;
-    }
-    for &point in &local {
-        include(point);
     }
     // Terrain triangle edges lie on integer x, y, and x+y grid lines.
     for &[a, b] in &mesh.edges {
@@ -10860,7 +11818,7 @@ fn include_ground_mesh(
             for line in begin..=finish {
                 let t = (line as f32 - first) / delta;
                 if t > 0.0 && t < 1.0 {
-                    include(local[a].lerp(local[b], t));
+                    include(offsets[a].lerp(offsets[b], t));
                 }
             }
         }
@@ -10882,9 +11840,55 @@ fn include_ground_mesh(
                 let s = relative.perp_dot(v) / determinant;
                 let t = u.perp_dot(relative) / determinant;
                 if s >= 0.0 && t >= 0.0 && s + t <= 1.0 {
-                    include(local[a] + (local[b] - local[a]) * s + (local[c] - local[a]) * t);
+                    include(
+                        offsets[a] + (offsets[b] - offsets[a]) * s + (offsets[c] - offsets[a]) * t,
+                    );
                 }
             }
+        }
+    }
+}
+
+/// Lower each wheel independently while keeping its complete triangulated
+/// surface above the rendered terrain. The motion is vertical in world space,
+/// so lowering a wheel does not also slide its contact patch sideways on a
+/// slope. Limit suspension travel to keep the wheel attached to the chassis.
+fn conform_agent_wheels(
+    state: Res<SnapshotState>,
+    roots: Query<(&Transform, &AgentGroundFootprint), With<AgentDisplayPose>>,
+    mut wheels: Query<(&WheelGroundContact, &mut Transform), Without<AgentDisplayPose>>,
+) {
+    let Some(snapshot) = &state.latest else {
+        return;
+    };
+    for (contact, mut wheel) in &mut wheels {
+        let Ok((root, footprint)) = roots.get(contact.root) else {
+            continue;
+        };
+        let radius = footprint.radius;
+        let position = Vec2::new(
+            root.translation.x + snapshot.world_size.x * 0.5,
+            snapshot.world_size.y * 0.5 - root.translation.z,
+        );
+        let center = Vec3::new(0.0, -0.46, contact.side * 0.9856) * radius;
+        let mut support = f32::NEG_INFINITY;
+        include_ground_mesh(
+            &ground_mesh_samples().wheel,
+            Transform::from_translation(center).with_scale(Vec3::splat(radius)),
+            root.rotation,
+            position,
+            &snapshot.terrain_height,
+            |offset| {
+                let point = position + Vec2::new(offset.x, -offset.z);
+                support = support.max(
+                    sample_height_world(&snapshot.terrain_height, point, TERRAIN_HEIGHT_SCALE)
+                        - offset.y,
+                );
+            },
+        );
+        if support.is_finite() {
+            let travel = (root.translation.y - support).clamp(0.0, radius * 0.65);
+            wheel.translation = center - root.rotation.inverse() * Vec3::Y * travel;
         }
     }
 }
@@ -10900,8 +11904,7 @@ fn terrain_footprint_height(
 ) -> f32 {
     let radius = footprint.radius;
     let mut required = f32::NEG_INFINITY;
-    let mut include = |local: Vec3| {
-        let offset = rotation * local;
+    let mut include = |offset: Vec3| {
         let sample = position + Vec2::new(offset.x, -offset.z);
         let height = sample_height_world(terrain, sample, TERRAIN_HEIGHT_SCALE) - offset.y;
         required = required.max(height);
@@ -10918,7 +11921,7 @@ fn terrain_footprint_height(
         for fraction in [-0.8_f32, -0.4, 0.0, 0.4, 0.8] {
             let z = cross_radius * fraction;
             let y = -(cross_radius * cross_radius - z * z).max(0.0).sqrt() - 0.02;
-            include(Vec3::new(x * radius, y * radius, z * radius));
+            include(rotation * Vec3::new(x * radius, y * radius, z * radius));
         }
     }
     // Sample the lower arc and side thickness of both wheels.
@@ -10926,11 +11929,10 @@ fn terrain_footprint_height(
         for x in [-0.36_f32, -0.24, -0.12, 0.0, 0.12, 0.24, 0.36] {
             let y = -0.46 - (0.45_f32.powi(2) - x * x).max(0.0).sqrt();
             for thickness in [-0.06, 0.0, 0.06] {
-                include(Vec3::new(
-                    x * radius,
-                    y * radius,
-                    (side * 0.9856 + thickness) * radius,
-                ));
+                include(
+                    rotation
+                        * Vec3::new(x * radius, y * radius, (side * 0.9856 + thickness) * radius),
+                );
             }
         }
     }
@@ -10959,11 +11961,7 @@ fn terrain_footprint_height(
     // The cone extends forward from the nose; sample its lower edge as well.
     let spike = 0.65 * radius + footprint.spike_extension;
     for (fraction, lower) in [(0.0, -0.156), (0.5, -0.048), (1.0, 0.06)] {
-        include(Vec3::new(
-            1.645 * radius + spike * fraction,
-            lower * radius,
-            0.0,
-        ));
+        include(rotation * Vec3::new(1.645 * radius + spike * fraction, lower * radius, 0.0));
     }
     let spike_transform = Transform {
         translation: Vec3::new(1.645 * radius + spike * 0.5, 0.06 * radius, 0.0),
@@ -11956,6 +12954,32 @@ mod tests {
     }
 
     #[test]
+    fn follow_off_button_preserves_a_queued_fit_but_cancels_stale_recenter() {
+        for pending_fit in [None, Some(FitCommand::World)] {
+            let mut app = App::new();
+            app.insert_resource(CameraRig {
+                follow_mode: FollowMode::Selected,
+                recenter_now: true,
+                pending_fit,
+                ..default()
+            });
+            app.add_systems(Update, handle_follow_button_interactions);
+            app.world_mut().spawn((
+                Button,
+                FollowButton {
+                    mode: FollowMode::Off,
+                },
+                Interaction::Pressed,
+            ));
+            app.update();
+            let rig = app.world().resource::<CameraRig>();
+            assert_eq!(rig.follow_mode, FollowMode::Off);
+            assert_eq!(rig.pending_fit, pending_fit);
+            assert_eq!(rig.recenter_now, pending_fit.is_some());
+        }
+    }
+
+    #[test]
     fn clear_selection_button_submits_command() {
         let mut app = App::new();
         app.add_systems(Update, handle_clear_selection_button);
@@ -12673,6 +13697,7 @@ mod tests {
         let footprint = AgentGroundFootprint {
             radius: 10.0,
             spike_extension: 0.0,
+            spike: None,
         };
         let start = AgentPoseTarget {
             translation: Vec3::new(-100.0, 81.1, 0.0),
@@ -13464,6 +14489,67 @@ mod tests {
     }
 
     #[test]
+    fn losing_followed_selection_holds_the_view_instead_of_following_another_agent() {
+        let world = WorldState::new(ScriptBotsConfig::default()).expect("world init");
+        let snapshot = WorldSnapshot::from_world(&world).expect("snapshot generation");
+        let followed = snapshot.world_size * 0.4;
+        let unrelated = snapshot.world_size * 0.8;
+        let mut app = App::new();
+        app.insert_resource(Time::<()>::default());
+        app.insert_resource(ButtonInput::<MouseButton>::default());
+        app.insert_resource(ButtonInput::<KeyCode>::default());
+        app.insert_resource(Messages::<MouseMotion>::default());
+        app.insert_resource(Messages::<MouseWheel>::default());
+        app.insert_resource(CameraRig {
+            follow_mode: FollowMode::Selected,
+            focus_smoothed: followed,
+            recenter_now: false,
+            ..Default::default()
+        });
+        app.insert_resource(SnapshotState {
+            world_size: snapshot.world_size,
+            world_center: snapshot.world_size * 0.5,
+            focus_point: followed,
+            selection_center: Some(followed),
+            first_agent_position: Some(unrelated),
+            latest: Some(snapshot),
+            ..Default::default()
+        });
+        app.add_systems(Update, control_camera);
+        let camera = app
+            .world_mut()
+            .spawn((PrimaryCamera, Transform::default()))
+            .id();
+
+        app.update();
+        let before = *app.world().get::<Transform>(camera).unwrap();
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            state.selection_center = None;
+            state.focus_point = unrelated;
+        }
+        app.update();
+        assert_eq!(
+            app.world().resource::<CameraRig>().follow_mode,
+            FollowMode::Off
+        );
+        let after = app.world().get::<Transform>(camera).unwrap();
+        assert!(before.translation.distance(after.translation) < 0.001);
+        assert!(before.rotation.dot(after.rotation).abs() > 0.99999);
+
+        app.world_mut()
+            .resource_mut::<SnapshotState>()
+            .first_agent_position = Some(unrelated * 0.5);
+        app.update();
+        assert!(
+            before
+                .translation
+                .distance(app.world().get::<Transform>(camera).unwrap().translation)
+                < 0.001
+        );
+    }
+
+    #[test]
     fn follow_mode_keeps_selection_centered() -> Result<()> {
         let mut app = App::new();
         app.add_plugins(MinimalPlugins);
@@ -13906,12 +14992,7 @@ mod tests {
             let root = app.world().resource::<AgentRegistry>().records[&agent.id].root;
             let transform = app.world().entity(root).get::<Transform>().unwrap();
             assert_eq!(transform.translation, agent_translation(snapshot, agent));
-            assert!(
-                transform
-                    .rotation
-                    .angle_between(agent_surface_pose(snapshot, agent).1)
-                    < 0.001
-            );
+            assert_eq!(transform.rotation, agent_surface_pose(snapshot, agent).1);
         }
 
         // Multiple presentation repaints on unchanged snapshot tick do not advance tick

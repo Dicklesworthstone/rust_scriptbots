@@ -1400,6 +1400,9 @@ fn add_capture_scene_systems(app: &mut App) {
         Update,
         (
             sync_world,
+            // Captures use the snapshot pose directly, but the wheel
+            // suspension must still match the interactive scene.
+            crate::conform_agent_wheels,
             crate::apply_tier_to_reflection_probes,
             crate::apply_tier_to_terrain_detail,
             apply_capture_corruption,
@@ -1624,7 +1627,7 @@ fn configure_session<'a>(
     configure_capture_camera_effects(
         app.world_mut(),
         &config.render_settings,
-        effective.features.bloom,
+        crate::effective_bloom(&effective),
     );
     configure_capture_fog(
         app.world_mut(),
@@ -1702,7 +1705,7 @@ fn configure_capture_rig(world: &mut World, target: &Handle<Image>, shadows: boo
     let mut cameras = world.query_filtered::<&mut Camera, With<CaptureCamera>>();
     for mut camera in cameras.iter_mut(world) {
         camera.target = RenderTarget::Image(target.clone().into());
-        camera.clear_color = ClearColorConfig::Custom(Color::srgb(0.03, 0.05, 0.09));
+        camera.clear_color = ClearColorConfig::Custom(crate::terrain_sky_color());
     }
     let mut lights = world.query::<&mut DirectionalLight>();
     for mut light in lights.iter_mut(world) {
@@ -1729,7 +1732,11 @@ fn configure_capture_fog(
 }
 
 /// Reset native tonemapping, exposure and bloom on the persistent session camera.
-fn configure_capture_camera_effects(world: &mut World, settings: &RenderSettings, bloom: bool) {
+fn configure_capture_camera_effects(
+    world: &mut World,
+    settings: &RenderSettings,
+    bloom: Option<crate::Bloom>,
+) {
     let state = crate::TonemappingState::from_render_settings(settings);
     let mut cameras = world
         .query_filtered::<
@@ -1747,8 +1754,8 @@ fn configure_capture_camera_effects(world: &mut World, settings: &RenderSettings
     for entity in entities {
         // As in the native camera, component presence enables the effect.
         // Reset both directions because this camera outlives each session.
-        if bloom {
-            world.entity_mut(entity).insert(crate::Bloom::NATURAL);
+        if let Some(bloom) = &bloom {
+            world.entity_mut(entity).insert(bloom.clone());
         } else {
             world.entity_mut(entity).remove::<crate::Bloom>();
         }
@@ -1773,7 +1780,7 @@ fn setup_capture_rig(mut commands: Commands, target: Res<CaptureTarget>) {
     commands.spawn((
         Camera3d::default(),
         Camera {
-            clear_color: ClearColorConfig::Custom(Color::srgb(0.03, 0.05, 0.09)),
+            clear_color: ClearColorConfig::Custom(crate::terrain_sky_color()),
             target: RenderTarget::Image(target.0.clone().into()),
             is_active: false,
             ..default()
@@ -1871,6 +1878,45 @@ mod tests {
         warmup_capture_app(&mut app, effective);
         configure_capture_rig(app.world_mut(), &Handle::default(), false);
         app
+    }
+
+    #[test]
+    fn capture_scene_runs_wheel_suspension_without_accumulating_travel() {
+        let mut app = corruption_app(false);
+        let pose = crate::AgentPoseTarget {
+            translation: Vec3::new(0.0, 10_000.0, 0.0),
+            rotation: Quat::IDENTITY,
+            tick: 1,
+        };
+        let root = app
+            .world_mut()
+            .spawn((
+                Transform::from_translation(pose.translation),
+                crate::AgentGroundFootprint {
+                    radius: 10.0,
+                    spike_extension: 0.0,
+                    spike: None,
+                },
+                crate::AgentDisplayPose {
+                    translation: pose.translation,
+                    rotation: pose.rotation,
+                    previous_target: pose,
+                },
+            ))
+            .id();
+        let wheel = app
+            .world_mut()
+            .spawn((
+                Transform::from_translation(Vec3::new(0.0, -4.6, 9.856)),
+                crate::WheelGroundContact { root, side: 1.0 },
+            ))
+            .id();
+
+        app.update();
+        let first = *app.world().get::<Transform>(wheel).unwrap();
+        assert!((first.translation.y - (-4.6 - 6.5)).abs() < 0.001);
+        app.update();
+        assert_eq!(*app.world().get::<Transform>(wheel).unwrap(), first);
     }
 
     #[test]
@@ -2240,7 +2286,7 @@ mod tests {
             tonemap_exposure_bias: Some(-0.75),
             ..Default::default()
         };
-        configure_capture_camera_effects(&mut world, &settings, false);
+        configure_capture_camera_effects(&mut world, &settings, None);
         assert_eq!(
             world.get::<crate::Tonemapping>(camera),
             Some(&crate::Tonemapping::AgX)
@@ -2253,7 +2299,7 @@ mod tests {
                 .exposure,
             -0.75
         );
-        configure_capture_camera_effects(&mut world, &RenderSettings::default(), false);
+        configure_capture_camera_effects(&mut world, &RenderSettings::default(), None);
         assert_eq!(
             world.get::<crate::Tonemapping>(camera),
             Some(&crate::Tonemapping::AcesFitted)
@@ -2363,7 +2409,11 @@ mod tests {
             .id();
         let unrelated = world.spawn(crate::Bloom::NATURAL).id();
         for enabled in [true, false, true, false] {
-            configure_capture_camera_effects(&mut world, &RenderSettings::default(), enabled);
+            configure_capture_camera_effects(
+                &mut world,
+                &RenderSettings::default(),
+                enabled.then_some(crate::Bloom::NATURAL),
+            );
             let bloom = world.get::<crate::Bloom>(camera);
             assert_eq!(bloom.is_some(), enabled, "stale capture bloom state");
             if let Some(bloom) = bloom {
@@ -2372,6 +2422,40 @@ mod tests {
             assert!(world.get::<crate::Bloom>(unrelated).is_some());
             assert!(world.get::<bevy::render::view::Hdr>(camera).is_some());
         }
+        let override_settings = RenderSettings {
+            quality: Some(scriptbots_core::RenderQuality::Low),
+            post: Some(scriptbots_core::RenderPostSettings {
+                bloom: Some(scriptbots_core::RenderBloomSettings {
+                    enabled: true,
+                    threshold: Some(3.0),
+                    intensity: Some(0.35),
+                }),
+                ..default()
+            }),
+            ..default()
+        };
+        let effective = crate::resolve_effective_render_settings_for_gpu(&override_settings, None);
+        configure_capture_camera_effects(
+            &mut world,
+            &override_settings,
+            crate::effective_bloom(&effective),
+        );
+        let bloom = world.get::<crate::Bloom>(camera).unwrap();
+        assert_eq!(bloom.intensity, 0.35);
+        assert_eq!(bloom.prefilter.threshold, 3.0);
+        let default_effective = crate::resolve_effective_render_settings_for_gpu(
+            &RenderSettings {
+                quality: Some(scriptbots_core::RenderQuality::Low),
+                ..default()
+            },
+            None,
+        );
+        configure_capture_camera_effects(
+            &mut world,
+            &RenderSettings::default(),
+            crate::effective_bloom(&default_effective),
+        );
+        assert!(world.get::<crate::Bloom>(camera).is_none());
     }
 
     #[test]
