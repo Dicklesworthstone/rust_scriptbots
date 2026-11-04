@@ -2324,8 +2324,8 @@ struct BrainOverlay {
 /// is one glyph per sample, so the budget differs while the policy does not.
 const HUD_SPARKLINE_SAMPLES: usize = 32;
 
-/// Ramp used to draw a text sparkline, lowest to highest.
-const SPARK_GLYPHS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+/// Eight relative levels that are available in Bevy's bundled default font.
+const SPARK_GLYPHS: [&str; 8] = ["0", "1", "2", "3", "4", "5", "6", "7"];
 
 /// Decimated population/birth/death series behind the HUD sparklines.
 ///
@@ -2513,7 +2513,10 @@ fn format_brain_overlay(overlay: &BrainOverlay) -> String {
             format!("Brain: unavailable (tick {})", overlay.source_tick)
         }
         BrainOverlayStatus::Ready => {
-            let mut out = format!("Brain @ tick {}", overlay.source_tick);
+            let mut out = format!(
+                "Brain @ tick {} (magnitude levels 0-7)",
+                overlay.source_tick
+            );
             if overlay.truncated {
                 out.push_str(" (clipped)");
             }
@@ -2573,11 +2576,11 @@ fn format_sparkline(series: &[u32]) -> String {
 /// Render the three history sparklines as a multi-line HUD block.
 fn format_history_panel(history: &HudHistory) -> String {
     if history.is_empty() {
-        return "History: collecting…".to_string();
+        return "History: collecting...".to_string();
     }
     let peak = |s: &[u32]| s.iter().max().copied().unwrap_or(0);
     format!(
-        "History ({} samples)\n  Agents {} peak {}\n  Births {} peak {}\n  Deaths {} peak {}",
+        "History ({} samples, relative levels 0-7)\n  Agents {} peak {}\n  Births {} peak {}\n  Deaths {} peak {}",
         history.agents.len(),
         format_sparkline(&history.agents),
         peak(&history.agents),
@@ -2608,13 +2611,12 @@ enum HudEventKind {
 }
 
 impl HudEventKind {
-    /// Glyph shown beside the entry. Kept to widely available symbols so a
-    /// missing font renders a box rather than nothing at all.
+    /// Distinguishable markers supported by Bevy's bundled font.
     const fn glyph(self) -> &'static str {
         match self {
-            Self::Birth => "✚",
-            Self::Death => "✖",
-            Self::SpikeHit => "⚔",
+            Self::Birth => "+",
+            Self::Death => "-",
+            Self::SpikeHit => "!",
         }
     }
 
@@ -3153,7 +3155,7 @@ fn setup_scene(
                 ..default()
             },
             BackgroundColor(Color::srgba(0.35, 0.10, 0.10, 0.82)),
-            Text::new("SOFTWARE RENDERER — not GPU accelerated, not representative"),
+            Text::new("SOFTWARE RENDERER - not GPU accelerated, not representative"),
             TextFont::from_font_size(15.0),
             TextColor(Color::srgb(1.0, 0.85, 0.85)),
             SoftwareRendererWatermark,
@@ -3249,14 +3251,14 @@ fn setup_scene(
             .id();
         tonemap = parent
             .spawn((
-                Text::new("Tone: ACES • AutoExp Off • Bias +0.0"),
+                Text::new("Tone: ACES | AutoExp Off | Bias +0.0"),
                 secondary_font.clone(),
                 TextColor(secondary_text_color),
             ))
             .id();
         palette = parent
             .spawn((
-                Text::new("Palette: Natural • press C to cycle"),
+                Text::new("Palette: Natural | press C to cycle"),
                 secondary_font.clone(),
                 TextColor(secondary_text_color),
             ))
@@ -3277,7 +3279,7 @@ fn setup_scene(
             .id();
         history = parent
             .spawn((
-                Text::new("History: collecting…"),
+                Text::new("History: collecting..."),
                 secondary_font.clone(),
                 TextColor(secondary_text_color),
             ))
@@ -3291,11 +3293,11 @@ fn setup_scene(
             .id();
 
         let playback_buttons = [
-            (PlaybackAction::Play, "▶ Run (Space)"),
-            (PlaybackAction::Pause, "⏸ Pause"),
-            (PlaybackAction::Step, "⏭ Step (N)"),
-            (PlaybackAction::SpeedDown, "➖ Speed (−)"),
-            (PlaybackAction::SpeedUp, "➕ Speed (+)"),
+            (PlaybackAction::Play, "Run (Space)"),
+            (PlaybackAction::Pause, "Pause"),
+            (PlaybackAction::Step, "Step (N)"),
+            (PlaybackAction::SpeedDown, "Speed (-)"),
+            (PlaybackAction::SpeedUp, "Speed (+)"),
         ];
 
         parent
@@ -3321,9 +3323,9 @@ fn setup_scene(
             });
 
         let follow_buttons = [
-            (FollowMode::Off, "🛑 Follow off (F)"),
-            (FollowMode::Selected, "🎯 Follow selected (Ctrl+S)"),
-            (FollowMode::Oldest, "📜 Follow oldest (Ctrl+O)"),
+            (FollowMode::Off, "Follow off (F)"),
+            (FollowMode::Selected, "Follow selected (Ctrl+S)"),
+            (FollowMode::Oldest, "Follow oldest (Ctrl+O)"),
         ];
 
         parent
@@ -3357,7 +3359,7 @@ fn setup_scene(
                 ))
                 .with_children(|btn| {
                     btn.spawn((
-                        Text::new("✖ Clear selection (Esc)"),
+                        Text::new("Clear selection (Esc)"),
                         secondary_font.clone(),
                         TextColor(secondary_text_color),
                     ));
@@ -3437,7 +3439,7 @@ fn setup_scene(
                 ))
                 .with_children(|btn| {
                     btn.spawn((
-                        Text::new("Exposure –"),
+                        Text::new("Exposure -"),
                         secondary_font.clone(),
                         TextColor(secondary_text_color),
                     ));
@@ -3696,12 +3698,12 @@ fn update_hud(
 
     let selection_text = if let Some((id, age, health)) = primary_selection {
         let extra = if selected_count > 1 {
-            format!(" • +{}", selected_count - 1)
+            format!(" | +{}", selected_count - 1)
         } else {
             String::new()
         };
         format!(
-            "Selection: {:?} • age {:>4} • health {:>5.1}{}",
+            "Selection: {:?} | age {:>4} | health {:>5.1}{}",
             id, age, health, extra
         )
     } else {
@@ -3723,7 +3725,7 @@ fn update_hud(
         }
         if let Ok(mut text) = texts.get_mut(hud_elements.follow) {
             **text = format!(
-                "Follow: {} • F cycle • Ctrl+S sel • Ctrl+O oldest",
+                "Follow: {} | F cycle | Ctrl+S sel | Ctrl+O oldest",
                 rig.follow_mode.label()
             );
         }
@@ -3731,20 +3733,20 @@ fn update_hud(
             let yaw_deg = rig.yaw.to_degrees();
             let pitch_deg = rig.pitch.to_degrees();
             **text = format!(
-                "Camera: dist {:>5.0} yaw {:>6.1}° pitch {:>5.1}° • Ctrl+F fit selection • Ctrl+W fit world",
+                "Camera: dist {:>5.0} yaw {:>6.1} deg pitch {:>5.1} deg | Ctrl+F fit selection | Ctrl+W fit world",
                 rig.distance, yaw_deg, pitch_deg
             );
         }
         if let Ok(mut text) = texts.get_mut(hud_elements.playback) {
             let speed = control_snapshot.speed_multiplier.clamp(0.0, 999.9);
             let mut message = if speed > 0.0 {
-                format!("Playback: {} • x{speed:>4.1}", playback_status)
+                format!("Playback: {} | x{speed:>4.1}", playback_status)
             } else {
-                format!("Playback: {} • x0.0", playback_status)
+                format!("Playback: {} | x0.0", playback_status)
             };
             if let Some(reason) = control_snapshot.auto_pause_reason {
-                message.push_str(" • ");
-                message.push_str(&reason);
+                message.push_str(" | ");
+                message.push_str(&reason.replace('≥', ">=").replace('≤', "<="));
             }
             **text = message;
         }
@@ -3759,7 +3761,7 @@ fn update_hud(
         }
         if let Ok(mut text) = texts.get_mut(hud_elements.world) {
             **text = format!(
-                "World: {:>4}×{:>4} • r {:>4.1}",
+                "World: {:>4}x{:>4} | r {:>4.1}",
                 world_size.x as i32, world_size.y as i32, agent_radius
             );
         }
@@ -3771,12 +3773,12 @@ fn update_hud(
                 "AutoExp Off"
             };
             **text = format!(
-                "Tone: {} • {} • Bias {:+.1}",
+                "Tone: {} | {} | Bias {:+.1}",
                 mode_label, auto_label, tonemap_state.exposure_bias
             );
         }
         if let Ok(mut text) = texts.get_mut(hud_elements.palette) {
-            **text = format!("{} • press C to cycle", accessibility.palette().label());
+            **text = format!("{} | press C to cycle", accessibility.palette().label());
         }
         if let Ok(mut text) = texts.get_mut(hud_elements.events) {
             **text = event_feed;
@@ -6188,14 +6190,14 @@ mod hud_brain_overlay_tests {
         let line = format_sparkline_signed(&[0.0, -1.0, 0.5]);
         assert_eq!(line.chars().count(), 3);
         assert!(
-            line.starts_with('▁'),
+            line.starts_with('0'),
             "zero should sit at the floor: {line}"
         );
         assert!(
-            line.contains('█'),
+            line.contains('7'),
             "peak magnitude should reach full height even when negative: {line}"
         );
-        assert_eq!(format_sparkline_signed(&[0.0, 0.0]), "▁▁");
+        assert_eq!(format_sparkline_signed(&[0.0, 0.0]), "00");
         assert_eq!(format_sparkline_signed(&[]), "");
     }
 }
@@ -6257,11 +6259,11 @@ mod hud_history_sparkline_tests {
         let births = format_sparkline(&h.births);
         assert_eq!(births.chars().count(), 3);
         assert!(
-            births.contains('█'),
+            births.contains('7'),
             "peak births must reach full height, got {births}"
         );
         assert!(
-            births.starts_with('▁'),
+            births.starts_with('0'),
             "zero births must sit at the floor, got {births}"
         );
     }
@@ -6269,7 +6271,7 @@ mod hud_history_sparkline_tests {
     /// A flat series renders at the floor rather than dividing by zero.
     #[test]
     fn all_zero_series_renders_at_the_floor() {
-        assert_eq!(format_sparkline(&[0, 0, 0]), "▁▁▁");
+        assert_eq!(format_sparkline(&[0, 0, 0]), "000");
         assert_eq!(format_sparkline(&[]), "");
     }
 
@@ -6290,7 +6292,7 @@ mod hud_history_sparkline_tests {
     fn empty_history_renders_a_stable_placeholder() {
         assert_eq!(
             format_history_panel(&HudHistory::default()),
-            "History: collecting…"
+            "History: collecting..."
         );
     }
 }
@@ -6380,8 +6382,18 @@ mod hud_event_feed_tests {
         let events = HudEvent::recent_from_history([summary(12, 2, 1, 0)].iter());
         let line = format_event_feed(&events);
         assert!(line.starts_with("Events:"), "line was {line}");
-        assert!(line.contains("✚ 2×born@12"), "line was {line}");
-        assert!(line.contains("✖ 1×died@12"), "line was {line}");
+        assert!(line.contains("+ 2xborn@12"), "line was {line}");
+        assert!(line.contains("- 1xdied@12"), "line was {line}");
+    }
+
+    #[test]
+    fn chart_levels_and_event_markers_are_supported_by_the_bundled_font() {
+        let history = [summary(12, 2, 1, 0), summary(13, 3, 0, 1)];
+        let panel = format_history_panel(&HudHistory::from_history(history.iter()));
+        let events = format_event_feed(&HudEvent::recent_from_history(history.iter()));
+        assert!(panel.is_ascii() && panel.contains("relative levels 0-7"));
+        assert!(events.is_ascii());
+        assert!(SPARK_GLYPHS.iter().all(|glyph| glyph.is_ascii()));
     }
 }
 
@@ -6460,9 +6472,9 @@ fn format_inspector(detail: Option<InspectorDetail>) -> String {
     };
     let t = &d.trait_modifiers;
     format!(
-        "Inspector: {:?}{}\n  Energy {:>5.2} • Health {:>5.2} • Age {:>5} • Gen {}\n  \
-         Diet {} ({:.2}) • Temp pref {:.2} • Repro {:.2}\n  \
-         Spike {} • Boost {:.2}\n  \
+        "Inspector: {:?}{}\n  Energy {:>5.2} | Health {:>5.2} | Age {:>5} | Gen {}\n  \
+         Diet {} ({:.2}) | Temp pref {:.2} | Repro {:.2}\n  \
+         Spike {} | Boost {:.2}\n  \
          Traits smell {:.2} sound {:.2} hearing {:.2} eye {:.2} blood {:.2}",
         d.id,
         extra,
@@ -6495,7 +6507,7 @@ fn format_event_feed(events: &[HudEvent]) -> String {
     let mut line = String::from("Events:");
     for event in events {
         line.push_str(&format!(
-            " {} {}×{}@{}",
+            " {} {}x{}@{}",
             event.kind.glyph(),
             event.count,
             event.kind.label(),
