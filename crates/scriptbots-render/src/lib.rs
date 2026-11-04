@@ -4947,7 +4947,15 @@ impl SimulationView {
 
     fn map_action(&self, action: MapAction) {
         if matches!(action, MapAction::Pause) {
-            self.submit_control_command(ControlCommand::Pause);
+            let enqueued = self.submit_control_command(ControlCommand::Pause);
+            if let Ok(mut sandbox) = self.map_sandbox.lock() {
+                sandbox.notice = if enqueued {
+                    "Pause requested. Check playback status for the result."
+                } else {
+                    "Pause request unconfirmed. Check playback status before applying a map."
+                }
+                .to_owned();
+            }
             return;
         }
         if matches!(action, MapAction::Generate) {
@@ -31763,6 +31771,31 @@ mod command_characterization_tests {
             sandbox.notice
         );
         assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+    }
+
+    #[test]
+    fn map_pause_reports_enqueue_and_unconfirmed_outcomes_without_claiming_application() {
+        let host = TestHost::take(command_characterization_world());
+        let mut view = SimulationView::headless(host.port.clone());
+
+        view.map_action(MapAction::Pause);
+        assert!(
+            view.map_sandbox
+                .lock()
+                .unwrap()
+                .notice
+                .contains("unconfirmed")
+        );
+
+        view.command_submit = Arc::new(|command| {
+            assert!(matches!(command, ControlCommand::Pause));
+            Some(CommandId::new(999).to_string())
+        });
+        view.map_action(MapAction::Pause);
+        let notice = view.map_sandbox.lock().unwrap().notice.clone();
+        assert!(notice.contains("requested"));
+        assert!(notice.contains("Check playback status"));
+        assert!(!notice.contains("paused"));
     }
 
     #[test]
