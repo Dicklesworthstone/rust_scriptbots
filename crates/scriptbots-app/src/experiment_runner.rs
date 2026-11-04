@@ -73,7 +73,7 @@ pub enum ExperimentRunnerError {
     /// A previously written status file is malformed or contradicts the current plan.
     #[error("invalid experiment status at {path}: {reason}")]
     InvalidStatus { path: PathBuf, reason: String },
-    /// A prior write stopped after creating the temporary status file.
+    /// A prior write left a temporary status file that cannot be safely promoted.
     #[error(
         "interrupted experiment status write left {temporary}; inspect it against {committed} before recovery"
     )]
@@ -983,8 +983,9 @@ impl MatchedSeedExperimentRunner {
     ///
     /// # Errors
     ///
-    /// Refuses malformed, stale, interrupted, or plan-incompatible state. A
-    /// malformed status is never treated as permission to start again at tick zero.
+    /// Recovers a complete interrupted publication only when it is the exact
+    /// initial plan or a valid immediate successor of the committed generation.
+    /// Malformed, stale, or plan-incompatible state never permits a tick-zero restart.
     pub fn load_or_create_status(
         &self,
         state_file: &Path,
@@ -1053,11 +1054,16 @@ impl MatchedSeedExperimentRunner {
         plan: &ValidatedPlan,
     ) -> Result<ExperimentBatchStatus, ExperimentRunnerError> {
         let temporary = status_temporary_path(state_file)?;
-        if temporary.exists() {
-            return Err(ExperimentRunnerError::InterruptedStatusWrite {
-                temporary,
-                committed: state_file.to_path_buf(),
-            });
+        match fs::symlink_metadata(&temporary) {
+            Ok(_) => return self.recover_status_publication_locked(state_file, &temporary, plan),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(ExperimentRunnerError::Io {
+                    operation: "inspect interrupted status publication",
+                    path: temporary,
+                    source,
+                });
+            }
         }
 
         if state_file.exists() {
@@ -1067,6 +1073,100 @@ impl MatchedSeedExperimentRunner {
         let status = self.initial_status(plan);
         self.write_status_atomically(state_file, &status, plan)?;
         Ok(status)
+    }
+
+    /// Recover only a complete writer-produced successor while holding the status lease.
+    fn recover_status_publication_locked(
+        &self,
+        state_file: &Path,
+        temporary: &Path,
+        plan: &ValidatedPlan,
+    ) -> Result<ExperimentBatchStatus, ExperimentRunnerError> {
+        let interrupted = || ExperimentRunnerError::InterruptedStatusWrite {
+            temporary: temporary.to_path_buf(),
+            committed: state_file.to_path_buf(),
+        };
+        let bytes = read_experiment_file_bounded(temporary, MAX_STATUS_BYTES)?;
+        let candidate =
+            serde_json::from_slice::<ExperimentBatchStatus>(&bytes).map_err(|_| interrupted())?;
+        self.validate_status(temporary, &candidate, plan)?;
+        if canonical_status_bytes(&candidate)? != bytes {
+            return Err(interrupted());
+        }
+
+        let committed_bytes = match fs::symlink_metadata(state_file) {
+            Ok(_) => Some(read_experiment_file_bounded(state_file, MAX_STATUS_BYTES)?),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(source) => {
+                return Err(ExperimentRunnerError::Io {
+                    operation: "inspect committed status for recovery",
+                    path: state_file.to_path_buf(),
+                    source,
+                });
+            }
+        };
+        if let Some(bytes) = &committed_bytes {
+            let committed = self.decode_status(state_file, bytes, plan)?;
+            if committed.generation.checked_add(1) != Some(candidate.generation) {
+                return Err(interrupted());
+            }
+            self.validate_status_transition(state_file, &committed, &candidate)?;
+        } else if candidate != self.initial_status(plan) {
+            return Err(interrupted());
+        }
+
+        // Completion is scientific evidence, not merely a monotonic enum transition.
+        // Verify the actual bundle and restored owner cut before publishing success.
+        for record in candidate
+            .runs
+            .iter()
+            .filter(|record| record.state == RunState::Completed)
+        {
+            let (variant, family) = &plan.variants[&record.variant_id];
+            self.verify_completed_bundle(record, variant, *family, &plan.digest)?;
+        }
+
+        // A cooperating writer cannot change these paths under our lease. Refuse
+        // external replacement too, rather than overwriting evidence read above.
+        if read_experiment_file_bounded(temporary, MAX_STATUS_BYTES)? != bytes {
+            return Err(interrupted());
+        }
+        match (&committed_bytes, fs::symlink_metadata(state_file)) {
+            (Some(expected), Ok(_)) => {
+                if read_experiment_file_bounded(state_file, MAX_STATUS_BYTES)? != *expected {
+                    return Err(interrupted());
+                }
+            }
+            (None, Err(error)) if error.kind() == io::ErrorKind::NotFound => {}
+            _ => return Err(interrupted()),
+        }
+        let mut options = OpenOptions::new();
+        options.read(true).write(cfg!(windows));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        options
+            .open(temporary)
+            .and_then(|file| file.sync_all())
+            .map_err(|source| ExperimentRunnerError::Io {
+                operation: "sync recovered experiment status",
+                path: temporary.to_path_buf(),
+                source,
+            })?;
+        fs::rename(temporary, state_file).map_err(|source| ExperimentRunnerError::Io {
+            operation: "promote recovered experiment status",
+            path: state_file.to_path_buf(),
+            source,
+        })?;
+        sync_parent_directory(
+            state_file
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new(".")),
+        )?;
+        Ok(candidate)
     }
 
     /// Atomically and durably flushes a validated status update to disk.
@@ -1684,7 +1784,16 @@ impl MatchedSeedExperimentRunner {
         plan: &ValidatedPlan,
     ) -> Result<ExperimentBatchStatus, ExperimentRunnerError> {
         let bytes = read_bounded_file(state_file, MAX_STATUS_BYTES, "read experiment status")?;
-        let status = serde_json::from_slice::<ExperimentBatchStatus>(&bytes).map_err(|source| {
+        self.decode_status(state_file, &bytes, plan)
+    }
+
+    fn decode_status(
+        &self,
+        state_file: &Path,
+        bytes: &[u8],
+        plan: &ValidatedPlan,
+    ) -> Result<ExperimentBatchStatus, ExperimentRunnerError> {
+        let status = serde_json::from_slice::<ExperimentBatchStatus>(bytes).map_err(|source| {
             ExperimentRunnerError::InvalidStatus {
                 path: state_file.to_path_buf(),
                 reason: format!("status JSON does not match the versioned schema: {source}"),
@@ -1770,12 +1879,7 @@ impl MatchedSeedExperimentRunner {
             path: parent.to_path_buf(),
             source,
         })?;
-        let mut bytes =
-            serde_json::to_vec_pretty(status).map_err(|source| ExperimentRunnerError::Json {
-                operation: "serialize experiment status",
-                source,
-            })?;
-        bytes.push(b'\n');
+        let bytes = canonical_status_bytes(status)?;
         if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_STATUS_BYTES {
             return Err(ExperimentRunnerError::InvalidStatus {
                 path: state_file.to_path_buf(),
@@ -2581,6 +2685,18 @@ fn status_temporary_path(state_file: &Path) -> Result<PathBuf, ExperimentRunnerE
     Ok(state_file.with_file_name(temporary_name))
 }
 
+fn canonical_status_bytes(
+    status: &ExperimentBatchStatus,
+) -> Result<Vec<u8>, ExperimentRunnerError> {
+    let mut bytes =
+        serde_json::to_vec_pretty(status).map_err(|source| ExperimentRunnerError::Json {
+            operation: "serialize experiment status",
+            source,
+        })?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
 fn status_lock_path(state_file: &Path) -> Result<PathBuf, ExperimentRunnerError> {
     let file_name = state_file
         .file_name()
@@ -3190,6 +3306,235 @@ mod tests {
             runner.load_or_create_status(&interrupted_state),
             Err(ExperimentRunnerError::InterruptedStatusWrite { .. })
         ));
+    }
+
+    fn interrupted_status_runner(directory: &Path) -> MatchedSeedExperimentRunner {
+        MatchedSeedExperimentRunner::new(
+            "exp-status-recovery",
+            MatchedSeedCohort {
+                cohort_id: "cohort".into(),
+                seeds: vec![7],
+            },
+            vec![ScenarioVariant {
+                variant_id: "mlp".into(),
+                brain_family: "mlp".into(),
+                config_overrides: BTreeMap::new(),
+            }],
+            3,
+            1,
+            directory.join("bundles"),
+        )
+    }
+
+    #[test]
+    fn interrupted_status_publication_recovers_initial_and_running_generations() {
+        let directory = tempfile::tempdir().unwrap();
+        let runner = interrupted_status_runner(directory.path());
+        let state_file = directory.path().join("status.json");
+        let temporary = status_temporary_path(&state_file).unwrap();
+        let plan = runner.validated_plan().unwrap();
+        let initial = runner.initial_status(&plan);
+        let initial_bytes = canonical_status_bytes(&initial).unwrap();
+        fs::write(&temporary, &initial_bytes).unwrap();
+
+        assert_eq!(runner.load_or_create_status(&state_file).unwrap(), initial);
+        assert_eq!(fs::read(&state_file).unwrap(), initial_bytes);
+        assert!(!temporary.exists());
+
+        let record = &initial.runs[0];
+        let (variant, family) = &plan.variants[&record.variant_id];
+        runner
+            .prepare_run_checkpoint(variant, *family, record.seed, &record.run_id, &plan.digest)
+            .unwrap();
+        let checkpoint_path = runner.run_checkpoint_path(&record.run_id);
+        let initial_cut = fs::read(&checkpoint_path).unwrap();
+        let mut running = initial;
+        running.generation += 1;
+        running.runs[0].state = RunState::Running;
+        let running_bytes = canonical_status_bytes(&running).unwrap();
+        fs::write(&temporary, &running_bytes).unwrap();
+
+        assert_eq!(runner.load_or_create_status(&state_file).unwrap(), running);
+        assert_eq!(fs::read(&state_file).unwrap(), running_bytes);
+        assert_eq!(fs::read(&checkpoint_path).unwrap(), initial_cut);
+        assert!(!temporary.exists());
+
+        let completed = runner.execute_batch(&state_file).unwrap();
+        assert_eq!(completed.completed_runs, 1, "{completed:?}");
+        assert_eq!(completed.failed_runs, 0);
+        assert_eq!(completed.runs[0].total_ticks, runner.max_ticks);
+        let final_cut = read_optional_run_checkpoint(&checkpoint_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(final_cut.owner.host_checkpoint().tick().0, runner.max_ticks);
+        assert_ne!(fs::read(&checkpoint_path).unwrap(), initial_cut);
+    }
+
+    #[test]
+    fn interrupted_status_publication_verifies_completion_before_promoting_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let runner = interrupted_status_runner(directory.path());
+        let state_file = directory.path().join("status.json");
+        let temporary = status_temporary_path(&state_file).unwrap();
+        let mut running = runner.load_or_create_status(&state_file).unwrap();
+        running.runs[0].state = RunState::Running;
+        runner.save_status(&state_file, &mut running).unwrap();
+        let record = runner
+            .execute_single_run(&runner.variants[0], runner.cohort.seeds[0])
+            .unwrap();
+        let checkpoint_path = runner.run_checkpoint_path(&record.run_id);
+        let sealed_cut = fs::read(&checkpoint_path).unwrap();
+        let bundle_dir = runner.output_dir.join(&record.run_id);
+        let summary_path = bundle_dir.join("exports/summary.csv");
+        let summary = fs::read(&summary_path).unwrap();
+        let mut completed = running;
+        completed.generation += 1;
+        completed.runs[0] = record;
+        recompute_status_counts(&mut completed);
+        let completed_bytes = canonical_status_bytes(&completed).unwrap();
+        fs::write(&temporary, &completed_bytes).unwrap();
+        let committed_bytes = fs::read(&state_file).unwrap();
+
+        fs::write(&summary_path, b"forged summary\n").unwrap();
+        assert!(matches!(
+            runner.load_or_create_status(&state_file),
+            Err(ExperimentRunnerError::Bundle { .. })
+        ));
+        assert_eq!(fs::read(&state_file).unwrap(), committed_bytes);
+        assert_eq!(fs::read(&temporary).unwrap(), completed_bytes);
+        assert_eq!(fs::read(&checkpoint_path).unwrap(), sealed_cut);
+
+        fs::write(&summary_path, &summary).unwrap();
+        // An already finished run is recovered without another owner execution
+        // or status generation. Its original continuation artifact stays exact.
+        assert_eq!(runner.execute_batch(&state_file).unwrap(), completed);
+        assert_eq!(fs::read(&state_file).unwrap(), completed_bytes);
+        assert_eq!(fs::read(&checkpoint_path).unwrap(), sealed_cut);
+        assert_eq!(fs::read(&summary_path).unwrap(), summary);
+        assert!(!temporary.exists());
+    }
+
+    #[test]
+    fn interrupted_status_publication_refuses_conflicts_and_retains_both_files() {
+        for case in [
+            "stale",
+            "skipped",
+            "changed-plan",
+            "changed-run",
+            "regressed",
+            "forged-success",
+            "partial",
+            "noncanonical",
+            "generation-overflow",
+            "missing-initial",
+            "nonzero-initial",
+            "corrupt-committed",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let runner = interrupted_status_runner(directory.path());
+            let state_file = directory.path().join("status.json");
+            let temporary = status_temporary_path(&state_file).unwrap();
+            let plan = runner.validated_plan().unwrap();
+            let mut committed = runner.initial_status(&plan);
+            committed.generation = 1;
+            committed.runs[0].state = RunState::Running;
+            let mut candidate = committed.clone();
+            candidate.generation = 2;
+            let has_committed = !matches!(case, "missing-initial" | "nonzero-initial");
+            match case {
+                "stale" => candidate.generation = committed.generation,
+                "skipped" => candidate.generation += 1,
+                "changed-plan" => candidate.plan_digest = "0".repeat(64),
+                "changed-run" => candidate.runs[0].seed += 1,
+                "regressed" => candidate.runs[0].state = RunState::Pending,
+                "forged-success" => {
+                    let record = &mut candidate.runs[0];
+                    record.state = RunState::Completed;
+                    record.total_ticks = runner.max_ticks;
+                    record.final_digest = Some("0".repeat(16));
+                    record.bundle_path = Some(
+                        runner
+                            .output_dir
+                            .join(&record.run_id)
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                    recompute_status_counts(&mut candidate);
+                }
+                "generation-overflow" => {
+                    committed.generation = u64::MAX;
+                    candidate.generation = 0;
+                }
+                "missing-initial" => candidate.generation = 0,
+                "nonzero-initial" => {
+                    candidate = runner.initial_status(&plan);
+                    candidate.generation = 1;
+                }
+                _ => {}
+            }
+            let mut committed_bytes = canonical_status_bytes(&committed).unwrap();
+            if case == "corrupt-committed" {
+                committed_bytes.truncate(committed_bytes.len() / 2);
+            }
+            if has_committed {
+                fs::write(&state_file, &committed_bytes).unwrap();
+            }
+            let mut candidate_bytes = canonical_status_bytes(&candidate).unwrap();
+            if case == "partial" {
+                candidate_bytes.truncate(candidate_bytes.len() / 2);
+            } else if case == "noncanonical" {
+                candidate_bytes.pop();
+            }
+            fs::write(&temporary, &candidate_bytes).unwrap();
+
+            assert!(runner.load_or_create_status(&state_file).is_err(), "{case}");
+            if has_committed {
+                assert_eq!(fs::read(&state_file).unwrap(), committed_bytes, "{case}");
+            } else {
+                assert!(!state_file.exists(), "{case}");
+            }
+            assert_eq!(fs::read(&temporary).unwrap(), candidate_bytes, "{case}");
+            assert!(!runner.output_dir.exists(), "{case}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interrupted_status_publication_refuses_linked_files() {
+        use std::os::unix::fs::symlink;
+
+        for (link_temporary, hard_link) in [(true, false), (false, false), (true, true)] {
+            let directory = tempfile::tempdir().unwrap();
+            let runner = interrupted_status_runner(directory.path());
+            let state_file = directory.path().join("status.json");
+            let temporary = status_temporary_path(&state_file).unwrap();
+            let target = directory.path().join("linked-status.json");
+            let plan = runner.validated_plan().unwrap();
+            let committed = runner.initial_status(&plan);
+            let mut candidate = committed.clone();
+            candidate.generation = 1;
+            candidate.runs[0].state = RunState::Running;
+            let committed_bytes = canonical_status_bytes(&committed).unwrap();
+            let candidate_bytes = canonical_status_bytes(&candidate).unwrap();
+            let (link_path, target_bytes) = if link_temporary {
+                fs::write(&state_file, &committed_bytes).unwrap();
+                (&temporary, &candidate_bytes)
+            } else {
+                fs::write(&temporary, &candidate_bytes).unwrap();
+                (&state_file, &committed_bytes)
+            };
+            fs::write(&target, target_bytes).unwrap();
+            if hard_link {
+                fs::hard_link(&target, link_path).unwrap();
+            } else {
+                symlink(&target, link_path).unwrap();
+            }
+
+            assert!(runner.load_or_create_status(&state_file).is_err());
+            assert_eq!(fs::read(&state_file).unwrap(), committed_bytes);
+            assert_eq!(fs::read(&temporary).unwrap(), candidate_bytes);
+            assert_eq!(fs::read(&target).unwrap(), *target_bytes);
+        }
     }
 
     #[test]
