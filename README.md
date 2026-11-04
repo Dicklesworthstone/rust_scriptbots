@@ -1180,7 +1180,7 @@ For an interactive run, ScriptBots parses the control environment and transactio
   - `POST /api/presets/apply` → apply preset by name
   - `GET /api/config/audit` → recent config patches (audit ring buffer)
   - `GET /api/scenario` → the launch scenario identity bound to this run
-  - `GET /api/ws/stream` → WebSocket stream of tick summaries
+  - `GET /api/ws/stream` → binary tick summaries and acknowledged JSON controls
   - `GET /api/narrative/search` → search the recent birth/death/combat narrative
   - `POST /api/v1/experiments` → start a matched-seed batch (`variants` × `seeds`, `ticks_per_run`) that executes on a
     background worker; `GET /api/v1/experiments/{id}` reports per-run state, final digest and bundle path;
@@ -1195,6 +1195,38 @@ For an interactive run, ScriptBots parses the control environment and transactio
   - Playback (two-axis command status): `POST /api/control/pause`, `POST /api/control/resume`,
     `POST /api/control/step`, `POST /api/control/speed`, `POST /api/control/shutdown`,
     and `GET /api/control/status/{command_id}`
+
+WebSocket control protocol version 1 accepts JSON text such as:
+
+```json
+{"protocol_version":1,"request_id":"my-step-42","command":"step"}
+```
+
+Commands are `pause`, `resume`, `step`, `speed` (with a finite nonnegative `speed`),
+and `status` (with the returned `command_id`). Replies contain `protocol_version`,
+`request_id`, and either `type: "receipt"` with the canonical two-axis `receipt`,
+or `type: "error"` with an HTTP-style `status` and diagnostic `message`.
+Admission does not establish application or durability. Use `status` or the REST
+command-status endpoint to observe those independent outcomes.
+
+For mutating commands, `request_id` is the host's idempotency key. Reuse the same
+ID and command after a lost response or reconnect to the same host session: a
+step is applied at most once while its identity remains in the host ledger.
+Reusing an ID with a different command returns 409. IDs share the canonical
+HTTP/MCP key namespace and must contain 1–1,024 bytes after trimming. A new host
+session has a new identity namespace; this is not cross-session deduplication.
+Plain `pause`, `resume`, and `step`, and unkeyed JSON controls remain available;
+each unkeyed submission is a new command. An omitted version means version 1.
+
+Control messages and frames are limited to 16 KiB. Invalid JSON, unsupported
+versions, unknown commands and unrelated fields are refused before admission;
+invalid input cannot silently become a step. A malformed request has a null
+reply ID because no validated identity was admitted. Client binary control frames
+receive an explicit refusal; server binary frames remain Postcard-encoded
+`TickSummaryDto` values at the existing 50 ms sampling cadence. Each connection
+has one write in flight with a five-second write timeout, and missed timer
+intervals are skipped. This is not the complete versioned canvas/event transport
+or a measured sub-16 ms latency claim; those remain under `bd-ac4l`.
 
 `GET /api/v1/checkpoints` also reports actual file/SQL usage, observed file high-water counts,
 pending request identities, retained directory leases and their limit, and inventory/query errors. Checkpoint quota exhaustion returns

@@ -70,6 +70,9 @@ const CONTROL_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const CONTROL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// Stack for every control-runtime worker and blocking thread (bd-6sgk).
 const CONTROL_RUNTIME_THREAD_STACK_BYTES: usize = 32 * 1024 * 1024;
+const WS_CONTROL_PROTOCOL_VERSION: u16 = 1;
+const MAX_WS_CONTROL_MESSAGE_BYTES: usize = 16 * 1024;
+const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Return the control CLI's default REST base URL from the server's socket authority.
 #[must_use]
@@ -838,8 +841,8 @@ impl ControlRuntime {
                             let error = anyhow!(
                                 "failed to build Tokio runtime for control servers: {source}"
                             );
-                            let _ = startup_tx
-                                .send(ControlStartupSignal::Failed(format!("{error:#}")));
+                            let _ =
+                                startup_tx.send(ControlStartupSignal::Failed(format!("{error:#}")));
                             Err(error)
                         }
                     }
@@ -1697,6 +1700,9 @@ impl From<ControlError> for AppError {
             ControlError::InvalidPatch(msg) => Self::bad_request(msg),
             ControlError::Serialization(msg) => Self::internal(msg),
             ControlError::Lock => Self::service_unavailable("world state is currently unavailable"),
+            ControlError::Host(
+                error @ scriptbots_runtime::HostAccessError::CommandIdCollision { .. },
+            ) => Self::conflict(error.to_string()),
             ControlError::Host(error) => Self::service_unavailable(error.to_string()),
             ControlError::CommandQueueFull => {
                 Self::service_unavailable("command queue is full; retry shortly")
@@ -2067,50 +2073,179 @@ async fn stream_ticks_sse(
     get,
     path = "/api/ws/stream",
     tag = "control",
-    responses((status = 101, description = "WebSocket upgrade for tick & event stream"))
+    responses((status = 101, description = "Binary tick summaries and versioned acknowledged JSON controls"))
 )]
 async fn stream_ticks_ws(ws: WebSocketUpgrade, State(state): State<ApiState>) -> Response {
-    ws.on_upgrade(move |socket| handle_ws_stream(socket, state))
+    ws.max_message_size(MAX_WS_CONTROL_MESSAGE_BYTES)
+        .max_frame_size(MAX_WS_CONTROL_MESSAGE_BYTES)
+        .on_upgrade(move |socket| handle_ws_stream(socket, state))
 }
 
-async fn apply_ws_control_message(
-    handle: ControlHandle,
-    text: String,
-) -> Result<Option<CommandStatusDto>, AppError> {
-    run_control(move || {
-        let text = text.trim();
-        let outcome = if text.eq_ignore_ascii_case("pause") {
-            Some(handle.pause(None))
-        } else if text.eq_ignore_ascii_case("resume") {
-            Some(handle.resume(None))
-        } else if text.eq_ignore_ascii_case("step") {
-            Some(handle.step())
-        } else if let Ok(json) = serde_json::from_str::<Value>(text) {
-            match json.get("command").and_then(|command| command.as_str()) {
-                Some("speed") => json
-                    .get("speed")
-                    .and_then(Value::as_f64)
-                    .map(|speed| handle.set_speed(speed as f32, None)),
-                _ => None,
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WsControlRequest {
+    #[serde(default = "ws_control_protocol_version")]
+    protocol_version: u16,
+    /// Also the canonical host idempotency key for a mutating command.
+    #[serde(default)]
+    request_id: Option<String>,
+    command: String,
+    #[serde(default)]
+    speed: Option<f32>,
+    #[serde(default)]
+    command_id: Option<String>,
+}
+
+const fn ws_control_protocol_version() -> u16 {
+    WS_CONTROL_PROTOCOL_VERSION
+}
+
+#[derive(Debug, Serialize)]
+struct WsControlReply {
+    protocol_version: u16,
+    request_id: Option<String>,
+    #[serde(flatten)]
+    outcome: WsControlOutcome,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum WsControlOutcome {
+    Receipt { receipt: CommandStatusDto },
+    Error { status: u16, message: String },
+}
+
+impl WsControlReply {
+    fn error(request_id: Option<String>, error: AppError) -> Self {
+        Self {
+            protocol_version: WS_CONTROL_PROTOCOL_VERSION,
+            request_id,
+            outcome: WsControlOutcome::Error {
+                status: error.status.as_u16(),
+                message: error.message,
+            },
+        }
+    }
+}
+
+fn parse_ws_control_message(text: &str) -> Result<WsControlRequest, AppError> {
+    if text.len() > MAX_WS_CONTROL_MESSAGE_BYTES {
+        return Err(AppError::payload_too_large(
+            "WebSocket control message exceeds 16 KiB",
+        ));
+    }
+    let text = text.trim();
+    let mut request = if ["pause", "resume", "step"]
+        .iter()
+        .any(|command| text.eq_ignore_ascii_case(command))
+    {
+        WsControlRequest {
+            protocol_version: WS_CONTROL_PROTOCOL_VERSION,
+            request_id: None,
+            command: text.to_ascii_lowercase(),
+            speed: None,
+            command_id: None,
+        }
+    } else {
+        serde_json::from_str::<WsControlRequest>(text).map_err(|error| {
+            AppError::bad_request(format!("invalid WebSocket control request: {error}"))
+        })?
+    };
+    if request.protocol_version != WS_CONTROL_PROTOCOL_VERSION {
+        return Err(AppError::bad_request(format!(
+            "unsupported WebSocket control protocol {}; expected {WS_CONTROL_PROTOCOL_VERSION}",
+            request.protocol_version,
+        )));
+    }
+    if let Some(request_id) = &mut request.request_id {
+        *request_id = request_id.trim().to_owned();
+        if request_id.is_empty() || request_id.len() > 1024 {
+            return Err(AppError::bad_request(
+                "request_id must contain 1..=1024 bytes",
+            ));
+        }
+    }
+    let valid_shape = match request.command.as_str() {
+        "pause" | "resume" | "step" => request.speed.is_none() && request.command_id.is_none(),
+        "speed" => {
+            request
+                .speed
+                .is_some_and(|speed| speed.is_finite() && speed >= 0.0)
+                && request.command_id.is_none()
+        }
+        "status" => {
+            request.speed.is_none()
+                && request
+                    .command_id
+                    .as_ref()
+                    .is_some_and(|id| !id.is_empty() && id.len() <= 128)
+        }
+        _ => false,
+    };
+    if !valid_shape {
+        return Err(AppError::bad_request(
+            "expected pause, resume, step, speed with a finite nonnegative speed, or status with command_id; unrelated command fields are refused",
+        ));
+    }
+    Ok(request)
+}
+
+async fn apply_ws_control_message(handle: ControlHandle, text: String) -> WsControlReply {
+    let request = match parse_ws_control_message(&text) {
+        Ok(request) => request,
+        Err(error) => return WsControlReply::error(None, error),
+    };
+    let request_id = request.request_id.clone();
+    let outcome = run_control(move || {
+        use scriptbots_core::ControlCommand;
+        let command = match request.command.as_str() {
+            "pause" => ControlCommand::Pause,
+            "resume" => ControlCommand::Resume,
+            "step" => ControlCommand::Step,
+            "speed" => ControlCommand::SetSpeed(request.speed.expect("validated speed")),
+            "status" => {
+                let command_id = request.command_id.as_deref().expect("validated command id");
+                return handle.command_status(command_id)?.ok_or_else(|| {
+                    ControlError::NotFound(format!("command '{command_id}' is not retained"))
+                });
             }
-        } else {
-            None
+            _ => unreachable!("validated WebSocket command"),
         };
-        outcome.transpose()
+        // The host owns retry identity and conflicting-payload refusal. A reconnect
+        // must not create a second Step after the first receipt was lost.
+        handle.submit_command(command, request.request_id.as_deref())
     })
-    .await
+    .await;
+    match outcome {
+        Ok(receipt) => WsControlReply {
+            protocol_version: WS_CONTROL_PROTOCOL_VERSION,
+            request_id,
+            outcome: WsControlOutcome::Receipt { receipt },
+        },
+        Err(error) => WsControlReply::error(request_id, error),
+    }
+}
+
+async fn send_ws_message(socket: &mut WebSocket, message: WsMessage) -> bool {
+    // There is one write in flight per connection, no producer queue. A client
+    // that stops reading relinquishes its connection after this bounded wait.
+    matches!(
+        tokio::time::timeout(WS_WRITE_TIMEOUT, socket.send(message)).await,
+        Ok(Ok(()))
+    )
 }
 
 async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
     let handle = state.handle.clone();
     let mut interval = tokio::time::interval(Duration::from_millis(50));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             _ = interval.tick() => {
                 if let Ok(summary) = read_latest_tick_summary(handle.clone()).await {
                     let dto = TickSummaryDto::from(summary);
                     if let Ok(bytes) = postcard::to_stdvec(&dto)
-                        && socket.send(WsMessage::Binary(bytes.into())).await.is_err()
+                        && !send_ws_message(&mut socket, WsMessage::Binary(bytes.into())).await
                     {
                         break;
                     }
@@ -2119,18 +2254,22 @@ async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
             msg = socket.recv() => {
                 match msg {
                     Some(Ok(WsMessage::Text(text))) => {
-                        // Owner admission can wait. Use the blocking pool and
-                        // return its receipt or error for every recognized command.
-                        let outcome = apply_ws_control_message(handle.clone(), text.to_string()).await;
-                        let payload = match outcome {
-                            Ok(Some(status)) => Some(serde_json::json!({"receipt": status})),
-                            Ok(None) => None,
-                            Err(error) => Some(serde_json::json!({"error": error.message})),
+                        let reply = apply_ws_control_message(handle.clone(), text.to_string()).await;
+                        let Ok(text) = serde_json::to_string(&reply) else {
+                            break;
                         };
-                        if let Some(payload) = payload
-                            && let Ok(text) = serde_json::to_string(&payload)
-                            && socket.send(WsMessage::Text(text.into())).await.is_err()
-                        {
+                        if !send_ws_message(&mut socket, WsMessage::Text(text.into())).await {
+                            break;
+                        }
+                    }
+                    Some(Ok(WsMessage::Binary(_))) => {
+                        let reply = WsControlReply::error(None, AppError::bad_request(
+                            "control requests must be JSON text; binary frames carry server tick summaries",
+                        ));
+                        let Ok(text) = serde_json::to_string(&reply) else {
+                            break;
+                        };
+                        if !send_ws_message(&mut socket, WsMessage::Text(text.into())).await {
                             break;
                         }
                     }
@@ -7712,11 +7851,11 @@ mod tests {
             "the population-dependent initial read must use the occupied pool"
         );
         assert_eq!(initial_summary, initial_expected);
-        let receipt = runtime
-            .block_on(websocket_command)
-            .expect("WebSocket command task joined")
-            .expect("WebSocket command dispatch")
-            .expect("recognized pause command");
+        let receipt = websocket_receipt(
+            runtime
+                .block_on(websocket_command)
+                .expect("WebSocket command task joined"),
+        );
         assert!(
             websocket_wait.is_err(),
             "WebSocket owner admission must use the occupied pool"
@@ -7750,6 +7889,16 @@ mod tests {
         assert_eq!(summary, expected);
     }
 
+    fn websocket_receipt(reply: WsControlReply) -> CommandStatusDto {
+        assert_eq!(reply.protocol_version, WS_CONTROL_PROTOCOL_VERSION);
+        match reply.outcome {
+            WsControlOutcome::Receipt { receipt } => receipt,
+            WsControlOutcome::Error { status, message } => {
+                panic!("expected owner receipt, got {status}: {message}")
+            }
+        }
+    }
+
     #[test]
     fn websocket_control_messages_return_owner_receipts() {
         let world = WorldState::new(ScriptBotsConfig {
@@ -7776,10 +7925,9 @@ mod tests {
             "resume",
             "pause",
         ] {
-            let receipt = runtime
-                .block_on(apply_ws_control_message(handle.clone(), message.to_owned()))
-                .expect("WebSocket command dispatch")
-                .expect("recognized command");
+            let receipt = websocket_receipt(
+                runtime.block_on(apply_ws_control_message(handle.clone(), message.to_owned())),
+            );
             let applied = owner.wait_applied(&receipt);
             assert_eq!(applied.command_id, receipt.command_id);
             let snapshot = handle.read_snapshot().expect("applied publication");
@@ -7790,22 +7938,33 @@ mod tests {
                 _ => assert_eq!(snapshot.playback.speed_multiplier, 2.0),
             }
         }
-        for message in ["unknown", "{", "{\"command\":\"speed\"}"] {
+        let before = handle.read_snapshot().expect("before invalid commands");
+        for message in [
+            "unknown",
+            "{",
+            "{\"command\":\"speed\"}",
+            r#"{"command":"speed","speed":-1}"#,
+            r#"{"command":"speed","speed":1e100}"#,
+            r#"{"command":"step","protocol_version":2}"#,
+            r#"{"command":"step","request_id":"  "}"#,
+            r#"{"command":"step","speed":2}"#,
+            r#"{"command":"step","count":2}"#,
+            r#"{"command":"status"}"#,
+        ] {
+            let reply =
+                runtime.block_on(apply_ws_control_message(handle.clone(), message.to_owned()));
+            let wire = serde_json::to_value(&reply).expect("error reply JSON");
+            assert_eq!(wire["type"], "error", "{message}: {wire}");
+            assert_eq!(wire["status"], 400, "{message}: {wire}");
             assert!(
-                runtime
-                    .block_on(apply_ws_control_message(handle.clone(), message.to_owned()))
-                    .expect("unrecognized message is ignored")
-                    .is_none()
+                wire["message"]
+                    .as_str()
+                    .is_some_and(|message| !message.is_empty())
             );
         }
-        let error = runtime
-            .block_on(apply_ws_control_message(
-                handle.clone(),
-                "{\"command\":\"speed\",\"speed\":-1}".to_owned(),
-            ))
-            .expect_err("invalid speed is rejected");
-        assert_eq!(error.status, StatusCode::BAD_REQUEST);
-        assert_eq!(error.message, "invalid speed multiplier");
+        let after = handle.read_snapshot().expect("after invalid commands");
+        assert_eq!(after.world, before.world);
+        assert_eq!(after.revisions, before.revisions);
         assert_eq!(
             handle
                 .read_snapshot()
@@ -7814,6 +7973,231 @@ mod tests {
                 .speed_multiplier,
             2.0
         );
+    }
+
+    #[test]
+    fn websocket_control_bounds_apply_before_parsing_or_dispatch() {
+        let message = r#"{"command":"step","protocol_version":1,"request_id":"bounded"}"#;
+        for len in [
+            MAX_WS_CONTROL_MESSAGE_BYTES - 1,
+            MAX_WS_CONTROL_MESSAGE_BYTES,
+        ] {
+            let padded = format!("{message}{}", " ".repeat(len - message.len()));
+            assert!(parse_ws_control_message(&padded).is_ok());
+        }
+        let oversized = format!(
+            "{message}{}",
+            " ".repeat(MAX_WS_CONTROL_MESSAGE_BYTES + 1 - message.len())
+        );
+        assert_eq!(
+            parse_ws_control_message(&oversized).unwrap_err().status,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        for len in [1023, 1024, 1025] {
+            let message = json!({"command":"step", "request_id":"k".repeat(len)}).to_string();
+            assert_eq!(parse_ws_control_message(&message).is_ok(), len <= 1024);
+        }
+        // Same normalization as keyed HTTP/MCP commands; no generated identity
+        // is introduced for a client that did not supply one.
+        assert_eq!(parse_ws_control_message("step").unwrap().request_id, None);
+        assert_eq!(
+            parse_ws_control_message(r#"{"command":"step","request_id":" retry "}"#)
+                .unwrap()
+                .request_id
+                .as_deref(),
+            Some("retry")
+        );
+    }
+
+    fn connect_websocket(address: SocketAddr) -> TcpStream {
+        let mut socket = TcpStream::connect(address).expect("connect WebSocket client");
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("WebSocket read bound");
+        socket
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("WebSocket write bound");
+        write!(socket,
+            "GET /api/ws/stream HTTP/1.1\r\nHost: {address}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+        ).expect("write real upgrade");
+        let mut header = Vec::new();
+        while !header.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            socket.read_exact(&mut byte).expect("read upgrade response");
+            header.push(byte[0]);
+            assert!(header.len() <= 4096, "bounded upgrade header");
+        }
+        assert!(
+            String::from_utf8(header)
+                .unwrap()
+                .starts_with("HTTP/1.1 101")
+        );
+        socket
+    }
+
+    fn send_websocket_text(socket: &mut TcpStream, text: &str) {
+        let mask = [0x12, 0x34, 0x56, 0x78];
+        let mut frame = vec![0x81];
+        let len = text.len();
+        if len < 126 {
+            frame.push(0x80 | u8::try_from(len).unwrap());
+        } else {
+            frame.push(0x80 | 126);
+            frame.extend_from_slice(
+                &u16::try_from(len)
+                    .expect("bounded test message")
+                    .to_be_bytes(),
+            );
+        }
+        frame.extend_from_slice(&mask);
+        frame.extend(
+            text.bytes()
+                .enumerate()
+                .map(|(index, byte)| byte ^ mask[index % 4]),
+        );
+        socket.write_all(&frame).expect("write masked client frame");
+    }
+
+    fn read_websocket_reply(socket: &mut TcpStream) -> Value {
+        for _ in 0..64 {
+            let mut header = [0; 2];
+            socket
+                .read_exact(&mut header)
+                .expect("read server frame header");
+            assert_eq!(header[0] & 0x80, 0x80, "small server frames are complete");
+            assert_eq!(header[1] & 0x80, 0, "server frames are unmasked");
+            let len = match header[1] & 0x7f {
+                126 => {
+                    let mut length = [0; 2];
+                    socket.read_exact(&mut length).unwrap();
+                    usize::from(u16::from_be_bytes(length))
+                }
+                127 => panic!("unexpected oversized server frame"),
+                len => usize::from(len),
+            };
+            assert!(len <= MAX_WS_CONTROL_MESSAGE_BYTES);
+            let mut payload = vec![0; len];
+            socket
+                .read_exact(&mut payload)
+                .expect("read server payload");
+            match header[0] & 0x0f {
+                1 => return serde_json::from_slice(&payload).expect("typed control reply"),
+                2 => {
+                    let _: TickSummaryDto = postcard::from_bytes(&payload)
+                        .expect("real binary tick stream remains available");
+                }
+                opcode => panic!("unexpected opcode {opcode}"),
+            }
+        }
+        panic!("no control reply within bounded frame count");
+    }
+
+    #[test]
+    fn websocket_reconnect_retries_step_once_and_recovers_its_owner_receipt() {
+        let world = WorldState::new(ScriptBotsConfig {
+            world_width: 64,
+            world_height: 64,
+            food_cell_size: 16,
+            persistence_interval: 0,
+            rng_seed: Some(42),
+            closed: true,
+            ..ScriptBotsConfig::default()
+        })
+        .expect("WebSocket real host");
+        let owner = crate::control::tests::TestHost::spawn(world);
+        let reservation = ControlServerReservation::prepare(ControlServerConfig {
+            rest_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            mcp_transport: McpTransportConfig::Disabled,
+            ..ControlServerConfig::default()
+        })
+        .expect("reserve WebSocket listener");
+        let address = reservation.rest_address().unwrap();
+        let (server, _) = reservation
+            .launch(owner.port.clone(), false)
+            .expect("launch real Axum server");
+        let handle = server.control_handle().unwrap();
+        let request = r#"{"protocol_version":1,"request_id":"ws-step-once","command":"step"}"#;
+        let mut first = connect_websocket(address);
+        send_websocket_text(&mut first, request);
+        let reply = read_websocket_reply(&mut first);
+        assert_eq!(reply["protocol_version"], 1);
+        assert_eq!(reply["request_id"], "ws-step-once");
+        assert_eq!(reply["type"], "receipt", "{reply}");
+        let receipt: CommandStatusDto = serde_json::from_value(reply["receipt"].clone()).unwrap();
+        owner.wait_applied(&receipt);
+        drop(first);
+
+        // A second connection shares only the owner's ledger, not a socket cache.
+        let mut second = connect_websocket(address);
+        send_websocket_text(&mut second, request);
+        let retry = read_websocket_reply(&mut second);
+        assert_eq!(retry["receipt"]["command_id"], receipt.command_id);
+        assert_eq!(
+            retry["receipt"]["admission_sequence"],
+            serde_json::to_value(receipt.admission_sequence).unwrap()
+        );
+        assert_eq!(
+            handle.status().unwrap().tick,
+            1,
+            "retry must not advance a second tick"
+        );
+
+        send_websocket_text(&mut second, &json!({
+            "protocol_version":1, "request_id":"receipt-lookup", "command":"status", "command_id":receipt.command_id,
+        }).to_string());
+        let observed = read_websocket_reply(&mut second);
+        assert_eq!(observed["request_id"], "receipt-lookup");
+        assert_eq!(observed["receipt"]["application_state"], "applied");
+
+        send_websocket_text(
+            &mut second,
+            r#"{"protocol_version":1,"request_id":"ws-step-once","command":"resume"}"#,
+        );
+        let conflict = read_websocket_reply(&mut second);
+        assert_eq!(conflict["type"], "error");
+        assert_eq!(conflict["status"], 409);
+        assert_eq!(conflict["request_id"], "ws-step-once");
+        let after = handle.status().unwrap();
+        assert_eq!(after.tick, 1);
+        assert!(after.paused);
+
+        send_websocket_text(
+            &mut second,
+            r#"{"protocol_version":2,"request_id":"foreign-version","command":"step"}"#,
+        );
+        let refused = read_websocket_reply(&mut second);
+        assert_eq!(refused["type"], "error");
+        assert_eq!(refused["status"], 400);
+        assert_eq!(handle.status().unwrap().tick, 1);
+        drop(second);
+
+        // Discard the actual response before reading it, then retry only after
+        // independently observing that its scientific step really happened.
+        let lost_request =
+            r#"{"protocol_version":1,"request_id":"lost-step-receipt","command":"step"}"#;
+        let mut lost = connect_websocket(address);
+        send_websocket_text(&mut lost, lost_request);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while handle.status().unwrap().tick != 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "first lost-receipt step never applied"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        drop(lost);
+        let mut recovered = connect_websocket(address);
+        send_websocket_text(&mut recovered, lost_request);
+        let recovered_reply = read_websocket_reply(&mut recovered);
+        assert_eq!(recovered_reply["request_id"], "lost-step-receipt");
+        assert_eq!(recovered_reply["receipt"]["application_state"], "applied");
+        assert_eq!(
+            handle.status().unwrap().tick,
+            2,
+            "lost receipt must not double-step"
+        );
+        drop(recovered);
+        server.shutdown().expect("WebSocket server shutdown");
     }
 
     #[test]
