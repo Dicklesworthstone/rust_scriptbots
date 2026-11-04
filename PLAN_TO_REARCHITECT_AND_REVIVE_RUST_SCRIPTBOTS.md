@@ -2,6 +2,74 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Actual remote browser qualification (2026-11-04):** [Qualified software
+journey — GentleDuck contribution to original `bd-ac4l` and `bd-2z0.12.3`;
+original ownership, dependencies and complete acceptance remain open/unchanged]
+
+- [x] Refresh Beads and identify newly delivered native/browser streaming code
+  at `0ca7ff1f`, whose actual WASM packaging/browser execution remains open.
+- [x] Reserve exact consumer/test/tracker paths and freeze that source for DSR.
+- [x] Build the real WASM package and native production server through DSR;
+  retain all failures and bind successful binaries/packages to exact source.
+- [x] Extend the existing browser test with a live native server journey and
+  its explicit allowed browser origin; preserve the authority/Origin guard.
+- [x] Observe actual decoded canvas/telemetry/event frames, consumed credits,
+  connection status and canonical remote identity; reject fabricated local data.
+- [x] Pause and step the remote owner through real browser controls; compare
+  receipts and published tick/revisions with independent native HTTP reads.
+- [x] Save an actual remote PNG, verify pixels/identity, reconnect with consumed
+  cursors, and prove the saved local owner remains frozen until explicit return.
+- [x] Preserve existing browser stats/fork/clock/export guards and execute
+  meaningful source-bound negative controls for any repair found by the run.
+- [x] Pass required workspace/native/browser/UBS gates on the final frozen
+  patch, review exact source, publish and repeat decisive clean-build checks.
+- [x] Record original Beads evidence, complete the bounded honesty audit and
+  retire this requested checklist without inflating software proof to hardware,
+  performance or full storage/durability acceptance.
+
+Consumer: a user connecting this browser to a real native simulation. Existing
+consumer-state fixtures and native codec tests do not establish that boundary.
+
+Source `01115bf75ed9e520ae21ff934be1f020733f2144` is committed and pushed to
+both required remote tips. Clean-commit DSR
+`remote_browser_clean_01115bf7/20261104T074136-3256949` passed **7/7** with
+the expected clean source before and after fresh native/WASM builds. Its real
+file-backed server, seed 17, one simulation thread and Chromium 140/SwiftShader
+journey retained the same Step command/admission identity at tick 1 after a
+lost receipt and reconnect. Both 1280×720 PNGs identify publication 5 and show
+all 15 qualifying visible native-agent centers (Canvas 821/WebGPU 747 bright
+pixels). Remote metrics report 20 agents; the saved local owner stays frozen
+until explicit return in its original session. Actual unlisted browser Origin,
+truncated/version-mismatched native bytes and exited-server negatives refuse;
+normal owner shutdown exits 0. The observed event page is **empty**.
+
+Workspace check, strict Clippy, formatting, 33 web tests (plus one existing
+ignored fixture writer), 14 remote protocol tests, three analytics tests, the
+real-socket subscriber/reconnect test, the HTTP policy test, 13 consumer-state
+cases and separate stats/fork/renderer browser modes passed. These are targeted
+lanes and repeated solo observations, not independent review or a full workspace
+test run. The original runtime integration came from `0ca7ff1f`; this contribution
+adds actual boundary qualification and strict-gate maintenance.
+
+The consolidated frozen run was **18/19**, not 19/19: its full five-file UBS scan
+reported three unchanged header false positives. The guarded allowlist response
+and two test-request maps now have justified inline annotations. Supplemental
+DSR `remote_browser_scanner_review/20261104T073630-3149141` passed **7/7**:
+strict Clippy/format, policy tests and reviewed UBS, with an unchecked-header
+scanner negative still failing with one critical finding. Published scanner
+split: 3 critical/1,358 warnings/933 informational before; 0 critical/1,354
+warnings/933 informational after. The four collateral omissions are inspected
+constant-fixture Host/Origin parse warnings. No scanner category was disabled;
+raw failed/interrupted reports and the explicit acceptance split remain retained.
+
+Protected evidence: `/data/tmp/scriptbots-remote-browser-sVP2sXBm/`, especially
+`remote-aUmLaF/result.json`, the clean/scanner-review DSR receipts and `audit.txt`.
+Original Beads evidence comments **3021–3023** preserve status, ownership,
+dependencies and acceptance; no new follow-up closes away unmet requirements.
+This requested checklist is retired. Hardware/browser-matrix, nonempty narrative,
+sub-16 ms nonpolling push, 60 TPS multi-client soak, long-run storage and physical
+durability qualification remain with their original open acceptance.
+
 **Remote browser streaming and mixed persistence reconciliation:**
 [Functional contribution — Codex; original `bd-ac4l` and persistence acceptance remain open]
 The native WebSocket surface now negotiates bounded, versioned telemetry, dynamic
