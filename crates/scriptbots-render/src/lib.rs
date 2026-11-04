@@ -14,10 +14,12 @@ mod hud_capture;
 mod vfx;
 
 use camera::{Camera, CameraSnapshot, ViewLayout};
+#[cfg(test)]
+use gpui::ScrollDelta;
 use gpui::{
     App, Background, Bounds, ClipboardItem, Context, Corners, Div, FocusHandle, InteractiveElement,
     KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    PathBuilder, Pixels, Point, QuitMode, RenderImage, Rgba, Role, ScrollDelta, ScrollWheelEvent,
+    PathBuilder, Pixels, Point, QuitMode, RenderImage, Rgba, Role, ScrollHandle, ScrollWheelEvent,
     SharedString, StyleRefinement, Window, WindowBounds, WindowOptions, canvas, div, fill,
     linear_color_stop, linear_gradient, point, prelude::*, px, rgb, size,
 };
@@ -2923,7 +2925,6 @@ pub fn run_demo(
 }
 
 const MAX_SELECTION_EVENTS: usize = 64;
-const WORLD_PRESENTATION_SETTINGS_ESTIMATED_HEIGHT: f32 = 440.0;
 static NEXT_BRAIN_INSPECTION_CLIENT: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -4698,6 +4699,10 @@ pub struct SimulationView {
     world_hud_detail_cache: Option<(WorldHudSampleSource, AgentInspectorDetails)>,
     world_hud_job: Option<WorldHudJob>,
     world_hud_last_request: Option<Instant>,
+    /// Lab detail is sampled off the UI thread and remains tied to its source publication.
+    lab_inspection_cache: Option<LabInspectionSample>,
+    lab_inspection_job: Option<LabInspectionJob>,
+    lab_inspection_last_request: Option<Instant>,
     /// Narrative rail visibility (bd-16g.2.4); toggled from the rail header.
     rail_visible: bool,
     /// Selected event index into the retained narrative, plus the selected event's
@@ -4832,6 +4837,9 @@ impl SimulationView {
             world_hud_detail_cache: None,
             world_hud_job: None,
             world_hud_last_request: None,
+            lab_inspection_cache: None,
+            lab_inspection_job: None,
+            lab_inspection_last_request: None,
             rail_visible: true,
             rail_selection: None,
             rail_selection_aged_out: false,
@@ -6448,7 +6456,17 @@ impl SimulationView {
     }
 
     fn selection_pick_radius(&self, snapshot: &RenderSnapshot) -> f32 {
-        (snapshot.config.bot_radius * 3.0).max(24.0)
+        let world_radius = (snapshot.config.bot_radius * 3.0).max(24.0);
+        // Creature silhouettes have a minimum screen size, so picking only by
+        // world-space radius makes them harder to hit as the camera zooms out.
+        // Keep a modest screen-space target while still selecting the nearest
+        // creature when targets overlap.
+        let scale = self.camera_snapshot().last_scale;
+        if scale.is_finite() && scale > f32::EPSILON {
+            world_radius.max(12.0 / scale)
+        } else {
+            world_radius
+        }
     }
 
     fn effective_selected_agents(
@@ -6515,6 +6533,9 @@ impl SimulationView {
             .map(|inspector| inspector.focused_agent.is_some() || inspector.hovered_agent.is_some())
             .unwrap_or(false);
         let changed = !selected.is_empty() || presentation_changed;
+        if !changed {
+            return false;
+        }
         if !self.submit_selection_update(SelectionUpdate {
             mode: SelectionMode::Clear,
             agent_ids: Vec::new(),
@@ -6567,6 +6588,22 @@ impl SimulationView {
         let (tick, canonical_selection, live_agents) = snapshot_selection(&snapshot);
         let selected_before = self.effective_selected_agents(&canonical_selection, &live_agents);
         let was_selected = candidate.is_some_and(|id| selected_before.contains(&id));
+
+        // Empty shift-clicks cannot change selection. A plain click on empty
+        // ground with no selection or focus only clears a local hover; neither
+        // operation needs to wait for durable command admission on the UI thread.
+        if candidate.is_none() {
+            if extend {
+                return false;
+            }
+            if selected_before.is_empty() && prior_focus.is_none() {
+                return self
+                    .inspector
+                    .lock()
+                    .map(|mut inspector| inspector.hovered_agent.take().is_some())
+                    .unwrap_or(false);
+            }
+        }
 
         let (mode, state, ids, selected_after, candidate_id) =
             match (extend, candidate, was_selected) {
@@ -6720,6 +6757,220 @@ impl SimulationView {
 
         inspector_changed
     }
+
+    fn poll_lab_inspection(
+        &mut self,
+        published: &Arc<RenderSnapshot>,
+        inspector: &InspectorState,
+        selection_projection: Option<&[AgentId]>,
+        summary: &InspectorSnapshot,
+    ) {
+        let focused = inspector
+            .focused_agent
+            .filter(|id| {
+                published
+                    .world
+                    .agents
+                    .iter()
+                    .any(|agent| agent.id == id.raw())
+            })
+            .or_else(|| summary.selected.first().map(|entry| entry.agent_id));
+        let uid = focused.and_then(|id| {
+            published
+                .world
+                .agents
+                .iter()
+                .find(|agent| agent.id == id.raw())
+                .map(|agent| agent.uid)
+        });
+        let selected_eye = inspector.selected_eye;
+        if self.lab_inspection_cache.as_ref().is_some_and(|sample| {
+            sample.selected_eye != selected_eye
+                || Some(sample.detail.agent_id) != focused
+                || !sample.source.matches(
+                    published.session_id,
+                    published.world.epoch,
+                    uid,
+                    published.world.tick,
+                )
+        }) {
+            self.lab_inspection_cache = None;
+        }
+
+        if let Some(mut job) = self.lab_inspection_job.take() {
+            let still_targeted = job.session == published.session_id
+                && job.epoch == published.world.epoch
+                && Some(job.uid) == uid
+                && job.selected_eye == selected_eye;
+            let received = job
+                .ready
+                .take()
+                .map(|sample| Ok(Some(sample)))
+                .unwrap_or_else(|| job.result.try_recv());
+            let keep_job = match received {
+                Ok(Some(sample))
+                    if still_targeted
+                        && Some(sample.detail.agent_id) == focused
+                        && sample.selected_eye == selected_eye =>
+                {
+                    if sample.source.matches(
+                        published.session_id,
+                        published.world.epoch,
+                        uid,
+                        published.world.tick,
+                    ) {
+                        self.lab_inspection_cache = Some(sample);
+                    } else if sample.source.session == published.session_id
+                        && sample.source.epoch == published.world.epoch
+                        && Some(sample.source.uid) == uid
+                        && sample.source.tick > published.world.tick
+                        && job
+                            .ready_since
+                            .is_none_or(|since| since.elapsed() < Duration::from_millis(500))
+                    {
+                        job.ready_since.get_or_insert_with(Instant::now);
+                        job.ready = Some(sample);
+                    }
+                    true
+                }
+                Ok(Some(_)) => true,
+                Ok(None) | Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
+                Err(std::sync::mpsc::TryRecvError::Empty) => true,
+            };
+            if keep_job {
+                self.lab_inspection_job = Some(job);
+            }
+        }
+
+        let Some(uid) = uid else { return };
+        if self.lab_inspection_job.is_some()
+            || self.lab_inspection_cache.as_ref().is_some_and(|sample| {
+                sample.source.revision == published.revision
+                    && sample.source.tick == published.world.tick
+                    && sample
+                        .brain
+                        .as_ref()
+                        .is_some_and(|brain| brain.source_revision == Some(published.revision))
+            })
+            || self
+                .lab_inspection_last_request
+                .is_some_and(|at| at.elapsed() < Duration::from_millis(100))
+        {
+            return;
+        }
+        let revision = BrainInspectionRevision::new(
+            self.brain_request_revision
+                .get()
+                .checked_add(1)
+                .expect("GPUI brain-inspection revision exhausted"),
+        );
+        let client_id = self.brain_client_id;
+        let host = self.host.clone();
+        let requested = Arc::clone(published);
+        let mut inspector = inspector.clone();
+        let selection_projection = selection_projection.map(<[AgentId]>::to_vec);
+        let (send, result) = std::sync::mpsc::sync_channel(2);
+        let worker = std::thread::Builder::new()
+            .name("scriptbots-lab-inspector".into())
+            .spawn(move || {
+                let _ = (|| -> Option<()> {
+                    let owner_detail = host
+                        .inspect_agent_before(
+                            uid,
+                            SENSE_PROBE_MAX_CONTRIBUTORS,
+                            Instant::now() + Duration::from_millis(500),
+                        )
+                        .ok()??;
+                    let latest = host.snapshot_hub().latest();
+                    let publication = if owner_detail.source.matches_snapshot(&requested) {
+                        &requested
+                    } else if owner_detail.source.matches_snapshot(&latest) {
+                        &latest
+                    } else {
+                        return None;
+                    };
+                    if publication.session_id != requested.session_id
+                        || publication.world.epoch != requested.world.epoch
+                    {
+                        return None;
+                    }
+                    let agent = publication
+                        .world
+                        .agents
+                        .iter()
+                        .find(|agent| agent.uid == uid)?;
+                    let agent_id = AgentId::from(slotmap::KeyData::from_ffi(agent.id));
+                    if Some(agent_id) != focused {
+                        return None;
+                    }
+                    let source = WorldHudSampleSource {
+                        session: publication.session_id,
+                        revision: publication.revision,
+                        epoch: publication.world.epoch,
+                        uid,
+                        tick: publication.world.tick,
+                    };
+                    let detail = AgentInspectorDetails::from_snapshot(
+                        publication,
+                        agent_id,
+                        owner_detail.clone(),
+                        None,
+                        selected_eye,
+                    )?;
+                    // Show coherent physiology immediately; a slow brain projection
+                    // must not hold the entire inspector hostage.
+                    send.send(Some(LabInspectionSample {
+                        source,
+                        selected_eye,
+                        detail,
+                        brain: None,
+                    }))
+                    .ok()?;
+                    inspector.focused_agent = Some(agent_id);
+                    let (_, brain, _) = InspectorSnapshot::from_snapshot(
+                        publication,
+                        &host,
+                        &inspector,
+                        selection_projection.as_deref(),
+                        None,
+                        Some((client_id, revision)),
+                        false,
+                    );
+                    let detail = AgentInspectorDetails::from_snapshot(
+                        publication,
+                        agent_id,
+                        owner_detail,
+                        brain.clone(),
+                        selected_eye,
+                    )?;
+                    send.send(Some(LabInspectionSample {
+                        source,
+                        selected_eye,
+                        detail,
+                        brain,
+                    }))
+                    .ok()?;
+                    Some(())
+                })();
+            });
+        self.lab_inspection_last_request = Some(Instant::now());
+        match worker {
+            Ok(_) => {
+                self.brain_request_revision = revision;
+                self.lab_inspection_job = Some(LabInspectionJob {
+                    session: published.session_id,
+                    epoch: published.world.epoch,
+                    uid,
+                    selected_eye,
+                    result,
+                    ready: None,
+                    ready_since: None,
+                });
+            }
+            Err(error) => debug!(%error, "could not start Lab inspection worker"),
+        }
+    }
+
     fn poll_world_hud_detail(
         &mut self,
         published: &Arc<RenderSnapshot>,
@@ -6729,13 +6980,14 @@ impl SimulationView {
         if self
             .world_hud_detail_cache
             .as_ref()
-            .is_some_and(|(source, _)| {
-                !source.matches(
-                    published.session_id,
-                    published.world.epoch,
-                    focused,
-                    published.world.tick,
-                )
+            .is_some_and(|(source, detail)| {
+                detail.selected_eye != selected_eye
+                    || !source.matches(
+                        published.session_id,
+                        published.world.epoch,
+                        focused,
+                        published.world.tick,
+                    )
             })
         {
             self.world_hud_detail_cache = None;
@@ -6743,7 +6995,8 @@ impl SimulationView {
         if let Some(mut job) = self.world_hud_job.take() {
             let still_targeted = job.session == published.session_id
                 && job.epoch == published.world.epoch
-                && Some(job.uid) == focused;
+                && Some(job.uid) == focused
+                && job.selected_eye == selected_eye;
             let ready = job.ready.take().map(|ready| Ok(Some(ready))).or_else(|| {
                 match job.result.try_recv() {
                     Ok(result) => Some(result),
@@ -6755,7 +7008,9 @@ impl SimulationView {
             });
             match ready {
                 None => self.world_hud_job = Some(job),
-                Some(Ok(Some((source, detail)))) if still_targeted => {
+                Some(Ok(Some((source, detail))))
+                    if still_targeted && detail.selected_eye == selected_eye =>
+                {
                     if source.matches(
                         published.session_id,
                         published.world.epoch,
@@ -6840,6 +7095,7 @@ impl SimulationView {
                     session: published.session_id,
                     epoch: published.world.epoch,
                     uid,
+                    selected_eye,
                     result,
                     ready: None,
                     ready_since: None,
@@ -7027,20 +7283,9 @@ impl SimulationView {
             .lock()
             .map(|projection| projection.clone())
             .unwrap_or_default();
-        let brain_request = (!self.minimal_canvas_mode
-            && matches!(self.playback.mode(), PlaybackMode::Live))
-        .then(|| {
-            let revision = self
-                .brain_request_revision
-                .get()
-                .checked_add(1)
-                .expect("GPUI brain-inspection revision exhausted");
-            (self.brain_client_id, BrainInspectionRevision::new(revision))
-        });
-        let cached_brain_inspection = self.brain_inspection_cache.clone();
         let accessibility = self.accessibility_snapshot();
 
-        let (next_brain_inspection_cache, brain_request_issued) = {
+        {
             snapshot.tick = published.world.tick;
             snapshot.epoch = published.world.epoch;
             snapshot.publication = Some((published.session_id, published.revision));
@@ -7101,20 +7346,19 @@ impl SimulationView {
                 snapshot.summary = Some(HudMetrics::from(latest));
             }
             snapshot.recent_history = ring.into_iter().map(HudHistoryEntry::from).collect();
-            let (inspector, cache, issued) = InspectorSnapshot::from_snapshot(
+            let (inspector, _, _) = InspectorSnapshot::from_snapshot(
                 &published,
                 &self.host,
                 &inspector_state,
                 selection_projection.as_deref(),
-                cached_brain_inspection.as_ref(),
-                brain_request,
-                !self.minimal_canvas_mode || !matches!(self.playback.mode(), PlaybackMode::Live),
+                None,
+                None,
+                false,
             );
             snapshot.inspector = inspector;
-            (cache, issued)
-        };
+        }
 
-        self.brain_inspection_cache = next_brain_inspection_cache;
+        self.brain_inspection_cache = None;
         if self.minimal_canvas_mode && matches!(self.playback.mode(), PlaybackMode::Live) {
             let focused = snapshot
                 .inspector
@@ -7132,12 +7376,23 @@ impl SimulationView {
                 snapshot.inspector.focused = Some(detail.clone());
             }
             self.poll_world_brain(&published, uid);
+        } else if !self.minimal_canvas_mode && matches!(self.playback.mode(), PlaybackMode::Live) {
+            self.poll_lab_inspection(
+                &published,
+                &inspector_state,
+                selection_projection.as_deref(),
+                &snapshot.inspector,
+            );
+            if let Some(sample) = self.lab_inspection_cache.as_ref()
+                && sample.source.revision == published.revision
+                && sample.source.tick == snapshot.tick
+            {
+                snapshot.inspector.focused = Some(sample.detail.clone());
+                self.brain_inspection_cache = sample.brain.clone();
+            }
         } else if self.minimal_canvas_mode {
             self.world_brain_capture = None;
             self.world_brain_error = None;
-        }
-        if brain_request_issued && let Some((_, revision)) = brain_request {
-            self.brain_request_revision = revision;
         }
         self.maybe_log_brain_panel(&snapshot);
 
@@ -7156,8 +7411,7 @@ impl SimulationView {
         self.playback.record(&snapshot);
         // A detail request may finish after this tick was first recorded. Fill
         // the existing entry only when it names the exact same publication.
-        if self.minimal_canvas_mode
-            && matches!(self.playback.mode(), PlaybackMode::Live)
+        if matches!(self.playback.mode(), PlaybackMode::Live)
             && let Some(detail) = snapshot.inspector.focused.as_ref()
             && let Some(recorded) = self.playback.timeline.back_mut()
             && recorded.publication == snapshot.publication
@@ -9123,6 +9377,9 @@ impl SimulationView {
             this.toggle_settings(cx);
         });
         let selection_bounds = self.selection_bounds(&snapshot.inspector);
+        let fitting_hover = snapshot.inspector.selected.is_empty()
+            && snapshot.inspector.focused.is_none()
+            && snapshot.inspector.hovered.is_some();
         let preserve_follow = matches!(controls.follow_mode, FollowMode::Selected)
             && snapshot.inspector.selected.len() == 1;
         let fit_selection = cx.listener(move |this, _event: &MouseDownEvent, _, cx| {
@@ -9180,16 +9437,36 @@ impl SimulationView {
             base_button("Narration".into()).on_mouse_down(MouseButton::Left, toggle_narration),
             accessibility.narration_enabled,
         );
-        let palette = base_button(format!("Palette: {}", accessibility.palette.label()).into())
+        let palette_label = if let Some(requested) = accessibility.requested_palette {
+            format!("{} → {}…", accessibility.palette.label(), requested.label())
+        } else if let Some(failed) = accessibility.palette_error {
+            format!("{} unavailable", failed.label())
+        } else {
+            format!("Palette: {}", accessibility.palette.label())
+        };
+        let palette = base_button(palette_label.into())
             .debug_selector(|| "world-toolbar-palette".to_owned())
             .on_mouse_down(MouseButton::Left, cycle_palette);
         let settings = base_button("Settings".into())
             .debug_selector(|| "world-toolbar-settings".to_owned())
             .on_mouse_down(MouseButton::Left, open_settings);
         let fit_selected = selection_bounds.map(|_| {
-            base_button("Fit selected".into())
-                .debug_selector(|| "world-toolbar-fit-selected".to_owned())
-                .on_mouse_down(MouseButton::Left, fit_selection)
+            base_button(
+                if fitting_hover {
+                    "Fit hovered"
+                } else {
+                    "Fit selected"
+                }
+                .into(),
+            )
+            .debug_selector(move || {
+                if fitting_hover {
+                    "world-toolbar-fit-hovered".to_owned()
+                } else {
+                    "world-toolbar-fit-selected".to_owned()
+                }
+            })
+            .on_mouse_down(MouseButton::Left, fit_selection)
         });
 
         if compact {
@@ -9314,6 +9591,9 @@ impl SimulationView {
         if let Some(frame) = snapshot.render_frame.clone() {
             self.render_canvas_world(snapshot, frame, compact_hud, cx)
         } else {
+            if let Ok(mut accessibility) = self.accessibility.lock() {
+                accessibility.disable_palette_staging();
+            }
             self.render_canvas_placeholder(snapshot)
         }
     }
@@ -9329,6 +9609,7 @@ impl SimulationView {
             frame: frame.clone(),
             camera: Arc::clone(&self.camera),
             world_raster_cache: Arc::clone(&self.world_raster_cache),
+            accessibility: Arc::clone(&self.accessibility),
             #[cfg(test)]
             force_legacy_world_painter: self.force_legacy_world_painter,
             focus_agent: snapshot.inspector.focus_id,
@@ -9343,6 +9624,9 @@ impl SimulationView {
             move |bounds, state, window, _| {
                 #[cfg(feature = "world_wgpu")]
                 if use_wgpu_renderer() {
+                    if let Ok(mut accessibility) = state.accessibility.lock() {
+                        accessibility.disable_palette_staging();
+                    }
                     paint_world_with_wgpu(&state, bounds, window);
                     return;
                 }
@@ -9489,6 +9773,79 @@ impl SimulationView {
                 compact_hud,
                 cx,
             ));
+        } else if matches!(self.playback.mode(), PlaybackMode::Live)
+            && snapshot.publication.is_some()
+            && snapshot.inspector.selected.is_empty()
+            && let Some(missing) = focused_agent
+            && !frame.agents.iter().any(|agent| agent.agent_id == missing)
+        {
+            // Keep an honest explanation when a followed creature disappears
+            // from a complete live frame. This does not infer a cause of death.
+            let recover = cx.listener(move |this, _event: &MouseDownEvent, _, cx| {
+                cx.stop_propagation();
+                let same_focus = if let Ok(mut inspector) = this.inspector.lock() {
+                    if inspector.focused_agent == Some(missing) {
+                        inspector.focused_agent = None;
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if same_focus {
+                    this.fit_world_view(cx);
+                }
+            });
+            canvas_stack = canvas_stack.child(
+                div()
+                    .absolute()
+                    .top(px(12.0))
+                    .left(px(12.0))
+                    .max_w(px(280.0))
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(chrome::border())
+                    .bg(rgb(0x101f22))
+                    .shadow_lg()
+                    .px_3()
+                    .py_3()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .debug_selector(|| "world-creature-unavailable".to_owned())
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(chrome::text_primary())
+                            .child("Creature unavailable"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(chrome::text_secondary())
+                            .child("The selected creature is no longer in the current world."),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(|| "world-creature-unavailable-fit".to_owned())
+                            .cursor_pointer()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(chrome::accent())
+                            .bg(chrome::surface_raised())
+                            .px_2()
+                            .py_1()
+                            .text_xs()
+                            .text_color(chrome::text_primary())
+                            .on_mouse_down(MouseButton::Left, recover)
+                            .child("Return to world"),
+                    ),
+            );
         }
 
         // The World owns the flexible viewport; the compact focus card floats
@@ -9598,7 +9955,7 @@ impl SimulationView {
                             .gap_3()
                             .child(metric("ENERGY", format!("{:.2}", selected.energy)))
                             .child(metric("HEALTH", format!("{:.2}", selected.health)))
-                            .child(metric("AGE", format!("{} steps", selected.age))),
+                            .child(metric("AGE", selected.age.to_string())),
                     )
                     .child(
                         div()
@@ -9730,7 +10087,7 @@ impl SimulationView {
                         .text_xs()
                         .text_color(chrome::text_secondary())
                         .child(format!(
-                            "Reproduction {:.2}  ·  Lifetime food {:+.2}",
+                            "Reproduction counter {:.2}  ·  Lifetime food {:+.2}",
                             life.reproduction_counter, life.food_balance_total
                         )),
                 )
@@ -9988,6 +10345,10 @@ impl SimulationView {
         }
         div()
             .id("world-creature-hud")
+            // A floating sibling does not automatically block scroll hit-testing
+            // on the canvas beneath it. Occlude the whole card, including its
+            // fixed header and footer, while its own detail viewport scrolls.
+            .occlude()
             .absolute()
             .top(px(12.0))
             .bottom(px(12.0))
@@ -10011,6 +10372,16 @@ impl SimulationView {
             )
             .child(header)
             .child(hud)
+            .when(detail.is_some(), |card| {
+                card.child(
+                    div()
+                        .flex_none()
+                        .pt_2()
+                        .text_xs()
+                        .text_color(chrome::text_secondary())
+                        .child("Scroll to explore the full creature state"),
+                )
+            })
     }
 
     fn compute_follow_target(
@@ -10286,16 +10657,47 @@ impl SimulationView {
             return;
         }
 
-        // When settings panel is open, give it exclusive keyboard control
-        // Only allow ToggleSettings (comma) to close the panel
+        // The window owns keyboard focus, so handle settings search here
+        // instead of relying on an unfocused drawer child to receive keys.
         if self.settings_panel.open {
             if let Some(action) = self.bindings.action_for(&event.keystroke)
                 && self.action_is_available_in_this_window(action)
                 && matches!(action, CommandAction::ToggleSettings)
             {
                 self.invoke_action(action, cx);
+                return;
             }
-            // Ignore all other key bindings - settings panel handles them
+            let modifiers = event.keystroke.modifiers;
+            if modifiers.control || modifiers.alt || modifiers.platform {
+                return;
+            }
+            let key = event.keystroke.key.as_str();
+            match key {
+                "escape" if self.settings_panel.search_query.is_empty() => {
+                    self.toggle_settings(cx);
+                }
+                "escape" => self.clear_search(cx),
+                "backspace" => {
+                    let mut query = self.settings_panel.search_query.clone();
+                    query.pop();
+                    self.update_search(query, cx);
+                }
+                "space" | " " => {
+                    let mut query = self.settings_panel.search_query.clone();
+                    query.push(' ');
+                    self.update_search(query, cx);
+                }
+                _ if key.chars().count() == 1
+                    && key.chars().all(|c| {
+                        c.is_alphanumeric() || c.is_whitespace() || "._-±×%".contains(c)
+                    }) =>
+                {
+                    let mut query = self.settings_panel.search_query.clone();
+                    query.push_str(key);
+                    self.update_search(query, cx);
+                }
+                _ => {}
+            }
             return;
         }
 
@@ -10407,20 +10809,10 @@ impl SimulationView {
     fn toggle_settings(&mut self, cx: &mut Context<Self>) {
         self.settings_panel.open = !self.settings_panel.open;
 
-        // Reset scroll position and recalculate content height when opening panel
         if self.settings_panel.open {
-            self.settings_panel.scroll_offset = 0.0;
-            let total_categories = ConfigCategory::all().len();
-            self.settings_panel.content_height = self
-                .settings_panel
-                .estimate_content_height(total_categories)
-                + if self.minimal_canvas_mode {
-                    WORLD_PRESENTATION_SETTINGS_ESTIMATED_HEIGHT
-                } else {
-                    0.0
-                };
-            // Note: viewport_height uses conservative default (400px) from state
-            // This ensures content is never blocked, at cost of allowing blank space on large windows
+            self.settings_panel
+                .scroll
+                .set_offset(point(px(0.0), px(0.0)));
         }
 
         info!(open = self.settings_panel.open, "Settings panel toggled");
@@ -10433,12 +10825,18 @@ impl SimulationView {
 
     fn clear_search(&mut self, cx: &mut Context<Self>) {
         self.settings_panel.search_query.clear();
+        self.settings_panel
+            .scroll
+            .set_offset(point(px(0.0), px(0.0)));
         info!("Search cleared");
         cx.notify();
     }
 
     fn update_search(&mut self, query: String, cx: &mut Context<Self>) {
         self.settings_panel.search_query = query;
+        self.settings_panel
+            .scroll
+            .set_offset(point(px(0.0), px(0.0)));
         info!(query = %self.settings_panel.search_query, "Search query updated");
         cx.notify();
     }
@@ -10977,19 +11375,6 @@ impl SimulationView {
             self.settings_panel.collapsed_categories.push(category);
         }
 
-        // Update content height and clamp scroll
-        let total_categories = ConfigCategory::all().len();
-        self.settings_panel.content_height = self
-            .settings_panel
-            .estimate_content_height(total_categories)
-            + if self.minimal_canvas_mode {
-                WORLD_PRESENTATION_SETTINGS_ESTIMATED_HEIGHT
-            } else {
-                0.0
-            };
-        // Clamp scroll with updated content height (viewport_height from state)
-        self.settings_panel.clamp_scroll();
-
         #[cfg(feature = "audio")]
         if let Some(audio) = self.audio.as_mut() {
             audio.play_toggle();
@@ -11193,7 +11578,11 @@ impl SimulationView {
                 Ok(accessibility) => accessibility,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            accessibility.palette = accessibility.palette.next();
+            let next = accessibility
+                .requested_palette
+                .unwrap_or(accessibility.palette)
+                .next();
+            accessibility.request_palette(next);
         }
         #[cfg(feature = "audio")]
         if let Some(audio) = self.audio.as_mut() {
@@ -11208,9 +11597,7 @@ impl SimulationView {
                 Ok(accessibility) => accessibility,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            let changed = accessibility.palette != palette;
-            accessibility.palette = palette;
-            changed
+            accessibility.request_palette(palette)
         };
         if changed {
             cx.notify();
@@ -11363,10 +11750,39 @@ impl SimulationView {
         let persistence_controls = self.render_persistence_controls(inspector, cx);
         let playback_controls = self.render_inspector_playback_controls(cx);
 
-        let detail = inspector
+        let current_detail = inspector
             .focused
             .as_ref()
-            .map(|detail| self.render_inspector_detail(detail, cx))
+            .map(|detail| (snapshot.tick, detail));
+        let cached_detail = self.lab_inspection_cache.as_ref().and_then(|sample| {
+            (matches!(self.playback.mode(), PlaybackMode::Live)
+                && inspector.focus_id == Some(sample.detail.agent_id)
+                && inspector.selected_eye == sample.selected_eye
+                && snapshot.publication.is_some_and(|(session, _)| {
+                    sample.source.matches(
+                        session,
+                        snapshot.epoch,
+                        Some(sample.source.uid),
+                        snapshot.tick,
+                    )
+                }))
+            .then_some((sample.source.tick, &sample.detail))
+        });
+        let detail = current_detail
+            .or(cached_detail)
+            .map(|(tick, detail)| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(chrome::text_muted())
+                            .child(format!("Creature detail · sampled at tick {tick}")),
+                    )
+                    .child(self.render_inspector_detail(detail, cx))
+            })
             .unwrap_or_else(|| {
                 div()
                     .text_xs()
@@ -11377,7 +11793,11 @@ impl SimulationView {
                     .bg(rgb(0x111d20))
                     .px_3()
                     .py_3()
-                    .child("Select an agent to inspect stats")
+                    .child(if inspector.selected.is_empty() {
+                        "Select an agent to inspect stats"
+                    } else {
+                        "Inspecting selected creature…"
+                    })
             });
 
         div()
@@ -12372,7 +12792,11 @@ impl SimulationView {
                     .gap_1()
                     .items_center()
                     .child(preview)
-                    .child(mode.label())
+                    .child(if accessibility.requested_palette == Some(mode) {
+                        format!("{} · preparing…", mode.label())
+                    } else {
+                        mode.label().to_owned()
+                    })
                     .on_mouse_down(MouseButton::Left, listener);
                 if active {
                     base.border_color(rgb(0x79ddbb))
@@ -12436,6 +12860,12 @@ impl SimulationView {
                     .child("Color palette"),
             )
             .child(div().flex().flex_wrap().gap_2().children(palette_buttons))
+            .when_some(accessibility.palette_error, |panel, failed| {
+                panel.child(div().text_xs().text_color(rgb(0xe8b66e)).child(format!(
+                    "{} could not be prepared; select it to retry",
+                    failed.label()
+                )))
+            })
             .child(div().text_xs().text_color(rgb(0xc6d9ce)).child("Narration"))
             .child(narration_button)
     }
@@ -12565,7 +12995,13 @@ impl SimulationView {
                     ) => format!(
                         "Brain detail · tick {source_tick} · request {request_revision} · {payload_bytes} B · {status}"
                     ),
-                    _ => "Brain detail · not requested".to_owned(),
+                    _ if !matches!(self.playback.mode(), PlaybackMode::Live) => {
+                        "Brain detail · unavailable in this frame".to_owned()
+                    }
+                    _ if self.lab_inspection_job.is_some() => {
+                        "Brain detail · updating…".to_owned()
+                    }
+                    _ => "Brain detail · unavailable".to_owned(),
                 };
                 div()
                     .text_xs()
@@ -13325,8 +13761,10 @@ impl SimulationView {
         card
     }
     fn render_settings_panel(&self, cx: &mut Context<Self>) -> Div {
-        // Modern, world-class settings panel with beautiful design
         let backdrop = div()
+            // Settings is modal: block wheel and pointer events from reaching
+            // the World while allowing the drawer above it to scroll normally.
+            .occlude()
             .absolute()
             .inset_0()
             .bg(rgb(0x020617))
@@ -13344,7 +13782,9 @@ impl SimulationView {
             .top(px(0.0))
             .left(px(0.0))
             .bottom(px(0.0))
-            .w(px(540.0))
+            .w_full()
+            .max_w(px(540.0))
+            .debug_selector(|| "world-settings-panel".to_owned())
             .bg(rgb(0x111d20))
             .border_r_1()
             .border_color(rgb(0x334155))
@@ -13358,97 +13798,55 @@ impl SimulationView {
                     // Prevent clicks on panel from propagating to backdrop
                     cx.stop_propagation();
                 }),
-            )
-            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
-                // Handle keyboard input for search when settings panel is open
-                let key = &event.keystroke.key;
-
-                if event.keystroke.key == "backspace" {
-                    // Remove last character from search
-                    let mut query = this.settings_panel.search_query.clone();
-                    query.pop();
-                    this.update_search(query, cx);
-                } else if event.keystroke.key == "escape" {
-                    // Clear search or close panel
-                    if !this.settings_panel.search_query.is_empty() {
-                        this.clear_search(cx);
-                    } else {
-                        this.toggle_settings(cx);
-                    }
-                } else if key.len() == 1
-                    && key
-                        .chars()
-                        .all(|c| c.is_alphanumeric() || c.is_whitespace() || "._-±×%".contains(c))
-                {
-                    // Add alphanumeric characters, spaces, punctuation, and special chars (±, ×, %) to search
-                    let mut query = this.settings_panel.search_query.clone();
-                    query.push_str(key);
-                    this.update_search(query, cx);
-                }
-            }));
+            );
 
         let header = div()
             .flex()
             .items_center()
             .justify_between()
-            .px_6()
-            .py_4()
+            .gap_3()
+            .px_4()
+            .py_3()
             .border_b_1()
             .border_color(rgb(0x334155))
-            .bg(rgb(0x304542))
+            .bg(rgb(0x1c3030))
             .child(
-                div().flex().items_center().gap_3().child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child(
-                            div()
-                                .text_xl()
-                                .text_color(rgb(0xf1f5f9))
-                                .child("Configuration"),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(rgb(0xa7bdb2))
-                                        .child("Simulation parameters & settings"),
-                                )
-                                .child(
-                                    div()
-                                        .px_2()
-                                        .py_1()
-                                        .rounded_md()
-                                        .bg(rgb(0x334155))
-                                        .text_xs()
-                                        .text_color(rgb(0xa7bdb2))
-                                        .child("Press , to toggle"),
-                                ),
-                        ),
-                ),
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(div().text_lg().text_color(rgb(0xf1f5f9)).child("Settings"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0xa7bdb2))
+                            .truncate()
+                            .child("Display · read-only parameters"),
+                    ),
             )
             .child(
                 div()
-                    .px_4()
-                    .py_2()
-                    .rounded_lg()
-                    .bg(rgb(0x91a9a0))
-                    .text_base()
-                    .text_color(rgb(0xf1f5f9))
+                    .flex_none()
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(chrome::border())
+                    .bg(chrome::surface_raised())
+                    .text_sm()
+                    .text_color(chrome::text_primary())
                     .cursor_pointer()
-                    .hover(|s| s.bg(rgb(0x91a9a0)))
+                    .hover(|s| s.border_color(chrome::accent()))
+                    .debug_selector(|| "world-settings-close".to_owned())
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| {
                             this.toggle_settings(cx);
                         }),
                     )
-                    .child("✕ Close"),
+                    .child("Close"),
             );
 
         // REAL functional search bar - displays current search query and allows filtering
@@ -13456,8 +13854,8 @@ impl SimulationView {
         let has_search = !search_query.is_empty();
 
         let search_bar = div()
-            .px_6()
-            .py_4()
+            .px_4()
+            .py_3()
             .border_b_1()
             .border_color(rgb(0x334155))
             .child(
@@ -13465,19 +13863,21 @@ impl SimulationView {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .px_4()
-                    .py_3()
-                    .rounded_lg()
-                    .bg(rgb(0x304542))
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .bg(chrome::surface_raised())
                     .border_1()
                     .border_color(if has_search {
-                        rgb(0x60a5fa)
+                        chrome::accent()
                     } else {
-                        rgb(0x91a9a0)
+                        chrome::border()
                     })
                     .child(
                         div()
                             .flex_1()
+                            .min_w(px(0.0))
+                            .truncate()
                             .text_sm()
                             .text_color(if has_search {
                                 rgb(0xf1f5f9)
@@ -13487,12 +13887,13 @@ impl SimulationView {
                             .child(if has_search {
                                 search_query.clone()
                             } else {
-                                "Search parameters...".to_string()
+                                "Search simulation parameters…".to_string()
                             }),
                     )
                     .when(has_search, |container| {
                         container.child(
                             div()
+                                .flex_none()
                                 .px_2()
                                 .py_1()
                                 .rounded_md()
@@ -13500,6 +13901,7 @@ impl SimulationView {
                                 .text_xs()
                                 .text_color(rgb(0xa7bdb2))
                                 .cursor_pointer()
+                                .debug_selector(|| "world-settings-clear".to_owned())
                                 .hover(|s: StyleRefinement| {
                                     s.bg(rgb(0x91a9a0)).text_color(rgb(0xf1f5f9))
                                 })
@@ -13514,68 +13916,17 @@ impl SimulationView {
                     }),
             );
 
-        // Scrollable container for categories with mouse wheel handling
-        // Use cached dimensions (updated when panel opens or categories collapse/expand)
-        let content_height = self.settings_panel.content_height;
-        let viewport_height = self.settings_panel.viewport_height;
-        let scroll_offset = self.settings_panel.scroll_offset;
-
-        // Calculate scroll bounds (must match clamp_scroll logic for consistency)
-        let max_scroll = (content_height - viewport_height).max(0.0);
-        let has_scrollable_content = max_scroll > 1.0;
-
         let categories_content = div()
+            .id("world-settings-content-scroll")
+            .debug_selector(|| "world-settings-content-scroll".to_owned())
             .flex_1()
-            .overflow_hidden()
-            .relative()
+            .min_h(px(0.0))
+            .overflow_y_scroll()
+            .track_scroll(&self.settings_panel.scroll)
+            .scrollbar_width(px(6.0))
             .px_6()
             .py_4()
-            .on_scroll_wheel(cx.listener(move |this, event: &ScrollWheelEvent, _, cx| {
-                // Handle scroll wheel to update offset
-                let scroll_delta = match event.delta {
-                    ScrollDelta::Pixels(delta) => f32::from(delta.y),
-                    ScrollDelta::Lines(lines) => lines.y * 20.0, // ~20px per line
-                };
-
-                // Update scroll offset with proper bounds
-                // Positive delta = scroll down = increase offset to show lower content
-                this.settings_panel.scroll_offset += scroll_delta;
-                this.settings_panel.clamp_scroll();
-                cx.notify();
-            }))
-            .child(
-                div()
-                    .absolute()
-                    .top(px(-scroll_offset))
-                    .left(px(0.0))
-                    .right(px(0.0))
-                    .child(self.render_all_config_categories(cx)),
-            )
-            .when(has_scrollable_content, |node| {
-                node.child(
-                    // Visual scroll indicator at bottom
-                    div()
-                        .absolute()
-                        .bottom(px(8.0))
-                        .right(px(16.0))
-                        .px_3()
-                        .py_1()
-                        .rounded_md()
-                        .bg(rgb(0x304542))
-                        .border_1()
-                        .border_color(rgb(0x91a9a0))
-                        .text_xs()
-                        .text_color(rgb(0xa7bdb2))
-                        .child(format!(
-                            "{:.0}%",
-                            if max_scroll > 0.0 {
-                                (scroll_offset / max_scroll * 100.0).min(100.0)
-                            } else {
-                                0.0
-                            }
-                        )),
-                )
-            });
+            .child(self.render_all_config_categories(cx));
 
         let panel_content = panel
             .child(header)
@@ -14242,6 +14593,9 @@ impl SimulationView {
             .flex_col()
             .gap_2()
             .py_2()
+            .when(label == "History Capacity", |node| {
+                node.debug_selector(|| "world-settings-last-parameter".to_owned())
+            })
             .child(
                 div()
                     .flex()
@@ -15843,6 +16197,13 @@ impl Render for SimulationView {
         }
         if !self.world_raster_cleanup_registered {
             cx.on_release_in(window, |this, window, _| {
+                if this.minimal_canvas_mode {
+                    let mut accessibility = this
+                        .accessibility
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    accessibility.disable_palette_staging();
+                }
                 let images = match this.world_raster_cache.lock() {
                     Ok(mut cache) => cache.drain(),
                     Err(poisoned) => poisoned.into_inner().drain(),
@@ -17424,12 +17785,8 @@ struct SettingsPanelState {
     /// Name of current preset configuration (future feature for save/load)
     #[allow(dead_code)]
     preset_name: String,
-    /// Vertical scroll offset for categories content (in pixels)
-    scroll_offset: f32,
-    /// Cached total content height for scroll bounds calculation
-    content_height: f32,
-    /// Cached viewport height for scroll bounds calculation
-    viewport_height: f32,
+    /// Measured scroll state for the current window and filtered content.
+    scroll: ScrollHandle,
 }
 
 impl Default for SettingsPanelState {
@@ -17441,51 +17798,8 @@ impl Default for SettingsPanelState {
             collapsed_categories: Vec::new(),
             modified_params: Vec::new(),
             preset_name: "Default".to_string(),
-            scroll_offset: 0.0,
-            content_height: 0.0,
-            // CRITICAL: Must use conservative (small) value to prevent blocking content access
-            // Default window: 720px - chrome (132px) = 588px actual viewport
-            // Use 400px to ensure scrolling works even on small windows (600px)
-            // Trade-off: Shows blank space on large windows vs. blocking content (blank space is acceptable)
-            viewport_height: 400.0,
+            scroll: ScrollHandle::new(),
         }
-    }
-}
-
-impl SettingsPanelState {
-    /// Calculate maximum scroll offset based on content and viewport heights
-    fn max_scroll_offset(&self) -> f32 {
-        (self.content_height - self.viewport_height).max(0.0)
-    }
-
-    /// Clamp scroll offset to valid bounds
-    fn clamp_scroll(&mut self) {
-        self.scroll_offset = self.scroll_offset.clamp(0.0, self.max_scroll_offset());
-    }
-
-    /// Calculate accurate content height based on actual parameter counts
-    /// Uses precise measurements from rendered categories
-    fn estimate_content_height(&self, _total_categories: usize) -> f32 {
-        let mut total_height = 0.0;
-
-        for category in ConfigCategory::all() {
-            let is_collapsed = self.collapsed_categories.contains(&category);
-
-            if is_collapsed {
-                // Collapsed: header (70px) + gap (16px) = 86px
-                total_height += 86.0;
-            } else {
-                // Expanded: header (70px) + params container + gap (16px)
-                // Params container: padding (32px) + params + gaps between params
-                // Each param: ~44px + 12px gap = 56px per param
-                let param_count = category.parameter_count();
-                let params_height = 32.0 + (param_count as f32 * 56.0);
-                total_height += 70.0 + params_height + 16.0;
-            }
-        }
-
-        // Add top/bottom padding for categories container (py_4 = 16px each side = 32px total)
-        total_height + 32.0
     }
 }
 
@@ -17571,24 +17885,6 @@ impl ConfigCategory {
             ConfigCategory::Population,
             ConfigCategory::Persistence,
         ]
-    }
-
-    /// Returns the exact number of parameters displayed in this category
-    fn parameter_count(self) -> usize {
-        match self {
-            ConfigCategory::World => 5, // ACTUAL: width, height, food_cell_size, initial_food, rng_seed
-            ConfigCategory::Food => 11, // ACTUAL: respawn_interval, respawn_amount, max, growth_rate, decay_rate, diffusion_rate, intake_rate, sharing_radius, sharing_rate, transfer_rate, sharing_distance
-            ConfigCategory::Agent => 5, // ACTUAL: bot_speed, bot_radius, boost_multiplier, sense_radius, carnivore_threshold
-            ConfigCategory::Metabolism => 5, // ACTUAL: drain, movement_drain, ramp_floor, ramp_rate, boost_penalty
-            ConfigCategory::Temperature => 4, // ACTUAL: discomfort_rate, comfort_band, gradient_exponent, discomfort_exponent
-            ConfigCategory::Reproduction => 14, // ACTUAL: energy_threshold, energy_cost, cooldown, herbivore_rate, carnivore_rate, child_energy, spawn_jitter, spawn_back_distance, color_jitter, mutation_scale, partner_chance, gene_log_capacity, meta_mutation_chance, meta_mutation_scale
-            ConfigCategory::Aging => 4, // ACTUAL: decay_start, decay_rate, decay_max, energy_penalty
-            ConfigCategory::Combat => 8, // ACTUAL: spike_radius, spike_damage, spike_energy_cost, min_length, alignment_cosine, speed_bonus, length_bonus, growth_rate
-            ConfigCategory::Carcass => 7, // ACTUAL: distribution_radius, health_reward, reproduction_reward, neighbor_exponent, maturity_age, energy_share, indicator_scale
-            ConfigCategory::Topography => 3, // ACTUAL: enabled, speed_gain, energy_penalty
-            ConfigCategory::Population => 4, // ACTUAL: minimum, spawn_interval, spawn_count, crossover_chance
-            ConfigCategory::Persistence => 2, // ACTUAL: interval, enabled (2 params visible in render)
-        }
     }
 }
 
@@ -17676,6 +17972,10 @@ impl InspectorSnapshot {
         if focus_candidate.is_none() {
             focus_candidate = selected.first().map(|entry| entry.agent_id);
         }
+        // Hover is a lightweight preview from the published snapshot. It must
+        // not turn every pointer movement into a synchronous owner inspection;
+        // detailed physiology and brain requests belong to a focused selection.
+        let detail_focus_id = focus_candidate;
         if focus_candidate.is_none() {
             focus_candidate = hovered.as_ref().map(|entry| entry.agent_id);
         }
@@ -17683,7 +17983,7 @@ impl InspectorSnapshot {
         let focus_id = focus_candidate;
 
         let mut request_issued = false;
-        let brain_capture = focus_id.and_then(|agent_id| {
+        let brain_capture = detail_focus_id.and_then(|agent_id| {
             let agent_uid = published
                 .world
                 .agents
@@ -17759,7 +18059,7 @@ impl InspectorSnapshot {
                 status,
             })
         });
-        let focused = focus_id.filter(|_| inspect_detail).and_then(|agent_id| {
+        let focused = detail_focus_id.filter(|_| inspect_detail).and_then(|agent_id| {
             let agent = published
                 .world
                 .agents
@@ -17840,7 +18140,40 @@ impl ColorPaletteMode {
 #[derive(Default, Clone)]
 struct AccessibilitySettings {
     palette: ColorPaletteMode,
+    /// A requested palette waits for a matching full-quality World raster.
+    requested_palette: Option<ColorPaletteMode>,
+    /// Set only while the World window has painted a usable CPU raster.
+    palette_stage_ready: bool,
+    palette_error: Option<ColorPaletteMode>,
     narration_enabled: bool,
+}
+
+impl AccessibilitySettings {
+    fn request_palette(&mut self, palette: ColorPaletteMode) -> bool {
+        let before = (self.palette, self.requested_palette, self.palette_error);
+        self.palette_error = None;
+        if self.palette_stage_ready && palette != self.palette {
+            self.requested_palette = Some(palette);
+        } else {
+            self.palette = palette;
+            self.requested_palette = None;
+        }
+        before != (self.palette, self.requested_palette, self.palette_error)
+    }
+
+    fn fail_palette_preparation(&mut self, displayed: ColorPaletteMode, failed: ColorPaletteMode) {
+        if self.palette == displayed && self.requested_palette == Some(failed) {
+            self.requested_palette = None;
+            self.palette_error = Some(failed);
+        }
+    }
+
+    fn disable_palette_staging(&mut self) {
+        self.palette_stage_ready = false;
+        if let Some(requested) = self.requested_palette.take() {
+            self.palette = requested;
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -18391,12 +18724,31 @@ impl WorldHudSampleSource {
     }
 }
 
+struct LabInspectionSample {
+    source: WorldHudSampleSource,
+    selected_eye: Option<usize>,
+    detail: AgentInspectorDetails,
+    brain: Option<BrainInspectorCapture>,
+}
+
+/// At most one selected-creature inspection is outstanding for the Lab.
+struct LabInspectionJob {
+    session: scriptbots_runtime::HostSessionId,
+    epoch: u64,
+    uid: AgentUid,
+    selected_eye: Option<usize>,
+    result: std::sync::mpsc::Receiver<Option<LabInspectionSample>>,
+    ready: Option<LabInspectionSample>,
+    ready_since: Option<Instant>,
+}
+
 /// One World detail request, including a completed response waiting for the
 /// displayed publication to catch up with its independently sampled tick.
 struct WorldHudJob {
     session: scriptbots_runtime::HostSessionId,
     epoch: u64,
     uid: AgentUid,
+    selected_eye: Option<usize>,
     result: std::sync::mpsc::Receiver<
         Result<Option<(WorldHudSampleSource, AgentInspectorDetails)>, String>,
     >,
@@ -19073,6 +19425,13 @@ impl PlaybackState {
             return live;
         };
         self.displaying_history = true;
+        // Palette is a live presentation preference, even when the science
+        // frame is historical. Preserve its own age and demographic grade.
+        if let (Some(frame), Some(live_frame)) =
+            (snapshot.render_frame.as_mut(), live.render_frame.as_ref())
+        {
+            frame.apply_current_palette(live_frame.palette);
+        }
         // History replays science and inspection, not the session's current
         // controls, health or receipts. In particular, a new owner rejection
         // must remain visible while the user inspects an earlier world frame.
@@ -19498,6 +19857,8 @@ struct RenderFrame {
     agent_reference_age: u64,
     agent_base_radius: f32,
     sense_radius: f32,
+    /// Retained so historical frames can use the current accessibility palette.
+    presentation_life_delta: f32,
     post_stack: PostProcessStack,
     palette: ColorPaletteMode,
     vfx: vfx::VfxFrame,
@@ -19541,17 +19902,37 @@ impl WorldRasterKey {
 enum WorldRasterMessage {
     Preview(WorldRasterPixels),
     Complete(Option<WorldRasterPixels>),
+    Cancelled,
 }
 
 struct PendingWorldRaster {
     key: WorldRasterKey,
     receiver: std::sync::mpsc::Receiver<WorldRasterMessage>,
+    cancel: Arc<AtomicBool>,
 }
 
 struct CachedWorldRaster {
     key: WorldRasterKey,
     image: Arc<RenderImage>,
     final_quality: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TerrainDetailKey {
+    field_fingerprint: u64,
+    palette: ColorPaletteMode,
+    region: TerrainRasterRegion,
+}
+
+struct PendingTerrainDetail {
+    key: TerrainDetailKey,
+    receiver: std::sync::mpsc::Receiver<Option<WorldRasterPixels>>,
+    cancel: Arc<AtomicBool>,
+}
+
+struct CachedTerrainDetail {
+    key: TerrainDetailKey,
+    image: Arc<RenderImage>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -19585,6 +19966,13 @@ struct WorldRasterCache {
     food_current: Option<CachedFoodRaster>,
     food_previous: Option<Arc<RenderImage>>,
     food_texture: Option<CachedFoodTexture>,
+    detail_current: Option<CachedTerrainDetail>,
+    detail_staged: Option<CachedTerrainDetail>,
+    staged_palette_pixels: Option<(WorldRasterKey, WorldRasterPixels)>,
+    detail_previous: Option<Arc<RenderImage>>,
+    detail_pending: Option<PendingTerrainDetail>,
+    detail_last_failure: Option<std::time::Instant>,
+    detail_active: bool,
 }
 
 impl WorldRasterCache {
@@ -19608,26 +19996,39 @@ impl WorldRasterCache {
         &mut self,
         desired: WorldRasterKey,
     ) -> Option<(WorldRasterKey, WorldRasterPixels, bool)> {
-        let result = match self.pending.as_ref()?.receiver.try_recv() {
+        let pending = self.pending.as_ref()?;
+        if !pending.key.same_world(desired) {
+            // Let the single worker stop at a row boundary before admitting a
+            // replacement. Daylight-only changes remain compatible.
+            pending.cancel.store(true, AtomicOrdering::Release);
+        }
+        let result = match pending.receiver.try_recv() {
             Ok(result) => result,
             Err(std::sync::mpsc::TryRecvError::Empty) => return None,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                let failed_key = self.pending.take()?.key;
-                self.last_failure = Some((failed_key, std::time::Instant::now()));
+                let pending = self.pending.take()?;
+                if !pending.cancel.load(AtomicOrdering::Acquire) {
+                    self.last_failure = Some((pending.key, std::time::Instant::now()));
+                }
                 return None;
             }
         };
         let key = self.pending.as_ref()?.key;
+        let cancelled = self.pending.as_ref()?.cancel.load(AtomicOrdering::Acquire);
         let (pixels, final_quality) = match result {
             WorldRasterMessage::Preview(pixels) => (Some(pixels), false),
             WorldRasterMessage::Complete(pixels) => {
                 self.pending = None;
-                self.last_failure = if pixels.is_none() {
+                self.last_failure = if pixels.is_none() && !cancelled {
                     Some((key, std::time::Instant::now()))
                 } else {
                     None
                 };
                 (pixels, true)
+            }
+            WorldRasterMessage::Cancelled => {
+                self.pending = None;
+                return None;
             }
         };
         pixels
@@ -19655,21 +20056,48 @@ impl WorldRasterCache {
             return;
         }
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
         match std::thread::Builder::new()
             .name("scriptbots-terrain-raster".into())
             .spawn(move || {
-                if include_preview
-                    && let Some(preview) =
-                        rasterize_terrain_input_at_resolution(&input, daylight, 1)
-                    && sender.send(WorldRasterMessage::Preview(preview)).is_err()
-                {
-                    return;
+                if include_preview {
+                    let preview = rasterize_terrain_input_at_resolution_cancellable(
+                        &input,
+                        daylight,
+                        WORLD_RASTER_PREVIEW_SAMPLES_PER_TERRAIN_CELL,
+                        Some(&worker_cancel),
+                    );
+                    if worker_cancel.load(AtomicOrdering::Acquire) {
+                        let _ = sender.send(WorldRasterMessage::Cancelled);
+                        return;
+                    }
+                    if let Some(preview) = preview
+                        && sender.send(WorldRasterMessage::Preview(preview)).is_err()
+                    {
+                        return;
+                    }
                 }
-                let _ = sender.send(WorldRasterMessage::Complete(rasterize_terrain_input(
-                    &input, daylight,
-                )));
+                let pixels = rasterize_terrain_input_at_resolution_cancellable(
+                    &input,
+                    daylight,
+                    WORLD_RASTER_SAMPLES_PER_TERRAIN_CELL,
+                    Some(&worker_cancel),
+                );
+                let result = if worker_cancel.load(AtomicOrdering::Acquire) {
+                    WorldRasterMessage::Cancelled
+                } else {
+                    WorldRasterMessage::Complete(pixels)
+                };
+                let _ = sender.send(result);
             }) {
-            Ok(_) => self.pending = Some(PendingWorldRaster { key, receiver }),
+            Ok(_) => {
+                self.pending = Some(PendingWorldRaster {
+                    key,
+                    receiver,
+                    cancel,
+                })
+            }
             Err(error) => {
                 self.last_failure = Some((key, std::time::Instant::now()));
                 warn!(?error, "could not start terrain raster worker");
@@ -19717,7 +20145,23 @@ impl WorldRasterCache {
 
     fn drain(&mut self) -> Vec<Arc<RenderImage>> {
         self.food_texture = None;
-        let mut images = Vec::with_capacity(2);
+        self.staged_palette_pixels = None;
+        if let Some(pending) = self.detail_pending.take() {
+            pending.cancel.store(true, AtomicOrdering::Release);
+        }
+        self.detail_active = false;
+        let mut images = Vec::with_capacity(6);
+        if let Some(entry) = self.detail_current.take() {
+            images.push(entry.image);
+        }
+        if let Some(entry) = self.detail_staged.take() {
+            images.push(entry.image);
+        }
+        if let Some(previous) = self.detail_previous.take()
+            && images.iter().all(|image| image.id != previous.id)
+        {
+            images.push(previous);
+        }
         if let Some(entry) = self.current.take() {
             images.push(entry.image);
         }
@@ -19790,18 +20234,43 @@ fn build_post_process_stack(world: &WorldState, palette: ColorPaletteMode) -> Po
         world.tick().0,
         world.config(),
         world.is_closed(),
-        world.agent_count(),
-        world.history().last(),
+        demographic_presentation_delta(world.history()),
         palette,
     )
+}
+
+/// Spread short-lived demographic events over a fixed window so one birth or
+/// death cannot flash the color grade and grain across the whole world.
+fn demographic_presentation_delta<'a>(
+    history: impl DoubleEndedIterator<Item = &'a TickSummary>,
+) -> f32 {
+    const WINDOW: usize = 30;
+    let delta = history
+        .rev()
+        .take(WINDOW)
+        .map(|summary| {
+            let population = summary.agent_count.max(1) as f32;
+            ((summary.births as f32 - summary.deaths as f32) / population).clamp(-1.0, 1.0)
+        })
+        .sum::<f32>();
+    delta / WINDOW as f32
+}
+
+fn palette_grade_temperature(palette: ColorPaletteMode, daylight: f32, life_delta: f32) -> f32 {
+    match palette {
+        ColorPaletteMode::Natural => 0.07 - (1.0 - daylight) * 0.13 - life_delta * 0.05,
+        ColorPaletteMode::Deuteranopia => 0.05,
+        ColorPaletteMode::Protanopia => -0.04,
+        ColorPaletteMode::Tritanopia => 0.12,
+        ColorPaletteMode::HighContrast => 0.20,
+    }
 }
 
 fn post_process_stack(
     tick: u64,
     config: &ScriptBotsConfig,
     closed: bool,
-    agent_count: usize,
-    latest: Option<&TickSummary>,
+    life_delta: f32,
     palette: ColorPaletteMode,
 ) -> PostProcessStack {
     let render = &config.render;
@@ -19811,16 +20280,7 @@ fn post_process_stack(
     let daylight = visual::daylight_factor(tick, cycle_ticks, start_phase);
     let night = 1.0 - daylight;
     let closed_bonus = if closed { 0.18 } else { 0.0 };
-    let agent_count = agent_count.max(1) as f32;
-    let (births_ratio, deaths_ratio) = latest
-        .map(|summary| {
-            (
-                summary.births as f32 / agent_count,
-                summary.deaths as f32 / agent_count,
-            )
-        })
-        .unwrap_or((0.0, 0.0));
-    let life_delta = (births_ratio - deaths_ratio).clamp(-1.0, 1.0);
+    let life_delta = life_delta.clamp(-1.0, 1.0);
     let tension = life_delta.abs();
     let post = render.post.as_ref();
     let atmosphere = &visual::visual_style().atmosphere;
@@ -19885,13 +20345,7 @@ fn post_process_stack(
         .and_then(|settings| settings.color)
         .unwrap_or_else(|| atmosphere.fog_srgb.map(srgb_to_linear));
 
-    let temperature = match palette {
-        ColorPaletteMode::Natural => 0.07 - night * 0.13 - life_delta * 0.05,
-        ColorPaletteMode::Deuteranopia => 0.05,
-        ColorPaletteMode::Protanopia => -0.04,
-        ColorPaletteMode::Tritanopia => 0.12,
-        ColorPaletteMode::HighContrast => 0.20,
-    };
+    let temperature = palette_grade_temperature(palette, daylight, life_delta);
 
     let color_grade = PostProcessPass::ColorGrade {
         lift: (0.025 + daylight * 0.025 + closed_bonus * 0.08 - life_delta * 0.04).clamp(0.0, 0.12),
@@ -19979,7 +20433,8 @@ struct AgentRenderData {
         expect(dead_code, reason = "consumed by audio cues and snapshot tests")
     )]
     spike_victim: bool,
-    reproduction_intent: f32,
+    #[cfg_attr(not(feature = "world_wgpu"), allow(dead_code))]
+    sharing_intent: f32,
 }
 
 #[derive(Clone)]
@@ -19987,6 +20442,7 @@ struct CanvasState {
     frame: RenderFrame,
     camera: Arc<Mutex<Camera>>,
     world_raster_cache: Arc<Mutex<WorldRasterCache>>,
+    accessibility: Arc<Mutex<AccessibilitySettings>>,
     #[cfg(test)]
     force_legacy_world_painter: bool,
     focus_agent: Option<AgentId>,
@@ -20008,6 +20464,31 @@ fn resolved_gpu_fxaa(config: &ScriptBotsConfig) -> bool {
 }
 
 impl RenderFrame {
+    fn apply_current_palette(&mut self, palette: ColorPaletteMode) {
+        if self.palette == palette {
+            return;
+        }
+        let daylight = visual::daylight_factor(
+            self.tick,
+            self.day_night_cycle_ticks,
+            self.day_night_start_phase,
+        );
+        let temperature = palette_grade_temperature(
+            palette,
+            daylight,
+            self.presentation_life_delta.clamp(-1.0, 1.0),
+        );
+        for pass in &mut self.post_stack.passes {
+            if let PostProcessPass::ColorGrade {
+                temperature: value, ..
+            } = pass
+            {
+                *value = temperature;
+            }
+        }
+        self.palette = palette;
+    }
+
     #[cfg(feature = "world_wgpu")]
     fn gpu_bloom_controls(&self) -> scriptbots_world_gfx::BloomControls {
         self.post_stack
@@ -20137,7 +20618,7 @@ impl RenderFrame {
                     spike_extended: visual.spike_extended,
                     spike_struck: visual.spike_struck,
                     spike_victim: visual.spike_victim,
-                    reproduction_intent: visual.reproduction_intent,
+                    sharing_intent: visual.reproduction_intent,
                 })
             })
             .collect::<Option<Vec<_>>>()?;
@@ -20170,6 +20651,8 @@ impl RenderFrame {
                 .map(|layer| layer.water_depth.as_slice()),
         );
         let (day_night_cycle_ticks, day_night_start_phase) = config.render.resolved_day_night();
+        let presentation_life_delta =
+            demographic_presentation_delta(snapshot.summary_history.iter());
         let vfx = vfx.unwrap_or_else(|| {
             let mut projection = vfx::VfxProjection::default();
             projection.ingest(
@@ -20199,12 +20682,12 @@ impl RenderFrame {
             agent_reference_age: u64::from(config.aging_health_decay_start.max(1)),
             agent_base_radius: config.bot_radius.max(1.0),
             sense_radius: config.sense_radius,
+            presentation_life_delta,
             post_stack: post_process_stack(
                 snapshot.world.tick,
                 config,
                 snapshot.world.world.closed,
-                snapshot.world.agents.len(),
-                snapshot.summary_history.last(),
+                presentation_life_delta,
                 palette,
             ),
             palette,
@@ -20248,7 +20731,7 @@ impl RenderFrame {
                 .is_some_and(|rt| rt.outputs.channel(OutputChannel::SpikeTarget) > 0.5);
             let spike_struck = runtime_entry.is_some_and(|rt| rt.combat.spike_attacker);
             let spike_victim = runtime_entry.is_some_and(|rt| rt.spiked);
-            let reproduction_intent = runtime_entry.map(|rt| rt.give_intent).unwrap_or(0.0);
+            let sharing_intent = runtime_entry.map(|rt| rt.give_intent).unwrap_or(0.0);
 
             let (
                 wheel_left,
@@ -20338,7 +20821,7 @@ impl RenderFrame {
                 spike_extended,
                 spike_struck,
                 spike_victim,
-                reproduction_intent,
+                sharing_intent,
             });
         }
 
@@ -20378,6 +20861,7 @@ impl RenderFrame {
             agent_reference_age,
             agent_base_radius: config.bot_radius.max(1.0),
             sense_radius: config.sense_radius,
+            presentation_life_delta: demographic_presentation_delta(world.history()),
             post_stack: build_post_process_stack(world, palette),
             palette,
             vfx,
@@ -20957,16 +21441,16 @@ fn agent_silhouette(
     let half = size_px * 0.5;
     let forward = (visuals.facing[0], visuals.facing[1]);
     let right = (visuals.right[0], visuals.right[1]);
-    let body_half_length = half * 1.35;
-    let body_radius = (half * 0.72).max(3.0);
+    let body_half_length = half * 1.08;
+    let body_radius = (half * 0.88).max(3.0);
 
-    let spike_base = body_radius * 0.65;
+    let spike_base = body_radius * 0.30;
     let base_offset = body_half_length - body_radius * 0.2;
     // Core's physical tip offset remains authoritative below, while readiness
     // provides a screen-space minimum so the production 0..=1 growth range does
     // not collapse to a sub-pixel difference at overview zoom.
     let spike_front_offset =
-        body_half_length + body_radius * (0.7 + visuals.spike_readiness * 2.0) + 2.0;
+        body_half_length + body_radius * (0.25 + visuals.spike_readiness * 0.75) + 1.0;
     let spike = [
         (
             position.0 + forward.0 * base_offset - right.0 * spike_base,
@@ -21034,8 +21518,11 @@ fn agent_spike_color(
 ) -> Rgba {
     palette_color(
         scale_rgb(
-            rgba_from_triplet_with_alpha(visuals.spike_color, 0.55 + visuals.spike_readiness * 0.4),
-            1.0 + visuals.spike_readiness * 0.3,
+            rgba_from_triplet_with_alpha(
+                visuals.spike_color,
+                0.35 + visuals.spike_readiness * 0.35,
+            ),
+            0.8 + visuals.spike_readiness * 0.2,
         ),
         palette,
         palette_is_natural,
@@ -21086,9 +21573,9 @@ fn paint_agent_avatar(
     let right = silhouette.right;
     let body_half_length = silhouette.body_half_length;
     let body_radius = silhouette.body_radius;
-    let wheel_half_length = body_half_length * 0.96;
-    let wheel_radius = (body_radius * 0.38).max(2.0);
-    let wheel_offset = body_radius + wheel_radius * 0.55;
+    let wheel_half_length = body_half_length * 0.72;
+    let wheel_radius = (body_radius * 0.28).max(1.5);
+    let wheel_offset = body_radius + wheel_radius * 0.25;
 
     let left_center = (px_x - right.0 * wheel_offset, px_y - right.1 * wheel_offset);
     let right_center = (px_x + right.0 * wheel_offset, px_y + right.1 * wheel_offset);
@@ -21166,7 +21653,11 @@ fn paint_agent_avatar(
         return;
     }
 
-    // Body shell
+    // At close range, give the body a shaded rim and an inset surface. The
+    // underlying color still comes from the simulation's diet/health/age
+    // visual projection; these layers only describe its material and light.
+    // Keep the extra paths out of the dense overview rendering path.
+    let close_detail = size_px >= 48.0;
     let mut body_shape = PathBuilder::fill();
     append_capsule_polygon(
         &mut body_shape,
@@ -21178,11 +21669,52 @@ fn paint_agent_avatar(
         16,
     );
     if let Ok(path) = body_shape.build() {
-        window.paint_path(path, body_color);
+        window.paint_path(
+            path,
+            if close_detail {
+                scale_rgb(body_color, 0.58)
+            } else {
+                body_color
+            },
+        );
+    }
+    if close_detail {
+        let mut surface = PathBuilder::fill();
+        append_capsule_polygon(
+            &mut surface,
+            (px_x - body_radius * 0.045, px_y - body_radius * 0.045),
+            forward,
+            right,
+            body_half_length * 0.91,
+            body_radius * 0.90,
+            20,
+        );
+        if let Ok(path) = surface.build() {
+            window.paint_path(path, body_color);
+        }
+
+        // A broad translucent highlight suggests a curved shell rather than a
+        // second opaque stripe. It is fixed to the screen-space light source.
+        let mut highlight = PathBuilder::fill();
+        append_capsule_polygon(
+            &mut highlight,
+            (px_x - body_radius * 0.18, px_y - body_radius * 0.18),
+            forward,
+            right,
+            body_half_length * 0.66,
+            body_radius * 0.48,
+            18,
+        );
+        if let Ok(path) = highlight.build() {
+            let mut highlight_color = lerp_rgba(body_color, rgba_from_hex(0xe6f2df, 1.0), 0.55);
+            highlight_color.a = 0.18;
+            window.paint_path(path, highlight_color);
+        }
     }
 
     // Diet stripe
-    let mut stripe_color = rgba_from_triplet_with_alpha(visuals.stripe_color, 0.42);
+    let mut stripe_color =
+        rgba_from_triplet_with_alpha(visuals.stripe_color, if close_detail { 0.24 } else { 0.42 });
     stripe_color = palette_color(stripe_color, palette, palette_is_natural);
     let mut stripe = PathBuilder::fill();
     append_capsule_polygon(
@@ -21191,7 +21723,7 @@ fn paint_agent_avatar(
         forward,
         right,
         body_half_length * 0.82,
-        body_radius * 0.45,
+        body_radius * if close_detail { 0.32 } else { 0.45 },
         14,
     );
     if let Ok(path) = stripe.build() {
@@ -21301,6 +21833,13 @@ fn paint_agent_avatar(
         eye_radius = eye_radius.min(max_eye_radius).max(min_eye_radius);
 
         let mut eye = PathBuilder::fill();
+        if close_detail {
+            let mut socket = PathBuilder::fill();
+            append_circle_polygon(&mut socket, eye_center.0, eye_center.1, eye_radius * 1.22);
+            if let Ok(path) = socket.build() {
+                window.paint_path(path, scale_rgb(body_color, 0.48));
+            }
+        }
         append_circle_polygon(&mut eye, eye_center.0, eye_center.1, eye_radius);
         if let Ok(path) = eye.build() {
             let mut sclera_color =
@@ -21317,6 +21856,18 @@ fn paint_agent_avatar(
                 rgba_from_triplet_with_alpha(visual::visual_style().substrate.abyss_srgb, 0.98);
             pupil_color = palette_color(pupil_color, palette, palette_is_natural);
             window.paint_path(path, pupil_color);
+        }
+        if close_detail {
+            let mut glint = PathBuilder::fill();
+            append_circle_polygon(
+                &mut glint,
+                eye_center.0 - pupil_radius * 0.28,
+                eye_center.1 - pupil_radius * 0.28,
+                (pupil_radius * 0.24).max(0.5),
+            );
+            if let Ok(path) = glint.build() {
+                window.paint_path(path, rgba_from_hex(0xf0f7ec, 0.8));
+            }
         }
     }
 
@@ -22096,7 +22647,14 @@ fn canonical_gpu_terrain_colors(frame: &RenderFrame) -> Vec<[f32; 4]> {
         .collect()
 }
 
-const WORLD_RASTER_SAMPLES_PER_TERRAIN_CELL: u32 = 8;
+// Use the existing one-megapixel ceiling more fully for the default 120×60
+// world: 1440×720 retains substantially more of the source materials at zoom.
+// Terrain generation remains on the background raster worker.
+const WORLD_RASTER_SAMPLES_PER_TERRAIN_CELL: u32 = 12;
+// The preview appears while a new world or palette is being generated. Two
+// samples per cell and the real materials avoid a flat, blurry flash, while
+// keeping the initial raster far smaller than the finished image.
+const WORLD_RASTER_PREVIEW_SAMPLES_PER_TERRAIN_CELL: u32 = 2;
 const MAX_WORLD_RASTER_TEXELS: u64 = 1_048_576;
 
 fn world_raster_key(frame: &RenderFrame, daylight: f32) -> WorldRasterKey {
@@ -22222,20 +22780,9 @@ fn natural_terrain_sample(image: &image::RgbImage, u: f32, v: f32) -> [f32; 3] {
 type NaturalMaterialSamples = Arc<Vec<[[u8; 3]; 3]>>;
 type NaturalMaterialEntry = ((u32, u32), NaturalMaterialSamples);
 
-fn natural_terrain_materials(width: u32, height: u32) -> Option<NaturalMaterialSamples> {
+fn natural_terrain_images() -> Option<&'static [image::RgbImage; 3]> {
     static IMAGES: std::sync::OnceLock<Option<[image::RgbImage; 3]>> = std::sync::OnceLock::new();
-    static CACHE: std::sync::OnceLock<Mutex<Vec<NaturalMaterialEntry>>> =
-        std::sync::OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
-    {
-        let entries = cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some((_, samples)) = entries.iter().find(|(size, _)| *size == (width, height)) {
-            return Some(Arc::clone(samples));
-        }
-    }
-    let images = IMAGES
+    IMAGES
         .get_or_init(|| {
             Some([
                 image::load_from_memory(include_bytes!("terrain_grass.png"))
@@ -22249,9 +22796,31 @@ fn natural_terrain_materials(width: u32, height: u32) -> Option<NaturalMaterialS
                     .to_rgb8(),
             ])
         })
-        .as_ref()?;
+        .as_ref()
+}
+
+fn natural_terrain_materials(
+    width: u32,
+    height: u32,
+    cancel: Option<&AtomicBool>,
+) -> Option<NaturalMaterialSamples> {
+    static CACHE: std::sync::OnceLock<Mutex<Vec<NaturalMaterialEntry>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    {
+        let entries = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((_, samples)) = entries.iter().find(|(size, _)| *size == (width, height)) {
+            return Some(Arc::clone(samples));
+        }
+    }
+    let images = natural_terrain_images()?;
     let mut samples = Vec::with_capacity((width as usize).checked_mul(height as usize)?);
     for y in 0..height {
+        if cancel.is_some_and(|flag| flag.load(AtomicOrdering::Acquire)) {
+            return None;
+        }
         for x in 0..width {
             let u = (x as f32 + 0.5) / width as f32;
             let v = (y as f32 + 0.5) / height as f32;
@@ -22296,19 +22865,70 @@ fn rasterize_world_fields(frame: &RenderFrame, daylight: f32) -> Option<WorldRas
     rasterize_terrain_input(&TerrainRasterInput::from(frame), daylight)
 }
 
-#[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
+#[cfg(test)]
 fn rasterize_terrain_input(frame: &TerrainRasterInput, daylight: f32) -> Option<WorldRasterPixels> {
     rasterize_terrain_input_at_resolution(frame, daylight, WORLD_RASTER_SAMPLES_PER_TERRAIN_CELL)
 }
 
-#[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
+#[cfg(test)]
 fn rasterize_terrain_input_at_resolution(
     frame: &TerrainRasterInput,
     daylight: f32,
     samples_per_cell: u32,
 ) -> Option<WorldRasterPixels> {
-    let (raster_width, raster_height) =
-        world_raster_dimensions_at_resolution(&frame.terrain, samples_per_cell)?;
+    rasterize_terrain_input_at_resolution_cancellable(frame, daylight, samples_per_cell, None)
+}
+
+/// A bounded part of the world, sampled at pixel centers. World coordinates
+/// keep local material and noise aligned with the overview image while panning.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TerrainRasterRegion {
+    origin: (f32, f32),
+    size: (f32, f32),
+    pixels: (u32, u32),
+}
+
+fn rasterize_terrain_input_at_resolution_cancellable(
+    frame: &TerrainRasterInput,
+    daylight: f32,
+    samples_per_cell: u32,
+    cancel: Option<&AtomicBool>,
+) -> Option<WorldRasterPixels> {
+    let pixels = world_raster_dimensions_at_resolution(&frame.terrain, samples_per_cell)?;
+    rasterize_terrain_input_region_cancellable(frame, daylight, None, pixels, false, cancel)
+}
+
+#[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
+fn rasterize_terrain_input_region_cancellable(
+    frame: &TerrainRasterInput,
+    daylight: f32,
+    region: Option<TerrainRasterRegion>,
+    full_pixels: (u32, u32),
+    microdetail: bool,
+    cancel: Option<&AtomicBool>,
+) -> Option<WorldRasterPixels> {
+    if cancel.is_some_and(|flag| flag.load(AtomicOrdering::Acquire)) {
+        return None;
+    }
+    let (raster_width, raster_height) = region.map_or(full_pixels, |region| region.pixels);
+    if raster_width == 0
+        || raster_height == 0
+        || u64::from(raster_width) * u64::from(raster_height) > MAX_WORLD_RASTER_TEXELS
+        || !frame.world_size.0.is_finite()
+        || frame.world_size.0 <= 0.0
+        || !frame.world_size.1.is_finite()
+        || frame.world_size.1 <= 0.0
+        || region.is_some_and(|region| {
+            !region.origin.0.is_finite()
+                || !region.origin.1.is_finite()
+                || !region.size.0.is_finite()
+                || region.size.0 <= 0.0
+                || !region.size.1.is_finite()
+                || region.size.1 <= 0.0
+        })
+    {
+        return None;
+    }
     let expected_tiles =
         (frame.terrain.dimensions.0 as usize).saturating_mul(frame.terrain.dimensions.1 as usize);
     if frame.terrain.tiles.len() < expected_tiles {
@@ -22369,13 +22989,17 @@ fn rasterize_terrain_input_at_resolution(
             }
         }
     }
-    // A representative, low-frequency preview avoids waiting for texture
-    // decoding; full-resolution terrain uses the sampled material images.
-    let materials = if samples_per_cell == 1 {
-        None
+    // Use the same materials for preview and final images so that changing
+    // palette does not first replace the world with an untextured surface.
+    let materials = if region.is_none() {
+        natural_terrain_materials(raster_width, raster_height, cancel)
     } else {
-        natural_terrain_materials(raster_width, raster_height)
+        None
     };
+    let region_materials = region.and_then(|_| natural_terrain_images());
+    if cancel.is_some_and(|flag| flag.load(AtomicOrdering::Acquire)) {
+        return None;
+    }
 
     let terrain_field = visual::TerrainFieldView {
         width: frame.terrain.dimensions.0,
@@ -22395,9 +23019,14 @@ fn rasterize_terrain_input_at_resolution(
     );
 
     for raster_y in 0..raster_height {
-        let world_y = (raster_y as f32 + 0.5) / raster_height as f32 * frame.world_size.1;
+        if cancel.is_some_and(|flag| flag.load(AtomicOrdering::Acquire)) {
+            return None;
+        }
+        let fy = (raster_y as f32 + 0.5) / raster_height as f32;
+        let world_y = region.map_or(fy * frame.world_size.1, |r| r.origin.1 + fy * r.size.1);
         for raster_x in 0..raster_width {
-            let world_x = (raster_x as f32 + 0.5) / raster_width as f32 * frame.world_size.0;
+            let fx = (raster_x as f32 + 0.5) / raster_width as f32;
+            let world_x = region.map_or(fx * frame.world_size.0, |r| r.origin.0 + fx * r.size.0);
             let corners = terrain_field.sample_corners(world_x, world_y);
             let weights = blend_channels(&splats, &corners);
             let sampled_moisture = blend_scalar(&moisture, &corners);
@@ -22422,8 +23051,16 @@ fn rasterize_terrain_input_at_resolution(
             // Stable, periodic surface detail follows the world rather than
             // the screen or tick. It shades the canonical biome colors; it
             // does not create terrain or resources in the simulation.
-            let u = (raster_x as f32 + 0.5) / raster_width as f32;
-            let v = (raster_y as f32 + 0.5) / raster_height as f32;
+            let u = if region.is_some() {
+                (world_x / frame.world_size.0).rem_euclid(1.0)
+            } else {
+                fx
+            };
+            let v = if region.is_some() {
+                (world_y / frame.world_size.1).rem_euclid(1.0)
+            } else {
+                fy
+            };
             let broad = food_field_noise(u * 24.0, v * 12.0, 24, 12);
             let detail = food_field_noise(u * 96.0, v * 48.0, 96, 48);
             let grain = food_field_noise(u * 240.0, v * 120.0, 240, 120);
@@ -22433,12 +23070,29 @@ fn rasterize_terrain_input_at_resolution(
                 (0.72 + broad * 0.38 + detail * 0.26 + grain * 0.08 + relief).clamp(0.55, 1.30);
             let mut display_rgb = display_rgb.map(|channel| channel * shade);
             {
-                let samples = materials.as_ref().map_or(
-                    [[74, 75, 19], [87, 80, 73], [22, 59, 56]],
-                    |materials| {
-                        materials[raster_y as usize * raster_width as usize + raster_x as usize]
-                    },
-                );
+                let samples = if let Some(images) = region_materials {
+                    std::array::from_fn(|i| {
+                        let broad = natural_terrain_sample(&images[i], u, v);
+                        let fine = if microdetail {
+                            natural_terrain_sample(&images[i], u * 16.0, v * 16.0)
+                        } else {
+                            broad
+                        };
+                        std::array::from_fn(|channel| {
+                            (broad[channel] * 0.35 + fine[channel] * 0.65)
+                                .clamp(0.0, 1.0)
+                                .mul_add(255.0, 0.0)
+                                .round() as u8
+                        })
+                    })
+                } else {
+                    materials.as_ref().map_or(
+                        [[74, 75, 19], [87, 80, 73], [22, 59, 56]],
+                        |materials| {
+                            materials[raster_y as usize * raster_width as usize + raster_x as usize]
+                        },
+                    )
+                };
                 let blend = [
                     ((weights[3] + weights[4]) * 0.8).clamp(0.0, 0.8),
                     (weights[5] * 0.8).clamp(0.0, 0.8),
@@ -22473,6 +23127,97 @@ fn rasterize_terrain_input_at_resolution(
         height: raster_height,
         bgra,
     })
+}
+
+// Keep close-up detail bounded and world-aligned. Palette-aware color patches
+// are prepared alongside the overview and never alter scientific terrain or food.
+const TERRAIN_DETAIL_MAX_SIDE: u32 = 1024;
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn terrain_detail_region(
+    world_size: (f32, f32),
+    view: (f32, f32, f32, f32),
+    offset: (f32, f32),
+    scale: f32,
+) -> Option<TerrainRasterRegion> {
+    if !scale.is_finite()
+        || scale <= 0.0
+        || !world_size.0.is_finite()
+        || !world_size.1.is_finite()
+        || world_size.0 <= 0.0
+        || world_size.1 <= 0.0
+        || ![view.0, view.1, view.2, view.3, offset.0, offset.1]
+            .iter()
+            .all(|v| v.is_finite())
+        || view.2 <= view.0
+        || view.3 <= view.1
+    {
+        return None;
+    }
+    let visible_width = (view.2 - view.0) / scale;
+    let visible_height = (view.3 - view.1) / scale;
+    // Quantize the patch center to a quarter of the next power-of-two
+    // viewport size. A six-cell patch still covers the full viewport and its
+    // feathered border as the center moves within a cell, without spending
+    // half of the image on terrain far outside the screen.
+    let cell = visible_width
+        .max(visible_height)
+        .max(1.0)
+        .log2()
+        .ceil()
+        .exp2()
+        * 0.25;
+    let center_x = ((view.0 + view.2) * 0.5 - offset.0) / scale;
+    let center_y = ((view.1 + view.3) * 0.5 - offset.1) / scale;
+    let x0 = (((center_x / cell).floor() - 2.5) * cell).clamp(0.0, world_size.0);
+    let y0 = (((center_y / cell).floor() - 2.5) * cell).clamp(0.0, world_size.1);
+    let x1 = (((center_x / cell).floor() + 3.5) * cell).clamp(0.0, world_size.0);
+    let y1 = (((center_y / cell).floor() + 3.5) * cell).clamp(0.0, world_size.1);
+    let size = (x1 - x0, y1 - y0);
+    if size.0 <= 0.0 || size.1 <= 0.0 {
+        return None;
+    }
+    let longest = size.0.max(size.1);
+    let width = ((size.0 / longest * TERRAIN_DETAIL_MAX_SIDE as f32).round() as u32).max(1);
+    let height = ((size.1 / longest * TERRAIN_DETAIL_MAX_SIDE as f32).round() as u32).max(1);
+    Some(TerrainRasterRegion {
+        origin: (x0, y0),
+        size,
+        pixels: (width, height),
+    })
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn rasterize_terrain_detail(
+    input: &TerrainRasterInput,
+    region: TerrainRasterRegion,
+    daylight: f32,
+    cancel: Option<&AtomicBool>,
+) -> Option<WorldRasterPixels> {
+    let mut pixels = rasterize_terrain_input_region_cancellable(
+        input,
+        daylight,
+        Some(region),
+        (0, 0),
+        true,
+        cancel,
+    )?;
+    for y in 0..pixels.height {
+        if cancel.is_some_and(|flag| flag.load(AtomicOrdering::Acquire)) {
+            return None;
+        }
+        let fy = (y as f32 + 0.5) / pixels.height as f32;
+        for x in 0..pixels.width {
+            let fx = (x as f32 + 0.5) / pixels.width as f32;
+            let edge = (fx.min(1.0 - fx).min(fy.min(1.0 - fy)) / 0.08).clamp(0.0, 1.0);
+            pixels.bgra[((y * pixels.width + x) * 4 + 3) as usize] = (edge * 255.0).round() as u8;
+        }
+    }
+    Some(pixels)
 }
 
 fn render_image_from_world_raster(pixels: WorldRasterPixels) -> Option<Arc<RenderImage>> {
@@ -22567,21 +23312,33 @@ fn rasterize_food_field_with_texture(
     let noise_width = u64::from((raster_width / 18).max(1));
     let noise_height = u64::from((raster_height / 18).max(1));
     let mut bgra = Vec::with_capacity(raster_width as usize * raster_height as usize * 4);
-    let sample = |x: u32, y: u32| {
-        frame.food_cells[(y % height) as usize * width as usize + (x % width) as usize].max(0.0)
-    };
+    // The horizontal sample coordinates are identical on every row. Resolve
+    // them once, including the wrapped neighbor, rather than repeating floating
+    // remainder, floor and integer remainder operations for every texel.
+    let columns: Vec<_> = (0..raster_width)
+        .map(|x| {
+            let fx = ((x as f32 + 0.5) * width as f32 / raster_width as f32 - 0.5)
+                .rem_euclid(width as f32);
+            let x0 = fx.floor() as u32;
+            (
+                (x0 % width) as usize,
+                ((x0 + 1) % width) as usize,
+                fx.fract(),
+            )
+        })
+        .collect();
     for y in 0..raster_height {
         let fy = ((y as f32 + 0.5) * height as f32 / raster_height as f32 - 0.5)
             .rem_euclid(height as f32);
         let y0 = fy.floor() as u32;
         let ty = fy.fract();
-        for x in 0..raster_width {
-            let fx = ((x as f32 + 0.5) * width as f32 / raster_width as f32 - 0.5)
-                .rem_euclid(width as f32);
-            let x0 = fx.floor() as u32;
-            let tx = fx.fract();
-            let top = sample(x0, y0) * (1.0 - tx) + sample(x0 + 1, y0) * tx;
-            let bottom = sample(x0, y0 + 1) * (1.0 - tx) + sample(x0 + 1, y0 + 1) * tx;
+        let row0 = (y0 % height) as usize * width as usize;
+        let row1 = ((y0 + 1) % height) as usize * width as usize;
+        for (x, &(x0, x1, tx)) in columns.iter().enumerate() {
+            let top = frame.food_cells[row0 + x0].max(0.0) * (1.0 - tx)
+                + frame.food_cells[row0 + x1].max(0.0) * tx;
+            let bottom = frame.food_cells[row1 + x0].max(0.0) * (1.0 - tx)
+                + frame.food_cells[row1 + x1].max(0.0) * tx;
             let density = ((top * (1.0 - ty) + bottom * ty) / max_food).clamp(0.0, 1.0);
             let mut color = food_color(density);
             if !matches!(frame.palette, ColorPaletteMode::Natural) {
@@ -22596,7 +23353,7 @@ fn rasterize_food_field_with_texture(
                         noise_height,
                     )
                 },
-                |samples| samples[y as usize * raster_width as usize + x as usize],
+                |samples| samples[y as usize * raster_width as usize + x],
             );
             // Keep sparse food visible at fitted-world scale without inventing
             // food in empty cells. A smooth density falloff avoids hard square
@@ -22698,44 +23455,432 @@ fn paint_food_field(
     true
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn paint_terrain_detail(
+    state: &CanvasState,
+    view: (f32, f32, f32, f32),
+    offset: (f32, f32),
+    scale: f32,
+    fingerprint: u64,
+    window: &mut Window,
+) {
+    let frame = &state.frame;
+    let Some((overview_width, overview_height)) = world_raster_dimensions_at_resolution(
+        &frame.terrain,
+        WORLD_RASTER_SAMPLES_PER_TERRAIN_CELL,
+    ) else {
+        return;
+    };
+    let stretch = scale
+        * (frame.world_size.0 / overview_width as f32)
+            .max(frame.world_size.1 / overview_height as f32);
+    let desired_region = terrain_detail_region(frame.world_size, view, offset, scale);
+    let settings = state
+        .accessibility
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let request = (settings.palette == frame.palette)
+        .then_some(settings.requested_palette)
+        .flatten();
+    let committed = (settings.palette != frame.palette).then_some(settings.palette);
+    let mut completed = None;
+    let mut stale_image = None;
+    let mut stage_failure = None;
+    let cached = {
+        let mut cache = state
+            .world_raster_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.detail_active = if cache.detail_active {
+            stretch > 1.6
+        } else {
+            stretch > 2.2
+        };
+        let active = cache.detail_active && desired_region.is_some();
+        let current = cache
+            .detail_current
+            .as_ref()
+            .filter(|entry| {
+                active
+                    && entry.key.field_fingerprint == fingerprint
+                    && entry.key.palette == frame.palette
+            })
+            .map(|entry| (entry.key, Arc::clone(&entry.image)));
+        if cache.detail_staged.as_ref().is_some_and(|entry| {
+            entry.key.field_fingerprint != fingerprint
+                || (request != Some(entry.key.palette) && committed != Some(entry.key.palette))
+        }) {
+            stale_image = cache.detail_staged.take().map(|entry| entry.image);
+        }
+        // While a palette transition is pending, prepare exactly the patch
+        // already on screen. Keep it stable until overview and patch can switch together.
+        let staging = request.zip(current.as_ref().map(|(key, _)| key.region));
+        let desired = if let Some((palette, region)) = staging {
+            Some(TerrainDetailKey {
+                field_fingerprint: fingerprint,
+                palette,
+                region,
+            })
+        } else if committed.is_some() {
+            None
+        } else {
+            desired_region.map(|region| TerrainDetailKey {
+                field_fingerprint: fingerprint,
+                palette: frame.palette,
+                region,
+            })
+        };
+        if let Some(pending) = cache.detail_pending.as_ref() {
+            if !active
+                || desired.is_none_or(|wanted| {
+                    pending.key.field_fingerprint != wanted.field_fingerprint
+                        || pending.key.palette != wanted.palette
+                        || (staging.is_some() && pending.key.region != wanted.region)
+                })
+            {
+                pending.cancel.store(true, AtomicOrdering::Release);
+            }
+            match pending.receiver.try_recv() {
+                Ok(pixels) => {
+                    let pending = cache.detail_pending.take().expect("pending detail exists");
+                    if !pending.cancel.load(AtomicOrdering::Acquire)
+                        && desired.is_some_and(|wanted| {
+                            pending.key.field_fingerprint == wanted.field_fingerprint
+                                && pending.key.palette == wanted.palette
+                                && (staging.is_none() || pending.key.region == wanted.region)
+                        })
+                    {
+                        if let Some(pixels) = pixels {
+                            completed = Some((pending.key, pixels));
+                            cache.detail_last_failure = None;
+                        } else {
+                            cache.detail_last_failure = Some(std::time::Instant::now());
+                            stage_failure = staging.map(|(palette, _)| palette);
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    let pending = cache.detail_pending.take().expect("pending detail exists");
+                    if !pending.cancel.load(AtomicOrdering::Acquire) {
+                        cache.detail_last_failure = Some(std::time::Instant::now());
+                        stage_failure = staging.map(|(palette, _)| palette);
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        let already_ready = |wanted| {
+            current.as_ref().is_some_and(|(key, _)| *key == wanted)
+                || cache
+                    .detail_staged
+                    .as_ref()
+                    .is_some_and(|entry| entry.key == wanted)
+        };
+        if active
+            && completed.is_none()
+            && cache.detail_pending.is_none()
+            && cache
+                .detail_last_failure
+                .is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(1))
+            && let Some(key) = desired
+            && !already_ready(key)
+        {
+            let mut input = TerrainRasterInput::from(frame);
+            input.palette = key.palette;
+            let daylight = visual::daylight_factor(
+                frame.tick,
+                frame.day_night_cycle_ticks,
+                frame.day_night_start_phase,
+            );
+            let daylight = (daylight * 512.0).round() / 512.0;
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            let cancel = Arc::new(AtomicBool::new(false));
+            let worker_cancel = Arc::clone(&cancel);
+            match std::thread::Builder::new()
+                .name("scriptbots-terrain-detail".into())
+                .spawn(move || {
+                    let pixels = rasterize_terrain_detail(
+                        &input,
+                        key.region,
+                        daylight,
+                        Some(&worker_cancel),
+                    );
+                    let _ = sender.send(pixels);
+                }) {
+                Ok(_) => {
+                    cache.detail_pending = Some(PendingTerrainDetail {
+                        key,
+                        receiver,
+                        cancel,
+                    })
+                }
+                Err(error) => {
+                    cache.detail_last_failure = Some(std::time::Instant::now());
+                    stage_failure = staging.map(|(palette, _)| palette);
+                    warn!(?error, "could not start terrain detail worker");
+                }
+            }
+        }
+        current
+    };
+    if let Some(image) = stale_image {
+        let _ = window.drop_image(image);
+    }
+    if let Some(palette) = stage_failure {
+        state
+            .accessibility
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .fail_palette_preparation(frame.palette, palette);
+    }
+
+    // Force the replacement into the atlas at zero size, without exposing it
+    // above the still-visible old palette. The overview waits for this upload.
+    let mut normal_completed = None;
+    if let Some((key, pixels)) = completed {
+        if request == Some(key.palette) && cached.is_some() {
+            if let Some(image) = render_image_from_world_raster(pixels) {
+                let empty = Bounds::new(point(px(0.0), px(0.0)), size(px(0.0), px(0.0)));
+                match window.paint_layer(empty, |window| {
+                    window.paint_image(empty, Corners::default(), Arc::clone(&image), 0, false)
+                }) {
+                    Ok(()) => {
+                        let still_requested = state
+                            .accessibility
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .requested_palette
+                            == Some(key.palette);
+                        if still_requested {
+                            let stale = state
+                                .world_raster_cache
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .detail_staged
+                                .replace(CachedTerrainDetail { key, image });
+                            if let Some(stale) = stale {
+                                let _ = window.drop_image(stale.image);
+                            }
+                        } else {
+                            let _ = window.drop_image(image);
+                        }
+                    }
+                    Err(error) => {
+                        let _ = window.drop_image(image);
+                        warn!(?error, "could not prepare palette terrain detail");
+                        state
+                            .accessibility
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .fail_palette_preparation(frame.palette, key.palette);
+                    }
+                }
+            } else {
+                state
+                    .accessibility
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .fail_palette_preparation(frame.palette, key.palette);
+            }
+        } else {
+            normal_completed = Some((key, pixels));
+        }
+    }
+    let old_cached = cached.clone();
+    let (key, image, newly_built) = if let Some((key, pixels)) = normal_completed {
+        let Some(image) = render_image_from_world_raster(pixels) else {
+            return;
+        };
+        (key, image, true)
+    } else if let Some((key, image)) = cached {
+        (key, image, false)
+    } else {
+        return;
+    };
+    let region = key.region;
+    let bounds = Bounds::new(
+        point(
+            px(offset.0 + region.origin.0 * scale),
+            px(offset.1 + region.origin.1 * scale),
+        ),
+        size(px(region.size.0 * scale), px(region.size.1 * scale)),
+    );
+    if let Err(error) = window.paint_layer(bounds, |window| {
+        window.paint_image(bounds, Corners::default(), Arc::clone(&image), 0, false)
+    }) {
+        if newly_built {
+            let _ = window.drop_image(image);
+            state
+                .world_raster_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .detail_last_failure = Some(std::time::Instant::now());
+            if let Some((old_key, old_image)) = old_cached {
+                let old = old_key.region;
+                let old_bounds = Bounds::new(
+                    point(
+                        px(offset.0 + old.origin.0 * scale),
+                        px(offset.1 + old.origin.1 * scale),
+                    ),
+                    size(px(old.size.0 * scale), px(old.size.1 * scale)),
+                );
+                let _ = window.paint_layer(old_bounds, |window| {
+                    window.paint_image(old_bounds, Corners::default(), old_image, 0, false)
+                });
+            }
+        }
+        warn!(?error, "could not paint terrain detail");
+        return;
+    }
+    let retired = {
+        let mut cache = state
+            .world_raster_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let replacement = if newly_built {
+            Some(CachedTerrainDetail { key, image })
+        } else if committed.is_some_and(|palette| {
+            cache.detail_staged.as_ref().is_some_and(|entry| {
+                entry.key.palette == palette
+                    && entry.key.field_fingerprint == fingerprint
+                    && entry.key.region == key.region
+            })
+        }) {
+            cache.detail_staged.take()
+        } else {
+            None
+        };
+        replacement.and_then(|replacement| {
+            let retired = cache.detail_previous.take();
+            cache.detail_previous = cache
+                .detail_current
+                .replace(replacement)
+                .map(|entry| entry.image);
+            retired
+        })
+    };
+    if let Some(retired) = retired
+        && let Err(error) = window.drop_image(retired)
+    {
+        debug!(?error, "could not evict retired terrain detail image");
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn paint_continuous_world_fields(
     state: &CanvasState,
     offset_x: f32,
     offset_y: f32,
     scale: f32,
-    daylight: f32,
+    key: WorldRasterKey,
     window: &mut Window,
 ) -> bool {
     let frame = &state.frame;
-    // A 1/512 daylight step is below one display byte for most terrain
-    // channels, and avoids rebuilding a full image for every simulation tick.
-    let raster_daylight = (daylight * 512.0).round() / 512.0;
-    let key = world_raster_key(frame, raster_daylight);
-    let (completed, cached, failed) = {
+    let raster_daylight = f32::from_bits(key.daylight_bits);
+    let requested = state.accessibility.lock().ok().and_then(|settings| {
+        if settings.palette == frame.palette {
+            settings.requested_palette
+        } else {
+            None
+        }
+    });
+    let (completed, cached, failed, staged, switch_without_raster, stage_failed) = {
         let mut cache = match state.world_raster_cache.lock() {
             Ok(cache) => cache,
             Err(poisoned) => poisoned.into_inner(),
         };
-        let completed = cache.take_completed(key);
         let cached = cache.compatible_image_for(key);
-        let completed_exact =
-            completed
+        if let Some(palette) = requested {
+            let target = WorldRasterKey { palette, ..key };
+            if cache
+                .staged_palette_pixels
                 .as_ref()
-                .is_some_and(|(completed_key, _, final_quality)| {
-                    *completed_key == key && *final_quality
-                });
-        if cache.pending.is_none() && cache.image_for(key).is_none() && !completed_exact {
-            cache.start_world_raster(
-                key,
-                TerrainRasterInput::from(frame),
-                raster_daylight,
-                cached.is_none(),
-            );
+                .is_some_and(|(ready, _)| !ready.same_world(target))
+            {
+                cache.staged_palette_pixels = None;
+            }
+            if let Some((built_key, pixels, true)) = cache.take_completed(target) {
+                cache.staged_palette_pixels = Some((built_key, pixels));
+            }
+            let detail_current = cache.detail_current.as_ref().filter(|entry| {
+                cache.detail_active
+                    && entry.key.field_fingerprint == key.field_fingerprint
+                    && entry.key.palette == frame.palette
+            });
+            let detail_ready = detail_current.is_none_or(|current| {
+                cache.detail_staged.as_ref().is_some_and(|prepared| {
+                    prepared.key.field_fingerprint == key.field_fingerprint
+                        && prepared.key.palette == palette
+                        && prepared.key.region == current.key.region
+                })
+            });
+            let staged = if detail_ready {
+                cache.staged_palette_pixels.take()
+            } else {
+                None
+            };
+            if cached.is_some()
+                && cache.pending.is_none()
+                && staged.is_none()
+                && cache.staged_palette_pixels.is_none()
+            {
+                let mut input = TerrainRasterInput::from(frame);
+                input.palette = palette;
+                cache.start_world_raster(target, input, raster_daylight, false);
+            }
+            let stage_failed = cached.is_some()
+                && staged.is_none()
+                && cache.staged_palette_pixels.is_none()
+                && cache.pending.is_none()
+                && cache.failed_for(target);
+            let switch_without_raster = cached.is_none();
+            (
+                None,
+                cached,
+                false,
+                staged,
+                switch_without_raster,
+                stage_failed,
+            )
+        } else {
+            cache.staged_palette_pixels = None;
+            let completed = cache.take_completed(key);
+            let completed_exact =
+                completed
+                    .as_ref()
+                    .is_some_and(|(completed_key, _, final_quality)| {
+                        *completed_key == key && *final_quality
+                    });
+            if cache.pending.is_none() && cache.image_for(key).is_none() && !completed_exact {
+                cache.start_world_raster(
+                    key,
+                    TerrainRasterInput::from(frame),
+                    raster_daylight,
+                    cached.is_none(),
+                );
+            }
+            let failed = cache.failed_for(key);
+            (completed, cached, failed, None, false, false)
         }
-        let failed = cache.failed_for(key);
-        (completed, cached, failed)
     };
+    if let Some(palette) = requested
+        && (switch_without_raster || stage_failed)
+    {
+        let mut settings = state
+            .accessibility
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if settings.palette == frame.palette && settings.requested_palette == Some(palette) {
+            settings.requested_palette = None;
+            if switch_without_raster {
+                settings.palette_stage_ready = false;
+                settings.palette = palette;
+            } else {
+                settings.palette_error = Some(palette);
+            }
+        }
+    }
     let (image, newly_built, image_key, final_quality) =
         if let Some((completed_key, pixels, final_quality)) = completed {
             let Some(image) = render_image_from_world_raster(pixels) else {
@@ -22770,6 +23915,35 @@ fn paint_continuous_world_fields(
             px((frame.world_size.1 * scale).max(1.0)),
         ),
     );
+    // Upload the replacement beneath the still-visible old raster. The shared
+    // palette changes only after both images have been accepted for painting.
+    let staged_image = staged.and_then(|(staged_key, pixels)| {
+        let Some(image) = render_image_from_world_raster(pixels) else {
+            if let Ok(mut settings) = state.accessibility.lock() {
+                settings.fail_palette_preparation(frame.palette, staged_key.palette);
+            }
+            return None;
+        };
+        match window.paint_layer(world_bounds, |window| {
+            window.paint_image(
+                world_bounds,
+                Corners::default(),
+                Arc::clone(&image),
+                0,
+                false,
+            )
+        }) {
+            Ok(()) => Some((staged_key, image)),
+            Err(error) => {
+                let _ = window.drop_image(image);
+                warn!(?error, "could not prepare palette terrain image");
+                if let Ok(mut settings) = state.accessibility.lock() {
+                    settings.fail_palette_preparation(frame.palette, staged_key.palette);
+                }
+                None
+            }
+        }
+    });
     let paint_result = window.paint_layer(world_bounds, |window| {
         window.paint_image(
             world_bounds,
@@ -22781,6 +23955,9 @@ fn paint_continuous_world_fields(
     });
 
     if let Err(error) = paint_result {
+        if let Some((_, image)) = staged_image {
+            let _ = window.drop_image(image);
+        }
         if newly_built {
             let _ = window.drop_image(image);
         }
@@ -22802,6 +23979,39 @@ fn paint_continuous_world_fields(
             && let Err(error) = window.drop_image(retired)
         {
             debug!(?error, "could not evict retired world raster image");
+        }
+    }
+    if final_quality {
+        let mut settings = state
+            .accessibility
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        settings.palette_stage_ready = true;
+    }
+    if let Some((staged_key, image)) = staged_image {
+        let mut settings = state
+            .accessibility
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if settings.palette == frame.palette
+            && settings.requested_palette == Some(staged_key.palette)
+        {
+            let retired = match state.world_raster_cache.lock() {
+                Ok(mut cache) => cache.commit(staged_key, image, true),
+                Err(poisoned) => poisoned.into_inner().commit(staged_key, image, true),
+            };
+            settings.palette = staged_key.palette;
+            settings.requested_palette = None;
+            settings.palette_error = None;
+            drop(settings);
+            if let Some(retired) = retired
+                && let Err(error) = window.drop_image(retired)
+            {
+                debug!(?error, "could not evict retired palette raster image");
+            }
+        } else {
+            drop(settings);
+            let _ = window.drop_image(image);
         }
     }
     true
@@ -22858,6 +24068,7 @@ mod continuous_world_raster_tests {
             agent_reference_age: 1,
             agent_base_radius: 1.0,
             sense_radius: 1.0,
+            presentation_life_delta: 0.0,
             post_stack: PostProcessStack { passes: Vec::new() },
             palette: ColorPaletteMode::Natural,
             vfx: vfx::VfxFrame::empty(17),
@@ -22893,11 +24104,20 @@ mod continuous_world_raster_tests {
                 frame.day_night_cycle_ticks,
                 frame.day_night_start_phase,
             );
-            let preview = rasterize_terrain_input_at_resolution(&input, day, 1).unwrap();
+            let preview = rasterize_terrain_input_at_resolution(
+                &input,
+                day,
+                WORLD_RASTER_PREVIEW_SAMPLES_PER_TERRAIN_CELL,
+            )
+            .unwrap();
             let full = rasterize_terrain_input(&input, day).unwrap();
+            let samples = WORLD_RASTER_SAMPLES_PER_TERRAIN_CELL
+                / WORLD_RASTER_PREVIEW_SAMPLES_PER_TERRAIN_CELL;
+            assert_eq!((full.width, full.height), (1440, 720));
+            assert!(u64::from(full.width) * u64::from(full.height) <= MAX_WORLD_RASTER_TEXELS);
             assert_eq!(
                 (full.width, full.height),
-                (preview.width * 8, preview.height * 8)
+                (preview.width * samples, preview.height * samples)
             );
             let mut errors = Vec::new();
             for y in 0..preview.height {
@@ -22905,17 +24125,18 @@ mod continuous_world_raster_tests {
                     let p = (y as usize * preview.width as usize + x as usize) * 4;
                     for channel in 0..3 {
                         let mut sum = 0_u32;
-                        for dy in 0..8 {
-                            for dx in 0..8 {
-                                let f = ((y * 8 + dy) as usize * full.width as usize
-                                    + (x * 8 + dx) as usize)
+                        for dy in 0..samples {
+                            for dx in 0..samples {
+                                let f = ((y * samples + dy) as usize * full.width as usize
+                                    + (x * samples + dx) as usize)
                                     * 4
                                     + channel;
                                 sum += u32::from(full.bgra[f]);
                             }
                         }
                         errors.push(
-                            (i32::from(preview.bgra[p + channel]) - (sum / 64) as i32)
+                            (i32::from(preview.bgra[p + channel])
+                                - (sum / (samples * samples)) as i32)
                                 .unsigned_abs(),
                         );
                     }
@@ -22930,6 +24151,221 @@ mod continuous_world_raster_tests {
                 "preview differs too much from the full image"
             );
         }
+    }
+
+    #[test]
+    fn local_terrain_raster_matches_world_coordinates_and_bounds_allocation() {
+        let frame = frame(
+            (4, 4),
+            100,
+            (0..16)
+                .map(|i| {
+                    tile(
+                        [
+                            TerrainKind::Grass,
+                            TerrainKind::Rock,
+                            TerrainKind::ShallowWater,
+                            TerrainKind::Sand,
+                        ][i % 4],
+                    )
+                })
+                .collect(),
+            (1, 1),
+            100,
+            vec![0.0],
+        );
+        let input = TerrainRasterInput::from(&frame);
+        let full =
+            rasterize_terrain_input_at_resolution_cancellable(&input, 0.7, 12, None).unwrap();
+        let region = TerrainRasterRegion {
+            origin: (100.0, 100.0),
+            size: (200.0, 200.0),
+            pixels: (24, 24),
+        };
+        let local = rasterize_terrain_input_region_cancellable(
+            &input,
+            0.7,
+            Some(region),
+            (0, 0),
+            false,
+            None,
+        )
+        .unwrap();
+        for y in 0..local.height {
+            for x in 0..local.width {
+                let expected = rgb_at(&full, x + 12, y + 12);
+                let actual = rgb_at(&local, x, y);
+                assert!(
+                    rgb_distance(actual, expected) <= 3.0 / 255.0,
+                    "local samples must align with overview at ({x}, {y}): {actual:?} vs {expected:?}"
+                );
+            }
+        }
+        let wrapped = TerrainRasterRegion {
+            origin: (-100.0, 300.0),
+            size: (200.0, 200.0),
+            pixels: (24, 24),
+        };
+        let seam = rasterize_terrain_input_region_cancellable(
+            &input,
+            0.7,
+            Some(wrapped),
+            (0, 0),
+            false,
+            None,
+        )
+        .unwrap();
+        for y in 0..seam.height {
+            for x in 0..seam.width {
+                let expected = rgb_at(&full, (x + 36) % full.width, (y + 36) % full.height);
+                let actual = rgb_at(&seam, x, y);
+                assert!(
+                    rgb_distance(actual, expected) <= 3.0 / 255.0,
+                    "local sampling must wrap across both world edges at ({x}, {y}): {actual:?} vs {expected:?}"
+                );
+            }
+        }
+        let oversized = TerrainRasterRegion {
+            pixels: (2048, 2048),
+            ..region
+        };
+        assert!(
+            rasterize_terrain_input_region_cancellable(
+                &input,
+                0.7,
+                Some(oversized),
+                (0, 0),
+                false,
+                None
+            )
+            .is_none()
+        );
+        let invalid = TerrainRasterRegion {
+            size: (f32::NAN, 1.0),
+            ..region
+        };
+        assert!(
+            rasterize_terrain_input_region_cancellable(
+                &input,
+                0.7,
+                Some(invalid),
+                (0, 0),
+                false,
+                None
+            )
+            .is_none()
+        );
+        let cancelled = AtomicBool::new(true);
+        assert!(
+            rasterize_terrain_input_region_cancellable(
+                &input,
+                0.7,
+                Some(region),
+                (0, 0),
+                false,
+                Some(&cancelled)
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn closeup_patch_covers_the_view_with_sharper_bounded_detail() {
+        let view = (0.0, 0.0, 1880.0, 1260.0);
+        let scale = 15.2;
+        let visible = ((view.2 - view.0) / scale, (view.3 - view.1) / scale);
+        for fraction in [0.0, 0.25, 0.5, 0.999] {
+            let center = (4096.0 + fraction * 32.0, 1536.0 + fraction * 32.0);
+            let offset = (
+                (view.0 + view.2) * 0.5 - center.0 * scale,
+                (view.1 + view.3) * 0.5 - center.1 * scale,
+            );
+            let region = terrain_detail_region((6000.0, 3000.0), view, offset, scale).unwrap();
+            assert!(
+                u64::from(region.pixels.0) * u64::from(region.pixels.1) <= MAX_WORLD_RASTER_TEXELS
+            );
+            assert!(
+                region.size.0 * scale / region.pixels.0 as f32 <= 3.0,
+                "the close-up should not stretch each sample across more than three screen pixels"
+            );
+            // The 8% feather must finish before the viewport begins, even at
+            // either extreme of the quantized center's movement.
+            assert!(region.origin.0 + region.size.0 * 0.08 <= center.0 - visible.0 * 0.5);
+            assert!(region.origin.1 + region.size.1 * 0.08 <= center.1 - visible.1 * 0.5);
+            assert!(region.origin.0 + region.size.0 * 0.92 >= center.0 + visible.0 * 0.5);
+            assert!(region.origin.1 + region.size.1 * 0.92 >= center.1 + visible.1 * 0.5);
+        }
+    }
+
+    #[test]
+    fn closeup_detail_is_bounded_world_aligned_and_palette_aware() {
+        let world = frame(
+            (4, 4),
+            100,
+            vec![tile(TerrainKind::Grass); 16],
+            (1, 1),
+            100,
+            vec![0.0],
+        );
+        let region = terrain_detail_region(
+            (400.0, 400.0),
+            (0.0, 0.0, 400.0, 300.0),
+            (-200.0, -150.0),
+            4.0,
+        )
+        .unwrap();
+        assert!(u64::from(region.pixels.0) * u64::from(region.pixels.1) <= MAX_WORLD_RASTER_TEXELS);
+        assert_eq!(
+            region,
+            terrain_detail_region(
+                (400.0, 400.0),
+                (0.0, 0.0, 400.0, 300.0),
+                (-201.0, -151.0),
+                4.0
+            )
+            .unwrap(),
+            "small camera moves must reuse the same patch"
+        );
+        assert!(
+            terrain_detail_region(
+                (400.0, 400.0),
+                (0.0, 0.0, 400.0, 300.0),
+                (0.0, 0.0),
+                f32::NAN
+            )
+            .is_none()
+        );
+        let region = TerrainRasterRegion {
+            origin: (100.0, 100.0),
+            size: (100.0, 100.0),
+            pixels: (64, 64),
+        };
+        let natural = TerrainRasterInput::from(&world);
+        let mut other = TerrainRasterInput::from(&world);
+        other.palette = ColorPaletteMode::HighContrast;
+        let detail = rasterize_terrain_detail(&natural, region, 0.7, None).unwrap();
+        let other_detail = rasterize_terrain_detail(&other, region, 0.7, None).unwrap();
+        assert_ne!(
+            detail.bgra, other_detail.bgra,
+            "detail must use the requested accessibility palette"
+        );
+        assert!(
+            detail
+                .bgra
+                .chunks_exact(4)
+                .zip(other_detail.bgra.chunks_exact(4))
+                .all(|(left, right)| left[3] == right[3]),
+            "palette changes must not change the feather mask"
+        );
+        assert_eq!(
+            detail.bgra[((32 * 64 + 32) * 4 + 3) as usize],
+            255,
+            "the center must show full-resolution color"
+        );
+        let corner_alpha = detail.bgra[3];
+        assert!(corner_alpha < 32, "patch edges must be feathered");
+        let cancelled = AtomicBool::new(true);
+        assert!(rasterize_terrain_detail(&natural, region, 0.7, Some(&cancelled)).is_none());
     }
 
     #[test]
@@ -22978,7 +24414,7 @@ mod continuous_world_raster_tests {
         );
         if let Some(path) = std::env::var_os("SCRIPTBOTS_TERRAIN_PROBE") {
             let mut rgba = pixels.bgra;
-            for pixel in rgba.as_chunks_mut::<4>().0 {
+            for pixel in rgba.chunks_exact_mut(4) {
                 pixel.swap(0, 2);
             }
             let image = image::RgbaImage::from_raw(pixels.width, pixels.height, rgba)
@@ -23190,15 +24626,114 @@ mod continuous_world_raster_tests {
         );
         let colors: std::collections::HashSet<_> = first
             .bgra
-            .as_chunks::<4>()
-            .0
-            .iter()
+            .chunks_exact(4)
             .map(|pixel| [pixel[0], pixel[1], pixel[2]])
             .collect();
         assert!(
             colors.len() > 8,
             "uniform terrain should retain visible material detail"
         );
+    }
+
+    // Preserve the former scalar implementation as an independent oracle for
+    // the optimized coordinate lookup, including wrapped and degenerate grids.
+    fn reference_food_raster(
+        frame: &RenderFrame,
+        texture: Option<&[f32]>,
+    ) -> Option<WorldRasterPixels> {
+        let (width, height) = frame.food_dimensions;
+        let (raster_width, raster_height) = food_raster_dimensions(frame)?;
+        if texture
+            .is_some_and(|samples| samples.len() != raster_width as usize * raster_height as usize)
+        {
+            return None;
+        }
+        let max_food = frame.food_max.max(f32::EPSILON);
+        let noise_width = u64::from((raster_width / 18).max(1));
+        let noise_height = u64::from((raster_height / 18).max(1));
+        let mut bgra = Vec::with_capacity(raster_width as usize * raster_height as usize * 4);
+        let sample = |x: u32, y: u32| {
+            frame.food_cells[(y % height) as usize * width as usize + (x % width) as usize].max(0.0)
+        };
+        for y in 0..raster_height {
+            let fy = ((y as f32 + 0.5) * height as f32 / raster_height as f32 - 0.5)
+                .rem_euclid(height as f32);
+            let y0 = fy.floor() as u32;
+            let ty = fy.fract();
+            for x in 0..raster_width {
+                let fx = ((x as f32 + 0.5) * width as f32 / raster_width as f32 - 0.5)
+                    .rem_euclid(width as f32);
+                let x0 = fx.floor() as u32;
+                let tx = fx.fract();
+                let top = sample(x0, y0) * (1.0 - tx) + sample(x0 + 1, y0) * tx;
+                let bottom = sample(x0, y0 + 1) * (1.0 - tx) + sample(x0 + 1, y0 + 1) * tx;
+                let density = ((top * (1.0 - ty) + bottom * ty) / max_food).clamp(0.0, 1.0);
+                let mut color = food_color(density);
+                if !matches!(frame.palette, ColorPaletteMode::Natural) {
+                    color = apply_palette(color, frame.palette);
+                }
+                let texture = texture.map_or_else(
+                    || {
+                        food_field_noise(
+                            (x as f32 + 0.5) / raster_width as f32 * noise_width as f32,
+                            (y as f32 + 0.5) / raster_height as f32 * noise_height as f32,
+                            noise_width,
+                            noise_height,
+                        )
+                    },
+                    |samples| samples[y as usize * raster_width as usize + x as usize],
+                );
+                // Keep sparse food visible at fitted-world scale without inventing
+                // food in empty cells. A smooth density falloff avoids hard square
+                // halos, and stable texture replaces per-tick shimmer.
+                let clusters = ((texture - 0.22) * 2.2).clamp(0.0, 1.0);
+                let sparse_floor = 0.24 + 0.61 * (1.0 - density);
+                color.a *= density.sqrt() * (sparse_floor + (1.0 - sparse_floor) * clusters);
+                let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+                bgra.extend_from_slice(&[
+                    byte(color.b),
+                    byte(color.g),
+                    byte(color.r),
+                    byte(color.a),
+                ]);
+            }
+        }
+        Some(WorldRasterPixels {
+            width: raster_width,
+            height: raster_height,
+            bgra,
+        })
+    }
+
+    #[test]
+    fn food_raster_coordinate_lookup_matches_scalar_reference() {
+        for (width, height) in [(1, 1), (1, 5), (7, 1), (3, 5), (11, 7)] {
+            let cells = (0..width * height)
+                .map(|index| ((index * 37 % 113) as f32 - 3.0) / 100.0)
+                .collect();
+            let mut frame = frame(
+                (1, 1),
+                10,
+                vec![tile(TerrainKind::Grass)],
+                (width, height),
+                10,
+                cells,
+            );
+            let (raster_width, raster_height) = food_raster_dimensions(&frame).unwrap();
+            let texture = food_texture_samples(raster_width, raster_height);
+            for palette in ColorPaletteMode::ALL {
+                frame.palette = palette;
+                for texture in [None, Some(texture.as_ref())] {
+                    let expected = reference_food_raster(&frame, texture).unwrap();
+                    let actual = rasterize_food_field_with_texture(&frame, texture).unwrap();
+                    assert_eq!(
+                        (actual.width, actual.height),
+                        (expected.width, expected.height)
+                    );
+                    assert_eq!(actual.bgra, expected.bgra, "{width}x{height}, {palette:?}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -23378,10 +24913,8 @@ mod continuous_world_raster_tests {
             20,
             vec![0.0, 0.0],
         );
-        let mut cache = WorldRasterCache {
-            last_failure: Some((key(1), std::time::Instant::now())),
-            ..WorldRasterCache::default()
-        };
+        let mut cache = WorldRasterCache::default();
+        cache.last_failure = Some((key(1), std::time::Instant::now()));
         assert!(cache.failed_for(key(1)));
         assert!(!cache.failed_for(key(2)));
         cache.start_world_raster(
@@ -23444,6 +24977,7 @@ mod continuous_world_raster_tests {
         cache.pending = Some(PendingWorldRaster {
             key: wanted,
             receiver,
+            cancel: Arc::new(AtomicBool::new(false)),
         });
         sender
             .send(WorldRasterMessage::Preview(WorldRasterPixels {
@@ -23492,6 +25026,7 @@ mod continuous_world_raster_tests {
         cache.pending = Some(PendingWorldRaster {
             key: original,
             receiver,
+            cancel: Arc::new(AtomicBool::new(false)),
         });
         assert!(cache.take_completed(later).is_none());
         assert!(
@@ -23524,6 +25059,7 @@ mod continuous_world_raster_tests {
             cache.pending = Some(PendingWorldRaster {
                 key: original,
                 receiver,
+                cancel: Arc::new(AtomicBool::new(false)),
             });
             sender
                 .send(WorldRasterMessage::Complete(Some(WorldRasterPixels {
@@ -23538,6 +25074,70 @@ mod continuous_world_raster_tests {
             );
             assert!(cache.pending.is_none());
         }
+    }
+
+    #[test]
+    fn obsolete_raster_is_cancelled_without_failure_or_parallel_replacement() {
+        let frame = frame(
+            (2, 1),
+            20,
+            vec![tile(TerrainKind::Grass), tile(TerrainKind::DeepWater)],
+            (2, 1),
+            20,
+            vec![0.0, 0.0],
+        );
+        let mut cache = WorldRasterCache::default();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let original = key(1);
+        cache.pending = Some(PendingWorldRaster {
+            key: original,
+            receiver,
+            cancel: Arc::clone(&cancel),
+        });
+        let mut later = original;
+        later.daylight_bits = 0.75_f32.to_bits();
+        assert!(cache.take_completed(later).is_none());
+        assert!(!cancel.load(AtomicOrdering::Acquire));
+
+        let different_palette = WorldRasterKey {
+            palette: ColorPaletteMode::HighContrast,
+            ..original
+        };
+        assert!(cache.take_completed(different_palette).is_none());
+        assert!(cancel.load(AtomicOrdering::Acquire));
+        assert!(
+            rasterize_terrain_input_at_resolution_cancellable(
+                &TerrainRasterInput::from(&frame),
+                visual::DAYLIGHT_STATIC,
+                WORLD_RASTER_SAMPLES_PER_TERRAIN_CELL,
+                Some(&cancel),
+            )
+            .is_none(),
+            "cancelled work must stop before producing a raster"
+        );
+        cache.start_world_raster(
+            different_palette,
+            TerrainRasterInput::from(&frame),
+            visual::DAYLIGHT_STATIC,
+            false,
+        );
+        assert_eq!(cache.pending.as_ref().unwrap().key, original);
+
+        sender.send(WorldRasterMessage::Cancelled).unwrap();
+        assert!(cache.take_completed(different_palette).is_none());
+        assert!(cache.pending.is_none());
+        assert!(!cache.failed_for(original));
+        cache.start_world_raster(
+            original,
+            TerrainRasterInput::from(&frame),
+            visual::DAYLIGHT_STATIC,
+            false,
+        );
+        assert!(
+            cache.pending.is_some(),
+            "returning to a cancelled palette must retry"
+        );
     }
 
     #[test]
@@ -23565,6 +25165,7 @@ mod continuous_world_raster_tests {
         cache.pending = Some(PendingWorldRaster {
             key: original,
             receiver,
+            cancel: Arc::new(AtomicBool::new(false)),
         });
         drop(sender);
         assert!(cache.take_completed(original).is_none());
@@ -24553,9 +26154,30 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
             true
         }
     };
-    let continuous_world_painted = use_continuous_world_fields
-        && paint_continuous_world_fields(state, offset_x, offset_y, scale, daylight, window);
+    // Both overview and close-up caches identify the same terrain; hash its
+    // fields once per paint instead of repeating the work at follow zoom. A
+    // 1/512 daylight step avoids rebuilding the overview on every tick.
+    let raster_key = use_continuous_world_fields
+        .then(|| world_raster_key(frame, (daylight * 512.0).round() / 512.0));
+    let continuous_world_painted = raster_key.is_some_and(|key| {
+        paint_continuous_world_fields(state, offset_x, offset_y, scale, key, window)
+    });
+    if continuous_world_painted {
+        paint_terrain_detail(
+            state,
+            (view_left, view_top, view_right, view_bottom),
+            (offset_x, offset_y),
+            scale,
+            raster_key
+                .expect("continuous world has a terrain key")
+                .field_fingerprint,
+            window,
+        );
+    }
     if !continuous_world_painted {
+        if let Ok(mut accessibility) = state.accessibility.lock() {
+            accessibility.disable_palette_staging();
+        }
         paint_terrain_layer(
             &frame.terrain,
             offset_x,
@@ -24688,16 +26310,38 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                 let px_y = offset_y + agent.position.y * scale;
                 let half = agent_screen_radius(frame, agent, scale);
                 let size_px = half * 2.0;
-
-                // Cull off-screen agents
-                if px_x + half < view_left
-                    || px_x - half > view_right
-                    || px_y + half < view_top
-                    || px_y - half > view_bottom
+                // A cheap conservative bound avoids resolving visual traits for
+                // distant agents, including their longest spike and boost tail.
+                let broad_extent = half * 5.0
+                    + agent.spike_length.abs() * scale
+                    + agent.sound_multiplier.max(1.0) * 4.0;
+                if px_x + broad_extent < view_left
+                    || px_x - broad_extent > view_right
+                    || px_y + broad_extent < view_top
+                    || px_y - broad_extent > view_bottom
                 {
                     continue;
                 }
                 let visuals = resolve_agent_visual(agent, frame.agent_reference_age);
+                let silhouette = agent_silhouette(
+                    (px_x, px_y),
+                    size_px,
+                    scale,
+                    &visuals,
+                    agent.boost,
+                    agent.sound_multiplier,
+                );
+
+                // Include appendages and focus markers in the visible extent.
+                // The center or body can be outside while a spike is still visible.
+                let extent = silhouette.extent.max(half * 2.1);
+                if px_x + extent < view_left
+                    || px_x - extent > view_right
+                    || px_y + extent < view_top
+                    || px_y - extent > view_bottom
+                {
+                    continue;
+                }
 
                 if !low_fps || preserve_detail {
                     let shadow_radius = half * 1.25;
@@ -24728,10 +26372,10 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                             let factor = 1.85;
                             let highlight_radius = half * factor;
                             let highlight = apply_palette(
-                                rgba_from_triplet_with_alpha(visuals.selection_rim_color, 0.36),
+                                rgba_from_triplet_with_alpha(visuals.selection_rim_color, 0.86),
                                 frame.palette,
                             );
-                            let mut highlight_path = PathBuilder::fill();
+                            let mut highlight_path = PathBuilder::stroke(px(2.4));
                             append_circle_polygon(
                                 &mut highlight_path,
                                 px_x,
@@ -24746,10 +26390,10 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                             let factor = 1.45;
                             let highlight_radius = half * factor;
                             let highlight = apply_palette(
-                                rgba_from_triplet_with_alpha(visuals.selection_rim_color, 0.26),
+                                rgba_from_triplet_with_alpha(visuals.selection_rim_color, 0.62),
                                 frame.palette,
                             );
-                            let mut highlight_path = PathBuilder::fill();
+                            let mut highlight_path = PathBuilder::stroke(px(1.8));
                             append_circle_polygon(
                                 &mut highlight_path,
                                 px_x,
@@ -24767,10 +26411,10 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                         let factor = 2.05;
                         let highlight_radius = half * factor;
                         let highlight = apply_palette(
-                            rgba_from_triplet_with_alpha(visuals.selection_rim_color, 0.32),
+                            rgba_from_triplet_with_alpha(visuals.selection_rim_color, 0.72),
                             frame.palette,
                         );
-                        let mut focus_path = PathBuilder::fill();
+                        let mut focus_path = PathBuilder::stroke(px(2.8));
                         append_circle_polygon(&mut focus_path, px_x, px_y, highlight_radius);
                         if let Ok(path) = focus_path.build() {
                             window.paint_path(path, highlight);
@@ -24782,30 +26426,15 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
 
                 if agent.indicator.intensity > 0.05 && (!low_fps || preserve_detail) {
                     let effect = agent.indicator.intensity.clamp(0.0, 1.0);
-                    let indicator_radius = half * (1.2 + effect * 1.4);
+                    let indicator_radius = half * (1.2 + effect * 0.4);
                     let indicator_color = apply_palette(
-                        rgba_from_triplet_with_alpha(agent.indicator.color, 0.15 + 0.35 * effect),
+                        rgba_from_triplet_with_alpha(agent.indicator.color, 0.3 + 0.4 * effect),
                         frame.palette,
                     );
-                    let mut indicator = PathBuilder::fill();
+                    let mut indicator = PathBuilder::stroke(px(1.5));
                     append_circle_polygon(&mut indicator, px_x, px_y, indicator_radius);
                     if let Ok(path) = indicator.build() {
                         window.paint_path(path, indicator_color);
-                    }
-                }
-
-                if agent.reproduction_intent > 0.2 && (!low_fps || preserve_detail) {
-                    let pulse = agent.reproduction_intent.clamp(0.0, 1.0);
-                    let pulse_radius = half * (1.8 + pulse * 1.6);
-                    let cue = visual::visual_cue_for_event(&WorldVisualEvent::Reproduce);
-                    let pulse_color = apply_palette(
-                        rgba_from_triplet_with_alpha(cue.color, 0.18 + 0.28 * pulse),
-                        frame.palette,
-                    );
-                    let mut pulse_path = PathBuilder::fill();
-                    append_circle_polygon(&mut pulse_path, px_x, px_y, pulse_radius);
-                    if let Ok(path) = pulse_path.build() {
-                        window.paint_path(path, pulse_color);
                     }
                 }
 
@@ -24876,26 +26505,30 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                     continue;
                 };
                 let half = agent_screen_radius(frame, agent, scale);
-                if px_x + half < view_left
-                    || px_x - half > view_right
-                    || px_y + half < view_top
-                    || px_y - half > view_bottom
+                let visuals = resolve_agent_visual(agent, frame.agent_reference_age);
+                let silhouette = agent_silhouette(
+                    (px_x, px_y),
+                    half * 2.0,
+                    scale,
+                    &visuals,
+                    agent.boost,
+                    agent.sound_multiplier,
+                );
+                if px_x + silhouette.extent < view_left
+                    || px_x - silhouette.extent > view_right
+                    || px_y + silhouette.extent < view_top
+                    || px_y - silhouette.extent > view_bottom
                 {
                     continue;
                 }
 
-                let visuals = resolve_agent_visual(agent, frame.agent_reference_age);
-                let forward = (visuals.facing[0], visuals.facing[1]);
-                let right = (visuals.right[0], visuals.right[1]);
-                let outline_half_length = (half * 1.35).max(half + 2.0);
-                let outline_radius = (half * 0.72).max(3.0);
                 append_capsule_polygon(
                     &mut outline_builder,
                     (px_x, px_y),
-                    forward,
-                    right,
-                    outline_half_length,
-                    outline_radius,
+                    silhouette.forward,
+                    silhouette.right,
+                    silhouette.body_half_length,
+                    silhouette.body_radius,
                     14,
                 );
             }
@@ -25036,8 +26669,8 @@ fn build_gpu_agent_instance(
     };
     let glow_indicator = (agent.indicator.intensity * 0.35).clamp(0.0, 1.0);
     let glow_spike = if agent.spike_struck { 0.45 } else { 0.0 };
-    let glow_repro = (agent.reproduction_intent * 0.25).clamp(0.0, 0.6);
-    let glow = glow_indicator.max(glow_spike).max(glow_repro);
+    let glow_sharing = (agent.sharing_intent * 0.25).clamp(0.0, 0.6);
+    let glow = glow_indicator.max(glow_spike).max(glow_sharing);
     let boost = agent.boost.clamp(0.0, 1.0);
     let spiked = if agent.spike_struck { 1.0 } else { 0.0 };
 
@@ -25347,6 +26980,27 @@ mod command_characterization_tests {
                 actual, expected,
                 "every frame field must survive host publication for {palette:?}"
             );
+        }
+        for recorded_palette in ColorPaletteMode::ALL {
+            for current_palette in ColorPaletteMode::ALL {
+                let recorded = RenderFrame::from_snapshot(&snapshot, recorded_palette).unwrap();
+                let expected = RenderFrame::from_snapshot(&snapshot, current_palette).unwrap();
+                let mut playback = PlaybackState::new(1);
+                playback.timeline.push_back(HudSnapshot {
+                    render_frame: Some(recorded),
+                    ..HudSnapshot::default()
+                });
+                playback.mode = PlaybackMode::Paused;
+                let shown = playback.snapshot_for_render(HudSnapshot {
+                    render_frame: Some(expected.clone()),
+                    ..HudSnapshot::default()
+                });
+                assert_eq!(
+                    shown.render_frame.unwrap(),
+                    expected,
+                    "historical presentation must use {current_palette:?} after recording {recorded_palette:?}"
+                );
+            }
         }
         let mut missing_visuals = snapshot.as_ref().clone();
         missing_visuals.agent_visuals = Arc::new(Vec::new());
@@ -25777,11 +27431,42 @@ mod command_characterization_tests {
     }
 
     #[test]
+    fn demographic_color_response_spreads_a_single_event_over_the_window() {
+        let summary = |births, deaths| TickSummary {
+            tick: scriptbots_core::Tick(0),
+            agent_count: 1,
+            births,
+            deaths,
+            total_energy: 0.0,
+            average_energy: 0.0,
+            average_health: 0.0,
+            max_age: 0,
+            spike_hits: 0,
+        };
+        let mut history = vec![summary(1, 0)];
+        let birth = demographic_presentation_delta(history.iter());
+        assert!((birth - 1.0 / 30.0).abs() < f32::EPSILON);
+        history.push(summary(0, 0));
+        assert_eq!(demographic_presentation_delta(history.iter()), birth);
+        let death = demographic_presentation_delta([summary(0, 1)].iter());
+        assert_eq!(death, -birth);
+
+        let config = ScriptBotsConfig::default();
+        assert_ne!(
+            post_process_stack(0, &config, false, birth, ColorPaletteMode::Natural),
+            post_process_stack(0, &config, false, 0.0, ColorPaletteMode::Natural),
+            "demographic changes still affect the visual response"
+        );
+        history.extend((0..29).map(|_| summary(0, 0)));
+        assert_eq!(demographic_presentation_delta(history.iter()), 0.0);
+    }
+
+    #[test]
     fn film_grain_seed_stays_stable_across_simulation_ticks() {
         let mut config = ScriptBotsConfig::default();
         config.render.quality = Some(RenderQuality::High);
         let seed_at = |tick| {
-            post_process_stack(tick, &config, false, 1, None, ColorPaletteMode::Natural)
+            post_process_stack(tick, &config, false, 0.0, ColorPaletteMode::Natural)
                 .passes
                 .into_iter()
                 .find_map(|pass| match pass {
@@ -25798,7 +27483,7 @@ mod command_characterization_tests {
     fn palette_fog_is_decoded_once_and_canvas_encode_restores_the_palette() {
         let mut config = ScriptBotsConfig::default();
         config.render.quality = Some(RenderQuality::Ultra);
-        let stack = post_process_stack(0, &config, false, 1, None, ColorPaletteMode::Natural);
+        let stack = post_process_stack(0, &config, false, 0.0, ColorPaletteMode::Natural);
         let color = stack
             .passes
             .iter()
@@ -26130,6 +27815,21 @@ mod command_characterization_tests {
                 < (y_tip.1 - facing_y.silhouette.center.1).abs(),
             "y-facing compact silhouette must remain oriented"
         );
+
+        // A quieter silhouette must still communicate growth and include the
+        // physical tip when culling, at every heading and zoom.
+        for agent in [&agents[0], &agents[1]] {
+            let mut visuals = resolve_agent_visual(agent, frame.agent_reference_age);
+            visuals.spike_readiness = 0.0;
+            visuals.spike_tip_offset = [0.0, 0.0];
+            let retracted = agent_silhouette((40.0, 40.0), 20.0, 2.0, &visuals, 0.0, 1.0);
+            visuals.spike_readiness = 1.0;
+            visuals.spike_tip_offset = [visuals.facing[0] * 6.0, visuals.facing[1] * 6.0];
+            let extended = agent_silhouette((40.0, 40.0), 20.0, 2.0, &visuals, 0.0, 1.0);
+            let distance = |tip: (f32, f32)| (tip.0 - 40.0).hypot(tip.1 - 40.0);
+            assert!(distance(extended.spike[2]) > distance(retracted.spike[2]) + 12.0);
+            assert!(extended.extent >= distance(extended.spike[2]));
+        }
     }
 
     #[derive(Default)]
@@ -32347,6 +34047,7 @@ mod command_characterization_tests {
             session: source.session,
             epoch: source.epoch,
             uid: first_uid,
+            selected_eye: None,
             result,
             ready: None,
             ready_since: None,
@@ -32381,6 +34082,27 @@ mod command_characterization_tests {
         assert_eq!(
             canvas.world_hud_detail_cache.as_ref().unwrap().0.uid,
             first_uid
+        );
+        let (sender, result) = std::sync::mpsc::sync_channel(1);
+        canvas.world_hud_job = Some(WorldHudJob {
+            session: source.session,
+            epoch: source.epoch,
+            uid: first_uid,
+            selected_eye: None,
+            result,
+            ready: None,
+            ready_since: None,
+        });
+        sender.send(Ok(Some((source, detail.clone())))).unwrap();
+        canvas.world_hud_last_request = Some(Instant::now());
+        canvas.poll_world_hud_detail(&published, Some(first_uid), Some(1));
+        assert!(
+            canvas.world_hud_detail_cache.is_none(),
+            "cached and late details for the previously selected eye must be discarded"
+        );
+        assert!(
+            canvas.world_hud_job.is_none(),
+            "a completed request for the previous eye must not block a new request"
         );
         canvas.world_hud_detail_cache = Some((
             WorldHudSampleSource {
@@ -32421,6 +34143,7 @@ mod command_characterization_tests {
             session: source.session,
             epoch: source.epoch,
             uid: first_uid,
+            selected_eye: None,
             result,
             ready: Some((
                 WorldHudSampleSource {
@@ -32443,6 +34166,7 @@ mod command_characterization_tests {
             session: source.session,
             epoch: source.epoch,
             uid: first_uid,
+            selected_eye: None,
             result,
             ready: None,
             ready_since: None,
@@ -32611,12 +34335,28 @@ mod command_characterization_tests {
             .expect("HUD inspector lock")
             .focused_agent = Some(focused_agent);
 
-        let first = hud.snapshot();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let first = loop {
+            let snapshot = hud.snapshot();
+            if snapshot
+                .inspector
+                .focused
+                .as_ref()
+                .is_some_and(|detail| detail.brain_request_revision == Some(1))
+            {
+                break snapshot;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Lab brain inspection did not arrive"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        };
         let first_detail = first
             .inspector
             .focused
             .as_ref()
-            .expect("immediate paused HUD inspection");
+            .expect("paused HUD inspection");
         assert_eq!(first_detail.brain_request_revision, Some(1));
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
         let second = hud.snapshot();
@@ -32637,8 +34377,25 @@ mod command_characterization_tests {
             .expect("peer inspector lock")
             .focused_agent = Some(focused_agent);
         assert_ne!(hud.brain_client_id, peer.brain_client_id);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let peer_snapshot = loop {
+            let snapshot = peer.snapshot();
+            if snapshot
+                .inspector
+                .focused
+                .as_ref()
+                .is_some_and(|detail| detail.brain_request_revision == Some(1))
+            {
+                break snapshot;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "peer brain inspection did not arrive"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        };
         assert_eq!(
-            peer.snapshot()
+            peer_snapshot
                 .inspector
                 .focused
                 .as_ref()
@@ -33161,6 +34918,355 @@ mod command_characterization_tests {
                 "group fit must not be immediately recentered on one creature"
             );
         });
+        host.apply(
+            scriptbots_runtime::HostCommand::try_from(ControlCommand::UpdateSelection(
+                SelectionUpdate {
+                    mode: SelectionMode::Clear,
+                    agent_ids: Vec::new(),
+                    state: SelectionState::None,
+                },
+            ))
+            .unwrap(),
+        );
+        context.update(|app| {
+            windows.canvas.root(app).unwrap().update(app, |view, _| {
+                let mut inspector = view.inspector.lock().unwrap();
+                inspector.focused_agent = None;
+                inspector.hovered_agent = Some(agent);
+            });
+        });
+        redraw(&mut gui);
+        assert!(
+            gui.debug_bounds("world-toolbar-fit-selected").is_none(),
+            "hover alone must not be described as a selection"
+        );
+        let hovered_button = gui
+            .debug_bounds("world-toolbar-fit-hovered")
+            .expect("hover fit control laid out");
+        gui.simulate_click(hovered_button.center(), gpui::Modifiers::default());
+        redraw(&mut gui);
+        context.update(|app| {
+            let root = windows.canvas.root(app).unwrap();
+            assert!(
+                root.read(app).camera_snapshot().zoom > 1.0,
+                "fitting the hovered creature must remain available"
+            );
+        });
+        context.quit();
+    }
+
+    #[test]
+    fn closeup_palette_switch_waits_for_both_uploaded_images() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 6000,
+            world_height: 3000,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            persistence_interval: 0,
+            ..ScriptBotsConfig::default()
+        })
+        .unwrap();
+        let agent = world
+            .try_spawn_agent(AgentData {
+                position: Position::new(3000.0, 1500.0),
+                ..AgentData::default()
+            })
+            .unwrap();
+        let host = Arc::new(TestHost::new(world));
+        host.apply(
+            scriptbots_runtime::HostCommand::try_from(ControlCommand::UpdateSelection(
+                SelectionUpdate {
+                    mode: SelectionMode::Replace,
+                    agent_ids: vec![agent.raw()],
+                    state: SelectionState::Selected,
+                },
+            ))
+            .unwrap(),
+        );
+        let session = Arc::new(GuiSession::new(
+            host.port.clone(),
+            AnalyticsSnapshotProvider::empty(),
+            Arc::new(|_| None),
+        ));
+        let context = gpui::TestAppContext::single();
+        let windows = context.update(|app| session.install(app)).unwrap();
+        context.update(|app| {
+            windows.canvas.root(app).unwrap().update(app, |view, _| {
+                view.inspector.lock().unwrap().focused_agent = Some(agent);
+                view.controls.follow_mode = FollowMode::Selected;
+            })
+        });
+        let mut gui = gpui::VisualTestContext::from_window(windows.canvas.into(), &context);
+        gui.simulate_resize(size(px(1280.0), px(720.0)));
+        let redraw = |gui: &mut gpui::VisualTestContext| {
+            gui.update(|window, app| {
+                window.refresh();
+                window.draw(app).clear();
+            })
+        };
+        redraw(&mut gui);
+        let fit = gui
+            .debug_bounds("world-toolbar-fit-selected")
+            .expect("fit control");
+        gui.simulate_click(fit.center(), gpui::Modifiers::default());
+        redraw(&mut gui);
+        let (world_send, world_receive) = std::sync::mpsc::sync_channel(1);
+        let (detail_send, detail_receive) = std::sync::mpsc::sync_channel(1);
+        let target = ColorPaletteMode::Deuteranopia;
+        context.update(|app| {
+            windows.canvas.root(app).unwrap().update(app, |view, _| {
+                let frame = view.snapshot().render_frame.expect("world frame");
+                let day = visual::daylight_factor(
+                    frame.tick,
+                    frame.day_night_cycle_ticks,
+                    frame.day_night_start_phase,
+                );
+                let key = world_raster_key(&frame, (day * 512.0).round() / 512.0);
+                let region = TerrainRasterRegion {
+                    origin: (2800.0, 1300.0),
+                    size: (400.0, 400.0),
+                    pixels: (1, 1),
+                };
+                let make_image = || {
+                    render_image_from_world_raster(WorldRasterPixels {
+                        width: 1,
+                        height: 1,
+                        bgra: vec![20, 40, 60, 255],
+                    })
+                    .unwrap()
+                };
+                let mut cache = view.world_raster_cache.lock().unwrap();
+                if let Some(pending) = cache.pending.take() {
+                    pending.cancel.store(true, AtomicOrdering::Release);
+                }
+                if let Some(pending) = cache.detail_pending.take() {
+                    pending.cancel.store(true, AtomicOrdering::Release);
+                }
+                cache.commit(key, make_image(), true);
+                cache.detail_active = true;
+                cache.detail_current = Some(CachedTerrainDetail {
+                    key: TerrainDetailKey {
+                        field_fingerprint: key.field_fingerprint,
+                        palette: frame.palette,
+                        region,
+                    },
+                    image: make_image(),
+                });
+                cache.pending = Some(PendingWorldRaster {
+                    key: WorldRasterKey {
+                        palette: target,
+                        ..key
+                    },
+                    receiver: world_receive,
+                    cancel: Arc::new(AtomicBool::new(false)),
+                });
+                cache.detail_pending = Some(PendingTerrainDetail {
+                    key: TerrainDetailKey {
+                        field_fingerprint: key.field_fingerprint,
+                        palette: target,
+                        region,
+                    },
+                    receiver: detail_receive,
+                    cancel: Arc::new(AtomicBool::new(false)),
+                });
+                drop(cache);
+                let mut settings = view.accessibility.lock().unwrap();
+                settings.palette_stage_ready = true;
+                assert!(settings.request_palette(target));
+            })
+        });
+        world_send
+            .send(WorldRasterMessage::Complete(Some(WorldRasterPixels {
+                width: 1,
+                height: 1,
+                bgra: vec![30, 50, 70, 255],
+            })))
+            .unwrap();
+        redraw(&mut gui);
+        assert_eq!(
+            session.accessibility.lock().unwrap().palette,
+            ColorPaletteMode::Natural,
+            "a ready overview alone must not switch the palette"
+        );
+        detail_send
+            .send(Some(WorldRasterPixels {
+                width: 1,
+                height: 1,
+                bgra: vec![40, 60, 80, 255],
+            }))
+            .unwrap();
+        redraw(&mut gui);
+        assert_eq!(
+            session.accessibility.lock().unwrap().palette,
+            ColorPaletteMode::Natural,
+            "preparing the detail must retain the old frame until the next paint"
+        );
+        redraw(&mut gui);
+        assert_eq!(session.accessibility.lock().unwrap().palette, target);
+        context.update(|app| {
+            let root = windows.canvas.root(app).unwrap();
+            let view = root.read(app);
+            let cache = view.world_raster_cache.lock().unwrap();
+            assert_eq!(cache.current.as_ref().unwrap().key.palette, target);
+            assert_eq!(
+                cache.detail_current.as_ref().unwrap().key.palette,
+                target,
+                "the visible detail and overview must commit together"
+            );
+            assert!(cache.detail_staged.is_none());
+        });
+        context.quit();
+    }
+
+    #[test]
+    fn palette_waits_for_compatible_raster_and_retains_old_palette_on_failure() {
+        let host = TestHost::take(command_characterization_world());
+        let session = Arc::new(GuiSession::new(
+            host.port.clone(),
+            AnalyticsSnapshotProvider::empty(),
+            Arc::new(|_| None),
+        ));
+        let context = gpui::TestAppContext::single();
+        let windows = context.update(|app| session.install(app)).unwrap();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let target = ColorPaletteMode::Deuteranopia;
+        let key = context.update(|app| {
+            windows.canvas.root(app).unwrap().update(app, |view, _| {
+                let frame = view.snapshot().render_frame.expect("world frame");
+                let daylight = visual::daylight_factor(
+                    frame.tick,
+                    frame.day_night_cycle_ticks,
+                    frame.day_night_start_phase,
+                );
+                let key = world_raster_key(&frame, (daylight * 512.0).round() / 512.0);
+                let image = render_image_from_world_raster(WorldRasterPixels {
+                    width: 1,
+                    height: 1,
+                    bgra: vec![20, 40, 60, 255],
+                })
+                .unwrap();
+                {
+                    let mut cache = view.world_raster_cache.lock().unwrap();
+                    cache.commit(key, image, true);
+                    cache.pending = Some(PendingWorldRaster {
+                        key: WorldRasterKey {
+                            palette: target,
+                            ..key
+                        },
+                        receiver,
+                        cancel: Arc::new(AtomicBool::new(false)),
+                    });
+                }
+                let mut accessibility = view.accessibility.lock().unwrap();
+                accessibility.palette_stage_ready = true;
+                assert!(accessibility.request_palette(target));
+                key
+            })
+        });
+        let mut gui = gpui::VisualTestContext::from_window(windows.canvas.into(), &context);
+        gui.simulate_resize(size(px(1280.0), px(720.0)));
+        let redraw = |gui: &mut gpui::VisualTestContext| {
+            gui.update(|window, app| {
+                window.refresh();
+                window.draw(app).clear();
+            })
+        };
+        redraw(&mut gui);
+        {
+            let settings = session.accessibility.lock().unwrap();
+            assert_eq!(settings.palette, ColorPaletteMode::Natural);
+            assert_eq!(settings.requested_palette, Some(target));
+        }
+        sender
+            .send(WorldRasterMessage::Complete(Some(WorldRasterPixels {
+                width: 1,
+                height: 1,
+                bgra: vec![30, 50, 70, 255],
+            })))
+            .unwrap();
+        redraw(&mut gui);
+        {
+            let settings = session.accessibility.lock().unwrap();
+            assert_eq!(settings.palette, target);
+            assert_eq!(settings.requested_palette, None);
+        }
+        context.update(|app| {
+            let root = windows.canvas.root(app).unwrap();
+            let view = root.read(app);
+            assert!(
+                view.world_raster_cache
+                    .lock()
+                    .unwrap()
+                    .compatible_image_for(WorldRasterKey {
+                        palette: target,
+                        ..key
+                    })
+                    .is_some()
+            );
+        });
+
+        let failed = ColorPaletteMode::Protanopia;
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        context.update(|app| {
+            windows.canvas.root(app).unwrap().update(app, |view, _| {
+                assert!(view.accessibility.lock().unwrap().request_palette(failed));
+                view.world_raster_cache.lock().unwrap().pending = Some(PendingWorldRaster {
+                    key: WorldRasterKey {
+                        palette: failed,
+                        ..key
+                    },
+                    receiver,
+                    cancel: Arc::new(AtomicBool::new(false)),
+                });
+            })
+        });
+        sender.send(WorldRasterMessage::Complete(None)).unwrap();
+        redraw(&mut gui);
+        {
+            let settings = session.accessibility.lock().unwrap();
+            assert_eq!(
+                settings.palette, target,
+                "failed preparation must keep the old palette"
+            );
+            assert_eq!(settings.requested_palette, None);
+            assert_eq!(settings.palette_error, Some(failed));
+        }
+
+        let newest = ColorPaletteMode::HighContrast;
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        context.update(|app| {
+            windows.canvas.root(app).unwrap().update(app, |view, _| {
+                let mut settings = view.accessibility.lock().unwrap();
+                assert!(settings.request_palette(failed));
+                assert!(settings.request_palette(newest));
+                drop(settings);
+                view.world_raster_cache.lock().unwrap().pending = Some(PendingWorldRaster {
+                    key: WorldRasterKey {
+                        palette: failed,
+                        ..key
+                    },
+                    receiver,
+                    cancel: Arc::new(AtomicBool::new(false)),
+                });
+            })
+        });
+        sender
+            .send(WorldRasterMessage::Complete(Some(WorldRasterPixels {
+                width: 1,
+                height: 1,
+                bgra: vec![1, 2, 3, 255],
+            })))
+            .unwrap();
+        redraw(&mut gui);
+        {
+            let settings = session.accessibility.lock().unwrap();
+            assert_eq!(
+                settings.palette, target,
+                "obsolete pixels must not change the palette"
+            );
+            assert_eq!(settings.requested_palette, Some(newest));
+            assert_eq!(settings.palette_error, None);
+        }
         context.quit();
     }
 
@@ -33204,11 +35310,9 @@ mod command_characterization_tests {
             mutation_log: recent_changes,
         };
         assert_eq!(detail.life, expected);
-        let parent_fixture = scriptbots_core::AgentRuntime {
-            lineage: [Some(AgentUid(31)), Some(AgentUid(47))],
-            hybrid: true,
-            ..scriptbots_core::AgentRuntime::default()
-        };
+        let mut parent_fixture = scriptbots_core::AgentRuntime::default();
+        parent_fixture.lineage = [Some(AgentUid(31)), Some(AgentUid(47))];
+        parent_fixture.hybrid = true;
         let parent_life = scriptbots_runtime::channel::AgentLifeData::from(&parent_fixture);
         assert_eq!(
             parent_life.lineage,
@@ -33223,6 +35327,249 @@ mod command_characterization_tests {
             before,
             "inspecting life state must not alter science"
         );
+    }
+
+    #[test]
+    fn world_settings_drawer_fits_and_closes_at_narrow_and_wide_sizes() {
+        let host = TestHost::take(command_characterization_world());
+        let session = Arc::new(GuiSession::new(
+            host.port.clone(),
+            AnalyticsSnapshotProvider::empty(),
+            Arc::new(|_| None),
+        ));
+        let context = gpui::TestAppContext::single();
+        let windows = context.update(|app| session.install(app)).unwrap();
+        let mut world = gpui::VisualTestContext::from_window(windows.canvas.into(), &context);
+        for width in [240.0, 320.0, 1280.0] {
+            context.update(|app| {
+                windows.canvas.root(app).unwrap().update(app, |view, cx| {
+                    if !view.settings_panel.open {
+                        view.toggle_settings(cx);
+                    }
+                });
+            });
+            world.simulate_resize(size(px(width), px(720.0)));
+            world.update(|window, app| {
+                window.refresh();
+                window.draw(app).clear();
+            });
+            let panel = world
+                .debug_bounds("world-settings-panel")
+                .expect("settings drawer laid out");
+            let close = world
+                .debug_bounds("world-settings-close")
+                .expect("settings close control laid out");
+            assert!(
+                panel.origin.x >= px(0.0) && panel.right() <= px(width),
+                "settings drawer must fit a {width}px window: {panel:?}"
+            );
+            assert!(
+                close.origin.x >= panel.origin.x && close.right() <= panel.right(),
+                "close control must remain reachable: {close:?} in {panel:?}"
+            );
+            if width == 320.0 {
+                let viewport = world
+                    .debug_bounds("world-settings-content-scroll")
+                    .expect("settings content viewport laid out");
+                let zoom = context.update(|app| {
+                    windows
+                        .canvas
+                        .root(app)
+                        .unwrap()
+                        .read(app)
+                        .camera_snapshot()
+                        .zoom
+                });
+                world.simulate_event(MouseMoveEvent {
+                    position: viewport.center(),
+                    ..MouseMoveEvent::default()
+                });
+                world.simulate_event(ScrollWheelEvent {
+                    position: viewport.center(),
+                    delta: ScrollDelta::Pixels(point(px(0.0), px(-100_000.0))),
+                    modifiers: gpui::Modifiers::default(),
+                    touch_phase: gpui::TouchPhase::Moved,
+                });
+                world.update(|window, app| {
+                    window.refresh();
+                    window.draw(app).clear();
+                });
+                let last = world
+                    .debug_bounds("world-settings-last-parameter")
+                    .expect("last settings parameter laid out");
+                assert!(
+                    last.origin.y >= viewport.origin.y && last.bottom() <= viewport.bottom(),
+                    "the last parameter must be reachable: {last:?} in {viewport:?}"
+                );
+                assert_eq!(
+                    zoom,
+                    context.update(|app| {
+                        windows
+                            .canvas
+                            .root(app)
+                            .unwrap()
+                            .read(app)
+                            .camera_snapshot()
+                            .zoom
+                    }),
+                    "scrolling settings must not zoom the world"
+                );
+                world.simulate_event(ScrollWheelEvent {
+                    position: viewport.center(),
+                    delta: ScrollDelta::Lines(point(0.0, 2.0)),
+                    modifiers: gpui::Modifiers::default(),
+                    touch_phase: gpui::TouchPhase::Moved,
+                });
+                world.update(|window, app| {
+                    window.refresh();
+                    window.draw(app).clear();
+                });
+                assert_eq!(
+                    zoom,
+                    context.update(|app| windows
+                        .canvas
+                        .root(app)
+                        .unwrap()
+                        .read(app)
+                        .camera_snapshot()
+                        .zoom),
+                    "line scrolling settings must not zoom the world"
+                );
+                for key in ["f", "o", "o", "d", "space", "r", "backspace"] {
+                    world.simulate_keystrokes(key);
+                }
+                assert_eq!(
+                    context.update(|app| windows
+                        .canvas
+                        .root(app)
+                        .unwrap()
+                        .read(app)
+                        .settings_panel
+                        .scroll
+                        .offset()
+                        .y),
+                    px(0.0),
+                    "searching after scrolling must return to the visible results"
+                );
+                assert_eq!(
+                    context.update(|app| windows
+                        .canvas
+                        .root(app)
+                        .unwrap()
+                        .read(app)
+                        .settings_panel
+                        .search_query
+                        .clone()),
+                    "food ",
+                    "typing and backspace must edit the settings search"
+                );
+                for _ in 0..40 {
+                    world.simulate_keystrokes("x");
+                }
+                world.update(|window, app| {
+                    window.refresh();
+                    window.draw(app).clear();
+                });
+                let clear = world
+                    .debug_bounds("world-settings-clear")
+                    .expect("clear control laid out for a long search");
+                assert!(
+                    clear.origin.x >= panel.origin.x && clear.right() <= panel.right(),
+                    "clear control must remain reachable for a long query: {clear:?} in {panel:?}"
+                );
+                world.simulate_click(clear.center(), gpui::Modifiers::default());
+                assert!(context.update(|app| {
+                    let root = windows.canvas.root(app).unwrap();
+                    let settings = &root.read(app).settings_panel;
+                    settings.open && settings.search_query.is_empty()
+                }));
+                world.simulate_keystrokes("f");
+                world.simulate_keystrokes("escape");
+                assert!(context.update(|app| {
+                    let root = windows.canvas.root(app).unwrap();
+                    let settings = &root.read(app).settings_panel;
+                    settings.open && settings.search_query.is_empty()
+                }));
+                world.simulate_keystrokes("escape");
+                assert!(context.update(|app| {
+                    !windows
+                        .canvas
+                        .root(app)
+                        .unwrap()
+                        .read(app)
+                        .settings_panel
+                        .open
+                }));
+                context.update(|app| {
+                    windows
+                        .canvas
+                        .root(app)
+                        .unwrap()
+                        .update(app, |view, cx| view.toggle_settings(cx));
+                });
+                world.update(|window, app| {
+                    window.refresh();
+                    window.draw(app).clear();
+                });
+            }
+            world.simulate_click(close.center(), gpui::Modifiers::default());
+            assert!(context.update(|app| {
+                !windows
+                    .canvas
+                    .root(app)
+                    .unwrap()
+                    .read(app)
+                    .settings_panel
+                    .open
+            }));
+        }
+        context.quit();
+    }
+
+    #[test]
+    fn missing_focused_creature_offers_a_world_recovery_action() {
+        let missing = command_characterization_world()
+            .lock()
+            .unwrap()
+            .try_spawn_agent(AgentData::default())
+            .unwrap();
+        let host = TestHost::take(command_characterization_world());
+        let session = Arc::new(GuiSession::new(
+            host.port.clone(),
+            AnalyticsSnapshotProvider::empty(),
+            Arc::new(|_| None),
+        ));
+        let context = gpui::TestAppContext::single();
+        let windows = context.update(|app| session.install(app)).unwrap();
+        context.update(|app| {
+            windows.canvas.root(app).unwrap().update(app, |view, _| {
+                view.inspector.lock().unwrap().focused_agent = Some(missing);
+                view.controls.follow_mode = FollowMode::Selected;
+            });
+        });
+        let mut world = gpui::VisualTestContext::from_window(windows.canvas.into(), &context);
+        world.simulate_resize(size(px(1280.0), px(720.0)));
+        world.update(|window, app| {
+            window.refresh();
+            window.draw(app).clear();
+        });
+        assert!(world.debug_bounds("world-creature-unavailable").is_some());
+        let recover = world
+            .debug_bounds("world-creature-unavailable-fit")
+            .expect("recovery action must be reachable");
+        world.simulate_click(recover.center(), gpui::Modifiers::default());
+        world.update(|window, app| {
+            window.refresh();
+            window.draw(app).clear();
+        });
+        assert!(world.debug_bounds("world-creature-unavailable").is_none());
+        context.update(|app| {
+            let root = windows.canvas.root(app).unwrap();
+            let view = root.read(app);
+            assert!(view.inspector.lock().unwrap().focused_agent.is_none());
+            assert!(matches!(view.controls.follow_mode, FollowMode::Off));
+        });
+        context.quit();
     }
 
     #[test]
@@ -33287,6 +35634,27 @@ mod command_characterization_tests {
             header.bottom() <= body.origin.y,
             "header must not overlap details"
         );
+        let outside = point(px(1100.0), px(400.0));
+        let initial_zoom = context.update(|app| {
+            windows
+                .canvas
+                .root(app)
+                .unwrap()
+                .read(app)
+                .camera_snapshot()
+                .zoom
+        });
+        world.simulate_event(MouseMoveEvent {
+            position: outside,
+            ..MouseMoveEvent::default()
+        });
+        world.simulate_event(ScrollWheelEvent {
+            position: outside,
+            delta: ScrollDelta::Lines(point(0.0, 2.0)),
+            modifiers: gpui::Modifiers::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        redraw(&mut world);
         let zoom_before = context.update(|app| {
             windows
                 .canvas
@@ -33295,6 +35663,11 @@ mod command_characterization_tests {
                 .read(app)
                 .camera_snapshot()
                 .zoom
+        });
+        assert!(zoom_before > initial_zoom, "wheel over the world must zoom");
+        world.simulate_event(MouseMoveEvent {
+            position: body.center(),
+            ..MouseMoveEvent::default()
         });
         world.simulate_event(ScrollWheelEvent {
             position: body.center(),
@@ -33330,6 +35703,32 @@ mod command_characterization_tests {
             zoom_before, zoom_after,
             "scrolling the HUD must not zoom the world"
         );
+        // Native mouse wheels deliver line deltas and may continue at the end
+        // of the scroll range. Neither case should leak through the card.
+        for position in [body.center(), header.center()] {
+            world.simulate_event(MouseMoveEvent {
+                position,
+                ..MouseMoveEvent::default()
+            });
+            world.simulate_event(ScrollWheelEvent {
+                position,
+                delta: ScrollDelta::Lines(point(0.0, -3.0)),
+                modifiers: gpui::Modifiers::default(),
+                touch_phase: gpui::TouchPhase::Moved,
+            });
+            redraw(&mut world);
+            assert_eq!(
+                zoom_before,
+                context.update(|app| windows
+                    .canvas
+                    .root(app)
+                    .unwrap()
+                    .read(app)
+                    .camera_snapshot()
+                    .zoom),
+                "line scrolling anywhere over the card must not zoom the world"
+            );
+        }
         select(second);
         set_focus(second);
         redraw(&mut world);
@@ -33391,6 +35790,10 @@ mod command_characterization_tests {
             compact_header.right() <= px(400.0),
             "header must fit the window"
         );
+        world.simulate_event(MouseMoveEvent {
+            position: compact_body.center(),
+            ..MouseMoveEvent::default()
+        });
         world.simulate_event(ScrollWheelEvent {
             position: compact_body.center(),
             delta: ScrollDelta::Pixels(point(px(0.0), px(-10000.0))),
@@ -33781,6 +36184,27 @@ mod command_characterization_tests {
 
         let initial_palette = fixture.read(|view| view.accessibility_snapshot().palette);
         fixture.press_world("ctrl-p");
+        // The World keeps its current palette visible until its replacement raster
+        // is prepared and painted. Drive the real window until that transition
+        // completes, rather than treating the asynchronous request as a commit.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            force_production_repaint(&mut fixture.app, fixture.canvas);
+            let settings = fixture.read_world(|view| view.accessibility_snapshot());
+            assert!(
+                settings.palette_error.is_none(),
+                "World palette preparation failed: {:?}",
+                settings.palette_error
+            );
+            if settings.palette != initial_palette && settings.requested_palette.is_none() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "World palette transition timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         let world_palette = fixture.read_world(|view| view.accessibility_snapshot().palette);
         let lab_palette = fixture.read(|view| view.accessibility_snapshot().palette);
         assert_ne!(
@@ -34125,25 +36549,46 @@ mod command_characterization_tests {
     #[test]
     fn cycling_the_palette_advances_and_returns_to_where_it_started() {
         let mut fixture = ShortcutFixture::install();
-        let palette = |view: &SimulationView| view.accessibility_snapshot().palette;
-
-        let start = fixture.read_world(palette);
-        fixture.press_world("ctrl-p");
-        assert_ne!(
-            start,
-            fixture.read_world(palette),
-            "CyclePalette: 'ctrl-p' must advance the accessibility palette"
-        );
-
-        // Four more presses complete the five-entry cycle.
-        for _ in 0..4 {
-            fixture.press_world("ctrl-p");
-        }
         assert_eq!(
-            fixture.read_world(palette),
-            start,
-            "CyclePalette must cycle through all five palettes and wrap, not saturate"
+            fixture.read_world(|view| view.accessibility_snapshot().palette),
+            ColorPaletteMode::Natural
         );
+        // Requests can be prepared asynchronously, so check their intended
+        // sequence and then drive the production window to the final commit.
+        for expected in [
+            ColorPaletteMode::Deuteranopia,
+            ColorPaletteMode::Protanopia,
+            ColorPaletteMode::Tritanopia,
+            ColorPaletteMode::HighContrast,
+            ColorPaletteMode::Natural,
+        ] {
+            fixture.press_world("ctrl-p");
+            let settings = fixture.read_world(|view| view.accessibility_snapshot());
+            assert_eq!(
+                settings.requested_palette.unwrap_or(settings.palette),
+                expected,
+                "CyclePalette must advance through each palette, including pending requests"
+            );
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            force_production_repaint(&mut fixture.app, fixture.canvas);
+            let settings = fixture.read_world(|view| view.accessibility_snapshot());
+            assert!(
+                settings.palette_error.is_none(),
+                "palette preparation failed: {:?}",
+                settings.palette_error
+            );
+            if settings.palette == ColorPaletteMode::Natural && settings.requested_palette.is_none()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "palette cycle timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     /// FitWorld was "driven but not state-proven". Proven by moving the camera
@@ -34888,6 +37333,352 @@ mod command_characterization_tests {
     }
 
     #[test]
+    fn empty_canvas_clicks_do_not_submit_but_selection_changes_do() {
+        let world = command_characterization_world();
+        let agent_id = world
+            .lock()
+            .expect("empty-click world lock")
+            .try_spawn_agent(AgentData {
+                position: Position::new(50.0, 50.0),
+                ..AgentData::default()
+            })
+            .expect("spawn empty-click fixture agent");
+        let host = TestHost::take(world);
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let submitted = Arc::clone(&commands);
+        let mut view = SimulationView::new(
+            host.port.clone(),
+            AnalyticsSnapshotProvider::empty(),
+            "empty clicks".into(),
+            Arc::new(move |command| {
+                submitted
+                    .lock()
+                    .expect("empty-click commands")
+                    .push(command);
+                Some("test-cmd".to_owned())
+            }),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(())),
+        );
+        {
+            let mut camera = view.camera.lock().expect("empty-click camera");
+            camera.ensure_default_zoom(1.0);
+            camera.record_render_metrics((0.0, 0.0), (100.0, 100.0), (100.0, 100.0), 1.0);
+        }
+        let empty = point(px(1.0), px(1.0));
+        view.inspector
+            .lock()
+            .expect("empty-click inspector")
+            .hovered_agent = Some(agent_id);
+        assert!(view.update_selection_from_point(empty, false));
+        assert!(!view.update_selection_from_point(empty, false));
+        assert!(!view.update_selection_from_point(empty, true));
+        assert!(!view.clear_all_selections());
+        assert!(commands.lock().expect("empty-click commands").is_empty());
+
+        assert!(view.update_selection_from_point(point(px(50.0), px(50.0)), false));
+        assert!(view.update_selection_from_point(empty, false));
+        assert_eq!(
+            commands.lock().expect("empty-click commands").as_slice(),
+            &[
+                ControlCommand::UpdateSelection(SelectionUpdate {
+                    mode: SelectionMode::Replace,
+                    agent_ids: vec![agent_id.raw()],
+                    state: SelectionState::Selected,
+                }),
+                ControlCommand::UpdateSelection(SelectionUpdate {
+                    mode: SelectionMode::Clear,
+                    agent_ids: Vec::new(),
+                    state: SelectionState::None,
+                }),
+            ],
+            "actual selection and clearing still require owner admission"
+        );
+    }
+
+    #[test]
+    fn zoomed_out_picking_keeps_a_screen_sized_target_and_chooses_nearest() {
+        let config = ScriptBotsConfig {
+            world_width: 1000,
+            world_height: 1000,
+            food_cell_size: 50,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            persistence_interval: 0,
+            ..ScriptBotsConfig::default()
+        };
+        let mut world = WorldState::new(config).expect("pick-radius world");
+        let spawn = |world: &mut WorldState, x| {
+            world
+                .try_spawn_agent(AgentData {
+                    position: Position::new(x, 500.0),
+                    ..AgentData::default()
+                })
+                .expect("spawn pick-radius creature")
+        };
+        let first = spawn(&mut world, 500.0);
+        let second = spawn(&mut world, 600.0);
+        let host = TestHost::take(Arc::new(Mutex::new(world)));
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let submitted = Arc::clone(&commands);
+        let mut view = SimulationView::new(
+            host.port.clone(),
+            AnalyticsSnapshotProvider::empty(),
+            "zoomed-out picking".into(),
+            Arc::new(move |command| {
+                submitted.lock().unwrap().push(command);
+                Some("test-cmd".to_owned())
+            }),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(())),
+        );
+        {
+            let mut camera = view.camera.lock().unwrap();
+            camera.ensure_default_zoom(1.0);
+            camera.record_render_metrics((0.0, 0.0), (100.0, 100.0), (1000.0, 1000.0), 0.1);
+        }
+        // The first creature is four pixels away; its old 30-world-unit
+        // picking radius was only three pixels at this scale. The second is
+        // also in range, so the closer creature must win.
+        let near_first = point(px(54.0), px(50.0));
+        assert!(view.update_hover_from_point(near_first));
+        assert_eq!(view.inspector.lock().unwrap().hovered_agent, Some(first));
+        assert!(view.update_selection_from_point(near_first, false));
+        assert!(view.update_selection_from_point(point(px(59.0), px(50.0)), false));
+        assert!(view.update_selection_from_point(point(px(75.0), px(50.0)), false));
+        assert_eq!(
+            commands.lock().unwrap().as_slice(),
+            &[
+                ControlCommand::UpdateSelection(SelectionUpdate {
+                    mode: SelectionMode::Replace,
+                    agent_ids: vec![first.raw()],
+                    state: SelectionState::Selected,
+                }),
+                ControlCommand::UpdateSelection(SelectionUpdate {
+                    mode: SelectionMode::Replace,
+                    agent_ids: vec![second.raw()],
+                    state: SelectionState::Selected,
+                }),
+                ControlCommand::UpdateSelection(SelectionUpdate {
+                    mode: SelectionMode::Clear,
+                    agent_ids: Vec::new(),
+                    state: SelectionState::None,
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn lab_inspection_waits_off_thread_and_discards_a_previous_selection() {
+        let world = command_characterization_world();
+        let (first, second) = {
+            let mut world = world.lock().expect("Lab inspection world");
+            (
+                world.try_spawn_agent(AgentData::default()).unwrap(),
+                world.try_spawn_agent(AgentData::default()).unwrap(),
+            )
+        };
+        let host = TestHost::take(world);
+        let select = |id: AgentId| {
+            host.apply(
+                scriptbots_runtime::HostCommand::try_from(ControlCommand::UpdateSelection(
+                    SelectionUpdate {
+                        mode: SelectionMode::Replace,
+                        agent_ids: vec![id.raw()],
+                        state: SelectionState::Selected,
+                    },
+                ))
+                .unwrap(),
+            );
+        };
+        select(first);
+        let published = host.snapshot();
+        let uid = published
+            .world
+            .agents
+            .iter()
+            .find(|a| a.id == first.raw())
+            .unwrap()
+            .uid;
+        let owner_detail = host.port.inspect_agent(uid, 0).unwrap().unwrap();
+        let detail =
+            AgentInspectorDetails::from_snapshot(&published, first, owner_detail, None, None)
+                .expect("matching Lab detail");
+        let source = WorldHudSampleSource {
+            session: published.session_id,
+            revision: published.revision,
+            epoch: published.world.epoch,
+            uid,
+            tick: published.world.tick,
+        };
+        let mut view = host_view(Arc::clone(&host));
+        let (sender, result) = std::sync::mpsc::sync_channel(1);
+        view.lab_inspection_job = Some(LabInspectionJob {
+            session: source.session,
+            epoch: source.epoch,
+            uid,
+            selected_eye: None,
+            result,
+            ready: None,
+            ready_since: None,
+        });
+        view.lab_inspection_last_request = Some(Instant::now());
+        let pending = view.snapshot();
+        assert!(
+            pending.inspector.focused.is_none(),
+            "pending inspection must not block rendering"
+        );
+        assert_eq!(
+            view.brain_request_revision.get(),
+            0,
+            "rendering must not issue a synchronous brain request"
+        );
+        sender
+            .send(Some(LabInspectionSample {
+                source,
+                selected_eye: None,
+                detail,
+                brain: None,
+            }))
+            .unwrap();
+        let exact = view.snapshot();
+        assert_eq!(
+            exact.inspector.focused.as_ref().map(|item| item.agent_id),
+            Some(first)
+        );
+        assert!(
+            view.lab_inspection_job.is_some(),
+            "the physiology sample must not discard the pending brain response"
+        );
+        let mut enriched_detail = exact.inspector.focused.unwrap();
+        enriched_detail.brain_request_revision = Some(1);
+        sender
+            .send(Some(LabInspectionSample {
+                source,
+                selected_eye: None,
+                detail: enriched_detail,
+                brain: Some(BrainInspectorCapture {
+                    agent_uid: uid,
+                    source_tick: source.tick,
+                    source_revision: Some(source.revision),
+                    request_revision: 1,
+                    retained_payload_bytes: 0,
+                    status: BrainInspectorCaptureStatus::Refused("test".to_owned()),
+                }),
+            }))
+            .unwrap();
+        let enriched = view.snapshot();
+        assert_eq!(
+            enriched
+                .inspector
+                .focused
+                .as_ref()
+                .and_then(|detail| detail.brain_request_revision),
+            Some(1),
+            "a later matching brain sample must enrich the same physiology"
+        );
+        let late_detail = enriched.inspector.focused.unwrap();
+        select(second);
+        sender
+            .send(Some(LabInspectionSample {
+                source,
+                selected_eye: None,
+                detail: late_detail,
+                brain: None,
+            }))
+            .unwrap();
+        view.lab_inspection_last_request = Some(Instant::now());
+        let changed = view.snapshot();
+        assert!(changed.inspector.focused.is_none());
+        assert!(
+            view.lab_inspection_cache.is_none(),
+            "old creature detail must be discarded"
+        );
+    }
+
+    #[test]
+    fn lab_physiology_arrives_while_brain_inspection_is_blocked() {
+        #[derive(Debug)]
+        struct SlowBrain {
+            started: Arc<std::sync::atomic::AtomicBool>,
+            release: Arc<std::sync::atomic::AtomicBool>,
+        }
+
+        impl scriptbots_core::BrainRunner for SlowBrain {
+            fn kind(&self) -> &'static str {
+                "gpui.slow_inspection"
+            }
+
+            fn tick(
+                &mut self,
+                _inputs: &[f32; scriptbots_core::INPUT_SIZE],
+            ) -> [f32; scriptbots_core::OUTPUT_SIZE] {
+                [0.0; scriptbots_core::OUTPUT_SIZE]
+            }
+
+            fn inspect(
+                &self,
+                _request: scriptbots_core::BrainInspection,
+            ) -> Result<
+                Option<scriptbots_core::BrainInspectionSnapshot>,
+                scriptbots_core::BrainInspectionError,
+            > {
+                self.started.store(true, AtomicOrdering::Release);
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !self.release.load(AtomicOrdering::Acquire) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Ok(None)
+            }
+
+            fn state_digest(&self) -> Option<u64> {
+                Some(0x534c_4f57_4252_4149)
+            }
+        }
+
+        let world = command_characterization_world();
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let agent = {
+            let mut world = world.lock().expect("slow inspection world");
+            let family = world
+                .brain_registry_mut()
+                .unwrap()
+                .register_with_state_digest("gpui.slow_inspection", 0x534c_4f57_4252_4149, {
+                    let started = Arc::clone(&started);
+                    let release = Arc::clone(&release);
+                    move |_rng| {
+                        Ok(Box::new(SlowBrain {
+                            started: Arc::clone(&started),
+                            release: Arc::clone(&release),
+                        }))
+                    }
+                });
+            let agent = world.try_spawn_agent(AgentData::default()).unwrap();
+            world.bind_agent_brain(agent, family).unwrap();
+            agent
+        };
+        let host = TestHost::take(world);
+        let mut view = host_view(Arc::clone(&host));
+        view.inspector.lock().unwrap().focused_agent = Some(agent);
+        view.snapshot();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !started.load(AtomicOrdering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let brain_is_waiting = started.load(AtomicOrdering::Acquire);
+        let snapshot = view.snapshot();
+        release.store(true, AtomicOrdering::Release);
+        assert!(brain_is_waiting, "the brain inspection must reach its wait");
+        let detail = snapshot.inspector.focused.expect("early physiology sample");
+        assert_eq!(detail.agent_id, agent);
+        assert!(
+            detail.brain_request_revision.is_none(),
+            "physiology must arrive before the blocked brain reply"
+        );
+    }
+
+    #[test]
     fn hover_is_view_local_command_free_and_digest_neutral() {
         let world = command_characterization_world();
         let agent_id = world
@@ -34948,6 +37739,15 @@ mod command_characterization_tests {
             Some(agent_id)
         );
         assert!(
+            hud_snapshot.inspector.focused.is_none(),
+            "hover must use the published quick preview without full owner inspection"
+        );
+        assert_eq!(
+            hud_view.brain_request_revision.get(),
+            0,
+            "hover alone must not request a brain projection"
+        );
+        assert!(
             hud_snapshot
                 .render_frame
                 .as_ref()
@@ -34976,8 +37776,27 @@ mod command_characterization_tests {
             ))
             .expect("owner selection command"),
         );
-        let selected_snapshot = hud_view.snapshot();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let selected_snapshot = loop {
+            let snapshot = hud_view.snapshot();
+            if snapshot.inspector.focused.is_some() {
+                break snapshot;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "selected creature detail did not arrive"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        };
         assert!(selected_snapshot.inspector.hovered.is_none());
+        assert!(
+            selected_snapshot.inspector.focused.is_some(),
+            "selecting the creature must still request its full detail"
+        );
+        assert!(
+            hud_view.brain_request_revision.get() > 0,
+            "selecting the creature must still request its brain projection"
+        );
         assert!(
             selected_snapshot
                 .render_frame
@@ -36452,7 +39271,7 @@ mod backend_agreement_tests {
             spike_extended: true,
             spike_struck: false,
             spike_victim: false,
-            reproduction_intent: 0.0,
+            sharing_intent: 0.0,
         };
 
         let mut frame = RenderFrame {
@@ -36477,6 +39296,7 @@ mod backend_agreement_tests {
             agent_reference_age: 300,
             agent_base_radius: 12.0,
             sense_radius: 50.0,
+            presentation_life_delta: 0.0,
             post_stack: PostProcessStack { passes: Vec::new() },
             vfx: vfx::VfxFrame::empty(100),
             palette: ColorPaletteMode::Natural,
