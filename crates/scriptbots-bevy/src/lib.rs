@@ -1178,6 +1178,28 @@ fn displayed_agent_position(
     })
 }
 
+/// Project a pointer ray onto the height of the displayed creature, then map
+/// the render coordinates back into the simulation's world coordinates.
+fn pick_point_at_height(
+    origin: Vec3,
+    direction: Vec3,
+    height: f32,
+    world_size: Vec2,
+) -> Option<Vec2> {
+    if direction.y.abs() <= f32::EPSILON {
+        return None;
+    }
+    let distance = (height - origin.y) / direction.y;
+    if !distance.is_finite() || distance <= 0.0 {
+        return None;
+    }
+    let impact = origin + direction * distance;
+    Some(Vec2::new(
+        impact.x + world_size.x * 0.5,
+        world_size.y * 0.5 - impact.z,
+    ))
+}
+
 #[derive(Component)]
 struct SpikePoseTarget {
     transform: Transform,
@@ -3073,6 +3095,9 @@ fn setup_scene(
         Camera2d,
         Camera {
             order: 1,
+            // The HUD is composited after the world camera. Clearing here
+            // would replace the 3D scene with the default background color.
+            clear_color: ClearColorConfig::None,
             ..Default::default()
         },
         Transform::default(),
@@ -4935,6 +4960,35 @@ mod adaptive_governor_tests {
         }
     }
 
+    #[test]
+    fn hud_camera_preserves_the_world_camera_output() {
+        let mut app = App::new();
+        app.insert_resource(Assets::<Mesh>::default())
+            .insert_resource(Assets::<Image>::default())
+            .insert_resource(auto_launch(RenderQuality::High))
+            .add_systems(Update, setup_scene);
+        app.update();
+
+        let world = app.world_mut();
+        let world_camera = world
+            .query_filtered::<&Camera, With<PrimaryCamera>>()
+            .single(world)
+            .expect("one world camera");
+        let world_order = world_camera.order;
+        let hud_camera = world
+            .query_filtered::<&Camera, With<Camera2d>>()
+            .single(world)
+            .expect("one HUD camera");
+        assert!(
+            hud_camera.order > world_order,
+            "HUD must render after the world"
+        );
+        assert!(
+            matches!(hud_camera.clear_color, ClearColorConfig::None),
+            "HUD camera must not clear the already rendered world"
+        );
+    }
+
     /// The real system, driven by a deterministic clock rather than wall time.
     fn governed_app(tier: RenderQuality) -> App {
         let effective = auto_launch(tier);
@@ -6557,22 +6611,14 @@ fn handle_selection_input(
         return;
     };
 
-    let dir_y = ray.direction.y;
-    if dir_y.abs() <= f32::EPSILON {
-        return;
-    }
-    let distance = -ray.origin.y / dir_y;
-    if distance <= 0.0 {
-        return;
-    }
-    let impact = ray.origin + ray.direction * distance;
-
     let world_size = state.world_size;
     if world_size.x <= 0.0 || world_size.y <= 0.0 {
         return;
     }
-
-    let world_point = Vec2::new(impact.x + world_size.x * 0.5, world_size.y * 0.5 - impact.z);
+    // Preserve the existing no-op for rays that do not reach the world plane.
+    if pick_point_at_height(ray.origin, *ray.direction, 0.0, world_size).is_none() {
+        return;
+    }
 
     let selection_radius = (snapshot.agent_radius * 3.0).max(24.0);
     let radius_sq = selection_radius * selection_radius;
@@ -6586,6 +6632,15 @@ fn handle_selection_input(
             .and_then(|registry| registry.records.get(&agent.id))
             .and_then(|record| display_poses.get(record.root).ok());
         let position = displayed_agent_position(agent.position, display, world_size);
+        let height = display.map_or_else(
+            || agent_translation(snapshot, agent).y,
+            |pose| pose.translation.y,
+        );
+        let Some(world_point) =
+            pick_point_at_height(ray.origin, *ray.direction, height, world_size)
+        else {
+            continue;
+        };
         // Argument order swapped versus the removed private copy: that computed
         // target - origin, core computes a - b. Both feed dist_sq below, so the
         // sign is unused, but the swap keeps the value identical rather than
@@ -7621,7 +7676,7 @@ fn control_camera(
 
     let dir = Vec3::new(
         yaw.cos() * pitch.cos(),
-        pitch.sin(),
+        -pitch.sin(),
         yaw.sin() * pitch.cos(),
     );
     transform.translation = center + dir * distance;
@@ -12196,6 +12251,53 @@ mod tests {
                     .forward()
                     .dot((center - transform.translation).normalize())
                     > 0.999
+            );
+        }
+    }
+
+    #[test]
+    fn picking_projects_onto_the_displayed_creature_height() {
+        let origin = Vec3::new(0.0, 200.0, 0.0);
+        let direction = Vec3::new(1.0, -1.0, 0.0).normalize();
+        let world_size = Vec2::new(6000.0, 3000.0);
+        let elevated = pick_point_at_height(origin, direction, 100.0, world_size).unwrap();
+        let ground = pick_point_at_height(origin, direction, 0.0, world_size).unwrap();
+        assert!(elevated.distance(Vec2::new(3100.0, 1500.0)) < 0.001);
+        assert!(
+            ground.distance(elevated) > 24.0,
+            "ground-plane picking would miss this creature"
+        );
+        assert!(pick_point_at_height(origin, Vec3::X, 100.0, world_size).is_none());
+        assert!(pick_point_at_height(origin, Vec3::Y, 100.0, world_size).is_none());
+    }
+
+    #[test]
+    fn camera_orbits_above_the_terrain_and_looks_down() {
+        let mut app = App::new();
+        app.insert_resource(Time::<()>::default())
+            .insert_resource(CameraRig::default())
+            .insert_resource(SnapshotState::default())
+            .insert_resource(ButtonInput::<MouseButton>::default())
+            .insert_resource(ButtonInput::<KeyCode>::default())
+            .insert_resource(Messages::<MouseMotion>::default())
+            .insert_resource(Messages::<MouseWheel>::default())
+            .add_systems(Update, control_camera);
+        let camera = app
+            .world_mut()
+            .spawn((PrimaryCamera, Transform::default()))
+            .id();
+
+        for pitch in [-1.45, -0.45, -0.05] {
+            app.world_mut().resource_mut::<CameraRig>().pitch = pitch;
+            app.update();
+            let transform = app.world().entity(camera).get::<Transform>().unwrap();
+            assert!(
+                transform.translation.y > 0.0,
+                "camera must stay above the ground at pitch {pitch}"
+            );
+            assert!(
+                transform.forward().y < 0.0,
+                "camera must look down at pitch {pitch}"
             );
         }
     }
