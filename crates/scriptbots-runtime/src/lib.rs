@@ -81,6 +81,8 @@ pub mod channel;
 pub mod host_core;
 pub mod migrator;
 pub mod native;
+pub mod remote;
+pub mod remote_subscription;
 
 const MAX_EVENT_PAGE_SIZE: usize = 4_096;
 const DEFAULT_PROJECTION_CACHE_BYTES: usize = 64 * 1024 * 1024;

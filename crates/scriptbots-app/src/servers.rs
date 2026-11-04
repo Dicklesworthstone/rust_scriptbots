@@ -55,6 +55,11 @@ use scriptbots_core::{
 };
 use scriptbots_runtime::RenderSnapshot;
 use scriptbots_runtime::channel::ChannelHostPort;
+use scriptbots_runtime::remote::{REMOTE_PROTOCOL_VERSION, RemoteFrame, encode_remote_frame};
+use scriptbots_runtime::remote_subscription::{
+    REMOTE_MAX_REQUEST_BYTES, RemoteChannel, RemoteDeliveryWindow, RemoteFrameAck,
+    RemoteSubscription, RemoteSubscriptionError, RemoteSubscriptionRequest,
+};
 // keep image out of servers unless needed
 
 /// Default loopback address for the REST control surface.
@@ -71,7 +76,7 @@ const CONTROL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// Stack for every control-runtime worker and blocking thread (bd-6sgk).
 const CONTROL_RUNTIME_THREAD_STACK_BYTES: usize = 32 * 1024 * 1024;
 const WS_CONTROL_PROTOCOL_VERSION: u16 = 1;
-const MAX_WS_CONTROL_MESSAGE_BYTES: usize = 16 * 1024;
+const MAX_WS_CONTROL_MESSAGE_BYTES: usize = REMOTE_MAX_REQUEST_BYTES;
 const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Return the control CLI's default REST base URL from the server's socket authority.
@@ -2074,7 +2079,7 @@ async fn stream_ticks_sse(
     get,
     path = "/api/ws/stream",
     tag = "control",
-    responses((status = 101, description = "Binary tick summaries and versioned acknowledged JSON controls"))
+    responses((status = 101, description = "Send a version-1 subscribe request with telemetry/canvas/events channels to negotiate bounded SBWS binary frames, session-bound resume cursors and acknowledged JSON controls; initial tick-summary stream remains available before negotiation"))
 )]
 async fn stream_ticks_ws(ws: WebSocketUpgrade, State(state): State<ApiState>) -> Response {
     ws.max_message_size(MAX_WS_CONTROL_MESSAGE_BYTES)
@@ -2236,14 +2241,228 @@ async fn send_ws_message(socket: &mut WebSocket, message: WsMessage) -> bool {
     )
 }
 
-async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
-    let handle = state.handle.clone();
-    let mut interval = tokio::time::interval(Duration::from_millis(50));
+fn remote_subscription_error(error: RemoteSubscriptionError) -> AppError {
+    match error {
+        RemoteSubscriptionError::SessionChanged { .. }
+        | RemoteSubscriptionError::CursorAhead { .. } => AppError::conflict(error.to_string()),
+        RemoteSubscriptionError::ProjectionLimit(_) => {
+            AppError::payload_too_large(error.to_string())
+        }
+        RemoteSubscriptionError::Request(_) => AppError::bad_request(error.to_string()),
+        RemoteSubscriptionError::DeliveryMismatch | RemoteSubscriptionError::Protocol(_) => {
+            AppError::internal(error.to_string())
+        }
+    }
+}
+
+async fn send_ws_error(
+    socket: &mut WebSocket,
+    request_id: Option<String>,
+    error: AppError,
+) -> bool {
+    let reply = WsControlReply::error(request_id, error);
+    let Ok(text) = serde_json::to_string(&reply) else {
+        return false;
+    };
+    send_ws_message(socket, WsMessage::Text(text.into())).await
+}
+
+/// A bounded projection batch runs away from async workers and holds only an
+/// immutable publication. No owner command, world mutex or storage read is used.
+struct PreparedRemoteFrame {
+    frame: RemoteFrame,
+    bytes: Vec<u8>,
+    delivered_subscription: RemoteSubscription,
+}
+
+async fn prepare_remote_frames(
+    mut subscription: RemoteSubscription,
+    snapshot: Arc<RenderSnapshot>,
+    awaiting_channels: Vec<RemoteChannel>,
+) -> Result<Vec<PreparedRemoteFrame>, AppError> {
+    struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+    impl<T> Drop for AbortOnDrop<T> {
+        fn drop(&mut self) {
+            // Cancels queued blocking work if this connection closes or times
+            // out. A job already running has only the bounded projection to finish.
+            self.0.abort();
+        }
+    }
+    let mut projection = AbortOnDrop(tokio::task::spawn_blocking(move || {
+        let mut frames = Vec::with_capacity(subscription.channels().len());
+        for channel in subscription.channels().to_vec() {
+            if awaiting_channels.contains(&channel) {
+                continue;
+            }
+            if let Some(frame) = subscription.next_frame(channel, &snapshot)? {
+                let bytes = encode_remote_frame(&frame)?;
+                // Validation walks the full canvas. Compute the next cursor
+                // here as well; the async worker installs it only after send.
+                subscription.delivered(&frame)?;
+                frames.push(PreparedRemoteFrame {
+                    frame,
+                    bytes,
+                    delivered_subscription: subscription.clone(),
+                });
+            }
+        }
+        Ok::<_, RemoteSubscriptionError>(frames)
+    }));
+    tokio::time::timeout(WS_WRITE_TIMEOUT, &mut projection.0)
+        .await
+        .map_err(|_| {
+            AppError::service_unavailable(
+                "remote projection deadline exceeded; reconnect with the last consumed cursors",
+            )
+        })?
+        .map_err(|error| AppError::internal(format!("remote projection task failed: {error}")))?
+        .map_err(remote_subscription_error)
+}
+
+/// Deterministic backoff given observed work duration. The requested rate is an
+/// upper bound, not a latency promise; eight cheap samples permit gradual recovery.
+#[derive(Debug)]
+struct WsStreamCadence {
+    requested: Duration,
+    current: Duration,
+    cheap_samples: u8,
+}
+
+impl WsStreamCadence {
+    fn new(requested: Duration) -> Self {
+        Self {
+            requested,
+            current: requested,
+            cheap_samples: 0,
+        }
+    }
+
+    fn observe(&mut self, elapsed: Duration) -> Option<&'static str> {
+        let previous = self.current;
+        let reason = if elapsed > self.current {
+            self.cheap_samples = 0;
+            self.current = elapsed
+                .saturating_mul(2)
+                .min(Duration::from_secs(1))
+                .max(self.requested);
+            "slow_consumer"
+        } else if elapsed.saturating_mul(4) < self.current && self.current > self.requested {
+            self.cheap_samples += 1;
+            if self.cheap_samples == 8 {
+                self.current = (self.current.saturating_mul(3) / 4).max(self.requested);
+                self.cheap_samples = 0;
+            }
+            "recovering"
+        } else {
+            self.cheap_samples = 0;
+            return None;
+        };
+        (previous != self.current).then_some(reason)
+    }
+}
+
+fn ws_interval(period: Duration) -> tokio::time::Interval {
+    let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval
+}
+
+async fn send_ws_cadence(
+    socket: &mut WebSocket,
+    cadence: &WsStreamCadence,
+    reason: &str,
+    connection_id: u64,
+) -> bool {
+    let notice = json!({
+        "type": "stream_rate", "protocol_version": WS_CONTROL_PROTOCOL_VERSION,
+        "requested_interval_us": cadence.requested.as_micros(),
+        "effective_interval_us": cadence.current.as_micros(), "reason": reason,
+    });
+    debug!(
+        connection_id,
+        reason,
+        interval_us = cadence.current.as_micros(),
+        "remote sampling cadence changed"
+    );
+    send_ws_message(socket, WsMessage::Text(notice.to_string().into())).await
+}
+
+async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
+    static NEXT_CONNECTION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let connection_id = NEXT_CONNECTION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let handle = state.handle.clone();
+    let mut interval = ws_interval(Duration::from_millis(50));
+    let mut subscription: Option<RemoteSubscription> = None;
+    let mut delivery: Option<RemoteDeliveryWindow> = None;
+    let mut cadence = WsStreamCadence::new(Duration::from_millis(50));
+    let connected_at = tokio::time::Instant::now();
+    debug!(connection_id, "WebSocket connected");
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                if let Ok(summary) = read_latest_tick_summary(handle.clone()).await {
+                if let Some(stream) = &mut subscription {
+                    let started = tokio::time::Instant::now();
+                    let window = delivery.as_mut().expect("negotiation installs a delivery window");
+                    if window.expired(connected_at.elapsed()) {
+                        send_ws_error(&mut socket, None, AppError::service_unavailable(
+                            "remote frame acknowledgement deadline exceeded; reconnect with the last consumed cursors",
+                        )).await;
+                        break;
+                    }
+                    let awaiting_channels = window.awaiting_channels();
+                    if awaiting_channels.len() == stream.channels().len() {
+                        continue;
+                    }
+                    let snapshot = match handle.read_snapshot() {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => {
+                            send_ws_error(&mut socket, None, AppError::from(error)).await;
+                            break;
+                        }
+                    };
+                    let frames = match prepare_remote_frames(stream.clone(), snapshot, awaiting_channels).await {
+                        Ok(frames) => frames,
+                        Err(error) => {
+                            warn!(connection_id, message = %error.message, "remote stream refused a projection");
+                            send_ws_error(&mut socket, None, error).await;
+                            break;
+                        }
+                    };
+                    let mut write_failed = false;
+                    for PreparedRemoteFrame { frame, bytes, delivered_subscription } in frames {
+                        let bytes_len = bytes.len();
+                        if !send_ws_message(&mut socket, WsMessage::Binary(bytes.into())).await {
+                            write_failed = true;
+                            break;
+                        }
+                        if let Err(error) = window.mark_sent(&frame, connected_at.elapsed()) {
+                            send_ws_error(&mut socket, None, remote_subscription_error(error)).await;
+                            write_failed = true;
+                            break;
+                        }
+                        *stream = delivered_subscription;
+                        let kind = match frame.payload {
+                            scriptbots_runtime::remote::RemoteFramePayload::Telemetry(_) => "telemetry",
+                            scriptbots_runtime::remote::RemoteFramePayload::Canvas(_) => "canvas",
+                            scriptbots_runtime::remote::RemoteFramePayload::Events(_) => "events",
+                        };
+                        debug!(connection_id, kind, revision = frame.identity.publication_revision,
+                            tick = frame.identity.tick, bytes = bytes_len,
+                            coalesced = frame.coalesced_publications, queue_depth = 0,
+                            awaiting_ack = window.awaiting_channels().len(),
+                            "remote frame delivered to socket");
+                    }
+                    if write_failed {
+                        debug!(connection_id, "remote stream closed after failed or timed-out write");
+                        break;
+                    }
+                    if let Some(reason) = cadence.observe(started.elapsed()) {
+                        interval = ws_interval(cadence.current);
+                        if !send_ws_cadence(&mut socket, &cadence, reason, connection_id).await {
+                            break;
+                        }
+                    }
+                } else if let Ok(summary) = read_latest_tick_summary(handle.clone()).await {
                     let dto = TickSummaryDto::from(summary);
                     if let Ok(bytes) = postcard::to_stdvec(&dto)
                         && !send_ws_message(&mut socket, WsMessage::Binary(bytes.into())).await
@@ -2255,6 +2474,73 @@ async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
             msg = socket.recv() => {
                 match msg {
                     Some(Ok(WsMessage::Text(text))) => {
+                        let json_request = serde_json::from_str::<Value>(&text).ok();
+                        if json_request.as_ref().and_then(|value| value.get("command"))
+                            .and_then(Value::as_str) == Some("stream_ack")
+                        {
+                            let consumed = (|| {
+                                let ack = RemoteFrameAck::parse(&text).map_err(remote_subscription_error)?;
+                                let window = delivery.as_mut().ok_or_else(|| AppError::bad_request(
+                                    "negotiate a subscription before acknowledging frames",
+                                ))?;
+                                window.acknowledge(&ack, connected_at.elapsed()).map_err(|error| {
+                                    AppError::conflict(format!("remote frame acknowledgement refused: {error}"))
+                                })
+                            })();
+                            match consumed {
+                                Ok(elapsed) => {
+                                    if let Some(reason) = cadence.observe(elapsed) {
+                                        interval = ws_interval(cadence.current);
+                                        if !send_ws_cadence(&mut socket, &cadence, reason, connection_id).await { break; }
+                                    }
+                                }
+                                Err(error) => {
+                                    send_ws_error(&mut socket, None, error).await;
+                                    break;
+                                }
+                            }
+                            continue;
+                        }
+                        if json_request.as_ref().and_then(|value| value.get("command"))
+                            .and_then(Value::as_str) == Some("subscribe")
+                        {
+                            let request_id = json_request.as_ref()
+                                .and_then(|value| value.get("request_id")).and_then(Value::as_str)
+                                .map(str::trim).filter(|id| !id.is_empty() && id.len() <= 1024).map(str::to_owned);
+                            let prepared = (|| {
+                                let request = RemoteSubscriptionRequest::parse(&text).map_err(remote_subscription_error)?;
+                                if delivery.as_ref().is_some_and(|window| !window.is_empty()) {
+                                    return Err(AppError::conflict("acknowledge outstanding frames before replacing a subscription"));
+                                }
+                                let snapshot = handle.read_snapshot().map_err(AppError::from)?;
+                                let stream = RemoteSubscription::new(&request, &snapshot).map_err(remote_subscription_error)?;
+                                let window = RemoteDeliveryWindow::new(u128::from(snapshot.session_id.get()), WS_WRITE_TIMEOUT);
+                                let ack = json!({
+                                    "type": "subscribed", "protocol_version": WS_CONTROL_PROTOCOL_VERSION,
+                                    "stream_protocol_version": REMOTE_PROTOCOL_VERSION,
+                                    "request_id": request.request_id,
+                                    "session_id": snapshot.session_id.get().to_string(),
+                                    "channels": request.channels, "max_fps": request.max_fps,
+                                });
+                                Ok::<_, AppError>((stream, window, ack))
+                            })();
+                            match prepared {
+                                Ok((stream, window, ack)) => {
+                                    if !send_ws_message(&mut socket, WsMessage::Text(ack.to_string().into())).await {
+                                        break;
+                                    }
+                                    debug!(connection_id, channels = ?stream.channels(), "remote subscription accepted");
+                                    cadence = WsStreamCadence::new(stream.interval());
+                                    interval = ws_interval(cadence.current);
+                                    subscription = Some(stream);
+                                    delivery = Some(window);
+                                }
+                                Err(error) => {
+                                    if !send_ws_error(&mut socket, request_id, error).await { break; }
+                                }
+                            }
+                            continue;
+                        }
                         let reply = apply_ws_control_message(handle.clone(), text.to_string()).await;
                         let Ok(text) = serde_json::to_string(&reply) else {
                             break;
@@ -2265,7 +2551,7 @@ async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
                     }
                     Some(Ok(WsMessage::Binary(_))) => {
                         let reply = WsControlReply::error(None, AppError::bad_request(
-                            "control requests must be JSON text; binary frames carry server tick summaries",
+                            "requests must be JSON text; binary frames carry server presentation data",
                         ));
                         let Ok(text) = serde_json::to_string(&reply) else {
                             break;
@@ -2280,6 +2566,7 @@ async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
             }
         }
     }
+    debug!(connection_id, "WebSocket disconnected");
 }
 
 #[derive(Debug, Default, Deserialize, ToSchema)]
@@ -8397,6 +8684,317 @@ mod tests {
                 .map(|(index, byte)| byte ^ mask[index % 4]),
         );
         socket.write_all(&frame).expect("write masked client frame");
+    }
+
+    fn read_remote_websocket_message(socket: &mut TcpStream) -> (u8, Vec<u8>) {
+        let mut header = [0; 2];
+        socket
+            .read_exact(&mut header)
+            .expect("actual server frame header");
+        assert_eq!(header[0] & 0x80, 0x80);
+        assert_eq!(header[1] & 0x80, 0);
+        let len = match header[1] & 0x7f {
+            126 => {
+                let mut length = [0; 2];
+                socket.read_exact(&mut length).unwrap();
+                usize::from(u16::from_be_bytes(length))
+            }
+            127 => {
+                let mut length = [0; 8];
+                socket.read_exact(&mut length).unwrap();
+                usize::try_from(u64::from_be_bytes(length)).unwrap()
+            }
+            len => usize::from(len),
+        };
+        assert!(len <= scriptbots_runtime::remote::REMOTE_MAX_FRAME_BYTES);
+        let mut payload = vec![0; len];
+        socket
+            .read_exact(&mut payload)
+            .expect("actual server frame payload");
+        (header[0] & 0x0f, payload)
+    }
+
+    fn read_remote_json(socket: &mut TcpStream, negotiated: bool) -> Value {
+        for _ in 0..16 {
+            let (opcode, payload) = read_remote_websocket_message(socket);
+            if opcode == 1 {
+                let json: Value = serde_json::from_slice(&payload).unwrap();
+                if json["type"] != "stream_rate" {
+                    return json;
+                }
+            } else {
+                assert_eq!(opcode, 2);
+                if negotiated {
+                    let frame = scriptbots_runtime::remote::decode_remote_frame(&payload)
+                        .expect("negotiated binary frame");
+                    acknowledge_remote_frame(socket, &frame);
+                } else {
+                    postcard::from_bytes::<TickSummaryDto>(&payload)
+                        .expect("only initial legacy telemetry before acknowledgment");
+                }
+            }
+        }
+        panic!("no JSON response in bounded frame count");
+    }
+
+    fn read_remote_binary(socket: &mut TcpStream) -> RemoteFrame {
+        for _ in 0..16 {
+            let (opcode, payload) = read_remote_websocket_message(socket);
+            if opcode == 2 {
+                let frame = scriptbots_runtime::remote::decode_remote_frame(&payload)
+                    .expect("actual SBWS frame");
+                acknowledge_remote_frame(socket, &frame);
+                return frame;
+            }
+            assert_eq!(opcode, 1);
+            let notice: Value = serde_json::from_slice(&payload).unwrap();
+            assert_eq!(notice["type"], "stream_rate", "unexpected JSON {notice}");
+        }
+        panic!("no binary frame in bounded frame count");
+    }
+
+    fn acknowledge_remote_frame(socket: &mut TcpStream, frame: &RemoteFrame) {
+        let channel = match &frame.payload {
+            scriptbots_runtime::remote::RemoteFramePayload::Canvas(_) => "canvas",
+            scriptbots_runtime::remote::RemoteFramePayload::Telemetry(_) => "telemetry",
+            scriptbots_runtime::remote::RemoteFramePayload::Events(_) => "events",
+        };
+        let mut ack = json!({
+            "protocol_version":1, "command":"stream_ack", "channel":channel,
+            "session_id":frame.identity.session_id.to_string(),
+            "publication_revision":frame.identity.publication_revision.to_string(),
+        });
+        if let scriptbots_runtime::remote::RemoteFramePayload::Events(page) = &frame.payload {
+            ack["after_event"] = json!(page.next_after_event().to_string());
+        }
+        send_websocket_text(socket, &ack.to_string());
+    }
+
+    #[test]
+    fn websocket_subscriptions_deliver_independent_channels_and_session_bound_resume() {
+        use scriptbots_runtime::remote::RemoteFramePayload;
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 64,
+            world_height: 64,
+            food_cell_size: 16,
+            persistence_interval: 0,
+            rng_seed: Some(42),
+            closed: true,
+            ..ScriptBotsConfig::default()
+        })
+        .unwrap();
+        world
+            .try_spawn_agent(scriptbots_core::AgentData::default())
+            .unwrap();
+        let owner = crate::control::tests::TestHost::spawn(world);
+        let reservation = ControlServerReservation::prepare(ControlServerConfig {
+            rest_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            mcp_transport: McpTransportConfig::Disabled,
+            ..ControlServerConfig::default()
+        })
+        .unwrap();
+        let address = reservation.rest_address().unwrap();
+        let (server, _) = reservation.launch(owner.port.clone(), false).unwrap();
+        let handle = server.control_handle().unwrap();
+        let initial = handle.read_snapshot().unwrap();
+
+        let mut telemetry = connect_websocket(address);
+        let mut canvas = connect_websocket(address);
+        let mut stalled = connect_websocket(address);
+        for (socket, id, channels) in [
+            (&mut telemetry, "telemetry-viewer", json!(["telemetry"])),
+            (&mut canvas, "canvas-viewer", json!(["canvas", "events"])),
+        ] {
+            send_websocket_text(
+                socket,
+                &json!({
+                    "protocol_version":1, "request_id":id, "command":"subscribe",
+                    "channels":channels, "max_fps":60,
+                })
+                .to_string(),
+            );
+            let ack = read_remote_json(socket, false);
+            assert_eq!(ack["type"], "subscribed");
+            assert_eq!(ack["request_id"], id);
+            assert_eq!(ack["channels"], channels);
+            assert_eq!(ack["stream_protocol_version"], 1);
+            assert_eq!(ack["session_id"], initial.session_id.get().to_string());
+        }
+        send_websocket_text(
+            &mut stalled,
+            r#"{"protocol_version":1,"command":"subscribe","channels":["canvas","events"],"max_fps":120}"#,
+        );
+        // This client withholds its consumption credits. The other clients and
+        // the real owner must still complete their own work.
+        let summary = read_remote_binary(&mut telemetry);
+        assert!(matches!(summary.payload, RemoteFramePayload::Telemetry(_)));
+        let image = read_remote_binary(&mut canvas);
+        let RemoteFramePayload::Canvas(world) = image.payload else {
+            panic!("canvas channel")
+        };
+        assert_eq!(world, initial.world);
+        let events = read_remote_binary(&mut canvas);
+        let RemoteFramePayload::Events(page) = events.payload else {
+            panic!("events channel")
+        };
+        assert!(page.events.is_empty());
+        assert_eq!(
+            handle.status().unwrap().tick,
+            0,
+            "subscribing never advances science"
+        );
+        assert_eq!(read_remote_json(&mut stalled, false)["type"], "subscribed");
+        let mut withheld = Vec::new();
+        for _ in 0..2 {
+            let (opcode, payload) = read_remote_websocket_message(&mut stalled);
+            assert_eq!(opcode, 2);
+            withheld.push(scriptbots_runtime::remote::decode_remote_frame(&payload).unwrap());
+        }
+
+        send_websocket_text(
+            &mut canvas,
+            r#"{"protocol_version":1,"request_id":"remote-step","command":"step"}"#,
+        );
+        let response = read_remote_json(&mut canvas, true);
+        let receipt: CommandStatusDto =
+            serde_json::from_value(response["receipt"].clone()).unwrap();
+        owner.wait_applied(&receipt);
+        let advanced = read_remote_binary(&mut telemetry);
+        let RemoteFramePayload::Telemetry(summary) = &advanced.payload else {
+            panic!("mask must remain telemetry-only")
+        };
+        assert_eq!(summary.tick, 1);
+        assert_eq!(advanced.identity.tick, 1);
+        assert_eq!(
+            advanced.identity.session_id,
+            u128::from(initial.session_id.get())
+        );
+
+        // A malformed replacement cannot remove the current valid subscription.
+        send_websocket_text(
+            &mut telemetry,
+            r#"{"protocol_version":2,"request_id":"bad-version","command":"subscribe","channels":["canvas"]}"#,
+        );
+        let refused = read_remote_json(&mut telemetry, true);
+        assert_eq!(refused["status"], 400);
+        assert_eq!(refused["request_id"], "bad-version");
+        drop(telemetry);
+        let mut reconnected = connect_websocket(address);
+        send_websocket_text(&mut reconnected, &json!({
+            "protocol_version":1, "request_id":"resume-view", "command":"subscribe",
+            "channels":["canvas","events"], "max_fps":60,
+            "resume": {"session_id":advanced.identity.session_id.to_string(),
+                "after_revision":advanced.identity.publication_revision.to_string(), "after_event":"0"},
+        }).to_string());
+        assert_eq!(
+            read_remote_json(&mut reconnected, false)["type"],
+            "subscribed"
+        );
+        // A resumed event lane confirms its cursor even if no narratives occurred.
+        let mut confirmation = read_remote_binary(&mut reconnected);
+        if matches!(confirmation.payload, RemoteFramePayload::Canvas(_)) {
+            // Journal-state publication may have followed the telemetry sample
+            // used as the resume cursor; that newer canvas is valid as well.
+            confirmation = read_remote_binary(&mut reconnected);
+        }
+        assert!(matches!(
+            confirmation.payload,
+            RemoteFramePayload::Events(_)
+        ));
+        let applied = handle
+            .submit_command(
+                scriptbots_core::ControlCommand::SetSpeed(2.0),
+                Some("remote-paused-speed"),
+            )
+            .unwrap();
+        owner.wait_applied(&applied);
+        let changed = read_remote_binary(&mut reconnected);
+        assert!(matches!(changed.payload, RemoteFramePayload::Canvas(_)));
+        assert_eq!(
+            changed.identity.tick, 1,
+            "a paused control publication must reach viewers without a scientific tick"
+        );
+        assert_eq!(changed.playback.speed_multiplier, 2.0);
+        assert!(changed.identity.publication_revision > advanced.identity.publication_revision);
+
+        send_websocket_text(
+            &mut stalled,
+            &json!({
+                "protocol_version":1, "command":"status", "request_id":"stalled-control",
+                "command_id":applied.command_id,
+            })
+            .to_string(),
+        );
+        let mut observed_control = false;
+        for _ in 0..16 {
+            let (opcode, payload) = read_remote_websocket_message(&mut stalled);
+            assert_eq!(
+                opcode, 1,
+                "no second binary frame may queue before its channel is acknowledged"
+            );
+            let reply: Value = serde_json::from_slice(&payload).unwrap();
+            if reply["type"] == "stream_rate" {
+                continue;
+            }
+            assert_eq!(reply["request_id"], "stalled-control");
+            assert_eq!(reply["receipt"]["application_state"], "applied");
+            observed_control = true;
+            break;
+        }
+        assert!(
+            observed_control,
+            "withheld display credit must not block controls"
+        );
+        for frame in &withheld {
+            acknowledge_remote_frame(&mut stalled, frame);
+        }
+        let caught_up = read_remote_binary(&mut stalled);
+        assert!(matches!(caught_up.payload, RemoteFramePayload::Canvas(_)));
+        assert_eq!(caught_up.identity.tick, 1);
+        assert_eq!(caught_up.playback.speed_multiplier, 2.0);
+        assert!(
+            caught_up.coalesced_publications > 0,
+            "released credit catches up from the newest publication"
+        );
+
+        send_websocket_text(&mut reconnected, &json!({
+            "protocol_version":1,"request_id":"foreign-session","command":"subscribe","channels":["canvas"],
+            "resume":{"session_id":(initial.session_id.get() ^ 1).to_string(),"after_revision":"0"},
+        }).to_string());
+        assert_eq!(read_remote_json(&mut reconnected, true)["status"], 409);
+        assert_eq!(handle.status().unwrap().tick, 1);
+        drop(reconnected);
+        drop(canvas);
+        drop(stalled);
+        server.shutdown().unwrap();
+    }
+
+    #[test]
+    fn websocket_cadence_backs_off_and_recovers_without_exceeding_requested_rate() {
+        let requested = Duration::from_nanos(1_000_000_000 / 60);
+        let mut cadence = WsStreamCadence::new(requested);
+        assert_eq!(
+            cadence.observe(Duration::from_millis(80)),
+            Some("slow_consumer")
+        );
+        assert_eq!(cadence.current, Duration::from_millis(160));
+        for _ in 0..7 {
+            assert_eq!(cadence.observe(Duration::from_millis(1)), None);
+        }
+        assert_eq!(
+            cadence.observe(Duration::from_millis(1)),
+            Some("recovering")
+        );
+        assert_eq!(cadence.current, Duration::from_millis(120));
+        for _ in 0..128 {
+            cadence.observe(Duration::from_millis(1));
+        }
+        assert_eq!(cadence.current, requested);
+        assert_eq!(
+            cadence.observe(Duration::from_secs(4)),
+            Some("slow_consumer")
+        );
+        assert_eq!(cadence.current, Duration::from_secs(1));
     }
 
     fn read_websocket_reply(socket: &mut TcpStream) -> Value {
