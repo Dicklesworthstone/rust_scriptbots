@@ -1130,6 +1130,12 @@ struct AgentDisplayPose {
     previous_target: AgentPoseTarget,
 }
 
+#[derive(Component, Clone, Copy)]
+struct AgentGroundFootprint {
+    radius: f32,
+    spike_extension: f32,
+}
+
 // Approximately 95% convergence in 100 ms, independent of render frame rate.
 const AGENT_POSE_RESPONSE: f32 = 30.0;
 
@@ -1142,10 +1148,15 @@ fn smooth_agent_poses(
     time: Res<Time>,
     state: Res<SnapshotState>,
     settings: Option<Res<AgentMotionSettings>>,
-    mut agents: Query<(&AgentPoseTarget, &mut AgentDisplayPose, &mut Transform)>,
+    mut agents: Query<(
+        &AgentPoseTarget,
+        &mut AgentDisplayPose,
+        &mut Transform,
+        Option<&AgentGroundFootprint>,
+    )>,
 ) {
     let blend = -(-time.delta_secs() * AGENT_POSE_RESPONSE).exp_m1();
-    for (target, mut display, mut transform) in &mut agents {
+    for (target, mut display, mut transform, footprint) in &mut agents {
         let delta = target.translation - display.previous_target.translation;
         let wrapped = (state.world_size.x > 0.0 && delta.x.abs() > state.world_size.x * 0.5)
             || (state.world_size.y > 0.0 && delta.z.abs() > state.world_size.y * 0.5);
@@ -1158,6 +1169,26 @@ fn smooth_agent_poses(
         } else {
             display.translation = display.translation.lerp(target.translation, blend);
             display.rotation = display.rotation.slerp(target.rotation, blend);
+        }
+        if let (Some(snapshot), Some(footprint)) = (&state.latest, footprint) {
+            let world_position = Vec2::new(
+                display.translation.x + snapshot.world_size.x * 0.5,
+                snapshot.world_size.y * 0.5 - display.translation.z,
+            );
+            let forward = display.rotation * Vec3::X;
+            let heading = (-forward.z).atan2(forward.x);
+            display.rotation = terrain_agent_rotation(
+                &snapshot.terrain_height,
+                world_position,
+                heading,
+                footprint.radius,
+            );
+            display.translation.y = terrain_footprint_height(
+                &snapshot.terrain_height,
+                world_position,
+                display.rotation,
+                *footprint,
+            );
         }
         display.previous_target = *target;
         transform.translation = display.translation;
@@ -9664,6 +9695,7 @@ mod terrain_tests {
     #[test]
     fn agent_translation_respects_terrain_height() {
         let mut snapshot = sample_world_snapshot();
+        snapshot.terrain_height.elevation.fill(0.5);
         snapshot.agents.push(sample_agent_visual());
 
         let translation = agent_translation(&snapshot, &snapshot.agents[0]);
@@ -9672,7 +9704,7 @@ mod terrain_tests {
             snapshot.agents[0].position,
             TERRAIN_HEIGHT_SCALE,
         );
-        let expected = terrain_height + snapshot.agent_radius * AGENT_GROUND_OFFSET_FACTOR;
+        let expected = terrain_height + snapshot.agent_radius * 0.91;
         assert!((translation.y - expected).abs() < 1e-3);
         assert!(
             translation.y - terrain_height >= snapshot.agent_radius * 0.88,
@@ -9692,6 +9724,107 @@ mod terrain_tests {
         assert!((sample(75.0, 75.0) - 65.0).abs() < 0.001);
         assert!((sample(50.0, 50.0) - 30.0).abs() < 0.001);
         assert!((sample(200.0, 200.0) - 100.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn creature_pose_tracks_a_sloped_surface_and_wheel_contacts() {
+        let mut snapshot = sample_world_snapshot();
+        snapshot.world_size = Vec2::splat(300.0);
+        snapshot.agent_radius = 10.0;
+        let terrain = &mut snapshot.terrain_height;
+        terrain.dims = UVec2::new(4, 4);
+        terrain.cell_size = 100;
+        terrain.elevation = (0..4)
+            .flat_map(|z| (0..4).map(move |x| 0.2 + x as f32 * 0.05 + z as f32 * 0.1))
+            .collect();
+        let expected_up = Vec3::new(-0.09, 1.0, 0.18).normalize();
+        let mut agent = sample_agent_visual();
+        agent.position = Vec2::splat(150.0);
+        agent.spike_length = 0.0;
+        for heading in [0.0, 0.8, -1.7, std::f32::consts::PI] {
+            agent.heading = heading;
+            let (translation, rotation) = agent_surface_pose(&snapshot, &agent);
+            assert!((rotation * Vec3::Y).distance(expected_up) < 1e-4);
+            let forward = rotation * Vec3::X;
+            let horizontal = Vec2::new(forward.x, -forward.z).normalize();
+            assert!(horizontal.distance(Vec2::new(heading.cos(), heading.sin())) < 1e-4);
+            for side in [-1.0, 1.0] {
+                let contact = rotation * Vec3::new(0.0, -9.1, side * 9.856);
+                let point = agent.position + Vec2::new(contact.x, -contact.z);
+                let ground =
+                    sample_height_world(&snapshot.terrain_height, point, TERRAIN_HEIGHT_SCALE);
+                assert!(
+                    (translation.y + contact.y - ground).abs() < 0.01,
+                    "wheel must meet the planar surface at heading {heading}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn creature_body_and_wheel_vertices_clear_uneven_terrain() {
+        let mut snapshot = sample_world_snapshot();
+        snapshot.world_size = Vec2::splat(300.0);
+        snapshot.agent_radius = 10.0;
+        snapshot.terrain_height.dims = UVec2::new(4, 4);
+        snapshot.terrain_height.cell_size = 100;
+        snapshot.terrain_height.elevation = vec![
+            0.1, 0.2, 0.1, 0.2, 0.3, 0.6, 0.2, 0.4, 0.1, 0.4, 0.8, 0.3, 0.2, 0.1, 0.4, 0.2,
+        ];
+        let body = Mesh::from(AGENT_BODY_CAPSULE);
+        let wheel = Mesh::from(Torus::new(0.3, 0.6));
+        let vertices = |mesh: &Mesh| match mesh.attribute(Mesh::ATTRIBUTE_POSITION).unwrap() {
+            VertexAttributeValues::Float32x3(values) => values.clone(),
+            _ => panic!("expected 3D mesh vertices"),
+        };
+        let body_vertices = vertices(&body);
+        let wheel_vertices = vertices(&wheel);
+        let body_transform = Transform {
+            rotation: Quat::from_rotation_z(std::f32::consts::FRAC_PI_2),
+            scale: Vec3::new(17.6, 23.5 / 2.6, 17.6) * (1.0 + BODY_IDLE_AMPLITUDE),
+            ..default()
+        };
+        let mut agent = sample_agent_visual();
+        agent.spike_length = 0.0;
+        let coordinates = [45.0, 95.0, 100.0, 105.0, 150.0, 195.0, 200.0, 205.0, 255.0];
+        for position in coordinates
+            .into_iter()
+            .flat_map(|x| coordinates.into_iter().map(move |y| Vec2::new(x, y)))
+        {
+            agent.position = position;
+            for heading in [0.0, 0.8, -1.7, 2.4] {
+                agent.heading = heading;
+                let (root, rotation) = agent_surface_pose(&snapshot, &agent);
+                let parts = std::iter::once((&body_vertices, body_transform)).chain(
+                    [-1.0, 1.0].map(|side| {
+                        (
+                            &wheel_vertices,
+                            Transform {
+                                translation: Vec3::new(0.0, -4.6, side * 9.856),
+                                rotation: Quat::from_rotation_x(std::f32::consts::FRAC_PI_2),
+                                scale: Vec3::new(7.5, 4.0, 7.5),
+                            },
+                        )
+                    }),
+                );
+                for (points, local) in parts {
+                    for point in points {
+                        let offset = rotation * local.transform_point(Vec3::from_array(*point));
+                        let ground_position = position + Vec2::new(offset.x, -offset.z);
+                        let ground = sample_height_world(
+                            &snapshot.terrain_height,
+                            ground_position,
+                            TERRAIN_HEIGHT_SCALE,
+                        );
+                        assert!(
+                            root.y + offset.y >= ground - 0.01,
+                            "mesh vertex intersects terrain at {position:?}, heading {heading}, depth {}",
+                            ground - (root.y + offset.y)
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -9726,8 +9859,8 @@ fn spawn_agent_entity(
     materials: &mut Assets<StandardMaterial>,
     palette: ColorPaletteMode,
 ) -> AgentRecord {
-    let root_transform = Transform::from_translation(agent_translation(snapshot, agent))
-        .with_rotation(Quat::from_rotation_y(agent.heading));
+    let (translation, rotation) = agent_surface_pose(snapshot, agent);
+    let root_transform = Transform::from_translation(translation).with_rotation(rotation);
     let target = AgentPoseTarget {
         translation: root_transform.translation,
         rotation: root_transform.rotation,
@@ -9737,6 +9870,7 @@ fn spawn_agent_entity(
         .spawn((
             root_transform,
             target,
+            agent_ground_footprint(snapshot, agent),
             AgentDisplayPose {
                 translation: target.translation,
                 rotation: target.rotation,
@@ -10028,10 +10162,10 @@ fn apply_agent_visuals(
     use std::f32::consts::FRAC_PI_2;
 
     let visuals = canonical_agent_visual_params(agent);
-    let translation = agent_translation(snapshot, agent);
-    let rotation = Quat::from_rotation_y(agent.heading);
+    let (translation, rotation) = agent_surface_pose(snapshot, agent);
     commands.entity(record.root).insert((
         Transform::from_translation(translation).with_rotation(rotation),
+        agent_ground_footprint(snapshot, agent),
         AgentPoseTarget {
             translation,
             rotation,
@@ -10085,11 +10219,14 @@ fn apply_agent_visuals(
     update_part_colors(materials, &record.stripe, stripe_color, stripe_emissive);
 
     let wheel_offset = body_radius * 1.12;
-    let wheel_vertical = -body_radius * 0.38;
+    // Torus lies in local XZ before the quarter-turn. Equal X/Z scales keep
+    // the visible wheel circular, and place its lowest point at the support
+    // plane used by the terrain footprint.
+    let wheel_vertical = -scale_factor * 0.46;
     let wheel_scale = Vec3::new(
         (scale_factor * 0.75).max(0.05),
-        (scale_factor * 0.75).max(0.05),
         (scale_factor * 0.4).max(0.05),
+        (scale_factor * 0.75).max(0.05),
     );
     let left_wheel_transform = Transform {
         translation: Vec3::new(0.0, wheel_vertical, wheel_offset),
@@ -10467,20 +10604,182 @@ fn sync_agents(
     }
 }
 
-fn agent_translation(snapshot: &WorldSnapshot, agent: &AgentVisual) -> Vec3 {
+fn agent_ground_footprint(snapshot: &WorldSnapshot, agent: &AgentVisual) -> AgentGroundFootprint {
+    AgentGroundFootprint {
+        radius: snapshot.agent_radius.clamp(0.2, 1024.0),
+        spike_extension: agent.spike_length.max(0.0),
+    }
+}
+
+/// Orient the model's up axis to a locally averaged surface normal, while
+/// retaining the simulation heading when projected onto the horizontal plane.
+fn terrain_agent_rotation(
+    terrain: &TerrainHeightSnapshot,
+    position: Vec2,
+    heading: f32,
+    radius: f32,
+) -> Quat {
+    let distance = (radius * 0.5).max(1.0);
+    let dx = (sample_height_world(terrain, position + Vec2::X * distance, TERRAIN_HEIGHT_SCALE)
+        - sample_height_world(terrain, position - Vec2::X * distance, TERRAIN_HEIGHT_SCALE))
+        / (2.0 * distance);
+    let dy = (sample_height_world(terrain, position + Vec2::Y * distance, TERRAIN_HEIGHT_SCALE)
+        - sample_height_world(terrain, position - Vec2::Y * distance, TERRAIN_HEIGHT_SCALE))
+        / (2.0 * distance);
+    let (sin, cos) = heading.sin_cos();
+    let forward = Vec3::new(cos, dx * cos + dy * sin, -sin).normalize_or_zero();
+    let surface_up = Vec3::new(-dx, 1.0, dy).normalize_or_zero();
+    let right = forward.cross(surface_up).normalize_or_zero();
+    let up = right.cross(forward).normalize_or_zero();
+    if !forward.is_finite() || !up.is_finite() || right.length_squared() < 0.5 {
+        return Quat::from_rotation_y(heading);
+    }
+    Quat::from_mat3(&Mat3::from_cols(forward, up, right))
+}
+
+struct GroundMeshSamples {
+    body: Vec<Vec3>,
+    wheel: Vec<Vec3>,
+    spike: Vec<Vec3>,
+}
+
+fn ground_mesh_samples() -> &'static GroundMeshSamples {
+    static SAMPLES: std::sync::OnceLock<GroundMeshSamples> = std::sync::OnceLock::new();
+    SAMPLES.get_or_init(|| {
+        fn positions(mesh: Mesh) -> Vec<Vec3> {
+            match mesh.attribute(Mesh::ATTRIBUTE_POSITION) {
+                Some(bevy::mesh::VertexAttributeValues::Float32x3(values)) => {
+                    values.iter().copied().map(Vec3::from_array).collect()
+                }
+                _ => panic!("built-in creature mesh must have 3D positions"),
+            }
+        }
+        let body_transform = Transform {
+            rotation: Quat::from_rotation_z(std::f32::consts::FRAC_PI_2),
+            scale: Vec3::new(1.76, 2.35 / 2.6, 1.76) * (1.0 + BODY_IDLE_AMPLITUDE),
+            ..default()
+        };
+        let wheel_transform = Transform {
+            rotation: Quat::from_rotation_x(std::f32::consts::FRAC_PI_2),
+            scale: Vec3::new(0.75, 0.4, 0.75),
+            ..default()
+        };
+        GroundMeshSamples {
+            body: positions(Mesh::from(AGENT_BODY_CAPSULE))
+                .into_iter()
+                .map(|point| body_transform.transform_point(point))
+                .collect(),
+            wheel: positions(Mesh::from(Torus::new(0.3, 0.6)))
+                .into_iter()
+                .map(|point| wheel_transform.transform_point(point))
+                .collect(),
+            spike: positions(Mesh::from(Cone {
+                radius: 0.45,
+                height: 1.0,
+            })),
+        }
+    })
+}
+
+/// Height needed to keep sampled underside and wheel contacts above the
+/// rendered heightfield. The finite support set is deliberately bounded; it
+/// is not a proof against every peak between samples.
+fn terrain_footprint_height(
+    terrain: &TerrainHeightSnapshot,
+    position: Vec2,
+    rotation: Quat,
+    footprint: AgentGroundFootprint,
+) -> f32 {
+    let radius = footprint.radius;
+    let mut required = f32::NEG_INFINITY;
+    let mut include = |local: Vec3| {
+        let offset = rotation * local;
+        let sample = position + Vec2::new(offset.x, -offset.z);
+        let height = sample_height_world(terrain, sample, TERRAIN_HEIGHT_SCALE) - offset.y;
+        required = required.max(height);
+    };
+    // Sample the lower capsule surface, including the rounded ends. Its
+    // idle breathing can enlarge the body by 0.8%, so reserve that clearance.
+    const CYLINDER_HALF: f32 = 2.35 * 0.8 / 2.6;
+    const CAP_LENGTH: f32 = 2.35 * 0.5 - CYLINDER_HALF;
+    for x in [
+        -1.10_f32, -0.95, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75, 0.95, 1.10,
+    ] {
+        let cap = ((x.abs() - CYLINDER_HALF).max(0.0) / CAP_LENGTH).min(1.0);
+        let cross_radius = 0.88 * (1.0 - cap * cap).sqrt() * (1.0 + BODY_IDLE_AMPLITUDE);
+        for fraction in [-0.8_f32, -0.4, 0.0, 0.4, 0.8] {
+            let z = cross_radius * fraction;
+            let y = -(cross_radius * cross_radius - z * z).max(0.0).sqrt() - 0.02;
+            include(Vec3::new(x * radius, y * radius, z * radius));
+        }
+    }
+    // Sample the lower arc and side thickness of both wheels.
+    for side in [-1.0, 1.0] {
+        for x in [-0.36_f32, -0.24, -0.12, 0.0, 0.12, 0.24, 0.36] {
+            let y = -0.46 - (0.45_f32.powi(2) - x * x).max(0.0).sqrt();
+            for thickness in [-0.06, 0.0, 0.06] {
+                include(Vec3::new(
+                    x * radius,
+                    y * radius,
+                    (side * 0.9856 + thickness) * radius,
+                ));
+            }
+        }
+    }
+    // Use the exact built-in mesh vertices as well as the analytic support
+    // samples. A terrain crease can pass between the latter.
+    let meshes = ground_mesh_samples();
+    for point in &meshes.body {
+        include(*point * radius);
+    }
+    for side in [-1.0, 1.0] {
+        let center = Vec3::new(0.0, -0.46, side * 0.9856);
+        for point in &meshes.wheel {
+            include((*point + center) * radius);
+        }
+    }
+    // The cone extends forward from the nose; sample its lower edge as well.
+    let spike = 0.65 * radius + footprint.spike_extension;
+    for (fraction, lower) in [(0.0, -0.156), (0.5, -0.048), (1.0, 0.06)] {
+        include(Vec3::new(
+            1.645 * radius + spike * fraction,
+            lower * radius,
+            0.0,
+        ));
+    }
+    let spike_transform = Transform {
+        translation: Vec3::new(1.645 * radius + spike * 0.5, 0.06 * radius, 0.0),
+        rotation: Quat::from_rotation_z(-std::f32::consts::FRAC_PI_2),
+        scale: Vec3::new(0.48 * radius, spike.max(0.06), 0.48 * radius),
+    };
+    for point in &meshes.spike {
+        include(spike_transform.transform_point(*point));
+    }
+    required
+}
+
+fn agent_surface_pose(snapshot: &WorldSnapshot, agent: &AgentVisual) -> (Vec3, Quat) {
     let half = snapshot.world_size * 0.5;
-    let terrain_height = sample_height_world(
+    let footprint = agent_ground_footprint(snapshot, agent);
+    let rotation = terrain_agent_rotation(
         &snapshot.terrain_height,
         agent.position,
-        TERRAIN_HEIGHT_SCALE,
+        agent.heading,
+        footprint.radius,
+    );
+    let ground_height = terrain_footprint_height(
+        &snapshot.terrain_height,
+        agent.position,
+        rotation,
+        footprint,
     );
     let x = agent.position.x - half.x;
     let z = half.y - agent.position.y;
-    Vec3::new(
-        x,
-        terrain_height + snapshot.agent_radius * AGENT_GROUND_OFFSET_FACTOR,
-        z,
-    )
+    (Vec3::new(x, ground_height, z), rotation)
+}
+
+fn agent_translation(snapshot: &WorldSnapshot, agent: &AgentVisual) -> Vec3 {
+    agent_surface_pose(snapshot, agent).0
 }
 #[cfg(test)]
 fn terrain_kind_color(kind: TerrainKind) -> [f32; 3] {
@@ -12141,6 +12440,65 @@ mod tests {
     }
 
     #[test]
+    fn interpolated_agent_stays_above_a_ridge_between_snapshot_positions() {
+        let world = WorldState::new(ScriptBotsConfig::default()).expect("world init");
+        let mut snapshot = WorldSnapshot::from_world(&world).expect("snapshot");
+        snapshot.world_size = Vec2::splat(300.0);
+        snapshot.terrain_height.dims = UVec2::new(3, 3);
+        snapshot.terrain_height.cell_size = 100;
+        snapshot.terrain_height.elevation = vec![0.0, 0.8, 0.0, 0.0, 0.8, 0.0, 0.0, 0.8, 0.0];
+        let footprint = AgentGroundFootprint {
+            radius: 10.0,
+            spike_extension: 0.0,
+        };
+        let start = AgentPoseTarget {
+            translation: Vec3::new(-100.0, 81.1, 0.0),
+            rotation: Quat::IDENTITY,
+            tick: 1,
+        };
+        let target = AgentPoseTarget {
+            translation: Vec3::new(0.0, 81.1, 0.0),
+            tick: 2,
+            ..start
+        };
+        let mut app = App::new();
+        let mut time = Time::<()>::default();
+        time.advance_by(Duration::from_secs_f32(
+            std::f32::consts::LN_2 / AGENT_POSE_RESPONSE,
+        ));
+        app.insert_resource(time)
+            .insert_resource(SnapshotState {
+                world_size: snapshot.world_size,
+                latest: Some(snapshot),
+                ..default()
+            })
+            .add_systems(Update, smooth_agent_poses);
+        let entity = app
+            .world_mut()
+            .spawn((
+                target,
+                AgentDisplayPose {
+                    translation: start.translation,
+                    rotation: start.rotation,
+                    previous_target: start,
+                },
+                footprint,
+                Transform::default(),
+            ))
+            .id();
+        app.update();
+        let transform = app.world().entity(entity).get::<Transform>().unwrap();
+        assert!(
+            (transform.translation.x + 50.0).abs() < 0.01,
+            "halfway over ridge"
+        );
+        assert!(
+            transform.translation.y > 140.0,
+            "interpolation must follow the ridge instead of cutting through it"
+        );
+    }
+
+    #[test]
     fn agent_pose_discontinuities_snap_and_picking_uses_displayed_pose() {
         let mut app = App::new();
         app.insert_resource(Time::<()>::default());
@@ -13328,7 +13686,7 @@ mod tests {
             assert!(
                 transform
                     .rotation
-                    .angle_between(Quat::from_rotation_y(agent.heading))
+                    .angle_between(agent_surface_pose(snapshot, agent).1)
                     < 0.001
             );
         }
