@@ -2,6 +2,42 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Runtime reliability contribution (2026-11-04):**
+[Source implemented; execution validation pending — Codex; `bd-16g.15.3`,
+`bd-2z0.5.11`]
+
+Automatic GPU sensing now certifies the initialized adapter independently of the
+preliminary probe and retains that adapter's evidence. Uncertified initialized
+devices fall back to CPU even when approximate sensing was permitted. Source
+`24a9be9756588561a1540db94fb55cba930b70ef` adds four selection-control tests;
+they do not establish hardware parity.
+
+Control-runtime shutdown now closes experiment admission, cancels all active
+batches, and joins every retained worker before returning from shutdown or
+reporting a successful stop. Runtime drop, startup errors and control-thread
+unwinding use the same cleanup; early failure notifications remain immediate.
+A prior worker panic is observed before resume clears diagnostics or reserves
+capacity; one failed join does not skip sibling cleanup. Cancellation preserves
+the runner's existing durable continuation cuts. Joins wait for the current tick
+and filesystem work; no hard shutdown-time bound is claimed.
+
+Added regressions cover real experiment progress before explicit shutdown/drop,
+retained-handle create/resume refusal, exact creation retry, unchanged stopped
+artifacts, injected worker panic with sibling cleanup, registry poison, prior
+panic on resume, disabled-surface failure reporting and transport error mapping.
+These are source additions, not observed passing executions.
+
+Validation remains open: real DSR 0.2.3 refused host-capacity admission before
+starting its backend because this environment's PID namespace did not match
+`/proc`. Authentic isolated namespace setup was unavailable. Workspace access
+briefly recovered after an outage, but a fresh selector probe reproduced the
+same refusal before the workspace became unavailable again. No compiler,
+formatter, Clippy, UBS, runtime test or GPU proof is claimed for this contribution.
+The GPU diff passed the earlier whitespace check and its recovered GitHub blob
+matches the reviewed local blob.
+Source review also checked the experiment registry/artifact/capacity lock order.
+Original task owners, status, dependencies and full acceptance remain unchanged.
+
 **Offline narrative reconstruction and smooth presentation (2026-11-03):**
 [Currently In Progress — Codex; `bd-16g.2.9`, `bd-2z0.14.1.9.1`]
 Connect the persisted canonical detector inputs to an independently reconstructed

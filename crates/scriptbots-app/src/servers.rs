@@ -809,34 +809,53 @@ impl ControlRuntime {
         // and the REST state hold THE SAME slot rather than two empty ones.
         let presented_frame = reservation.config.presented_frame.clone();
         let control_handle = Some(handle.clone());
+        let experiment_services = Arc::clone(handle.data_services());
 
         let thread = thread::Builder::new()
             .name("scriptbots-control".into())
             .spawn(move || -> Result<()> {
-                let result = match tokio::runtime::Builder::new_multi_thread()
-                    .thread_name("scriptbots-control-rt")
-                    // Handlers open StorageReaders, which run FrankenSQLite futures synchronously
-                    // on the calling thread; in debug builds that overflowed tokio's default 2 MiB
-                    // and aborted the whole server on the first narrative search (bd-6sgk). Same
-                    // budget as the storage worker. Also applies to spawn_blocking threads.
-                    .thread_stack_size(CONTROL_RUNTIME_THREAD_STACK_BYTES)
-                    .enable_all()
-                    .build()
-                {
-                    Ok(runtime) => runtime.block_on(run_control_servers(
-                        handle,
-                        reservation,
-                        shutdown_for_thread,
-                        shutdown_rx,
-                        startup_tx,
-                        status_for_thread.clone(),
-                        initial_resume,
-                    )),
-                    Err(source) => {
-                        let error =
-                            anyhow!("failed to build Tokio runtime for control servers: {source}");
-                        let _ = startup_tx.send(ControlStartupSignal::Failed(format!("{error:#}")));
-                        Err(error)
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    match tokio::runtime::Builder::new_multi_thread()
+                        .thread_name("scriptbots-control-rt")
+                        // Handlers open StorageReaders, which run FrankenSQLite futures synchronously
+                        // on the calling thread; in debug builds that overflowed tokio's default 2 MiB
+                        // and aborted the whole server on the first narrative search (bd-6sgk). Same
+                        // budget as the storage worker. Also applies to spawn_blocking threads.
+                        .thread_stack_size(CONTROL_RUNTIME_THREAD_STACK_BYTES)
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(runtime) => runtime.block_on(run_control_servers(
+                            handle,
+                            reservation,
+                            shutdown_for_thread,
+                            shutdown_rx,
+                            startup_tx,
+                            status_for_thread.clone(),
+                            initial_resume,
+                        )),
+                        Err(source) => {
+                            let error = anyhow!(
+                                "failed to build Tokio runtime for control servers: {source}"
+                            );
+                            let _ = startup_tx
+                                .send(ControlStartupSignal::Failed(format!("{error:#}")));
+                            Err(error)
+                        }
+                    }
+                }))
+                .unwrap_or_else(|panic| Err(anyhow!("control runtime panicked: {panic:?}")));
+                // Batch workers are native threads, not Tokio children. Drain them
+                // on every exit before publishing the final result, including
+                // startup failures, unwinding, and the Drop/reaper paths.
+                let cleanup = experiment_services
+                    .shutdown_experiments()
+                    .context("experiment worker shutdown failed");
+                let result = match (result, cleanup) {
+                    (Ok(()), cleanup) => cleanup,
+                    (Err(error), Ok(())) => Err(error),
+                    (Err(error), Err(cleanup)) => {
+                        Err(error).context(format!("experiment cleanup also failed: {cleanup:#}"))
                     }
                 };
                 publish_control_runtime_result(&status_for_thread, &result);
@@ -943,7 +962,7 @@ fn publish_control_runtime_result(
     status: &watch::Sender<ControlRuntimeStatus>,
     result: &Result<()>,
 ) {
-    if matches!(*status.borrow(), ControlRuntimeStatus::Disabled) {
+    if result.is_ok() && matches!(*status.borrow(), ControlRuntimeStatus::Disabled) {
         return;
     }
     let final_status = match result {
@@ -1654,6 +1673,10 @@ fn require_json_content_type(headers: &HeaderMap, bytes: &[u8]) -> Result<(), Ap
 impl From<ControlError> for AppError {
     fn from(err: ControlError) -> Self {
         match err {
+            ControlError::ExperimentShuttingDown => {
+                Self::service_unavailable(ControlError::ExperimentShuttingDown.to_string())
+            }
+            ControlError::ExperimentWorkerFailed(message) => Self::internal(message),
             capacity @ ControlError::ExperimentCapacity(_) => {
                 Self::service_unavailable(capacity.to_string())
             }
@@ -4658,6 +4681,13 @@ where
 fn map_control_error(err: ControlError) -> McpError {
     tracing::warn!(error = %err, "MCP control operation failed");
     match err {
+        ControlError::ExperimentShuttingDown => McpError::new(
+            McpErrorCode::ToolExecutionError,
+            ControlError::ExperimentShuttingDown.to_string(),
+        ),
+        ControlError::ExperimentWorkerFailed(message) => {
+            McpError::new(McpErrorCode::ToolExecutionError, message)
+        }
         capacity @ ControlError::ExperimentCapacity(_) => {
             // Capacity is a retryable tool execution failure. FastMCP returns
             // its actionable text with isError=true, while InternalError would
@@ -5289,6 +5319,26 @@ mod tests {
         assert!(format!("{error:#}").contains("initial resume admission"));
         let listener = TcpListener::bind(address).expect("failed launch releases reservation");
         drop(listener);
+    }
+
+    #[test]
+    fn experiment_shutdown_failure_is_visible_for_disabled_control_surfaces() {
+        let (status, observed) = watch::channel(ControlRuntimeStatus::Disabled);
+        publish_control_runtime_result(&status, &Err(anyhow!("experiment worker failed")));
+        assert!(matches!(
+            &*observed.borrow(),
+            ControlRuntimeStatus::Failed(reason) if reason.contains("experiment worker failed")
+        ));
+    }
+
+    #[test]
+    fn experiment_shutdown_refusal_maps_to_service_unavailable() {
+        let error = AppError::from(ControlError::ExperimentShuttingDown);
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(error.message.contains("resume retained work"));
+        let mcp = map_control_error(ControlError::ExperimentShuttingDown);
+        assert_eq!(mcp.code, McpErrorCode::ToolExecutionError);
+        assert!(mcp.message.contains("resume retained work"));
     }
 
     #[test]

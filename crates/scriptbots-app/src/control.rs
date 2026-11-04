@@ -182,6 +182,10 @@ pub struct KnobUpdate {
 pub enum ControlError {
     #[error("experiment execution capacity exhausted: {0}")]
     ExperimentCapacity(String),
+    #[error("experiment service is shutting down; resume retained work in a new control runtime")]
+    ExperimentShuttingDown,
+    #[error("experiment worker failed: {0}")]
+    ExperimentWorkerFailed(String),
     #[error("checkpoint retention exhausted: {0}")]
     CheckpointCapacity(String),
     #[error("checkpoint retention unavailable: {0}")]
@@ -1076,6 +1080,8 @@ struct ExperimentJob {
     created_at_utc: String,
     artifact_root: PathBuf,
     artifact_generation: Mutex<Option<u64>>,
+    /// Retain ownership until restart or control-runtime shutdown joins this worker.
+    worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl std::fmt::Debug for ExperimentJob {
@@ -1088,6 +1094,21 @@ impl std::fmt::Debug for ExperimentJob {
 }
 
 impl ExperimentJob {
+    fn join_worker(&mut self) -> Result<(), String> {
+        if let Some(worker) = self.worker.take()
+            && let Err(panic) = worker.join()
+        {
+            let message = format!(
+                "experiment '{}' worker panicked: {panic:?}",
+                self.runner.experiment_id
+            );
+            *self.last_error.lock().unwrap_or_else(PoisonError::into_inner) =
+                Some(message.clone());
+            return Err(message);
+        }
+        Ok(())
+    }
+
     fn recover_artifacts(&self, services: &DataServices) -> Result<(), ControlError> {
         let status = self
             .runner
@@ -1111,11 +1132,13 @@ impl ExperimentJob {
     /// Start (or restart) the batch worker. `running` is raised before the
     /// thread exists so a status read can never observe a false idle gap.
     fn start(
-        &self,
+        &mut self,
         services: std::sync::Arc<DataServices>,
         mut reservation: ExperimentExecutionReservation,
     ) {
         use std::sync::atomic::Ordering;
+        // New jobs have no worker; resume reaps the previous worker before admission.
+        debug_assert!(self.worker.is_none());
         self.running.store(true, Ordering::Release);
         reservation.running = Some(std::sync::Arc::clone(&self.running));
         let runner = std::sync::Arc::clone(&self.runner);
@@ -1144,11 +1167,14 @@ impl ExperimentJob {
                     }
                 }
             });
-        if let Err(error) = spawned {
-            if let Ok(mut slot) = self.last_error.lock() {
-                *slot = Some(format!("cannot spawn experiment worker: {error}"));
+        match spawned {
+            Ok(worker) => self.worker = Some(worker),
+            Err(error) => {
+                if let Ok(mut slot) = self.last_error.lock() {
+                    *slot = Some(format!("cannot spawn experiment worker: {error}"));
+                }
+                self.running.store(false, Ordering::Release);
             }
-            self.running.store(false, Ordering::Release);
         }
     }
 
@@ -1233,6 +1259,8 @@ impl ExperimentJob {
 #[derive(Debug)]
 pub struct DataServices {
     experiments: Mutex<BTreeMap<String, ExperimentJob>>,
+    /// Once closed, retained handles may inspect work but cannot start or resume it.
+    experiment_shutdown_requested: std::sync::atomic::AtomicBool,
     execution_capacity: Arc<Mutex<ExperimentExecutionCapacityDto>>,
     checkpoints: Mutex<BTreeMap<String, CheckpointMetadataDto>>,
     artifacts: Mutex<BTreeMap<String, RetainedArtifact>>,
@@ -1437,6 +1465,7 @@ impl DataServices {
         };
         Self {
             experiments: Mutex::new(BTreeMap::new()),
+            experiment_shutdown_requested: std::sync::atomic::AtomicBool::new(false),
             execution_capacity: Arc::new(Mutex::new(ExperimentExecutionCapacityDto {
                 max_run_slots: crate::experiment_runner::MAX_CONCURRENT_RUNS,
                 reserved_run_slots: 0,
@@ -1572,6 +1601,7 @@ impl DataServices {
                 created_at_utc: definition.created_at_utc,
                 artifact_root: root,
                 artifact_generation: Mutex::new(None),
+                worker: None,
             },
         );
         Ok(())
@@ -1788,6 +1818,12 @@ impl DataServices {
         experiment_id: &str,
         run_slots: usize,
     ) -> Result<ExperimentExecutionReservation, ControlError> {
+        if self
+            .experiment_shutdown_requested
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(ControlError::ExperimentShuttingDown);
+        }
         if run_slots == 0 {
             return Err(ControlError::BadRequest(
                 "experiment execution must reserve at least one run slot".to_owned(),
@@ -1827,6 +1863,40 @@ impl DataServices {
             "experiment execution capacity reserved"
         );
         Ok(reservation)
+    }
+
+    /// Close experiment admission, cancel every active batch, and join all workers.
+    ///
+    /// The existing runner finishes its current durable tick before stopping.
+    /// This waits for that work and filesystem operations; it is not a hard
+    /// shutdown deadline. Retained continuation artifacts remain resumable by a
+    /// fresh service. The registry lock serializes admission and repeated shutdown
+    /// calls; workers never acquire it while finishing or publishing artifacts.
+    pub(crate) fn shutdown_experiments(&self) -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+        self.experiment_shutdown_requested.store(true, Ordering::Release);
+        let (mut jobs, poisoned) = match self.experiments.lock() {
+            Ok(jobs) => (jobs, false),
+            Err(error) => (error.into_inner(), true),
+        };
+        for job in jobs.values() {
+            job.cancel.store(true, Ordering::Release);
+        }
+        let mut failures = Vec::new();
+        if poisoned {
+            failures.push("experiment registry was poisoned before shutdown".to_owned());
+        }
+        for job in jobs.values_mut() {
+            if let Err(error) = job.join_worker() {
+                tracing::error!(%error, "experiment worker failed during shutdown");
+                failures.push(error);
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(failures.join("; ")))
+        }
     }
 }
 
@@ -2246,7 +2316,7 @@ impl ControlHandle {
             created_at_utc: secs.to_string(),
             request_identity: request_identity.clone(),
         };
-        let job = ExperimentJob {
+        let mut job = ExperimentJob {
             runner: std::sync::Arc::new(runner),
             state_file: output_dir.join("status.json"),
             cancel: std::sync::Arc::default(),
@@ -2255,6 +2325,7 @@ impl ControlHandle {
             created_at_utc: format!("{secs}"),
             artifact_root,
             artifact_generation: Mutex::new(None),
+            worker: None,
         };
         {
             let mut lock = self
@@ -2331,12 +2402,12 @@ impl ControlHandle {
         experiment_id: &str,
     ) -> Result<ExperimentBatchStatusDto, ControlError> {
         self.data_services.recover_experiment(experiment_id)?;
-        let lock = self
+        let mut lock = self
             .data_services
             .experiments
             .lock()
             .map_err(|_| ControlError::Lock)?;
-        let job = lock.get(experiment_id).ok_or_else(|| {
+        let job = lock.get_mut(experiment_id).ok_or_else(|| {
             ControlError::NotFound(format!("experiment '{experiment_id}' not found"))
         })?;
         let current = job.status_dto()?;
@@ -2365,6 +2436,10 @@ impl ControlHandle {
             .filter(|run| matches!(run.state.as_str(), "pending" | "running"))
             .count()
             .min(job.runner.max_concurrency);
+        // A cleared running flag can also mean unwind. Observe the old exit
+        // before clearing diagnostics, cancellation or reserving a new wave.
+        job.join_worker()
+            .map_err(ControlError::ExperimentWorkerFailed)?;
         let reservation = self
             .data_services
             .reserve_experiment_execution(experiment_id, run_slots)?;
@@ -4754,6 +4829,233 @@ pub(crate) mod tests {
         .persist(&directory)
         .unwrap();
         directory.join("definition.json")
+    }
+
+    #[test]
+    fn control_runtime_shutdown_and_drop_join_active_experiments() {
+        use std::time::{Duration, Instant};
+
+        for explicit_shutdown in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let (_unused_handle, host) = handle();
+            let (runtime, _submit) = crate::ControlRuntime::launch(
+                host.port.clone(),
+                crate::ControlServerConfig {
+                    rest_enabled: false,
+                    mcp_transport: crate::servers::McpTransportConfig::Disabled,
+                    ..crate::ControlServerConfig::default()
+                },
+            )
+            .unwrap();
+            let retained = runtime
+                .control_handle()
+                .unwrap()
+                .with_artifacts_dir(root.path().to_path_buf())
+                .unwrap();
+            let mut request = experiment_creation_request();
+            request.experiment_id = Some("shutdown-active".into());
+            request.idempotency_key = Some("shutdown-active-key".into());
+            request.seeds = vec![7, 9];
+            request.max_concurrency = Some(2);
+            request.ticks_per_run = Some(10_000);
+            let created = retained.create_experiment(request.clone()).unwrap();
+            let directory = root.path().join("experiments/shutdown-active");
+            let mut cuts = created
+                .runs
+                .iter()
+                .map(|run| {
+                    (
+                        directory.join(format!("{}.checkpoint", run.run_id)),
+                        std::collections::BTreeSet::new(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while cuts.iter().any(|(_, seen)| seen.len() < 2) {
+                for (path, seen) in &mut cuts {
+                    if let Ok(bytes) = fs::read(path)
+                        && let Some(end) = bytes.len().checked_sub(blake3::OUT_LEN)
+                        && blake3::hash(&bytes[..end]).as_bytes() == &bytes[end..]
+                    {
+                        seen.insert(compute_blake3(&bytes));
+                    }
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "both experiment owners must advance"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+
+            if explicit_shutdown {
+                runtime.shutdown().unwrap();
+            } else {
+                drop(runtime);
+            }
+            let stopped = retained.get_experiment("shutdown-active").unwrap();
+            assert_eq!(stopped.status, "cancelled");
+            // Cancelled records retain the resumable state; progress is in the
+            // distinct, checksummed continuation cuts observed above.
+            assert!(
+                stopped
+                    .runs
+                    .iter()
+                    .all(|run| run.state == "running" && run.total_ticks == 0)
+            );
+            let capacity = retained
+                .list_experiments(None, None)
+                .unwrap()
+                .execution_capacity;
+            assert_eq!(capacity.reserved_run_slots, 0);
+            assert_eq!(capacity.reserved_batches, 0);
+            assert!(
+                retained
+                    .data_services
+                    .experiments
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .all(|job| job.worker.is_none())
+            );
+
+            let saved_status = fs::read(directory.join("status.json")).unwrap();
+            let saved_cuts = cuts
+                .iter()
+                .map(|(path, _)| (path.clone(), fs::read(path).unwrap()))
+                .collect::<Vec<_>>();
+            assert!(matches!(
+                retained.resume_experiment("shutdown-active"),
+                Err(ControlError::ExperimentShuttingDown)
+            ));
+            // An exact creation retry remains a read of the admitted identity.
+            assert_eq!(
+                retained
+                    .create_experiment(request.clone())
+                    .unwrap()
+                    .experiment_id,
+                created.experiment_id
+            );
+            request.experiment_id = Some("after-shutdown".into());
+            request.idempotency_key = Some("after-shutdown-key".into());
+            assert!(matches!(
+                retained.create_experiment(request),
+                Err(ControlError::ExperimentShuttingDown)
+            ));
+            assert!(!root.path().join("experiments/after-shutdown").exists());
+            retained.data_services.shutdown_experiments().unwrap();
+            assert_eq!(fs::read(directory.join("status.json")).unwrap(), saved_status);
+            for (path, bytes) in saved_cuts {
+                assert_eq!(fs::read(path).unwrap(), bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn experiment_shutdown_joins_siblings_after_an_injected_worker_panic() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+
+        let root = tempfile::tempdir().unwrap();
+        let services = DataServices::new(root.path().to_path_buf());
+        for id in ["a-panic", "z-sibling"] {
+            pending_catalog_definition(root.path(), id);
+            services.recover_experiment(id).unwrap();
+        }
+        let sibling_finished = Arc::new(AtomicBool::new(false));
+        let observed_all_cancellations = Arc::new(AtomicUsize::new(0));
+        {
+            let mut jobs = services.experiments.lock().unwrap();
+            let cancellation = jobs
+                .values()
+                .map(|job| Arc::clone(&job.cancel))
+                .collect::<Vec<_>>();
+            for (index, job) in jobs.values_mut().enumerate() {
+                let flags = cancellation.clone();
+                let finished = Arc::clone(&sibling_finished);
+                let observed = Arc::clone(&observed_all_cancellations);
+                let mut reservation = services
+                    .reserve_experiment_execution(&job.runner.experiment_id, 1)
+                    .unwrap();
+                job.running.store(true, Ordering::Release);
+                reservation.running = Some(Arc::clone(&job.running));
+                // Inject thread lifecycle behavior only; the test above runs real science.
+                job.worker = Some(std::thread::spawn(move || {
+                    let _reservation = reservation;
+                    let deadline = Instant::now() + Duration::from_secs(30);
+                    while !flags.iter().all(|flag| flag.load(Ordering::Acquire)) {
+                        assert!(
+                            Instant::now() < deadline,
+                            "all jobs must be cancelled before joining"
+                        );
+                        std::thread::yield_now();
+                    }
+                    observed.fetch_add(1, Ordering::AcqRel);
+                    assert_ne!(index, 0, "injected experiment worker panic");
+                    finished.store(true, Ordering::Release);
+                }));
+            }
+        }
+        let error = services.shutdown_experiments().unwrap_err().to_string();
+        assert!(error.contains("a-panic"), "{error}");
+        assert!(sibling_finished.load(Ordering::Acquire));
+        assert_eq!(observed_all_cancellations.load(Ordering::Acquire), 2);
+        let jobs = services.experiments.lock().unwrap();
+        assert!(jobs.values().all(|job| job.worker.is_none()));
+        assert!(jobs.values().all(|job| !job.running.load(Ordering::Acquire)));
+        assert!(jobs["a-panic"].last_error.lock().unwrap().is_some());
+        drop(jobs);
+        let capacity = *services.execution_capacity.lock().unwrap();
+        assert_eq!(capacity.reserved_run_slots, 0);
+        assert_eq!(capacity.reserved_batches, 0);
+        assert!(matches!(
+            services.reserve_experiment_execution("new", 1),
+            Err(ControlError::ExperimentShuttingDown)
+        ));
+    }
+
+    #[test]
+    fn experiment_shutdown_reports_registry_poison() {
+        let root = tempfile::tempdir().unwrap();
+        let services = DataServices::new(root.path().to_path_buf());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _jobs = services.experiments.lock().unwrap();
+                panic!("injected registry-owner panic");
+            }))
+            .is_err()
+        );
+        let error = services.shutdown_experiments().unwrap_err().to_string();
+        assert!(error.contains("registry was poisoned"), "{error}");
+        assert!(matches!(
+            services.reserve_experiment_execution("new", 1),
+            Err(ControlError::ExperimentShuttingDown)
+        ));
+    }
+
+    #[test]
+    fn experiment_resume_reports_a_prior_worker_panic_before_admission() {
+        let root = tempfile::tempdir().unwrap();
+        let (handle, _host) = handle();
+        let handle = handle.with_artifacts_dir(root.path().to_path_buf()).unwrap();
+        pending_catalog_definition(root.path(), "failed-worker");
+        handle.data_services.recover_experiment("failed-worker").unwrap();
+        {
+            let mut jobs = handle.data_services.experiments.lock().unwrap();
+            jobs.get_mut("failed-worker").unwrap().worker = Some(std::thread::spawn(|| {
+                panic!("injected prior worker panic");
+            }));
+        }
+        assert!(matches!(
+            handle.resume_experiment("failed-worker"),
+            Err(ControlError::ExperimentWorkerFailed(message)) if message.contains("failed-worker")
+        ));
+        let capacity = *handle.data_services.execution_capacity.lock().unwrap();
+        assert_eq!(capacity.reserved_run_slots, 0);
+        assert_eq!(capacity.reserved_batches, 0);
+        assert!(!root.path().join("experiments/failed-worker/status.json").exists());
+        let jobs = handle.data_services.experiments.lock().unwrap();
+        assert!(jobs["failed-worker"].worker.is_none());
+        assert!(jobs["failed-worker"].last_error.lock().unwrap().is_some());
     }
 
     #[test]
