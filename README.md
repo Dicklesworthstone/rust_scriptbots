@@ -1086,6 +1086,25 @@ This is the schema migration for the narrative timeline; unrelated reports retai
 their existing versions. Both reports use the create-free finished-reader lease.
 For a multi-run database, select its canonical ID with `--run-id`.
 
+To reconstruct the narrative independently from the complete recorded detector
+inputs, use:
+
+```bash
+sb-analyze runs/example.sqlite run narrative-reconstruct --params limit=100 --json reconstruction.json --md reconstruction.md
+```
+
+`narrative-reconstruct` replays every input through the production detector in
+bounded pages, preserves the recorded cadence and history, and returns the newest
+events in canonical order. Its event counts cover the complete run, including
+events evicted from the live event ring. The default output limit is 1,024 and the
+maximum is 4,096; `limit=0` still validates and reconstructs the entire input stream.
+The JSON includes input provenance, coverage, output truncation and eviction counts.
+Missing or corrupt inputs are refused, so older databases without canonical detector
+inputs cannot use this report. Changes to detector interval, history capacity or
+event capacity during a run are also refused; unrelated authenticated configuration
+revisions are supported. The report does not use saved narrative outputs to supply
+its reconstructed events.
+
 ### Pipeline and maintenance
 
 - A persistence transaction either commits the entire accepted batch or rolls it back; a failed statement may not leave the connection in an active transaction.

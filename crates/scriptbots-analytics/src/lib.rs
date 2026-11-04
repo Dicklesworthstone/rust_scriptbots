@@ -24,10 +24,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::time::Instant;
 
+use scriptbots_core::narrative::{EventRecord, NarrativeInputRecordV1, NarrativeReplay};
 use scriptbots_core::{AgentUid, Tick};
 use scriptbots_storage::{
-    PersistedAgentObservation, PersistedInteraction, PersistedInteractionCapture, PersistedMetric,
-    PersistedRunEvent, PersistenceBatchId, StorageError, StorageReader,
+    NarrativeInputBindingV1, NarrativeInputStreamError, PersistedAgentObservation,
+    PersistedInteraction, PersistedInteractionCapture, PersistedMetric, PersistedRunEvent,
+    PersistenceBatchId, RunEventIdentity, StorageError, StorageReader,
 };
 use serde::Serialize;
 
@@ -128,6 +130,9 @@ const NARRATIVE_TIMELINE_MAX_LIMIT: usize = 4_096;
 
 /// Reserve one row of the bounded SQL page to observe narrative truncation.
 const NARRATIVE_TIMELINE_EVENT_LIMIT: usize = NARRATIVE_TIMELINE_MAX_LIMIT - 1;
+
+/// Detector inputs are traversed in bounded pages, independently of the output limit.
+const NARRATIVE_RECONSTRUCT_PAGE_SIZE: usize = 256;
 
 /// Stable schema identifier shared by reports and downstream behavior consumers.
 pub const PHENOTYPE_FEATURE_SCHEMA_ID_V1: &str = "scriptbots.phenotype-features.v1";
@@ -587,6 +592,17 @@ pub enum AnalyticsError {
     /// Graph construction, algorithm, or export error (bd-2z0.11.7).
     #[error("graph error: {0}")]
     Graph(String),
+    /// The canonical narrative detector refused a recorded input or policy.
+    #[error("narrative reconstruction error: {0}")]
+    NarrativeInput(#[from] scriptbots_core::narrative::NarrativeInputError),
+    /// The current replay kernel cannot reproduce a mid-run detector policy change.
+    #[error(
+        "narrative detector policy changed at tick {tick}; reconstruction requires constant narrative_interval, history_capacity, and narrative_capacity"
+    )]
+    NarrativePolicyChanged {
+        /// First input whose detector policy differs from the initial recorded policy.
+        tick: u64,
+    },
 }
 
 /// Read-only context handed to every report.
@@ -1580,6 +1596,7 @@ impl Registry {
             reports: vec![
                 Box::new(RunSummary),
                 Box::new(NarrativeTimeline),
+                Box::new(NarrativeReconstruct),
                 Box::new(ReplayTimeline),
                 Box::new(MetricSummary),
                 Box::new(MetricChangepoints),
@@ -2687,6 +2704,227 @@ impl Report for RunSummary {
         )?;
         log_report_stage("render", &render_started, output.row_count);
         Ok(output)
+    }
+}
+
+/// `narrative-reconstruct`: independently replay the complete persisted detector input stream.
+struct NarrativeReconstruct;
+
+#[derive(Debug, Serialize)]
+struct NarrativeReconstructionMachine {
+    input_binding: NarrativeInputBindingV1,
+    inputs_replayed: u64,
+    input_pages: u64,
+    events_reconstructed: u64,
+    event_counts_scope: &'static str,
+    event_counts: Vec<(String, u64)>,
+    events: Vec<EventRecord>,
+    truncated_to: Option<usize>,
+    history_inputs_evicted: u64,
+    detector_events_evicted: u64,
+}
+
+impl Report for NarrativeReconstruct {
+    fn name(&self) -> &'static str {
+        "narrative-reconstruct"
+    }
+
+    fn description(&self) -> &'static str {
+        "Independently reconstruct narrative events from complete persisted detector inputs"
+    }
+
+    fn run(&self, cx: &ReaderCtx, params: &ReportParams) -> Result<ReportOutput, AnalyticsError> {
+        let limit = timeline_limit(params, NARRATIVE_TIMELINE_MAX_LIMIT)?;
+        let read_started = Instant::now();
+        let machine = reconstruct_narrative(&cx.reader, limit)?;
+        log_report_stage("reconstruct", &read_started, machine.events.len());
+
+        let render_started = Instant::now();
+        let mut md = String::from("# Narrative reconstruction\n\n");
+        let binding = &machine.input_binding;
+        let _ = writeln!(md, "Run: `{}`\n", binding.run_id);
+        let _ = writeln!(
+            md,
+            "Replayed all {} detector inputs from tick {} through {} in {} bounded pages. The recorded policy uses an interval of {} ticks, {} history entries, and an event ring of {}.\n",
+            machine.inputs_replayed,
+            binding.first_tick,
+            binding.terminal_tick,
+            machine.input_pages,
+            binding.policy.narrative_interval,
+            binding.policy.history_capacity,
+            binding.policy.event_capacity,
+        );
+        let _ = writeln!(
+            md,
+            "Reconstructed {} events independently of persisted narrative output rows. Event counts cover the complete run.\n",
+            machine.events_reconstructed,
+        );
+        if machine.events_reconstructed == 0 {
+            let _ = writeln!(
+                md,
+                "_The complete recorded input stream produced no narrative events._"
+            );
+        } else if machine.events.is_empty() {
+            let _ = writeln!(
+                md,
+                "_Events were reconstructed; limit=0 requested an empty output window._"
+            );
+        } else {
+            let _ = writeln!(md, "| tick | kind | severity | metric | narrative |");
+            let _ = writeln!(md, "|---|---|---|---|---|");
+            for event in &machine.events {
+                let _ = writeln!(
+                    md,
+                    "| {} | {} | {:.3} | {} | {} |",
+                    event.tick.0,
+                    event.kind.as_str(),
+                    event.severity,
+                    timeline_markdown_cell(&event.metric),
+                    timeline_markdown_cell(&event.human_text),
+                );
+            }
+        }
+        if let Some(count) = machine.truncated_to {
+            let _ = writeln!(
+                md,
+                "\n_Showing the newest {count} events in canonical tick/kind/metric order; the output limit does not limit detector input coverage._"
+            );
+        }
+        let output = base_output(
+            self.name(),
+            cx,
+            machine.events.len(),
+            serde_json::to_value(&machine)?,
+            md,
+        )?;
+        log_report_stage("render", &render_started, output.row_count);
+        Ok(output)
+    }
+}
+
+fn reconstruct_narrative(
+    reader: &StorageReader,
+    limit: usize,
+) -> Result<NarrativeReconstructionMachine, AnalyticsError> {
+    // This finished-reader API validates the entire input stream before returning
+    // its first page. A missing stream is a scientific refusal, not a quiet run.
+    let mut page = reader.narrative_input_page_v1(None, NARRATIVE_RECONSTRUCT_PAGE_SIZE, 0)?;
+    let binding = page.binding.clone();
+    let first = page
+        .inputs
+        .first()
+        .ok_or(StorageError::NarrativeInputStream(
+            NarrativeInputStreamError::MissingEvidence {
+                first_offending_tick: binding.first_tick,
+            },
+        ))?;
+    let mut replay = NarrativeReplay::new(first.replay_policy()?)?;
+    let mut inputs_replayed = 0_u64;
+    let mut input_pages = 0_u64;
+    let mut events_reconstructed = 0_u64;
+    let mut counts = BTreeMap::new();
+    let mut events = BTreeMap::new();
+    loop {
+        input_pages = input_pages.saturating_add(1);
+        for record in page.inputs {
+            replay_narrative_record(&mut replay, record)?;
+            inputs_replayed = inputs_replayed.saturating_add(1);
+            // Drain each tick so complete-run counting neither depends on the
+            // production event-ring capacity nor accumulates an unbounded tail.
+            for event in replay.drain_pending_persistence() {
+                events_reconstructed = events_reconstructed.saturating_add(1);
+                *counts.entry(event.kind.as_str()).or_insert(0_u64) += 1;
+                events.insert(RunEventIdentity::from_record(&event), event);
+                if events.len() > limit {
+                    events.pop_first();
+                }
+            }
+        }
+        let Some(cursor) = page.next_after else {
+            break;
+        };
+        page = reader.narrative_input_page_v1(Some(&cursor), NARRATIVE_RECONSTRUCT_PAGE_SIZE, 0)?;
+    }
+    Ok(NarrativeReconstructionMachine {
+        input_binding: binding,
+        inputs_replayed,
+        input_pages,
+        events_reconstructed,
+        event_counts_scope: "complete_run",
+        event_counts: counts
+            .into_iter()
+            .map(|(kind, count)| (kind.to_owned(), count))
+            .collect(),
+        events: events.into_values().collect(),
+        truncated_to: (events_reconstructed > u64::try_from(limit).unwrap_or(u64::MAX))
+            .then_some(limit),
+        history_inputs_evicted: replay.dropped_inputs(),
+        detector_events_evicted: replay.dropped_events(),
+    })
+}
+
+fn replay_narrative_record(
+    replay: &mut NarrativeReplay,
+    record: NarrativeInputRecordV1,
+) -> Result<(), AnalyticsError> {
+    if record.replay_policy()? != replay.policy() {
+        // Resetting the detector here would silently lose its history and
+        // cooldown state. Unrelated authenticated config revisions are safe.
+        return Err(AnalyticsError::NarrativePolicyChanged {
+            tick: record.input.tick.0,
+        });
+    }
+    replay.push(record.input)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod narrative_reconstruction_tests {
+    use super::*;
+    use scriptbots_core::narrative::NarrativeInputV1;
+
+    #[test]
+    fn replay_refuses_policy_changes_without_losing_state() {
+        let original = NarrativeInputRecordV1 {
+            record_schema_version: 1,
+            input: NarrativeInputV1::new(Tick(1), 12, 1.0, 0).expect("valid input"),
+            config_revision: 0,
+            narrative_interval: 16,
+            history_capacity: 128,
+            event_capacity: 32,
+        };
+        let mut replay =
+            NarrativeReplay::new(original.replay_policy().expect("policy")).expect("replay");
+        replay_narrative_record(&mut replay, original).expect("first input");
+        let next = NarrativeInputRecordV1 {
+            input: NarrativeInputV1::new(Tick(2), 12, 1.0, 0).expect("valid input"),
+            config_revision: 1,
+            ..original
+        };
+        for changed in [
+            NarrativeInputRecordV1 {
+                narrative_interval: 8,
+                ..next
+            },
+            NarrativeInputRecordV1 {
+                history_capacity: 64,
+                ..next
+            },
+            NarrativeInputRecordV1 {
+                event_capacity: 16,
+                ..next
+            },
+        ] {
+            assert!(matches!(
+                replay_narrative_record(&mut replay, changed),
+                Err(AnalyticsError::NarrativePolicyChanged { tick: 2 })
+            ));
+            assert_eq!(replay.history().len(), 1);
+            assert_eq!(replay.history().front(), Some(&original.input));
+        }
+        replay_narrative_record(&mut replay, next)
+            .expect("an unrelated authenticated config revision preserves detector policy");
+        assert_eq!(replay.history().len(), 2);
     }
 }
 

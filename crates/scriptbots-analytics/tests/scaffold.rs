@@ -14,12 +14,14 @@ use scriptbots_analytics::{
     AnalyticsError, NARRATIVE_TIMELINE_SCHEMA_VERSION, REPORT_SCHEMA_VERSION, ReaderCtx, Registry,
     ReportParams,
 };
-use scriptbots_core::narrative::{EventKind, EventRecord, SubjectRef};
+use scriptbots_core::narrative::{EventKind, EventRecord, NarrativeInputRecordV1, SubjectRef};
 use scriptbots_core::{
-    AgentUid, MetricSample, PersistenceBatch, ReplayEvent, ReplayEventKind, ReplayRngScope, Tick,
-    TickSummary,
+    AgentData, AgentUid, Intervention, MetricSample, PersistenceBatch, Position, Region,
+    ReplayEvent, ReplayEventKind, ReplayRngScope, ScriptBotsConfig, Tick, TickSummary, WorldState,
 };
-use scriptbots_storage::Storage;
+use scriptbots_storage::{
+    Connection, NarrativeInputStreamError, Storage, StorageError, StoragePipeline,
+};
 use serde_json::json;
 
 fn batch(tick: u64, agent_count: usize, energy: f32) -> PersistenceBatch {
@@ -130,6 +132,88 @@ fn synth_db_with_events(
     }
     storage.flush().expect("flush");
     storage.close().expect("close");
+    path
+}
+
+/// A real production run whose complete input stream spans more than one report page.
+fn real_narrative_db(dir: &tempfile::TempDir) -> (String, u64) {
+    let path = dir.path().join("narrative.sqlite").display().to_string();
+    let mut pipeline = StoragePipeline::create_unattributed_file(&path).expect("create run");
+    let config = ScriptBotsConfig {
+        world_width: 200,
+        world_height: 200,
+        food_cell_size: 20,
+        closed: true,
+        population_spawn_interval: 0,
+        metabolism_drain: 0.0,
+        movement_drain: 0.0,
+        temperature_discomfort_rate: 0.0,
+        aging_health_decay_rate: 0.0,
+        spike_damage: 0.0,
+        spike_energy_cost: 0.0,
+        reproduction_energy_threshold: f32::MAX,
+        persistence_interval: 37,
+        narrative_interval: 16,
+        history_capacity: 128,
+        narrative_capacity: 1,
+        rng_seed: Some(0x16_020_901),
+        ..ScriptBotsConfig::default()
+    };
+    let (mut world, mut session) =
+        WorldState::with_persistence(config, Box::new(pipeline.sink())).expect("world");
+    for index in 0..12_u16 {
+        world
+            .try_spawn_agent(AgentData {
+                position: Position::new(f32::from(index).mul_add(10.0, 20.0), 20.0),
+                health: 2.0,
+                ..AgentData::default()
+            })
+            .expect("spawn founder");
+    }
+    for tick in 1..=320 {
+        if tick == 97 {
+            world
+                .enqueue_intervention(Intervention::Meteor {
+                    region: Region::All,
+                    lethality: 10.0,
+                    scorch: 0.0,
+                })
+                .expect("extinction intervention");
+        }
+        session.step_outcome(&mut world).expect("production step");
+        session.admit_pending(&mut world).expect("admit tick");
+    }
+    session
+        .finalize(&mut world)
+        .expect("finalize partial batch");
+    let dropped_events = world.narrative_dropped_events();
+    drop(world);
+    pipeline.shutdown().expect("durable storage shutdown");
+    (path, dropped_events)
+}
+
+fn synth_narrative_input_db(dir: &tempfile::TempDir, interval: u32) -> String {
+    let path = dir.path().join("inputs.sqlite").display().to_string();
+    let mut storage = Storage::create_unattributed_file(&path).expect("create input run");
+    let config = ScriptBotsConfig {
+        narrative_interval: interval,
+        history_capacity: 128,
+        ..ScriptBotsConfig::default()
+    };
+    for tick in 1..=4 {
+        let mut tick_batch = batch(tick, 10, 10.0);
+        let record = NarrativeInputRecordV1::from_summary(&tick_batch.summary, 0, &config)
+            .expect("canonical input");
+        tick_batch.replay_events.push(ReplayEvent {
+            agent_uid: None,
+            position: None,
+            counterpart: None,
+            counterpart_position: None,
+            kind: ReplayEventKind::NarrativeInputV1 { record },
+        });
+        storage.persist(&tick_batch).expect("persist input");
+    }
+    storage.close().expect("close input run");
     path
 }
 
@@ -454,6 +538,162 @@ fn narrative_timeline_distinguishes_empty_evidence_and_rejects_bad_limits() {
 }
 
 #[test]
+fn narrative_reconstruct_matches_online_events_across_pages_and_output_limits() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (path, dropped_events) = real_narrative_db(&dir);
+    let cx = ReaderCtx::open(&path).expect("finished reader");
+    let expected: Vec<_> = cx
+        .reader
+        .recent_run_events(4096)
+        .expect("persisted online events")
+        .into_iter()
+        .map(|event| event.into_parts().1)
+        .collect();
+    assert!(
+        expected
+            .iter()
+            .any(|event| event.kind == EventKind::Extinction)
+    );
+    assert!(
+        expected.len() > 1,
+        "nonempty parity must outlive the one-event ring"
+    );
+    assert!(dropped_events > 0, "the production event ring must wrap");
+
+    let registry = Registry::builtin();
+    let full = registry
+        .run("narrative-reconstruct", &cx, &ReportParams::default())
+        .expect("independent reconstruction");
+    assert_eq!(full.schema_version, REPORT_SCHEMA_VERSION);
+    assert_eq!(full.latest_tick, Some(320));
+    assert_eq!(full.row_count, expected.len());
+    assert_eq!(
+        full.machine["events"],
+        serde_json::to_value(&expected).unwrap()
+    );
+    assert_eq!(full.machine["inputs_replayed"], 320);
+    assert_eq!(full.machine["input_pages"], 2);
+    assert_eq!(full.machine["input_binding"]["input_count"], 320);
+    assert_eq!(
+        full.machine["input_binding"]["policy"]["history_capacity"],
+        128
+    );
+    assert_eq!(full.machine["history_inputs_evicted"], 192);
+    assert_eq!(full.machine["detector_events_evicted"], dropped_events);
+    assert_eq!(full.machine["event_counts_scope"], "complete_run");
+    assert_eq!(full.machine["truncated_to"], serde_json::Value::Null);
+
+    for limit in [1, 0] {
+        let params = ReportParams::from_pairs([format!("limit={limit}")]).expect("limit");
+        let limited = registry
+            .run("narrative-reconstruct", &cx, &params)
+            .expect("limited report");
+        assert_eq!(limited.row_count, limit);
+        assert_eq!(
+            limited.machine["inputs_replayed"],
+            full.machine["inputs_replayed"]
+        );
+        assert_eq!(limited.machine["input_pages"], full.machine["input_pages"]);
+        assert_eq!(limited.machine["events_reconstructed"], expected.len());
+        assert_eq!(
+            limited.machine["event_counts"],
+            full.machine["event_counts"]
+        );
+        assert_eq!(limited.machine["truncated_to"], limit);
+        assert_eq!(
+            limited.machine["events"],
+            serde_json::to_value(&expected[expected.len() - limit..]).unwrap()
+        );
+    }
+
+    drop(cx);
+    let connection = Connection::open_existing(path.clone()).expect("open negative control");
+    connection.execute("BEGIN").expect("begin output removal");
+    // The finished reader requires the independently maintained FTS mirror to
+    // match relational output rows. Remove both while leaving all inputs intact.
+    connection
+        .execute("DELETE FROM run_events_fts")
+        .expect("remove indexed output rows");
+    assert!(
+        connection
+            .execute("DELETE FROM run_events")
+            .expect("remove only output rows")
+            > 0
+    );
+    connection.execute("COMMIT").expect("commit output removal");
+    connection.close().expect("close negative control");
+    let cx = ReaderCtx::open(&path).expect("inputs remain complete");
+    let independent = registry
+        .run("narrative-reconstruct", &cx, &ReportParams::default())
+        .expect("reconstruct without saved event outputs");
+    assert_eq!(
+        independent.machine, full.machine,
+        "output rows cannot supply reconstruction"
+    );
+}
+
+#[test]
+fn narrative_reconstruct_distinguishes_quiet_inputs_from_missing_or_corrupt_evidence() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = synth_narrative_input_db(&dir, 0);
+    let registry = Registry::builtin();
+    let cx = ReaderCtx::open(&path).expect("finished reader");
+    let output = registry
+        .run("narrative-reconstruct", &cx, &ReportParams::default())
+        .expect("disabled detector with a complete short stream");
+    assert_eq!(output.row_count, 0);
+    assert_eq!(output.machine["inputs_replayed"], 4);
+    assert_eq!(output.machine["events_reconstructed"], 0);
+    assert_eq!(
+        output.machine["input_binding"]["policy"]["narrative_interval"],
+        0
+    );
+    assert!(output.human_md.contains("complete recorded input stream"));
+    drop(cx);
+
+    let connection = Connection::open_existing(path.clone()).expect("open corruption control");
+    assert_eq!(
+        connection
+            .execute(
+                "DELETE FROM replay_events WHERE event_type = 'narrative_input_v1' AND tick = 3"
+            )
+            .expect("remove one detector input"),
+        1
+    );
+    connection.close().expect("close corruption control");
+    let cx = ReaderCtx::open(&path).expect("open finished corrupt stream");
+    let params = ReportParams::from_pairs(["limit=0".to_owned()]).expect("zero output limit");
+    assert!(matches!(
+        registry.run("narrative-reconstruct", &cx, &params),
+        Err(AnalyticsError::Storage(StorageError::NarrativeInputStream(
+            NarrativeInputStreamError::TickGap {
+                expected: 3,
+                actual: 4,
+                ..
+            }
+        )))
+    ));
+
+    let missing_dir = tempfile::tempdir().expect("tempdir");
+    let missing = ReaderCtx::open(&synth_db(&missing_dir)).expect("legacy run without inputs");
+    assert!(matches!(
+        registry.run("narrative-reconstruct", &missing, &params),
+        Err(AnalyticsError::Storage(StorageError::NarrativeInputStream(
+            NarrativeInputStreamError::MissingEvidence {
+                first_offending_tick: 1
+            }
+        )))
+    ));
+    for invalid in ["limit=4097", "limit=banana", "limt=1"] {
+        let params = ReportParams::from_pairs([invalid.to_owned()]).expect("parameter pair");
+        assert!(matches!(
+            registry.run("narrative-reconstruct", &missing, &params),
+            Err(AnalyticsError::BadParam { .. })
+        ));
+    }
+}
+
+#[test]
 fn unknown_report_is_a_typed_error() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = synth_db(&dir);
@@ -519,6 +759,7 @@ fn registry_lists_builtin_reports_with_descriptions() {
         vec![
             "run-summary",
             "narrative-timeline",
+            "narrative-reconstruct",
             "replay-timeline",
             "metric-summary",
             "metric-changepoints",
@@ -554,6 +795,7 @@ fn sb_analyze_list_and_run_use_the_real_fixture_database() {
     let list_stdout = String::from_utf8(list.stdout).expect("list stdout utf8");
     assert!(list_stdout.contains("run-summary"));
     assert!(list_stdout.contains("narrative-timeline"));
+    assert!(list_stdout.contains("narrative-reconstruct"));
 
     let json_path = dir.path().join("summary.json");
     let md_path = dir.path().join("summary.md");

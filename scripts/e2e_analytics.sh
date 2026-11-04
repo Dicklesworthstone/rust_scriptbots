@@ -62,7 +62,8 @@ assert set(stages) == {"synthetic_fixture_persistence", "report_suite_execution"
 declared = stages["report_suite_execution"]["details"]["reports_executed"]
 required = stages["report_suite_execution"]["details"]["required_reports"]
 report_contract = {
-    "run-summary", "narrative-timeline", "metric-summary", "metric-changepoints",
+    "run-summary", "narrative-timeline", "narrative-reconstruct", "replay-timeline",
+    "metric-summary", "metric-changepoints",
     "compare-runs", "metric-distribution", "phenotype-interactions", "lineage-fitness",
     "lineage-structure", "dynasty-communities", "interaction-centrality", "narrative-validate",
 }
@@ -74,7 +75,8 @@ invariants = {i["invariant"]: i for i in fixture["invariants"]}
 assert len(invariants) == len(fixture["invariants"])
 assert all(i["status"] == "pass" for i in invariants.values())
 invariant_contract = {
-    "run_summary_accounting_verified", "narrative_timeline_replay_events_present",
+    "run_summary_accounting_verified", "narrative_timeline_typed_records_present",
+    "replay_timeline_replay_events_present",
     "planted_shift_significant_fdr", "null_noise_not_significant",
     "lineage_founder_components_conserved", "lineage_descendants_match_births",
     "parquet_sql_row_count_equality", "narrative_search_hit_confirmed",

@@ -2,13 +2,23 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
-**Concurrent controls and experiment-family integration (2026-11-04):**
-[Currently In Progress — Codex; `bd-2z0.12.2`, `bd-2z0.5.11`, `bd-2z0.3.12.6`]
-Bind merged configuration updates to the exact observed host configuration revision
-so concurrent clients cannot silently overwrite each other's changes. Connect the
-existing optional FrankenTorch protocol family to matched-seed planning, execution,
-checkpoint continuation and portable-bundle verification. Preserve existing feature
-gates, original bead ownership and full acceptance requirements.
+**Concurrent controls, experiment families and offline reconstruction (2026-11-04):**
+[Source implemented — Codex; `bd-2z0.12.2`, `bd-2z0.5.11`, `bd-2z0.3.12.6`,
+`bd-16g.2.9`; original ownership and full acceptance remain open]
+Merged configuration updates now carry the exact observed host configuration
+revision, so concurrent clients receive an explicit conflict instead of silently
+overwriting each other's changes. The optional FrankenTorch protocol family is
+connected to matched-seed planning, execution, checkpoint continuation and portable
+bundle verification under the existing `brain-ft` feature gate. Control API
+admission uses the same family resolver and advertises that compiled capability.
+The `narrative-reconstruct` report traverses the complete recorded detector input
+stream in bounded pages and reconstructs events through the production kernel,
+independently of persisted narrative outputs and live-ring retention. Output limits
+preserve full-run coverage and counts; missing/corrupt evidence and unsupported
+detector-policy transitions are explicit refusals. Targeted regressions cover real
+host concurrency, enabled/disabled family admission, continuation/bundle recovery,
+and a multipage real-run narrative with event eviction. These additions do not
+close broader native, multi-seed, performance or long-horizon acceptance.
 
 **Actual remote browser qualification (2026-11-04):** [Qualified software
 journey — GentleDuck contribution to original `bd-ac4l` and `bd-2z0.12.3`;
