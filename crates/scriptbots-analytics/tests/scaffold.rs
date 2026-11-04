@@ -180,8 +180,9 @@ fn real_narrative_db(dir: &tempfile::TempDir) -> (String, u64) {
                 })
                 .expect("extinction intervention");
         }
-        session.step_outcome(&mut world).expect("production step");
-        session.admit_pending(&mut world).expect("admit tick");
+        session
+            .step(&mut world)
+            .expect("production step and persistence admission");
     }
     session
         .finalize(&mut world)

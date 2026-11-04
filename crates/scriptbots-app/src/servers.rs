@@ -1165,27 +1165,39 @@ impl RunningControlServers {
         match outcome {
             SupervisionOutcome::Shutdown => self.shutdown().await,
             SupervisionOutcome::ServerExit(exit) => {
-                let primary = self.take_unexpected_exit(exit);
-                status.send_replace(ControlRuntimeStatus::Failed(format!("{primary:#}")));
-                let _ = shutdown_signal.send(true);
-                match self.shutdown().await {
-                    Ok(()) => Err(primary),
-                    Err(cleanup) => Err(primary)
-                        .context(format!("control sibling shutdown also failed: {cleanup:#}")),
-                }
+                self.finish_server_exit(exit, shutdown_signal, status).await
             }
         }
     }
 
-    fn take_unexpected_exit(&mut self, exit: ControlServerExit) -> anyhow::Error {
-        match exit {
+    async fn finish_server_exit(
+        &mut self,
+        exit: ControlServerExit,
+        shutdown_signal: &watch::Sender<bool>,
+        status: &watch::Sender<ControlRuntimeStatus>,
+    ) -> Result<()> {
+        let (name, result) = match exit {
             ControlServerExit::Rest(result) => {
                 self.rest = None;
-                unexpected_server_exit("REST", result)
+                ("REST", result)
             }
             ControlServerExit::Mcp(result) => {
                 self.mcp = None;
-                unexpected_server_exit("MCP HTTP", result)
+                ("MCP HTTP", result)
+            }
+        };
+        // Shutdown can arrive after select polls its first branch but before a
+        // server completes. Recheck here; real task errors still fail shutdown.
+        if matches!(result, Ok(Ok(()))) && *shutdown_signal.borrow() {
+            return self.shutdown().await;
+        }
+        let primary = unexpected_server_exit(name, result);
+        status.send_replace(ControlRuntimeStatus::Failed(format!("{primary:#}")));
+        let _ = shutdown_signal.send(true);
+        match self.shutdown().await {
+            Ok(()) => Err(primary),
+            Err(cleanup) => {
+                Err(primary).context(format!("control sibling shutdown also failed: {cleanup:#}"))
             }
         }
     }
@@ -6315,6 +6327,79 @@ mod tests {
             Cx::current().is_none(),
             "MCP test restores the entry context"
         );
+    }
+
+    #[tokio::test]
+    async fn shutdown_observed_after_server_completion_preserves_real_errors() {
+        for exiting_rest in [true, false] {
+            for fails in [false, true] {
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                let (status_tx, status_rx) = watch::channel(ControlRuntimeStatus::Running);
+                let exiting_listener =
+                    TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("exiting listener");
+                let exiting_address = exiting_listener.local_addr().expect("exiting address");
+                let sibling_listener =
+                    TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("sibling listener");
+                let sibling_address = sibling_listener.local_addr().expect("sibling address");
+                let exiting = tokio::spawn(async move {
+                    let _listener = exiting_listener;
+                    if fails {
+                        Err(anyhow!("serve failed during shutdown"))
+                    } else {
+                        Ok(())
+                    }
+                });
+                let mut sibling_shutdown = shutdown_rx;
+                let sibling_stopped = Arc::new(AtomicBool::new(false));
+                let stopped = Arc::clone(&sibling_stopped);
+                let sibling = tokio::spawn(async move {
+                    let _listener = sibling_listener;
+                    let _ = sibling_shutdown.wait_for(|stop| *stop).await;
+                    stopped.store(true, Ordering::SeqCst);
+                    Ok(())
+                });
+                let result = exiting.await;
+                // Deterministically exercise the interval after select has
+                // obtained a task result and before it classifies that result.
+                shutdown_tx.send(true).expect("request shutdown");
+                let (mut servers, exit) = if exiting_rest {
+                    (
+                        RunningControlServers {
+                            rest: None,
+                            mcp: Some(sibling),
+                        },
+                        ControlServerExit::Rest(result),
+                    )
+                } else {
+                    (
+                        RunningControlServers {
+                            rest: Some(sibling),
+                            mcp: None,
+                        },
+                        ControlServerExit::Mcp(result),
+                    )
+                };
+                let result = servers
+                    .finish_server_exit(exit, &shutdown_tx, &status_tx)
+                    .await;
+                if fails {
+                    let error = result.expect_err("shutdown must retain a real serve error");
+                    assert!(format!("{error:#}").contains("serve failed during shutdown"));
+                    assert!(matches!(
+                        status_rx.borrow().clone(),
+                        ControlRuntimeStatus::Failed(detail)
+                            if detail.contains("serve failed during shutdown")
+                    ));
+                } else {
+                    result.expect("graceful completion after shutdown is expected");
+                    assert_eq!(status_rx.borrow().clone(), ControlRuntimeStatus::Running);
+                }
+                assert!(sibling_stopped.load(Ordering::SeqCst));
+                let exiting = TcpListener::bind(exiting_address).expect("exited port released");
+                let sibling = TcpListener::bind(sibling_address).expect("sibling port released");
+                drop((exiting, sibling));
+            }
+        }
     }
 
     #[tokio::test]

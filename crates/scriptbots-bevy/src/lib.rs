@@ -8996,6 +8996,7 @@ fn sync_terrain(
 
             match registry.chunks.get_mut(&key) {
                 Some(record) => {
+                    // ubs:ignore[rust.security.constant-time-compare] — public terrain geometry/material digest for mesh cache invalidation, not authentication.
                     if record.palette != palette || record.signature != built.stats.signature {
                         if let Some(existing) = meshes.get_mut(&record.mesh) {
                             *existing = built.mesh;
@@ -12565,7 +12566,7 @@ fn ground_mesh_samples() -> &'static GroundMeshSamples {
                     .map(Vec3::from_array)
                     .map(|point| transform.transform_point(point))
                     .collect(),
-                _ => panic!("built-in creature mesh must have 3D positions"),
+                _ => panic!("built-in creature mesh must have 3D positions"), // ubs:ignore[rust.ownership.panic-macro] — private helper receives only built-in Capsule3d, Torus and Cone meshes with Float32x3 positions.
             };
             let indices: Vec<usize> = match mesh
                 .indices()

@@ -120,6 +120,22 @@ fn live_frankentui_pty_routes_and_restores_terminal() -> Result<()> {
             interaction["mouse_navigation"]["observed_sgr_capture"],
             observation["capability_profile"] != "dumb"
         );
+        if observation["capability_profile"] == "truecolor" {
+            let headers = observation["header_click_evidence"].as_array().unwrap();
+            assert_eq!(headers.len(), 4);
+            for (case, (width, baseline)) in
+                headers
+                    .iter()
+                    .zip([(80, false), (80, true), (240, false), (240, true)])
+            {
+                assert_eq!(case["width"], width);
+                assert_eq!(case["baseline"], baseline);
+                assert_eq!(case["pause_clicks"].as_array().unwrap().len(), 2);
+                assert_eq!(case["speed_clicks"].as_array().unwrap().len(), 3);
+                assert_eq!(case["help_opened"], true);
+                assert_eq!(case["palette_clicked"], width == 240);
+            }
+        }
         assert!(
             observation["python_identity"]["executable_sha256"]
                 .as_str()
@@ -883,6 +899,7 @@ for profile in profiles:
     binary_source = None
     data_provider_evidence = None
     interaction_evidence = None
+    header_click_evidence = None
     shutdown_evidence = None
     interaction_artifacts = []
     interaction_events = []
@@ -1335,6 +1352,120 @@ for profile in profiles:
                     assert response.status == 200, (path, response.status, body.decode())
                 return body, response_headers
 
+            if profile == 'truecolor' and exit_action == 'quit':
+                header_click_evidence = []
+                send_terminal_input(b'1')
+
+                def displayed_header(label, prefix):
+                    def observe():
+                        if screen.synchronized or screen.pending:
+                            return False
+                        body, headers = interaction_api('/api/screenshot/ascii')
+                        if body is None or headers.get('x-scriptbots-frame-size') != str(screen.width) + 'x' + str(screen.height):
+                            return False
+                        if 'ScriptBots Terminal HUD' not in screen.text() or label not in body.decode():
+                            return False
+                        baseline_pattern = r'Agents\s+\d+ \([+-]\d+\)'
+                        baseline_observed = re.search(baseline_pattern, screen.text().splitlines()[1]) is not None
+                        if (baseline_observed != baseline
+                                or (re.search(baseline_pattern, body.decode().splitlines()[1]) is not None) != baseline):
+                            return False
+                        positions = [(x, y) for y, row in enumerate(screen.cells[:3])
+                                     for x in range(len(row) - len(label) + 1)
+                                     if ''.join(row[x:x + len(label)]) == label]
+                        if len(positions) != 1:
+                            return False
+                        observe.position = positions[0]
+                        displayed_header.baseline_observed = baseline_observed
+                        retain_interaction(prefix + '-terminal.txt', screen.text().encode())
+                        retain_interaction(prefix + '-screen.txt', body)
+                        return True
+                    pump_until(observe, 'actual displayed header ' + prefix)
+                    return observe.position
+
+                def click_header(label, prefix):
+                    x, y = displayed_header(label, prefix)
+                    assert 1006 in screen.enabled_capture_modes, 'SGR mouse reporting is not enabled'
+                    down = ('\x1b[<0;' + str(x + 1) + ';' + str(y + 1) + 'M').encode()
+                    up = ('\x1b[<0;' + str(x + 1) + ';' + str(y + 1) + 'm').encode()
+                    send_terminal_input(down + up)
+                    record_interaction('submitted_header_click', label=label, column=x, row=y,
+                                       down_hex=down.hex(), up_hex=up.hex())
+
+                def observe_header_command(before, expected, prefix):
+                    def applied():
+                        body, _ = interaction_api('/api/status')
+                        owner = json.loads(body)
+                        command_id = owner['last_applied_command']
+                        if command_id == before['last_applied_command'] or not expected(owner):
+                            return False
+                        receipt_body, _ = interaction_api('/api/control/status/' + command_id)
+                        receipt = json.loads(receipt_body)
+                        assert receipt['command_id'] == command_id, receipt
+                        if receipt['application_state'] != 'applied':
+                            return False
+                        retain_interaction(prefix + '-owner.json', body)
+                        retain_interaction(prefix + '-receipt.json', receipt_body)
+                        applied.result = {'owner': owner, 'receipt': receipt}
+                        return True
+                    pump_until(applied, 'independent owner application for ' + prefix)
+                    return applied.result
+
+                for width in (80, 240):
+                    screen.resize(width, 36)
+                    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 36, width, 0, 0))
+                    os.killpg(process.pid, signal.SIGWINCH)
+                    assert struct.unpack('HHHH', fcntl.ioctl(slave, termios.TIOCGWINSZ, b'\0' * 8))[:2] == (36, width)
+                    record_interaction('requested_header_resize', width=width, height=36)
+                    for baseline in (False, True):
+                        if baseline:
+                            send_terminal_input(b'b')
+                        prefix = 'header-' + str(width) + '-' + str(baseline).lower()
+                        case = {'width': width, 'baseline': baseline, 'pause_clicks': [], 'speed_clicks': []}
+                        for index in range(2):
+                            before = json.loads(interaction_api('/api/status')[0])
+                            label = 'PAUSED' if before['paused'] else 'RUNNING'
+                            name = prefix + '-pause-' + str(index)
+                            click_header(label, name)
+                            case['baseline'] = displayed_header.baseline_observed
+                            result = observe_header_command(before, lambda owner: owner['paused'] != before['paused'], name)
+                            displayed_header('PAUSED' if result['owner']['paused'] else 'RUNNING', name + '-after')
+                            case['pause_clicks'].append(result)
+                        # /api/status exposes applied identity, not speed. Bind
+                        # that receipt to the newly displayed owner-derived
+                        # label; the native unit journey also reads playback.
+                        for index, speed in enumerate((1.0, 2.0, 4.0)):
+                            before = json.loads(interaction_api('/api/status')[0])
+                            expected_speed = 1.0 if speed >= 4.0 else speed * 2.0
+                            name = prefix + '-speed-' + str(index)
+                            click_header('x' + format(speed, '.1f'), name)
+                            result = observe_header_command(before, lambda owner: owner['paused'] == before['paused'], name)
+                            label = 'x' + format(expected_speed, '.1f')
+                            displayed_header(label, name + '-after')
+                            result['observed_speed_label'] = label
+                            case['speed_clicks'].append(result)
+                        click_header('Help: ?/h', prefix + '-help')
+                        pump_until(lambda: 'Toggle this help' in screen.text(), 'help opened by its displayed title')
+                        case['help_opened'] = True
+                        send_terminal_input(b'\x1b')
+                        pump_until(lambda: 'Toggle this help' not in screen.text(), 'help closed with Escape')
+                        case['palette_clicked'] = width == 240
+                        if width == 240:
+                            before_palette = screen.text().splitlines()[1].split('Palette ', 1)[1].split(' (c to cycle)', 1)[0]
+                            click_header('Palette ', prefix + '-palette')
+                            pump_until(lambda: not screen.synchronized and not screen.pending
+                                       and 'Palette ' in screen.text().splitlines()[1]
+                                       and screen.text().splitlines()[1].split('Palette ', 1)[1].split(' (c to cycle)', 1)[0] != before_palette,
+                                       'displayed palette changed after its actual click')
+                            displayed_header('Palette ', prefix + '-palette-after')
+                        header_click_evidence.append(case)
+                    send_terminal_input(b'b')
+                screen.resize(120, 36)
+                fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 36, 120, 0, 0))
+                os.killpg(process.pid, signal.SIGWINCH)
+                send_terminal_input(b'9')
+                retain_interaction('header-results.json', json.dumps(header_click_evidence, sort_keys=True).encode())
+
             pause_body, _ = interaction_api('/api/control/pause', {})
             retain_interaction('interaction-pause-response.json', pause_body)
             pause_id = json.loads(pause_body)['command_id']
@@ -1689,6 +1820,7 @@ for profile in profiles:
                       'python_identity': python_identity,
                       'parser_guard_evidence': parser_guard_evidence,
                       'byte_input_resize_evidence': interaction_evidence,
+                      'header_click_evidence': header_click_evidence,
                       'shutdown_evidence': shutdown_evidence,
                       'observed_color_sgr_count': screen.color_count,
                       'observed_truecolor_sgr_count': screen.truecolor_count,

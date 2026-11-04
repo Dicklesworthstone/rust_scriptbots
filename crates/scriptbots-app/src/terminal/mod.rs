@@ -3119,43 +3119,13 @@ impl<'a> TerminalApp<'a> {
         }
         self.body_width =
             (layout.stats.x.saturating_add(layout.stats.width)).saturating_sub(layout.map.x);
-        let h_y = layout.header.y;
-        let h_h = layout.header.height;
-        let status_len = if self.baseline.is_some() {
-            96u16
-        } else {
-            82u16
-        };
-        let base_x = layout.header.x.saturating_add(1);
-        let pause_x = base_x.saturating_add(status_len).saturating_add(2);
-        let speed_x = pause_x.saturating_add(10);
-        let palette_x = speed_x.saturating_add(45);
-        let theme_x = palette_x.saturating_add(18);
-        let help_x = theme_x.saturating_add(18);
-
-        self.hit_regions.header_targets = vec![
-            (
-                HeaderHitTarget::PauseToggle,
-                Rect::new(pause_x, h_y, 10, h_h),
-            ),
-            (HeaderHitTarget::SpeedCycle, Rect::new(speed_x, h_y, 8, h_h)),
-            (
-                HeaderHitTarget::PaletteCycle,
-                Rect::new(palette_x, h_y, 16, h_h),
-            ),
-            (
-                HeaderHitTarget::ThemeToggle,
-                Rect::new(theme_x, h_y, 16, h_h),
-            ),
-            (HeaderHitTarget::HelpToggle, Rect::new(help_x, h_y, 10, h_h)),
-        ];
         self.hit_regions.help_rect = if self.help_visible {
             Some(frame.area())
         } else {
             None
         };
 
-        self.draw_header(frame, layout.header, &self.snapshot);
+        self.hit_regions.header_targets = self.draw_header(frame, layout.header, &self.snapshot);
         if let Some(rail) = layout.rail {
             self.draw_rail(frame, rail, &self.snapshot);
         }
@@ -3238,6 +3208,23 @@ impl<'a> TerminalApp<'a> {
     }
 
     fn exclude_pointer_overlay(&mut self, overlay: Rect) {
+        let active_origin = match self.pointer_gesture {
+            PointerGestureState::Down {
+                start_col,
+                start_row,
+                ..
+            }
+            | PointerGestureState::Dragging {
+                start_col,
+                start_row,
+                ..
+            } => Some((
+                start_col,
+                start_row,
+                self.hit_regions.hit_test(start_col, start_row),
+            )),
+            _ => None,
+        };
         let overlaps = |area: Rect| {
             let intersection = area.intersection(overlay);
             intersection.width > 0 && intersection.height > 0
@@ -3270,7 +3257,9 @@ impl<'a> TerminalApp<'a> {
         if regions.map_rect.is_none() {
             self.map_area = None;
         }
-        if covered {
+        if covered
+            && active_origin.is_some_and(|(col, row, region)| regions.hit_test(col, row) != region)
+        {
             self.pointer_gesture
                 .cancel("pending receipt covered the active control");
         }
@@ -3290,33 +3279,72 @@ impl<'a> TerminalApp<'a> {
         self.map_area = None;
         self.hover_tooltip = None;
         let area = frame.area();
-        let mut pool = ftui::render::grapheme_pool::GraphemePool::new();
-        let mut science = ftui::render::frame::Frame::new(area.width, area.height, &mut pool);
-        science.set_degradation(degradation);
-        self.frankentui.view(&mut science);
-        frame.render_widget(Clear, area);
-        let theme = self.palette.theme();
-        let style = Style::default().fg(theme.text).bg(theme.surface);
-        for y in 0..area.height {
-            for x in 0..area.width {
-                if let Some(cell) = science.buffer.get(x, y) {
-                    let symbol = cell.content.grapheme_id().map_or_else(
-                        || {
-                            cell.content
-                                .as_char()
-                                .map_or_else(|| " ".into(), |ch| ch.to_string())
-                        },
-                        |id| science.pool.get(id).unwrap_or(" ").to_owned(),
-                    );
-                    let target = &mut frame.buffer_mut()[(area.x + x, area.y + y)];
-                    target.set_symbol(&symbol).set_style(style);
-                    if cell.content.is_continuation() {
-                        target.set_diff_option(CellDiffOption::Skip);
+        let reduced_legacy = degradation >= ftui::render::budget::DegradationLevel::EssentialOnly
+            && matches!(
+                self.frankentui.route,
+                frankentui_shell::ShellRoute::Dashboard
+                    | frankentui_shell::ShellRoute::WorldCanvas
+                    | frankentui_shell::ShellRoute::Inspector
+            );
+        if reduced_legacy {
+            // Avoid constructing the full science view and copying every cell
+            // through two widget formats when only essential controls are needed.
+            frame.render_widget(Clear, area);
+            let title = if self.frankentui.route == frankentui_shell::ShellRoute::Dashboard {
+                "SIMULATION DASHBOARD"
+            } else {
+                self.frankentui.route.name()
+            };
+            let body = Rect::new(
+                area.x,
+                area.y + area.height.min(3),
+                area.width,
+                area.height.saturating_sub(3),
+            );
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from(title),
+                    Line::from("Controls remain active while detail is reduced."),
+                ]),
+                body,
+            );
+        } else {
+            let mut pool = ftui::render::grapheme_pool::GraphemePool::new();
+            let mut science = ftui::render::frame::Frame::new(area.width, area.height, &mut pool);
+            science.set_degradation(degradation);
+            self.frankentui.view(&mut science);
+            frame.render_widget(Clear, area);
+            let theme = self.palette.theme();
+            let style = Style::default().fg(theme.text).bg(theme.surface);
+            for y in 0..area.height {
+                for x in 0..area.width {
+                    if let Some(cell) = science.buffer.get(x, y) {
+                        let symbol = cell.content.grapheme_id().map_or_else(
+                            || {
+                                cell.content
+                                    .as_char()
+                                    .map_or_else(|| " ".into(), |ch| ch.to_string())
+                            },
+                            |id| science.pool.get(id).unwrap_or(" ").to_owned(),
+                        );
+                        let target = &mut frame.buffer_mut()[(area.x + x, area.y + y)];
+                        target.set_symbol(&symbol).set_style(style);
+                        if cell.content.is_continuation() {
+                            target.set_diff_option(CellDiffOption::Skip);
+                        }
                     }
                 }
             }
         }
+        // Keep the displayed dashboard controls usable when the expensive
+        // canvas is omitted. All hidden body bindings were cleared above.
+        if reduced_legacy {
+            let header = Rect::new(area.x, area.y, area.width, area.height.min(3));
+            self.hit_regions.header_rect = Some(header);
+            self.hit_regions.header_targets = self.draw_header(frame, header, &self.snapshot);
+        }
         if self.help_visible {
+            self.hit_regions.help_rect = Some(area);
             self.draw_help(frame);
         }
         if self.palette_open {
@@ -4130,7 +4158,45 @@ impl<'a> TerminalApp<'a> {
         }
     }
 
-    fn draw_header(&self, frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot) {
+    fn draw_header(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        snapshot: &Snapshot,
+    ) -> Vec<(HeaderHitTarget, Rect)> {
+        let area = area.intersection(frame.area());
+        let help = Span::styled(" Help: ?/h ", self.palette.accent_style());
+        let block = Block::default()
+            .title(self.palette.title(format!(
+                "ScriptBots Terminal HUD — {} · bootstrap {}",
+                self.scenario.id, self.scenario.bootstrap_ticks
+            )))
+            .title_top(Line::from(help.clone()).right_aligned())
+            .borders(Borders::ALL);
+        let inner = block.inner(area);
+        let body = Rect::new(inner.x, inner.y, inner.width, inner.height.min(1));
+        let mut targets = Vec::new();
+        // Use the same cell widths and clipping as the rendered spans. In
+        // particular, neither a clipped control nor a border is a body target.
+        let mut add_target = |target, row: Rect, offset: usize, span: &Span<'_>| {
+            let width = span.width();
+            let start = offset.min(usize::from(row.width));
+            let end = offset.saturating_add(width).min(usize::from(row.width));
+            let leading_spaces = width - Span::raw(span.content.trim_start()).width();
+            if row.height > 0 && end - start > leading_spaces {
+                targets.push((
+                    target,
+                    Rect::new(row.x + start as u16, row.y, (end - start) as u16, 1),
+                ));
+            }
+        };
+        let title_row = Rect::new(inner.x, area.y, inner.width, u16::from(!area.is_empty()));
+        add_target(
+            HeaderHitTarget::HelpToggle,
+            title_row,
+            usize::from(title_row.width).saturating_sub(help.width()),
+            &help,
+        );
         let (agents_delta, energy_delta, health_delta) = if let Some(base) = &self.baseline {
             (
                 diff_i(snapshot.agent_count as i64 - base.agent_count as i64),
@@ -4181,6 +4247,13 @@ impl<'a> TerminalApp<'a> {
             format!(" x{:.1} ", self.speed_multiplier),
             self.palette.speed_style(self.speed_multiplier),
         );
+        add_target(HeaderHitTarget::PauseToggle, body, 0, &paused_flag);
+        add_target(
+            HeaderHitTarget::SpeedCycle,
+            body,
+            paused_flag.width(),
+            &mode_span,
+        );
 
         // The line is clipped at the right edge, and on an 80-column terminal everything after
         // "Food" used to vanish: whether the run is going leads, the counters follow.
@@ -4196,26 +4269,17 @@ impl<'a> TerminalApp<'a> {
             self.palette.accent_style(),
         ));
         line.spans.push(Span::raw("  "));
-        line.spans.push(Span::styled(
+        let palette = Span::styled(
             format!("Palette {}", self.palette.mode_label()),
             self.palette.accent_style(),
-        ));
+        );
+        add_target(HeaderHitTarget::PaletteCycle, body, line.width(), &palette);
+        line.spans.push(palette);
         line.spans.push(Span::raw(" (c to cycle)"));
 
-        let paragraph = Paragraph::new(line).block(
-            Block::default()
-                .title(self.palette.title(format!(
-                    "ScriptBots Terminal HUD — {} · bootstrap {}",
-                    self.scenario.id, self.scenario.bootstrap_ticks
-                )))
-                // In the border, where no width of status line can push it off screen.
-                .title_top(
-                    Line::from(Span::styled(" Help: ?/h ", self.palette.accent_style()))
-                        .right_aligned(),
-                )
-                .borders(Borders::ALL),
-        );
+        let paragraph = Paragraph::new(line).block(block);
         frame.render_widget(paragraph, area);
+        targets
     }
 
     fn draw_stats(&self, frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot) {
@@ -27325,6 +27389,316 @@ for case in ('panic', 'subscription', 'renderer'):
                 .unwrap();
             assert!(!app.pointer_gesture.is_dragging());
             assert_eq!(app.map_split_pct, Some(60));
+        });
+    }
+
+    #[test]
+    fn rendered_header_pause_text_is_the_mouse_target() {
+        with_shortcut_app(|app| {
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 36)).unwrap();
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let row: String = (0..120).map(|x| buffer[(x, 1)].symbol()).collect();
+            let column = u16::try_from(row.find("PAUSED").expect("visible pause control")).unwrap();
+            assert_eq!(
+                app.hit_regions.hit_test(column, 1),
+                HitRegion::Header(Some(HeaderHitTarget::PauseToggle)),
+                "the displayed pause text must dispatch the pause action: {row}"
+            );
+        });
+    }
+
+    fn rendered_ascii_label(buffer: &Buffer, label: &str) -> Option<(u16, u16)> {
+        assert!(label.is_ascii());
+        let symbols: Vec<_> = label.chars().map(|ch| ch.to_string()).collect();
+        let width = u16::try_from(symbols.len()).unwrap();
+        for y in buffer.area.y..buffer.area.bottom() {
+            for x in buffer.area.x..buffer.area.right() {
+                if x.saturating_add(width) <= buffer.area.right()
+                    && symbols.iter().enumerate().all(|(offset, symbol)| {
+                        buffer[(x + u16::try_from(offset).unwrap(), y)].symbol() == symbol
+                    })
+                {
+                    return Some((x, y));
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn rendered_header_targets_follow_visible_cells_without_phantom_actions() {
+        with_shortcut_app(|app| {
+            for width in [80, 120, 160, 240] {
+                for baseline in [false, true] {
+                    app.baseline = baseline.then_some(Baseline {
+                        agent_count: 0,
+                        avg_energy: 0.0,
+                        avg_health: 0.0,
+                    });
+                    for paused in [false, true] {
+                        app.paused = paused;
+                        for (tick, speed) in [(0, 1.0), (u64::MAX, 128.0)] {
+                            app.snapshot.tick = tick;
+                            app.speed_multiplier = speed;
+                            let mut terminal =
+                                Terminal::new(ratatui::backend::TestBackend::new(width, 36))
+                                    .unwrap();
+                            terminal.draw(|frame| app.draw(frame)).unwrap();
+                            let buffer = terminal.backend().buffer();
+                            assert_eq!(
+                                rendered_ascii_label(buffer, "(+0)").is_some(),
+                                baseline,
+                                "baseline rows must visibly differ from ordinary rows"
+                            );
+                            for (label, target) in [
+                                (
+                                    if paused { "PAUSED" } else { "RUNNING" }.to_owned(),
+                                    HeaderHitTarget::PauseToggle,
+                                ),
+                                (format!("x{speed:.1}"), HeaderHitTarget::SpeedCycle),
+                                ("Help: ?/h".to_owned(), HeaderHitTarget::HelpToggle),
+                            ] {
+                                let (x, y) =
+                                    rendered_ascii_label(buffer, &label).unwrap_or_else(|| {
+                                        panic!("{width}/{baseline}/{paused}: missing {label}")
+                                    });
+                                for offset in 0..u16::try_from(label.len()).unwrap() {
+                                    assert_eq!(
+                                        app.hit_regions.hit_test(x + offset, y),
+                                        HitRegion::Header(Some(target))
+                                    );
+                                }
+                            }
+                            let (x, y) = rendered_ascii_label(buffer, "Tick ").unwrap();
+                            assert_eq!(app.hit_regions.hit_test(x, y), HitRegion::Header(None));
+                            assert_eq!(app.hit_regions.hit_test(2, 2), HitRegion::Header(None));
+                            assert_eq!(app.hit_regions.hit_test(0, 1), HitRegion::Header(None));
+                            assert!(
+                                !app.hit_regions
+                                    .header_targets
+                                    .iter()
+                                    .any(|(target, _)| *target == HeaderHitTarget::ThemeToggle)
+                            );
+                            if let Some((x, y)) = rendered_ascii_label(buffer, "Palette ") {
+                                assert_eq!(
+                                    app.hit_regions.hit_test(x, y),
+                                    HitRegion::Header(Some(HeaderHitTarget::PaletteCycle))
+                                );
+                            } else if width <= 120 {
+                                assert!(
+                                    !app.hit_regions
+                                        .header_targets
+                                        .iter()
+                                        .any(|(target, _)| *target == HeaderHitTarget::PaletteCycle)
+                                );
+                            }
+                            let header = app.frame_layout(buffer.area).header;
+                            for (_, rect) in &app.hit_regions.header_targets {
+                                assert_eq!(rect.height, 1);
+                                assert_eq!(rect.intersection(header), *rect);
+                                assert!(rect.width > 0);
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn rendered_header_targets_clip_and_translate_with_the_widget() {
+        with_shortcut_app(|app| {
+            for width in 0..=32 {
+                for height in 0..=3 {
+                    let area = Rect::new(7, 4, width, height);
+                    let mut targets = Vec::new();
+                    let mut terminal =
+                        Terminal::new(ratatui::backend::TestBackend::new(48, 12)).unwrap();
+                    terminal
+                        .draw(|frame| {
+                            targets = app.draw_header(frame, area, &app.snapshot);
+                        })
+                        .unwrap();
+                    let buffer = terminal.backend().buffer();
+                    for (target, rect) in targets {
+                        assert_eq!(rect.intersection(area), rect);
+                        assert_eq!(rect.height, 1);
+                        assert!(rect.width > 0);
+                        assert_eq!(
+                            rect.y,
+                            area.y + u16::from(target != HeaderHitTarget::HelpToggle)
+                        );
+                        assert!(
+                            (rect.x..rect.right())
+                                .any(|x| !buffer[(x, rect.y)].symbol().trim().is_empty()),
+                            "an invisible target cannot be clicked: {target:?} {rect:?}"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    fn click_rendered_header(app: &mut TerminalApp<'_>, label: &str) {
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(240, 36)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let (column, row) = rendered_ascii_label(terminal.backend().buffer(), label)
+            .unwrap_or_else(|| panic!("missing displayed control: {label}"));
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            app.handle_mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn reduced_dashboard_keeps_displayed_controls_without_hidden_canvas_targets() {
+        for width in [80, 240] {
+            with_shortcut_app(|app| {
+                let mut terminal =
+                    Terminal::new(ratatui::backend::TestBackend::new(width, 36)).unwrap();
+                terminal.draw(|frame| app.draw(frame)).unwrap();
+                let old_map = app.hit_regions.map_rect.unwrap();
+                for (label, paused_after) in [("PAUSED", false), ("RUNNING", true)] {
+                    terminal
+                        .draw(|frame| {
+                            app.draw_shell_frame(
+                                frame,
+                                ftui::render::budget::DegradationLevel::EssentialOnly,
+                            );
+                        })
+                        .unwrap();
+                    assert!(app.map_area.is_none());
+                    assert!(app.hit_regions.map_rect.is_none());
+                    assert!(!matches!(
+                        app.hit_regions.hit_test(old_map.x + 1, old_map.y + 1),
+                        HitRegion::Map { .. }
+                    ));
+                    let (column, row) =
+                        rendered_ascii_label(terminal.backend().buffer(), label).unwrap();
+                    assert_eq!(
+                        app.hit_regions.hit_test(column, row),
+                        HitRegion::Header(Some(HeaderHitTarget::PauseToggle))
+                    );
+                    for kind in [
+                        MouseEventKind::Down(MouseButton::Left),
+                        MouseEventKind::Up(MouseButton::Left),
+                    ] {
+                        app.handle_mouse(MouseEvent {
+                            kind,
+                            column,
+                            row,
+                            modifiers: KeyModifiers::NONE,
+                        })
+                        .unwrap();
+                    }
+                    let id = app.frankentui.latest_receipt().unwrap().command_id.clone();
+                    assert_eq!(
+                        wait_for_terminal_receipt(app, &id).status,
+                        frankentui_shell::ReceiptStatusKind::Applied
+                    );
+                    assert_eq!(
+                        app.host.snapshot_hub().latest().playback.paused,
+                        paused_after
+                    );
+                    app.refresh_snapshot();
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn receipt_over_map_preserves_header_press_but_cancels_hidden_map_press() {
+        with_shortcut_app(|app| {
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(240, 36)).unwrap();
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+            let (column, row) = rendered_ascii_label(terminal.backend().buffer(), "x1.0").unwrap();
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+            .unwrap();
+            let footer = Rect::new(0, 35, 240, 1);
+            app.exclude_pointer_overlay(footer);
+            assert!(app.hit_regions.map_rect.is_none());
+            assert!(app.pointer_gesture.is_down(), "the header is still visible");
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+            .unwrap();
+            let id = app.frankentui.latest_receipt().unwrap().command_id.clone();
+            assert_eq!(
+                wait_for_terminal_receipt(app, &id).status,
+                frankentui_shell::ReceiptStatusKind::Applied
+            );
+            assert_eq!(
+                app.host.snapshot_hub().latest().playback.speed_multiplier,
+                2.0
+            );
+
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+            let map = app.hit_regions.map_rect.unwrap();
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: map.x + 1,
+                row: map.y + 1,
+                modifiers: KeyModifiers::NONE,
+            })
+            .unwrap();
+            assert!(app.pointer_gesture.is_down());
+            app.exclude_pointer_overlay(footer);
+            assert!(!app.pointer_gesture.is_down(), "the map binding was hidden");
+        });
+    }
+
+    #[test]
+    fn rendered_header_mouse_gestures_reach_owner_and_local_controls() {
+        with_shortcut_app(|app| {
+            for (label, paused_after) in [("PAUSED", false), ("RUNNING", true)] {
+                click_rendered_header(app, label);
+                let id = app.frankentui.latest_receipt().unwrap().command_id.clone();
+                assert_eq!(
+                    wait_for_terminal_receipt(app, &id).status,
+                    frankentui_shell::ReceiptStatusKind::Applied
+                );
+                assert_eq!(
+                    app.host.snapshot_hub().latest().playback.paused,
+                    paused_after
+                );
+                app.refresh_snapshot();
+                assert_eq!(app.paused, paused_after);
+            }
+            click_rendered_header(app, "x1.0");
+            let id = app.frankentui.latest_receipt().unwrap().command_id.clone();
+            assert_eq!(
+                wait_for_terminal_receipt(app, &id).status,
+                frankentui_shell::ReceiptStatusKind::Applied
+            );
+            assert_eq!(
+                app.host.snapshot_hub().latest().playback.speed_multiplier,
+                2.0
+            );
+            app.refresh_snapshot();
+            assert_eq!(app.speed_multiplier, 2.0);
+            let mode = app.palette.mode;
+            click_rendered_header(app, "Palette ");
+            assert_ne!(app.palette.mode, mode);
+            assert!(!app.help_visible);
+            click_rendered_header(app, "Help: ?/h");
+            assert!(app.help_visible);
         });
     }
 

@@ -7,7 +7,7 @@
 //! - Deterministic stacked-agent cycling and empty-click selection clearing.
 //! - Stabilized hover probe (150 ms threshold) exposing: uid, diet, energy, health, age, brain_key.
 //! - Clamped splitter resizing between map canvas and sidebar columns.
-//! - Status toggle targets in header for pause, speed, theme, and palette.
+//! - Header targets bound to the visible pause, speed, palette, and help controls.
 
 use super::command_palette::CommandPaletteAction;
 use crossterm::event::MouseButton;

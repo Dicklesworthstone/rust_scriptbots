@@ -24407,8 +24407,10 @@ mod continuous_world_raster_tests {
         assert!(
             detail
                 .bgra
-                .chunks_exact(4)
-                .zip(other_detail.bgra.chunks_exact(4))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(other_detail.bgra.as_chunks::<4>().0)
                 .all(|(left, right)| left[3] == right[3]),
             "palette changes must not change the feather mask"
         );
@@ -24469,7 +24471,7 @@ mod continuous_world_raster_tests {
         );
         if let Some(path) = std::env::var_os("SCRIPTBOTS_TERRAIN_PROBE") {
             let mut rgba = pixels.bgra;
-            for pixel in rgba.chunks_exact_mut(4) {
+            for pixel in rgba.as_chunks_mut::<4>().0 {
                 pixel.swap(0, 2);
             }
             let image = image::RgbaImage::from_raw(pixels.width, pixels.height, rgba)
@@ -24681,7 +24683,9 @@ mod continuous_world_raster_tests {
         );
         let colors: std::collections::HashSet<_> = first
             .bgra
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|pixel| [pixel[0], pixel[1], pixel[2]])
             .collect();
         assert!(
@@ -24968,8 +24972,10 @@ mod continuous_world_raster_tests {
             20,
             vec![0.0, 0.0],
         );
-        let mut cache = WorldRasterCache::default();
-        cache.last_failure = Some((key(1), std::time::Instant::now()));
+        let mut cache = WorldRasterCache {
+            last_failure: Some((key(1), std::time::Instant::now())),
+            ..WorldRasterCache::default()
+        };
         assert!(cache.failed_for(key(1)));
         assert!(!cache.failed_for(key(2)));
         cache.start_world_raster(
@@ -35390,9 +35396,11 @@ mod command_characterization_tests {
             mutation_log: recent_changes,
         };
         assert_eq!(detail.life, expected);
-        let mut parent_fixture = scriptbots_core::AgentRuntime::default();
-        parent_fixture.lineage = [Some(AgentUid(31)), Some(AgentUid(47))];
-        parent_fixture.hybrid = true;
+        let parent_fixture = scriptbots_core::AgentRuntime {
+            lineage: [Some(AgentUid(31)), Some(AgentUid(47))],
+            hybrid: true,
+            ..scriptbots_core::AgentRuntime::default()
+        };
         let parent_life = scriptbots_runtime::channel::AgentLifeData::from(&parent_fixture);
         assert_eq!(
             parent_life.lineage,
