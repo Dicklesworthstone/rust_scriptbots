@@ -2034,6 +2034,8 @@ impl ControlHandle {
                 "gui".into(),
                 #[cfg(feature = "ml")]
                 "ml".into(),
+                #[cfg(feature = "brain-ft")]
+                "brain-ft".into(),
                 #[cfg(feature = "neuro")]
                 "neuro".into(),
                 "fastmcp".into(),
@@ -2163,20 +2165,8 @@ impl ControlHandle {
                 )));
             }
             let fam = v.brain_family.trim().to_lowercase();
-            if !matches!(
-                fam.as_str(),
-                "mlp"
-                    | "mlp.baseline"
-                    | "dwraon"
-                    | "dwraon.baseline"
-                    | "assembly"
-                    | "assembly.experimental"
-            ) {
-                return Err(ControlError::BadRequest(format!(
-                    "unknown brain family '{}': must be mlp, dwraon, or assembly",
-                    v.brain_family
-                )));
-            }
+            crate::experiment_runner::validate_experiment_brain_family(trimmed_id, &fam)
+                .map_err(|error| ControlError::BadRequest(error.to_string()))?;
         }
         if request.seeds.is_empty() {
             return Err(ControlError::BadRequest("seeds cannot be empty".into()));
@@ -5512,6 +5502,141 @@ pub(crate) mod tests {
         assert_eq!(fs::read(&temporary).unwrap(), b"partial");
         assert!(services.recover_experiment("../outside").is_err());
         assert!(services.experiments.lock().unwrap().is_empty());
+    }
+
+    #[cfg(feature = "brain-ft")]
+    #[test]
+    fn experiment_creation_accepts_frankentorch_alias_and_exports_restorable_ft_bundle() {
+        let root = tempfile::tempdir().unwrap();
+        let (_unused_handle, host) = handle();
+        // This guard joins experiment workers before the temporary root is dropped,
+        // including when an assertion fails.
+        let (runtime, _submit) = crate::ControlRuntime::launch(
+            host.port.clone(),
+            crate::ControlServerConfig {
+                rest_enabled: false,
+                mcp_transport: crate::servers::McpTransportConfig::Disabled,
+                ..crate::ControlServerConfig::default()
+            },
+        )
+        .unwrap();
+        let handle = runtime
+            .control_handle()
+            .unwrap()
+            .with_artifacts_dir(root.path().to_path_buf())
+            .unwrap();
+        let live_digest = host.port.scientific_digest_v1().unwrap();
+        let live_snapshot = handle.read_snapshot().unwrap();
+        assert!(handle.version().features.iter().any(|f| f == "brain-ft"));
+
+        let mut request = experiment_creation_request();
+        request.experiment_id = Some("ft-api-run".into());
+        request.idempotency_key = Some("ft-api-run-key".into());
+        request.variants[0].brain_family = " FrAnKeNtOrCh ".into();
+        let expected_runs = request.variants.len() * request.seeds.len();
+        let expected_seed = request.seeds[0];
+        let expected_ticks = request.ticks_per_run.unwrap();
+        let created = handle.create_experiment(request).expect("admit Ft alias");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let completed = loop {
+            let status = handle.get_experiment(&created.experiment_id).unwrap();
+            if status.status == "completed" {
+                break status;
+            }
+            assert_ne!(status.status, "failed", "{status:?}");
+            assert!(std::time::Instant::now() < deadline, "{status:?}");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        assert_eq!(completed.total_runs, expected_runs);
+        assert_eq!(completed.completed_runs, expected_runs);
+        assert_eq!(completed.failed_runs, 0);
+        assert_eq!(completed.runs.len(), expected_runs);
+        let run = &completed.runs[0];
+        assert_eq!(run.brain_family, "ft");
+        assert_eq!(run.state, "completed");
+        assert_eq!(run.seed, expected_seed);
+        assert_eq!(run.total_ticks, expected_ticks);
+        let bundle_dir = Path::new(run.bundle_path.as_ref().expect("published Ft bundle"));
+        let verified = crate::experiment_runner::verify_portable_run_bundle(bundle_dir)
+            .expect("restore the actual Ft checkpoint from its portable bundle");
+        let final_state = verified.final_state.expect("observed Ft final science");
+        assert_eq!(final_state.run_id, run.run_id);
+        assert_eq!(final_state.tick, expected_ticks);
+        assert_eq!(
+            Some(final_state.scientific_digest.as_str()),
+            run.final_digest.as_deref()
+        );
+        let bundle: scriptbots_storage::RunBundleV1 =
+            serde_json::from_slice(&fs::read(bundle_dir.join("bundle_manifest.json")).unwrap())
+                .unwrap();
+        let manifest: crate::RunManifestV3 =
+            serde_json::from_str(&bundle.manifest.manifest_json).unwrap();
+        assert_eq!(manifest.brain_roster.len(), 1);
+        assert_eq!(manifest.brain_roster[0].kind, "ft");
+        assert_eq!(manifest.root_seed, expected_seed);
+        assert_eq!(
+            manifest.identity.requested_tick_budget,
+            Some(expected_ticks)
+        );
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), live_digest);
+        let after = handle.read_snapshot().unwrap();
+        assert_eq!(after.config, live_snapshot.config);
+        assert_eq!(after.world.tick, live_snapshot.world.tick);
+        runtime.shutdown().expect("join Ft experiment worker");
+    }
+
+    #[cfg(not(feature = "brain-ft"))]
+    #[test]
+    fn experiment_creation_refuses_ft_aliases_before_admission_without_feature() {
+        let root = tempfile::tempdir().unwrap();
+        let (_unused_handle, host) = handle();
+        let (runtime, _submit) = crate::ControlRuntime::launch(
+            host.port.clone(),
+            crate::ControlServerConfig {
+                rest_enabled: false,
+                mcp_transport: crate::servers::McpTransportConfig::Disabled,
+                ..crate::ControlServerConfig::default()
+            },
+        )
+        .unwrap();
+        let handle = runtime
+            .control_handle()
+            .unwrap()
+            .with_artifacts_dir(root.path().to_path_buf())
+            .unwrap()
+            .with_experiment_run_capacity(1)
+            .unwrap();
+        let live_digest = host.port.scientific_digest_v1().unwrap();
+        let capacity = handle
+            .list_experiments(None, None)
+            .unwrap()
+            .execution_capacity;
+        assert_eq!(capacity.reserved_run_slots, 0);
+        assert_eq!(capacity.reserved_batches, 0);
+        assert!(!handle.version().features.iter().any(|f| f == "brain-ft"));
+
+        for alias in [" Ft ", " FrAnKeNtOrCh "] {
+            let mut request = experiment_creation_request();
+            request.experiment_id = Some("unavailable-ft".into());
+            request.variants[0].brain_family = alias.into();
+            let error = handle
+                .create_experiment(request)
+                .expect_err("disabled Ft must fail before any experiment side effects");
+            assert!(matches!(
+                error,
+                ControlError::BadRequest(reason) if reason.contains("brain-ft")
+            ));
+            assert!(!root.path().join("experiments").exists());
+            assert!(handle.data_services.experiments.lock().unwrap().is_empty());
+            assert!(handle.data_services.idempotency.lock().unwrap().is_empty());
+            let listed = handle.list_experiments(None, None).unwrap();
+            assert_eq!(listed.total, 0);
+            assert_eq!(listed.execution_capacity, capacity);
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), live_digest);
+        }
+        runtime
+            .shutdown()
+            .expect("join any unexpected experiment worker");
     }
 
     #[test]

@@ -1197,6 +1197,10 @@ For an interactive run, ScriptBots parses the control environment and transactio
     `POST .../resume` continues pending runs and
     unfinished runs from validated owner/journal cuts, and recovers verified completed
     bundles saved before their final status write. Missing or incompatible cuts are refused.
+    Arms support MLP, DWRAON and Assembly; builds with `--features brain-ft` additionally
+    accept `ft` or `frankentorch`, recorded canonically as `ft`. The same compiled
+    adapter restores continuation cuts and independently verifies the final bundle state.
+    A build without `brain-ft` refuses these arms before starting a worker or writing files.
   - `POST /api/v1/checkpoints` → capture a `WorldCheckpointV1` and record it in the run database (usable by
     `--checkpoint-start`); `GET /api/v1/checkpoints`, `/api/v1/artifacts`
   - Playback aliases (two-axis command status): `POST /api/pause`, `POST /api/resume`,
@@ -1515,6 +1519,10 @@ cargo run -p scriptbots-app --bin control_cli -- hydrology
 separate application and journal states. Follow the printed `lookup-status`
 command against the same server; use `get` to inspect the resulting configuration.
 An admission receipt alone does not prove application or durable storage.
+Configuration patches carry the revision of the configuration they were merged
+against. If another client changes it before application, the owner returns
+`config_revision_conflict`; read the current configuration and submit a fresh patch
+to retain the intervening edit. Playback-only changes do not invalidate that guard.
 
 Interactive dashboard:
 ```bash
@@ -1548,7 +1556,8 @@ digest evidence within its window.
   - Observation: `get_status` → current simulation status; `get_command_status` → two-axis status by command ID;
     `narrative_search`, `narrative_around` → narrative events; `get_version`, `get_schema`
   - Maps: `map_generate` → procedural sandbox map generation; `map_apply` → apply map artifact to running simulation
-  - Experiments: `experiment_create` runs a real matched-seed batch (MLP/DWRAON/Assembly arms × seeds) on a
+  - Experiments: `experiment_create` runs a real matched-seed batch (MLP/DWRAON/Assembly arms × seeds,
+    plus FtBrain when built with `brain-ft`) on a
     background worker and writes a verified run bundle per run; `experiment_status`, `experiment_list`,
     `experiment_cancel` (stops active runs between durable ticks), `experiment_resume` (continues pending runs
     and unfinished runs from validated owner/journal cuts, and recovers verified completed

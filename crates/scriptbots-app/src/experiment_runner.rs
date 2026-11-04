@@ -8,6 +8,8 @@ use scriptbots_brain::{
     AssemblyBrain, DwraonBrain, MlpBrain, assembly::AssemblyFamilyAdapter,
     dwraon::DwraonFamilyAdapter, mlp::MlpBrainFamily,
 };
+#[cfg(feature = "brain-ft")]
+use scriptbots_brain_ml::{FT_BRAIN_KIND, FtBrainFamily};
 use scriptbots_core::{
     BrainFamilyAdapter, BrainRegistry, NullPersistence, ScriptBotsConfig, WorldState, knob_range,
 };
@@ -213,6 +215,8 @@ enum ResolvedBrainFamily {
     Mlp,
     Dwraon,
     Assembly,
+    #[cfg(feature = "brain-ft")]
+    FrankenTorch,
 }
 
 impl ResolvedBrainFamily {
@@ -221,7 +225,16 @@ impl ResolvedBrainFamily {
             "mlp" | "mlp.baseline" => Ok(Self::Mlp),
             "dwraon" | "dwraon.baseline" => Ok(Self::Dwraon),
             "assembly" | "assembly.experimental" => Ok(Self::Assembly),
-            "neuroflow" | "ft" | "frankentorch" => {
+            #[cfg(feature = "brain-ft")]
+            "ft" | "frankentorch" => Ok(Self::FrankenTorch),
+            #[cfg(not(feature = "brain-ft"))]
+            "ft" | "frankentorch" => Err(ExperimentRunnerError::UnavailableBrainFamily {
+                variant_id: variant.variant_id.clone(),
+                brain_family: variant.brain_family.clone(),
+                reason: "FrankenTorch experiments require a build with the brain-ft feature"
+                    .to_owned(),
+            }),
+            "neuroflow" => {
                 Err(ExperimentRunnerError::UnavailableBrainFamily {
                     variant_id: variant.variant_id.clone(),
                     brain_family: variant.brain_family.clone(),
@@ -240,6 +253,8 @@ impl ResolvedBrainFamily {
             Self::Mlp => MlpBrain::KIND.as_str(),
             Self::Dwraon => DwraonBrain::KIND.as_str(),
             Self::Assembly => AssemblyBrain::KIND.as_str(),
+            #[cfg(feature = "brain-ft")]
+            Self::FrankenTorch => FT_BRAIN_KIND,
         }
     }
 
@@ -256,6 +271,8 @@ impl ResolvedBrainFamily {
                 })?;
                 Box::new(adapter)
             }
+            #[cfg(feature = "brain-ft")]
+            Self::FrankenTorch => Box::new(FtBrainFamily::default()),
         })
     }
 
@@ -3172,6 +3189,22 @@ pub fn validate_scenario_arm(
     config_for_run(overrides, 0).map(|_| ())
 }
 
+/// Validate a requested experiment family against the adapters in this build.
+///
+/// Control-plane admission and checkpoint/bundle reconstruction use the same
+/// resolver so a compiled optional family cannot be admitted by only one path.
+pub(crate) fn validate_experiment_brain_family(
+    variant_id: &str,
+    brain_family: &str,
+) -> Result<(), ExperimentRunnerError> {
+    ResolvedBrainFamily::resolve(&ScenarioVariant {
+        variant_id: variant_id.to_owned(),
+        brain_family: brain_family.to_owned(),
+        config_overrides: BTreeMap::new(),
+    })
+    .map(|_| ())
+}
+
 pub(crate) fn config_for_run(
     overrides: &BTreeMap<String, serde_json::Value>,
     seed: u64,
@@ -3375,6 +3408,67 @@ mod tests {
         assert_eq!(plan[0].brain_family, "mlp.baseline");
         assert_eq!(plan[3].run_id, "exp-001-dwraon_base-seed100");
         assert_eq!(plan[3].brain_family, "dwraon.baseline");
+    }
+
+    #[test]
+    fn frankentorch_arm_admission_matches_the_compiled_family() {
+        let directory = tempfile::tempdir().unwrap();
+        for requested_family in ["ft", "frankentorch"] {
+            let variant = ScenarioVariant {
+                variant_id: "torch".into(),
+                brain_family: requested_family.into(),
+                config_overrides: BTreeMap::new(),
+            };
+            let runner = MatchedSeedExperimentRunner::new(
+                "torch-plan",
+                MatchedSeedCohort {
+                    cohort_id: "cohort".into(),
+                    seeds: vec![71],
+                },
+                vec![variant.clone()],
+                2,
+                1,
+                directory.path().join("bundles"),
+            );
+            #[cfg(feature = "brain-ft")]
+            {
+                validate_experiment_brain_family(&variant.variant_id, requested_family)
+                    .expect("compiled family is admitted by the control plane");
+                let plan = runner.plan_batch().expect("compiled family is executable");
+                assert_eq!(plan[0].brain_family, "ft");
+
+                let duplicate = MatchedSeedExperimentRunner {
+                    variants: vec![
+                        variant,
+                        ScenarioVariant {
+                            variant_id: "same-science".into(),
+                            brain_family: "ft".into(),
+                            config_overrides: BTreeMap::new(),
+                        },
+                    ],
+                    ..runner
+                };
+                assert!(matches!(
+                    duplicate.plan_batch(),
+                    Err(ExperimentRunnerError::InvalidPlan { .. })
+                ));
+            }
+            #[cfg(not(feature = "brain-ft"))]
+            {
+                for result in [
+                    validate_experiment_brain_family(&variant.variant_id, requested_family),
+                    runner.plan_batch().map(|_| ()),
+                ] {
+                    let error = result.expect_err("missing family must not silently fall back");
+                    assert!(matches!(
+                        error,
+                        ExperimentRunnerError::UnavailableBrainFamily { .. }
+                    ));
+                    assert!(error.to_string().contains("brain-ft"));
+                }
+            }
+        }
+        assert!(directory.path().read_dir().unwrap().next().is_none());
     }
 
     #[test]
@@ -4089,7 +4183,12 @@ mod tests {
 
     #[test]
     fn running_checkpoint_continues_real_families_and_retains_original_owner_cut() {
-        for family_name in ["mlp", "dwraon"] {
+        for family_name in [
+            "mlp",
+            "dwraon",
+            #[cfg(feature = "brain-ft")]
+            "ft",
+        ] {
             for completed_ticks in [0_u64, 2, 4] {
                 let directory = tempfile::tempdir().expect("continuation directory");
                 let runner = MatchedSeedExperimentRunner::new(
@@ -4350,13 +4449,18 @@ mod tests {
     fn recorded_matched_cohort_keeps_exact_science_at_concurrency_one_and_two() {
         let directory = tempfile::tempdir().unwrap();
         let seeds = vec![53, 71];
-        let variants = ["mlp", "dwraon"]
-            .map(|family| ScenarioVariant {
-                variant_id: family.into(),
-                brain_family: family.into(),
-                config_overrides: BTreeMap::new(),
-            })
-            .to_vec();
+        let variants = [
+            "mlp",
+            "dwraon",
+            #[cfg(feature = "brain-ft")]
+            "ft",
+        ]
+        .map(|family| ScenarioVariant {
+            variant_id: family.into(),
+            brain_family: family.into(),
+            config_overrides: BTreeMap::new(),
+        })
+        .to_vec();
         let mut outcomes = Vec::new();
         for concurrency in [1, 2] {
             let output = directory.path().join(format!("concurrency-{concurrency}"));
@@ -4397,7 +4501,7 @@ mod tests {
             );
         }
         assert_eq!(outcomes[0], outcomes[1]);
-        // All four treatment/seed cells must exist and differ. A collapsed
+        // All treatment/seed cells must exist and differ. A collapsed
         // registry or seed schedule cannot masquerade as schedule independence.
         assert_eq!(outcomes[0].len(), variants.len() * seeds.len());
         assert_eq!(
@@ -5433,18 +5537,28 @@ mod tests {
                 brain_family: "assembly".into(),
                 config_overrides: BTreeMap::new(),
             },
+            #[cfg(feature = "brain-ft")]
+            ScenarioVariant {
+                variant_id: "variant_d".into(),
+                brain_family: "frankentorch".into(),
+                config_overrides: BTreeMap::new(),
+            },
         ];
+
+        let expected_runs = variants.len() * cohort.seeds.len();
 
         let runner =
             MatchedSeedExperimentRunner::new("exp-matched", cohort, variants, 2, 2, &output_dir);
 
         let status = runner.execute_batch(&state_file).unwrap();
-        assert_eq!(status.completed_runs, 3);
+        assert_eq!(status.completed_runs, expected_runs);
         assert_eq!(status.failed_runs, 0);
         assert!(status.is_finished());
         assert_eq!(status.runs[0].brain_family, "mlp.baseline");
         assert_eq!(status.runs[1].brain_family, "dwraon.baseline");
         assert_eq!(status.runs[2].brain_family, "assembly.experimental");
+        #[cfg(feature = "brain-ft")]
+        assert_eq!(status.runs[3].brain_family, "ft");
         assert_ne!(
             status.runs[0].final_digest, status.runs[1].final_digest,
             "real distinct family registries must produce distinct full world digests"
@@ -5452,6 +5566,16 @@ mod tests {
         assert_ne!(
             status.runs[0].final_digest, status.runs[2].final_digest,
             "real distinct family registries must produce distinct full world digests"
+        );
+        assert_eq!(
+            status
+                .runs
+                .iter()
+                .map(|run| run.final_digest.as_ref().unwrap())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            expected_runs,
+            "every requested family must execute its own scientific state"
         );
 
         for run in &status.runs {
@@ -5500,7 +5624,7 @@ mod tests {
         // than trusting status JSON, depending on the external continuation cuts,
         // or executing duplicate runs.
         let resumed_status = runner.execute_batch(&state_file).unwrap();
-        assert_eq!(resumed_status.completed_runs, 3);
+        assert_eq!(resumed_status.completed_runs, expected_runs);
         assert_eq!(resumed_status.failed_runs, 0);
         assert_eq!(resumed_status, status);
 
