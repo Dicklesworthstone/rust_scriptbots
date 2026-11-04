@@ -41,6 +41,10 @@ use serde::{Deserialize, Serialize};
 use serde_wasm_bindgen::{from_value, to_value};
 use wasm_bindgen::prelude::*;
 
+use scriptbots_runtime::remote::{
+    RemoteEventPage, RemoteEventRecord, RemoteFrame, RemoteFrameIdentity, RemoteFramePayload,
+    decode_remote_frame,
+};
 use scriptbots_runtime::{
     ApplicationState, CommandStatus, DriveReceipt, HostCommand, HostCore, HostCoreOptions,
     HostSessionId, LocalHostPort, ManualHostDriver, ManualInstant, NullFrontend, PlaybackSnapshot,
@@ -171,16 +175,280 @@ impl<'a> BrowserFrame<'a> {
     fn new(publication: &'a RenderSnapshot) -> Self {
         Self {
             schema: "scriptbots.browser-frame.v1",
-            identity: BrowserFrameIdentity {
-                session_id: publication.session_id.get().to_string(),
-                publication_revision: publication.revision.get().to_string(),
-                scientific_revision: publication.revisions.scientific.get().to_string(),
-                control_revision: publication.revisions.control.get().to_string(),
-                config_revision: publication.revisions.config.get().to_string(),
-                tick: publication.world.tick.to_string(),
-            },
+            identity: RemoteFrameIdentity::from(publication).into(),
             snapshot: &publication.world,
         }
+    }
+}
+
+impl From<RemoteFrameIdentity> for BrowserFrameIdentity {
+    fn from(identity: RemoteFrameIdentity) -> Self {
+        Self {
+            session_id: identity.session_id.to_string(),
+            publication_revision: identity.publication_revision.to_string(),
+            scientific_revision: identity.scientific_revision.to_string(),
+            control_revision: identity.control_revision.to_string(),
+            config_revision: identity.config_revision.to_string(),
+            tick: identity.tick.to_string(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserRemoteFrame<'a> {
+    schema: &'static str,
+    kind: &'static str,
+    identity: BrowserFrameIdentity,
+    playback: BrowserRemotePlayback,
+    coalesced_publications: String,
+    payload: BrowserRemotePayload<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserRemotePlayback {
+    paused: bool,
+    speed_multiplier: f32,
+}
+
+// This is only the JavaScript object projection, not the positional wire codec.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum BrowserRemotePayload<'a> {
+    Telemetry(&'a scriptbots_core::TickSummaryDto),
+    Canvas(&'a SimulationSnapshot),
+    Events(BrowserRemoteEventPage<'a>),
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserRemoteEventPage<'a> {
+    after_event: String,
+    earliest_retained: String,
+    latest_event: String,
+    gap: Option<BrowserRemoteEventGap>,
+    events: Vec<BrowserRemoteSequencedEvent<'a>>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserRemoteEventGap {
+    first_missing: String,
+    last_missing: String,
+}
+
+#[derive(Serialize)]
+struct BrowserRemoteSequencedEvent<'a> {
+    sequence: String,
+    record: BrowserRemoteEventRecord<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserRemoteEventRecord<'a> {
+    schema_version: u32,
+    tick: String,
+    kind: scriptbots_core::narrative::EventKind,
+    severity: f32,
+    magnitude: f64,
+    window: [String; 2],
+    metric: &'a str,
+    before: f64,
+    after: f64,
+    score: f64,
+    subject: Option<&'a str>,
+    human_text: &'a str,
+}
+
+impl<'a> From<&'a RemoteEventRecord> for BrowserRemoteEventRecord<'a> {
+    fn from(record: &'a RemoteEventRecord) -> Self {
+        Self {
+            schema_version: record.schema_version,
+            tick: record.tick.to_string(),
+            kind: record.kind,
+            severity: record.severity,
+            magnitude: record.magnitude,
+            window: [record.window.0.to_string(), record.window.1.to_string()],
+            metric: &record.metric,
+            before: record.before,
+            after: record.after,
+            score: record.score,
+            subject: record.subject.as_deref(),
+            human_text: &record.human_text,
+        }
+    }
+}
+
+impl<'a> From<&'a RemoteEventPage> for BrowserRemoteEventPage<'a> {
+    fn from(page: &'a RemoteEventPage) -> Self {
+        Self {
+            after_event: page.after_event.to_string(),
+            earliest_retained: page.earliest_retained.to_string(),
+            latest_event: page.latest_event.to_string(),
+            gap: page.gap.map(|gap| BrowserRemoteEventGap {
+                first_missing: gap.first_missing.to_string(),
+                last_missing: gap.last_missing.to_string(),
+            }),
+            events: page
+                .events
+                .iter()
+                .map(|event| BrowserRemoteSequencedEvent {
+                    sequence: event.sequence.to_string(),
+                    record: (&event.record).into(),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl<'a> From<&'a RemoteFrame> for BrowserRemoteFrame<'a> {
+    fn from(frame: &'a RemoteFrame) -> Self {
+        let (kind, payload) = match &frame.payload {
+            RemoteFramePayload::Telemetry(summary) => {
+                ("telemetry", BrowserRemotePayload::Telemetry(summary))
+            }
+            RemoteFramePayload::Canvas(snapshot) => {
+                ("canvas", BrowserRemotePayload::Canvas(snapshot))
+            }
+            RemoteFramePayload::Events(page) => {
+                ("events", BrowserRemotePayload::Events(page.into()))
+            }
+        };
+        Self {
+            schema: "scriptbots.remote-frame.v1",
+            kind,
+            identity: frame.identity.into(),
+            playback: BrowserRemotePlayback {
+                paused: frame.playback.paused,
+                speed_multiplier: frame.playback.speed_multiplier,
+            },
+            coalesced_publications: frame.coalesced_publications.to_string(),
+            payload,
+        }
+    }
+}
+
+#[cfg(test)]
+mod remote_frame_tests {
+    use super::*;
+    use scriptbots_runtime::remote::{RemoteEventPage, RemoteSequencedEvent, encode_remote_frame};
+
+    #[test]
+    fn remote_frame_canvas_keeps_the_existing_renderer_contract_and_exact_identities() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            rng_seed: Some(17),
+            world_width: 80,
+            world_height: 80,
+            food_cell_size: 40,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            persistence_interval: 0,
+            ..ScriptBotsConfig::default()
+        })
+        .unwrap();
+        world.try_spawn_agent(AgentData::default()).unwrap();
+        let host =
+            HostCore::new(HostSessionId::new(17), world, HostCoreOptions::default()).unwrap();
+        let publication = host.latest_snapshot();
+        let mut frame = RemoteFrame {
+            identity: RemoteFrameIdentity::from(publication.as_ref()),
+            playback: publication.playback,
+            coalesced_publications: 0,
+            payload: RemoteFramePayload::Canvas(publication.world.clone()),
+        };
+        let bytes = encode_remote_frame(&frame).unwrap();
+        let decoded = decode_remote_frame(&bytes).unwrap();
+        let browser = serde_json::to_value(BrowserRemoteFrame::from(&decoded)).unwrap();
+        let local = serde_json::to_value(BrowserFrame::new(&publication)).unwrap();
+        assert_eq!(browser["payload"], local["snapshot"]);
+        assert_eq!(browser["identity"], local["identity"]);
+        assert_eq!(browser["kind"], "canvas");
+        assert_eq!(browser["schema"], "scriptbots.remote-frame.v1");
+        assert_eq!(browser["playback"]["paused"], publication.playback.paused);
+        assert_eq!(
+            browser["playback"]["speedMultiplier"],
+            publication.playback.speed_multiplier
+        );
+
+        // JS numeric identities cannot represent these values. Their decimal
+        // strings must survive the actual wire and the same JS projection.
+        frame.identity.session_id = u128::MAX;
+        frame.identity.publication_revision = u64::MAX;
+        frame.identity.scientific_revision = u64::MAX - 1;
+        frame.coalesced_publications = u64::MAX - 2;
+        let decoded = decode_remote_frame(&encode_remote_frame(&frame).unwrap()).unwrap();
+        let browser = serde_json::to_value(BrowserRemoteFrame::from(&decoded)).unwrap();
+        assert_eq!(browser["identity"]["sessionId"], u128::MAX.to_string());
+        assert_eq!(
+            browser["identity"]["publicationRevision"],
+            u64::MAX.to_string()
+        );
+        assert_eq!(
+            browser["identity"]["scientificRevision"],
+            (u64::MAX - 1).to_string()
+        );
+        assert_eq!(browser["coalescedPublications"], (u64::MAX - 2).to_string());
+    }
+
+    #[test]
+    fn remote_frame_events_preserve_large_cursors_and_canonical_prose() {
+        let record = RemoteEventRecord {
+            schema_version: 1,
+            tick: 0,
+            kind: scriptbots_core::narrative::EventKind::PopulationBoom,
+            severity: 0.5,
+            magnitude: 1.0,
+            window: (0, 0),
+            metric: "population".to_owned(),
+            before: 1.0,
+            after: 2.0,
+            score: 3.0,
+            subject: Some(format!("agent:{}", u64::MAX)),
+            human_text: "canonical prose".to_owned(),
+        };
+        let frame = RemoteFrame {
+            identity: RemoteFrameIdentity {
+                session_id: u128::MAX,
+                publication_revision: 1,
+                scientific_revision: 0,
+                control_revision: 0,
+                config_revision: 0,
+                tick: 0,
+            },
+            playback: PlaybackSnapshot {
+                paused: true,
+                speed_multiplier: 2.0,
+            },
+            coalesced_publications: 0,
+            payload: RemoteFramePayload::Events(RemoteEventPage {
+                after_event: u64::MAX - 1,
+                earliest_retained: u64::MAX,
+                latest_event: u64::MAX,
+                gap: None,
+                events: vec![RemoteSequencedEvent {
+                    sequence: u64::MAX,
+                    record,
+                }],
+            }),
+        };
+        let decoded = decode_remote_frame(&encode_remote_frame(&frame).unwrap()).unwrap();
+        let browser = serde_json::to_value(BrowserRemoteFrame::from(&decoded)).unwrap();
+        assert_eq!(browser["payload"]["afterEvent"], (u64::MAX - 1).to_string());
+        assert_eq!(browser["payload"]["latestEvent"], u64::MAX.to_string());
+        assert_eq!(
+            browser["payload"]["events"][0]["sequence"],
+            u64::MAX.to_string()
+        );
+        assert_eq!(browser["payload"]["events"][0]["record"]["tick"], "0");
+        assert_eq!(
+            browser["payload"]["events"][0]["record"]["subject"],
+            format!("agent:{}", u64::MAX)
+        );
+        assert_eq!(
+            browser["payload"]["events"][0]["record"]["humanText"],
+            "canonical prose"
+        );
     }
 }
 
@@ -785,6 +1053,17 @@ pub fn decode_snapshot_binary(bytes: &[u8]) -> Result<JsValue, JsValue> {
     let snapshot: SimulationSnapshot =
         from_bytes(bytes).map_err(|err| js_error(format!("postcard decode failed: {err}")))?;
     to_value(&snapshot).map_err(js_error)
+}
+
+/// Decode a negotiated server frame using the shared bounded Postcard protocol.
+///
+/// Identity and event-cursor integers are decimal strings at the JS boundary.
+/// Canvas payloads retain the existing camelCase dynamic-world snapshot shape.
+/// This function never creates, drives, or mutates a local simulation.
+#[wasm_bindgen]
+pub fn decode_remote_frame_binary(bytes: &[u8]) -> Result<JsValue, JsValue> {
+    let frame = decode_remote_frame(bytes).map_err(js_error)?;
+    to_value(&BrowserRemoteFrame::from(&frame)).map_err(js_error)
 }
 
 /// Initialize a simulation from a shareable permalink string (`sbw1...`).

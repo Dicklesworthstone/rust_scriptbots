@@ -2,6 +2,24 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Remote browser streaming and mixed persistence reconciliation:**
+[Functional contribution — Codex; original `bd-ac4l` and persistence acceptance remain open]
+The native WebSocket surface now negotiates bounded, versioned telemetry, dynamic
+canvas and canonical narrative frames from immutable host publications. Shared
+native/WASM decoding preserves exact session and revision identities, and explicit
+consumer credits bound each channel while a slow browser catches up. Narrative
+pages retain canonical records and declare exact retention gaps. The browser's
+existing renderers, metrics, command receipts and PNG capture consume the remote
+owner; its local simulation is frozen until the user explicitly returns to it.
+Reconnects retain consumed cursors and refuse foreign sessions.
+
+Journal completion also reconciles earlier ordinary persistence batches covered
+by its real watermarks. Finalized byte permits are released before publishing the
+newer journal analytics, preventing later flush/shutdown from reintroducing the
+older tick. Real file and volatile worker regressions cover that handoff.
+These changes do not close long-run storage probes, event-driven sub-16 ms push,
+the full browser/hardware matrix, or the original clean-source DSR soak criteria.
+
 **Experiment recovery, retryable controls, and native feedback (2026-11-04):**
 [Source implemented; original acceptance remains open — Codex; `bd-2z0.5.11`, `bd-ac4l`,
 `bd-k7nq`, `bd-2z0.7.14`, `bd-2z0.14.1.9.1`]

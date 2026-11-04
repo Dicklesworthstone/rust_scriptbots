@@ -172,7 +172,7 @@ function createServer(packageInfo) {
     } else if (url.pathname === "/main.js") {
       res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8" });
       res.end(fs.readFileSync(path.join(webDir, "main.js")));
-    } else if (["/renderers/canvas.js", "/renderers/webgpu.js"].includes(url.pathname)) {
+    } else if (["/remote.js", "/renderers/canvas.js", "/renderers/webgpu.js"].includes(url.pathname)) {
       res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8" });
       res.end(fs.readFileSync(path.join(webDir, url.pathname.slice(1))));
     } else if (url.pathname.startsWith("/pkg/")

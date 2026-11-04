@@ -1189,7 +1189,7 @@ For an interactive run, ScriptBots parses the control environment and transactio
   - `POST /api/presets/apply` → apply preset by name
   - `GET /api/config/audit` → recent config patches (audit ring buffer)
   - `GET /api/scenario` → the launch scenario identity bound to this run
-  - `GET /api/ws/stream` → binary tick summaries and acknowledged JSON controls
+  - `GET /api/ws/stream` → negotiated binary telemetry, canvas and narrative subscriptions with acknowledged JSON controls
   - `GET /api/narrative/search` → search the recent birth/death/combat narrative
   - `POST /api/v1/experiments` → start a matched-seed batch (`variants` × `seeds`, `ticks_per_run`) that executes on a
     background worker; `GET /api/v1/experiments/{id}` reports per-run state, final digest and bundle path;
@@ -1227,15 +1227,114 @@ session has a new identity namespace; this is not cross-session deduplication.
 Plain `pause`, `resume`, and `step`, and unkeyed JSON controls remain available;
 each unkeyed submission is a new command. An omitted version means version 1.
 
-Control messages and frames are limited to 16 KiB. Invalid JSON, unsupported
+Inbound control messages and frames are limited to 16 KiB. Invalid JSON, unsupported
 versions, unknown commands and unrelated fields are refused before admission;
 invalid input cannot silently become a step. A malformed request has a null
 reply ID because no validated identity was admitted. Client binary control frames
-receive an explicit refusal; server binary frames remain Postcard-encoded
-`TickSummaryDto` values at the existing 50 ms sampling cadence. Each connection
-has one write in flight with a five-second write timeout, and missed timer
-intervals are skipped. This is not the complete versioned canvas/event transport
-or a measured sub-16 ms latency claim; those remain under `bd-ac4l`.
+receive an explicit refusal. Before a subscription is negotiated, the server sends
+Postcard-encoded `TickSummaryDto` values at a 50 ms sampling cadence.
+
+#### Remote browser viewing and stream subscriptions
+
+The web demo's **Remote Server** controls connect its existing Canvas 2D or WebGPU
+renderer to a native server. Enter the server's WebSocket URL, then choose
+**Connect to Server**. The browser freezes its local simulation while displaying
+the remote world; **Return to Local Simulation** explicitly resumes that saved
+local owner. Server pause, resume and single-step commands have retry identities,
+and the UI displays the application and journal states actually returned in their
+receipts. **Refresh Command Outcome** observes later settlement; **Retry Last
+Command with Same ID** recovers a lost receipt without inventing a new step.
+PNG export uses the displayed remote frame's exact host and revision identity.
+Build the WASM package from the same source as the viewer and server.
+
+Browser origin checks also apply to WebSocket upgrades. If the static demo is
+served from a different origin, include that exact origin in
+`SCRIPTBOTS_CONTROL_ALLOWED_ORIGINS`; use `wss://` when the browser's HTTPS policy
+requires it. Existing Host/origin validation remains in force.
+
+Send a subscription as JSON text:
+
+```json
+{"protocol_version":1,"request_id":"viewer-1","command":"subscribe","channels":["canvas","telemetry","events"],"max_fps":60}
+```
+
+The server acknowledges with `type: "subscribed"`, the correlation `request_id`,
+`protocol_version: 1`, `stream_protocol_version: 1`, decimal-string `session_id`,
+selected `channels`, and `max_fps`. Ignore any initial binary summaries until
+that acknowledgment. Every subsequent binary message begins with ASCII `SBWS`,
+a little-endian `u16` version (`1`), and exactly one Postcard `RemoteFrame` from
+`scriptbots_runtime::remote`. Its identity contains the actual host session,
+publication, scientific, control and configuration revisions, and completed tick.
+Every frame also carries observed playback state and `coalesced_publications`.
+The WASM `decode_remote_frame_binary` export validates this envelope and exposes
+all identity/cursor integers as decimal strings under
+`schema: "scriptbots.remote-frame.v1"`. The dynamic canvas payload preserves the
+existing world-v2 schema used by both renderers.
+
+| Channel | Payload and delivery behavior |
+| --- | --- |
+| `telemetry` | Canonical `TickSummaryDto` from one host publication; latest value only. |
+| `canvas` | Complete dynamic-world snapshot from that same publication; latest value only, including paused control changes. |
+| `events` | Up to 64 canonical narrative records, oldest first, with session-bound sequence numbers and an exact missing-prefix gap when retention overtakes a reader. Backlogged pages drain even while science is paused. |
+
+Subscriptions contain one through three unique channels. Omitted channels do no
+projection work. `max_fps` defaults to 60 and accepts 1–120; it bounds sampling
+frequency, not simulation speed. Binary frames are capped at 8 MiB, canvas frames
+at 65,536 agents, and narrative pages at 64 records with bounded text. An
+unrepresentable source is refused instead of silently truncated. The shared
+decoder rejects unknown versions, trailing data, invalid lengths, non-finite
+presentation values, mismatched ticks and noncontiguous event pages.
+
+Each channel has one consumption credit. After consuming a frame, acknowledge its
+exact identity before another frame in that channel can be sent:
+
+```json
+{"protocol_version":1,"command":"stream_ack","session_id":"891","channel":"canvas","publication_revision":"42"}
+```
+
+For `events`, also include `after_event` as a decimal string: the last record's
+sequence, the declared gap's last missing ordinal if the page has no records, or
+the page's unchanged cursor if it is empty. Canvas and telemetry acknowledgments
+must omit that field. The supplied browser client sends this acknowledgment only
+after synchronous validation and consumption. A wrong, duplicate or expired
+acknowledgment closes the stream; it never releases another channel's credit.
+Subscription replacement requires all outstanding frames to be acknowledged.
+
+Each connection prepares at most one frame per selected channel from an immutable
+publication and has one socket write in flight. Until the browser consumes that
+frame, newer publications coalesce in the host's latest-value slot. This also
+bounds traffic entering a browser whose main thread has fallen behind. No per-tick
+snapshot queue or simulation lock is retained. Projection, socket writes and
+consumption acknowledgments each have a five-second deadline; expired credit is
+checked at the next sampling boundary. Queued blocking preparation is cancelled
+when the connection closes or its preparation deadline expires. Missed timer
+intervals are skipped. Preparation/write work or observed consumption round trips
+exceeding the current sample interval back sampling off to twice the observed
+duration, capped at one second. Eight cheap samples permit a 25% recovery toward
+the requested rate. A `stream_rate`
+JSON notice reports the requested/effective intervals in microseconds and the
+`slow_consumer` or `recovering` decision. Snapshot frames report skipped revisions;
+narrative frames preserve contiguous records or explicitly declare retention loss.
+
+For reconnect, retain only frames successfully consumed by the client and send
+their session-bound cursors:
+
+```json
+{"protocol_version":1,"request_id":"viewer-resume","command":"subscribe","channels":["canvas","events"],"max_fps":60,"resume":{"session_id":"891","after_revision":"42","after_event":"7"}}
+```
+
+Use the minimum last-consumed revision across enabled latest-value channels.
+Foreign sessions or future cursors return 409 and leave an existing subscription
+unchanged. Narrative pages report `after_event`, `earliest_retained`, `latest_event`,
+optional `gap`, and sequenced records; accepting a gap explicitly advances past
+that unavailable prefix. The browser reconnects only on request, retains exact
+cursors, and never silently retries a command or discards a changed host session.
+A fresh **Connect to Server** is the explicit choice to start without old cursors.
+
+This provides the functional versioned transport and browser consumer under
+`bd-ac4l`. It samples the latest publication; event-driven sub-16 ms delivery,
+multi-client soak/latency measurements and the full original DSR/hardware
+acceptance remain open. A requested 60 Hz rate is not measured latency evidence.
 
 The REST step routes (`/api/step` and `/api/control/step`) accept an
 `Idempotency-Key` header, and MCP `step` accepts `idempotency_key`. For `count: 1`

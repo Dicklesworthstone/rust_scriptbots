@@ -1,6 +1,7 @@
 import initWasm, * as wasm from "./pkg/scriptbots_web.js";
 import { CanvasRenderer } from "./renderers/canvas.js";
 import { WebGpuRenderer } from "./renderers/webgpu.js";
+import { RemoteStreamClient } from "./remote.js";
 
 const {
   init_sim,
@@ -38,6 +39,20 @@ const stepsSlider = document.getElementById("steps-per-frame");
 const populationSlider = document.getElementById("population");
 const logView = document.getElementById("log");
 const versionEl = document.getElementById("version");
+const remoteUrl = document.getElementById("remote-url");
+const remoteConnect = document.getElementById("remote-connect");
+const remoteReconnect = document.getElementById("remote-reconnect");
+const remoteLocal = document.getElementById("remote-local");
+const remoteStatus = document.getElementById("remote-status");
+const remotePlayback = document.getElementById("remote-playback");
+const remoteReceipt = document.getElementById("remote-receipt");
+const remoteEvents = document.getElementById("remote-events");
+const remoteOverlay = document.getElementById("remote-overlay");
+const remotePause = document.getElementById("remote-pause");
+const remoteResume = document.getElementById("remote-resume");
+const remoteStep = document.getElementById("remote-step");
+const remoteRefresh = document.getElementById("remote-refresh");
+const remoteRetry = document.getElementById("remote-retry");
 
 const mismatchBannerEl = document.getElementById("mismatch-banner");
 const permalinkInput = document.getElementById("permalink-input");
@@ -81,8 +96,16 @@ let simulationStartedAt = null;
 let simulationTimer = null;
 let queuedReset = false;
 let population = Number(populationSlider.value);
+let remoteMode = false;
+let remoteClient = null;
+let remoteFrame = null;
+let remoteConnected = false;
+let lastRemoteRequestId = null;
+let lastRemoteCommandId = null;
+let lastRemoteStatusRequestId = null;
 
 stepsSlider.addEventListener("input", () => {
+  if (remoteMode) return;
   speedMultiplier = Number(stepsSlider.value);
   applyPlaybackSpeed();
   appendLog(`Simulation speed set to ${speedMultiplier}×`);
@@ -95,6 +118,7 @@ populationSlider.addEventListener("input", () => {
 });
 
 resetButton.addEventListener("click", () => {
+  if (remoteMode) return;
   queuedReset = true;
   if (permalinkStatus) {
     permalinkStatus.textContent = "";
@@ -108,11 +132,192 @@ function appendLog(message) {
   logView.textContent = `${line}\n${logView.textContent}`.slice(0, 4096);
 }
 
+function hasPresentationFrame() {
+  return remoteMode ? remoteFrame !== null : simHandle !== null;
+}
+
+function updateRemoteControls() {
+  for (const input of [stepsSlider, populationSlider, resetButton, permalinkInput,
+    loadPermalinkBtn, copyPermalinkBtn, forkPatchInput, forkBtn, loadForkedBtn, copyForkBtn]) {
+    if (input) input.disabled = remoteMode;
+  }
+  remoteLocal.disabled = !remoteMode;
+  remoteReconnect.disabled = !remoteMode || !remoteClient || remoteConnected;
+  for (const button of [remotePause, remoteResume, remoteStep]) button.disabled = !remoteConnected;
+  remoteRefresh.disabled = !remoteConnected || !lastRemoteCommandId;
+  remoteRetry.disabled = !remoteConnected || !lastRemoteRequestId;
+  captureButton.disabled = !hasPresentationFrame() || !!captureRequest || !!encodingRequest;
+  remoteOverlay.hidden = !remoteMode || !!remoteFrame;
+}
+
+function remoteEventLine(text) {
+  const item = document.createElement("li");
+  item.textContent = text;
+  remoteEvents.append(item);
+  while (remoteEvents.children.length > 48) remoteEvents.firstElementChild.remove();
+  remoteEvents.scrollTop = remoteEvents.scrollHeight;
+}
+
+function receiveRemoteFrame(frame) {
+  if (!remoteMode) return;
+  remotePlayback.textContent = `Observed server: ${frame.playback.paused ? "paused" : "running"}, ${frame.playback.speedMultiplier}× — tick ${frame.identity.tick}`;
+  if (frame.kind === "canvas") {
+    const browserFrame = { schema: "scriptbots.browser-frame.v1", identity: frame.identity, snapshot: frame.payload };
+    validateFrameIdentity(browserFrame);
+    remoteFrame = browserFrame;
+    if (frame.coalescedPublications !== "0") {
+      remoteStatus.textContent = `Connected — latest publication ${frame.identity.publicationRevision}; skipped ${frame.coalescedPublications} intermediate publications.`;
+    }
+    updateRemoteControls();
+  } else if (frame.kind === "events") {
+    const page = frame.payload;
+    if (page.gap) {
+      remoteEventLine(`History gap: narrative events ${page.gap.firstMissing}–${page.gap.lastMissing} are no longer retained by this server.`);
+    }
+    for (const event of page.events) {
+      remoteEventLine(`#${event.sequence} · tick ${event.record.tick}: ${event.record.humanText}`);
+    }
+  }
+}
+
+function receiveRemoteState(state) {
+  if (!remoteMode) return;
+  remoteConnected = state.state === "connected";
+  remoteStatus.dataset.state = state.state;
+  remoteStatus.textContent = state.message || state.state;
+  if (["disconnected", "error", "session_changed"].includes(state.state) && remoteFrame) {
+    remoteStatus.textContent += " Showing the last received frame.";
+  }
+  if (state.state === "session_changed") {
+    remoteStatus.textContent += " Connect to Server starts a fresh subscription; old cursors are not reused.";
+  }
+  updateRemoteControls();
+}
+
+function receiveRemoteReceipt(reply) {
+  if (!remoteMode) return;
+  if (reply.request_id !== lastRemoteRequestId && reply.request_id !== lastRemoteStatusRequestId) {
+    appendLog(`Earlier remote request ${reply.request_id}: ${reply.type === "receipt"
+      ? `${reply.receipt.application_state}; journal ${reply.receipt.journal_state}`
+      : `${reply.status}: ${reply.message}`}`);
+    return;
+  }
+  if (reply.type === "receipt") {
+    const receipt = reply.receipt;
+    lastRemoteCommandId = receipt.command_id;
+    remoteReceipt.textContent = `Command ${receipt.command_id}: application ${receipt.application_state}; journal ${receipt.journal_state}.`;
+    if (receipt.rejection_reason) remoteReceipt.textContent += ` ${JSON.stringify(receipt.rejection_reason)}`;
+  } else {
+    remoteReceipt.textContent = `Command response ${reply.status}: ${reply.message}`;
+  }
+  appendLog(remoteReceipt.textContent);
+  updateRemoteControls();
+}
+
+function connectRemote() {
+  try {
+    // Freeze local science before changing the active source. The saved local
+    // owner is resumed only by the user's explicit Return to Local action.
+    if (!remoteMode && simHandle) {
+      driveSimulation();
+      simHandle.setSpeed(0);
+    }
+    if (simulationTimer !== null) clearTimeout(simulationTimer);
+    simulationTimer = null;
+    queuedReset = false;
+    remoteClient?.disconnect();
+    remoteClient = null;
+    remoteMode = true;
+    remoteConnected = false;
+    remoteFrame = null;
+    lastRemoteRequestId = null;
+    lastRemoteCommandId = null;
+    lastRemoteStatusRequestId = null;
+    simulationGeneration += 1;
+    lastPaintedFrame = null;
+    if (captureRequest) finishCapture(captureRequest, new Error("Presentation source changed"));
+    remoteEvents.replaceChildren();
+    remoteReceipt.textContent = "";
+    remotePlayback.textContent = "Waiting for observed server state…";
+    remoteClient = new RemoteStreamClient({
+      url: remoteUrl.value.trim(),
+      decodeFrame: wasm.decode_remote_frame_binary,
+      channels: ["canvas", "telemetry", "events"],
+      maxFps: 60,
+      onFrame: receiveRemoteFrame,
+      onState: receiveRemoteState,
+      onReceipt: receiveRemoteReceipt,
+    });
+    updateMismatchBanner(null);
+    resetPerformanceWindows();
+    updateRemoteControls();
+    remoteClient.connect();
+  } catch (error) {
+    receiveRemoteState({ state: "error", message: `Connection failed: ${error.message}` });
+  }
+}
+
+remoteConnect.addEventListener("click", connectRemote);
+remoteReconnect.addEventListener("click", () => {
+  try { remoteClient?.reconnect(); }
+  catch (error) { receiveRemoteState({ state: "error", message: error.message }); }
+});
+remoteLocal.addEventListener("click", () => {
+  remoteClient?.disconnect();
+  remoteMode = false;
+  remoteConnected = false;
+  remoteClient = null;
+  remoteFrame = null;
+  simulationGeneration += 1;
+  lastPaintedFrame = null;
+  if (captureRequest) finishCapture(captureRequest, new Error("Presentation source changed"));
+  remoteStatus.textContent = "Running locally in this browser.";
+  remoteStatus.dataset.state = "local";
+  remotePlayback.textContent = "";
+  remoteReceipt.textContent = "";
+  resetPerformanceWindows();
+  updateRemoteControls();
+  applyPlaybackSpeed();
+  if (simulationTimer === null) pumpSimulation();
+});
+
+function sendRemoteControl(command) {
+  try {
+    lastRemoteCommandId = null;
+    lastRemoteStatusRequestId = null;
+    lastRemoteRequestId = remoteClient.sendControl(command);
+    remoteReceipt.textContent = `Sent ${command} (${lastRemoteRequestId}); awaiting the server's receipt.`;
+    updateRemoteControls();
+  } catch (error) {
+    if (error.requestId) {
+      lastRemoteRequestId = error.requestId;
+      remoteReceipt.textContent = `Command delivery unconfirmed (${error.requestId}): ${error.message}. Reconnect and retry with the same ID.`;
+    } else {
+      remoteReceipt.textContent = `Command was not sent: ${error.message}`;
+    }
+    updateRemoteControls();
+  }
+}
+
+remotePause.addEventListener("click", () => sendRemoteControl("pause"));
+remoteResume.addEventListener("click", () => sendRemoteControl("resume"));
+remoteStep.addEventListener("click", () => sendRemoteControl("step"));
+remoteRefresh.addEventListener("click", () => {
+  try { lastRemoteStatusRequestId = remoteClient.sendControl("status", { commandId: lastRemoteCommandId }); }
+  catch (error) { remoteReceipt.textContent = `Outcome lookup failed: ${error.message}`; }
+});
+remoteRetry.addEventListener("click", () => {
+  try {
+    remoteClient.retryControl(lastRemoteRequestId);
+    remoteReceipt.textContent = `Retried the same command identity (${lastRemoteRequestId}); awaiting the server's receipt.`;
+  } catch (error) { remoteReceipt.textContent = `Retry failed: ${error.message}`; }
+});
+
 function resetPerformanceWindows() {
   const now = performance.now();
   metrics.lastFrameTs = now;
   metrics.lastStatsTs = now;
-  metrics.previousTick = simHandle ? simHandle.snapshot().tick : null;
+  metrics.previousTick = remoteMode ? remoteFrame?.snapshot.tick ?? null : simHandle ? simHandle.snapshot().tick : null;
   metrics.fps = 0;
   metrics.tps = 0;
   metrics.tick = 0;
@@ -230,14 +435,14 @@ function finishCapture(request, error = null) {
   if (captureRequest !== request) return;
   clearTimeout(request.timeout);
   captureRequest = null;
-  captureButton.disabled = !simHandle || !!encodingRequest;
+  captureButton.disabled = !hasPresentationFrame() || !!encodingRequest;
   if (error) {
     showCaptureError(`PNG export failed: ${error.message}`);
   }
 }
 
 captureButton.addEventListener("click", () => {
-  if (!simHandle || captureRequest || encodingRequest) return;
+  if (!hasPresentationFrame() || captureRequest || encodingRequest) return;
   const request = { simulationGeneration, encoding: false, timeout: null };
   request.timeout = setTimeout(() => finishCapture(request, new Error(encodingRequest === request
     ? "No PNG completed within 10 seconds; encoding is still finishing"
@@ -270,7 +475,7 @@ function captureAdmittedFrame(frameIdentity) {
         if (completedEncoding && !captureRequest) {
           showCaptureError("PNG encoding finished after its request expired; try again");
         }
-        captureButton.disabled = !simHandle || !!captureRequest || !!encodingRequest;
+        captureButton.disabled = !hasPresentationFrame() || !!captureRequest || !!encodingRequest;
         return;
       }
       try {
@@ -296,6 +501,7 @@ function captureAdmittedFrame(frameIdentity) {
 }
 
 window.addEventListener("pagehide", () => {
+  remoteClient?.disconnect();
   if (captureRequest) finishCapture(captureRequest, new Error("Page left during capture"));
   if (captureUrl) URL.revokeObjectURL(captureUrl);
   captureUrl = null;
@@ -349,19 +555,19 @@ function updateStats(snapshot, now) {
 }
 
 function presentSimulation(now) {
-  if (!simHandle) {
+  if (!hasPresentationFrame()) {
     requestAnimationFrame(presentSimulation);
     return;
   }
 
-  const frame = simHandle.frame();
+  const frame = remoteMode ? remoteFrame : simHandle.frame();
   drawSnapshot(frame);
   updateStats(frame.snapshot, now);
   requestAnimationFrame(presentSimulation);
 }
 
 function driveSimulation() {
-  if (!simHandle || simulationStartedAt === null) return;
+  if (remoteMode || !simHandle || simulationStartedAt === null) return;
   const receipt = simHandle.drive(performance.now() - simulationStartedAt);
   if (receipt.automatic_steps_skipped > 0) {
     appendLog(
@@ -371,7 +577,7 @@ function driveSimulation() {
 }
 
 function applyPlaybackSpeed() {
-  if (!simHandle) return;
+  if (remoteMode || !simHandle) return;
   // Settle the prior speed up to this input boundary before applying the new
   // canonical command. Resuming never accrues science for a hidden interval.
   driveSimulation();
@@ -387,6 +593,7 @@ function startSimulationClock() {
 
 function pumpSimulation() {
   simulationTimer = null;
+  if (remoteMode) return;
 
   if (queuedReset) {
     resetSimulation(population).catch((err) => {
@@ -506,7 +713,7 @@ function updateDiffTable(linkStr) {
 }
 
 async function loadWorldFromPermalink(linkStr) {
-  if (!linkStr) return;
+  if (remoteMode || !linkStr) return;
   try {
     if (permalinkStatus) {
       permalinkStatus.textContent = "Loading permalink...";
@@ -568,7 +775,7 @@ async function loadWorldFromPermalink(linkStr) {
 }
 
 async function handleFork() {
-  if (!simHandle) {
+  if (remoteMode || !simHandle) {
     appendLog("Cannot fork: simulation not running");
     return;
   }
@@ -631,6 +838,7 @@ if (loadPermalinkBtn) {
 
 if (copyPermalinkBtn) {
   copyPermalinkBtn.addEventListener("click", () => {
+    if (remoteMode) return;
     if (!currentPermalink && simHandle) {
       try {
         if (permalink_of) {
@@ -684,6 +892,7 @@ if (copyForkBtn) {
 }
 
 async function resetSimulation(populationOverride) {
+  if (remoteMode) return;
   const defaults = default_init_options ? default_init_options() : {};
   const seed = Math.floor(Math.random() * 1_000_000);
   const options = {
@@ -751,6 +960,7 @@ async function bootstrap() {
     }
 
     if (simulationTimer === null) pumpSimulation();
+    remoteConnect.disabled = false;
     requestAnimationFrame(presentSimulation);
   } catch (err) {
     console.error("Failed to initialise wasm module", err);

@@ -152,6 +152,33 @@
             transform: translateY(-1px);
         }
 
+        .controls button:disabled {
+            opacity: 0.45;
+            cursor: default;
+            transform: none;
+        }
+
+        #remote-status, #remote-playback, #remote-receipt {
+            font-size: 0.75rem;
+            overflow-wrap: anywhere;
+        }
+
+        #remote-events {
+            max-height: 12rem;
+            overflow: auto;
+            margin: 0;
+            padding-left: 1.2rem;
+            font-size: 0.75rem;
+        }
+
+        #remote-overlay {
+            position: absolute;
+            inset: 0;
+            padding: 3rem 1rem;
+            background: #0f172a;
+            text-align: center;
+        }
+
         .chip {
             display: inline-flex;
             align-items: center;
@@ -234,6 +261,7 @@
     <main>
         <section id="sim-container">
             <canvas id="sim-canvas" width="1280" height="720" aria-label="Simulation canvas"></canvas>
+            <div id="remote-overlay" role="status" hidden>Waiting for a remote canvas frame…</div>
         </section>
         <aside id="stats-panel">
             <div class="controls">
@@ -274,6 +302,25 @@
                     <input id="population" type="range" min="32" max="1024" step="32" value="256" />
                 </label>
                 <button id="reset-btn" type="button">Reset Simulation</button>
+            </div>
+            <div class="controls" aria-label="Remote simulation">
+                <div class="chip">Remote Server</div>
+                <label>
+                    WebSocket URL
+                    <input id="remote-url" type="text" value="ws://127.0.0.1:8088/api/ws/stream" spellcheck="false" />
+                </label>
+                <button id="remote-connect" type="button" disabled>Connect to Server</button>
+                <button id="remote-reconnect" type="button" disabled>Reconnect with Cursor</button>
+                <button id="remote-local" type="button" disabled>Return to Local Simulation</button>
+                <div id="remote-status" role="status" aria-live="polite">Running locally in this browser.</div>
+                <div id="remote-playback" role="status"></div>
+                <button id="remote-pause" type="button" disabled>Pause Server</button>
+                <button id="remote-resume" type="button" disabled>Resume Server</button>
+                <button id="remote-step" type="button" disabled>Step Server Once</button>
+                <button id="remote-refresh" type="button" disabled>Refresh Command Outcome</button>
+                <button id="remote-retry" type="button" disabled>Retry Last Command with Same ID</button>
+                <div id="remote-receipt" role="status" aria-live="polite"></div>
+                <ul id="remote-events" aria-label="Remote narrative events" aria-live="polite"></ul>
             </div>
             <div class="controls">
                 <div class="chip">Share &amp; Fork</div>
