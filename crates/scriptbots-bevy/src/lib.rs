@@ -3110,22 +3110,23 @@ fn setup_scene(
 
     let primary_text_color = Color::WHITE;
     let secondary_text_color = Color::srgb(0.74, 0.82, 0.94);
-    let primary_font = TextFont::from_font_size(18.0);
-    let secondary_font = TextFont::from_font_size(15.0);
+    let primary_font = TextFont::from_font_size(16.0);
+    let secondary_font = TextFont::from_font_size(14.0);
 
     let button_node = Node {
-        padding: UiRect::axes(Val::Px(12.0), Val::Px(8.0)),
+        padding: UiRect::axes(Val::Px(8.0), Val::Px(6.0)),
         border: UiRect::all(Val::Px(1.0)),
         align_items: AlignItems::Center,
         justify_content: JustifyContent::Center,
-        min_width: Val::Px(120.0),
+        min_width: Val::Px(90.0),
         ..default()
     };
     let button_row_node = Node {
         flex_direction: FlexDirection::Row,
+        flex_wrap: FlexWrap::Wrap,
         column_gap: Val::Px(8.0),
         row_gap: Val::Px(8.0),
-        margin: UiRect::axes(Val::Px(0.0), Val::Px(8.0)),
+        margin: UiRect::axes(Val::Px(0.0), Val::Px(4.0)),
         ..default()
     };
     let button_border_color = Color::srgba(0.32, 0.38, 0.58, 1.0);
@@ -3168,9 +3169,11 @@ fn setup_scene(
                 position_type: PositionType::Absolute,
                 top: Val::Px(12.0),
                 left: Val::Px(12.0),
+                width: Val::Px(560.0),
+                max_width: Val::Percent(90.0),
                 padding: UiRect::all(Val::Px(10.0)),
                 flex_direction: FlexDirection::Column,
-                row_gap: Val::Px(6.0),
+                row_gap: Val::Px(4.0),
                 ..default()
             },
             BackgroundColor(Color::srgba(0.07, 0.11, 0.18, 0.72)),
@@ -3323,9 +3326,9 @@ fn setup_scene(
             });
 
         let follow_buttons = [
-            (FollowMode::Off, "Follow off (F)"),
-            (FollowMode::Selected, "Follow selected (Ctrl+S)"),
-            (FollowMode::Oldest, "Follow oldest (Ctrl+O)"),
+            (FollowMode::Off, "Follow off"),
+            (FollowMode::Selected, "Follow selected"),
+            (FollowMode::Oldest, "Follow oldest"),
         ];
 
         parent
@@ -3359,7 +3362,7 @@ fn setup_scene(
                 ))
                 .with_children(|btn| {
                     btn.spawn((
-                        Text::new("Clear selection (Esc)"),
+                        Text::new("Clear (Esc)"),
                         secondary_font.clone(),
                         TextColor(secondary_text_color),
                     ));
@@ -3733,7 +3736,7 @@ fn update_hud(
             let yaw_deg = rig.yaw.to_degrees();
             let pitch_deg = rig.pitch.to_degrees();
             **text = format!(
-                "Camera: dist {:>5.0} yaw {:>6.1} deg pitch {:>5.1} deg | Ctrl+F fit selection | Ctrl+W fit world",
+                "Camera: dist {:>5.0} | yaw {:>6.1} | pitch {:>5.1} deg\nCtrl+F fit selection | Ctrl+W fit world",
                 rig.distance, yaw_deg, pitch_deg
             );
         }
@@ -6505,7 +6508,10 @@ fn format_event_feed(events: &[HudEvent]) -> String {
         return "Events: none yet".to_string();
     }
     let mut line = String::from("Events:");
-    for event in events {
+    for (index, event) in events.iter().enumerate() {
+        if index == 3 {
+            line.push_str("\n ");
+        }
         line.push_str(&format!(
             " {} {}x{}@{}",
             event.kind.glyph(),
