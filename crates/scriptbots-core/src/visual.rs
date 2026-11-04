@@ -399,10 +399,31 @@ pub const BIOLUMINESCENT_DARK_FIELD_V1: VisualStyleV1 = {
     }
 };
 
+/// Natural daylight terrain direction. Creature and interface semantics remain
+/// inherited until their own redesigns are ready; biome colors and atmospheric
+/// haze share one authority across all renderers.
+pub const NATURAL_FIELD_STYLE_V2: VisualStyleV1 = {
+    let mut style = BIOLUMINESCENT_DARK_FIELD_V1;
+    style.terrain[0].albedo_srgb = [0.045, 0.140, 0.190];
+    style.terrain[1].albedo_srgb = [0.110, 0.255, 0.270];
+    style.terrain[2].albedo_srgb = [0.620, 0.550, 0.380];
+    style.terrain[3].albedo_srgb = [0.240, 0.380, 0.180];
+    style.terrain[4].albedo_srgb = [0.350, 0.450, 0.230];
+    style.terrain[5].albedo_srgb = [0.340, 0.340, 0.300];
+    style.terrain[0].emissive_srgb = [0.006, 0.014, 0.018];
+    style.terrain[1].emissive_srgb = [0.008, 0.018, 0.016];
+    style.terrain[2].emissive_srgb = [0.015, 0.012, 0.008];
+    style.terrain[3].emissive_srgb = [0.010, 0.018, 0.008];
+    style.terrain[4].emissive_srgb = [0.014, 0.020, 0.010];
+    style.terrain[5].emissive_srgb = [0.006, 0.006, 0.005];
+    style.atmosphere.fog_srgb = [0.58, 0.68, 0.74];
+    style
+};
+
 /// Return the canonical visual style.
 #[must_use]
 pub const fn visual_style() -> &'static VisualStyleV1 {
-    &BIOLUMINESCENT_DARK_FIELD_V1
+    &NATURAL_FIELD_STYLE_V2
 }
 
 // ---------------------------------------------------------------------------
@@ -830,12 +851,12 @@ pub fn agent_visual_params(input: &AgentVisualInput) -> AgentVisualParams {
 
 /// Base color per terrain kind (natural palette, `sRGB` bytes as floats).
 pub const TERRAIN_BASE_COLORS: [Srgb; 6] = [
-    BIOLUMINESCENT_DARK_FIELD_V1.terrain[0].albedo_srgb,
-    BIOLUMINESCENT_DARK_FIELD_V1.terrain[1].albedo_srgb,
-    BIOLUMINESCENT_DARK_FIELD_V1.terrain[2].albedo_srgb,
-    BIOLUMINESCENT_DARK_FIELD_V1.terrain[3].albedo_srgb,
-    BIOLUMINESCENT_DARK_FIELD_V1.terrain[4].albedo_srgb,
-    BIOLUMINESCENT_DARK_FIELD_V1.terrain[5].albedo_srgb,
+    NATURAL_FIELD_STYLE_V2.terrain[0].albedo_srgb,
+    NATURAL_FIELD_STYLE_V2.terrain[1].albedo_srgb,
+    NATURAL_FIELD_STYLE_V2.terrain[2].albedo_srgb,
+    NATURAL_FIELD_STYLE_V2.terrain[3].albedo_srgb,
+    NATURAL_FIELD_STYLE_V2.terrain[4].albedo_srgb,
+    NATURAL_FIELD_STYLE_V2.terrain[5].albedo_srgb,
 ];
 
 /// Layer index shared by canonical terrain materials, colors and biome textures.
@@ -854,7 +875,7 @@ pub const fn terrain_kind_index(kind: TerrainKind) -> usize {
 /// Canonical physical material for a terrain kind.
 #[must_use]
 pub const fn terrain_material(kind: TerrainKind) -> TerrainMaterialStyle {
-    BIOLUMINESCENT_DARK_FIELD_V1.terrain[terrain_kind_index(kind)]
+    NATURAL_FIELD_STYLE_V2.terrain[terrain_kind_index(kind)]
 }
 
 /// Base color for a terrain kind.
@@ -2179,7 +2200,7 @@ pub const CANONICAL_BIOME_ATLAS_BYTE_LEN: usize =
 
 /// Canonical BLAKE3 digest of the baked biome atlas fixture.
 pub const CANONICAL_BIOME_ATLAS_DIGEST: &str =
-    "bf2a0ef5fdc3cb1b503a4c6f42bab90054809855ce8e5d31661117eb61451b5a";
+    "186f83b607d5160f3ef75fe2a597de492fb832f90cbcfb9fa41681dbbc0da27a";
 
 /// Diagnostic verification error for canonical biome atlas conformance (bd-2z0.14.1.2.4).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -2433,7 +2454,7 @@ mod tests {
     }
 
     #[test]
-    fn dark_field_style_is_finite_in_gamut_and_materially_coherent() {
+    fn canonical_style_is_finite_in_gamut_and_materially_coherent() {
         let style = visual_style();
         let colors = [
             style.substrate.abyss_srgb,
@@ -2577,7 +2598,7 @@ mod tests {
         for (expected_index, kind) in kinds.into_iter().enumerate() {
             assert_eq!(
                 terrain_material(kind),
-                BIOLUMINESCENT_DARK_FIELD_V1.terrain[expected_index]
+                NATURAL_FIELD_STYLE_V2.terrain[expected_index]
             );
             let weights = splat_weights(&SplatInput {
                 kind,
@@ -2598,6 +2619,19 @@ mod tests {
                 "{kind:?} material and splat slots must stay aligned"
             );
         }
+    }
+
+    #[test]
+    fn natural_terrain_palette_keeps_biomes_distinct() {
+        let grass = terrain_kind_base_color(TerrainKind::Grass);
+        let sand = terrain_kind_base_color(TerrainKind::Sand);
+        let deep = terrain_kind_base_color(TerrainKind::DeepWater);
+        let shallow = terrain_kind_base_color(TerrainKind::ShallowWater);
+        assert!(grass[1] > grass[0] && grass[1] > grass[2]);
+        assert!(sand[0] > sand[1] && sand[1] > sand[2]);
+        assert!(deep[2] > deep[0] && shallow[2] > shallow[0]);
+        assert!(luminance(deep) < luminance(shallow));
+        assert_ne!(grass, BIOLUMINESCENT_DARK_FIELD_V1.terrain[3].albedo_srgb);
     }
 
     #[test]
@@ -2894,11 +2928,11 @@ mod tests {
     fn terrain_base_colors_are_aliases_into_the_style() {
         assert_eq!(
             terrain_kind_base_color(TerrainKind::DeepWater),
-            BIOLUMINESCENT_DARK_FIELD_V1.terrain[0].albedo_srgb
+            NATURAL_FIELD_STYLE_V2.terrain[0].albedo_srgb
         );
         assert_eq!(
             terrain_kind_base_color(TerrainKind::Rock),
-            BIOLUMINESCENT_DARK_FIELD_V1.terrain[5].albedo_srgb
+            NATURAL_FIELD_STYLE_V2.terrain[5].albedo_srgb
         );
     }
 

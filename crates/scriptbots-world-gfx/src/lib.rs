@@ -1468,8 +1468,7 @@ mod capture_smoke_test {
                     5 // Rock
                 };
                 tiles.push(kind_idx);
-                let albedo =
-                    visual::BIOLUMINESCENT_DARK_FIELD_V1.terrain[kind_idx as usize].albedo_srgb;
+                let albedo = visual::TERRAIN_BASE_COLORS[kind_idx as usize];
                 colors.push([albedo[0], albedo[1], albedo[2], 1.0]);
                 let elev = match kind_idx {
                     0 => 0.08,

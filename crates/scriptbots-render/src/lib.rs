@@ -22627,12 +22627,12 @@ fn paint_terrain_layer(
 // retired call-site by call-site. Core visual semantics own every value.
 const LEGACY_TERRAIN_BASE: [[f32; 3]; 6] = visual::TERRAIN_BASE_COLORS;
 const LEGACY_TERRAIN_ACCENT: [[f32; 3]; 6] = [
-    visual::BIOLUMINESCENT_DARK_FIELD_V1.terrain[0].emissive_srgb,
-    visual::BIOLUMINESCENT_DARK_FIELD_V1.terrain[1].emissive_srgb,
-    visual::BIOLUMINESCENT_DARK_FIELD_V1.terrain[2].emissive_srgb,
-    visual::BIOLUMINESCENT_DARK_FIELD_V1.terrain[3].emissive_srgb,
-    visual::BIOLUMINESCENT_DARK_FIELD_V1.terrain[4].emissive_srgb,
-    visual::BIOLUMINESCENT_DARK_FIELD_V1.terrain[5].emissive_srgb,
+    visual::NATURAL_FIELD_STYLE_V2.terrain[0].emissive_srgb,
+    visual::NATURAL_FIELD_STYLE_V2.terrain[1].emissive_srgb,
+    visual::NATURAL_FIELD_STYLE_V2.terrain[2].emissive_srgb,
+    visual::NATURAL_FIELD_STYLE_V2.terrain[3].emissive_srgb,
+    visual::NATURAL_FIELD_STYLE_V2.terrain[4].emissive_srgb,
+    visual::NATURAL_FIELD_STYLE_V2.terrain[5].emissive_srgb,
 ];
 
 #[inline]
