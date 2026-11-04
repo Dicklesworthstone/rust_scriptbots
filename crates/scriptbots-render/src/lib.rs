@@ -21511,6 +21511,33 @@ fn append_triangle(builder: &mut PathBuilder, triangle: [(f32, f32); 3]) {
     builder.close();
 }
 
+/// A tapered exhaust plume for close views. Its bounds stay inside the simple
+/// triangle used for culling and for the low-detail population renderer.
+fn append_boost_plume(builder: &mut PathBuilder, triangle: [(f32, f32); 3]) {
+    let base = (
+        (triangle[0].0 + triangle[1].0) * 0.5,
+        (triangle[0].1 + triangle[1].1) * 0.5,
+    );
+    let half_width = (
+        (triangle[1].0 - triangle[0].0) * 0.5,
+        (triangle[1].1 - triangle[0].1) * 0.5,
+    );
+    let sample = |along: f32, across: f32| {
+        point(
+            px(base.0 + (triangle[2].0 - base.0) * along + half_width.0 * across),
+            px(base.1 + (triangle[2].1 - base.1) * along + half_width.1 * across),
+        )
+    };
+    builder.move_to(sample(0.0, -0.75));
+    builder.line_to(sample(0.25, -0.68));
+    builder.line_to(sample(0.52, -0.35));
+    builder.line_to(sample(0.72, 0.0));
+    builder.line_to(sample(0.52, 0.35));
+    builder.line_to(sample(0.25, 0.68));
+    builder.line_to(sample(0.0, 0.75));
+    builder.close();
+}
+
 fn agent_spike_color(
     visuals: &AgentVisualParams,
     palette: ColorPaletteMode,
@@ -21733,12 +21760,17 @@ fn paint_agent_avatar(
     // Boost exhaust
     if let Some(boost) = silhouette.boost {
         let mut flame = PathBuilder::fill();
-        append_triangle(&mut flame, boost);
+        if close_detail {
+            append_boost_plume(&mut flame, boost);
+        } else {
+            append_triangle(&mut flame, boost);
+        }
         if let Ok(path) = flame.build() {
-            window.paint_path(
-                path,
-                agent_boost_color(agent.boost, visuals, palette, palette_is_natural),
-            );
+            let mut color = agent_boost_color(agent.boost, visuals, palette, palette_is_natural);
+            if close_detail {
+                color.a *= 0.75;
+            }
+            window.paint_path(path, color);
         }
     }
 
@@ -21809,13 +21841,28 @@ fn paint_agent_avatar(
     let base_ear_color = rgba_from_triplet_with_alpha(visuals.stripe_color, 0.85);
     for center in [ear_center_left, ear_center_right] {
         let mut ear = PathBuilder::fill();
-        append_circle_polygon(&mut ear, center.0, center.1, ear_radius);
+        if close_detail {
+            append_capsule_polygon(
+                &mut ear,
+                center,
+                right,
+                forward,
+                ear_radius * 1.12,
+                ear_radius * 0.48,
+                12,
+            );
+        } else {
+            append_circle_polygon(&mut ear, center.0, center.1, ear_radius);
+        }
         if let Ok(path) = ear.build() {
             let mut ear_color = scale_rgb(
                 base_ear_color,
                 0.9 + agent.trait_sound.clamp(0.1, 1.4) * 0.45,
             );
             ear_color = palette_color(ear_color, palette, palette_is_natural);
+            if close_detail {
+                ear_color.a *= 0.78;
+            }
             window.paint_path(path, ear_color);
         }
     }
