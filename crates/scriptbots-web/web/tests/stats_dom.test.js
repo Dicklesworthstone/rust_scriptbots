@@ -2,6 +2,7 @@
 // DOM contract controls (bd-2z0.12.6) and actual packaged WASM loading (bd-azi3).
 
 import { createHash } from "node:crypto";
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
@@ -918,6 +919,311 @@ async function runRendererTests(browser, baseUrl) {
   return true;
 }
 
+async function runRemoteTests(browser, baseUrl, packageInfo) {
+  const binary = process.env.SCRIPTBOTS_APP_BINARY;
+  if (!binary || !fs.statSync(binary).isFile()) throw new Error("A source-bound production SCRIPTBOTS_APP_BINARY is required");
+  const proof = fs.mkdtempSync(path.join(process.env.SCRIPTBOTS_WASM_PROOF_DIR || "/tmp", "remote-"));
+  const result = { schema: "scriptbots.browser-remote.v1", status: "running", browser: browser.version(), proof,
+    binary: { path: binary, sha256: createHash("sha256").update(fs.readFileSync(binary)).digest("hex") },
+    package: packageInfo.files, observations: {}, errors: [] };
+  const observations = result.observations;
+  const context = await browser.newContext({ acceptDownloads: true });
+  const page = await context.newPage();
+  page.on("pageerror", (error) => result.errors.push(error.message));
+  // Reserve an ephemeral loopback address, then fail explicitly if another
+  // process takes it before the production listener starts.
+  const reservation = http.createServer();
+  await new Promise((resolve) => reservation.listen(0, "127.0.0.1", resolve));
+  const port = reservation.address().port;
+  await new Promise((resolve) => reservation.close(resolve));
+  const endpoint = `http://127.0.0.1:${port}`;
+  const args = ["--mode", "server", "--storage", "file", "--threads", "1", "--bootstrap-ticks", "0", "--rng-seed", "17"];
+  const log = fs.openSync(path.join(proof, "native.log"), "wx");
+  const child = spawn(binary, args, { stdio: ["ignore", log, log], env: { ...process.env,
+    SCRIPTBOTS_STORAGE_PATH: path.join(proof, "run.sqlite"),
+    SCRIPTBOTS_CONTROL_REST_ADDR: `127.0.0.1:${port}`,
+    SCRIPTBOTS_CONTROL_REST_ENABLED: "true", SCRIPTBOTS_CONTROL_MCP: "disabled",
+    SCRIPTBOTS_CONTROL_ALLOWED_ORIGINS: baseUrl } });
+  fs.closeSync(log);
+  let spawnError = null;
+  child.on("error", (error) => { spawnError = error; });
+  const exited = new Promise((resolve) => {
+    child.once("exit", (code, signal) => resolve({ code, signal }));
+    child.once("error", (error) => resolve({ error: String(error) }));
+  });
+  const request = async (pathname, options = {}) => {
+    const response = await fetch(`${endpoint}${pathname}`, { ...options, signal: AbortSignal.timeout(5_000) });
+    if (!response.ok) throw new Error(`${pathname}: HTTP ${response.status}: ${await response.text()}`);
+    return response.json();
+  };
+  const until = async (observe, accept, description) => {
+    const deadline = Date.now() + 30_000;
+    let last;
+    do {
+      if (spawnError) throw spawnError;
+      if (child.exitCode !== null || child.signalCode !== null) throw new Error(`Native server exited before ${description}`);
+      last = await observe();
+      if (accept(last)) return last;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    } while (Date.now() < deadline);
+    throw new Error(`Timed out waiting for ${description}: ${JSON.stringify(last)}`);
+  };
+  try {
+    await until(async () => {
+      try { return await request("/api/status"); } catch (error) {
+        if ((error.code ?? error.cause?.code) === "ECONNREFUSED") {
+          observations.startupConnectionRefusals = (observations.startupConnectionRefusals ?? 0) + 1;
+          return null;
+        }
+        throw error;
+      }
+    }, (status) => status !== null, "native startup");
+    const initialPause = await request("/api/control/pause", { method: "POST" });
+    await until(() => request(`/api/control/status/${initialPause.command_id}`),
+      (receipt) => receipt.application_state === "applied" && receipt.journal_state === "durable", "initial durable pause");
+    observations.initial = await until(() => request("/api/status"), (status) => status.paused, "initial pause");
+    await page.goto(baseUrl);
+    await page.waitForFunction(() => document.getElementById("metric-tick").textContent !== "–");
+    await page.evaluate(async (moduleFile) => {
+      const wasm = await import(`/pkg/${moduleFile}`);
+      const originalFrame = wasm.SimHandle.prototype.frame;
+      wasm.SimHandle.prototype.frame = function () {
+        window.__remoteLocalHandle = this;
+        return originalFrame.call(this);
+      };
+      const proof = window.__remoteWire = { sent: [], replies: [], frames: {}, binaries: [], sockets: [], decodeErrors: [],
+        dropNextReceipt: false, droppedReceipts: [] };
+      const NativeSocket = WebSocket;
+      window.WebSocket = class extends NativeSocket {
+        constructor(url) {
+          super(url);
+          proof.sockets.push(this);
+          this.addEventListener("message", (event) => {
+            const { data } = event;
+            if (typeof data === "string") {
+              const reply = JSON.parse(data);
+              proof.replies.push(reply);
+              // Drop one real server receipt before the production consumer.
+              // The command itself and every binary frame remain unmodified.
+              if (reply.type === "receipt" && proof.dropNextReceipt) {
+                proof.dropNextReceipt = false;
+                proof.droppedReceipts.push(reply);
+                event.stopImmediatePropagation();
+              }
+              return;
+            }
+            const bytes = new Uint8Array(data);
+            if (bytes[0] !== 83 || bytes[1] !== 66 || bytes[2] !== 87 || bytes[3] !== 83) return;
+            try {
+              const frame = wasm.decode_remote_frame_binary(bytes);
+              proof.frames[frame.kind] = frame;
+              if (proof.binaries.length < 6) proof.binaries.push(Array.from(bytes));
+            } catch (error) { proof.decodeErrors.push(String(error)); }
+          });
+        }
+        send(text) {
+          proof.sent.push(JSON.parse(text));
+          return super.send(text);
+        }
+      };
+    }, packageInfo.moduleFile);
+    await page.waitForFunction(() => !!window.__remoteLocalHandle);
+    observations.localBefore = await page.evaluate(() => window.__remoteLocalHandle.frame().identity);
+    await page.fill("#remote-url", endpoint.replace("http:", "ws:") + "/api/ws/stream");
+    await page.click("#remote-connect");
+    await page.waitForFunction(() => document.getElementById("remote-status").dataset.state === "connected"
+      && ["canvas", "telemetry", "events"].every((kind) => window.__remoteWire.frames[kind]));
+    observations.frozenLocal = await page.evaluate(() => window.__remoteLocalHandle.frame().identity);
+    observations.connected = await page.evaluate(() => ({ frames: window.__remoteWire.frames,
+      sent: window.__remoteWire.sent, replies: window.__remoteWire.replies,
+      disabled: ["steps-per-frame", "population", "reset-btn"].map((id) => [id, document.getElementById(id)?.disabled]) }));
+    const { canvas, telemetry, events } = observations.connected.frames;
+    for (const frame of [canvas, telemetry, events]) {
+      if (frame.identity.tick !== String(observations.initial.tick)
+          || frame.identity.publicationRevision !== String(observations.initial.snapshot_revision)
+          || !frame.playback.paused || !observations.connected.sent.some((message) => message.command === "stream_ack"
+            && message.channel === frame.kind && message.session_id === frame.identity.sessionId
+            && message.publication_revision === frame.identity.publicationRevision)) {
+        throw new Error(`Remote ${frame.kind} identity/consumption differs from the independently paused owner`);
+      }
+    }
+    if (canvas.payload.agents.length === 0 || canvas.payload.summary.agentCount !== observations.initial.agent_count
+        || telemetry.payload.tick !== observations.initial.tick || observations.connected.disabled.some(([, disabled]) => !disabled)) {
+      throw new Error("Remote world did not populate the production view or disable local controls");
+    }
+    observations.eventHistory = { observedRecords: events.payload.events.length, latestEvent: events.payload.latestEvent,
+      rendered: await page.locator("#remote-events li").allTextContents() };
+    for (const event of events.payload.events) {
+      if (!observations.eventHistory.rendered.includes(`#${event.sequence} · tick ${event.record.tick}: ${event.record.humanText}`)) {
+        throw new Error("A native narrative record was omitted or changed by the browser view");
+      }
+    }
+    if (events.payload.events.length === 0 && !events.payload.gap && observations.eventHistory.rendered.length !== 0) {
+      throw new Error("The browser fabricated narrative text for an empty native history");
+    }
+    observations.decoderNegatives = await page.evaluate(async (moduleFile) => {
+      const { decode_remote_frame_binary: decode } = await import(`/pkg/${moduleFile}`);
+      const original = new Uint8Array(window.__remoteWire.binaries[0]);
+      const badVersion = original.slice();
+      badVersion[4] = 255;
+      return [original.subarray(0, original.length - 1), badVersion].map((bytes) => {
+        try { decode(bytes); return null; } catch (error) { return String(error); }
+      });
+    }, packageInfo.moduleFile);
+    if (observations.decoderNegatives.some((error) => !error)) throw new Error("Actual WASM accepted a truncated or foreign-version native frame");
+    const control = async (selector, command) => {
+      const start = await page.evaluate(() => window.__remoteWire.replies.length);
+      await page.click(selector);
+      const receipt = await until(() => page.evaluate(({ start, command }) => {
+        const wire = window.__remoteWire;
+        const sent = wire.sent.findLast((message) => message.command === command);
+        return wire.replies.slice(start).findLast((reply) => reply.type === "receipt" && reply.request_id === sent?.request_id)?.receipt;
+      }, { start, command }), (receipt) => !!receipt, `${command} receipt`);
+      const settled = await until(() => request(`/api/control/status/${receipt.command_id}`),
+        (status) => status.application_state !== "admitted" && status.journal_state !== "pending", `${command} outcome`);
+      if (settled.application_state !== "applied" || settled.journal_state !== "durable") {
+        throw new Error(`Remote ${command} did not apply and journal durably: ${JSON.stringify(settled)}`);
+      }
+      return settled;
+    };
+    observations.pause = await control("#remote-pause", "pause");
+    const beforeStep = await request("/api/status");
+    await page.evaluate(() => { window.__remoteWire.dropNextReceipt = true; });
+    observations.step = await control("#remote-step", "step");
+    observations.afterStep = await request("/api/status");
+    if (!observations.afterStep.paused || observations.afterStep.tick !== beforeStep.tick + 1
+        || observations.afterStep.scientific_revision !== beforeStep.scientific_revision + 1) {
+      throw new Error("Browser Step did not advance exactly one native science tick while paused");
+    }
+    observations.droppedReceipt = await page.evaluate(() => ({ dropped: window.__remoteWire.droppedReceipts,
+      consumer: document.getElementById("remote-receipt").textContent }));
+    if (observations.droppedReceipt.dropped.length !== 1 || !observations.droppedReceipt.consumer.includes("awaiting the server's receipt")) {
+      throw new Error("The dropped-receipt control did not reach the actual browser consumer");
+    }
+    await page.waitForFunction(({ tick, population }) => document.getElementById("metric-tick").textContent === String(tick)
+      && document.getElementById("metric-population").textContent === String(population),
+    { tick: observations.afterStep.tick, population: observations.afterStep.agent_count });
+    observations.remoteMetrics = await page.evaluate(() => Object.fromEntries(
+      ["tick", "population", "energy", "health"].map((key) => [key, document.getElementById(`metric-${key}`).textContent])));
+    await page.waitForFunction((tick) => window.__remoteWire.frames.canvas.identity.tick === String(tick), observations.afterStep.tick);
+    const sourceFrame = await page.evaluate(() => window.__remoteWire.frames.canvas);
+    const expectedPng = sourceFrame.identity;
+    const saveRemotePng = async (backend) => {
+      await page.selectOption("#renderer", backend);
+      await page.waitForFunction((backend) => document.getElementById("renderer-status").dataset.renderer === backend, backend);
+      const [download] = await Promise.all([page.waitForEvent("download"), page.click("#capture-btn")]);
+      const file = path.join(proof, `remote-${backend}.png`);
+      await download.saveAs(file);
+      if (await download.failure()) throw new Error(`Remote PNG download failed: ${await download.failure()}`);
+      await page.waitForFunction(() => document.getElementById("capture-status").dataset.state === "ready");
+      const png = await page.evaluate(async ({ bytes, snapshot }) => {
+        const bitmap = await createImageBitmap(new Blob([new Uint8Array(bytes)], { type: "image/png" }));
+        try {
+          const canvas = document.createElement("canvas");
+          canvas.width = bitmap.width; canvas.height = bitmap.height;
+          const ctx = canvas.getContext("2d"); ctx.drawImage(bitmap, 0, 0);
+          const pixels = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+          let brightPixels = 0;
+          for (let offset = 0; offset < pixels.length; offset += 4) {
+            if (Math.max(pixels[offset], pixels[offset + 1], pixels[offset + 2]) > 80) brightPixels += 1;
+          }
+          const sourceAgentPixels = snapshot.agents.filter((agent) => Math.max(...agent.color) > 0.5)
+            .map((agent) => {
+              const x = Math.floor(agent.position[0] / snapshot.world.width * canvas.width);
+              const y = Math.floor(agent.position[1] / snapshot.world.height * canvas.height);
+              return { x, y, color: agent.color, pixel: Array.from(ctx.getImageData(x, y, 1, 1).data) };
+            }).filter(({ x, y }) => x >= 0 && y >= 0 && x < canvas.width && y < canvas.height);
+          return { status: { ...document.getElementById("capture-status").dataset }, width: canvas.width, height: canvas.height,
+            brightPixels, sourceAgentPixels };
+        } finally { bitmap.close(); }
+      }, { bytes: Array.from(fs.readFileSync(file)), snapshot: sourceFrame.payload });
+      png.filename = download.suggestedFilename();
+      for (const [key, value] of Object.entries(expectedPng)) {
+        if (png.status[key] !== value) throw new Error(`Remote PNG ${key} identifies another owner/publication`);
+      }
+      const { sessionId, publicationRevision, scientificRevision, controlRevision, configRevision, tick } = expectedPng;
+      if (png.brightPixels === 0 || png.sourceAgentPixels.length === 0
+          || png.sourceAgentPixels.some(({ pixel }) => Math.max(...pixel.slice(0, 3)) <= 80)
+          || png.width !== 1280 || png.height !== 720 || png.status.renderer !== backend
+          || png.filename !== `scriptbots-session-${sessionId}-p${publicationRevision}-s${scientificRevision}-c${controlRevision}-g${configRevision}-t${tick}-${backend}.png`) {
+        throw new Error("Remote PNG is empty or misidentified");
+      }
+      return png;
+    };
+    observations.png = { canvas: await saveRemotePng("canvas"), webgpu: await saveRemotePng("webgpu") };
+    await page.evaluate(() => window.__remoteWire.sockets.at(-1).close(1000, "Live reconnect test"));
+    await page.waitForFunction(() => document.getElementById("remote-status").dataset.state === "disconnected");
+    const consumed = await page.evaluate(() => window.__remoteWire.sent.filter((message) => message.command === "stream_ack"));
+    await page.click("#remote-reconnect");
+    await page.waitForFunction(() => document.getElementById("remote-status").dataset.state === "connected");
+    observations.reconnect = await page.evaluate(() => window.__remoteWire.sent.filter((message) => message.command === "subscribe").at(-1));
+    const cursor = observations.reconnect.resume;
+    const revisions = ["canvas", "telemetry"].map((kind) => BigInt(consumed.findLast((ack) => ack.channel === kind).publication_revision));
+    if (cursor?.session_id !== expectedPng.sessionId || BigInt(cursor.after_revision) !== (revisions[0] < revisions[1] ? revisions[0] : revisions[1])
+        || cursor.after_event !== consumed.findLast((ack) => ack.channel === "events").after_event) throw new Error("Reconnect did not use independently consumed channel cursors");
+    observations.retry = await control("#remote-retry", "step");
+    if (observations.retry.command_id !== observations.step.command_id || (await request("/api/status")).tick !== observations.afterStep.tick) {
+      throw new Error("Same-ID browser retry after a lost receipt/reconnect duplicated a native Step");
+    }
+    await control("#remote-refresh", "status");
+    observations.resume = await control("#remote-resume", "resume");
+    await until(() => request("/api/status"), (status) => !status.paused && status.tick > observations.afterStep.tick, "remote science after Resume");
+    await control("#remote-pause", "pause");
+    observations.localStillFrozen = await page.evaluate(() => window.__remoteLocalHandle.frame().identity);
+    if (JSON.stringify(observations.localStillFrozen) !== JSON.stringify(observations.frozenLocal)) throw new Error("Remote viewing advanced or replaced the saved local owner");
+    // Use a second real browser origin for the hostile-Origin control. The
+    // positive lane above uses only the explicitly allowed static-server origin.
+    const denied = await context.newPage();
+    await denied.goto(baseUrl.replace("127.0.0.1", "localhost") + "/pkg/package.json");
+    observations.deniedOrigin = await denied.evaluate((url) => new Promise((resolve) => {
+      const socket = new WebSocket(url);
+      socket.onopen = () => { socket.close(); resolve("opened"); };
+      socket.onerror = () => resolve("refused");
+      setTimeout(() => resolve("timeout"), 5_000);
+    }), endpoint.replace("http:", "ws:") + "/api/ws/stream");
+    await denied.close();
+    if (observations.deniedOrigin !== "refused") throw new Error("Native server admitted an unlisted browser Origin");
+    await page.click("#remote-local");
+    await page.waitForFunction((tick) => document.getElementById("remote-status").dataset.state === "local"
+      && Number(window.__remoteLocalHandle.frame().identity.tick) > tick, Number(observations.frozenLocal.tick));
+    observations.returnedLocal = await page.evaluate(() => window.__remoteLocalHandle.frame().identity);
+    if (observations.returnedLocal.sessionId !== observations.frozenLocal.sessionId
+        || observations.returnedLocal.sessionId === expectedPng.sessionId) throw new Error("Return to Local replaced its saved owner or kept the native owner");
+    const wire = await page.evaluate(() => ({ sent: window.__remoteWire.sent, replies: window.__remoteWire.replies,
+      frames: window.__remoteWire.frames, decodeErrors: window.__remoteWire.decodeErrors, binaries: window.__remoteWire.binaries }));
+    for (const [index, bytes] of wire.binaries.entries()) fs.writeFileSync(path.join(proof, `native-frame-${index}.bin`), new Uint8Array(bytes), { flag: "wx" });
+    delete wire.binaries;
+    observations.wire = wire;
+    if (result.errors.length || wire.decodeErrors.length) throw new Error(`Remote browser errors: ${JSON.stringify(result.errors.concat(wire.decodeErrors))}`);
+    result.status = "pass";
+  } catch (error) {
+    result.status = "fail";
+    result.failure = String(error.stack ?? error);
+    observations.failureDom = await page.evaluate(() => ({ status: document.getElementById("remote-status")?.textContent,
+      receipt: document.getElementById("remote-receipt")?.textContent, log: document.getElementById("log")?.textContent,
+      sent: window.__remoteWire?.sent, replies: window.__remoteWire?.replies, frames: window.__remoteWire?.frames })).catch(() => null);
+    throw error;
+  } finally {
+    try { await context.close(); }
+    catch (error) { result.browserCloseError = String(error); }
+    if (child.exitCode === null && child.signalCode === null) {
+      try { await request("/api/control/shutdown", { method: "POST" }); }
+      catch (error) { result.shutdownRequestError = String(error); }
+      const stopped = await Promise.race([exited, new Promise((resolve) => setTimeout(() => resolve(null), 10_000))]);
+      if (!stopped) child.kill("SIGTERM");
+      const terminated = stopped ?? await Promise.race([exited, new Promise((resolve) => setTimeout(() => resolve(null), 5_000))]);
+      if (!terminated) { child.kill("SIGKILL"); await exited; }
+    }
+    result.process = { args, code: child.exitCode, signal: child.signalCode };
+    const failedCleanup = result.status === "pass" && (child.exitCode !== 0 || child.signalCode !== null || result.browserCloseError);
+    if (failedCleanup) result.status = "fail";
+    fs.writeFileSync(path.join(proof, "result.json"), JSON.stringify(result, null, 2), { flag: "wx" });
+    console.log(JSON.stringify(result));
+    if (failedCleanup) throw new Error(`Remote test cleanup failed: ${JSON.stringify({ process: result.process, browserCloseError: result.browserCloseError })}`);
+  }
+  return true;
+}
+
 async function runTests() {
   const observations = {
     camelCasePositive: null,
@@ -937,11 +1243,12 @@ async function runTests() {
   const browser = await chromium.launch({
     headless: true,
     executablePath: process.env.SCRIPTBOTS_CHROMIUM_EXECUTABLE || undefined,
-    args: process.env.SCRIPTBOTS_WEB_RENDERER_TESTS === "1"
+    args: process.env.SCRIPTBOTS_WEB_RENDERER_TESTS === "1" || process.env.SCRIPTBOTS_WEB_REMOTE_TESTS === "1"
       ? ["--enable-unsafe-webgpu", "--use-angle=swiftshader", "--enable-features=Vulkan", "--use-vulkan=swiftshader", "--disable-vulkan-surface"] : [],
   });
 
   try {
+    if (process.env.SCRIPTBOTS_WEB_REMOTE_TESTS === "1") return await runRemoteTests(browser, baseUrl, packageInfo);
     if (process.env.SCRIPTBOTS_WEB_RENDERER_TESTS === "1") return await runRendererTests(browser, baseUrl);
     // =========================================================================
     // Test 1: Production camelCase Contract & Multiple Window TPS Deltas

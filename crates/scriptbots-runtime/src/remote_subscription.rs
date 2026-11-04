@@ -652,7 +652,7 @@ impl RemoteSubscription {
     }
 }
 
-fn reject_ahead(
+const fn reject_ahead(
     field: &'static str,
     requested: u64,
     current: u64,
@@ -1300,7 +1300,7 @@ mod tests {
         let RemoteFramePayload::Events(page) = &confirmation.payload else {
             panic!("events")
         };
-        assert!(page.events.is_empty());
+        assert_eq!(page.events, Vec::<RemoteSequencedEvent>::new());
         reconnect.delivered(&confirmation).unwrap();
         assert!(
             reconnect

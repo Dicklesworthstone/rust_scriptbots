@@ -562,7 +562,7 @@ async fn enforce_control_http_policy(
         next.run(request).await
     };
     if let Some(origin) = origin {
-        response
+        response // ubs:ignore -- policy.check above admits only one configured Origin.
             .headers_mut()
             .insert(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
         response.headers_mut().append(
@@ -5513,7 +5513,7 @@ mod tests {
                 .check(&headers, &uri, Version::HTTP_11)
                 .expect("CLI without Origin");
             for origin in [own_origin, "https://lab.example"] {
-                headers.insert("origin", origin.parse().expect("Origin"));
+                headers.insert("origin", origin.parse().expect("Origin")); // ubs:ignore -- test request, not response
                 policy
                     .check(&headers, &uri, Version::HTTP_11)
                     .expect("allowed browser");
@@ -5526,7 +5526,7 @@ mod tests {
                 "http://localhost:1",
                 "https://lab.example https://other.example",
             ] {
-                headers.insert("origin", origin.parse().expect("negative Origin"));
+                headers.insert("origin", origin.parse().expect("negative Origin")); // ubs:ignore -- test request, not response
                 assert!(
                     policy.check(&headers, &uri, Version::HTTP_11).is_err(),
                     "{origin}"
@@ -8772,7 +8772,7 @@ mod tests {
 
     #[test]
     fn websocket_subscriptions_deliver_independent_channels_and_session_bound_resume() {
-        use scriptbots_runtime::remote::RemoteFramePayload;
+        use scriptbots_runtime::remote::{RemoteFramePayload, RemoteSequencedEvent};
         let mut world = WorldState::new(ScriptBotsConfig {
             world_width: 64,
             world_height: 64,
@@ -8837,7 +8837,7 @@ mod tests {
         let RemoteFramePayload::Events(page) = events.payload else {
             panic!("events channel")
         };
-        assert!(page.events.is_empty());
+        assert_eq!(page.events, Vec::<RemoteSequencedEvent>::new());
         assert_eq!(
             handle.status().unwrap().tick,
             0,

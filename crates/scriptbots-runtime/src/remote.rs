@@ -417,7 +417,7 @@ pub fn decode_remote_frame(bytes: &[u8]) -> Result<RemoteFrame, RemoteProtocolEr
     Ok(frame)
 }
 
-fn require_limit(
+const fn require_limit(
     field: &'static str,
     observed: usize,
     limit: usize,

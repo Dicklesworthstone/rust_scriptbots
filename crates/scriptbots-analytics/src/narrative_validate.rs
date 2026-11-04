@@ -177,7 +177,7 @@ fn parse_params(params: &ReportParams) -> Result<(CertificationParams, usize), A
             reason: e.to_string(),
         })?
         .unwrap_or(0.05);
-    if !fdr.is_finite() || !(0.0 < fdr && fdr <= 1.0) {
+    if !(fdr.is_finite() && 0.0 < fdr && fdr <= 1.0) {
         return Err(AnalyticsError::BadParam {
             name: "fdr".to_owned(),
             reason: "must be finite and in (0, 1]".to_owned(),
@@ -375,7 +375,6 @@ impl Report for NarrativeValidate {
         Ok(output)
     }
 }
-
 
 #[cfg(test)]
 mod tests {

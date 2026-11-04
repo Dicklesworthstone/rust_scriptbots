@@ -38,6 +38,32 @@ under bd-azi3 until actual qualification; this setup does not implement Vite.
 The pinned DSR profile can select its provisioned Chrome binary with
 `SCRIPTBOTS_CHROMIUM_EXECUTABLE`; the smoke records the actual browser version.
 
+The same test has a live remote mode. Inside a source-pinned DSR profile, build
+the native `scriptbots-app` binary and the WASM package from that source, then run:
+
+```bash
+SCRIPTBOTS_WEB_REMOTE_TESTS=1 \
+  SCRIPTBOTS_APP_BINARY=/absolute/source-bound/scriptbots-app \
+  SCRIPTBOTS_WASM_PACKAGE_DIR=/absolute/fresh/scriptbots-web-package \
+  SCRIPTBOTS_WASM_PROOF_DIR=/absolute/existing/dsr-proof \
+  bun crates/scriptbots-web/web/tests/stats_dom.test.js
+```
+
+This starts the production server with a fresh file-backed run, one simulation
+thread and the static server's exact allowed Origin. It checks actual native
+binary frames through the packaged WASM decoder, per-channel credits, browser
+pause/step/resume controls against independent HTTP reads, durable command
+receipts, same-ID retry after a deliberately dropped receipt and cursor reconnect,
+Canvas/software-WebGPU remote PNG pixels/identity and saved
+local-owner freeze/return. Truncated/version-mismatched native frames and an
+unlisted browser Origin must fail. The test retains the database, native log,
+wire samples, PNG and structured observations; it requests owner shutdown on
+exit. This bounded software journey does not qualify hardware, stream latency,
+saturation, long-run persistence or the complete remote/browser acceptance. The
+initial event subscription records how many native narrative records were
+observed and verifies their displayed text. An empty page qualifies only empty
+history/credit handling; nonempty narrative delivery requires observed records.
+
 ### Controls & metrics
 
 - **Simulation speed**: choose the host playback multiplier (default `2×`;
