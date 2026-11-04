@@ -28,7 +28,7 @@ use bevy::pbr::prelude::*;
 use bevy::prelude::*;
 use bevy::render::render_resource::PrimitiveTopology;
 use bevy::render::view::{ColorGrading, Hdr};
-use bevy::ui::{BorderColor, BorderRadius};
+use bevy::ui::{BorderColor, BorderRadius, FocusPolicy};
 use bevy::window::{PresentMode, PrimaryWindow, WindowPlugin, WindowRef};
 use bevy_mesh::{Indices, Mesh};
 use bevy_post_process::auto_exposure::{AutoExposure, AutoExposurePlugin};
@@ -3177,6 +3177,8 @@ fn setup_scene(
                 ..default()
             },
             BackgroundColor(Color::srgba(0.07, 0.11, 0.18, 0.72)),
+            Interaction::default(),
+            FocusPolicy::Pass,
         ))
         .id();
 
@@ -5493,6 +5495,14 @@ mod quality_tier_consumer_tests {
         ));
     }
 
+    #[test]
+    fn hovered_and_pressed_hud_nodes_capture_world_pointer_input() {
+        assert!(!hud_pointer_captured(std::iter::empty()));
+        assert!(!hud_pointer_captured([&Interaction::None].into_iter()));
+        assert!(hud_pointer_captured([&Interaction::Hovered].into_iter()));
+        assert!(hud_pointer_captured([&Interaction::Pressed].into_iter()));
+    }
+
     /// A camera that renders off-screen has no pointer window at all.
     ///
     /// The positive control is the test above: these same inputs DO resolve for
@@ -6561,6 +6571,10 @@ fn window_received_selection_click(
         != 0
 }
 
+fn hud_pointer_captured<'a>(mut interactions: impl Iterator<Item = &'a Interaction>) -> bool {
+    interactions.any(|interaction| *interaction != Interaction::None)
+}
+
 fn handle_selection_input(
     (mut mouse_buttons, keys): (MessageReader<MouseButtonInput>, Res<ButtonInput<KeyCode>>),
     windows: Query<&Window>,
@@ -6572,6 +6586,7 @@ fn handle_selection_input(
         Query<&AgentDisplayPose>,
     ),
     submitter: Option<Res<CommandSubmitter>>,
+    ui_interactions: Query<&Interaction, With<Node>>,
     mut rig: ResMut<CameraRig>,
 ) {
     let camera_state = camera_query.single().ok();
@@ -6598,7 +6613,7 @@ fn handle_selection_input(
         return;
     }
 
-    if !selection_clicked {
+    if !selection_clicked || hud_pointer_captured(ui_interactions.iter()) {
         return;
     }
 
@@ -7442,6 +7457,7 @@ fn control_camera(
     keys: Res<ButtonInput<KeyCode>>,
     mut mouse_motion: MessageReader<MouseMotion>,
     mut mouse_wheel: MessageReader<MouseWheel>,
+    ui_interactions: Query<&Interaction, With<Node>>,
     mut camera_query: Query<&mut Transform, With<PrimaryCamera>>,
 ) {
     let Ok(mut transform) = camera_query.single_mut() else {
@@ -7455,9 +7471,10 @@ fn control_camera(
     let alt_held = keys.pressed(KeyCode::AltLeft) || keys.pressed(KeyCode::AltRight);
 
     rig.distance = rig.distance.clamp(CAMERA_MIN_DISTANCE, CAMERA_MAX_DISTANCE);
+    let pointer_over_hud = hud_pointer_captured(ui_interactions.iter());
     let scroll_lines: f64 = mouse_wheel
         .read()
-        .filter(|wheel| wheel.y.is_finite())
+        .filter(|wheel| !pointer_over_hud && wheel.y.is_finite())
         .map(|wheel| match wheel.unit {
             MouseScrollUnit::Line => f64::from(wheel.y),
             MouseScrollUnit::Pixel => f64::from(wheel.y) / CAMERA_SCROLL_PIXELS_PER_LINE,
@@ -7508,7 +7525,7 @@ fn control_camera(
         rig.pitch -= time.delta_secs() * 0.8;
     }
 
-    if buttons.pressed(MouseButton::Right) {
+    if buttons.pressed(MouseButton::Right) && !pointer_over_hud {
         for ev in mouse_motion.read() {
             rig.yaw -= ev.delta.x * 0.005;
             rig.pitch = (rig.pitch - ev.delta.y * 0.005).clamp(-1.45, -0.05);
@@ -7686,9 +7703,16 @@ fn control_camera(
         .distance_smoothed
         .clamp(CAMERA_MIN_DISTANCE, CAMERA_MAX_DISTANCE);
 
+    let focus_height = state.latest.as_ref().map_or(0.0, |snapshot| {
+        sample_height_world(
+            &snapshot.terrain_height,
+            rig.focus_smoothed,
+            TERRAIN_HEIGHT_SCALE,
+        ) + snapshot.agent_radius * 0.35
+    });
     let center = Vec3::new(
         rig.focus_smoothed.x - world_size.x * 0.5,
-        0.0,
+        focus_height,
         world_size.y * 0.5 - rig.focus_smoothed.y,
     );
 
@@ -7697,7 +7721,21 @@ fn control_camera(
         -pitch.sin(),
         yaw.sin() * pitch.cos(),
     );
-    transform.translation = center + dir * distance;
+    let mut camera_position = center + dir * distance;
+    if let Some(snapshot) = &state.latest {
+        let camera_world = Vec2::new(
+            camera_position.x + world_size.x * 0.5,
+            world_size.y * 0.5 - camera_position.z,
+        );
+        if camera_world.cmpge(Vec2::ZERO).all() && camera_world.cmple(world_size).all() {
+            let ground =
+                sample_height_world(&snapshot.terrain_height, camera_world, TERRAIN_HEIGHT_SCALE);
+            camera_position.y = camera_position
+                .y
+                .max(ground + snapshot.agent_radius.max(20.0));
+        }
+    }
+    transform.translation = camera_position;
     transform.look_at(center, Vec3::Y);
 }
 
@@ -8650,7 +8688,16 @@ mod terrain_tests {
                     "mode={mode:?}, paused={paused}, reduced={reduced}, recenter={recenter}, fit={fit}"
                 );
                 let transform = app.world().entity(camera).get::<Transform>().unwrap();
-                let look_at = Vec3::new(expected.x - 500.0, 0.0, 500.0 - expected.y);
+                let snapshot = app
+                    .world()
+                    .resource::<SnapshotState>()
+                    .latest
+                    .as_ref()
+                    .unwrap();
+                let focus_height =
+                    sample_height_world(&snapshot.terrain_height, expected, TERRAIN_HEIGHT_SCALE)
+                        + snapshot.agent_radius * 0.35;
+                let look_at = Vec3::new(expected.x - 500.0, focus_height, 500.0 - expected.y);
                 assert!(
                     transform
                         .forward()
@@ -12321,6 +12368,50 @@ mod tests {
     }
 
     #[test]
+    fn close_shallow_camera_clears_elevated_terrain_and_targets_its_surface() {
+        let world = WorldState::new(ScriptBotsConfig::default()).expect("world init");
+        let mut snapshot = WorldSnapshot::from_world(&world).expect("snapshot");
+        snapshot.terrain_height.elevation.fill(0.9);
+        let focus = snapshot.world_size * 0.5;
+        let focus_y = 0.9 * TERRAIN_HEIGHT_SCALE + snapshot.agent_radius * 0.35;
+        let min_clearance = snapshot.agent_radius.max(20.0);
+        let mut app = App::new();
+        app.insert_resource(Time::<()>::default())
+            .insert_resource(CameraRig {
+                pitch: -0.05,
+                distance: CAMERA_MIN_DISTANCE,
+                distance_smoothed: CAMERA_MIN_DISTANCE,
+                follow_mode: FollowMode::Off,
+                ..default()
+            })
+            .insert_resource(SnapshotState {
+                world_size: snapshot.world_size,
+                focus_point: focus,
+                latest: Some(snapshot),
+                ..default()
+            })
+            .insert_resource(ButtonInput::<MouseButton>::default())
+            .insert_resource(ButtonInput::<KeyCode>::default())
+            .insert_resource(Messages::<MouseMotion>::default())
+            .insert_resource(Messages::<MouseWheel>::default())
+            .add_systems(Update, control_camera);
+        let camera = app
+            .world_mut()
+            .spawn((PrimaryCamera, Transform::default()))
+            .id();
+        app.update();
+        let transform = app.world().entity(camera).get::<Transform>().unwrap();
+        assert!(transform.translation.y >= 0.9 * TERRAIN_HEIGHT_SCALE + min_clearance - 0.001);
+        let target = Vec3::new(0.0, focus_y, 0.0);
+        assert!(
+            transform
+                .forward()
+                .dot((target - transform.translation).normalize())
+                > 0.999
+        );
+    }
+
+    #[test]
     fn reduced_motion_camera_applies_targets_immediately_and_can_resume_easing() {
         let mut app = App::new();
         app.insert_resource(Time::<()>::default());
@@ -12539,6 +12630,47 @@ mod tests {
     }
 
     #[test]
+    fn hud_scroll_does_not_zoom_the_world_or_leak_to_the_next_frame() {
+        let mut app = App::new();
+        app.insert_resource(Time::<()>::default())
+            .insert_resource(CameraRig::default())
+            .insert_resource(SnapshotState::default())
+            .insert_resource(ButtonInput::<MouseButton>::default())
+            .insert_resource(ButtonInput::<KeyCode>::default())
+            .insert_resource(Messages::<MouseMotion>::default())
+            .insert_resource(Messages::<MouseWheel>::default())
+            .add_systems(Update, control_camera);
+        app.world_mut().spawn((PrimaryCamera, Transform::default()));
+        let hud = app
+            .world_mut()
+            .spawn((Node::default(), Interaction::Hovered))
+            .id();
+        let wheel = MouseWheel {
+            unit: MouseScrollUnit::Line,
+            x: 0.0,
+            y: 1.0,
+            window: Entity::PLACEHOLDER,
+        };
+        app.world_mut()
+            .resource_mut::<Messages<MouseWheel>>()
+            .write(wheel);
+        app.update();
+        assert_eq!(app.world().resource::<CameraRig>().distance, 2200.0);
+
+        *app.world_mut()
+            .entity_mut(hud)
+            .get_mut::<Interaction>()
+            .unwrap() = Interaction::None;
+        app.update();
+        assert_eq!(app.world().resource::<CameraRig>().distance, 2200.0);
+        app.world_mut()
+            .resource_mut::<Messages<MouseWheel>>()
+            .write(wheel);
+        app.update();
+        assert!(app.world().resource::<CameraRig>().distance < 2200.0);
+    }
+
+    #[test]
     fn camera_zoom_is_reversible_and_independent_of_event_segmentation_inside_limits() {
         for split_frames in [false, true] {
             let roundtrip = camera_zoom_after_scroll(
@@ -12658,7 +12790,11 @@ mod tests {
             .expect("camera transform");
         let expected_center = Vec3::new(
             selection_center.x - snapshot.world_size.x * 0.5,
-            0.0,
+            sample_height_world(
+                &snapshot.terrain_height,
+                selection_center,
+                TERRAIN_HEIGHT_SCALE,
+            ) + snapshot.agent_radius * 0.35,
             snapshot.world_size.y * 0.5 - selection_center.y,
         );
         let distance_expected = transform.translation.distance(expected_center);
