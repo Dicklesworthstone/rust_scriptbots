@@ -47,7 +47,7 @@ use scriptbots_storage::{
     PersistenceGuarantee, ShutdownReceipt, StoragePipeline, StorageReader,
 };
 use scriptbots_world_gfx::sense_parity::{
-    SenseBackendId, SenseDeterminism, SensePolicyV0, init_gpu_sense_provider,
+    SenseBackendId, SenseDeterminism, SenseGateEvidenceV0, SensePolicyV0, init_gpu_sense_provider,
     is_adapter_certified_exact, probe_gpu_adapter,
 };
 use scriptbots_world_gfx::wgpu;
@@ -245,89 +245,91 @@ fn resolve_sense_config(cli: &AppCli) -> Result<ResolvedSenseConfig> {
                 );
             }
         }
-        SenseBackendMode::Auto => {
-            let probed_info = probe_gpu_adapter();
-            let certified_evidence = probed_info
-                .as_ref()
-                .and_then(|info| is_adapter_certified_exact(info, None));
+        SenseBackendMode::Auto => Ok(resolve_auto_sense_config(
+            cli.allow_approximate_sense,
+            probe_gpu_adapter(),
+            init_gpu_sense_provider,
+            |info| is_adapter_certified_exact(info, None),
+        )),
+    }
+}
 
-            if let (Some(_info), Some(evidence)) = (probed_info.as_ref(), certified_evidence) {
-                match init_gpu_sense_provider() {
-                    Ok((provider, actual_info)) => {
-                        info!(
-                            adapter = %actual_info.name,
-                            "Auto selected GPU sense backend (certified exact)"
-                        );
-                        println!("Auto selected GPU sense backend ({})", actual_info.name);
-                        Ok(ResolvedSenseConfig {
-                            policy: SensePolicyV0 {
-                                backend: SenseBackendId::Gpu,
-                                determinism: SenseDeterminism::Exact,
-                                source: "auto".to_string(),
-                                certified_exact: true,
-                                allow_approximate: cli.allow_approximate_sense,
-                                gate_evidence: Some(evidence),
-                                reason: format!(
-                                    "Auto selected certified exact GPU sense backend on {}",
-                                    actual_info.name
-                                ),
-                            },
-                            provider: Some(Box::new(provider)),
-                        })
-                    }
-                    Err(e) => {
-                        let reason = format!(
-                            "Auto selected CPU sense backend (honest default; GPU initialization failed: {e})"
-                        );
-                        info!(reason = %reason, "Auto selected CPU sense backend");
-                        println!("{reason}");
-                        Ok(ResolvedSenseConfig {
-                            policy: SensePolicyV0 {
-                                backend: SenseBackendId::Cpu,
-                                determinism: SenseDeterminism::Exact,
-                                source: "auto".to_string(),
-                                certified_exact: true,
-                                allow_approximate: cli.allow_approximate_sense,
-                                gate_evidence: None,
-                                reason,
-                            },
-                            provider: None,
-                        })
-                    }
+fn resolve_auto_sense_config<P: SenseProvider + 'static>(
+    allow_approximate: bool,
+    probed_info: Option<wgpu::AdapterInfo>,
+    initialize: impl FnOnce() -> std::result::Result<
+        (P, wgpu::AdapterInfo),
+        scriptbots_world_gfx::sense_wgsl::GpuSenseError,
+    >,
+    mut certify: impl FnMut(&wgpu::AdapterInfo) -> Option<SenseGateEvidenceV0>,
+) -> ResolvedSenseConfig {
+    let probe_certified = probed_info
+        .as_ref()
+        .is_some_and(|info| certify(info).is_some());
+    let reason = if probe_certified {
+        match initialize() {
+            Ok((provider, actual_info)) => {
+                // Initialization selects its own adapter. Only evidence for that actual
+                // device may certify the provider installed into the scientific world.
+                if let Some(evidence) = certify(&actual_info) {
+                    info!(
+                        adapter = %actual_info.name,
+                        "Auto selected GPU sense backend (certified exact)"
+                    );
+                    println!("Auto selected GPU sense backend ({})", actual_info.name);
+                    return ResolvedSenseConfig {
+                        policy: SensePolicyV0 {
+                            backend: SenseBackendId::Gpu,
+                            determinism: SenseDeterminism::Exact,
+                            source: "auto".to_string(),
+                            certified_exact: true,
+                            allow_approximate,
+                            gate_evidence: Some(evidence),
+                            reason: format!(
+                                "Auto selected certified exact GPU sense backend on {}",
+                                actual_info.name
+                            ),
+                        },
+                        provider: Some(Box::new(provider)),
+                    };
                 }
-            } else {
-                let reason = if let Some(ref info) = probed_info {
-                    if info.device_type == wgpu::DeviceType::Cpu {
-                        format!(
-                            "Auto selected CPU sense backend (honest default; detected adapter '{}' is a software fallback)",
-                            info.name
-                        )
-                    } else {
-                        format!(
-                            "Auto selected CPU sense backend (honest default; GPU adapter '{}' is not certified exact)",
-                            info.name
-                        )
-                    }
-                } else {
-                    "Auto selected CPU sense backend (honest default; no GPU adapter available)"
-                        .to_string()
-                };
-                info!(reason = %reason, "Auto selected CPU sense backend");
-                println!("{reason}");
-                Ok(ResolvedSenseConfig {
-                    policy: SensePolicyV0 {
-                        backend: SenseBackendId::Cpu,
-                        determinism: SenseDeterminism::Exact,
-                        source: "auto".to_string(),
-                        certified_exact: true,
-                        allow_approximate: cli.allow_approximate_sense,
-                        gate_evidence: None,
-                        reason,
-                    },
-                    provider: None,
-                })
+                format!(
+                    "Auto selected CPU sense backend (honest default; initialized GPU adapter '{}' is not certified exact)",
+                    actual_info.name
+                )
             }
+            Err(error) => format!(
+                "Auto selected CPU sense backend (honest default; GPU initialization failed: {error})"
+            ),
         }
+    } else if let Some(info) = probed_info {
+        if info.device_type == wgpu::DeviceType::Cpu {
+            format!(
+                "Auto selected CPU sense backend (honest default; detected adapter '{}' is a software fallback)",
+                info.name
+            )
+        } else {
+            format!(
+                "Auto selected CPU sense backend (honest default; GPU adapter '{}' is not certified exact)",
+                info.name
+            )
+        }
+    } else {
+        "Auto selected CPU sense backend (honest default; no GPU adapter available)".to_string()
+    };
+    info!(reason = %reason, "Auto selected CPU sense backend");
+    println!("{reason}");
+    ResolvedSenseConfig {
+        policy: SensePolicyV0 {
+            backend: SenseBackendId::Cpu,
+            determinism: SenseDeterminism::Exact,
+            source: "auto".to_string(),
+            certified_exact: true,
+            allow_approximate,
+            gate_evidence: None,
+            reason,
+        },
+        provider: None,
     }
 }
 
@@ -6909,6 +6911,169 @@ mod tests {
     use std::fs;
     use std::sync::{Mutex, OnceLock};
     use tempfile::tempdir;
+
+    // These injected fixtures exercise selection control flow, not GPU execution or parity.
+    struct SelectionControlSenseProvider;
+
+    impl SenseProvider for SelectionControlSenseProvider {
+        fn compute_accumulators(
+            &mut self,
+            _world: &WorldState,
+            _handles: &[scriptbots_core::AgentId],
+        ) -> std::result::Result<
+            Vec<scriptbots_core::sense_fixed::SenseAccum>,
+            scriptbots_core::sense_fixed::SenseProviderError,
+        > {
+            Err(scriptbots_core::sense_fixed::SenseProviderError::Execution(
+                "selection-control fixture cannot execute sensing".to_string(),
+            ))
+        }
+    }
+
+    fn selection_control_adapter() -> wgpu::AdapterInfo {
+        wgpu::AdapterInfo {
+            name: "selection-control adapter".to_string(),
+            vendor: 1,
+            device: 2,
+            device_type: wgpu::DeviceType::DiscreteGpu,
+            driver: "selection-control driver".to_string(),
+            driver_info: "selection-control version".to_string(),
+            backend: wgpu::Backend::Vulkan,
+        }
+    }
+
+    fn selection_control_evidence(info: &wgpu::AdapterInfo) -> SenseGateEvidenceV0 {
+        SenseGateEvidenceV0 {
+            target: "selection-control target".to_string(),
+            adapter: info.name.clone(),
+            vendor: info.vendor,
+            device: info.device,
+            backend: format!("{:?}", info.backend),
+            driver: info.driver.clone(),
+            driver_info: info.driver_info.clone(),
+            shader_digest: "selection-control shader".to_string(),
+            build_identity: "selection-control build".to_string(),
+            toolchain_identity: "selection-control toolchain".to_string(),
+            fixture_digest: "selection-control fixture".to_string(),
+            tick_count: 1,
+            evidence_time_unix_ms: 1,
+            evidence_digest: "selection-control evidence".to_string(),
+            determinism: SenseDeterminism::Exact,
+            max_sensor_delta: 0.0,
+        }
+    }
+
+    fn assert_auto_cpu_sense_selection(config: &ResolvedSenseConfig, allow_approximate: bool) {
+        assert_eq!(config.policy.backend, SenseBackendId::Cpu);
+        assert_eq!(config.policy.determinism, SenseDeterminism::Exact);
+        assert_eq!(config.policy.source, "auto");
+        assert!(config.policy.certified_exact);
+        assert_eq!(config.policy.allow_approximate, allow_approximate);
+        assert!(config.policy.gate_evidence.is_none());
+        assert!(config.provider.is_none());
+    }
+
+    #[test]
+    fn auto_sense_selection_retains_the_initialized_adapters_certification() {
+        for changed_adapter in [false, true] {
+            let probe = selection_control_adapter();
+            let mut actual = probe.clone();
+            if changed_adapter {
+                actual.name = "different certified selection-control adapter".to_string();
+                actual.device += 1;
+            }
+            let mut actual_evidence = selection_control_evidence(&actual);
+            actual_evidence.evidence_digest = "initialized selection-control evidence".to_string();
+            let mut certified = Vec::new();
+            let config = resolve_auto_sense_config(
+                false,
+                Some(probe.clone()),
+                || Ok((SelectionControlSenseProvider, actual.clone())),
+                |info| {
+                    certified.push(info.clone());
+                    Some(if certified.len() == 1 {
+                        selection_control_evidence(info)
+                    } else {
+                        actual_evidence.clone()
+                    })
+                },
+            );
+            assert_eq!(certified, vec![probe, actual.clone()]);
+            assert_eq!(config.policy.backend, SenseBackendId::Gpu);
+            assert_eq!(config.policy.determinism, SenseDeterminism::Exact);
+            assert!(config.policy.certified_exact);
+            assert_eq!(config.policy.gate_evidence, Some(actual_evidence));
+            assert!(config.policy.reason.contains(&actual.name));
+            assert!(config.provider.is_some());
+        }
+    }
+
+    #[test]
+    fn auto_sense_selection_refuses_an_uncertified_initialized_adapter() {
+        let probe = selection_control_adapter();
+        let mut other_device = probe.clone();
+        other_device.name = "uncertified selection-control adapter".to_string();
+        other_device.device += 1;
+        let mut other_driver = probe.clone();
+        other_driver.driver_info = "unqualified selection-control driver".to_string();
+        let mut software = probe.clone();
+        software.device_type = wgpu::DeviceType::Cpu;
+        for actual in [other_device, other_driver, software] {
+            for allow_approximate in [false, true] {
+                let mut certified = Vec::new();
+                let config = resolve_auto_sense_config(
+                    allow_approximate,
+                    Some(probe.clone()),
+                    || Ok((SelectionControlSenseProvider, actual.clone())),
+                    |info| {
+                        certified.push(info.clone());
+                        (info == &probe).then(|| selection_control_evidence(info))
+                    },
+                );
+                assert_eq!(certified, vec![probe.clone(), actual.clone()]);
+                assert_auto_cpu_sense_selection(&config, allow_approximate);
+                assert!(config.policy.reason.contains("initialized GPU adapter"));
+                assert!(config.policy.reason.contains(&actual.name));
+            }
+        }
+    }
+
+    #[test]
+    fn auto_sense_selection_does_not_initialize_an_absent_or_uncertified_probe() {
+        for probe in [None, Some(selection_control_adapter())] {
+            let mut certification_calls = 0;
+            let expected_calls = usize::from(probe.is_some());
+            let config = resolve_auto_sense_config::<SelectionControlSenseProvider>(
+                true,
+                probe,
+                || panic!("uncertified probes must not initialize a GPU provider"),
+                |_| {
+                    certification_calls += 1;
+                    None
+                },
+            );
+            assert_eq!(certification_calls, expected_calls);
+            assert_auto_cpu_sense_selection(&config, true);
+        }
+    }
+
+    #[test]
+    fn auto_sense_selection_falls_back_when_initialization_fails() {
+        let mut certified = Vec::new();
+        let probe = selection_control_adapter();
+        let config = resolve_auto_sense_config::<SelectionControlSenseProvider>(
+            false,
+            Some(probe.clone()),
+            || Err(scriptbots_world_gfx::sense_wgsl::GpuSenseError::NoAdapter),
+            |info| {
+                certified.push(info.clone());
+                Some(selection_control_evidence(info))
+            },
+        );
+        assert_eq!(certified, vec![probe]);
+        assert_auto_cpu_sense_selection(&config, false);
+        assert!(config.policy.reason.contains("GPU initialization failed"));
+    }
 
     #[test]
     fn production_regions_close_real_services_and_persist_a_partial_tail() -> Result<()> {
