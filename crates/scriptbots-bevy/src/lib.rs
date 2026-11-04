@@ -9797,7 +9797,9 @@ mod terrain_tests {
         };
         let mut agent = sample_agent_visual();
         agent.spike_length = 0.0;
-        let coordinates = [45.0, 95.0, 100.0, 105.0, 150.0, 195.0, 200.0, 205.0, 255.0];
+        let coordinates = [
+            25.0, 45.0, 75.0, 95.0, 100.0, 105.0, 150.0, 195.0, 200.0, 205.0, 255.0,
+        ];
         for position in coordinates
             .into_iter()
             .flat_map(|x| coordinates.into_iter().map(move |y| Vec2::new(x, y)))
@@ -10787,10 +10789,10 @@ fn include_ground_mesh(
     transform: Transform,
     rotation: Quat,
     position: Vec2,
-    cell: f32,
-    dims: UVec2,
+    terrain: &TerrainHeightSnapshot,
     mut include: impl FnMut(Vec3),
 ) {
+    let cell = terrain.cell_size.max(1) as f32;
     let local: Vec<Vec3> = mesh
         .vertices
         .iter()
@@ -10803,20 +10805,42 @@ fn include_ground_mesh(
             (position + Vec2::new(offset.x, -offset.z)) / cell
         })
         .collect();
-    for &point in &local {
-        include(point);
-    }
     // A triangle is convex. If all projected mesh vertices lie in one
     // terrain triangle, every mesh face does too, and vertex support is exact
     // for this planar patch. Keep the full overlay path across any boundary.
-    if let Some(first) = grid
+    if let Some((x, y, lower)) = grid
         .first()
-        .and_then(|&point| terrain_triangle_at(point, dims))
+        .and_then(|&point| terrain_triangle_at(point, terrain.dims))
         && grid
             .iter()
-            .all(|&point| terrain_triangle_at(point, dims) == Some(first))
+            .all(|&point| terrain_triangle_at(point, terrain.dims) == Some((x, y, lower)))
     {
+        // The height difference is linear across the patch. Compute its
+        // maximum over the mesh vertices using one plane instead of querying
+        // the heightfield for every vertex.
+        let h00 = terrain.elevation[terrain.index(x, y)] * TERRAIN_HEIGHT_SCALE;
+        let h10 = terrain.elevation[terrain.index(x + 1, y)] * TERRAIN_HEIGHT_SCALE;
+        let h01 = terrain.elevation[terrain.index(x, y + 1)] * TERRAIN_HEIGHT_SCALE;
+        let h11 = terrain.elevation[terrain.index(x + 1, y + 1)] * TERRAIN_HEIGHT_SCALE;
+        let (base, dx, dy) = if lower {
+            (h00, h10 - h00, h01 - h00)
+        } else {
+            (h01 + h10 - h11, h11 - h01, h11 - h10)
+        };
+        let origin = Vec2::new(x as f32, y as f32);
+        let mut best = (f32::NEG_INFINITY, Vec3::ZERO);
+        for (&point, &projected) in local.iter().zip(&grid) {
+            let within = projected - origin;
+            let height = base + dx * within.x + dy * within.y - (rotation * point).y;
+            if height > best.0 {
+                best = (height, point);
+            }
+        }
+        include(best.1);
         return;
+    }
+    for &point in &local {
+        include(point);
     }
     // Terrain triangle edges lie on integer x, y, and x+y grid lines.
     for &[a, b] in &mesh.edges {
@@ -10913,14 +10937,12 @@ fn terrain_footprint_height(
     // Use the exact built-in mesh vertices as well as the analytic support
     // samples. A terrain crease can pass between the latter.
     let meshes = ground_mesh_samples();
-    let cell = terrain.cell_size.max(1) as f32;
     include_ground_mesh(
         &meshes.body,
         Transform::from_scale(Vec3::splat(radius)),
         rotation,
         position,
-        cell,
-        terrain.dims,
+        terrain,
         &mut include,
     );
     for side in [-1.0, 1.0] {
@@ -10930,8 +10952,7 @@ fn terrain_footprint_height(
             Transform::from_translation(center).with_scale(Vec3::splat(radius)),
             rotation,
             position,
-            cell,
-            terrain.dims,
+            terrain,
             &mut include,
         );
     }
@@ -10954,8 +10975,7 @@ fn terrain_footprint_height(
         spike_transform,
         rotation,
         position,
-        cell,
-        terrain.dims,
+        terrain,
         &mut include,
     );
     required
