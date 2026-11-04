@@ -2225,6 +2225,16 @@ impl MatchedSeedExperimentRunner {
                 run_id: run_id.to_owned(),
                 completed_ticks: 0,
             })?;
+        if experiment_path_exists(
+            &self.staged_bundle_path(run_id),
+            "inspect bundle staging before continuation",
+        )? && checkpoint.owner.host_checkpoint().tick().0 != self.max_ticks
+        {
+            return Err(invalid_checkpoint(
+                &path,
+                "bundle staging exists without a sealed final owner cut; replaying ticks is refused",
+            ));
+        }
         let mut parent_digest = blake3::hash(&checkpoint.encode(&path)?)
             .to_hex()
             .to_string();
@@ -2389,16 +2399,23 @@ impl MatchedSeedExperimentRunner {
         // owner-journal state. Reporting its digest alone is not portable state.
         let final_checkpoint_bytes = checkpoint.encode(&path)?;
         let bundle_dir = self.output_dir.join(run_id);
-        if bundle_dir.exists() {
-            return Err(ExperimentRunnerError::BundleAlreadyExists {
-                run_id: run_id.to_owned(),
-                path: bundle_dir,
-            });
-        }
-        create_run_bundle_from_artifacts(
-            &bundle_dir,
+        let completed = RunRecord {
+            run_id: run_id.to_owned(),
+            variant_id: variant.variant_id.clone(),
+            brain_family: family.canonical_name().to_owned(),
+            seed,
+            state: RunState::Completed,
+            total_ticks: self.max_ticks,
+            final_digest: Some(digest_hex),
+            bundle_path: Some(bundle_dir.to_string_lossy().into_owned()),
+            error_reason: None,
+        };
+        self.publish_completed_bundle(
+            &completed,
+            variant,
+            family,
+            plan_digest,
             manifest_record,
-            self.max_ticks,
             &[
                 (
                     "exports/summary.csv",
@@ -2416,25 +2433,142 @@ impl MatchedSeedExperimentRunner {
                     &final_checkpoint_bytes,
                 ),
             ],
-        )
-        .map_err(|source| ExperimentRunnerError::Bundle {
-            run_id: run_id.to_owned(),
-            reason: format!("assembly failed: {source}"),
-        })?;
-
-        let completed = RunRecord {
-            run_id: run_id.to_owned(),
-            variant_id: variant.variant_id.clone(),
-            brain_family: family.canonical_name().to_owned(),
-            seed,
-            state: RunState::Completed,
-            total_ticks: self.max_ticks,
-            final_digest: Some(digest_hex),
-            bundle_path: Some(bundle_dir.to_string_lossy().into_owned()),
-            error_reason: None,
-        };
+        )?;
         self.verify_completed_bundle(&completed, variant, family, plan_digest)?;
         Ok(completed)
+    }
+
+    fn staged_bundle_path(&self, run_id: &str) -> PathBuf {
+        self.output_dir.join(format!("{run_id}.bundle.tmp"))
+    }
+
+    /// Publish only verified output from the final sealed owner cut. The caller holds
+    /// the run's writer lease across restore, execution and this directory handoff.
+    fn publish_completed_bundle(
+        &self,
+        record: &RunRecord,
+        variant: &ScenarioVariant,
+        family: ResolvedBrainFamily,
+        plan_digest: &str,
+        manifest: scriptbots_storage::RunManifestRecord,
+        artifacts: &[(&str, &str, &[u8])],
+    ) -> Result<(), ExperimentRunnerError> {
+        let bundle_dir = self.output_dir.join(&record.run_id);
+        if experiment_path_exists(&bundle_dir, "inspect final experiment bundle")? {
+            return Err(ExperimentRunnerError::BundleAlreadyExists {
+                run_id: record.run_id.clone(),
+                path: bundle_dir,
+            });
+        }
+        let staged = self.staged_bundle_path(&record.run_id);
+        let verify_staged = || -> Result<(), ExperimentRunnerError> {
+            self.verify_completed_bundle_at(&staged, record, variant, family, plan_digest)?;
+            for (relative, _, expected) in artifacts {
+                let path = staged.join(relative);
+                if read_experiment_file_bounded(&path, MAX_BUNDLE_ARTIFACT_BYTES)?.as_slice()
+                    != *expected
+                {
+                    return Err(ExperimentRunnerError::Bundle {
+                        run_id: record.run_id.clone(),
+                        reason: format!(
+                            "staged artifact {} differs from the exact sealed final owner cut",
+                            path.display()
+                        ),
+                    });
+                }
+            }
+            Ok(())
+        };
+        let mut ready = false;
+        if experiment_path_exists(&staged, "inspect staged experiment bundle")? {
+            validate_staged_bundle_layout(&staged, &record.run_id)?;
+            match verify_staged() {
+                Ok(()) => ready = true,
+                Err(error) => {
+                    // Only uncommitted staging can be regenerated. Preserve one
+                    // bounded incident instead of deleting or overwriting evidence.
+                    let retained = self
+                        .output_dir
+                        .join(format!("{}.bundle.interrupted", record.run_id));
+                    if experiment_path_exists(&retained, "inspect retained bundle incident")? {
+                        return Err(ExperimentRunnerError::Bundle {
+                            run_id: record.run_id.clone(),
+                            reason: format!(
+                                "staging is incomplete or invalid ({error}); prior incident at {} must be inspected before another recovery",
+                                retained.display()
+                            ),
+                        });
+                    }
+                    fs::rename(&staged, &retained).map_err(|source| ExperimentRunnerError::Io {
+                        operation: "retain interrupted bundle staging",
+                        path: staged.clone(),
+                        source,
+                    })?;
+                    sync_parent_directory(&self.output_dir)?;
+                    info!(
+                        run_id = %record.run_id,
+                        retained_path = %retained.display(),
+                        error = %error,
+                        "retained interrupted staging; rebuilding from the verified final owner cut"
+                    );
+                }
+            }
+        }
+        if !ready {
+            fs::create_dir(&staged).map_err(|source| ExperimentRunnerError::Io {
+                operation: "reserve experiment bundle staging",
+                path: staged.clone(),
+                source,
+            })?;
+            create_run_bundle_from_artifacts(&staged, manifest, self.max_ticks, artifacts)
+                .map_err(|source| ExperimentRunnerError::Bundle {
+                    run_id: record.run_id.clone(),
+                    reason: format!("staged assembly failed: {source}"),
+                })?;
+            validate_staged_bundle_layout(&staged, &record.run_id)?;
+            verify_staged()?;
+        }
+
+        // File contents and nested directory entries must precede publication of
+        // the final directory name, including recovery of a pre-rename crash.
+        for relative in REQUIRED_EXPERIMENT_ARTIFACTS
+            .iter()
+            .map(|(path, _)| *path)
+            .chain(std::iter::once("bundle_manifest.json"))
+        {
+            let path = staged.join(relative);
+            let mut options = OpenOptions::new();
+            options.read(true).write(cfg!(windows));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+            }
+            options
+                .open(&path)
+                .and_then(|file| file.sync_all())
+                .map_err(|source| ExperimentRunnerError::Io {
+                    operation: "sync staged experiment artifact",
+                    path: path.clone(),
+                    source,
+                })?;
+            if let Some(parent) = path.parent() {
+                sync_parent_directory(parent)?;
+            }
+        }
+        sync_parent_directory(&staged)?;
+        if experiment_path_exists(&bundle_dir, "reinspect final experiment bundle")? {
+            return Err(ExperimentRunnerError::BundleAlreadyExists {
+                run_id: record.run_id.clone(),
+                path: bundle_dir,
+            });
+        }
+        fs::rename(&staged, &bundle_dir).map_err(|source| ExperimentRunnerError::Io {
+            operation: "publish verified experiment bundle",
+            path: bundle_dir,
+            source,
+        })?;
+        sync_parent_directory(&self.output_dir)
     }
 
     /// Recover only the bundle/status commit gap; never replay an unfinished run.
@@ -2489,8 +2623,19 @@ impl MatchedSeedExperimentRunner {
         plan_digest: &str,
     ) -> Result<(), ExperimentRunnerError> {
         let bundle_dir = self.output_dir.join(&record.run_id);
+        self.verify_completed_bundle_at(&bundle_dir, record, variant, family, plan_digest)
+    }
+
+    fn verify_completed_bundle_at(
+        &self,
+        bundle_dir: &Path,
+        record: &RunRecord,
+        variant: &ScenarioVariant,
+        family: ResolvedBrainFamily,
+        plan_digest: &str,
+    ) -> Result<(), ExperimentRunnerError> {
         verify_run_bundle_bounded(
-            &bundle_dir,
+            bundle_dir,
             RunBundleVerificationLimits {
                 max_manifest_bytes: MAX_STATUS_BYTES,
                 max_artifacts: MAX_BUNDLE_ARTIFACTS,
@@ -2637,7 +2782,7 @@ impl MatchedSeedExperimentRunner {
                 plan_digest,
             )?;
             verify_restored_final_checkpoint(
-                &bundle_dir,
+                bundle_dir,
                 &checkpoint,
                 &full_manifest,
                 &evidence,
@@ -2651,6 +2796,101 @@ impl MatchedSeedExperimentRunner {
         })?;
         Ok(())
     }
+}
+
+fn experiment_path_exists(
+    path: &Path,
+    operation: &'static str,
+) -> Result<bool, ExperimentRunnerError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(ExperimentRunnerError::Io {
+            operation,
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+/// Inspect the bounded writer-owned layout before any staged file is opened or moved.
+/// Missing files are expected after an interruption; aliases and unrelated files are not.
+fn validate_staged_bundle_layout(staged: &Path, run_id: &str) -> Result<(), ExperimentRunnerError> {
+    let invalid = |path: &Path, reason: &str| ExperimentRunnerError::Bundle {
+        run_id: run_id.to_owned(),
+        reason: format!("invalid bundle staging at {}: {reason}", path.display()),
+    };
+    let files = REQUIRED_EXPERIMENT_ARTIFACTS
+        .iter()
+        .map(|(path, _)| PathBuf::from(path))
+        .chain(std::iter::once(PathBuf::from("bundle_manifest.json")))
+        .collect::<BTreeSet<_>>();
+    let directories = files
+        .iter()
+        .flat_map(|path| path.ancestors().skip(1))
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .collect::<BTreeSet<_>>();
+    let mut pending = vec![PathBuf::new()];
+    let mut artifact_bytes = 0_u64;
+    while let Some(relative) = pending.pop() {
+        let directory = staged.join(&relative);
+        let metadata =
+            fs::symlink_metadata(&directory).map_err(|source| ExperimentRunnerError::Io {
+                operation: "inspect bundle staging directory",
+                path: directory.clone(),
+                source,
+            })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(invalid(&directory, "expected a non-symlink directory"));
+        }
+        let entries = fs::read_dir(&directory).map_err(|source| ExperimentRunnerError::Io {
+            operation: "list bundle staging directory",
+            path: directory.clone(),
+            source,
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|source| ExperimentRunnerError::Io {
+                operation: "read bundle staging directory entry",
+                path: directory.clone(),
+                source,
+            })?;
+            let relative_path = relative.join(entry.file_name());
+            let path = entry.path();
+            let metadata =
+                fs::symlink_metadata(&path).map_err(|source| ExperimentRunnerError::Io {
+                    operation: "inspect bundle staging entry",
+                    path: path.clone(),
+                    source,
+                })?;
+            if metadata.file_type().is_symlink() {
+                return Err(invalid(&path, "symlinks are refused"));
+            }
+            if directories.contains(&relative_path) && metadata.is_dir() {
+                pending.push(relative_path);
+            } else if files.contains(&relative_path) && metadata.is_file() {
+                if !same_status_file_identity(&metadata, &metadata) {
+                    return Err(invalid(&path, "multiply linked files are refused"));
+                }
+                if relative_path == Path::new("bundle_manifest.json") {
+                    if metadata.len() > MAX_STATUS_BYTES {
+                        return Err(invalid(&path, "manifest exceeds its byte cap"));
+                    }
+                } else {
+                    if metadata.len() > MAX_BUNDLE_ARTIFACT_BYTES {
+                        return Err(invalid(&path, "artifact exceeds its byte cap"));
+                    }
+                    artifact_bytes = artifact_bytes
+                        .checked_add(metadata.len())
+                        .filter(|total| *total <= MAX_BUNDLE_TOTAL_ARTIFACT_BYTES)
+                        .ok_or_else(|| invalid(staged, "artifacts exceed their total byte cap"))?;
+                }
+            } else {
+                return Err(invalid(&path, "unexpected path or non-regular artifact"));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_path_component(label: &str, value: &str) -> Result<(), ExperimentRunnerError> {
@@ -3534,6 +3774,280 @@ mod tests {
             assert_eq!(fs::read(&state_file).unwrap(), committed_bytes);
             assert_eq!(fs::read(&temporary).unwrap(), candidate_bytes);
             assert_eq!(fs::read(&target).unwrap(), *target_bytes);
+        }
+    }
+
+    #[test]
+    fn staged_bundle_publication_recovers_a_complete_bundle_without_replaying_ticks() {
+        let directory = tempfile::tempdir().unwrap();
+        let runner = interrupted_status_runner(directory.path());
+        let state_file = directory.path().join("status.json");
+        let mut running = runner.load_or_create_status(&state_file).unwrap();
+        running.runs[0].state = RunState::Running;
+        runner.save_status(&state_file, &mut running).unwrap();
+        let completed = runner
+            .execute_single_run(&runner.variants[0], runner.cohort.seeds[0])
+            .unwrap();
+        let checkpoint_path = runner.run_checkpoint_path(&completed.run_id);
+        let original_cut = fs::read(&checkpoint_path).unwrap();
+        let bundle_dir = runner.output_dir.join(&completed.run_id);
+        let original_bundle = fs::read(bundle_dir.join("bundle_manifest.json")).unwrap();
+        let staged = runner.staged_bundle_path(&completed.run_id);
+        // A complete real bundle models the crash after staging verification,
+        // before the single directory rename and final status publication.
+        fs::rename(&bundle_dir, &staged).unwrap();
+
+        let recovered = runner.execute_batch(&state_file).unwrap();
+        assert_eq!(recovered.completed_runs, 1, "{recovered:?}");
+        assert_eq!(recovered.failed_runs, 0);
+        assert_eq!(recovered.runs[0], completed);
+        assert_eq!(fs::read(&checkpoint_path).unwrap(), original_cut);
+        assert_eq!(
+            fs::read(bundle_dir.join("bundle_manifest.json")).unwrap(),
+            original_bundle
+        );
+        assert!(!staged.exists());
+        assert!(
+            !runner
+                .output_dir
+                .join(format!("{}.bundle.interrupted", completed.run_id))
+                .exists()
+        );
+    }
+
+    #[test]
+    fn staged_bundle_publication_retains_each_partial_write_and_uses_the_final_cut() {
+        let reference_dir = tempfile::tempdir().unwrap();
+        let reference = interrupted_status_runner(reference_dir.path());
+        let expected = reference
+            .execute_single_run(&reference.variants[0], reference.cohort.seeds[0])
+            .unwrap();
+        let original_cut = fs::read(reference.run_checkpoint_path(&expected.run_id)).unwrap();
+        let bundle_dir = reference.output_dir.join(&expected.run_id);
+        let artifacts = REQUIRED_EXPERIMENT_ARTIFACTS
+            .iter()
+            .map(|(path, _)| *path)
+            .chain(std::iter::once("bundle_manifest.json"))
+            .map(|path| (path, fs::read(bundle_dir.join(path)).unwrap()))
+            .collect::<Vec<_>>();
+
+        // Empty staging, then a power loss during each actual file's write.
+        for partial_file in std::iter::once(None).chain((0..artifacts.len()).map(Some)) {
+            let directory = tempfile::tempdir().unwrap();
+            let runner = interrupted_status_runner(directory.path());
+            let state_file = directory.path().join("status.json");
+            let mut running = runner.load_or_create_status(&state_file).unwrap();
+            running.runs[0].state = RunState::Running;
+            runner.save_status(&state_file, &mut running).unwrap();
+            fs::create_dir_all(&runner.output_dir).unwrap();
+            let checkpoint_path = runner.run_checkpoint_path(&expected.run_id);
+            fs::write(&checkpoint_path, &original_cut).unwrap();
+            let staged = runner.staged_bundle_path(&expected.run_id);
+            fs::create_dir(&staged).unwrap();
+            let mut interrupted_files = Vec::new();
+            if let Some(last) = partial_file {
+                for (index, (path, bytes)) in artifacts.iter().enumerate().take(last + 1) {
+                    let bytes = if index == last {
+                        &bytes[..bytes.len() / 2]
+                    } else {
+                        bytes.as_slice()
+                    };
+                    let destination = staged.join(path);
+                    fs::create_dir_all(destination.parent().unwrap()).unwrap();
+                    fs::write(&destination, bytes).unwrap();
+                    interrupted_files.push((*path, bytes.to_vec()));
+                }
+            }
+
+            let recovered = runner.execute_batch(&state_file).unwrap();
+            assert_eq!(
+                recovered.completed_runs, 1,
+                "{partial_file:?}: {recovered:?}"
+            );
+            assert_eq!(recovered.failed_runs, 0);
+            assert_eq!(recovered.runs[0].final_digest, expected.final_digest);
+            assert_eq!(recovered.runs[0].total_ticks, expected.total_ticks);
+            assert_eq!(fs::read(&checkpoint_path).unwrap(), original_cut);
+            assert!(!staged.exists());
+            let retained = runner
+                .output_dir
+                .join(format!("{}.bundle.interrupted", expected.run_id));
+            assert!(retained.is_dir());
+            for (path, bytes) in &interrupted_files {
+                assert_eq!(fs::read(retained.join(path)).unwrap(), *bytes);
+            }
+            for (path, _) in artifacts.iter().skip(interrupted_files.len()) {
+                assert!(!retained.join(path).exists());
+            }
+            for (path, bytes) in &artifacts[..REQUIRED_EXPERIMENT_ARTIFACTS.len()] {
+                assert_eq!(
+                    fs::read(runner.output_dir.join(&expected.run_id).join(path)).unwrap(),
+                    *bytes
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn staged_bundle_publication_refuses_unsafe_recovery_and_preserves_evidence() {
+        let reference_dir = tempfile::tempdir().unwrap();
+        let reference = interrupted_status_runner(reference_dir.path());
+        let expected = reference
+            .execute_single_run(&reference.variants[0], reference.cohort.seeds[0])
+            .unwrap();
+        let final_cut = fs::read(reference.run_checkpoint_path(&expected.run_id)).unwrap();
+        for case in [
+            "prior-incident",
+            "nonfinal-cut",
+            "corrupt-cut",
+            "oversized",
+            "unrelated-file",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let runner = interrupted_status_runner(directory.path());
+            let state_file = directory.path().join("status.json");
+            let mut running = runner.load_or_create_status(&state_file).unwrap();
+            running.runs[0].state = RunState::Running;
+            runner.save_status(&state_file, &mut running).unwrap();
+            let plan = runner.validated_plan().unwrap();
+            let record = &plan.runs[0];
+            let (variant, family) = &plan.variants[&record.variant_id];
+            runner
+                .prepare_run_checkpoint(variant, *family, record.seed, &record.run_id, &plan.digest)
+                .unwrap();
+            let checkpoint_path = runner.run_checkpoint_path(&record.run_id);
+            if case != "nonfinal-cut" {
+                let mut bytes = final_cut.clone();
+                if case == "corrupt-cut" {
+                    bytes[0] ^= 1;
+                }
+                fs::write(&checkpoint_path, bytes).unwrap();
+            }
+            let original_cut = fs::read(&checkpoint_path).unwrap();
+            let staged = runner.staged_bundle_path(&record.run_id);
+            fs::create_dir(&staged).unwrap();
+            let staged_file = if case == "unrelated-file" {
+                staged.join("unrelated.txt")
+            } else {
+                let exports = staged.join("exports");
+                fs::create_dir(&exports).unwrap();
+                exports.join("summary.csv")
+            };
+            fs::write(&staged_file, b"partial").unwrap();
+            if case == "oversized" {
+                OpenOptions::new()
+                    .write(true)
+                    .open(&staged_file)
+                    .unwrap()
+                    .set_len(MAX_BUNDLE_ARTIFACT_BYTES + 1)
+                    .unwrap();
+            }
+            let retained = runner
+                .output_dir
+                .join(format!("{}.bundle.interrupted", record.run_id));
+            if case == "prior-incident" {
+                fs::create_dir(&retained).unwrap();
+                fs::write(retained.join("original-incident"), b"keep this evidence").unwrap();
+            }
+
+            let result = runner.execute_batch(&state_file);
+            if case == "corrupt-cut" {
+                assert!(matches!(
+                    result,
+                    Err(ExperimentRunnerError::InvalidCheckpoint { .. })
+                ));
+            } else {
+                let status = result.unwrap();
+                assert_eq!(status.completed_runs, 0, "{case}: {status:?}");
+                assert_eq!(status.failed_runs, 1, "{case}: {status:?}");
+                assert!(status.runs[0].error_reason.is_some());
+            }
+            assert_eq!(fs::read(&checkpoint_path).unwrap(), original_cut, "{case}");
+            assert!(!runner.output_dir.join(&record.run_id).exists(), "{case}");
+            assert!(staged.is_dir(), "{case}");
+            if case == "oversized" {
+                assert_eq!(
+                    fs::metadata(&staged_file).unwrap().len(),
+                    MAX_BUNDLE_ARTIFACT_BYTES + 1
+                );
+            } else {
+                assert_eq!(fs::read(&staged_file).unwrap(), b"partial", "{case}");
+            }
+            if case == "prior-incident" {
+                assert_eq!(
+                    fs::read(retained.join("original-incident")).unwrap(),
+                    b"keep this evidence"
+                );
+            } else {
+                assert!(!retained.exists(), "{case}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_bundle_publication_refuses_symlink_and_hard_link_aliases() {
+        use std::os::unix::fs::symlink;
+
+        let reference_dir = tempfile::tempdir().unwrap();
+        let reference = interrupted_status_runner(reference_dir.path());
+        let expected = reference
+            .execute_single_run(&reference.variants[0], reference.cohort.seeds[0])
+            .unwrap();
+        let final_cut = fs::read(reference.run_checkpoint_path(&expected.run_id)).unwrap();
+        for case in [
+            "root-symlink",
+            "directory-symlink",
+            "file-symlink",
+            "file-hard-link",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let runner = interrupted_status_runner(directory.path());
+            let state_file = directory.path().join("status.json");
+            let mut running = runner.load_or_create_status(&state_file).unwrap();
+            running.runs[0].state = RunState::Running;
+            runner.save_status(&state_file, &mut running).unwrap();
+            fs::create_dir_all(&runner.output_dir).unwrap();
+            let checkpoint_path = runner.run_checkpoint_path(&expected.run_id);
+            fs::write(&checkpoint_path, &final_cut).unwrap();
+            let staged = runner.staged_bundle_path(&expected.run_id);
+            let external = directory.path().join("external");
+            fs::create_dir(&external).unwrap();
+            fs::write(external.join("summary.csv"), b"external evidence").unwrap();
+            if case == "root-symlink" {
+                symlink(&external, &staged).unwrap();
+            } else {
+                fs::create_dir(&staged).unwrap();
+                let exports = staged.join("exports");
+                if case == "directory-symlink" {
+                    symlink(&external, &exports).unwrap();
+                } else {
+                    fs::create_dir(&exports).unwrap();
+                    if case == "file-symlink" {
+                        symlink(external.join("summary.csv"), exports.join("summary.csv")).unwrap();
+                    } else {
+                        fs::hard_link(external.join("summary.csv"), exports.join("summary.csv"))
+                            .unwrap();
+                    }
+                }
+            }
+
+            let status = runner.execute_batch(&state_file).unwrap();
+            assert_eq!(status.completed_runs, 0, "{case}: {status:?}");
+            assert_eq!(status.failed_runs, 1, "{case}: {status:?}");
+            assert_eq!(fs::read(&checkpoint_path).unwrap(), final_cut);
+            assert_eq!(
+                fs::read(external.join("summary.csv")).unwrap(),
+                b"external evidence"
+            );
+            assert!(fs::symlink_metadata(&staged).is_ok());
+            assert!(!runner.output_dir.join(&expected.run_id).exists());
+            assert!(
+                !runner
+                    .output_dir
+                    .join(format!("{}.bundle.interrupted", expected.run_id))
+                    .exists()
+            );
         }
     }
 
