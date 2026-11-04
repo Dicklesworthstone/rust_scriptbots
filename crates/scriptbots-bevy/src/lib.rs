@@ -1141,6 +1141,15 @@ struct AgentMotionSettings {
     enabled: bool,
 }
 
+fn smooth_toroidal_axis(current: f32, target: f32, extent: f32, blend: f32) -> f32 {
+    if !extent.is_finite() || extent <= 0.0 {
+        return current + (target - current) * blend;
+    }
+    let half = extent * 0.5;
+    let delta = toroidal_delta(target, current, extent);
+    (current + delta * blend + half).rem_euclid(extent) - half
+}
+
 fn smooth_agent_poses(
     time: Res<Time>,
     state: Res<SnapshotState>,
@@ -1149,17 +1158,29 @@ fn smooth_agent_poses(
 ) {
     let blend = -(-time.delta_secs() * AGENT_POSE_RESPONSE).exp_m1();
     for (target, mut display, mut transform) in &mut agents {
-        let delta = target.translation - display.previous_target.translation;
-        let wrapped = (state.world_size.x > 0.0 && delta.x.abs() > state.world_size.x * 0.5)
-            || (state.world_size.y > 0.0 && delta.z.abs() > state.world_size.y * 0.5);
         if settings.as_ref().is_some_and(|settings| !settings.enabled)
             || target.tick < display.previous_target.tick
-            || wrapped
         {
             display.translation = target.translation;
             display.rotation = target.rotation;
         } else {
-            display.translation = display.translation.lerp(target.translation, blend);
+            // X/Z are toroidal world axes. Ease along their shortest wrapped
+            // displacement so crossing a seam does not teleport an otherwise
+            // continuously moving stable agent across the whole viewport.
+            let mut translation = display.translation.lerp(target.translation, blend);
+            translation.x = smooth_toroidal_axis(
+                display.translation.x,
+                target.translation.x,
+                state.world_size.x,
+                blend,
+            );
+            translation.z = smooth_toroidal_axis(
+                display.translation.z,
+                target.translation.z,
+                state.world_size.y,
+                blend,
+            );
+            display.translation = translation;
             display.rotation = display.rotation.slerp(target.rotation, blend);
         }
         display.previous_target = *target;
@@ -9783,7 +9804,7 @@ fn apply_agent_visuals(
     commands.entity(record.body.entity).insert(IdleBodyTarget {
         transform: body_transform,
         // Stable, distributed phases keep agents from breathing in lockstep.
-        phase: (agent.id.data().as_ffi().wrapping_mul(2_654_435_761) % 1024) as f32
+        phase: (agent.uid.0.wrapping_mul(2_654_435_761) % 1024) as f32
             * (std::f32::consts::TAU / 1024.0),
     });
     update_part_colors(materials, &record.body, body_color, body_emissive);
@@ -11858,9 +11879,11 @@ mod tests {
     }
 
     #[test]
-    fn agent_pose_discontinuities_snap_and_picking_uses_displayed_pose() {
+    fn agent_pose_wraps_smoothly_but_rewinds_snap_and_picking_uses_displayed_pose() {
         let mut app = App::new();
-        app.insert_resource(Time::<()>::default());
+        let mut time = Time::<()>::default();
+        time.advance_by(Duration::from_secs_f32(1.0 / 60.0));
+        app.insert_resource(time);
         app.insert_resource(SnapshotState {
             world_size: Vec2::splat(1000.0),
             ..Default::default()
@@ -11889,13 +11912,24 @@ mod tests {
             ))
             .id();
         app.update();
+        let seam_pose = app
+            .world()
+            .entity(entity)
+            .get::<Transform>()
+            .unwrap()
+            .translation;
+        assert!(
+            seam_pose.x > 490.0 && seam_pose.x < 500.0,
+            "seam crossing should ease along the short +20-unit toroidal path, got {seam_pose:?}"
+        );
+        assert!(
+            (seam_pose.x - target.translation.x).abs() > 900.0,
+            "the first eased frame must not snap directly to the wrapped target"
+        );
         assert_eq!(
-            app.world()
-                .entity(entity)
-                .get::<Transform>()
-                .unwrap()
-                .translation,
-            target.translation
+            smooth_toroidal_axis(499.0, -499.0, 1000.0, 0.75),
+            -499.5,
+            "crossing the centered boundary wraps only after following the short path"
         );
         let rewind = AgentPoseTarget {
             translation: Vec3::ZERO,
