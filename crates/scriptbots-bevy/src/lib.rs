@@ -9762,6 +9762,17 @@ mod terrain_tests {
     }
 
     #[test]
+    fn planar_support_shortcut_distinguishes_terrain_seams() {
+        let dims = UVec2::new(4, 4);
+        let lower = terrain_triangle_at(Vec2::new(1.2, 1.3), dims);
+        assert_eq!(lower, terrain_triangle_at(Vec2::new(1.4, 1.5), dims));
+        assert_ne!(lower, terrain_triangle_at(Vec2::new(1.6, 1.5), dims));
+        assert_ne!(lower, terrain_triangle_at(Vec2::new(2.0, 1.2), dims));
+        assert_eq!(terrain_triangle_at(Vec2::new(-0.1, 1.2), dims), None);
+        assert_eq!(terrain_triangle_at(Vec2::new(3.0, 1.2), dims), None);
+    }
+
+    #[test]
     fn creature_body_and_wheel_vertices_clear_uneven_terrain() {
         let mut snapshot = sample_world_snapshot();
         snapshot.world_size = Vec2::splat(300.0);
@@ -9821,6 +9832,50 @@ mod terrain_tests {
                             "mesh vertex intersects terrain at {position:?}, heading {heading}, depth {}",
                             ground - (root.y + offset.y)
                         );
+                    }
+                }
+
+                // Terrain creases can cross a mesh face even when its
+                // vertices are clear. Probe its edges and interior too.
+                for (mesh, local) in
+                    std::iter::once((&body, body_transform)).chain([-1.0, 1.0].map(|side| {
+                        (
+                            &wheel,
+                            Transform {
+                                translation: Vec3::new(0.0, -4.6, side * 9.856),
+                                rotation: Quat::from_rotation_x(std::f32::consts::FRAC_PI_2),
+                                scale: Vec3::new(7.5, 4.0, 7.5),
+                            },
+                        )
+                    }))
+                {
+                    let points = vertices(mesh);
+                    let indices: Vec<usize> = match mesh.indices().unwrap() {
+                        Indices::U16(indices) => indices.iter().map(|&i| usize::from(i)).collect(),
+                        Indices::U32(indices) => indices.iter().map(|&i| i as usize).collect(),
+                    };
+                    for triangle in indices.as_chunks::<3>().0 {
+                        let [a, b, c] = [triangle[0], triangle[1], triangle[2]].map(|index| {
+                            rotation * local.transform_point(Vec3::from_array(points[index]))
+                        });
+                        for offset in [
+                            (a + b) * 0.5,
+                            (b + c) * 0.5,
+                            (c + a) * 0.5,
+                            (a + b + c) / 3.0,
+                        ] {
+                            let ground_position = position + Vec2::new(offset.x, -offset.z);
+                            let ground = sample_height_world(
+                                &snapshot.terrain_height,
+                                ground_position,
+                                TERRAIN_HEIGHT_SCALE,
+                            );
+                            assert!(
+                                root.y + offset.y >= ground - 0.01,
+                                "mesh face intersects terrain at {position:?}, heading {heading}, depth {}",
+                                ground - (root.y + offset.y)
+                            );
+                        }
                     }
                 }
             }
@@ -10637,21 +10692,51 @@ fn terrain_agent_rotation(
     Quat::from_mat3(&Mat3::from_cols(forward, up, right))
 }
 
+struct GroundSupportMesh {
+    vertices: Vec<Vec3>,
+    edges: Vec<[usize; 2]>,
+    faces: Vec<[usize; 3]>,
+}
+
 struct GroundMeshSamples {
-    body: Vec<Vec3>,
-    wheel: Vec<Vec3>,
-    spike: Vec<Vec3>,
+    body: GroundSupportMesh,
+    wheel: GroundSupportMesh,
+    spike: GroundSupportMesh,
 }
 
 fn ground_mesh_samples() -> &'static GroundMeshSamples {
     static SAMPLES: std::sync::OnceLock<GroundMeshSamples> = std::sync::OnceLock::new();
     SAMPLES.get_or_init(|| {
-        fn positions(mesh: Mesh) -> Vec<Vec3> {
-            match mesh.attribute(Mesh::ATTRIBUTE_POSITION) {
-                Some(bevy::mesh::VertexAttributeValues::Float32x3(values)) => {
-                    values.iter().copied().map(Vec3::from_array).collect()
-                }
+        fn support_mesh(mesh: Mesh, transform: Transform) -> GroundSupportMesh {
+            let vertices = match mesh.attribute(Mesh::ATTRIBUTE_POSITION) {
+                Some(bevy::mesh::VertexAttributeValues::Float32x3(values)) => values
+                    .iter()
+                    .copied()
+                    .map(Vec3::from_array)
+                    .map(|point| transform.transform_point(point))
+                    .collect(),
                 _ => panic!("built-in creature mesh must have 3D positions"),
+            };
+            let indices: Vec<usize> = match mesh
+                .indices()
+                .expect("built-in creature mesh must be indexed")
+            {
+                Indices::U16(values) => values.iter().map(|&value| usize::from(value)).collect(),
+                Indices::U32(values) => values.iter().map(|&value| value as usize).collect(),
+            };
+            let faces = indices.as_chunks::<3>().0.to_vec();
+            let mut edges = Vec::with_capacity(faces.len() * 3);
+            for &[a, b, c] in &faces {
+                for [a, b] in [[a, b], [b, c], [c, a]] {
+                    edges.push([a.min(b), a.max(b)]);
+                }
+            }
+            edges.sort_unstable();
+            edges.dedup();
+            GroundSupportMesh {
+                vertices,
+                edges,
+                faces,
             }
         }
         let body_transform = Transform {
@@ -10665,20 +10750,119 @@ fn ground_mesh_samples() -> &'static GroundMeshSamples {
             ..default()
         };
         GroundMeshSamples {
-            body: positions(Mesh::from(AGENT_BODY_CAPSULE))
-                .into_iter()
-                .map(|point| body_transform.transform_point(point))
-                .collect(),
-            wheel: positions(Mesh::from(Torus::new(0.3, 0.6)))
-                .into_iter()
-                .map(|point| wheel_transform.transform_point(point))
-                .collect(),
-            spike: positions(Mesh::from(Cone {
-                radius: 0.45,
-                height: 1.0,
-            })),
+            body: support_mesh(Mesh::from(AGENT_BODY_CAPSULE), body_transform),
+            wheel: support_mesh(Mesh::from(Torus::new(0.3, 0.6)), wheel_transform),
+            spike: support_mesh(
+                Mesh::from(Cone {
+                    radius: 0.45,
+                    height: 1.0,
+                }),
+                Transform::IDENTITY,
+            ),
         }
     })
+}
+
+fn terrain_triangle_at(point: Vec2, dims: UVec2) -> Option<(u32, u32, bool)> {
+    if dims.x < 2
+        || dims.y < 2
+        || !point.is_finite()
+        || point.x < 0.0
+        || point.y < 0.0
+        || point.x >= (dims.x - 1) as f32
+        || point.y >= (dims.y - 1) as f32
+    {
+        return None;
+    }
+    let cell = point.floor();
+    let within = point - cell;
+    Some((cell.x as u32, cell.y as u32, within.x + within.y <= 1.0))
+}
+
+/// Include vertices of the overlay between a projected creature mesh and the
+/// terrain's triangulation. On each overlay polygon both surfaces are planar,
+/// so the maximum clearance occurs at an overlay vertex.
+fn include_ground_mesh(
+    mesh: &GroundSupportMesh,
+    transform: Transform,
+    rotation: Quat,
+    position: Vec2,
+    cell: f32,
+    dims: UVec2,
+    mut include: impl FnMut(Vec3),
+) {
+    let local: Vec<Vec3> = mesh
+        .vertices
+        .iter()
+        .map(|&point| transform.transform_point(point))
+        .collect();
+    let grid: Vec<Vec2> = local
+        .iter()
+        .map(|&point| {
+            let offset = rotation * point;
+            (position + Vec2::new(offset.x, -offset.z)) / cell
+        })
+        .collect();
+    for &point in &local {
+        include(point);
+    }
+    // A triangle is convex. If all projected mesh vertices lie in one
+    // terrain triangle, every mesh face does too, and vertex support is exact
+    // for this planar patch. Keep the full overlay path across any boundary.
+    if let Some(first) = grid
+        .first()
+        .and_then(|&point| terrain_triangle_at(point, dims))
+        && grid
+            .iter()
+            .all(|&point| terrain_triangle_at(point, dims) == Some(first))
+    {
+        return;
+    }
+    // Terrain triangle edges lie on integer x, y, and x+y grid lines.
+    for &[a, b] in &mesh.edges {
+        let start = grid[a];
+        let end = grid[b];
+        for (first, last) in [
+            (start.x, end.x),
+            (start.y, end.y),
+            (start.x + start.y, end.x + end.y),
+        ] {
+            let delta = last - first;
+            if delta.abs() < f32::EPSILON {
+                continue;
+            }
+            let begin = first.min(last).ceil() as i32;
+            let finish = first.max(last).floor() as i32;
+            for line in begin..=finish {
+                let t = (line as f32 - first) / delta;
+                if t > 0.0 && t < 1.0 {
+                    include(local[a].lerp(local[b], t));
+                }
+            }
+        }
+    }
+    // A terrain grid vertex can also lie strictly inside a mesh face.
+    for &[a, b, c] in &mesh.faces {
+        let p = grid[a];
+        let u = grid[b] - p;
+        let v = grid[c] - p;
+        let determinant = u.perp_dot(v);
+        if determinant.abs() < 1e-8 {
+            continue;
+        }
+        let min = p.min(grid[b]).min(grid[c]).ceil().as_ivec2();
+        let max = p.max(grid[b]).max(grid[c]).floor().as_ivec2();
+        for x in min.x..=max.x {
+            for y in min.y..=max.y {
+                let relative = Vec2::new(x as f32, y as f32) - p;
+                let s = relative.perp_dot(v) / determinant;
+                let t = u.perp_dot(relative) / determinant;
+                if s >= 0.0 && t >= 0.0 && s + t <= 1.0 {
+                    include(local[a] + (local[b] - local[a]) * s + (local[c] - local[a]) * t);
+                }
+            }
+        }
+    }
 }
 
 /// Height needed to keep sampled underside and wheel contacts above the
@@ -10729,14 +10913,27 @@ fn terrain_footprint_height(
     // Use the exact built-in mesh vertices as well as the analytic support
     // samples. A terrain crease can pass between the latter.
     let meshes = ground_mesh_samples();
-    for point in &meshes.body {
-        include(*point * radius);
-    }
+    let cell = terrain.cell_size.max(1) as f32;
+    include_ground_mesh(
+        &meshes.body,
+        Transform::from_scale(Vec3::splat(radius)),
+        rotation,
+        position,
+        cell,
+        terrain.dims,
+        &mut include,
+    );
     for side in [-1.0, 1.0] {
-        let center = Vec3::new(0.0, -0.46, side * 0.9856);
-        for point in &meshes.wheel {
-            include((*point + center) * radius);
-        }
+        let center = Vec3::new(0.0, -0.46, side * 0.9856) * radius;
+        include_ground_mesh(
+            &meshes.wheel,
+            Transform::from_translation(center).with_scale(Vec3::splat(radius)),
+            rotation,
+            position,
+            cell,
+            terrain.dims,
+            &mut include,
+        );
     }
     // The cone extends forward from the nose; sample its lower edge as well.
     let spike = 0.65 * radius + footprint.spike_extension;
@@ -10752,9 +10949,15 @@ fn terrain_footprint_height(
         rotation: Quat::from_rotation_z(-std::f32::consts::FRAC_PI_2),
         scale: Vec3::new(0.48 * radius, spike.max(0.06), 0.48 * radius),
     };
-    for point in &meshes.spike {
-        include(spike_transform.transform_point(*point));
-    }
+    include_ground_mesh(
+        &meshes.spike,
+        spike_transform,
+        rotation,
+        position,
+        cell,
+        terrain.dims,
+        &mut include,
+    );
     required
 }
 
