@@ -1808,6 +1808,9 @@ fn follow_active_color() -> Color {
 }
 pub(crate) const TERRAIN_CHUNK_SIZE: u32 = 64;
 pub(crate) const TERRAIN_HEIGHT_SCALE: f32 = 180.0;
+// The horizontal capsule extends 0.88 agent radii below its center. Keep the
+// body above a flat surface, with a small clearance for presentation motion.
+const AGENT_GROUND_OFFSET_FACTOR: f32 = 0.90;
 
 fn bounds_extent(bounds: (Vec2, Vec2)) -> Vec2 {
     let size = bounds.1 - bounds.0;
@@ -3610,6 +3613,12 @@ pub(crate) fn sync_world(
     state.oldest_lead = oldest.map_or(state.selected_lead, |(_, _, lead)| lead);
 }
 
+fn set_hud_text_if_changed(text: &mut Mut<Text>, value: String) {
+    if text.0 != value {
+        text.0 = value;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn update_hud(
     mut state: ResMut<SnapshotState>,
@@ -3717,29 +3726,38 @@ fn update_hud(
 
     if let Some(hud_elements) = hud {
         if let Ok(mut text) = texts.get_mut(hud_elements.tick) {
-            **text = format!("Tick: {}", tick);
+            set_hud_text_if_changed(&mut text, format!("Tick: {}", tick));
         }
         if let Ok(mut text) = texts.get_mut(hud_elements.agents) {
-            **text = format!(
-                "Agents: {:>4} (selected {:>2})",
-                agent_count, selected_count
+            set_hud_text_if_changed(
+                &mut text,
+                format!(
+                    "Agents: {:>4} (selected {:>2})",
+                    agent_count, selected_count
+                ),
             );
         }
         if let Ok(mut text) = texts.get_mut(hud_elements.selection) {
-            **text = selection_text.clone();
+            set_hud_text_if_changed(&mut text, selection_text);
         }
         if let Ok(mut text) = texts.get_mut(hud_elements.follow) {
-            **text = format!(
-                "Follow: {} | F cycle | Ctrl+S sel | Ctrl+O oldest",
-                rig.follow_mode.label()
+            set_hud_text_if_changed(
+                &mut text,
+                format!(
+                    "Follow: {} | F cycle | Ctrl+S sel | Ctrl+O oldest",
+                    rig.follow_mode.label()
+                ),
             );
         }
         if let Ok(mut text) = texts.get_mut(hud_elements.camera) {
             let yaw_deg = rig.yaw.to_degrees();
             let pitch_deg = rig.pitch.to_degrees();
-            **text = format!(
-                "Camera: dist {:>5.0} | yaw {:>6.1} | pitch {:>5.1} deg\nCtrl+F fit selection | Ctrl+W fit world",
-                rig.distance, yaw_deg, pitch_deg
+            set_hud_text_if_changed(
+                &mut text,
+                format!(
+                    "Camera: dist {:>5.0} | yaw {:>6.1} | pitch {:>5.1} deg\nCtrl+F fit selection | Ctrl+W fit world",
+                    rig.distance, yaw_deg, pitch_deg
+                ),
             );
         }
         if let Ok(mut text) = texts.get_mut(hud_elements.playback) {
@@ -3753,7 +3771,7 @@ fn update_hud(
                 message.push_str(" | ");
                 message.push_str(&reason.replace('≥', ">=").replace('≤', "<="));
             }
-            **text = message;
+            set_hud_text_if_changed(&mut text, message);
         }
         if let Ok(mut text) = texts.get_mut(hud_elements.fps) {
             let delta_seconds = time.delta_secs();
@@ -3762,12 +3780,15 @@ fn update_hud(
             } else {
                 0.0
             };
-            **text = format!("FPS: {:>5.1}", fps);
+            set_hud_text_if_changed(&mut text, format!("FPS: {:>5.1}", fps));
         }
         if let Ok(mut text) = texts.get_mut(hud_elements.world) {
-            **text = format!(
-                "World: {:>4}x{:>4} | r {:>4.1}",
-                world_size.x as i32, world_size.y as i32, agent_radius
+            set_hud_text_if_changed(
+                &mut text,
+                format!(
+                    "World: {:>4}x{:>4} | r {:>4.1}",
+                    world_size.x as i32, world_size.y as i32, agent_radius
+                ),
             );
         }
         if let Ok(mut text) = texts.get_mut(hud_elements.tonemap) {
@@ -3777,25 +3798,31 @@ fn update_hud(
             } else {
                 "AutoExp Off"
             };
-            **text = format!(
-                "Tone: {} | {} | Bias {:+.1}",
-                mode_label, auto_label, tonemap_state.exposure_bias
+            set_hud_text_if_changed(
+                &mut text,
+                format!(
+                    "Tone: {} | {} | Bias {:+.1}",
+                    mode_label, auto_label, tonemap_state.exposure_bias
+                ),
             );
         }
         if let Ok(mut text) = texts.get_mut(hud_elements.palette) {
-            **text = format!("{} | press C to cycle", accessibility.palette().label());
+            set_hud_text_if_changed(
+                &mut text,
+                format!("{} | press C to cycle", accessibility.palette().label()),
+            );
         }
         if let Ok(mut text) = texts.get_mut(hud_elements.events) {
-            **text = event_feed;
+            set_hud_text_if_changed(&mut text, event_feed);
         }
         if let Ok(mut text) = texts.get_mut(hud_elements.inspector) {
-            **text = inspector_text;
+            set_hud_text_if_changed(&mut text, inspector_text);
         }
         if let Ok(mut text) = texts.get_mut(hud_elements.history) {
-            **text = history_panel;
+            set_hud_text_if_changed(&mut text, history_panel);
         }
         if let Ok(mut text) = texts.get_mut(hud_elements.brain) {
-            **text = brain_panel;
+            set_hud_text_if_changed(&mut text, brain_panel);
         }
     }
 }
@@ -3803,6 +3830,44 @@ fn update_hud(
 #[cfg(test)]
 mod hud_inspector_tests {
     use super::*;
+
+    #[test]
+    fn unchanged_hud_text_does_not_trigger_change_detection() {
+        #[derive(Resource)]
+        struct DesiredText(String);
+        fn update_text(desired: Res<DesiredText>, mut texts: Query<&mut Text>) {
+            for mut text in &mut texts {
+                set_hud_text_if_changed(&mut text, desired.0.clone());
+            }
+        }
+
+        let mut app = App::new();
+        app.insert_resource(DesiredText("Paused".into()));
+        let entity = app.world_mut().spawn(Text::new("Paused")).id();
+        app.add_systems(Update, update_text);
+        app.update();
+        let original = app
+            .world()
+            .entity(entity)
+            .get_ref::<Text>()
+            .unwrap()
+            .last_changed();
+        app.update();
+        assert_eq!(
+            app.world()
+                .entity(entity)
+                .get_ref::<Text>()
+                .unwrap()
+                .last_changed(),
+            original,
+            "unchanged text must not be marked changed"
+        );
+        app.world_mut().resource_mut::<DesiredText>().0 = "Running".into();
+        app.update();
+        let current = app.world().entity(entity);
+        assert_eq!(current.get::<Text>().unwrap().0, "Running");
+        assert_ne!(current.get_ref::<Text>().unwrap().last_changed(), original);
+    }
 
     fn sample_agent_visual_for_inspector() -> AgentVisual {
         AgentVisual {
@@ -6577,8 +6642,7 @@ fn hud_pointer_captured<'a>(mut interactions: impl Iterator<Item = &'a Interacti
 
 fn handle_selection_input(
     (mut mouse_buttons, keys): (MessageReader<MouseButtonInput>, Res<ButtonInput<KeyCode>>),
-    windows: Query<&Window>,
-    primary_window: Query<Entity, With<PrimaryWindow>>,
+    (windows, primary_window): (Query<&Window>, Query<Entity, With<PrimaryWindow>>),
     camera_query: Query<(&Camera, &GlobalTransform), With<PrimaryCamera>>,
     (state, registry, display_poses): (
         Res<SnapshotState>,
@@ -7708,7 +7772,7 @@ fn control_camera(
             &snapshot.terrain_height,
             rig.focus_smoothed,
             TERRAIN_HEIGHT_SCALE,
-        ) + snapshot.agent_radius * 0.35
+        ) + snapshot.agent_radius * AGENT_GROUND_OFFSET_FACTOR
     });
     let center = Vec3::new(
         rig.focus_smoothed.x - world_size.x * 0.5,
@@ -8311,7 +8375,25 @@ fn sample_height_world(terrain: &TerrainHeightSnapshot, position: Vec2, height_s
     let cell = terrain.cell_size.max(1) as f32;
     let grid_x = (position.x / cell).clamp(0.0, (terrain.dims.x - 1) as f32);
     let grid_z = (position.y / cell).clamp(0.0, (terrain.dims.y - 1) as f32);
-    sample_height_linear(terrain, grid_x, grid_z, height_scale)
+    let x0 = grid_x.floor() as u32;
+    let z0 = grid_z.floor() as u32;
+    let x1 = (x0 + 1).min(terrain.dims.x - 1);
+    let z1 = (z0 + 1).min(terrain.dims.y - 1);
+    let tx = grid_x - x0 as f32;
+    let tz = grid_z - z0 as f32;
+    let h00 = terrain.elevation[terrain.index(x0, z0)];
+    let h10 = terrain.elevation[terrain.index(x1, z0)];
+    let h01 = terrain.elevation[terrain.index(x0, z1)];
+    let h11 = terrain.elevation[terrain.index(x1, z1)];
+    // Match the two actual triangles [00,10,01] and [10,11,01].
+    // Bilinear interpolation describes a curved patch, which can be well
+    // above or below the rendered planar surface on a saddle-shaped cell.
+    let height = if tx + tz <= 1.0 {
+        h00 + (h10 - h00) * tx + (h01 - h00) * tz
+    } else {
+        h11 + (h01 - h11) * (1.0 - tx) + (h10 - h11) * (1.0 - tz)
+    };
+    height * height_scale
 }
 
 fn terrain_tile_surface_srgb(
@@ -8696,7 +8778,7 @@ mod terrain_tests {
                     .unwrap();
                 let focus_height =
                     sample_height_world(&snapshot.terrain_height, expected, TERRAIN_HEIGHT_SCALE)
-                        + snapshot.agent_radius * 0.35;
+                        + snapshot.agent_radius * AGENT_GROUND_OFFSET_FACTOR;
                 let look_at = Vec3::new(expected.x - 500.0, focus_height, 500.0 - expected.y);
                 assert!(
                     transform
@@ -9523,8 +9605,26 @@ mod terrain_tests {
             snapshot.agents[0].position,
             TERRAIN_HEIGHT_SCALE,
         );
-        let expected = terrain_height + snapshot.agent_radius * 0.35;
+        let expected = terrain_height + snapshot.agent_radius * AGENT_GROUND_OFFSET_FACTOR;
         assert!((translation.y - expected).abs() < 1e-3);
+        assert!(
+            translation.y - terrain_height >= snapshot.agent_radius * 0.88,
+            "the horizontal body must not start below a flat terrain surface"
+        );
+    }
+
+    #[test]
+    fn world_height_matches_both_rendered_triangles_of_a_saddle_cell() {
+        let mut snapshot = sample_world_snapshot();
+        let terrain = &mut snapshot.terrain_height;
+        terrain.dims = UVec2::new(2, 2);
+        terrain.cell_size = 100;
+        terrain.elevation = vec![0.0, 0.2, 0.4, 1.0];
+        let sample = |x, y| sample_height_world(terrain, Vec2::new(x, y), 100.0);
+        assert!((sample(25.0, 25.0) - 15.0).abs() < 0.001);
+        assert!((sample(75.0, 75.0) - 65.0).abs() < 0.001);
+        assert!((sample(50.0, 50.0) - 30.0).abs() < 0.001);
+        assert!((sample(200.0, 200.0) - 100.0).abs() < 0.001);
     }
 }
 
@@ -9988,7 +10088,9 @@ fn apply_agent_visuals(
     update_part_colors(materials, &record.nose, nose_color, nose_emissive);
 
     let spike_ready = visuals.spike_readiness;
-    let spike_length = scale_factor * (0.65 + agent.spike_length.max(0.0));
+    // Core combat treats spike_length as a world-space extension beyond the
+    // creature radius. Scaling it by the body radius magnifies it twice.
+    let spike_length = scale_factor * 0.65 + agent.spike_length.max(0.0);
     let spike_transform = Transform {
         translation: Vec3::new(
             body_length * 0.7 + spike_length * 0.5,
@@ -10307,7 +10409,11 @@ fn agent_translation(snapshot: &WorldSnapshot, agent: &AgentVisual) -> Vec3 {
     );
     let x = agent.position.x - half.x;
     let z = half.y - agent.position.y;
-    Vec3::new(x, terrain_height + snapshot.agent_radius * 0.35, z)
+    Vec3::new(
+        x,
+        terrain_height + snapshot.agent_radius * AGENT_GROUND_OFFSET_FACTOR,
+        z,
+    )
 }
 #[cfg(test)]
 fn terrain_kind_color(kind: TerrainKind) -> [f32; 3] {
@@ -12373,7 +12479,8 @@ mod tests {
         let mut snapshot = WorldSnapshot::from_world(&world).expect("snapshot");
         snapshot.terrain_height.elevation.fill(0.9);
         let focus = snapshot.world_size * 0.5;
-        let focus_y = 0.9 * TERRAIN_HEIGHT_SCALE + snapshot.agent_radius * 0.35;
+        let focus_y =
+            0.9 * TERRAIN_HEIGHT_SCALE + snapshot.agent_radius * AGENT_GROUND_OFFSET_FACTOR;
         let min_clearance = snapshot.agent_radius.max(20.0);
         let mut app = App::new();
         app.insert_resource(Time::<()>::default())
@@ -12794,7 +12901,7 @@ mod tests {
                 &snapshot.terrain_height,
                 selection_center,
                 TERRAIN_HEIGHT_SCALE,
-            ) + snapshot.agent_radius * 0.35,
+            ) + snapshot.agent_radius * AGENT_GROUND_OFFSET_FACTOR,
             snapshot.world_size.y * 0.5 - selection_center.y,
         );
         let distance_expected = transform.translation.distance(expected_center);
@@ -13005,6 +13112,29 @@ mod tests {
                 "body remains centered"
             );
             assert_eq!(app.world().resource::<SnapshotState>().last_applied_tick, 0);
+        }
+
+        for radius in [10.0, 30.0] {
+            let mut lengths = Vec::new();
+            for extension in [0.0, 5.0, 10.0] {
+                let mut state = app.world_mut().resource_mut::<SnapshotState>();
+                let snapshot = state.latest.as_mut().unwrap();
+                snapshot.revision += 1;
+                snapshot.agent_radius = radius;
+                snapshot.agents[0].spike_length = extension;
+                app.update();
+                let record = &app.world().resource::<AgentRegistry>().records[&id];
+                lengths.push(
+                    app.world()
+                        .entity(record.spike.entity)
+                        .get::<Transform>()
+                        .unwrap()
+                        .scale
+                        .y,
+                );
+            }
+            assert!((lengths[1] - lengths[0] - 5.0).abs() < 0.001);
+            assert!((lengths[2] - lengths[1] - 5.0).abs() < 0.001);
         }
 
         let mut attachment: Option<Vec3> = None;
