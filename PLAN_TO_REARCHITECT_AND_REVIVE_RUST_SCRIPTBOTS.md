@@ -2,6 +2,14 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Concurrent controls and experiment-family integration (2026-11-04):**
+[Currently In Progress — Codex; `bd-2z0.12.2`, `bd-2z0.5.11`, `bd-2z0.3.12.6`]
+Bind merged configuration updates to the exact observed host configuration revision
+so concurrent clients cannot silently overwrite each other's changes. Connect the
+existing optional FrankenTorch protocol family to matched-seed planning, execution,
+checkpoint continuation and portable-bundle verification. Preserve existing feature
+gates, original bead ownership and full acceptance requirements.
+
 **Actual remote browser qualification (2026-11-04):** [Qualified software
 journey — GentleDuck contribution to original `bd-ac4l` and `bd-2z0.12.3`;
 original ownership, dependencies and complete acceptance remain open/unchanged]

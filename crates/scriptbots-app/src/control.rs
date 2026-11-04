@@ -3932,8 +3932,21 @@ impl ControlHandle {
         })
     }
 
-    /// Apply a structured JSON patch object onto the configuration.
+    /// Apply a structured JSON patch object onto the observed configuration.
+    ///
+    /// The host rejects the command if another configuration change wins before
+    /// application. The returned command status exposes that conflict so callers
+    /// can read the new configuration before choosing to submit another patch.
     pub fn apply_patch(&self, patch: Value) -> Result<CommandStatusDto, ControlError> {
+        let envelope = self.prepare_config_patch(patch)?;
+        let status = self.host.clone().submit(envelope)?;
+        let receipt = self.status_dto(status)?;
+        *lock_cache(&self.knobs_cache) = None;
+        Ok(receipt)
+    }
+
+    /// Bind the complete replacement to the same publication used for the merge.
+    fn prepare_config_patch(&self, patch: Value) -> Result<CommandEnvelope, ControlError> {
         if !patch.is_object() {
             return Err(ControlError::InvalidPatch(
                 "configuration patch must be a JSON object".into(),
@@ -4002,27 +4015,14 @@ impl ControlHandle {
                     .into(),
             ));
         }
-        // No explicit drop is needed any more: the borrow ended at the seam
-        // above, so the submit below - which reads tick and revision under the
-        // same non-reentrant mutex - cannot deadlock against a guard this
-        // function is still holding.
-        // Return the receipt, not a projection. This used to build a
-        // ConfigSnapshot from the REQUESTED config and hand it back as though
-        // it were current, so a client was told the new configuration was in
-        // effect when the command had only been admitted to a bounded queue. It
-        // was worse than a plain projection: the requested config was stamped
-        // with `current_tick`, the tick at which those values were NOT in
-        // effect, making the response a chimera of a config that had not been
-        // applied and a tick at which it had not been applied (bd-k7nq).
-        //
-        // Acceptance criterion 4 of the migration is explicit that reads use
-        // immutable snapshots and never project future config, so the caller
-        // now gets a command id it can poll and reads the configuration back
-        // through /api/config when it wants the applied truth.
-        let status =
-            self.submit_control_command(ControlCommand::UpdateConfig(Box::new(new_config)))?;
-        *lock_cache(&self.knobs_cache) = None;
-        Ok(status)
+        // A patch becomes a full UpdateConfig command. Without this guard, two
+        // clients merging disjoint fields from the same publication would both
+        // apply and the later replacement would silently undo the first edit.
+        // Keep the observed revision with the immutable config that produced it;
+        // a fresh revision read here would authorize precisely that stale write.
+        Ok(self
+            .prepare_control_command(ControlCommand::UpdateConfig(Box::new(new_config)), None)?
+            .expecting_config_revision(snapshot.revisions.config))
     }
 
     /// Apply a list of knob updates by path.
@@ -8223,6 +8223,144 @@ pub(crate) mod tests {
                 .abs()
                 < f64::from(f32::EPSILON),
             "the owner-applied receipt must agree with a later config read"
+        );
+    }
+
+    #[test]
+    fn concurrent_disjoint_patches_reject_stale_replacement_and_preserve_both_on_retry() {
+        let world = WorldState::new(ScriptBotsConfig {
+            world_width: 40,
+            world_height: 40,
+            food_cell_size: 10,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            persistence_interval: 0,
+            closed: false,
+            rng_seed: Some(42),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("paused patch world");
+        let host = TestHost::spawn(world);
+        let clients = [host.handle(), host.handle()];
+        let before = clients[0].read_snapshot().expect("shared publication");
+        let patches = [
+            serde_json::json!({"closed": true}),
+            serde_json::json!({"food_max": 0.75}),
+        ];
+
+        // Both requests finish the production read/validate/merge before either
+        // is submitted. This deterministically reproduces concurrent clients
+        // observing one publication, without depending on thread timing.
+        let first = clients[0]
+            .prepare_config_patch(patches[0].clone())
+            .expect("first prepared patch");
+        let second = clients[1]
+            .prepare_config_patch(patches[1].clone())
+            .expect("second prepared patch");
+        let start = std::sync::Barrier::new(3);
+        let submitted = std::thread::scope(|scope| {
+            let pending = [
+                (clients[0].host.clone(), first),
+                (clients[1].host.clone(), second),
+            ]
+            .map(|(mut port, envelope)| {
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    port.submit(envelope).expect("real host admission")
+                })
+            });
+            start.wait();
+            pending.map(|worker| worker.join().expect("patch submitter joined"))
+        });
+        let outcomes = submitted.map(|status| host.wait_finished(&status.command_id().to_string()));
+        let (winner, stale) = match (
+            outcomes[0].application_state.as_str(),
+            outcomes[1].application_state.as_str(),
+        ) {
+            ("applied", "rejected") => (0, 1),
+            ("rejected", "applied") => (1, 0),
+            other => panic!("one competing patch must win and the other conflict: {other:?}"),
+        };
+        assert!(
+            outcomes[winner].admission_sequence.expect("winning order")
+                < outcomes[stale]
+                    .admission_sequence
+                    .expect("conflicting order")
+        );
+        assert_eq!(
+            outcomes[stale].rejection_reason,
+            Some(serde_json::json!({
+                "kind": "config_revision_conflict",
+                "expected": before.revisions.config.get(),
+                "actual": before.revisions.config.get() + 1,
+            }))
+        );
+        let after = clients[0].read_snapshot().expect("resolved owner config");
+        let mut expected = before.config.as_ref().clone();
+        if winner == 0 {
+            expected.closed = true;
+        } else {
+            expected.food_max = 0.75;
+        }
+        assert_eq!(after.config.as_ref(), &expected);
+        assert_eq!(
+            after.revisions.config.get(),
+            before.revisions.config.get() + 1
+        );
+        assert_eq!(after.world.tick, before.world.tick);
+        assert_eq!(
+            after.last_applied_command.map(|id| id.to_string()),
+            Some(outcomes[winner].command_id.clone())
+        );
+
+        // A new public request merges against the winning publication. It must
+        // retain the peer's edit and obtain its own observable application.
+        let retry = clients[stale]
+            .apply_patch(patches[stale].clone())
+            .expect("fresh patch after observed conflict");
+        assert_ne!(retry.command_id, outcomes[stale].command_id);
+        host.wait_applied(&retry);
+        expected.closed = true;
+        expected.food_max = 0.75;
+        let final_snapshot = clients[0].read_snapshot().expect("both edits applied");
+        assert_eq!(final_snapshot.config.as_ref(), &expected);
+        assert_eq!(
+            final_snapshot.revisions.config.get(),
+            before.revisions.config.get() + 2
+        );
+        assert_eq!(final_snapshot.world.tick, before.world.tick);
+    }
+
+    #[test]
+    fn prepared_config_patch_survives_unrelated_playback_revision() {
+        let (handle, host) = handle();
+        let before = handle.read_snapshot().expect("original publication");
+        let envelope = handle
+            .prepare_config_patch(serde_json::json!({"food_max": 0.75}))
+            .expect("prepared configuration");
+        let playback = handle.set_speed(2.0, None).expect("speed command");
+        host.wait_applied(&playback);
+        let after_playback = handle.read_snapshot().expect("applied playback");
+        assert!(after_playback.revisions.control > before.revisions.control);
+        assert_eq!(after_playback.revisions.config, before.revisions.config);
+
+        let submitted = handle
+            .host
+            .clone()
+            .submit(envelope)
+            .expect("patch admission");
+        let receipt = handle.status_dto(submitted).expect("patch receipt");
+        host.wait_applied(&receipt);
+        let after = handle.read_snapshot().expect("applied config");
+        let mut expected = before.config.as_ref().clone();
+        expected.food_max = 0.75;
+        assert_eq!(after.config.as_ref(), &expected);
+        assert_eq!(after.playback, after_playback.playback);
+        assert_eq!(after.world.tick, before.world.tick);
+        assert_eq!(
+            after.revisions.config.get(),
+            before.revisions.config.get() + 1
         );
     }
 
