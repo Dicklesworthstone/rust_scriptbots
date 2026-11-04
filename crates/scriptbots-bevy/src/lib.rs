@@ -1234,7 +1234,8 @@ fn smooth_agent_poses(
                 footprint.spike.and_then(|spike| spikes.get(spike).ok())
             {
                 let length = spike_display.map_or(spike_target.transform.scale.y, |display| {
-                    if settings.as_ref().is_some_and(|settings| !settings.enabled)
+                    if paused
+                        || settings.as_ref().is_some_and(|settings| !settings.enabled)
                         || spike_target.tick < display.tick
                     {
                         spike_target.transform.scale.y
@@ -5564,6 +5565,54 @@ mod adaptive_governor_tests {
     }
 
     #[test]
+    fn live_terrain_updates_keep_the_mesh_handle_and_change_its_vertices() {
+        use bevy_mesh::VertexAttributeValues;
+
+        let mut app = terrain_detail_app();
+        app.update();
+        let key = TerrainChunkKey { x: 0, y: 0 };
+        let mesh_handle = app.world().resource::<TerrainChunkRegistry>().chunks[&key]
+            .mesh
+            .clone();
+        let first_height = {
+            let meshes = app.world().resource::<Assets<Mesh>>();
+            let mesh = meshes.get(&mesh_handle).unwrap();
+            assert!(
+                mesh.asset_usage
+                    .contains(RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD)
+            );
+            let Some(VertexAttributeValues::Float32x3(positions)) =
+                mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+            else {
+                panic!("terrain positions must be Float32x3");
+            };
+            positions[0][1]
+        };
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            let snapshot = state.latest.as_mut().unwrap();
+            snapshot.terrain_height.elevation[0] += 0.25;
+            snapshot.revision += 1;
+        }
+        app.update();
+        assert_eq!(
+            app.world().resource::<TerrainChunkRegistry>().chunks[&key]
+                .mesh
+                .id(),
+            mesh_handle.id(),
+            "updated terrain should retain its mesh handle"
+        );
+        let meshes = app.world().resource::<Assets<Mesh>>();
+        let mesh = meshes.get(&mesh_handle).unwrap();
+        let Some(VertexAttributeValues::Float32x3(positions)) =
+            mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+        else {
+            panic!("terrain positions must be Float32x3");
+        };
+        assert_ne!(positions[0][1], first_height);
+    }
+
+    #[test]
     fn live_terrain_materials_select_distinct_detail_for_every_biome() {
         let mut app = terrain_detail_app();
         app.update();
@@ -9436,7 +9485,9 @@ fn build_chunk_mesh(
     );
     let mut mesh = Mesh::new(
         PrimitiveTopology::TriangleList,
-        RenderAssetUsages::RENDER_WORLD,
+        // Terrain is updated in place as snapshots change. Keep the CPU copy
+        // after extraction so those updates do not continually replace handles.
+        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
     );
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
     mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
@@ -9703,7 +9754,10 @@ mod terrain_tests {
             .init_resource::<SnapshotState>()
             .init_resource::<AgentRegistry>()
             .init_resource::<TerrainChunkRegistry>()
-            .init_resource::<AgentMeshes>()
+            .insert_resource(AgentMeshes {
+                base_radius: 1.0,
+                ..default()
+            })
             .init_resource::<Assets<Mesh>>()
             .init_resource::<Assets<StandardMaterial>>()
             .init_resource::<AccessibilityState>()
@@ -15682,7 +15736,7 @@ mod tests {
                 snapshot.agent_radius = radius;
                 snapshot.agents[0].spike_length = extension;
                 app.update();
-                let record = &app.world().resource::<AgentRegistry>().records[&id];
+                let record = &app.world().resource::<AgentRegistry>().records[&uid];
                 lengths.push(
                     app.world()
                         .entity(record.spike.entity)
