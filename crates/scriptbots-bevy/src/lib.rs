@@ -28,7 +28,9 @@ use bevy::pbr::prelude::*;
 use bevy::prelude::*;
 use bevy::render::render_resource::PrimitiveTopology;
 use bevy::render::view::{ColorGrading, Hdr};
-use bevy::ui::{BorderColor, BorderRadius, FocusPolicy};
+use bevy::ui::{
+    BorderColor, BorderRadius, FocusPolicy, ScrollPosition, UiGlobalTransform, UiScale,
+};
 use bevy::window::{PresentMode, PrimaryWindow, WindowPlugin, WindowRef};
 use bevy_mesh::{Indices, Mesh};
 use bevy_post_process::auto_exposure::{AutoExposure, AutoExposurePlugin};
@@ -869,6 +871,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
     .insert_non_send_resource(snapshot_inbox)
     .insert_non_send_resource(owner_inspector)
     .init_resource::<InspectorPage>()
+    .init_resource::<HudPointerCapture>()
     .insert_non_send_resource(BevyLifecycleFailureInbox {
         receiver: failure_rx,
         first_failure: Arc::clone(&first_worker_failure),
@@ -929,7 +932,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
             handle_auto_exposure_toggle,
             handle_exposure_adjust_buttons,
             handle_palette_shortcuts,
-            handle_selection_input,
+            (scroll_hud_panels, layout_hud_panels, handle_selection_input).chain(),
             handle_follow_button_interactions,
             handle_clear_selection_button,
             update_playback_button_colors,
@@ -2697,6 +2700,186 @@ struct HudControlDock;
 #[derive(Component)]
 struct HudScenePanel;
 
+#[derive(Component)]
+struct HudToggleButton;
+
+#[derive(Resource, Default)]
+struct HudPointerCapture(bool);
+
+type HudPanelFilter = Or<(With<HudScenePanel>, With<HudControlDock>)>;
+type HudLayoutQuery<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static mut Node,
+        &'static mut Visibility,
+        Option<&'static HudScenePanel>,
+    ),
+    (HudPanelFilter, Without<SoftwareRendererWatermark>),
+>;
+type HudScrollQuery<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static ComputedNode,
+        &'static UiGlobalTransform,
+        &'static Visibility,
+        &'static mut ScrollPosition,
+    ),
+    HudPanelFilter,
+>;
+
+/// Style uses UI units, while Bevy's computed bounds and cursor use physical pixels.
+fn layout_hud_panels(
+    windows: Query<&Window, With<PrimaryWindow>>,
+    scale: Option<Res<UiScale>>,
+    keys: Option<Res<ButtonInput<KeyCode>>>,
+    buttons: Query<&Interaction, (With<HudToggleButton>, Changed<Interaction>)>,
+    mut panels: HudLayoutQuery<'_, '_>,
+    mut watermarks: Query<(&ComputedNode, &mut Node), With<SoftwareRendererWatermark>>,
+) {
+    let Ok(window) = windows.single() else {
+        return;
+    };
+    let scale = scale.as_ref().map_or(1.0, |scale| scale.0);
+    if !scale.is_finite() || scale <= 0.0 {
+        return;
+    }
+    let width = window.width() / scale;
+    let height = window.height() / scale;
+    let available_width = (width - 24.0).max(1.0);
+    let mut notice_height = 0.0_f32;
+    for (computed, mut node) in &mut watermarks {
+        let desired = Val::Px(available_width);
+        if node.max_width != desired {
+            node.max_width = desired;
+        }
+        notice_height = notice_height.max(computed.size.y * computed.inverse_scale_factor);
+    }
+    let top = 12.0
+        + if notice_height > 0.0 {
+            notice_height + 8.0
+        } else {
+            0.0
+        };
+    let available_height = (height - top - 12.0).max(1.0);
+    let stacked = width < 1000.0;
+    let toggle = keys.is_some_and(|keys| keys.just_pressed(KeyCode::KeyH))
+        || buttons
+            .iter()
+            .any(|interaction| *interaction == Interaction::Pressed);
+    for (mut node, mut visibility, scene) in &mut panels {
+        let panel_width = if stacked {
+            Val::Px(available_width)
+        } else {
+            Val::Px(560.0)
+        };
+        let max_width = if stacked {
+            Val::Px(available_width)
+        } else {
+            Val::Percent(45.0)
+        };
+        let max_height = Val::Px(if stacked {
+            let share = ((available_height - 12.0).max(1.0)
+                * if scene.is_some() { 0.42 } else { 0.36 })
+            .max(1.0);
+            if scene.is_some() {
+                share.min((height * 0.5 - top - 12.0).max(1.0))
+            } else {
+                share
+            }
+        } else {
+            available_height
+        });
+        if node.width != panel_width || node.max_width != max_width || node.max_height != max_height
+        {
+            node.width = panel_width;
+            node.max_width = max_width;
+            node.max_height = max_height;
+        }
+        if scene.is_some() {
+            if node.top != Val::Px(top) {
+                node.top = Val::Px(top);
+            }
+            if toggle {
+                *visibility = if *visibility == Visibility::Hidden {
+                    Visibility::Visible
+                } else {
+                    Visibility::Hidden
+                };
+            }
+        }
+    }
+}
+
+fn scroll_hud_panels(
+    windows: Query<(Entity, &Window), With<PrimaryWindow>>,
+    mut wheel: MessageReader<MouseWheel>,
+    mut capture: ResMut<HudPointerCapture>,
+    mut panels: HudScrollQuery<'_, '_>,
+) {
+    let window = windows.single().ok();
+    let cursor = window.and_then(|(_, window)| window.physical_cursor_position());
+    let mut captured = false;
+    for (computed, transform, visibility, mut scroll) in &mut panels {
+        if *visibility == Visibility::Hidden {
+            continue;
+        }
+        let hovered = cursor.is_some_and(|cursor| computed.contains_point(*transform, cursor));
+        captured |= hovered;
+        let max_y = ((f64::from(computed.content_size.y) - f64::from(computed.size.y)).max(0.0)
+            * f64::from(computed.inverse_scale_factor))
+        .min(f64::from(f32::MAX));
+        let max_y = if max_y.is_finite() {
+            max_y.max(0.0)
+        } else {
+            0.0
+        };
+        let position = if scroll.0.y.is_finite() {
+            f64::from(scroll.0.y)
+        } else {
+            0.0
+        };
+        let position = position.clamp(0.0, max_y) as f32;
+        if scroll.0.y != position {
+            scroll.0.y = position;
+        }
+    }
+    if capture.0 != captured {
+        capture.0 = captured;
+    }
+    // Consume every event, even when the window is absent or the panel is at an
+    // edge. A scroll over UI must never become a world gesture on a later frame.
+    for event in wheel.read() {
+        if !event.y.is_finite() || window.is_none_or(|(id, _)| event.window != id) {
+            continue;
+        }
+        let delta = -f64::from(event.y)
+            * if event.unit == MouseScrollUnit::Line {
+                40.0
+            } else {
+                1.0
+            };
+        for (computed, transform, visibility, mut scroll) in &mut panels {
+            if *visibility == Visibility::Hidden
+                || !cursor.is_some_and(|cursor| computed.contains_point(*transform, cursor))
+            {
+                continue;
+            }
+            let max_y = ((f64::from(computed.content_size.y) - f64::from(computed.size.y))
+                .max(0.0)
+                * f64::from(computed.inverse_scale_factor))
+            .min(f64::from(f32::MAX));
+            if max_y.is_finite() {
+                let next = (f64::from(scroll.0.y) + delta).clamp(0.0, max_y.max(0.0)) as f32;
+                if scroll.0.y != next {
+                    scroll.0.y = next;
+                }
+            }
+        }
+    }
+}
+
 /// The sun light whose shadow state follows the resolved quality tier.
 ///
 /// Marked so [`apply_tier_to_sun_light`] can re-apply on a runtime tier change
@@ -3964,6 +4147,8 @@ fn setup_scene(
             TextFont::from_font_size(15.0),
             TextColor(Color::srgb(1.0, 0.85, 0.85)),
             SoftwareRendererWatermark,
+            Interaction::default(),
+            FocusPolicy::Pass,
         ));
     }
 
@@ -3975,6 +4160,7 @@ fn setup_scene(
                 left: Val::Px(12.0),
                 width: Val::Px(560.0),
                 max_width: Val::Percent(45.0),
+                overflow: Overflow::scroll_y(),
                 padding: UiRect::all(Val::Px(10.0)),
                 flex_direction: FlexDirection::Column,
                 row_gap: Val::Px(4.0),
@@ -3984,6 +4170,7 @@ fn setup_scene(
             Interaction::default(),
             FocusPolicy::Pass,
             HudScenePanel,
+            ScrollPosition::default(),
         ))
         .id();
 
@@ -4003,10 +4190,21 @@ fn setup_scene(
     let mut history = Entity::PLACEHOLDER;
     let mut brain = Entity::PLACEHOLDER;
 
-    commands.entity(hud_root).with_children(|parent| {
+    let panel_content_node = Node {
+        width: Val::Percent(100.0),
+        flex_direction: FlexDirection::Column,
+        row_gap: Val::Px(4.0),
+        flex_shrink: 0.0,
+        ..default()
+    };
+    let hud_content = commands.spawn(panel_content_node.clone()).id();
+    let panel_text_layout = TextLayout::new_with_linebreak(bevy::text::LineBreak::WordOrCharacter);
+    commands.entity(hud_root).add_child(hud_content);
+    commands.entity(hud_content).with_children(|parent| {
         tick = parent
             .spawn((
                 Text::new("Tick: --"),
+                panel_text_layout,
                 primary_font.clone(),
                 TextColor(primary_text_color),
             ))
@@ -4014,6 +4212,7 @@ fn setup_scene(
         agents = parent
             .spawn((
                 Text::new("Agents: --"),
+                panel_text_layout,
                 primary_font.clone(),
                 TextColor(primary_text_color),
             ))
@@ -4021,6 +4220,7 @@ fn setup_scene(
         selection = parent
             .spawn((
                 Text::new("Selection: --"),
+                panel_text_layout,
                 secondary_font.clone(),
                 TextColor(secondary_text_color),
             ))
@@ -4028,6 +4228,7 @@ fn setup_scene(
         follow = parent
             .spawn((
                 Text::new("Follow: --"),
+                panel_text_layout,
                 primary_font.clone(),
                 TextColor(primary_text_color),
             ))
@@ -4035,6 +4236,7 @@ fn setup_scene(
         camera = parent
             .spawn((
                 Text::new("Camera: --"),
+                panel_text_layout,
                 primary_font.clone(),
                 TextColor(primary_text_color),
             ))
@@ -4042,6 +4244,7 @@ fn setup_scene(
         playback = parent
             .spawn((
                 Text::new("Playback: --"),
+                panel_text_layout,
                 secondary_font.clone(),
                 TextColor(secondary_text_color),
             ))
@@ -4049,6 +4252,7 @@ fn setup_scene(
         command_feedback = parent
             .spawn((
                 Text::new("Commands: no requests"),
+                panel_text_layout,
                 secondary_font.clone(),
                 TextColor(secondary_text_color),
                 Node {
@@ -4060,6 +4264,7 @@ fn setup_scene(
         fps = parent
             .spawn((
                 Text::new("FPS: --"),
+                panel_text_layout,
                 secondary_font.clone(),
                 TextColor(secondary_text_color),
             ))
@@ -4067,6 +4272,7 @@ fn setup_scene(
         world = parent
             .spawn((
                 Text::new("World: --"),
+                panel_text_layout,
                 secondary_font.clone(),
                 TextColor(secondary_text_color),
             ))
@@ -4074,6 +4280,7 @@ fn setup_scene(
         tonemap = parent
             .spawn((
                 Text::new("Tone: ACES | AutoExp Off | Bias +0.0"),
+                panel_text_layout,
                 secondary_font.clone(),
                 TextColor(secondary_text_color),
             ))
@@ -4081,6 +4288,7 @@ fn setup_scene(
         palette = parent
             .spawn((
                 Text::new("Palette: Natural | press C to cycle"),
+                panel_text_layout,
                 secondary_font.clone(),
                 TextColor(secondary_text_color),
             ))
@@ -4088,6 +4296,7 @@ fn setup_scene(
         events = parent
             .spawn((
                 Text::new("Events: --"),
+                panel_text_layout,
                 secondary_font.clone(),
                 TextColor(secondary_text_color),
             ))
@@ -4095,6 +4304,7 @@ fn setup_scene(
         inspector = parent
             .spawn((
                 Text::new("Inspector: no selection"),
+                panel_text_layout,
                 secondary_font.clone(),
                 TextColor(secondary_text_color),
             ))
@@ -4102,6 +4312,7 @@ fn setup_scene(
         history = parent
             .spawn((
                 Text::new("History: collecting..."),
+                panel_text_layout,
                 secondary_font.clone(),
                 TextColor(secondary_text_color),
             ))
@@ -4109,6 +4320,7 @@ fn setup_scene(
         brain = parent
             .spawn((
                 Text::new("Brain: select an agent"),
+                panel_text_layout,
                 secondary_font.clone(),
                 TextColor(secondary_text_color),
             ))
@@ -4126,6 +4338,7 @@ fn setup_scene(
                 right: Val::Px(12.0),
                 width: Val::Px(560.0),
                 max_width: Val::Percent(45.0),
+                overflow: Overflow::scroll_y(),
                 padding: UiRect::all(Val::Px(10.0)),
                 flex_direction: FlexDirection::Column,
                 row_gap: Val::Px(4.0),
@@ -4135,10 +4348,13 @@ fn setup_scene(
             Interaction::default(),
             FocusPolicy::Pass,
             HudControlDock,
+            ScrollPosition::default(),
         ))
         .id();
 
-    commands.entity(controls_root).with_children(|parent| {
+    let controls_content = commands.spawn(panel_content_node).id();
+    commands.entity(controls_root).add_child(controls_content);
+    commands.entity(controls_content).with_children(|parent| {
         let playback_buttons = [
             (PlaybackAction::Play, "Run (Space)"),
             (PlaybackAction::Pause, "Pause"),
@@ -4223,6 +4439,21 @@ fn setup_scene(
                 .with_children(|btn| {
                     btn.spawn((
                         Text::new("Inspector page (I)"),
+                        secondary_font.clone(),
+                        TextColor(secondary_text_color),
+                    ));
+                });
+                row.spawn((
+                    Button,
+                    button_node.clone(),
+                    BackgroundColor(follow_idle_color()),
+                    BorderRadius::all(Val::Px(6.0)),
+                    BorderColor::all(button_border_color),
+                    HudToggleButton,
+                ))
+                .with_children(|btn| {
+                    btn.spawn((
+                        Text::new("Details (H)"),
                         secondary_font.clone(),
                         TextColor(secondary_text_color),
                     ));
@@ -6198,6 +6429,259 @@ mod adaptive_governor_tests {
             world.query::<&ExposureAdjustButton>().iter(world).count(),
             2
         );
+    }
+
+    #[test]
+    fn responsive_hud_bounds_scale_and_toggle_without_losing_content() {
+        for (width, height, window_scale, ui_scale, notice_height) in [
+            (1280, 750, 1.0, 1.0, 34.0),
+            (800, 600, 1.0, 1.0, 34.0),
+            (1280, 800, 2.0, 1.0, 34.0),
+            (1600, 1000, 1.0, 2.0, 34.0),
+            (800, 600, 2.0, 1.0, 52.0),
+        ] {
+            let mut app = App::new();
+            app.insert_resource(Assets::<Mesh>::default())
+                .insert_resource(Assets::<Image>::default())
+                .insert_resource(auto_launch(RenderQuality::High))
+                .insert_resource(UiScale(ui_scale))
+                .insert_resource(ButtonInput::<KeyCode>::default())
+                .add_systems(Startup, setup_scene)
+                .add_systems(Update, layout_hud_panels);
+            let window = app
+                .world_mut()
+                .spawn((
+                    Window {
+                        resolution: bevy::window::WindowResolution::new(width, height)
+                            .with_scale_factor_override(window_scale),
+                        ..default()
+                    },
+                    PrimaryWindow,
+                ))
+                .id();
+            let factor = window_scale * ui_scale;
+            // Explicit physical layout fixture, not an actual GPU layout claim.
+            app.world_mut().spawn((
+                Node::default(),
+                SoftwareRendererWatermark,
+                ComputedNode {
+                    size: Vec2::new(300.0, notice_height) * factor,
+                    inverse_scale_factor: factor.recip(),
+                    ..default()
+                },
+            ));
+            app.update();
+            let inspector = app.world().resource::<HudElements>().inspector;
+            let roots = app
+                .world_mut()
+                .query_filtered::<Entity, With<HudScenePanel>>()
+                .iter(app.world())
+                .collect::<Vec<_>>();
+            assert_eq!(roots.len(), 1);
+            let root = roots[0];
+            let node = app.world().get::<Node>(root).unwrap().clone();
+            let Val::Px(top) = node.top else {
+                panic!("HUD top must be explicit")
+            };
+            let Val::Px(max_height) = node.max_height else {
+                panic!("HUD must have a finite viewport bound")
+            };
+            let viewport = Vec2::new(width as f32, height as f32) / factor;
+            assert_eq!(
+                top,
+                12.0 + notice_height + 8.0,
+                "reserve the observed notice height in UI units"
+            );
+            assert!(top + max_height <= viewport.y - 12.0);
+            assert_eq!(node.overflow.y, OverflowAxis::Scroll);
+            assert!(app.world().get::<ScrollPosition>(root).is_some());
+            let dock = app
+                .world_mut()
+                .query_filtered::<&Node, With<HudControlDock>>()
+                .single(app.world())
+                .unwrap();
+            if viewport.x < 1000.0 {
+                assert!(top + max_height <= viewport.y * 0.5 - 12.0);
+                assert_eq!(node.width, Val::Px(viewport.x - 24.0));
+                let Val::Px(dock_height) = dock.max_height else {
+                    panic!("bounded dock")
+                };
+                assert!(top + max_height + 12.0 < viewport.y - 12.0 - dock_height);
+            }
+            let mut pending = vec![root];
+            let mut texts = 0;
+            while let Some(entity) = pending.pop() {
+                if let Some(children) = app.world().get::<Children>(entity) {
+                    pending.extend(children.iter());
+                }
+                if app.world().get::<Text>(entity).is_some() {
+                    texts += 1;
+                    assert_eq!(
+                        app.world().get::<TextLayout>(entity).unwrap().linebreak,
+                        bevy::text::LineBreak::WordOrCharacter
+                    );
+                }
+            }
+            assert!(texts > 0);
+            let text = app.world().get::<Text>(inspector).unwrap().0.clone();
+            app.world_mut()
+                .resource_mut::<ButtonInput<KeyCode>>()
+                .press(KeyCode::KeyH);
+            app.update();
+            assert_eq!(
+                *app.world().get::<Visibility>(root).unwrap(),
+                Visibility::Hidden
+            );
+            assert_eq!(app.world().get::<Text>(inspector).unwrap().0, text);
+            app.world_mut()
+                .resource_mut::<ButtonInput<KeyCode>>()
+                .clear();
+            app.world_mut()
+                .get_mut::<Window>(window)
+                .unwrap()
+                .resolution
+                .set(900.0, 500.0);
+            app.update();
+            assert_eq!(
+                *app.world().get::<Visibility>(root).unwrap(),
+                Visibility::Hidden
+            );
+            let button = app
+                .world_mut()
+                .query_filtered::<Entity, With<HudToggleButton>>()
+                .single(app.world())
+                .unwrap();
+            *app.world_mut().get_mut::<Interaction>(button).unwrap() = Interaction::Pressed;
+            app.update();
+            assert_eq!(
+                *app.world().get::<Visibility>(root).unwrap(),
+                Visibility::Visible
+            );
+            assert_eq!(app.world().get::<Text>(inspector).unwrap().0, text);
+        }
+    }
+
+    #[test]
+    fn responsive_hud_scroll_clamps_and_captures_world_input_in_physical_bounds() {
+        for factor in [1.0, 2.0] {
+            let mut app = App::new();
+            app.insert_resource(HudPointerCapture::default())
+                .insert_resource(Time::<()>::default())
+                .insert_resource(CameraRig::default())
+                .insert_resource(SnapshotState::default())
+                .insert_resource(ButtonInput::<MouseButton>::default())
+                .insert_resource(ButtonInput::<KeyCode>::default())
+                .insert_resource(Messages::<MouseWheel>::default())
+                .insert_resource(Messages::<MouseMotion>::default())
+                .add_systems(Update, (scroll_hud_panels, control_camera).chain());
+            let mut window = Window {
+                resolution: bevy::window::WindowResolution::new(800, 600)
+                    .with_scale_factor_override(factor),
+                ..default()
+            };
+            window.set_physical_cursor_position(Some((Vec2::splat(80.0) * factor).as_dvec2()));
+            let window = app.world_mut().spawn((window, PrimaryWindow)).id();
+            app.world_mut().spawn((PrimaryCamera, Transform::default()));
+            // Computed-node fixture intentionally has no hovered Interaction:
+            // padding/child buttons must be protected by actual panel bounds.
+            let panel = app
+                .world_mut()
+                .spawn((
+                    Node::default(),
+                    HudScenePanel,
+                    ScrollPosition::default(),
+                    Visibility::Visible,
+                    ComputedNode {
+                        size: Vec2::splat(200.0) * factor,
+                        content_size: Vec2::new(200.0, 600.0) * factor,
+                        inverse_scale_factor: factor.recip(),
+                        ..default()
+                    },
+                    UiGlobalTransform::from(bevy::math::Affine2::from_translation(
+                        Vec2::splat(100.0) * factor,
+                    )),
+                ))
+                .id();
+            let send = |app: &mut App, unit, y, target| {
+                app.world_mut()
+                    .resource_mut::<Messages<MouseWheel>>()
+                    .write(MouseWheel {
+                        unit,
+                        x: 0.0,
+                        y,
+                        window: target,
+                    });
+            };
+            send(&mut app, MouseScrollUnit::Line, -1.0, window);
+            app.update();
+            assert_eq!(app.world().get::<ScrollPosition>(panel).unwrap().0.y, 40.0);
+            assert!(app.world().resource::<HudPointerCapture>().0);
+            assert_eq!(app.world().resource::<CameraRig>().distance, 2200.0);
+            send(&mut app, MouseScrollUnit::Pixel, -20.0, window);
+            app.update();
+            assert_eq!(app.world().get::<ScrollPosition>(panel).unwrap().0.y, 60.0);
+            for (target, y) in [
+                (Entity::PLACEHOLDER, -40.0),
+                (window, f32::NAN),
+                (window, f32::INFINITY),
+            ] {
+                send(&mut app, MouseScrollUnit::Line, y, target);
+            }
+            app.update();
+            assert_eq!(app.world().get::<ScrollPosition>(panel).unwrap().0.y, 60.0);
+            send(&mut app, MouseScrollUnit::Line, -f32::MAX, window);
+            app.update();
+            assert_eq!(app.world().get::<ScrollPosition>(panel).unwrap().0.y, 400.0);
+            let yaw = app.world().resource::<CameraRig>().yaw;
+            app.world_mut()
+                .resource_mut::<ButtonInput<MouseButton>>()
+                .press(MouseButton::Right);
+            app.world_mut()
+                .resource_mut::<Messages<MouseMotion>>()
+                .write(MouseMotion {
+                    delta: Vec2::splat(100.0),
+                });
+            app.update();
+            assert_eq!(app.world().resource::<CameraRig>().yaw, yaw);
+            app.world_mut()
+                .resource_mut::<ButtonInput<MouseButton>>()
+                .clear();
+            *app.world_mut().get_mut::<Visibility>(panel).unwrap() = Visibility::Hidden;
+            app.update();
+            assert!(!app.world().resource::<HudPointerCapture>().0);
+            assert_eq!(
+                app.world().resource::<CameraRig>().distance,
+                2200.0,
+                "consumed UI wheel cannot replay"
+            );
+            send(&mut app, MouseScrollUnit::Line, 1.0, window);
+            app.update();
+            assert!(app.world().resource::<CameraRig>().distance < 2200.0);
+            assert_eq!(app.world().get::<ScrollPosition>(panel).unwrap().0.y, 400.0);
+            *app.world_mut().get_mut::<Visibility>(panel).unwrap() = Visibility::Visible;
+            app.world_mut()
+                .get_mut::<ComputedNode>(panel)
+                .unwrap()
+                .content_size
+                .y = 250.0 * factor;
+            app.update();
+            assert_eq!(app.world().get::<ScrollPosition>(panel).unwrap().0.y, 50.0);
+            let changed = app
+                .world()
+                .entity(panel)
+                .get_ref::<ScrollPosition>()
+                .unwrap()
+                .last_changed();
+            app.update();
+            assert_eq!(
+                app.world()
+                    .entity(panel)
+                    .get_ref::<ScrollPosition>()
+                    .unwrap()
+                    .last_changed(),
+                changed
+            );
+        }
     }
 
     /// The real system, driven by a deterministic clock rather than wall time.
@@ -8757,7 +9241,10 @@ fn handle_selection_input(
         Query<&AgentDisplayPose>,
     ),
     submitter: Option<Res<CommandSubmitter>>,
-    ui_interactions: Query<&Interaction, With<Node>>,
+    (ui_interactions, hud_capture): (
+        Query<&Interaction, With<Node>>,
+        Option<Res<HudPointerCapture>>,
+    ),
     mut rig: ResMut<CameraRig>,
 ) {
     let camera_state = camera_query.single().ok();
@@ -8784,7 +9271,10 @@ fn handle_selection_input(
         return;
     }
 
-    if !selection_clicked || hud_pointer_captured(ui_interactions.iter()) {
+    if !selection_clicked
+        || hud_pointer_captured(ui_interactions.iter())
+        || hud_capture.is_some_and(|capture| capture.0)
+    {
         return;
     }
 
@@ -9664,7 +10154,10 @@ fn control_camera(
     keys: Res<ButtonInput<KeyCode>>,
     mut mouse_motion: MessageReader<MouseMotion>,
     mut mouse_wheel: MessageReader<MouseWheel>,
-    ui_interactions: Query<&Interaction, With<Node>>,
+    (ui_interactions, hud_capture): (
+        Query<&Interaction, With<Node>>,
+        Option<Res<HudPointerCapture>>,
+    ),
     windows: Query<&Window, With<PrimaryWindow>>,
     panels: Query<(&ComputedNode, &Visibility), With<HudScenePanel>>,
     mut camera_query: Query<(&mut Transform, Option<&Projection>), With<PrimaryCamera>>,
@@ -9695,7 +10188,8 @@ fn control_camera(
     let alt_held = keys.pressed(KeyCode::AltLeft) || keys.pressed(KeyCode::AltRight);
 
     rig.distance = rig.distance.clamp(CAMERA_MIN_DISTANCE, CAMERA_MAX_DISTANCE);
-    let pointer_over_hud = hud_pointer_captured(ui_interactions.iter());
+    let pointer_over_hud = hud_pointer_captured(ui_interactions.iter())
+        || hud_capture.is_some_and(|capture| capture.0);
     let scroll_lines: f64 = mouse_wheel
         .read()
         .filter(|wheel| !pointer_over_hud && wheel.y.is_finite())
@@ -9990,6 +10484,9 @@ fn control_camera(
             (windows.single(), panels.single(), projection)
         && *visibility != Visibility::Hidden
         && panel.size().x > 0.0
+        // A stacked panel spans the window. Keep its target in the central
+        // world strip rather than framing beside a nonexistent right gutter.
+        && panel.size().x < window.physical_width() as f32 * 0.5
         && window.physical_width() > 0
         && window.physical_height() > 0
     {
@@ -11105,7 +11602,7 @@ mod terrain_tests {
         use bevy::camera::PerspectiveProjection;
         use bevy::window::WindowResolution;
 
-        for (width, height, panel_width, scale, yaw, mode, visible, fit, slope, edge) in [
+        for (width, height, panel_width, scale, yaw, mode, visible, fit, slope, edge, beside) in [
             (
                 1280,
                 720,
@@ -11117,6 +11614,7 @@ mod terrain_tests {
                 false,
                 false,
                 false,
+                true,
             ),
             (
                 800,
@@ -11129,6 +11627,7 @@ mod terrain_tests {
                 false,
                 false,
                 false,
+                true,
             ),
             (
                 1600,
@@ -11141,6 +11640,7 @@ mod terrain_tests {
                 false,
                 false,
                 false,
+                true,
             ),
             (
                 1280,
@@ -11153,6 +11653,7 @@ mod terrain_tests {
                 false,
                 false,
                 false,
+                true,
             ),
             (
                 1280,
@@ -11165,6 +11666,7 @@ mod terrain_tests {
                 false,
                 false,
                 false,
+                true,
             ),
             (
                 1280,
@@ -11174,29 +11676,6 @@ mod terrain_tests {
                 -0.6,
                 FollowMode::Selected,
                 true,
-                true,
-                false,
-                false,
-            ),
-            (
-                1280,
-                720,
-                560.0,
-                1.0,
-                -0.6,
-                FollowMode::Selected,
-                true,
-                false,
-                true,
-                false,
-            ),
-            (
-                1280,
-                720,
-                560.0,
-                1.0,
-                -0.6,
-                FollowMode::Selected,
                 true,
                 false,
                 false,
@@ -11212,7 +11691,47 @@ mod terrain_tests {
                 true,
                 false,
                 true,
+                false,
                 true,
+            ),
+            (
+                1280,
+                720,
+                560.0,
+                1.0,
+                -0.6,
+                FollowMode::Selected,
+                true,
+                false,
+                false,
+                true,
+                true,
+            ),
+            (
+                1280,
+                720,
+                560.0,
+                1.0,
+                -0.6,
+                FollowMode::Selected,
+                true,
+                false,
+                true,
+                true,
+                true,
+            ),
+            (
+                800,
+                600,
+                776.0,
+                1.0,
+                1.3,
+                FollowMode::Selected,
+                true,
+                false,
+                false,
+                false,
+                false,
             ),
         ] {
             let mut app = App::new();
@@ -11309,7 +11828,7 @@ mod terrain_tests {
             let point = transform.rotation.inverse() * (target - transform.translation);
             let half_width = -point.z * (fov * 0.5).tan() * width as f32 / height as f32;
             let screen_x = (point.x / half_width + 1.0) * width as f32 * 0.5;
-            let expected = if visible && mode != FollowMode::Off && !fit {
+            let expected = if visible && mode != FollowMode::Off && !fit && beside {
                 (width as f32 + 12.0 * scale + panel_width) * 0.5
             } else {
                 width as f32 * 0.5
