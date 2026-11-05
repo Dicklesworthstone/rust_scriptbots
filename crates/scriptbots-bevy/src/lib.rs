@@ -871,6 +871,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
     .insert_non_send_resource(snapshot_inbox)
     .insert_non_send_resource(owner_inspector)
     .init_resource::<InspectorPage>()
+    .init_resource::<HudDiagnostics>()
     .insert_non_send_resource(BevyLifecycleFailureInbox {
         receiver: failure_rx,
         first_failure: Arc::clone(&first_worker_failure),
@@ -907,8 +908,11 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
                 animate_idle_bodies,
             )
                 .chain(),
-            handle_playback_shortcuts,
-            handle_playback_buttons,
+            (
+                handle_playback_shortcuts,
+                handle_playback_buttons,
+                handle_hud_diagnostics,
+            ),
             handle_tonemap_mode_buttons,
             // Nested so the outer tuple stays within Bevy's 20-system arity
             // limit; the inner .chain() preserves strict ordering, so the
@@ -1768,6 +1772,24 @@ impl CommandSubmitter {
 const NATIVE_RECENT_COMMANDS: usize = 4;
 const NATIVE_COMMAND_DETAIL_CHARS: usize = 160;
 
+// Keep the outcome visible in the compact HUD; the diagnostics view retains
+// the full command identity and history.
+fn compact_command_feedback(message: &str) -> String {
+    if message == "Commands: no requests" {
+        return String::new();
+    }
+    let line = message.lines().next().unwrap_or("");
+    let compact = line
+        .split_once(" [")
+        .and_then(|(label, rest)| {
+            let (id, outcome) = rest.split_once("]: ")?;
+            (id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                .then(|| format!("{label}: {outcome}"))
+        })
+        .unwrap_or_else(|| line.to_owned());
+    compact.replace(" • ", " | ")
+}
+
 #[derive(Clone, Copy)]
 enum NativeCommandSubmission {
     Identified(CommandId),
@@ -2236,6 +2258,7 @@ mod native_command_feedback_tests {
             camera: Entity::PLACEHOLDER,
             playback: Entity::PLACEHOLDER,
             command_feedback: label,
+            command_summary: Entity::PLACEHOLDER,
             fps: Entity::PLACEHOLDER,
             world: Entity::PLACEHOLDER,
             tonemap: Entity::PLACEHOLDER,
@@ -2529,15 +2552,15 @@ fn report_frame_metrics(mut ticker: ResMut<DiagnosticsTicker>, diagnostics: Res<
 }
 
 fn follow_idle_color() -> Color {
-    Color::srgba(0.16, 0.22, 0.33, 0.92)
+    Color::srgba(0.12, 0.20, 0.21, 0.94)
 }
 
 fn follow_hover_color() -> Color {
-    Color::srgba(0.22, 0.30, 0.46, 0.95)
+    Color::srgba(0.18, 0.31, 0.29, 0.97)
 }
 
 fn follow_active_color() -> Color {
-    Color::srgba(0.34, 0.26, 0.64, 0.95)
+    Color::srgba(0.24, 0.48, 0.36, 0.98)
 }
 pub(crate) const TERRAIN_CHUNK_SIZE: u32 = 64;
 pub(crate) const TERRAIN_HEIGHT_SCALE: f32 = 180.0;
@@ -2682,6 +2705,7 @@ struct HudElements {
     camera: Entity,
     playback: Entity,
     command_feedback: Entity,
+    command_summary: Entity,
     fps: Entity,
     world: Entity,
     tonemap: Entity,
@@ -2698,6 +2722,151 @@ struct HudControlDock;
 /// The left-hand panel that covers part of the follow camera's view.
 #[derive(Component)]
 struct HudScenePanel;
+
+/// Keep technical telemetry available without obscuring creature details.
+#[derive(Resource, Default)]
+struct HudDiagnostics(bool);
+
+#[derive(Component)]
+struct HudDiagnostic;
+
+#[derive(Component)]
+struct HudInspectorContent;
+
+#[derive(Component)]
+struct HudDiagnosticsButton;
+
+fn hud_diagnostic_node() -> Node {
+    Node {
+        display: Display::None,
+        ..default()
+    }
+}
+
+fn handle_hud_diagnostics(
+    keys: Option<Res<ButtonInput<KeyCode>>>,
+    mut mode: ResMut<HudDiagnostics>,
+    buttons: Query<&Interaction, (Changed<Interaction>, With<HudDiagnosticsButton>)>,
+    mut sections: Query<(&mut Node, Has<HudDiagnostic>, Has<HudInspectorContent>)>,
+    mut colors: Query<&mut BackgroundColor, With<HudDiagnosticsButton>>,
+) {
+    let presses = buttons
+        .iter()
+        .filter(|interaction| **interaction == Interaction::Pressed)
+        .count()
+        + usize::from(keys.is_some_and(|keys| keys.just_pressed(KeyCode::KeyH)));
+    if presses % 2 == 1 {
+        mode.0 = !mode.0;
+    }
+    if !mode.is_changed() {
+        return;
+    }
+    for (mut node, diagnostic, inspector) in &mut sections {
+        if diagnostic || inspector {
+            node.display = if diagnostic == mode.0 {
+                Display::Flex
+            } else {
+                Display::None
+            };
+        }
+    }
+    for mut color in &mut colors {
+        color.0 = if mode.0 {
+            follow_active_color()
+        } else {
+            follow_idle_color()
+        };
+    }
+}
+
+#[cfg(test)]
+mod hud_diagnostics_tests {
+    use super::*;
+
+    #[test]
+    fn compact_feedback_retains_outcomes_and_unrecognized_identities() {
+        assert_eq!(compact_command_feedback("Commands: no requests"), "");
+        assert_eq!(
+            compact_command_feedback(
+                "Selection [00000000000000010000000000000002]: Rejected • invalid target\nPause: Applied"
+            ),
+            "Selection: Rejected | invalid target"
+        );
+        assert_eq!(
+            compact_command_feedback(
+                "Selection: invalid receipt identity • Application not observed"
+            ),
+            "Selection: invalid receipt identity | Application not observed"
+        );
+        assert_eq!(
+            compact_command_feedback("Selection [not-an-id]: submission unconfirmed"),
+            "Selection [not-an-id]: submission unconfirmed"
+        );
+        assert_eq!(
+            compact_command_feedback("Commands: feedback unavailable"),
+            "Commands: feedback unavailable"
+        );
+    }
+
+    #[test]
+    fn diagnostics_toggle_keeps_creature_details_and_telemetry_separately_accessible() {
+        let mut app = App::new();
+        app.init_resource::<HudDiagnostics>()
+            .init_resource::<ButtonInput<KeyCode>>()
+            .add_systems(Update, handle_hud_diagnostics);
+        let detail = app
+            .world_mut()
+            .spawn((Node::default(), HudInspectorContent))
+            .id();
+        let diagnostic = app
+            .world_mut()
+            .spawn((hud_diagnostic_node(), HudDiagnostic))
+            .id();
+        let button = app
+            .world_mut()
+            .spawn((
+                Interaction::None,
+                BackgroundColor(follow_idle_color()),
+                HudDiagnosticsButton,
+            ))
+            .id();
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(detail).unwrap().display,
+            Display::Flex
+        );
+        assert_eq!(
+            app.world().get::<Node>(diagnostic).unwrap().display,
+            Display::None
+        );
+        *app.world_mut().get_mut::<Interaction>(button).unwrap() = Interaction::Pressed;
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(detail).unwrap().display,
+            Display::None
+        );
+        assert_eq!(
+            app.world().get::<Node>(diagnostic).unwrap().display,
+            Display::Flex
+        );
+        assert_eq!(
+            app.world().get::<BackgroundColor>(button).unwrap().0,
+            follow_active_color()
+        );
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::KeyH);
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(detail).unwrap().display,
+            Display::Flex
+        );
+        assert_eq!(
+            app.world().get::<Node>(diagnostic).unwrap().display,
+            Display::None
+        );
+    }
+}
 
 /// The sun light whose shadow state follows the resolved quality tier.
 ///
@@ -3915,7 +4084,7 @@ fn setup_scene(
     ));
 
     let primary_text_color = Color::WHITE;
-    let secondary_text_color = Color::srgb(0.74, 0.82, 0.94);
+    let secondary_text_color = Color::srgb(0.80, 0.87, 0.84);
     let primary_font = TextFont::from_font_size(16.0);
     let secondary_font = TextFont::from_font_size(14.0);
 
@@ -3935,7 +4104,7 @@ fn setup_scene(
         margin: UiRect::axes(Val::Px(0.0), Val::Px(4.0)),
         ..default()
     };
-    let button_border_color = Color::srgba(0.32, 0.38, 0.58, 1.0);
+    let button_border_color = Color::srgba(0.34, 0.46, 0.40, 1.0);
 
     // Persistent SOFTWARE RENDERER watermark (bd-2z0.14.3.3 item 4).
     //
@@ -3982,7 +4151,8 @@ fn setup_scene(
                 row_gap: Val::Px(4.0),
                 ..default()
             },
-            BackgroundColor(Color::srgba(0.07, 0.11, 0.18, 0.72)),
+            BackgroundColor(Color::srgba(0.05, 0.10, 0.09, 0.88)),
+            BorderRadius::all(Val::Px(10.0)),
             Interaction::default(),
             FocusPolicy::Pass,
             HudScenePanel,
@@ -3996,6 +4166,7 @@ fn setup_scene(
     let mut camera = Entity::PLACEHOLDER;
     let mut playback = Entity::PLACEHOLDER;
     let mut command_feedback = Entity::PLACEHOLDER;
+    let mut command_summary = Entity::PLACEHOLDER;
     let mut fps = Entity::PLACEHOLDER;
     let mut world = Entity::PLACEHOLDER;
     let mut tonemap = Entity::PLACEHOLDER;
@@ -4006,6 +4177,11 @@ fn setup_scene(
     let mut brain = Entity::PLACEHOLDER;
 
     commands.entity(hud_root).with_children(|parent| {
+        parent.spawn((
+            Text::new("SCRIPTBOTS  /  LIVE WORLD"),
+            TextFont::from_font_size(13.0),
+            TextColor(Color::srgb(0.62, 0.82, 0.68)),
+        ));
         tick = parent
             .spawn((
                 Text::new("Tick: --"),
@@ -4032,6 +4208,8 @@ fn setup_scene(
                 Text::new("Follow: --"),
                 primary_font.clone(),
                 TextColor(primary_text_color),
+                hud_diagnostic_node(),
+                HudDiagnostic,
             ))
             .id();
         camera = parent
@@ -4039,6 +4217,8 @@ fn setup_scene(
                 Text::new("Camera: --"),
                 primary_font.clone(),
                 TextColor(primary_text_color),
+                hud_diagnostic_node(),
+                HudDiagnostic,
             ))
             .id();
         playback = parent
@@ -4048,15 +4228,26 @@ fn setup_scene(
                 TextColor(secondary_text_color),
             ))
             .id();
+        command_summary = parent
+            .spawn((
+                Text::default(),
+                secondary_font.clone(),
+                TextColor(secondary_text_color),
+                Node::default(),
+                HudInspectorContent,
+            ))
+            .id();
         command_feedback = parent
             .spawn((
                 Text::new("Commands: no requests"),
                 secondary_font.clone(),
                 TextColor(secondary_text_color),
                 Node {
+                    display: Display::None,
                     max_width: Val::Px(760.0),
                     ..default()
                 },
+                HudDiagnostic,
             ))
             .id();
         fps = parent
@@ -4064,6 +4255,8 @@ fn setup_scene(
                 Text::new("FPS: --"),
                 secondary_font.clone(),
                 TextColor(secondary_text_color),
+                hud_diagnostic_node(),
+                HudDiagnostic,
             ))
             .id();
         world = parent
@@ -4071,6 +4264,8 @@ fn setup_scene(
                 Text::new("World: --"),
                 secondary_font.clone(),
                 TextColor(secondary_text_color),
+                hud_diagnostic_node(),
+                HudDiagnostic,
             ))
             .id();
         tonemap = parent
@@ -4078,6 +4273,8 @@ fn setup_scene(
                 Text::new("Tone: ACES | AutoExp Off | Bias +0.0"),
                 secondary_font.clone(),
                 TextColor(secondary_text_color),
+                hud_diagnostic_node(),
+                HudDiagnostic,
             ))
             .id();
         palette = parent
@@ -4085,6 +4282,8 @@ fn setup_scene(
                 Text::new("Palette: Natural | press C to cycle"),
                 secondary_font.clone(),
                 TextColor(secondary_text_color),
+                hud_diagnostic_node(),
+                HudDiagnostic,
             ))
             .id();
         events = parent
@@ -4092,6 +4291,8 @@ fn setup_scene(
                 Text::new("Events: --"),
                 secondary_font.clone(),
                 TextColor(secondary_text_color),
+                hud_diagnostic_node(),
+                HudDiagnostic,
             ))
             .id();
         inspector = parent
@@ -4099,6 +4300,8 @@ fn setup_scene(
                 Text::new("Inspector: no selection"),
                 secondary_font.clone(),
                 TextColor(secondary_text_color),
+                Node::default(),
+                HudInspectorContent,
             ))
             .id();
         history = parent
@@ -4106,6 +4309,8 @@ fn setup_scene(
                 Text::new("History: collecting..."),
                 secondary_font.clone(),
                 TextColor(secondary_text_color),
+                hud_diagnostic_node(),
+                HudDiagnostic,
             ))
             .id();
         brain = parent
@@ -4113,6 +4318,8 @@ fn setup_scene(
                 Text::new("Brain: select an agent"),
                 secondary_font.clone(),
                 TextColor(secondary_text_color),
+                hud_diagnostic_node(),
+                HudDiagnostic,
             ))
             .id();
     });
@@ -4133,7 +4340,8 @@ fn setup_scene(
                 row_gap: Val::Px(4.0),
                 ..default()
             },
-            BackgroundColor(Color::srgba(0.07, 0.11, 0.18, 0.82)),
+            BackgroundColor(Color::srgba(0.05, 0.10, 0.09, 0.90)),
+            BorderRadius::all(Val::Px(10.0)),
             Interaction::default(),
             FocusPolicy::Pass,
             HudControlDock,
@@ -4247,6 +4455,21 @@ fn setup_scene(
                             });
                     }
                 });
+                row.spawn((
+                    Button,
+                    button_node.clone(),
+                    BackgroundColor(follow_idle_color()),
+                    BorderRadius::all(Val::Px(6.0)),
+                    BorderColor::all(button_border_color),
+                    HudDiagnosticsButton,
+                ))
+                .with_children(|btn| {
+                    btn.spawn((
+                        Text::new("Diagnostics (H)"),
+                        secondary_font.clone(),
+                        TextColor(secondary_text_color),
+                    ));
+                });
             });
 
         let tonemap_modes = [
@@ -4354,6 +4577,7 @@ fn setup_scene(
         camera,
         playback,
         command_feedback,
+        command_summary,
         fps,
         world,
         tonemap,
@@ -4657,13 +4881,16 @@ fn update_hud(
             }
             set_hud_text_if_changed(&mut text, message);
         }
-        if let Ok(mut text) = texts.get_mut(hud_elements.command_feedback) {
-            if let Some(feedback) = &command_feedback {
-                if let Some(message) = feedback.text() {
-                    **text = message;
-                }
-            } else {
-                **text = "Commands: feedback unavailable".to_owned();
+        let feedback_message = command_feedback.as_ref().map_or_else(
+            || Some("Commands: feedback unavailable".to_owned()),
+            |feedback| feedback.text(),
+        );
+        if let Some(message) = feedback_message {
+            if let Ok(mut text) = texts.get_mut(hud_elements.command_feedback) {
+                set_hud_text_if_changed(&mut text, message.clone());
+            }
+            if let Ok(mut text) = texts.get_mut(hud_elements.command_summary) {
+                set_hud_text_if_changed(&mut text, compact_command_feedback(&message));
             }
         }
         if let Ok(mut text) = texts.get_mut(hud_elements.fps) {
@@ -8556,6 +8783,7 @@ mod owner_inspector_tests {
             camera: Entity::PLACEHOLDER,
             playback: Entity::PLACEHOLDER,
             command_feedback: Entity::PLACEHOLDER,
+            command_summary: Entity::PLACEHOLDER,
             fps: Entity::PLACEHOLDER,
             world: Entity::PLACEHOLDER,
             tonemap: Entity::PLACEHOLDER,
@@ -15903,6 +16131,7 @@ mod tests {
             camera: spawn_label(&mut app),
             playback: spawn_label(&mut app),
             command_feedback: spawn_label(&mut app),
+            command_summary: spawn_label(&mut app),
             fps: spawn_label(&mut app),
             world: spawn_label(&mut app),
             tonemap: spawn_label(&mut app),
