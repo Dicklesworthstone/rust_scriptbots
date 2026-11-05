@@ -8244,6 +8244,7 @@ struct OwnerInspector {
     last_request: Option<Instant>,
     last_attempt: Option<InspectorTarget>,
     status: String,
+    last_failure: Option<String>,
 }
 
 impl OwnerInspector {
@@ -8255,6 +8256,7 @@ impl OwnerInspector {
             last_request: None,
             last_attempt: None,
             status: "select a living agent".into(),
+            last_failure: None,
         }
     }
 
@@ -8265,6 +8267,7 @@ impl OwnerInspector {
             .is_some_and(|sample| target.is_none_or(|target| !sample.target.same_subject(target)))
         {
             self.sample = None;
+            self.last_failure = None;
         }
         // Never join a running worker from an Update system. A completed thread
         // can be reaped without waiting for owner work or channel admission.
@@ -8281,24 +8284,25 @@ impl OwnerInspector {
                         if target.is_some_and(|target| sample.target.same_subject(target)) =>
                     {
                         self.sample = Some(sample);
+                        self.last_failure = None;
                         self.status = "waiting for detail matching this frame".into();
                     }
                     (Ok(()), Ok(Ok(_))) => {
                         self.sample = None;
-                        self.status =
-                            "unavailable: subject died or source changed (I to retry)".into();
+                        self.last_failure = None;
+                        self.status = "unavailable: subject no longer exists (I to retry)".into();
                     }
                     (Ok(()), Ok(Err(error))) => {
-                        self.sample = None;
                         self.status = format!(
                             "unavailable: {} (I to retry)",
                             bounded_inspector_text(&error)
                         );
+                        self.last_failure = Some(bounded_inspector_text(&error));
                     }
                     _ => {
-                        self.sample = None;
                         self.status =
                             "unavailable: inspection worker disconnected (I to retry)".into();
+                        self.last_failure = Some("inspection worker disconnected".into());
                     }
                 }
             }
@@ -8345,6 +8349,9 @@ impl OwnerInspector {
                 self.last_request = Some(now);
                 self.status =
                     format!("unavailable: could not start inspection: {error} (I to retry)");
+                self.last_failure = Some(bounded_inspector_text(&format!(
+                    "could not start inspection: {error}"
+                )));
             }
         }
     }
@@ -8362,18 +8369,27 @@ impl OwnerInspector {
         };
         let source = sample.target.source;
         let index = page % sample.pages.len();
+        let provenance = self.last_failure.as_ref().map_or_else(
+            || {
+                format!(
+                    "Session {:x} | publication {} | config {} | control {}",
+                    source.session_id.get(),
+                    source.published_snapshot.get(),
+                    source.inspected_host.config.get(),
+                    source.inspected_host.control.get(),
+                )
+            },
+            |error| format!("Refresh failed: {error} (I to retry)"),
+        );
         format!(
             "Owner UID {} | tick {} | age {} ticks | page {}/{} (I / Shift+I)\n\
-             Session {:x} | publication {} | config {} | control {}\n{}",
+             {}\n{}",
             sample.target.uid.0,
             source.inspected_tick.0,
             current.source.inspected_tick.0 - source.inspected_tick.0,
             index + 1,
             sample.pages.len(),
-            source.session_id.get(),
-            source.published_snapshot.get(),
-            source.inspected_host.config.get(),
-            source.inspected_host.control.get(),
+            provenance,
             sample.pages[index],
         )
     }
@@ -8400,15 +8416,27 @@ fn capture_owner_inspector(
         return Ok(None);
     };
     let latest = host.snapshot_hub().latest();
+    let captured = inspector_target_for_detail(&detail, target, &latest)?;
+    Ok(Some(OwnerInspectorSample {
+        target: captured,
+        pages: owner_inspector_pages(&detail),
+    }))
+}
+
+fn inspector_target_for_detail(
+    detail: &scriptbots_runtime::channel::AgentInspectorData,
+    target: InspectorTarget,
+    latest: &RenderSnapshot,
+) -> std::result::Result<InspectorTarget, String> {
     // A response must correspond to an actual immutable owner publication.
     // The owner may advance between submission and completion, so also accept
     // its independently read latest publication, never a fabricated revision.
     let epoch = if detail.source == target.source {
         target.epoch
-    } else if detail.source.matches_snapshot(&latest) {
+    } else if detail.source.matches_snapshot(latest) {
         latest.world.epoch
     } else {
-        return Ok(None);
+        return Err("owner detail did not match a published frame".into());
     };
     let captured = InspectorTarget {
         source: detail.source,
@@ -8416,12 +8444,9 @@ fn capture_owner_inspector(
         uid: detail.uid,
     };
     if !captured.same_subject(target) {
-        return Ok(None);
+        return Err("owner detail subject or source changed".into());
     }
-    Ok(Some(OwnerInspectorSample {
-        target: captured,
-        pages: owner_inspector_pages(&detail),
-    }))
+    Ok(captured)
 }
 
 fn owner_inspector_pages(detail: &scriptbots_runtime::channel::AgentInspectorData) -> Vec<String> {
@@ -9075,6 +9100,131 @@ mod owner_inspector_tests {
         assert!(!inspector.panel(&frame, 0).contains("Reproduction counter"));
         frame.agents.clear();
         assert!(inspector.panel(&frame, 0).contains("select a living agent"));
+    }
+
+    #[test]
+    fn failed_refresh_keeps_labeled_detail_only_for_the_same_subject() {
+        let mut owner = TestOwner::new();
+        owner.serve();
+        let mut frame = owner.frame();
+        let target = InspectorTarget::from_frame(&frame).unwrap();
+        let mut inspector = OwnerInspector::new(owner.port.clone());
+        inspector.sample = capture_owner_inspector(&owner.port, target).unwrap();
+        drop(owner);
+
+        let mut later = target;
+        later.source.inspected_tick = scriptbots_core::Tick(3);
+        later.source.inspected_host.scientific = scriptbots_runtime::ScientificRevision::new(3);
+        later.source.published_host = later.source.inspected_host;
+        frame.owner_source = Some((later.source, later.epoch));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            inspector.poll(Some(later), Instant::now());
+            if inspector.last_failure.is_some() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "inspection failure did not arrive"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        let shown = inspector.panel(&frame, 0);
+        assert!(shown.contains("Reproduction counter 0.375"), "{shown}");
+        assert!(shown.contains("age 3 ticks"), "{shown}");
+        assert!(shown.contains("Refresh failed:"), "{shown}");
+
+        frame.agents[0].uid = AgentUid(target.uid.0 + 1);
+        inspector.poll(InspectorTarget::from_frame(&frame), Instant::now());
+        assert!(!inspector.panel(&frame, 0).contains("Reproduction counter"));
+        assert!(inspector.sample.is_none());
+    }
+
+    #[test]
+    fn successful_owner_refresh_clears_the_previous_failure() {
+        let mut owner = TestOwner::new();
+        owner.serve();
+        let mut frame = owner.frame();
+        let target = InspectorTarget::from_frame(&frame).unwrap();
+        let mut inspector = OwnerInspector::new(owner.port.clone());
+        inspector.sample = capture_owner_inspector(&owner.port, target).unwrap();
+        let mut later = target;
+        later.source.inspected_tick = scriptbots_core::Tick(3);
+        later.source.inspected_host.scientific = scriptbots_runtime::ScientificRevision::new(3);
+        later.source.published_host = later.source.inspected_host;
+        frame.owner_source = Some((later.source, later.epoch));
+
+        let (send, result) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || send.send(Err("simulated timeout".into())).unwrap());
+        inspector.job = Some(OwnerInspectorJob {
+            target: later,
+            result,
+            worker,
+        });
+        inspector.last_attempt = Some(later);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while inspector.last_failure.is_none() {
+            inspector.poll(Some(later), Instant::now());
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(inspector.panel(&frame, 0).contains("simulated timeout"));
+
+        inspector.last_attempt = None;
+        inspector.last_request = None;
+        while inspector.last_failure.is_some() {
+            inspector.poll(Some(later), Instant::now());
+            assert!(Instant::now() < deadline, "real owner did not recover");
+            thread::sleep(Duration::from_millis(1));
+        }
+        let shown = inspector.panel(&frame, 0);
+        assert!(shown.contains("Reproduction counter 0.375"), "{shown}");
+        assert!(shown.contains("Session 2cd"), "{shown}");
+        assert!(!shown.contains("Refresh failed:"), "{shown}");
+    }
+
+    #[test]
+    fn unmatched_owner_detail_is_a_retryable_failure_not_a_death() {
+        let mut owner = TestOwner::new();
+        owner.serve();
+        let frame = owner.frame();
+        let target = InspectorTarget::from_frame(&frame).unwrap();
+        let latest = owner.port.snapshot_hub().latest();
+        let mut detail = owner
+            .port
+            .inspect_agent_for_hud_before(target.uid, Instant::now() + Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            inspector_target_for_detail(&detail, target, &latest).unwrap(),
+            target
+        );
+
+        let original = detail.source;
+        detail.source.published_snapshot =
+            scriptbots_runtime::SnapshotRevision::new(original.published_snapshot.get() + 1);
+        assert!(
+            inspector_target_for_detail(&detail, target, &latest)
+                .unwrap_err()
+                .contains("did not match a published frame")
+        );
+        detail.source = original;
+        detail.uid = AgentUid(target.uid.0 + 1);
+        assert!(
+            inspector_target_for_detail(&detail, target, &latest)
+                .unwrap_err()
+                .contains("subject or source changed")
+        );
+
+        detail.uid = target.uid;
+        let mut changed_request = target;
+        changed_request.source.published_snapshot =
+            scriptbots_runtime::SnapshotRevision::new(original.published_snapshot.get() + 1);
+        assert_eq!(
+            inspector_target_for_detail(&detail, changed_request, &latest).unwrap(),
+            target,
+            "a response matching the independently read publication stays valid"
+        );
     }
 
     #[test]
