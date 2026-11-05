@@ -8,8 +8,7 @@ use scriptbots_analytics::{
     AnalyticsError, NARRATIVE_VALIDATE_SCHEMA_VERSION, ReaderCtx, Registry, ReportParams,
 };
 use scriptbots_core::narrative::{
-    EventKind, EventRecord, METRIC_COMBAT, METRIC_ENERGY, METRIC_POPULATION,
-    NarrativeInputRecordV1,
+    EventKind, EventRecord, METRIC_COMBAT, METRIC_ENERGY, METRIC_POPULATION, NarrativeInputRecordV1,
 };
 use scriptbots_core::{
     AgentData, Intervention, MetricSample, PersistenceBatch, Position, Region, ReplayEvent,
@@ -25,7 +24,7 @@ fn synthetic_summary(tick: u64) -> TickSummary {
     let phase = u16::try_from(tick % 5).expect("bounded phase");
     let population = if tick < 100 { 10_u16 } else { 40_u16 } + phase;
     let energy_phase = i16::try_from(tick % 7).expect("bounded energy phase");
-    let average_energy = 50.0 + f32::from(energy_phase - 3) * 0.5;
+    let average_energy = f32::from(energy_phase - 3).mul_add(0.5, 50.0);
     let spike_hits = if tick < 100 { 2 } else { 12 } + u32::from(phase);
     TickSummary {
         tick: Tick(tick),
@@ -62,11 +61,7 @@ fn event(tick: u64, kind: EventKind, metric: &str) -> EventRecord {
 /// Summaries and canonical inputs agree exactly. Batches use the production
 /// default persistence cadence; generic dashboard metrics deliberately carry
 /// no evidence of the planted shift.
-fn create_fixture(
-    dir: &tempfile::TempDir,
-    events: &[EventRecord],
-    include_inputs: bool,
-) -> String {
+fn create_fixture(dir: &tempfile::TempDir, events: &[EventRecord], include_inputs: bool) -> String {
     let path = dir.path().join("series.sqlite").display().to_string();
     let mut storage = Storage::create_unattributed_file(&path).expect("create fixture");
     let config = ScriptBotsConfig::default();
@@ -379,13 +374,18 @@ fn real_world_default_persistence_certifies_an_event_between_batch_boundaries() 
             .step(&mut world)
             .expect("production step and persistence admission");
     }
-    session.finalize(&mut world).expect("finalize partial batch");
+    session
+        .finalize(&mut world)
+        .expect("finalize partial batch");
     drop(world);
     pipeline.shutdown().expect("durable shutdown");
 
     let cx = ReaderCtx::open(&path).expect("finished reader");
     assert!(
-        !cx.reader.summary_ticks().expect("batch boundaries").contains(&97),
+        !cx.reader
+            .summary_ticks()
+            .expect("batch boundaries")
+            .contains(&97),
         "the extinction tick must not be a dashboard summary boundary"
     );
     let output = Registry::builtin()

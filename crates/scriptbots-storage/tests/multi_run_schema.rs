@@ -1,12 +1,12 @@
 //! End-to-end proof that one FrankenSQLite file can hold independent runs with overlapping keys.
 
+use scriptbots_core::sense_fixed::{
+    MIN_GPU_SENSE_PARITY_TICKS, SenseDeterminism, SenseGateEvidenceV0,
+};
 use scriptbots_core::{
     AgentData, AgentIdentity, AgentRuntime, AgentState, AgentUid, BirthOrigin, BirthRecord,
     Generation, MetricSample, PersistenceBatch, Position, ScriptBotsConfig, Tick, TickSummary,
     WorldState,
-};
-use scriptbots_core::sense_fixed::{
-    MIN_GPU_SENSE_PARITY_TICKS, SenseDeterminism, SenseGateEvidenceV0,
 };
 use scriptbots_runtime::RunId;
 use scriptbots_storage::{
@@ -324,7 +324,9 @@ fn exact_gpu_evidence_fixture(record: &RunManifestRecord) -> SenseGateEvidenceV0
             .as_str()
             .expect("fixture rustc -Vv")
             .to_owned(),
-        fixture_digest: blake3::hash(b"schema-fixture scenario").to_hex().to_string(),
+        fixture_digest: blake3::hash(b"schema-fixture scenario")
+            .to_hex()
+            .to_string(),
         tick_count: MIN_GPU_SENSE_PARITY_TICKS,
         evidence_time_unix_ms: record.started_at_unix_ms,
         evidence_digest: blake3::hash(b"schema-fixture report").to_hex().to_string(),
@@ -436,11 +438,8 @@ fn sensing_manifest_rejects_forged_reproducibility_and_inconsistent_policy() {
 #[test]
 fn exact_gpu_sensing_evidence_survives_file_recovery() -> Result<(), Box<dyn std::error::Error>> {
     let run_id = RunId::from_namespace_sequence(0x5e05_e003, 1);
-    let record = with_exact_gpu_sensing_policy(manifest(
-        run_id,
-        "exact_gpu_schema",
-        1_700_000_000_001,
-    ));
+    let record =
+        with_exact_gpu_sensing_policy(manifest(run_id, "exact_gpu_schema", 1_700_000_000_001));
     let expected: serde_json::Value = serde_json::from_str(&record.manifest_json)?;
     let path = temp_db_path("exact_gpu_schema");
     let mut pipeline = StoragePipeline::create_new_file_for_run(&path, record)?;
@@ -462,11 +461,8 @@ fn exact_gpu_sensing_evidence_survives_file_recovery() -> Result<(), Box<dyn std
 #[test]
 fn exact_gpu_sensing_requires_every_canonical_evidence_field() {
     let run_id = RunId::from_namespace_sequence(0x5e05_e004, 1);
-    let valid = with_exact_gpu_sensing_policy(manifest(
-        run_id,
-        "complete_gpu_evidence",
-        1_700_000_000_001,
-    ));
+    let valid =
+        with_exact_gpu_sensing_policy(manifest(run_id, "complete_gpu_evidence", 1_700_000_000_001));
     accept_manifest(valid.clone());
 
     let value: serde_json::Value =
@@ -487,7 +483,10 @@ fn exact_gpu_sensing_requires_every_canonical_evidence_field() {
             assert!(removed.is_some(), "the canonical field {field} was present");
         });
         let error = manifest_validation_error(invalid);
-        assert!(error.contains("/sense_policy/gate_evidence"), "{field}: {error}");
+        assert!(
+            error.contains("/sense_policy/gate_evidence"),
+            "{field}: {error}"
+        );
         assert!(error.contains(&field), "{field}: {error}");
     }
 }
@@ -495,11 +494,8 @@ fn exact_gpu_sensing_requires_every_canonical_evidence_field() {
 #[test]
 fn exact_gpu_sensing_refuses_foreign_identity_and_false_exact_outcomes() {
     let run_id = RunId::from_namespace_sequence(0x5e05_e005, 1);
-    let valid = with_exact_gpu_sensing_policy(manifest(
-        run_id,
-        "gpu_evidence_controls",
-        1_700_000_000_001,
-    ));
+    let valid =
+        with_exact_gpu_sensing_policy(manifest(run_id, "gpu_evidence_controls", 1_700_000_000_001));
     for (field, replacement) in [
         ("adapter", serde_json::json!(" ")),
         ("backend", serde_json::json!("")),
@@ -508,12 +504,27 @@ fn exact_gpu_sensing_refuses_foreign_identity_and_false_exact_outcomes() {
         ("vendor", serde_json::json!(u64::from(u32::MAX) + 1)),
         ("device", serde_json::json!(-1)),
         ("target", serde_json::json!("x86_64-unknown-linux-gnu")),
-        ("toolchain_identity", serde_json::json!("different rustc -Vv")),
+        (
+            "toolchain_identity",
+            serde_json::json!("different rustc -Vv"),
+        ),
         ("shader_digest", serde_json::json!("not-a-digest")),
-        ("build_identity", serde_json::json!("0".repeat(blake3::OUT_LEN * 2))),
-        ("fixture_digest", serde_json::json!("F".repeat(blake3::OUT_LEN * 2))),
-        ("evidence_digest", serde_json::json!("a".repeat(blake3::OUT_LEN * 2 - 1))),
-        ("tick_count", serde_json::json!(MIN_GPU_SENSE_PARITY_TICKS - 1)),
+        (
+            "build_identity",
+            serde_json::json!("0".repeat(blake3::OUT_LEN * 2)),
+        ),
+        (
+            "fixture_digest",
+            serde_json::json!("F".repeat(blake3::OUT_LEN * 2)),
+        ),
+        (
+            "evidence_digest",
+            serde_json::json!("a".repeat(blake3::OUT_LEN * 2 - 1)),
+        ),
+        (
+            "tick_count",
+            serde_json::json!(MIN_GPU_SENSE_PARITY_TICKS - 1),
+        ),
         ("tick_count", serde_json::json!(0)),
         ("evidence_time_unix_ms", serde_json::json!(0)),
         ("determinism", serde_json::json!("approximate")),
@@ -528,7 +539,10 @@ fn exact_gpu_sensing_refuses_foreign_identity_and_false_exact_outcomes() {
             value["sense_policy"]["gate_evidence"][field] = replacement;
         });
         let error = manifest_validation_error(invalid);
-        assert!(error.contains("/sense_policy/gate_evidence"), "{field}: {error}");
+        assert!(
+            error.contains("/sense_policy/gate_evidence"),
+            "{field}: {error}"
+        );
     }
 
     let mut longer = valid;
@@ -561,7 +575,9 @@ fn incomplete_exact_gpu_evidence_is_refused_before_file_creation() {
     let error = match StoragePipeline::create_new_file_for_run(&path, invalid) {
         Err(error) => error,
         Ok(mut unexpected) => {
-            unexpected.shutdown().expect("unexpected pipeline shuts down");
+            unexpected
+                .shutdown()
+                .expect("unexpected pipeline shuts down");
             panic!("incomplete exact evidence reached database creation");
         }
     };

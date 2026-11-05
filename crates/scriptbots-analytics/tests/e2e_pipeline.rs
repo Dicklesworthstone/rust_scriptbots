@@ -223,7 +223,7 @@ fn populate_seeded_fixture(dir: &Path) -> (String, String) {
         // Plant a real change in this fixture's agent states, so persisted summary
         // energy and canonical detector inputs describe the same population.
         let phase = f32::from(u16::try_from(tick % 5).expect("energy phase fits u16"));
-        let agent_energy = if tick < 100 { 40.0 } else { 10.0 } + (phase - 2.0) * 0.2;
+        let agent_energy = (phase - 2.0).mul_add(0.2, if tick < 100 { 40.0 } else { 10.0 });
         for agent in &mut agents {
             agent.runtime.energy = agent_energy;
         }
@@ -634,7 +634,12 @@ fn test_analytics_e2e_full_pipeline_and_invariants() {
         invariant: "null_noise_not_significant".to_string(),
         expected: serde_json::json!({ "significant_fdr": false }),
         observed: serde_json::json!({ "significant_fdr": !combat_not_significant }),
-        status: if combat_not_significant { "pass" } else { "fail" }.to_string(),
+        status: if combat_not_significant {
+            "pass"
+        } else {
+            "fail"
+        }
+        .to_string(),
     });
     assert!(
         combat_not_significant,

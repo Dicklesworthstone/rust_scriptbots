@@ -315,8 +315,7 @@ fn evaluate_window(
         return Ok(None);
     }
     let event = run_event.record();
-    let Some(values) =
-        exact_window_values(inputs, event.tick.0, params.window, &event.metric)
+    let Some(values) = exact_window_values(inputs, event.tick.0, params.window, &event.metric)
     else {
         return Ok(None);
     };

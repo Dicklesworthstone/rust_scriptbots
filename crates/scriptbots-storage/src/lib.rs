@@ -3960,8 +3960,7 @@ fn validate_v3_exact_gpu_sense_evidence(
     // Check the JSON number too: a forged nonzero f64 can underflow to zero
     // while serde narrows it into the portable f32 field.
     let raw_delta =
-        manifest_required_value(manifest, "/sense_policy/gate_evidence/max_sensor_delta")?
-            .as_f64();
+        manifest_required_value(manifest, "/sense_policy/gate_evidence/max_sensor_delta")?.as_f64();
     if raw_delta != Some(0.0)
         || !evidence.max_sensor_delta.is_finite()
         || evidence.max_sensor_delta != 0.0
