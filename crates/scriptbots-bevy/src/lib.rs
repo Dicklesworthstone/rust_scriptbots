@@ -760,6 +760,8 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
     }
     let terrain_detail_source =
         TerrainDetailSource::bake().context("could not load the canonical biome detail atlas")?;
+    terrain_albedo_photos()
+        .map_err(|error| anyhow!("could not load terrain color images: {error}"))?;
 
     let (snapshot_publisher, snapshot_inbox) = SnapshotInbox::pair();
     let (failure_tx, failure_rx) = mpsc::channel::<BevyLifecycleFailure>();
@@ -872,6 +874,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
     .insert_non_send_resource(owner_inspector)
     .init_resource::<InspectorPage>()
     .init_resource::<HudPointerCapture>()
+    .init_resource::<HudDiagnostics>()
     .insert_non_send_resource(BevyLifecycleFailureInbox {
         receiver: failure_rx,
         first_failure: Arc::clone(&first_worker_failure),
@@ -908,8 +911,11 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
                 animate_idle_bodies,
             )
                 .chain(),
-            handle_playback_shortcuts,
-            handle_playback_buttons,
+            (
+                handle_playback_shortcuts,
+                handle_playback_buttons,
+                handle_hud_diagnostics,
+            ),
             handle_tonemap_mode_buttons,
             // Nested so the outer tuple stays within Bevy's 20-system arity
             // limit; the inner .chain() preserves strict ordering, so the
@@ -921,6 +927,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
             (
                 handle_quality_tier_button,
                 drive_adaptive_quality,
+                update_quality_tier_label,
                 apply_tier_to_sun_light,
                 apply_tier_to_bloom,
                 apply_tier_to_fog,
@@ -1230,10 +1237,10 @@ fn smooth_agent_poses(
         .as_ref()
         .is_some_and(|snapshot| snapshot.paused);
     for (target, mut display, mut transform, footprint) in &mut agents {
-        if paused
+        let snap_to_target = paused
             || settings.as_ref().is_some_and(|settings| !settings.enabled)
-            || target.tick < display.previous_target.tick
-        {
+            || target.tick < display.previous_target.tick;
+        if snap_to_target {
             // A committed pause (including a paused single step) presents the
             // exact observed pose immediately. It must not keep converging
             // while the inspector reports a stationary scientific tick.
@@ -1259,7 +1266,7 @@ fn smooth_agent_poses(
             display.translation = translation;
             display.rotation = display.rotation.slerp(target.rotation, blend);
         }
-        if let (Some(snapshot), Some(footprint)) = (&state.latest, footprint) {
+        if !snap_to_target && let (Some(snapshot), Some(footprint)) = (&state.latest, footprint) {
             let mut footprint = *footprint;
             if let Some((spike_target, spike_display)) =
                 footprint.spike.and_then(|spike| spikes.get(spike).ok())
@@ -1769,6 +1776,24 @@ impl CommandSubmitter {
 const NATIVE_RECENT_COMMANDS: usize = 4;
 const NATIVE_COMMAND_DETAIL_CHARS: usize = 160;
 
+// Keep the outcome visible in the compact HUD; the diagnostics view retains
+// the full command identity and history.
+fn compact_command_feedback(message: &str) -> String {
+    if message == "Commands: no requests" {
+        return String::new();
+    }
+    let line = message.lines().next().unwrap_or("");
+    let compact = line
+        .split_once(" [")
+        .and_then(|(label, rest)| {
+            let (id, outcome) = rest.split_once("]: ")?;
+            (id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                .then(|| format!("{label}: {outcome}"))
+        })
+        .unwrap_or_else(|| line.to_owned());
+    compact.replace(" • ", " | ")
+}
+
 #[derive(Clone, Copy)]
 enum NativeCommandSubmission {
     Identified(CommandId),
@@ -2229,6 +2254,7 @@ mod native_command_feedback_tests {
                     .chain(),
             );
         let label = app.world_mut().spawn(Text::default()).id();
+        let compact_label = app.world_mut().spawn(Text::default()).id();
         app.insert_resource(HudElements {
             tick: Entity::PLACEHOLDER,
             agents: Entity::PLACEHOLDER,
@@ -2237,6 +2263,7 @@ mod native_command_feedback_tests {
             camera: Entity::PLACEHOLDER,
             playback: Entity::PLACEHOLDER,
             command_feedback: label,
+            command_summary: compact_label,
             fps: Entity::PLACEHOLDER,
             world: Entity::PLACEHOLDER,
             tonemap: Entity::PLACEHOLDER,
@@ -2272,6 +2299,12 @@ mod native_command_feedback_tests {
         assert!(text.contains("status not observed locally"), "{text}");
         assert!(!text.contains(&CommandId::from_client_sequence(0xBE17, 1).to_string()));
 
+        let step_changed = app
+            .world()
+            .entity(label)
+            .get_ref::<Text>()
+            .unwrap()
+            .last_changed();
         let button = app
             .world_mut()
             .spawn((
@@ -2286,6 +2319,42 @@ mod native_command_feedback_tests {
         app.world_mut().entity_mut(button).insert(Interaction::None);
         wait_for_hud_receipt(&mut app, label, 6, 5, "Pause");
         assert_eq!(port.snapshot_hub().latest().world.tick, 5);
+        assert_ne!(
+            app.world()
+                .entity(label)
+                .get_ref::<Text>()
+                .unwrap()
+                .last_changed(),
+            step_changed,
+            "the real HUD consumer must publish a changed command outcome"
+        );
+        assert!(
+            app.world()
+                .get::<Text>(compact_label)
+                .unwrap()
+                .0
+                .starts_with("Pause: Applied")
+        );
+        for entity in [label, compact_label] {
+            let value = app.world().get::<Text>(entity).unwrap().0.clone();
+            let changed = app
+                .world()
+                .entity(entity)
+                .get_ref::<Text>()
+                .unwrap()
+                .last_changed();
+            app.update();
+            assert_eq!(app.world().get::<Text>(entity).unwrap().0, value);
+            assert_eq!(
+                app.world()
+                    .entity(entity)
+                    .get_ref::<Text>()
+                    .unwrap()
+                    .last_changed(),
+                changed,
+                "stationary command feedback must not trigger Text change detection"
+            );
+        }
 
         drop(app);
         drop(port);
@@ -2530,18 +2599,20 @@ fn report_frame_metrics(mut ticker: ResMut<DiagnosticsTicker>, diagnostics: Res<
 }
 
 fn follow_idle_color() -> Color {
-    Color::srgba(0.16, 0.22, 0.33, 0.92)
+    Color::srgba(0.12, 0.20, 0.21, 0.94)
 }
 
 fn follow_hover_color() -> Color {
-    Color::srgba(0.22, 0.30, 0.46, 0.95)
+    Color::srgba(0.18, 0.31, 0.29, 0.97)
 }
 
 fn follow_active_color() -> Color {
-    Color::srgba(0.34, 0.26, 0.64, 0.95)
+    Color::srgba(0.24, 0.48, 0.36, 0.98)
 }
 pub(crate) const TERRAIN_CHUNK_SIZE: u32 = 64;
-pub(crate) const TERRAIN_HEIGHT_SCALE: f32 = 180.0;
+// Vertical display scale for the normalized simulation heightfield. Keep the
+// underlying elevations unchanged while avoiding needle-like terrain relief.
+pub(crate) const TERRAIN_HEIGHT_SCALE: f32 = 60.0;
 // Bevy's 150-unit default ends before even the closest 300-unit camera view.
 // Keep a stable range around the close creature view so shadows do not pop
 // as the camera eases, without spending the shadow map on the entire world.
@@ -2633,7 +2704,7 @@ impl Default for CameraRig {
             framing_offset: Vec2::ZERO,
             free_height_bias: 0.0,
             free_edge_anchor: None,
-            follow_mode: FollowMode::Selected,
+            follow_mode: FollowMode::Off,
             pending_fit: None,
             recenter_now: true,
         }
@@ -2641,6 +2712,13 @@ impl Default for CameraRig {
 }
 
 impl CameraRig {
+    fn startup() -> Self {
+        Self {
+            pending_fit: Some(FitCommand::World),
+            ..default()
+        }
+    }
+
     fn toggle_follow_mode(&mut self, mode: FollowMode) {
         if mode == FollowMode::Off && self.follow_mode == FollowMode::Off {
             return;
@@ -2683,6 +2761,7 @@ struct HudElements {
     camera: Entity,
     playback: Entity,
     command_feedback: Entity,
+    command_summary: Entity,
     fps: Entity,
     world: Entity,
     tonemap: Entity,
@@ -2764,7 +2843,7 @@ fn layout_hud_panels(
         };
     let available_height = (height - top - 12.0).max(1.0);
     let stacked = width < 1000.0;
-    let toggle = keys.is_some_and(|keys| keys.just_pressed(KeyCode::KeyH))
+    let toggle = keys.is_some_and(|keys| keys.just_pressed(KeyCode::KeyV))
         || buttons
             .iter()
             .any(|interaction| *interaction == Interaction::Pressed);
@@ -2854,18 +2933,19 @@ fn scroll_hud_panels(
         if !event.y.is_finite() || window.is_none_or(|(id, _)| event.window != id) {
             continue;
         }
-        let delta = -f64::from(event.y)
-            * if event.unit == MouseScrollUnit::Line {
-                40.0
-            } else {
-                1.0
-            };
         for (computed, transform, visibility, mut scroll) in &mut panels {
             if *visibility == Visibility::Hidden
                 || !cursor.is_some_and(|cursor| computed.contains_point(*transform, cursor))
             {
                 continue;
             }
+            // Winit's pixel deltas are physical; ScrollPosition uses UI units.
+            let delta = -f64::from(event.y)
+                * if event.unit == MouseScrollUnit::Line {
+                    40.0
+                } else {
+                    f64::from(computed.inverse_scale_factor)
+                };
             let max_y = ((f64::from(computed.content_size.y) - f64::from(computed.size.y))
                 .max(0.0)
                 * f64::from(computed.inverse_scale_factor))
@@ -2877,6 +2957,151 @@ fn scroll_hud_panels(
                 }
             }
         }
+    }
+}
+
+/// Keep technical telemetry available without obscuring creature details.
+#[derive(Resource, Default)]
+struct HudDiagnostics(bool);
+
+#[derive(Component)]
+struct HudDiagnostic;
+
+#[derive(Component)]
+struct HudInspectorContent;
+
+#[derive(Component)]
+struct HudDiagnosticsButton;
+
+fn hud_diagnostic_node() -> Node {
+    Node {
+        display: Display::None,
+        ..default()
+    }
+}
+
+fn handle_hud_diagnostics(
+    keys: Option<Res<ButtonInput<KeyCode>>>,
+    mut mode: ResMut<HudDiagnostics>,
+    buttons: Query<&Interaction, (Changed<Interaction>, With<HudDiagnosticsButton>)>,
+    mut sections: Query<(&mut Node, Has<HudDiagnostic>, Has<HudInspectorContent>)>,
+    mut colors: Query<&mut BackgroundColor, With<HudDiagnosticsButton>>,
+) {
+    let presses = buttons
+        .iter()
+        .filter(|interaction| **interaction == Interaction::Pressed)
+        .count()
+        + usize::from(keys.is_some_and(|keys| keys.just_pressed(KeyCode::KeyH)));
+    if presses % 2 == 1 {
+        mode.0 = !mode.0;
+    }
+    if !mode.is_changed() {
+        return;
+    }
+    for (mut node, diagnostic, inspector) in &mut sections {
+        if diagnostic || inspector {
+            node.display = if diagnostic == mode.0 {
+                Display::Flex
+            } else {
+                Display::None
+            };
+        }
+    }
+    for mut color in &mut colors {
+        color.0 = if mode.0 {
+            follow_active_color()
+        } else {
+            follow_idle_color()
+        };
+    }
+}
+
+#[cfg(test)]
+mod hud_diagnostics_tests {
+    use super::*;
+
+    #[test]
+    fn compact_feedback_retains_outcomes_and_unrecognized_identities() {
+        assert_eq!(compact_command_feedback("Commands: no requests"), "");
+        assert_eq!(
+            compact_command_feedback(
+                "Selection [00000000000000010000000000000002]: Rejected • invalid target\nPause: Applied"
+            ),
+            "Selection: Rejected | invalid target"
+        );
+        assert_eq!(
+            compact_command_feedback(
+                "Selection: invalid receipt identity • Application not observed"
+            ),
+            "Selection: invalid receipt identity | Application not observed"
+        );
+        assert_eq!(
+            compact_command_feedback("Selection [not-an-id]: submission unconfirmed"),
+            "Selection [not-an-id]: submission unconfirmed"
+        );
+        assert_eq!(
+            compact_command_feedback("Commands: feedback unavailable"),
+            "Commands: feedback unavailable"
+        );
+    }
+
+    #[test]
+    fn diagnostics_toggle_keeps_creature_details_and_telemetry_separately_accessible() {
+        let mut app = App::new();
+        app.init_resource::<HudDiagnostics>()
+            .init_resource::<ButtonInput<KeyCode>>()
+            .add_systems(Update, handle_hud_diagnostics);
+        let detail = app
+            .world_mut()
+            .spawn((Node::default(), HudInspectorContent))
+            .id();
+        let diagnostic = app
+            .world_mut()
+            .spawn((hud_diagnostic_node(), HudDiagnostic))
+            .id();
+        let button = app
+            .world_mut()
+            .spawn((
+                Interaction::None,
+                BackgroundColor(follow_idle_color()),
+                HudDiagnosticsButton,
+            ))
+            .id();
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(detail).unwrap().display,
+            Display::Flex
+        );
+        assert_eq!(
+            app.world().get::<Node>(diagnostic).unwrap().display,
+            Display::None
+        );
+        *app.world_mut().get_mut::<Interaction>(button).unwrap() = Interaction::Pressed;
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(detail).unwrap().display,
+            Display::None
+        );
+        assert_eq!(
+            app.world().get::<Node>(diagnostic).unwrap().display,
+            Display::Flex
+        );
+        assert_eq!(
+            app.world().get::<BackgroundColor>(button).unwrap().0,
+            follow_active_color()
+        );
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::KeyH);
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(detail).unwrap().display,
+            Display::Flex
+        );
+        assert_eq!(
+            app.world().get::<Node>(diagnostic).unwrap().display,
+            Display::None
+        );
     }
 }
 
@@ -2898,6 +3123,9 @@ struct SoftwareRendererWatermark;
 /// Cycles the render quality tier at runtime.
 #[derive(Component)]
 struct QualityTierButton;
+
+#[derive(Component)]
+struct QualityTierLabel;
 
 #[derive(Component)]
 struct FollowButton {
@@ -4069,7 +4297,7 @@ fn setup_scene(
         height_scale: TERRAIN_HEIGHT_SCALE,
         ..default()
     });
-    commands.insert_resource(CameraRig::default());
+    commands.insert_resource(CameraRig::startup());
 
     commands.insert_resource(ReflectionProbeAssets::fallback(&mut images));
 
@@ -4096,7 +4324,7 @@ fn setup_scene(
     ));
 
     let primary_text_color = Color::WHITE;
-    let secondary_text_color = Color::srgb(0.74, 0.82, 0.94);
+    let secondary_text_color = Color::srgb(0.80, 0.87, 0.84);
     let primary_font = TextFont::from_font_size(16.0);
     let secondary_font = TextFont::from_font_size(14.0);
 
@@ -4116,7 +4344,7 @@ fn setup_scene(
         margin: UiRect::axes(Val::Px(0.0), Val::Px(4.0)),
         ..default()
     };
-    let button_border_color = Color::srgba(0.32, 0.38, 0.58, 1.0);
+    let button_border_color = Color::srgba(0.34, 0.46, 0.40, 1.0);
 
     // Persistent SOFTWARE RENDERER watermark (bd-2z0.14.3.3 item 4).
     //
@@ -4166,7 +4394,8 @@ fn setup_scene(
                 row_gap: Val::Px(4.0),
                 ..default()
             },
-            BackgroundColor(Color::srgba(0.07, 0.11, 0.18, 0.72)),
+            BackgroundColor(Color::srgba(0.05, 0.10, 0.09, 0.88)),
+            BorderRadius::all(Val::Px(10.0)),
             Interaction::default(),
             FocusPolicy::Pass,
             HudScenePanel,
@@ -4181,6 +4410,7 @@ fn setup_scene(
     let mut camera = Entity::PLACEHOLDER;
     let mut playback = Entity::PLACEHOLDER;
     let mut command_feedback = Entity::PLACEHOLDER;
+    let mut command_summary = Entity::PLACEHOLDER;
     let mut fps = Entity::PLACEHOLDER;
     let mut world = Entity::PLACEHOLDER;
     let mut tonemap = Entity::PLACEHOLDER;
@@ -4201,6 +4431,12 @@ fn setup_scene(
     let panel_text_layout = TextLayout::new_with_linebreak(bevy::text::LineBreak::WordOrCharacter);
     commands.entity(hud_root).add_child(hud_content);
     commands.entity(hud_content).with_children(|parent| {
+        parent.spawn((
+            Text::new("SCRIPTBOTS  /  LIVE WORLD"),
+            panel_text_layout,
+            TextFont::from_font_size(13.0),
+            TextColor(Color::srgb(0.62, 0.82, 0.68)),
+        ));
         tick = parent
             .spawn((
                 Text::new("Tick: --"),
@@ -4231,6 +4467,8 @@ fn setup_scene(
                 panel_text_layout,
                 primary_font.clone(),
                 TextColor(primary_text_color),
+                hud_diagnostic_node(),
+                HudDiagnostic,
             ))
             .id();
         camera = parent
@@ -4239,6 +4477,8 @@ fn setup_scene(
                 panel_text_layout,
                 primary_font.clone(),
                 TextColor(primary_text_color),
+                hud_diagnostic_node(),
+                HudDiagnostic,
             ))
             .id();
         playback = parent
@@ -4249,6 +4489,16 @@ fn setup_scene(
                 TextColor(secondary_text_color),
             ))
             .id();
+        command_summary = parent
+            .spawn((
+                Text::default(),
+                panel_text_layout,
+                secondary_font.clone(),
+                TextColor(secondary_text_color),
+                Node::default(),
+                HudInspectorContent,
+            ))
+            .id();
         command_feedback = parent
             .spawn((
                 Text::new("Commands: no requests"),
@@ -4256,9 +4506,11 @@ fn setup_scene(
                 secondary_font.clone(),
                 TextColor(secondary_text_color),
                 Node {
+                    display: Display::None,
                     max_width: Val::Px(760.0),
                     ..default()
                 },
+                HudDiagnostic,
             ))
             .id();
         fps = parent
@@ -4267,6 +4519,8 @@ fn setup_scene(
                 panel_text_layout,
                 secondary_font.clone(),
                 TextColor(secondary_text_color),
+                hud_diagnostic_node(),
+                HudDiagnostic,
             ))
             .id();
         world = parent
@@ -4275,6 +4529,8 @@ fn setup_scene(
                 panel_text_layout,
                 secondary_font.clone(),
                 TextColor(secondary_text_color),
+                hud_diagnostic_node(),
+                HudDiagnostic,
             ))
             .id();
         tonemap = parent
@@ -4283,6 +4539,8 @@ fn setup_scene(
                 panel_text_layout,
                 secondary_font.clone(),
                 TextColor(secondary_text_color),
+                hud_diagnostic_node(),
+                HudDiagnostic,
             ))
             .id();
         palette = parent
@@ -4291,6 +4549,8 @@ fn setup_scene(
                 panel_text_layout,
                 secondary_font.clone(),
                 TextColor(secondary_text_color),
+                hud_diagnostic_node(),
+                HudDiagnostic,
             ))
             .id();
         events = parent
@@ -4299,6 +4559,8 @@ fn setup_scene(
                 panel_text_layout,
                 secondary_font.clone(),
                 TextColor(secondary_text_color),
+                hud_diagnostic_node(),
+                HudDiagnostic,
             ))
             .id();
         inspector = parent
@@ -4307,6 +4569,8 @@ fn setup_scene(
                 panel_text_layout,
                 secondary_font.clone(),
                 TextColor(secondary_text_color),
+                Node::default(),
+                HudInspectorContent,
             ))
             .id();
         history = parent
@@ -4315,6 +4579,8 @@ fn setup_scene(
                 panel_text_layout,
                 secondary_font.clone(),
                 TextColor(secondary_text_color),
+                hud_diagnostic_node(),
+                HudDiagnostic,
             ))
             .id();
         brain = parent
@@ -4323,6 +4589,8 @@ fn setup_scene(
                 panel_text_layout,
                 secondary_font.clone(),
                 TextColor(secondary_text_color),
+                hud_diagnostic_node(),
+                HudDiagnostic,
             ))
             .id();
     });
@@ -4344,7 +4612,8 @@ fn setup_scene(
                 row_gap: Val::Px(4.0),
                 ..default()
             },
-            BackgroundColor(Color::srgba(0.07, 0.11, 0.18, 0.82)),
+            BackgroundColor(Color::srgba(0.05, 0.10, 0.09, 0.90)),
+            BorderRadius::all(Val::Px(10.0)),
             Interaction::default(),
             FocusPolicy::Pass,
             HudControlDock,
@@ -4428,17 +4697,50 @@ fn setup_scene(
                     ));
                 });
 
+                // Keep both directions together if the surrounding row wraps.
+                row.spawn(Node {
+                    flex_direction: FlexDirection::Row,
+                    flex_shrink: 0.0,
+                    column_gap: Val::Px(8.0),
+                    ..default()
+                })
+                .with_children(|group| {
+                    for (direction, label) in [
+                        (InspectorPageButton::Previous, "Page <"),
+                        (InspectorPageButton::Next, "Page >"),
+                    ] {
+                        group
+                            .spawn((
+                                Button,
+                                Node {
+                                    min_width: Val::Px(60.0),
+                                    ..button_node.clone()
+                                },
+                                BackgroundColor(follow_idle_color()),
+                                BorderRadius::all(Val::Px(6.0)),
+                                BorderColor::all(button_border_color),
+                                direction,
+                            ))
+                            .with_children(|btn| {
+                                btn.spawn((
+                                    Text::new(label),
+                                    secondary_font.clone(),
+                                    TextColor(secondary_text_color),
+                                ));
+                            });
+                    }
+                });
                 row.spawn((
                     Button,
                     button_node.clone(),
                     BackgroundColor(follow_idle_color()),
                     BorderRadius::all(Val::Px(6.0)),
                     BorderColor::all(button_border_color),
-                    InspectorPageButton,
+                    HudDiagnosticsButton,
                 ))
                 .with_children(|btn| {
                     btn.spawn((
-                        Text::new("Inspector page (I)"),
+                        Text::new("Diagnostics (H)"),
                         secondary_font.clone(),
                         TextColor(secondary_text_color),
                     ));
@@ -4453,7 +4755,7 @@ fn setup_scene(
                 ))
                 .with_children(|btn| {
                     btn.spawn((
-                        Text::new("Details (H)"),
+                        Text::new("Details (V)"),
                         secondary_font.clone(),
                         TextColor(secondary_text_color),
                     ));
@@ -4517,9 +4819,10 @@ fn setup_scene(
                 ))
                 .with_children(|btn| {
                     btn.spawn((
-                        Text::new("Quality"),
+                        Text::new(quality_tier_label(&effective)),
                         secondary_font.clone(),
                         TextColor(secondary_text_color),
+                        QualityTierLabel,
                     ));
                 });
 
@@ -4565,6 +4868,7 @@ fn setup_scene(
         camera,
         playback,
         command_feedback,
+        command_summary,
         fps,
         world,
         tonemap,
@@ -4868,13 +5172,16 @@ fn update_hud(
             }
             set_hud_text_if_changed(&mut text, message);
         }
-        if let Ok(mut text) = texts.get_mut(hud_elements.command_feedback) {
-            if let Some(feedback) = &command_feedback {
-                if let Some(message) = feedback.text() {
-                    **text = message;
-                }
-            } else {
-                **text = "Commands: feedback unavailable".to_owned();
+        let feedback_message = command_feedback.as_ref().map_or_else(
+            || Some("Commands: feedback unavailable".to_owned()),
+            |feedback| feedback.text(),
+        );
+        if let Some(message) = feedback_message {
+            if let Ok(mut text) = texts.get_mut(hud_elements.command_feedback) {
+                set_hud_text_if_changed(&mut text, message.clone());
+            }
+            if let Ok(mut text) = texts.get_mut(hud_elements.command_summary) {
+                set_hud_text_if_changed(&mut text, compact_command_feedback(&message));
             }
         }
         if let Ok(mut text) = texts.get_mut(hud_elements.fps) {
@@ -6023,6 +6330,7 @@ mod adaptive_governor_tests {
         let images = app.world().resource::<Assets<Image>>();
         let mut per_kind = HashMap::new();
         let mut patterns = HashSet::new();
+        let mut albedo_by_group = HashMap::new();
         for chunk in registry.chunks.values() {
             let kind = snapshot
                 .terrain_height
@@ -6051,7 +6359,26 @@ mod adaptive_governor_tests {
                 Color::WHITE,
                 "do not double-tint vertex albedo"
             );
-            assert!(material.base_color_texture.is_none());
+            let albedo = material
+                .base_color_texture
+                .as_ref()
+                .expect("photo albedo bound");
+            let group = terrain_albedo_layer(visual::terrain_kind_index(kind));
+            if let Some(previous) = albedo_by_group.insert(group, albedo.id()) {
+                assert_eq!(previous, albedo.id(), "similar biomes share one image");
+            }
+            let image = images.get(albedo).expect("bound albedo exists");
+            assert!(
+                image
+                    .data
+                    .as_ref()
+                    .unwrap()
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .any(|pixel| pixel[0] != pixel[1] || pixel[1] != pixel[2]),
+                "photo detail must retain color"
+            );
         }
         assert_eq!(
             per_kind.len(),
@@ -6068,6 +6395,146 @@ mod adaptive_governor_tests {
             per_kind.len(),
             "bindings must contain distinct pixel patterns"
         );
+        assert_eq!(albedo_by_group.len(), TERRAIN_ALBEDO_LAYERS);
+        assert_eq!(
+            albedo_by_group.values().collect::<HashSet<_>>().len(),
+            TERRAIN_ALBEDO_LAYERS
+        );
+    }
+
+    #[test]
+    fn terrain_albedo_is_mipmapped_opaque_and_mirrored() {
+        use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler};
+        use bevy::render::render_resource::TextureFormat;
+        for layer in 0..TERRAIN_ALBEDO_LAYERS {
+            let image = terrain_albedo_image(layer);
+            let side = image.texture_descriptor.size.width;
+            assert_eq!(
+                image.texture_descriptor.format,
+                TextureFormat::Rgba8UnormSrgb
+            );
+            assert_eq!(image.texture_descriptor.mip_level_count, side.ilog2() + 1);
+            let ImageSampler::Descriptor(sampler) = &image.sampler else {
+                panic!("explicit sampler required");
+            };
+            assert_eq!(sampler.address_mode_u, ImageAddressMode::MirrorRepeat);
+            assert_eq!(sampler.address_mode_v, ImageAddressMode::MirrorRepeat);
+            assert_eq!(sampler.mipmap_filter, ImageFilterMode::Linear);
+            assert!(
+                image
+                    .data
+                    .as_ref()
+                    .unwrap()
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .all(|p| p[3] == 255)
+            );
+        }
+        let mut pixels = [0, 0, 0, 255].repeat(9);
+        pixels[8 * 4] = 255;
+        assert_eq!(append_terrain_albedo_mips(&mut pixels, 3), 2);
+        assert_eq!(&pixels[36..40], &[28, 0, 0, 255]);
+    }
+
+    #[test]
+    fn terrain_albedo_uvs_join_across_chunk_boundaries() {
+        use bevy_mesh::VertexAttributeValues;
+        let mut app = terrain_detail_app();
+        app.update();
+        let registry = app.world().resource::<TerrainChunkRegistry>();
+        let meshes = app.world().resource::<Assets<Mesh>>();
+        let left = meshes
+            .get(&registry.chunks[&TerrainChunkKey { x: 0, y: 0 }].mesh)
+            .unwrap();
+        let right = meshes
+            .get(&registry.chunks[&TerrainChunkKey { x: 1, y: 0 }].mesh)
+            .unwrap();
+        let Some(VertexAttributeValues::Float32x2(left)) = left.attribute(Mesh::ATTRIBUTE_UV_0)
+        else {
+            panic!("left chunk must have UVs");
+        };
+        let Some(VertexAttributeValues::Float32x2(right)) = right.attribute(Mesh::ATTRIBUTE_UV_0)
+        else {
+            panic!("right chunk must have UVs");
+        };
+        assert_eq!(left[1], right[0]);
+        assert_eq!(left[3], right[2]);
+        assert!(left[1][0] > 0.0);
+        for width in [1, 3, 12, 97, 120] {
+            let start = terrain_detail_uv(0, width);
+            let end = terrain_detail_uv(width, width);
+            assert_eq!(start, 0.0);
+            assert_eq!(end % 2.0, 0.0, "mirrored texture phase must wrap");
+        }
+    }
+
+    #[test]
+    fn terrain_albedo_preserves_accessibility_palette_hues() {
+        let mut app = terrain_detail_app();
+        app.update();
+        let key = TerrainChunkKey { x: 0, y: 0 };
+        let material = app.world().resource::<TerrainChunkRegistry>().chunks[&key]
+            .material
+            .clone();
+        let natural = app
+            .world()
+            .resource::<Assets<StandardMaterial>>()
+            .get(&material)
+            .unwrap()
+            .base_color_texture
+            .clone()
+            .unwrap();
+        let image_count = app.world().resource::<Assets<Image>>().len();
+        for palette in [
+            ColorPaletteMode::Deuteranopia,
+            ColorPaletteMode::Protanopia,
+            ColorPaletteMode::Tritanopia,
+            ColorPaletteMode::HighContrast,
+        ] {
+            app.world_mut().resource_mut::<AccessibilityState>().palette = palette;
+            app.update();
+            let materials = app.world().resource::<Assets<StandardMaterial>>();
+            let neutral = materials
+                .get(&material)
+                .unwrap()
+                .base_color_texture
+                .as_ref()
+                .unwrap();
+            assert_ne!(neutral, &natural);
+            let images = app.world().resource::<Assets<Image>>();
+            assert_eq!(images.len(), image_count);
+            assert!(
+                images
+                    .get(neutral)
+                    .unwrap()
+                    .data
+                    .as_ref()
+                    .unwrap()
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .all(|pixel| pixel[0] == pixel[1] && pixel[1] == pixel[2])
+            );
+            if palette == ColorPaletteMode::HighContrast {
+                assert_eq!(
+                    images.get(neutral).unwrap().data.as_deref(),
+                    Some(&[255; 4][..])
+                );
+            }
+        }
+        app.world_mut().resource_mut::<AccessibilityState>().palette = ColorPaletteMode::Natural;
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<Assets<StandardMaterial>>()
+                .get(&material)
+                .unwrap()
+                .base_color_texture
+                .as_ref(),
+            Some(&natural)
+        );
+        assert_eq!(app.world().resource::<Assets<Image>>().len(), image_count);
     }
 
     #[test]
@@ -6192,6 +6659,51 @@ mod adaptive_governor_tests {
             Some(&other_image),
             "repair must retain unrelated biome handles"
         );
+        let albedo = app
+            .world()
+            .resource::<Assets<StandardMaterial>>()
+            .get(&material)
+            .unwrap()
+            .base_color_texture
+            .clone()
+            .unwrap();
+        let other_albedo = app
+            .world()
+            .resource::<Assets<StandardMaterial>>()
+            .get(&other_material)
+            .unwrap()
+            .base_color_texture
+            .clone()
+            .unwrap();
+        assert_ne!(albedo, other_albedo);
+        app.world_mut()
+            .resource_mut::<Assets<Image>>()
+            .remove(&albedo)
+            .unwrap();
+        app.update();
+        let materials = app.world().resource::<Assets<StandardMaterial>>();
+        let repaired = materials
+            .get(&material)
+            .unwrap()
+            .base_color_texture
+            .as_ref()
+            .unwrap();
+        assert_ne!(repaired, &albedo);
+        assert!(
+            app.world()
+                .resource::<Assets<Image>>()
+                .get(repaired)
+                .is_some()
+        );
+        assert_eq!(
+            materials
+                .get(&other_material)
+                .unwrap()
+                .base_color_texture
+                .as_ref(),
+            Some(&other_albedo)
+        );
+        assert_eq!(app.world().resource::<Assets<Image>>().len(), image_count);
     }
 
     #[test]
@@ -6215,6 +6727,19 @@ mod adaptive_governor_tests {
             .metallic_roughness_texture
             .clone()
             .expect("production material must bind texture");
+        let albedo = material
+            .base_color_texture
+            .clone()
+            .expect("photo albedo bound");
+        let albedo_pixels = app
+            .world()
+            .resource::<Assets<Image>>()
+            .get(&albedo)
+            .unwrap()
+            .data
+            .as_ref()
+            .unwrap()
+            .as_ptr();
         let image_count = app.world().resource::<Assets<Image>>().len();
         for tier in [
             RenderQuality::Potato,
@@ -6230,12 +6755,23 @@ mod adaptive_governor_tests {
                 image.texture_descriptor.size.width,
                 TERRAIN_DETAIL_RESOLUTION / u32::from(tier_features(tier).terrain_detail_divisor)
             );
+            let photo = images.get(&albedo).unwrap();
+            assert_eq!(
+                photo.texture_descriptor.size.width,
+                TERRAIN_ALBEDO_RESOLUTION
+            );
+            assert_eq!(
+                photo.data.as_ref().unwrap().as_ptr(),
+                albedo_pixels,
+                "tier changes must not rebuild shared albedo images"
+            );
             let material = app
                 .world()
                 .resource::<Assets<StandardMaterial>>()
                 .get(&material_handle)
                 .unwrap();
             assert_eq!(material.metallic_roughness_texture.as_ref(), Some(&texture));
+            assert_eq!(material.base_color_texture.as_ref(), Some(&albedo));
             assert_eq!(
                 (
                     material.base_color,
@@ -6446,8 +6982,9 @@ mod adaptive_governor_tests {
                 .insert_resource(auto_launch(RenderQuality::High))
                 .insert_resource(UiScale(ui_scale))
                 .insert_resource(ButtonInput::<KeyCode>::default())
+                .init_resource::<HudDiagnostics>()
                 .add_systems(Startup, setup_scene)
-                .add_systems(Update, layout_hud_panels);
+                .add_systems(Update, (handle_hud_diagnostics, layout_hud_panels).chain());
             let window = app
                 .world_mut()
                 .spawn((
@@ -6527,6 +7064,19 @@ mod adaptive_governor_tests {
             app.world_mut()
                 .resource_mut::<ButtonInput<KeyCode>>()
                 .press(KeyCode::KeyH);
+            app.update();
+            assert!(app.world().resource::<HudDiagnostics>().0);
+            assert_ne!(
+                *app.world().get::<Visibility>(root).unwrap(),
+                Visibility::Hidden,
+                "diagnostics must not also hide the whole panel"
+            );
+            app.world_mut()
+                .resource_mut::<ButtonInput<KeyCode>>()
+                .clear();
+            app.world_mut()
+                .resource_mut::<ButtonInput<KeyCode>>()
+                .press(KeyCode::KeyV);
             app.update();
             assert_eq!(
                 *app.world().get::<Visibility>(root).unwrap(),
@@ -6619,7 +7169,11 @@ mod adaptive_governor_tests {
             assert_eq!(app.world().resource::<CameraRig>().distance, 2200.0);
             send(&mut app, MouseScrollUnit::Pixel, -20.0, window);
             app.update();
-            assert_eq!(app.world().get::<ScrollPosition>(panel).unwrap().0.y, 60.0);
+            let scaled_position = 40.0 + 20.0 / factor;
+            assert_eq!(
+                app.world().get::<ScrollPosition>(panel).unwrap().0.y,
+                scaled_position
+            );
             for (target, y) in [
                 (Entity::PLACEHOLDER, -40.0),
                 (window, f32::NAN),
@@ -6628,7 +7182,10 @@ mod adaptive_governor_tests {
                 send(&mut app, MouseScrollUnit::Line, y, target);
             }
             app.update();
-            assert_eq!(app.world().get::<ScrollPosition>(panel).unwrap().0.y, 60.0);
+            assert_eq!(
+                app.world().get::<ScrollPosition>(panel).unwrap().0.y,
+                scaled_position
+            );
             send(&mut app, MouseScrollUnit::Line, -f32::MAX, window);
             app.update();
             assert_eq!(app.world().get::<ScrollPosition>(panel).unwrap().0.y, 400.0);
@@ -6653,6 +7210,13 @@ mod adaptive_governor_tests {
                 app.world().resource::<CameraRig>().distance,
                 2200.0,
                 "consumed UI wheel cannot replay"
+            );
+            send(&mut app, MouseScrollUnit::Line, 1.0, Entity::PLACEHOLDER);
+            app.update();
+            assert_eq!(
+                app.world().resource::<CameraRig>().distance,
+                2200.0,
+                "another window's wheel cannot zoom the world"
             );
             send(&mut app, MouseScrollUnit::Line, 1.0, window);
             app.update();
@@ -6819,6 +7383,118 @@ mod adaptive_governor_tests {
 #[cfg(test)]
 mod quality_tier_consumer_tests {
     use super::*;
+
+    #[test]
+    fn adaptive_quality_updates_the_visible_label_and_preserves_software_ceiling() {
+        for (class, requested, initial) in [
+            (GpuClass::Discrete, RenderQuality::Auto, RenderQuality::High),
+            (
+                GpuClass::Software,
+                RenderQuality::Auto,
+                RenderQuality::Potato,
+            ),
+        ] {
+            let mut effective = resolve_effective_render_settings_for_gpu(
+                &RenderSettings {
+                    quality: Some(requested),
+                    ..default()
+                },
+                Some(gpu_info("test adapter", class)),
+            );
+            // Give the discrete test a known starting ceiling independent of
+            // the synthetic adapter's memory or capability defaults.
+            effective.tier = initial;
+            effective.features = tier_features(initial);
+            let mut app = App::new();
+            app.insert_resource(Time::<()>::default())
+                .insert_resource(AdaptiveQualityGovernor::for_launch(&effective))
+                .insert_resource(effective)
+                .add_systems(
+                    Update,
+                    (drive_adaptive_quality, update_quality_tier_label).chain(),
+                );
+            let text = app
+                .world_mut()
+                .spawn((QualityTierLabel, Text::default()))
+                .id();
+            for _ in 0..(120 * (RenderGovernor::BLOWOUT_WINDOWS_REQUIRED as usize + 1)) {
+                app.world_mut()
+                    .resource_mut::<Time>()
+                    .advance_by(std::time::Duration::from_millis(40));
+                app.update();
+            }
+            let settings = app.world().resource::<EffectiveRenderSettings>();
+            if class == GpuClass::Software {
+                assert_eq!(settings.tier, RenderQuality::Potato);
+                assert_eq!(
+                    app.world().get::<Text>(text).unwrap().0,
+                    "Quality: Potato CPU"
+                );
+                for _ in 0..(120 * (RenderGovernor::HEADROOM_WINDOWS_REQUIRED as usize + 2)) {
+                    app.world_mut()
+                        .resource_mut::<Time>()
+                        .advance_by(std::time::Duration::from_millis(1));
+                    app.update();
+                }
+                assert_eq!(
+                    app.world().resource::<EffectiveRenderSettings>().tier,
+                    RenderQuality::Potato
+                );
+                assert_eq!(
+                    app.world().get::<Text>(text).unwrap().0,
+                    "Quality: Potato CPU"
+                );
+            } else {
+                assert_ne!(settings.tier, RenderQuality::High);
+                assert_eq!(
+                    app.world().get::<Text>(text).unwrap().0,
+                    quality_tier_label(settings)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn manual_quality_control_reports_the_tier_and_respects_software_limit() {
+        for (class, expected, label) in [
+            (GpuClass::Discrete, RenderQuality::Low, "Quality: Low"),
+            (
+                GpuClass::Software,
+                RenderQuality::Potato,
+                "Quality: Potato CPU",
+            ),
+        ] {
+            let effective = resolve_effective_render_settings_for_gpu(
+                &RenderSettings {
+                    quality: Some(RenderQuality::Potato),
+                    ..default()
+                },
+                Some(gpu_info("test adapter", class)),
+            );
+            let mut app = App::new();
+            app.insert_resource(AdaptiveQualityGovernor::for_launch(&effective))
+                .insert_resource(effective)
+                .add_systems(
+                    Update,
+                    (handle_quality_tier_button, update_quality_tier_label).chain(),
+                );
+            let button = app
+                .world_mut()
+                .spawn((QualityTierButton, Interaction::None))
+                .id();
+            let text = app
+                .world_mut()
+                .spawn((QualityTierLabel, Text::default()))
+                .id();
+            app.update();
+            *app.world_mut().get_mut::<Interaction>(button).unwrap() = Interaction::Pressed;
+            app.update();
+            let settings = app.world().resource::<EffectiveRenderSettings>();
+            assert_eq!(settings.tier, expected);
+            assert_eq!(settings.features.shadows, tier_features(expected).shadows);
+            assert_eq!(app.world().get::<Text>(text).unwrap().0, label);
+        }
+    }
 
     #[test]
     fn ssao_rejects_each_missing_device_requirement() {
@@ -7689,6 +8365,20 @@ mod quality_tier_consumer_tests {
     }
 
     #[test]
+    fn default_fog_keeps_the_overview_readable() {
+        let fog = tier_distance_fog(true, None).expect("default atmosphere");
+        let FogFalloff::Exponential { density } = fog.falloff else {
+            panic!("expected exponential distance falloff");
+        };
+        let visibility = (-density * 2_000.0).exp();
+        assert!(
+            (0.90..=0.95).contains(&visibility),
+            "default fog should retain most terrain contrast at overview distance: {visibility}"
+        );
+        assert!(tier_distance_fog(false, None).is_none());
+    }
+
+    #[test]
     fn fog_overrides_reach_the_camera_and_preserve_the_software_tier_clamp() {
         use scriptbots_core::{RenderFogMode, RenderFogSettings};
         let mut app = App::new();
@@ -8180,8 +8870,11 @@ const INSPECTOR_ROWS_PER_PAGE: usize = 8;
 #[derive(Resource, Default)]
 struct InspectorPage(usize);
 
-#[derive(Component)]
-struct InspectorPageButton;
+#[derive(Component, Clone, Copy)]
+enum InspectorPageButton {
+    Previous,
+    Next,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct InspectorTarget {
@@ -8240,6 +8933,7 @@ struct OwnerInspector {
     last_request: Option<Instant>,
     last_attempt: Option<InspectorTarget>,
     status: String,
+    last_failure: Option<String>,
 }
 
 impl OwnerInspector {
@@ -8251,6 +8945,7 @@ impl OwnerInspector {
             last_request: None,
             last_attempt: None,
             status: "select a living agent".into(),
+            last_failure: None,
         }
     }
 
@@ -8261,6 +8956,7 @@ impl OwnerInspector {
             .is_some_and(|sample| target.is_none_or(|target| !sample.target.same_subject(target)))
         {
             self.sample = None;
+            self.last_failure = None;
         }
         // Never join a running worker from an Update system. A completed thread
         // can be reaped without waiting for owner work or channel admission.
@@ -8277,24 +8973,25 @@ impl OwnerInspector {
                         if target.is_some_and(|target| sample.target.same_subject(target)) =>
                     {
                         self.sample = Some(sample);
+                        self.last_failure = None;
                         self.status = "waiting for detail matching this frame".into();
                     }
                     (Ok(()), Ok(Ok(_))) => {
                         self.sample = None;
-                        self.status =
-                            "unavailable: subject died or source changed (I to retry)".into();
+                        self.last_failure = None;
+                        self.status = "unavailable: subject no longer exists (I to retry)".into();
                     }
                     (Ok(()), Ok(Err(error))) => {
-                        self.sample = None;
                         self.status = format!(
                             "unavailable: {} (I to retry)",
                             bounded_inspector_text(&error)
                         );
+                        self.last_failure = Some(bounded_inspector_text(&error));
                     }
                     _ => {
-                        self.sample = None;
                         self.status =
                             "unavailable: inspection worker disconnected (I to retry)".into();
+                        self.last_failure = Some("inspection worker disconnected".into());
                     }
                 }
             }
@@ -8341,6 +9038,9 @@ impl OwnerInspector {
                 self.last_request = Some(now);
                 self.status =
                     format!("unavailable: could not start inspection: {error} (I to retry)");
+                self.last_failure = Some(bounded_inspector_text(&format!(
+                    "could not start inspection: {error}"
+                )));
             }
         }
     }
@@ -8358,18 +9058,27 @@ impl OwnerInspector {
         };
         let source = sample.target.source;
         let index = page % sample.pages.len();
+        let provenance = self.last_failure.as_ref().map_or_else(
+            || {
+                format!(
+                    "Session {:x} | publication {} | config {} | control {}",
+                    source.session_id.get(),
+                    source.published_snapshot.get(),
+                    source.inspected_host.config.get(),
+                    source.inspected_host.control.get(),
+                )
+            },
+            |error| format!("Refresh failed: {error} (I to retry)"),
+        );
         format!(
-            "Owner UID {} | tick {} | age {} ticks | page {}/{} (I)\n\
-             Session {:x} | publication {} | config {} | control {}\n{}",
+            "Owner UID {} | tick {} | age {} ticks | page {}/{} (I / Shift+I)\n\
+             {}\n{}",
             sample.target.uid.0,
             source.inspected_tick.0,
             current.source.inspected_tick.0 - source.inspected_tick.0,
             index + 1,
             sample.pages.len(),
-            source.session_id.get(),
-            source.published_snapshot.get(),
-            source.inspected_host.config.get(),
-            source.inspected_host.control.get(),
+            provenance,
             sample.pages[index],
         )
     }
@@ -8390,21 +9099,33 @@ fn capture_owner_inspector(
     target: InspectorTarget,
 ) -> std::result::Result<Option<OwnerInspectorSample>, String> {
     let Some(detail) = host
-        .inspect_agent_before(target.uid, 0, Instant::now() + OWNER_INSPECTOR_DEADLINE)
+        .inspect_agent_for_hud_before(target.uid, Instant::now() + OWNER_INSPECTOR_DEADLINE)
         .map_err(|error| error.to_string())?
     else {
         return Ok(None);
     };
     let latest = host.snapshot_hub().latest();
+    let captured = inspector_target_for_detail(&detail, target, &latest)?;
+    Ok(Some(OwnerInspectorSample {
+        target: captured,
+        pages: owner_inspector_pages(&detail),
+    }))
+}
+
+fn inspector_target_for_detail(
+    detail: &scriptbots_runtime::channel::AgentInspectorData,
+    target: InspectorTarget,
+    latest: &RenderSnapshot,
+) -> std::result::Result<InspectorTarget, String> {
     // A response must correspond to an actual immutable owner publication.
     // The owner may advance between submission and completion, so also accept
     // its independently read latest publication, never a fabricated revision.
     let epoch = if detail.source == target.source {
         target.epoch
-    } else if detail.source.matches_snapshot(&latest) {
+    } else if detail.source.matches_snapshot(latest) {
         latest.world.epoch
     } else {
-        return Ok(None);
+        return Err("owner detail did not match a published frame".into());
     };
     let captured = InspectorTarget {
         source: detail.source,
@@ -8412,12 +9133,9 @@ fn capture_owner_inspector(
         uid: detail.uid,
     };
     if !captured.same_subject(target) {
-        return Ok(None);
+        return Err("owner detail subject or source changed".into());
     }
-    Ok(Some(OwnerInspectorSample {
-        target: captured,
-        pages: owner_inspector_pages(&detail),
-    }))
+    Ok(captured)
 }
 
 fn owner_inspector_pages(detail: &scriptbots_runtime::channel::AgentInspectorData) -> Vec<String> {
@@ -8492,6 +9210,40 @@ fn owner_inspector_pages(detail: &scriptbots_runtime::channel::AgentInspectorDat
         })
         .collect::<Vec<_>>();
     pages.push(format!("Eyes (radians)\n{}", eyes.join("\n")));
+    let physiology = &detail.physiology;
+    pages.push(format!(
+        "Physiology\nEnergy {:.3} | food change {:+.3}\n\
+         Diet tendency {:.3} | temperature preference {:.3}\n\
+         Sound {:.3} | sound scale {:.3}\n\
+         Food sharing intent {:.3}\n\
+         Selection {:?} | indicator {:.3}\n\
+         Indicator RGB {:.3}, {:.3}, {:.3}",
+        physiology.energy,
+        physiology.food_delta,
+        physiology.herbivore_tendency,
+        physiology.temperature_preference,
+        physiology.sound_output,
+        physiology.sound_multiplier,
+        physiology.give_intent,
+        physiology.selection,
+        physiology.indicator.intensity,
+        physiology.indicator.color[0],
+        physiology.indicator.color[1],
+        physiology.indicator.color[2],
+    ));
+    let combat = physiology.combat;
+    pages.push(format!(
+        "Combat this tick\nSpike damage received {}\nSpike attacker {} | victim {}\n\
+         Hit carnivore {} | herbivore {}\n\
+         Spiked by carnivore {} | herbivore {}",
+        physiology.spiked,
+        combat.spike_attacker,
+        combat.spike_victim,
+        combat.hit_carnivore,
+        combat.hit_herbivore,
+        combat.was_spiked_by_carnivore,
+        combat.was_spiked_by_herbivore,
+    ));
     pages.push(detail.genome_browser.as_ref().map_or_else(
         || "Genome summary: unavailable for this family".into(),
         |genome| {
@@ -8557,19 +9309,39 @@ fn handle_inspector_page(
     page: Option<ResMut<InspectorPage>>,
     inspector: Option<NonSendMut<OwnerInspector>>,
     keys: Option<Res<ButtonInput<KeyCode>>>,
-    buttons: Query<&Interaction, (Changed<Interaction>, With<InspectorPageButton>)>,
+    buttons: Query<(&InspectorPageButton, &Interaction), Changed<Interaction>>,
 ) {
-    if (keys.is_some_and(|keys| keys.just_pressed(KeyCode::KeyI))
-        || buttons
-            .iter()
-            .any(|interaction| *interaction == Interaction::Pressed))
+    let button = buttons.iter().find_map(|(direction, interaction)| {
+        (*interaction == Interaction::Pressed).then_some(*direction)
+    });
+    let keyboard = keys.as_ref().and_then(|keys| {
+        keys.just_pressed(KeyCode::KeyI).then_some(
+            if keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight) {
+                InspectorPageButton::Previous
+            } else {
+                InspectorPageButton::Next
+            },
+        )
+    });
+    if let Some(direction) = button.or(keyboard)
         && let Some(mut page) = page
     {
         let count = inspector
             .as_ref()
             .and_then(|inspector| inspector.sample.as_ref().map(|sample| sample.pages.len()))
-            .unwrap_or(1);
-        page.0 = (page.0 + 1) % count;
+            .unwrap_or(1)
+            .max(1);
+        page.0 %= count;
+        page.0 = match direction {
+            InspectorPageButton::Previous => {
+                if page.0 == 0 {
+                    count - 1
+                } else {
+                    page.0 - 1
+                }
+            }
+            InspectorPageButton::Next => (page.0 + 1) % count,
+        };
         if let Some(mut inspector) = inspector
             && inspector.sample.is_none()
         {
@@ -8616,6 +9388,18 @@ mod owner_inspector_tests {
                         runtime.reproduction_counter = 0.375;
                         runtime.clocks = [1.25, 2.5];
                         runtime.food_balance_total = 6.25;
+                        runtime.energy = 0.73;
+                        runtime.food_delta = -0.12;
+                        runtime.herbivore_tendency = 0.83;
+                        runtime.temperature_preference = 0.61;
+                        runtime.sound_output = 0.37;
+                        runtime.sound_multiplier = 1.42;
+                        runtime.give_intent = 0.27;
+                        runtime.spiked = true;
+                        runtime.combat.spike_attacker = true;
+                        runtime.combat.was_spiked_by_herbivore = true;
+                        runtime.indicator.intensity = 0.64;
+                        runtime.indicator.color = [0.2, 0.4, 0.6];
                         runtime.mutation_log.push("owner mutation sample".into());
                         for (index, sensor) in runtime.sensors.iter_mut().enumerate() {
                             *sensor = (index + 1) as f32 / 100.0;
@@ -8722,6 +9506,7 @@ mod owner_inspector_tests {
             camera: Entity::PLACEHOLDER,
             playback: Entity::PLACEHOLDER,
             command_feedback: Entity::PLACEHOLDER,
+            command_summary: Entity::PLACEHOLDER,
             fps: Entity::PLACEHOLDER,
             world: Entity::PLACEHOLDER,
             tonemap: Entity::PLACEHOLDER,
@@ -8817,6 +9602,20 @@ mod owner_inspector_tests {
         assert!(joined.contains("owner mutation sample"));
         assert!(joined.contains("Genome summary: unavailable"));
         assert!(joined.contains("Eyes (radians)"));
+        for expected in [
+            "Energy 0.730 | food change -0.120",
+            "Diet tendency 0.830 | temperature preference 0.610",
+            "Sound 0.370 | sound scale 1.420",
+            "Food sharing intent 0.270",
+            "Selection Selected | indicator 0.640",
+            "Indicator RGB 0.200, 0.400, 0.600",
+            "Spike damage received true",
+            "Spike attacker true | victim false",
+            "Hit carnivore false | herbivore false",
+            "Spiked by carnivore false | herbivore true",
+        ] {
+            assert!(joined.contains(expected), "missing {expected}: {joined}");
+        }
         assert!(
             pages
                 .iter()
@@ -8825,7 +9624,7 @@ mod owner_inspector_tests {
         // Actual button and keyboard consumers reach different owner-data pages.
         let button = app
             .world_mut()
-            .spawn((InspectorPageButton, Interaction::Pressed))
+            .spawn((InspectorPageButton::Next, Interaction::Pressed))
             .id();
         app.update();
         assert!(
@@ -8846,6 +9645,57 @@ mod owner_inspector_tests {
                 .unwrap()
                 .0
                 .contains("Sensors 9-16/")
+        );
+        {
+            let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+            keys.clear();
+            keys.release(KeyCode::KeyI);
+            keys.press(KeyCode::ShiftRight);
+            keys.press(KeyCode::KeyI);
+        }
+        app.update();
+        assert!(
+            app.world()
+                .get::<Text>(text)
+                .unwrap()
+                .0
+                .contains("Sensors 1-8/")
+        );
+
+        // The previous button wraps from the first page to the final page;
+        // the next button takes the user back to the first page.
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .clear();
+        app.world_mut().resource_mut::<InspectorPage>().0 = 0;
+        let count = app
+            .world()
+            .non_send_resource::<OwnerInspector>()
+            .sample
+            .as_ref()
+            .unwrap()
+            .pages
+            .len();
+        let previous = app
+            .world_mut()
+            .spawn((InspectorPageButton::Previous, Interaction::Pressed))
+            .id();
+        app.update();
+        assert_eq!(app.world().resource::<InspectorPage>().0, count - 1);
+        app.world_mut()
+            .entity_mut(previous)
+            .insert(Interaction::None);
+        app.world_mut()
+            .entity_mut(button)
+            .insert(Interaction::Pressed);
+        app.update();
+        assert_eq!(app.world().resource::<InspectorPage>().0, 0);
+        assert!(
+            app.world()
+                .get::<Text>(text)
+                .unwrap()
+                .0
+                .contains("Life and lineage")
         );
     }
 
@@ -8939,6 +9789,131 @@ mod owner_inspector_tests {
         assert!(!inspector.panel(&frame, 0).contains("Reproduction counter"));
         frame.agents.clear();
         assert!(inspector.panel(&frame, 0).contains("select a living agent"));
+    }
+
+    #[test]
+    fn failed_refresh_keeps_labeled_detail_only_for_the_same_subject() {
+        let mut owner = TestOwner::new();
+        owner.serve();
+        let mut frame = owner.frame();
+        let target = InspectorTarget::from_frame(&frame).unwrap();
+        let mut inspector = OwnerInspector::new(owner.port.clone());
+        inspector.sample = capture_owner_inspector(&owner.port, target).unwrap();
+        drop(owner);
+
+        let mut later = target;
+        later.source.inspected_tick = scriptbots_core::Tick(3);
+        later.source.inspected_host.scientific = scriptbots_runtime::ScientificRevision::new(3);
+        later.source.published_host = later.source.inspected_host;
+        frame.owner_source = Some((later.source, later.epoch));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            inspector.poll(Some(later), Instant::now());
+            if inspector.last_failure.is_some() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "inspection failure did not arrive"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        let shown = inspector.panel(&frame, 0);
+        assert!(shown.contains("Reproduction counter 0.375"), "{shown}");
+        assert!(shown.contains("age 3 ticks"), "{shown}");
+        assert!(shown.contains("Refresh failed:"), "{shown}");
+
+        frame.agents[0].uid = AgentUid(target.uid.0 + 1);
+        inspector.poll(InspectorTarget::from_frame(&frame), Instant::now());
+        assert!(!inspector.panel(&frame, 0).contains("Reproduction counter"));
+        assert!(inspector.sample.is_none());
+    }
+
+    #[test]
+    fn successful_owner_refresh_clears_the_previous_failure() {
+        let mut owner = TestOwner::new();
+        owner.serve();
+        let mut frame = owner.frame();
+        let target = InspectorTarget::from_frame(&frame).unwrap();
+        let mut inspector = OwnerInspector::new(owner.port.clone());
+        inspector.sample = capture_owner_inspector(&owner.port, target).unwrap();
+        let mut later = target;
+        later.source.inspected_tick = scriptbots_core::Tick(3);
+        later.source.inspected_host.scientific = scriptbots_runtime::ScientificRevision::new(3);
+        later.source.published_host = later.source.inspected_host;
+        frame.owner_source = Some((later.source, later.epoch));
+
+        let (send, result) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || send.send(Err("simulated timeout".into())).unwrap());
+        inspector.job = Some(OwnerInspectorJob {
+            target: later,
+            result,
+            worker,
+        });
+        inspector.last_attempt = Some(later);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while inspector.last_failure.is_none() {
+            inspector.poll(Some(later), Instant::now());
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(inspector.panel(&frame, 0).contains("simulated timeout"));
+
+        inspector.last_attempt = None;
+        inspector.last_request = None;
+        while inspector.last_failure.is_some() {
+            inspector.poll(Some(later), Instant::now());
+            assert!(Instant::now() < deadline, "real owner did not recover");
+            thread::sleep(Duration::from_millis(1));
+        }
+        let shown = inspector.panel(&frame, 0);
+        assert!(shown.contains("Reproduction counter 0.375"), "{shown}");
+        assert!(shown.contains("Session 2cd"), "{shown}");
+        assert!(!shown.contains("Refresh failed:"), "{shown}");
+    }
+
+    #[test]
+    fn unmatched_owner_detail_is_a_retryable_failure_not_a_death() {
+        let mut owner = TestOwner::new();
+        owner.serve();
+        let frame = owner.frame();
+        let target = InspectorTarget::from_frame(&frame).unwrap();
+        let latest = owner.port.snapshot_hub().latest();
+        let mut detail = owner
+            .port
+            .inspect_agent_for_hud_before(target.uid, Instant::now() + Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            inspector_target_for_detail(&detail, target, &latest).unwrap(),
+            target
+        );
+
+        let original = detail.source;
+        detail.source.published_snapshot =
+            scriptbots_runtime::SnapshotRevision::new(original.published_snapshot.get() + 1);
+        assert!(
+            inspector_target_for_detail(&detail, target, &latest)
+                .unwrap_err()
+                .contains("did not match a published frame")
+        );
+        detail.source = original;
+        detail.uid = AgentUid(target.uid.0 + 1);
+        assert!(
+            inspector_target_for_detail(&detail, target, &latest)
+                .unwrap_err()
+                .contains("subject or source changed")
+        );
+
+        detail.uid = target.uid;
+        let mut changed_request = target;
+        changed_request.source.published_snapshot =
+            scriptbots_runtime::SnapshotRevision::new(original.published_snapshot.get() + 1);
+        assert_eq!(
+            inspector_target_for_detail(&detail, changed_request, &latest).unwrap(),
+            target,
+            "a response matching the independently read publication stays valid"
+        );
     }
 
     #[test]
@@ -9040,7 +10015,7 @@ mod owner_inspector_tests {
             .last_request = Some(Instant::now() - OWNER_INSPECTOR_REFRESH);
         let button = app
             .world_mut()
-            .spawn((InspectorPageButton, Interaction::Pressed))
+            .spawn((InspectorPageButton::Next, Interaction::Pressed))
             .id();
         app.update();
         assert!(
@@ -9672,6 +10647,13 @@ fn handle_quality_tier_button(
 ) {
     for interaction in &mut query {
         if *interaction == Interaction::Pressed {
+            if effective
+                .gpu
+                .as_ref()
+                .is_some_and(|gpu| gpu.class == GpuClass::Software)
+            {
+                continue;
+            }
             // Taking the tier by hand is an explicit choice, so the governor
             // stands down permanently. Without this the next completed window
             // would silently overwrite what the operator just picked.
@@ -9687,6 +10669,33 @@ fn handle_quality_tier_button(
                 tier_bloom = effective.features.bloom,
                 "Bevy quality tier changed at runtime"
             );
+        }
+    }
+}
+
+fn quality_tier_label(effective: &EffectiveRenderSettings) -> String {
+    if effective
+        .gpu
+        .as_ref()
+        .is_some_and(|gpu| gpu.class == GpuClass::Software)
+    {
+        format!("Quality: {:?} CPU", effective.tier)
+    } else {
+        format!("Quality: {:?}", effective.tier)
+    }
+}
+
+fn update_quality_tier_label(
+    effective: Res<EffectiveRenderSettings>,
+    mut labels: Query<&mut Text, With<QualityTierLabel>>,
+) {
+    if !effective.is_changed() {
+        return;
+    }
+    let label = quality_tier_label(&effective);
+    for mut text in &mut labels {
+        if text.0 != label {
+            text.0.clone_from(&label);
         }
     }
 }
@@ -9845,7 +10854,8 @@ fn apply_tier_to_bloom(
 
 /// Shared native/capture default for the tier's distance haze. This is classic
 /// PBR distance fog, not volumetric or height fog. Density is in inverse world
-/// units: at 2,000 units the default mixes roughly 26% atmospheric color.
+/// units: at 2,000 units the default mixes roughly 8% atmospheric color,
+/// keeping the overview readable while retaining a little distance depth.
 fn tier_distance_fog(
     enabled: bool,
     settings: Option<&scriptbots_core::RenderFogSettings>,
@@ -9856,7 +10866,8 @@ fn tier_distance_fog(
     }
     let density = match settings.and_then(|settings| settings.mode) {
         Some(RenderFogMode::Off) => return None,
-        Some(RenderFogMode::Low) | None => 0.00015,
+        None => 0.00004,
+        Some(RenderFogMode::Low) => 0.00015,
         Some(RenderFogMode::Medium) => 0.0003,
         Some(RenderFogMode::High) => 0.0006,
     };
@@ -10158,7 +11169,7 @@ fn control_camera(
         Query<&Interaction, With<Node>>,
         Option<Res<HudPointerCapture>>,
     ),
-    windows: Query<&Window, With<PrimaryWindow>>,
+    windows: Query<(Entity, &Window), With<PrimaryWindow>>,
     panels: Query<(&ComputedNode, &Visibility), With<HudScenePanel>>,
     mut camera_query: Query<(&mut Transform, Option<&Projection>), With<PrimaryCamera>>,
 ) {
@@ -10190,12 +11201,19 @@ fn control_camera(
     rig.distance = rig.distance.clamp(CAMERA_MIN_DISTANCE, CAMERA_MAX_DISTANCE);
     let pointer_over_hud = hud_pointer_captured(ui_interactions.iter())
         || hud_capture.is_some_and(|capture| capture.0);
+    let window = windows.single().ok();
+    let pixels_per_line = CAMERA_SCROLL_PIXELS_PER_LINE
+        * window.map_or(1.0, |(_, window)| f64::from(window.scale_factor()));
     let scroll_lines: f64 = mouse_wheel
         .read()
-        .filter(|wheel| !pointer_over_hud && wheel.y.is_finite())
+        .filter(|wheel| {
+            !pointer_over_hud
+                && wheel.y.is_finite()
+                && window.is_some_and(|(id, _)| wheel.window == id)
+        })
         .map(|wheel| match wheel.unit {
             MouseScrollUnit::Line => f64::from(wheel.y),
-            MouseScrollUnit::Pixel => f64::from(wheel.y) / CAMERA_SCROLL_PIXELS_PER_LINE,
+            MouseScrollUnit::Pixel => f64::from(wheel.y) / pixels_per_line,
         })
         .sum();
     if scroll_lines != 0.0 {
@@ -10301,6 +11319,9 @@ fn control_camera(
     if state.latest.is_some()
         && let Some(command) = rig.pending_fit
     {
+        // A fit queued before the first snapshot still needs an immediate
+        // recenter once the world dimensions are known.
+        rig.recenter_now = true;
         match command {
             FitCommand::World => {
                 focus_override = Some(state.world_center);
@@ -10480,10 +11501,12 @@ fn control_camera(
     if rig.follow_mode != FollowMode::Off
         && follow_target.is_some()
         && focus_override.is_none()
-        && let (Ok(window), Ok((panel, visibility)), Some(Projection::Perspective(perspective))) =
-            (windows.single(), panels.single(), projection)
+        && let (Some((_, window)), Ok((panel, visibility)), Some(Projection::Perspective(perspective))) =
+            (window, panels.single(), projection)
         && *visibility != Visibility::Hidden
         && panel.size().x > 0.0
+        && panel.inverse_scale_factor.is_finite()
+        && panel.inverse_scale_factor > 0.0
         // A stacked panel spans the window. Keep its target in the central
         // world strip rather than framing beside a nonexistent right gutter.
         && panel.size().x < window.physical_width() as f32 * 0.5
@@ -10492,7 +11515,8 @@ fn control_camera(
     {
         let viewport_width = window.physical_width() as f32;
         let viewport_height = window.physical_height() as f32;
-        let covered = (12.0 * window.scale_factor() + panel.size().x).clamp(0.0, viewport_width);
+        let covered =
+            (12.0 / panel.inverse_scale_factor + panel.size().x).clamp(0.0, viewport_width);
         let shift = distance * (perspective.fov * 0.5).tan() * covered / viewport_height;
         let camera_right = (-dir).cross(Vec3::Y).normalize_or_zero();
         let offset = -camera_right * shift;
@@ -10674,6 +11698,7 @@ const TERRAIN_DETAIL_RESOLUTION: u32 = visual::CANONICAL_BIOME_ATLAS_TILE_SIZE;
 struct TerrainDetailTextures {
     divisor: u8,
     handles: Vec<Handle<Image>>,
+    albedo_handles: Vec<Handle<Image>>,
 }
 
 fn terrain_detail_image(source: &TerrainDetailSource, layer: usize, divisor: u8) -> Image {
@@ -10714,7 +11739,136 @@ fn terrain_detail_image(source: &TerrainDetailSource, layer: usize, divisor: u8)
     let pixels = image.data.as_mut().expect("terrain detail has CPU pixels");
     image.texture_descriptor.mip_level_count = append_terrain_detail_mips(pixels, side);
     image.sampler = bevy::image::ImageSampler::linear();
+    if let bevy::image::ImageSampler::Descriptor(sampler) = &mut image.sampler {
+        sampler.address_mode_u = bevy::image::ImageAddressMode::MirrorRepeat;
+        sampler.address_mode_v = bevy::image::ImageAddressMode::MirrorRepeat;
+    }
     image
+}
+
+// The 2D renderer already ships these images. Blend them toward white so
+// simulation and accessibility colors carried by terrain vertices remain
+// visible, while providing surface detail between the coarse terrain vertices.
+const TERRAIN_ALBEDO_RESOLUTION: u32 = 512;
+const TERRAIN_ALBEDO_LAYERS: usize = 3;
+type TerrainAlbedoPhotos = [::image::RgbaImage; TERRAIN_ALBEDO_LAYERS];
+
+fn terrain_albedo_layer(detail_layer: usize) -> usize {
+    match detail_layer {
+        0 | 1 => 0, // water
+        3 | 4 => 1, // grass and bloom
+        _ => 2,     // sand and rock
+    }
+}
+
+fn terrain_albedo_photos() -> std::result::Result<&'static TerrainAlbedoPhotos, &'static str> {
+    static PHOTOS: std::sync::OnceLock<std::result::Result<TerrainAlbedoPhotos, String>> =
+        std::sync::OnceLock::new();
+    PHOTOS
+        .get_or_init(|| {
+            let decode = |bytes: &[u8]| -> std::result::Result<::image::RgbaImage, String> {
+                let decoded = ::image::load_from_memory(bytes)
+                    .map_err(|error| error.to_string())?
+                    .to_rgba8();
+                Ok(::image::imageops::resize(
+                    &decoded,
+                    TERRAIN_ALBEDO_RESOLUTION,
+                    TERRAIN_ALBEDO_RESOLUTION,
+                    ::image::imageops::FilterType::Triangle,
+                ))
+            };
+            Ok([
+                decode(include_bytes!(
+                    "../../scriptbots-render/src/terrain_water.png"
+                ))?,
+                decode(include_bytes!(
+                    "../../scriptbots-render/src/terrain_grass.png"
+                ))?,
+                decode(include_bytes!(
+                    "../../scriptbots-render/src/terrain_rock.png"
+                ))?,
+            ])
+        })
+        .as_ref()
+        .map_err(String::as_str)
+}
+
+fn terrain_albedo_image(variant: usize) -> Image {
+    use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+    let white = variant == TERRAIN_ALBEDO_LAYERS * 2;
+    let neutral = variant >= TERRAIN_ALBEDO_LAYERS && !white;
+    let side = if white { 1 } else { TERRAIN_ALBEDO_RESOLUTION };
+    let mut pixels = if white {
+        vec![255; 4]
+    } else {
+        let photos = terrain_albedo_photos().expect("embedded terrain images must decode");
+        photos[variant % TERRAIN_ALBEDO_LAYERS].clone().into_raw()
+    };
+    for pixel in pixels.as_chunks_mut::<4>().0 {
+        if neutral {
+            // A neutral texture preserves the hue chosen by an accessibility
+            // palette instead of reintroducing the photo's original colors.
+            let luminance = (u32::from(pixel[0]) * 54
+                + u32::from(pixel[1]) * 183
+                + u32::from(pixel[2]) * 19
+                + 128)
+                / 256;
+            pixel[..3].fill(luminance as u8);
+        }
+        for channel in &mut pixel[..3] {
+            *channel = ((u16::from(*channel) * 4 + 255) / 5) as u8;
+        }
+        pixel[3] = 255;
+    }
+    let mut image = Image::new(
+        Extent3d {
+            width: side,
+            height: side,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        pixels,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(),
+    );
+    let pixels = image.data.as_mut().expect("terrain albedo has CPU pixels");
+    image.texture_descriptor.mip_level_count = append_terrain_albedo_mips(pixels, side);
+    image.sampler = bevy::image::ImageSampler::linear();
+    if let bevy::image::ImageSampler::Descriptor(sampler) = &mut image.sampler {
+        sampler.address_mode_u = bevy::image::ImageAddressMode::MirrorRepeat;
+        sampler.address_mode_v = bevy::image::ImageAddressMode::MirrorRepeat;
+    }
+    image
+}
+
+fn append_terrain_albedo_mips(pixels: &mut Vec<u8>, side: u32) -> u32 {
+    let mut previous_side = side;
+    let mut previous_offset = 0;
+    let mut levels = 1;
+    while previous_side > 1 {
+        let next_side = previous_side / 2;
+        let next_offset = pixels.len();
+        for y in 0..next_side {
+            for x in 0..next_side {
+                let mut sum = [0_u32; 4];
+                let mut count = 0_u32;
+                for sy in y * previous_side / next_side..(y + 1) * previous_side / next_side {
+                    for sx in x * previous_side / next_side..(x + 1) * previous_side / next_side {
+                        let offset = previous_offset + ((sy * previous_side + sx) * 4) as usize;
+                        for channel in 0..4 {
+                            sum[channel] += u32::from(pixels[offset + channel]);
+                        }
+                        count += 1;
+                    }
+                }
+                pixels.extend(sum.map(|value| ((value + count / 2) / count) as u8));
+            }
+        }
+        previous_side = next_side;
+        previous_offset = next_offset;
+        levels += 1;
+    }
+    levels
 }
 
 fn append_terrain_detail_mips(pixels: &mut Vec<u8>, side: u32) -> u32 {
@@ -10751,6 +11905,7 @@ pub(crate) fn apply_tier_to_terrain_detail(
     effective: Res<EffectiveRenderSettings>,
     registry: Res<TerrainChunkRegistry>,
     source: Res<TerrainDetailSource>,
+    accessibility: Res<AccessibilityState>,
     mut active: Local<TerrainDetailTextures>,
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
@@ -10773,6 +11928,19 @@ pub(crate) fn apply_tier_to_terrain_detail(
                 .push(images.add(terrain_detail_image(&source, layer, divisor)));
         }
     }
+    // Keep the small shared albedo images stable across quality switches;
+    // changing tiers should not require re-uploading all terrain color maps.
+    for variant in 0..=TERRAIN_ALBEDO_LAYERS * 2 {
+        if let Some(handle) = active.albedo_handles.get_mut(variant) {
+            if images.get(&*handle).is_none() {
+                *handle = images.add(terrain_albedo_image(variant));
+            }
+        } else {
+            active
+                .albedo_handles
+                .push(images.add(terrain_albedo_image(variant)));
+        }
+    }
     active.divisor = divisor;
     // New chunks also need binding when the tier has not changed. Existing
     // material parameters and vertex palette colors remain authoritative.
@@ -10784,6 +11952,19 @@ pub(crate) fn apply_tier_to_terrain_detail(
             && let Some(material) = materials.get_mut(&chunk.material)
         {
             material.metallic_roughness_texture = Some(handle.clone());
+        }
+        let variant = match accessibility.palette() {
+            ColorPaletteMode::Natural => terrain_albedo_layer(chunk.stats.detail_layer),
+            ColorPaletteMode::HighContrast => TERRAIN_ALBEDO_LAYERS * 2,
+            _ => terrain_albedo_layer(chunk.stats.detail_layer) + TERRAIN_ALBEDO_LAYERS,
+        };
+        let albedo = &active.albedo_handles[variant];
+        if materials
+            .get(&chunk.material)
+            .is_some_and(|material| material.base_color_texture.as_ref() != Some(albedo))
+            && let Some(material) = materials.get_mut(&chunk.material)
+        {
+            material.base_color_texture = Some(albedo.clone());
         }
     }
 }
@@ -10951,6 +12132,12 @@ fn terrain_vertex_normal(
     sum.try_normalize().unwrap_or(Vec3::Y)
 }
 
+fn terrain_detail_uv(coordinate: u32, tiles: u32) -> f32 {
+    let span = tiles.max(1) as f32;
+    let mirrored_periods = (span / 8.0).round().max(1.0);
+    coordinate as f32 / span * (mirrored_periods * 2.0)
+}
+
 fn build_chunk_mesh(
     snapshot: &WorldSnapshot,
     bounds: TerrainChunkBounds,
@@ -10989,19 +12176,21 @@ fn build_chunk_mesh(
             );
             max_height = max_height.max(height);
 
-            let uv_x = global_x as f32 / terrain.dims.x.max(1) as f32;
-            let uv_z = global_z as f32 / terrain.dims.y.max(1) as f32;
+            // Align chunk edges and complete an even number of mirrored
+            // repeats across the world so the texture phase wraps at its edge.
+            let uv_x = terrain_detail_uv(global_x, terrain.dims.x);
+            let uv_z = terrain_detail_uv(global_z, terrain.dims.y);
             uvs.push([uv_x, uv_z]);
 
-            let color = terrain_vertex_color(terrain, global_x, global_z, palette);
+            let sample = terrain.sample_tile(global_x, global_z);
+            let slope = compute_tile_slope(terrain, global_x, global_z);
+            let color = terrain_vertex_color_from_sample(sample, slope, terrain.daylight, palette);
             colors.push(color);
 
-            let sample = terrain.sample_tile(global_x, global_z);
             if vx < bounds.size.x && vz < bounds.size.y {
                 biome_tiles[visual::terrain_kind_index(sample.kind)] += 1;
             }
             sum_moisture += sample.moisture as f64;
-            let slope = compute_tile_slope(terrain, global_x, global_z);
             sum_slope += slope as f64;
         }
     }
@@ -11138,6 +12327,15 @@ fn terrain_tile_surface_srgb(
 ) -> [f32; 3] {
     let sample = terrain.sample_tile(x, z);
     let slope = compute_tile_slope(terrain, x, z);
+    terrain_tile_surface_srgb_from_sample(sample, slope, terrain.daylight, palette)
+}
+
+fn terrain_tile_surface_srgb_from_sample(
+    sample: TerrainTileSample,
+    slope: f32,
+    daylight: f32,
+    palette: ColorPaletteMode,
+) -> [f32; 3] {
     let weights = visual::splat_weights(&SplatInput {
         kind: sample.kind,
         elevation: sample.elevation,
@@ -11152,19 +12350,31 @@ fn terrain_tile_surface_srgb(
         elevation: sample.elevation,
         slope,
         accent: sample.accent,
-        daylight: terrain.daylight,
+        daylight,
         accessibility: palette.accessibility(),
         temperature: sample.temperature,
     })
 }
 
+#[cfg(test)]
 fn terrain_vertex_color(
     terrain: &TerrainHeightSnapshot,
     x: u32,
     z: u32,
     palette: ColorPaletteMode,
 ) -> [f32; 4] {
-    let mapped = terrain_tile_surface_srgb(terrain, x, z, palette);
+    let sample = terrain.sample_tile(x, z);
+    let slope = compute_tile_slope(terrain, x, z);
+    terrain_vertex_color_from_sample(sample, slope, terrain.daylight, palette)
+}
+
+fn terrain_vertex_color_from_sample(
+    sample: TerrainTileSample,
+    slope: f32,
+    daylight: f32,
+    palette: ColorPaletteMode,
+) -> [f32; 4] {
+    let mapped = terrain_tile_surface_srgb_from_sample(sample, slope, daylight, palette);
     let linear = srgb_to_linear_rgb(mapped);
     [linear[0], linear[1], linear[2], 1.0]
 }
@@ -11332,6 +12542,87 @@ mod terrain_tests {
             .init_resource::<AccessibilityState>()
             .insert_resource(AgentMotionSettings { enabled: true });
         app
+    }
+
+    #[test]
+    fn snapped_creature_poses_remain_exact_at_varied_slopes_and_headings() {
+        let mut app = presentation_test_app();
+        let (publisher, inbox) = SnapshotInbox::pair();
+        app.insert_non_send_resource(inbox).add_systems(
+            Update,
+            (
+                poll_snapshots,
+                sync_world,
+                smooth_agent_poses,
+                smooth_spike_poses,
+            )
+                .chain(),
+        );
+        let mut snapshot = sample_world_snapshot();
+        snapshot.tick = 1_000;
+        snapshot.agents.push(sample_agent_visual());
+        let cone = Mesh::from(Cone {
+            radius: 0.45,
+            height: 1.0,
+        });
+        let VertexAttributeValues::Float32x3(points) =
+            cone.attribute(Mesh::ATTRIBUTE_POSITION).unwrap()
+        else {
+            panic!("expected 3D spike positions");
+        };
+        for mode in 0..3 {
+            snapshot.paused = mode == 0;
+            snapshot.reduced_motion = mode == 1;
+            for index in 0..64 {
+                snapshot.revision += 1;
+                if mode == 2 {
+                    snapshot.tick -= 1;
+                } else {
+                    snapshot.tick += 1;
+                }
+                snapshot.agents[0].heading = index as f32 * 0.107;
+                snapshot.agents[0].position = Vec2::new(
+                    15.0 + (index % 7) as f32 * 8.0,
+                    15.0 + (index % 5) as f32 * 9.0,
+                );
+                snapshot.agents[0].spike_length = 4.0 + (index % 4) as f32 * 3.0;
+                assert!(publisher.publish(snapshot.clone()));
+                app.update();
+                let record = &app.world().resource::<AgentRegistry>().records[&AgentUid(1)];
+                let root = app.world().entity(record.root);
+                let target = root.get::<AgentPoseTarget>().unwrap();
+                let actual = root.get::<Transform>().unwrap();
+                assert_eq!(
+                    actual.translation, target.translation,
+                    "position mode {mode}, case {index}"
+                );
+                assert_eq!(
+                    actual.rotation, target.rotation,
+                    "rotation mode {mode}, case {index}"
+                );
+                let spike = app.world().entity(record.spike.entity);
+                let spike_pose = *spike.get::<Transform>().unwrap();
+                assert_eq!(
+                    spike_pose,
+                    spike.get::<SpikePoseTarget>().unwrap().transform,
+                    "spike mode {mode}, case {index}"
+                );
+                for &point in points {
+                    let offset =
+                        actual.rotation * spike_pose.transform_point(Vec3::from_array(point));
+                    let position = snapshot.agents[0].position + Vec2::new(offset.x, -offset.z);
+                    let ground = sample_height_world(
+                        &snapshot.terrain_height,
+                        position,
+                        TERRAIN_HEIGHT_SCALE,
+                    );
+                    assert!(
+                        actual.translation.y + offset.y >= ground - 0.01,
+                        "spike vertex intersects ground in mode {mode}, case {index}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -11602,7 +12893,10 @@ mod terrain_tests {
         use bevy::camera::PerspectiveProjection;
         use bevy::window::WindowResolution;
 
-        for (width, height, panel_width, scale, yaw, mode, visible, fit, slope, edge, beside) in [
+        for (
+            (width, height, panel_width, scale, yaw, mode, visible, fit, slope, edge, beside),
+            ui_scale,
+        ) in [
             (
                 1280,
                 720,
@@ -11733,7 +13027,25 @@ mod terrain_tests {
                 false,
                 false,
             ),
-        ] {
+        ]
+        .into_iter()
+        .map(|case| (case, 1.0))
+        .chain([(
+            (
+                2560,
+                1440,
+                1120.0,
+                1.0,
+                0.8,
+                FollowMode::Selected,
+                true,
+                false,
+                false,
+                false,
+                true,
+            ),
+            2.0,
+        )]) {
             let mut app = App::new();
             app.insert_resource(Time::<()>::default());
             app.insert_resource(ButtonInput::<KeyCode>::default());
@@ -11786,6 +13098,8 @@ mod terrain_tests {
                 HudScenePanel,
                 ComputedNode {
                     size: Vec2::new(panel_width, 400.0),
+                    // Physical bounds include both native and Bevy UI scale.
+                    inverse_scale_factor: (scale * ui_scale).recip(),
                     ..default()
                 },
                 if visible {
@@ -11829,7 +13143,7 @@ mod terrain_tests {
             let half_width = -point.z * (fov * 0.5).tan() * width as f32 / height as f32;
             let screen_x = (point.x / half_width + 1.0) * width as f32 * 0.5;
             let expected = if visible && mode != FollowMode::Off && !fit && beside {
-                (width as f32 + 12.0 * scale + panel_width) * 0.5
+                (width as f32 + 12.0 * scale * ui_scale + panel_width) * 0.5
             } else {
                 width as f32 * 0.5
             };
@@ -11848,7 +13162,10 @@ mod terrain_tests {
                 app.update();
                 let after = app.world().get::<Transform>(camera).unwrap();
                 if slope {
-                    assert!(app.world().resource::<CameraRig>().free_height_bias.abs() > 0.1);
+                    assert!(
+                        app.world().resource::<CameraRig>().free_height_bias.abs()
+                            > 0.1 * (TERRAIN_HEIGHT_SCALE / 180.0)
+                    );
                 }
                 if edge {
                     let anchor = app
@@ -12888,7 +14205,12 @@ mod terrain_tests {
         terrain.elevation = (0..4)
             .flat_map(|z| (0..4).map(move |x| 0.2 + x as f32 * 0.05 + z as f32 * 0.1))
             .collect();
-        let expected_up = Vec3::new(-0.09, 1.0, 0.18).normalize();
+        let expected_up = Vec3::new(
+            -0.05 * TERRAIN_HEIGHT_SCALE / 100.0,
+            1.0,
+            0.1 * TERRAIN_HEIGHT_SCALE / 100.0,
+        )
+        .normalize();
         let mut agent = sample_agent_visual();
         agent.position = Vec2::splat(150.0);
         agent.spike_length = 0.0;
@@ -15874,6 +17196,7 @@ mod tests {
             camera: spawn_label(&mut app),
             playback: spawn_label(&mut app),
             command_feedback: spawn_label(&mut app),
+            command_summary: spawn_label(&mut app),
             fps: spawn_label(&mut app),
             world: spawn_label(&mut app),
             tonemap: spawn_label(&mut app),
@@ -16158,12 +17481,12 @@ mod tests {
             spike: None,
         };
         let start = AgentPoseTarget {
-            translation: Vec3::new(-100.0, 81.1, 0.0),
+            translation: Vec3::new(-100.0, 0.45 * TERRAIN_HEIGHT_SCALE + 0.1, 0.0),
             rotation: Quat::IDENTITY,
             tick: 1,
         };
         let target = AgentPoseTarget {
-            translation: Vec3::new(0.0, 81.1, 0.0),
+            translation: Vec3::new(0.0, 0.45 * TERRAIN_HEIGHT_SCALE + 0.1, 0.0),
             tick: 2,
             ..start
         };
@@ -16199,7 +17522,7 @@ mod tests {
             "halfway over ridge"
         );
         assert!(
-            transform.translation.y > 140.0,
+            transform.translation.y > 0.8 * TERRAIN_HEIGHT_SCALE,
             "interpolation must follow the ridge instead of cutting through it"
         );
     }
@@ -16729,6 +18052,55 @@ mod tests {
     }
 
     #[test]
+    fn startup_camera_waits_for_the_world_and_does_not_follow_an_unselected_creature() {
+        let mut app = App::new();
+        let mut time = Time::<()>::default();
+        time.advance_by(Duration::from_secs_f32(1.0 / 60.0));
+        app.insert_resource(time);
+        app.insert_resource(CameraRig::startup());
+        app.insert_resource(SnapshotState::default());
+        app.insert_resource(ButtonInput::<MouseButton>::default());
+        app.insert_resource(ButtonInput::<KeyCode>::default());
+        app.insert_resource(Messages::<MouseMotion>::default());
+        app.insert_resource(Messages::<MouseWheel>::default());
+        app.add_systems(Update, control_camera);
+        app.world_mut().spawn((PrimaryCamera, Transform::default()));
+
+        // The camera system can run before the first owner snapshot arrives.
+        app.update();
+        let world = WorldState::new(ScriptBotsConfig::default()).expect("world init");
+        let snapshot = WorldSnapshot::from_world(&world).expect("snapshot");
+        let center = snapshot.world_size * 0.5;
+        let extent = snapshot.world_size;
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            state.world_size = extent;
+            state.world_center = center;
+            state.focus_point = Vec2::splat(50.0);
+            state.first_agent_position = Some(Vec2::splat(50.0));
+            state.latest = Some(snapshot);
+        }
+        app.update();
+        {
+            let rig = app.world().resource::<CameraRig>();
+            assert_eq!(rig.follow_mode, FollowMode::Off);
+            assert_eq!(rig.focus_smoothed, center);
+            assert_eq!(rig.free_focus, Some(center));
+            assert_eq!(
+                rig.distance_smoothed,
+                fit_distance_for_extent(extent, FIT_WORLD_FACTOR)
+            );
+        }
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            state.focus_point = Vec2::splat(400.0);
+            state.first_agent_position = Some(Vec2::splat(400.0));
+        }
+        app.update();
+        assert_eq!(app.world().resource::<CameraRig>().focus_smoothed, center);
+    }
+
+    #[test]
     fn free_camera_holds_position_across_snapshot_motion_and_follow_transitions() {
         let mut app = App::new();
         let mut time = Time::<()>::default();
@@ -16821,6 +18193,7 @@ mod tests {
     fn camera_zoom_after_scroll(
         events: &[(MouseScrollUnit, f32)],
         split_frames: bool,
+        scale_factor: f32,
     ) -> (f32, f32) {
         let mut app = App::new();
         let mut time = Time::<()>::default();
@@ -16836,6 +18209,17 @@ mod tests {
         app.insert_resource(Messages::<MouseMotion>::default());
         app.insert_resource(Messages::<MouseWheel>::default());
         app.add_systems(Update, control_camera);
+        let window = app
+            .world_mut()
+            .spawn((
+                PrimaryWindow,
+                Window {
+                    resolution: bevy::window::WindowResolution::new(800, 600)
+                        .with_scale_factor_override(scale_factor),
+                    ..default()
+                },
+            ))
+            .id();
         let camera = app
             .world_mut()
             .spawn((PrimaryCamera, Transform::default()))
@@ -16847,7 +18231,7 @@ mod tests {
                     unit,
                     x: 0.0,
                     y,
-                    window: Entity::PLACEHOLDER,
+                    window,
                 });
             if split_frames {
                 app.update();
@@ -16867,8 +18251,8 @@ mod tests {
 
     #[test]
     fn camera_zoom_normalizes_device_units_and_preserves_easing_at_world_origin() {
-        let line = camera_zoom_after_scroll(&[(MouseScrollUnit::Line, 1.0)], false);
-        let pixel = camera_zoom_after_scroll(&[(MouseScrollUnit::Pixel, 40.0)], false);
+        let line = camera_zoom_after_scroll(&[(MouseScrollUnit::Line, 1.0)], false, 1.0);
+        let pixel = camera_zoom_after_scroll(&[(MouseScrollUnit::Pixel, 40.0)], false, 1.0);
         assert!((line.0 - pixel.0).abs() < 0.001);
         assert!((line.1 - pixel.1).abs() < 0.001);
         assert!(line.0 > CAMERA_MIN_DISTANCE && line.0 < 2200.0);
@@ -16876,8 +18260,12 @@ mod tests {
             line.1 > line.0 && line.1 < 2200.0,
             "rendered camera must ease toward the requested distance"
         );
-        let fine = camera_zoom_after_scroll(&[(MouseScrollUnit::Pixel, 1.0)], false);
+        let fine = camera_zoom_after_scroll(&[(MouseScrollUnit::Pixel, 1.0)], false, 1.0);
         assert!(fine.0 > line.0 && fine.0 < 2200.0);
+        let scaled_line = camera_zoom_after_scroll(&[(MouseScrollUnit::Line, 1.0)], false, 2.0);
+        let scaled_pixel = camera_zoom_after_scroll(&[(MouseScrollUnit::Pixel, 80.0)], false, 2.0);
+        assert!((scaled_line.0 - line.0).abs() < 0.001);
+        assert!((scaled_pixel.0 - line.0).abs() < 0.001);
     }
 
     #[test]
@@ -16892,6 +18280,10 @@ mod tests {
             .insert_resource(Messages::<MouseWheel>::default())
             .add_systems(Update, control_camera);
         app.world_mut().spawn((PrimaryCamera, Transform::default()));
+        let window = app
+            .world_mut()
+            .spawn((PrimaryWindow, Window::default()))
+            .id();
         let hud = app
             .world_mut()
             .spawn((Node::default(), Interaction::Hovered))
@@ -16900,7 +18292,7 @@ mod tests {
             unit: MouseScrollUnit::Line,
             x: 0.0,
             y: 1.0,
-            window: Entity::PLACEHOLDER,
+            window,
         };
         app.world_mut()
             .resource_mut::<Messages<MouseWheel>>()
@@ -16927,11 +18319,12 @@ mod tests {
             let roundtrip = camera_zoom_after_scroll(
                 &[(MouseScrollUnit::Line, 1.0), (MouseScrollUnit::Line, -1.0)],
                 split_frames,
+                1.0,
             );
             assert!((roundtrip.0 - 2200.0).abs() < 0.001);
             let split =
-                camera_zoom_after_scroll(&[(MouseScrollUnit::Pixel, 10.0); 4], split_frames);
-            let whole = camera_zoom_after_scroll(&[(MouseScrollUnit::Pixel, 40.0)], false);
+                camera_zoom_after_scroll(&[(MouseScrollUnit::Pixel, 10.0); 4], split_frames, 1.0);
+            let whole = camera_zoom_after_scroll(&[(MouseScrollUnit::Pixel, 40.0)], false, 1.0);
             assert!((split.0 - whole.0).abs() < 0.001);
         }
     }
@@ -16942,7 +18335,7 @@ mod tests {
             (f32::MAX, CAMERA_MIN_DISTANCE),
             (-f32::MAX, CAMERA_MAX_DISTANCE),
         ] {
-            let result = camera_zoom_after_scroll(&[(MouseScrollUnit::Line, y)], false);
+            let result = camera_zoom_after_scroll(&[(MouseScrollUnit::Line, y)], false, 1.0);
             assert!((result.0 - expected).abs() < 0.001);
             assert!(result.1.is_finite());
         }
@@ -16954,6 +18347,7 @@ mod tests {
                 (MouseScrollUnit::Pixel, 0.0),
             ],
             false,
+            1.0,
         );
         assert!((ignored.0 - 2200.0).abs() < 0.001);
         assert!(ignored.1.is_finite());

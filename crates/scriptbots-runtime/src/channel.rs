@@ -41,8 +41,9 @@ use crate::{
     SnapshotRevision, WorldCheckpointCut, WorldDigestCut,
 };
 use scriptbots_core::{
-    AgentDebugInfo, AgentDebugQuery, AgentUid, CharacterizationDigestV0, INPUT_SIZE, MutationRates,
-    NUM_EYES, OUTPUT_SIZE, SensorAttribution, TraitModifiers, WorldDigestV1,
+    AgentDebugInfo, AgentDebugQuery, AgentUid, CharacterizationDigestV0, CombatEventFlags,
+    INPUT_SIZE, IndicatorState, MutationRates, NUM_EYES, OUTPUT_SIZE, SelectionState,
+    SensorAttribution, TraitModifiers, WorldDigestV1,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
@@ -148,7 +149,7 @@ enum IngressMessage {
     },
     AgentInspection {
         uid: AgentUid,
-        max_contributors: usize,
+        max_contributors: Option<usize>,
         expires_at: Instant,
         reply: Sender<Result<Option<AgentInspectorData>, HostAccessError>>,
     },
@@ -238,6 +239,52 @@ impl From<&scriptbots_core::AgentRuntime> for AgentLifeData {
     }
 }
 
+/// Live physiology and event markers captured at the same owner boundary as the
+/// selected creature's sensors and outputs.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AgentPhysiologyData {
+    /// Current energy reserve.
+    pub energy: f32,
+    /// Net food intake for the current tick.
+    pub food_delta: f32,
+    /// Diet tendency, from carnivore (0) to herbivore (1).
+    pub herbivore_tendency: f32,
+    /// Preferred normalized temperature.
+    pub temperature_preference: f32,
+    /// Current emitted sound level.
+    pub sound_output: f32,
+    /// Emitted-sound scale.
+    pub sound_multiplier: f32,
+    /// Current intent to share food.
+    pub give_intent: f32,
+    /// Whether the creature received spike damage this tick.
+    pub spiked: bool,
+    /// Per-tick combat markers.
+    pub combat: CombatEventFlags,
+    /// Current indicator pulse and color.
+    pub indicator: IndicatorState,
+    /// Selection state at the inspected owner boundary.
+    pub selection: SelectionState,
+}
+
+impl From<&scriptbots_core::AgentRuntime> for AgentPhysiologyData {
+    fn from(runtime: &scriptbots_core::AgentRuntime) -> Self {
+        Self {
+            energy: runtime.energy,
+            food_delta: runtime.food_delta,
+            herbivore_tendency: runtime.herbivore_tendency,
+            temperature_preference: runtime.temperature_preference,
+            sound_output: runtime.sound_output,
+            sound_multiplier: runtime.sound_multiplier,
+            give_intent: runtime.give_intent,
+            spiked: runtime.spiked,
+            combat: runtime.combat,
+            indicator: runtime.indicator,
+            selection: runtime.selection,
+        }
+    }
+}
+
 /// On-demand focused-agent detail captured entirely on the scientific owner thread.
 /// Arrays have the core sensor/actuator widths; no evaluator or world handle crosses threads.
 #[derive(Debug, Clone)]
@@ -248,6 +295,8 @@ pub struct AgentInspectorData {
     pub uid: AgentUid,
     /// Life-history values read at the same scientific boundary.
     pub life: AgentLifeData,
+    /// Physiology and event markers read at the same scientific boundary.
+    pub physiology: AgentPhysiologyData,
     /// Most recently recorded sensor inputs, in the core's declared input order.
     pub sensors: [f32; INPUT_SIZE],
     /// Most recently recorded brain outputs, in actuator order.
@@ -266,7 +315,8 @@ pub struct AgentInspectorData {
     pub eye_fov: [f32; NUM_EYES],
     /// Genome detail when the bound family supports the browser projection.
     pub genome_browser: Option<scriptbots_core::genome_browser::GenomeBrowserViewModel>,
-    /// Explanation captured at the same source boundary as the inspector arrays.
+    /// Explanation captured at the same source boundary as the inspector arrays,
+    /// when requested.
     pub sensor_attribution: Option<SensorAttribution>,
 }
 
@@ -518,6 +568,14 @@ impl ChannelHostPort {
                 "sensor explanation contributor limit exceeded before enqueue",
             ));
         }
+        self.inspect_agent_with_attribution(uid, Some(max_contributors))
+    }
+
+    fn inspect_agent_with_attribution(
+        &self,
+        uid: AgentUid,
+        max_contributors: Option<usize>,
+    ) -> Result<Option<AgentInspectorData>, HostAccessError> {
         let expires_at = self.inspection_deadline()?;
         self.read_owner(|reply| IngressMessage::AgentInspection {
             uid,
@@ -536,6 +594,16 @@ impl ChannelHostPort {
     ) -> Result<Option<AgentInspectorData>, HostAccessError> {
         self.bounded_before(deadline)?
             .inspect_agent(uid, max_contributors)
+    }
+
+    /// Read the selected-agent HUD fields without computing a sensor explanation.
+    pub fn inspect_agent_for_hud_before(
+        &self,
+        uid: AgentUid,
+        deadline: Instant,
+    ) -> Result<Option<AgentInspectorData>, HostAccessError> {
+        self.bounded_before(deadline)?
+            .inspect_agent_with_attribution(uid, None)
     }
 
     /// Query the owner's debug rows, preserving the query's filters and limit.
@@ -1366,7 +1434,11 @@ impl ChannelHostDriver {
                     )));
                     return;
                 }
-                let _ = reply.send(self.host.core().inspect_agent(uid, max_contributors));
+                let _ = reply.send(
+                    self.host
+                        .core()
+                        .inspect_agent_with_attribution(uid, max_contributors),
+                );
             }
             IngressMessage::DebugAgents { query, reply } => {
                 let _ = reply.send(Ok(self.host.core().world().agent_debug_view(query)));
@@ -1847,6 +1919,25 @@ mod tests {
             let id = world
                 .try_spawn_agent(scriptbots_core::AgentData::default())
                 .expect("living inspector subject");
+            world
+                .try_spawn_agent(scriptbots_core::AgentData::default())
+                .expect("neighbor for sensor explanation");
+            world
+                .try_update_agent_runtime(id, |runtime| {
+                    runtime.energy = 0.73;
+                    runtime.food_delta = -0.12;
+                    runtime.herbivore_tendency = 0.83;
+                    runtime.temperature_preference = 0.61;
+                    runtime.sound_output = 0.37;
+                    runtime.sound_multiplier = 1.42;
+                    runtime.give_intent = 0.27;
+                    runtime.spiked = true;
+                    runtime.combat.spike_attacker = true;
+                    runtime.combat.was_spiked_by_herbivore = true;
+                    runtime.indicator.intensity = 0.64;
+                    runtime.indicator.color = [0.2, 0.4, 0.6];
+                })
+                .expect("set inspector values");
             let uid = world.agent_uid(id).expect("subject UID");
             let expected = serde_json::to_value(world.agent_debug_view(AgentDebugQuery::default()))
                 .expect("expected owner rows");
@@ -1889,6 +1980,36 @@ mod tests {
             .expect("living subject");
         assert_eq!(detail.uid, uid);
         assert!(detail.source.matches_snapshot(&snapshot));
+        assert!(detail.sensor_attribution.is_some());
+        let hud = port
+            .inspect_agent_for_hud_before(uid, Instant::now() + Duration::from_secs(1))
+            .expect("HUD detail")
+            .expect("living HUD subject");
+        assert!(hud.sensor_attribution.is_none());
+        assert_eq!(hud.uid, detail.uid);
+        assert_eq!(hud.source, detail.source);
+        assert_eq!(hud.life, detail.life);
+        assert_eq!(hud.physiology, detail.physiology);
+        assert_eq!(hud.sensors, detail.sensors);
+        assert_eq!(hud.outputs, detail.outputs);
+        assert_eq!(hud.brain_bound, detail.brain_bound);
+        assert_eq!(hud.brain_descriptor, detail.brain_descriptor);
+        assert_eq!(hud.eye_direction, detail.eye_direction);
+        assert_eq!(hud.eye_fov, detail.eye_fov);
+        let physiology = detail.physiology;
+        assert_eq!(physiology.energy, 0.73);
+        assert_eq!(physiology.food_delta, -0.12);
+        assert_eq!(physiology.herbivore_tendency, 0.83);
+        assert_eq!(physiology.temperature_preference, 0.61);
+        assert_eq!(physiology.sound_output, 0.37);
+        assert_eq!(physiology.sound_multiplier, 1.42);
+        assert_eq!(physiology.give_intent, 0.27);
+        assert!(physiology.spiked);
+        assert!(physiology.combat.spike_attacker);
+        assert!(physiology.combat.was_spiked_by_herbivore);
+        assert!(!physiology.combat.spike_victim);
+        assert_eq!(physiology.indicator.intensity, 0.64);
+        assert_eq!(physiology.indicator.color, [0.2, 0.4, 0.6]);
         assert_eq!(
             serde_json::to_value(
                 port.debug_agents(AgentDebugQuery::default())
@@ -3573,6 +3694,10 @@ mod tests {
             port.inspect_agent_before(AgentUid(1), 0, expired),
             Err(HostAccessError::ProtocolViolation { .. })
         ));
+        assert!(matches!(
+            port.inspect_agent_for_hud_before(AgentUid(1), expired),
+            Err(HostAccessError::ProtocolViolation { .. })
+        ));
         let request = BrainProjectionRequest::focused(
             crate::ProjectionClientId::new(613),
             crate::ProjectionRequestRevision::new(1),
@@ -3637,7 +3762,7 @@ mod tests {
         let (reply, receive) = std::sync::mpsc::channel();
         driver.process_ingress(IngressMessage::AgentInspection {
             uid: AgentUid(u64::MAX),
-            max_contributors: 0,
+            max_contributors: Some(0),
             expires_at: Instant::now(),
             reply,
         });
@@ -3650,7 +3775,7 @@ mod tests {
         let (reply, receive) = std::sync::mpsc::channel();
         driver.process_ingress(IngressMessage::AgentInspection {
             uid: AgentUid(u64::MAX),
-            max_contributors: 0,
+            max_contributors: Some(0),
             expires_at: Instant::now() + Duration::from_secs(1),
             reply,
         });

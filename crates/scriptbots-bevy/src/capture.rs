@@ -2403,7 +2403,7 @@ mod tests {
         let fog = world.get::<crate::DistanceFog>(camera).unwrap();
         assert_ne!(fog.color, Color::linear_rgb(0.2, 0.4, 0.6));
         assert!(
-            matches!(fog.falloff, crate::FogFalloff::Exponential { density } if density == 0.00015)
+            matches!(fog.falloff, crate::FogFalloff::Exponential { density } if density == 0.00004)
         );
     }
 
