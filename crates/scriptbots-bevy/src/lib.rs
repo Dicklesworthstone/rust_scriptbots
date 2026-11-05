@@ -915,7 +915,6 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
                 handle_playback_shortcuts,
                 handle_playback_buttons,
                 handle_hud_diagnostics,
-                scroll_hud_panel,
             ),
             handle_tonemap_mode_buttons,
             // Nested so the outer tuple stays within Bevy's 20-system arity
@@ -3003,34 +3002,6 @@ fn hud_diagnostic_node() -> Node {
     }
 }
 
-/// Scroll the left panel only while the pointer is over it. Camera input has
-/// its own message reader and ignores wheel events captured by a HUD node.
-fn scroll_hud_panel(
-    mut wheels: MessageReader<MouseWheel>,
-    mut panels: Query<(&Interaction, &ComputedNode, &mut ScrollPosition), With<HudScenePanel>>,
-) {
-    let scroll_pixels: f32 = wheels
-        .read()
-        .filter(|wheel| wheel.y.is_finite())
-        .map(|wheel| match wheel.unit {
-            MouseScrollUnit::Line => wheel.y.clamp(-100.0, 100.0) * 40.0,
-            MouseScrollUnit::Pixel => wheel.y.clamp(-4000.0, 4000.0),
-        })
-        .sum();
-    if scroll_pixels == 0.0 {
-        return;
-    }
-    for (interaction, computed, mut scroll) in &mut panels {
-        if !matches!(interaction, Interaction::Hovered | Interaction::Pressed) {
-            continue;
-        }
-        let limit = ((computed.content_size.y - computed.size.y).max(0.0)
-            * computed.inverse_scale_factor)
-            .max(0.0);
-        scroll.0.y = (scroll.0.y - scroll_pixels).clamp(0.0, limit);
-    }
-}
-
 fn handle_hud_diagnostics(
     keys: Option<Res<ButtonInput<KeyCode>>>,
     mut mode: ResMut<HudDiagnostics>,
@@ -3081,8 +3052,16 @@ mod hud_diagnostics_tests {
             .insert_resource(ButtonInput::<KeyCode>::default())
             .insert_resource(Messages::<MouseMotion>::default())
             .insert_resource(Messages::<MouseWheel>::default())
-            .add_systems(Update, (scroll_hud_panel, control_camera).chain());
+            .insert_resource(HudPointerCapture::default())
+            .add_systems(Update, (scroll_hud_panels, control_camera).chain());
         app.world_mut().spawn((PrimaryCamera, Transform::default()));
+        let mut window = Window {
+            resolution: bevy::window::WindowResolution::new(800, 600)
+                .with_scale_factor_override(2.0),
+            ..default()
+        };
+        window.set_physical_cursor_position(Some(Vec2::splat(80.0).as_dvec2()));
+        let window = app.world_mut().spawn((window, PrimaryWindow)).id();
         let panel = app
             .world_mut()
             .spawn((
@@ -3093,6 +3072,10 @@ mod hud_diagnostics_tests {
                     inverse_scale_factor: 0.5,
                     ..default()
                 },
+                UiGlobalTransform::from(bevy::math::Affine2::from_translation(Vec2::new(
+                    200.0, 150.0,
+                ))),
+                Visibility::Visible,
                 Interaction::Hovered,
                 ScrollPosition::default(),
                 HudScenePanel,
@@ -3106,7 +3089,7 @@ mod hud_diagnostics_tests {
                     unit,
                     x: 0.0,
                     y,
-                    window: Entity::PLACEHOLDER,
+                    window,
                 });
             app.update();
         };
@@ -3116,6 +3099,10 @@ mod hud_diagnostics_tests {
             app.world().resource::<CameraRig>().distance,
             original_distance
         );
+        send_wheel(&mut app, MouseScrollUnit::Pixel, -20.0);
+        assert_eq!(app.world().get::<ScrollPosition>(panel).unwrap().0.y, 50.0);
+        send_wheel(&mut app, MouseScrollUnit::Pixel, 20.0);
+        assert_eq!(app.world().get::<ScrollPosition>(panel).unwrap().0.y, 40.0);
         send_wheel(&mut app, MouseScrollUnit::Pixel, -500.0);
         assert_eq!(app.world().get::<ScrollPosition>(panel).unwrap().0.y, 200.0);
         send_wheel(&mut app, MouseScrollUnit::Pixel, 500.0);
@@ -3123,6 +3110,10 @@ mod hud_diagnostics_tests {
         send_wheel(&mut app, MouseScrollUnit::Pixel, f32::NAN);
         assert_eq!(app.world().get::<ScrollPosition>(panel).unwrap().0.y, 0.0);
         *app.world_mut().get_mut::<Interaction>(panel).unwrap() = Interaction::None;
+        app.world_mut()
+            .get_mut::<Window>(window)
+            .unwrap()
+            .set_physical_cursor_position(Some(Vec2::new(600.0, 500.0).as_dvec2()));
         send_wheel(&mut app, MouseScrollUnit::Line, -1.0);
         assert_eq!(app.world().get::<ScrollPosition>(panel).unwrap().0.y, 0.0);
         assert_ne!(
@@ -4503,14 +4494,12 @@ fn setup_scene(
                 padding: UiRect::all(Val::Px(10.0)),
                 flex_direction: FlexDirection::Column,
                 row_gap: Val::Px(4.0),
-                overflow: Overflow::scroll_y(),
                 ..default()
             },
             BackgroundColor(Color::srgba(0.05, 0.10, 0.09, 0.88)),
             BorderRadius::all(Val::Px(10.0)),
             Interaction::default(),
             FocusPolicy::Pass,
-            ScrollPosition::default(),
             HudScenePanel,
             ScrollPosition::default(),
         ))
@@ -4626,6 +4615,8 @@ fn setup_scene(
             .spawn((
                 Node {
                     display: Display::None,
+                    min_width: Val::Px(0.0),
+                    max_width: Val::Percent(100.0),
                     margin: UiRect {
                         top: Val::Px(8.0),
                         ..default()
@@ -4649,6 +4640,7 @@ fn setup_scene(
                 card_identity = card
                     .spawn((
                         Text::default(),
+                        panel_text_layout,
                         TextFont::from_font_size(21.0),
                         TextColor(Color::srgb(0.95, 0.98, 0.93)),
                     ))
@@ -4656,6 +4648,7 @@ fn setup_scene(
                 card_context = card
                     .spawn((
                         Text::default(),
+                        panel_text_layout,
                         TextFont::from_font_size(13.0),
                         TextColor(Color::srgb(0.72, 0.83, 0.77)),
                     ))
@@ -4695,6 +4688,7 @@ fn setup_scene(
                             *slot = tile
                                 .spawn((
                                     Text::default(),
+                                    panel_text_layout,
                                     TextFont::from_font_size(17.0),
                                     TextColor(Color::srgb(0.95, 0.98, 0.93)),
                                 ))
@@ -4705,6 +4699,7 @@ fn setup_scene(
                 card_page_status = card
                     .spawn((
                         Text::default(),
+                        panel_text_layout,
                         TextFont::from_font_size(11.0),
                         TextColor(Color::srgb(0.66, 0.81, 0.73)),
                     ))
@@ -4712,6 +4707,7 @@ fn setup_scene(
                 card_page_title = card
                     .spawn((
                         Text::default(),
+                        panel_text_layout,
                         TextFont::from_font_size(15.0),
                         TextColor(Color::srgb(0.91, 0.96, 0.89)),
                     ))
@@ -4719,6 +4715,7 @@ fn setup_scene(
                 card_page_body = card
                     .spawn((
                         Text::default(),
+                        panel_text_layout,
                         TextFont::from_font_size(13.0),
                         TextColor(Color::srgb(0.79, 0.87, 0.82)),
                     ))
@@ -7279,6 +7276,24 @@ mod adaptive_governor_tests {
             world.query::<&ExposureAdjustButton>().iter(world).count(),
             2
         );
+        let card = world.resource::<CreatureCardElements>();
+        for entity in [
+            card.identity,
+            card.context,
+            card.health,
+            card.energy,
+            card.age,
+            card.generation,
+            card.page_status,
+            card.page_title,
+            card.page_body,
+        ] {
+            assert_eq!(
+                world.get::<TextLayout>(entity).unwrap().linebreak,
+                bevy::text::LineBreak::WordOrCharacter,
+                "every actual card field must wrap long values within the responsive panel"
+            );
+        }
     }
 
     #[test]
@@ -9918,6 +9933,17 @@ mod owner_inspector_tests {
         let status = card.page_status;
         let title = card.page_title;
         let body = card.page_body;
+        let labels = [
+            card.identity,
+            card.context,
+            card.health,
+            card.energy,
+            card.age,
+            card.generation,
+            card.page_status,
+            card.page_title,
+            card.page_body,
+        ];
         app.insert_resource(card)
             .add_systems(Update, update_creature_card);
         app.update();
@@ -9954,6 +9980,35 @@ mod owner_inspector_tests {
                 .0
                 .contains("0 ticks old")
         );
+        let unchanged = labels.map(|entity| {
+            let text = app.world().entity(entity).get_ref::<Text>().unwrap();
+            (entity, text.0.clone(), text.last_changed())
+        });
+        let root_changed = app
+            .world()
+            .entity(root)
+            .get_ref::<Node>()
+            .unwrap()
+            .last_changed();
+        app.update();
+        for (entity, value, changed) in &unchanged {
+            let text = app.world().entity(*entity).get_ref::<Text>().unwrap();
+            assert_eq!(&text.0, value);
+            assert_eq!(
+                text.last_changed(),
+                *changed,
+                "unchanged actual creature-card Text must not trigger change detection"
+            );
+        }
+        assert_eq!(
+            app.world()
+                .entity(root)
+                .get_ref::<Node>()
+                .unwrap()
+                .last_changed(),
+            root_changed,
+            "unchanged card visibility must not trigger layout change detection"
+        );
         app.world_mut().resource_mut::<InspectorPage>().0 = 1;
         app.world_mut()
             .non_send_resource_mut::<OwnerInspector>()
@@ -9973,6 +10028,18 @@ mod owner_inspector_tests {
                 .0
                 .contains("REFRESH FAILED: test timeout")
         );
+        for entity in [status, title, body] {
+            let (_, value, changed) = unchanged
+                .iter()
+                .find(|(label, _, _)| *label == entity)
+                .unwrap();
+            let text = app.world().entity(entity).get_ref::<Text>().unwrap();
+            assert_ne!(
+                &text.0, value,
+                "changed owner-page selection and injected refresh failure must be presented"
+            );
+            assert_ne!(text.last_changed(), *changed);
+        }
         app.world_mut().resource_mut::<HudDiagnostics>().0 = true;
         app.update();
         assert_eq!(
