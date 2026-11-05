@@ -1,45 +1,53 @@
 //! Statistical certification of narrative events from a run database (`bd-2z0.11.6`, item 1).
 //!
-//! Provides the `narrative-validate` report: for each persisted [`scriptbots_core::narrative::EventRecord`],
-//! it extracts the metric series surrounding the event, computes moving-block bootstrap confidence intervals
-//! and permutation significance tests against a stationary null, applies Benjamini-Hochberg false discovery rate
-//! (FDR) control across all evaluated events, and emits typed machine JSON and Markdown summary tables.
+//! The report reads the complete canonical per-tick detector input stream in bounded
+//! pages. Certification windows are exact simulation ticks, independently of the
+//! cadence and retention of dashboard metrics. Missing or corrupt detector evidence
+//! is a typed storage refusal, never a substitute window of nearby metric samples.
 
-use std::collections::BTreeMap;
+use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::time::Instant;
 
-use scriptbots_storage::PersistedMetric;
+use scriptbots_core::narrative::{
+    METRIC_COMBAT, METRIC_ENERGY, METRIC_POPULATION, NarrativeInputV1,
+};
+use scriptbots_storage::{NarrativeInputBindingV1, PersistedRunEvent, StorageReader};
 use serde::{Deserialize, Serialize};
 
 use crate::certify::{self, CertificationParams};
 use crate::stats::{EffectSizeEstimator, StatsError};
 use crate::{
     AnalyticsError, ReaderCtx, Report, ReportOutput, ReportParams, base_output, log_report_stage,
-    metric_stats_error,
+    metric_stats_error, timeline_markdown_cell,
 };
 
-/// Maximum rows read from the metrics table when validating narrative events.
-const METRIC_READ_ROW_LIMIT: usize = 4_096;
+/// V2 certifies exact canonical tick windows and reports their complete source binding.
+///
+/// V1 sampled a capped dashboard-metric tail and used sample counts as ticks.
+/// The `truncated` field now describes event selection, not detector-input coverage.
+pub const NARRATIVE_VALIDATE_SCHEMA_VERSION: u32 = 2;
+
+/// Rows fetched at a time; the complete run is traversed without retaining it.
+const INPUT_READ_PAGE_SIZE: usize = 256;
+
+/// Bound the retained before/after window independently of the run length.
+const MAX_WINDOW_TICKS: usize = 4_096;
 
 /// Default event limit when not explicitly overridden via parameters.
 const DEFAULT_EVENT_LIMIT: usize = 1_000;
 
-/// Hard ceiling for one narrative-validation request.
-///
-/// Validation is an offline statistical operation whose cost scales with both
-/// events and resampling counts. Keep a single request bounded and aligned with
-/// the storage reader's bounded narrative-page contract.
+/// Reserve one row of the storage page to observe event-selection truncation.
 const MAX_EVENT_LIMIT: usize = 4_095;
 
-/// `narrative-validate`: offline statistical certification of detected narrative events.
+/// Offline statistical certification of persisted narrative events.
 #[derive(Debug, Default)]
 pub struct NarrativeValidate;
 
-/// Machine-readable report payload for `narrative-validate`.
+/// Machine-readable report payload.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NarrativeValidateMachine {
-    /// Analysis window (number of ticks before and after the event).
+    /// Ticks per exact window: before `[tick-window, tick)`, after `[tick, tick+window)`.
     pub window: usize,
     /// Target False Discovery Rate for Benjamini-Hochberg multiple-testing control.
     pub fdr: f64,
@@ -49,10 +57,18 @@ pub struct NarrativeValidateMachine {
     pub events_examined: usize,
     /// Number of events certified significant under FDR control.
     pub significant: usize,
-    /// Number of events skipped because metric data was unavailable or window was out-of-range.
+    /// Selected events with unsupported island/metric evidence or incomplete tick windows.
     pub skipped: usize,
-    /// True if the bounded metric read hit the maximum row limit.
+    /// True when older events were excluded by the requested event limit.
+    ///
+    /// Detector inputs are never truncated to a newest-only metric window.
     pub truncated: bool,
+    /// Canonical source binding, absent only when no events were selected.
+    pub input_binding: Option<NarrativeInputBindingV1>,
+    /// Exact number of canonical inputs read across the complete finished run.
+    pub inputs_read: u64,
+    /// Number of bounded detector-input pages consumed.
+    pub input_pages: u64,
     /// Detailed certification rows for tested events.
     pub events: Vec<NarrativeValidateRow>,
 }
@@ -64,7 +80,7 @@ pub struct NarrativeValidateRow {
     pub tick: u64,
     /// Classification of the narrative event.
     pub kind: String,
-    /// Metric series evaluated (e.g., "population", "`average_energy`").
+    /// Detector metric: `population`, `agents.energy`, `average_energy`, or `spike_hits`.
     pub metric: String,
     /// Deterministic templated event narrative description.
     pub human_text: String,
@@ -84,7 +100,7 @@ pub struct NarrativeValidateRow {
     pub effect_estimator: String,
     /// True if p-value < alpha prior to multiple testing correction.
     pub significant_uncorrected: bool,
-    /// True if the event survives Benjamini-Hochberg FDR control across all tested events.
+    /// True if the event survives Benjamini-Hochberg FDR control across tested events.
     pub significant_fdr: bool,
 }
 
@@ -103,13 +119,33 @@ struct CandidateValidation {
     significant_uncorrected: bool,
 }
 
+#[derive(Default)]
+struct ValidationEvidence {
+    candidates: Vec<CandidateValidation>,
+    skipped: usize,
+    input_binding: Option<NarrativeInputBindingV1>,
+    inputs_read: u64,
+    input_pages: u64,
+}
+
 fn render_narrative_validate_markdown(machine: &NarrativeValidateMachine) -> String {
     let mut md = String::new();
     let _ = writeln!(md, "# Narrative event statistical certification\n");
     if machine.truncated {
         let _ = writeln!(
             md,
-            "> **Note:** metric history read reached the {METRIC_READ_ROW_LIMIT}-row limit; early events may lack surrounding data.\n"
+            "> **Note:** the requested event limit excludes older events. FDR control covers the selected, tested events.\n"
+        );
+    }
+    if let Some(binding) = &machine.input_binding {
+        let _ = writeln!(
+            md,
+            "Read all {} canonical detector inputs from tick {} through {} in {} bounded pages. Each side of a certification window contains {} consecutive simulation ticks.\n",
+            machine.inputs_read,
+            binding.first_tick,
+            binding.terminal_tick,
+            machine.input_pages,
+            machine.window,
         );
     }
     let _ = writeln!(
@@ -117,6 +153,12 @@ fn render_narrative_validate_markdown(machine: &NarrativeValidateMachine) -> Str
         "_window={}, FDR={}, {} of {} events certified significant ({} skipped)._\n",
         machine.window, machine.fdr, machine.significant, machine.events_examined, machine.skipped
     );
+    if machine.skipped > 0 {
+        let _ = writeln!(
+            md,
+            "_Skipped events lack a complete exact-tick window, belong to another island, or use a metric outside population, agents.energy, average_energy, and spike_hits._\n"
+        );
+    }
 
     if machine.events.is_empty() {
         let _ = writeln!(md, "_No narrative events could be certified in this run._");
@@ -135,7 +177,7 @@ fn render_narrative_validate_markdown(machine: &NarrativeValidateMachine) -> Str
             "| {} | {} | {} | {:+.4} | [{:.3}, {:.3}] | {:.4} | {:+.3} | {:+.3} | {} | {} |",
             row.tick,
             row.kind,
-            row.metric,
+            timeline_markdown_cell(&row.metric),
             row.shift,
             row.ci_lower,
             row.ci_upper,
@@ -143,7 +185,7 @@ fn render_narrative_validate_markdown(machine: &NarrativeValidateMachine) -> Str
             row.cohens_d,
             row.cliffs_delta,
             if row.significant_fdr { "yes" } else { "no" },
-            row.human_text,
+            timeline_markdown_cell(&row.human_text),
         );
     }
 
@@ -161,10 +203,10 @@ fn parse_params(params: &ReportParams) -> Result<(CertificationParams, usize), A
     ])?;
 
     let window = params.get_usize("window")?.unwrap_or(30);
-    if window == 0 {
+    if window == 0 || window > MAX_WINDOW_TICKS {
         return Err(AnalyticsError::BadParam {
             name: "window".to_owned(),
-            reason: "must be at least 1".to_owned(),
+            reason: format!("must be between 1 and {MAX_WINDOW_TICKS} ticks"),
         });
     }
 
@@ -227,79 +269,144 @@ fn parse_params(params: &ReportParams) -> Result<(CertificationParams, usize), A
     ))
 }
 
-fn group_metrics_by_name(readings: Vec<PersistedMetric>) -> BTreeMap<String, Vec<(u64, f64)>> {
-    let mut by_metric: BTreeMap<String, Vec<(u64, f64)>> = BTreeMap::new();
-    for PersistedMetric { tick, name, value } in readings {
-        by_metric.entry(name).or_default().push((tick, value));
+/// A sample's position can stand for a tick only after exact adjacency is observed.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "population uses the same u64-to-f64 series projection as the production detector"
+)]
+fn exact_window_values(
+    inputs: &VecDeque<NarrativeInputV1>,
+    event_tick: u64,
+    window: usize,
+    metric: &str,
+) -> Option<Vec<f64>> {
+    let length = window.checked_mul(2)?;
+    if window == 0 || inputs.len() != length {
+        return None;
     }
-    for series in by_metric.values_mut() {
-        series.sort_by_key(|entry| entry.0);
+    let first_tick = event_tick.checked_sub(u64::try_from(window).ok()?)?;
+    let mut values = Vec::with_capacity(length);
+    for (offset, input) in inputs.iter().enumerate() {
+        let expected_tick = first_tick.checked_add(u64::try_from(offset).ok()?)?;
+        if input.tick.0 != expected_tick {
+            return None;
+        }
+        let value = match metric {
+            METRIC_POPULATION => input.agent_count as f64,
+            // The evidence bridge and live kernel currently name this exact
+            // same input lane differently. Preserve the producer's identity.
+            METRIC_ENERGY | "average_energy" => f64::from(input.average_energy),
+            METRIC_COMBAT => f64::from(input.spike_hits),
+            _ => return None,
+        };
+        values.push(value);
     }
-    by_metric
+    Some(values)
 }
 
-fn exact_event_index(series: &[(u64, f64)], event_tick: u64) -> Option<usize> {
-    series
-        .binary_search_by_key(&event_tick, |entry| entry.0)
-        .ok()
+fn evaluate_window(
+    run_event: &PersistedRunEvent,
+    inputs: &VecDeque<NarrativeInputV1>,
+    params: &CertificationParams,
+) -> Result<Option<CandidateValidation>, AnalyticsError> {
+    // The V1 input stream has no island dimension. Never attach its evidence to
+    // an event from another world merely because the tick and metric match.
+    if run_event.identity().island().0 != 0 {
+        return Ok(None);
+    }
+    let event = run_event.record();
+    let Some(values) =
+        exact_window_values(inputs, event.tick.0, params.window, &event.metric)
+    else {
+        return Ok(None);
+    };
+    match certify::certify_event(&values, params.window, params) {
+        Ok(certification) => Ok(Some(CandidateValidation {
+            tick: event.tick.0,
+            kind: format!("{:?}", event.kind),
+            metric: event.metric.clone(),
+            human_text: event.human_text.clone(),
+            shift: certification.shift_ci.point,
+            ci_lower: certification.shift_ci.lower,
+            ci_upper: certification.shift_ci.upper,
+            p_value: certification.p_value,
+            cohens_d: certification.cohens_d,
+            cliffs_delta: certification.cliffs_delta,
+            effect_estimator: certification.effect_estimator,
+            significant_uncorrected: certification.significant_uncorrected,
+        })),
+        Err(StatsError::EmptySample { .. }) => Ok(None),
+        Err(error) => Err(metric_stats_error(&error)),
+    }
 }
 
 fn evaluate_events(
-    persisted_events: &[scriptbots_storage::PersistedRunEvent],
-    by_metric: &BTreeMap<String, Vec<(u64, f64)>>,
+    reader: &StorageReader,
+    persisted_events: &[PersistedRunEvent],
     cert_params: &CertificationParams,
-) -> Result<(Vec<CandidateValidation>, usize), AnalyticsError> {
-    let mut candidates = Vec::new();
-    let mut skipped = 0usize;
-
-    for run_event in persisted_events {
-        let event = run_event.record();
-        let event_tick = event.tick.0;
-        let metric_name = &event.metric;
-
-        let Some(series) = by_metric.get(metric_name) else {
-            skipped += 1;
-            continue;
-        };
-
-        // Scientific certification must use evidence from the event's exact
-        // simulation tick. Falling back to the nearest persisted sample can
-        // shift a window across an intervention or regime boundary and turn a
-        // missing observation into a confident but false certification.
-        let Some(idx) = exact_event_index(series, event_tick) else {
-            skipped += 1;
-            continue;
-        };
-
-        let values: Vec<f64> = series.iter().map(|entry| entry.1).collect();
-
-        match certify::certify_event(&values, idx, cert_params) {
-            Ok(certification) => {
-                candidates.push(CandidateValidation {
-                    tick: event_tick,
-                    kind: format!("{:?}", event.kind),
-                    metric: metric_name.clone(),
-                    human_text: event.human_text.clone(),
-                    shift: certification.shift_ci.point,
-                    ci_lower: certification.shift_ci.lower,
-                    ci_upper: certification.shift_ci.upper,
-                    p_value: certification.p_value,
-                    cohens_d: certification.cohens_d,
-                    cliffs_delta: certification.cliffs_delta,
-                    effect_estimator: certification.effect_estimator,
-                    significant_uncorrected: certification.significant_uncorrected,
-                });
+) -> Result<ValidationEvidence, AnalyticsError> {
+    if persisted_events.is_empty() {
+        return Ok(ValidationEvidence::default());
+    }
+    let window = u64::try_from(cert_params.window).map_err(|error| AnalyticsError::BadParam {
+        name: "window".to_owned(),
+        reason: error.to_string(),
+    })?;
+    // This first read validates complete-run continuity and source identity. A
+    // missing stream, missing tick, duplicate, or corrupt contract must refuse
+    // the report even when the affected tick lies outside a selected window.
+    // Live detector history capacity does not limit the persisted evidence.
+    let mut page = reader.narrative_input_page_v1(None, INPUT_READ_PAGE_SIZE, 0)?;
+    let mut evidence = ValidationEvidence {
+        input_binding: Some(page.binding.clone()),
+        ..ValidationEvidence::default()
+    };
+    let input_capacity = cert_params.window * 2;
+    let mut inputs = VecDeque::with_capacity(input_capacity);
+    let mut event_index = 0;
+    loop {
+        evidence.input_pages = evidence.input_pages.saturating_add(1);
+        for record in page.inputs {
+            let tick = record.input.tick.0;
+            if inputs.len() == input_capacity {
+                inputs.pop_front();
             }
-            Err(StatsError::EmptySample { .. }) => {
-                skipped += 1;
-            }
-            Err(error) => {
-                return Err(metric_stats_error(&error));
+            inputs.push_back(record.input);
+            evidence.inputs_read = evidence.inputs_read.saturating_add(1);
+
+            while let Some(run_event) = persisted_events.get(event_index) {
+                let Some(last_tick) = run_event
+                    .record()
+                    .tick
+                    .0
+                    .checked_add(window)
+                    .and_then(|end| end.checked_sub(1))
+                else {
+                    evidence.skipped += 1;
+                    event_index += 1;
+                    continue;
+                };
+                if last_tick > tick {
+                    break;
+                }
+                event_index += 1;
+                if last_tick == tick
+                    && let Some(candidate) = evaluate_window(run_event, &inputs, cert_params)?
+                {
+                    evidence.candidates.push(candidate);
+                } else {
+                    evidence.skipped += 1;
+                }
             }
         }
+        let Some(cursor) = page.next_after else {
+            break;
+        };
+        page = reader.narrative_input_page_v1(Some(&cursor), INPUT_READ_PAGE_SIZE, 0)?;
     }
-
-    Ok((candidates, skipped))
+    // Events at the end of a run have no complete after window; never shorten it.
+    evidence.skipped += persisted_events.len() - event_index;
+    Ok(evidence)
 }
 
 impl Report for NarrativeValidate {
@@ -308,29 +415,29 @@ impl Report for NarrativeValidate {
     }
 
     fn description(&self) -> &'static str {
-        "Statistical certification of persisted narrative events (block-bootstrap CI + permutation test + FDR control)"
+        "Statistical certification of persisted narrative events from exact per-tick detector evidence"
     }
 
     fn run(&self, cx: &ReaderCtx, params: &ReportParams) -> Result<ReportOutput, AnalyticsError> {
         let (cert_params, limit) = parse_params(params)?;
 
         let read_started = Instant::now();
-        let persisted_events = cx.reader.recent_run_events(limit)?;
-        let metric_readings = cx.reader.recent_metrics(METRIC_READ_ROW_LIMIT)?;
-        let truncated = metric_readings.len() >= METRIC_READ_ROW_LIMIT;
+        let mut persisted_events = cx.reader.recent_run_events(limit + 1)?;
+        let truncated = persisted_events.len() > limit;
+        if truncated {
+            persisted_events.remove(0);
+        }
+        let evidence = evaluate_events(&cx.reader, &persisted_events, &cert_params)?;
         log_report_stage("read", &read_started, persisted_events.len());
 
         let render_started = Instant::now();
-        let by_metric = group_metrics_by_name(metric_readings);
-        let (candidates, skipped) = evaluate_events(&persisted_events, &by_metric, &cert_params)?;
-
-        let p_values: Vec<f64> = candidates.iter().map(|c| c.p_value).collect();
+        let p_values: Vec<f64> = evidence.candidates.iter().map(|c| c.p_value).collect();
         let rejected = certify::benjamini_hochberg(&p_values, cert_params.fdr);
 
-        let mut rows = Vec::with_capacity(candidates.len());
+        let mut rows = Vec::with_capacity(evidence.candidates.len());
         let mut significant = 0usize;
 
-        for (candidate, &is_significant) in candidates.into_iter().zip(&rejected) {
+        for (candidate, &is_significant) in evidence.candidates.into_iter().zip(&rejected) {
             if is_significant {
                 significant += 1;
             }
@@ -357,20 +464,23 @@ impl Report for NarrativeValidate {
             block_len: cert_params.block_len,
             events_examined: rows.len(),
             significant,
-            skipped,
+            skipped: evidence.skipped,
             truncated,
+            input_binding: evidence.input_binding,
+            inputs_read: evidence.inputs_read,
+            input_pages: evidence.input_pages,
             events: rows,
         };
 
         let md = render_narrative_validate_markdown(&machine);
-
-        let output = base_output(
+        let mut output = base_output(
             self.name(),
             cx,
             machine.events.len(),
             serde_json::to_value(&machine)?,
             md,
         )?;
+        output.schema_version = NARRATIVE_VALIDATE_SCHEMA_VERSION;
         log_report_stage("render", &render_started, output.row_count);
         Ok(output)
     }
@@ -379,19 +489,111 @@ impl Report for NarrativeValidate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use scriptbots_core::Tick;
+    use scriptbots_core::narrative::{EventKind, EventRecord};
+
+    fn inputs_at(ticks: &[u64]) -> VecDeque<NarrativeInputV1> {
+        ticks
+            .iter()
+            .map(|&tick| NarrativeInputV1::new(Tick(tick), tick, 1.5, 2).expect("valid input"))
+            .collect()
+    }
 
     #[test]
-    fn exact_event_index_never_substitutes_a_neighboring_tick() {
-        let series = vec![(10, 1.0), (12, 2.0), (14, 3.0)];
-        assert_eq!(exact_event_index(&series, 12), Some(1));
-        assert_eq!(exact_event_index(&series, 11), None);
-        assert_eq!(exact_event_index(&series, 13), None);
+    fn exact_tick_windows_preserve_metric_values_and_half_open_boundaries() {
+        let inputs = inputs_at(&[8, 9, 10, 11]);
+        assert_eq!(
+            exact_window_values(&inputs, 10, 2, METRIC_POPULATION),
+            Some(vec![8.0, 9.0, 10.0, 11.0])
+        );
+        assert_eq!(
+            exact_window_values(&inputs, 10, 2, METRIC_ENERGY),
+            Some(vec![1.5; 4])
+        );
+        assert_eq!(
+            exact_window_values(&inputs, 10, 2, METRIC_COMBAT),
+            Some(vec![2.0; 4])
+        );
+        assert_eq!(
+            exact_window_values(&inputs, 10, 2, "average_energy"),
+            Some(vec![1.5; 4])
+        );
+        assert_eq!(exact_window_values(&inputs, 10, 2, "energy"), None);
+    }
+
+    #[test]
+    fn exact_event_tick_does_not_authorize_sparse_duplicate_or_reordered_windows() {
+        for ticks in [
+            [6, 8, 10, 12],
+            [8, 8, 10, 11],
+            [9, 8, 10, 11],
+            [8, 9, 10, 12],
+        ] {
+            assert_eq!(
+                exact_window_values(&inputs_at(&ticks), 10, 2, METRIC_POPULATION),
+                None,
+                "the event tick exists but its surrounding window is not exact: {ticks:?}"
+            );
+        }
+        let inputs = inputs_at(&[8, 9, 10, 11]);
+        assert_eq!(exact_window_values(&inputs, 10, 3, METRIC_POPULATION), None);
+        assert_eq!(exact_window_values(&inputs, 1, 2, METRIC_POPULATION), None);
+        assert_eq!(
+            exact_window_values(&inputs, 10, usize::MAX, METRIC_POPULATION),
+            None
+        );
+    }
+
+    #[test]
+    fn another_islands_event_cannot_borrow_single_world_input_evidence() {
+        let record = EventRecord {
+            schema_version: 1,
+            tick: Tick(10),
+            kind: EventKind::PopulationBoom,
+            severity: 0.5,
+            magnitude: 2.0,
+            window: (8, 12),
+            metric: METRIC_POPULATION.to_owned(),
+            before: 8.5,
+            after: 10.5,
+            score: 1.0,
+            subject: None,
+            human_text: "population rose".to_owned(),
+        };
+        let mut payload = serde_json::json!({
+            "identity": {
+                "tick": 10, "kind": "population_boom",
+                "metric": METRIC_POPULATION, "island": 0
+            },
+            "record": record
+        });
+        let params = CertificationParams {
+            window: 2,
+            n_resamples: 20,
+            n_permutations: 20,
+            ..CertificationParams::default()
+        };
+        let local: PersistedRunEvent = serde_json::from_value(payload.clone()).expect("local");
+        let inputs = inputs_at(&[8, 9, 10, 11]);
+        assert!(
+            evaluate_window(&local, &inputs, &params)
+                .expect("local evidence")
+                .is_some()
+        );
+        payload["identity"]["island"] = serde_json::json!(1);
+        let foreign = serde_json::from_value(payload).expect("another island");
+        assert!(
+            evaluate_window(&foreign, &inputs, &params)
+                .expect("unsupported island is skipped")
+                .is_none()
+        );
     }
 
     #[test]
     fn certification_params_fail_closed_on_invalid_statistical_controls() {
         for raw in [
             "window=0",
+            "window=4097",
             "fdr=0",
             "fdr=1.1",
             "fdr=NaN",
@@ -412,7 +614,7 @@ mod tests {
     #[test]
     fn certification_params_accept_the_bounded_public_surface() {
         let params = ReportParams::from_pairs([
-            "window=20".to_owned(),
+            "window=4096".to_owned(),
             "fdr=0.1".to_owned(),
             "resamples=100".to_owned(),
             "permutations=100".to_owned(),
@@ -421,7 +623,7 @@ mod tests {
         ])
         .expect("params");
         let (cert, limit) = parse_params(&params).expect("valid controls");
-        assert_eq!(cert.window, 20);
+        assert_eq!(cert.window, MAX_WINDOW_TICKS);
         assert_eq!(cert.fdr, 0.1);
         assert_eq!(cert.n_resamples, 100);
         assert_eq!(cert.n_permutations, 100);

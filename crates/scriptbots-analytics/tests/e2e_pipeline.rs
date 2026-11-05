@@ -1,8 +1,9 @@
 //! End-to-end analytics pipeline integration test (`bd-2z0.11.9`).
 //!
 //! Validates the complete scientific analysis journey:
-//! 1. A hand-built seeded fixture with a planted regime change (population crash) and a
-//!    stationary null control, so statistical reports have a known ground truth.
+//! 1. A hand-built seeded fixture with a planted mean-energy collapse and periodic-combat
+//!    null control derived from agent states and replay events. Separate synthetic metric series
+//!    exercise distribution, changepoint, and paired-run reports.
 //! 2. Execution of the registered report suite, with the real-world test also invoking the CLI.
 //! 3. Ground-truth invariant assertions across reports (significance under FDR, false-positive control,
 //!    lineage component conservation, descendant birth accounting).
@@ -20,7 +21,9 @@ use scriptbots_analytics::dataframe::{
     AnalyticsExportFormat, export_database_table, read_parquet_batch,
 };
 use scriptbots_analytics::{ReaderCtx, Registry, ReportParams};
-use scriptbots_core::narrative::{EventKind, EventRecord, NarrativeInputRecordV1};
+use scriptbots_core::narrative::{
+    EventKind, EventRecord, METRIC_COMBAT, METRIC_ENERGY, NarrativeInputRecordV1,
+};
 use scriptbots_core::{
     AgentData, AgentIdentity, AgentRuntime, AgentState, AgentUid, BirthOrigin, BirthRecord,
     BrainBinding, Generation, INTERACTION_EVENTS_OBSERVED_KIND, INTERACTION_EVENTS_PERSISTED_KIND,
@@ -173,6 +176,8 @@ fn populate_seeded_fixture(dir: &Path) -> (String, String) {
     };
 
     for tick in 0..=200u64 {
+        // These independent synthetic series exercise generic metric reports; they
+        // do not stand in for the actual population or canonical detector inputs.
         let pop_val = if tick < 100 { 40.0 } else { 10.0 } + wobble(tick);
         let energy_val = 50.0 + noise(tick);
 
@@ -215,7 +220,16 @@ fn populate_seeded_fixture(dir: &Path) -> (String, String) {
             }
         }
 
-        // Interactions recorded periodically
+        // Plant a real change in this fixture's agent states, so persisted summary
+        // energy and canonical detector inputs describe the same population.
+        let phase = f32::from(u16::try_from(tick % 5).expect("energy phase fits u16"));
+        let agent_energy = if tick < 100 { 40.0 } else { 10.0 } + (phase - 2.0) * 0.2;
+        for agent in &mut agents {
+            agent.runtime.energy = agent_energy;
+        }
+
+        // Interactions recorded periodically. Each 30-tick certification window
+        // contains three combat hits, making their rate a stationary null control.
         if tick > 0 && tick % 10 == 0 {
             replay_events.push(ReplayEvent {
                 agent_uid: Some(AgentUid(1)),
@@ -276,8 +290,28 @@ fn populate_seeded_fixture(dir: &Path) -> (String, String) {
             ));
         }
 
+        let mut summary = empty_summary(tick, agents.len(), born_count);
+        summary.total_energy = agents.iter().map(|agent| agent.runtime.energy).sum();
+        summary.average_energy = summary.total_energy
+            / f32::from(u16::try_from(agents.len()).expect("fixture population fits u16"));
+        summary.spike_hits = u32::try_from(
+            replay_events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event.kind,
+                        ReplayEventKind::Interaction {
+                            kind: ReplayInteractionKind::Combat,
+                            ..
+                        }
+                    )
+                })
+                .count(),
+        )
+        .expect("fixture combat count fits u32");
+
         let mut batch = PersistenceBatch {
-            summary: empty_summary(tick, agents.len(), born_count),
+            summary,
             epoch: 1,
             closed: false,
             metrics: vec![
@@ -306,36 +340,37 @@ fn populate_seeded_fixture(dir: &Path) -> (String, String) {
         }
 
         if tick == 100 {
-            // Planted regime change event
-            batch.narrative_events.push(EventRecord {
-                schema_version: 1,
-                tick: Tick(100),
-                kind: EventKind::PopulationCrash,
-                severity: 0.95,
-                magnitude: 30.0,
-                window: (70, 130),
-                metric: "population".to_owned(),
-                before: 40.0,
-                after: 10.0,
-                score: 15.0,
-                subject: None,
-                human_text: "drought triggered catastrophic population crash".to_owned(),
-            });
-
-            // Planted null-control noise event
+            // Planted mean-energy change in the canonical detector evidence.
             batch.narrative_events.push(EventRecord {
                 schema_version: 1,
                 tick: Tick(100),
                 kind: EventKind::EnergyCollapse,
+                severity: 0.95,
+                magnitude: 30.0,
+                window: (70, 130),
+                metric: METRIC_ENERGY.to_owned(),
+                before: 40.0,
+                after: 10.0,
+                score: 15.0,
+                subject: None,
+                human_text: "drought triggered catastrophic mean energy collapse".to_owned(),
+            });
+
+            // Deliberately planted false-positive candidate: the combat rate has
+            // the same nonzero variance and mean in both exact 30-tick windows.
+            batch.narrative_events.push(EventRecord {
+                schema_version: 1,
+                tick: Tick(100),
+                kind: EventKind::CombatSurge,
                 severity: 0.2,
                 magnitude: 0.0,
                 window: (70, 130),
-                metric: "energy".to_owned(),
-                before: 50.0,
-                after: 50.0,
+                metric: METRIC_COMBAT.to_owned(),
+                before: 0.1,
+                after: 0.1,
                 score: 0.05,
                 subject: None,
-                human_text: "stationary energy fluctuation".to_owned(),
+                human_text: "stationary periodic combat fluctuation".to_owned(),
             });
         }
 
@@ -345,7 +380,7 @@ fn populate_seeded_fixture(dir: &Path) -> (String, String) {
     storage.flush().expect("flush run db");
     storage.close().expect("close run db");
 
-    // Paired control fixture (for compare-runs report)
+    // Paired control for the independent synthetic metric series (compare-runs).
     let ctrl_path = dir.join("control.sqlite").display().to_string();
     let mut ctrl_storage =
         Storage::create_unattributed_file(&ctrl_path).expect("create control db");
@@ -473,6 +508,9 @@ fn test_analytics_e2e_full_pipeline_and_invariants() {
             !output.human_md.is_empty(),
             "report '{name}' markdown must not be empty"
         );
+        if *name == "narrative-validate" {
+            assert_eq!(output.schema_version, 2, "canonical evidence report schema");
+        }
         report_machines.insert(name.to_string(), output.machine);
     }
 
@@ -515,9 +553,11 @@ fn test_analytics_e2e_full_pipeline_and_invariants() {
     let timeline_events = timeline["events"].as_array().expect("timeline events");
     assert_eq!(timeline_events.len(), 2, "both planted narrative records");
     assert_eq!(timeline_events[0]["record"]["tick"], 100);
-    assert_eq!(timeline_events[0]["record"]["kind"], "energy_collapse");
+    assert_eq!(timeline_events[0]["record"]["kind"], "combat_surge");
+    assert_eq!(timeline_events[0]["record"]["metric"], METRIC_COMBAT);
     assert_eq!(timeline_events[1]["record"]["tick"], 100);
-    assert_eq!(timeline_events[1]["record"]["kind"], "population_crash");
+    assert_eq!(timeline_events[1]["record"]["kind"], "energy_collapse");
+    assert_eq!(timeline_events[1]["record"]["metric"], METRIC_ENERGY);
     invariants.push(InvariantRecord {
         invariant: "narrative_timeline_typed_records_present".to_string(),
         expected: serde_json::json!({ "events_count": 2 }),
@@ -549,52 +589,56 @@ fn test_analytics_e2e_full_pipeline_and_invariants() {
     // Invariant 3: narrative-validate certifies planted shift under FDR (p < 0.05, CI < 0)
     let validate = &report_machines["narrative-validate"];
     let validate_events = validate["events"].as_array().expect("validate events");
-    let pop_validation = validate_events
+    assert_eq!(validate["inputs_read"], 200, "all canonical inputs read");
+    assert_eq!(validate["skipped"], 0, "both exact windows are complete");
+    let energy_validation = validate_events
         .iter()
-        .find(|ev| ev["metric"] == "population")
-        .expect("population event validated");
+        .find(|ev| ev["metric"] == METRIC_ENERGY)
+        .expect("canonical energy event validated");
 
-    assert_eq!(pop_validation["tick"].as_u64(), Some(100));
-    assert_eq!(pop_validation["kind"].as_str(), Some("PopulationCrash"));
+    assert_eq!(energy_validation["tick"].as_u64(), Some(100));
+    assert_eq!(energy_validation["kind"].as_str(), Some("EnergyCollapse"));
     assert!(
-        pop_validation["human_text"]
+        energy_validation["human_text"]
             .as_str()
             .is_some_and(|t| t.contains("drought")),
         "human_text must contain 'drought'"
     );
 
-    let pop_sig = pop_validation["significant_fdr"].as_bool() == Some(true);
-    let pop_p = pop_validation["p_value"].as_f64().unwrap_or(1.0);
-    let pop_ci_upper = pop_validation["ci_upper"].as_f64().unwrap_or(0.0);
-    let pop_valid = pop_sig && pop_p < 0.05 && pop_ci_upper < 0.0;
+    let energy_sig = energy_validation["significant_fdr"].as_bool() == Some(true);
+    let energy_p = energy_validation["p_value"].as_f64().unwrap_or(1.0);
+    let energy_ci_upper = energy_validation["ci_upper"].as_f64().unwrap_or(0.0);
+    let energy_valid = energy_sig && energy_p < 0.05 && energy_ci_upper < 0.0;
 
     invariants.push(InvariantRecord {
         invariant: "planted_shift_significant_fdr".to_string(),
         expected: serde_json::json!({ "significant_fdr": true, "p_value_max": 0.05, "ci_upper_max": 0.0, "tick": 100 }),
-        observed: serde_json::json!({ "significant_fdr": pop_sig, "p_value": pop_p, "ci_upper": pop_ci_upper, "tick": pop_validation["tick"] }),
-        status: if pop_valid { "pass" } else { "fail" }.to_string(),
+        observed: serde_json::json!({ "significant_fdr": energy_sig, "p_value": energy_p, "ci_upper": energy_ci_upper, "tick": energy_validation["tick"] }),
+        status: if energy_valid { "pass" } else { "fail" }.to_string(),
     });
     assert!(
-        pop_valid,
-        "planted population shift must be certified significant with negative CI"
+        energy_valid,
+        "planted canonical energy shift must be certified significant with negative CI"
     );
 
     // Invariant 3: narrative-validate rejects null noise (false-positive control)
-    let energy_validation = validate_events
+    let combat_validation = validate_events
         .iter()
-        .find(|ev| ev["metric"] == "energy")
-        .expect("energy event validated");
+        .find(|ev| ev["metric"] == METRIC_COMBAT)
+        .expect("canonical combat event validated");
+    assert_eq!(combat_validation["tick"].as_u64(), Some(100));
+    assert_eq!(combat_validation["kind"].as_str(), Some("CombatSurge"));
 
-    let energy_sig = energy_validation["significant_fdr"].as_bool() == Some(false);
+    let combat_not_significant = combat_validation["significant_fdr"].as_bool() == Some(false);
     invariants.push(InvariantRecord {
         invariant: "null_noise_not_significant".to_string(),
         expected: serde_json::json!({ "significant_fdr": false }),
-        observed: serde_json::json!({ "significant_fdr": !energy_sig }),
-        status: if energy_sig { "pass" } else { "fail" }.to_string(),
+        observed: serde_json::json!({ "significant_fdr": !combat_not_significant }),
+        status: if combat_not_significant { "pass" } else { "fail" }.to_string(),
     });
     assert!(
-        energy_sig,
-        "stationary null energy fluctuation must not be certified significant"
+        combat_not_significant,
+        "stationary periodic combat must not be certified significant"
     );
 
     // Invariant 4 & 5: lineage structure founder components and descendant conservation
@@ -1088,6 +1132,9 @@ fn report_suite_on_a_real_seeded_simulation_matches_the_simulation_ground_truth(
             serde_json::from_slice(&json_bytes).expect("parse actual CLI report envelope");
         assert_eq!(cli_json["report"], name);
         assert_eq!(cli_json["schema_version"], output.schema_version);
+        if name == "narrative-validate" {
+            assert_eq!(output.schema_version, 2, "canonical evidence report schema");
+        }
         assert_eq!(cli_json["db_path"], run_db);
         assert_eq!(cli_json["latest_tick"], ticks);
         assert_eq!(cli_json["row_count"], output.row_count);
