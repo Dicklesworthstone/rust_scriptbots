@@ -14,21 +14,18 @@ use scriptbots_storage::{
     StoragePipeline, StorageReader, StorageWorkerError,
 };
 use scriptbots_storage::{Connection, RowExt};
-use std::{
-    fs,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::fs;
 
 fn temp_db_path(label: &str) -> String {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
-    std::env::temp_dir()
-        .join(format!(
-            "scriptbots_multi_run_{label}_{}_{nonce}.sqlite",
-            std::process::id()
-        ))
+    // Reserve an isolated parent while leaving the database name uncreated for
+    // Storage's exclusive reservation. Retain the directory for failure review.
+    let prefix = format!("scriptbots_multi_run_{label}_");
+    tempfile::Builder::new()
+        .prefix(&prefix)
+        .tempdir()
+        .expect("isolated temporary database directory")
+        .keep()
+        .join("run.sqlite")
         .to_str()
         .expect("temporary database path is UTF-8")
         .to_owned()
