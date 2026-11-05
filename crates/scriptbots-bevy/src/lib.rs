@@ -4212,20 +4212,38 @@ fn setup_scene(
                     ));
                 });
 
-                row.spawn((
-                    Button,
-                    button_node.clone(),
-                    BackgroundColor(follow_idle_color()),
-                    BorderRadius::all(Val::Px(6.0)),
-                    BorderColor::all(button_border_color),
-                    InspectorPageButton,
-                ))
-                .with_children(|btn| {
-                    btn.spawn((
-                        Text::new("Inspector page (I)"),
-                        secondary_font.clone(),
-                        TextColor(secondary_text_color),
-                    ));
+                // Keep both directions together if the surrounding row wraps.
+                row.spawn(Node {
+                    flex_direction: FlexDirection::Row,
+                    flex_shrink: 0.0,
+                    column_gap: Val::Px(8.0),
+                    ..default()
+                })
+                .with_children(|group| {
+                    for (direction, label) in [
+                        (InspectorPageButton::Previous, "Page <"),
+                        (InspectorPageButton::Next, "Page >"),
+                    ] {
+                        group
+                            .spawn((
+                                Button,
+                                Node {
+                                    min_width: Val::Px(60.0),
+                                    ..button_node.clone()
+                                },
+                                BackgroundColor(follow_idle_color()),
+                                BorderRadius::all(Val::Px(6.0)),
+                                BorderColor::all(button_border_color),
+                                direction,
+                            ))
+                            .with_children(|btn| {
+                                btn.spawn((
+                                    Text::new(label),
+                                    secondary_font.clone(),
+                                    TextColor(secondary_text_color),
+                                ));
+                            });
+                    }
                 });
             });
 
@@ -7696,8 +7714,11 @@ const INSPECTOR_ROWS_PER_PAGE: usize = 8;
 #[derive(Resource, Default)]
 struct InspectorPage(usize);
 
-#[derive(Component)]
-struct InspectorPageButton;
+#[derive(Component, Clone, Copy)]
+enum InspectorPageButton {
+    Previous,
+    Next,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct InspectorTarget {
@@ -7875,7 +7896,7 @@ impl OwnerInspector {
         let source = sample.target.source;
         let index = page % sample.pages.len();
         format!(
-            "Owner UID {} | tick {} | age {} ticks | page {}/{} (I)\n\
+            "Owner UID {} | tick {} | age {} ticks | page {}/{} (I / Shift+I)\n\
              Session {:x} | publication {} | config {} | control {}\n{}",
             sample.target.uid.0,
             source.inspected_tick.0,
@@ -8107,19 +8128,39 @@ fn handle_inspector_page(
     page: Option<ResMut<InspectorPage>>,
     inspector: Option<NonSendMut<OwnerInspector>>,
     keys: Option<Res<ButtonInput<KeyCode>>>,
-    buttons: Query<&Interaction, (Changed<Interaction>, With<InspectorPageButton>)>,
+    buttons: Query<(&InspectorPageButton, &Interaction), Changed<Interaction>>,
 ) {
-    if (keys.is_some_and(|keys| keys.just_pressed(KeyCode::KeyI))
-        || buttons
-            .iter()
-            .any(|interaction| *interaction == Interaction::Pressed))
+    let button = buttons.iter().find_map(|(direction, interaction)| {
+        (*interaction == Interaction::Pressed).then_some(*direction)
+    });
+    let keyboard = keys.as_ref().and_then(|keys| {
+        keys.just_pressed(KeyCode::KeyI).then_some(
+            if keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight) {
+                InspectorPageButton::Previous
+            } else {
+                InspectorPageButton::Next
+            },
+        )
+    });
+    if let Some(direction) = button.or(keyboard)
         && let Some(mut page) = page
     {
         let count = inspector
             .as_ref()
             .and_then(|inspector| inspector.sample.as_ref().map(|sample| sample.pages.len()))
-            .unwrap_or(1);
-        page.0 = (page.0 + 1) % count;
+            .unwrap_or(1)
+            .max(1);
+        page.0 %= count;
+        page.0 = match direction {
+            InspectorPageButton::Previous => {
+                if page.0 == 0 {
+                    count - 1
+                } else {
+                    page.0 - 1
+                }
+            }
+            InspectorPageButton::Next => (page.0 + 1) % count,
+        };
         if let Some(mut inspector) = inspector
             && inspector.sample.is_none()
         {
@@ -8401,7 +8442,7 @@ mod owner_inspector_tests {
         // Actual button and keyboard consumers reach different owner-data pages.
         let button = app
             .world_mut()
-            .spawn((InspectorPageButton, Interaction::Pressed))
+            .spawn((InspectorPageButton::Next, Interaction::Pressed))
             .id();
         app.update();
         assert!(
@@ -8422,6 +8463,57 @@ mod owner_inspector_tests {
                 .unwrap()
                 .0
                 .contains("Sensors 9-16/")
+        );
+        {
+            let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+            keys.clear();
+            keys.release(KeyCode::KeyI);
+            keys.press(KeyCode::ShiftRight);
+            keys.press(KeyCode::KeyI);
+        }
+        app.update();
+        assert!(
+            app.world()
+                .get::<Text>(text)
+                .unwrap()
+                .0
+                .contains("Sensors 1-8/")
+        );
+
+        // The previous button wraps from the first page to the final page;
+        // the next button takes the user back to the first page.
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .clear();
+        app.world_mut().resource_mut::<InspectorPage>().0 = 0;
+        let count = app
+            .world()
+            .non_send_resource::<OwnerInspector>()
+            .sample
+            .as_ref()
+            .unwrap()
+            .pages
+            .len();
+        let previous = app
+            .world_mut()
+            .spawn((InspectorPageButton::Previous, Interaction::Pressed))
+            .id();
+        app.update();
+        assert_eq!(app.world().resource::<InspectorPage>().0, count - 1);
+        app.world_mut()
+            .entity_mut(previous)
+            .insert(Interaction::None);
+        app.world_mut()
+            .entity_mut(button)
+            .insert(Interaction::Pressed);
+        app.update();
+        assert_eq!(app.world().resource::<InspectorPage>().0, 0);
+        assert!(
+            app.world()
+                .get::<Text>(text)
+                .unwrap()
+                .0
+                .contains("Life and lineage")
         );
     }
 
@@ -8616,7 +8708,7 @@ mod owner_inspector_tests {
             .last_request = Some(Instant::now() - OWNER_INSPECTOR_REFRESH);
         let button = app
             .world_mut()
-            .spawn((InspectorPageButton, Interaction::Pressed))
+            .spawn((InspectorPageButton::Next, Interaction::Pressed))
             .id();
         app.update();
         assert!(
