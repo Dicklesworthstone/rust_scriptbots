@@ -1233,10 +1233,10 @@ fn smooth_agent_poses(
         .as_ref()
         .is_some_and(|snapshot| snapshot.paused);
     for (target, mut display, mut transform, footprint) in &mut agents {
-        if paused
+        let snap_to_target = paused
             || settings.as_ref().is_some_and(|settings| !settings.enabled)
-            || target.tick < display.previous_target.tick
-        {
+            || target.tick < display.previous_target.tick;
+        if snap_to_target {
             // A committed pause (including a paused single step) presents the
             // exact observed pose immediately. It must not keep converging
             // while the inspector reports a stationary scientific tick.
@@ -1262,7 +1262,7 @@ fn smooth_agent_poses(
             display.translation = translation;
             display.rotation = display.rotation.slerp(target.rotation, blend);
         }
-        if let (Some(snapshot), Some(footprint)) = (&state.latest, footprint) {
+        if !snap_to_target && let (Some(snapshot), Some(footprint)) = (&state.latest, footprint) {
             let mut footprint = *footprint;
             if let Some((spike_target, spike_display)) =
                 footprint.spike.and_then(|spike| spikes.get(spike).ok())
@@ -11611,6 +11611,87 @@ mod terrain_tests {
             .init_resource::<AccessibilityState>()
             .insert_resource(AgentMotionSettings { enabled: true });
         app
+    }
+
+    #[test]
+    fn snapped_creature_poses_remain_exact_at_varied_slopes_and_headings() {
+        let mut app = presentation_test_app();
+        let (publisher, inbox) = SnapshotInbox::pair();
+        app.insert_non_send_resource(inbox).add_systems(
+            Update,
+            (
+                poll_snapshots,
+                sync_world,
+                smooth_agent_poses,
+                smooth_spike_poses,
+            )
+                .chain(),
+        );
+        let mut snapshot = sample_world_snapshot();
+        snapshot.tick = 1_000;
+        snapshot.agents.push(sample_agent_visual());
+        let cone = Mesh::from(Cone {
+            radius: 0.45,
+            height: 1.0,
+        });
+        let VertexAttributeValues::Float32x3(points) =
+            cone.attribute(Mesh::ATTRIBUTE_POSITION).unwrap()
+        else {
+            panic!("expected 3D spike positions");
+        };
+        for mode in 0..3 {
+            snapshot.paused = mode == 0;
+            snapshot.reduced_motion = mode == 1;
+            for index in 0..64 {
+                snapshot.revision += 1;
+                if mode == 2 {
+                    snapshot.tick -= 1;
+                } else {
+                    snapshot.tick += 1;
+                }
+                snapshot.agents[0].heading = index as f32 * 0.107;
+                snapshot.agents[0].position = Vec2::new(
+                    15.0 + (index % 7) as f32 * 8.0,
+                    15.0 + (index % 5) as f32 * 9.0,
+                );
+                snapshot.agents[0].spike_length = 4.0 + (index % 4) as f32 * 3.0;
+                assert!(publisher.publish(snapshot.clone()));
+                app.update();
+                let record = &app.world().resource::<AgentRegistry>().records[&AgentUid(1)];
+                let root = app.world().entity(record.root);
+                let target = root.get::<AgentPoseTarget>().unwrap();
+                let actual = root.get::<Transform>().unwrap();
+                assert_eq!(
+                    actual.translation, target.translation,
+                    "position mode {mode}, case {index}"
+                );
+                assert_eq!(
+                    actual.rotation, target.rotation,
+                    "rotation mode {mode}, case {index}"
+                );
+                let spike = app.world().entity(record.spike.entity);
+                let spike_pose = *spike.get::<Transform>().unwrap();
+                assert_eq!(
+                    spike_pose,
+                    spike.get::<SpikePoseTarget>().unwrap().transform,
+                    "spike mode {mode}, case {index}"
+                );
+                for &point in points {
+                    let offset =
+                        actual.rotation * spike_pose.transform_point(Vec3::from_array(point));
+                    let position = snapshot.agents[0].position + Vec2::new(offset.x, -offset.z);
+                    let ground = sample_height_world(
+                        &snapshot.terrain_height,
+                        position,
+                        TERRAIN_HEIGHT_SCALE,
+                    );
+                    assert!(
+                        actual.translation.y + offset.y >= ground - 0.01,
+                        "spike vertex intersects ground in mode {mode}, case {index}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
