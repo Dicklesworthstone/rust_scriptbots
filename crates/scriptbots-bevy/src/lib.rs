@@ -946,7 +946,13 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
             update_exposure_button_colors,
             control_camera,
             sync_camera_tonemapping,
-            (poll_owner_inspector, handle_inspector_page, update_hud).chain(),
+            (
+                poll_owner_inspector,
+                handle_inspector_page,
+                update_hud,
+                update_creature_card,
+            )
+                .chain(),
         )
             .chain(),
     )
@@ -2726,6 +2732,22 @@ struct HudElements {
     brain: Entity,
 }
 
+/// Presentation handles for the selected creature, kept separate from the
+/// diagnostic text so the card can use a clear visual hierarchy.
+#[derive(Resource)]
+struct CreatureCardElements {
+    root: Entity,
+    identity: Entity,
+    context: Entity,
+    health: Entity,
+    energy: Entity,
+    age: Entity,
+    generation: Entity,
+    page_status: Entity,
+    page_title: Entity,
+    page_body: Entity,
+}
+
 #[derive(Component)]
 struct HudControlDock;
 
@@ -4188,6 +4210,16 @@ fn setup_scene(
     let mut inspector = Entity::PLACEHOLDER;
     let mut history = Entity::PLACEHOLDER;
     let mut brain = Entity::PLACEHOLDER;
+    let mut card_root = Entity::PLACEHOLDER;
+    let mut card_identity = Entity::PLACEHOLDER;
+    let mut card_context = Entity::PLACEHOLDER;
+    let mut card_health = Entity::PLACEHOLDER;
+    let mut card_energy = Entity::PLACEHOLDER;
+    let mut card_age = Entity::PLACEHOLDER;
+    let mut card_generation = Entity::PLACEHOLDER;
+    let mut card_page_status = Entity::PLACEHOLDER;
+    let mut card_page_title = Entity::PLACEHOLDER;
+    let mut card_page_body = Entity::PLACEHOLDER;
 
     commands.entity(hud_root).with_children(|parent| {
         parent.spawn((
@@ -4249,6 +4281,109 @@ fn setup_scene(
                 Node::default(),
                 HudInspectorContent,
             ))
+            .id();
+        card_root = parent
+            .spawn((
+                Node {
+                    display: Display::None,
+                    margin: UiRect {
+                        top: Val::Px(8.0),
+                        ..default()
+                    },
+                    padding: UiRect::all(Val::Px(12.0)),
+                    border: UiRect::all(Val::Px(1.0)),
+                    flex_direction: FlexDirection::Column,
+                    row_gap: Val::Px(7.0),
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(0.08, 0.16, 0.14, 0.96)),
+                BorderColor::all(Color::srgb(0.26, 0.42, 0.36)),
+                BorderRadius::all(Val::Px(8.0)),
+            ))
+            .with_children(|card| {
+                card.spawn((
+                    Text::new("CREATURE  /  FIELD PROFILE"),
+                    TextFont::from_font_size(11.0),
+                    TextColor(Color::srgb(0.57, 0.78, 0.66)),
+                ));
+                card_identity = card
+                    .spawn((
+                        Text::default(),
+                        TextFont::from_font_size(21.0),
+                        TextColor(Color::srgb(0.95, 0.98, 0.93)),
+                    ))
+                    .id();
+                card_context = card
+                    .spawn((
+                        Text::default(),
+                        TextFont::from_font_size(13.0),
+                        TextColor(Color::srgb(0.72, 0.83, 0.77)),
+                    ))
+                    .id();
+                card.spawn(Node {
+                    flex_direction: FlexDirection::Row,
+                    flex_wrap: FlexWrap::Wrap,
+                    column_gap: Val::Px(6.0),
+                    row_gap: Val::Px(6.0),
+                    ..default()
+                })
+                .with_children(|row| {
+                    for (label, slot) in [
+                        ("HEALTH", &mut card_health),
+                        ("ENERGY", &mut card_energy),
+                        ("AGE", &mut card_age),
+                        ("GEN", &mut card_generation),
+                    ] {
+                        row.spawn((
+                            Node {
+                                min_width: Val::Px(72.0),
+                                flex_grow: 1.0,
+                                padding: UiRect::axes(Val::Px(8.0), Val::Px(6.0)),
+                                flex_direction: FlexDirection::Column,
+                                row_gap: Val::Px(2.0),
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgba(0.13, 0.23, 0.19, 0.95)),
+                            BorderRadius::all(Val::Px(5.0)),
+                        ))
+                        .with_children(|tile| {
+                            tile.spawn((
+                                Text::new(label),
+                                TextFont::from_font_size(10.0),
+                                TextColor(Color::srgb(0.65, 0.80, 0.71)),
+                            ));
+                            *slot = tile
+                                .spawn((
+                                    Text::default(),
+                                    TextFont::from_font_size(17.0),
+                                    TextColor(Color::srgb(0.95, 0.98, 0.93)),
+                                ))
+                                .id();
+                        });
+                    }
+                });
+                card_page_status = card
+                    .spawn((
+                        Text::default(),
+                        TextFont::from_font_size(11.0),
+                        TextColor(Color::srgb(0.66, 0.81, 0.73)),
+                    ))
+                    .id();
+                card_page_title = card
+                    .spawn((
+                        Text::default(),
+                        TextFont::from_font_size(15.0),
+                        TextColor(Color::srgb(0.91, 0.96, 0.89)),
+                    ))
+                    .id();
+                card_page_body = card
+                    .spawn((
+                        Text::default(),
+                        TextFont::from_font_size(13.0),
+                        TextColor(Color::srgb(0.79, 0.87, 0.82)),
+                    ))
+                    .id();
+            })
             .id();
         command_feedback = parent
             .spawn((
@@ -4313,8 +4448,8 @@ fn setup_scene(
                 Text::new("Inspector: no selection"),
                 secondary_font.clone(),
                 TextColor(secondary_text_color),
-                Node::default(),
-                HudInspectorContent,
+                hud_diagnostic_node(),
+                HudDiagnostic,
             ))
             .id();
         history = parent
@@ -4601,6 +4736,18 @@ fn setup_scene(
         history,
         brain,
     });
+    commands.insert_resource(CreatureCardElements {
+        root: card_root,
+        identity: card_identity,
+        context: card_context,
+        health: card_health,
+        energy: card_energy,
+        age: card_age,
+        generation: card_generation,
+        page_status: card_page_status,
+        page_title: card_page_title,
+        page_body: card_page_body,
+    });
 }
 
 fn poll_snapshots(
@@ -4730,6 +4877,82 @@ pub(crate) fn sync_world(
 fn set_hud_text_if_changed(text: &mut Mut<Text>, value: String) {
     if text.0 != value {
         text.0 = value;
+    }
+}
+
+/// Present selected snapshot data independently of the asynchronous owner
+/// inspector; stale owner pages remain explicitly labeled with their age.
+fn update_creature_card(
+    state: Res<SnapshotState>,
+    card: Option<Res<CreatureCardElements>>,
+    diagnostics: Option<Res<HudDiagnostics>>,
+    owner: Option<NonSend<OwnerInspector>>,
+    page: Option<Res<InspectorPage>>,
+    mut nodes: Query<&mut Node>,
+    mut texts: Query<&mut Text>,
+) {
+    let Some(card) = card else { return };
+    let selected = state.latest.as_ref().and_then(|frame| {
+        frame
+            .agents
+            .iter()
+            .find(|agent| agent.selection == SelectionState::Selected)
+    });
+    if let Ok(mut root) = nodes.get_mut(card.root) {
+        let display = if selected.is_some() && !diagnostics.as_ref().is_some_and(|d| d.0) {
+            Display::Flex
+        } else {
+            Display::None
+        };
+        if root.display != display {
+            root.display = display;
+        }
+    }
+    let (Some(frame), Some(agent)) = (state.latest.as_ref(), selected) else {
+        return;
+    };
+    let selected_count = frame
+        .agents
+        .iter()
+        .filter(|a| a.selection == SelectionState::Selected)
+        .count();
+    let detail = InspectorDetail::from_agent(agent, selected_count.saturating_sub(1));
+    let context = format!(
+        "{} | position {:.0}, {:.0}{}{}",
+        detail.diet(),
+        agent.position.x,
+        agent.position.y,
+        if detail.spiked { " | spike hit" } else { "" },
+        if detail.also_selected > 0 {
+            format!(" | +{} selected", detail.also_selected)
+        } else {
+            String::new()
+        },
+    );
+    let (status, title, body) = owner.as_ref().map_or_else(
+        || {
+            (
+                "DETAIL UNAVAILABLE".into(),
+                "Owner inspection unavailable".into(),
+                String::new(),
+            )
+        },
+        |inspector| inspector.card_page(frame, page.as_ref().map_or(0, |p| p.0)),
+    );
+    for (entity, value) in [
+        (card.identity, format!("Creature #{}", agent.uid.0)),
+        (card.context, context),
+        (card.health, format!("{:.2}", agent.health)),
+        (card.energy, format!("{:.2}", agent.energy)),
+        (card.age, format!("{} steps", agent.age)),
+        (card.generation, format!("{}", agent.generation)),
+        (card.page_status, status),
+        (card.page_title, title),
+        (card.page_body, body),
+    ] {
+        if let Ok(mut text) = texts.get_mut(entity) {
+            set_hud_text_if_changed(&mut text, value);
+        }
     }
 }
 
@@ -8524,6 +8747,43 @@ impl OwnerInspector {
             sample.pages[index],
         )
     }
+
+    fn card_page(&self, frame: &WorldSnapshot, page: usize) -> (String, String, String) {
+        let Some(current) = InspectorTarget::from_frame(frame) else {
+            return (
+                "DETAIL UNAVAILABLE".into(),
+                "Select a living creature".into(),
+                String::new(),
+            );
+        };
+        let Some(sample) = self
+            .sample
+            .as_ref()
+            .filter(|sample| sample.target.visible_at(current))
+        else {
+            return (
+                "DETAIL STATUS".into(),
+                "Creature detail".into(),
+                self.status.clone(),
+            );
+        };
+        let index = page % sample.pages.len();
+        let age = current.source.inspected_tick.0 - sample.target.source.inspected_tick.0;
+        let mut status = format!(
+            "PAGE {}/{} | SAMPLE TICK {} | {} ticks old | I / SHIFT+I",
+            index + 1,
+            sample.pages.len(),
+            sample.target.source.inspected_tick.0,
+            age
+        );
+        if let Some(error) = &self.last_failure {
+            status.push_str(&format!("\nREFRESH FAILED: {error} (I to retry)"));
+        }
+        let (title, body) = sample.pages[index]
+            .split_once('\n')
+            .unwrap_or((&sample.pages[index], ""));
+        (status, title.to_owned(), body.to_owned())
+    }
 }
 
 impl Drop for OwnerInspector {
@@ -8959,9 +9219,133 @@ mod owner_inspector_tests {
         });
         app.add_systems(
             Update,
-            (poll_owner_inspector, handle_inspector_page, update_hud).chain(),
+            (
+                poll_owner_inspector,
+                handle_inspector_page,
+                update_hud,
+                update_creature_card,
+            )
+                .chain(),
         );
         (app, text)
+    }
+
+    #[test]
+    fn creature_card_tracks_selection_real_detail_pages_and_failure() {
+        let mut owner = TestOwner::new();
+        owner.serve();
+        let frame = owner.frame();
+        let target = InspectorTarget::from_frame(&frame).expect("selected subject");
+        let mut inspector = OwnerInspector::new(owner.port.clone());
+        inspector.sample = capture_owner_inspector(&owner.port, target).unwrap();
+        assert!(
+            inspector.sample.is_some(),
+            "real owner must return a sample"
+        );
+        let mut app = App::new();
+        app.insert_resource(SnapshotState {
+            latest: Some(frame),
+            ..default()
+        });
+        app.insert_resource(HudDiagnostics::default());
+        app.insert_resource(InspectorPage::default());
+        app.insert_non_send_resource(inspector);
+        let root = app.world_mut().spawn(Node::default()).id();
+        let mut label = || app.world_mut().spawn(Text::default()).id();
+        let card = CreatureCardElements {
+            root,
+            identity: label(),
+            context: label(),
+            health: label(),
+            energy: label(),
+            age: label(),
+            generation: label(),
+            page_status: label(),
+            page_title: label(),
+            page_body: label(),
+        };
+        let identity = card.identity;
+        let energy = card.energy;
+        let status = card.page_status;
+        let title = card.page_title;
+        let body = card.page_body;
+        app.insert_resource(card)
+            .add_systems(Update, update_creature_card);
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(root).unwrap().display,
+            Display::Flex
+        );
+        assert!(
+            app.world()
+                .get::<Text>(identity)
+                .unwrap()
+                .0
+                .contains(&target.uid.0.to_string())
+        );
+        assert_eq!(app.world().get::<Text>(energy).unwrap().0, "0.73");
+        assert!(
+            app.world()
+                .get::<Text>(title)
+                .unwrap()
+                .0
+                .contains("Life and lineage")
+        );
+        assert!(
+            app.world()
+                .get::<Text>(body)
+                .unwrap()
+                .0
+                .contains("Reproduction counter 0.375")
+        );
+        assert!(
+            app.world()
+                .get::<Text>(status)
+                .unwrap()
+                .0
+                .contains("0 ticks old")
+        );
+        app.world_mut().resource_mut::<InspectorPage>().0 = 1;
+        app.world_mut()
+            .non_send_resource_mut::<OwnerInspector>()
+            .last_failure = Some("test timeout".into());
+        app.update();
+        assert!(
+            app.world()
+                .get::<Text>(title)
+                .unwrap()
+                .0
+                .contains("Sensors")
+        );
+        assert!(
+            app.world()
+                .get::<Text>(status)
+                .unwrap()
+                .0
+                .contains("REFRESH FAILED: test timeout")
+        );
+        app.world_mut().resource_mut::<HudDiagnostics>().0 = true;
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(root).unwrap().display,
+            Display::None
+        );
+        app.world_mut().resource_mut::<HudDiagnostics>().0 = false;
+        for agent in &mut app
+            .world_mut()
+            .resource_mut::<SnapshotState>()
+            .latest
+            .as_mut()
+            .unwrap()
+            .agents
+        {
+            agent.selection = SelectionState::None;
+        }
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(root).unwrap().display,
+            Display::None
+        );
     }
 
     #[test]
