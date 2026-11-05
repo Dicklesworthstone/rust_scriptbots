@@ -322,18 +322,23 @@ pub fn create_run_bundle(
     })?;
     let db_path = output_bundle_dir.join("run.db");
     let mut copied_reader = reader.materialize_finished_database(run_db_path, &db_path)?;
-    let db_bytes = fs::read(&db_path).map_err(|error| BundleError::Io {
-        path: db_path,
-        error,
-    })?;
+    // A run database can be much larger than memory. The copied reader keeps
+    // its lease while the same streaming verifier checks the complete image.
+    let db_bytes_len = fs::metadata(&db_path)
+        .map_err(|error| BundleError::Io {
+            path: db_path.clone(),
+            error,
+        })?
+        .len();
+    let db_blake3_hex = hash_file_exact_bounded(&db_path, db_bytes_len)?;
     let events_json = serde_json::to_string_pretty(&events)?;
     let checkpoints_json = serde_json::to_string_pretty(&checkpoints)?;
 
     let artifacts = vec![
         RunBundleArtifactEntry {
             relative_path: "run.db".to_owned(),
-            blake3_hex: hash_hex(&db_bytes),
-            bytes_len: db_bytes.len() as u64,
+            blake3_hex: db_blake3_hex,
+            bytes_len: db_bytes_len,
             artifact_type: "database".to_owned(),
         },
         stage_artifact(
@@ -476,20 +481,7 @@ pub fn verify_run_bundle(bundle_dir: &Path) -> Result<RunBundleVerificationResul
             return Err(BundleError::MissingArtifact(rel_path.to_path_buf()));
         }
 
-        let bytes = fs::read(&full_path).map_err(|error| BundleError::Io {
-            path: full_path.clone(),
-            error,
-        })?;
-
-        if bytes.len() as u64 != entry.bytes_len {
-            return Err(BundleError::HashMismatch {
-                path: rel_path.to_path_buf(),
-                expected: format!("{} bytes", entry.bytes_len),
-                actual: format!("{} bytes", bytes.len()),
-            });
-        }
-
-        let actual_hash = hash_hex(&bytes);
+        let actual_hash = hash_file_exact_bounded(&full_path, entry.bytes_len)?;
         if actual_hash != entry.blake3_hex {
             return Err(BundleError::HashMismatch {
                 path: rel_path.to_path_buf(),
@@ -498,7 +490,14 @@ pub fn verify_run_bundle(bundle_dir: &Path) -> Result<RunBundleVerificationResul
             });
         }
 
-        total_bytes += bytes.len() as u64;
+        total_bytes = total_bytes.checked_add(entry.bytes_len).ok_or_else(|| {
+            BundleError::VerificationLimitExceeded {
+                resource: "total_artifact_bytes",
+                path: bundle_dir.to_path_buf(),
+                observed: u64::MAX,
+                limit: u64::MAX,
+            }
+        })?;
     }
 
     if let Some(lease) = database_lease {
@@ -1475,6 +1474,87 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(bundle_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn bundle_hashing_checks_empty_files_and_complete_multichunk_payloads()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let bundle_dir = temp_bundle_dir("streamed-artifacts");
+        let payload: Vec<u8> = (0_u8..=255).cycle().take(3 * 64 * 1024 + 17).collect();
+        let expected_bytes = u64::try_from(payload.len())?;
+        let expected_hash = blake3::hash(&payload).to_hex().to_string();
+        let bundle = create_run_bundle_from_artifacts(
+            &bundle_dir,
+            crate::RunManifestRecord::unattributed(scriptbots_runtime::RunId::new(43)),
+            100,
+            &[
+                ("empty.txt", "export", b""),
+                ("exports/payload.bin", "export", &payload),
+            ],
+        )?;
+        assert_eq!(bundle.artifacts[1].bytes_len, expected_bytes);
+        assert_eq!(bundle.artifacts[1].blake3_hex, expected_hash);
+        let limits = RunBundleVerificationLimits {
+            max_manifest_bytes: 1024 * 1024,
+            max_artifacts: 2,
+            max_artifact_bytes: expected_bytes,
+            max_total_artifact_bytes: expected_bytes,
+        };
+        for result in [
+            verify_run_bundle(&bundle_dir),
+            verify_run_bundle_bounded(&bundle_dir, limits),
+        ] {
+            let verified = result?;
+            assert_eq!(verified.total_artifacts_verified, 2);
+            assert_eq!(verified.total_bytes_verified, expected_bytes);
+        }
+
+        // A correct prefix is insufficient: corruption in the last partial
+        // buffer must be observed even though the file length stays unchanged.
+        let mut changed = payload.clone();
+        *changed.last_mut().expect("nonempty payload") ^= 1;
+        let changed_hash = blake3::hash(&changed).to_hex().to_string();
+        assert_ne!(changed_hash, expected_hash);
+        fs::write(bundle_dir.join("exports/payload.bin"), &changed)?;
+        for result in [
+            verify_run_bundle(&bundle_dir),
+            verify_run_bundle_bounded(&bundle_dir, limits),
+        ] {
+            assert!(
+                matches!(
+                    result,
+                    Err(BundleError::HashMismatch { expected, actual, .. })
+                        if expected == expected_hash && actual == changed_hash
+                ),
+                "the complete artifact must determine the observed digest"
+            );
+        }
+        fs::write(bundle_dir.join("exports/payload.bin"), &payload)?;
+
+        // Neither verifier may accept a valid digest with an inaccurate size,
+        // whether the manifest truncates the stream or promises extra bytes.
+        let size_limits = RunBundleVerificationLimits {
+            max_artifact_bytes: expected_bytes + 1,
+            max_total_artifact_bytes: expected_bytes + 1,
+            ..limits
+        };
+        for declared_bytes in [expected_bytes - 1, expected_bytes + 1] {
+            let mut inconsistent = bundle.clone();
+            inconsistent.artifacts[1].bytes_len = declared_bytes;
+            replace_test_manifest(&bundle_dir, &inconsistent)?;
+            for result in [
+                verify_run_bundle(&bundle_dir),
+                verify_run_bundle_bounded(&bundle_dir, size_limits),
+            ] {
+                assert!(matches!(result, Err(BundleError::HashMismatch { .. })));
+            }
+        }
+        replace_test_manifest(&bundle_dir, &bundle)?;
+        assert_eq!(
+            verify_run_bundle(&bundle_dir)?.total_bytes_verified,
+            expected_bytes
+        );
         Ok(())
     }
 

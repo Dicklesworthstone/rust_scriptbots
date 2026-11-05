@@ -2,6 +2,21 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Large-run export and scientific evidence (2026-11-05):** [Currently In Progress —
+Codex; bounded source contributions, original acceptance remains open]
+
+The session traced the current plan and authoritative Beads before editing.
+Bundle assembly and ordinary verification now stream database/artifact hashes
+through the existing 64 KiB reader instead of retaining entire files in memory.
+Existing leases, logical database projection checks and bounded-verifier refusals
+remain in force; JSON/SQL projection memory is outside this narrower change.
+The added regression covers empty and multiple-chunk artifacts, corrupt trailing
+bytes, and incorrect declared lengths through both public verifiers.
+Source review is complete; Cargo, formatting, Clippy, UBS and DSR execution are
+unavailable in this session and are not claimed. Narrative tick-window evidence
+and durable GPU certification admission are under implementation separately.
+No original Bead acceptance or scientific baseline is changed.
+
 **Bevy owner inspector (2026-11-05):** [Qualified bounded contribution — GentleDuck;
 original `bd-2z0.14.1.18.3` closed, acceptance unchanged; fresh solo verification]
 
