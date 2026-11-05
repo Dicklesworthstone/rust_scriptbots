@@ -678,6 +678,9 @@ pub struct OffscreenCaptureConfig {
     pub viewport: (u32, u32),
     /// Render settings (quality tier resolved against the probed adapter).
     pub render_settings: RenderSettings,
+    /// Logging owner when the process-wide capture app is first constructed.
+    /// Later sessions reuse that app and never initialize logging again.
+    pub logging: crate::LoggingOwnership,
     /// Alarm-test corruption: bind a nonuniform emissive texture to terrain
     /// materials. Background, lighting and camera inputs stay unchanged; a
     /// difference requires the terrain render path to execute.
@@ -948,6 +951,12 @@ impl<'a> OffscreenCapture<'a> {
     #[must_use]
     pub fn gpu_info(&self) -> Option<&scriptbots_core::GpuInfo> {
         self.effective.gpu.as_ref()
+    }
+
+    /// Quality request received by the renderer before adapter policy is applied.
+    #[must_use]
+    pub const fn requested_quality(&self) -> RenderQuality {
+        self.effective.requested
     }
 
     /// Effective quality tier the capture renders at.
@@ -1346,24 +1355,26 @@ fn build_capture_app(config: &OffscreenCaptureConfig) -> Result<App> {
     .insert_resource(AgentRegistry::default())
     .insert_resource(AccessibilityState::new())
     .add_plugins(
-        DefaultPlugins
-            .build()
-            .disable::<bevy::winit::WinitPlugin>()
-            .disable::<bevy::render::pipelined_rendering::PipelinedRenderingPlugin>()
-            .set(RenderPlugin {
-                render_creation,
-                // Captures need completed pipelines, not interactive startup
-                // responsiveness. Async compilation can outlive all warmup
-                // updates and leave the first readback blank on a cold run.
-                synchronous_pipeline_compilation: true,
-                ..default()
-            })
-            .set(WindowPlugin {
-                primary_window: None,
-                exit_condition: ExitCondition::DontExit,
-                close_when_requested: false,
-                ..Default::default()
-            }),
+        config.logging.configure_plugins(
+            DefaultPlugins
+                .build()
+                .disable::<bevy::winit::WinitPlugin>()
+                .disable::<bevy::render::pipelined_rendering::PipelinedRenderingPlugin>()
+                .set(RenderPlugin {
+                    render_creation,
+                    // Captures need completed pipelines, not interactive startup
+                    // responsiveness. Async compilation can outlive all warmup
+                    // updates and leave the first readback blank on a cold run.
+                    synchronous_pipeline_compilation: true,
+                    ..default()
+                })
+                .set(WindowPlugin {
+                    primary_window: None,
+                    exit_condition: ExitCondition::DontExit,
+                    close_when_requested: false,
+                    ..Default::default()
+                }),
+        ),
     )
     .add_systems(
         Startup,
@@ -2463,6 +2474,7 @@ mod tests {
         for bias in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             let config = OffscreenCaptureConfig {
                 viewport: (32, 32),
+                logging: crate::LoggingOwnership::Renderer,
                 render_settings: RenderSettings {
                     tonemap_exposure_bias: Some(bias),
                     ..Default::default()
@@ -2480,6 +2492,7 @@ mod tests {
     fn adaptive_capture_exposure_is_explicitly_refused() {
         let config = OffscreenCaptureConfig {
             viewport: (32, 32),
+            logging: crate::LoggingOwnership::Renderer,
             render_settings: RenderSettings {
                 auto_exposure: Some(scriptbots_core::RenderAutoExposureSettings {
                     enabled: true,
@@ -2630,6 +2643,7 @@ mod tests {
         let digest_before = world.world_digest_v1().expect("pre-render science digest");
         let config = OffscreenCaptureConfig {
             viewport: (160, 120),
+            logging: crate::LoggingOwnership::Renderer,
             render_settings: RenderSettings::default(),
             corrupt: false,
         };
@@ -2706,6 +2720,7 @@ mod tests {
         let world = seeded_world(ROOT_SEED);
         let honest_config = OffscreenCaptureConfig {
             viewport: (160, 120),
+            logging: crate::LoggingOwnership::Renderer,
             render_settings: RenderSettings::default(),
             corrupt: false,
         };

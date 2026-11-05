@@ -74,10 +74,33 @@ use tracing::{error, info, warn};
 pub type CommandSubmitFn = Arc<dyn Fn(ControlCommand) -> Option<String> + Send + Sync>;
 pub type ControlHealthFn = Arc<dyn Fn() -> std::result::Result<(), String> + Send + Sync>;
 
+/// Which caller initializes process-wide logging before the renderer starts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LoggingOwnership {
+    /// Reuse the host's global subscriber and log-to-tracing bridge.
+    Host,
+    /// Install Bevy's logger and subscriber for a standalone library launch.
+    #[default]
+    Renderer,
+}
+
+impl LoggingOwnership {
+    fn configure_plugins(
+        self,
+        plugins: bevy::app::PluginGroupBuilder,
+    ) -> bevy::app::PluginGroupBuilder {
+        match self {
+            Self::Host => plugins.disable::<bevy::log::LogPlugin>(),
+            Self::Renderer => plugins,
+        }
+    }
+}
+
 pub struct BevyRendererContext {
     pub host: ChannelHostPort,
     pub command_submit: CommandSubmitFn,
     pub control_health: Option<ControlHealthFn>,
+    pub logging: LoggingOwnership,
 }
 
 impl BevyRendererContext {
@@ -696,11 +719,11 @@ fn drive_adaptive_quality(
     );
 }
 
-fn renderer_plugins() -> bevy::app::PluginGroupBuilder {
+fn renderer_plugins(logging: LoggingOwnership) -> bevy::app::PluginGroupBuilder {
     // This renderer does not play audio. Bevy's default audio plugin opens an
     // output stream eagerly, which can repeatedly report device failures even
     // when no sound is requested. Enable it deliberately when audio is added.
-    DefaultPlugins
+    let plugins = DefaultPlugins
         .set(WindowPlugin {
             primary_window: Some(Window {
                 title: "ScriptBots • Bevy Renderer".to_string(),
@@ -709,7 +732,8 @@ fn renderer_plugins() -> bevy::app::PluginGroupBuilder {
             }),
             ..Default::default()
         })
-        .disable::<bevy::audio::AudioPlugin>()
+        .disable::<bevy::audio::AudioPlugin>();
+    logging.configure_plugins(plugins)
 }
 
 pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
@@ -719,6 +743,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
         mut host,
         command_submit,
         control_health,
+        logging,
     } = ctx;
 
     let initial = host
@@ -862,7 +887,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
         &initial_render_settings,
     ))
     .insert_resource(effective_render_settings)
-    .add_plugins(renderer_plugins())
+    .add_plugins(renderer_plugins(logging))
     .add_plugins(AutoExposurePlugin)
     .add_systems(Startup, (initialize_ssao_support, setup_scene).chain())
     .add_systems(
@@ -4632,11 +4657,103 @@ mod renderer_plugins_tests {
     use super::*;
 
     #[test]
+    fn host_and_standalone_logging_keep_events_without_duplicate_initialization() {
+        const OWNER_ENV: &str = "SCRIPTBOTS_TEST_LOGGING_OWNER";
+        if let Ok(owner) = std::env::var(OWNER_ENV) {
+            assert!(matches!(owner.as_str(), "host" | "standalone"));
+            if owner == "host" {
+                bevy::log::tracing_subscriber::fmt()
+                    .with_writer(std::io::stdout)
+                    .with_ansi(false)
+                    .without_time()
+                    .with_target(false)
+                    .try_init()
+                    .expect("host initializes process logging");
+                info!("host_logging_event_before_renderer");
+            }
+            let logging = if owner == "host" {
+                LoggingOwnership::Host
+            } else {
+                LoggingOwnership::Renderer
+            };
+            let plugins = renderer_plugins(logging);
+            let initializes_logging = plugins.enabled::<bevy::log::LogPlugin>();
+            // Exercise the selected real LogPlugin without making this process
+            // isolation test depend on an available window or GPU adapter.
+            let mut app = App::new();
+            logging
+                .configure_plugins(
+                    bevy::app::PluginGroupBuilder::start::<MinimalPlugins>()
+                        .add(bevy::log::LogPlugin::default()),
+                )
+                .finish(&mut app);
+            info!(owner, "renderer_logging_event_after_setup");
+            println!("logging_plugin_enabled={initializes_logging}");
+            return;
+        }
+
+        for owner in ["host", "standalone"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "renderer_plugins_tests::host_and_standalone_logging_keep_events_without_duplicate_initialization",
+                    "--nocapture",
+                ])
+                .env(OWNER_ENV, owner)
+                .env_remove("RUST_LOG")
+                .output()
+                .expect("run process-isolated logging probe");
+            let stdout = String::from_utf8(output.stdout).expect("logging stdout is UTF-8");
+            let stderr = String::from_utf8(output.stderr).expect("logging stderr is UTF-8");
+            println!(
+                "{}",
+                serde_json::json!({
+                    "logging_owner": owner,
+                    "source_commit": option_env!("SCRIPTBOTS_SOURCE_REVISION"),
+                    "status": output.status.code(),
+                    "stdout": stdout,
+                    "stderr": stderr,
+                })
+            );
+            assert!(output.status.success(), "{owner}: {stdout}\n{stderr}");
+            let (events, other_stream) = if owner == "host" {
+                (&stdout, &stderr)
+            } else {
+                (&stderr, &stdout)
+            };
+            assert!(
+                events.contains("renderer_logging_event_after_setup"),
+                "{owner}: renderer events disappeared: {stdout}\n{stderr}"
+            );
+            assert_eq!(
+                events.matches("renderer_logging_event_after_setup").count(),
+                1
+            );
+            assert!(!other_stream.contains("renderer_logging_event_after_setup"));
+            assert!(
+                !stdout.contains("Could not set global")
+                    && !stderr.contains("Could not set global"),
+                "{owner}: duplicate logging initialization: {stdout}\n{stderr}"
+            );
+            if owner == "host" {
+                assert!(stdout.contains("host_logging_event_before_renderer"));
+                assert!(!stdout.contains('\u{1b}'), "the host formatter changed");
+            }
+        }
+    }
+
+    #[test]
     fn renderer_keeps_graphics_without_opening_unused_audio() {
-        let plugins = renderer_plugins();
-        assert!(plugins.enabled::<WindowPlugin>());
-        assert!(plugins.enabled::<bevy::render::RenderPlugin>());
-        assert!(!plugins.enabled::<bevy::audio::AudioPlugin>());
+        for logging in [LoggingOwnership::Host, LoggingOwnership::Renderer] {
+            let plugins = renderer_plugins(logging);
+            assert!(plugins.enabled::<WindowPlugin>());
+            assert!(plugins.enabled::<bevy::render::RenderPlugin>());
+            assert!(!plugins.enabled::<bevy::audio::AudioPlugin>());
+            assert_eq!(
+                plugins.enabled::<bevy::log::LogPlugin>(),
+                logging == LoggingOwnership::Renderer
+            );
+        }
     }
 }
 

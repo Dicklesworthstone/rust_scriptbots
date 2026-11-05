@@ -325,6 +325,8 @@ impl SceneManifest {
 pub struct SceneRenderFacts {
     /// Actual adapter capability report; absent when the session could not report it.
     pub gpu: Option<scriptbots_core::GpuInfo>,
+    /// Request consumed by the renderer, before adapter policy resolves the tier.
+    pub requested_quality: scriptbots_core::RenderQuality,
     /// Tier after adapter classification and software-fallback clamping.
     pub effective_quality: scriptbots_core::RenderQuality,
 }
@@ -836,6 +838,8 @@ pub struct BevyOffscreenDriver {
     pub seed_agents: u32,
     /// Viewport in pixels.
     pub viewport: (u32, u32),
+    /// Owner of process logging before the first offscreen capture starts.
+    pub logging: scriptbots_bevy::LoggingOwnership,
     /// Artifact directory (PNG + provenance JSON); `None` = hashes only.
     pub artifacts_dir: Option<PathBuf>,
 }
@@ -846,6 +850,7 @@ impl Default for BevyOffscreenDriver {
         Self {
             seed_agents: 16,
             viewport: (1280, 720),
+            logging: scriptbots_bevy::LoggingOwnership::Renderer,
             artifacts_dir: None,
         }
     }
@@ -886,11 +891,13 @@ impl SceneDriver for BevyOffscreenDriver {
             &OffscreenCaptureConfig {
                 viewport: self.viewport,
                 render_settings: config.render.clone(),
+                logging: self.logging,
                 corrupt,
             },
             |capture| {
                 facts.render = Some(SceneRenderFacts {
                     gpu: capture.gpu_info().cloned(),
+                    requested_quality: capture.requested_quality(),
                     effective_quality: capture.tier(),
                 });
                 let mut do_captures = |world: &WorldState,
@@ -1558,6 +1565,7 @@ stars = true
                     driver,
                     driver_info: None,
                 }),
+                requested_quality: scriptbots_core::RenderQuality::Ultra,
                 effective_quality: tier,
             };
             let log = run_scene(&manifest, &mut ReportDriver(report.clone())).expect("scene");

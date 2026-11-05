@@ -4519,6 +4519,7 @@ fn run_scene_capture_cli(scene_path: &Path) -> Result<()> {
 
     let mut driver = BevyOffscreenDriver {
         artifacts_dir: Some(artifacts_dir.clone()),
+        logging: scriptbots_bevy::LoggingOwnership::Host,
         ..BevyOffscreenDriver::default()
     };
     let log = run_scene(&manifest, &mut driver).map_err(|error| anyhow!("scene run: {error}"))?;
@@ -5074,6 +5075,7 @@ impl Renderer for BevyRenderer {
             host: ctx.host,
             command_submit: Arc::clone(&ctx.command_submit),
             control_health: Some(control_health),
+            logging: scriptbots_bevy::LoggingOwnership::Host,
         };
         scriptbots_bevy::run_renderer(bevy_ctx)
     }

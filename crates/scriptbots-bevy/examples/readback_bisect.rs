@@ -16,6 +16,7 @@ fn main() {
     let config = OffscreenCaptureConfig {
         viewport: (64, 64),
         render_settings: Default::default(),
+        logging: scriptbots_bevy::LoggingOwnership::Renderer,
         corrupt: false,
     };
 

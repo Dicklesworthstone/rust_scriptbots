@@ -123,6 +123,7 @@ fn same_tick_camera_bookmarks_render_distinct_views_of_identical_science() {
         seed_agents: 8,
         viewport: (256, 256),
         artifacts_dir: Some(artifacts.to_path_buf()),
+        logging: scriptbots_bevy::LoggingOwnership::Renderer,
     };
     let facts = driver.run(&manifest).expect("real GPU bookmark captures");
     assert_eq!(facts.captures.len(), manifest.captures.len());
@@ -175,6 +176,7 @@ fn look_development_exposure_changes_pixels_without_changing_science() {
             seed_agents: 8,
             viewport: (256, 256),
             artifacts_dir: Some(artifacts.clone()),
+            logging: scriptbots_bevy::LoggingOwnership::Renderer,
         };
         let facts = driver.run(&manifest).expect("real GPU exposure capture");
         let provenance: scriptbots_bevy::capture::CaptureProvenance =
@@ -250,6 +252,7 @@ fn follow_camera_matches_explicit_view_without_changing_science() {
         seed_agents: 8,
         viewport: (256, 256),
         artifacts_dir: Some(artifacts.to_path_buf()),
+        logging: scriptbots_bevy::LoggingOwnership::Renderer,
     };
     let facts = driver.run(&manifest).expect("real follow capture");
     assert_eq!(facts.captures.len(), manifest.captures.len());
@@ -328,6 +331,7 @@ fn render_tiny(
         seed_agents: 8,
         viewport: (256, 256),
         artifacts_dir: artifacts_dir.map(Path::to_path_buf),
+        logging: scriptbots_bevy::LoggingOwnership::Renderer,
     };
     let facts = match driver.run(&manifest) {
         Ok(facts) => facts,
@@ -588,39 +592,62 @@ fn missing_scene_manifest_fails_closed() {
 
 #[test]
 fn bevy_offscreen_driver_honors_manifest_quality() {
-    // No-GPU path: only explicit adapter unavailability may skip. A successful
-    // run must render a real frame whose provenance proves the requested tier
-    // reached the renderer.
-    let mut manifest = tiny_manifest("quality_gate");
-    manifest.quality = Some("ultra".to_string());
-    let temp = tempfile::tempdir().expect("quality proof tempdir");
-    let mut driver = BevyOffscreenDriver {
-        seed_agents: 4,
-        viewport: (64, 64),
-        artifacts_dir: Some(temp.path().to_path_buf()),
-    };
-    match driver.run(&manifest) {
-        Ok(facts) => {
-            assert_eq!(facts.agent_counts.len(), 5, "ticks 0..=4");
-            assert!(facts.world_digest.is_some());
-            assert_eq!(facts.captures.len(), 1, "the quality proof must render");
-            let provenance: scriptbots_bevy::capture::CaptureProvenance = serde_json::from_str(
-                &std::fs::read_to_string(temp.path().join("mid.provenance.json"))
-                    .expect("quality proof provenance"),
-            )
-            .expect("decode quality proof provenance");
-            assert_eq!(
-                provenance.quality_tier, "Ultra",
-                "an explicit Ultra request must be consumed by the actual renderer"
-            );
-        }
-        Err(error) => {
-            assert!(
-                is_adapter_unavailable(&error),
-                "only explicit adapter unavailability may skip this GPU proof, got: {error}"
-            );
-        }
+    use scriptbots_core::{GpuClass, RenderQuality, initial_tier_for};
+
+    // Requested and effective tiers are distinct observations: software always
+    // clamps to Potato, so effective quality alone cannot prove manifest wiring.
+    let mut observed_requests = Vec::new();
+    for (quality, requested) in [
+        (Some("ultra"), RenderQuality::Ultra),
+        (Some("low"), RenderQuality::Low),
+        (None, RenderQuality::Auto),
+    ] {
+        let mut manifest = tiny_manifest("quality_gate");
+        manifest.quality = quality.map(str::to_owned);
+        let temp = tempfile::tempdir().expect("quality proof tempdir");
+        let mut driver = BevyOffscreenDriver {
+            seed_agents: 4,
+            viewport: (64, 64),
+            artifacts_dir: Some(temp.path().to_path_buf()),
+            logging: scriptbots_bevy::LoggingOwnership::Renderer,
+        };
+        let facts = match driver.run(&manifest) {
+            Ok(facts) => facts,
+            Err(error) => {
+                assert!(
+                    is_adapter_unavailable(&error),
+                    "only explicit adapter unavailability may skip this GPU proof, got: {error}"
+                );
+                return;
+            }
+        };
+        assert_eq!(facts.agent_counts.len(), 5, "ticks 0..=4");
+        assert!(facts.world_digest.is_some());
+        assert_eq!(facts.captures.len(), 1, "the quality proof must render");
+        let render = facts.render.expect("initialized renderer facts");
+        assert_eq!(render.requested_quality, requested, "manifest {quality:?}");
+        observed_requests.push(render.requested_quality);
+        let gpu = render.gpu.expect("actual adapter capability report");
+        let effective = if gpu.class == GpuClass::Software {
+            RenderQuality::Potato
+        } else if requested == RenderQuality::Auto {
+            initial_tier_for(gpu.class, gpu.vram_bytes)
+        } else {
+            requested
+        };
+        assert_eq!(render.effective_quality, effective, "manifest {quality:?}");
+        let provenance: scriptbots_bevy::capture::CaptureProvenance = serde_json::from_str(
+            &std::fs::read_to_string(temp.path().join("mid.provenance.json"))
+                .expect("quality proof provenance"),
+        )
+        .expect("decode quality proof provenance");
+        assert_eq!(provenance.quality_tier, format!("{effective:?}"));
+        println!(
+            "quality request={:?} effective={:?} adapter={:?}",
+            render.requested_quality, render.effective_quality, gpu.class
+        );
     }
+    assert!(observed_requests.windows(2).all(|pair| pair[0] != pair[1]));
 }
 
 #[test]
