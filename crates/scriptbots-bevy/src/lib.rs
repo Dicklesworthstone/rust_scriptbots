@@ -11272,15 +11272,15 @@ fn build_chunk_mesh(
             let uv_z = terrain_detail_uv(global_z, terrain.dims.y);
             uvs.push([uv_x, uv_z]);
 
-            let color = terrain_vertex_color(terrain, global_x, global_z, palette);
+            let sample = terrain.sample_tile(global_x, global_z);
+            let slope = compute_tile_slope(terrain, global_x, global_z);
+            let color = terrain_vertex_color_from_sample(sample, slope, terrain.daylight, palette);
             colors.push(color);
 
-            let sample = terrain.sample_tile(global_x, global_z);
             if vx < bounds.size.x && vz < bounds.size.y {
                 biome_tiles[visual::terrain_kind_index(sample.kind)] += 1;
             }
             sum_moisture += sample.moisture as f64;
-            let slope = compute_tile_slope(terrain, global_x, global_z);
             sum_slope += slope as f64;
         }
     }
@@ -11417,6 +11417,15 @@ fn terrain_tile_surface_srgb(
 ) -> [f32; 3] {
     let sample = terrain.sample_tile(x, z);
     let slope = compute_tile_slope(terrain, x, z);
+    terrain_tile_surface_srgb_from_sample(sample, slope, terrain.daylight, palette)
+}
+
+fn terrain_tile_surface_srgb_from_sample(
+    sample: TerrainTileSample,
+    slope: f32,
+    daylight: f32,
+    palette: ColorPaletteMode,
+) -> [f32; 3] {
     let weights = visual::splat_weights(&SplatInput {
         kind: sample.kind,
         elevation: sample.elevation,
@@ -11431,19 +11440,31 @@ fn terrain_tile_surface_srgb(
         elevation: sample.elevation,
         slope,
         accent: sample.accent,
-        daylight: terrain.daylight,
+        daylight,
         accessibility: palette.accessibility(),
         temperature: sample.temperature,
     })
 }
 
+#[cfg(test)]
 fn terrain_vertex_color(
     terrain: &TerrainHeightSnapshot,
     x: u32,
     z: u32,
     palette: ColorPaletteMode,
 ) -> [f32; 4] {
-    let mapped = terrain_tile_surface_srgb(terrain, x, z, palette);
+    let sample = terrain.sample_tile(x, z);
+    let slope = compute_tile_slope(terrain, x, z);
+    terrain_vertex_color_from_sample(sample, slope, terrain.daylight, palette)
+}
+
+fn terrain_vertex_color_from_sample(
+    sample: TerrainTileSample,
+    slope: f32,
+    daylight: f32,
+    palette: ColorPaletteMode,
+) -> [f32; 4] {
+    let mapped = terrain_tile_surface_srgb_from_sample(sample, slope, daylight, palette);
     let linear = srgb_to_linear_rgb(mapped);
     [linear[0], linear[1], linear[2], 1.0]
 }
