@@ -62,7 +62,7 @@ use std::{
         mpsc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tracing::{error, info, warn};
 
@@ -770,6 +770,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
     let controls_for_thread = controls_resource.clone();
     let snapshot_failures = failure_tx.clone();
     let host_snapshots = host.snapshot_hub();
+    let owner_inspector = OwnerInspector::new(host.clone());
 
     let snapshot_worker = thread::Builder::new()
         .name("scriptbots-bevy-snapshot".into())
@@ -866,6 +867,8 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
         &effective_render_settings,
     ))
     .insert_non_send_resource(snapshot_inbox)
+    .insert_non_send_resource(owner_inspector)
+    .init_resource::<InspectorPage>()
     .insert_non_send_resource(BevyLifecycleFailureInbox {
         receiver: failure_rx,
         first_failure: Arc::clone(&first_worker_failure),
@@ -936,7 +939,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
             update_exposure_button_colors,
             control_camera,
             sync_camera_tonemapping,
-            update_hud,
+            (poll_owner_inspector, handle_inspector_page, update_hud).chain(),
         )
             .chain(),
     )
@@ -3009,6 +3012,8 @@ impl TerrainChunkSignature {
 pub(crate) struct WorldSnapshot {
     revision: u64,
     tick: u64,
+    /// Exact owner publication identity; standalone captures have no owner port.
+    owner_source: Option<(scriptbots_runtime::BrainProjectionSource, u64)>,
     reduced_motion: bool,
     paused: bool,
     world_size: Vec2,
@@ -3569,6 +3574,16 @@ impl WorldSnapshot {
         Some(Self {
             revision: 1,
             tick: snapshot.world.tick,
+            owner_source: Some((
+                scriptbots_runtime::BrainProjectionSource {
+                    session_id: snapshot.session_id,
+                    published_snapshot: snapshot.revision,
+                    published_host: snapshot.revisions,
+                    inspected_host: snapshot.revisions,
+                    inspected_tick: scriptbots_core::Tick(snapshot.world.tick),
+                },
+                snapshot.world.epoch,
+            )),
             reduced_motion: config.render.reduced_motion.unwrap_or(false),
             paused: snapshot.playback.paused,
             world_size: Vec2::new(width, height),
@@ -3753,6 +3768,7 @@ impl WorldSnapshot {
         Some(Self {
             revision: 1,
             tick: world.tick().0,
+            owner_source: None,
             reduced_motion: config.render.reduced_motion.unwrap_or(false),
             paused: false,
             world_size: Vec2::new(width, height),
@@ -3778,7 +3794,9 @@ fn assign_presentation_revision(
     previous: Option<&WorldSnapshot>,
     next_revision: &mut u64,
 ) -> Result<bool> {
-    if previous.is_some_and(|last| snapshot.same_render_content(last)) {
+    if previous.is_some_and(|last| {
+        snapshot.same_render_content(last) && snapshot.owner_source == last.owner_source
+    }) {
         return Ok(false);
     }
     snapshot.revision = *next_revision;
@@ -4193,6 +4211,22 @@ fn setup_scene(
                         TextColor(secondary_text_color),
                     ));
                 });
+
+                row.spawn((
+                    Button,
+                    button_node.clone(),
+                    BackgroundColor(follow_idle_color()),
+                    BorderRadius::all(Val::Px(6.0)),
+                    BorderColor::all(button_border_color),
+                    InspectorPageButton,
+                ))
+                .with_children(|btn| {
+                    btn.spawn((
+                        Text::new("Inspector page (I)"),
+                        secondary_font.clone(),
+                        TextColor(secondary_text_color),
+                    ));
+                });
             });
 
         let tonemap_modes = [
@@ -4451,6 +4485,8 @@ fn update_hud(
     command_feedback: Option<Res<NativeCommandFeedback>>,
     tonemap_state: Res<TonemappingState>,
     accessibility: Res<AccessibilityState>,
+    owner_inspector: Option<NonSend<OwnerInspector>>,
+    inspector_page: Option<Res<InspectorPage>>,
     mut texts: Query<&mut Text>,
 ) {
     let Some(_) = state.latest.as_ref() else {
@@ -4491,10 +4527,15 @@ fn update_hud(
         let event_feed = format_event_feed(&snapshot.events);
         let history_panel = format_history_panel(&snapshot.history);
         let brain_panel = format_brain_overlay(&snapshot.brain);
-        let inspector_text = format_inspector(
+        let mut inspector_text = format_inspector(
             primary_agent
                 .map(|agent| InspectorDetail::from_agent(agent, selected_count.saturating_sub(1))),
         );
+        if let Some(owner) = owner_inspector.as_ref() {
+            inspector_text.push('\n');
+            inspector_text
+                .push_str(&owner.panel(snapshot, inspector_page.as_ref().map_or(0, |page| page.0)));
+        }
         (
             tick,
             agent_count,
@@ -7648,6 +7689,899 @@ mod hud_event_feed_tests {
     }
 }
 
+const OWNER_INSPECTOR_REFRESH: Duration = Duration::from_millis(250);
+const OWNER_INSPECTOR_DEADLINE: Duration = Duration::from_millis(500);
+const INSPECTOR_ROWS_PER_PAGE: usize = 8;
+
+#[derive(Resource, Default)]
+struct InspectorPage(usize);
+
+#[derive(Component)]
+struct InspectorPageButton;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InspectorTarget {
+    source: scriptbots_runtime::BrainProjectionSource,
+    epoch: u64,
+    uid: AgentUid,
+}
+
+impl InspectorTarget {
+    fn from_frame(frame: &WorldSnapshot) -> Option<Self> {
+        let (source, epoch) = frame.owner_source?;
+        let agent = frame
+            .agents
+            .iter()
+            .find(|agent| agent.selection == SelectionState::Selected)?;
+        Some(Self {
+            source,
+            epoch,
+            uid: agent.uid,
+        })
+    }
+
+    fn same_subject(self, current: Self) -> bool {
+        self.uid == current.uid
+            && self.epoch == current.epoch
+            && self.source.session_id == current.source.session_id
+            && self.source.inspected_host.control == current.source.inspected_host.control
+            && self.source.inspected_host.config == current.source.inspected_host.config
+    }
+
+    fn visible_at(self, current: Self) -> bool {
+        self.same_subject(current)
+            && self.source.published_snapshot <= current.source.published_snapshot
+            && self.source.inspected_tick <= current.source.inspected_tick
+            && self.source.inspected_host.scientific <= current.source.inspected_host.scientific
+    }
+}
+
+struct OwnerInspectorSample {
+    target: InspectorTarget,
+    pages: Vec<String>,
+}
+
+struct OwnerInspectorJob {
+    target: InspectorTarget,
+    result: mpsc::Receiver<std::result::Result<Option<OwnerInspectorSample>, String>>,
+    worker: thread::JoinHandle<()>,
+}
+
+/// Render-thread controller: no owner wait and at most one request/response retained.
+/// The owner read has a deadline; renderer shutdown reaps the sole worker.
+struct OwnerInspector {
+    host: ChannelHostPort,
+    job: Option<OwnerInspectorJob>,
+    sample: Option<OwnerInspectorSample>,
+    last_request: Option<Instant>,
+    last_attempt: Option<InspectorTarget>,
+    status: String,
+}
+
+impl OwnerInspector {
+    fn new(host: ChannelHostPort) -> Self {
+        Self {
+            host,
+            job: None,
+            sample: None,
+            last_request: None,
+            last_attempt: None,
+            status: "select a living agent".into(),
+        }
+    }
+
+    fn poll(&mut self, target: Option<InspectorTarget>, now: Instant) {
+        if self
+            .sample
+            .as_ref()
+            .is_some_and(|sample| target.is_none_or(|target| !sample.target.same_subject(target)))
+        {
+            self.sample = None;
+        }
+        // Never join a running worker from an Update system. A completed thread
+        // can be reaped without waiting for owner work or channel admission.
+        if self
+            .job
+            .as_ref()
+            .is_some_and(|job| job.worker.is_finished())
+        {
+            let job = self.job.take().expect("finished inspection job exists");
+            let joined = job.worker.join();
+            if target.is_some_and(|target| job.target.same_subject(target)) {
+                match (joined, job.result.try_recv()) {
+                    (Ok(()), Ok(Ok(Some(sample))))
+                        if target.is_some_and(|target| sample.target.same_subject(target)) =>
+                    {
+                        self.sample = Some(sample);
+                        self.status = "waiting for detail matching this frame".into();
+                    }
+                    (Ok(()), Ok(Ok(_))) => {
+                        self.sample = None;
+                        self.status =
+                            "unavailable: subject died or source changed (I to retry)".into();
+                    }
+                    (Ok(()), Ok(Err(error))) => {
+                        self.sample = None;
+                        self.status = format!(
+                            "unavailable: {} (I to retry)",
+                            bounded_inspector_text(&error)
+                        );
+                    }
+                    _ => {
+                        self.sample = None;
+                        self.status =
+                            "unavailable: inspection worker disconnected (I to retry)".into();
+                    }
+                }
+            }
+        }
+        let Some(target) = target else {
+            self.last_attempt = None;
+            self.status = "select a living agent".into();
+            return;
+        };
+        if self.job.is_some()
+            || self.last_attempt == Some(target)
+            || self
+                .sample
+                .as_ref()
+                .is_some_and(|sample| sample.target == target)
+            || self
+                .last_request
+                .is_some_and(|at| now.duration_since(at) < OWNER_INSPECTOR_REFRESH)
+        {
+            return;
+        }
+        let host = self.host.clone();
+        let (send, result) = mpsc::sync_channel(1);
+        // A deadline bounds this frontend's wait, not owner-side cancellation.
+        // Do not enqueue another read for a stationary failed source unless
+        // the user explicitly retries; new publications naturally re-enable it.
+        self.last_attempt = Some(target);
+        match thread::Builder::new()
+            .name("scriptbots-bevy-inspector".into())
+            .spawn(move || {
+                let response = capture_owner_inspector(&host, target);
+                let _ = send.send(response);
+            }) {
+            Ok(worker) => {
+                self.job = Some(OwnerInspectorJob {
+                    target,
+                    result,
+                    worker,
+                });
+                self.last_request = Some(now);
+                self.status = "reading owner detail".into();
+            }
+            Err(error) => {
+                self.last_request = Some(now);
+                self.status =
+                    format!("unavailable: could not start inspection: {error} (I to retry)");
+            }
+        }
+    }
+
+    fn panel(&self, frame: &WorldSnapshot, page: usize) -> String {
+        let Some(current) = InspectorTarget::from_frame(frame) else {
+            return "Owner detail: select a living agent".into();
+        };
+        let Some(sample) = self
+            .sample
+            .as_ref()
+            .filter(|sample| sample.target.visible_at(current))
+        else {
+            return format!("Owner detail: {}", self.status);
+        };
+        let source = sample.target.source;
+        let index = page % sample.pages.len();
+        format!(
+            "Owner UID {} | tick {} | age {} ticks | page {}/{} (I)\n\
+             Session {:x} | publication {} | config {} | control {}\n{}",
+            sample.target.uid.0,
+            source.inspected_tick.0,
+            current.source.inspected_tick.0 - source.inspected_tick.0,
+            index + 1,
+            sample.pages.len(),
+            source.session_id.get(),
+            source.published_snapshot.get(),
+            source.inspected_host.config.get(),
+            source.inspected_host.control.get(),
+            sample.pages[index],
+        )
+    }
+}
+
+impl Drop for OwnerInspector {
+    fn drop(&mut self) {
+        if let Some(job) = self.job.take()
+            && job.worker.join().is_err()
+        {
+            warn!("Bevy owner inspection worker panicked during shutdown");
+        }
+    }
+}
+
+fn capture_owner_inspector(
+    host: &ChannelHostPort,
+    target: InspectorTarget,
+) -> std::result::Result<Option<OwnerInspectorSample>, String> {
+    let Some(detail) = host
+        .inspect_agent_before(target.uid, 0, Instant::now() + OWNER_INSPECTOR_DEADLINE)
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(None);
+    };
+    let latest = host.snapshot_hub().latest();
+    // A response must correspond to an actual immutable owner publication.
+    // The owner may advance between submission and completion, so also accept
+    // its independently read latest publication, never a fabricated revision.
+    let epoch = if detail.source == target.source {
+        target.epoch
+    } else if detail.source.matches_snapshot(&latest) {
+        latest.world.epoch
+    } else {
+        return Ok(None);
+    };
+    let captured = InspectorTarget {
+        source: detail.source,
+        epoch,
+        uid: detail.uid,
+    };
+    if !captured.same_subject(target) {
+        return Ok(None);
+    }
+    Ok(Some(OwnerInspectorSample {
+        target: captured,
+        pages: owner_inspector_pages(&detail),
+    }))
+}
+
+fn owner_inspector_pages(detail: &scriptbots_runtime::channel::AgentInspectorData) -> Vec<String> {
+    let life = &detail.life;
+    let mut pages = vec![format!(
+        "Life and lineage | {} | bound {}\nParents {:?} | hybrid {}\n\
+         Reproduction counter {:.3} | clock scales {:.3}, {:.3}\n\
+         Lifetime food {:.3} | mutation log entries {}/{}\nMutation rate {:.4} | scale {:.4}\n\
+         Traits smell {:.2} sound {:.2} hearing {:.2} eye {:.2} blood {:.2}",
+        bounded_inspector_text(&detail.brain_descriptor),
+        detail.brain_bound,
+        life.lineage,
+        life.hybrid,
+        life.reproduction_counter,
+        life.clock_scales[0],
+        life.clock_scales[1],
+        life.food_balance_total,
+        life.mutation_log.len(),
+        life.mutation_log_total,
+        detail.mutation_rates.primary,
+        detail.mutation_rates.secondary,
+        detail.trait_modifiers.smell,
+        detail.trait_modifiers.sound,
+        detail.trait_modifiers.hearing,
+        detail.trait_modifiers.eye,
+        detail.trait_modifiers.blood,
+    )];
+    let sensors = scriptbots_core::SENSOR_LAYOUT
+        .iter()
+        .zip(detail.sensors)
+        .map(|(channel, value)| format!("{:02} {}: {value:.4}", channel.index, channel.name))
+        .collect::<Vec<_>>();
+    for (index, rows) in sensors.chunks(INSPECTOR_ROWS_PER_PAGE).enumerate() {
+        pages.push(format!(
+            "Sensors {}-{}/{}\n{}",
+            index * INSPECTOR_ROWS_PER_PAGE + 1,
+            index * INSPECTOR_ROWS_PER_PAGE + rows.len(),
+            sensors.len(),
+            rows.join("\n")
+        ));
+    }
+    let outputs = OutputChannel::ALL
+        .iter()
+        .map(|channel| {
+            format!(
+                "{:02} {}: {:.4}",
+                channel.index(),
+                channel.name(),
+                detail.outputs[channel.index()]
+            )
+        })
+        .collect::<Vec<_>>();
+    for (index, rows) in outputs.chunks(INSPECTOR_ROWS_PER_PAGE).enumerate() {
+        pages.push(format!(
+            "Outputs {}-{}/{}\n{}",
+            index * INSPECTOR_ROWS_PER_PAGE + 1,
+            index * INSPECTOR_ROWS_PER_PAGE + rows.len(),
+            outputs.len(),
+            rows.join("\n")
+        ));
+    }
+    let eyes = detail
+        .eye_direction
+        .iter()
+        .zip(detail.eye_fov)
+        .enumerate()
+        .map(|(index, (direction, fov))| {
+            format!(
+                "Eye {}: direction {direction:.4} | field of view {fov:.4}",
+                index + 1
+            )
+        })
+        .collect::<Vec<_>>();
+    pages.push(format!("Eyes (radians)\n{}", eyes.join("\n")));
+    pages.push(detail.genome_browser.as_ref().map_or_else(
+        || "Genome summary: unavailable for this family".into(),
+        |genome| {
+            use scriptbots_core::genome_browser::MutationDiffStatus;
+            let mutation = match &genome.mutation_diff {
+                MutationDiffStatus::FounderNoParent => "founder, no parent".into(),
+                MutationDiffStatus::Computed { total_deltas, .. }
+                | MutationDiffStatus::SexualPrimary { total_deltas, .. } => {
+                    format!("{total_deltas} deltas against primary parent")
+                }
+                MutationDiffStatus::Unavailable { reason } => {
+                    format!("unavailable: {}", bounded_inspector_text(reason))
+                }
+            };
+            format!(
+                "Genome summary | {} schema {}\nDigest {}\n\
+                 Retained nodes {}/{} | loci {} | truncated {}\nParents {:?}\nMutation diff {}",
+                genome.family_id,
+                genome.schema_version,
+                genome.genome_digest,
+                genome.nodes.len(),
+                genome.paging.total_nodes,
+                genome.paging.total_loci,
+                genome.paging.is_truncated,
+                genome.parent_uids,
+                mutation,
+            )
+        },
+    ));
+    for rows in life.mutation_log.chunks(3) {
+        pages.push(format!(
+            "Recent mutation log ({}/{})\n{}",
+            life.mutation_log.len(),
+            life.mutation_log_total,
+            rows.iter()
+                .map(|row| bounded_inspector_text(row))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+    pages
+}
+
+fn bounded_inspector_text(text: &str) -> String {
+    let mut chars = text.chars();
+    let mut result = chars.by_ref().take(128).collect::<String>();
+    if chars.next().is_some() {
+        result.push_str("... (clipped)");
+    }
+    result
+}
+
+fn poll_owner_inspector(state: Res<SnapshotState>, inspector: Option<NonSendMut<OwnerInspector>>) {
+    if let Some(mut inspector) = inspector {
+        inspector.poll(
+            state.latest.as_ref().and_then(InspectorTarget::from_frame),
+            Instant::now(),
+        );
+    }
+}
+
+fn handle_inspector_page(
+    page: Option<ResMut<InspectorPage>>,
+    inspector: Option<NonSendMut<OwnerInspector>>,
+    keys: Option<Res<ButtonInput<KeyCode>>>,
+    buttons: Query<&Interaction, (Changed<Interaction>, With<InspectorPageButton>)>,
+) {
+    if (keys.is_some_and(|keys| keys.just_pressed(KeyCode::KeyI))
+        || buttons
+            .iter()
+            .any(|interaction| *interaction == Interaction::Pressed))
+        && let Some(mut page) = page
+    {
+        let count = inspector
+            .as_ref()
+            .and_then(|inspector| inspector.sample.as_ref().map(|sample| sample.pages.len()))
+            .unwrap_or(1);
+        page.0 = (page.0 + 1) % count;
+        if let Some(mut inspector) = inspector
+            && inspector.sample.is_none()
+        {
+            inspector.last_attempt = None;
+            inspector.status = "retry queued".into();
+        }
+    }
+}
+
+#[cfg(test)]
+mod owner_inspector_tests {
+    use super::*;
+    use scriptbots_core::{AgentData, ScriptBotsConfig};
+    use scriptbots_runtime::{
+        CommandEnvelope, FixedDeadlineHost, HostCommand, HostCore, HostCoreOptions, HostSessionId,
+        ManualInstant, PlaybackSnapshot,
+        channel::{ChannelHostDriver, ChannelHostOptions},
+    };
+
+    struct TestOwner {
+        port: ChannelHostPort,
+        start: Option<mpsc::SyncSender<()>>,
+        worker: Option<thread::JoinHandle<()>>,
+    }
+
+    impl TestOwner {
+        fn new() -> Self {
+            let (send, receive) = mpsc::sync_channel(1);
+            let (start, serving) = mpsc::sync_channel(1);
+            let worker = thread::spawn(move || {
+                let mut world = WorldState::new(ScriptBotsConfig {
+                    rng_seed: Some(17),
+                    world_width: 80,
+                    world_height: 80,
+                    food_cell_size: 40,
+                    population_minimum: 0,
+                    persistence_interval: 0,
+                    ..default()
+                })
+                .unwrap();
+                let id = world.try_inject_agent(AgentData::default()).unwrap();
+                world
+                    .try_update_agent_runtime(id, |runtime| {
+                        runtime.reproduction_counter = 0.375;
+                        runtime.clocks = [1.25, 2.5];
+                        runtime.food_balance_total = 6.25;
+                        runtime.mutation_log.push("owner mutation sample".into());
+                        for (index, sensor) in runtime.sensors.iter_mut().enumerate() {
+                            *sensor = (index + 1) as f32 / 100.0;
+                        }
+                        for (index, output) in runtime.outputs.iter_mut().enumerate() {
+                            *output = (index + 1) as f32 / 20.0;
+                        }
+                    })
+                    .unwrap();
+                let selected = world.apply_selection_update(SelectionUpdate {
+                    mode: SelectionMode::Replace,
+                    agent_ids: vec![id.data().as_ffi()],
+                    state: SelectionState::Selected,
+                });
+                assert_eq!(selected.applied, 1);
+                assert_eq!(selected.remaining_selected, 1);
+                let core = HostCore::new(
+                    HostSessionId::new(717),
+                    world,
+                    HostCoreOptions {
+                        capture_agent_visuals: true,
+                        initial_playback: PlaybackSnapshot {
+                            paused: true,
+                            speed_multiplier: 1.0,
+                        },
+                        ..default()
+                    },
+                )
+                .unwrap();
+                let (mut driver, port) = ChannelHostDriver::new(
+                    FixedDeadlineHost::new(core),
+                    ChannelHostOptions {
+                        maintenance_period: Duration::from_millis(1),
+                        ..default()
+                    },
+                )
+                .unwrap();
+                send.send(port).unwrap();
+                serving.recv().unwrap();
+                let started = Instant::now();
+                driver
+                    .run(move || {
+                        ManualInstant::from_nanos(
+                            u64::try_from(started.elapsed().as_nanos()).unwrap(),
+                        )
+                    })
+                    .unwrap();
+            });
+            Self {
+                port: receive.recv().unwrap(),
+                start: Some(start),
+                worker: Some(worker),
+            }
+        }
+
+        fn serve(&mut self) {
+            if let Some(start) = self.start.take() {
+                start.send(()).unwrap();
+            }
+        }
+
+        fn frame(&self) -> WorldSnapshot {
+            WorldSnapshot::from_snapshot(&self.port.snapshot_hub().latest()).unwrap()
+        }
+    }
+
+    impl Drop for TestOwner {
+        fn drop(&mut self) {
+            self.serve();
+            let mut port = self.port.clone();
+            let _ = port.submit(CommandEnvelope::new(
+                CommandId::from_client_sequence(717, 1),
+                HostCommand::Shutdown,
+            ));
+            if let Some(worker) = self.worker.take() {
+                let result = worker.join();
+                if !thread::panicking() {
+                    assert!(result.is_ok(), "real test owner failed");
+                }
+            }
+        }
+    }
+
+    fn inspector_app(owner: &TestOwner) -> (App, Entity) {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.insert_resource(SnapshotState {
+            latest: Some(owner.frame()),
+            ..default()
+        });
+        app.insert_resource(CameraRig::default());
+        app.insert_resource(SimulationControl::new());
+        app.insert_resource(TonemappingState::default());
+        app.insert_resource(AccessibilityState::new());
+        app.init_resource::<InspectorPage>();
+        app.insert_non_send_resource(OwnerInspector::new(owner.port.clone()));
+        let text = app.world_mut().spawn(Text::default()).id();
+        app.insert_resource(HudElements {
+            inspector: text,
+            tick: Entity::PLACEHOLDER,
+            agents: Entity::PLACEHOLDER,
+            selection: Entity::PLACEHOLDER,
+            follow: Entity::PLACEHOLDER,
+            camera: Entity::PLACEHOLDER,
+            playback: Entity::PLACEHOLDER,
+            command_feedback: Entity::PLACEHOLDER,
+            fps: Entity::PLACEHOLDER,
+            world: Entity::PLACEHOLDER,
+            tonemap: Entity::PLACEHOLDER,
+            palette: Entity::PLACEHOLDER,
+            events: Entity::PLACEHOLDER,
+            history: Entity::PLACEHOLDER,
+            brain: Entity::PLACEHOLDER,
+        });
+        app.add_systems(
+            Update,
+            (poll_owner_inspector, handle_inspector_page, update_hud).chain(),
+        );
+        (app, text)
+    }
+
+    #[test]
+    fn renderer_keeps_updating_while_owner_waits_then_displays_real_detail() {
+        let mut owner = TestOwner::new();
+        let (mut app, text) = inspector_app(&owner);
+        // The real owner deliberately serves no requests yet. A synchronous
+        // consumer cannot complete these updates with a still-running job.
+        for _ in 0..20 {
+            app.update();
+        }
+        let inspector = app.world().non_send_resource::<OwnerInspector>();
+        assert!(inspector.sample.is_none());
+        assert!(!inspector.job.as_ref().unwrap().worker.is_finished());
+        assert!(
+            app.world()
+                .get::<Text>(text)
+                .unwrap()
+                .0
+                .contains("reading owner detail")
+        );
+        owner.serve();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while app
+            .world()
+            .non_send_resource::<OwnerInspector>()
+            .sample
+            .is_none()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "actual owner detail did not reach the HUD"
+            );
+            app.update();
+            thread::sleep(Duration::from_millis(1));
+        }
+        let shown = &app.world().get::<Text>(text).unwrap().0;
+        for expected in [
+            "Owner UID",
+            "age 0 ticks",
+            "Session 2cd",
+            "Life and lineage",
+            "Reproduction counter 0.375",
+            "clock scales 1.250, 2.500",
+            "Lifetime food 6.250",
+        ] {
+            assert!(shown.contains(expected), "missing {expected}: {shown}");
+        }
+        let inspector = app.world().non_send_resource::<OwnerInspector>();
+        assert!(
+            inspector.job.is_none(),
+            "paused exact source must reuse its completed sample"
+        );
+        let pages = &inspector.sample.as_ref().unwrap().pages;
+        let joined = pages.join("\n");
+        for channel in scriptbots_core::SENSOR_LAYOUT {
+            let expected = format!(
+                "{:02} {}: {:.4}",
+                channel.index,
+                channel.name,
+                (channel.index + 1) as f32 / 100.0
+            );
+            assert!(
+                joined.contains(&expected),
+                "sensor omitted or mislabeled: {expected}"
+            );
+        }
+        for channel in OutputChannel::ALL {
+            let expected = format!(
+                "{:02} {}: {:.4}",
+                channel.index(),
+                channel.name(),
+                (channel.index() + 1) as f32 / 20.0
+            );
+            assert!(
+                joined.contains(&expected),
+                "output omitted or mislabeled: {expected}"
+            );
+        }
+        assert!(joined.contains("owner mutation sample"));
+        assert!(joined.contains("Genome summary: unavailable"));
+        assert!(joined.contains("Eyes (radians)"));
+        assert!(
+            pages
+                .iter()
+                .all(|page| page.lines().count() <= INSPECTOR_ROWS_PER_PAGE + 1)
+        );
+        // Actual button and keyboard consumers reach different owner-data pages.
+        let button = app
+            .world_mut()
+            .spawn((InspectorPageButton, Interaction::Pressed))
+            .id();
+        app.update();
+        assert!(
+            app.world()
+                .get::<Text>(text)
+                .unwrap()
+                .0
+                .contains("Sensors 1-8/")
+        );
+        app.world_mut().entity_mut(button).insert(Interaction::None);
+        let mut keys = ButtonInput::<KeyCode>::default();
+        keys.press(KeyCode::KeyI);
+        app.insert_resource(keys);
+        app.update();
+        assert!(
+            app.world()
+                .get::<Text>(text)
+                .unwrap()
+                .0
+                .contains("Sensors 9-16/")
+        );
+    }
+
+    #[test]
+    fn no_selection_never_starts_an_owner_request() {
+        let owner = TestOwner::new();
+        let (mut app, text) = inspector_app(&owner);
+        app.world_mut()
+            .resource_mut::<SnapshotState>()
+            .latest
+            .as_mut()
+            .unwrap()
+            .agents[0]
+            .selection = SelectionState::None;
+        for _ in 0..4 {
+            app.update();
+        }
+        let inspector = app.world().non_send_resource::<OwnerInspector>();
+        assert!(inspector.job.is_none());
+        assert!(inspector.last_request.is_none());
+        assert!(
+            app.world()
+                .get::<Text>(text)
+                .unwrap()
+                .0
+                .contains("select a living agent")
+        );
+    }
+
+    #[test]
+    fn cached_owner_detail_rejects_foreign_stale_and_reused_selection() {
+        let mut owner = TestOwner::new();
+        owner.serve();
+        let mut frame = owner.frame();
+        let target = InspectorTarget::from_frame(&frame).unwrap();
+        let mut inspector = OwnerInspector::new(owner.port.clone());
+        inspector.sample = capture_owner_inspector(&owner.port, target).unwrap();
+        assert!(
+            inspector
+                .panel(&frame, 0)
+                .contains("Reproduction counter 0.375")
+        );
+        let mut variants = Vec::new();
+        let mut changed = target;
+        changed.uid = AgentUid(target.uid.0 + 1);
+        variants.push(changed);
+        changed = target;
+        changed.epoch += 1;
+        variants.push(changed);
+        changed = target;
+        changed.source.session_id = HostSessionId::new(718);
+        variants.push(changed);
+        changed = target;
+        changed.source.inspected_host.control = scriptbots_runtime::ControlRevision::new(
+            target.source.inspected_host.control.get() + 1,
+        );
+        variants.push(changed);
+        changed = target;
+        changed.source.inspected_host.config =
+            scriptbots_runtime::ConfigRevision::new(target.source.inspected_host.config.get() + 1);
+        variants.push(changed);
+        for changed in variants {
+            assert!(
+                !target.visible_at(changed),
+                "foreign identity admitted: {changed:?}"
+            );
+        }
+        let mut future_publication = target;
+        future_publication.source.published_snapshot =
+            scriptbots_runtime::SnapshotRevision::new(target.source.published_snapshot.get() + 1);
+        assert!(
+            !future_publication.visible_at(target),
+            "an unpresented publication cannot label its detail as visible"
+        );
+        let mut later = target;
+        later.source.inspected_tick = scriptbots_core::Tick(3);
+        later.source.inspected_host.scientific = scriptbots_runtime::ScientificRevision::new(3);
+        later.source.published_host = later.source.inspected_host;
+        assert!(
+            target.visible_at(later),
+            "a correctly labeled older scientific sample is usable"
+        );
+        assert!(
+            !later.visible_at(target),
+            "a future sample cannot be presented early"
+        );
+        frame.owner_source = Some((later.source, later.epoch));
+        assert!(inspector.panel(&frame, 0).contains("age 3 ticks"));
+        // The transient AgentId stays the same while the stable UID changes.
+        frame.agents[0].uid = AgentUid(target.uid.0 + 1);
+        assert!(!inspector.panel(&frame, 0).contains("Reproduction counter"));
+        frame.agents.clear();
+        assert!(inspector.panel(&frame, 0).contains("select a living agent"));
+    }
+
+    #[test]
+    fn late_owner_response_cannot_replace_a_new_selection() {
+        let mut owner = TestOwner::new();
+        let (mut app, _) = inspector_app(&owner);
+        app.update();
+        app.world_mut()
+            .resource_mut::<SnapshotState>()
+            .latest
+            .as_mut()
+            .unwrap()
+            .agents[0]
+            .uid = AgentUid(999);
+        owner.serve();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while app
+            .world()
+            .non_send_resource::<OwnerInspector>()
+            .job
+            .as_ref()
+            .is_some_and(|job| job.target.uid != AgentUid(999))
+        {
+            assert!(Instant::now() < deadline);
+            app.update();
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            app.world()
+                .non_send_resource::<OwnerInspector>()
+                .sample
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn bounded_text_marks_clipping_and_preserves_unicode() {
+        let short = "owner detail";
+        assert_eq!(bounded_inspector_text(short), short);
+        let long = "界".repeat(129);
+        let clipped = bounded_inspector_text(&long);
+        assert_eq!(
+            clipped.chars().take(128).collect::<String>(),
+            "界".repeat(128)
+        );
+        assert!(clipped.ends_with("... (clipped)"));
+    }
+
+    #[test]
+    fn unchanged_visuals_still_publish_new_owner_identity() {
+        let owner = TestOwner::new();
+        let original = owner.frame();
+        let mut next = original.clone();
+        let source = &mut next.owner_source.as_mut().unwrap().0;
+        source.published_snapshot =
+            scriptbots_runtime::SnapshotRevision::new(source.published_snapshot.get() + 1);
+        assert!(next.same_render_content(&original));
+        let mut revision = original.revision + 1;
+        assert!(assign_presentation_revision(&mut next, Some(&original), &mut revision).unwrap());
+        let previous = next.clone();
+        assert!(!assign_presentation_revision(&mut next, Some(&previous), &mut revision).unwrap());
+    }
+
+    #[test]
+    fn disconnected_owner_failure_is_visible_in_the_actual_hud() {
+        let owner = TestOwner::new();
+        let (mut app, text) = inspector_app(&owner);
+        drop(owner);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            app.update();
+            let shown = &app.world().get::<Text>(text).unwrap().0;
+            if shown.contains("Owner detail: unavailable:") {
+                assert!(!shown.contains("Life and lineage"));
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "owner error was not displayed: {shown}"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        let attempted = app
+            .world()
+            .non_send_resource::<OwnerInspector>()
+            .last_attempt;
+        assert!(attempted.is_some());
+        for _ in 0..4 {
+            app.update();
+        }
+        assert!(
+            app.world()
+                .non_send_resource::<OwnerInspector>()
+                .job
+                .is_none()
+        );
+        app.world_mut()
+            .non_send_resource_mut::<OwnerInspector>()
+            .last_request = Some(Instant::now() - OWNER_INSPECTOR_REFRESH);
+        let button = app
+            .world_mut()
+            .spawn((InspectorPageButton, Interaction::Pressed))
+            .id();
+        app.update();
+        assert!(
+            app.world()
+                .non_send_resource::<OwnerInspector>()
+                .last_attempt
+                .is_none()
+        );
+        app.world_mut().entity_mut(button).insert(Interaction::None);
+        app.update();
+        assert_eq!(
+            app.world()
+                .non_send_resource::<OwnerInspector>()
+                .last_attempt,
+            attempted
+        );
+        assert!(
+            app.world()
+                .non_send_resource::<OwnerInspector>()
+                .job
+                .is_some()
+        );
+    }
+}
+
 /// The primary selection's vitals, projected for the inspector overlay.
 ///
 /// Field vocabulary deliberately mirrors GPUI's inspector detail (`energy`,
@@ -9867,6 +10801,7 @@ mod terrain_tests {
         WorldSnapshot {
             revision: 1,
             tick: 42,
+            owner_source: None,
             reduced_motion: false,
             paused: false,
             world_size,
@@ -10547,6 +11482,7 @@ mod terrain_tests {
         WorldSnapshot {
             revision: 1,
             tick: 42,
+            owner_source: None,
             reduced_motion: false,
             paused: false,
             world_size: Vec2::splat(150.0),
