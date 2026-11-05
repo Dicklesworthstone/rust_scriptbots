@@ -758,6 +758,8 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
     }
     let terrain_detail_source =
         TerrainDetailSource::bake().context("could not load the canonical biome detail atlas")?;
+    terrain_albedo_photos()
+        .map_err(|error| anyhow!("could not load terrain color images: {error}"))?;
 
     let (snapshot_publisher, snapshot_inbox) = SnapshotInbox::pair();
     let (failure_tx, failure_rx) = mpsc::channel::<BevyLifecycleFailure>();
@@ -5810,6 +5812,7 @@ mod adaptive_governor_tests {
         let images = app.world().resource::<Assets<Image>>();
         let mut per_kind = HashMap::new();
         let mut patterns = HashSet::new();
+        let mut albedo_by_group = HashMap::new();
         for chunk in registry.chunks.values() {
             let kind = snapshot
                 .terrain_height
@@ -5838,7 +5841,26 @@ mod adaptive_governor_tests {
                 Color::WHITE,
                 "do not double-tint vertex albedo"
             );
-            assert!(material.base_color_texture.is_none());
+            let albedo = material
+                .base_color_texture
+                .as_ref()
+                .expect("photo albedo bound");
+            let group = terrain_albedo_layer(visual::terrain_kind_index(kind));
+            if let Some(previous) = albedo_by_group.insert(group, albedo.id()) {
+                assert_eq!(previous, albedo.id(), "similar biomes share one image");
+            }
+            let image = images.get(albedo).expect("bound albedo exists");
+            assert!(
+                image
+                    .data
+                    .as_ref()
+                    .unwrap()
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .any(|pixel| pixel[0] != pixel[1] || pixel[1] != pixel[2]),
+                "photo detail must retain color"
+            );
         }
         assert_eq!(
             per_kind.len(),
@@ -5855,6 +5877,146 @@ mod adaptive_governor_tests {
             per_kind.len(),
             "bindings must contain distinct pixel patterns"
         );
+        assert_eq!(albedo_by_group.len(), TERRAIN_ALBEDO_LAYERS);
+        assert_eq!(
+            albedo_by_group.values().collect::<HashSet<_>>().len(),
+            TERRAIN_ALBEDO_LAYERS
+        );
+    }
+
+    #[test]
+    fn terrain_albedo_is_mipmapped_opaque_and_mirrored() {
+        use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler};
+        use bevy::render::render_resource::TextureFormat;
+        for layer in 0..TERRAIN_ALBEDO_LAYERS {
+            let image = terrain_albedo_image(layer);
+            let side = image.texture_descriptor.size.width;
+            assert_eq!(
+                image.texture_descriptor.format,
+                TextureFormat::Rgba8UnormSrgb
+            );
+            assert_eq!(image.texture_descriptor.mip_level_count, side.ilog2() + 1);
+            let ImageSampler::Descriptor(sampler) = &image.sampler else {
+                panic!("explicit sampler required");
+            };
+            assert_eq!(sampler.address_mode_u, ImageAddressMode::MirrorRepeat);
+            assert_eq!(sampler.address_mode_v, ImageAddressMode::MirrorRepeat);
+            assert_eq!(sampler.mipmap_filter, ImageFilterMode::Linear);
+            assert!(
+                image
+                    .data
+                    .as_ref()
+                    .unwrap()
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .all(|p| p[3] == 255)
+            );
+        }
+        let mut pixels = [0, 0, 0, 255].repeat(9);
+        pixels[8 * 4] = 255;
+        assert_eq!(append_terrain_albedo_mips(&mut pixels, 3), 2);
+        assert_eq!(&pixels[36..40], &[28, 0, 0, 255]);
+    }
+
+    #[test]
+    fn terrain_albedo_uvs_join_across_chunk_boundaries() {
+        use bevy_mesh::VertexAttributeValues;
+        let mut app = terrain_detail_app();
+        app.update();
+        let registry = app.world().resource::<TerrainChunkRegistry>();
+        let meshes = app.world().resource::<Assets<Mesh>>();
+        let left = meshes
+            .get(&registry.chunks[&TerrainChunkKey { x: 0, y: 0 }].mesh)
+            .unwrap();
+        let right = meshes
+            .get(&registry.chunks[&TerrainChunkKey { x: 1, y: 0 }].mesh)
+            .unwrap();
+        let Some(VertexAttributeValues::Float32x2(left)) = left.attribute(Mesh::ATTRIBUTE_UV_0)
+        else {
+            panic!("left chunk must have UVs");
+        };
+        let Some(VertexAttributeValues::Float32x2(right)) = right.attribute(Mesh::ATTRIBUTE_UV_0)
+        else {
+            panic!("right chunk must have UVs");
+        };
+        assert_eq!(left[1], right[0]);
+        assert_eq!(left[3], right[2]);
+        assert!(left[1][0] > 0.0);
+        for width in [1, 3, 12, 97, 120] {
+            let start = terrain_detail_uv(0, width);
+            let end = terrain_detail_uv(width, width);
+            assert_eq!(start, 0.0);
+            assert_eq!(end % 2.0, 0.0, "mirrored texture phase must wrap");
+        }
+    }
+
+    #[test]
+    fn terrain_albedo_preserves_accessibility_palette_hues() {
+        let mut app = terrain_detail_app();
+        app.update();
+        let key = TerrainChunkKey { x: 0, y: 0 };
+        let material = app.world().resource::<TerrainChunkRegistry>().chunks[&key]
+            .material
+            .clone();
+        let natural = app
+            .world()
+            .resource::<Assets<StandardMaterial>>()
+            .get(&material)
+            .unwrap()
+            .base_color_texture
+            .clone()
+            .unwrap();
+        let image_count = app.world().resource::<Assets<Image>>().len();
+        for palette in [
+            ColorPaletteMode::Deuteranopia,
+            ColorPaletteMode::Protanopia,
+            ColorPaletteMode::Tritanopia,
+            ColorPaletteMode::HighContrast,
+        ] {
+            app.world_mut().resource_mut::<AccessibilityState>().palette = palette;
+            app.update();
+            let materials = app.world().resource::<Assets<StandardMaterial>>();
+            let neutral = materials
+                .get(&material)
+                .unwrap()
+                .base_color_texture
+                .as_ref()
+                .unwrap();
+            assert_ne!(neutral, &natural);
+            let images = app.world().resource::<Assets<Image>>();
+            assert_eq!(images.len(), image_count);
+            assert!(
+                images
+                    .get(neutral)
+                    .unwrap()
+                    .data
+                    .as_ref()
+                    .unwrap()
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .all(|pixel| pixel[0] == pixel[1] && pixel[1] == pixel[2])
+            );
+            if palette == ColorPaletteMode::HighContrast {
+                assert_eq!(
+                    images.get(neutral).unwrap().data.as_deref(),
+                    Some(&[255; 4][..])
+                );
+            }
+        }
+        app.world_mut().resource_mut::<AccessibilityState>().palette = ColorPaletteMode::Natural;
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<Assets<StandardMaterial>>()
+                .get(&material)
+                .unwrap()
+                .base_color_texture
+                .as_ref(),
+            Some(&natural)
+        );
+        assert_eq!(app.world().resource::<Assets<Image>>().len(), image_count);
     }
 
     #[test]
@@ -5979,6 +6141,51 @@ mod adaptive_governor_tests {
             Some(&other_image),
             "repair must retain unrelated biome handles"
         );
+        let albedo = app
+            .world()
+            .resource::<Assets<StandardMaterial>>()
+            .get(&material)
+            .unwrap()
+            .base_color_texture
+            .clone()
+            .unwrap();
+        let other_albedo = app
+            .world()
+            .resource::<Assets<StandardMaterial>>()
+            .get(&other_material)
+            .unwrap()
+            .base_color_texture
+            .clone()
+            .unwrap();
+        assert_ne!(albedo, other_albedo);
+        app.world_mut()
+            .resource_mut::<Assets<Image>>()
+            .remove(&albedo)
+            .unwrap();
+        app.update();
+        let materials = app.world().resource::<Assets<StandardMaterial>>();
+        let repaired = materials
+            .get(&material)
+            .unwrap()
+            .base_color_texture
+            .as_ref()
+            .unwrap();
+        assert_ne!(repaired, &albedo);
+        assert!(
+            app.world()
+                .resource::<Assets<Image>>()
+                .get(repaired)
+                .is_some()
+        );
+        assert_eq!(
+            materials
+                .get(&other_material)
+                .unwrap()
+                .base_color_texture
+                .as_ref(),
+            Some(&other_albedo)
+        );
+        assert_eq!(app.world().resource::<Assets<Image>>().len(), image_count);
     }
 
     #[test]
@@ -6002,6 +6209,19 @@ mod adaptive_governor_tests {
             .metallic_roughness_texture
             .clone()
             .expect("production material must bind texture");
+        let albedo = material
+            .base_color_texture
+            .clone()
+            .expect("photo albedo bound");
+        let albedo_pixels = app
+            .world()
+            .resource::<Assets<Image>>()
+            .get(&albedo)
+            .unwrap()
+            .data
+            .as_ref()
+            .unwrap()
+            .as_ptr();
         let image_count = app.world().resource::<Assets<Image>>().len();
         for tier in [
             RenderQuality::Potato,
@@ -6017,12 +6237,23 @@ mod adaptive_governor_tests {
                 image.texture_descriptor.size.width,
                 TERRAIN_DETAIL_RESOLUTION / u32::from(tier_features(tier).terrain_detail_divisor)
             );
+            let photo = images.get(&albedo).unwrap();
+            assert_eq!(
+                photo.texture_descriptor.size.width,
+                TERRAIN_ALBEDO_RESOLUTION
+            );
+            assert_eq!(
+                photo.data.as_ref().unwrap().as_ptr(),
+                albedo_pixels,
+                "tier changes must not rebuild shared albedo images"
+            );
             let material = app
                 .world()
                 .resource::<Assets<StandardMaterial>>()
                 .get(&material_handle)
                 .unwrap();
             assert_eq!(material.metallic_roughness_texture.as_ref(), Some(&texture));
+            assert_eq!(material.base_color_texture.as_ref(), Some(&albedo));
             assert_eq!(
                 (
                     material.base_color,
@@ -10329,6 +10560,7 @@ const TERRAIN_DETAIL_RESOLUTION: u32 = visual::CANONICAL_BIOME_ATLAS_TILE_SIZE;
 struct TerrainDetailTextures {
     divisor: u8,
     handles: Vec<Handle<Image>>,
+    albedo_handles: Vec<Handle<Image>>,
 }
 
 fn terrain_detail_image(source: &TerrainDetailSource, layer: usize, divisor: u8) -> Image {
@@ -10369,7 +10601,136 @@ fn terrain_detail_image(source: &TerrainDetailSource, layer: usize, divisor: u8)
     let pixels = image.data.as_mut().expect("terrain detail has CPU pixels");
     image.texture_descriptor.mip_level_count = append_terrain_detail_mips(pixels, side);
     image.sampler = bevy::image::ImageSampler::linear();
+    if let bevy::image::ImageSampler::Descriptor(sampler) = &mut image.sampler {
+        sampler.address_mode_u = bevy::image::ImageAddressMode::MirrorRepeat;
+        sampler.address_mode_v = bevy::image::ImageAddressMode::MirrorRepeat;
+    }
     image
+}
+
+// The 2D renderer already ships these images. Blend them toward white so
+// simulation and accessibility colors carried by terrain vertices remain
+// visible, while providing surface detail between the coarse terrain vertices.
+const TERRAIN_ALBEDO_RESOLUTION: u32 = 512;
+const TERRAIN_ALBEDO_LAYERS: usize = 3;
+type TerrainAlbedoPhotos = [::image::RgbaImage; TERRAIN_ALBEDO_LAYERS];
+
+fn terrain_albedo_layer(detail_layer: usize) -> usize {
+    match detail_layer {
+        0 | 1 => 0, // water
+        3 | 4 => 1, // grass and bloom
+        _ => 2,     // sand and rock
+    }
+}
+
+fn terrain_albedo_photos() -> std::result::Result<&'static TerrainAlbedoPhotos, &'static str> {
+    static PHOTOS: std::sync::OnceLock<std::result::Result<TerrainAlbedoPhotos, String>> =
+        std::sync::OnceLock::new();
+    PHOTOS
+        .get_or_init(|| {
+            let decode = |bytes: &[u8]| -> std::result::Result<::image::RgbaImage, String> {
+                let decoded = ::image::load_from_memory(bytes)
+                    .map_err(|error| error.to_string())?
+                    .to_rgba8();
+                Ok(::image::imageops::resize(
+                    &decoded,
+                    TERRAIN_ALBEDO_RESOLUTION,
+                    TERRAIN_ALBEDO_RESOLUTION,
+                    ::image::imageops::FilterType::Triangle,
+                ))
+            };
+            Ok([
+                decode(include_bytes!(
+                    "../../scriptbots-render/src/terrain_water.png"
+                ))?,
+                decode(include_bytes!(
+                    "../../scriptbots-render/src/terrain_grass.png"
+                ))?,
+                decode(include_bytes!(
+                    "../../scriptbots-render/src/terrain_rock.png"
+                ))?,
+            ])
+        })
+        .as_ref()
+        .map_err(String::as_str)
+}
+
+fn terrain_albedo_image(variant: usize) -> Image {
+    use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+    let white = variant == TERRAIN_ALBEDO_LAYERS * 2;
+    let neutral = variant >= TERRAIN_ALBEDO_LAYERS && !white;
+    let side = if white { 1 } else { TERRAIN_ALBEDO_RESOLUTION };
+    let mut pixels = if white {
+        vec![255; 4]
+    } else {
+        let photos = terrain_albedo_photos().expect("embedded terrain images must decode");
+        photos[variant % TERRAIN_ALBEDO_LAYERS].clone().into_raw()
+    };
+    for pixel in pixels.as_chunks_mut::<4>().0 {
+        if neutral {
+            // A neutral texture preserves the hue chosen by an accessibility
+            // palette instead of reintroducing the photo's original colors.
+            let luminance = (u32::from(pixel[0]) * 54
+                + u32::from(pixel[1]) * 183
+                + u32::from(pixel[2]) * 19
+                + 128)
+                / 256;
+            pixel[..3].fill(luminance as u8);
+        }
+        for channel in &mut pixel[..3] {
+            *channel = ((u16::from(*channel) * 4 + 255) / 5) as u8;
+        }
+        pixel[3] = 255;
+    }
+    let mut image = Image::new(
+        Extent3d {
+            width: side,
+            height: side,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        pixels,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(),
+    );
+    let pixels = image.data.as_mut().expect("terrain albedo has CPU pixels");
+    image.texture_descriptor.mip_level_count = append_terrain_albedo_mips(pixels, side);
+    image.sampler = bevy::image::ImageSampler::linear();
+    if let bevy::image::ImageSampler::Descriptor(sampler) = &mut image.sampler {
+        sampler.address_mode_u = bevy::image::ImageAddressMode::MirrorRepeat;
+        sampler.address_mode_v = bevy::image::ImageAddressMode::MirrorRepeat;
+    }
+    image
+}
+
+fn append_terrain_albedo_mips(pixels: &mut Vec<u8>, side: u32) -> u32 {
+    let mut previous_side = side;
+    let mut previous_offset = 0;
+    let mut levels = 1;
+    while previous_side > 1 {
+        let next_side = previous_side / 2;
+        let next_offset = pixels.len();
+        for y in 0..next_side {
+            for x in 0..next_side {
+                let mut sum = [0_u32; 4];
+                let mut count = 0_u32;
+                for sy in y * previous_side / next_side..(y + 1) * previous_side / next_side {
+                    for sx in x * previous_side / next_side..(x + 1) * previous_side / next_side {
+                        let offset = previous_offset + ((sy * previous_side + sx) * 4) as usize;
+                        for channel in 0..4 {
+                            sum[channel] += u32::from(pixels[offset + channel]);
+                        }
+                        count += 1;
+                    }
+                }
+                pixels.extend(sum.map(|value| ((value + count / 2) / count) as u8));
+            }
+        }
+        previous_side = next_side;
+        previous_offset = next_offset;
+        levels += 1;
+    }
+    levels
 }
 
 fn append_terrain_detail_mips(pixels: &mut Vec<u8>, side: u32) -> u32 {
@@ -10406,6 +10767,7 @@ pub(crate) fn apply_tier_to_terrain_detail(
     effective: Res<EffectiveRenderSettings>,
     registry: Res<TerrainChunkRegistry>,
     source: Res<TerrainDetailSource>,
+    accessibility: Res<AccessibilityState>,
     mut active: Local<TerrainDetailTextures>,
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
@@ -10428,6 +10790,19 @@ pub(crate) fn apply_tier_to_terrain_detail(
                 .push(images.add(terrain_detail_image(&source, layer, divisor)));
         }
     }
+    // Keep the small shared albedo images stable across quality switches;
+    // changing tiers should not require re-uploading all terrain color maps.
+    for variant in 0..=TERRAIN_ALBEDO_LAYERS * 2 {
+        if let Some(handle) = active.albedo_handles.get_mut(variant) {
+            if images.get(&*handle).is_none() {
+                *handle = images.add(terrain_albedo_image(variant));
+            }
+        } else {
+            active
+                .albedo_handles
+                .push(images.add(terrain_albedo_image(variant)));
+        }
+    }
     active.divisor = divisor;
     // New chunks also need binding when the tier has not changed. Existing
     // material parameters and vertex palette colors remain authoritative.
@@ -10439,6 +10814,19 @@ pub(crate) fn apply_tier_to_terrain_detail(
             && let Some(material) = materials.get_mut(&chunk.material)
         {
             material.metallic_roughness_texture = Some(handle.clone());
+        }
+        let variant = match accessibility.palette() {
+            ColorPaletteMode::Natural => terrain_albedo_layer(chunk.stats.detail_layer),
+            ColorPaletteMode::HighContrast => TERRAIN_ALBEDO_LAYERS * 2,
+            _ => terrain_albedo_layer(chunk.stats.detail_layer) + TERRAIN_ALBEDO_LAYERS,
+        };
+        let albedo = &active.albedo_handles[variant];
+        if materials
+            .get(&chunk.material)
+            .is_some_and(|material| material.base_color_texture.as_ref() != Some(albedo))
+            && let Some(material) = materials.get_mut(&chunk.material)
+        {
+            material.base_color_texture = Some(albedo.clone());
         }
     }
 }
@@ -10606,6 +10994,12 @@ fn terrain_vertex_normal(
     sum.try_normalize().unwrap_or(Vec3::Y)
 }
 
+fn terrain_detail_uv(coordinate: u32, tiles: u32) -> f32 {
+    let span = tiles.max(1) as f32;
+    let mirrored_periods = (span / 8.0).round().max(1.0);
+    coordinate as f32 / span * (mirrored_periods * 2.0)
+}
+
 fn build_chunk_mesh(
     snapshot: &WorldSnapshot,
     bounds: TerrainChunkBounds,
@@ -10644,8 +11038,10 @@ fn build_chunk_mesh(
             );
             max_height = max_height.max(height);
 
-            let uv_x = global_x as f32 / terrain.dims.x.max(1) as f32;
-            let uv_z = global_z as f32 / terrain.dims.y.max(1) as f32;
+            // Align chunk edges and complete an even number of mirrored
+            // repeats across the world so the texture phase wraps at its edge.
+            let uv_x = terrain_detail_uv(global_x, terrain.dims.x);
+            let uv_z = terrain_detail_uv(global_z, terrain.dims.y);
             uvs.push([uv_x, uv_z]);
 
             let color = terrain_vertex_color(terrain, global_x, global_z, palette);
