@@ -2655,7 +2655,7 @@ impl Default for CameraRig {
             framing_offset: Vec2::ZERO,
             free_height_bias: 0.0,
             free_edge_anchor: None,
-            follow_mode: FollowMode::Selected,
+            follow_mode: FollowMode::Off,
             pending_fit: None,
             recenter_now: true,
         }
@@ -2663,6 +2663,13 @@ impl Default for CameraRig {
 }
 
 impl CameraRig {
+    fn startup() -> Self {
+        Self {
+            pending_fit: Some(FitCommand::World),
+            ..default()
+        }
+    }
+
     fn toggle_follow_mode(&mut self, mode: FollowMode) {
         if mode == FollowMode::Off && self.follow_mode == FollowMode::Off {
             return;
@@ -4057,7 +4064,7 @@ fn setup_scene(
         height_scale: TERRAIN_HEIGHT_SCALE,
         ..default()
     });
-    commands.insert_resource(CameraRig::default());
+    commands.insert_resource(CameraRig::startup());
 
     commands.insert_resource(ReflectionProbeAssets::fallback(&mut images));
 
@@ -10418,6 +10425,9 @@ fn control_camera(
     if state.latest.is_some()
         && let Some(command) = rig.pending_fit
     {
+        // A fit queued before the first snapshot still needs an immediate
+        // recenter once the world dimensions are known.
+        rig.recenter_now = true;
         match command {
             FitCommand::World => {
                 focus_override = Some(state.world_center);
@@ -17086,6 +17096,55 @@ mod tests {
         let rig = app.world().resource::<CameraRig>();
         assert_eq!(rig.focus_smoothed, Vec2::splat(800.0));
         assert_eq!(rig.distance_smoothed, 900.0);
+    }
+
+    #[test]
+    fn startup_camera_waits_for_the_world_and_does_not_follow_an_unselected_creature() {
+        let mut app = App::new();
+        let mut time = Time::<()>::default();
+        time.advance_by(Duration::from_secs_f32(1.0 / 60.0));
+        app.insert_resource(time);
+        app.insert_resource(CameraRig::startup());
+        app.insert_resource(SnapshotState::default());
+        app.insert_resource(ButtonInput::<MouseButton>::default());
+        app.insert_resource(ButtonInput::<KeyCode>::default());
+        app.insert_resource(Messages::<MouseMotion>::default());
+        app.insert_resource(Messages::<MouseWheel>::default());
+        app.add_systems(Update, control_camera);
+        app.world_mut().spawn((PrimaryCamera, Transform::default()));
+
+        // The camera system can run before the first owner snapshot arrives.
+        app.update();
+        let world = WorldState::new(ScriptBotsConfig::default()).expect("world init");
+        let snapshot = WorldSnapshot::from_world(&world).expect("snapshot");
+        let center = snapshot.world_size * 0.5;
+        let extent = snapshot.world_size;
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            state.world_size = extent;
+            state.world_center = center;
+            state.focus_point = Vec2::splat(50.0);
+            state.first_agent_position = Some(Vec2::splat(50.0));
+            state.latest = Some(snapshot);
+        }
+        app.update();
+        {
+            let rig = app.world().resource::<CameraRig>();
+            assert_eq!(rig.follow_mode, FollowMode::Off);
+            assert_eq!(rig.focus_smoothed, center);
+            assert_eq!(rig.free_focus, Some(center));
+            assert_eq!(
+                rig.distance_smoothed,
+                fit_distance_for_extent(extent, FIT_WORLD_FACTOR)
+            );
+        }
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            state.focus_point = Vec2::splat(400.0);
+            state.first_agent_position = Some(Vec2::splat(400.0));
+        }
+        app.update();
+        assert_eq!(app.world().resource::<CameraRig>().focus_smoothed, center);
     }
 
     #[test]
