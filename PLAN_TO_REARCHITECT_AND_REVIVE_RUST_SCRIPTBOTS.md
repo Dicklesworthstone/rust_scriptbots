@@ -2,6 +2,110 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Responsive Bevy HUD (2026-11-05):** [Currently In Progress — GentleDuck;
+original `bd-2z0.14.1.18.1`; verify existing `bd-2z0.14.1.18.4`, scopes unchanged]
+
+- [x] Inspect ready and in-progress work, source, original criteria and current
+  native evidence; reserve exact paths and claim the original tasks.
+- [x] Trace existing UI docking, pointer capture, text-change guard and Bevy's
+  pinned scrolling/layout APIs; add no dependency or replacement UI model.
+- [x] Bound panel heights and scroll overflow while retaining all fields/actions.
+- [x] Stack panels in narrow viewports, honor UI scale, retain the software
+  watermark and provide a reversible detail toggle without changing science.
+- [x] Route wheel input through computed visible panel bounds, including padding
+  and buttons; suppress world selection, zoom and drag over either panel.
+- [x] Preserve a clear central world strip in stacked layouts and retain centered
+  follow framing when the information panel spans the window.
+- [x] Exercise real ECS unchanged/changed text, responsive layout, scroll bounds,
+  resize/clamping, hidden panels, device units, narrow follow, nonfinite/foreign input and
+  pointer isolation; require the positive regression to reject a broken consumer.
+- [x] Run source-bound DSR format, required workspace check/strict Clippy and
+  focused/full Bevy library suites without weakening assertions, gates or goldens.
+- [x] Run the crate-wide Bevy suite, including integration and documentation
+  tests, before declaring the original unchanged-text task complete.
+- [x] Retain the actual crate-wide snapshot failure and reopen original
+  `bd-2z0.14.3.9`; trace the later intentional `2de46a55` daylight-palette change.
+- [x] Generate and visually review a separate CPU-semantic golden candidate;
+  retain the recording run's source-moved refusal rather than call it green.
+- [x] Compare old/new image observations, unchanged guard thresholds and shared
+  palette authority; require a stable candidate readback without regeneration.
+- [x] Promote only the reviewed image bytes with the palette justification,
+  then run a clean committed-source crate-wide Bevy comparison before closure.
+- [x] Preserve Jeff's incoming runtime deadline fix byte-for-byte through a
+  reviewed canonical merge; repeat clean-source compiler/lint and runtime tests.
+- [x] Reconcile the later incoming renderer/runtime work and review the combined
+  HUD; keep diagnostics and detail visibility on distinct shortcuts.
+- [x] Correct physical pixel-wheel conversion for scaled UI and camera input;
+  reject foreign-window wheel events and add scale/window assertions.
+- [x] Extend the real host-backed command-feedback regression to observe both
+  compact/full text, actual changed outcomes and unchanged change-detection ticks.
+- [x] Qualify the final combined source and the strengthened real-consumer test,
+  then require the same tests to reject reverted consumers in retained scratch.
+- [x] Review the required commit tool's explicit canonical merge-choice extension
+  separately, including retained wrong-tree, tampering and missing-parent refusals.
+- [x] Retain failed cache relocation and verify all 17,838 original files against
+  their saved SHA256 digests; no missing or mismatched bytes and no cleanup credit.
+- [x] Relocate seven inactive build artifacts (1,234,037,196 bytes) to protected
+  RAM-backed storage; verify every hash and original-path symlink before reuse.
+- [x] Drive the optimized native window through selection, actual resize/scale,
+  panel scroll, toggle and controls; verify owner receipts/identity and images.
+- [ ] Qualify the canonical merge of later storage/analytics source through
+  `fa4e22ff`; preserve its author attribution and run its previously unexecuted regressions.
+- [x] Preserve the later creature card through `7122ef2f`; remove the overlapping
+  wheel handler and duplicate panel components, and wrap the actual card fields.
+- [x] Retain incoming scroll assertions with a real scaled primary window and
+  add a nonsaturating pixel-delta observation; keep one physical-bounds consumer.
+- [x] Extend the real-owner card regression to observe stationary Text/layout
+  change ticks and changed page/injected-failure labels, retaining prior assertions.
+- [x] Require reverted card Text and body-wrap consumers to fail those actual
+  regressions at a source-matched compiled mutant.
+- [x] Retain the failed `64a283d6` qualification: the all-text layout guard caught
+  static captions, and sparse narrative fixtures incorrectly assumed default
+  persistence was enabled. Fix both without relaxing the original assertions.
+- [x] Pass the corrected working-source seven-check DSR probe: Bevy 299+7,
+  narrative integration ten, both complete pipeline tests and storage schema 26.
+- [ ] Requalify committed `0237f3d7` with full Bevy/runtime suites, required
+  workspace gates, incoming scientific regressions, UBS and an optimized build.
+- [ ] Drive and visually inspect the new card's optimized native window at both
+  scales before closing the reopened original HUD/text tasks again.
+- [x] Review/commit source, re-execute the committed source in a fresh solo pass,
+  audit original acceptance and update Beads only on cited observed evidence.
+- [ ] Publish qualified source and prepare a separate tracker snapshot; verify
+  final remote tips, tracked state and released reservations in the session.
+
+Consumer: native users reading selected creatures while retaining world controls.
+This bounded TODO retires at publication. Evidence and audit:
+`/data/tmp/scriptbots-responsive-hud-EpiJWQBq/`.
+
+Original acceptance is observed at clean source `4f0f3db8`: DSR
+`responsive_hud_clean_final/20261105T211747-1654146` passes **13/13**, including
+workspace all-target check, strict workspace/Bevy-app Clippy, formatting,
+**297 Bevy library + seven integration tests**, zero doctests and zero ignored
+Bevy tests. Runtime has **259 passed / six pre-existing ignored** lanes.
+Source-matched reverted consumers fail their intended regressions; no existing
+assertion, budget or lint threshold was relaxed. The separately reviewed golden
+promotion follows intentional daylight palette `2de46a55`, retains unchanged
+image thresholds, and qualifies only the CPU-semantic image. The separate commit
+tool extension admits explicitly reviewed canonical favor-ours merges; default
+unresolved merges, wrong trees and token tampering remain refused.
+
+Optimized native DSR
+`responsive_hud_native_final_4f0f3db8/20261105T220318-1754666` passes **6/6**,
+binary SHA256 `cf5d3a62b39fd469e126bbb1291c11e83c246ceae7bf32dbe4fc065e2547004b`.
+Actual X11 resizes at 1×/2× retain selection, reachable genome/dock content and
+the software notice; the 400×300 logical view wraps the full 64-hex digest.
+Pointer Step advances **1→2** and **3→4**, both applied and journal-durable;
+other paused gestures preserve ticks. The two processes exit normally.
+One paused software frame pair at each scale has zero changed crop pixels,
+24,000/99,000 observed respectively; this establishes neither a flicker cause
+nor temporal/hardware quality. These observations originally closed `.18.1`,
+`.18.4` and `.3.9` on unchanged criteria after fresh solo re-execution. The later
+creature-card integration reopens `.18.1` and `.18.4` until its own source passes
+the same criteria; `.3.9` remains closed. No independent verifier was available.
+Hardware, Metal, broader HUD/terrain, science and performance parents remain
+open. Later integration and publication remain pending below; this native binary
+is explicitly `4f0f3db8`, not the later merged revision.
+
 **Large-run export and scientific evidence (2026-11-05):** [Currently In Progress —
 Codex; source contributions landed, original acceptance remains open]
 
@@ -31,7 +135,10 @@ persistence, with typed refusal for missing/corrupt evidence and explicit skips
 for incomplete windows or unsupported metrics/islands. Statistical thresholds
 and FDR calculations remain unchanged. Added regressions include multi-page
 history, gaps outside the selected window, truncated evidence and a production
-world extinction between default persistence boundaries. The end-to-end fixture's
+world extinction between explicitly configured sparse persistence boundaries.
+The production default disables periodic persistence; the fixture configures a
+13-tick cadence and verifies that final partial batches retain complete inputs.
+The end-to-end fixture's
 planted energy shift and combat null now derive from its actual agents/replay.
 
 Migration note: only narrative-validate moves to schema v2. Its payload adds the
@@ -41,10 +148,12 @@ was shortened. Metric-only historical runs with selected events are refused
 rather than certified from noncanonical samples; unrelated report schemas stay
 unchanged.
 
-Independent source reviews are complete; Cargo, formatting, Clippy, UBS and DSR
-execution are unavailable in this session and are not claimed. The new regressions
-are authored, not executed. No original Bead acceptance or scientific baseline
-is changed.
+The original author reported source review without execution. Subsequent fresh
+solo DSR execution by GentleDuck passed the ten narrative integration cases,
+both complete pipeline cases (including actual CLI/Parquet/SQL comparisons),
+and 26 storage-schema cases in `responsive_hud_static_sparse_probe`,
+`20261105T225726-1991874`. Clean committed-source workspace qualification remains
+pending below. No original broad Bead acceptance or scientific baseline changed.
 
 **Bevy owner inspector (2026-11-05):** [Qualified bounded contribution — GentleDuck;
 original `bd-2z0.14.1.18.3` closed, acceptance unchanged; fresh solo verification]
