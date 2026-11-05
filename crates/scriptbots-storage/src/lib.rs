@@ -31710,7 +31710,11 @@ mod tests {
             })
         ));
         assert!(reader.metrics_at_tick(1, 0).is_err());
-        assert!(reader.metrics_at_tick(1, MAX_STORAGE_QUERY_PAGE + 1).is_err());
+        assert!(
+            reader
+                .metrics_at_tick(1, MAX_STORAGE_QUERY_PAGE + 1)
+                .is_err()
+        );
         assert!(reader.metrics_at_tick(u64::MAX, 3).is_err());
         reader.close()?;
 

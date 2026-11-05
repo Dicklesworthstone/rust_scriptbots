@@ -193,7 +193,8 @@ fn manifest(run_id: RunId, seed: u64, arm: &str, budget: u64) -> RunManifestReco
             "comparison_lane": "same pinned test lane",
             "superseded_by": "WorldDigestV1"
         }
-    }).to_string();
+    })
+    .to_string();
     RunManifestRecord {
         run_id,
         manifest_schema_version: 3,
@@ -239,17 +240,23 @@ fn attributed_run(
 fn persist_endpoints(storage: &mut Storage, observations: &[(u64, f64, f64)]) {
     let mut previous = 0;
     for &(tick, shifting, flat) in observations {
-        let mut endpoint = batch(tick, vec![
-            MetricSample::new("shifting", shifting),
-            MetricSample::new("flat", flat),
-        ]);
+        let mut endpoint = batch(
+            tick,
+            vec![
+                MetricSample::new("shifting", shifting),
+                MetricSample::new("flat", flat),
+            ],
+        );
         // Attributed persistence requires the complete canonical per-tick narrative stream,
         // including ticks whose generic metrics are intentionally absent in endpoint tests.
         for input_tick in previous + 1..=tick {
             let input_summary = batch(input_tick, Vec::new()).summary;
             let record = NarrativeInputRecordV1::from_summary(
-                &input_summary, 0, &ScriptBotsConfig::default(),
-            ).expect("canonical input");
+                &input_summary,
+                0,
+                &ScriptBotsConfig::default(),
+            )
+            .expect("canonical input");
             endpoint.replay_events.push(ReplayEvent {
                 agent_uid: None,
                 position: None,
@@ -265,9 +272,11 @@ fn persist_endpoints(storage: &mut Storage, observations: &[(u64, f64, f64)]) {
 }
 
 fn cohort_value(endpoint: u64, control: &[String], treatment: &[String]) -> serde_json::Value {
-    let entries = |paths: &[String]| paths.iter().map(|path| {
+    let entries = |paths: &[String]| {
+        paths.iter().map(|path| {
         serde_json::json!({"db": Path::new(path).file_name().unwrap().to_str().unwrap()})
-    }).collect::<Vec<_>>();
+    }).collect::<Vec<_>>()
+    };
     serde_json::json!({
         "schema": RUN_COMPARISON_COHORT_SCHEMA_V1,
         "endpoint_tick": endpoint,
@@ -289,7 +298,10 @@ fn compare_cohort(control: &str, cohort: &str) -> Result<ReportOutput, Analytics
 
 fn assert_refused(control: &str, cohort: &str, reason: &str) {
     let error = compare_cohort(control, cohort).expect_err("invalid cohort must be refused");
-    assert!(error.to_string().contains(reason), "unexpected refusal: {error}");
+    assert!(
+        error.to_string().contains(reason),
+        "unexpected refusal: {error}"
+    );
 }
 
 #[test]
@@ -301,25 +313,39 @@ fn independent_seed_endpoints_detect_the_planted_effect_and_preserve_the_null() 
         let baseline = 25.0 * f64::from(seed);
         let null = 7.0 + f64::from(seed);
         let mut control_manifest = manifest(
-            RunId::new(100 + u128::from(seed)), u64::from(seed), "control", 2,
+            RunId::new(100 + u128::from(seed)),
+            u64::from(seed),
+            "control",
+            2,
         );
         if seed == 1 {
             // Object insertion order and an explicit empty intervention schedule must not
             // make a different scientific condition from the other runs in this arm.
-            let mut value: serde_json::Value = serde_json::from_str(&control_manifest.manifest_json).unwrap();
+            let mut value: serde_json::Value =
+                serde_json::from_str(&control_manifest.manifest_json).unwrap();
             value["scenario"]["interventions"] = serde_json::json!([]);
             value.sort_all_objects();
             control_manifest.manifest_json = value.to_string();
         }
         control.push(attributed_run(
-            dir.path(), &format!("control,seed-{seed}.sqlite"),
+            dir.path(),
+            &format!("control,seed-{seed}.sqlite"),
             control_manifest,
             &[(1, -1000.0, null), (2, baseline, null)],
         ));
         treatment.push(attributed_run(
-            dir.path(), &format!("treatment,seed-{seed}.sqlite"),
-            manifest(RunId::new(200 + u128::from(seed)), u64::from(seed), "treatment", 2),
-            &[(1, 1000.0, null), (2, baseline + 5.0 + wobble(u64::from(seed), 3), null)],
+            dir.path(),
+            &format!("treatment,seed-{seed}.sqlite"),
+            manifest(
+                RunId::new(200 + u128::from(seed)),
+                u64::from(seed),
+                "treatment",
+                2,
+            ),
+            &[
+                (1, 1000.0, null),
+                (2, baseline + 5.0 + wobble(u64::from(seed), 3), null),
+            ],
         ));
     }
     // Array position is deliberately the wrong pairing; only the manifested root seeds agree.
@@ -336,7 +362,8 @@ fn independent_seed_endpoints_detect_the_planted_effect_and_preserve_the_null() 
     assert_eq!(machine["endpoint_tick"], 2);
     let shifting = metric(&machine, "shifting").expect("shifting must be compared");
     assert_eq!(
-        shifting["n_pairs"], control.len(),
+        shifting["n_pairs"],
+        control.len(),
         "each independently seeded run contributes exactly one endpoint"
     );
     assert!(
@@ -376,7 +403,10 @@ fn independent_seed_endpoints_detect_the_planted_effect_and_preserve_the_null() 
     let reader = StorageReader::open_finished(&control[0]).unwrap();
     let durable_digest = reader.run_manifest().unwrap().manifest_digest().unwrap();
     reader.close().unwrap();
-    assert_eq!(machine["pairs"][0]["control"]["manifest_digest"], durable_digest);
+    assert_eq!(
+        machine["pairs"][0]["control"]["manifest_digest"],
+        durable_digest
+    );
 
     let mut reordered = value;
     reordered["control"].as_array_mut().unwrap().reverse();
@@ -395,10 +425,17 @@ fn arbitrarily_many_ticks_in_one_pair_remain_descriptive() {
     let treatment = run_db(&dir, "treatment.sqlite", &ticks, 15.0, 2);
     let output = compare(&control, &[format!("treatment_db={treatment}")]).unwrap();
     assert_eq!(output.schema_version, 2);
-    assert!(output.human_md.contains("insufficient independent seed pairs"));
+    assert!(
+        output
+            .human_md
+            .contains("insufficient independent seed pairs")
+    );
     let machine = output.machine;
     assert_eq!(machine["mode"], "descriptive_pair");
-    assert_eq!(machine["inference_status"], "insufficient_independent_pairs");
+    assert_eq!(
+        machine["inference_status"],
+        "insufficient_independent_pairs"
+    );
     assert_eq!(machine["seed_pairing"], "unknown");
     assert_eq!(machine["independent_pairs"], 0);
     assert_eq!(machine["declared_pairs"], 1);
@@ -421,16 +458,31 @@ fn arbitrarily_many_ticks_in_one_pair_remain_descriptive() {
 #[test]
 fn an_explicit_earlier_endpoint_is_exact_and_a_single_seed_has_no_inference() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let control = attributed_run(dir.path(), "control.sqlite",
-        manifest(RunId::new(101), 7, "control", 4), &[(1, 10.0, 7.0), (4, 90.0, 7.0)]);
-    let treatment = attributed_run(dir.path(), "treatment.sqlite",
-        manifest(RunId::new(201), 7, "treatment", 4), &[(1, 15.0, 7.0), (4, -90.0, 7.0)]);
-    let value = cohort_value(1, std::slice::from_ref(&control), std::slice::from_ref(&treatment));
+    let control = attributed_run(
+        dir.path(),
+        "control.sqlite",
+        manifest(RunId::new(101), 7, "control", 4),
+        &[(1, 10.0, 7.0), (4, 90.0, 7.0)],
+    );
+    let treatment = attributed_run(
+        dir.path(),
+        "treatment.sqlite",
+        manifest(RunId::new(201), 7, "treatment", 4),
+        &[(1, 15.0, 7.0), (4, -90.0, 7.0)],
+    );
+    let value = cohort_value(
+        1,
+        std::slice::from_ref(&control),
+        std::slice::from_ref(&treatment),
+    );
     let path = write_cohort(dir.path(), "earlier.json", &value);
     let output = compare_cohort(&control, &path).unwrap();
     assert_eq!(output.machine["independent_pairs"], 1);
     assert_eq!(output.machine["seed_pairing"], "matched");
-    assert_eq!(output.machine["inference_status"], "insufficient_independent_pairs");
+    assert_eq!(
+        output.machine["inference_status"],
+        "insufficient_independent_pairs"
+    );
     assert_eq!(output.machine["pairs"][0]["control"]["terminal_tick"], 4);
     let shifting = metric(&output.machine, "shifting").unwrap();
     assert_eq!(shifting["mean_difference"], 5.0);
@@ -450,10 +502,18 @@ fn an_explicit_earlier_endpoint_is_exact_and_a_single_seed_has_no_inference() {
 #[test]
 fn incomplete_budgets_and_unattributed_seed_claims_are_refused() {
     let dir = tempfile::tempdir().unwrap();
-    let control = attributed_run(dir.path(), "control.sqlite",
-        manifest(RunId::new(101), 7, "control", 4), &[(2, 10.0, 7.0), (4, 10.0, 7.0)]);
-    let unfinished = attributed_run(dir.path(), "unfinished.sqlite",
-        manifest(RunId::new(201), 7, "treatment", 4), &[(2, 15.0, 7.0), (3, 15.0, 7.0)]);
+    let control = attributed_run(
+        dir.path(),
+        "control.sqlite",
+        manifest(RunId::new(101), 7, "control", 4),
+        &[(2, 10.0, 7.0), (4, 10.0, 7.0)],
+    );
+    let unfinished = attributed_run(
+        dir.path(),
+        "unfinished.sqlite",
+        manifest(RunId::new(201), 7, "treatment", 4),
+        &[(2, 15.0, 7.0), (3, 15.0, 7.0)],
+    );
     let value = cohort_value(2, std::slice::from_ref(&control), &[unfinished]);
     let path = write_cohort(dir.path(), "unfinished.json", &value);
     assert_refused(&control, &path, "has not completed");
@@ -467,17 +527,62 @@ fn incomplete_budgets_and_unattributed_seed_claims_are_refused() {
 #[test]
 fn duplicate_unmatched_reused_and_unrelated_sources_are_refused() {
     let dir = tempfile::tempdir().unwrap();
-    let c7 = attributed_run(dir.path(), "c7.sqlite", manifest(RunId::new(107), 7, "control", 2), &[(2, 10.0, 7.0)]);
-    let c8 = attributed_run(dir.path(), "c8.sqlite", manifest(RunId::new(108), 8, "control", 2), &[(2, 11.0, 7.0)]);
-    let c7_duplicate = attributed_run(dir.path(), "c7-duplicate.sqlite", manifest(RunId::new(117), 7, "control", 2), &[(2, 10.0, 7.0)]);
-    let t7 = attributed_run(dir.path(), "t7.sqlite", manifest(RunId::new(207), 7, "treatment", 2), &[(2, 15.0, 7.0)]);
-    let t8 = attributed_run(dir.path(), "t8.sqlite", manifest(RunId::new(208), 8, "treatment", 2), &[(2, 16.0, 7.0)]);
-    let t9 = attributed_run(dir.path(), "t9.sqlite", manifest(RunId::new(209), 9, "treatment", 2), &[(2, 17.0, 7.0)]);
+    let c7 = attributed_run(
+        dir.path(),
+        "c7.sqlite",
+        manifest(RunId::new(107), 7, "control", 2),
+        &[(2, 10.0, 7.0)],
+    );
+    let c8 = attributed_run(
+        dir.path(),
+        "c8.sqlite",
+        manifest(RunId::new(108), 8, "control", 2),
+        &[(2, 11.0, 7.0)],
+    );
+    let c7_duplicate = attributed_run(
+        dir.path(),
+        "c7-duplicate.sqlite",
+        manifest(RunId::new(117), 7, "control", 2),
+        &[(2, 10.0, 7.0)],
+    );
+    let t7 = attributed_run(
+        dir.path(),
+        "t7.sqlite",
+        manifest(RunId::new(207), 7, "treatment", 2),
+        &[(2, 15.0, 7.0)],
+    );
+    let t8 = attributed_run(
+        dir.path(),
+        "t8.sqlite",
+        manifest(RunId::new(208), 8, "treatment", 2),
+        &[(2, 16.0, 7.0)],
+    );
+    let t9 = attributed_run(
+        dir.path(),
+        "t9.sqlite",
+        manifest(RunId::new(209), 9, "treatment", 2),
+        &[(2, 17.0, 7.0)],
+    );
     let control = vec![c7.clone(), c8.clone()];
     for (name, controls, treatments, reason) in [
-        ("duplicate", vec![c7.clone(), c7_duplicate.clone()], vec![t7.clone(), t8.clone()], "duplicate root seed"),
-        ("unmatched", control.clone(), vec![t7.clone(), t9], "unmatched root seed sets"),
-        ("reused", control.clone(), vec![c7.clone(), t8.clone()], "reused run identity"),
+        (
+            "duplicate",
+            vec![c7.clone(), c7_duplicate.clone()],
+            vec![t7.clone(), t8.clone()],
+            "duplicate root seed",
+        ),
+        (
+            "unmatched",
+            control.clone(),
+            vec![t7.clone(), t9],
+            "unmatched root seed sets",
+        ),
+        (
+            "reused",
+            control.clone(),
+            vec![c7.clone(), t8.clone()],
+            "reused run identity",
+        ),
     ] {
         let value = cohort_value(2, &controls, &treatments);
         let path = write_cohort(dir.path(), &format!("{name}.json"), &value);
@@ -496,8 +601,12 @@ fn duplicate_unmatched_reused_and_unrelated_sources_are_refused() {
 #[test]
 fn scheduled_interventions_are_part_of_the_executable_arm_condition() {
     let dir = tempfile::tempdir().unwrap();
-    let c7 = attributed_run(dir.path(), "c7.sqlite",
-        manifest(RunId::new(107), 7, "control", 2), &[(2, 10.0, 7.0)]);
+    let c7 = attributed_run(
+        dir.path(),
+        "c7.sqlite",
+        manifest(RunId::new(107), 7, "control", 2),
+        &[(2, 10.0, 7.0)],
+    );
     let mut changed = manifest(RunId::new(108), 8, "control", 2);
     let mut value: serde_json::Value = serde_json::from_str(&changed.manifest_json).unwrap();
     value["scenario"]["interventions"] = serde_json::json!([
@@ -505,10 +614,18 @@ fn scheduled_interventions_are_part_of_the_executable_arm_condition() {
     ]);
     changed.manifest_json = value.to_string();
     let c8 = attributed_run(dir.path(), "c8.sqlite", changed, &[(2, 11.0, 7.0)]);
-    let t7 = attributed_run(dir.path(), "t7.sqlite",
-        manifest(RunId::new(207), 7, "treatment", 2), &[(2, 15.0, 7.0)]);
-    let t8 = attributed_run(dir.path(), "t8.sqlite",
-        manifest(RunId::new(208), 8, "treatment", 2), &[(2, 16.0, 7.0)]);
+    let t7 = attributed_run(
+        dir.path(),
+        "t7.sqlite",
+        manifest(RunId::new(207), 7, "treatment", 2),
+        &[(2, 15.0, 7.0)],
+    );
+    let t8 = attributed_run(
+        dir.path(),
+        "t8.sqlite",
+        manifest(RunId::new(208), 8, "treatment", 2),
+        &[(2, 16.0, 7.0)],
+    );
     let value = cohort_value(2, &[c7.clone(), c8], &[t7, t8]);
     let path = write_cohort(dir.path(), "mixed-condition.json", &value);
     assert_refused(&c7, &path, "control arm mixes conditions");
@@ -524,18 +641,33 @@ fn descriptive_pairs_disclose_conditional_metrics_without_claiming_replication()
     ] {
         let path = dir.path().join(file).display().to_string();
         let mut storage = Storage::create_unattributed_file(&path).unwrap();
-        storage.persist(&batch(1, vec![
-            MetricSample::new("shifting", value), MetricSample::new(extra, 1.0),
-        ])).unwrap();
+        storage
+            .persist(&batch(
+                1,
+                vec![
+                    MetricSample::new("shifting", value),
+                    MetricSample::new(extra, 1.0),
+                ],
+            ))
+            .unwrap();
         storage.close().unwrap();
         paths.push(path);
     }
     let output = compare(&paths[0], &[format!("treatment_db={}", paths[1])]).unwrap();
-    assert_eq!(output.machine["control_only_metrics"], serde_json::json!(["only_control"]));
-    assert_eq!(output.machine["treatment_only_metrics"], serde_json::json!(["only_treatment"]));
+    assert_eq!(
+        output.machine["control_only_metrics"],
+        serde_json::json!(["only_control"])
+    );
+    assert_eq!(
+        output.machine["treatment_only_metrics"],
+        serde_json::json!(["only_treatment"])
+    );
     assert_eq!(output.machine["metrics_compared"], 1);
     assert_eq!(output.machine["significant"], 0);
-    assert_eq!(metric(&output.machine, "shifting").unwrap()["mean_difference"], 5.0);
+    assert_eq!(
+        metric(&output.machine, "shifting").unwrap()["mean_difference"],
+        5.0
+    );
     assert!(metric(&output.machine, "shifting").unwrap()["p_value"].is_null());
     assert!(output.human_md.contains("only_control"));
     assert!(output.human_md.contains("only_treatment"));
@@ -546,12 +678,36 @@ fn cohort_schema_parameter_and_resource_bounds_fail_before_analysis() {
     let dir = tempfile::tempdir().unwrap();
     let control = run_db(&dir, "control.sqlite", &[1], 10.0, 1);
     let treatment = run_db(&dir, "treatment.sqlite", &[1], 15.0, 2);
-    let base = cohort_value(1, std::slice::from_ref(&control), std::slice::from_ref(&treatment));
+    let base = cohort_value(
+        1,
+        std::slice::from_ref(&control),
+        std::slice::from_ref(&treatment),
+    );
     let cases = [
-        ("schema", "schema", serde_json::json!("unknown-schema"), "schema must be"),
-        ("duplicate-metrics", "metrics", serde_json::json!(["shifting", "shifting"]), "metric names must be unique"),
-        ("too-many-metrics", "metrics", serde_json::json!(vec!["shifting"; MAX_COMPARISON_METRICS + 1]), "endpoint metrics"),
-        ("unknown-field", "seed", serde_json::json!(7), "unknown field"),
+        (
+            "schema",
+            "schema",
+            serde_json::json!("unknown-schema"),
+            "schema must be",
+        ),
+        (
+            "duplicate-metrics",
+            "metrics",
+            serde_json::json!(["shifting", "shifting"]),
+            "metric names must be unique",
+        ),
+        (
+            "too-many-metrics",
+            "metrics",
+            serde_json::json!(vec!["shifting"; MAX_COMPARISON_METRICS + 1]),
+            "endpoint metrics",
+        ),
+        (
+            "unknown-field",
+            "seed",
+            serde_json::json!(7),
+            "unknown field",
+        ),
     ];
     for (name, key, value, reason) in cases {
         let mut invalid = base.clone();
@@ -561,7 +717,8 @@ fn cohort_schema_parameter_and_resource_bounds_fail_before_analysis() {
     }
     let mut many = base.clone();
     many["control"] = serde_json::json!(vec![base["control"][0].clone(); MAX_COMPARISON_PAIRS + 1]);
-    many["treatment"] = serde_json::json!(vec![base["treatment"][0].clone(); MAX_COMPARISON_PAIRS + 1]);
+    many["treatment"] =
+        serde_json::json!(vec![base["treatment"][0].clone(); MAX_COMPARISON_PAIRS + 1]);
     let path = write_cohort(dir.path(), "too-many-runs.json", &many);
     assert_refused(&control, &path, "equal lengths");
     let oversized = dir.path().join("oversized.json");
@@ -573,18 +730,35 @@ fn cohort_schema_parameter_and_resource_bounds_fail_before_analysis() {
         vec![format!("treatment_db={treatment}"), "fdr=NaN".to_owned()],
         vec![format!("treatment_db={treatment}"), "fdr=1".to_owned()],
         vec![format!("treatment_db={treatment}"), "unknown=1".to_owned()],
-        vec![format!("treatment_db={treatment}"), "cohort_file=unused.json".to_owned()],
+        vec![
+            format!("treatment_db={treatment}"),
+            "cohort_file=unused.json".to_owned(),
+        ],
     ] {
-        assert!(matches!(compare(&control, &params), Err(AnalyticsError::BadParam { .. })));
+        assert!(matches!(
+            compare(&control, &params),
+            Err(AnalyticsError::BadParam { .. })
+        ));
     }
 }
 
 #[test]
 fn explicit_run_ids_select_the_correct_run_in_a_multi_run_input() {
     let dir = tempfile::tempdir().unwrap();
-    let control = attributed_run(dir.path(), "control.sqlite", manifest(RunId::new(107), 7, "control", 2), &[(2, 10.0, 7.0)]);
-    let treatment = attributed_run(dir.path(), "treatment.sqlite", manifest(RunId::new(207), 7, "treatment", 2), &[(2, 15.0, 7.0)]);
-    let mut storage = Storage::append_run(&treatment, manifest(RunId::new(208), 8, "treatment", 2)).unwrap();
+    let control = attributed_run(
+        dir.path(),
+        "control.sqlite",
+        manifest(RunId::new(107), 7, "control", 2),
+        &[(2, 10.0, 7.0)],
+    );
+    let treatment = attributed_run(
+        dir.path(),
+        "treatment.sqlite",
+        manifest(RunId::new(207), 7, "treatment", 2),
+        &[(2, 15.0, 7.0)],
+    );
+    let mut storage =
+        Storage::append_run(&treatment, manifest(RunId::new(208), 8, "treatment", 2)).unwrap();
     persist_endpoints(&mut storage, &[(2, 1000.0, 7.0)]);
     storage.close().unwrap();
     let mut value = cohort_value(2, std::slice::from_ref(&control), &[treatment]);
@@ -593,11 +767,22 @@ fn explicit_run_ids_select_the_correct_run_in_a_multi_run_input() {
     value["treatment"][0]["run_id"] = serde_json::to_value(RunId::new(207)).unwrap();
     let path = write_cohort(dir.path(), "selected.json", &value);
     let output = compare_cohort(&control, &path).unwrap();
-    assert_eq!(output.machine["pairs"][0]["treatment"]["run_id"], RunId::new(207).to_string());
-    assert_eq!(metric(&output.machine, "shifting").unwrap()["mean_difference"], 5.0);
+    assert_eq!(
+        output.machine["pairs"][0]["treatment"]["run_id"],
+        RunId::new(207).to_string()
+    );
+    assert_eq!(
+        metric(&output.machine, "shifting").unwrap()["mean_difference"],
+        5.0
+    );
 }
 
 #[test]
 fn the_report_is_registered() {
-    assert!(Registry::builtin().list().iter().any(|(name, _)| *name == "compare-runs"));
+    assert!(
+        Registry::builtin()
+            .list()
+            .iter()
+            .any(|(name, _)| *name == "compare-runs")
+    );
 }

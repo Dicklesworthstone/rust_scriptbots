@@ -1716,7 +1716,10 @@ fn agent_export_row(row: &Row) -> Result<AgentExportRow, StorageError> {
     Ok(AgentExportRow {
         run_id: decode_column(row, 0, "agents.run_id")?,
         tick: checked_u64("agents.tick", decode_column(row, 1, "agents.tick")?)?,
-        agent_uid: checked_u64("agents.agent_uid", decode_column(row, 2, "agents.agent_uid")?)?,
+        agent_uid: checked_u64(
+            "agents.agent_uid",
+            decode_column(row, 2, "agents.agent_uid")?,
+        )?,
         generation: decode_column::<i64>(row, 3, "agents.generation")? as u32,
         age: decode_column::<i64>(row, 4, "agents.age")? as u32,
         pos_x: decode_column::<f64>(row, 5, "agents.position_x")? as f32,
@@ -1757,7 +1760,10 @@ fn event_export_row(row: &Row) -> Result<EventExportRow, StorageError> {
     let event_type: String = decode_column(row, 4, "replay_events.event_type")?;
     Ok(EventExportRow {
         run_id: decode_column(row, 0, "replay_events.run_id")?,
-        tick: checked_u64("replay_events.tick", decode_column(row, 1, "replay_events.tick")?)?,
+        tick: checked_u64(
+            "replay_events.tick",
+            decode_column(row, 1, "replay_events.tick")?,
+        )?,
         seq: checked_u64("replay_events.seq", seq)?,
         event_id: format!("evt-{seq}"),
         kind: format!("{scope}:{event_type}"),
@@ -1778,7 +1784,10 @@ fn birth_parent_export_rows(rows: &[Row]) -> Result<Vec<LineageExportRow>, Stora
     let mut edges = Vec::with_capacity(rows.len() * 2);
     for row in rows {
         let run_id: String = decode_column(row, 0, "births.run_id")?;
-        let child = checked_u64("births.agent_uid", decode_column(row, 1, "births.agent_uid")?)?;
+        let child = checked_u64(
+            "births.agent_uid",
+            decode_column(row, 1, "births.agent_uid")?,
+        )?;
         let parent_a: Option<i64> = decode_column(row, 2, "births.parent_a")?;
         let parent_b: Option<i64> = decode_column(row, 3, "births.parent_b")?;
         let tick = checked_u64("births.tick", decode_column(row, 4, "births.tick")?)?;
@@ -1837,7 +1846,8 @@ pub fn export_storage_table_with_provenance<W: Write>(
     if expected_provenance != *prov {
         return Err(StorageError::InvalidData {
             context: "export.provenance",
-            reason: "captured export provenance does not match the selected run and table".to_owned(),
+            reason: "captured export provenance does not match the selected run and table"
+                .to_owned(),
         });
     }
     export_storage_table_captured(reader, table, format, writer, prov, None)
@@ -1961,12 +1971,14 @@ pub fn verify_storage_table_export<R: Read>(
         });
     }
     let mut trailing = [0_u8; 1];
-    let trailing_count = readback.actual.read(&mut trailing).map_err(|error| {
-        StorageError::InvalidData {
-            context: "export.verify_eof",
-            reason: error.to_string(),
-        }
-    })?;
+    let trailing_count =
+        readback
+            .actual
+            .read(&mut trailing)
+            .map_err(|error| StorageError::InvalidData {
+                context: "export.verify_eof",
+                reason: error.to_string(),
+            })?;
     if trailing_count != 0 {
         return Err(StorageError::InvalidData {
             context: "export.verify_eof",

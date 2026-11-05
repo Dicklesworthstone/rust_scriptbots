@@ -2290,7 +2290,7 @@ fn read_comparison_source(
     let config: serde_json::Value = serde_json::from_str(&manifest.normalized_config_json)?;
     let seed = (manifest.manifest_schema_version != 0
         && config.get("rng_seed").and_then(serde_json::Value::as_u64) == Some(manifest.root_seed))
-        .then_some(manifest.root_seed);
+    .then_some(manifest.root_seed);
     if require_cohort_evidence && seed.is_none() {
         return Err(comparison_error(format!(
             "run {} in {db} lacks attributable seed evidence; cohort runs require a validated manifest and matching normalized_config.rng_seed",
@@ -2298,7 +2298,10 @@ fn read_comparison_source(
         )));
     }
     let terminal_tick = reader.max_tick()?.ok_or_else(|| {
-        comparison_error(format!("run {} in {db} has no durable tick", manifest.run_id))
+        comparison_error(format!(
+            "run {} in {db} has no durable tick",
+            manifest.run_id
+        ))
     })?;
     if endpoint_tick > terminal_tick {
         return Err(comparison_error(format!(
@@ -2335,12 +2338,8 @@ fn read_comparison_source(
         )));
     }
 
-    let condition_digest = comparison_condition_digest(
-        &manifest,
-        &manifest_value,
-        config,
-        require_cohort_evidence,
-    )?;
+    let condition_digest =
+        comparison_condition_digest(&manifest, &manifest_value, config, require_cohort_evidence)?;
     let manifest_digest = manifest.manifest_digest()?;
     Ok((
         seed,
@@ -2415,20 +2414,16 @@ impl ComparisonInputReader<'_> {
                 || StorageReader::open_finished(db),
                 |run_id| StorageReader::open_finished_for_run(db, run_id),
             )?;
-            let result = read_comparison_source(
-                &reader,
-                db,
-                self.endpoint_tick,
-                Some(self.metrics),
-                true,
-            );
+            let result =
+                read_comparison_source(&reader, db, self.endpoint_tick, Some(self.metrics), true);
             let close_result = reader.close();
             let observation = result?;
             close_result?;
             observation
         };
         let (seed, source) = observation;
-        let seed = seed.ok_or_else(|| comparison_error("cohort source has no verified root seed"))?;
+        let seed =
+            seed.ok_or_else(|| comparison_error("cohort source has no verified root seed"))?;
         Ok((seed, source, is_context))
     }
 
@@ -2591,9 +2586,10 @@ fn comparison_machine(
     let metrics = compare_endpoint_metrics(&pairs, names, params, infer)?;
     let seed_pairing = if matched {
         "matched"
-    } else if pairs.iter().any(|pair| {
-        pair.control.root_seed_hex.is_none() || pair.treatment.root_seed_hex.is_none()
-    }) {
+    } else if pairs
+        .iter()
+        .any(|pair| pair.control.root_seed_hex.is_none() || pair.treatment.root_seed_hex.is_none())
+    {
         "unknown"
     } else {
         "mismatched"
@@ -2640,7 +2636,10 @@ fn comparison_machine(
         n_resamples: if infer { params.n_resamples } else { 0 },
         n_permutations: if infer { params.n_permutations } else { 0 },
         metrics_compared: metrics.len(),
-        significant: metrics.iter().filter(|metric| metric.significant_fdr).count(),
+        significant: metrics
+            .iter()
+            .filter(|metric| metric.significant_fdr)
+            .count(),
         control_only_metrics,
         treatment_only_metrics,
         pairs,
@@ -2664,7 +2663,8 @@ fn compare_cohort_file(
         metrics: &cohort.metrics,
     };
     let mut identities = BTreeSet::new();
-    let (control, includes_context) = input_reader.arm("control", &cohort.control, &mut identities)?;
+    let (control, includes_context) =
+        input_reader.arm("control", &cohort.control, &mut identities)?;
     if !includes_context {
         return Err(comparison_error(
             "the selected database/run must be a declared control in cohort_file",
@@ -2820,7 +2820,8 @@ fn compare_descriptive_pair(
             read_comparison_source(&cx.reader, &cx.db_path, endpoint_tick, None, false)?;
         let (treatment_seed, treatment) =
             read_comparison_source(&reader, path, endpoint_tick, None, false)?;
-        if control_seed.is_some() && treatment_seed.is_some() && control.run_id == treatment.run_id {
+        if control_seed.is_some() && treatment_seed.is_some() && control.run_id == treatment.run_id
+        {
             return Err(comparison_error(
                 "control and treatment reuse the same attributed run identity",
             ));

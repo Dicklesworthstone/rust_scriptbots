@@ -3173,11 +3173,17 @@ impl ControlHandle {
                             .map_err(|error| ControlError::InvalidPatch(error.to_string()))?;
                         continue;
                     }
-                    if !edits.peek().is_some_and(|entry| entry.tick == world.tick().0) {
+                    if !edits
+                        .peek()
+                        .is_some_and(|entry| entry.tick == world.tick().0)
+                    {
                         return Err(mismatch());
                     }
                 }
-                if !edits.peek().is_some_and(|entry| entry.tick == world.tick().0) {
+                if !edits
+                    .peek()
+                    .is_some_and(|entry| entry.tick == world.tick().0)
+                {
                     break;
                 }
                 // Commands at this tick name their observed config revision. Apply only
@@ -6747,7 +6753,10 @@ pub(crate) mod tests {
             assert_eq!(review.checkpoint_id, checkpoint_id);
             assert_eq!(review.base_tick, saved.tick().0);
             assert_eq!(review.snapshot.world.tick, oracle.world.tick);
-            assert_eq!(review.snapshot.world.agents.len(), oracle.world.agents.len());
+            assert_eq!(
+                review.snapshot.world.agents.len(),
+                oracle.world.agents.len()
+            );
             assert_eq!(
                 review.snapshot.config.food_growth_rate.to_bits(),
                 oracle.config.food_growth_rate.to_bits()
@@ -6827,8 +6836,13 @@ pub(crate) mod tests {
                 );
             }
             assert!(
-                ControlHandle::event_review_agent_commands(&source, &current, target_tick, &changed)
-                    .is_err(),
+                ControlHandle::event_review_agent_commands(
+                    &source,
+                    &current,
+                    target_tick,
+                    &changed
+                )
+                .is_err(),
                 "{fault}"
             );
         }

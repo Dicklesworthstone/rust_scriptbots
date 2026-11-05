@@ -616,8 +616,7 @@ where
             let current = self.current.as_ref().ok_or_else(|| {
                 DataFrameError::Verification("Missing current read-back batch".to_owned())
             })?;
-            let count =
-                (expected.num_rows() - source_offset).min(current.num_rows() - self.offset);
+            let count = (expected.num_rows() - source_offset).min(current.num_rows() - self.offset);
             verify_record_batches(
                 &expected.slice(source_offset, count),
                 &current.slice(self.offset, count),
@@ -792,12 +791,7 @@ pub fn export_database_table(
                 &prov,
             )?;
             if verify {
-                verify_storage_table_export(
-                    reader,
-                    &prov,
-                    &receipt,
-                    File::open(&target_path)?,
-                )?;
+                verify_storage_table_export(reader, &prov, &receipt, File::open(&target_path)?)?;
             }
         }
         AnalyticsExportFormat::Parquet => {
@@ -814,8 +808,7 @@ pub fn export_database_table(
             })?;
             writer.close()?;
             if verify {
-                let builder =
-                    ParquetRecordBatchReaderBuilder::try_new(File::open(&target_path)?)?;
+                let builder = ParquetRecordBatchReaderBuilder::try_new(File::open(&target_path)?)?;
                 let schema = builder.schema().clone();
                 let batches = builder.with_batch_size(EXPORT_PAGE_ROWS).build()?;
                 verify_columnar_pages(reader, table, &prov, &schema, batches)?;
@@ -1436,7 +1429,10 @@ mod tests {
         let mut changed_rows = rows;
         changed_rows[3].value += 1.0;
         let mut changed = readback(vec![metric_rows_to_batch(&prov, &changed_rows).unwrap()]);
-        assert!(changed.compare(&expected).is_err(), "interior value mutation");
+        assert!(
+            changed.compare(&expected).is_err(),
+            "interior value mutation"
+        );
 
         let mut corrupt_tail = BatchReadback::new(
             vec![
@@ -1513,21 +1509,27 @@ mod tests {
         };
         let expected = make(vec![Some(-0.0), None], vec![None, Some(-0.0)]);
         verify_record_batches(&expected, &expected).unwrap();
-        assert!(verify_record_batches(
-            &expected,
-            &make(vec![Some(0.0), None], vec![None, Some(-0.0)]),
-        )
-        .is_err());
-        assert!(verify_record_batches(
-            &expected,
-            &make(vec![Some(-0.0), None], vec![None, Some(0.0)]),
-        )
-        .is_err());
-        assert!(verify_record_batches(
-            &expected,
-            &make(vec![Some(-0.0), Some(0.0)], vec![None, Some(-0.0)]),
-        )
-        .is_err());
+        assert!(
+            verify_record_batches(
+                &expected,
+                &make(vec![Some(0.0), None], vec![None, Some(-0.0)]),
+            )
+            .is_err()
+        );
+        assert!(
+            verify_record_batches(
+                &expected,
+                &make(vec![Some(-0.0), None], vec![None, Some(0.0)]),
+            )
+            .is_err()
+        );
+        assert!(
+            verify_record_batches(
+                &expected,
+                &make(vec![Some(-0.0), Some(0.0)], vec![None, Some(-0.0)]),
+            )
+            .is_err()
+        );
     }
 
     #[test]

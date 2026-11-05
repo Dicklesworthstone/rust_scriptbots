@@ -1806,7 +1806,10 @@ fn export_keyset_pages_preserve_same_tick_rows_and_require_a_finished_source() {
         metrics, expected_metrics,
         "no row omitted, duplicated or reordered"
     );
-    assert_eq!(events, expected_events, "event ordering and payloads preserved");
+    assert_eq!(
+        events, expected_events,
+        "event ordering and payloads preserved"
+    );
 
     let mut calls = 0;
     let error = visit_export_pages::<StorageError>(&reader, ExportTable::Metric, |_| {
@@ -1878,7 +1881,9 @@ fn text_export_readback_compares_source_values_receipt_and_final_eof() {
         for row in &rows {
             writer.write_metric_row(row).expect("forged row");
         }
-        let forged_receipt = writer.finish(ExportTable::Metric).expect("coherent receipt");
+        let forged_receipt = writer
+            .finish(ExportTable::Metric)
+            .expect("coherent receipt");
         verify_export_receipt(
             std::str::from_utf8(&forged).expect("UTF-8 export"),
             ExportTable::Metric,
@@ -2165,7 +2170,9 @@ fn export_pages_refuse_isolated_foreign_agent_birth_and_event_rows() {
         1,
     ));
     let mut storage = Storage::create_unattributed_file(path_str).expect("fixture storage");
-    storage.persist(&batch).expect("persist valid island-zero rows");
+    storage
+        .persist(&batch)
+        .expect("persist valid island-zero rows");
     storage.close().expect("durable fixture close");
 
     let reader = StorageReader::open_finished(path_str).expect("finished positive source");
@@ -2176,7 +2183,9 @@ fn export_pages_refuse_isolated_foreign_agent_birth_and_event_rows() {
     })
     .expect("the valid source exports");
     assert_eq!(observations, 1);
-    reader.close().expect("release source before fault injection");
+    reader
+        .close()
+        .expect("release source before fault injection");
 
     for table in ["agents", "births", "events"] {
         let connection = Connection::open_existing(path_str).expect("fault connection");
@@ -2196,11 +2205,17 @@ fn export_pages_refuse_isolated_foreign_agent_birth_and_event_rows() {
                 Ok(())
             })
             .expect_err("a foreign row anywhere must refuse this island-free projection");
-            assert!(matches!(error, StorageError::InvalidData {
-                context: "export.island_scope",
-                ..
-            }));
-            assert_eq!(calls, 0, "{table}: refuse before a page reaches the consumer");
+            assert!(matches!(
+                error,
+                StorageError::InvalidData {
+                    context: "export.island_scope",
+                    ..
+                }
+            ));
+            assert_eq!(
+                calls, 0,
+                "{table}: refuse before a page reaches the consumer"
+            );
             let mut bytes = Vec::new();
             assert!(matches!(
                 export_storage_table(&reader, exported, ExportFormat::Csv, &mut bytes),
@@ -2209,7 +2224,10 @@ fn export_pages_refuse_isolated_foreign_agent_birth_and_event_rows() {
                     ..
                 })
             ));
-            assert!(bytes.is_empty(), "{table}: refuse before the provenance header");
+            assert!(
+                bytes.is_empty(),
+                "{table}: refuse before the provenance header"
+            );
         }
         reader.close().expect("release refused source");
         let connection = Connection::open_existing(path_str).expect("restore isolated fixture");
