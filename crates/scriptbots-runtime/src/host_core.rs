@@ -4210,7 +4210,16 @@ impl HostCore {
         uid: AgentUid,
         max_contributors: usize,
     ) -> Result<Option<crate::channel::AgentInspectorData>, HostAccessError> {
-        if max_contributors > crate::channel::MAX_INSPECTOR_CONTRIBUTORS {
+        self.inspect_agent_with_attribution(uid, Some(max_contributors))
+    }
+
+    pub(crate) fn inspect_agent_with_attribution(
+        &self,
+        uid: AgentUid,
+        max_contributors: Option<usize>,
+    ) -> Result<Option<crate::channel::AgentInspectorData>, HostAccessError> {
+        if max_contributors.is_some_and(|limit| limit > crate::channel::MAX_INSPECTOR_CONTRIBUTORS)
+        {
             return Err(HostAccessError::ProtocolViolation {
                 message: "sensor explanation contributor limit exceeded".to_owned(),
             });
@@ -4292,7 +4301,8 @@ impl HostCore {
             eye_direction: runtime.eye_direction,
             eye_fov: runtime.eye_fov,
             genome_browser,
-            sensor_attribution: self.world.explain_sensors(id, max_contributors),
+            sensor_attribution: max_contributors
+                .and_then(|limit| self.world.explain_sensors(id, limit)),
         }))
     }
 

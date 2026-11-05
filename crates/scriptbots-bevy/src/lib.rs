@@ -8158,7 +8158,7 @@ fn capture_owner_inspector(
     target: InspectorTarget,
 ) -> std::result::Result<Option<OwnerInspectorSample>, String> {
     let Some(detail) = host
-        .inspect_agent_before(target.uid, 0, Instant::now() + OWNER_INSPECTOR_DEADLINE)
+        .inspect_agent_for_hud_before(target.uid, Instant::now() + OWNER_INSPECTOR_DEADLINE)
         .map_err(|error| error.to_string())?
     else {
         return Ok(None);
