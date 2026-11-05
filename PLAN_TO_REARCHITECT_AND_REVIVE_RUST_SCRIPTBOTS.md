@@ -12,10 +12,21 @@ Existing leases, logical database projection checks and bounded-verifier refusal
 remain in force; JSON/SQL projection memory is outside this narrower change.
 The added regression covers empty and multiple-chunk artifacts, corrupt trailing
 bytes, and incorrect declared lengths through both public verifiers.
+
+Exact-GPU manifest admission now requires the complete shared evidence envelope,
+canonical digest shapes, the full matching target/compiler identity, at least
+1,000 parity ticks and an exactly zero finite sensor delta. The portable DTO
+lives in core and remains re-exported from gfx; storage gains no GPU dependency.
+Producer compiler whitespace matches the manifest's existing normalization.
+This checks available evidence bindings, not independent hardware certification
+or recomputation of the full report digest. Single-world narrative input reads
+also refuse foreign-island rows before returning a partial page. Regressions
+cover malformed evidence, file recovery, approximate-policy preservation and
+foreign-island streams. Canonical narrative tick-window certification is next.
+
 Source review is complete; Cargo, formatting, Clippy, UBS and DSR execution are
-unavailable in this session and are not claimed. Narrative tick-window evidence
-and durable GPU certification admission are under implementation separately.
-No original Bead acceptance or scientific baseline is changed.
+unavailable in this session and are not claimed. No original Bead acceptance
+or scientific baseline is changed.
 
 **Bevy owner inspector (2026-11-05):** [Qualified bounded contribution — GentleDuck;
 original `bd-2z0.14.1.18.3` closed, acceptance unchanged; fresh solo verification]

@@ -535,6 +535,7 @@ use scriptbots_core::{
     rng_domains::{
         AgentSubstreamProtocolV1, DomainStreams, DomainStreamsCheckpoint, IslandId, RngDomain,
     },
+    sense_fixed::{MIN_GPU_SENSE_PARITY_TICKS, SenseDeterminism, SenseGateEvidenceV0},
     world_counters_digest_v1,
 };
 use scriptbots_runtime::{
@@ -3876,32 +3877,100 @@ fn validate_v3_sense_policy(
             Ok(false)
         }
         ("gpu", "exact") if certified && has_evidence => {
-            manifest_required_object(manifest, "/sense_policy/gate_evidence")?;
-            require_manifest_projection(
-                manifest,
-                "/sense_policy/gate_evidence/determinism",
-                &json!("exact"),
-            )?;
-            require_manifest_projection(
-                manifest,
-                "/sense_policy/gate_evidence/target",
-                &json!(record.target_triple),
-            )?;
-            let ticks = manifest_required_u64(manifest, "/sense_policy/gate_evidence/tick_count")?;
-            let delta =
-                manifest_required_value(manifest, "/sense_policy/gate_evidence/max_sensor_delta")?
-                    .as_f64();
-            if ticks == 0 || delta != Some(0.0) {
-                return Err(manifest_projection_error(
-                    "/sense_policy exact GPU evidence requires executed ticks and zero sensor delta",
-                ));
-            }
+            validate_v3_exact_gpu_sense_evidence(record, manifest)?;
             Ok(true)
         }
         _ => Err(manifest_projection_error(
             "/sense_policy requires certified exact CPU, certified GPU with exact evidence, or explicitly allowed uncertified approximate GPU",
         )),
     }
+}
+
+/// Validate the complete portable evidence shape and its manifest bindings.
+///
+/// This is not another hardware parity gate. The V0 projection omits fields
+/// covered by the full report checksum, so storage cannot recompute that checksum
+/// or reestablish the adapter/build match performed by the live GPU gate.
+fn validate_v3_exact_gpu_sense_evidence(
+    record: &RunManifestRecord,
+    manifest: &Value,
+) -> Result<(), StorageError> {
+    let value = manifest_required_object(manifest, "/sense_policy/gate_evidence")?;
+    let evidence: SenseGateEvidenceV0 = serde_json::from_value(value.clone()).map_err(|error| {
+        manifest_projection_error(format!(
+            "/sense_policy/gate_evidence requires the complete SenseGateEvidenceV0: {error}"
+        ))
+    })?;
+    for (field, value) in [
+        ("adapter", evidence.adapter.as_str()),
+        ("backend", evidence.backend.as_str()),
+        ("driver", evidence.driver.as_str()),
+        ("driver_info", evidence.driver_info.as_str()),
+    ] {
+        if value.trim().is_empty() || value.len() > MAX_MANIFEST_TEXT_BYTES {
+            return Err(manifest_projection_error(format!(
+                "/sense_policy/gate_evidence/{field} must be nonblank and at most {MAX_MANIFEST_TEXT_BYTES} bytes"
+            )));
+        }
+    }
+    for (field, digest) in [
+        ("shader_digest", evidence.shader_digest.as_str()),
+        ("build_identity", evidence.build_identity.as_str()),
+        ("fixture_digest", evidence.fixture_digest.as_str()),
+        ("evidence_digest", evidence.evidence_digest.as_str()),
+    ] {
+        if digest.len() != blake3::OUT_LEN * 2
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || digest.bytes().all(|byte| byte == b'0')
+        {
+            return Err(manifest_projection_error(format!(
+                "/sense_policy/gate_evidence/{field} must be a canonical nonzero BLAKE3 hex digest"
+            )));
+        }
+    }
+    if evidence.target != record.target_triple {
+        return Err(manifest_projection_error(
+            "/sense_policy/gate_evidence/target must match the run target",
+        ));
+    }
+    let toolchain =
+        manifest_required_bounded_string(manifest, "/build/rustc_vv", MAX_MANIFEST_TEXT_BYTES)?;
+    if evidence.toolchain_identity != toolchain {
+        return Err(manifest_projection_error(
+            "/sense_policy/gate_evidence/toolchain_identity must match /build/rustc_vv",
+        ));
+    }
+    if evidence.determinism != SenseDeterminism::Exact {
+        return Err(manifest_projection_error(
+            "/sense_policy/gate_evidence/determinism must be exact",
+        ));
+    }
+    if evidence.tick_count < MIN_GPU_SENSE_PARITY_TICKS {
+        return Err(manifest_projection_error(format!(
+            "/sense_policy/gate_evidence/tick_count must be at least {MIN_GPU_SENSE_PARITY_TICKS}"
+        )));
+    }
+    if evidence.evidence_time_unix_ms == 0 {
+        return Err(manifest_projection_error(
+            "/sense_policy/gate_evidence/evidence_time_unix_ms must be nonzero",
+        ));
+    }
+    // Check the JSON number too: a forged nonzero f64 can underflow to zero
+    // while serde narrows it into the portable f32 field.
+    let raw_delta =
+        manifest_required_value(manifest, "/sense_policy/gate_evidence/max_sensor_delta")?
+            .as_f64();
+    if raw_delta != Some(0.0)
+        || !evidence.max_sensor_delta.is_finite()
+        || evidence.max_sensor_delta != 0.0
+    {
+        return Err(manifest_projection_error(
+            "/sense_policy/gate_evidence/max_sensor_delta must be finite and zero",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_v3_core_build(manifest: &Value) -> Result<(), StorageError> {
@@ -11974,6 +12043,16 @@ impl StorageReader {
             for row in &rows {
                 let replay_row = replay_event_row_from_query_row(row)?;
                 let row_tick = checked_u64("narrative_input.tick", replay_row.tick)?;
+                if replay_row.island_id != 0 {
+                    return Err(NarrativeInputStreamError::InvalidRecord {
+                        tick: row_tick,
+                        reason: format!(
+                            "single-world narrative input stream requires island 0, found island {}",
+                            replay_row.island_id
+                        ),
+                    }
+                    .into());
+                }
                 let expected_tick =
                     after_tick
                         .checked_add(1)
@@ -12109,7 +12188,10 @@ impl StorageReader {
         Ok(())
     }
 
-    /// Read one bounded forward page of complete production narrative inputs.
+    /// Read one bounded forward page of complete production narrative inputs for island zero.
+    ///
+    /// This binding has no island dimension. Any nonzero island input refuses the
+    /// complete stream instead of being attributed to the single-world history.
     ///
     /// The immutable finished-reader lease prevents the stream from changing between pages.
     /// The first page scans the reserved identities in bounded chunks, proving prefix/suffix
@@ -39052,6 +39134,51 @@ mod tests {
         }
         storage.close()?;
         Ok(path_string)
+    }
+
+    #[test]
+    fn finished_narrative_reader_refuses_foreign_island_streams_before_paging()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const TERMINAL_TICK: u64 = 4;
+        for first_foreign_tick in [1_u64, 3] {
+            let path = create_complete_narrative_database(
+                &format!("storage-narrative-foreign-island-{first_foreign_tick}"),
+                TERMINAL_TICK,
+            )?;
+            let original = StorageReader::open_finished(&path)?;
+            let original_page = original.narrative_input_page_v1(None, 1, 0)?;
+            assert_eq!(original_page.binding.input_count, TERMINAL_TICK);
+            assert_eq!(original_page.inputs[0].input.tick.0, 1);
+            original.close()?;
+
+            let connection = Connection::open_existing(&path)?;
+            assert_eq!(
+                connection.execute_with_params(
+                    "UPDATE replay_events SET island_id = ?1
+                     WHERE run_id = ?2 AND event_type = ?3 AND tick >= ?4",
+                    &[
+                        7_i64.into(),
+                        sqlite_run_id(RunId::new(1)),
+                        NARRATIVE_INPUT_EVENT_TYPE.into(),
+                        encode_u64("test.narrative.tick", first_foreign_tick)?.into(),
+                    ],
+                )?,
+                usize::try_from(TERMINAL_TICK - first_foreign_tick + 1)?
+            );
+            connection.close()?;
+
+            // With every tick still present and every payload unchanged, the old
+            // reader accepted island 7 or a mixed-island stream as island-zero science.
+            let reader = StorageReader::open_finished(&path)?;
+            assert!(matches!(
+                reader.narrative_input_page_v1(None, 1, 0),
+                Err(StorageError::NarrativeInputStream(
+                    NarrativeInputStreamError::InvalidRecord { tick, ref reason }
+                )) if tick == first_foreign_tick && reason.contains("found island 7")
+            ));
+            reader.close()?;
+        }
+        Ok(())
     }
 
     #[test]

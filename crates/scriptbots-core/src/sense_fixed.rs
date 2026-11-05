@@ -51,6 +51,70 @@
 #![allow(clippy::float_cmp, clippy::while_float)]
 
 use crate::NUM_EYES;
+use serde::{Deserialize, Serialize};
+
+/// Minimum observed simulation ticks required to claim exact GPU sensing.
+///
+/// The parity runner and durable run-manifest validation share this threshold.
+/// Short exploratory runs may still report their observations, but they cannot
+/// establish a certified exact hardware lane.
+pub const MIN_GPU_SENSE_PARITY_TICKS: u64 = 1_000;
+
+/// Certification status of sensory accumulation determinism.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SenseDeterminism {
+    /// Zero divergence across verified ticks; identical characterization digest.
+    Exact,
+    /// Non-zero divergence detected or uncertified adapter.
+    Approximate,
+}
+
+impl std::fmt::Display for SenseDeterminism {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Exact => write!(f, "exact"),
+            Self::Approximate => write!(f, "approximate"),
+        }
+    }
+}
+
+/// Parity gate evidence certifying a GPU sense backend against CPU reference.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SenseGateEvidenceV0 {
+    /// Target triple (e.g. `x86_64-unknown-linux-gnu`).
+    pub target: String,
+    /// Graphics adapter description name.
+    pub adapter: String,
+    /// PCI vendor identifier.
+    pub vendor: u32,
+    /// PCI device identifier.
+    pub device: u32,
+    /// Graphics backend name (e.g. `Vulkan`, `Metal`, `Dx12`).
+    pub backend: String,
+    /// Driver name.
+    pub driver: String,
+    /// Driver information string.
+    pub driver_info: String,
+    /// BLAKE3 hex digest of the GPU compute shader source.
+    pub shader_digest: String,
+    /// Build identity (git commit / version).
+    pub build_identity: String,
+    /// Compiler toolchain identity (`rustc -Vv`).
+    pub toolchain_identity: String,
+    /// Scenario fixture digest.
+    pub fixture_digest: String,
+    /// Number of verified simulation ticks.
+    pub tick_count: u64,
+    /// Unix timestamp in milliseconds when evidence was captured.
+    pub evidence_time_unix_ms: u64,
+    /// BLAKE3 digest over all canonical parity fields.
+    pub evidence_digest: String,
+    /// Certification determinism verdict.
+    pub determinism: SenseDeterminism,
+    /// Maximum observed sensor delta across all agents and ticks.
+    pub max_sensor_delta: f32,
+}
 
 /// Fractional bits in the fixed-point accumulator.
 pub const SENSE_FRAC_BITS: u32 = 20;

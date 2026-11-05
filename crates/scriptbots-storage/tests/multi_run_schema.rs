@@ -5,6 +5,9 @@ use scriptbots_core::{
     Generation, MetricSample, PersistenceBatch, Position, ScriptBotsConfig, Tick, TickSummary,
     WorldState,
 };
+use scriptbots_core::sense_fixed::{
+    MIN_GPU_SENSE_PARITY_TICKS, SenseDeterminism, SenseGateEvidenceV0,
+};
 use scriptbots_runtime::RunId;
 use scriptbots_storage::{
     BatchPersistenceState, FailureCommitState, RunManifestRecord, StorageError, StorageOperation,
@@ -302,6 +305,50 @@ fn with_sensing_policy(mut record: RunManifestRecord, approximate: bool) -> RunM
     record
 }
 
+// Constructed envelopes exercise storage shape/binding validation only. These
+// hashes name fixture inputs; they are not retained hardware parity evidence.
+fn exact_gpu_evidence_fixture(record: &RunManifestRecord) -> SenseGateEvidenceV0 {
+    let value: serde_json::Value =
+        serde_json::from_str(&record.manifest_json).expect("valid fixture manifest");
+    SenseGateEvidenceV0 {
+        target: record.target_triple.clone(),
+        adapter: "schema-fixture adapter".to_owned(),
+        vendor: 0x1234,
+        device: 0x5678,
+        backend: "Metal".to_owned(),
+        driver: "schema-fixture driver".to_owned(),
+        driver_info: "schema-fixture driver version".to_owned(),
+        shader_digest: blake3::hash(b"schema-fixture shader").to_hex().to_string(),
+        build_identity: blake3::hash(b"schema-fixture build").to_hex().to_string(),
+        toolchain_identity: value["build"]["rustc_vv"]
+            .as_str()
+            .expect("fixture rustc -Vv")
+            .to_owned(),
+        fixture_digest: blake3::hash(b"schema-fixture scenario").to_hex().to_string(),
+        tick_count: MIN_GPU_SENSE_PARITY_TICKS,
+        evidence_time_unix_ms: record.started_at_unix_ms,
+        evidence_digest: blake3::hash(b"schema-fixture report").to_hex().to_string(),
+        determinism: SenseDeterminism::Exact,
+        max_sensor_delta: 0.0,
+    }
+}
+
+fn with_exact_gpu_sensing_policy(mut record: RunManifestRecord) -> RunManifestRecord {
+    let evidence = exact_gpu_evidence_fixture(&record);
+    mutate_manifest(&mut record, |value| {
+        value["sense_policy"] = serde_json::json!({
+            "backend": "gpu",
+            "determinism": "exact",
+            "source": "test-schema",
+            "allow_approximate": false,
+            "gate_evidence": evidence,
+            "certified_exact": true,
+            "reason": "complete portable schema fixture, not hardware parity proof"
+        });
+    });
+    record
+}
+
 #[test]
 fn sensing_reproducibility_is_persisted_separately_from_build_provenance()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -384,6 +431,168 @@ fn sensing_manifest_rejects_forged_reproducibility_and_inconsistent_policy() {
         value["sense_policy"]["certified_exact"] = serde_json::json!(true);
     });
     assert!(manifest_validation_error(invalid).contains("/sense_policy requires"));
+}
+
+#[test]
+fn exact_gpu_sensing_evidence_survives_file_recovery() -> Result<(), Box<dyn std::error::Error>> {
+    let run_id = RunId::from_namespace_sequence(0x5e05_e003, 1);
+    let record = with_exact_gpu_sensing_policy(manifest(
+        run_id,
+        "exact_gpu_schema",
+        1_700_000_000_001,
+    ));
+    let expected: serde_json::Value = serde_json::from_str(&record.manifest_json)?;
+    let path = temp_db_path("exact_gpu_schema");
+    let mut pipeline = StoragePipeline::create_new_file_for_run(&path, record)?;
+    pipeline.shutdown()?;
+    let mut recovered = StoragePipeline::recover_existing(&path)?;
+    recovered.shutdown()?;
+    let reader = StorageReader::open_finished_for_run(&path, run_id)?;
+    let persisted = reader.run_manifest()?;
+    assert!(persisted.reproducible);
+    let actual: serde_json::Value = serde_json::from_str(&persisted.manifest_json)?;
+    assert_eq!(actual, expected);
+    let evidence: SenseGateEvidenceV0 =
+        serde_json::from_value(actual["sense_policy"]["gate_evidence"].clone())?;
+    assert_eq!(evidence.tick_count, MIN_GPU_SENSE_PARITY_TICKS);
+    reader.close()?;
+    Ok(())
+}
+
+#[test]
+fn exact_gpu_sensing_requires_every_canonical_evidence_field() {
+    let run_id = RunId::from_namespace_sequence(0x5e05_e004, 1);
+    let valid = with_exact_gpu_sensing_policy(manifest(
+        run_id,
+        "complete_gpu_evidence",
+        1_700_000_000_001,
+    ));
+    accept_manifest(valid.clone());
+
+    let value: serde_json::Value =
+        serde_json::from_str(&valid.manifest_json).expect("valid fixture manifest");
+    let fields: Vec<String> = value["sense_policy"]["gate_evidence"]
+        .as_object()
+        .expect("typed evidence is an object")
+        .keys()
+        .cloned()
+        .collect();
+    for field in fields {
+        let mut invalid = valid.clone();
+        mutate_manifest(&mut invalid, |value| {
+            let removed = value["sense_policy"]["gate_evidence"]
+                .as_object_mut()
+                .expect("evidence object")
+                .remove(&field);
+            assert!(removed.is_some(), "the canonical field {field} was present");
+        });
+        let error = manifest_validation_error(invalid);
+        assert!(error.contains("/sense_policy/gate_evidence"), "{field}: {error}");
+        assert!(error.contains(&field), "{field}: {error}");
+    }
+}
+
+#[test]
+fn exact_gpu_sensing_refuses_foreign_identity_and_false_exact_outcomes() {
+    let run_id = RunId::from_namespace_sequence(0x5e05_e005, 1);
+    let valid = with_exact_gpu_sensing_policy(manifest(
+        run_id,
+        "gpu_evidence_controls",
+        1_700_000_000_001,
+    ));
+    for (field, replacement) in [
+        ("adapter", serde_json::json!(" ")),
+        ("backend", serde_json::json!("")),
+        ("driver", serde_json::json!("\t")),
+        ("driver_info", serde_json::json!("")),
+        ("vendor", serde_json::json!(u64::from(u32::MAX) + 1)),
+        ("device", serde_json::json!(-1)),
+        ("target", serde_json::json!("x86_64-unknown-linux-gnu")),
+        ("toolchain_identity", serde_json::json!("different rustc -Vv")),
+        ("shader_digest", serde_json::json!("not-a-digest")),
+        ("build_identity", serde_json::json!("0".repeat(blake3::OUT_LEN * 2))),
+        ("fixture_digest", serde_json::json!("F".repeat(blake3::OUT_LEN * 2))),
+        ("evidence_digest", serde_json::json!("a".repeat(blake3::OUT_LEN * 2 - 1))),
+        ("tick_count", serde_json::json!(MIN_GPU_SENSE_PARITY_TICKS - 1)),
+        ("tick_count", serde_json::json!(0)),
+        ("evidence_time_unix_ms", serde_json::json!(0)),
+        ("determinism", serde_json::json!("approximate")),
+        ("max_sensor_delta", serde_json::json!(0.001)),
+        ("max_sensor_delta", serde_json::json!(-0.001)),
+        ("max_sensor_delta", serde_json::json!(1e-100)),
+        ("max_sensor_delta", serde_json::json!(1e100)),
+        ("max_sensor_delta", serde_json::json!(null)),
+    ] {
+        let mut invalid = valid.clone();
+        mutate_manifest(&mut invalid, |value| {
+            value["sense_policy"]["gate_evidence"][field] = replacement;
+        });
+        let error = manifest_validation_error(invalid);
+        assert!(error.contains("/sense_policy/gate_evidence"), "{field}: {error}");
+    }
+
+    let mut longer = valid;
+    mutate_manifest(&mut longer, |value| {
+        value["sense_policy"]["gate_evidence"]["tick_count"] =
+            serde_json::json!(MIN_GPU_SENSE_PARITY_TICKS + 1);
+    });
+    accept_manifest(longer);
+}
+
+#[test]
+fn incomplete_exact_gpu_evidence_is_refused_before_file_creation() {
+    let run_id = RunId::from_namespace_sequence(0x5e05_e006, 1);
+    let mut invalid = with_exact_gpu_sensing_policy(manifest(
+        run_id,
+        "incomplete_gpu_evidence",
+        1_700_000_000_001,
+    ));
+    let target = invalid.target_triple.clone();
+    mutate_manifest(&mut invalid, |value| {
+        // This four-field object passed the old partial-JSON validator.
+        value["sense_policy"]["gate_evidence"] = serde_json::json!({
+            "determinism": "exact",
+            "target": target,
+            "tick_count": 1,
+            "max_sensor_delta": 0.0
+        });
+    });
+    let path = temp_db_path("incomplete_gpu_evidence");
+    let error = match StoragePipeline::create_new_file_for_run(&path, invalid) {
+        Err(error) => error,
+        Ok(mut unexpected) => {
+            unexpected.shutdown().expect("unexpected pipeline shuts down");
+            panic!("incomplete exact evidence reached database creation");
+        }
+    };
+    assert!(
+        error.to_string().contains("/sense_policy/gate_evidence"),
+        "{error}"
+    );
+    assert!(!std::path::Path::new(&path).exists());
+}
+
+#[test]
+fn short_uncertified_gpu_evidence_remains_available_for_exploration() {
+    let run_id = RunId::from_namespace_sequence(0x5e05_e007, 1);
+    let mut record = with_sensing_policy(
+        manifest(run_id, "approximate_gpu_evidence", 1_700_000_000_001),
+        true,
+    );
+    let mut evidence = exact_gpu_evidence_fixture(&record);
+    evidence.determinism = SenseDeterminism::Approximate;
+    evidence.tick_count = 1;
+    evidence.max_sensor_delta = 0.5;
+    evidence.target = "unavailable".to_owned();
+    evidence.build_identity = "unavailable".to_owned();
+    evidence.toolchain_identity = "unavailable".to_owned();
+    evidence.driver.clear();
+    evidence.driver_info.clear();
+    mutate_manifest(&mut record, |value| {
+        value["sense_policy"]["gate_evidence"] = serde_json::json!(evidence);
+    });
+    assert!(!record.reproducible);
+    accept_manifest(record);
 }
 
 fn overlapping_batch(epoch: u64, energy: f32) -> PersistenceBatch {

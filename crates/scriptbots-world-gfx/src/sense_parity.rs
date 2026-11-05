@@ -9,7 +9,10 @@
 use crate::sense_wgsl::{
     AgentGpuData, GpuSenseError, GpuSensePipeline, GridUniforms, PRODUCTION_WORKGROUP_SIZE,
 };
-use scriptbots_core::sense_fixed::{SenseAccum, SenseProvider, SenseProviderError};
+use scriptbots_core::sense_fixed::{
+    MIN_GPU_SENSE_PARITY_TICKS, SenseAccum, SenseProvider, SenseProviderError,
+};
+pub use scriptbots_core::sense_fixed::{SenseDeterminism, SenseGateEvidenceV0};
 use scriptbots_core::{AgentData, AgentId, OutputsExt, Position, ScriptBotsConfig, WorldState};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -37,25 +40,6 @@ impl std::fmt::Display for SenseBackendId {
     }
 }
 
-/// Certification status of sensory accumulation determinism.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SenseDeterminism {
-    /// Zero divergence across verified ticks; identical characterization digest.
-    Exact,
-    /// Non-zero divergence detected or uncertified adapter.
-    Approximate,
-}
-
-impl std::fmt::Display for SenseDeterminism {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Exact => write!(f, "exact"),
-            Self::Approximate => write!(f, "approximate"),
-        }
-    }
-}
-
 /// Exact coordinates and values of first observed sensor divergence.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SenseDivergenceCoordinates {
@@ -79,43 +63,6 @@ pub struct SenseDivergenceCoordinates {
     /// GPU accumulator channels if available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_accumulator: Option<Vec<i64>>,
-}
-
-/// Parity gate evidence certifying a GPU sense backend against CPU reference.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SenseGateEvidenceV0 {
-    /// Target triple (e.g. `x86_64-unknown-linux-gnu`).
-    pub target: String,
-    /// Graphics adapter description name.
-    pub adapter: String,
-    /// PCI vendor identifier.
-    pub vendor: u32,
-    /// PCI device identifier.
-    pub device: u32,
-    /// Graphics backend name (e.g. `Vulkan`, `Metal`, `Dx12`).
-    pub backend: String,
-    /// Driver name.
-    pub driver: String,
-    /// Driver information string.
-    pub driver_info: String,
-    /// BLAKE3 hex digest of the GPU compute shader source.
-    pub shader_digest: String,
-    /// Build identity (git commit / version).
-    pub build_identity: String,
-    /// Compiler toolchain identity (`rustc -Vv`).
-    pub toolchain_identity: String,
-    /// Scenario fixture digest.
-    pub fixture_digest: String,
-    /// Number of verified simulation ticks.
-    pub tick_count: u64,
-    /// Unix timestamp in milliseconds when evidence was captured.
-    pub evidence_time_unix_ms: u64,
-    /// BLAKE3 digest over all canonical parity fields.
-    pub evidence_digest: String,
-    /// Certification determinism verdict.
-    pub determinism: SenseDeterminism,
-    /// Maximum observed sensor delta across all agents and ticks.
-    pub max_sensor_delta: f32,
 }
 
 /// Resolved sensory accumulation policy attached to [`scriptbots_app::RunManifestV3`].
@@ -602,7 +549,9 @@ impl ParityBuildIdentity {
             return None;
         }
         let target = target?;
-        let toolchain = toolchain?;
+        // Run manifests normalize embedded rustc -Vv text through compile_time_text.
+        // Preserve that same representation in parity evidence so the two bind exactly.
+        let toolchain = toolchain?.trim();
         if target.trim().is_empty()
             || !toolchain.lines().any(|line| line.starts_with("release: "))
             || !toolchain
@@ -738,7 +687,7 @@ pub struct SenseParityOptions {
 impl Default for SenseParityOptions {
     fn default() -> Self {
         Self {
-            tick_count: 1_000,
+            tick_count: MIN_GPU_SENSE_PARITY_TICKS,
             seed: 42,
             population: 20,
             fault_injection: None,
@@ -1300,8 +1249,18 @@ mod tests {
         };
         let valid = resolve(input).expect("declared complete inputs");
         assert_eq!(valid.target, "test-target");
-        assert_eq!(valid.toolchain, compiler);
+        assert_eq!(valid.toolchain, compiler.trim());
         assert_eq!(valid.build.len(), blake3::OUT_LEN * 2);
+        let padded_compiler = format!(" \n{compiler}\n ");
+        let padded = ParityBuildIdentity::from_embedded(
+            Some("true"),
+            Some(revision),
+            Some("test-target"),
+            Some(&padded_compiler),
+        )
+        .expect("outer whitespace does not change embedded compiler identity");
+        assert_eq!(padded.toolchain, valid.toolchain);
+        assert_eq!(padded.build, valid.build);
         for index in 0..input.len() {
             let mut missing = input;
             missing[index] = None;
