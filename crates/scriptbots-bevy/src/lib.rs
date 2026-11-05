@@ -912,6 +912,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
                 handle_playback_shortcuts,
                 handle_playback_buttons,
                 handle_hud_diagnostics,
+                scroll_hud_panel,
             ),
             handle_tonemap_mode_buttons,
             // Nested so the outer tuple stays within Bevy's 20-system arity
@@ -2775,6 +2776,34 @@ fn hud_diagnostic_node() -> Node {
     }
 }
 
+/// Scroll the left panel only while the pointer is over it. Camera input has
+/// its own message reader and ignores wheel events captured by a HUD node.
+fn scroll_hud_panel(
+    mut wheels: MessageReader<MouseWheel>,
+    mut panels: Query<(&Interaction, &ComputedNode, &mut ScrollPosition), With<HudScenePanel>>,
+) {
+    let scroll_pixels: f32 = wheels
+        .read()
+        .filter(|wheel| wheel.y.is_finite())
+        .map(|wheel| match wheel.unit {
+            MouseScrollUnit::Line => wheel.y.clamp(-100.0, 100.0) * 40.0,
+            MouseScrollUnit::Pixel => wheel.y.clamp(-4000.0, 4000.0),
+        })
+        .sum();
+    if scroll_pixels == 0.0 {
+        return;
+    }
+    for (interaction, computed, mut scroll) in &mut panels {
+        if !matches!(interaction, Interaction::Hovered | Interaction::Pressed) {
+            continue;
+        }
+        let limit = ((computed.content_size.y - computed.size.y).max(0.0)
+            * computed.inverse_scale_factor)
+            .max(0.0);
+        scroll.0.y = (scroll.0.y - scroll_pixels).clamp(0.0, limit);
+    }
+}
+
 fn handle_hud_diagnostics(
     keys: Option<Res<ButtonInput<KeyCode>>>,
     mut mode: ResMut<HudDiagnostics>,
@@ -2814,6 +2843,66 @@ fn handle_hud_diagnostics(
 #[cfg(test)]
 mod hud_diagnostics_tests {
     use super::*;
+
+    #[test]
+    fn panel_wheel_scrolls_bounded_content_without_zooming_world() {
+        let mut app = App::new();
+        app.insert_resource(Time::<()>::default())
+            .insert_resource(CameraRig::default())
+            .insert_resource(SnapshotState::default())
+            .insert_resource(ButtonInput::<MouseButton>::default())
+            .insert_resource(ButtonInput::<KeyCode>::default())
+            .insert_resource(Messages::<MouseMotion>::default())
+            .insert_resource(Messages::<MouseWheel>::default())
+            .add_systems(Update, (scroll_hud_panel, control_camera).chain());
+        app.world_mut().spawn((PrimaryCamera, Transform::default()));
+        let panel = app
+            .world_mut()
+            .spawn((
+                Node::default(),
+                ComputedNode {
+                    size: Vec2::new(400.0, 300.0),
+                    content_size: Vec2::new(400.0, 700.0),
+                    inverse_scale_factor: 0.5,
+                    ..default()
+                },
+                Interaction::Hovered,
+                ScrollPosition::default(),
+                HudScenePanel,
+            ))
+            .id();
+        let original_distance = app.world().resource::<CameraRig>().distance;
+        let send_wheel = |app: &mut App, unit, y| {
+            app.world_mut()
+                .resource_mut::<Messages<MouseWheel>>()
+                .write(MouseWheel {
+                    unit,
+                    x: 0.0,
+                    y,
+                    window: Entity::PLACEHOLDER,
+                });
+            app.update();
+        };
+        send_wheel(&mut app, MouseScrollUnit::Line, -1.0);
+        assert_eq!(app.world().get::<ScrollPosition>(panel).unwrap().0.y, 40.0);
+        assert_eq!(
+            app.world().resource::<CameraRig>().distance,
+            original_distance
+        );
+        send_wheel(&mut app, MouseScrollUnit::Pixel, -500.0);
+        assert_eq!(app.world().get::<ScrollPosition>(panel).unwrap().0.y, 200.0);
+        send_wheel(&mut app, MouseScrollUnit::Pixel, 500.0);
+        assert_eq!(app.world().get::<ScrollPosition>(panel).unwrap().0.y, 0.0);
+        send_wheel(&mut app, MouseScrollUnit::Pixel, f32::NAN);
+        assert_eq!(app.world().get::<ScrollPosition>(panel).unwrap().0.y, 0.0);
+        *app.world_mut().get_mut::<Interaction>(panel).unwrap() = Interaction::None;
+        send_wheel(&mut app, MouseScrollUnit::Line, -1.0);
+        assert_eq!(app.world().get::<ScrollPosition>(panel).unwrap().0.y, 0.0);
+        assert_ne!(
+            app.world().resource::<CameraRig>().distance,
+            original_distance
+        );
+    }
 
     #[test]
     fn compact_feedback_retains_outcomes_and_unrecognized_identities() {
@@ -4181,15 +4270,18 @@ fn setup_scene(
                 left: Val::Px(12.0),
                 width: Val::Px(560.0),
                 max_width: Val::Percent(45.0),
+                max_height: Val::Percent(92.0),
                 padding: UiRect::all(Val::Px(10.0)),
                 flex_direction: FlexDirection::Column,
                 row_gap: Val::Px(4.0),
+                overflow: Overflow::scroll_y(),
                 ..default()
             },
             BackgroundColor(Color::srgba(0.05, 0.10, 0.09, 0.88)),
             BorderRadius::all(Val::Px(10.0)),
             Interaction::default(),
             FocusPolicy::Pass,
+            ScrollPosition::default(),
             HudScenePanel,
         ))
         .id();
