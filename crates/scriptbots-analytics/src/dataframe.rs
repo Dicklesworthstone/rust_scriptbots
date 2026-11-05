@@ -21,13 +21,13 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, BooleanBuilder, Float32Builder, Float64Builder, RecordBatch, StringBuilder,
-    UInt32Builder, UInt64Builder,
+    ArrayRef, BooleanBuilder, Float32Array, Float32Builder, Float64Array, Float64Builder,
+    RecordBatch, StringBuilder, UInt32Builder, UInt64Builder,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::ipc::reader::FileReader as ArrowFileReader;
@@ -40,8 +40,10 @@ use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::file::properties::WriterProperties;
 use scriptbots_storage::export_pipeline::{
-    AGENT_ARROW_SCHEMA, ArrowColumnSpec, ArrowDataType, EVENT_ARROW_SCHEMA, LINEAGE_ARROW_SCHEMA,
-    METRIC_ARROW_SCHEMA, RUN_ARROW_SCHEMA,
+    AGENT_ARROW_SCHEMA, ArrowColumnSpec, ArrowDataType, EVENT_ARROW_SCHEMA, EXPORT_PAGE_ROWS,
+    ExportTablePage, LINEAGE_ARROW_SCHEMA, METRIC_ARROW_SCHEMA, RUN_ARROW_SCHEMA,
+    export_provenance, export_storage_table_with_provenance, verify_storage_table_export,
+    visit_export_pages,
 };
 use scriptbots_storage::{
     AgentExportRow, EventExportRow, ExportFormat as StorageExportFormat, ExportProvenance,
@@ -492,6 +494,7 @@ pub fn verify_record_batches(
 
     let exp_schema = expected.schema();
     let act_schema = actual.schema();
+    verify_export_schema(&exp_schema, &act_schema)?;
 
     for i in 0..expected.num_columns() {
         let exp_field = exp_schema.field(i);
@@ -514,7 +517,28 @@ pub fn verify_record_batches(
 
         let exp_col = expected.column(i);
         let act_col = actual.column(i);
-        if exp_col != act_col {
+        let equal = match exp_field.data_type() {
+            DataType::Float32 => exp_col
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .zip(act_col.as_any().downcast_ref::<Float32Array>())
+                .is_some_and(|(left, right)| {
+                    left.iter()
+                        .map(|value| value.map(f32::to_bits))
+                        .eq(right.iter().map(|value| value.map(f32::to_bits)))
+                }),
+            DataType::Float64 => exp_col
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .zip(act_col.as_any().downcast_ref::<Float64Array>())
+                .is_some_and(|(left, right)| {
+                    left.iter()
+                        .map(|value| value.map(f64::to_bits))
+                        .eq(right.iter().map(|value| value.map(f64::to_bits)))
+                }),
+            _ => exp_col == act_col,
+        };
+        if !equal {
             return Err(DataFrameError::Verification(format!(
                 "Column '{}' data contents mismatch",
                 exp_field.name()
@@ -523,6 +547,99 @@ pub fn verify_record_batches(
     }
 
     Ok(())
+}
+
+fn verify_export_schema(expected: &SchemaRef, actual: &SchemaRef) -> Result<(), DataFrameError> {
+    if expected != actual {
+        return Err(DataFrameError::Verification(format!(
+            "Export schema or provenance mismatch: expected {expected:?}, got {actual:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// Compare a decoded stream to source pages even when their batch boundaries differ.
+/// Only the current decoded batch is retained; an early EOF or extra row is an error.
+struct BatchReadback<I> {
+    batches: I,
+    schema: SchemaRef,
+    current: Option<RecordBatch>,
+    offset: usize,
+}
+
+impl<I> BatchReadback<I>
+where
+    I: Iterator<Item = Result<RecordBatch, arrow::error::ArrowError>>,
+{
+    fn new(
+        batches: I,
+        expected_schema: SchemaRef,
+        actual_schema: &SchemaRef,
+    ) -> Result<Self, DataFrameError> {
+        verify_export_schema(&expected_schema, actual_schema)?;
+        Ok(Self {
+            batches,
+            schema: expected_schema,
+            current: None,
+            offset: 0,
+        })
+    }
+
+    fn advance(&mut self) -> Result<bool, DataFrameError> {
+        for next in self.batches.by_ref() {
+            let batch = next?;
+            verify_export_schema(&self.schema, &batch.schema())?;
+            if batch.num_rows() > EXPORT_PAGE_ROWS {
+                return Err(DataFrameError::Verification(format!(
+                    "Decoded batch exceeds the export page bound: {} > {EXPORT_PAGE_ROWS}",
+                    batch.num_rows()
+                )));
+            }
+            if batch.num_rows() != 0 {
+                self.current = Some(batch);
+                self.offset = 0;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn compare(&mut self, expected: &RecordBatch) -> Result<(), DataFrameError> {
+        verify_export_schema(&self.schema, &expected.schema())?;
+        let mut source_offset = 0;
+        while source_offset < expected.num_rows() {
+            if self.current.is_none() && !self.advance()? {
+                return Err(DataFrameError::Verification(
+                    "Export ended before every source row was verified".to_owned(),
+                ));
+            }
+            let current = self.current.as_ref().ok_or_else(|| {
+                DataFrameError::Verification("Missing current read-back batch".to_owned())
+            })?;
+            let count =
+                (expected.num_rows() - source_offset).min(current.num_rows() - self.offset);
+            verify_record_batches(
+                &expected.slice(source_offset, count),
+                &current.slice(self.offset, count),
+            )?;
+            source_offset += count;
+            self.offset += count;
+            if self.offset == current.num_rows() {
+                self.current = None;
+                self.offset = 0;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<(), DataFrameError> {
+        if self.current.is_some() || self.advance()? {
+            return Err(DataFrameError::Verification(
+                "Export contains rows after the complete source traversal".to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -607,9 +724,47 @@ pub fn load_metric_rows(
 // EXPORT PIPELINE
 // ============================================================================
 
+fn export_page_to_batch(
+    prov: &ExportProvenance,
+    page: ExportTablePage,
+) -> Result<RecordBatch, DataFrameError> {
+    match page {
+        ExportTablePage::Run(row) => run_rows_to_batch(prov, std::slice::from_ref(&row)),
+        ExportTablePage::Agent(rows) => agent_rows_to_batch(prov, &rows),
+        ExportTablePage::Lineage(rows) => lineage_rows_to_batch(prov, &rows),
+        ExportTablePage::Event(rows) => event_rows_to_batch(prov, &rows),
+        ExportTablePage::Metric(rows) => metric_rows_to_batch(prov, &rows),
+    }
+}
+
+fn verify_columnar_pages<I>(
+    reader: &StorageReader,
+    table: ExportTable,
+    prov: &ExportProvenance,
+    actual_schema: &SchemaRef,
+    batches: I,
+) -> Result<(), DataFrameError>
+where
+    I: Iterator<Item = Result<RecordBatch, arrow::error::ArrowError>>,
+{
+    let expected_schema = spec_to_arrow_schema(table.arrow_schema(), Some(prov));
+    let mut readback = BatchReadback::new(batches, expected_schema, actual_schema)?;
+    visit_export_pages::<DataFrameError>(reader, table, |page| {
+        readback.compare(&export_page_to_batch(prov, page)?)
+    })?;
+    readback.finish()
+}
+
 /// Export a canonical table from a run database to Parquet, Arrow, or CSV.
 ///
-/// If `verify` is true, re-reads the written artifact and asserts equality.
+/// Arrow record batches and Parquet row groups contain at most [`EXPORT_PAGE_ROWS`]
+/// rows. Source pages and decoded verification batches are never accumulated into
+/// a complete table. Variable-size row payloads, SQL engine allocations and file
+/// footer metadata are separate from this row-buffer bound.
+///
+/// If `verify` is true, compares every columnar value, null and embedded schema/
+/// provenance field, or every CSV byte, to a second traversal of the same finished
+/// source and requires the decoded stream to end with the source.
 pub fn export_database_table(
     reader: &StorageReader,
     table: ExportTable,
@@ -617,6 +772,7 @@ pub fn export_database_table(
     out_dir: &Path,
     verify: bool,
 ) -> Result<PathBuf, DataFrameError> {
+    let prov = export_provenance(reader, table)?;
     let run_id = reader.run_id().to_string();
     let filename = format!("{run_id}_{}.{}", table.as_str(), format.extension());
     let target_path = out_dir.join(filename);
@@ -627,75 +783,56 @@ pub fn export_database_table(
 
     match format {
         AnalyticsExportFormat::Csv => {
-            let file = File::create(&target_path)?;
-            export_storage_table(reader, table, StorageExportFormat::Csv, file)?;
+            let file = BufWriter::new(File::create(&target_path)?);
+            let receipt = export_storage_table_with_provenance(
+                reader,
+                table,
+                StorageExportFormat::Csv,
+                file,
+                &prov,
+            )?;
             if verify {
-                let (_prov_line, headers, _rows) = read_csv_with_provenance(&target_path)?;
-                let expected_schema = table.arrow_schema();
-                let expected_names: Vec<&str> = expected_schema.iter().map(|s| s.name).collect();
-                if headers != expected_names {
-                    return Err(DataFrameError::Verification(format!(
-                        "CSV headers mismatch on read-back: expected {expected_names:?}, got {headers:?}"
-                    )));
-                }
+                verify_storage_table_export(
+                    reader,
+                    &prov,
+                    &receipt,
+                    File::open(&target_path)?,
+                )?;
             }
         }
         AnalyticsExportFormat::Parquet => {
-            let batch = match table {
-                ExportTable::Run => {
-                    let (prov, rows) = load_run_rows(reader)?;
-                    run_rows_to_batch(&prov, &rows)?
-                }
-                ExportTable::Agent => {
-                    let (prov, rows) = load_agent_rows(reader)?;
-                    agent_rows_to_batch(&prov, &rows)?
-                }
-                ExportTable::Lineage => {
-                    let (prov, rows) = load_lineage_rows(reader)?;
-                    lineage_rows_to_batch(&prov, &rows)?
-                }
-                ExportTable::Event => {
-                    let (prov, rows) = load_event_rows(reader)?;
-                    event_rows_to_batch(&prov, &rows)?
-                }
-                ExportTable::Metric => {
-                    let (prov, rows) = load_metric_rows(reader)?;
-                    metric_rows_to_batch(&prov, &rows)?
-                }
-            };
-            write_batch_to_parquet(&target_path, &batch)?;
+            let schema = spec_to_arrow_schema(table.arrow_schema(), Some(&prov));
+            let props = WriterProperties::builder().build();
+            let mut writer =
+                ArrowWriter::try_new(File::create(&target_path)?, schema, Some(props))?;
+            visit_export_pages::<DataFrameError>(reader, table, |page| {
+                writer.write(&export_page_to_batch(&prov, page)?)?;
+                // The default Parquet writer can retain a much larger row group.
+                // Seal each source page before admitting the next one.
+                writer.flush()?;
+                Ok(())
+            })?;
+            writer.close()?;
             if verify {
-                let read_back = read_parquet_batch(&target_path)?;
-                verify_record_batches(&batch, &read_back)?;
+                let builder =
+                    ParquetRecordBatchReaderBuilder::try_new(File::open(&target_path)?)?;
+                let schema = builder.schema().clone();
+                let batches = builder.with_batch_size(EXPORT_PAGE_ROWS).build()?;
+                verify_columnar_pages(reader, table, &prov, &schema, batches)?;
             }
         }
         AnalyticsExportFormat::Arrow => {
-            let batch = match table {
-                ExportTable::Run => {
-                    let (prov, rows) = load_run_rows(reader)?;
-                    run_rows_to_batch(&prov, &rows)?
-                }
-                ExportTable::Agent => {
-                    let (prov, rows) = load_agent_rows(reader)?;
-                    agent_rows_to_batch(&prov, &rows)?
-                }
-                ExportTable::Lineage => {
-                    let (prov, rows) = load_lineage_rows(reader)?;
-                    lineage_rows_to_batch(&prov, &rows)?
-                }
-                ExportTable::Event => {
-                    let (prov, rows) = load_event_rows(reader)?;
-                    event_rows_to_batch(&prov, &rows)?
-                }
-                ExportTable::Metric => {
-                    let (prov, rows) = load_metric_rows(reader)?;
-                    metric_rows_to_batch(&prov, &rows)?
-                }
-            };
-            write_batch_to_arrow(&target_path, &batch)?;
+            let schema = spec_to_arrow_schema(table.arrow_schema(), Some(&prov));
+            let mut writer = ArrowFileWriter::try_new(File::create(&target_path)?, &schema)?;
+            visit_export_pages::<DataFrameError>(reader, table, |page| {
+                writer.write(&export_page_to_batch(&prov, page)?)?;
+                Ok(())
+            })?;
+            writer.finish()?;
             if verify {
-                let read_back = read_arrow_batch(&target_path)?;
-                verify_record_batches(&batch, &read_back)?;
+                let batches = ArrowFileReader::try_new(File::open(&target_path)?, None)?;
+                let schema = batches.schema();
+                verify_columnar_pages(reader, table, &prov, &schema, batches)?;
             }
         }
     }
@@ -1254,6 +1391,143 @@ mod tests {
             schema_version: 1,
             exported_at_utc: "2026-09-03T12:00:00Z".into(),
         }
+    }
+
+    #[test]
+    fn streaming_readback_checks_every_row_across_different_batch_boundaries() {
+        let prov = sample_provenance();
+        let rows: Vec<_> = (0_u32..7)
+            .map(|index| MetricExportRow {
+                run_id: prov.run_id.clone(),
+                tick: u64::from(index),
+                name: "energy".to_owned(),
+                value: f64::from(index) + 0.25,
+            })
+            .collect();
+        let expected = metric_rows_to_batch(&prov, &rows).unwrap();
+        let schema = expected.schema();
+        let readback = |parts: Vec<RecordBatch>| {
+            BatchReadback::new(
+                parts.into_iter().map(Ok::<_, arrow::error::ArrowError>),
+                schema.clone(),
+                &schema,
+            )
+            .unwrap()
+        };
+
+        let mut complete = readback(vec![
+            expected.slice(0, 1),
+            RecordBatch::new_empty(schema.clone()),
+            expected.slice(1, 4),
+            expected.slice(5, 2),
+        ]);
+        for (offset, length) in [(0, 2), (2, 3), (5, 2)] {
+            complete.compare(&expected.slice(offset, length)).unwrap();
+        }
+        complete.finish().unwrap();
+
+        let mut truncated = readback(vec![expected.slice(0, 6)]);
+        assert!(truncated.compare(&expected).is_err(), "missing last row");
+
+        let mut extra = readback(vec![expected.clone(), expected.slice(0, 1)]);
+        extra.compare(&expected).unwrap();
+        assert!(extra.finish().is_err(), "extra rows after the source ends");
+
+        let mut changed_rows = rows;
+        changed_rows[3].value += 1.0;
+        let mut changed = readback(vec![metric_rows_to_batch(&prov, &changed_rows).unwrap()]);
+        assert!(changed.compare(&expected).is_err(), "interior value mutation");
+
+        let mut corrupt_tail = BatchReadback::new(
+            vec![
+                Ok(expected.clone()),
+                Err(arrow::error::ArrowError::ParseError(
+                    "truncated footer".to_owned(),
+                )),
+            ]
+            .into_iter(),
+            schema.clone(),
+            &schema,
+        )
+        .unwrap();
+        corrupt_tail.compare(&expected).unwrap();
+        assert!(
+            corrupt_tail.finish().is_err(),
+            "decoder errors at EOF propagate"
+        );
+    }
+
+    #[test]
+    fn streaming_readback_checks_empty_schema_metadata_and_field_nullability() {
+        let prov = sample_provenance();
+        let expected = metric_rows_to_batch(&prov, &[]).unwrap();
+        let schema = expected.schema();
+        let empty = std::iter::empty::<Result<RecordBatch, arrow::error::ArrowError>>;
+        BatchReadback::new(empty(), schema.clone(), &schema)
+            .unwrap()
+            .finish()
+            .unwrap();
+
+        let mut foreign = prov.clone();
+        foreign.run_id.push_str("-different-source");
+        let foreign_schema = spec_to_arrow_schema(METRIC_ARROW_SCHEMA, Some(&foreign));
+        assert!(BatchReadback::new(empty(), schema.clone(), &foreign_schema).is_err());
+
+        let mut fields: Vec<_> = schema
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone())
+            .collect();
+        fields[0] = Field::new("run_id", DataType::Utf8, true);
+        let nullable = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
+        assert!(BatchReadback::new(empty(), schema.clone(), &nullable).is_err());
+
+        let mut changed_midstream = BatchReadback::new(
+            vec![Ok(RecordBatch::new_empty(foreign_schema))].into_iter(),
+            schema.clone(),
+            &schema,
+        )
+        .unwrap();
+        changed_midstream.compare(&expected).unwrap();
+        assert!(
+            changed_midstream.finish().is_err(),
+            "even an empty decoded batch must retain the source schema"
+        );
+    }
+
+    #[test]
+    fn readback_preserves_float_bits_and_null_masks() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("f32", DataType::Float32, true),
+            Field::new("f64", DataType::Float64, true),
+        ]));
+        let make = |single: Vec<Option<f32>>, double: Vec<Option<f64>>| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Float32Array::from(single)) as ArrayRef,
+                    Arc::new(Float64Array::from(double)) as ArrayRef,
+                ],
+            )
+            .unwrap()
+        };
+        let expected = make(vec![Some(-0.0), None], vec![None, Some(-0.0)]);
+        verify_record_batches(&expected, &expected).unwrap();
+        assert!(verify_record_batches(
+            &expected,
+            &make(vec![Some(0.0), None], vec![None, Some(-0.0)]),
+        )
+        .is_err());
+        assert!(verify_record_batches(
+            &expected,
+            &make(vec![Some(-0.0), None], vec![None, Some(0.0)]),
+        )
+        .is_err());
+        assert!(verify_record_batches(
+            &expected,
+            &make(vec![Some(-0.0), Some(0.0)], vec![None, Some(-0.0)]),
+        )
+        .is_err());
     }
 
     #[test]

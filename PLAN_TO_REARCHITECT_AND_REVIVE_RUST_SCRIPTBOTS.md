@@ -3639,6 +3639,33 @@ It supports matched seeds, bounded parallelism, checkpoint/branch experiments, r
 
 ### 7.8 offline analysis integrations
 
+**Source implementation update — Codex, 2026-11-05:** Table export now supports
+bounded Parquet/Arrow production and full-data readback. Storage exposes
+finished-run keyset pages for all five export tables, including the legacy birth
+parent fallback, and verifies CSV/JSONL against the complete source traversal,
+original provenance and receipt timestamps, and final EOF. Foreign-island rows in
+any scientific table are refused before single-world export. Parquet and Arrow now
+consume the same pages, seal bounded row groups/record batches, and verify all
+decoded values, null masks, schema/provenance and stream exhaustion against a
+second source traversal, independent of batch boundaries. Multi-page and empty
+table regressions retain independent SQL oracles. These are row-buffer bounds,
+not SQL execution, variable-payload or footer-memory bounds. The offline comparison
+adapter now takes one exact predeclared endpoint per independent matched seed,
+validates attributed manifests and completed finite budgets, and rejects missing
+metrics, duplicate/unmatched seeds and mixed conditions within an arm. Scheduled
+interventions participate in condition equality; descriptive scenario labels and
+JSON object insertion order do not. Single-pair output is explicitly descriptive,
+with null inferential statistics and disclosed unmatched metrics. Report schema 2
+retains source identities, authoritative manifest digests and endpoint observations.
+Historical event review now merges complete
+configuration and agent-command histories in their observed order, validates each
+command against its captured configuration revision, and checks the reconstructed
+current scientific digest before publishing a historical view. Regressions cover
+multiple interleaved same-tick edits, nonzero checkpoint revisions and incomplete
+or contradictory histories. These are source contributions; original acceptance
+and native DSR qualification remain open. Dependency pins, statistical thresholds
+and scientific baselines are unchanged.
+
 Sibling scientific projects are optional analysis adapters, not hot-loop dependencies:
 
 - `frankenscipy`: bootstrap confidence intervals, permutation tests, nonparametric comparisons, ACF/FFT, phenotype clustering; gated because its stats dependency graph is large and some periodogram/Welch behavior is known incomplete;

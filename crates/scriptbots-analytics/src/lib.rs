@@ -22,16 +22,19 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
+use std::io::Read as _;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use scriptbots_core::narrative::{EventRecord, NarrativeInputRecordV1, NarrativeReplay};
 use scriptbots_core::{AgentUid, Tick};
+use scriptbots_runtime::RunId;
 use scriptbots_storage::{
     NarrativeInputBindingV1, NarrativeInputStreamError, PersistedAgentObservation,
     PersistedInteraction, PersistedInteractionCapture, PersistedMetric, PersistedRunEvent,
-    PersistenceBatchId, RunEventIdentity, StorageError, StorageReader,
+    PersistenceBatchId, RunEventIdentity, RunManifestRecord, StorageError, StorageReader,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 pub use stats::StatsError;
 
@@ -58,8 +61,8 @@ pub mod certify;
 /// Given the same seeds run under a control and a treatment, measures whether the treatment
 /// changed each metric — with a paired design (sign-flip permutation, paired bootstrap CI,
 /// Cohen's `d_z`) that exploits the matched seeds, and Benjamini-Hochberg across metrics so a
-/// study measuring many outcomes cannot report a chance "effect". Pure functions; the DB glue
-/// that pulls per-seed outcomes from two run databases is a thin adapter on top.
+/// study measuring many outcomes cannot report a chance "effect". The report adapter extracts
+/// one declared endpoint per seed from cohort databases; a single run pair remains descriptive.
 pub mod compare;
 
 /// Single change-point detection over a metric series (bd-2z0.11.6).
@@ -2032,49 +2035,439 @@ impl Report for MetricChangepoints {
     }
 }
 
-/// `compare-runs`: paired treatment-effect comparison of two run databases (serves bd-16g.1.4).
+/// Input contract for a predeclared matched-seed endpoint comparison.
+pub const RUN_COMPARISON_COHORT_SCHEMA_V1: &str = "scriptbots.run-comparison-cohort.v1";
+/// Report-specific contract distinguishing independent seed pairs from trajectory samples.
+pub const RUN_COMPARISON_SCHEMA_V2: &str = "scriptbots.run-comparison.v2";
+
+/// Maximum encoded cohort JSON size; enforced again while reading a growing file.
+pub const MAX_COMPARISON_COHORT_BYTES: usize = 1_048_576;
+/// Maximum independent seeds in either arm of one cohort comparison.
+pub const MAX_COMPARISON_PAIRS: usize = 128;
+/// Maximum predeclared outcomes in one cohort's multiple-testing family.
+pub const MAX_COMPARISON_METRICS: usize = 64;
+const MAX_COMPARISON_ENDPOINT_ROWS: usize = 4_096;
+
+/// One finished database and, when necessary, an explicit run within it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunComparisonInputV1 {
+    /// Database path, relative to the cohort JSON file unless absolute.
+    pub db: String,
+    /// Canonical 32-character run ID. Required when the database contains multiple runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<RunId>,
+}
+
+/// Bounded input to `compare-runs --params cohort_file=study.json`.
 ///
-/// Given a control run (the database this report runs against) and a `treatment_db=<path>`, it
-/// measures whether the treatment shifted each metric the two runs share. The runs are assumed to
-/// share seeds, so each metric is compared TICK-ALIGNED — the control and treatment values at the
-/// same tick form a matched pair — and the pairing is fed to [`compare`], which applies a
-/// sign-flip permutation test, a paired-bootstrap CI, Cohen's `d_z`, and Benjamini-Hochberg across
-/// the metrics. It is the DB-facing glue for the matched-seed statistics; the pure analysis was
-/// proven in isolation, this wires it to two real databases.
+/// The CLI's selected database/run must be a declared control. Root seeds come from revalidated
+/// run manifests, not array positions or user-supplied seed labels. Every requested metric must
+/// have an exact observation at `endpoint_tick` in every run. Each run contributes one value per
+/// metric; increasing a trajectory's length or sampling cadence does not increase replication.
+///
+/// ```json
+/// {
+///   "schema": "scriptbots.run-comparison-cohort.v1",
+///   "endpoint_tick": 1000,
+///   "metrics": ["total_energy", "average_energy"],
+///   "control": [{"db": "control-seed-7.sqlite"}, {"db": "control-seed-8.sqlite"}],
+///   "treatment": [{"db": "treatment-seed-8.sqlite"}, {"db": "treatment-seed-7.sqlite"}]
+/// }
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunComparisonCohortV1 {
+    /// Must equal [`RUN_COMPARISON_COHORT_SCHEMA_V1`].
+    pub schema: String,
+    /// Predeclared scientific tick, which may precede the complete run's terminal tick.
+    pub endpoint_tick: u64,
+    /// Complete multiple-testing family, declared before outcomes are read.
+    pub metrics: Vec<String>,
+    /// Control runs, with a unique attributable root seed per entry.
+    pub control: Vec<RunComparisonInputV1>,
+    /// Treatment runs with exactly the same seed set as the control arm.
+    pub treatment: Vec<RunComparisonInputV1>,
+}
+
+/// Seed-level endpoint inference, or a descriptive comparison when only two runs are supplied.
 struct RunComparison;
 
 #[derive(Debug, Serialize)]
 struct RunComparisonMachine {
-    /// The treatment database this control run was compared against (provenance).
-    treatment_db: String,
-    /// Target false-discovery rate for the across-metrics correction.
+    schema: &'static str,
+    mode: &'static str,
+    inference_status: &'static str,
+    seed_pairing: &'static str,
+    endpoint_tick: u64,
+    declared_pairs: usize,
+    independent_pairs: usize,
+    cohort_file: Option<String>,
+    cohort_digest: Option<String>,
+    treatment_db: Option<String>,
     fdr: f64,
-    /// Metrics present in BOTH runs with enough tick-aligned pairs to compare.
+    confidence: f64,
+    resampling_seed: u64,
+    n_resamples: usize,
+    n_permutations: usize,
     metrics_compared: usize,
-    /// How many hold up under FDR control — the honest count of real treatment effects.
     significant: usize,
-    /// True when either bounded metric read hit its cap, so the comparison is over recent history
-    /// rather than the whole run.
-    truncated: bool,
+    control_only_metrics: Vec<String>,
+    treatment_only_metrics: Vec<String>,
+    pairs: Vec<RunComparisonPair>,
     metrics: Vec<RunComparisonRow>,
+}
+
+#[derive(Debug, Serialize)]
+struct RunComparisonSource {
+    db: String,
+    run_id: RunId,
+    root_seed_hex: Option<String>,
+    experiment_id: Option<String>,
+    variant_id: Option<String>,
+    scenario_id: String,
+    scenario_version: u16,
+    manifest_schema_version: u16,
+    manifest_digest: String,
+    config_digest: String,
+    condition_digest: String,
+    source_revision: Option<String>,
+    source_tree_digest: Option<String>,
+    rust_toolchain: String,
+    cargo_lock_digest: String,
+    target_triple: String,
+    reproducible: bool,
+    terminal_tick: u64,
+    requested_tick_budget: Option<u64>,
+    values: BTreeMap<String, f64>,
+}
+
+#[derive(Debug, Serialize)]
+struct RunComparisonPair {
+    seed_hex: Option<String>,
+    control: RunComparisonSource,
+    treatment: RunComparisonSource,
 }
 
 #[derive(Debug, Serialize)]
 struct RunComparisonRow {
     metric: String,
-    /// Number of tick-aligned matched pairs.
+    /// Number of run pairs, never the number of ticks within a run.
     n_pairs: usize,
-    /// Mean of `treatment - control` over the matched pairs. The treatment-effect estimate.
     mean_difference: f64,
-    ci_lower: f64,
-    ci_upper: f64,
-    p_value: f64,
-    /// Paired standardized effect size (`d_z`).
-    cohens_dz: f64,
-    /// Fraction of pairs where treatment exceeded control.
+    /// Inference is absent for a single run pair, including an arbitrarily long trajectory.
+    ci_lower: Option<f64>,
+    ci_upper: Option<f64>,
+    p_value: Option<f64>,
+    /// Also absent when a zero-spread difference has no finite standardized effect size.
+    cohens_dz: Option<f64>,
     fraction_positive: f64,
-    /// Survives Benjamini-Hochberg across the run's shared metrics. The field to act on.
     significant_fdr: bool,
+}
+
+fn comparison_error(reason: impl Into<String>) -> AnalyticsError {
+    AnalyticsError::BadParam {
+        name: "compare-runs".to_owned(),
+        reason: reason.into(),
+    }
+}
+
+fn read_comparison_cohort(
+    path: &str,
+) -> Result<(RunComparisonCohortV1, PathBuf, String), AnalyticsError> {
+    let file = std::fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    let max_bytes = u64::try_from(MAX_COMPARISON_COHORT_BYTES)
+        .map_err(|error| comparison_error(error.to_string()))?;
+    if !metadata.is_file() || metadata.len() > max_bytes {
+        return Err(comparison_error(format!(
+            "cohort_file must be a regular JSON file no larger than {MAX_COMPARISON_COHORT_BYTES} bytes"
+        )));
+    }
+    let mut bytes = Vec::new();
+    file.take(max_bytes + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_COMPARISON_COHORT_BYTES {
+        return Err(comparison_error("cohort_file grew beyond its byte bound"));
+    }
+    let cohort: RunComparisonCohortV1 = serde_json::from_slice(&bytes)
+        .map_err(|error| comparison_error(format!("invalid cohort_file: {error}")))?;
+    if cohort.schema != RUN_COMPARISON_COHORT_SCHEMA_V1 {
+        return Err(comparison_error(format!(
+            "cohort_file schema must be {RUN_COMPARISON_COHORT_SCHEMA_V1}"
+        )));
+    }
+    if cohort.control.is_empty()
+        || cohort.control.len() > MAX_COMPARISON_PAIRS
+        || cohort.control.len() != cohort.treatment.len()
+    {
+        return Err(comparison_error(format!(
+            "cohort arms must have equal lengths in 1..={MAX_COMPARISON_PAIRS}"
+        )));
+    }
+    if cohort.metrics.is_empty() || cohort.metrics.len() > MAX_COMPARISON_METRICS {
+        return Err(comparison_error(format!(
+            "declare 1..={MAX_COMPARISON_METRICS} endpoint metrics"
+        )));
+    }
+    let mut names = BTreeSet::new();
+    for name in &cohort.metrics {
+        if name.trim().is_empty()
+            || name.len() > 256
+            || name.chars().any(char::is_control)
+            || !names.insert(name)
+        {
+            return Err(comparison_error(
+                "metric names must be unique, nonblank, control-free, and at most 256 bytes",
+            ));
+        }
+    }
+    for input in cohort.control.iter().chain(&cohort.treatment) {
+        if input.db.trim().is_empty()
+            || input.db.len() > 4_096
+            || input.db.chars().any(char::is_control)
+        {
+            return Err(comparison_error(
+                "database paths must be nonblank, control-free, and at most 4096 bytes",
+            ));
+        }
+    }
+    let digest = format!("blake3:{}", blake3::hash(&bytes).to_hex());
+    Ok((cohort, std::fs::canonicalize(path)?, digest))
+}
+
+fn comparison_condition_digest(
+    manifest: &RunManifestRecord,
+    manifest_value: &serde_json::Value,
+    mut config: serde_json::Value,
+    require_cohort_evidence: bool,
+) -> Result<String, AnalyticsError> {
+    // A cohort arm represents one declared launch condition. Its seed-dependent streams
+    // differ, but configuration, roster, implementation and execution policy must agree.
+    if let Some(object) = config.as_object_mut() {
+        let _ = object.remove("rng_seed");
+    }
+    let interventions = manifest_value
+        .pointer("/scenario/interventions")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+    if require_cohort_evidence && !interventions.is_array() {
+        return Err(comparison_error("scenario interventions must be an array"));
+    }
+    let mut condition = serde_json::json!({
+        "normalized_config_without_seed": config,
+        // The producer uses a unique caller_seeded scenario ID per run. This descriptive
+        // label is retained in source provenance, not condition equality.
+        "scenario_version": manifest.scenario_version,
+        "population_recipe": manifest_value.pointer("/scenario/population_recipe"),
+        "bootstrap_ticks": manifest_value.pointer("/scenario/bootstrap_ticks"),
+        "interventions": interventions,
+        "brain_roster": manifest_value.get("brain_roster"),
+        "build": manifest_value.get("build"),
+        "threads": manifest_value.pointer("/thread_policy/threads"),
+        "sense_backend": manifest_value.pointer("/sense_policy/backend"),
+        "sense_determinism": manifest_value.pointer("/sense_policy/determinism"),
+        "rng_algorithm": manifest.rng_algorithm,
+        "rng_version": manifest.rng_version,
+    });
+    // preserve_order is enabled in the workspace. Equivalent manifest objects may arrive
+    // with different insertion order; condition equality must compare their content.
+    condition.sort_all_objects();
+    Ok(format!(
+        "blake3:{}",
+        blake3::hash(&serde_json::to_vec(&condition)?).to_hex()
+    ))
+}
+
+fn read_comparison_source(
+    reader: &StorageReader,
+    db: &str,
+    endpoint_tick: u64,
+    metrics: Option<&[String]>,
+    require_cohort_evidence: bool,
+) -> Result<(Option<u64>, RunComparisonSource), AnalyticsError> {
+    let manifest = reader.run_manifest()?;
+    let manifest_value: serde_json::Value = serde_json::from_str(&manifest.manifest_json)?;
+    let config: serde_json::Value = serde_json::from_str(&manifest.normalized_config_json)?;
+    let seed = (manifest.manifest_schema_version != 0
+        && config.get("rng_seed").and_then(serde_json::Value::as_u64) == Some(manifest.root_seed))
+        .then_some(manifest.root_seed);
+    if require_cohort_evidence && seed.is_none() {
+        return Err(comparison_error(format!(
+            "run {} in {db} lacks attributable seed evidence; cohort runs require a validated manifest and matching normalized_config.rng_seed",
+            manifest.run_id
+        )));
+    }
+    let terminal_tick = reader.max_tick()?.ok_or_else(|| {
+        comparison_error(format!("run {} in {db} has no durable tick", manifest.run_id))
+    })?;
+    if endpoint_tick > terminal_tick {
+        return Err(comparison_error(format!(
+            "run {} ends at tick {terminal_tick}, before declared endpoint {endpoint_tick}",
+            manifest.run_id
+        )));
+    }
+    if require_cohort_evidence && manifest.requested_tick_budget != Some(terminal_tick) {
+        return Err(comparison_error(format!(
+            "run {} has not completed an attributable finite tick budget: requested {:?}, durable terminal tick {terminal_tick}",
+            manifest.run_id, manifest.requested_tick_budget
+        )));
+    }
+    let mut values: BTreeMap<String, f64> = reader
+        .metrics_at_tick(endpoint_tick, MAX_COMPARISON_ENDPOINT_ROWS)?
+        .into_iter()
+        .map(|metric| (metric.name, metric.value))
+        .collect();
+    if let Some(metrics) = metrics {
+        for name in metrics {
+            if !values.contains_key(name) {
+                return Err(comparison_error(format!(
+                    "run {} in {db} has no exact value for metric {name:?} at endpoint {endpoint_tick}; recent values are not substituted",
+                    manifest.run_id
+                )));
+            }
+        }
+        values.retain(|name, _| metrics.contains(name));
+    }
+    if values.is_empty() {
+        return Err(comparison_error(format!(
+            "run {} in {db} has no metrics at exact endpoint {endpoint_tick}",
+            manifest.run_id
+        )));
+    }
+
+    let condition_digest = comparison_condition_digest(
+        &manifest,
+        &manifest_value,
+        config,
+        require_cohort_evidence,
+    )?;
+    let manifest_digest = manifest.manifest_digest()?;
+    Ok((
+        seed,
+        RunComparisonSource {
+            db: db.to_owned(),
+            run_id: manifest.run_id,
+            root_seed_hex: seed.map(|value| format!("{value:016x}")),
+            experiment_id: manifest.experiment_id,
+            variant_id: manifest.variant_id,
+            scenario_id: manifest.scenario_id,
+            scenario_version: manifest.scenario_version,
+            manifest_schema_version: manifest.manifest_schema_version,
+            manifest_digest,
+            config_digest: manifest.config_digest,
+            condition_digest,
+            source_revision: manifest.source_revision,
+            source_tree_digest: manifest.source_tree_digest,
+            rust_toolchain: manifest.rust_toolchain,
+            cargo_lock_digest: manifest.cargo_lock_digest,
+            target_triple: manifest.target_triple,
+            reproducible: manifest.reproducible,
+            terminal_tick,
+            requested_tick_budget: manifest.requested_tick_budget,
+            values,
+        },
+    ))
+}
+
+struct ComparisonInputReader<'a> {
+    context: &'a ReaderCtx,
+    context_path: PathBuf,
+    base_dir: &'a Path,
+    endpoint_tick: u64,
+    metrics: &'a [String],
+}
+
+impl ComparisonInputReader<'_> {
+    fn read(
+        &self,
+        input: &RunComparisonInputV1,
+    ) -> Result<(u64, RunComparisonSource, bool), AnalyticsError> {
+        let path = self.base_dir.join(&input.db);
+        let canonical_path = std::fs::canonicalize(&path)?;
+        let db = path
+            .to_str()
+            .ok_or_else(|| comparison_error("database path is not UTF-8"))?;
+        let is_context = canonical_path == self.context_path;
+        let observation = if is_context {
+            if input
+                .run_id
+                .is_some_and(|run_id| run_id != self.context.reader.run_id())
+            {
+                return Err(comparison_error(
+                    "the context database is already leased for its selected run; use a separate database for another run in this cohort",
+                ));
+            }
+            if input.run_id.is_none() && StorageReader::catalog_page(db, 0, 2)?.len() != 1 {
+                return Err(comparison_error(
+                    "a cohort input in a multi-run database must specify run_id",
+                ));
+            }
+            read_comparison_source(
+                &self.context.reader,
+                db,
+                self.endpoint_tick,
+                Some(self.metrics),
+                true,
+            )?
+        } else {
+            // Preserve the original path for storage's symlink/identity refusal checks.
+            let reader = input.run_id.map_or_else(
+                || StorageReader::open_finished(db),
+                |run_id| StorageReader::open_finished_for_run(db, run_id),
+            )?;
+            let result = read_comparison_source(
+                &reader,
+                db,
+                self.endpoint_tick,
+                Some(self.metrics),
+                true,
+            );
+            let close_result = reader.close();
+            let observation = result?;
+            close_result?;
+            observation
+        };
+        let (seed, source) = observation;
+        let seed = seed.ok_or_else(|| comparison_error("cohort source has no verified root seed"))?;
+        Ok((seed, source, is_context))
+    }
+
+    fn arm(
+        &self,
+        label: &str,
+        inputs: &[RunComparisonInputV1],
+        identities: &mut BTreeSet<RunId>,
+    ) -> Result<(BTreeMap<u64, RunComparisonSource>, bool), AnalyticsError> {
+        let mut runs = BTreeMap::new();
+        let mut condition = None;
+        let mut includes_context = false;
+        for input in inputs {
+            let (seed, source, is_context) = self.read(input)?;
+            if !identities.insert(source.run_id) {
+                return Err(comparison_error(format!(
+                    "reused run identity {} in cohort; every arm/seed observation must come from a distinct run",
+                    source.run_id
+                )));
+            }
+            if runs.contains_key(&seed) {
+                return Err(comparison_error(format!(
+                    "{label} arm contains duplicate root seed {seed:016x}"
+                )));
+            }
+            if condition
+                .as_ref()
+                .is_some_and(|value| value != &source.condition_digest)
+            {
+                return Err(comparison_error(format!(
+                    "{label} arm mixes conditions: configuration excluding rng_seed, brain roster, build and execution policies must agree"
+                )));
+            }
+            condition.get_or_insert_with(|| source.condition_digest.clone());
+            includes_context |= is_context;
+            runs.insert(seed, source);
+        }
+        Ok((runs, includes_context))
+    }
 }
 
 struct PairedMetricSeries {
@@ -2083,129 +2476,385 @@ struct PairedMetricSeries {
     treatment: Vec<f64>,
 }
 
-type MetricsByTick = BTreeMap<String, BTreeMap<u64, f64>>;
-
-fn index_metrics_by_tick(readings: Vec<PersistedMetric>) -> MetricsByTick {
-    let mut indexed: MetricsByTick = BTreeMap::new();
-    for PersistedMetric { tick, name, value } in readings {
-        indexed.entry(name).or_default().insert(tick, value);
-    }
-    indexed
-}
-
-fn pair_shared_metrics(
-    control: &MetricsByTick,
-    treatment: &MetricsByTick,
-) -> Vec<PairedMetricSeries> {
-    let mut paired = Vec::new();
-    for (name, control_ticks) in control {
-        let Some(treatment_ticks) = treatment.get(name) else {
-            continue;
-        };
-        let mut control_values = Vec::new();
-        let mut treatment_values = Vec::new();
-        for (tick, control_value) in control_ticks {
-            if let Some(treatment_value) = treatment_ticks.get(tick) {
-                control_values.push(*control_value);
-                treatment_values.push(*treatment_value);
-            }
-        }
-        if control_values.len() >= 3 {
-            paired.push(PairedMetricSeries {
-                name: name.clone(),
-                control: control_values,
-                treatment: treatment_values,
-            });
-        }
-    }
-    paired
-}
-
-fn compare_paired_metrics(
-    paired: &[PairedMetricSeries],
-    fdr: f64,
+#[allow(
+    clippy::too_many_lines,
+    reason = "one bounded endpoint projection handles descriptive and inferential result fields"
+)]
+fn compare_endpoint_metrics(
+    pairs: &[RunComparisonPair],
+    names: &[String],
+    params: &compare::CompareParams,
+    infer: bool,
 ) -> Result<Vec<RunComparisonRow>, AnalyticsError> {
-    let series: Vec<compare::MetricSeries<'_>> = paired
+    let mut series = Vec::with_capacity(names.len());
+    for name in names {
+        let mut control = Vec::with_capacity(pairs.len());
+        let mut treatment = Vec::with_capacity(pairs.len());
+        for pair in pairs {
+            control.push(*pair.control.values.get(name).ok_or_else(|| {
+                comparison_error(format!("control endpoint metric {name:?} is missing"))
+            })?);
+            treatment.push(*pair.treatment.values.get(name).ok_or_else(|| {
+                comparison_error(format!("treatment endpoint metric {name:?} is missing"))
+            })?);
+        }
+        series.push(PairedMetricSeries {
+            name: name.clone(),
+            control,
+            treatment,
+        });
+    }
+    if !infer {
+        if pairs.len() != 1 {
+            return Err(comparison_error(
+                "descriptive comparison requires exactly one run pair",
+            ));
+        }
+        return series
+            .into_iter()
+            .map(|metric| {
+                let difference = metric.treatment[0] - metric.control[0];
+                if !difference.is_finite() {
+                    return Err(comparison_error("endpoint difference is not finite"));
+                }
+                Ok(RunComparisonRow {
+                    metric: metric.name,
+                    n_pairs: 1,
+                    mean_difference: difference,
+                    ci_lower: None,
+                    ci_upper: None,
+                    p_value: None,
+                    cohens_dz: None,
+                    fraction_positive: if difference > 0.0 { 1.0 } else { 0.0 },
+                    significant_fdr: false,
+                })
+            })
+            .collect();
+    }
+    let borrowed: Vec<compare::MetricSeries<'_>> = series
         .iter()
-        .map(|pair| compare::MetricSeries {
-            name: pair.name.as_str(),
-            control: pair.control.as_slice(),
-            treatment: pair.treatment.as_slice(),
+        .map(|metric| compare::MetricSeries {
+            name: &metric.name,
+            control: &metric.control,
+            treatment: &metric.treatment,
         })
         .collect();
-    let study = compare::compare_metrics(
-        &series,
-        &compare::CompareParams {
-            fdr,
-            ..compare::CompareParams::default()
-        },
-    )
-    .map_err(|error| metric_stats_error(&error))?;
-
-    Ok(study
+    let study =
+        compare::compare_metrics(&borrowed, params).map_err(|error| metric_stats_error(&error))?;
+    study
         .metrics
-        .iter()
+        .into_iter()
         .map(|named| {
-            let comparison = &named.comparison;
-            RunComparisonRow {
-                metric: named.metric.clone(),
+            let comparison = named.comparison;
+            if [
+                comparison.mean_difference,
+                comparison.difference_ci.lower,
+                comparison.difference_ci.upper,
+                comparison.p_value,
+                comparison.fraction_positive,
+            ]
+            .iter()
+            .any(|value| !value.is_finite())
+            {
+                return Err(comparison_error(
+                    "endpoint inference produced a non-finite statistic",
+                ));
+            }
+            Ok(RunComparisonRow {
+                metric: named.metric,
                 n_pairs: comparison.n_pairs,
                 mean_difference: comparison.mean_difference,
-                ci_lower: comparison.difference_ci.lower,
-                ci_upper: comparison.difference_ci.upper,
-                p_value: comparison.p_value,
-                cohens_dz: comparison.cohens_dz,
+                ci_lower: Some(comparison.difference_ci.lower),
+                ci_upper: Some(comparison.difference_ci.upper),
+                p_value: Some(comparison.p_value),
+                cohens_dz: comparison
+                    .cohens_dz
+                    .is_finite()
+                    .then_some(comparison.cohens_dz),
                 fraction_positive: comparison.fraction_positive,
                 significant_fdr: comparison.significant_fdr,
-            }
+            })
         })
-        .collect())
+        .collect()
+}
+
+fn comparison_machine(
+    pairs: Vec<RunComparisonPair>,
+    names: &[String],
+    endpoint_tick: u64,
+    params: &compare::CompareParams,
+    cohort: Option<(String, String)>,
+) -> Result<RunComparisonMachine, AnalyticsError> {
+    let matched = pairs.iter().all(|pair| pair.seed_hex.is_some());
+    let independent_pairs = if matched { pairs.len() } else { 0 };
+    let infer = cohort.is_some() && independent_pairs > 1;
+    let metrics = compare_endpoint_metrics(&pairs, names, params, infer)?;
+    let seed_pairing = if matched {
+        "matched"
+    } else if pairs.iter().any(|pair| {
+        pair.control.root_seed_hex.is_none() || pair.treatment.root_seed_hex.is_none()
+    }) {
+        "unknown"
+    } else {
+        "mismatched"
+    };
+    let treatment_db = (cohort.is_none()).then(|| pairs[0].treatment.db.clone());
+    let (cohort_file, cohort_digest) =
+        cohort.map_or((None, None), |(file, digest)| (Some(file), Some(digest)));
+    let control_only_metrics = pairs[0]
+        .control
+        .values
+        .keys()
+        .filter(|name| !pairs[0].treatment.values.contains_key(*name))
+        .cloned()
+        .collect();
+    let treatment_only_metrics = pairs[0]
+        .treatment
+        .values
+        .keys()
+        .filter(|name| !pairs[0].control.values.contains_key(*name))
+        .cloned()
+        .collect();
+    Ok(RunComparisonMachine {
+        schema: RUN_COMPARISON_SCHEMA_V2,
+        mode: if infer {
+            "matched_seed_cohort"
+        } else {
+            "descriptive_pair"
+        },
+        inference_status: if infer {
+            "computed"
+        } else {
+            "insufficient_independent_pairs"
+        },
+        seed_pairing,
+        endpoint_tick,
+        declared_pairs: pairs.len(),
+        independent_pairs,
+        cohort_file,
+        cohort_digest,
+        treatment_db,
+        fdr: params.fdr,
+        confidence: params.confidence,
+        resampling_seed: params.seed,
+        n_resamples: if infer { params.n_resamples } else { 0 },
+        n_permutations: if infer { params.n_permutations } else { 0 },
+        metrics_compared: metrics.len(),
+        significant: metrics.iter().filter(|metric| metric.significant_fdr).count(),
+        control_only_metrics,
+        treatment_only_metrics,
+        pairs,
+        metrics,
+    })
+}
+
+fn compare_cohort_file(
+    cx: &ReaderCtx,
+    path: &str,
+    params: &compare::CompareParams,
+) -> Result<RunComparisonMachine, AnalyticsError> {
+    let (cohort, cohort_path, digest) = read_comparison_cohort(path)?;
+    let input_reader = ComparisonInputReader {
+        context: cx,
+        context_path: std::fs::canonicalize(&cx.db_path)?,
+        base_dir: cohort_path
+            .parent()
+            .ok_or_else(|| comparison_error("cohort_file has no parent"))?,
+        endpoint_tick: cohort.endpoint_tick,
+        metrics: &cohort.metrics,
+    };
+    let mut identities = BTreeSet::new();
+    let (control, includes_context) = input_reader.arm("control", &cohort.control, &mut identities)?;
+    if !includes_context {
+        return Err(comparison_error(
+            "the selected database/run must be a declared control in cohort_file",
+        ));
+    }
+    let (mut treatment, _) = input_reader.arm("treatment", &cohort.treatment, &mut identities)?;
+    if control.keys().ne(treatment.keys()) {
+        return Err(comparison_error(
+            "control and treatment have unmatched root seed sets",
+        ));
+    }
+    let mut pairs = Vec::with_capacity(control.len());
+    for (seed, control) in control {
+        let treatment = treatment
+            .remove(&seed)
+            .ok_or_else(|| comparison_error("treatment root seed is missing"))?;
+        pairs.push(RunComparisonPair {
+            seed_hex: Some(format!("{seed:016x}")),
+            control,
+            treatment,
+        });
+    }
+    comparison_machine(
+        pairs,
+        &cohort.metrics,
+        cohort.endpoint_tick,
+        params,
+        Some((cohort_path.display().to_string(), digest)),
+    )
 }
 
 fn render_run_comparison_markdown(machine: &RunComparisonMachine) -> String {
     let mut md = String::new();
-    let _ = writeln!(md, "# Run comparison\n");
+    let _ = writeln!(md, "# Run endpoint comparison\n");
     let _ = writeln!(
         md,
-        "_treatment=`{}`, FDR={}, {} of {} shared metrics show a certified treatment effect._\n",
-        machine.treatment_db, machine.fdr, machine.significant, machine.metrics_compared
+        "_Endpoint tick: {}. Declared run pairs: {}. Independently matched seed pairs: {}._\n",
+        machine.endpoint_tick, machine.declared_pairs, machine.independent_pairs
     );
-    if machine.truncated {
+    if machine.inference_status == "computed" {
         let _ = writeln!(
             md,
-            "> **Note:** a metric read hit its {METRIC_SUMMARY_ROW_LIMIT}-row cap; the \
-             comparison is over recent history, not the whole run.\n"
+            "{} of {} predeclared metrics meet the Benjamini–Hochberg FDR threshold {}. \
+             Confidence intervals resample seed pairs, and permutation tests flip paired \
+             endpoint differences. Each run contributes one observation per metric.\n",
+            machine.significant, machine.metrics_compared, machine.fdr
         );
-    }
-    if machine.metrics.is_empty() {
+    } else {
         let _ = writeln!(
             md,
-            "_No metric was present in both runs with enough matched ticks._"
+            "**Descriptive comparison: insufficient independent seed pairs for inference.** \
+             Seed pairing is `{}`. Confidence intervals, p-values and inferential decisions \
+             are unavailable for this single run pair. Repeated ticks within the pair do \
+             not provide independent seed replication.\n",
+            machine.seed_pairing
         );
-        return md;
     }
-
+    if !machine.control_only_metrics.is_empty() || !machine.treatment_only_metrics.is_empty() {
+        let _ = writeln!(
+            md,
+            "Endpoint metrics without a counterpart are listed separately: control only `{}`; \
+             treatment only `{}`. The table contains the shared endpoint metrics.\n",
+            machine.control_only_metrics.join(", "),
+            machine.treatment_only_metrics.join(", "),
+        );
+    }
     let _ = writeln!(
         md,
-        "| metric | pairs | Δ (treat−ctrl) | 95% CI | p | d_z | +frac | real? |"
+        "| metric | run pairs | Δ (treat−ctrl) | {:.0}% CI | p | d_z | +frac | FDR discovery |",
+        machine.confidence * 100.0
     );
     let _ = writeln!(md, "|---|---|---|---|---|---|---|---|");
     for row in &machine.metrics {
+        let interval = row.ci_lower.zip(row.ci_upper).map_or_else(
+            || "—".to_owned(),
+            |(lower, upper)| format!("[{lower:.3}, {upper:.3}]"),
+        );
+        let p_value = row
+            .p_value
+            .map_or_else(|| "—".to_owned(), |value| format!("{value:.4}"));
+        let effect = row
+            .cohens_dz
+            .map_or_else(|| "—".to_owned(), |value| format!("{value:.3}"));
         let _ = writeln!(
             md,
-            "| {} | {} | {:+.4} | [{:.3}, {:.3}] | {:.4} | {:.3} | {:.2} | {} |",
+            "| {} | {} | {:+.4} | {} | {} | {} | {:.2} | {} |",
             row.metric,
             row.n_pairs,
             row.mean_difference,
-            row.ci_lower,
-            row.ci_upper,
-            row.p_value,
-            row.cohens_dz,
+            interval,
+            p_value,
+            effect,
             row.fraction_positive,
-            if row.significant_fdr { "yes" } else { "no" },
+            if machine.inference_status != "computed" {
+                "unavailable"
+            } else if row.significant_fdr {
+                "yes"
+            } else {
+                "no"
+            },
+        );
+    }
+    let _ = writeln!(md, "\n## Source runs\n");
+    for pair in &machine.pairs {
+        let _ = writeln!(
+            md,
+            "- Seed `{}`: control `{}` (`{}`); treatment `{}` (`{}`).",
+            pair.seed_hex.as_deref().unwrap_or("unknown or unmatched"),
+            pair.control.run_id,
+            pair.control.db,
+            pair.treatment.run_id,
+            pair.treatment.db,
         );
     }
     md
+}
+
+fn compare_descriptive_pair(
+    cx: &ReaderCtx,
+    params: &ReportParams,
+    comparison_params: &compare::CompareParams,
+) -> Result<RunComparisonMachine, AnalyticsError> {
+    let path = params.get("treatment_db").ok_or_else(|| {
+        comparison_error("supply cohort_file=<path> for a matched-seed study or treatment_db=<path> for a descriptive pair")
+    })?;
+    let run_id = params
+        .get("treatment_run_id")
+        .map(str::parse::<RunId>)
+        .transpose()
+        .map_err(|error| comparison_error(format!("invalid treatment_run_id: {error}")))?;
+    if std::fs::canonicalize(path)? == std::fs::canonicalize(&cx.db_path)? {
+        return Err(comparison_error(
+            "treatment_db must be distinct from the already leased context database",
+        ));
+    }
+    let reader = run_id.map_or_else(
+        || StorageReader::open_finished(path),
+        |run_id| StorageReader::open_finished_for_run(path, run_id),
+    )?;
+    let result = (|| {
+        let endpoint_tick = match params.get_u64("endpoint_tick")? {
+            Some(tick) => tick,
+            None => match (cx.reader.max_tick()?, reader.max_tick()?) {
+                (Some(control), Some(treatment)) if control == treatment => control,
+                _ => {
+                    return Err(comparison_error(
+                        "runs have no shared terminal tick; declare endpoint_tick explicitly or use cohort_file",
+                    ));
+                }
+            },
+        };
+        let (control_seed, control) =
+            read_comparison_source(&cx.reader, &cx.db_path, endpoint_tick, None, false)?;
+        let (treatment_seed, treatment) =
+            read_comparison_source(&reader, path, endpoint_tick, None, false)?;
+        if control_seed.is_some() && treatment_seed.is_some() && control.run_id == treatment.run_id {
+            return Err(comparison_error(
+                "control and treatment reuse the same attributed run identity",
+            ));
+        }
+        let names: Vec<String> = control
+            .values
+            .keys()
+            .filter(|name| treatment.values.contains_key(*name))
+            .cloned()
+            .collect();
+        if names.is_empty() {
+            return Err(comparison_error(
+                "the exact endpoint has no metrics shared by both runs",
+            ));
+        }
+        let seed_hex = control_seed
+            .filter(|seed| Some(*seed) == treatment_seed)
+            .map(|seed| format!("{seed:016x}"));
+        comparison_machine(
+            vec![RunComparisonPair {
+                seed_hex,
+                control,
+                treatment,
+            }],
+            &names,
+            endpoint_tick,
+            comparison_params,
+            None,
+        )
+    })();
+    let close_result = reader.close();
+    let machine = result?;
+    close_result?;
+    Ok(machine)
 }
 
 impl Report for RunComparison {
@@ -2214,19 +2863,17 @@ impl Report for RunComparison {
     }
 
     fn description(&self) -> &'static str {
-        "Paired treatment-effect comparison of two run databases (tick-aligned, FDR-controlled)"
+        "Matched-seed endpoint inference (cohort_file), or descriptive two-run differences (treatment_db)"
     }
 
     fn run(&self, cx: &ReaderCtx, params: &ReportParams) -> Result<ReportOutput, AnalyticsError> {
-        let treatment_path =
-            params
-                .get("treatment_db")
-                .ok_or_else(|| AnalyticsError::BadParam {
-                    name: "treatment_db".to_owned(),
-                    reason:
-                        "compare-runs requires treatment_db=<path> (the treatment run database)"
-                            .to_owned(),
-                })?;
+        params.validate_keys(&[
+            "cohort_file",
+            "treatment_db",
+            "treatment_run_id",
+            "endpoint_tick",
+            "fdr",
+        ])?;
         let fdr = params
             .get("fdr")
             .map(str::parse::<f64>)
@@ -2236,46 +2883,42 @@ impl Report for RunComparison {
                 reason: e.to_string(),
             })?
             .unwrap_or(0.05);
-
-        let read_started = Instant::now();
-        let control_readings = cx.reader.recent_metrics(METRIC_SUMMARY_ROW_LIMIT)?;
-        let treatment_reader = StorageReader::open_finished(treatment_path)?;
-        let treatment_readings = treatment_reader.recent_metrics(METRIC_SUMMARY_ROW_LIMIT)?;
-        let truncated = control_readings.len() >= METRIC_SUMMARY_ROW_LIMIT
-            || treatment_readings.len() >= METRIC_SUMMARY_ROW_LIMIT;
-        log_report_stage(
-            "read",
-            &read_started,
-            control_readings.len() + treatment_readings.len(),
-        );
+        if !fdr.is_finite() || fdr <= 0.0 || fdr >= 1.0 {
+            return Err(comparison_error(
+                "fdr must be finite and strictly between 0 and 1",
+            ));
+        }
+        let comparison_params = compare::CompareParams {
+            fdr,
+            ..compare::CompareParams::default()
+        };
+        let started = Instant::now();
+        let machine = if let Some(path) = params.get("cohort_file") {
+            if ["treatment_db", "treatment_run_id", "endpoint_tick"]
+                .iter()
+                .any(|key| params.get(key).is_some())
+            {
+                return Err(comparison_error(
+                    "cohort_file declares all runs and the endpoint; do not combine it with treatment_db, treatment_run_id or endpoint_tick",
+                ));
+            }
+            compare_cohort_file(cx, path, &comparison_params)?
+        } else {
+            compare_descriptive_pair(cx, params, &comparison_params)?
+        };
+        log_report_stage("read_and_compare", &started, machine.declared_pairs * 2);
 
         let render_started = Instant::now();
-        // BTreeMap keeps both metric and tick order stable. Pair only ticks shared by both runs;
-        // three pairs is the minimum accepted by the paired statistical test.
-        let control = index_metrics_by_tick(control_readings);
-        let treatment = index_metrics_by_tick(treatment_readings);
-        let paired = pair_shared_metrics(&control, &treatment);
-        let rows = compare_paired_metrics(&paired, fdr)?;
-        let significant = rows.iter().filter(|row| row.significant_fdr).count();
-
-        let machine = RunComparisonMachine {
-            treatment_db: treatment_path.to_owned(),
-            fdr,
-            metrics_compared: rows.len(),
-            significant,
-            truncated,
-            metrics: rows,
-        };
-
         let md = render_run_comparison_markdown(&machine);
 
-        let output = base_output(
+        let mut output = base_output(
             self.name(),
             cx,
             machine.metrics.len(),
             serde_json::to_value(&machine)?,
             md,
         )?;
+        output.schema_version = 2;
         log_report_stage("render", &render_started, output.row_count);
         Ok(output)
     }

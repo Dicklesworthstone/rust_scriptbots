@@ -3058,9 +3058,9 @@ impl ControlHandle {
         Ok(projection.latest_snapshot())
     }
 
-    /// Reconstruct an older event from ticks and a complete published config audit.
+    /// Reconstruct an older event from ticks and complete observed input histories.
     /// Configuration schedules require their complete committed outcome history;
-    /// agent commands require their complete observed suffix without config edits.
+    /// agent commands retain the configuration revision observed at application.
     /// Other scientific revisions refuse before stepping. The atomic current digest
     /// must also match before the reconstructed target is published.
     pub(crate) fn event_canvas(&self, target_tick: u64) -> Result<EventCanvasReview, ControlError> {
@@ -3093,40 +3093,30 @@ impl ControlHandle {
         Self::validate_event_review_boundary(&retained, &current, target_tick)?;
         let published = self.read_snapshot()?;
         Self::validate_event_review_schedule(&retained, &current, &published)?;
-        let mut agent_commands = Vec::new();
-        let config_audit = match Self::validate_event_review_span(&retained, &current, target_tick)
-        {
-            Ok(()) => Vec::new(),
-            Err(_)
-                if retained.source_config_revision == current.config_revision
-                    && current.config_revision.checked_next().is_some() =>
-            {
-                agent_commands =
-                    Self::event_review_agent_commands(&retained, &current, target_tick)?;
-                Vec::new()
-            }
-            Err(error) => {
-                let span = Self::validate_event_review_boundary(&retained, &current, target_tick)?;
-                // Audit fallback requires a strictly increasing, nonsaturated config revision.
-                if retained.source_config_revision >= current.config_revision
-                    || current.config_revision.checked_next().is_none()
-                {
-                    return Err(error);
+        let (config_audit, agent_commands) =
+            match Self::validate_event_review_span(&retained, &current, target_tick) {
+                Ok(()) => (Vec::new(), Vec::new()),
+                Err(error) => {
+                    if retained.source_config_revision > current.config_revision
+                        || retained.source_config_revision.checked_next().is_none()
+                        || current.config_revision.checked_next().is_none()
+                    {
+                        return Err(error);
+                    }
+                    let audit = if retained.source_config_revision == current.config_revision {
+                        Vec::new()
+                    } else {
+                        Self::event_review_config_audit(&retained, &current, &published)?
+                    };
+                    let commands = Self::event_review_agent_commands(
+                        &retained,
+                        &current,
+                        target_tick,
+                        &audit,
+                    )?;
+                    (audit, commands)
                 }
-                if current
-                    .scientific_revision
-                    .get()
-                    .checked_sub(retained.source_scientific_revision.get())
-                    != Some(span)
-                {
-                    return Err(ControlError::BadRequest(
-                        "event review needs recorded inputs for intervening scientific revisions"
-                            .into(),
-                    ));
-                }
-                Self::event_review_config_audit(&retained, &current, &published)?
-            }
-        };
+            };
         let world = Self::replay_event_canvas_world(
             &checkpoint,
             &current.digest,
@@ -3158,10 +3148,40 @@ impl ControlHandle {
         let mut commands = agent_commands.iter().peekable();
         let mut target = None;
         loop {
-            while edits
-                .peek()
-                .is_some_and(|entry| entry.tick == world.tick().0)
-            {
+            loop {
+                if let Some(entry) = commands
+                    .peek()
+                    .filter(|entry| entry.boundary().tick == world.tick())
+                {
+                    let mismatch = || {
+                        ControlError::InvalidPatch(
+                            "recorded agent command configuration differs".into(),
+                        )
+                    };
+                    let replayed_config_revision = world
+                        .config_revision()
+                        .checked_sub(restored_config_revision)
+                        .and_then(|delta| source_config_revision.get().checked_add(delta))
+                        .ok_or_else(mismatch)?;
+                    let command_config_revision = entry.boundary().revisions.config.get();
+                    if replayed_config_revision > command_config_revision {
+                        return Err(mismatch());
+                    }
+                    if replayed_config_revision == command_config_revision {
+                        let entry = commands.next().expect("peeked agent command");
+                        scriptbots_core::apply_control_command(&mut world, entry.command().clone())
+                            .map_err(|error| ControlError::InvalidPatch(error.to_string()))?;
+                        continue;
+                    }
+                    if !edits.peek().is_some_and(|entry| entry.tick == world.tick().0) {
+                        return Err(mismatch());
+                    }
+                }
+                if !edits.peek().is_some_and(|entry| entry.tick == world.tick().0) {
+                    break;
+                }
+                // Commands at this tick name their observed config revision. Apply only
+                // preceding edits before each command, then any remaining same-tick edits.
                 let expected = world.config_revision().checked_add(1).ok_or_else(|| {
                     ControlError::InvalidPatch("replayed configuration revision saturated".into())
                 })?;
@@ -3175,23 +3195,6 @@ impl ControlHandle {
                         "recorded config edit did not advance its revision".into(),
                     ));
                 }
-            }
-            while commands
-                .peek()
-                .is_some_and(|entry| entry.boundary().tick == world.tick())
-            {
-                let entry = commands.next().expect("peeked agent command");
-                let replayed_config_revision = world
-                    .config_revision()
-                    .checked_sub(restored_config_revision)
-                    .and_then(|delta| source_config_revision.get().checked_add(delta));
-                if replayed_config_revision != Some(entry.boundary().revisions.config.get()) {
-                    return Err(ControlError::InvalidPatch(
-                        "recorded agent command configuration differs".into(),
-                    ));
-                }
-                scriptbots_core::apply_control_command(&mut world, entry.command().clone())
-                    .map_err(|error| ControlError::InvalidPatch(error.to_string()))?;
             }
             if world.tick().0 == target_tick {
                 target = Some(
@@ -3344,15 +3347,33 @@ impl ControlHandle {
         retained: &RetainedCheckpoint,
         current: &scriptbots_runtime::WorldDigestCut,
         target_tick: u64,
+        config_audit: &[ConfigAuditEntry],
     ) -> Result<Vec<scriptbots_runtime::AppliedAgentCommand>, ControlError> {
         let span = Self::validate_event_review_boundary(retained, current, target_tick)?;
         let missing = || {
             ControlError::BadRequest(
-            "event review needs complete recorded agent inputs for intervening scientific revisions, without configuration edits".into(),
-        )
+                "event review needs complete recorded agent inputs for intervening \
+                 scientific revisions and their observed configuration revisions"
+                    .into(),
+            )
         };
-        if retained.source_config_revision != current.config_revision
+        let config_count = u64::try_from(config_audit.len()).map_err(|_| missing())?;
+        if retained.source_config_revision.checked_next().is_none()
             || current.config_revision.checked_next().is_none()
+            || current
+                .config_revision
+                .get()
+                .checked_sub(retained.source_config_revision.get())
+                != Some(config_count)
+            || config_audit
+                .first()
+                .is_some_and(|entry| entry.tick < retained.metadata.tick)
+            || config_audit
+                .last()
+                .is_some_and(|entry| entry.tick > current.digest.tick.0)
+            || config_audit
+                .windows(2)
+                .any(|entries| entries[0].tick > entries[1].tick)
         {
             return Err(missing());
         }
@@ -3368,6 +3389,7 @@ impl ControlHandle {
             .cloned()
             .collect();
         let mut previous_tick = retained.metadata.tick;
+        let mut previous_config_revision = retained.source_config_revision;
         // A tick advances science once; each recorded agent command advances it once.
         // Check every boundary, so an omitted or different scientific input leaves a gap.
         for (index, entry) in commands.iter().enumerate() {
@@ -3379,10 +3401,27 @@ impl ControlHandle {
             let expected = elapsed
                 .and_then(|ticks| source_revision.checked_add(ticks))
                 .and_then(|revision| ordinal.and_then(|ordinal| revision.checked_add(ordinal)));
+            // The observed revision partitions the complete audit at this command:
+            // applied edits cannot be later, and unapplied edits cannot be earlier.
+            // Equality deliberately allows either side of an edit at the same tick.
+            let config_index = boundary
+                .revisions
+                .config
+                .get()
+                .checked_sub(retained.source_config_revision.get())
+                .and_then(|index| usize::try_from(index).ok())
+                .filter(|index| *index <= config_audit.len())
+                .ok_or_else(missing)?;
             if expected != Some(boundary.revisions.scientific.get())
                 || boundary.tick.0 < previous_tick
                 || boundary.tick > current.digest.tick
-                || boundary.revisions.config != retained.source_config_revision
+                || boundary.revisions.config < previous_config_revision
+                || config_audit[..config_index]
+                    .last()
+                    .is_some_and(|entry| entry.tick > boundary.tick.0)
+                || config_audit
+                    .get(config_index)
+                    .is_some_and(|entry| entry.tick < boundary.tick.0)
                 || !matches!(
                     entry.command(),
                     ControlCommand::AdjustAgentMutationRates { .. }
@@ -3393,6 +3432,7 @@ impl ControlHandle {
                 return Err(missing());
             }
             previous_tick = boundary.tick.0;
+            previous_config_revision = boundary.revisions.config;
         }
         let expected_current = source_revision.checked_add(span).and_then(|revision| {
             u64::try_from(commands.len())
@@ -6424,6 +6464,72 @@ pub(crate) mod tests {
         }
     }
 
+    fn mixed_canvas_journey() -> AgentCanvasJourney {
+        let mut journey = agent_canvas_journey();
+        let handle = &journey.handle;
+        let host = &journey.host;
+        // Retain a real input prefix before the saved cut. Replay must rebase config
+        // revisions and exclude those older commands, rather than assuming tick zero.
+        host.wait_applied(
+            &handle
+                .apply_patch(serde_json::json!({"food_growth_rate": 0.005}))
+                .unwrap(),
+        );
+        let checkpoint = handle
+            .create_checkpoint(CheckpointCreateRequest::default())
+            .unwrap();
+        journey.checkpoint_id = checkpoint.checkpoint_id;
+        journey.oracles.clear();
+        host.wait_applied(&handle.step().unwrap());
+        let parents = handle
+            .read_snapshot()
+            .unwrap()
+            .world
+            .agents
+            .iter()
+            .take(2)
+            .map(|agent| agent.uid)
+            .collect::<Vec<_>>();
+        assert_eq!(parents.len(), 2);
+        for offset in [100_u128, 200] {
+            if offset == 200 {
+                host.wait_applied(
+                    &handle
+                        .apply_patch(serde_json::json!({"food_growth_rate": 0.006}))
+                        .unwrap(),
+                );
+            }
+            for ((id, command), rates) in agent_canvas_commands([parents[0], parents[1]])
+                .into_iter()
+                .zip([[0.004, 0.003], [0.002, 0.001], [0.0004, 0.0002]])
+            {
+                let mut port = host.port.clone();
+                let id = CommandId::new(id + offset);
+                port.submit(CommandEnvelope::new(id, command)).unwrap();
+                assert_eq!(
+                    host.wait_finished(&id.to_string()).application_state,
+                    "applied"
+                );
+                // Two edits between commands prevent an implementation from merely
+                // alternating one edit and one command at this shared tick.
+                for rate in rates {
+                    host.wait_applied(
+                        &handle
+                            .apply_patch(serde_json::json!({"food_growth_rate": rate}))
+                            .unwrap(),
+                    );
+                }
+            }
+            journey.oracles.push((
+                handle.read_snapshot().unwrap(),
+                host.port.scientific_digest_v1().unwrap(),
+            ));
+            host.wait_applied(&handle.step().unwrap());
+        }
+        host.wait_applied(&handle.step().unwrap());
+        journey
+    }
+
     #[test]
     fn event_canvas_replays_actual_agent_commands_with_full_target_oracles() {
         let AgentCanvasJourney {
@@ -6448,9 +6554,13 @@ pub(crate) mod tests {
         let current = host.port.scientific_digest_cut().unwrap();
         assert_eq!(current.agent_commands.len(), oracles.len());
         for (oracle, digest) in &oracles {
-            let commands =
-                ControlHandle::event_review_agent_commands(&source, &current, oracle.world.tick)
-                    .unwrap();
+            let commands = ControlHandle::event_review_agent_commands(
+                &source,
+                &current,
+                oracle.world.tick,
+                &[],
+            )
+            .unwrap();
             let target = ControlHandle::replay_event_canvas_world(
                 &saved,
                 &current.digest,
@@ -6500,7 +6610,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn event_canvas_agent_commands_refuse_incomplete_history_and_mixed_inputs() {
+    fn event_canvas_agent_commands_refuse_incomplete_history() {
         let AgentCanvasJourney {
             handle,
             host,
@@ -6510,7 +6620,6 @@ pub(crate) mod tests {
         let retention = &handle.data_services.checkpoint_retention;
         let source = retention.lock().unwrap().requests[&checkpoint_id].clone();
         let saved = handle.verified_canvas_checkpoint(&checkpoint_id).unwrap();
-        let publication = handle.read_snapshot().unwrap();
         let current = host.port.scientific_digest_cut().unwrap();
         for fault in [
             "missing",
@@ -6545,7 +6654,7 @@ pub(crate) mod tests {
                 _ => unreachable!(),
             }
             assert!(
-                ControlHandle::event_review_agent_commands(&source, &changed, 2).is_err(),
+                ControlHandle::event_review_agent_commands(&source, &changed, 2, &[]).is_err(),
                 "{fault}"
             );
         }
@@ -6578,24 +6687,220 @@ pub(crate) mod tests {
             ),
             "a wrong absolute source revision must still fail at the command guard"
         );
-        let mut config = (*publication.config).clone();
-        config.food_growth_rate *= 0.5;
-        let mut port = host.port.clone();
-        let command_id = CommandId::new(104);
-        port.submit(CommandEnvelope::new(
-            command_id,
-            HostCommand::UpdateConfig(Box::new(config)),
-        ))
+    }
+
+    #[test]
+    fn event_canvas_replays_mixed_inputs_in_observed_same_tick_order() {
+        let AgentCanvasJourney {
+            handle,
+            host,
+            directory,
+            checkpoint_id,
+            oracles,
+        } = mixed_canvas_journey();
+        let retention = &handle.data_services.checkpoint_retention;
+        let source = retention.lock().unwrap().requests[&checkpoint_id].clone();
+        let saved = handle.verified_canvas_checkpoint(&checkpoint_id).unwrap();
+        let current = host.port.scientific_digest_cut().unwrap();
+        let published = handle.read_snapshot().unwrap();
+        let audit =
+            ControlHandle::event_review_config_audit(&source, &current, &published).unwrap();
+        let commands = ControlHandle::event_review_agent_commands(
+            &source,
+            &current,
+            oracles[0].0.world.tick,
+            &audit,
+        )
         .unwrap();
+        assert_eq!(source.source_config_revision.get(), 1);
+        assert_eq!(audit.len(), 13);
+        assert_eq!(current.agent_commands.len(), 9);
         assert_eq!(
-            host.wait_finished(&command_id.to_string())
-                .application_state,
-            "applied"
+            commands
+                .iter()
+                .map(|entry| entry.boundary().revisions.config.get())
+                .collect::<Vec<_>>(),
+            [1, 3, 5, 8, 10, 12],
+            "actual commands must observe distinct positions within each tick's edits"
         );
-        assert!(
-            handle.event_canvas(2).is_err(),
-            "mixed config and agent inputs remain unsupported"
+        assert_eq!(
+            commands
+                .iter()
+                .map(|entry| entry.boundary().tick.0)
+                .collect::<Vec<_>>(),
+            [11, 11, 11, 12, 12, 12]
         );
+        for (oracle, digest) in &oracles {
+            let target = ControlHandle::replay_event_canvas_world(
+                &saved,
+                &current.digest,
+                &audit,
+                &commands,
+                oracle.world.tick,
+                source.source_persistence_interval,
+                source.source_config_revision,
+            )
+            .unwrap();
+            assert_eq!(&target.world_digest_v1().unwrap(), digest);
+            assert_ne!(*digest, current.digest);
+            let review = handle.event_canvas(oracle.world.tick).unwrap();
+            assert_eq!(review.checkpoint_id, checkpoint_id);
+            assert_eq!(review.base_tick, saved.tick().0);
+            assert_eq!(review.snapshot.world.tick, oracle.world.tick);
+            assert_eq!(review.snapshot.world.agents.len(), oracle.world.agents.len());
+            assert_eq!(
+                review.snapshot.config.food_growth_rate.to_bits(),
+                oracle.config.food_growth_rate.to_bits()
+            );
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), current.digest);
+            assert!(Arc::ptr_eq(&handle.read_snapshot().unwrap(), &published));
+            fs::write(
+                directory.join(format!("mixed-target-{}-digest.json", oracle.world.tick)),
+                serde_json::to_vec_pretty(digest).unwrap(),
+            )
+            .unwrap();
+        }
+        eprintln!(
+            "mixed replay: source={} targets=11,12 live={} commands={} edits={} current={}; {}",
+            saved.tick().0,
+            current.digest.tick.0,
+            commands.len(),
+            audit.len(),
+            current.digest.overall,
+            directory.display()
+        );
+    }
+
+    #[test]
+    // One real mixed-history cut supplies both cross-history and final-digest negatives.
+    #[allow(clippy::too_many_lines)]
+    fn event_canvas_mixed_inputs_refuse_inconsistent_histories() {
+        let AgentCanvasJourney {
+            handle,
+            host,
+            checkpoint_id,
+            oracles,
+            ..
+        } = mixed_canvas_journey();
+        let retention = &handle.data_services.checkpoint_retention;
+        let source = retention.lock().unwrap().requests[&checkpoint_id].clone();
+        let saved = handle.verified_canvas_checkpoint(&checkpoint_id).unwrap();
+        let current = host.port.scientific_digest_cut().unwrap();
+        let published = handle.read_snapshot().unwrap();
+        let target_tick = oracles[0].0.world.tick;
+        let audit =
+            ControlHandle::event_review_config_audit(&source, &current, &published).unwrap();
+        let commands =
+            ControlHandle::event_review_agent_commands(&source, &current, target_tick, &audit)
+                .unwrap();
+        for fault in ["missing", "early", "late", "future", "order"] {
+            let mut changed = audit.clone();
+            match fault {
+                "missing" => {
+                    changed.remove(0);
+                }
+                "early" => changed[0].tick = source.metadata.tick,
+                "late" => {
+                    for entry in &mut changed {
+                        if entry.tick == target_tick {
+                            entry.tick += 1;
+                        }
+                    }
+                }
+                "future" => changed.last_mut().unwrap().tick = current.digest.tick.0 + 1,
+                "order" => changed.last_mut().unwrap().tick = source.metadata.tick,
+                _ => unreachable!(),
+            }
+            if matches!(fault, "early" | "late") {
+                let mut altered_publication = (*published).clone();
+                let prefix = altered_publication.config_audit.len() - changed.len();
+                Arc::make_mut(&mut altered_publication.config_audit)[prefix..]
+                    .clone_from_slice(&changed);
+                assert!(
+                    ControlHandle::event_review_config_audit(
+                        &source,
+                        &current,
+                        &altered_publication,
+                    )
+                    .is_ok(),
+                    "the {fault} audit is internally complete but contradicts observed commands"
+                );
+            }
+            assert!(
+                ControlHandle::event_review_agent_commands(&source, &current, target_tick, &changed)
+                    .is_err(),
+                "{fault}"
+            );
+        }
+        for fault in [
+            "missing",
+            "duplicate",
+            "order",
+            "session",
+            "science",
+            "config",
+            "saturated",
+        ] {
+            let mut changed = current.clone();
+            let last = changed.agent_commands.len() - 1;
+            match fault {
+                "missing" => {
+                    changed.agent_commands.remove(last);
+                }
+                "duplicate" => {
+                    let duplicate = changed.agent_commands[last].clone();
+                    changed.agent_commands.push(duplicate);
+                }
+                "order" => changed.agent_commands.swap(last - 1, last),
+                "session" => {
+                    changed.session_id =
+                        scriptbots_runtime::HostSessionId::new(current.session_id.get() ^ 1)
+                }
+                "science" => {
+                    changed.scientific_revision =
+                        current.scientific_revision.checked_next().unwrap()
+                }
+                "config" => {
+                    changed.config_revision = current.config_revision.checked_next().unwrap()
+                }
+                "saturated" => {
+                    changed.config_revision = scriptbots_runtime::ConfigRevision::new(u64::MAX)
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                ControlHandle::event_review_agent_commands(&source, &changed, target_tick, &audit)
+                    .is_err(),
+                "{fault}"
+            );
+        }
+        for fault in ["audit-value", "current-digest"] {
+            let mut changed = audit.clone();
+            let mut digest = current.digest.clone();
+            if fault == "audit-value" {
+                changed.last_mut().unwrap().patch["food_growth_rate"] = serde_json::json!(0.009);
+            } else {
+                digest.overall = "0000000000000000".into();
+            }
+            assert!(
+                matches!(
+                    ControlHandle::replay_event_canvas_world(
+                        &saved,
+                        &digest,
+                        &changed,
+                        &commands,
+                        target_tick,
+                        source.source_persistence_interval,
+                        source.source_config_revision,
+                    ),
+                    Err(ControlError::InvalidPatch(message))
+                        if message.contains("current scientific digest")
+                ),
+                "{fault}"
+            );
+        }
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), current.digest);
+        assert!(Arc::ptr_eq(&handle.read_snapshot().unwrap(), &published));
     }
 
     #[test]

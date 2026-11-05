@@ -1,10 +1,13 @@
 //! Typed storage exports, canonical schemas, and completion-receipt verification.
 
 use serde::{Deserialize, Serialize};
-use std::io::Write;
+use std::io::{BufReader, Read, Write};
 use std::time::SystemTime;
 
-use crate::{StorageError, StorageReader, checked_u64, decode as decode_column, sqlite_run_id};
+use crate::{
+    Row, SqliteValue, StorageError, StorageReader, checked_query_limit, checked_u64,
+    decode as decode_column, sqlite_run_id,
+};
 
 // ============================================================================
 // SCHEMA EVOLUTION AND DIGEST COMPARABILITY POLICY (bd-2z0.5.6)
@@ -202,7 +205,7 @@ pub enum ExportFormat {
 }
 
 /// Provenance metadata embedded in exported artifacts.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExportProvenance {
     /// Identifier of the exported run.
     pub run_id: String,
@@ -1295,14 +1298,22 @@ impl<W: Write> CoreTableExportWriter<W> {
     }
 
     /// Atomically seal the export artifact by stamping the trailing completion receipt.
-    pub fn finish(mut self, table: ExportTable) -> std::io::Result<ExportReceipt> {
+    pub fn finish(self, table: ExportTable) -> std::io::Result<ExportReceipt> {
+        self.finish_at(table, current_utc_iso8601())
+    }
+
+    fn finish_at(
+        mut self,
+        table: ExportTable,
+        completed_at_utc: String,
+    ) -> std::io::Result<ExportReceipt> {
         let checksum_hex = self.hasher.finalize().to_hex().to_string();
         let receipt = ExportReceipt {
             table,
             format: self.format,
             row_count: self.row_count,
             checksum_blake3: format!("blake3:{checksum_hex}"),
-            completed_at_utc: current_utc_iso8601(),
+            completed_at_utc,
         };
 
         match self.format {
@@ -1318,8 +1329,8 @@ impl<W: Write> CoreTableExportWriter<W> {
                         ExportTable::Lineage => {
                             "run_id,child_agent_uid,parent_agent_uid,parent_ordinal,relationship,birth_tick"
                         }
-                        ExportTable::Event => "run_id,tick,seq,kind,agent_uid,value,payload_json",
-                        ExportTable::Metric => "run_id,tick,metric_name,value",
+                        ExportTable::Event => "run_id,tick,seq,event_id,kind,payload",
+                        ExportTable::Metric => "run_id,tick,name,value",
                     };
                     writeln!(self.writer, "{header}")?;
                     self.hasher.update(header.as_bytes());
@@ -1464,224 +1475,505 @@ impl<W: Write> MetricExportWriter<W> {
 // DATABASE STREAMING EXPORTER (bd-2z0.5.6)
 // ============================================================================
 
+/// Maximum number of canonical records handed to an export consumer at once.
+///
+/// This bounds retained row counts, not the size of an individual text payload or
+/// the database engine's own working memory.
+pub const EXPORT_PAGE_ROWS: usize = 1_024;
+
+/// One bounded page in the canonical order of an export table.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExportTablePage {
+    /// The selected run's single provenance row.
+    Run(RunExportRow),
+    /// Agent observations ordered by tick and stable agent UID.
+    Agent(Vec<AgentExportRow>),
+    /// Lineage edges ordered by birth tick, child UID and parent ordinal.
+    Lineage(Vec<LineageExportRow>),
+    /// Replay events ordered by tick and sequence.
+    Event(Vec<EventExportRow>),
+    /// Metric samples ordered by tick and name.
+    Metric(Vec<MetricExportRow>),
+}
+
+impl ExportTablePage {
+    /// Number of canonical records in this page.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        match self {
+            Self::Run(_) => 1,
+            Self::Agent(rows) => rows.len(),
+            Self::Lineage(rows) => rows.len(),
+            Self::Event(rows) => rows.len(),
+            Self::Metric(rows) => rows.len(),
+        }
+    }
+
+    /// Whether the page has no canonical records.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+fn require_finished_export(reader: &StorageReader) -> Result<(), StorageError> {
+    reader.require_island_zero_science("export.island_scope")?;
+    if reader._finished_run_lease.is_none() {
+        return Err(StorageError::InvalidData {
+            context: "export.finished_reader",
+            reason: "complete exports require StorageReader::open_finished or StorageReader::open_finished_for_run".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Capture the same provenance for text and columnar exports.
+pub fn export_provenance(
+    reader: &StorageReader,
+    table: ExportTable,
+) -> Result<ExportProvenance, StorageError> {
+    require_finished_export(reader)?;
+    let manifest = reader.run_manifest()?;
+    Ok(ExportProvenance {
+        run_id: reader.run_id().to_string(),
+        seed: manifest.root_seed,
+        config_digest: manifest.config_digest,
+        source_revision: manifest.source_revision.unwrap_or_else(|| "unknown".into()),
+        source_tree_digest: manifest
+            .source_tree_digest
+            .unwrap_or_else(|| "unknown".into()),
+        authority_decisions: vec!["persisted_storage_export".into()],
+        conservation_tolerances: None,
+        schema_version: table.current_version(),
+        exported_at_utc: current_utc_iso8601(),
+    })
+}
+
+#[derive(Clone, Copy)]
+enum ExportPageSource {
+    Table(ExportTable),
+    BirthParents,
+}
+
+impl ExportPageSource {
+    const fn query(self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            Self::Table(ExportTable::Agent) => (
+                "SELECT run_id, tick, agent_uid, generation, age, position_x, position_y,
+                        velocity_x, velocity_y, heading, health, energy, herbivore_tendency,
+                        brain_binding FROM agents WHERE run_id = ?1",
+                "tick ASC, agent_uid ASC",
+                " AND (tick > ?2 OR (tick = ?2 AND agent_uid > ?3))",
+            ),
+            Self::Table(ExportTable::Lineage) => (
+                "SELECT run_id, child_agent_uid, parent_agent_uid, parent_ordinal,
+                        relationship, birth_tick FROM lineage_edges WHERE run_id = ?1",
+                "birth_tick ASC, child_agent_uid ASC, parent_ordinal ASC",
+                " AND (birth_tick > ?2 OR (birth_tick = ?2 AND child_agent_uid > ?3)
+                        OR (birth_tick = ?2 AND child_agent_uid = ?3 AND parent_ordinal > ?4))",
+            ),
+            Self::Table(ExportTable::Event) => (
+                "SELECT run_id, tick, seq, scope, event_type, payload
+                 FROM replay_events WHERE run_id = ?1",
+                "tick ASC, seq ASC",
+                " AND (tick > ?2 OR (tick = ?2 AND seq > ?3))",
+            ),
+            Self::Table(ExportTable::Metric) => (
+                "SELECT run_id, tick, name, value FROM metrics WHERE run_id = ?1",
+                "tick ASC, name ASC",
+                " AND (tick > ?2 OR (tick = ?2 AND name > ?3))",
+            ),
+            Self::BirthParents => (
+                "SELECT run_id, agent_uid, parent_a, parent_b, tick FROM births
+                 WHERE run_id = ?1 AND (parent_a IS NOT NULL OR parent_b IS NOT NULL)",
+                "tick ASC, agent_uid ASC",
+                " AND (tick > ?2 OR (tick = ?2 AND agent_uid > ?3))",
+            ),
+            Self::Table(ExportTable::Run) => unreachable!("run export has exactly one row"),
+        }
+    }
+
+    fn cursor(self, row: &Row) -> Result<Vec<SqliteValue>, StorageError> {
+        match self {
+            Self::Table(ExportTable::Agent | ExportTable::Event) => Ok(vec![
+                decode_column::<i64>(row, 1, "export.cursor.tick")?.into(),
+                decode_column::<i64>(row, 2, "export.cursor.ordinal")?.into(),
+            ]),
+            Self::Table(ExportTable::Lineage) => Ok(vec![
+                decode_column::<i64>(row, 5, "export.cursor.birth_tick")?.into(),
+                decode_column::<i64>(row, 1, "export.cursor.child_uid")?.into(),
+                decode_column::<i64>(row, 3, "export.cursor.parent_ordinal")?.into(),
+            ]),
+            Self::Table(ExportTable::Metric) => Ok(vec![
+                decode_column::<i64>(row, 1, "export.cursor.tick")?.into(),
+                decode_column::<String>(row, 2, "export.cursor.name")?.into(),
+            ]),
+            Self::BirthParents => Ok(vec![
+                decode_column::<i64>(row, 4, "export.cursor.birth_tick")?.into(),
+                decode_column::<i64>(row, 1, "export.cursor.child_uid")?.into(),
+            ]),
+            Self::Table(ExportTable::Run) => unreachable!("run export has no page cursor"),
+        }
+    }
+
+    fn decode(self, rows: &[Row]) -> Result<ExportTablePage, StorageError> {
+        match self {
+            Self::Table(ExportTable::Agent) => rows
+                .iter()
+                .map(agent_export_row)
+                .collect::<Result<Vec<_>, _>>()
+                .map(ExportTablePage::Agent),
+            Self::Table(ExportTable::Lineage) => rows
+                .iter()
+                .map(lineage_export_row)
+                .collect::<Result<Vec<_>, _>>()
+                .map(ExportTablePage::Lineage),
+            Self::Table(ExportTable::Event) => rows
+                .iter()
+                .map(event_export_row)
+                .collect::<Result<Vec<_>, _>>()
+                .map(ExportTablePage::Event),
+            Self::Table(ExportTable::Metric) => rows
+                .iter()
+                .map(metric_export_row)
+                .collect::<Result<Vec<_>, _>>()
+                .map(ExportTablePage::Metric),
+            Self::BirthParents => birth_parent_export_rows(rows).map(ExportTablePage::Lineage),
+            Self::Table(ExportTable::Run) => unreachable!("run export uses the manifest"),
+        }
+    }
+}
+
+fn visit_export_source<E: From<StorageError>>(
+    reader: &StorageReader,
+    source: ExportPageSource,
+    visit: &mut impl FnMut(ExportTablePage) -> Result<(), E>,
+) -> Result<bool, E> {
+    // A birth can contribute two parent edges; bound the resulting canonical page.
+    let row_limit = if matches!(source, ExportPageSource::BirthParents) {
+        EXPORT_PAGE_ROWS / 2
+    } else {
+        EXPORT_PAGE_ROWS
+    };
+    let sql_limit = checked_query_limit("export.page_limit", row_limit)?;
+    let (select, order, after) = source.query();
+    let mut cursor = Vec::new();
+    let mut observed_rows = false;
+    loop {
+        let mut params = vec![sqlite_run_id(reader.run_id())];
+        params.extend(cursor.iter().cloned());
+        let limit_parameter = params.len() + 1;
+        params.push(sql_limit.into());
+        let predicate = if cursor.is_empty() { "" } else { after };
+        let sql = format!("{select}{predicate} ORDER BY {order} LIMIT ?{limit_parameter}");
+        let rows = reader
+            .connection()?
+            .query_with_params(&sql, &params)
+            .map_err(StorageError::from)?;
+        let Some(last) = rows.last() else {
+            return Ok(observed_rows);
+        };
+        cursor = source.cursor(last)?;
+        observed_rows = true;
+        visit(source.decode(&rows)?)?;
+        if rows.len() < row_limit {
+            return Ok(true);
+        }
+    }
+}
+
+/// Visit every canonical row without accumulating the table or a JSON copy of it.
+///
+/// Each callback receives at most [`EXPORT_PAGE_ROWS`] records. Keyset cursors retain
+/// same-tick rows across page boundaries without progressively larger OFFSET scans.
+/// Empty tables invoke no callback. A finished reader is required to retain one
+/// immutable source across traversal and independent read-back verification.
+pub fn visit_export_pages<E: From<StorageError>>(
+    reader: &StorageReader,
+    table: ExportTable,
+    mut visit: impl FnMut(ExportTablePage) -> Result<(), E>,
+) -> Result<(), E> {
+    require_finished_export(reader)?;
+    visit_export_pages_validated(reader, table, &mut visit)
+}
+
+fn visit_export_pages_validated<E: From<StorageError>>(
+    reader: &StorageReader,
+    table: ExportTable,
+    visit: &mut impl FnMut(ExportTablePage) -> Result<(), E>,
+) -> Result<(), E> {
+    if table == ExportTable::Run {
+        return visit(ExportTablePage::Run(reader.load_run_export_row()?));
+    }
+    let populated = visit_export_source(reader, ExportPageSource::Table(table), visit)?;
+    if table == ExportTable::Lineage && !populated {
+        visit_export_source(reader, ExportPageSource::BirthParents, visit)?;
+    }
+    Ok(())
+}
+
+fn agent_export_row(row: &Row) -> Result<AgentExportRow, StorageError> {
+    Ok(AgentExportRow {
+        run_id: decode_column(row, 0, "agents.run_id")?,
+        tick: checked_u64("agents.tick", decode_column(row, 1, "agents.tick")?)?,
+        agent_uid: checked_u64("agents.agent_uid", decode_column(row, 2, "agents.agent_uid")?)?,
+        generation: decode_column::<i64>(row, 3, "agents.generation")? as u32,
+        age: decode_column::<i64>(row, 4, "agents.age")? as u32,
+        pos_x: decode_column::<f64>(row, 5, "agents.position_x")? as f32,
+        pos_y: decode_column::<f64>(row, 6, "agents.position_y")? as f32,
+        vel_x: decode_column::<f64>(row, 7, "agents.velocity_x")? as f32,
+        vel_y: decode_column::<f64>(row, 8, "agents.velocity_y")? as f32,
+        heading: decode_column::<f64>(row, 9, "agents.heading")? as f32,
+        health: decode_column::<f64>(row, 10, "agents.health")? as f32,
+        energy: decode_column::<f64>(row, 11, "agents.energy")? as f32,
+        herbivore_tendency: decode_column::<f64>(row, 12, "agents.herbivore_tendency")? as f32,
+        brain_binding: decode_column(row, 13, "agents.brain_binding")?,
+    })
+}
+
+fn lineage_export_row(row: &Row) -> Result<LineageExportRow, StorageError> {
+    Ok(LineageExportRow {
+        run_id: decode_column(row, 0, "lineage_edges.run_id")?,
+        child_agent_uid: checked_u64(
+            "lineage_edges.child_agent_uid",
+            decode_column(row, 1, "lineage_edges.child_agent_uid")?,
+        )?,
+        parent_agent_uid: checked_u64(
+            "lineage_edges.parent_agent_uid",
+            decode_column(row, 2, "lineage_edges.parent_agent_uid")?,
+        )?,
+        parent_ordinal: decode_column::<i64>(row, 3, "lineage_edges.parent_ordinal")? as u32,
+        relationship: decode_column(row, 4, "lineage_edges.relationship")?,
+        birth_tick: checked_u64(
+            "lineage_edges.birth_tick",
+            decode_column(row, 5, "lineage_edges.birth_tick")?,
+        )?,
+    })
+}
+
+fn event_export_row(row: &Row) -> Result<EventExportRow, StorageError> {
+    let seq: i64 = decode_column(row, 2, "replay_events.seq")?;
+    let scope: String = decode_column(row, 3, "replay_events.scope")?;
+    let event_type: String = decode_column(row, 4, "replay_events.event_type")?;
+    Ok(EventExportRow {
+        run_id: decode_column(row, 0, "replay_events.run_id")?,
+        tick: checked_u64("replay_events.tick", decode_column(row, 1, "replay_events.tick")?)?,
+        seq: checked_u64("replay_events.seq", seq)?,
+        event_id: format!("evt-{seq}"),
+        kind: format!("{scope}:{event_type}"),
+        payload: decode_column(row, 5, "replay_events.payload")?,
+    })
+}
+
+fn metric_export_row(row: &Row) -> Result<MetricExportRow, StorageError> {
+    Ok(MetricExportRow {
+        run_id: decode_column(row, 0, "metrics.run_id")?,
+        tick: checked_u64("metrics.tick", decode_column(row, 1, "metrics.tick")?)?,
+        name: decode_column(row, 2, "metrics.name")?,
+        value: decode_column(row, 3, "metrics.value")?,
+    })
+}
+
+fn birth_parent_export_rows(rows: &[Row]) -> Result<Vec<LineageExportRow>, StorageError> {
+    let mut edges = Vec::with_capacity(rows.len() * 2);
+    for row in rows {
+        let run_id: String = decode_column(row, 0, "births.run_id")?;
+        let child = checked_u64("births.agent_uid", decode_column(row, 1, "births.agent_uid")?)?;
+        let parent_a: Option<i64> = decode_column(row, 2, "births.parent_a")?;
+        let parent_b: Option<i64> = decode_column(row, 3, "births.parent_b")?;
+        let tick = checked_u64("births.tick", decode_column(row, 4, "births.tick")?)?;
+        for (ordinal, parent, relationship) in [
+            (
+                0,
+                parent_a,
+                if parent_b.is_some() {
+                    "sexual_parent_a"
+                } else {
+                    "asexual"
+                },
+            ),
+            (1, parent_b, "sexual_parent_b"),
+        ] {
+            if let Some(parent) = parent {
+                edges.push(LineageExportRow {
+                    run_id: run_id.clone(),
+                    child_agent_uid: child,
+                    parent_agent_uid: checked_u64("births.parent", parent)?,
+                    parent_ordinal: ordinal,
+                    relationship: relationship.to_owned(),
+                    birth_tick: tick,
+                });
+            }
+        }
+    }
+    Ok(edges)
+}
+
 /// Stream rows from a finished run database into a `CoreTableExportWriter` in
-/// bounded pages (O(1) memory), stamping an atomic completion receipt.
+/// bounded row pages, stamping an atomic completion receipt.
 pub fn export_storage_table<W: Write>(
     reader: &StorageReader,
     table: ExportTable,
     format: ExportFormat,
     writer: W,
 ) -> Result<ExportReceipt, StorageError> {
-    reader.require_island_zero_science("export.island_scope")?;
-    let mut export_writer = CoreTableExportWriter::new_with_format(writer, format);
-    let manifest = reader.run_manifest()?;
-    let run_id = reader.run_id();
+    let prov = export_provenance(reader, table)?;
+    export_storage_table_captured(reader, table, format, writer, &prov, None)
+}
 
-    // Embed canonical provenance header
-    let prov = ExportProvenance {
-        run_id: run_id.to_string(),
-        seed: manifest.root_seed,
-        config_digest: manifest.config_digest.clone(),
-        source_revision: manifest
-            .source_revision
-            .clone()
-            .unwrap_or_else(|| "unknown".into()),
-        source_tree_digest: manifest
-            .source_tree_digest
-            .clone()
-            .unwrap_or_else(|| "unknown".into()),
-        authority_decisions: vec!["persisted_storage_export".into()],
-        conservation_tolerances: None,
-        schema_version: table.current_version(),
-        exported_at_utc: current_utc_iso8601(),
-    };
+/// Export with an already captured provenance header, including its original time.
+/// This lets a second traversal verify the same source-bound text representation.
+pub fn export_storage_table_with_provenance<W: Write>(
+    reader: &StorageReader,
+    table: ExportTable,
+    format: ExportFormat,
+    writer: W,
+    prov: &ExportProvenance,
+) -> Result<ExportReceipt, StorageError> {
+    let mut expected_provenance = export_provenance(reader, table)?;
+    expected_provenance
+        .exported_at_utc
+        .clone_from(&prov.exported_at_utc);
+    if expected_provenance != *prov {
+        return Err(StorageError::InvalidData {
+            context: "export.provenance",
+            reason: "captured export provenance does not match the selected run and table".to_owned(),
+        });
+    }
+    export_storage_table_captured(reader, table, format, writer, prov, None)
+}
+
+fn export_storage_table_captured<W: Write>(
+    reader: &StorageReader,
+    table: ExportTable,
+    format: ExportFormat,
+    writer: W,
+    prov: &ExportProvenance,
+    completed_at_utc: Option<&str>,
+) -> Result<ExportReceipt, StorageError> {
+    let mut export_writer = CoreTableExportWriter::new_with_format(writer, format);
     export_writer
-        .write_provenance(&prov)
+        .write_provenance(prov)
         .map_err(|e| StorageError::InvalidData {
             context: "export_storage_table.write_provenance",
             reason: e.to_string(),
         })?;
+    visit_export_pages_validated::<StorageError>(reader, table, &mut |page| {
+        let result = match page {
+            ExportTablePage::Run(row) => export_writer.write_run_row(&row),
+            ExportTablePage::Agent(rows) => rows
+                .iter()
+                .try_for_each(|row| export_writer.write_agent_row(row)),
+            ExportTablePage::Lineage(rows) => rows
+                .iter()
+                .try_for_each(|row| export_writer.write_lineage_row(row)),
+            ExportTablePage::Event(rows) => rows
+                .iter()
+                .try_for_each(|row| export_writer.write_event_row(row)),
+            ExportTablePage::Metric(rows) => rows
+                .iter()
+                .try_for_each(|row| export_writer.write_metric_row(row)),
+        };
+        result.map_err(|error| StorageError::InvalidData {
+            context: "export_storage_table.write_page",
+            reason: error.to_string(),
+        })
+    })?;
 
-    match table {
-        ExportTable::Run => {
-            let row = RunExportRow {
-                run_id: manifest.run_id.to_string(),
-                manifest_schema_version: manifest.manifest_schema_version as u32,
-                scenario_id: manifest.scenario_id,
-                scenario_version: manifest.scenario_version as u32,
-                config_digest: manifest.config_digest,
-                root_seed_hex: format!("{:016x}", manifest.root_seed),
-                source_revision: manifest.source_revision,
-                source_tree_digest: manifest.source_tree_digest,
-                started_at_unix_ms: manifest.started_at_unix_ms,
-                reproducible: manifest.reproducible,
-            };
-            export_writer
-                .write_run_row(&row)
-                .map_err(|e| StorageError::InvalidData {
-                    context: "export_storage_table.write_run_row",
-                    reason: e.to_string(),
-                })?;
-        }
-        ExportTable::Agent => {
-            let limit = 1024;
-            let mut offset = 0;
-            loop {
-                let rows = reader.connection()?.query_with_params(
-                    "SELECT run_id, tick, agent_uid, generation, age, position_x, position_y, velocity_x, velocity_y, heading, health, energy, herbivore_tendency, brain_binding
-                     FROM agents
-                     WHERE run_id = ?1
-                     ORDER BY tick ASC, agent_uid ASC
-                     LIMIT ?2 OFFSET ?3",
-                    &[sqlite_run_id(run_id), (limit as i64).into(), (offset as i64).into()],
-                )?;
-                if rows.is_empty() {
-                    break;
-                }
-                for r in &rows {
-                    let row = AgentExportRow {
-                        run_id: decode_column(r, 0, "agents.run_id")?,
-                        tick: checked_u64("agents.tick", decode_column(r, 1, "agents.tick")?)?,
-                        agent_uid: checked_u64(
-                            "agents.agent_uid",
-                            decode_column(r, 2, "agents.agent_uid")?,
-                        )?,
-                        generation: decode_column::<i64>(r, 3, "agents.generation")? as u32,
-                        age: decode_column::<i64>(r, 4, "agents.age")? as u32,
-                        pos_x: decode_column::<f64>(r, 5, "agents.position_x")? as f32,
-                        pos_y: decode_column::<f64>(r, 6, "agents.position_y")? as f32,
-                        vel_x: decode_column::<f64>(r, 7, "agents.velocity_x")? as f32,
-                        vel_y: decode_column::<f64>(r, 8, "agents.velocity_y")? as f32,
-                        heading: decode_column::<f64>(r, 9, "agents.heading")? as f32,
-                        health: decode_column::<f64>(r, 10, "agents.health")? as f32,
-                        energy: decode_column::<f64>(r, 11, "agents.energy")? as f32,
-                        herbivore_tendency: decode_column::<f64>(
-                            r,
-                            12,
-                            "agents.herbivore_tendency",
-                        )? as f32,
-                        brain_binding: decode_column(r, 13, "agents.brain_binding")?,
-                    };
-                    export_writer
-                        .write_agent_row(&row)
-                        .map_err(|e| StorageError::InvalidData {
-                            context: "export_storage_table.write_agent_row",
-                            reason: e.to_string(),
-                        })?;
-                }
-                offset += rows.len();
-                if rows.len() < limit {
-                    break;
-                }
-            }
-        }
-        ExportTable::Lineage => {
-            let rows = reader.load_lineage_export_rows()?;
-            for row in &rows {
-                export_writer
-                    .write_lineage_row(row)
-                    .map_err(|e| StorageError::InvalidData {
-                        context: "export_storage_table.write_lineage_row",
-                        reason: e.to_string(),
-                    })?;
-            }
-        }
-        ExportTable::Event => {
-            let limit = 1024;
-            let mut offset = 0;
-            loop {
-                let rows = reader.connection()?.query_with_params(
-                    "SELECT run_id, tick, seq, scope, event_type, payload
-                     FROM replay_events
-                     WHERE run_id = ?1
-                     ORDER BY tick ASC, seq ASC
-                     LIMIT ?2 OFFSET ?3",
-                    &[
-                        sqlite_run_id(run_id),
-                        (limit as i64).into(),
-                        (offset as i64).into(),
-                    ],
-                )?;
-                if rows.is_empty() {
-                    break;
-                }
-                for r in &rows {
-                    let seq: i64 = decode_column(r, 2, "replay_events.seq")?;
-                    let scope: String = decode_column(r, 3, "replay_events.scope")?;
-                    let event_type: String = decode_column(r, 4, "replay_events.event_type")?;
-                    let row = EventExportRow {
-                        run_id: decode_column(r, 0, "replay_events.run_id")?,
-                        tick: checked_u64(
-                            "replay_events.tick",
-                            decode_column(r, 1, "replay_events.tick")?,
-                        )?,
-                        seq: checked_u64("replay_events.seq", seq)?,
-                        event_id: format!("evt-{seq}"),
-                        kind: format!("{scope}:{event_type}"),
-                        payload: decode_column(r, 5, "replay_events.payload")?,
-                    };
-                    export_writer
-                        .write_event_row(&row)
-                        .map_err(|e| StorageError::InvalidData {
-                            context: "export_storage_table.write_event_row",
-                            reason: e.to_string(),
-                        })?;
-                }
-                offset += rows.len();
-                if rows.len() < limit {
-                    break;
-                }
-            }
-        }
-        ExportTable::Metric => {
-            let limit = 1024;
-            let mut offset = 0;
-            loop {
-                let rows = reader.connection()?.query_with_params(
-                    "SELECT run_id, tick, name, value
-                     FROM metrics
-                     WHERE run_id = ?1
-                     ORDER BY tick ASC, name ASC
-                     LIMIT ?2 OFFSET ?3",
-                    &[
-                        sqlite_run_id(run_id),
-                        (limit as i64).into(),
-                        (offset as i64).into(),
-                    ],
-                )?;
-                if rows.is_empty() {
-                    break;
-                }
-                for r in &rows {
-                    let row = MetricExportRow {
-                        run_id: decode_column(r, 0, "metrics.run_id")?,
-                        tick: checked_u64("metrics.tick", decode_column(r, 1, "metrics.tick")?)?,
-                        name: decode_column(r, 2, "metrics.name")?,
-                        value: decode_column::<f64>(r, 3, "metrics.value")?,
-                    };
-                    export_writer.write_metric_row(&row).map_err(|e| {
-                        StorageError::InvalidData {
-                            context: "export_storage_table.write_metric_row",
-                            reason: e.to_string(),
-                        }
-                    })?;
-                }
-                offset += rows.len();
-                if rows.len() < limit {
-                    break;
-                }
-            }
-        }
-    }
-
-    let receipt = export_writer
-        .finish(table)
-        .map_err(|e| StorageError::InvalidData {
-            context: "export_storage_table.finish",
-            reason: e.to_string(),
-        })?;
+    let completion = match completed_at_utc {
+        Some(timestamp) => export_writer.finish_at(table, timestamp.to_owned()),
+        None => export_writer.finish(table),
+    };
+    let receipt = completion.map_err(|e| StorageError::InvalidData {
+        context: "export_storage_table.finish",
+        reason: e.to_string(),
+    })?;
 
     Ok(receipt)
+}
+
+struct ExportReadback<R: Read> {
+    actual: BufReader<R>,
+    position: u64,
+}
+
+impl<R: Read> Write for ExportReadback<R> {
+    fn write(&mut self, expected: &[u8]) -> std::io::Result<usize> {
+        let mut actual = [0_u8; 8 * 1024];
+        for chunk in expected.chunks(actual.len()) {
+            self.actual.read_exact(&mut actual[..chunk.len()])?;
+            if actual[..chunk.len()] != *chunk {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("export differs from the source at byte {}", self.position),
+                ));
+            }
+            self.position = self
+                .position
+                .checked_add(u64::try_from(chunk.len()).map_err(std::io::Error::other)?)
+                .ok_or_else(|| std::io::Error::other("export read-back position overflow"))?;
+        }
+        Ok(expected.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Verify every encoded byte against a fresh traversal of the same finished run.
+///
+/// The original provenance and completion time are reused; elapsed export time
+/// cannot change the expected artifact. This checks headers, all rows, their
+/// receipt and final EOF with fixed byte buffers rather than retaining the file.
+pub fn verify_storage_table_export<R: Read>(
+    reader: &StorageReader,
+    prov: &ExportProvenance,
+    receipt: &ExportReceipt,
+    actual: R,
+) -> Result<(), StorageError> {
+    let mut expected_provenance = export_provenance(reader, receipt.table)?;
+    expected_provenance
+        .exported_at_utc
+        .clone_from(&prov.exported_at_utc);
+    if expected_provenance != *prov {
+        return Err(StorageError::InvalidData {
+            context: "export.provenance",
+            reason: "verification provenance does not match the selected run and table".to_owned(),
+        });
+    }
+    let mut readback = ExportReadback {
+        actual: BufReader::new(actual),
+        position: 0,
+    };
+    let observed = export_storage_table_captured(
+        reader,
+        receipt.table,
+        receipt.format,
+        &mut readback,
+        prov,
+        Some(&receipt.completed_at_utc),
+    )?;
+    if observed != *receipt {
+        return Err(StorageError::InvalidData {
+            context: "export.verify_receipt",
+            reason: "completion receipt does not match the complete source traversal".to_owned(),
+        });
+    }
+    let mut trailing = [0_u8; 1];
+    let trailing_count = readback.actual.read(&mut trailing).map_err(|error| {
+        StorageError::InvalidData {
+            context: "export.verify_eof",
+            reason: error.to_string(),
+        }
+    })?;
+    if trailing_count != 0 {
+        return Err(StorageError::InvalidData {
+            context: "export.verify_eof",
+            reason: "artifact contains bytes after its completion receipt".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 impl StorageReader {
@@ -2655,6 +2947,16 @@ mod tests {
             let verified = verify_export_receipt(&content, table).unwrap();
             assert_eq!(verified.row_count, 0);
             assert_eq!(verified.table, table);
+            let headers: Vec<_> = content.lines().nth(1).unwrap().split(',').collect();
+            let expected: Vec<_> = table
+                .arrow_schema()
+                .iter()
+                .map(|column| column.name)
+                .collect();
+            assert_eq!(
+                headers, expected,
+                "empty {table:?} must retain its canonical schema"
+            );
         }
     }
 
