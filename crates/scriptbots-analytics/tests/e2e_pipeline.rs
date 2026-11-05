@@ -380,7 +380,8 @@ fn populate_seeded_fixture(dir: &Path) -> (String, String) {
     storage.flush().expect("flush run db");
     storage.close().expect("close run db");
 
-    // Paired control for the independent synthetic metric series (compare-runs).
+    // A second synthetic trajectory for descriptive endpoint comparison; these ticks
+    // do not represent independent matched-seed replications.
     let ctrl_path = dir.join("control.sqlite").display().to_string();
     let mut ctrl_storage =
         Storage::create_unattributed_file(&ctrl_path).expect("create control db");
@@ -510,6 +511,20 @@ fn test_analytics_e2e_full_pipeline_and_invariants() {
         );
         if *name == "narrative-validate" {
             assert_eq!(output.schema_version, 2, "canonical evidence report schema");
+        }
+        if *name == "compare-runs" {
+            assert_eq!(output.schema_version, 2, "seed-level comparison schema");
+            assert_eq!(output.machine["mode"], "descriptive_pair");
+            assert_eq!(
+                output.machine["inference_status"],
+                "insufficient_independent_pairs"
+            );
+            assert_eq!(output.machine["significant"], 0);
+            for metric in output.machine["metrics"].as_array().expect("comparisons") {
+                assert!(metric["p_value"].is_null());
+                assert!(metric["ci_lower"].is_null());
+                assert!(metric["ci_upper"].is_null());
+            }
         }
         report_machines.insert(name.to_string(), output.machine);
     }
@@ -1134,6 +1149,20 @@ fn report_suite_on_a_real_seeded_simulation_matches_the_simulation_ground_truth(
         assert_eq!(cli_json["schema_version"], output.schema_version);
         if name == "narrative-validate" {
             assert_eq!(output.schema_version, 2, "canonical evidence report schema");
+        }
+        if name == "compare-runs" {
+            assert_eq!(output.schema_version, 2, "seed-level comparison schema");
+            assert_eq!(output.machine["mode"], "descriptive_pair");
+            assert_eq!(
+                output.machine["inference_status"],
+                "insufficient_independent_pairs"
+            );
+            assert_eq!(output.machine["significant"], 0);
+            for metric in output.machine["metrics"].as_array().expect("comparisons") {
+                assert!(metric["p_value"].is_null());
+                assert!(metric["ci_lower"].is_null());
+                assert!(metric["ci_upper"].is_null());
+            }
         }
         assert_eq!(cli_json["db_path"], run_db);
         assert_eq!(cli_json["latest_tick"], ticks);

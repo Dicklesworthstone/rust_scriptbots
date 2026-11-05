@@ -3084,7 +3084,10 @@ impl RunManifestRecord {
         Ok(self)
     }
 
-    fn manifest_digest(&self) -> Result<String, StorageError> {
+    /// Digest of the complete provenance record, using the durable `runs.manifest_digest`
+    /// encoding. A record returned by [`StorageReader::run_manifest`] has been validated and
+    /// normalized, so its digest identifies the same record as the persisted database value.
+    pub fn manifest_digest(&self) -> Result<String, StorageError> {
         let encoded = serde_json::to_vec(self).map_err(|error| StorageError::InvalidData {
             context: "runs.manifest_digest",
             reason: error.to_string(),
@@ -13798,6 +13801,60 @@ impl StorageReader {
             "completed bounded narrative tick-window scan"
         );
         Ok(hits)
+    }
+
+    /// Read the complete bounded metric set at one exact tick of an island-zero run.
+    ///
+    /// `limit` must be positive and within the storage query page ceiling. An endpoint with
+    /// more rows is refused rather than truncated; an absent tick returns an empty vector and
+    /// never substitutes a recent sample.
+    /// Values must be finite. This projection has no island dimension, so foreign-island
+    /// science or metric rows anywhere in the selected run are refused before reading values.
+    pub fn metrics_at_tick(
+        &self,
+        tick: u64,
+        limit: usize,
+    ) -> Result<Vec<PersistedMetric>, StorageError> {
+        let tick_sql = encode_u64("metrics_at_tick.tick", tick)?;
+        let limit_sql = checked_query_limit("metrics_at_tick.limit", limit)?;
+        if limit == 0 {
+            return Err(StorageError::InvalidData {
+                context: "metrics_at_tick.limit",
+                reason: "a complete endpoint read requires a positive row limit".to_owned(),
+            });
+        }
+        self.require_island_zero_science("metrics_at_tick.island_scope")?;
+        let rows = self.connection()?.query_with_params(
+            "SELECT name, value FROM metrics
+             WHERE run_id = ?1 AND tick = ?2
+             ORDER BY name ASC LIMIT ?3",
+            &[
+                sqlite_run_id(self.run_id),
+                tick_sql.into(),
+                (limit_sql + 1).into(),
+            ],
+        )?;
+        if rows.len() > limit {
+            return Err(StorageError::InvalidData {
+                context: "metrics_at_tick.limit",
+                reason: format!(
+                    "tick {tick} contains more than {limit} metrics; refusing an incomplete endpoint"
+                ),
+            });
+        }
+        rows.into_iter()
+            .map(|row| {
+                let name: String = decode(&row, 0, "metrics.name")?;
+                let value: f64 = decode(&row, 1, "metrics.value")?;
+                if !value.is_finite() {
+                    return Err(StorageError::InvalidData {
+                        context: "metrics.value",
+                        reason: format!("metric {name:?} at tick {tick} is not finite"),
+                    });
+                }
+                Ok(PersistedMetric { tick, name, value })
+            })
+            .collect()
     }
 
     /// Read up to `limit` recent metric rows for the selected run.
@@ -31624,6 +31681,54 @@ mod tests {
             !unrelated_lock.try_exists()?,
             "refused reader open created a writer-lease sidecar"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn exact_metric_endpoints_are_bounded_complete_and_island_scoped()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-exact-metric-endpoint");
+        let path_string = path.to_string_lossy().to_string();
+        let mut storage = create_file_storage(&path_string)?;
+        storage.persist(&sample_batch(1, 10.0))?;
+        storage.persist(&sample_batch(9, 30.0))?;
+        storage.flush()?;
+        storage.close()?;
+
+        let reader = StorageReader::open_finished(&path_string)?;
+        let first = reader.metrics_at_tick(1, 3)?;
+        assert_eq!(first.len(), 3);
+        assert!(first.iter().all(|metric| metric.tick == 1));
+        assert_eq!(first[0].name, "average_energy");
+        assert_eq!(first[0].value, 10.0);
+        assert_eq!(reader.metrics_at_tick(9, 3)?[0].value, 30.0);
+        assert!(reader.metrics_at_tick(8, 3)?.is_empty());
+        assert!(matches!(
+            reader.metrics_at_tick(1, 2),
+            Err(StorageError::InvalidData {
+                context: "metrics_at_tick.limit",
+                ..
+            })
+        ));
+        assert!(reader.metrics_at_tick(1, 0).is_err());
+        assert!(reader.metrics_at_tick(1, MAX_STORAGE_QUERY_PAGE + 1).is_err());
+        assert!(reader.metrics_at_tick(u64::MAX, 3).is_err());
+        reader.close()?;
+
+        // A foreign metric outside the selected endpoint must not disappear merely because
+        // the endpoint query itself could return an apparently clean island-zero sample.
+        let connection = Connection::open_existing(&path_string)?;
+        connection.execute("UPDATE metrics SET island_id = 7 WHERE tick = 1")?;
+        connection.close()?;
+        let reader = StorageReader::open_finished(&path_string)?;
+        assert!(matches!(
+            reader.metrics_at_tick(9, 3),
+            Err(StorageError::InvalidData {
+                context: "metrics_at_tick.island_scope",
+                ..
+            })
+        ));
+        reader.close()?;
         Ok(())
     }
 

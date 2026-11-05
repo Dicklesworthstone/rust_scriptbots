@@ -1105,6 +1105,72 @@ event capacity during a run are also refused; unrelated authenticated configurat
 revisions are supported. The report does not use saved narrative outputs to supply
 its reconstructed events.
 
+### Matched-seed endpoint comparisons
+
+Use `compare-runs` with a cohort manifest to compare independent simulation runs.
+Declare one endpoint tick and the complete family of metrics to test. Each run
+contributes exactly one observation per metric; longer trajectories and denser
+sampling do not increase the number of independent pairs.
+
+For example, save this as `runs/study.json`, with database paths relative to that
+file:
+
+```json
+{
+  "schema": "scriptbots.run-comparison-cohort.v1",
+  "endpoint_tick": 600,
+  "metrics": ["total_energy", "average_energy"],
+  "control": [
+    {"db": "control-seed-7.sqlite"},
+    {"db": "control-seed-8.sqlite"}
+  ],
+  "treatment": [
+    {"db": "treatment-seed-8.sqlite"},
+    {"db": "treatment-seed-7.sqlite"}
+  ]
+}
+```
+
+```bash
+sb-analyze runs/control-seed-7.sqlite run compare-runs --params cohort_file=runs/study.json --json comparison.json --md comparison.md
+```
+
+Pairing uses the root seeds in revalidated run manifests, regardless of array
+order or filename. Every source must have completed its declared finite tick
+budget and contain every requested metric at the exact endpoint. An explicitly
+chosen endpoint may precede the terminal tick; a missing observation is refused
+instead of replaced with a recent sample. Duplicate seeds, unmatched seed sets,
+reused run identities, unattributed seed evidence and foreign-island data are
+also refused. Within each arm, launch configuration other than `rng_seed`,
+population recipe, scheduled interventions, brain roster, build identity and
+execution policy must agree. The selected CLI database/run
+must be one of the declared controls. Add `"run_id": "<32 lowercase hex digits>"`
+to an entry when its database contains multiple runs; the already selected
+context database can contribute only its selected run.
+
+The manifest is limited to 1 MiB, 128 pairs and 64 metrics. With at least two
+matched pairs, the report bootstraps paired endpoint differences, uses paired
+sign-flip tests and applies Benjamini–Hochberg FDR across the declared metrics.
+The machine output includes the exact endpoint values, source run IDs, seed and
+manifest/configuration digests, build provenance and resampling parameters.
+
+For a descriptive comparison of just two runs, the existing form remains useful:
+
+```bash
+sb-analyze runs/control.sqlite run compare-runs --params treatment_db=runs/treatment.sqlite --params endpoint_tick=600 --json pair.json
+```
+
+`endpoint_tick` can be omitted when both runs share a terminal tick. This mode,
+and a cohort with only one matched pair, reports endpoint differences with
+`inference_status: "insufficient_independent_pairs"`, null confidence intervals,
+null p-values and no FDR discoveries. Unknown or mismatched seed provenance is
+explicit in `seed_pairing`. Differences use shared endpoint metrics; conditionally
+emitted metrics found in only one run are disclosed in `control_only_metrics` or
+`treatment_only_metrics` and retained in that source's values. `compare-runs` now
+uses report envelope schema **2**
+and machine schema `scriptbots.run-comparison.v2`; consumers of the old
+trajectory-based inference must migrate to the cohort contract.
+
 ### Pipeline and maintenance
 
 - A persistence transaction either commits the entire accepted batch or rolls it back; a failed statement may not leave the connection in an active transaction.

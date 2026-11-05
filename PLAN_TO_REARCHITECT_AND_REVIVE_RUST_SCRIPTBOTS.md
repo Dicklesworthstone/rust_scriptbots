@@ -3530,8 +3530,8 @@ It supports matched seeds, bounded parallelism, checkpoint/branch experiments, r
 
 ### 7.8 offline analysis integrations
 
-**[Currently In Progress — Codex, 2026-11-05]:** Complete bounded table export
-through Parquet/Arrow production and full-data readback. Storage now exposes
+**Source implementation update — Codex, 2026-11-05:** Table export now supports
+bounded Parquet/Arrow production and full-data readback. Storage exposes
 finished-run keyset pages for all five export tables, including the legacy birth
 parent fallback, and verifies CSV/JSONL against the complete source traversal,
 original provenance and receipt timestamps, and final EOF. Foreign-island rows in
@@ -3540,10 +3540,15 @@ consume the same pages, seal bounded row groups/record batches, and verify all
 decoded values, null masks, schema/provenance and stream exhaustion against a
 second source traversal, independent of batch boundaries. Multi-page and empty
 table regressions retain independent SQL oracles. These are row-buffer bounds,
-not SQL execution, variable-payload or footer-memory bounds. Also replace the
-offline comparison adapter's time-sample
-pseudoreplication with one predeclared observation per matched seed and retain
-descriptive single-pair output. Historical event review now merges complete
+not SQL execution, variable-payload or footer-memory bounds. The offline comparison
+adapter now takes one exact predeclared endpoint per independent matched seed,
+validates attributed manifests and completed finite budgets, and rejects missing
+metrics, duplicate/unmatched seeds and mixed conditions within an arm. Scheduled
+interventions participate in condition equality; descriptive scenario labels and
+JSON object insertion order do not. Single-pair output is explicitly descriptive,
+with null inferential statistics and disclosed unmatched metrics. Report schema 2
+retains source identities, authoritative manifest digests and endpoint observations.
+Historical event review now merges complete
 configuration and agent-command histories in their observed order, validates each
 command against its captured configuration revision, and checks the reconstructed
 current scientific digest before publishing a historical view. Regressions cover
