@@ -1649,7 +1649,7 @@ fn test_bd_2z0_5_6_e2e_real_db_export_roundtrip() {
     let shutdown = pipeline.shutdown().expect("durable pipeline shutdown");
     assert!(shutdown.committed_tick.is_some());
 
-    let storage = StorageReader::open(path_str).expect("open storage after shutdown");
+    let storage = StorageReader::open_finished(path_str).expect("lease storage after shutdown");
     let manifest = storage.run_manifest().expect("load run manifest");
 
     eprintln!(
@@ -1718,6 +1718,190 @@ fn test_bd_2z0_5_6_e2e_real_db_export_roundtrip() {
     eprintln!(
         "[bd-2z0.5.6] End-to-end real DB export verified in {:?}",
         start_time.elapsed()
+    );
+}
+
+fn create_export_page_fixture(label: &str) -> (String, usize) {
+    use scriptbots_core::MetricSample;
+    use scriptbots_storage::export_pipeline::EXPORT_PAGE_ROWS;
+
+    let path = temp_run_path(label).display().to_string();
+    let mut storage = Storage::create_unattributed_file(&path).expect("create export fixture");
+    let per_tick = EXPORT_PAGE_ROWS / 2 + 3;
+    for tick in [1, 2] {
+        // Hand-built persistence records exercise paging, not simulated physiology.
+        let events = (0..per_tick)
+            .map(|index| ReplayEvent {
+                agent_uid: None,
+                position: None,
+                counterpart: None,
+                counterpart_position: None,
+                kind: ReplayEventKind::BrainOutputs {
+                    outputs: vec![f32::from(u16::try_from(index).expect("bounded fixture"))],
+                },
+            })
+            .collect();
+        let mut batch = batch_with_replay_events(tick, events);
+        batch.summary.agent_count = 0;
+        batch.metrics = (0..per_tick)
+            .map(|index| {
+                scriptbots_core::MetricSample::new(
+                    format!("metric-{index:05}"),
+                    f64::from(u32::try_from(index).expect("bounded fixture")),
+                )
+            })
+            .collect::<Vec<MetricSample>>();
+        storage.persist(&batch).expect("persist page fixture");
+    }
+    storage.close().expect("durable fixture close");
+    (path, per_tick * 2)
+}
+
+#[test]
+fn export_keyset_pages_preserve_same_tick_rows_and_require_a_finished_source() {
+    use scriptbots_storage::export_pipeline::{
+        EXPORT_PAGE_ROWS, ExportTablePage, visit_export_pages,
+    };
+
+    let (path, expected_count) = create_export_page_fixture("export_keyset_pages");
+    let unleased = StorageReader::open(&path).expect("ordinary reader");
+    assert!(matches!(
+        visit_export_pages::<StorageError>(&unleased, ExportTable::Metric, |_| Ok(())),
+        Err(StorageError::InvalidData {
+            context: "export.finished_reader",
+            ..
+        })
+    ));
+    unleased.close().expect("close ordinary reader");
+
+    let reader = StorageReader::open_finished(&path).expect("finished source lease");
+    let expected_metrics = reader
+        .load_metric_export_rows()
+        .expect("independent metric query");
+    let expected_events = reader
+        .load_event_export_rows()
+        .expect("independent event query");
+    assert_eq!(expected_metrics.len(), expected_count);
+    assert_eq!(expected_events.len(), expected_count);
+    let mut metrics = Vec::new();
+    let mut events = Vec::new();
+    for table in [ExportTable::Metric, ExportTable::Event] {
+        let mut page_sizes = Vec::new();
+        visit_export_pages::<StorageError>(&reader, table, |page| {
+            page_sizes.push(page.len());
+            match page {
+                ExportTablePage::Metric(rows) => metrics.extend(rows),
+                ExportTablePage::Event(rows) => events.extend(rows),
+                _ => panic!("page changed its declared export table"),
+            }
+            Ok(())
+        })
+        .expect("complete keyset traversal");
+        assert_eq!(
+            page_sizes,
+            vec![EXPORT_PAGE_ROWS, expected_count - EXPORT_PAGE_ROWS]
+        );
+    }
+    assert_eq!(
+        metrics, expected_metrics,
+        "no row omitted, duplicated or reordered"
+    );
+    assert_eq!(events, expected_events, "event ordering and payloads preserved");
+
+    let mut calls = 0;
+    let error = visit_export_pages::<StorageError>(&reader, ExportTable::Metric, |_| {
+        calls += 1;
+        Err(StorageError::InvalidData {
+            context: "fixture.consumer_failure",
+            reason: "stop after the first page".to_owned(),
+        })
+    })
+    .expect_err("consumer failure must stop traversal");
+    assert_eq!(calls, 1);
+    assert!(matches!(
+        error,
+        StorageError::InvalidData {
+            context: "fixture.consumer_failure",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn text_export_readback_compares_source_values_receipt_and_final_eof() {
+    use scriptbots_storage::export_pipeline::{
+        CoreTableExportWriter, export_provenance, export_storage_table_with_provenance,
+        verify_storage_table_export,
+    };
+
+    let (path, _) = create_export_page_fixture("export_source_readback");
+    let reader = StorageReader::open_finished(&path).expect("finished source lease");
+    let mut prov = export_provenance(&reader, ExportTable::Metric).expect("source provenance");
+    prov.exported_at_utc = "2001-02-03T04:05:06Z".to_owned();
+    for format in [ExportFormat::Csv, ExportFormat::JsonLines] {
+        let mut bytes = Vec::new();
+        let mut receipt = export_storage_table_with_provenance(
+            &reader,
+            ExportTable::Metric,
+            format,
+            &mut bytes,
+            &prov,
+        )
+        .expect("complete export");
+        // Completion metadata is outside the row checksum. Rebind its timestamp
+        // to prove read-back never samples the wall clock again for either format.
+        let original_completion = receipt.completed_at_utc.clone();
+        receipt.completed_at_utc = "2002-03-04T05:06:07Z".to_owned();
+        bytes = String::from_utf8(bytes)
+            .expect("UTF-8 export")
+            .replace(&original_completion, &receipt.completed_at_utc)
+            .into_bytes();
+        verify_storage_table_export(&reader, &prov, &receipt, bytes.as_slice())
+            .expect("exact read-back, including original timestamps");
+        assert!(
+            verify_storage_table_export(&reader, &prov, &receipt, &bytes[..bytes.len() - 1])
+                .is_err(),
+            "truncated receipt must fail"
+        );
+        let mut trailing = bytes.clone();
+        trailing.push(b'x');
+        assert!(
+            verify_storage_table_export(&reader, &prov, &receipt, trailing.as_slice()).is_err(),
+            "bytes after the receipt must fail"
+        );
+
+        let mut rows = reader.load_metric_export_rows().expect("source rows");
+        rows[0].value += 1.0;
+        let mut forged = Vec::new();
+        let mut writer = CoreTableExportWriter::new_with_format(&mut forged, format);
+        writer.write_provenance(&prov).expect("forged header");
+        for row in &rows {
+            writer.write_metric_row(row).expect("forged row");
+        }
+        let forged_receipt = writer.finish(ExportTable::Metric).expect("coherent receipt");
+        verify_export_receipt(
+            std::str::from_utf8(&forged).expect("UTF-8 export"),
+            ExportTable::Metric,
+        )
+        .expect("the changed artifact is internally checksum-valid");
+        assert!(
+            verify_storage_table_export(&reader, &prov, &forged_receipt, forged.as_slice())
+                .is_err(),
+            "valid self-checksum cannot substitute for exact source values"
+        );
+    }
+    let mut foreign = prov.clone();
+    foreign.seed = foreign.seed.wrapping_add(1);
+    assert!(
+        export_storage_table_with_provenance(
+            &reader,
+            ExportTable::Metric,
+            ExportFormat::Csv,
+            Vec::new(),
+            &foreign,
+        )
+        .is_err(),
+        "a captured header must remain bound to the selected source"
     );
 }
 
@@ -1924,4 +2108,126 @@ fn test_map_elites_archive_persistence_roundtrip() {
     // Verify existing tables (e.g. tick_summaries) are intact
     let max_tick = reader.max_tick().expect("query max tick");
     assert_eq!(max_tick, Some(100));
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "One persisted source is checked before, during, and after each isolated island-scope fault"
+)]
+fn export_pages_refuse_isolated_foreign_agent_birth_and_event_rows() {
+    use scriptbots_core::{BirthOrigin, BirthRecord, PersistenceEvent, PersistenceEventKind};
+    use scriptbots_storage::export_pipeline::visit_export_pages;
+
+    let path = temp_run_path("export_isolated_foreign_science");
+    let path_str = path.to_str().expect("UTF-8 fixture path");
+    let mut world = WorldState::new(ScriptBotsConfig {
+        rng_seed: Some(42),
+        world_width: 40,
+        world_height: 40,
+        food_cell_size: 10,
+        persistence_interval: 0,
+        closed: true,
+        ..ScriptBotsConfig::default()
+    })
+    .expect("fixture world");
+    let id = world
+        .try_spawn_agent(AgentData::default())
+        .expect("seeded agent");
+    let agent = world.snapshot_agent(id).expect("actual seeded state");
+    // This is a storage-scope fixture, not a simulated event claim. Preserve the actual
+    // founder identity/state and persist one explicitly synthetic aggregate event.
+    let mut batch = batch_with_replay_events(0, Vec::new());
+    batch.closed = true;
+    batch.summary.agent_count = 1;
+    batch.summary.total_energy = agent.runtime.energy;
+    batch.summary.average_energy = agent.runtime.energy;
+    batch.summary.average_health = agent.data.health;
+    batch.summary.max_age = agent.data.age;
+    batch.births.push(BirthRecord {
+        tick: Tick(0),
+        agent_uid: agent.identity.uid,
+        spawn_ordinal: agent.identity.spawn_ordinal,
+        birth_ordinal: agent.identity.birth_ordinal,
+        origin: BirthOrigin::Seeded,
+        parent_a: agent.runtime.lineage[0],
+        parent_b: agent.runtime.lineage[1],
+        brain_kind: agent.runtime.brain.kind().map(str::to_owned),
+        brain_key: agent.runtime.brain.registry_key(),
+        herbivore_tendency: agent.runtime.herbivore_tendency,
+        generation: agent.data.generation,
+        position: agent.data.position,
+        is_hybrid: agent.runtime.hybrid,
+    });
+    batch.agents.push(agent);
+    batch.events.push(PersistenceEvent::new(
+        PersistenceEventKind::Custom(std::borrow::Cow::Borrowed("export_scope_fixture")),
+        1,
+    ));
+    let mut storage = Storage::create_unattributed_file(path_str).expect("fixture storage");
+    storage.persist(&batch).expect("persist valid island-zero rows");
+    storage.close().expect("durable fixture close");
+
+    let reader = StorageReader::open_finished(path_str).expect("finished positive source");
+    let mut observations = 0;
+    visit_export_pages::<StorageError>(&reader, ExportTable::Agent, |page| {
+        observations += page.len();
+        Ok(())
+    })
+    .expect("the valid source exports");
+    assert_eq!(observations, 1);
+    reader.close().expect("release source before fault injection");
+
+    for table in ["agents", "births", "events"] {
+        let connection = Connection::open_existing(path_str).expect("fault connection");
+        assert_eq!(
+            connection
+                .execute(&format!("UPDATE {table} SET island_id = 7"))
+                .expect("relabel the isolated table"),
+            1,
+            "{table} must contain an actual row"
+        );
+        connection.close().expect("commit isolated island fault");
+        let reader = StorageReader::open_finished(path_str).expect("lease the fault fixture");
+        for exported in ExportTable::ALL {
+            let mut calls = 0;
+            let error = visit_export_pages::<StorageError>(&reader, exported, |_| {
+                calls += 1;
+                Ok(())
+            })
+            .expect_err("a foreign row anywhere must refuse this island-free projection");
+            assert!(matches!(error, StorageError::InvalidData {
+                context: "export.island_scope",
+                ..
+            }));
+            assert_eq!(calls, 0, "{table}: refuse before a page reaches the consumer");
+            let mut bytes = Vec::new();
+            assert!(matches!(
+                export_storage_table(&reader, exported, ExportFormat::Csv, &mut bytes),
+                Err(StorageError::InvalidData {
+                    context: "export.island_scope",
+                    ..
+                })
+            ));
+            assert!(bytes.is_empty(), "{table}: refuse before the provenance header");
+        }
+        reader.close().expect("release refused source");
+        let connection = Connection::open_existing(path_str).expect("restore isolated fixture");
+        assert_eq!(
+            connection
+                .execute(&format!("UPDATE {table} SET island_id = 0"))
+                .expect("restore only the relabeled table"),
+            1
+        );
+        connection.close().expect("close restored fixture");
+    }
+    let reader = StorageReader::open_finished(path_str).expect("restored source");
+    let mut observations = 0;
+    visit_export_pages::<StorageError>(&reader, ExportTable::Agent, |page| {
+        observations += page.len();
+        Ok(())
+    })
+    .expect("restoring the scope restores export");
+    assert_eq!(observations, 1);
+    reader.close().expect("close restored source");
 }

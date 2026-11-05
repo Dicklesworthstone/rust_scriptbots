@@ -12400,6 +12400,13 @@ impl StorageReader {
              UNION SELECT island_id FROM tick_summaries WHERE run_id = ?1 AND island_id <> 0
              UNION SELECT island_id FROM islands WHERE run_id = ?1 AND island_id <> 0
              UNION SELECT island_id FROM lineage_edges WHERE run_id = ?1 AND island_id <> 0
+             UNION SELECT island_id FROM agents WHERE run_id = ?1 AND island_id <> 0
+             UNION SELECT island_id FROM metrics WHERE run_id = ?1 AND island_id <> 0
+             UNION SELECT island_id FROM births WHERE run_id = ?1 AND island_id <> 0
+             UNION SELECT island_id FROM deaths WHERE run_id = ?1 AND island_id <> 0
+             UNION SELECT island_id FROM events WHERE run_id = ?1 AND island_id <> 0
+             UNION SELECT island_id FROM run_events WHERE run_id = ?1 AND island_id <> 0
+             UNION SELECT island_id FROM genomes WHERE run_id = ?1 AND island_id <> 0
              LIMIT 1",
             &[sqlite_run_id(self.run_id)],
         )?;

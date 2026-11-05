@@ -3531,9 +3531,13 @@ It supports matched seeds, bounded parallelism, checkpoint/branch experiments, r
 ### 7.8 offline analysis integrations
 
 **[Currently In Progress — Codex, 2026-11-05]:** Complete bounded table export
-through Parquet/Arrow production and full-data readback, including CSV verification.
-The current columnar adapter materializes entire tables and CSV verification checks
-only headers. Also replace the offline comparison adapter's time-sample
+through Parquet/Arrow production and full-data readback. Storage now exposes
+finished-run keyset pages for all five export tables, including the legacy birth
+parent fallback, and verifies CSV/JSONL against the complete source traversal,
+original provenance and receipt timestamps, and final EOF. Foreign-island rows in
+any scientific table are refused before single-world export. The columnar adapter
+still needs to consume these pages instead of materializing entire tables. Also
+replace the offline comparison adapter's time-sample
 pseudoreplication with one predeclared observation per matched seed and retain
 descriptive single-pair output. Historical event review now merges complete
 configuration and agent-command histories in their observed order, validates each
