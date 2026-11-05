@@ -8008,6 +8008,40 @@ fn owner_inspector_pages(detail: &scriptbots_runtime::channel::AgentInspectorDat
         })
         .collect::<Vec<_>>();
     pages.push(format!("Eyes (radians)\n{}", eyes.join("\n")));
+    let physiology = &detail.physiology;
+    pages.push(format!(
+        "Physiology\nEnergy {:.3} | food change {:+.3}\n\
+         Diet tendency {:.3} | temperature preference {:.3}\n\
+         Sound {:.3} | sound scale {:.3}\n\
+         Food sharing intent {:.3}\n\
+         Selection {:?} | indicator {:.3}\n\
+         Indicator RGB {:.3}, {:.3}, {:.3}",
+        physiology.energy,
+        physiology.food_delta,
+        physiology.herbivore_tendency,
+        physiology.temperature_preference,
+        physiology.sound_output,
+        physiology.sound_multiplier,
+        physiology.give_intent,
+        physiology.selection,
+        physiology.indicator.intensity,
+        physiology.indicator.color[0],
+        physiology.indicator.color[1],
+        physiology.indicator.color[2],
+    ));
+    let combat = physiology.combat;
+    pages.push(format!(
+        "Combat this tick\nSpike damage received {}\nSpike attacker {} | victim {}\n\
+         Hit carnivore {} | herbivore {}\n\
+         Spiked by carnivore {} | herbivore {}",
+        physiology.spiked,
+        combat.spike_attacker,
+        combat.spike_victim,
+        combat.hit_carnivore,
+        combat.hit_herbivore,
+        combat.was_spiked_by_carnivore,
+        combat.was_spiked_by_herbivore,
+    ));
     pages.push(detail.genome_browser.as_ref().map_or_else(
         || "Genome summary: unavailable for this family".into(),
         |genome| {
@@ -8132,6 +8166,18 @@ mod owner_inspector_tests {
                         runtime.reproduction_counter = 0.375;
                         runtime.clocks = [1.25, 2.5];
                         runtime.food_balance_total = 6.25;
+                        runtime.energy = 0.73;
+                        runtime.food_delta = -0.12;
+                        runtime.herbivore_tendency = 0.83;
+                        runtime.temperature_preference = 0.61;
+                        runtime.sound_output = 0.37;
+                        runtime.sound_multiplier = 1.42;
+                        runtime.give_intent = 0.27;
+                        runtime.spiked = true;
+                        runtime.combat.spike_attacker = true;
+                        runtime.combat.was_spiked_by_herbivore = true;
+                        runtime.indicator.intensity = 0.64;
+                        runtime.indicator.color = [0.2, 0.4, 0.6];
                         runtime.mutation_log.push("owner mutation sample".into());
                         for (index, sensor) in runtime.sensors.iter_mut().enumerate() {
                             *sensor = (index + 1) as f32 / 100.0;
@@ -8333,6 +8379,20 @@ mod owner_inspector_tests {
         assert!(joined.contains("owner mutation sample"));
         assert!(joined.contains("Genome summary: unavailable"));
         assert!(joined.contains("Eyes (radians)"));
+        for expected in [
+            "Energy 0.730 | food change -0.120",
+            "Diet tendency 0.830 | temperature preference 0.610",
+            "Sound 0.370 | sound scale 1.420",
+            "Food sharing intent 0.270",
+            "Selection Selected | indicator 0.640",
+            "Indicator RGB 0.200, 0.400, 0.600",
+            "Spike damage received true",
+            "Spike attacker true | victim false",
+            "Hit carnivore false | herbivore false",
+            "Spiked by carnivore false | herbivore true",
+        ] {
+            assert!(joined.contains(expected), "missing {expected}: {joined}");
+        }
         assert!(
             pages
                 .iter()

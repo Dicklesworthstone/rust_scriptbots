@@ -4282,6 +4282,7 @@ impl HostCore {
             },
             uid,
             life: crate::channel::AgentLifeData::from(runtime),
+            physiology: crate::channel::AgentPhysiologyData::from(runtime),
             sensors: runtime.sensors,
             outputs: runtime.outputs,
             brain_bound: runtime.brain.is_bound(),
