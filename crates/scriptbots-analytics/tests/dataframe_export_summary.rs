@@ -348,10 +348,12 @@ fn read_columnar_pages(path: &Path, format: AnalyticsExportFormat) -> Vec<Record
                     "Parquet writer must not retain a whole-table row group"
                 );
             }
+            let schema = builder.schema().clone();
             builder
                 .with_batch_size(EXPORT_PAGE_ROWS)
                 .build()
                 .unwrap()
+                .map(|batch| batch.and_then(|batch| batch.with_schema(schema.clone())))
                 .collect::<Result<_, _>>()
                 .unwrap()
         }
