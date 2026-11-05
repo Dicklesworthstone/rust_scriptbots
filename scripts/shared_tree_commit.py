@@ -22,8 +22,12 @@ pre-commit plugin rejects commits that did not come through this protocol.
 
 For a conflict-free merge, review with ``--merge-parent COMMIT`` and name every
 path changed from HEAD by the merge. The frozen tree must exactly match Git's
-clean merge result. Conflicted merges and unrelated in-progress operations
-remain unsupported; ordinary reviews still create single-parent commits.
+clean merge result. For an already-integrated incoming parent whose textual
+conflicts should retain HEAD, explicitly add ``--merge-favor ours``; the frozen
+tree must then match Git's canonical merge with that choice, and review also
+prints the full incoming-parent-to-result diff. Unresolved merges and unrelated
+in-progress operations remain unsupported; ordinary reviews still create
+single-parent commits.
 """
 
 from __future__ import annotations
