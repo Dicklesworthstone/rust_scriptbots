@@ -3221,7 +3221,7 @@ pub struct AgentRuntime {
     pub combat: CombatEventFlags,
     /// Net food intake this tick.
     pub food_delta: f32,
-    /// Whether the spike is extended.
+    /// Whether this agent received spike damage during the current tick.
     pub spiked: bool,
     /// Whether the agent has two parents.
     pub hybrid: bool,
