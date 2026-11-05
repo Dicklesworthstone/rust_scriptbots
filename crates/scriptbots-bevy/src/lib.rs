@@ -3876,9 +3876,16 @@ fn setup_scene(
         Camera2d,
         Camera {
             order: 1,
-            // The HUD is composited after the world camera. Clearing here
-            // would replace the 3D scene with the default background color.
-            clear_color: ClearColorConfig::None,
+            // HDR world and SDR HUD use separate intermediate textures. Clear
+            // the HUD to transparent, then blend its premultiplied pixels over
+            // the world without clearing the shared output texture.
+            clear_color: ClearColorConfig::Custom(Color::NONE),
+            output_mode: bevy::camera::CameraOutputMode::Write {
+                blend_state: Some(
+                    bevy::render::render_resource::BlendState::PREMULTIPLIED_ALPHA_BLENDING,
+                ),
+                clear_color: ClearColorConfig::None,
+            },
             ..Default::default()
         },
         Transform::default(),
@@ -6096,8 +6103,20 @@ mod adaptive_governor_tests {
             "HUD must render after the world"
         );
         assert!(
-            matches!(hud_camera.clear_color, ClearColorConfig::None),
-            "HUD camera must not clear the already rendered world"
+            matches!(hud_camera.clear_color, ClearColorConfig::Custom(color) if color == Color::NONE),
+            "the HUD's independent intermediate texture must start transparent"
+        );
+        assert!(
+            matches!(
+                hud_camera.output_mode,
+                bevy::camera::CameraOutputMode::Write {
+                    blend_state: Some(
+                        bevy::render::render_resource::BlendState::PREMULTIPLIED_ALPHA_BLENDING
+                    ),
+                    clear_color: ClearColorConfig::None,
+                }
+            ),
+            "the HUD must composite without clearing or overwriting the world output"
         );
     }
 
