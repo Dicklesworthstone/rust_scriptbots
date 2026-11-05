@@ -20,6 +20,70 @@ host concurrency, enabled/disabled family admission, continuation/bundle recover
 and a multipage real-run narrative with event eviction. These additions do not
 close broader native, multi-seed, performance or long-horizon acceptance.
 
+**Displayed TUI header controls (2026-11-04):** [Qualified bounded repair —
+GentleDuck, 2026-11-05; original `bd-2z0.14.2.5` remains in progress]
+
+- [x] Identify the production consumer and the stale fixed-offset hitboxes.
+- [x] Reserve exact source/tracker paths and freeze a rendered-cell regression.
+- [x] Observe the original rendered PAUSED cell failing to resolve to PauseToggle.
+- [x] Reopen the original interaction bead with that observed regression.
+- [x] Derive mouse targets from the rendered spans, Unicode cell widths and rows.
+- [x] Clip targets to visible content; remove actions without displayed controls.
+- [x] Exercise actual mouse down/up on displayed controls at multiple widths,
+  paused/running states, baseline states and long counters/speed labels.
+- [x] Preserve modal/navigation clearing, keyboard parity and golden assertions;
+  review intentional changes to expected pixels separately.
+- [x] Extend the existing production PTY journey with actual header clicks and
+  independent owner-state reads; retain raw output and source identity.
+- [x] Trace the live Dashboard timeout to reduced-detail presentation clearing
+  all controls; retain visible header controls there while clearing hidden maps.
+- [x] Correct the incoming Bevy geometry test's undefined `id` to its actual `uid`.
+- [x] Retain a header press when a receipt masks another panel; retain cancellation
+  when the gesture's own map or palette target is hidden.
+- [x] Use the production step-and-admit API in the incoming narrative fixture,
+  consuming completed-step faults instead of discarding a must-use completion.
+- [x] Reproduce the incoming capability golden failure on its clean incumbent;
+  collect old/new raw cells and review the intentional canonical palette delta.
+- [x] Update only reviewed palette-dependent golden values, retaining exact
+  assertions and all negative controls (original `bd-2z0.14.2.6` reopened).
+- [x] Observe all four native header cases succeeding at 80/240 columns and
+  baseline off/on; retain independent owner receipts and displayed outcomes.
+- [x] Repair the observed normal-quit REST supervision race; retain unexpected
+  server-exit and real-error guards, and repeat the complete native journey.
+- [x] Pass workspace check, strict Clippy, formatting, targeted TUI tests and UBS
+  through source-bound DSR; retain failures without weakening existing gates.
+- [x] Review/commit source, repeat decisive clean-source checks, record original
+  Beads evidence, complete the honesty audit and publish both required tips.
+
+Consumer: a terminal user clicking the status they can see, including while the
+canvas is omitted under render pressure. Broad HUD redesign and the original
+cross-surface interaction acceptance remain separate open obligations.
+Protected evidence: `/data/tmp/scriptbots-header-s9ltf1wa/`.
+
+Source `b1825266e4e8d2d2d78440d91819947c350edce2` passes clean-source DSR
+`header_clean_b1825266/20261104T234924-923448` **13/13**, with the expected
+clean source identical before and after execution. All 339 TUI, four screenshot
+API, one actual CLI, five E2E and three supervision tests pass, as do workspace
+all-target check, strict Clippy, formatting and UBS (zero critical findings;
+warnings remain). Actual terminal clicks cover 80/240 columns and baseline
+off/on, with owner application receipts and displayed results; all three normal
+quit profiles exit zero and restore the terminal. The file-backed Shutdown
+journey retains its own durable receipt before restoration.
+
+The original `bd-2z0.14.2.6` buffer/golden acceptance is requalified and closed.
+Only 14 observed hashes changed for the incoming canonical terrain palette:
+all 34,560 old/new cells were reviewed, seven capability rows change map colors
+and five rows remain identical. Glyphs, layouts and assertions are preserved.
+The original broader interaction acceptance stays open on `bd-2z0.14.2.5`.
+This is fresh solo verification, not independent review, hardware qualification,
+native 16/256-color wire qualification or a measured performance win. The
+separate 27-test raster lane includes explicit llvmpipe software captures.
+
+Both required remote tips were observed at `690afbde9045534bfd45be47b3e30d56054b3f96`,
+which preserves the qualified source and an incoming documentation-only change.
+The final tracking snapshot records this completed bounded checklist; it does
+not declare the wider project or remaining original interaction scope complete.
+
 **Actual remote browser qualification (2026-11-04):** [Qualified software
 journey — GentleDuck contribution to original `bd-ac4l` and `bd-2z0.12.3`;
 original ownership, dependencies and complete acceptance remain open/unchanged]
