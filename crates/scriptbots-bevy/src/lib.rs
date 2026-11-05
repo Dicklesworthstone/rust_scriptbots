@@ -7690,6 +7690,20 @@ mod quality_tier_consumer_tests {
     }
 
     #[test]
+    fn default_fog_keeps_the_overview_readable() {
+        let fog = tier_distance_fog(true, None).expect("default atmosphere");
+        let FogFalloff::Exponential { density } = fog.falloff else {
+            panic!("expected exponential distance falloff");
+        };
+        let visibility = (-density * 2_000.0).exp();
+        assert!(
+            (0.90..=0.95).contains(&visibility),
+            "default fog should retain most terrain contrast at overview distance: {visibility}"
+        );
+        assert!(tier_distance_fog(false, None).is_none());
+    }
+
+    #[test]
     fn fog_overrides_reach_the_camera_and_preserve_the_software_tier_clamp() {
         use scriptbots_core::{RenderFogMode, RenderFogSettings};
         let mut app = App::new();
@@ -10125,7 +10139,8 @@ fn apply_tier_to_bloom(
 
 /// Shared native/capture default for the tier's distance haze. This is classic
 /// PBR distance fog, not volumetric or height fog. Density is in inverse world
-/// units: at 2,000 units the default mixes roughly 26% atmospheric color.
+/// units: at 2,000 units the default mixes roughly 8% atmospheric color,
+/// keeping the overview readable while retaining a little distance depth.
 fn tier_distance_fog(
     enabled: bool,
     settings: Option<&scriptbots_core::RenderFogSettings>,
@@ -10136,7 +10151,8 @@ fn tier_distance_fog(
     }
     let density = match settings.and_then(|settings| settings.mode) {
         Some(RenderFogMode::Off) => return None,
-        Some(RenderFogMode::Low) | None => 0.00015,
+        None => 0.00004,
+        Some(RenderFogMode::Low) => 0.00015,
         Some(RenderFogMode::Medium) => 0.0003,
         Some(RenderFogMode::High) => 0.0006,
     };
