@@ -2,6 +2,71 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Bevy logging ownership (2026-11-05):** [Qualified repair — GentleDuck;
+original `bd-2z0.14.1.21.8` closed]
+
+- [x] Trace the host's tracing initialization and Bevy's second global setup.
+- [x] Check pinned plugin behavior and reserve exact source/tracker paths.
+- [x] Observe the duplicate-initialization regression in isolated child processes.
+- [x] Give hosted and standalone renderer startup explicit logging ownership.
+- [x] Apply the same ownership policy to the persistent offscreen capture app;
+  application capture inherits logging and standalone driver/probes initialize it.
+- [x] Preserve standalone logging and the host formatter/filter/log bridge.
+- [x] Verify useful events and reject duplicate setup errors in both child modes.
+- [x] Run the actual Bevy host under the available software display and retain
+  source identity, startup logs, owner control/shutdown results and limitations.
+- [x] Reproduce the unrelated manifest-quality test defect on clean incumbent
+  source: effective Ultra contradicts the mandatory software Potato clamp.
+- [x] Observe actual requested quality at the capture renderer and retain it in
+  scene logs; test distinct Ultra/Low/Auto requests and adapter-effective tiers.
+- [x] Verify a disconnected manifest-quality consumer fails that same test;
+  keep broader capture qualification open on original `bd-2z0.14.3.10`.
+- [x] Fix the native probe's observed Xvfb display-pipe lifetime error, preserving
+  the original failed run and without changing retries or timeouts.
+- [x] Diagnose linker SIGBUS from the actual per-user tmpfs quota, retain old
+  limits, raise only the block limit to 29 GiB within a 2 GiB filesystem reserve,
+  and re-execute the same scene suite successfully without deleting files.
+- [x] Pass appropriate source-bound tests, feature-enabled compilation, strict
+  workspace check/Clippy, formatting and UBS through DSR.
+- [x] Read every hunk of the immutable source review and commit the eight owned
+  source paths as `ff2003c47e747a467dad501b45875dbc640fc7ae`.
+- [x] Repeat decisive clean-source verification against original acceptance.
+- [x] Record original Beads evidence and the full honesty audit/disposition.
+- [x] Review tracker/TODO metadata separately and publish qualified source to both
+  required tips; the final tracking snapshot follows the verified source.
+
+Consumer: host and standalone users who need useful startup/runtime diagnostics.
+This does not diagnose the separate black-world quality-tier or hardware issues.
+This bounded checklist is retired from active work; retain raw proof in the task's
+protected temporary evidence directory `/data/tmp/scriptbots-logging-60ectndw/`.
+
+Source `ff2003c47e747a467dad501b45875dbc640fc7ae` passes clean-source DSR
+`logging_clean_ff2003c4/20261105T010912-1481534` **16/16**, with exact clean
+source unchanged before and after execution. All 18 targeted tests pass: two
+logging/component tests, four host-client tests, eleven scene-capture tests and
+one scene-log report test. The two child logging modes are not double-counted.
+The actual native software-window probe opens Bevy, applies Pause at tick 3 and
+Step at tick 4, observes a real wgpu legacy-log event, and exits normally with no
+duplicate logger error or ERROR-level lines. Its manifest names the exact source.
+Workspace all-target check, strict workspace and Bevy-enabled Clippy, formatting,
+feature-enabled build and UBS pass; UBS reports zero critical findings, 2,946
+warnings and 1,082 informational findings across eight Rust files.
+
+The clean incumbent reproduces the defective Ultra assertion. Correct source
+observes three distinct requested tiers (Ultra/Low/Auto), all clamped to Potato
+on actual Software; a disconnected manifest-quality consumer fails Auto versus
+Ultra. Existing hardware expectations and software policy are preserved. The
+broader capture task `bd-2z0.14.3.10` remains open and unassigned for its remaining
+hardware/visual acceptance, including the unresolved `trj` host address.
+
+The audit retains the initial prematurely reported capture pass and its explicit
+retraction, incorrect new stdout oracle, missed literals, formatter failure,
+Xvfb probe lifetime error, quota-caused linker crashes, and subsequent exact-source
+proof. This is fresh solo verification, not independent review, hardware pixel
+qualification or a measured performance win. No additional files were deleted.
+Both required remote tips were observed at `ff2003c4` before this separate final
+tracking snapshot, which leaves the qualified source unchanged.
+
 **Concurrent controls, experiment families and offline reconstruction (2026-11-04):**
 [Source implemented — Codex; `bd-2z0.12.2`, `bd-2z0.5.11`, `bd-2z0.3.12.6`,
 `bd-16g.2.9`; original ownership and full acceptance remain open]
