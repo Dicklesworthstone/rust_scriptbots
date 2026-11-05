@@ -924,6 +924,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
             (
                 handle_quality_tier_button,
                 drive_adaptive_quality,
+                update_quality_tier_label,
                 apply_tier_to_sun_light,
                 apply_tier_to_bloom,
                 apply_tier_to_fog,
@@ -2897,6 +2898,9 @@ struct SoftwareRendererWatermark;
 struct QualityTierButton;
 
 #[derive(Component)]
+struct QualityTierLabel;
+
+#[derive(Component)]
 struct FollowButton {
     mode: FollowMode,
 }
@@ -4538,9 +4542,10 @@ fn setup_scene(
                 ))
                 .with_children(|btn| {
                     btn.spawn((
-                        Text::new("Quality"),
+                        Text::new(quality_tier_label(&effective)),
                         secondary_font.clone(),
                         TextColor(secondary_text_color),
+                        QualityTierLabel,
                     ));
                 });
 
@@ -6820,6 +6825,118 @@ mod adaptive_governor_tests {
 #[cfg(test)]
 mod quality_tier_consumer_tests {
     use super::*;
+
+    #[test]
+    fn adaptive_quality_updates_the_visible_label_and_preserves_software_ceiling() {
+        for (class, requested, initial) in [
+            (GpuClass::Discrete, RenderQuality::Auto, RenderQuality::High),
+            (
+                GpuClass::Software,
+                RenderQuality::Auto,
+                RenderQuality::Potato,
+            ),
+        ] {
+            let mut effective = resolve_effective_render_settings_for_gpu(
+                &RenderSettings {
+                    quality: Some(requested),
+                    ..default()
+                },
+                Some(gpu_info("test adapter", class)),
+            );
+            // Give the discrete test a known starting ceiling independent of
+            // the synthetic adapter's memory or capability defaults.
+            effective.tier = initial;
+            effective.features = tier_features(initial);
+            let mut app = App::new();
+            app.insert_resource(Time::<()>::default())
+                .insert_resource(AdaptiveQualityGovernor::for_launch(&effective))
+                .insert_resource(effective)
+                .add_systems(
+                    Update,
+                    (drive_adaptive_quality, update_quality_tier_label).chain(),
+                );
+            let text = app
+                .world_mut()
+                .spawn((QualityTierLabel, Text::default()))
+                .id();
+            for _ in 0..(120 * (RenderGovernor::BLOWOUT_WINDOWS_REQUIRED as usize + 1)) {
+                app.world_mut()
+                    .resource_mut::<Time>()
+                    .advance_by(std::time::Duration::from_millis(40));
+                app.update();
+            }
+            let settings = app.world().resource::<EffectiveRenderSettings>();
+            if class == GpuClass::Software {
+                assert_eq!(settings.tier, RenderQuality::Potato);
+                assert_eq!(
+                    app.world().get::<Text>(text).unwrap().0,
+                    "Quality: Potato CPU"
+                );
+                for _ in 0..(120 * (RenderGovernor::HEADROOM_WINDOWS_REQUIRED as usize + 2)) {
+                    app.world_mut()
+                        .resource_mut::<Time>()
+                        .advance_by(std::time::Duration::from_millis(1));
+                    app.update();
+                }
+                assert_eq!(
+                    app.world().resource::<EffectiveRenderSettings>().tier,
+                    RenderQuality::Potato
+                );
+                assert_eq!(
+                    app.world().get::<Text>(text).unwrap().0,
+                    "Quality: Potato CPU"
+                );
+            } else {
+                assert_ne!(settings.tier, RenderQuality::High);
+                assert_eq!(
+                    app.world().get::<Text>(text).unwrap().0,
+                    quality_tier_label(settings)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn manual_quality_control_reports_the_tier_and_respects_software_limit() {
+        for (class, expected, label) in [
+            (GpuClass::Discrete, RenderQuality::Low, "Quality: Low"),
+            (
+                GpuClass::Software,
+                RenderQuality::Potato,
+                "Quality: Potato CPU",
+            ),
+        ] {
+            let effective = resolve_effective_render_settings_for_gpu(
+                &RenderSettings {
+                    quality: Some(RenderQuality::Potato),
+                    ..default()
+                },
+                Some(gpu_info("test adapter", class)),
+            );
+            let mut app = App::new();
+            app.insert_resource(AdaptiveQualityGovernor::for_launch(&effective))
+                .insert_resource(effective)
+                .add_systems(
+                    Update,
+                    (handle_quality_tier_button, update_quality_tier_label).chain(),
+                );
+            let button = app
+                .world_mut()
+                .spawn((QualityTierButton, Interaction::None))
+                .id();
+            let text = app
+                .world_mut()
+                .spawn((QualityTierLabel, Text::default()))
+                .id();
+            app.update();
+            *app.world_mut().get_mut::<Interaction>(button).unwrap() = Interaction::Pressed;
+            app.update();
+            let settings = app.world().resource::<EffectiveRenderSettings>();
+            assert_eq!(settings.tier, expected);
+            assert_eq!(settings.features.shadows, tier_features(expected).shadows);
+            assert_eq!(app.world().get::<Text>(text).unwrap().0, label);
+        }
+    }
 
     #[test]
     fn ssao_rejects_each_missing_device_requirement() {
@@ -9966,6 +10083,13 @@ fn handle_quality_tier_button(
 ) {
     for interaction in &mut query {
         if *interaction == Interaction::Pressed {
+            if effective
+                .gpu
+                .as_ref()
+                .is_some_and(|gpu| gpu.class == GpuClass::Software)
+            {
+                continue;
+            }
             // Taking the tier by hand is an explicit choice, so the governor
             // stands down permanently. Without this the next completed window
             // would silently overwrite what the operator just picked.
@@ -9981,6 +10105,33 @@ fn handle_quality_tier_button(
                 tier_bloom = effective.features.bloom,
                 "Bevy quality tier changed at runtime"
             );
+        }
+    }
+}
+
+fn quality_tier_label(effective: &EffectiveRenderSettings) -> String {
+    if effective
+        .gpu
+        .as_ref()
+        .is_some_and(|gpu| gpu.class == GpuClass::Software)
+    {
+        format!("Quality: {:?} CPU", effective.tier)
+    } else {
+        format!("Quality: {:?}", effective.tier)
+    }
+}
+
+fn update_quality_tier_label(
+    effective: Res<EffectiveRenderSettings>,
+    mut labels: Query<&mut Text, With<QualityTierLabel>>,
+) {
+    if !effective.is_changed() {
+        return;
+    }
+    let label = quality_tier_label(&effective);
+    for mut text in &mut labels {
+        if text.0 != label {
+            text.0.clone_from(&label);
         }
     }
 }
