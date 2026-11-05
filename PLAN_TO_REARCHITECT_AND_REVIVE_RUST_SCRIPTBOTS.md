@@ -2,6 +2,77 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Bevy owner inspector (2026-11-05):** [Qualified bounded contribution — GentleDuck;
+original `bd-2z0.14.1.18.3` closed, acceptance unchanged; fresh solo verification]
+
+- [x] Inspect current Beads priorities and incoming source; import authoritative
+  graph after fast-forward and reserve the original task's exact edit surface.
+- [x] Trace the existing bounded owner inspection API and the missing HUD consumer.
+- [x] Retain exact source identity in Bevy's projected frame.
+- [x] Read owner detail off the render thread with one outstanding bounded request
+  and a refresh cap; issue no request without a living stable selection.
+- [x] Validate response session, epoch, stable UID and revision domains; reject
+  changed/dead/reused selection and expose refusal, failure and freshness.
+- [x] Present life/lineage, sensors, outputs, mutation, eyes and genome summary in
+  bounded pages with pointer and keyboard access, preserving existing actions.
+- [x] Exercise real owner responses, nonblocking behavior, changed identity,
+  failure, no-selection and every declared input/output channel.
+- [x] Coalesce failed reads of a stationary source and expose explicit retry;
+  keep completed future-source samples hidden until the frame catches up.
+- [x] Prove a disconnected detail consumer fails the positive regression.
+- [x] Requalify with private content-checked Cargo artifacts after observing
+  a shared mtime cache reuse the disconnected mutant for intact source.
+- [x] Run required workspace checks, strict Clippy, formatting and Bevy tests
+  through source-bound DSR without weakening existing gates or goldens.
+- [x] Build and drive the actual optimized native GUI; retain screenshots and
+  adapter identity, and leave any unmet native acceptance on the original Bead.
+- [x] Observe selected owner detail while science ticks advance, re-pause and
+  clear selection; inspect real presented frames without a hardware/perf claim.
+- [x] Drive the debug native window through real owner pages, step, selection
+  change and clear; inspect actual presented frames (software-renderer smoke).
+- [x] Review and commit exact source as `0b900cf2`, preserving Jeff's incoming
+  `131d6d0b` HUD composition fix; qualify that source in a clean checkout.
+- [x] Re-verify committed source in a clean checkout in a fresh solo pass.
+- [x] Update original Beads/TODO evidence and final audit dispositions.
+- [x] Publish qualified source to both required tips and prepare this separate
+  tracker snapshot without changing qualified runtime source.
+
+Source `0b900cf27ae14b528ea67f15ec254748c0048e53` passes clean-source DSR
+`owner_inspector_clean_0b900cf2/20261105T050520-3051471` **9/9**, including
+**282 Bevy tests, zero failed/ignored**, workspace all-target check, strict
+workspace and Bevy-enabled application Clippy, and formatting. The seven new
+inspector tests are included in 282. A source-matched disconnected-consumer
+mutation fails the positive HUD assertion; restoring the consumer recompiles
+and passes. UBS reports zero critical findings and 1,543 warnings, not a clean
+warning scan. Clippy's nested Cargo drops the outer checksum flag; its fresh
+private-cache compile is bound to the clean source path, while actual test/build
+dep-info checksums are separately verified. All failed/invalid runs remain in
+the audit; no existing gate, golden, dependency or default science was changed.
+
+Optimized native DSR
+`owner_inspector_release_0b900cf2/20261105T053916-3353333` passes **6/6** with
+binary SHA-256 `4258672db43a95eddb4b3970a95dfe0204baa57739652b62a8c39225393cffc6`.
+Actual Linux/X11 images show life/lineage, sensors, outputs, eyes and genome
+summary, a changed UID and cleared selection. Paused paging leaves tick 0
+unchanged; explicit Step reaches 1. Running-state DSR
+`owner_inspector_live_0b900cf2/20261105T062358-3701136` passes **3/3**, advancing
+the actual owner from tick 1 to 148 before re-pausing and clearing. All eight
+running frames were read: one pending, then seven real samples with displayed
+tick/source/age differences agreeing, including `115 - 102 = 13` ticks.
+Each native process exits normally. These are software-renderer GUI observations
+with an explicit llvmpipe watermark; broader hardware, pixel-quality, Mac and
+performance qualification remains open. No independent verifier was available.
+
+Both remote tips were read back at `9d6d7b68`, containing qualified source
+`0b900cf2` plus a preserved human metadata-only merge. This tracker snapshot
+leaves that runtime source unchanged. Final tracker publication, clean tracked
+files and released-reservation readback are checked after committing this
+snapshot and reported in the session result.
+
+Consumer: a native user inspecting a selected creature's actual internal state.
+This bounded TODO retires at publication. Raw evidence and the skill's audit:
+`/data/tmp/scriptbots-owner-inspector-2cDX6HHA/`.
+
 **Browser continuation files (2026-11-05):** [Qualified bounded contribution —
 GentleDuck; original `bd-ywtv` remains in progress for IndexedDB/SQLite durability]
 
