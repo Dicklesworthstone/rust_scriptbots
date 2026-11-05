@@ -2563,7 +2563,9 @@ fn follow_active_color() -> Color {
     Color::srgba(0.24, 0.48, 0.36, 0.98)
 }
 pub(crate) const TERRAIN_CHUNK_SIZE: u32 = 64;
-pub(crate) const TERRAIN_HEIGHT_SCALE: f32 = 180.0;
+// Vertical display scale for the normalized simulation heightfield. Keep the
+// underlying elevations unchanged while avoiding needle-like terrain relief.
+pub(crate) const TERRAIN_HEIGHT_SCALE: f32 = 60.0;
 // Bevy's 150-unit default ends before even the closest 300-unit camera view.
 // Keep a stable range around the close creature view so shadows do not pop
 // as the camera eases, without spending the shadow map on the entire world.
@@ -12217,7 +12219,10 @@ mod terrain_tests {
                 app.update();
                 let after = app.world().get::<Transform>(camera).unwrap();
                 if slope {
-                    assert!(app.world().resource::<CameraRig>().free_height_bias.abs() > 0.1);
+                    assert!(
+                        app.world().resource::<CameraRig>().free_height_bias.abs()
+                            > 0.1 * (TERRAIN_HEIGHT_SCALE / 180.0)
+                    );
                 }
                 if edge {
                     let anchor = app
@@ -13257,7 +13262,12 @@ mod terrain_tests {
         terrain.elevation = (0..4)
             .flat_map(|z| (0..4).map(move |x| 0.2 + x as f32 * 0.05 + z as f32 * 0.1))
             .collect();
-        let expected_up = Vec3::new(-0.09, 1.0, 0.18).normalize();
+        let expected_up = Vec3::new(
+            -0.05 * TERRAIN_HEIGHT_SCALE / 100.0,
+            1.0,
+            0.1 * TERRAIN_HEIGHT_SCALE / 100.0,
+        )
+        .normalize();
         let mut agent = sample_agent_visual();
         agent.position = Vec2::splat(150.0);
         agent.spike_length = 0.0;
@@ -16528,12 +16538,12 @@ mod tests {
             spike: None,
         };
         let start = AgentPoseTarget {
-            translation: Vec3::new(-100.0, 81.1, 0.0),
+            translation: Vec3::new(-100.0, 0.45 * TERRAIN_HEIGHT_SCALE + 0.1, 0.0),
             rotation: Quat::IDENTITY,
             tick: 1,
         };
         let target = AgentPoseTarget {
-            translation: Vec3::new(0.0, 81.1, 0.0),
+            translation: Vec3::new(0.0, 0.45 * TERRAIN_HEIGHT_SCALE + 0.1, 0.0),
             tick: 2,
             ..start
         };
@@ -16569,7 +16579,7 @@ mod tests {
             "halfway over ridge"
         );
         assert!(
-            transform.translation.y > 140.0,
+            transform.translation.y > 0.8 * TERRAIN_HEIGHT_SCALE,
             "interpolation must follow the ridge instead of cutting through it"
         );
     }
