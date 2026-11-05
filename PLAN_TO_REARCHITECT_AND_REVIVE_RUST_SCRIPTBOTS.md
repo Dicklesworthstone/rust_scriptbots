@@ -3530,6 +3530,20 @@ It supports matched seeds, bounded parallelism, checkpoint/branch experiments, r
 
 ### 7.8 offline analysis integrations
 
+**[Currently In Progress — Codex, 2026-11-05]:** Complete bounded table export
+through Parquet/Arrow production and full-data readback, including CSV verification.
+The current columnar adapter materializes entire tables and CSV verification checks
+only headers. Also replace the offline comparison adapter's time-sample
+pseudoreplication with one predeclared observation per matched seed and retain
+descriptive single-pair output. Historical event review now merges complete
+configuration and agent-command histories in their observed order, validates each
+command against its captured configuration revision, and checks the reconstructed
+current scientific digest before publishing a historical view. Regressions cover
+multiple interleaved same-tick edits, nonzero checkpoint revisions and incomplete
+or contradictory histories. These are source contributions; original acceptance
+and native DSR qualification remain open. Dependency pins, statistical thresholds
+and scientific baselines are unchanged.
+
 Sibling scientific projects are optional analysis adapters, not hot-loop dependencies:
 
 - `frankenscipy`: bootstrap confidence intervals, permutation tests, nonparametric comparisons, ACF/FFT, phenotype clustering; gated because its stats dependency graph is large and some periodogram/Welch behavior is known incomplete;
