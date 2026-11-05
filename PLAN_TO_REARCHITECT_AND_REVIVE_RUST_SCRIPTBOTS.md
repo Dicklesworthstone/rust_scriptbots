@@ -2,6 +2,50 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Large-run export and scientific evidence (2026-11-05):** [Currently In Progress —
+Codex; source contributions landed, original acceptance remains open]
+
+The session traced the current plan and authoritative Beads before editing.
+Bundle assembly and ordinary verification now stream database/artifact hashes
+through the existing 64 KiB reader instead of retaining entire files in memory.
+Existing leases, logical database projection checks and bounded-verifier refusals
+remain in force; JSON/SQL projection memory is outside this narrower change.
+The added regression covers empty and multiple-chunk artifacts, corrupt trailing
+bytes, and incorrect declared lengths through both public verifiers.
+
+Exact-GPU manifest admission now requires the complete shared evidence envelope,
+canonical digest shapes, the full matching target/compiler identity, at least
+1,000 parity ticks and an exactly zero finite sensor delta. The portable DTO
+lives in core and remains re-exported from gfx; storage gains no GPU dependency.
+Producer compiler whitespace matches the manifest's existing normalization.
+This checks available evidence bindings, not independent hardware certification
+or recomputation of the full report digest. Single-world narrative input reads
+also refuse foreign-island rows before returning a partial page. Regressions
+cover malformed evidence, file recovery, approximate-policy preservation and
+foreign-island streams.
+
+Narrative statistical certification now traverses the complete canonical detector
+input stream in 256-record pages and retains a bounded before/after tick window.
+It certifies exact consecutive simulation ticks independently of sparse dashboard
+persistence, with typed refusal for missing/corrupt evidence and explicit skips
+for incomplete windows or unsupported metrics/islands. Statistical thresholds
+and FDR calculations remain unchanged. Added regressions include multi-page
+history, gaps outside the selected window, truncated evidence and a production
+world extinction between default persistence boundaries. The end-to-end fixture's
+planted energy shift and combat null now derive from its actual agents/replay.
+
+Migration note: only narrative-validate moves to schema v2. Its payload adds the
+canonical input binding, input count and page count; truncated now means older
+events were excluded by the selection limit, never that detector input coverage
+was shortened. Metric-only historical runs with selected events are refused
+rather than certified from noncanonical samples; unrelated report schemas stay
+unchanged.
+
+Independent source reviews are complete; Cargo, formatting, Clippy, UBS and DSR
+execution are unavailable in this session and are not claimed. The new regressions
+are authored, not executed. No original Bead acceptance or scientific baseline
+is changed.
+
 **Bevy owner inspector (2026-11-05):** [Qualified bounded contribution — GentleDuck;
 original `bd-2z0.14.1.18.3` closed, acceptance unchanged; fresh solo verification]
 
