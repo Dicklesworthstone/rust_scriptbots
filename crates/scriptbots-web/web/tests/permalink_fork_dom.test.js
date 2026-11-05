@@ -193,7 +193,10 @@ async function runTests() {
   const port = server.address().port;
   const baseUrl = `http://127.0.0.1:${port}`;
 
-  const browser = await chromium.launch({ headless: true });
+  const browser = await chromium.launch({
+    headless: true,
+    executablePath: process.env.SCRIPTBOTS_CHROMIUM_EXECUTABLE || undefined,
+  });
 
   try {
     // =========================================================================

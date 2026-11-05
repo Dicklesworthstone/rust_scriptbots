@@ -55,15 +55,28 @@ The crate exposes the following wasm-bindgen surface:
   the host's bounded automatic catch-up policy; invalid/backwards time or a
   nanosecond receipt beyond JavaScript's safe-integer range refuses before work.
   This is a scheduling entry point, never a render callback.
-- `SimHandle::setSpeed(multiplier: number) -> JsValue` — applies a canonical host
-  command in the range `0..=32` and returns its two-axis command status. Zero
-  pauses automatic science. Explicit `tick(steps)` still completes exactly the
+- `SimHandle::setSpeed(multiplier: number) -> JsValue` — atomically sets speed
+  and pause state through one canonical host command in `0..=32`, returning its
+  two-axis status. Zero pauses; positive values resume a paused owner.
+  Explicit `tick(steps)` still completes exactly the
   requested manual steps without advancing the elapsed clock or changing speed.
 - `SimHandle::snapshot() -> JsValue` — builds a snapshot without ticking (uses the same format toggle).
 - `SimHandle::reset(seed?: number)` — rebuilds the world. An explicit seed
   overrides the nested config for that reset; omitting it falls back to the
   original `config.rng_seed` (or entropy when the nested seed is also absent).
 - `SimHandle::registerBrain(kind: string)` — installs a brain preset for all agents (`"wander"`, `"mlp"`, or `"none"`).
+- `SimHandle::checkpoint() -> Uint8Array` — settles the current volatile journal
+  boundary and exports the existing full owner checkpoint: science, evaluators,
+  command history and cadence credit. It does not advance elapsed time. Legacy
+  wander evaluators are refused; MLP and unbound worlds are supported.
+- `restore_checkpoint(bytes: Uint8Array) -> SimHandle` — validates and restores a
+  new owner, with a new command namespace and rebased elapsed clock. Failed
+  imports preserve existing handles. Future science matches the saved state;
+  offline wall time adds no ticks. Reset starts a new world using the loaded
+  configuration, checkpoint population and supported brain preset.
+- `checkpoint_byte_limit() -> number` — the canonical owner codec's file bound,
+  also checked before the demo reads a selected file.
+- `SimHandle::brainPreset() -> string` — the new-world brain preset for this handle.
 - `decode_snapshot_binary(bytes: &[u8]) -> JsValue` — helper exposed for JS callers to convert binary snapshots back into structured data.
 
 Snapshots are deterministic and use camelCase field names at the JavaScript boundary. They include:
@@ -81,3 +94,13 @@ Browser timers and rendering still share the main JS thread, so suspended or bus
 pages have no hard real-time guarantee. The receipt exposes skipped opportunities.
 Full packaged-browser/DSR acceptance remains with `bd-2z0.12.3` and `bd-azi3`;
 native unit tests alone do not establish browser scheduling or durability.
+
+The demo's **Brain for new worlds** selector takes effect on Reset. Wander remains
+the default. Select MLP or Unbound to use **Save Continuation File**; **Load
+Continuation File** validates a saved owner before replacing the current world,
+then pauses it. Local continuation controls are disabled while displaying a remote
+server. A delayed file read cannot replace a newer reset or remote session.
+
+These are downloadable owner continuation files. The demo does not automatically
+persist to IndexedDB, write a SQLite-image checkpoint, or promote volatile journal
+receipts to `Durable`. Those original `bd-ywtv` requirements remain open.

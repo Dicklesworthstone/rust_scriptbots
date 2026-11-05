@@ -302,6 +302,16 @@
                     <input id="population" type="range" min="32" max="1024" step="32" value="256" />
                 </label>
                 <button id="reset-btn" type="button">Reset Simulation</button>
+                <label for="brain-preset">Brain for new worlds</label>
+                <select id="brain-preset">
+                    <option value="wander" selected>Wander</option>
+                    <option value="mlp">MLP (supports continuation files)</option>
+                    <option value="none">Unbound (supports continuation files)</option>
+                </select>
+                <button id="checkpoint-save" type="button" disabled>Save Continuation File</button>
+                <label for="checkpoint-load">Load Continuation File (pauses the loaded world)</label>
+                <input id="checkpoint-load" type="file" accept=".sbcheckpoint,application/octet-stream" disabled />
+                <div id="checkpoint-status" role="status" aria-live="polite"></div>
             </div>
             <div class="controls" aria-label="Remote simulation">
                 <div class="chip">Remote Server</div>

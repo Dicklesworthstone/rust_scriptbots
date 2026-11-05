@@ -199,6 +199,130 @@ async function installPausedClock(context) {
   await context.clock.pauseAt(epoch + 1_000);
 }
 
+async function runCheckpointJourney(browser, baseUrl, moduleFile) {
+  const proof = fs.mkdtempSync(path.join(process.env.SCRIPTBOTS_WASM_PROOF_DIR || "/tmp", "continuation-"));
+  const context = await browser.newContext({ acceptDownloads: true });
+  const page = await context.newPage();
+  const errors = [];
+  const logs = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  page.on("console", (message) => logs.push({ type: message.type(), text: message.text() }));
+  let downloads = 0;
+  page.on("download", () => { downloads += 1; });
+  try {
+    await page.goto(`${baseUrl}/`);
+    await page.waitForFunction(() => document.getElementById("version").textContent !== "initializing…");
+    await page.evaluate(async (file) => {
+      const wasm = await import(`/pkg/${file}`);
+      const frame = wasm.SimHandle.prototype.frame;
+      wasm.SimHandle.prototype.frame = function () {
+        window.__continuationOwner = this;
+        return frame.call(this);
+      };
+      const speed = document.getElementById("steps-per-frame");
+      speed.value = "0";
+      speed.dispatchEvent(new Event("input", { bubbles: true }));
+    }, moduleFile);
+    await page.waitForFunction(() => !!window.__continuationOwner);
+    const snapshot = () => page.evaluate(() => JSON.stringify(window.__continuationOwner.snapshot()));
+    const legacy = await snapshot();
+    await page.click("#checkpoint-save");
+    await page.waitForFunction(() => document.getElementById("checkpoint-status").textContent.startsWith("Save failed:"));
+    if (downloads !== 0 || await snapshot() !== legacy) throw new Error("Legacy refusal changed science or produced a file");
+
+    await page.selectOption("#brain-preset", "mlp");
+    await page.evaluate(() => {
+      const population = document.getElementById("population");
+      population.value = "32";
+      population.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await page.click("#reset-btn");
+    await page.waitForFunction(() => window.__continuationOwner?.brainPreset() === "mlp"
+      && window.__continuationOwner.snapshot().agents.length === 32);
+    const saved = await page.evaluate(() => {
+      const owner = window.__continuationOwner;
+      owner.tick(3);
+      return { snapshot: JSON.stringify(owner.snapshot()), identity: owner.frame().identity };
+    });
+    const [download] = await Promise.all([page.waitForEvent("download"), page.click("#checkpoint-save")]);
+    const artifact = path.join(proof, download.suggestedFilename());
+    await download.saveAs(artifact);
+    const bytes = fs.readFileSync(artifact);
+    if (bytes.length === 0 || !artifact.endsWith(".sbcheckpoint")) throw new Error("Continuation download is empty or misnamed");
+    const expectedNext = await page.evaluate(() => {
+      const owner = window.__continuationOwner;
+      owner.tick(1);
+      return JSON.stringify(owner.snapshot());
+    });
+    await page.setInputFiles("#checkpoint-load", artifact);
+    await page.waitForFunction(() => document.getElementById("checkpoint-status").textContent.startsWith("Loaded continuation"));
+    if (await snapshot() !== saved.snapshot || await page.inputValue("#steps-per-frame") !== "0") {
+      throw new Error("Actual downloaded file failed to restore the saved paused science");
+    }
+    const continued = await page.evaluate(() => {
+      const owner = window.__continuationOwner;
+      owner.tick(1);
+      return { snapshot: JSON.stringify(owner.snapshot()), identity: owner.frame().identity };
+    });
+    if (continued.snapshot !== expectedNext) throw new Error("Loaded MLP evaluators do not produce the uninterrupted next tick");
+
+    const rejected = [];
+    for (const [name, payload] of [
+      ["empty", Buffer.alloc(0)], ["truncated", bytes.subarray(0, bytes.length - 1)],
+      ["corrupt", Buffer.from(bytes)],
+    ]) {
+      if (name === "corrupt") payload[Math.floor(payload.length / 2)] ^= 1;
+      const before = await snapshot();
+      await page.setInputFiles("#checkpoint-load", { name: `${name}.sbcheckpoint`, mimeType: "application/octet-stream", buffer: payload });
+      await page.waitForFunction(() => document.getElementById("checkpoint-status").textContent.startsWith("Load failed:")
+        && !document.getElementById("checkpoint-load").disabled);
+      if (await snapshot() !== before) throw new Error(`${name} import replaced the active world`);
+      rejected.push({ name, bytes: payload.length, message: await page.textContent("#checkpoint-status") });
+    }
+    const limit = await page.evaluate(async (file) => (await import(`/pkg/${file}`)).checkpoint_byte_limit(), moduleFile);
+    const oversized = path.join(proof, "oversized.sbcheckpoint");
+    fs.writeFileSync(oversized, Buffer.alloc(0), { flag: "wx" });
+    fs.truncateSync(oversized, limit + 1);
+    await page.evaluate(() => {
+      const read = File.prototype.arrayBuffer;
+      window.__continuationReads = 0;
+      File.prototype.arrayBuffer = function () { window.__continuationReads += 1; return read.call(this); };
+    });
+    const beforeOversize = await snapshot();
+    await page.setInputFiles("#checkpoint-load", oversized);
+    await page.waitForFunction(() => document.getElementById("checkpoint-status").textContent.includes("exceeds the browser size limit"));
+    if (await snapshot() !== beforeOversize || await page.evaluate(() => window.__continuationReads) !== 0) {
+      throw new Error("Oversized file was read or changed the running world");
+    }
+    await page.evaluate(() => {
+      const read = File.prototype.arrayBuffer;
+      window.__ownerBeforeDelayedLoad = window.__continuationOwner;
+      File.prototype.arrayBuffer = function () {
+        return new Promise((resolve, reject) => {
+          window.__releaseContinuationRead = () => read.call(this).then(resolve, reject);
+        });
+      };
+    });
+    await page.setInputFiles("#checkpoint-load", artifact);
+    await page.waitForFunction(() => !!window.__releaseContinuationRead);
+    await page.click("#reset-btn");
+    await page.waitForFunction(() => window.__continuationOwner !== window.__ownerBeforeDelayedLoad);
+    const reset = await snapshot();
+    await page.evaluate(() => window.__releaseContinuationRead());
+    await page.waitForFunction(() => document.getElementById("checkpoint-status").textContent.startsWith("Load cancelled"));
+    if (await snapshot() !== reset || errors.length !== 0) throw new Error(`Stale file read or browser error: ${JSON.stringify(errors)}`);
+    const result = { passed: true, artifact, bytes: bytes.length, sourceIdentity: saved.identity,
+      continuedIdentity: continued.identity, savedTick: JSON.parse(saved.snapshot).tick,
+      nextTick: JSON.parse(continued.snapshot).tick, rejected, oversizedBytes: limit + 1,
+      oversizedReads: 0, staleReadPreservedReset: true, downloads, errors, consoleLogs: logs };
+    fs.writeFileSync(path.join(proof, "result.json"), JSON.stringify(result, null, 2), { flag: "wx" });
+    return result;
+  } finally {
+    fs.writeFileSync(path.join(proof, "console.json"), JSON.stringify({ errors, logs }, null, 2), { flag: "wx" });
+    await context.close();
+  }
+}
+
 async function runRendererTests(browser, baseUrl) {
   const proof = fs.mkdtempSync(path.join(process.env.SCRIPTBOTS_WASM_PROOF_DIR || "/tmp", "renderer-"));
   // The compositor PNG is the visible-frame observation. A later GPU-canvas
@@ -1036,7 +1160,7 @@ async function runRemoteTests(browser, baseUrl, packageInfo) {
     observations.frozenLocal = await page.evaluate(() => window.__remoteLocalHandle.frame().identity);
     observations.connected = await page.evaluate(() => ({ frames: window.__remoteWire.frames,
       sent: window.__remoteWire.sent, replies: window.__remoteWire.replies,
-      disabled: ["steps-per-frame", "population", "reset-btn"].map((id) => [id, document.getElementById(id)?.disabled]) }));
+      disabled: ["steps-per-frame", "population", "reset-btn", "brain-preset", "checkpoint-save", "checkpoint-load"].map((id) => [id, document.getElementById(id)?.disabled]) }));
     const { canvas, telemetry, events } = observations.connected.frames;
     for (const frame of [canvas, telemetry, events]) {
       if (frame.identity.tick !== String(observations.initial.tick)
@@ -1795,6 +1919,7 @@ async function runTests() {
         throw new Error(`Corrupt packaged WASM did not fail at bootstrap: ${JSON.stringify({ corruptRequests, corruptDom, corruptConsole })}`);
       }
       await corruptContext.close();
+      const checkpointContinuation = await runCheckpointJourney(browser, baseUrl, packageInfo.moduleFile);
       observations.realPackage = {
         passed: true,
         directory: packageDir,
@@ -1805,6 +1930,7 @@ async function runTests() {
         files: packageInfo.files,
         loadedFiles,
         window1, window2, api, pageErrors, consoleLogs,
+        checkpointContinuation,
         independentClock: {
           passed: true, clockBefore, firstPresentedTps, clockAfter, pausedTick, hiddenTick, resumedTick,
           heldRaf: true, extraPresentations: 120, clockErrors,

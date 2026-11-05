@@ -51,6 +51,10 @@ use scriptbots_runtime::{
     RenderSnapshot,
 };
 
+/// Browser files obey the canonical paired-owner codec's byte bound.
+pub const MAX_BROWSER_CHECKPOINT_BYTES: usize =
+    scriptbots_runtime::MAX_VOLATILE_HOST_CHECKPOINT_BYTES;
+
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 extern "C" {
@@ -512,6 +516,80 @@ impl SimSpec {
 }
 
 impl Simulation {
+    fn checkpoint(&mut self) -> Result<Vec<u8>> {
+        // Complete the previous boundary's deferred volatile-journal receipt.
+        // Reusing the exact clock boundary adds no elapsed science time.
+        self.core.drive(ManualInstant::from_nanos(self.now_nanos))?;
+        let bytes = self
+            .core
+            .capture_volatile_host_checkpoint_v1()
+            .context("browser owner is not checkpointable at this boundary")?
+            .encode()?;
+        ensure!(
+            bytes.len() <= MAX_BROWSER_CHECKPOINT_BYTES,
+            "browser checkpoint exceeds {MAX_BROWSER_CHECKPOINT_BYTES} bytes"
+        );
+        Ok(bytes)
+    }
+
+    fn from_checkpoint(bytes: &[u8]) -> Result<Self> {
+        ensure!(
+            bytes.len() <= MAX_BROWSER_CHECKPOINT_BYTES,
+            "browser checkpoint exceeds {MAX_BROWSER_CHECKPOINT_BYTES} bytes"
+        );
+        let checkpoint = scriptbots_runtime::VolatileHostCheckpointV1::decode(bytes)?;
+        let science = checkpoint.host_checkpoint().world_checkpoint();
+        let required = science.required_brain_registry();
+        let mut registry = scriptbots_core::BrainRegistry::new();
+        let mlp_key = match required.entries.as_slice() {
+            [] => None,
+            [entry] if entry.kind == MlpBrain::KIND.as_str() => Some(
+                registry
+                    .register_family(MlpBrain::KIND.as_str(), Box::new(MlpBrainFamily::new()))?,
+            ),
+            _ => anyhow::bail!("checkpoint requires a brain registry unavailable in this browser"),
+        };
+        // The existing owner codec validates complete evaluator/registry identity;
+        // browser import must never substitute newly randomized brains.
+        let world = checkpoint.host_checkpoint().restore_world(registry)?;
+        let mut spec = SimSpec::new(
+            world.config().clone(),
+            world.agent_count(),
+            world.config().rng_seed,
+            SnapshotFormat::Json,
+            SeedStrategy::None,
+            mlp_key.map(|_| BrainPreset::Mlp),
+        );
+        // This is an observed world configuration, not fresh-demo options.
+        spec.preserve_population_config = true;
+        let persistence = world.bind_persistence(Box::new(scriptbots_core::NullPersistence))?;
+        let core = HostCore::restore_volatile_host_checkpoint_v1(
+            &checkpoint,
+            world,
+            persistence,
+            None,
+            ManualInstant::from_nanos(0),
+        )?;
+        // Every browser continuation gets a new command namespace. Starting the
+        // old namespace at sequence one would replay an old Step or collide.
+        let namespace = core
+            .latest_snapshot()
+            .last_applied_command
+            .map_or(1, |id| {
+                u64::try_from(id.get() >> u64::BITS).expect("upper half fits u64")
+            })
+            .checked_add(1)
+            .context("browser checkpoint command namespace is exhausted")?;
+        let controls = NullFrontend::new(core.local_port(), namespace);
+        Ok(Self {
+            core,
+            controls,
+            spec,
+            mlp_key,
+            now_nanos: 0,
+        })
+    }
+
     fn new(spec: SimSpec) -> Result<Self> {
         let mut world = WorldState::new(spec.config())
             .context("failed to initialize ScriptBots world state")?;
@@ -631,10 +709,20 @@ impl Simulation {
             multiplier.is_finite() && (0.0..=32.0).contains(&multiplier),
             "browser speed multiplier must be finite and within 0..=32"
         );
-        self.apply_command(HostCommand::SetSpeed(multiplier))
+        self.apply_command(HostCommand::UpdateSimulation(
+            scriptbots_core::SimulationCommand {
+                paused: Some(multiplier == 0.0),
+                speed_multiplier: Some(multiplier),
+                step_once: false,
+            },
+        ))
     }
 
     fn apply_command(&mut self, command: HostCommand) -> Result<CommandStatus> {
+        let before = self.core.latest_snapshot().revisions.control;
+        let expected = before
+            .checked_next()
+            .context("browser control revision is exhausted")?;
         let admitted = self
             .controls
             .submit(command, None)
@@ -650,6 +738,11 @@ impl Simulation {
         ensure!(
             matches!(status.application(), ApplicationState::Applied { .. }),
             "browser host command did not apply: {status:?}"
+        );
+        ensure!(
+            self.core.latest_snapshot().revisions.control == expected,
+            "browser command {} did not apply a fresh control revision after {before:?}",
+            status.command_id()
         );
         Ok(status)
     }
@@ -712,6 +805,27 @@ impl InitOptions {
 
 #[wasm_bindgen]
 impl SimHandle {
+    /// Export a complete volatile owner continuation, without claiming disk durability.
+    /// Legacy wander evaluators are explicitly refused by the core codec.
+    #[wasm_bindgen(js_name = checkpoint)]
+    pub fn checkpoint_js(&self) -> Result<Vec<u8>, JsValue> {
+        self.inner.borrow_mut().checkpoint().map_err(js_error)
+    }
+
+    /// Brain preset used when starting a new world from this handle's configuration.
+    #[must_use]
+    #[wasm_bindgen(js_name = brainPreset)]
+    pub fn brain_preset_js(&self) -> String {
+        if self.inner.borrow().spec.default_brain == Some(BrainPreset::Mlp) {
+            "mlp"
+        } else if self.inner.borrow().spec.seed_strategy == SeedStrategy::Wander {
+            "wander"
+        } else {
+            "none"
+        }
+        .to_owned()
+    }
+
     /// Advance exactly the requested number of scientific steps and encode the snapshot.
     #[wasm_bindgen(js_name = tick)]
     pub fn tick_js(&self, steps: u32) -> Result<JsValue, JsValue> {
@@ -733,7 +847,7 @@ impl SimHandle {
         to_value(&receipt).map_err(js_error)
     }
 
-    /// Apply a canonical host speed command (zero pauses automatic science).
+    /// Atomically apply speed and pause state through the canonical host command.
     /// The returned status preserves separate application and journal outcomes.
     #[wasm_bindgen(js_name = setSpeed)]
     pub fn set_speed_js(&self, multiplier: f32) -> Result<JsValue, JsValue> {
@@ -1039,6 +1153,27 @@ fn encode_snapshot(
 #[wasm_bindgen]
 pub fn version() -> String {
     format!("scriptbots-web {}", env!("CARGO_PKG_VERSION"))
+}
+
+/// Maximum browser continuation file size, checked before reading a selected file.
+#[must_use]
+#[wasm_bindgen]
+#[expect(
+    clippy::missing_const_for_fn,
+    reason = "wasm_bindgen rejects const exports; the bound itself is a canonical constant"
+)]
+pub fn checkpoint_byte_limit() -> usize {
+    MAX_BROWSER_CHECKPOINT_BYTES
+}
+
+/// Validate a full owner continuation and construct a new browser handle.
+/// Failure leaves every existing handle untouched; offline wall time is discarded.
+#[wasm_bindgen]
+pub fn restore_checkpoint(bytes: &[u8]) -> Result<SimHandle, JsValue> {
+    let simulation = Simulation::from_checkpoint(bytes).map_err(js_error)?;
+    Ok(SimHandle {
+        inner: Rc::new(RefCell::new(simulation)),
+    })
 }
 
 /// Encode the default browser initialization options.
@@ -1421,6 +1556,174 @@ mod tests {
     use wasm_bindgen_test::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
+
+    fn checkpoint_world(brain: Option<BrainPreset>, strategy: SeedStrategy) -> Simulation {
+        Simulation::new(SimSpec::new(
+            ScriptBotsConfig {
+                world_width: 160,
+                world_height: 160,
+                food_cell_size: 40,
+                persistence_interval: 0,
+                reproduction_energy_threshold: f32::MAX,
+                ..Default::default()
+            },
+            3,
+            Some(17),
+            SnapshotFormat::Json,
+            strategy,
+            brain,
+        ))
+        .unwrap()
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_checkpoint_continues_exact_science_and_fresh_command_namespaces() {
+        for brain in [None, Some(BrainPreset::Mlp)] {
+            let mut original = checkpoint_world(brain, SeedStrategy::None);
+            original.tick(3).unwrap();
+            original.set_speed(0.5).unwrap();
+            original.drive(8.0).unwrap();
+            let bytes = original.checkpoint().unwrap();
+            let mut restored = Simulation::from_checkpoint(&bytes).unwrap();
+            assert_eq!(original.snapshot(), restored.snapshot());
+            assert_eq!(
+                original.core.scientific_digest_v1().unwrap(),
+                restored.core.scientific_digest_v1().unwrap()
+            );
+            // Rebase wall time while retaining the owner's fractional credit.
+            for elapsed in [5.0, 20.0, 34.0, 50.0] {
+                original.drive(8.0 + elapsed).unwrap();
+                restored.drive(elapsed).unwrap();
+                assert_eq!(
+                    original.core.scientific_digest_v1().unwrap(),
+                    restored.core.scientific_digest_v1().unwrap()
+                );
+            }
+            for _ in 0..3 {
+                let prior = restored
+                    .core
+                    .latest_snapshot()
+                    .last_applied_command
+                    .unwrap();
+                restored = Simulation::from_checkpoint(&restored.checkpoint().unwrap()).unwrap();
+                let tick = restored.snapshot().tick;
+                restored.tick(1).unwrap();
+                original.tick(1).unwrap();
+                assert_eq!(restored.snapshot().tick, tick + 1);
+                assert_ne!(
+                    restored.core.latest_snapshot().last_applied_command,
+                    Some(prior),
+                    "a resumed frontend must not replay an already applied command"
+                );
+                assert_eq!(
+                    original.core.scientific_digest_v1().unwrap(),
+                    restored.core.scientific_digest_v1().unwrap()
+                );
+            }
+            restored.set_speed(0.0).unwrap();
+            let mut paused = Simulation::from_checkpoint(&restored.checkpoint().unwrap()).unwrap();
+            assert!(paused.core.latest_snapshot().playback.paused);
+            let tick = paused.snapshot().tick;
+            paused.drive(10_000.0).unwrap();
+            assert_eq!(paused.snapshot().tick, tick);
+            paused.set_speed(2.0).unwrap();
+            paused.drive(10_050.0).unwrap();
+            assert!(paused.snapshot().tick > tick);
+            restored.reset(Some(17)).unwrap();
+            assert_eq!(restored.snapshot().tick, 0);
+            assert_eq!(restored.snapshot().agents.len(), 3);
+            restored.tick(1).unwrap();
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_checkpoint_corruption_and_bounds_preserve_the_existing_world() {
+        let mut original = checkpoint_world(Some(BrainPreset::Mlp), SeedStrategy::None);
+        original.tick(2).unwrap();
+        let bytes = original.checkpoint().unwrap();
+        let digest = original.core.scientific_digest_v1().unwrap();
+        for index in [0, bytes.len() / 2, bytes.len() - 1] {
+            let mut damaged = bytes.clone();
+            damaged[index] ^= 1;
+            assert!(Simulation::from_checkpoint(&damaged).is_err());
+        }
+        assert!(Simulation::from_checkpoint(&[]).is_err());
+        assert!(Simulation::from_checkpoint(&bytes[..bytes.len() - 1]).is_err());
+        let oversized = vec![0; MAX_BROWSER_CHECKPOINT_BYTES + 1];
+        assert!(
+            Simulation::from_checkpoint(&oversized)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("exceeds")
+        );
+        assert_eq!(original.core.scientific_digest_v1().unwrap(), digest);
+        original.tick(1).unwrap();
+        assert_eq!(original.snapshot().tick, 3);
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_checkpoint_refuses_legacy_wander_without_changing_defaults() {
+        let mut original = checkpoint_world(None, SeedStrategy::Wander);
+        original.tick(2).unwrap();
+        let digest = original.core.scientific_digest_v1().unwrap();
+        assert!(original.checkpoint().is_err());
+        assert_eq!(original.core.scientific_digest_v1().unwrap(), digest);
+        assert!(InitOptions::default().default_brain.is_none());
+        assert_eq!(
+            InitOptions::default().into_spec().seed_strategy,
+            SeedStrategy::Wander
+        );
+        original.tick(1).unwrap();
+        assert_eq!(original.snapshot().tick, 3);
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_checkpoint_preserves_an_empty_zero_tick_boundary() {
+        let mut spec = checkpoint_world(Some(BrainPreset::Mlp), SeedStrategy::None).spec;
+        spec.initial_population = 0;
+        let mut original = Simulation::new(spec).unwrap();
+        original.set_speed(0.0).unwrap();
+        let digest = original.core.scientific_digest_v1().unwrap();
+        let bytes = original.checkpoint().unwrap();
+        assert_eq!(original.core.scientific_digest_v1().unwrap(), digest);
+        let mut restored = Simulation::from_checkpoint(&bytes).unwrap();
+        assert_eq!(restored.snapshot().tick, 0);
+        assert_eq!(restored.snapshot().agents.len(), 0);
+        restored.tick(1).unwrap();
+        original.tick(1).unwrap();
+        assert_eq!(restored.snapshot().tick, 1);
+        assert_eq!(
+            original.core.scientific_digest_v1().unwrap(),
+            restored.core.scientific_digest_v1().unwrap()
+        );
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_checkpoint_replayed_pause_receipt_cannot_claim_a_fresh_pause() {
+        let mut original = checkpoint_world(None, SeedStrategy::None);
+        original.set_speed(0.0).unwrap();
+        original.tick(2).unwrap();
+        original.set_speed(2.0).unwrap();
+        let mut restored = Simulation::from_checkpoint(&original.checkpoint().unwrap()).unwrap();
+        // Deliberately reuse the source frontend's namespace. Command one is
+        // an old, successfully applied pause, while the restored owner runs.
+        restored.controls = NullFrontend::new(restored.core.local_port(), 1);
+        let digest = restored.core.scientific_digest_v1().unwrap();
+        let error = restored.set_speed(0.0).unwrap_err();
+        assert!(error.to_string().contains("fresh control revision"));
+        assert!(!restored.core.latest_snapshot().playback.paused);
+        assert_eq!(
+            restored.core.latest_snapshot().playback.speed_multiplier,
+            2.0
+        );
+        assert_eq!(restored.core.scientific_digest_v1().unwrap(), digest);
+    }
 
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
     #[cfg_attr(not(target_arch = "wasm32"), test)]

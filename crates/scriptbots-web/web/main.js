@@ -35,6 +35,11 @@ const deathsEl = document.getElementById("metric-deaths");
 const energyEl = document.getElementById("metric-energy");
 const healthEl = document.getElementById("metric-health");
 const resetButton = document.getElementById("reset-btn");
+const brainPresetSelect = document.getElementById("brain-preset");
+const checkpointSaveButton = document.getElementById("checkpoint-save");
+const checkpointLoadInput = document.getElementById("checkpoint-load");
+const checkpointStatus = document.getElementById("checkpoint-status");
+let checkpointLoadPending = false;
 const stepsSlider = document.getElementById("steps-per-frame");
 const populationSlider = document.getElementById("population");
 const logView = document.getElementById("log");
@@ -148,6 +153,13 @@ function updateRemoteControls() {
   remoteRetry.disabled = !remoteConnected || !lastRemoteRequestId;
   captureButton.disabled = !hasPresentationFrame() || !!captureRequest || !!encodingRequest;
   remoteOverlay.hidden = !remoteMode || !!remoteFrame;
+  updateCheckpointControls();
+}
+
+function updateCheckpointControls() {
+  if (brainPresetSelect) brainPresetSelect.disabled = remoteMode;
+  if (checkpointSaveButton) checkpointSaveButton.disabled = remoteMode || !simHandle;
+  if (checkpointLoadInput) checkpointLoadInput.disabled = remoteMode || !simHandle || checkpointLoadPending;
 }
 
 function remoteEventLine(text) {
@@ -584,11 +596,12 @@ function applyPlaybackSpeed() {
   simHandle.setSpeed(document.hidden ? 0 : speedMultiplier);
 }
 
-function startSimulationClock() {
+function startSimulationClock(applySpeed = true) {
   simulationGeneration += 1;
   simulationStartedAt = performance.now();
-  simHandle.setSpeed(document.hidden ? 0 : speedMultiplier);
+  if (applySpeed) simHandle.setSpeed(document.hidden ? 0 : speedMultiplier);
   captureButton.disabled = !!captureRequest || !!encodingRequest;
+  updateCheckpointControls();
 }
 
 function pumpSimulation() {
@@ -899,6 +912,8 @@ async function resetSimulation(populationOverride) {
     ...defaults,
     seed,
     population: populationOverride,
+    default_brain: brainPresetSelect?.value === "mlp" ? "mlp" : null,
+    seed_strategy: brainPresetSelect?.value === "none" || brainPresetSelect?.value === "mlp" ? "none" : "wander",
   };
 
   simHandle = init_sim(options);
@@ -936,6 +951,75 @@ async function resetSimulation(populationOverride) {
 
   appendLog(`Simulation reset (seed=${seed}, population=${populationOverride})`);
 }
+
+checkpointSaveButton?.addEventListener("click", () => {
+  if (remoteMode || !simHandle) return;
+  try {
+    driveSimulation();
+    const bytes = simHandle.checkpoint();
+    const tick = simHandle.frame().identity.tick;
+    const url = URL.createObjectURL(new Blob([bytes], { type: "application/octet-stream" }));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `scriptbots-tick-${tick}.sbcheckpoint`;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+    checkpointStatus.textContent = `Continuation file prepared at tick ${tick}.`;
+  } catch (error) {
+    checkpointStatus.textContent = `Save failed: ${error.message || error}`;
+  }
+});
+
+checkpointLoadInput?.addEventListener("change", async () => {
+  const file = checkpointLoadInput.files?.[0];
+  checkpointLoadInput.value = "";
+  if (!file || remoteMode || !simHandle || checkpointLoadPending) return;
+  const generation = simulationGeneration;
+  const original = simHandle;
+  checkpointLoadPending = true;
+  checkpointStatus.textContent = "Reading continuation file…";
+  updateCheckpointControls();
+  try {
+    if (file.size > wasm.checkpoint_byte_limit()) throw new Error("Continuation file exceeds the browser size limit");
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    if (remoteMode || queuedReset || simulationGeneration !== generation || simHandle !== original) {
+      checkpointStatus.textContent = "Load cancelled because the active world changed.";
+      return;
+    }
+    const next = wasm.restore_checkpoint(bytes);
+    try {
+      next.setSpeed(0);
+    } catch (error) {
+      next.free();
+      throw error;
+    }
+    simHandle = next;
+    speedMultiplier = 0;
+    stepsSlider.value = "0";
+    if (brainPresetSelect) brainPresetSelect.value = next.brainPreset();
+    startSimulationClock(false);
+    resetPerformanceWindows();
+    currentPermalink = null;
+    if (permalinkInput) permalinkInput.value = "";
+    latestForkedLink = null;
+    if (forkOutput) forkOutput.style.display = "none";
+    updateMismatchBanner(null);
+    updateDiffTable(null);
+    original.free();
+    try {
+      const url = new URL(window.location.href);
+      url.searchParams.delete("world");
+      url.searchParams.delete("permalink");
+      window.history.replaceState({}, "", url.toString());
+    } catch (_) {}
+    checkpointStatus.textContent = `Loaded continuation at tick ${next.frame().identity.tick}; paused.`;
+  } catch (error) {
+    checkpointStatus.textContent = `Load failed: ${error.message || error}`;
+  } finally {
+    checkpointLoadPending = false;
+    updateCheckpointControls();
+  }
+});
 
 async function bootstrap() {
   try {
