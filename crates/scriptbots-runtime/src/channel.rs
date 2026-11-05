@@ -149,6 +149,7 @@ enum IngressMessage {
     AgentInspection {
         uid: AgentUid,
         max_contributors: usize,
+        expires_at: Instant,
         reply: Sender<Result<Option<AgentInspectorData>, HostAccessError>>,
     },
     DebugAgents {
@@ -434,6 +435,23 @@ impl ChannelHostPort {
         })
     }
 
+    /// Bound queued inspection work by both the port and caller budgets.
+    fn inspection_deadline(&self) -> Result<Instant, HostAccessError> {
+        let now = Instant::now();
+        let per_call = now.checked_add(self.submit_deadline).ok_or_else(|| {
+            Self::protocol_violation("inspection deadline exceeds monotonic clock range")
+        })?;
+        let deadline = self
+            .caller_deadline
+            .map_or(per_call, |outer| outer.min(per_call));
+        if deadline <= now {
+            return Err(Self::protocol_violation(
+                "inspection budget elapsed before ingress",
+            ));
+        }
+        Ok(deadline)
+    }
+
     /// Clone the lock-free publication reader without retaining command ingress.
     #[must_use]
     pub fn snapshot_hub(&self) -> SnapshotHub {
@@ -500,9 +518,11 @@ impl ChannelHostPort {
                 "sensor explanation contributor limit exceeded before enqueue",
             ));
         }
+        let expires_at = self.inspection_deadline()?;
         self.read_owner(|reply| IngressMessage::AgentInspection {
             uid,
             max_contributors,
+            expires_at,
             reply,
         })
     }
@@ -1337,8 +1357,15 @@ impl ChannelHostDriver {
             IngressMessage::AgentInspection {
                 uid,
                 max_contributors,
+                expires_at,
                 reply,
             } => {
+                if Instant::now() >= expires_at {
+                    let _ = reply.send(Err(ChannelHostPort::protocol_violation(
+                        "owner inspection budget elapsed in ingress",
+                    )));
+                    return;
+                }
                 let _ = reply.send(self.host.core().inspect_agent(uid, max_contributors));
             }
             IngressMessage::DebugAgents { query, reply } => {
@@ -3572,8 +3599,9 @@ mod tests {
         )
         .expect("driver");
         let started = Instant::now();
+        let deadline = started + Duration::from_millis(20);
         assert!(matches!(
-            port.inspect_agent_before(AgentUid(1), 0, started + Duration::from_millis(20)),
+            port.inspect_agent_before(AgentUid(1), 0, deadline),
             Err(HostAccessError::ProtocolViolation { .. })
         ));
         assert!(started.elapsed() < Duration::from_secs(1));
@@ -3582,7 +3610,8 @@ mod tests {
                 .receiver
                 .try_recv()
                 .expect("actual inspector ingress"),
-            IngressMessage::AgentInspection { .. }
+            IngressMessage::AgentInspection { expires_at, .. }
+                if expires_at <= deadline && expires_at <= Instant::now()
         ));
         let request = BrainProjectionRequest::focused(
             crate::ProjectionClientId::new(614),
@@ -3599,6 +3628,33 @@ mod tests {
             driver.receiver.try_recv().expect("actual brain ingress"),
             IngressMessage::BrainProjection { .. }
         ));
+    }
+
+    #[test]
+    fn expired_queued_inspections_are_discarded_before_owner_work() {
+        let (mut driver, _) =
+            ChannelHostDriver::new(test_host(true), fast_options()).expect("driver");
+        let (reply, receive) = std::sync::mpsc::channel();
+        driver.process_ingress(IngressMessage::AgentInspection {
+            uid: AgentUid(u64::MAX),
+            max_contributors: 0,
+            expires_at: Instant::now(),
+            reply,
+        });
+        assert!(matches!(
+            receive.recv().expect("expired reply"),
+            Err(HostAccessError::ProtocolViolation { message })
+                if message.contains("elapsed in ingress")
+        ));
+
+        let (reply, receive) = std::sync::mpsc::channel();
+        driver.process_ingress(IngressMessage::AgentInspection {
+            uid: AgentUid(u64::MAX),
+            max_contributors: 0,
+            expires_at: Instant::now() + Duration::from_secs(1),
+            reply,
+        });
+        assert!(matches!(receive.recv().expect("live reply"), Ok(None)));
     }
 
     #[test]
