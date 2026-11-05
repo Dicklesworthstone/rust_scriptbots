@@ -3535,9 +3535,13 @@ through Parquet/Arrow production and full-data readback. Storage now exposes
 finished-run keyset pages for all five export tables, including the legacy birth
 parent fallback, and verifies CSV/JSONL against the complete source traversal,
 original provenance and receipt timestamps, and final EOF. Foreign-island rows in
-any scientific table are refused before single-world export. The columnar adapter
-still needs to consume these pages instead of materializing entire tables. Also
-replace the offline comparison adapter's time-sample
+any scientific table are refused before single-world export. Parquet and Arrow now
+consume the same pages, seal bounded row groups/record batches, and verify all
+decoded values, null masks, schema/provenance and stream exhaustion against a
+second source traversal, independent of batch boundaries. Multi-page and empty
+table regressions retain independent SQL oracles. These are row-buffer bounds,
+not SQL execution, variable-payload or footer-memory bounds. Also replace the
+offline comparison adapter's time-sample
 pseudoreplication with one predeclared observation per matched seed and retain
 descriptive single-pair output. Historical event review now merges complete
 configuration and agent-command histories in their observed order, validates each

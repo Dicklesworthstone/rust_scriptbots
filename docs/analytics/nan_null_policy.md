@@ -56,10 +56,32 @@ FrankenPandas (`fp-frame`, `fp-columnar`) and Apache Arrow resolve this at the a
   - If a group contains `N = 1` observations, sample variance is mathematically undefined. In summary tables, sample standard deviation for singletons is reported as `0.0` with explicit population count `1`, avoiding downstream rendering errors.
 
 ### 4.3 Export Round-Trip Conformance Net
-- Exporters (`sb-analyze export`) re-read written Parquet and Arrow files to guarantee that:
-  1. `null_count` matches identically between the written `RecordBatch` and the re-read batch.
-  2. Floating-point values do not undergo lossy rounding that turns denormalized floats into zeros or NaNs.
-  3. CSV lines with empty fields parse unambiguously to `NULL`, while preserving string columns containing empty strings.
+
+Use `--verify` to compare the complete exported artifact with a second traversal
+of the same finished database:
+
+```bash
+sb-analyze runs/example.sqlite export --format parquet --out-dir exports --verify
+```
+
+All five canonical tables use keyset pages containing at most 1,024 rows. Arrow
+files contain bounded record batches; Parquet seals a row group after each page.
+Verification walks source and decoded rows together even when their batch
+boundaries differ. It checks column order, types, nullability, provenance metadata,
+every value and null position, and complete decoded-stream exhaustion. Floating
+values are compared by their IEEE bit patterns, including signed zero. Missing
+rows, extra rows and decoder errors fail verification.
+
+CSV verification compares every encoded byte with a fresh source traversal,
+including the header, escaped rows and final completion receipt. It reuses the
+original timestamps and refuses bytes after the receipt. A self-consistent
+checksum on altered rows is insufficient. This verifies the canonical CSV text;
+the existing text encoding does not distinguish an absent optional string from
+an empty string. Use Arrow or Parquet when typed null semantics are required.
+
+The finished-reader lease keeps the source fixed throughout export and readback.
+The page limit bounds retained row buffers, not individual variable-length
+payloads, SQL engine working memory, file footer metadata or wall-clock duration.
 
 ---
 
