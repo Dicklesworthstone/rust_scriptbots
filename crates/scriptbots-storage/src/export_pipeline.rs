@@ -1589,7 +1589,7 @@ impl ExportPageSource {
                 "tick ASC, agent_uid ASC",
                 " AND (tick > ?2 OR (tick = ?2 AND agent_uid > ?3))",
             ),
-            Self::Table(ExportTable::Run) => unreachable!("run export has exactly one row"),
+            Self::Table(ExportTable::Run) => panic!("run export has exactly one row"),
         }
     }
 

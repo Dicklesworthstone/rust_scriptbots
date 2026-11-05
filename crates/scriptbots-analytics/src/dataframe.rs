@@ -1464,7 +1464,7 @@ mod tests {
             .finish()
             .unwrap();
 
-        let mut foreign = prov.clone();
+        let mut foreign = prov;
         foreign.run_id.push_str("-different-source");
         let foreign_schema = spec_to_arrow_schema(METRIC_ARROW_SCHEMA, Some(&foreign));
         assert!(BatchReadback::new(empty(), schema.clone(), &foreign_schema).is_err());

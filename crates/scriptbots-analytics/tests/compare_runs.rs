@@ -304,9 +304,7 @@ fn assert_refused(control: &str, cohort: &str, reason: &str) {
     );
 }
 
-#[test]
-fn independent_seed_endpoints_detect_the_planted_effect_and_preserve_the_null() {
-    let dir = tempfile::tempdir().expect("tempdir");
+fn matched_seed_cohort_runs(dir: &tempfile::TempDir) -> (Vec<String>, Vec<String>) {
     let mut control = Vec::new();
     let mut treatment = Vec::new();
     for seed in 1..=12u32 {
@@ -350,6 +348,13 @@ fn independent_seed_endpoints_detect_the_planted_effect_and_preserve_the_null() 
     }
     // Array position is deliberately the wrong pairing; only the manifested root seeds agree.
     treatment.reverse();
+    (control, treatment)
+}
+
+#[test]
+fn independent_seed_endpoints_detect_the_planted_effect_and_preserve_the_null() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (control, treatment) = matched_seed_cohort_runs(&dir);
     let value = cohort_value(2, &control, &treatment);
     let path = write_cohort(dir.path(), "study.json", &value);
     let report = compare_cohort(&control[0], &path).expect("matched-seed comparison");
