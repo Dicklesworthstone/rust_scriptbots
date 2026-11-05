@@ -2,6 +2,70 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Browser continuation files (2026-11-05):** [Qualified bounded contribution —
+GentleDuck; original `bd-ywtv` remains in progress for IndexedDB/SQLite durability]
+
+- [x] Inspect ready dependencies and distinguish unavailable hardware/science
+  decisions from a local product capability; inspect existing checkpoint codecs.
+- [x] Reserve exact source, browser UI/test and tracker paths; claim original Bead.
+- [x] Expose bounded full-owner checkpoint export through the existing codec.
+- [x] Restore validated science, MLP evaluators, journal and command identity;
+  rebase browser time without crediting offline time or silently resetting brains.
+- [x] Settle deferred volatile journal receipts at the identical clock boundary
+  before capture; verify that export adds no science ticks.
+- [x] Allocate a fresh frontend command namespace on every continuation and
+  reject an old Applied receipt without a newly observed control revision.
+- [x] Apply pause and speed atomically so a loaded paused owner can resume;
+  verify pause succeeds before replacing the active browser handle.
+- [x] Keep unsupported legacy wander brains explicit and preserve browser defaults.
+- [x] Wire save/load controls and an explicit new-world brain choice into the UI.
+- [x] Preserve the current world on corrupt/oversized input and stale asynchronous
+  loads; disable local save/load while displaying a remote server world.
+- [x] Exercise nonempty continuation, actual next commands/ticks, paused/resumed
+  scheduling, corruption, bounds, reset behavior and unchanged default parity.
+- [x] Execute actual generated WASM and file download/import in Chromium; retain
+  failures and source-bound logs without substituting mock DOM fixtures.
+- [x] Disconnect only the UI restore consumer in an external frozen mutant;
+  observe the real downloaded-file journey reject its fresh-world substitution.
+- [x] Pass workspace check, strict Clippy, formatting, native/browser tests and
+  scoped static review through DSR; review and commit exact owned source.
+- [x] Re-execute committed source in a fresh pass, record the audit and bounded
+  Beads evidence, and publish qualified source to both required remote tips;
+  this separate final tracker snapshot leaves that source unchanged.
+
+Consumer: browser users continuing a saved versioned-brain world. This checklist
+retires at publication; downloadable owner files do not fulfill the remaining
+IndexedDB journal, FrankenSQLite image or durable-watermark requirements.
+Evidence: `/data/tmp/scriptbots-browser-checkpoint-5_ynpl2n/`.
+
+Source `2a87af8902be46e66a97799333e377bb76a5abdc` passes fresh clean-source DSR
+`browser_checkpoint_clean_2a87af89/20261105T025835-2053356` **12/12**. Source
+identity and completely clean status are unchanged before and after execution.
+The native web suite runs **38 passed, zero failed, one unchanged fixture-writer
+ignore**; both native browser subprocess tests actually execute. Workspace
+all-target check, strict workspace and WASM Clippy, formatting, generated WASM
+packaging, actual file download/import and live native remote regressions pass.
+The Chromium journey restores a nonempty MLP owner's exact tick-3 snapshot and
+uninterrupted tick 4, rejects empty/truncated/corrupt files, refuses the canonical
+limit plus one byte before reading, and preserves a newer reset against a delayed
+read. The external disconnected-import control fails that same positive journey.
+The remote regression retains its original assertions and deadlines; all six
+local controls disable remotely and actual Canvas/WebGPU PNG checks pass.
+UBS reports zero critical findings, 716 warnings and 825 informational findings
+across four files; this is not a warning-clean claim.
+
+Earlier failed profiles remain retained: const-export/compiler and lint conflict,
+pending journal acknowledgement, paused-owner resume, package ordering, assertion
+lint/formatting, and a remote PNG timeout whose cause remains unresolved despite
+later successful runs. One narrowly justified lint expectation applies only to
+the non-const wasm export because wasm-bindgen rejects const exports; all other
+strict lint gates remain unchanged. The full audit is `audit.txt` in the evidence
+directory. This is fresh solo verification, not independent review, IndexedDB or
+SQLite-image durability, hardware-GPU qualification or a measured performance win.
+Both required remote tips were observed at the qualified source before this final
+tracker snapshot. No additional files were deleted. The bounded checklist is
+retired; the original durability requirements below and in Beads remain open.
+
 **Bevy logging ownership (2026-11-05):** [Qualified repair — GentleDuck;
 original `bd-2z0.14.1.21.8` closed]
 

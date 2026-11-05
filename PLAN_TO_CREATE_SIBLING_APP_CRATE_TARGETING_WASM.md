@@ -166,6 +166,13 @@
 ## Phase 4 · Persistence & Analytics
 
 ### 4.1 Short-Term Persistence
+[Partially implemented — GentleDuck, 2026-11-05; full-owner continuation-file
+download/import qualified at `2a87af8902be46e66a97799333e377bb76a5abdc` under
+`bd-ywtv`. This preserves evaluator/journal state and loads paused. The original
+ring-buffer and snapshot JSON/SQLite-image exports below, plus IndexedDB/SQLite
+durability in 4.2, remain open. Clean-source DSR
+`browser_checkpoint_clean_2a87af89/20261105T025835-2053356` passes 12/12;
+raw evidence: `/data/tmp/scriptbots-browser-checkpoint-5_ynpl2n/`.]
 - Implement in-memory ring buffer of snapshots for replay within single session.
 - Allow exporting snapshots as downloadable JSON and qualified standard-SQLite images via browser download APIs.
 
