@@ -4634,6 +4634,7 @@ fn setup_scene(
             .with_children(|card| {
                 card.spawn((
                     Text::new("CREATURE  /  FIELD PROFILE"),
+                    panel_text_layout,
                     TextFont::from_font_size(11.0),
                     TextColor(Color::srgb(0.57, 0.78, 0.66)),
                 ));
@@ -4682,6 +4683,7 @@ fn setup_scene(
                         .with_children(|tile| {
                             tile.spawn((
                                 Text::new(label),
+                                panel_text_layout,
                                 TextFont::from_font_size(10.0),
                                 TextColor(Color::srgb(0.65, 0.80, 0.71)),
                             ));

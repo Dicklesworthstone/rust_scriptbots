@@ -1,8 +1,8 @@
 //! Certification regressions over exact persisted detector inputs.
 //!
 //! Hand-built fixtures isolate statistical behavior and corruption controls. A
-//! separate production-world test proves that ordinary sparse persistence still
-//! supplies complete tick windows, without changing the persistence interval.
+//! separate production-world test uses a configured sparse persistence cadence
+//! and proves that it supplies complete tick windows, including its partial tail.
 
 use scriptbots_analytics::{
     AnalyticsError, NARRATIVE_VALIDATE_SCHEMA_VERSION, ReaderCtx, Registry, ReportParams,
@@ -19,6 +19,9 @@ use scriptbots_storage::{
 };
 
 const TERMINAL_TICK: u64 = 600;
+// Explicitly exercise sparse batches and a final partial batch. The production
+// default disables periodic persistence and cannot supply this scenario.
+const SPARSE_PERSISTENCE_INTERVAL: u32 = 13;
 
 fn synthetic_summary(tick: u64) -> TickSummary {
     let phase = u16::try_from(tick % 5).expect("bounded phase");
@@ -58,15 +61,19 @@ fn event(tick: u64, kind: EventKind, metric: &str) -> EventRecord {
 
 /// A synthetic statistics fixture, not a claim of simulated lifecycle counts.
 ///
-/// Summaries and canonical inputs agree exactly. Batches use the production
-/// default persistence cadence; generic dashboard metrics deliberately carry
+/// Summaries and canonical inputs agree exactly. Batches use an explicitly
+/// configured sparse cadence; generic dashboard metrics deliberately carry
 /// no evidence of the planted shift.
 fn create_fixture(dir: &tempfile::TempDir, events: &[EventRecord], include_inputs: bool) -> String {
     let path = dir.path().join("series.sqlite").display().to_string();
     let mut storage = Storage::create_unattributed_file(&path).expect("create fixture");
-    let config = ScriptBotsConfig::default();
+    let config = ScriptBotsConfig {
+        persistence_interval: SPARSE_PERSISTENCE_INTERVAL,
+        ..ScriptBotsConfig::default()
+    };
     let interval = u64::from(config.persistence_interval);
     assert!(interval > 1, "the fixture must exercise sparse persistence");
+    assert!(!TERMINAL_TICK.is_multiple_of(interval));
     let mut replay_events = Vec::new();
     let mut previous_boundary = 0;
     for tick in 1..=TERMINAL_TICK {
@@ -326,11 +333,14 @@ fn truncated_canonical_tail_is_not_reported_as_a_complete_quiet_window() {
 }
 
 #[test]
-fn real_world_default_persistence_certifies_an_event_between_batch_boundaries() {
+fn real_world_sparse_persistence_certifies_an_event_between_batch_boundaries() {
+    const EXTINCTION_TICK: u64 = 97;
+    const RUN_TICKS: u64 = 320;
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("production.sqlite").display().to_string();
     let mut pipeline = StoragePipeline::create_unattributed_file(&path).expect("create run");
     let config = ScriptBotsConfig {
+        persistence_interval: SPARSE_PERSISTENCE_INTERVAL,
         world_width: 200,
         world_height: 200,
         food_cell_size: 20,
@@ -348,7 +358,8 @@ fn real_world_default_persistence_certifies_an_event_between_batch_boundaries() 
     };
     let persistence_interval = u64::from(config.persistence_interval);
     assert!(persistence_interval > 1);
-    assert!(!97_u64.is_multiple_of(persistence_interval));
+    assert!(!EXTINCTION_TICK.is_multiple_of(persistence_interval));
+    assert!(!RUN_TICKS.is_multiple_of(persistence_interval));
     let (mut world, mut session) =
         WorldState::with_persistence(config, Box::new(pipeline.sink())).expect("world");
     for index in 0..12_u16 {
@@ -360,8 +371,8 @@ fn real_world_default_persistence_certifies_an_event_between_batch_boundaries() 
             })
             .expect("spawn founder");
     }
-    for tick in 1..=320 {
-        if tick == 97 {
+    for tick in 1..=RUN_TICKS {
+        if tick == EXTINCTION_TICK {
             world
                 .enqueue_intervention(Intervention::Meteor {
                     region: Region::All,
@@ -385,20 +396,20 @@ fn real_world_default_persistence_certifies_an_event_between_batch_boundaries() 
         !cx.reader
             .summary_ticks()
             .expect("batch boundaries")
-            .contains(&97),
+            .contains(&EXTINCTION_TICK),
         "the extinction tick must not be a dashboard summary boundary"
     );
     let output = Registry::builtin()
         .run("narrative-validate", &cx, &certification_params())
         .expect("certify production inputs");
-    assert_eq!(output.machine["inputs_read"], 320);
+    assert_eq!(output.machine["inputs_read"], RUN_TICKS);
     assert_eq!(output.machine["input_pages"], 2);
     let rows = output.machine["events"].as_array().expect("certifications");
     let extinction = rows
         .iter()
         .find(|row| row["kind"] == "Extinction")
         .expect("the production detector must produce a certified extinction row");
-    assert_eq!(extinction["tick"], 97);
+    assert_eq!(extinction["tick"], EXTINCTION_TICK);
     assert_eq!(extinction["metric"], METRIC_POPULATION);
     assert_eq!(extinction["significant_fdr"], true);
     assert!(extinction["ci_upper"].as_f64().expect("CI") < 0.0);
