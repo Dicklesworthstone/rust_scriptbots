@@ -101,6 +101,20 @@ Continuation File** validates a saved owner before replacing the current world,
 then pauses it. Local continuation controls are disabled while displaying a remote
 server. A delayed file read cannot replace a newer reset or remote session.
 
-These are downloadable owner continuation files. The demo does not automatically
-persist to IndexedDB, write a SQLite-image checkpoint, or promote volatile journal
-receipts to `Durable`. Those original `bd-ywtv` requirements remain open.
+**Save in This Browser** stores one complete owner continuation in IndexedDB for
+this site's origin and browser profile. The UI acknowledges the save only after
+the transaction completes; quota or abort failures preserve the previous slot.
+Reload discovers the saved tick and time. **Restore Saved World** explicitly
+validates and installs that continuation, paused, including when a bad startup
+permalink left no active owner. Saves are manual: later ticks are not autosaved.
+Browser data clearing or eviction can remove the slot; download a continuation
+file when a portable copy is needed. An in-flight restore cannot replace a reset,
+new permalink, or remote session. Remote mode disables local save/restore.
+
+The browser record holds bounded opaque checkpoint bytes as a Blob, allowing a
+size check before materializing an ArrayBuffer. Corrupt or unsupported records,
+and a stored tick that disagrees with the validated owner, leave the current
+world intact. This saved continuation is separate from the owner's journal
+receipt state. It does not write a SQLite image or ordered batch journal, or
+promote volatile receipts to `Durable`; those original `bd-ywtv` requirements
+remain open. Multiple tabs share the slot: the last completed manual save wins.

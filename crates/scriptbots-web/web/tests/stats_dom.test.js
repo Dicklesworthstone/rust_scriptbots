@@ -59,6 +59,7 @@ function readPackage() {
 const camelCaseWasmModule = `
   export default async function initWasm() { return {}; }
   export function version() { return "0.1.0-camel-case-prod"; }
+  export function checkpoint_byte_limit() { return 1024; }
   export function default_init_options() { return { world_width: 1280, world_height: 720 }; }
   export function init_sim(opts) {
     let tick = 0;
@@ -120,6 +121,7 @@ const camelCaseWasmModule = `
 const snakeCaseWasmModule = `
   export default async function initWasm() { return {}; }
   export function version() { return "0.1.0-snake-case-control"; }
+  export function checkpoint_byte_limit() { return 1024; }
   export function default_init_options() { return { world_width: 1280, world_height: 720 }; }
   export function init_sim(opts) {
     let tick = 0;
@@ -175,7 +177,7 @@ function createServer(packageInfo) {
     } else if (url.pathname === "/main.js") {
       res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8" });
       res.end(fs.readFileSync(path.join(webDir, "main.js")));
-    } else if (["/remote.js", "/renderers/canvas.js", "/renderers/webgpu.js"].includes(url.pathname)) {
+    } else if (["/remote.js", "/continuation-store.js", "/renderers/canvas.js", "/renderers/webgpu.js"].includes(url.pathname)) {
       res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8" });
       res.end(fs.readFileSync(path.join(webDir, url.pathname.slice(1))));
     } else if (url.pathname.startsWith("/pkg/")
@@ -211,9 +213,7 @@ async function runCheckpointJourney(browser, baseUrl, moduleFile) {
   page.on("console", (message) => logs.push({ type: message.type(), text: message.text() }));
   let downloads = 0;
   page.on("download", () => { downloads += 1; });
-  try {
-    await page.goto(`${baseUrl}/`);
-    await page.waitForFunction(() => document.getElementById("version").textContent !== "initializing…");
+  const observeOwnerAndPause = async (expectOwner = true) => {
     await page.evaluate(async (file) => {
       const wasm = await import(`/pkg/${file}`);
       const frame = wasm.SimHandle.prototype.frame;
@@ -225,7 +225,12 @@ async function runCheckpointJourney(browser, baseUrl, moduleFile) {
       speed.value = "0";
       speed.dispatchEvent(new Event("input", { bubbles: true }));
     }, moduleFile);
-    await page.waitForFunction(() => !!window.__continuationOwner);
+    if (expectOwner) await page.waitForFunction(() => !!window.__continuationOwner);
+  };
+  try {
+    await page.goto(`${baseUrl}/`);
+    await page.waitForFunction(() => document.getElementById("version").textContent !== "initializing…");
+    await observeOwnerAndPause();
     const snapshot = () => page.evaluate(() => JSON.stringify(window.__continuationOwner.snapshot()));
     const legacy = await snapshot();
     await page.click("#checkpoint-save");
@@ -251,6 +256,9 @@ async function runCheckpointJourney(browser, baseUrl, moduleFile) {
     await download.saveAs(artifact);
     const bytes = fs.readFileSync(artifact);
     if (bytes.length === 0 || !artifact.endsWith(".sbcheckpoint")) throw new Error("Continuation download is empty or misnamed");
+    await page.click("#checkpoint-browser-save");
+    await page.waitForFunction(() => document.getElementById("checkpoint-browser-status").textContent.startsWith("Saved continuation in this browser:"));
+    if (await snapshot() !== saved.snapshot) throw new Error("Saving in IndexedDB advanced science");
     const expectedNext = await page.evaluate(() => {
       const owner = window.__continuationOwner;
       owner.tick(1);
@@ -267,6 +275,99 @@ async function runCheckpointJourney(browser, baseUrl, moduleFile) {
       return { snapshot: JSON.stringify(owner.snapshot()), identity: owner.frame().identity };
     });
     if (continued.snapshot !== expectedNext) throw new Error("Loaded MLP evaluators do not produce the uninterrupted next tick");
+
+    // A real request succeeds, then its real IndexedDB transaction aborts.
+    // Neither a success message nor a partial replacement may escape that abort.
+    await page.evaluate(async (file) => {
+      const { BrowserContinuationStore } = await import("/continuation-store.js");
+      const wasm = await import(`/pkg/${file}`);
+      window.__savedBrowserRecord = await new BrowserContinuationStore(wasm.checkpoint_byte_limit()).read();
+      const put = IDBObjectStore.prototype.put;
+      IDBObjectStore.prototype.put = function (...args) {
+        IDBObjectStore.prototype.put = put;
+        const request = put.apply(this, args);
+        request.addEventListener("success", () => {
+          window.__abortedSuccessfulPut = true;
+          this.transaction.abort();
+        }, { once: true });
+        return request;
+      };
+    }, moduleFile);
+    const beforeAbortedSave = await snapshot();
+    await page.click("#checkpoint-browser-save");
+    await page.waitForFunction(() => document.getElementById("checkpoint-browser-status").textContent.startsWith("Browser save failed:"));
+    const previousSlotPreserved = await page.evaluate(async (file) => {
+      const { BrowserContinuationStore } = await import("/continuation-store.js");
+      const wasm = await import(`/pkg/${file}`);
+      const current = await new BrowserContinuationStore(wasm.checkpoint_byte_limit()).read();
+      const before = window.__savedBrowserRecord;
+      const oldBytes = new Uint8Array(await before.blob.arrayBuffer());
+      const newBytes = new Uint8Array(await current.blob.arrayBuffer());
+      return window.__abortedSuccessfulPut && current.tick === before.tick && current.savedAt === before.savedAt
+        && newBytes.length === oldBytes.length && newBytes.every((value, index) => value === oldBytes[index]);
+    }, moduleFile);
+    if (!previousSlotPreserved || await snapshot() !== beforeAbortedSave) {
+      throw new Error("An aborted IndexedDB replacement changed the saved slot or running science");
+    }
+
+    await page.reload();
+    await page.waitForFunction(() => document.getElementById("checkpoint-browser-status").textContent.startsWith("Saved continuation found:"));
+    await observeOwnerAndPause();
+    if (await snapshot() === saved.snapshot) throw new Error("Page reload restored a stored world without explicit consent");
+    await page.selectOption("#brain-preset", "wander");
+    await page.evaluate(() => { window.__browserBeforeWanderReset = window.__continuationOwner; });
+    await page.click("#reset-btn");
+    await page.waitForFunction(() => window.__continuationOwner !== window.__browserBeforeWanderReset
+      && window.__continuationOwner?.brainPreset() === "wander");
+    const legacyAfterReload = await snapshot();
+    await page.click("#checkpoint-browser-save");
+    await page.waitForFunction(() => document.getElementById("checkpoint-browser-status").textContent.startsWith("Browser save failed:"));
+    if (await snapshot() !== legacyAfterReload) throw new Error("Unsupported browser save changed the Wander world");
+    await page.click("#checkpoint-browser-restore");
+    await page.waitForFunction(() => document.getElementById("checkpoint-browser-status").textContent.startsWith("Restored browser continuation at tick"));
+    if (await snapshot() !== saved.snapshot || await page.inputValue("#steps-per-frame") !== "0") {
+      throw new Error("Explicit browser restore after reload did not recover the saved paused owner");
+    }
+    const browserNext = await page.evaluate(() => {
+      window.__continuationOwner.tick(1);
+      return JSON.stringify(window.__continuationOwner.snapshot());
+    });
+    if (browserNext !== expectedNext) throw new Error("IndexedDB continuation diverged from the uninterrupted next tick");
+
+    await page.evaluate(async (file) => {
+      const { BrowserContinuationStore } = await import("/continuation-store.js");
+      const wasm = await import(`/pkg/${file}`);
+      const store = new BrowserContinuationStore(wasm.checkpoint_byte_limit());
+      const record = window.__savedBrowserRecord = await store.read();
+      const bytes = new Uint8Array(await record.blob.arrayBuffer());
+      bytes[Math.floor(bytes.length / 2)] ^= 1;
+      await store.save(new Blob([bytes]), record.tick, record.savedAt);
+    }, moduleFile);
+    const beforeCorruptStored = await snapshot();
+    await page.click("#checkpoint-browser-restore");
+    await page.waitForFunction(() => document.getElementById("checkpoint-browser-status").textContent.startsWith("Browser restore failed:"));
+    if (await snapshot() !== beforeCorruptStored) throw new Error("Corrupt stored WASM checkpoint replaced the live world");
+    const corruptStoredMessage = await page.textContent("#checkpoint-browser-status");
+    await page.evaluate(async (file) => {
+      const { BrowserContinuationStore } = await import("/continuation-store.js");
+      const wasm = await import(`/pkg/${file}`);
+      const record = window.__savedBrowserRecord;
+      await new BrowserContinuationStore(wasm.checkpoint_byte_limit()).save(record.blob, record.tick, record.savedAt);
+    }, moduleFile);
+
+    // Discovery and explicit restore must also work when an invalid startup
+    // permalink left no owner, no clock, and no rendered snapshot to replace.
+    await page.goto(`${baseUrl}/?world=invalid_startup_link`);
+    await page.waitForFunction(() => document.getElementById("permalink-status").textContent.startsWith("Error:")
+      && document.getElementById("checkpoint-browser-status").textContent.startsWith("Saved continuation found:"));
+    await observeOwnerAndPause(false);
+    await page.click("#checkpoint-browser-restore");
+    await page.waitForFunction(() => document.getElementById("checkpoint-browser-status").textContent.startsWith("Restored browser continuation at tick"));
+    if (await snapshot() !== saved.snapshot || await page.inputValue("#steps-per-frame") !== "0") {
+      throw new Error("Saved browser continuation could not recover an ownerless startup");
+    }
+    const browserStorage = { savedTick: JSON.parse(saved.snapshot).tick, nextTick: JSON.parse(browserNext).tick,
+      previousSlotPreserved, explicitRestoreAfterReload: true, ownerlessStartupRecovered: true, corruptStoredMessage };
 
     const rejected = [];
     for (const [name, payload] of [
@@ -316,7 +417,7 @@ async function runCheckpointJourney(browser, baseUrl, moduleFile) {
     const result = { passed: true, artifact, bytes: bytes.length, sourceIdentity: saved.identity,
       continuedIdentity: continued.identity, savedTick: JSON.parse(saved.snapshot).tick,
       nextTick: JSON.parse(continued.snapshot).tick, rejected, oversizedBytes: limit + 1,
-      oversizedReads: 0, staleReadPreservedReset: true, downloads, errors, consoleLogs: logs };
+      oversizedReads: 0, staleReadPreservedReset: true, browserStorage, downloads, errors, consoleLogs: logs };
     fs.writeFileSync(path.join(proof, "result.json"), JSON.stringify(result, null, 2), { flag: "wx" });
     return result;
   } finally {
@@ -1162,7 +1263,8 @@ async function runRemoteTests(browser, baseUrl, packageInfo) {
     observations.frozenLocal = await page.evaluate(() => window.__remoteLocalHandle.frame().identity);
     observations.connected = await page.evaluate(() => ({ frames: window.__remoteWire.frames,
       sent: window.__remoteWire.sent, replies: window.__remoteWire.replies,
-      disabled: ["steps-per-frame", "population", "reset-btn", "brain-preset", "checkpoint-save", "checkpoint-load"].map((id) => [id, document.getElementById(id)?.disabled]) }));
+      disabled: ["steps-per-frame", "population", "reset-btn", "brain-preset", "checkpoint-save", "checkpoint-load",
+        "checkpoint-browser-save", "checkpoint-browser-restore"].map((id) => [id, document.getElementById(id)?.disabled]) }));
     const { canvas, telemetry, events } = observations.connected.frames;
     for (const frame of [canvas, telemetry, events]) {
       if (frame.identity.tick !== String(observations.initial.tick)

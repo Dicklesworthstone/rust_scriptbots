@@ -105,8 +105,9 @@ const mockWasmModule = `
 
   export function checkpoint_byte_limit() { return 1024; }
   export function restore_checkpoint(bytes) {
-    if (bytes.length !== 1 || bytes[0] !== 42) throw new Error("intentional checkpoint refusal");
-    return createHandle("checkpoint", "sbw1.continuation", 37);
+    if (![1, 9].includes(bytes.length) || bytes[0] !== 42) throw new Error("intentional checkpoint refusal");
+    const tick = bytes.length === 1 ? 37 : Number(new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getBigUint64(1, true));
+    return createHandle("checkpoint", "sbw1.continuation", tick);
   }
   export function decode_remote_frame_binary() { throw new Error("No remote frame in this lifecycle fixture"); }
 
@@ -129,6 +130,13 @@ const mockWasmModule = `
       },
       permalinkOf() { check("permalink"); return link; },
       brainPreset() { check("preset"); return kind === "checkpoint" ? "mlp" : "wander"; },
+      checkpoint() {
+        check("checkpoint");
+        const bytes = new Uint8Array(9);
+        bytes[0] = 42;
+        new DataView(bytes.buffer).setBigUint64(1, BigInt(record.tick), true);
+        return bytes;
+      },
       setSpeed(value) { check("speed"); record.speed = value; },
       drive(now) {
         check("drive");
@@ -391,8 +399,144 @@ async function runOwnerLifecycleCases(page, context) {
     throw new Error("Return to local failed to resume its retained world with one timer");
   }
   observations.staleRemotePreservedOwner = activeOwner(returned).id;
-  observations.releasedOwners = returned.records.filter((owner) => owner.freeCalls === 1).length;
-  observations.maximumPendingTimers = returned.maximumTimers;
+
+  // Real IndexedDB and DOM, with the same explicit WASM owner double. These
+  // cases observe storage refusal and ownership races; stats_dom.test.js also
+  // exercises reload and continuation through the generated Rust/WASM package.
+  await setSpeed(0);
+  await replace("checkpoint");
+  const browserClick = async (selector, prefix) => {
+    let timeout;
+    try {
+      return await Promise.race([
+        page.evaluate(({ selector, prefix }) => new Promise((resolve) => {
+          const status = document.getElementById("checkpoint-browser-status");
+          const observer = new MutationObserver(() => {
+            if (status.textContent.startsWith(prefix)) {
+              observer.disconnect();
+              resolve(status.textContent);
+            }
+          });
+          observer.observe(status, { childList: true, characterData: true, subtree: true });
+          document.querySelector(selector).click();
+        }), { selector, prefix }),
+        new Promise((_, reject) => {
+          timeout = setTimeout(() => reject(new Error(`${selector} did not produce ${prefix}`)), 10_000);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timeout);
+    }
+  };
+  await browserClick("#checkpoint-browser-save", "Saved continuation in this browser:");
+  await page.evaluate(async () => {
+    const { BrowserContinuationStore } = await import("/continuation-store.js");
+    window.__storedGoodRecord = await new BrowserContinuationStore(1024).read();
+    window.__replaceStoredRecord = (record) => new Promise((resolve, reject) => {
+      const open = indexedDB.open("scriptbots-continuations", 1);
+      open.onerror = () => reject(open.error);
+      open.onsuccess = () => {
+        const database = open.result;
+        const transaction = database.transaction("continuations", "readwrite");
+        transaction.oncomplete = () => { database.close(); resolve(); };
+        transaction.onabort = () => { database.close(); reject(transaction.error); };
+        transaction.objectStore("continuations").put(record, "latest");
+      };
+    });
+  });
+
+  const storedRefusals = [];
+  for (const defect of ["tick", "corrupt", "oversized", "version"]) {
+    await page.evaluate(async (defect) => {
+      const record = { ...window.__storedGoodRecord };
+      if (defect === "tick") record.tick = String(BigInt(record.tick) + 1n);
+      if (defect === "corrupt") record.blob = new Blob([new Uint8Array([0])]);
+      if (defect === "oversized") record.blob = new Blob([new Uint8Array(1025)]);
+      if (defect === "version") record.schema = "scriptbots.browser-continuation.v999";
+      await window.__replaceStoredRecord(record);
+      const read = Blob.prototype.arrayBuffer;
+      window.__storedReadCount = 0;
+      window.__restoreBlobRead = () => { Blob.prototype.arrayBuffer = read; };
+      Blob.prototype.arrayBuffer = function () { window.__storedReadCount += 1; return read.call(this); };
+    }, defect);
+    const before = await state();
+    const message = await browserClick("#checkpoint-browser-restore", "Browser restore failed:");
+    await context.clock.runFor(32);
+    const after = await state();
+    const reads = await page.evaluate(() => { window.__restoreBlobRead(); return window.__storedReadCount; });
+    const candidates = after.records.slice(before.records.length);
+    if (activeOwner(after).id !== activeOwner(before).id || activeOwner(after).tick !== activeOwner(before).tick
+        || candidates.length !== (defect === "tick" ? 1 : 0) || candidates.some((owner) => owner.freeCalls !== 1)
+        || after.pendingTimers !== 1 || after.maximumTimers !== 1
+        || reads !== (["tick", "corrupt"].includes(defect) ? 1 : 0)) {
+      throw new Error(`Stored ${defect} did not preserve the owner or byte-allocation boundary`);
+    }
+    storedRefusals.push({ defect, reads, candidates: candidates.length, message });
+  }
+  await page.evaluate(() => window.__replaceStoredRecord(window.__storedGoodRecord));
+
+  await page.evaluate(() => {
+    const put = IDBObjectStore.prototype.put;
+    IDBObjectStore.prototype.put = function (...args) {
+      IDBObjectStore.prototype.put = put;
+      throw new DOMException("Controlled quota refusal", "QuotaExceededError");
+    };
+  });
+  const beforeQuota = await state();
+  const quotaMessage = await browserClick("#checkpoint-browser-save", "Browser save failed:");
+  if (!quotaMessage.includes("quota") || activeOwner(await state()).id !== activeOwner(beforeQuota).id) {
+    throw new Error("Browser quota refusal changed the active owner or lost its typed explanation");
+  }
+  await browserClick("#checkpoint-browser-restore", "Restored browser continuation at tick 37;");
+  await context.clock.runFor(32);
+  if (activeOwner(await state()).tick !== 37) throw new Error("Quota refusal replaced the saved checkpoint");
+
+  const delayedRestore = async () => {
+    await page.evaluate(() => {
+      const read = Blob.prototype.arrayBuffer;
+      let started;
+      window.__browserReadStarted = new Promise((resolve) => { started = resolve; });
+      Blob.prototype.arrayBuffer = function () {
+        Blob.prototype.arrayBuffer = read;
+        return new Promise((resolve, reject) => {
+          window.__releaseBrowserRead = () => read.call(this).then(resolve, reject);
+          started();
+        });
+      };
+      document.getElementById("checkpoint-browser-restore").click();
+    });
+    await page.evaluate(() => window.__browserReadStarted);
+  };
+  const staleStoredReads = [];
+  for (const change of ["reset", "remote"]) {
+    await delayedRestore();
+    if (change === "reset") await replace("reset");
+    else await page.evaluate(() => document.getElementById("remote-connect").click());
+    const changed = await state();
+    await page.evaluate(() => window.__releaseBrowserRead());
+    const after = await state();
+    if (!await page.evaluate(() => document.getElementById("checkpoint-browser-status").textContent.startsWith("Browser restore cancelled"))
+        || activeOwner(after).id !== activeOwner(changed).id || after.records.length !== changed.records.length
+        || after.pendingTimers !== (change === "remote" ? 0 : 1)) {
+      throw new Error(`Delayed browser restore ignored ${change}`);
+    }
+    if (change === "remote") {
+      const disabled = await page.evaluate(() => ["checkpoint-browser-save", "checkpoint-browser-restore"].every((id) => {
+        const button = document.getElementById(id);
+        button.dispatchEvent(new Event("click"));
+        return button.disabled;
+      }));
+      if (!disabled || (await state()).records.length !== changed.records.length) {
+        throw new Error("Remote mode admitted a local browser continuation operation");
+      }
+      await page.evaluate(() => document.getElementById("remote-local").click());
+    }
+    staleStoredReads.push({ change, retainedOwner: activeOwner(after).id });
+  }
+  observations.browserStorage = { storedRefusals, quotaMessage, staleStoredReads };
+  const finalState = await state();
+  observations.releasedOwners = finalState.records.filter((owner) => owner.freeCalls === 1).length;
+  observations.maximumPendingTimers = finalState.maximumTimers;
   return observations;
 }
 
@@ -405,7 +549,7 @@ function createServer() {
     } else if (url.pathname === "/main.js") {
       res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8" });
       res.end(fs.readFileSync(path.join(webDir, "main.js")));
-    } else if (["/remote.js", "/renderers/canvas.js", "/renderers/webgpu.js"].includes(url.pathname)) {
+    } else if (["/remote.js", "/continuation-store.js", "/renderers/canvas.js", "/renderers/webgpu.js"].includes(url.pathname)) {
       res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8" });
       res.end(fs.readFileSync(path.join(webDir, url.pathname.slice(1))));
     } else {

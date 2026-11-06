@@ -85,6 +85,17 @@ history/credit handling; nonempty narrative delivery requires observed records.
   beside the controls. The demo consumes one latest JSON snapshot per paint;
   binary bindings are separate from these controls.
 - **Reset Simulation**: reseeds with a fresh RNG seed and reuses the slider settings. A rolling 5-second performance log is appended to the console pane (`FPS`, `TPS`, population).
+- **Saved continuations**: choose MLP or Unbound for a new world, then Reset.
+  **Save Continuation File** downloads a portable full-owner checkpoint; **Load
+  Continuation File** validates and restores it paused. **Save in This Browser**
+  replaces one IndexedDB slot for this site and browser profile. The save is
+  acknowledged only when the transaction completes. A reload displays the saved
+  tick and time; **Restore Saved World** is always explicit and starts paused,
+  without adding ticks for offline time. There is no autosave. Browser storage
+  clearing or eviction can remove the slot, so download a file for a portable
+  copy. Quota/abort errors keep the previous save, and invalid or stale restores
+  preserve the active world. Both local restore paths work after an invalid
+  startup permalink; all local continuation controls are disabled in remote mode.
 - Runtime brain presets can be toggled programmatically via `registerBrain("wander" | "mlp" | "none")` on the `SimHandle`.
 
 Snapshots returned to JS follow the selected `snapshot_format` (defaults to JSON). To switch to binary snapshots (Postcard-encoded `Uint8Array`), pass `snapshot_format: "binary"` to `init_sim`.
@@ -159,6 +170,21 @@ The visible-frame guard inspects compositor PNG pixels, with transparent and
 opaque empty-frame negatives and a one-pixel positive control. A separate
 canvas-copy count is diagnostic; it does not qualify GPU image export.
 The ordinary stats mode retains its separate four-case contract.
+
+The ordinary real-package checkpoint journey also saves a nonempty MLP owner in
+actual IndexedDB, aborts a replacement after request success, reloads the page,
+and explicitly restores the original snapshot and uninterrupted next tick. It
+checks stored-byte corruption and recovery from an ownerless startup. The
+permalink lifecycle harness separately checks stored tick mismatches, bounds,
+quota refusal, and delayed restore races with reset/remote mode using its explicit
+WASM double. `tests/continuation_store.test.mjs` can run under Node through DSR;
+its controlled IndexedDB events test adapter ordering, error handling and bounds,
+not real browser persistence or the Rust codec.
+
+The saved slot contains an opaque full-owner checkpoint Blob, not a database
+image or a batch journal. It leaves internal `CommittedVolatile` receipts intact
+and does not qualify the full SQLite-image/journal `Durable` path in `bd-ywtv`.
+Multiple tabs share the slot; the last completed manual save wins.
 
 For determinism validation, run the accompanying WASM parity test:
 

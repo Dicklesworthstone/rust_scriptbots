@@ -11,6 +11,22 @@ replacement. This contributes to Phase 4.3, Phase 5.2 and `bd-2z0.7.6.1`; the
 saved-continuation slice does not complete `bd-ywtv`'s SQLite-image/batch-journal
 durability architecture or promote volatile journal receipts to Durable.
 
+**Browser saved continuations (2026-11-06):** [Implemented in source — browser
+runtime qualification remains blocked]
+
+The browser now saves one explicit full-owner continuation in IndexedDB and
+discovers its tick/time after reload. Restore validates a bounded Blob before
+installing a paused owner, including recovery from an invalid startup permalink.
+Transactions acknowledge only on completion; abort/quota failures preserve the
+previous record. Reset, permalink and remote transitions invalidate delayed
+restores; a saved tick mismatch rejects and frees the candidate. Blocked database
+opens retain one pending request rather than accumulating retries. DSR passed
+all eight adapter tests using controlled IndexedDB events and the five edited
+JavaScript syntax checks. Actual packaged-WASM reload/next-tick/abort/corruption
+and DOM ownership-race regressions are authored; Chromium remains unavailable,
+so those browser journeys are unexecuted. No Durable receipt or SQLite/journal
+qualification is claimed.
+
 **MCP comparison increment (2026-11-06):** [Implemented in source — native
 qualification remains blocked]
 
