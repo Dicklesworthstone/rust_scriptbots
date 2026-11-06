@@ -463,14 +463,23 @@ impl ChannelHostPort {
     }
 
     fn bounded_before(&self, deadline: Instant) -> Result<Self, HostAccessError> {
+        self.bounded_before_with_error(
+            deadline,
+            Self::protocol_violation("channel caller budget elapsed before ingress"),
+        )
+    }
+
+    fn bounded_before_with_error(
+        &self,
+        deadline: Instant,
+        expired: HostAccessError,
+    ) -> Result<Self, HostAccessError> {
         let deadline = self
             .caller_deadline
             .map_or(deadline, |bound| bound.min(deadline));
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(Self::protocol_violation(
-                "channel caller budget elapsed before ingress",
-            ));
+            return Err(expired);
         }
         let mut bounded = self.clone();
         bounded.submit_deadline = bounded.submit_deadline.min(remaining);
@@ -495,9 +504,7 @@ impl ChannelHostPort {
             .caller_deadline
             .map_or(per_call, |outer| outer.min(per_call));
         if deadline <= now {
-            return Err(Self::protocol_violation(
-                "inspection budget elapsed before ingress",
-            ));
+            return Err(HostAccessError::OwnerReadTimeout);
         }
         Ok(deadline)
     }
@@ -520,14 +527,11 @@ impl ChannelHostPort {
     ) -> Result<R, HostAccessError> {
         let started = Instant::now();
         let (reply, receiver) = std::sync::mpsc::channel();
-        self.enqueue(message(reply), started)?;
+        self.enqueue_with_error(message(reply), started, HostAccessError::OwnerReadTimeout)?;
         receiver
             .recv_timeout(self.remaining_budget(started))
             .map_err(|error| match error {
-                RecvTimeoutError::Timeout => Self::protocol_violation(format!(
-                    "owner inspection reply exceeded {:?}",
-                    self.submit_deadline
-                )),
+                RecvTimeoutError::Timeout => HostAccessError::OwnerReadTimeout,
                 RecvTimeoutError::Disconnected => HostAccessError::Disconnected,
             })?
     }
@@ -554,7 +558,8 @@ impl ChannelHostPort {
         request: &BrainProjectionRequest,
         deadline: Instant,
     ) -> Result<BrainProjection, HostAccessError> {
-        self.bounded_before(deadline)?.project_brain(request)
+        self.bounded_before_with_error(deadline, HostAccessError::OwnerReadTimeout)?
+            .project_brain(request)
     }
 
     /// Read one living agent's inspector detail; a deceased UID returns `None`.
@@ -592,7 +597,7 @@ impl ChannelHostPort {
         max_contributors: usize,
         deadline: Instant,
     ) -> Result<Option<AgentInspectorData>, HostAccessError> {
-        self.bounded_before(deadline)?
+        self.bounded_before_with_error(deadline, HostAccessError::OwnerReadTimeout)?
             .inspect_agent(uid, max_contributors)
     }
 
@@ -602,7 +607,7 @@ impl ChannelHostPort {
         uid: AgentUid,
         deadline: Instant,
     ) -> Result<Option<AgentInspectorData>, HostAccessError> {
-        self.bounded_before(deadline)?
+        self.bounded_before_with_error(deadline, HostAccessError::OwnerReadTimeout)?
             .inspect_agent_with_attribution(uid, None)
     }
 
@@ -741,6 +746,22 @@ impl ChannelHostPort {
     }
 
     fn enqueue(&self, message: IngressMessage, started: Instant) -> Result<(), HostAccessError> {
+        self.enqueue_with_error(
+            message,
+            started,
+            Self::protocol_violation(format!(
+                "channel host did not drain ingress within {:?}",
+                self.submit_deadline
+            )),
+        )
+    }
+
+    fn enqueue_with_error(
+        &self,
+        message: IngressMessage,
+        started: Instant,
+        timeout: HostAccessError,
+    ) -> Result<(), HostAccessError> {
         // `SyncSender::send_timeout` is unstable; park briefly between retries inside the
         // caller's original deadline instead of blocking without bound or resetting the budget.
         const RETRY_PARK: Duration = Duration::from_millis(2);
@@ -748,10 +769,7 @@ impl ChannelHostPort {
         loop {
             let remaining = self.remaining_budget(started);
             if remaining.is_zero() {
-                return Err(Self::protocol_violation(format!(
-                    "channel host did not drain ingress within {:?}",
-                    self.submit_deadline
-                )));
+                return Err(timeout);
             }
             let ingress_open = match self.ingress_open.try_lock() {
                 Ok(guard) => guard,
@@ -1429,9 +1447,7 @@ impl ChannelHostDriver {
                 reply,
             } => {
                 if Instant::now() >= expires_at {
-                    let _ = reply.send(Err(ChannelHostPort::protocol_violation(
-                        "owner inspection budget elapsed in ingress",
-                    )));
+                    let _ = reply.send(Err(HostAccessError::OwnerReadTimeout));
                     return;
                 }
                 let _ = reply.send(
@@ -1903,6 +1919,46 @@ mod tests {
             maintenance_period: Duration::from_millis(2),
             ..ChannelHostOptions::default()
         }
+    }
+
+    #[test]
+    fn expired_inspection_is_a_timeout_not_a_protocol_violation() {
+        let (mut driver, port) =
+            ChannelHostDriver::new(test_host(true), fast_options()).expect("inspection transport");
+        let (reply, result) = std::sync::mpsc::channel();
+        driver.process_ingress(IngressMessage::AgentInspection {
+            uid: AgentUid(1),
+            max_contributors: None,
+            expires_at: Instant::now(),
+            reply,
+        });
+        assert!(matches!(
+            result.recv().unwrap(),
+            Err(HostAccessError::OwnerReadTimeout)
+        ));
+        assert!(matches!(
+            port.inspect_agent(AgentUid(1), MAX_INSPECTOR_CONTRIBUTORS + 1),
+            Err(HostAccessError::ProtocolViolation { .. })
+        ));
+        assert!(matches!(
+            port.inspect_agent_for_hud_before(AgentUid(1), Instant::now()),
+            Err(HostAccessError::OwnerReadTimeout)
+        ));
+        let (_stalled_driver, stalled_port) = ChannelHostDriver::new(
+            test_host(true),
+            ChannelHostOptions {
+                ingress_capacity: 1,
+                submit_deadline: Duration::from_millis(25),
+                ..fast_options()
+            },
+        )
+        .expect("stalled inspection transport");
+        assert!(stalled_port.sender.try_send(IngressMessage::Wake).is_ok());
+        assert!(matches!(
+            stalled_port
+                .inspect_agent_for_hud_before(AgentUid(1), Instant::now() + Duration::from_secs(1)),
+            Err(HostAccessError::OwnerReadTimeout)
+        ));
     }
 
     #[test]
@@ -3692,11 +3748,11 @@ mod tests {
         ));
         assert!(matches!(
             port.inspect_agent_before(AgentUid(1), 0, expired),
-            Err(HostAccessError::ProtocolViolation { .. })
+            Err(HostAccessError::OwnerReadTimeout)
         ));
         assert!(matches!(
             port.inspect_agent_for_hud_before(AgentUid(1), expired),
-            Err(HostAccessError::ProtocolViolation { .. })
+            Err(HostAccessError::OwnerReadTimeout)
         ));
         let request = BrainProjectionRequest::focused(
             crate::ProjectionClientId::new(613),
@@ -3705,7 +3761,7 @@ mod tests {
         );
         assert!(matches!(
             port.project_brain_before(&request, expired),
-            Err(HostAccessError::ProtocolViolation { .. })
+            Err(HostAccessError::OwnerReadTimeout)
         ));
         assert!(matches!(
             driver.receiver.try_recv(),
@@ -3727,7 +3783,7 @@ mod tests {
         let deadline = started + Duration::from_millis(20);
         assert!(matches!(
             port.inspect_agent_before(AgentUid(1), 0, deadline),
-            Err(HostAccessError::ProtocolViolation { .. })
+            Err(HostAccessError::OwnerReadTimeout)
         ));
         assert!(started.elapsed() < Duration::from_secs(1));
         assert!(matches!(
@@ -3746,7 +3802,7 @@ mod tests {
         let started = Instant::now();
         assert!(matches!(
             port.project_brain_before(&request, started + Duration::from_millis(20)),
-            Err(HostAccessError::ProtocolViolation { .. })
+            Err(HostAccessError::OwnerReadTimeout)
         ));
         assert!(started.elapsed() < Duration::from_secs(1));
         assert!(matches!(
@@ -3768,8 +3824,7 @@ mod tests {
         });
         assert!(matches!(
             receive.recv().expect("expired reply"),
-            Err(HostAccessError::ProtocolViolation { message })
-                if message.contains("elapsed in ingress")
+            Err(HostAccessError::OwnerReadTimeout)
         ));
 
         let (reply, receive) = std::sync::mpsc::channel();
@@ -3795,7 +3850,7 @@ mod tests {
         }
         assert!(matches!(
             bounded.inspect_agent(AgentUid(1), 0),
-            Err(HostAccessError::ProtocolViolation { .. })
+            Err(HostAccessError::OwnerReadTimeout)
         ));
         assert!(matches!(
             driver.receiver.try_recv(),

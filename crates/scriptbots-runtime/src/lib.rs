@@ -97,9 +97,9 @@ pub use host_core::{
     HOST_CHECKPOINT_V1_SCHEMA, HostCheckpointBusy, HostCheckpointError, HostCheckpointV1, HostCore,
     HostCoreBuildError, HostCoreOptions, HostJournalCutV1, LocalHostPort,
     MAX_HOST_CHECKPOINT_BYTES, MAX_SCIENTIFIC_COMMAND_HISTORY_BYTES,
-    MAX_VOLATILE_HOST_CHECKPOINT_BYTES, MigrationArrival,
-    PreparedConfigPatchResolver, VolatileHostCheckpointV1, VolatileJournal,
-    VolatileJournalCheckpointV1, WorldCheckpointCut, WorldDigestCut,
+    MAX_VOLATILE_HOST_CHECKPOINT_BYTES, MigrationArrival, PreparedConfigPatchResolver,
+    VolatileHostCheckpointV1, VolatileJournal, VolatileJournalCheckpointV1, WorldCheckpointCut,
+    WorldDigestCut,
 };
 pub use native::{FixedDeadlineHost, NativeDriveReceipt, NativeDriveTrigger, NativeScheduleError};
 
@@ -5105,6 +5105,10 @@ pub enum HostAccessError {
         /// Lifecycle observed when the caller attempted submission.
         lifecycle: HostLifecycle,
     },
+    /// An owner read did not complete within its bounded wait. The owner may
+    /// still be busy; this does not imply an ordering or protocol violation.
+    #[error("owner read timed out before the detail was available")]
+    OwnerReadTimeout,
     /// A host implementation violated the public ordering contract.
     #[error("host protocol violation: {message}")]
     ProtocolViolation {
