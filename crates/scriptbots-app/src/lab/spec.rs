@@ -50,8 +50,10 @@ pub const MAX_TICKS_PER_RUN: u64 = 1_000_000;
 /// Longest free-text field.
 pub const MAX_STRING_LEN: usize = 4_096;
 
-/// Metrics emitted by the matched-seed runner and therefore valid for analysis.
-pub const KNOWN_METRICS: &[&str] = &["alive_agents"];
+/// Final-state endpoints emitted by the matched-seed runner and valid for analysis.
+/// Population means and maxima are unavailable after extinction; choosing one
+/// requires it to be observed in every matched run, without zero imputation.
+pub const KNOWN_METRICS: &[&str] = &crate::experiment_runner::EXPERIMENT_ENDPOINT_METRICS;
 
 /// The knob that may NEVER be a factor.
 ///
@@ -112,7 +114,9 @@ pub struct ExperimentSpec {
     pub seeds: SeedPlan,
     /// How long each run lasts.
     pub ticks_per_run: u64,
-    /// Which summary columns to compare. Must name metrics that exist.
+    /// Which final-state endpoints to compare. Every requested metric must be
+    /// available in every completed run. Population means and maxima are
+    /// unavailable after extinction and are never silently replaced by zero.
     pub metrics: Vec<String>,
     /// The ceiling this spec must fit inside.
     pub budget: SpecBudget,
@@ -458,6 +462,12 @@ pub fn render_errors(errors: &[SpecError]) -> String {
 /// `serde_json` cannot encode.
 pub fn tool_input_schema() -> Result<serde_json::Value, serde_json::Error> {
     let mut root = serde_json::to_value(<ExperimentSpec as PartialSchema>::schema())?;
+    if let Some(items) = root
+        .pointer_mut("/properties/metrics/items")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        items.insert("enum".to_owned(), serde_json::json!(KNOWN_METRICS));
+    }
     let mut referenced = Vec::new();
     <ExperimentSpec as ToSchema>::schemas(&mut referenced);
     let schemas = referenced
@@ -1331,8 +1341,12 @@ mod tests {
             "nested canonical schemas must accompany their references: {schema}"
         );
         assert_eq!(
-            schema.pointer("/x-scriptbots-known-metrics/0"),
-            Some(&serde_json::json!("alive_agents"))
+            schema.pointer("/x-scriptbots-known-metrics"),
+            Some(&serde_json::json!(KNOWN_METRICS))
+        );
+        assert_eq!(
+            schema.pointer("/properties/metrics/items/enum"),
+            Some(&serde_json::json!(KNOWN_METRICS))
         );
         assert!(
             schema

@@ -3509,13 +3509,21 @@ clean source-status and source-diff digests plus Cargo.lock digest
 
 ### 7.7 experiment runner
 
-**[Currently In Progress — Codex, 2026-11-05]:** Extend the portable runner/Lab
-measurement contract beyond final population. A shared typed endpoint projection
-will derive energy, health, age, generation and food observations from the restored
-final world, bind the canonical summary artifact to that observation, and feed
-verified values to the existing matched-seed statistics. Empty-population means
-remain unavailable. This does not add fabricated per-tick database history or a
-second statistics implementation; original native qualification remains open.
+**Source implementation extension — Codex, 2026-11-05:** The runner and Lab now
+share eight final-state endpoints: population, total/mean live-agent energy,
+mean health, mean/max current age counter, max living generation and total food.
+Agent-UID-ordered `f64` reductions and row-major food reduction feed a typed V2
+summary and canonical CSV. V2 run evidence binds the summary schema; the portable
+verifier recomputes the complete summary from the restored final owner cut. Lab
+consumes those verified values, pins the selected manifest/summary digests, and
+uses the existing matched-seed statistics and notebook path. Proposal schema and
+validation share the same metric catalog. Extinction retains zero population and
+energy totals while population means/maxima remain unavailable, causing refusal
+when explicitly requested. Regression source covers known-world endpoints, CSV
+round trips, real energy/food analysis and reports, extinction, and checksum-valid
+semantic forgeries. V1 experiment summaries/evidence are deliberately refused.
+Native DSR qualification remains open; the extension adds no per-tick persistence
+history, dependencies, statistical thresholds or scientific-baseline changes.
 
 The headless experiment runner accepts a declarative experiment:
 

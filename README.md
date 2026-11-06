@@ -668,8 +668,9 @@ export does not checkpoint or rewrite the source. The copied database is indepen
 and compared with the manifest, events, checkpoints, maximum tick and persistence watermarks
 before the final bundle manifest is written. `--verify-bundle DIRECTORY` repeats those logical
 checks alongside artifact hashes. For matched-seed experiment bundles it also restores the
-included final HostCore checkpoint and compares the actual scientific digest and population
-with the reports. The printed `Scientific final state` line names those observed values;
+included final HostCore checkpoint and compares the actual scientific digest, population
+and complete V2 endpoint summary with the reports. The printed `Scientific final state`
+line names the observed digest and population;
 renaming or moving the bundle does not require its external continuation file or status.
 This checks the saved result, not the whole cohort plan or source authenticity, and does not
 promote incomplete build provenance to reproducibility. Database-free experiment bundles
@@ -1471,6 +1472,36 @@ counts existing binary artifacts without labelling them current-run checkpoints.
 `SCRIPTBOTS_ARTIFACTS_DIR` for an explicit directory; otherwise each control service reserves
 a unique temporary directory. Files, including partial failed captures, are never automatically
 removed or overwritten.
+
+Completed experiment bundles expose these final-state outcomes in
+`exports/summary.csv`. The same metric names are available to Lab proposals,
+paired analysis and notebook reports:
+
+| Metric | Observation at the final tick | Empty population |
+| --- | --- | --- |
+| `alive_agents` | Number of living agents | `0` |
+| `total_energy` | Sum of living agents' energy reserves | `0` |
+| `average_energy` | Mean living-agent energy | Unavailable |
+| `average_health` | Mean living-agent health | Unavailable |
+| `mean_age` | Mean current age counter | Unavailable |
+| `max_age` | Largest current age counter | Unavailable |
+| `max_generation` | Largest living lineage generation | Unavailable |
+| `total_food` | Sum of current food-grid cell values | Observed grid total |
+
+Age counters advance at the configured aging cadence. Agent measurements use
+`f64` reductions in stable agent-UID order; food uses row-major cell order.
+The portable verifier recomputes these observations from the final checkpoint
+and requires exact canonical summary bytes. Lab takes its analysis values from
+that verified projection and checks the selected manifest and summary digests.
+A proposal can request, for example, `"metrics": ["average_energy", "total_food"]`.
+Every requested endpoint must be available in every matched run. Unavailable
+population statistics use empty CSV cells and cause analysis to refuse that
+requested metric; they are never replaced with zero.
+
+The summary now declares `schema_version=2`, bound by
+`scriptbots.experiment-run-evidence.v2`. Verification and completed-run recovery
+refuse earlier V1 experiment summaries/evidence. Existing files are preserved;
+there is no implicit conversion to the new measurement contract.
 
 For experiment recovery after a server restart, configure the same explicit
 `SCRIPTBOTS_ARTIFACTS_DIR`. Experiment creation saves a versioned, checksummed
