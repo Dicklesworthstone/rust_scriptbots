@@ -33,12 +33,10 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     let photo_detail = (textureSample(water_texture, water_sampler, in.uv).rgb * weights.x
         + textureSample(grass_texture, grass_sampler, in.uv).rgb * weights.y
         + textureSample(rock_texture, rock_sampler, in.uv).rgb * rock_weight) / total;
-    // Photos are sampled as linear RGB. Their mean is much darker than white,
-    // while the vertex color already carries the canonical biome and lighting
-    // tint. Lift the detail in linear space while retaining most of its local
-    // contrast. Clamp at white so accessibility white remains unchanged and
-    // the texture cannot brighten a semantic color beyond its base value.
-    let detail = min(vec3<f32>(1.0), vec3<f32>(0.55) + 0.75 * photo_detail);
+    // Ease the dark photo modulation without washing out its local detail.
+    // The square-root curve lifts shadows more than highlights, stays within
+    // the base biome tint, and leaves the white accessibility texture white.
+    let detail = mix(photo_detail, sqrt(max(photo_detail, vec3<f32>(0.0))), 0.6);
     pbr_input.material.base_color = vec4<f32>(pbr_input.material.base_color.rgb * detail,
                                             pbr_input.material.base_color.a);
 #endif
