@@ -2,14 +2,43 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
-**Experiment consumers and browser recovery (2026-11-06):** [Currently In Progress — Codex]
+**Experiment consumers and browser recovery (2026-11-06):** [Source increments
+implemented — original native/browser qualification remains open]
 
-Extend the verified experiment service to MCP and the supported GPUI Lab, with
-paged checkpoint discovery/review in that Lab. Add explicit browser-local saved
+The verified experiment service now reaches MCP and the supported GPUI Lab, with
+paged checkpoint discovery/review in that Lab. Explicit browser-local saved
 continuations using the existing full-owner checkpoint codec and atomic IndexedDB
-replacement. This contributes to Phase 4.3, Phase 5.2 and `bd-2z0.7.6.1`; the
-saved-continuation slice does not complete `bd-ywtv`'s SQLite-image/batch-journal
-durability architecture or promote volatile journal receipts to Durable.
+replacement are implemented. This contributes to Phase 4.3, Phase 5.2 and
+`bd-2z0.7.6.1`; the saved-continuation slice does not complete `bd-ywtv`'s
+SQLite-image/batch-journal durability architecture or promote volatile journal
+receipts to Durable.
+
+**GPUI experiment and checkpoint consumers (2026-11-06):** [Implemented in source
+— `bd-2z0.7.6.1` remains open]
+
+The optional `--features gui --mode gui` Lab has real Experiments and Checkpoints
+tabs backed by application-owned `ControlHandle` callbacks. Catalogs page 12 rows;
+cohort aggregation includes every admitted run before paging all variants in
+groups of eight. Active batches refresh progress and expose existing cooperative
+stop/resume. Explicit baseline/challenger analysis uses verified population
+endpoints, preserving paired uncertainty, provenance and descriptive-only cases.
+Saved checkpoint review reconstructs World without replacing the owner or claiming
+a fresh-session branch. One retained 32 MiB-stack worker bounds outstanding work;
+session/selection/generation checks, failed-evidence clearing and shared World/Lab
+review cancellation prevent stale presentation. Tests are authored for actual
+bundle/checkpoint adapters, 4,096-run projections, worker ownership, invalid
+evidence and native button dispatch with a delayed result after Return Live.
+This does not promote Bevy or complete original GPU interaction/export acceptance.
+
+**Verification limit for the recovered native candidate:** the execution
+environment became unavailable after filesystem exhaustion. The complete authored
+module and reviewed corrections were recovered from retained patches, and the
+integration hunks were reviewed against the exact GitHub parent. This recovered
+candidate has no formatter, compiler or native-window execution result. The
+earlier formatting attempt does not qualify these recovered bytes. The browser's
+eight controlled-event adapter tests passed; its last test-only Reset identity
+wait correction was manually reviewed after the five-file syntax run and was
+not rechecked before the disconnect.
 
 **Browser saved continuations (2026-11-06):** [Implemented in source — browser
 runtime qualification remains blocked]

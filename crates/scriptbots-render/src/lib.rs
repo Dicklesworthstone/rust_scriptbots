@@ -3,6 +3,7 @@
 #![recursion_limit = "256"]
 
 mod camera;
+pub mod lab_workflows;
 /// Headless GPUI HUD capture (bd-abu3). Test-only: it depends on GPUI's
 /// `test-support` feature, which is a dev-dependency and must not reach production.
 #[cfg(test)]
@@ -2669,6 +2670,7 @@ struct GuiSession {
     selection_submission: Arc<Mutex<()>>,
     timeline_submit: Option<TimelineReviewSubmit>,
     timeline_cancelled: Arc<AtomicBool>,
+    lab_submit: Option<lab_workflows::LabWorkflowSubmit>,
 }
 
 impl GuiSession {
@@ -2705,6 +2707,7 @@ impl GuiSession {
             selection_submission: Arc::new(Mutex::new(())),
             timeline_submit: None,
             timeline_cancelled: Arc::new(AtomicBool::new(false)),
+            lab_submit: None,
         }
     }
 
@@ -2726,6 +2729,7 @@ impl GuiSession {
         view.timeline_cancelled = Arc::clone(&self.timeline_cancelled);
         if role == GuiViewRole::Hud {
             view.timeline_submit = self.timeline_submit.clone();
+            view.lab_workflows.submit = self.lab_submit.clone();
         }
         view.focus_handle = Some(focus_handle);
         if role == GuiViewRole::WorldCanvas {
@@ -2854,6 +2858,7 @@ pub fn run_demo(
     command_submit: Arc<dyn Fn(ControlCommand) -> Option<String> + Send + Sync + 'static>,
     map_apply_submit: MapApplySubmit,
     timeline_submit: TimelineReviewSubmit,
+    lab_submit: lab_workflows::LabWorkflowSubmit,
     health_probe: GuiHealthProbe,
 ) -> Result<(), GuiRunError> {
     if let Ok(Some(snapshot)) = host.clone().snapshot_after(None)
@@ -2873,6 +2878,7 @@ pub fn run_demo(
     let mut session = GuiSession::new(host, analytics, command_submit);
     session.map_apply_submit = Some(map_apply_submit);
     session.timeline_submit = Some(timeline_submit);
+    session.lab_submit = Some(lab_submit);
     let session = Arc::new(session);
     let session_for_app = Arc::clone(&session);
     let run_error = Arc::new(Mutex::new(None));
@@ -2934,6 +2940,8 @@ enum DashboardTab {
     Inspect,
     Analytics,
     Timeline,
+    Experiments,
+    Checkpoints,
     Maps,
 }
 
@@ -4650,6 +4658,7 @@ pub struct SimulationView {
     timeline_submit: Option<TimelineReviewSubmit>,
     timeline_job: Option<TimelineReviewJob>,
     timeline_cancelled: Arc<AtomicBool>,
+    lab_workflows: lab_workflows::LabWorkflows,
     perf: PerfStats,
     last_perf: PerfSnapshot,
     /// When set, `render` must NOT overwrite `last_perf` (bd-c7pg).
@@ -4796,6 +4805,7 @@ impl SimulationView {
             timeline_submit: None,
             timeline_job: None,
             timeline_cancelled: Arc::new(AtomicBool::new(false)),
+            lab_workflows: lab_workflows::LabWorkflows::default(),
             perf: PerfStats::new(240),
             last_perf: PerfSnapshot::default(),
             forced_perf: None,
@@ -7466,10 +7476,13 @@ impl SimulationView {
             (DashboardTab::Inspect, "Inspect"),
             (DashboardTab::Analytics, "Analytics"),
             (DashboardTab::Timeline, "Timeline"),
+            (DashboardTab::Experiments, "Experiments"),
+            (DashboardTab::Checkpoints, "Checkpoints"),
             (DashboardTab::Maps, "Maps"),
         ];
         div()
             .flex()
+            .flex_wrap()
             .gap_1()
             .p_1()
             .rounded_lg()
@@ -7481,11 +7494,14 @@ impl SimulationView {
                     DashboardTab::Inspect => "dashboard-tab-inspect",
                     DashboardTab::Analytics => "dashboard-tab-analytics",
                     DashboardTab::Timeline => "dashboard-tab-timeline",
+                    DashboardTab::Experiments => "dashboard-tab-experiments",
+                    DashboardTab::Checkpoints => "dashboard-tab-checkpoints",
                     DashboardTab::Maps => "dashboard-tab-maps",
                 };
                 let listener = cx.listener(move |this, _event, _, cx| {
                     if this.dashboard_tab != tab {
                         this.timeline_cancelled.store(true, AtomicOrdering::Release);
+                        this.lab_workflows.invalidate();
                         this.dashboard_tab = tab;
                         cx.notify();
                     }
@@ -7498,6 +7514,7 @@ impl SimulationView {
                     {
                         if this.dashboard_tab != tab {
                             this.timeline_cancelled.store(true, AtomicOrdering::Release);
+                            this.lab_workflows.invalidate();
                             this.dashboard_tab = tab;
                             cx.notify();
                         }
@@ -7652,6 +7669,8 @@ impl SimulationView {
             }
             DashboardTab::Inspect => self.render_inspector(snapshot, cx),
             DashboardTab::Maps => self.render_map_sandbox(snapshot, cx),
+            DashboardTab::Experiments => self.render_lab_experiments(cx),
+            DashboardTab::Checkpoints => self.render_lab_checkpoints(cx),
             DashboardTab::Analytics => div()
                 .flex()
                 .flex_col()
@@ -16231,6 +16250,7 @@ impl Render for SimulationView {
         let live_snapshot = self.snapshot();
         self.validate_rail_selection(&live_snapshot);
         self.poll_timeline_job(cx);
+        self.poll_lab_workflows(cx);
         let snapshot = self.playback.snapshot_for_render(live_snapshot);
 
         // Update per-agent brain output history from the current inspector focus
