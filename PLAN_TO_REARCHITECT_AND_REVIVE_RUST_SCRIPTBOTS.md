@@ -2,6 +2,43 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Checkpoint discovery and experiment admission (2026-11-05):** [Source
+implemented — Codex; native qualification remains open]
+
+New API checkpoint captures now retain an immutable bounded descriptor and an
+empty completion marker, published after the original persistence receipt.
+Restarted catalogs discover, download and reconstruct those saved scientific
+cuts without adopting the old owner's request identities, session or journal.
+Unmarked binary/partial descriptor files remain preserved and consume existing
+binary retention quota; they are not promoted to completed captures. Discovery
+checks the descriptor, exact payload, codec, tick, population and science digest,
+refuses ambiguous IDs across roots, and bounds metadata, directory scanning and
+per-call verification. These descriptors do not establish a fresh host
+continuation or requalify old SQL receipts.
+
+Experiment preflight derives dense grid cardinality from the same normalized
+dimensions as WorldState. It admits at most 262,144 cells per run and 1,048,576
+cells across the largest possible concurrent run set, including resume packing.
+Control services reserve that same aggregate budget across separate batches and
+release it with worker ownership. The capacity DTO exposes both grid and run-slot
+reservations. This bounds grid cardinality, not population or total resident
+memory, and changes no scientific calculations or baseline artifacts.
+
+Nine Rust regressions are authored for these paths. Independent source review
+and formatting were performed; the native candidate was not compiled or tested.
+The exact pinned toolchain and dependencies were prepared, but the baseline
+compiler run was interrupted and candidate execution refused when shared free
+disk fell below the retained 6 GiB working margin. Native tests and Clippy remain
+unexecuted. Original Phase 4.1/4.3 and `bd-2z0.5.13`/`bd-2z0.5.11` acceptance
+criteria and status remain unchanged.
+
+Browser presentation recovery is committed at `1ec247a`: one RAF chain survives
+frame/Canvas failures, partial paints are retried, repeated failures are reported
+once per episode, and recovery cannot restart a stopped science clock. DSR passed
+both edited JavaScript syntax checks and all 21 existing continuation/remote
+adapter tests. The new real-DOM lifecycle regressions remain unexecuted because
+the managed environment refused Chrome's Unix socket creation before startup.
+
 **Experiment consumers and browser recovery (2026-11-06):** [Source increments
 implemented — original native/browser qualification remains open]
 

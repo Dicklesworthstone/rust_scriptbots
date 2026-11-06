@@ -43,6 +43,12 @@ const MAX_BATCH_RUNS: usize = 4_096;
 pub(crate) const MAX_RUN_COMPONENT_BYTES: usize = 128;
 const MAX_TICKS_PER_RUN: u64 = 10_000_000;
 pub(crate) const MAX_CONCURRENT_RUNS: usize = 64;
+// Admission limits for the shared dense food/terrain grid dimensions. Each cell
+// also feeds profiles, tick scratch and checkpoint state, so bounding only each
+// world dimension admits prohibitive products. These are cardinality policies,
+// not measurements or guarantees of total memory, population or artifact bytes.
+const MAX_RUN_GRID_CELLS: u64 = 262_144;
+pub(crate) const MAX_CONCURRENT_GRID_CELLS: u64 = 1_048_576;
 pub(crate) const MAX_EXPERIMENT_INTERVENTIONS: usize = 64;
 pub(crate) const MAX_EXPERIMENT_INTERVENTION_PATCH_BYTES: usize = 4_096;
 const HOST_RECEIPT_DRIVE_LIMIT: usize = 16;
@@ -64,6 +70,24 @@ pub enum ExperimentRunnerError {
     /// A declarative experiment cannot produce an unambiguous bounded plan.
     #[error("invalid experiment plan: {reason}")]
     InvalidPlan { reason: String },
+    /// One normalized world would allocate too many dense grid cells.
+    #[error(
+        "variant `{variant_id}` requires {cells} dense grid cells, exceeding the per-run limit {limit}; reduce world dimensions or increase food_cell_size"
+    )]
+    RunGridCapacityExceeded {
+        variant_id: String,
+        cells: u64,
+        limit: u64,
+    },
+    /// Concurrent owners in one plan would exceed the shared dense-grid budget.
+    #[error(
+        "experiment's largest {concurrent_runs} concurrent runs require {cells} dense grid cells, exceeding the limit {limit}; reduce max_concurrency or grid dimensions, or increase food_cell_size"
+    )]
+    ConcurrentGridCapacityExceeded {
+        concurrent_runs: usize,
+        cells: u64,
+        limit: u64,
+    },
     /// A variant names no registered protocol family supported by this runner.
     #[error("variant `{variant_id}` requests unknown brain family `{brain_family}`")]
     UnknownBrainFamily {
@@ -317,6 +341,7 @@ struct ValidatedPlan {
     digest: String,
     runs: Vec<RunRecord>,
     variants: BTreeMap<String, (ScenarioVariant, ResolvedBrainFamily)>,
+    concurrent_grid_cells: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1225,6 +1250,14 @@ impl MatchedSeedExperimentRunner {
         self.validated_plan().map(|plan| plan.runs)
     }
 
+    /// Dense grid cells reserved by the largest executable concurrent run set.
+    ///
+    /// The same preflight guards initial admission, status recovery and resume.
+    /// Service callers reserve this amount across batches as well as run slots.
+    pub(crate) fn concurrent_grid_cells(&self) -> Result<u64, ExperimentRunnerError> {
+        self.validated_plan().map(|plan| plan.concurrent_grid_cells)
+    }
+
     /// Bind a saved definition to the same source-aware plan as status and cuts.
     pub(crate) fn plan_digest(&self) -> Result<String, ExperimentRunnerError> {
         self.validated_plan().map(|plan| plan.digest)
@@ -1909,6 +1942,7 @@ impl MatchedSeedExperimentRunner {
             })?;
 
         let mut variants = BTreeMap::new();
+        let mut run_grid_cells = Vec::with_capacity(total_runs);
         let mut semantic_arms = BTreeSet::new();
         for variant in &self.variants {
             validate_path_component("variant_id", &variant.variant_id)?;
@@ -1927,6 +1961,29 @@ impl MatchedSeedExperimentRunner {
                         ),
                     }
                 })?;
+            // Use the constructor's validated dimensions, not a copied rounding
+            // rule. WorldState::build uses this exact grid for food and terrain.
+            let (width, height) = normalized_config.food_dimensions().map_err(|error| {
+                ExperimentRunnerError::InvalidPlan {
+                    reason: format!(
+                        "variant `{}` has invalid grid dimensions: {error}",
+                        variant.variant_id
+                    ),
+                }
+            })?;
+            let cells = u64::from(width)
+                .checked_mul(u64::from(height))
+                .ok_or_else(|| ExperimentRunnerError::InvalidPlan {
+                    reason: format!("variant `{}` grid cell count overflows", variant.variant_id),
+                })?;
+            if cells > MAX_RUN_GRID_CELLS {
+                return Err(ExperimentRunnerError::RunGridCapacityExceeded {
+                    variant_id: variant.variant_id.clone(),
+                    cells,
+                    limit: MAX_RUN_GRID_CELLS,
+                });
+            }
+            run_grid_cells.extend(std::iter::repeat_n(cells, self.cohort.seeds.len()));
             let interventions = PreparedInterventions::new(
                 &normalized_config,
                 &variant.interventions,
@@ -1954,6 +2011,27 @@ impl MatchedSeedExperimentRunner {
                 });
             }
             variants.insert(variant.variant_id.clone(), (variant.clone(), family));
+        }
+
+        // Completed runs disappear from the resume queue, so its new waves can
+        // combine arms that occupied different initial waves. Reserve the largest
+        // possible concurrent subset instead of trusting the original chunking.
+        run_grid_cells.sort_unstable();
+        let concurrent_runs = self.max_concurrency.min(total_runs);
+        let concurrent_grid_cells = run_grid_cells
+            .iter()
+            .rev()
+            .take(concurrent_runs)
+            .try_fold(0_u64, |total, cells| total.checked_add(*cells))
+            .ok_or_else(|| ExperimentRunnerError::InvalidPlan {
+                reason: "concurrent grid cell count overflows".to_owned(),
+            })?;
+        if concurrent_grid_cells > MAX_CONCURRENT_GRID_CELLS {
+            return Err(ExperimentRunnerError::ConcurrentGridCapacityExceeded {
+                concurrent_runs,
+                cells: concurrent_grid_cells,
+                limit: MAX_CONCURRENT_GRID_CELLS,
+            });
         }
 
         let mut runs = Vec::with_capacity(total_runs);
@@ -1996,6 +2074,7 @@ impl MatchedSeedExperimentRunner {
             digest: blake3::hash(&digest_bytes).to_hex().to_string(),
             runs,
             variants,
+            concurrent_grid_cells,
         })
     }
 
@@ -4501,6 +4580,222 @@ mod tests {
             unavailable.plan_batch(),
             Err(ExperimentRunnerError::UnavailableBrainFamily { .. })
         ));
+    }
+
+    fn grid_test_variant(
+        variant_id: &str,
+        width: u32,
+        height: u32,
+        cell_size: u32,
+    ) -> ScenarioVariant {
+        ScenarioVariant {
+            variant_id: variant_id.to_owned(),
+            brain_family: "mlp".to_owned(),
+            config_overrides: BTreeMap::from([
+                ("world_width".to_owned(), serde_json::json!(width)),
+                ("world_height".to_owned(), serde_json::json!(height)),
+                ("food_cell_size".to_owned(), serde_json::json!(cell_size)),
+            ]),
+            interventions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn experiment_grid_preflight_uses_actual_dimensions_and_rejects_one_cell_over() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("unallocated");
+        let boundary = grid_test_variant("boundary", 16_384, 16_384, 32);
+        let config = config_for_run(&boundary.config_overrides, 1).unwrap();
+        let (width, height) = config.food_dimensions().unwrap();
+        assert_eq!((width, height), (512, 512));
+        assert_eq!(u64::from(width) * u64::from(height), MAX_RUN_GRID_CELLS);
+        let mut runner = MatchedSeedExperimentRunner::new(
+            "grid-boundary",
+            MatchedSeedCohort {
+                cohort_id: "grid".to_owned(),
+                seeds: vec![1],
+            },
+            vec![boundary],
+            1,
+            MAX_CONCURRENT_RUNS,
+            &output,
+        );
+        assert_eq!(runner.plan_batch().unwrap().len(), 1);
+        assert_eq!(runner.concurrent_grid_cells().unwrap(), MAX_RUN_GRID_CELLS);
+
+        // Both extents remain within the existing knob ranges; only their
+        // normalized product exceeds the new owner allocation limit.
+        runner.variants = vec![grid_test_variant("one-over", 65, 4_033, 1)];
+        assert!(matches!(
+            runner.plan_batch(),
+            Err(ExperimentRunnerError::RunGridCapacityExceeded { variant_id, cells, limit })
+                if variant_id == "one-over"
+                    && cells == MAX_RUN_GRID_CELLS + 1
+                    && limit == MAX_RUN_GRID_CELLS
+        ));
+        runner.variants = vec![grid_test_variant("huge", 20_000, 20_000, 1)];
+        assert!(matches!(
+            runner.plan_batch(),
+            Err(ExperimentRunnerError::RunGridCapacityExceeded {
+                cells: 400_000_000,
+                ..
+            })
+        ));
+        assert!(
+            !output.exists(),
+            "preflight must never construct a world or write a cut"
+        );
+    }
+
+    #[test]
+    fn experiment_grid_preflight_preserves_default_and_small_mixed_cohorts() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("unallocated");
+        let mut runner = MatchedSeedExperimentRunner::new(
+            "grid-default",
+            MatchedSeedCohort {
+                cohort_id: "grid".to_owned(),
+                seeds: (0..u64::try_from(MAX_CONCURRENT_RUNS).unwrap()).collect(),
+            },
+            vec![ScenarioVariant {
+                variant_id: "default".to_owned(),
+                brain_family: "mlp".to_owned(),
+                config_overrides: BTreeMap::new(),
+                interventions: Vec::new(),
+            }],
+            1,
+            MAX_CONCURRENT_RUNS,
+            &output,
+        );
+        let (width, height) = ScriptBotsConfig::default().food_dimensions().unwrap();
+        let expected =
+            u64::from(width) * u64::from(height) * u64::try_from(MAX_CONCURRENT_RUNS).unwrap();
+        assert_eq!(runner.plan_batch().unwrap().len(), MAX_CONCURRENT_RUNS);
+        assert_eq!(runner.concurrent_grid_cells().unwrap(), expected);
+        assert!(expected <= MAX_CONCURRENT_GRID_CELLS);
+
+        runner.cohort.seeds = vec![1];
+        runner.variants = vec![
+            grid_test_variant("large", 512, 512, 1),
+            grid_test_variant("small", 32, 32, 32),
+        ];
+        assert_eq!(runner.plan_batch().unwrap().len(), 2);
+        assert_eq!(
+            runner.concurrent_grid_cells().unwrap(),
+            MAX_RUN_GRID_CELLS + 1
+        );
+        assert!(
+            !output.exists(),
+            "capacity discovery must not allocate owners or touch their artifact directory"
+        );
+    }
+
+    #[test]
+    fn experiment_grid_preflight_counts_matched_seeds_and_resume_wave_reordering() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("unallocated");
+        let mut runner = MatchedSeedExperimentRunner::new(
+            "grid-waves",
+            MatchedSeedCohort {
+                cohort_id: "grid".to_owned(),
+                seeds: vec![1, 2, 3, 4],
+            },
+            vec![
+                grid_test_variant("large", 512, 512, 1),
+                grid_test_variant("small", 32, 32, 32),
+            ],
+            1,
+            4,
+            &output,
+        );
+        assert_eq!(runner.plan_batch().unwrap().len(), 8);
+        assert_eq!(
+            runner.concurrent_grid_cells().unwrap(),
+            MAX_CONCURRENT_GRID_CELLS
+        );
+        let digest = runner.plan_digest().unwrap();
+        runner.max_concurrency = 3;
+        assert_eq!(
+            runner.concurrent_grid_cells().unwrap(),
+            3 * MAX_RUN_GRID_CELLS
+        );
+        assert_eq!(
+            runner.plan_digest().unwrap(),
+            digest,
+            "capacity does not change the science plan"
+        );
+
+        runner.max_concurrency = 5;
+        for _ in 0..2 {
+            assert!(matches!(
+                runner.plan_batch(),
+                Err(ExperimentRunnerError::ConcurrentGridCapacityExceeded {
+                    concurrent_runs: 5, cells, limit,
+                }) if cells == MAX_CONCURRENT_GRID_CELLS + 1
+                    && limit == MAX_CONCURRENT_GRID_CELLS
+            ));
+            // When the small arm comes first, the original five-run wave holds
+            // only one large world. Filtering completed companions on resume
+            // can pack all four large worlds with a small one into the same wave.
+            runner.variants.reverse();
+        }
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn experiment_grid_preflight_guards_status_recovery_and_execution_before_io() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("unallocated");
+        let state_file = directory.path().join("status.json");
+        let mut runner = MatchedSeedExperimentRunner::new(
+            "grid-recovery",
+            MatchedSeedCohort {
+                cohort_id: "grid".to_owned(),
+                seeds: vec![1, 2, 3, 4],
+            },
+            vec![
+                grid_test_variant("large", 512, 512, 1),
+                grid_test_variant("small", 32, 32, 32),
+            ],
+            1,
+            4,
+            &output,
+        );
+        let mut status = runner.load_or_create_status(&state_file).unwrap();
+        status.runs[0].state = RunState::Running;
+        runner.save_status(&state_file, &mut status).unwrap();
+        let committed = fs::read(&state_file).unwrap();
+        runner.max_concurrency = 5;
+        let outcomes = [
+            runner.plan_digest().map(|_| ()),
+            runner.status_snapshot(&state_file).map(|_| ()),
+            runner.load_or_create_status(&state_file).map(|_| ()),
+            runner.save_status(&state_file, &mut status),
+            runner.verify_completed_status(&state_file, &status),
+            runner.execute_batch(&state_file).map(|_| ()),
+            runner
+                .execute_single_run(&runner.variants[0], 1)
+                .map(|_| ()),
+        ];
+        for result in outcomes {
+            assert!(matches!(
+                result,
+                Err(ExperimentRunnerError::ConcurrentGridCapacityExceeded { .. })
+            ));
+        }
+        assert_eq!(fs::read(&state_file).unwrap(), committed);
+        assert!(!status_temporary_path(&state_file).unwrap().exists());
+        assert!(
+            !output.exists(),
+            "oversized resume must not allocate a world or write a cut"
+        );
+
+        let unopened_state = directory.path().join("unopened").join("status.json");
+        assert!(matches!(
+            runner.load_or_create_status(&unopened_state),
+            Err(ExperimentRunnerError::ConcurrentGridCapacityExceeded { .. })
+        ));
+        assert!(!unopened_state.parent().unwrap().exists());
     }
 
     #[test]

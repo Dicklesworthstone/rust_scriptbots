@@ -727,6 +727,10 @@ pub struct PaginatedExperimentsResponse {
 pub struct ExperimentExecutionCapacityDto {
     pub max_run_slots: usize,
     pub reserved_run_slots: usize,
+    /// Dense grid cardinality across every concurrently admitted experiment.
+    /// This is not a bound on population or total resident memory.
+    pub max_grid_cells: u64,
+    pub reserved_grid_cells: u64,
     pub reserved_batches: usize,
 }
 
@@ -735,6 +739,7 @@ pub struct ExperimentExecutionCapacityDto {
 struct ExperimentExecutionReservation {
     capacity: Arc<Mutex<ExperimentExecutionCapacityDto>>,
     run_slots: usize,
+    grid_cells: u64,
     experiment_id: String,
     running: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
@@ -746,6 +751,7 @@ impl Drop for ExperimentExecutionReservation {
             // Poison must not prevent this unique owner's reservation being returned.
             let mut capacity = self.capacity.lock().unwrap_or_else(PoisonError::into_inner);
             capacity.reserved_run_slots -= self.run_slots;
+            capacity.reserved_grid_cells -= self.grid_cells;
             capacity.reserved_batches -= 1;
             *capacity
         };
@@ -756,7 +762,9 @@ impl Drop for ExperimentExecutionReservation {
             tracing::info!(
                 experiment_id = %self.experiment_id,
                 released_run_slots = self.run_slots,
+                released_grid_cells = self.grid_cells,
                 reserved_run_slots = observed.reserved_run_slots,
+                reserved_grid_cells = observed.reserved_grid_cells,
                 reserved_batches = observed.reserved_batches,
                 max_run_slots = observed.max_run_slots,
                 "experiment execution reservation released"
@@ -1451,6 +1459,212 @@ struct RetainedCheckpoint {
     source_scheduled_input_count: u64,
 }
 
+const CHECKPOINT_CATALOG_SUFFIX: &str = ".checkpoint.json";
+const CHECKPOINT_CATALOG_READY_SUFFIX: &str = ".checkpoint.ready";
+const MAX_CHECKPOINT_CATALOG_RECORD_BYTES: usize = 16 * 1024;
+const MAX_CATALOG_CHECKPOINTS: usize = 1_024;
+const MAX_CHECKPOINT_DISCOVERY_ENTRIES: usize = 16_384;
+const MAX_CHECKPOINT_DISCOVERY_BYTES: u64 = 256 * 1024 * 1024;
+
+/// A completed file catalog entry, published only after the original writer
+/// acknowledges. Recovery exposes saved science for review/download; it does
+/// not adopt the original owner's requests, journal or persistence session.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointCatalogRecord {
+    schema_version: u16,
+    metadata: CheckpointMetadataDto,
+    checksum_blake3: String,
+}
+
+fn checkpoint_catalog_error(path: &Path, error: impl std::fmt::Display) -> ControlError {
+    ControlError::CheckpointRetentionUnavailable(format!(
+        "checkpoint catalog {}: {error}; retained files are preserved",
+        path.display()
+    ))
+}
+
+fn valid_checkpoint_catalog_id(id: &str) -> bool {
+    let Some((nonce, tick)) = id.strip_prefix("ckpt-").and_then(|id| id.split_once("-t")) else {
+        return false;
+    };
+    nonce.len() == 32
+        && nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && tick
+            .parse::<u64>()
+            .is_ok_and(|value| value.to_string() == tick)
+}
+
+fn checkpoint_artifact_metadata(metadata: &CheckpointMetadataDto) -> ArtifactMetadataDto {
+    let filename = format!("{}.bin", metadata.checkpoint_id);
+    ArtifactMetadataDto {
+        artifact_id: metadata.checkpoint_id.clone(),
+        filename: filename.clone(),
+        content_type: "application/octet-stream".to_owned(),
+        byte_size: metadata.byte_size,
+        checksum_blake3: metadata.checksum_blake3.clone(),
+        checksum_sha256: metadata.checksum_sha256.clone(),
+        created_at_utc: metadata.created_at_utc.clone(),
+        relative_path: filename,
+    }
+}
+
+fn read_checkpoint_catalog(
+    directory: &Path,
+    id: &str,
+) -> Result<CheckpointMetadataDto, ControlError> {
+    let path = directory.join(format!("{id}{CHECKPOINT_CATALOG_SUFFIX}"));
+    if !valid_checkpoint_catalog_id(id) {
+        return Err(checkpoint_catalog_error(
+            &path,
+            "invalid checkpoint identity",
+        ));
+    }
+    let ready_path = directory.join(format!("{id}{CHECKPOINT_CATALOG_READY_SUFFIX}"));
+    read_artifact_file_bounded(&ready_path, 0)
+        .map_err(|error| checkpoint_catalog_error(&ready_path, error))?;
+    let bytes = read_artifact_file_bounded(&path, MAX_CHECKPOINT_CATALOG_RECORD_BYTES)
+        .map_err(|error| checkpoint_catalog_error(&path, error))?;
+    let record: CheckpointCatalogRecord =
+        serde_json::from_slice(&bytes).map_err(|error| checkpoint_catalog_error(&path, error))?;
+    let encoded = serde_json::to_vec(&record.metadata).map_err(ControlError::serialization)?;
+    let metadata = record.metadata;
+    if record.schema_version != 1
+        || record.checksum_blake3 != compute_blake3(&encoded)
+        || metadata.checkpoint_id != id
+        || !id.ends_with(&format!("-t{}", metadata.tick))
+        || metadata.schema != scriptbots_core::WORLD_CHECKPOINT_V1_SCHEMA
+        || metadata.byte_size == 0
+        || metadata.byte_size > MAX_ARTIFACT_DOWNLOAD_BYTES as u64
+        || metadata
+            .description
+            .as_ref()
+            .is_some_and(|description| description.len() > 4096)
+    {
+        return Err(checkpoint_catalog_error(
+            &path,
+            "unsupported, inconsistent or corrupt descriptor",
+        ));
+    }
+    Ok(metadata)
+}
+
+fn verify_checkpoint_catalog_payload(
+    directory: &Path,
+    metadata: &CheckpointMetadataDto,
+) -> Result<ArtifactMetadataDto, ControlError> {
+    let artifact = checkpoint_artifact_metadata(metadata);
+    let path = directory.join(&artifact.relative_path);
+    let declared_bytes = usize::try_from(metadata.byte_size)
+        .map_err(|error| checkpoint_catalog_error(&path, error))?;
+    // Discovery charges this exact declaration against its per-call budget.
+    // Refuse a larger file before reading it, including sparse or forged inputs.
+    let bytes = read_artifact_file_bounded(&path, declared_bytes)
+        .map_err(|error| checkpoint_catalog_error(&path, error))?;
+    if bytes.len() as u64 != metadata.byte_size
+        || compute_blake3(&bytes) != metadata.checksum_blake3
+        || compute_sha256(&bytes) != metadata.checksum_sha256
+    {
+        return Err(checkpoint_catalog_error(&path, "artifact identity changed"));
+    }
+    let checkpoint = scriptbots_core::WorldCheckpointV1::decode(&bytes)
+        .map_err(|error| checkpoint_catalog_error(&path, error))?;
+    if checkpoint.tick().0 != metadata.tick
+        || checkpoint.agent_count() != metadata.agent_count
+        || checkpoint.source_digest().overall != metadata.world_digest_v1
+    {
+        return Err(checkpoint_catalog_error(
+            &path,
+            "descriptor disagrees with the saved scientific cut",
+        ));
+    }
+    Ok(artifact)
+}
+
+fn write_checkpoint_catalog(
+    directory: &Path,
+    metadata: &CheckpointMetadataDto,
+) -> Result<(), ControlError> {
+    let path = directory.join(format!(
+        "{}{CHECKPOINT_CATALOG_SUFFIX}",
+        metadata.checkpoint_id
+    ));
+    let encoded = serde_json::to_vec(metadata).map_err(ControlError::serialization)?;
+    let record = CheckpointCatalogRecord {
+        schema_version: 1,
+        metadata: metadata.clone(),
+        checksum_blake3: compute_blake3(&encoded),
+    };
+    let bytes = serde_json::to_vec(&record).map_err(ControlError::serialization)?;
+    if bytes.len() > MAX_CHECKPOINT_CATALOG_RECORD_BYTES {
+        return Err(checkpoint_catalog_error(
+            &path,
+            "descriptor exceeds its byte bound",
+        ));
+    }
+    let file = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            file.write_all(&bytes)
+                .map_err(|error| checkpoint_catalog_error(&path, error))?;
+            file
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let (file, existing) =
+                open_artifact_file_bounded(&path, MAX_CHECKPOINT_CATALOG_RECORD_BYTES, true)
+                    .map_err(|error| checkpoint_catalog_error(&path, error))?;
+            if existing != bytes {
+                return Err(checkpoint_catalog_error(
+                    &path,
+                    "existing descriptor is incomplete or different; retry cannot overwrite it",
+                ));
+            }
+            file
+        }
+        Err(error) => return Err(checkpoint_catalog_error(&path, error)),
+    };
+    file.sync_all()
+        .map_err(|error| checkpoint_catalog_error(&path, error))?;
+    verify_open_artifact(&path, &file).map_err(|error| checkpoint_catalog_error(&path, error))?;
+    #[cfg(unix)]
+    sync_checkpoint_directory(directory)
+        .map_err(|error| checkpoint_catalog_error(directory, error))?;
+    // An empty marker is an atomic, no-overwrite publication. A crash during
+    // descriptor writing leaves an undiscoverable partial file, not a poisoned
+    // catalog. Keep both files immutable and never remove interrupted evidence.
+    let ready_path = directory.join(format!(
+        "{}{CHECKPOINT_CATALOG_READY_SUFFIX}",
+        metadata.checkpoint_id
+    ));
+    let ready = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&ready_path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            open_artifact_file_bounded(&ready_path, 0, true)
+                .map_err(|error| checkpoint_catalog_error(&ready_path, error))?
+                .0
+        }
+        Err(error) => return Err(checkpoint_catalog_error(&ready_path, error)),
+    };
+    ready
+        .sync_all()
+        .map_err(|error| checkpoint_catalog_error(&ready_path, error))?;
+    verify_open_artifact(&ready_path, &ready)
+        .map_err(|error| checkpoint_catalog_error(&ready_path, error))?;
+    #[cfg(unix)]
+    sync_checkpoint_directory(directory)
+        .map_err(|error| checkpoint_catalog_error(directory, error))?;
+    Ok(())
+}
+
 /// Hard bound on the complete checkpoint-to-current verification interval.
 pub(crate) const MAX_EVENT_REVIEW_TICKS: u64 = 1_024;
 
@@ -1640,6 +1854,8 @@ impl DataServices {
             execution_capacity: Arc::new(Mutex::new(ExperimentExecutionCapacityDto {
                 max_run_slots: crate::experiment_runner::MAX_CONCURRENT_RUNS,
                 reserved_run_slots: 0,
+                max_grid_cells: crate::experiment_runner::MAX_CONCURRENT_GRID_CELLS,
+                reserved_grid_cells: 0,
                 reserved_batches: 0,
             })),
             checkpoints: Mutex::new(BTreeMap::new()),
@@ -1665,6 +1881,203 @@ impl DataServices {
             .read()
             .map(|p| p.clone())
             .unwrap_or_else(|_| std::env::temp_dir().join("scriptbots_artifacts"))
+    }
+
+    fn verify_checkpoint_catalog_identity(&self, id: &str) -> Result<(), ControlError> {
+        if !valid_checkpoint_catalog_id(id) {
+            return Ok(());
+        }
+        let retention = self
+            .checkpoint_retention
+            .lock()
+            .map_err(|_| ControlError::Lock)?;
+        if retention.directories.len() > MAX_CHECKPOINT_DISCOVERY_ENTRIES {
+            return Err(ControlError::CheckpointCapacity(
+                "checkpoint discovery directory budget exceeded".into(),
+            ));
+        }
+        let mut found = false;
+        for directory in retention.directories.keys() {
+            retention.verify_directory(directory)?;
+            let path = directory.join(format!("{id}{CHECKPOINT_CATALOG_READY_SUFFIX}"));
+            match fs::symlink_metadata(&path) {
+                Ok(_) if found => {
+                    return Err(ControlError::Conflict(format!(
+                        "checkpoint {id} appears in multiple retained directories"
+                    )));
+                }
+                Ok(_) => found = true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(checkpoint_catalog_error(&path, error)),
+            }
+        }
+        Ok(())
+    }
+
+    /// Recover only completed descriptors in leased roots. Uncatalogued binary
+    /// files still consume retention capacity but cannot imply a completed
+    /// capture. Reads never record historical checkpoints in the live database.
+    fn recover_checkpoint_catalogs(&self, requested: Option<&str>) -> Result<(), ControlError> {
+        if requested.is_some_and(|id| !valid_checkpoint_catalog_id(id)) {
+            return Ok(());
+        }
+        let retention = self
+            .checkpoint_retention
+            .lock()
+            .map_err(|_| ControlError::Lock)?;
+        let mut paths = Vec::new();
+        let mut entries_seen = 0_usize;
+        for directory in retention.directories.keys() {
+            entries_seen += 1;
+            if entries_seen > MAX_CHECKPOINT_DISCOVERY_ENTRIES {
+                return Err(ControlError::CheckpointCapacity(
+                    "checkpoint discovery directory budget exceeded".into(),
+                ));
+            }
+            retention.verify_directory(directory)?;
+            if let Some(id) = requested {
+                let path = directory.join(format!("{id}{CHECKPOINT_CATALOG_READY_SUFFIX}"));
+                match fs::symlink_metadata(&path) {
+                    Ok(_) => paths.push((directory.clone(), id.to_owned())),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(checkpoint_catalog_error(&path, error)),
+                }
+            } else {
+                for entry in fs::read_dir(directory)
+                    .map_err(|error| checkpoint_catalog_error(directory, error))?
+                {
+                    let entry =
+                        entry.map_err(|error| checkpoint_catalog_error(directory, error))?;
+                    entries_seen += 1;
+                    if entries_seen > MAX_CHECKPOINT_DISCOVERY_ENTRIES {
+                        return Err(ControlError::CheckpointCapacity(format!(
+                            "checkpoint discovery exceeds {MAX_CHECKPOINT_DISCOVERY_ENTRIES} directory entries; request a checkpoint by ID"
+                        )));
+                    }
+                    let name = entry.file_name();
+                    let Some(id) = name
+                        .to_str()
+                        .filter(|name| name.starts_with("ckpt-"))
+                        .and_then(|name| name.strip_suffix(CHECKPOINT_CATALOG_READY_SUFFIX))
+                    else {
+                        continue;
+                    };
+                    paths.push((directory.clone(), id.to_owned()));
+                    if paths.len() > MAX_CATALOG_CHECKPOINTS {
+                        return Err(ControlError::CheckpointCapacity(format!(
+                            "checkpoint discovery exceeds {MAX_CATALOG_CHECKPOINTS} descriptors; request a saved checkpoint by ID; no files were removed"
+                        )));
+                    }
+                }
+            }
+        }
+        paths.sort();
+        let mut verified_bytes = 0_u64;
+        let mut first_error = None;
+        let mut identity_counts = BTreeMap::new();
+        for (_, id) in &paths {
+            *identity_counts.entry(id.clone()).or_insert(0_usize) += 1;
+        }
+        for (id, count) in &identity_counts {
+            if *count > 1 {
+                // Invalidate derived caches as well: an observed ambiguity must
+                // not become an apparently successful fast-path read later.
+                self.checkpoints
+                    .lock()
+                    .map_err(|_| ControlError::Lock)?
+                    .remove(id);
+                self.artifacts
+                    .lock()
+                    .map_err(|_| ControlError::Lock)?
+                    .remove(id);
+                first_error.get_or_insert_with(|| {
+                    ControlError::Conflict(format!(
+                        "checkpoint {id} appears in multiple retained directories"
+                    ))
+                });
+            }
+        }
+        for (directory, id) in paths {
+            if identity_counts[&id] > 1 {
+                continue;
+            }
+            let recovered = (|| {
+                if retention
+                    .requests
+                    .values()
+                    .any(|request| !request.acknowledged && request.metadata.checkpoint_id == id)
+                {
+                    // Only the original exact retry may finish a pending capture.
+                    return Ok(());
+                }
+                let metadata = read_checkpoint_catalog(&directory, &id)?;
+                {
+                    let checkpoints = self.checkpoints.lock().map_err(|_| ControlError::Lock)?;
+                    let artifacts = self.artifacts.lock().map_err(|_| ControlError::Lock)?;
+                    if let Some(known) = checkpoints.get(&id) {
+                        if serde_json::to_vec(known).map_err(ControlError::serialization)?
+                            != serde_json::to_vec(&metadata).map_err(ControlError::serialization)?
+                            || artifacts
+                                .get(&id)
+                                .is_none_or(|artifact| artifact.directory != directory)
+                        {
+                            return Err(ControlError::Conflict(format!(
+                                "checkpoint {id} has conflicting retained descriptors"
+                            )));
+                        }
+                        return Ok(());
+                    }
+                    let uncatalogued = retention
+                        .requests
+                        .values()
+                        .filter(|request| {
+                            !checkpoints.contains_key(&request.metadata.checkpoint_id)
+                        })
+                        .count();
+                    let retained_id = retention
+                        .requests
+                        .values()
+                        .any(|request| request.metadata.checkpoint_id == id);
+                    if !retained_id
+                        && checkpoints.len().saturating_add(uncatalogued) >= MAX_CATALOG_CHECKPOINTS
+                    {
+                        return Err(ControlError::CheckpointCapacity(format!(
+                            "checkpoint metadata reached its {MAX_CATALOG_CHECKPOINTS}-entry bound; retained files remain available in their source directories"
+                        )));
+                    }
+                }
+                verified_bytes = verified_bytes
+                    .checked_add(metadata.byte_size)
+                    .filter(|bytes| *bytes <= MAX_CHECKPOINT_DISCOVERY_BYTES)
+                    .ok_or_else(|| ControlError::CheckpointCapacity(format!(
+                        "checkpoint discovery reached its {MAX_CHECKPOINT_DISCOVERY_BYTES}-byte verification budget; retry discovery or request a checkpoint by ID"
+                    )))?;
+                let artifact = verify_checkpoint_catalog_payload(&directory, &metadata)?;
+                retention.verify_directory(&directory)?;
+                let mut checkpoints = self.checkpoints.lock().map_err(|_| ControlError::Lock)?;
+                let mut artifacts = self.artifacts.lock().map_err(|_| ControlError::Lock)?;
+                if artifacts.contains_key(&id) {
+                    return Err(ControlError::Conflict(format!(
+                        "checkpoint {id} conflicts with an existing artifact"
+                    )));
+                }
+                checkpoints.insert(id.clone(), metadata);
+                artifacts.insert(
+                    id,
+                    RetainedArtifact {
+                        metadata: artifact,
+                        directory,
+                    },
+                );
+                Ok(())
+            })();
+            if let Err(error) = recovered
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Reconstitute admission only. Reads never launch a worker or rewrite status.
@@ -1989,6 +2402,7 @@ impl DataServices {
         &self,
         experiment_id: &str,
         run_slots: usize,
+        grid_cells: u64,
     ) -> Result<ExperimentExecutionReservation, ControlError> {
         if self
             .experiment_shutdown_requested
@@ -1996,9 +2410,9 @@ impl DataServices {
         {
             return Err(ControlError::ExperimentShuttingDown);
         }
-        if run_slots == 0 {
+        if run_slots == 0 || grid_cells == 0 {
             return Err(ControlError::BadRequest(
-                "experiment execution must reserve at least one run slot".to_owned(),
+                "experiment execution must reserve nonzero run slots and grid cells".to_owned(),
             ));
         }
         let mut capacity = self
@@ -2013,23 +2427,35 @@ impl DataServices {
                 "requested_run_slots={run_slots}, reserved_run_slots={}, max_run_slots={}; no experiment worker admitted; retry after capacity is released or change SCRIPTBOTS_EXPERIMENT_RUN_SLOTS at startup",
                 capacity.reserved_run_slots, capacity.max_run_slots,
             )))?;
+        let reserved_grid_cells = capacity
+            .reserved_grid_cells
+            .checked_add(grid_cells)
+            .filter(|count| *count <= capacity.max_grid_cells)
+            .ok_or_else(|| ControlError::ExperimentCapacity(format!(
+                "requested_grid_cells={grid_cells}, reserved_grid_cells={}, max_grid_cells={}; no experiment worker admitted; retry after capacity is released or reduce concurrent world grids",
+                capacity.reserved_grid_cells, capacity.max_grid_cells,
+            )))?;
         let reserved_batches = capacity.reserved_batches.checked_add(1).ok_or_else(|| {
             ControlError::ExperimentCapacity("batch reservation count overflow".to_owned())
         })?;
         let reservation = ExperimentExecutionReservation {
             capacity: Arc::clone(&self.execution_capacity),
             run_slots,
+            grid_cells,
             experiment_id: experiment_id.to_owned(),
             running: None,
         };
         capacity.reserved_run_slots = reserved_run_slots;
+        capacity.reserved_grid_cells = reserved_grid_cells;
         capacity.reserved_batches = reserved_batches;
         let observed = *capacity;
         drop(capacity);
         tracing::info!(
             experiment_id,
             requested_run_slots = run_slots,
+            requested_grid_cells = grid_cells,
             reserved_run_slots = observed.reserved_run_slots,
+            reserved_grid_cells = observed.reserved_grid_cells,
             reserved_batches = observed.reserved_batches,
             max_run_slots = observed.max_run_slots,
             "experiment execution capacity reserved"
@@ -2474,6 +2900,9 @@ impl ControlHandle {
             .map_err(|error| ControlError::BadRequest(error.to_string()))?
             .len()
             .min(runner.max_concurrency);
+        let grid_cells = runner
+            .concurrent_grid_cells()
+            .map_err(|error| ControlError::BadRequest(error.to_string()))?;
         let definition = ExperimentDefinitionV1 {
             schema_version: 1,
             experiment_id: experiment_id.clone(),
@@ -2514,9 +2943,11 @@ impl ControlHandle {
                     "experiment catalog capacity reached".into(),
                 ));
             }
-            let reservation = self
-                .data_services
-                .reserve_experiment_execution(&experiment_id, run_slots)?;
+            let reservation = self.data_services.reserve_experiment_execution(
+                &experiment_id,
+                run_slots,
+                grid_cells,
+            )?;
             definition.persist(&output_dir)?;
             job.start(std::sync::Arc::clone(&self.data_services), reservation);
             lock.insert(experiment_id.clone(), job);
@@ -2791,13 +3222,19 @@ impl ControlHandle {
             .filter(|run| matches!(run.state.as_str(), "pending" | "running"))
             .count()
             .min(job.runner.max_concurrency);
+        let grid_cells = job
+            .runner
+            .concurrent_grid_cells()
+            .map_err(|error| ControlError::BadRequest(error.to_string()))?;
         // A cleared running flag can also mean unwind. Observe the old exit
         // before clearing diagnostics, cancellation or reserving a new wave.
         job.join_worker()
             .map_err(ControlError::ExperimentWorkerFailed)?;
-        let reservation = self
-            .data_services
-            .reserve_experiment_execution(experiment_id, run_slots)?;
+        let reservation = self.data_services.reserve_experiment_execution(
+            experiment_id,
+            run_slots,
+            grid_cells,
+        )?;
         job.cancel
             .store(false, std::sync::atomic::Ordering::Release);
         if let Ok(mut error) = job.last_error.lock() {
@@ -2917,6 +3354,23 @@ impl ControlHandle {
             }
             return self.finish_retained_checkpoint(&mut retention, identity, retained);
         }
+        {
+            let checkpoints = self
+                .data_services
+                .checkpoints
+                .lock()
+                .map_err(|_| ControlError::Lock)?;
+            let uncatalogued = retention
+                .requests
+                .values()
+                .filter(|request| !checkpoints.contains_key(&request.metadata.checkpoint_id))
+                .count();
+            if checkpoints.len().saturating_add(uncatalogued) >= MAX_CATALOG_CHECKPOINTS {
+                return Err(ControlError::CheckpointCapacity(format!(
+                    "checkpoint metadata reached its {MAX_CATALOG_CHECKPOINTS}-entry bound; no new capture was admitted"
+                )));
+            }
+        }
         let dir = self.data_services.artifacts_dir();
         if !retention.directories.contains_key(&dir) {
             return Err(ControlError::CheckpointRetentionUnavailable(
@@ -2955,26 +3409,15 @@ impl ControlHandle {
             agent_count: checkpoint.agent_count(),
             world_digest_v1: checkpoint.source_digest().overall.clone(),
             byte_size,
-            checksum_blake3: blake3_hex.clone(),
-            checksum_sha256: sha256_hex.clone(),
+            checksum_blake3: blake3_hex,
+            checksum_sha256: sha256_hex,
             schema,
             created_at_utc: format!("{secs}"),
             description: request.description.clone(),
         };
 
-        let filename = format!("{checkpoint_id}.bin");
-        let art_meta = ArtifactMetadataDto {
-            artifact_id: checkpoint_id.clone(),
-            filename: filename.clone(),
-            content_type: "application/octet-stream".into(),
-            byte_size,
-            checksum_blake3: blake3_hex.clone(),
-            checksum_sha256: sha256_hex,
-            created_at_utc: format!("{secs}"),
-            relative_path: filename.clone(),
-        };
-
-        let file_path = dir.join(&filename);
+        let art_meta = checkpoint_artifact_metadata(&meta);
+        let file_path = dir.join(&art_meta.relative_path);
         let identity = request_identity.unwrap_or_else(|| checkpoint_id.clone());
         let retained = RetainedCheckpoint {
             request_hash,
@@ -3070,6 +3513,11 @@ impl ControlHandle {
                         )),
                     })?;
             }
+            // A raw .bin can exist after an unconfirmed write. Publish its
+            // immutable descriptor only after the original persistence receipt,
+            // so restart discovery cannot turn an incomplete capture into one.
+            write_checkpoint_catalog(&retained.directory, &retained.metadata)?;
+            retention.verify_directory(&retained.directory)?;
             self.data_services
                 .checkpoints
                 .lock()
@@ -3145,6 +3593,20 @@ impl ControlHandle {
         &self,
         checkpoint_id: &str,
     ) -> Result<CheckpointMetadataDto, ControlError> {
+        let cached = self
+            .data_services
+            .checkpoints
+            .lock()
+            .map_err(|_| ControlError::Lock)?
+            .get(checkpoint_id)
+            .cloned();
+        if let Some(metadata) = cached {
+            self.data_services
+                .verify_checkpoint_catalog_identity(checkpoint_id)?;
+            return Ok(metadata);
+        }
+        self.data_services
+            .recover_checkpoint_catalogs(Some(checkpoint_id))?;
         let lock = self
             .data_services
             .checkpoints
@@ -3170,6 +3632,7 @@ impl ControlHandle {
             0
         };
 
+        self.data_services.recover_checkpoint_catalogs(None)?;
         let lock = self
             .data_services
             .checkpoints
@@ -3205,15 +3668,31 @@ impl ControlHandle {
     }
 
     fn retained_artifact(&self, artifact_id: &str) -> Result<RetainedArtifact, ControlError> {
-        if let Some(artifact) = self
+        let cached = self
             .data_services
             .artifacts
             .lock()
             .map_err(|_| ControlError::Lock)?
             .get(artifact_id)
-            .cloned()
-        {
+            .cloned();
+        if let Some(artifact) = cached {
+            self.data_services
+                .verify_checkpoint_catalog_identity(artifact_id)?;
             return Ok(artifact);
+        }
+        if valid_checkpoint_catalog_id(artifact_id) {
+            self.data_services
+                .recover_checkpoint_catalogs(Some(artifact_id))?;
+            if let Some(artifact) = self
+                .data_services
+                .artifacts
+                .lock()
+                .map_err(|_| ControlError::Lock)?
+                .get(artifact_id)
+                .cloned()
+            {
+                return Ok(artifact);
+            }
         }
         // Do not hold the artifact lock while discovery takes the job locks or
         // publishes verified files. The miss path also supports cold downloads
@@ -3250,6 +3729,7 @@ impl ControlHandle {
             0
         };
 
+        self.data_services.recover_checkpoint_catalogs(None)?;
         self.data_services.recover_experiment_artifacts()?;
         let lock = self
             .data_services
@@ -5849,7 +6329,7 @@ pub(crate) mod tests {
                 let finished = Arc::clone(&sibling_finished);
                 let observed = Arc::clone(&observed_all_cancellations);
                 let mut reservation = services
-                    .reserve_experiment_execution(&job.runner.experiment_id, 1)
+                    .reserve_experiment_execution(&job.runner.experiment_id, 1, 1)
                     .unwrap();
                 job.running.store(true, Ordering::Release);
                 reservation.running = Some(Arc::clone(&job.running));
@@ -5886,7 +6366,7 @@ pub(crate) mod tests {
         assert_eq!(capacity.reserved_run_slots, 0);
         assert_eq!(capacity.reserved_batches, 0);
         assert!(matches!(
-            services.reserve_experiment_execution("new", 1),
+            services.reserve_experiment_execution("new", 1, 1),
             Err(ControlError::ExperimentShuttingDown)
         ));
     }
@@ -5905,7 +6385,7 @@ pub(crate) mod tests {
         let error = services.shutdown_experiments().unwrap_err().to_string();
         assert!(error.contains("registry was poisoned"), "{error}");
         assert!(matches!(
-            services.reserve_experiment_execution("new", 1),
+            services.reserve_experiment_execution("new", 1, 1),
             Err(ControlError::ExperimentShuttingDown)
         ));
     }
@@ -6190,6 +6670,60 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn experiment_grid_capacity_is_shared_across_batches_and_released_atomically() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let (handle, _host) = handle();
+        let handle = handle.with_artifacts_dir(directory.clone()).unwrap();
+        let services = handle.data_services();
+        let limit = crate::experiment_runner::MAX_CONCURRENT_GRID_CELLS;
+        let first = services
+            .reserve_experiment_execution("first", 1, limit - 1)
+            .unwrap();
+        let last = services.reserve_experiment_execution("last", 1, 1).unwrap();
+        let full = *services.execution_capacity.lock().unwrap();
+        assert_eq!(full.reserved_grid_cells, limit);
+        assert!(full.reserved_run_slots < full.max_run_slots);
+        for cells in [1, u64::MAX] {
+            assert!(matches!(
+                services.reserve_experiment_execution("overflow", 1, cells),
+                Err(ControlError::ExperimentCapacity(_))
+            ));
+            assert_eq!(*services.execution_capacity.lock().unwrap(), full);
+        }
+        let mut request = experiment_creation_request();
+        request.experiment_id = Some("grid-refused".into());
+        assert!(matches!(
+            handle.create_experiment(request),
+            Err(ControlError::ExperimentCapacity(message)) if message.contains("grid_cells")
+        ));
+        assert!(!directory.join("experiments/grid-refused").exists());
+        assert!(
+            !services
+                .experiments
+                .lock()
+                .unwrap()
+                .contains_key("grid-refused")
+        );
+        assert_eq!(*services.execution_capacity.lock().unwrap(), full);
+        drop(last);
+        let retry = services
+            .reserve_experiment_execution("retry", 1, 1)
+            .unwrap();
+        assert_eq!(*services.execution_capacity.lock().unwrap(), full);
+        drop(first);
+        drop(retry);
+        let free = *services.execution_capacity.lock().unwrap();
+        assert_eq!(free.reserved_grid_cells, 0);
+        assert_eq!(free.reserved_run_slots, 0);
+        assert_eq!(free.reserved_batches, 0);
+        assert!(matches!(
+            services.reserve_experiment_execution("empty-grid", 1, 0),
+            Err(ControlError::BadRequest(_))
+        ));
+        assert_eq!(*services.execution_capacity.lock().unwrap(), free);
+    }
+
+    #[test]
     fn experiment_execution_reservation_returns_capacity_on_unstarted_drop_and_unwind() {
         use std::sync::atomic::{AtomicBool, Ordering};
         let root = tempfile::tempdir().unwrap();
@@ -6198,9 +6732,11 @@ pub(crate) mod tests {
         let running = Arc::new(AtomicBool::new(false));
         assert!(
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut reservation = services.reserve_experiment_execution("unwind", 1).unwrap();
+                let mut reservation = services
+                    .reserve_experiment_execution("unwind", 1, 1)
+                    .unwrap();
                 assert!(matches!(
-                    services.reserve_experiment_execution("over-cap", 1),
+                    services.reserve_experiment_execution("over-cap", 1, 1),
                     Err(ControlError::ExperimentCapacity(_))
                 ));
                 running.store(true, Ordering::Release);
@@ -6211,14 +6747,15 @@ pub(crate) mod tests {
         );
         assert!(!running.load(Ordering::Acquire));
         let reservation = services
-            .reserve_experiment_execution("unstarted", 1)
+            .reserve_experiment_execution("unstarted", 1, 1)
             .unwrap();
         drop(reservation);
         let free = *services.execution_capacity.lock().unwrap();
         assert_eq!(free.reserved_run_slots, 0);
+        assert_eq!(free.reserved_grid_cells, 0);
         assert_eq!(free.reserved_batches, 0);
         assert!(matches!(
-            services.reserve_experiment_execution("zero", 0),
+            services.reserve_experiment_execution("zero", 0, 1),
             Err(ControlError::BadRequest(_))
         ));
         assert_eq!(*services.execution_capacity.lock().unwrap(), free);
@@ -8828,6 +9365,306 @@ pub(crate) mod tests {
                 directory.display()
             );
         }
+    }
+
+    #[test]
+    fn checkpoint_catalog_recovers_download_review_and_pagination_without_adopting_requests() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let (handle, host) = checkpoint_test_handle(&directory, 8, 8 * 1024 * 1024);
+        host.wait_applied(&handle.step().unwrap());
+        let first = handle
+            .create_checkpoint(CheckpointCreateRequest {
+                description: Some("saved before the second intervention".into()),
+                idempotency_key: Some("original-request".into()),
+            })
+            .unwrap();
+        let first_bytes = handle.read_artifact_bytes(&first.checkpoint_id).unwrap().1;
+        host.wait_applied(&handle.step().unwrap());
+        let second = handle
+            .create_checkpoint(CheckpointCreateRequest::default())
+            .unwrap();
+        let second_bytes = handle.read_artifact_bytes(&second.checkpoint_id).unwrap().1;
+        let uncatalogued_id = format!("ckpt-{:032x}-t{}", 0, first.tick);
+        fs::write(
+            directory.join(format!("{uncatalogued_id}.bin")),
+            &first_bytes,
+        )
+        .unwrap();
+        fs::write(
+            directory.join(format!("{uncatalogued_id}{CHECKPOINT_CATALOG_SUFFIX}")),
+            b"interrupted descriptor without a completion marker",
+        )
+        .unwrap();
+        let descriptors = [first.clone(), second.clone()].map(|metadata| {
+            let path = directory.join(format!(
+                "{}{CHECKPOINT_CATALOG_SUFFIX}",
+                metadata.checkpoint_id
+            ));
+            let bytes = fs::read(&path).unwrap();
+            (path, bytes)
+        });
+        drop(handle);
+        drop(host);
+
+        let (restarted, owner) = checkpoint_test_handle(&directory, 8, 8 * 1024 * 1024);
+        let before = owner.port.scientific_digest_v1().unwrap();
+        assert_eq!(before.tick.0, 0);
+        // Cold download must work even when no catalog/list method was called.
+        assert_eq!(
+            restarted
+                .read_artifact_bytes(&first.checkpoint_id)
+                .unwrap()
+                .1,
+            first_bytes
+        );
+        let page = restarted.list_checkpoints(Some(1), None).unwrap();
+        assert_eq!(page.total, 2);
+        assert_eq!(page.items.len(), 1);
+        assert!(page.has_more);
+        let next = restarted
+            .list_checkpoints(Some(1), page.next_cursor.as_deref())
+            .unwrap();
+        assert_eq!(next.total, 2);
+        assert_eq!(next.items.len(), 1);
+        assert!(!next.has_more);
+        assert_ne!(page.items[0].checkpoint_id, next.items[0].checkpoint_id);
+        for (expected, bytes) in [(&first, &first_bytes), (&second, &second_bytes)] {
+            assert_eq!(
+                serde_json::to_value(restarted.get_checkpoint(&expected.checkpoint_id).unwrap())
+                    .unwrap(),
+                serde_json::to_value(expected).unwrap(),
+            );
+            assert_eq!(
+                &restarted
+                    .read_artifact_bytes(&expected.checkpoint_id)
+                    .unwrap()
+                    .1,
+                bytes
+            );
+            let snapshot = restarted
+                .checkpoint_canvas(&expected.checkpoint_id)
+                .unwrap();
+            assert_eq!(snapshot.world.tick, expected.tick);
+            assert_eq!(snapshot.world.agents.len(), expected.agent_count);
+        }
+        assert_eq!(restarted.list_artifacts(None, None).unwrap().total, 2);
+        let usage = restarted.checkpoint_retention_usage().unwrap();
+        assert_eq!(
+            usage.file_count, 3,
+            "uncatalogued files still consume quota"
+        );
+        assert_eq!(usage.request_entries, 0);
+        assert_eq!(usage.pending_entries, 0);
+        assert!(matches!(
+            restarted.get_checkpoint(&uncatalogued_id),
+            Err(ControlError::NotFound(_))
+        ));
+        assert!(matches!(
+            restarted.event_canvas(first.tick),
+            Err(ControlError::NotFound(_))
+        ));
+        assert_eq!(owner.port.scientific_digest_v1().unwrap(), before);
+        for (path, bytes) in descriptors {
+            assert_eq!(
+                fs::read(path).unwrap(),
+                bytes,
+                "discovery must not rewrite evidence"
+            );
+        }
+        assert_eq!(
+            fs::read(directory.join(format!("{uncatalogued_id}.bin"))).unwrap(),
+            first_bytes
+        );
+    }
+
+    #[test]
+    fn checkpoint_catalog_rejects_corrupt_and_rehashed_false_descriptors_without_mutating_owner() {
+        for corruption in [
+            "checksum",
+            "population",
+            "schema",
+            "payload_bound",
+            "record_bound",
+        ] {
+            let directory = tempfile::tempdir().unwrap().keep();
+            let (handle, host) = checkpoint_test_handle(&directory, 4, 8 * 1024 * 1024);
+            let metadata = handle
+                .create_checkpoint(CheckpointCreateRequest::default())
+                .unwrap();
+            let path = directory.join(format!(
+                "{}{CHECKPOINT_CATALOG_SUFFIX}",
+                metadata.checkpoint_id
+            ));
+            let original = fs::read(&path).unwrap();
+            fs::write(directory.join("descriptor.original"), &original).unwrap();
+            let payload =
+                fs::read(directory.join(format!("{}.bin", metadata.checkpoint_id))).unwrap();
+            let mut record: CheckpointCatalogRecord = serde_json::from_slice(&original).unwrap();
+            match corruption {
+                "checksum" => {
+                    record.metadata.description = Some("changed without rehashing".into())
+                }
+                "population" => record.metadata.agent_count += 1,
+                "schema" => record.schema_version += 1,
+                "payload_bound" => record.metadata.byte_size = 1,
+                "record_bound" => {}
+                _ => unreachable!(),
+            }
+            if corruption != "checksum" {
+                record.checksum_blake3 =
+                    compute_blake3(&serde_json::to_vec(&record.metadata).unwrap());
+            }
+            if corruption == "record_bound" {
+                fs::write(&path, vec![b' '; MAX_CHECKPOINT_CATALOG_RECORD_BYTES + 1]).unwrap();
+            } else {
+                fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+            }
+            let changed = fs::read(&path).unwrap();
+            drop(handle);
+            drop(host);
+            let (restarted, owner) = checkpoint_test_handle(&directory, 4, 8 * 1024 * 1024);
+            let before = owner.port.scientific_digest_v1().unwrap();
+            let error = restarted
+                .get_checkpoint(&metadata.checkpoint_id)
+                .unwrap_err();
+            assert!(
+                matches!(error, ControlError::CheckpointRetentionUnavailable(_)),
+                "{corruption}: {error}"
+            );
+            if corruption.ends_with("_bound") {
+                assert!(
+                    error.to_string().contains("byte bound"),
+                    "{corruption}: {error}"
+                );
+            }
+            assert!(restarted.list_checkpoints(None, None).is_err());
+            assert!(
+                restarted
+                    .read_artifact_bytes(&metadata.checkpoint_id)
+                    .is_err()
+            );
+            assert!(
+                restarted
+                    .data_services
+                    .checkpoints
+                    .lock()
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(restarted.data_services.artifacts.lock().unwrap().is_empty());
+            assert_eq!(owner.port.scientific_digest_v1().unwrap(), before);
+            assert_eq!(fs::read(&path).unwrap(), changed);
+            assert_eq!(
+                fs::read(directory.join(format!("{}.bin", metadata.checkpoint_id))).unwrap(),
+                payload
+            );
+        }
+    }
+
+    #[test]
+    fn checkpoint_catalog_rejects_ambiguous_directories_even_after_a_cached_read() {
+        let first = tempfile::tempdir().unwrap().keep();
+        let second = tempfile::tempdir().unwrap().keep();
+        let (handle, host) = checkpoint_test_handle(&first, 4, 8 * 1024 * 1024);
+        let metadata = handle
+            .create_checkpoint(CheckpointCreateRequest::default())
+            .unwrap();
+        let expected = handle
+            .read_artifact_bytes(&metadata.checkpoint_id)
+            .unwrap()
+            .1;
+        for suffix in [
+            ".bin",
+            CHECKPOINT_CATALOG_SUFFIX,
+            CHECKPOINT_CATALOG_READY_SUFFIX,
+        ] {
+            let name = format!("{}{suffix}", metadata.checkpoint_id);
+            fs::copy(first.join(&name), second.join(&name)).unwrap();
+        }
+        let handle = handle.with_artifacts_dir(second.clone()).unwrap();
+        let before = host.port.scientific_digest_v1().unwrap();
+        assert!(matches!(
+            handle.get_checkpoint(&metadata.checkpoint_id),
+            Err(ControlError::Conflict(_))
+        ));
+        assert!(matches!(
+            handle.read_artifact_bytes(&metadata.checkpoint_id),
+            Err(ControlError::Conflict(_))
+        ));
+        assert!(matches!(
+            handle.list_checkpoints(None, None),
+            Err(ControlError::Conflict(_))
+        ));
+        for _ in 0..2 {
+            assert!(matches!(
+                handle.get_checkpoint(&metadata.checkpoint_id),
+                Err(ControlError::Conflict(_))
+            ));
+            assert!(matches!(
+                handle.read_artifact_bytes(&metadata.checkpoint_id),
+                Err(ControlError::Conflict(_))
+            ));
+        }
+        assert!(handle.data_services.checkpoints.lock().unwrap().is_empty());
+        assert!(handle.data_services.artifacts.lock().unwrap().is_empty());
+        assert_eq!(
+            handle.checkpoint_retention_usage().unwrap().request_entries,
+            1
+        );
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        for directory in [first, second] {
+            assert_eq!(
+                fs::read(directory.join(format!("{}.bin", metadata.checkpoint_id))).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn checkpoint_catalog_failure_preserves_pending_identity_and_never_overwrites_descriptor() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let (handle, host) = checkpoint_test_handle(&directory, 4, 8 * 1024 * 1024);
+        let request = CheckpointCreateRequest {
+            description: None,
+            idempotency_key: Some("catalog-retry".into()),
+        };
+        let metadata = handle.create_checkpoint(request.clone()).unwrap();
+        let path = directory.join(format!(
+            "{}{CHECKPOINT_CATALOG_SUFFIX}",
+            metadata.checkpoint_id
+        ));
+        let original = fs::read(&path).unwrap();
+        fs::write(directory.join("descriptor.original"), &original).unwrap();
+        fs::write(&path, b"partial descriptor").unwrap();
+        assert!(matches!(
+            write_checkpoint_catalog(&directory, &metadata),
+            Err(ControlError::CheckpointRetentionUnavailable(_))
+        ));
+        assert_eq!(fs::read(&path).unwrap(), b"partial descriptor");
+        // Model the retained state immediately before descriptor publication.
+        // Discovery must never promote that request; only its exact retry can.
+        {
+            let mut retention = handle.data_services.checkpoint_retention.lock().unwrap();
+            retention
+                .requests
+                .get_mut("checkpoint:catalog-retry")
+                .unwrap()
+                .acknowledged = false;
+            handle.data_services.checkpoints.lock().unwrap().clear();
+            handle.data_services.artifacts.lock().unwrap().clear();
+        }
+        assert_eq!(handle.list_checkpoints(None, None).unwrap().total, 0);
+        let before = host.port.scientific_digest_v1().unwrap();
+        assert!(matches!(
+            handle.create_checkpoint(request),
+            Err(ControlError::CheckpointRetentionUnavailable(_))
+        ));
+        let usage = handle.checkpoint_retention_usage().unwrap();
+        assert_eq!(usage.file_count, 1);
+        assert_eq!(usage.request_entries, 1);
+        assert_eq!(usage.pending_entries, 1);
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        assert_eq!(fs::read(path).unwrap(), b"partial descriptor");
     }
 
     #[test]
