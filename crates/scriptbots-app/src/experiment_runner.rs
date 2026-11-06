@@ -212,6 +212,19 @@ impl ExperimentBatchStatus {
     }
 }
 
+/// Canonical family used when an experiment proposal omits its family axis.
+pub(crate) const DEFAULT_EXPERIMENT_BRAIN_FAMILY: &str = MlpBrain::KIND.as_str();
+
+/// Canonical experiment families backed by executable adapters in this build.
+/// Proposal schemas and arm validation consume the same installed-family list.
+pub(crate) const EXPERIMENT_BRAIN_FAMILIES: &[&str] = &[
+    DEFAULT_EXPERIMENT_BRAIN_FAMILY,
+    DwraonBrain::KIND.as_str(),
+    AssemblyBrain::KIND.as_str(),
+    #[cfg(feature = "brain-ft")]
+    FT_BRAIN_KIND,
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum ResolvedBrainFamily {
     Mlp,
@@ -3409,12 +3422,21 @@ pub(crate) fn validate_experiment_brain_family(
     variant_id: &str,
     brain_family: &str,
 ) -> Result<(), ExperimentRunnerError> {
+    canonical_experiment_brain_family(variant_id, brain_family).map(|_| ())
+}
+
+/// Resolve an accepted experiment-family alias to its installed canonical identity.
+/// This is pure validation: it constructs no world, adapter, worker or artifact.
+pub(crate) fn canonical_experiment_brain_family(
+    variant_id: &str,
+    requested: &str,
+) -> Result<&'static str, ExperimentRunnerError> {
     ResolvedBrainFamily::resolve(&ScenarioVariant {
         variant_id: variant_id.to_owned(),
-        brain_family: brain_family.to_owned(),
+        brain_family: requested.to_owned(),
         config_overrides: BTreeMap::new(),
     })
-    .map(|_| ())
+    .map(ResolvedBrainFamily::canonical_name)
 }
 
 pub(crate) fn config_for_run(

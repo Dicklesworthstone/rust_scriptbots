@@ -1,5 +1,6 @@
 //! Retained-evidence verification and same-build canonical cohort re-execution.
 use super::notebook::{NotebookContext, RunRef};
+use super::spec::Arm;
 use super::stats::{AnalysisParams, MatchedSeedAnalysis, RunSummary, analyze_matched_seed_runs};
 use crate::experiment_runner::{
     ExperimentBatchStatus, MatchedSeedCohort, MatchedSeedExperimentRunner, RunRecord, RunState,
@@ -211,8 +212,17 @@ fn verify_rows(input: &ReproductionInput, run_records: Vec<RunRecord>) -> Result
     let arms = input
         .variants
         .iter()
-        .map(|v| v.config_overrides.clone())
-        .collect::<Vec<_>>();
+        .map(|variant| {
+            let family = crate::experiment_runner::canonical_experiment_brain_family(
+                &variant.variant_id,
+                &variant.brain_family,
+            )?;
+            Ok(Arm {
+                brain_family: family.to_owned(),
+                config_overrides: variant.config_overrides.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
     for record in &run_records {
         let bundle = Path::new(record.bundle_path.as_deref().context("missing bundle")?);
         let wire: scriptbots_storage::RunBundleV1 =
@@ -240,8 +250,11 @@ fn verify_rows(input: &ReproductionInput, run_records: Vec<RunRecord>) -> Result
         let arm_overrides = arms.get(arm_index).ok_or_else(|| {
             anyhow::anyhow!("variant {} outside the cited plan", record.variant_id)
         })?;
-        let expected_config = crate::experiment_runner::config_for_run(arm_overrides, record.seed)
-            .map_err(anyhow::Error::msg)?;
+        let expected_config = crate::experiment_runner::config_for_run(
+            &arm_overrides.config_overrides,
+            record.seed,
+        )
+        .map_err(anyhow::Error::msg)?;
         let expected_value = serde_json::to_value(&expected_config)?;
         ensure!(
             manifest.normalized_config == expected_value,

@@ -1498,6 +1498,32 @@ Every requested endpoint must be available in every matched run. Unavailable
 population statistics use empty CSV cells and cause analysis to refuse that
 requested metric; they are never replaced with zero.
 
+Lab proposals can also compare executable brain families directly:
+
+```json
+{
+  "hypothesis": "MLP and DWRAON differ in final energy under the same environment",
+  "falsifier": "The paired energy difference remains compatible with zero",
+  "factors": [],
+  "brain_families": ["mlp", "dwraon"],
+  "seeds": {"base": 41, "count": 8},
+  "ticks_per_run": 1000,
+  "metrics": ["average_energy", "total_food"],
+  "budget": {"runs": 16, "ticks": 16000}
+}
+```
+
+Omitting `brain_families` selects the existing MLP default. The proposal tool lists
+the canonical families installed in the current build; accepted aliases resolve
+through the runner's registry. Unknown or unavailable families and duplicate aliases
+are refused before execution. Configuration-factor combinations expand in declaration
+order, with the requested families inside each combination, and every arm receives
+the same seed cohort. Run and tick budgets include the full product, subject to the
+existing 32-arm ceiling. Empty `factors` requires at least two distinct families.
+The first expanded arm is the statistical control; every later arm is compared
+with it through the existing matched-seed analysis. Result ingestion and notebook
+reproduction bind each arm to its actual family and launch configuration.
+
 The summary now declares `schema_version=2`, bound by
 `scriptbots.experiment-run-evidence.v2`. Verification and completed-run recovery
 refuse earlier V1 experiment summaries/evidence. Existing files are preserved;

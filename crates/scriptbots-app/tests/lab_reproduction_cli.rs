@@ -32,20 +32,23 @@ fn spec_input() -> serde_json::Value {
 /// Runs the REAL pipeline end-to-end: validated spec -> real worlds -> real
 /// analysis -> materialized notebook. No provider and no mocks anywhere.
 fn real_notebook(root: &std::path::Path) -> std::path::PathBuf {
-    materialize_real_notebook(root, false)
+    materialize_real_notebook(root, false, spec_input())
 }
 
 fn materialize_real_notebook(
     root: &std::path::Path,
     shuffled_rerender: bool,
+    input: serde_json::Value,
 ) -> std::path::PathBuf {
+    let hypothesis = input["hypothesis"].as_str().unwrap().to_owned();
+    let falsifier = input["falsifier"].as_str().unwrap().to_owned();
     let turn = ScriptedTurn::from_body(serde_json::json!({
         "stop_reason": "tool_use",
         "usage": {"input_tokens": 4, "output_tokens": 6},
         "content": [{
             "type": "tool_use",
             "name": PROPOSE_EXPERIMENT_TOOL_NAME,
-            "input": spec_input()
+            "input": input
         }]
     }));
     let mut lab = LabStateMachine::new(
@@ -69,7 +72,7 @@ fn materialize_real_notebook(
     }
     let summaries = lab.run_summaries.clone();
     let analysis = lab.analysis.clone().expect("canonical analysis");
-    let claims = claims_from_analysis(&analysis, &summaries, "hypothesis", "falsifier")
+    let claims = claims_from_analysis(&analysis, &summaries, &hypothesis, &falsifier)
         .expect("claims rederive");
     let context = NotebookContext {
         model_id: "offline-scripted".to_owned(),
@@ -87,7 +90,7 @@ fn materialize_real_notebook(
     let out = root.join("notebook");
     NotebookRenderer::render_notebook(
         "e2e-reproduction",
-        "faster food growth raises the final population",
+        &hypothesis,
         &claims,
         &run_refs(&summaries),
         &out,
@@ -102,7 +105,7 @@ fn materialize_real_notebook(
         shuffled_claims.reverse();
         NotebookRenderer::render_notebook(
             "e2e-reproduction",
-            "faster food growth raises the final population",
+            &hypothesis,
             &shuffled_claims,
             &shuffled_runs,
             &out,
@@ -282,7 +285,7 @@ fn tampered_build_identity_is_refused_before_execution() {
 #[test]
 fn shuffled_cohort_rerender_preserves_retained_artifacts() {
     let temp = tempfile::tempdir().expect("temp root");
-    let notebook = materialize_real_notebook(temp.path(), true);
+    let notebook = materialize_real_notebook(temp.path(), true, spec_input());
     let output = run_script(&notebook);
     assert_eq!(output.status.code(), Some(0), "{}", log(&output));
 }
@@ -341,6 +344,83 @@ fn clean_cohort_reproduces_every_arm_and_seed() {
     assert_eq!(
         actual, expected,
         "canonical regenerated scientific summaries differ"
+    );
+}
+
+#[test]
+fn family_only_cohort_reproduces_each_executed_family_at_every_matched_seed() {
+    let temp = tempfile::tempdir().expect("temporary experiment root");
+    let root = temp.path().canonicalize().expect("canonical fixture root");
+    let mut proposal = spec_input();
+    proposal["hypothesis"] = "brain family changes final total energy at matched seeds".into();
+    proposal["falsifier"] = "total energy is unchanged across brain families".into();
+    proposal["factors"] = serde_json::json!([]);
+    proposal["brain_families"] = serde_json::json!(["mlp", "dwraon"]);
+    proposal["metrics"] = serde_json::json!(["total_energy"]);
+    let notebook = materialize_real_notebook(&root, false, proposal);
+    let input = read_json(&notebook.join("reproduction.json"));
+    assert_eq!(input["variants"].as_array().unwrap().len(), 2);
+    for (index, family) in ["mlp.baseline", "dwraon.baseline"].into_iter().enumerate() {
+        assert_eq!(input["variants"][index]["brain_family"], family);
+        assert_eq!(
+            input["variants"][index]["config_overrides"],
+            serde_json::json!({})
+        );
+    }
+    let output = run_script(&notebook);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "two-family emitted-script reproduction must pass:\n{}",
+        log(&output)
+    );
+    let regenerated = notebook.join("rerun-000000");
+    assert_eq!(
+        read_json(&regenerated.join("analysis.json")),
+        read_json(&notebook.join("analysis.json"))
+    );
+    let mut expected = read_json(&notebook.join("summaries.json"));
+    let mut actual = read_json(&regenerated.join("summaries.json"));
+    let expected_rows = expected.as_array_mut().unwrap();
+    let actual_rows = actual.as_array_mut().unwrap();
+    let expected_cells = [
+        (0, "mlp.baseline", 41),
+        (0, "mlp.baseline", 42),
+        (1, "dwraon.baseline", 41),
+        (1, "dwraon.baseline", 42),
+    ];
+    assert_eq!(actual_rows.len(), expected_cells.len());
+    for (index, (arm, family, seed)) in expected_cells.into_iter().enumerate() {
+        let row = &actual_rows[index]["reference"];
+        assert_eq!(row["arm_id"], arm);
+        assert_eq!(row["brain_family"], family);
+        assert_eq!(row["seed"], seed);
+        assert_eq!(row["config_overrides"], serde_json::json!({}));
+        let record = read_json(&regenerated.join(format!("record-{index:04}.json")));
+        assert_eq!(record["state"], "Completed");
+        assert_eq!(record["brain_family"], family);
+        assert_eq!(record["seed"], seed);
+        assert_eq!(record["final_digest"], row["digest"]);
+    }
+    for pair in [(0, 2), (1, 3)] {
+        let control = &actual_rows[pair.0]["reference"];
+        let treatment = &actual_rows[pair.1]["reference"];
+        assert_eq!(control["config_digest"], treatment["config_digest"]);
+        assert_ne!(
+            control["digest"], treatment["digest"],
+            "different family cells must contain different executed brain states"
+        );
+    }
+    for rows in [expected_rows, actual_rows] {
+        for row in rows {
+            let path = row["reference"]["summary_path"].as_str().unwrap();
+            assert!(std::path::Path::new(path).is_file());
+            row["reference"]["summary_path"] = serde_json::Value::Null;
+        }
+    }
+    assert_eq!(
+        actual, expected,
+        "all scientific family provenance must reproduce"
     );
 }
 

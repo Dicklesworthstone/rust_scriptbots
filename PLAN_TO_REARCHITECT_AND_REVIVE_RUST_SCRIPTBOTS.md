@@ -3509,6 +3509,24 @@ clean source-status and source-diff digests plus Cargo.lock digest
 
 ### 7.7 experiment runner
 
+**Source implementation extension — Codex, 2026-11-06 UTC:** Lab proposals now
+expose installed brain families as a bounded treatment axis. Typed expanded arms
+use the runner's canonical family resolver, include the family/configuration product
+in admission costs, and bind actual family and launch configuration through result
+ingestion and notebook reproduction. Family-only studies require two distinct
+executable families. Every treatment compares against the first arm with matched
+seeds; factorial interaction effects are not estimated. Real two-family pipeline
+and emitted-script regression controls are authored. Native qualification remains
+pending because the required DSR execution path is unavailable in this session.
+
+**[Currently In Progress — Codex, 2026-11-06 UTC]:** Extend experiment variants
+with ordered, bounded timed interventions
+executed by the existing HostCore schedule. Continuation and portable verification
+must bind the exact declared schedule, completed receipts, remaining inputs and
+observed configuration at each cut. Preserve the current atomic volatile-owner
+continuation boundary; durable database history still requires a solution for a
+database prefix committed beyond the last saved owner cut.
+
 **Source implementation extension — Codex, 2026-11-05:** The runner and Lab now
 share eight final-state endpoints: population, total/mean live-agent energy,
 mean health, mean/max current age counter, max living generation and total food.
