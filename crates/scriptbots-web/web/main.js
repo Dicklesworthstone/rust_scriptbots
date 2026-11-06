@@ -27,6 +27,7 @@ let captureUrl = null;
 let renderer = null;
 let rendererGeneration = 0;
 let lastPaintedFrame = null;
+let presentationFailure = null;
 const fpsEl = document.getElementById("metric-fps");
 const tpsEl = document.getElementById("metric-tps");
 const tickEl = document.getElementById("metric-tick");
@@ -423,20 +424,20 @@ function validateFrameIdentity(frame) {
 }
 
 function drawSnapshot(frame) {
-  if (!renderer) return;
+  if (!renderer) return false;
   try {
     validateFrameIdentity(frame);
   } catch (error) {
     if (captureRequest) finishCapture(captureRequest, error);
     else showCaptureError(`Frame refused: ${error.message}`);
-    return;
+    return false;
   }
   if (lastPaintedFrame?.simulationGeneration === simulationGeneration
       && lastPaintedFrame.publicationRevision === frame.identity.publicationRevision
       && lastPaintedFrame.sessionId === frame.identity.sessionId
       && lastPaintedFrame.width === canvas.width && lastPaintedFrame.height === canvas.height
       && (!captureRequest || captureRequest.encoding)) {
-    return;
+    return true;
   }
   try {
     if (renderer.render(frame.snapshot)) {
@@ -446,6 +447,7 @@ function drawSnapshot(frame) {
         rendererStatus.dataset[key === "tick" ? "snapshotTick" : key] = value;
       }
       captureAdmittedFrame(frame.identity);
+      return true;
     }
   } catch (error) {
     if (rendererStatus.dataset.renderer === "webgpu") {
@@ -454,6 +456,7 @@ function drawSnapshot(frame) {
       throw error;
     }
   }
+  return false;
 }
 
 function showCaptureError(message) {
@@ -587,15 +590,49 @@ function updateStats(snapshot, now) {
 }
 
 function presentSimulation(now) {
-  if (!hasPresentationFrame()) {
-    requestAnimationFrame(presentSimulation);
-    return;
-  }
+  try {
+    if (!hasPresentationFrame()) return;
 
-  const frame = remoteMode ? remoteFrame : simHandle.frame();
-  drawSnapshot(frame);
-  updateStats(frame.snapshot, now);
-  requestAnimationFrame(presentSimulation);
+    const frame = remoteMode ? remoteFrame : simHandle.frame();
+    const presented = drawSnapshot(frame);
+    updateStats(frame.snapshot, now);
+    if (presented && presentationFailure) {
+      if (rendererStatus.textContent === presentationFailure.message) {
+        rendererStatus.textContent = presentationFailure.previousStatus;
+      }
+      delete rendererStatus.dataset.presentationState;
+      presentationFailure = null;
+      appendLog("Presentation resumed");
+    }
+  } catch (error) {
+    // A renderer may have changed part of the canvas before throwing. Even a
+    // paused, unchanged publication must be painted again after recovery.
+    lastPaintedFrame = null;
+    const detail = String(error?.message || error).slice(0, 512);
+    if (captureRequest) finishCapture(captureRequest, new Error(detail));
+    if (!presentationFailure) {
+      presentationFailure = {
+        message: `Presentation interrupted: ${detail}. Retrying…`,
+        previousStatus: rendererStatus.textContent,
+      };
+      console.error("Presentation interrupted", error);
+      appendLog(presentationFailure.message);
+    }
+    // Report once per continuous failure, including when the failing frame
+    // changes every callback. A renderer selection can replace the status while
+    // recovery is pending; retain that new backend's label for successful paint.
+    if (rendererStatus.textContent !== presentationFailure.message) {
+      presentationFailure.previousStatus = rendererStatus.textContent;
+      rendererStatus.textContent = presentationFailure.message;
+    }
+    if (rendererStatus.dataset.presentationState !== "error") {
+      rendererStatus.dataset.presentationState = "error";
+    }
+  } finally {
+    // Presentation owns one RAF chain, independently of the scientific timer.
+    // A failed frame must not kill that chain or restart a stopped owner clock.
+    requestAnimationFrame(presentSimulation);
+  }
 }
 
 function driveSimulation() {

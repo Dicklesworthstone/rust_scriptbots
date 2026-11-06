@@ -1,6 +1,7 @@
 // crates/scriptbots-web/web/tests/permalink_fork_dom.test.js
 // Real-browser Playwright test for permalink loading, fork-this-world UX,
-// parent-diff display, honest build mismatch banner, and local owner replacement.
+// parent-diff display, honest build mismatch banner, local owner replacement,
+// and presentation recovery through the production page and Canvas renderer.
 // The WASM double exercises browser lifecycle behavior, not checkpoint codec proof.
 
 import fs from "node:fs";
@@ -19,8 +20,9 @@ const mockWasmModule = `
   export function default_init_options() { return { world_width: 1280, world_height: 720 }; }
   
   const currentWorldLink = "sbw1.root_world_link";
-  const owners = window.__ownerTest = { records: [], nextFailure: null, failDriveId: null };
+  const owners = window.__ownerTest = { records: [], nextFailure: null, failDriveId: null, frameFailure: null };
   const timers = window.__ownerTimers = { pending: new Set(), maximum: 0 };
+  const frames = window.__ownerFrames = { pending: new Set(), maximum: 0, callbacks: 0 };
   const schedule = window.setTimeout.bind(window);
   const cancel = window.clearTimeout.bind(window);
   window.setTimeout = (callback, delay, ...args) => {
@@ -31,6 +33,20 @@ const mockWasmModule = `
     return id;
   };
   window.clearTimeout = (id) => { timers.pending.delete(id); cancel(id); };
+  const scheduleFrame = window.requestAnimationFrame.bind(window);
+  const cancelFrame = window.cancelAnimationFrame.bind(window);
+  window.requestAnimationFrame = (callback) => {
+    if (callback?.name !== "presentSimulation") return scheduleFrame(callback);
+    const id = scheduleFrame((now) => {
+      frames.pending.delete(id);
+      frames.callbacks += 1;
+      callback(now);
+    });
+    frames.pending.add(id);
+    frames.maximum = Math.max(frames.maximum, frames.pending.size);
+    return id;
+  };
+  window.cancelAnimationFrame = (id) => { frames.pending.delete(id); cancelFrame(id); };
 
   export function build_identity() {
     return {
@@ -116,7 +132,7 @@ const mockWasmModule = `
     owners.nextFailure = null;
     if (failure === "create") throw new Error("intentional create failure");
     const record = { id: owners.records.length + 1, kind, tick: initialTick,
-      freeCalls: 0, driveCalls: 0, elapsed: 0, speed: 1 };
+      freeCalls: 0, driveCalls: 0, frameCalls: 0, elapsed: 0, speed: 1 };
     owners.records.push(record);
     let credit = 0;
     function check(stage) {
@@ -151,7 +167,12 @@ const mockWasmModule = `
         return { scientific_steps: steps, automatic_steps_skipped: 0 };
       },
       frame() {
+        record.frameCalls += 1;
         check("frame");
+        if (owners.frameFailure?.ownerId === record.id && owners.frameFailure.remaining !== 0) {
+          if (owners.frameFailure.remaining > 0) owners.frameFailure.remaining -= 1;
+          throw new Error("intentional presentation frame failure " + record.frameCalls);
+        }
         const snapshot = this.snapshot();
         return { schema: "scriptbots.browser-frame.v1", snapshot, identity: {
           sessionId: String(2000 + record.id), publicationRevision: String(snapshot.tick + 400),
@@ -187,7 +208,7 @@ const mockWasmModule = `
 `;
 
 async function runOwnerLifecycleCases(page, context) {
-  const observations = { refusals: [], recoveries: [], replacements: [] };
+  const observations = { refusals: [], recoveries: [], replacements: [], presentationRecoveries: [] };
   await page.evaluate(() => {
     const read = File.prototype.arrayBuffer;
     File.prototype.arrayBuffer = function () {
@@ -200,13 +221,20 @@ async function runOwnerLifecycleCases(page, context) {
     session: document.getElementById("renderer-status").dataset.sessionId,
     pendingTimers: window.__ownerTimers.pending.size,
     maximumTimers: window.__ownerTimers.maximum,
+    pendingFrames: window.__ownerFrames.pending.size,
+    maximumFrames: window.__ownerFrames.maximum,
+    frameCallbacks: window.__ownerFrames.callbacks,
+    presentedTick: document.getElementById("renderer-status").dataset.snapshotTick,
+    presentationState: document.getElementById("renderer-status").dataset.presentationState,
+    rendererStatus: document.getElementById("renderer-status").textContent,
     speed: document.getElementById("steps-per-frame").value,
     preset: document.getElementById("brain-preset").value,
   }));
   const activeOwner = (value) => {
     const live = value.records.filter((owner) => owner.freeCalls === 0);
     if (live.length !== 1 || value.records.some((owner) => owner.freeCalls > 1)
-        || value.session !== String(2000 + live[0].id)) {
+        || value.session !== String(2000 + live[0].id)
+        || value.pendingFrames !== 1 || value.maximumFrames !== 1) {
       throw new Error(`Expected one live, presented owner: ${JSON.stringify(value)}`);
     }
     return live[0];
@@ -238,6 +266,108 @@ async function runOwnerLifecycleCases(page, context) {
     }
     await context.clock.runFor(32);
   };
+
+  // Keep reading the active owner after presentation faults, without flooding
+  // the UI/log or creating a second scientific timer or RAF chain.
+  await setSpeed(1);
+  await context.clock.runFor(32);
+  const beforeFrameFailure = await state();
+  const frameOwner = activeOwner(beforeFrameFailure);
+  await page.evaluate((ownerId) => {
+    window.__presentationReports = 0;
+    const status = document.getElementById("renderer-status");
+    window.__presentationObserver = new MutationObserver(() => {
+      if (status.textContent.startsWith("Presentation interrupted:")) window.__presentationReports += 1;
+    });
+    window.__presentationObserver.observe(status, { childList: true, characterData: true, subtree: true });
+    window.__ownerTest.frameFailure = { ownerId, remaining: -1 };
+  }, frameOwner.id);
+  await context.clock.runFor(160);
+  const failingFrames = await state();
+  const reporting = await page.evaluate(() => ({
+    updates: window.__presentationReports,
+    logs: document.getElementById("log").textContent.split("Presentation interrupted:").length - 1,
+  }));
+  if (activeOwner(failingFrames).id !== frameOwner.id
+      || activeOwner(failingFrames).frameCalls <= frameOwner.frameCalls + 1
+      || activeOwner(failingFrames).tick <= frameOwner.tick || failingFrames.pendingTimers !== 1
+      || failingFrames.presentationState !== "error" || reporting.updates !== 1 || reporting.logs !== 1) {
+    throw new Error(`Presentation failure stopped scheduling or flooded reporting: ${JSON.stringify({ failingFrames, reporting })}`);
+  }
+  await page.evaluate(() => { window.__ownerTest.frameFailure = null; });
+  await context.clock.runFor(64);
+  const frameRecovered = await state();
+  if (activeOwner(frameRecovered).id !== frameOwner.id || frameRecovered.presentationState
+      || Number(frameRecovered.presentedTick) <= frameOwner.tick
+      || frameRecovered.pendingTimers !== 1 || frameRecovered.maximumTimers !== 1
+      || !await page.evaluate(() => document.getElementById("log").textContent.includes("Presentation resumed"))) {
+    throw new Error("The existing owner failed to resume presentation after frame reads recovered");
+  }
+  await page.evaluate(() => window.__presentationObserver.disconnect());
+  observations.presentationRecoveries.push({ fault: "repeated frame read", owner: frameOwner.id,
+    attemptedFrames: activeOwner(failingFrames).frameCalls - frameOwner.frameCalls, reports: reporting,
+    presentedTick: frameRecovered.presentedTick });
+
+  // Fail after actually modifying the Canvas during capture of a paused world.
+  // Recovery must repaint the same publication even though capture was refused;
+  // merely continuing callbacks or trusting the old paint identity leaves red.
+  await setSpeed(0);
+  await context.clock.runFor(32);
+  const pausedBeforePaint = await state();
+  const pausedOwner = activeOwner(pausedBeforePaint);
+  await page.evaluate(() => {
+    const fill = CanvasRenderingContext2D.prototype.fillRect;
+    window.__canvasFaults = 0;
+    CanvasRenderingContext2D.prototype.fillRect = function (...args) {
+      if (this.canvas.id !== "sim-canvas") return fill.apply(this, args);
+      CanvasRenderingContext2D.prototype.fillRect = fill;
+      this.fillStyle = "#ff0000";
+      fill.apply(this, args);
+      window.__canvasFaults += 1;
+      throw new Error("intentional Canvas draw failure");
+    };
+    document.getElementById("capture-btn").click();
+  });
+  await context.clock.runFor(16);
+  const interruptedPaint = await page.evaluate(() => ({
+    faults: window.__canvasFaults,
+    capture: document.getElementById("capture-status").dataset.state,
+    pixel: Array.from(document.getElementById("sim-canvas").getContext("2d").getImageData(0, 0, 1, 1).data),
+  }));
+  if (interruptedPaint.faults !== 1 || interruptedPaint.capture !== "error"
+      || interruptedPaint.pixel.join(",") !== "255,0,0,255") {
+    throw new Error(`Canvas failure did not reach a partial paint and refuse capture: ${JSON.stringify(interruptedPaint)}`);
+  }
+  await context.clock.runFor(64);
+  const repainted = await state();
+  const pixel = await page.evaluate(() => Array.from(document.getElementById("sim-canvas")
+    .getContext("2d").getImageData(0, 0, 1, 1).data));
+  if (activeOwner(repainted).id !== pausedOwner.id || activeOwner(repainted).tick !== pausedOwner.tick
+      || repainted.presentedTick !== pausedBeforePaint.presentedTick || repainted.presentationState
+      || pixel.join(",") !== "11,17,32,255" || repainted.pendingTimers !== 1 || repainted.maximumTimers !== 1) {
+    throw new Error(`Canvas failed to repaint the paused publication: ${JSON.stringify({ repainted, pixel })}`);
+  }
+  observations.presentationRecoveries.push({ fault: "partial Canvas draw", owner: pausedOwner.id,
+    unchangedTick: repainted.presentedTick, interruptedPixel: interruptedPaint.pixel, recoveredPixel: pixel });
+
+  for (const operation of ["reset", "permalink", "checkpoint"]) {
+    const previous = activeOwner(await state());
+    await page.evaluate((ownerId) => {
+      window.__ownerTest.frameFailure = { ownerId, remaining: -1 };
+    }, previous.id);
+    await context.clock.runFor(32);
+    if ((await state()).presentationState !== "error") throw new Error("Replacement case did not observe a presentation fault");
+    await replace(operation);
+    const recovered = await state();
+    const next = activeOwner(recovered);
+    if (next.id === previous.id || recovered.records[previous.id - 1].freeCalls !== 1
+        || recovered.presentationState || recovered.pendingTimers !== 1 || recovered.maximumTimers !== 1) {
+      throw new Error(`${operation} did not recover a failed presentation: ${JSON.stringify(recovered)}`);
+    }
+    observations.presentationRecoveries.push({ fault: "persistent owner frame read", operation,
+      previousOwner: previous.id, presentedOwner: next.id, presentedTick: recovered.presentedTick });
+  }
+  await page.evaluate(() => { window.__ownerTest.frameFailure = null; });
 
   // Refusals after allocation are different from a decoder rejecting input:
   // each failed candidate must be freed without moving the paused old world.
@@ -271,18 +401,26 @@ async function runOwnerLifecycleCases(page, context) {
     await setSpeed(1);
     await context.clock.runFor(64);
     const previous = activeOwner(await state());
-    await page.evaluate((id) => { window.__ownerTest.failDriveId = id; }, previous.id);
+    await page.evaluate((id) => {
+      window.__ownerTest.failDriveId = id;
+      window.__ownerTest.frameFailure = { ownerId: id, remaining: 1 };
+    }, previous.id);
     await context.clock.runFor(32);
     const stopped = await state();
     if (stopped.pendingTimers !== 0) throw new Error("Clock fault left a pump scheduled");
     await context.clock.runFor(80);
-    if (activeOwner(await state()).driveCalls !== activeOwner(stopped).driveCalls) {
-      throw new Error("Stopped clock continued to drive the old world");
+    const stillStopped = await state();
+    if (activeOwner(stillStopped).driveCalls !== activeOwner(stopped).driveCalls
+        || activeOwner(stillStopped).frameCalls <= activeOwner(stopped).frameCalls
+        || stillStopped.pendingTimers !== 0 || stillStopped.presentationState
+        || !await page.evaluate(() => document.getElementById("log").textContent.includes("Simulation clock stopped"))) {
+      throw new Error("Presentation recovery restarted or concealed a stopped scientific clock");
     }
     await page.evaluate(() => {
       // The clock fault was transient. Refusing a candidate must still preserve
       // the old owner's stopped state rather than implicitly trying it again.
       window.__ownerTest.failDriveId = null;
+      window.__ownerTest.frameFailure = null;
       window.__ownerTest.nextFailure = "speed";
     });
     await replace(operation);
@@ -537,6 +675,7 @@ async function runOwnerLifecycleCases(page, context) {
   const finalState = await state();
   observations.releasedOwners = finalState.records.filter((owner) => owner.freeCalls === 1).length;
   observations.maximumPendingTimers = finalState.maximumTimers;
+  observations.maximumPendingFrames = finalState.maximumFrames;
   return observations;
 }
 
