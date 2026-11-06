@@ -1251,9 +1251,7 @@ pub fn summarize_run(
                     summary_diet_class(row.herbivore_tendency),
                 );
                 let group = diet_deviations.get_mut(&key).ok_or_else(|| {
-                    DataFrameError::Verification(
-                        "Agent groups changed during summary".into(),
-                    )
+                    DataFrameError::Verification("Agent groups changed during summary".into())
                 })?;
                 let squared_health = (f64::from(row.health) - group.row.mean_health).powi(2);
                 let squared_energy = (f64::from(row.energy) - group.row.mean_energy).powi(2);
@@ -1315,8 +1313,7 @@ pub fn summarize_run(
             .cmp(&right.metric_name)
             .then(left.tick.cmp(&right.tick))
     });
-    for points in
-        rolling_metrics.chunk_by_mut(|left, right| left.metric_name == right.metric_name)
+    for points in rolling_metrics.chunk_by_mut(|left, right| left.metric_name == right.metric_name)
     {
         let values: Vec<Scalar> = points
             .iter()

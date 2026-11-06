@@ -249,11 +249,7 @@ fn attributed_run(
     path
 }
 
-fn append_attributed_run(
-    path: &str,
-    record: RunManifestRecord,
-    observations: &[(u64, f64, f64)],
-) {
+fn append_attributed_run(path: &str, record: RunManifestRecord, observations: &[(u64, f64, f64)]) {
     let mut storage = Storage::append_run(path, record).expect("append attributed run");
     persist_endpoints(&mut storage, observations);
     storage.close().expect("close appended run");
@@ -339,6 +335,74 @@ fn assert_refused(control: &str, cohort: &str, reason: &str) {
         error.to_string().contains(reason),
         "unexpected refusal: {error}"
     );
+}
+
+/// Repack an established independent-seed oracle into one database with overlapping ticks.
+/// Only each run's manifested endpoint is copied; earlier trajectory rows cannot affect inference.
+fn assert_shared_database_cohort_matches(dir: &Path, machine: &serde_json::Value) {
+    let file = "shared-cohort.sqlite";
+    let shared = fs::canonicalize(dir)
+        .unwrap()
+        .join(file)
+        .display()
+        .to_string();
+    let endpoint = machine["endpoint_tick"].as_u64().unwrap();
+    let mut expected_pairs = machine["pairs"].clone();
+    let mut cohort = serde_json::json!({
+        "schema": RUN_COMPARISON_COHORT_SCHEMA_V1,
+        "endpoint_tick": endpoint,
+        "metrics": ["shifting", "flat"],
+        "control": [],
+        "treatment": [],
+    });
+    let pairs = expected_pairs.as_array_mut().unwrap();
+    for (index, pair) in pairs.iter_mut().enumerate() {
+        for arm in ["control", "treatment"] {
+            let source = &mut pair[arm];
+            let reader = StorageReader::open_finished(source["db"].as_str().unwrap()).unwrap();
+            let record = reader.run_manifest().unwrap();
+            reader.close().unwrap();
+            let observations = [(
+                endpoint,
+                source["values"]["shifting"].as_f64().unwrap(),
+                source["values"]["flat"].as_f64().unwrap(),
+            )];
+            if index == 0 && arm == "control" {
+                attributed_run(dir, file, record, &observations);
+            } else {
+                append_attributed_run(&shared, record, &observations);
+            }
+            cohort[arm].as_array_mut().unwrap().push(serde_json::json!({
+                "db": file,
+                "run_id": source["run_id"],
+            }));
+            source["db"] = serde_json::json!(shared);
+        }
+    }
+    cohort["control"].as_array_mut().unwrap().reverse();
+    let path = write_cohort(dir, "shared-cohort.json", &cohort);
+    let selected: RunId = pairs[0]["control"]["run_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let cx = ReaderCtx::open_for_run(&shared, selected).unwrap();
+    let params = ReportParams::from_pairs([format!("cohort_file={path}")]).unwrap();
+    let result = Registry::builtin()
+        .run("compare-runs", &cx, &params)
+        .unwrap();
+    assert_eq!(result.machine["mode"], "matched_seed_cohort");
+    assert_eq!(result.machine["inference_status"], "computed");
+    assert_eq!(result.machine["independent_pairs"], 12);
+    assert_eq!(result.machine["metrics"], machine["metrics"]);
+    assert_eq!(result.machine["pairs"], expected_pairs);
+    assert_eq!(cx.reader.run_id(), selected);
+    assert_eq!(cx.reader.run_manifest().unwrap().run_id, selected);
+    assert_eq!(
+        cx.reader.metrics_at_tick(endpoint, 2).unwrap()[1].value,
+        25.0
+    );
+    cx.reader.close().unwrap();
 }
 
 fn matched_seed_cohort_runs(dir: &tempfile::TempDir) -> (Vec<String>, Vec<String>) {
@@ -833,9 +897,18 @@ fn descriptive_pairs_can_select_two_runs_in_the_context_database() {
     let output = compare_selected(&db, control_id, &params).unwrap();
     assert_eq!(output.machine["mode"], "descriptive_pair");
     assert_eq!(output.machine["seed_pairing"], "matched");
-    assert_eq!(output.machine["inference_status"], "insufficient_independent_pairs");
-    assert_eq!(output.machine["pairs"][0]["control"]["run_id"], control_id.to_string());
-    assert_eq!(output.machine["pairs"][0]["treatment"]["run_id"], treatment_id.to_string());
+    assert_eq!(
+        output.machine["inference_status"],
+        "insufficient_independent_pairs"
+    );
+    assert_eq!(
+        output.machine["pairs"][0]["control"]["run_id"],
+        control_id.to_string()
+    );
+    assert_eq!(
+        output.machine["pairs"][0]["treatment"]["run_id"],
+        treatment_id.to_string()
+    );
     let shifting = metric(&output.machine, "shifting").unwrap();
     assert_eq!(shifting["mean_difference"], 5.0);
     assert!(shifting["p_value"].is_null());
@@ -845,7 +918,10 @@ fn descriptive_pairs_can_select_two_runs_in_the_context_database() {
     earlier_params.push("endpoint_tick=1".to_owned());
     let earlier = compare_selected(&db, control_id, &earlier_params).unwrap();
     assert_eq!(earlier.machine["endpoint_tick"], 1);
-    assert_eq!(metric(&earlier.machine, "shifting").unwrap()["mean_difference"], 2000.0);
+    assert_eq!(
+        metric(&earlier.machine, "shifting").unwrap()["mean_difference"],
+        2000.0
+    );
 
     for (selection, reason) in [
         (None, "multiple runs"),
@@ -857,7 +933,10 @@ fn descriptive_pairs_can_select_two_runs_in_the_context_database() {
             params.push(format!("treatment_run_id={run_id}"));
         }
         let error = compare_selected(&db, control_id, &params).unwrap_err();
-        assert!(error.to_string().contains(reason), "unexpected refusal: {error}");
+        assert!(
+            error.to_string().contains(reason),
+            "unexpected refusal: {error}"
+        );
     }
 }
 
@@ -873,20 +952,37 @@ fn cohort_selection_is_explicit_and_preserves_the_context_run_binding() {
     let path = write_cohort(dir.path(), "selected-shared.json", &value);
     let params = [format!("cohort_file={path}")];
     let output = compare_selected(&db, control_id, &params).unwrap();
-    assert_eq!(metric(&output.machine, "shifting").unwrap()["mean_difference"], 5.0);
+    assert_eq!(
+        metric(&output.machine, "shifting").unwrap()["mean_difference"],
+        5.0
+    );
     let error = compare_selected(&db, treatment_id, &params).unwrap_err();
     assert!(error.to_string().contains("must be a declared control"));
 
     for (file, arm, run_id, reason) in [
         ("ambiguous-shared.json", "control", None, "multiple runs"),
-        ("absent-shared.json", "treatment", Some(RunId::new(999)), "does not exist"),
-        ("reused-shared.json", "treatment", Some(control_id), "reused run identity"),
+        (
+            "absent-shared.json",
+            "treatment",
+            Some(RunId::new(999)),
+            "does not exist",
+        ),
+        (
+            "reused-shared.json",
+            "treatment",
+            Some(control_id),
+            "reused run identity",
+        ),
     ] {
         let mut invalid = value.clone();
         invalid[arm][0]["run_id"] = serde_json::to_value(run_id).unwrap();
         let path = write_cohort(dir.path(), file, &invalid);
-        let error = compare_selected(&db, control_id, &[format!("cohort_file={path}")]).unwrap_err();
-        assert!(error.to_string().contains(reason), "unexpected refusal: {error}");
+        let error =
+            compare_selected(&db, control_id, &[format!("cohort_file={path}")]).unwrap_err();
+        assert!(
+            error.to_string().contains(reason),
+            "unexpected refusal: {error}"
+        );
     }
 }
 
@@ -900,18 +996,29 @@ fn same_database_aliases_preserve_finished_reader_path_refusals() {
     let alias = alias.display().to_string();
     let control_id = RunId::new(107);
     let treatment_id = RunId::new(207);
-    let error = compare_selected(&db, control_id, &[
-        format!("treatment_db={alias}"),
-        format!("treatment_run_id={treatment_id}"),
-    ]).unwrap_err();
-    assert!(error.to_string().contains("SYMLINK"), "unexpected refusal: {error}");
+    let error = compare_selected(
+        &db,
+        control_id,
+        &[
+            format!("treatment_db={alias}"),
+            format!("treatment_run_id={treatment_id}"),
+        ],
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("SYMLINK"),
+        "unexpected refusal: {error}"
+    );
 
     let mut value = cohort_value(2, std::slice::from_ref(&db), &[alias]);
     value["control"][0]["run_id"] = serde_json::to_value(control_id).unwrap();
     value["treatment"][0]["run_id"] = serde_json::to_value(treatment_id).unwrap();
     let path = write_cohort(dir.path(), "alias-shared.json", &value);
     let error = compare_selected(&db, control_id, &[format!("cohort_file={path}")]).unwrap_err();
-    assert!(error.to_string().contains("SYMLINK"), "unexpected refusal: {error}");
+    assert!(
+        error.to_string().contains("SYMLINK"),
+        "unexpected refusal: {error}"
+    );
 }
 
 #[test]

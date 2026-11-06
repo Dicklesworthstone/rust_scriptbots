@@ -26,8 +26,8 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use scriptbots_analytics::{
     AnalyticsExportFormat, EpochBrainSummaryRow, EpochDietSummaryRow, RollingMetricRow,
     RunSummaryReport, agent_rows_to_batch, event_rows_to_batch, export_database_table,
-    lineage_rows_to_batch, load_agent_rows, load_metric_rows, metric_rows_to_batch,
-    summarize_run, verify_record_batches,
+    lineage_rows_to_batch, load_agent_rows, load_metric_rows, metric_rows_to_batch, summarize_run,
+    verify_record_batches,
 };
 use scriptbots_core::{
     AgentData, AgentIdentity, AgentRuntime, AgentState, AgentUid, BirthOrigin, BirthRecord,
@@ -343,7 +343,11 @@ fn build_multi_page_fixture_db(dir: &tempfile::TempDir) -> String {
 /// Several demographics and sparse metric series straddle storage page boundaries.
 /// Every agent is a seeded founder, so the summary must not invent lineage edges.
 fn build_summary_fixture_db(dir: &tempfile::TempDir) -> String {
-    let db_path = dir.path().join("summary_pages.sqlite").display().to_string();
+    let db_path = dir
+        .path()
+        .join("summary_pages.sqlite")
+        .display()
+        .to_string();
     let mut storage = Storage::create_unattributed_file(&db_path).expect("summary fixture");
     let population = EXPORT_PAGE_ROWS / 2 + 3;
     for (step, tick) in [0, 1, 100, 101, 1001].into_iter().enumerate() {
@@ -424,7 +428,9 @@ fn build_summary_fixture_db(dir: &tempfile::TempDir) -> String {
                 .metrics
                 .push(MetricSample::new(format!("metric-{index:05}"), value));
         }
-        storage.persist(&batch).expect("persist summary page fixture");
+        storage
+            .persist(&batch)
+            .expect("persist summary page fixture");
     }
     storage.close().expect("finish summary page fixture");
     db_path
@@ -448,7 +454,11 @@ fn assert_float_identical(actual: f64, expected: f64) {
     if expected.is_nan() {
         assert!(actual.is_nan(), "expected upstream NaN, got {actual}");
     } else {
-        assert_eq!(actual.to_bits(), expected.to_bits(), "{actual} != {expected}");
+        assert_eq!(
+            actual.to_bits(),
+            expected.to_bits(),
+            "{actual} != {expected}"
+        );
     }
 }
 
@@ -994,7 +1004,11 @@ fn paged_summary_preserves_both_parents_and_legacy_lineage_fallback() {
 #[test]
 fn empty_summary_has_defaults_and_no_fabricated_observations() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let db_path = dir.path().join("empty_summary.sqlite").display().to_string();
+    let db_path = dir
+        .path()
+        .join("empty_summary.sqlite")
+        .display()
+        .to_string();
     Storage::create_unattributed_file(&db_path)
         .expect("create empty source")
         .close()
@@ -1036,7 +1050,10 @@ fn summary_preserves_nonfinite_source_refusal_without_json_staging() {
         } else {
             load_agent_rows(&reader).is_err()
         };
-        assert!(old_load_refused, "old JSONL summary refused nonfinite {field}");
+        assert!(
+            old_load_refused,
+            "old JSONL summary refused nonfinite {field}"
+        );
         let error = summarize_run(&reader, 10, 3).expect_err("nonfinite source refusal");
         assert!(error.to_string().contains(field), "{error}");
     }

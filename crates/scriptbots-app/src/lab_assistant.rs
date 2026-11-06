@@ -1,12 +1,12 @@
 //! Autonomous LLM lab assistant: canonical proposal -> validation -> matched-seed execution.
 
+#[cfg(test)]
+use crate::experiment_runner::MAX_BUNDLE_ARTIFACT_BYTES;
 use crate::experiment_runner::{
     ExperimentBatchStatus, MAX_EXPERIMENT_SUMMARY_BYTES, MatchedSeedCohort,
     MatchedSeedExperimentRunner, RunState, ScenarioVariant, validate_scenario_arm,
     verify_portable_run_bundle,
 };
-#[cfg(test)]
-use crate::experiment_runner::MAX_BUNDLE_ARTIFACT_BYTES;
 use crate::lab::llm::{
     LlmClient, LlmError, LlmMessage, LlmRequest, PROPOSE_EXPERIMENT_TOOL_NAME, StopReason,
     propose_experiment_tool,
@@ -1692,7 +1692,10 @@ mod tests {
                 .final_state
                 .unwrap();
             assert_eq!(run.metrics, observed.summary.available_metrics());
-            assert_eq!(run.summary_artifact_digest, observed.summary_artifact_digest);
+            assert_eq!(
+                run.summary_artifact_digest,
+                observed.summary_artifact_digest
+            );
         }
         let notebook = lab.rendered_notebook.as_ref().expect("report retained");
         assert!(notebook.contains("average_energy"));
@@ -1707,7 +1710,10 @@ mod tests {
             ("food_intake_rate".to_owned(), serde_json::json!(0.0)),
             ("movement_drain".to_owned(), serde_json::json!(0.0)),
             ("spike_damage".to_owned(), serde_json::json!(0.0)),
-            ("temperature_discomfort_rate".to_owned(), serde_json::json!(0.0)),
+            (
+                "temperature_discomfort_rate".to_owned(),
+                serde_json::json!(0.0),
+            ),
             ("population_minimum".to_owned(), serde_json::json!(0)),
             ("population_spawn_interval".to_owned(), serde_json::json!(0)),
         ]);
@@ -1739,7 +1745,9 @@ mod tests {
             2,
             temp.path().join("bundles"),
         );
-        let status = runner.execute_batch(&temp.path().join("status.json")).unwrap();
+        let status = runner
+            .execute_batch(&temp.path().join("status.json"))
+            .unwrap();
         assert_eq!(status.completed_runs, 4);
         assert_eq!(status.failed_runs, 0);
         let summaries = completed_run_summaries(&arms, &status).unwrap();

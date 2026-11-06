@@ -748,7 +748,9 @@ impl ExperimentEndpointSummaryV2 {
                 world
                     .agent_uid(id)
                     .map(|uid| (uid, index, id))
-                    .ok_or_else(|| format!("endpoint agent at dense index {index} has no stable UID"))
+                    .ok_or_else(|| {
+                        format!("endpoint agent at dense index {index} has no stable UID")
+                    })
             })
             .collect::<Result<Vec<_>, _>>()?;
         ordered.sort_unstable_by_key(|(uid, _, _)| *uid);
@@ -767,7 +769,9 @@ impl ExperimentEndpointSummaryV2 {
             let energy = f64::from(runtime.energy);
             let health = f64::from(columns.health()[index]);
             if !energy.is_finite() || !health.is_finite() {
-                return Err(format!("endpoint agent UID {uid} has non-finite energy or health"));
+                return Err(format!(
+                    "endpoint agent UID {uid} has non-finite energy or health"
+                ));
             }
             let age = columns.ages()[index];
             let generation = columns.generations()[index].0;
@@ -2645,11 +2649,7 @@ impl MatchedSeedExperimentRunner {
             plan_digest,
             manifest_record,
             &[
-                (
-                    "exports/summary.csv",
-                    "experiment-summary",
-                    &summary_csv,
-                ),
+                ("exports/summary.csv", "experiment-summary", &summary_csv),
                 (
                     "evidence/run.json",
                     "experiment-run-evidence",

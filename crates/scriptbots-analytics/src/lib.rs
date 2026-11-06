@@ -2403,8 +2403,15 @@ impl ComparisonInputReader<'_> {
                 || StorageReader::open_finished(db),
                 |run_id| StorageReader::open_finished_for_run(db, run_id),
             )?;
-            let result =
-                read_comparison_source(&reader, db, self.endpoint_tick, Some(self.metrics), true);
+            let result = (|| {
+                read_comparison_source(
+                    &reader.select_finished_run(Some(reader.run_id()))?,
+                    db,
+                    self.endpoint_tick,
+                    Some(self.metrics),
+                    true,
+                )
+            })();
             let close_result = reader.close();
             let observation = result?;
             close_result?;
@@ -2413,6 +2420,7 @@ impl ComparisonInputReader<'_> {
         let (seed, source) = observation;
         let seed =
             seed.ok_or_else(|| comparison_error("cohort source has no verified root seed"))?;
+        let is_context = same_database && source.run_id == self.context.reader.run_id();
         Ok((seed, source, is_context))
     }
 
@@ -2862,48 +2870,11 @@ fn compare_descriptive_pair(
         |run_id| StorageReader::open_finished_for_run(path, run_id),
     )?;
     let result = (|| {
-        let endpoint_tick = match params.get_u64("endpoint_tick")? {
-            Some(tick) => tick,
-            None => match (cx.reader.max_tick()?, reader.max_tick()?) {
-                (Some(control), Some(treatment)) if control == treatment => control,
-                _ => {
-                    return Err(comparison_error(
-                        "runs have no shared terminal tick; declare endpoint_tick explicitly or use cohort_file",
-                    ));
-                }
-            },
-        };
-        let (control_seed, control) =
-            read_comparison_source(&cx.reader, &cx.db_path, endpoint_tick, None, false)?;
-        let (treatment_seed, treatment) =
-            read_comparison_source(&reader, path, endpoint_tick, None, false)?;
-        if control_seed.is_some() && treatment_seed.is_some() && control.run_id == treatment.run_id
-        {
-            return Err(comparison_error(
-                "control and treatment reuse the same attributed run identity",
-            ));
-        }
-        let names: Vec<String> = control
-            .values
-            .keys()
-            .filter(|name| treatment.values.contains_key(*name))
-            .cloned()
-            .collect();
-        if names.is_empty() {
-            return Err(comparison_error(
-                "the exact endpoint has no metrics shared by both runs",
-            ));
-        }
-        let seed_hex = control_seed
-            .filter(|seed| Some(*seed) == treatment_seed)
-            .map(|seed| format!("{seed:016x}"));
-        comparison_machine(
-            vec![RunComparisonPair {
-                seed_hex,
-                control,
-                treatment,
-            }],
-            &names,
+        read_descriptive_pair(
+            &control,
+            &cx.db_path,
+            &reader.select_finished_run(Some(reader.run_id()))?,
+            path,
             endpoint_tick,
             comparison_params,
         )
