@@ -844,7 +844,9 @@ impl ExperimentEndpointSummaryV2 {
             .into_inner()
             .map_err(|error| format!("finish V2 endpoint summary: {error}"))?;
         if bytes.len() > MAX_EXPERIMENT_SUMMARY_BYTES {
-            return Err("V2 endpoint summary exceeds the 4096-byte artifact bound".to_owned());
+            return Err(format!(
+                "V2 endpoint summary exceeds the {MAX_EXPERIMENT_SUMMARY_BYTES}-byte artifact bound"
+            ));
         }
         Ok(bytes)
     }
@@ -3533,7 +3535,7 @@ mod tests {
         assert_eq!(empty.max_age, None);
         assert_eq!(empty.max_generation, None);
 
-        for (energy, health, age, generation) in [(2.0, 1.0, 3, 1), (6.0, 3.0, 9, 4)] {
+        for (energy, health, age, generation) in [(2.0, 0.5, 3, 1), (6.0, 1.5, 9, 5)] {
             world
                 .try_spawn_agent_with(
                     scriptbots_core::AgentData {
@@ -3559,12 +3561,22 @@ mod tests {
                 ("alive_agents".into(), 2.0),
                 ("total_energy".into(), 8.0),
                 ("average_energy".into(), 4.0),
-                ("average_health".into(), 2.0),
+                ("average_health".into(), 1.0),
                 ("mean_age".into(), 6.0),
                 ("max_age".into(), 9.0),
-                ("max_generation".into(), 4.0),
+                ("max_generation".into(), 5.0),
                 ("total_food".into(), 15.0),
             ])
+        );
+        assert_eq!(
+            populated
+                .available_metrics()
+                .values()
+                .map(|value| value.to_bits())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            EXPERIMENT_ENDPOINT_METRICS.len(),
+            "distinct known-world outcomes must expose mislabeled endpoint mappings"
         );
         for summary in [empty, populated] {
             let bytes = summary.canonical_csv_bytes().unwrap();
