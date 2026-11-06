@@ -3548,11 +3548,17 @@ database, explicit and ambiguous selections, writer exclusion, symlink aliases,
 secondary-run corruption and unchanged source observations/statistics. Native DSR
 qualification remains open; no inference thresholds or scientific baselines changed.
 
-**[Currently In Progress — Codex, 2026-11-05]:** Stream summary inputs through the
-existing typed pages, retaining group accumulators and required output/lineage
-state rather than full agent tables and duplicate raw sample vectors. Preserve
-source-order numerical reductions and the pinned FrankenPandas rolling kernel.
-Output size and per-metric rolling workspace remain explicit memory costs.
+**Source implementation extension — Codex, 2026-11-05:** Summary inputs now stream
+through the existing typed pages. Two agent traversals retain group accumulators
+and preserve source-order means and sample deviations, including signed-zero sum
+identities. Metrics are collected directly into final report rows and passed one
+complete series at a time to the unchanged pinned FrankenPandas rolling kernel;
+lineage pages feed the existing graph. Observation-count windows and population
+counts retain their original meaning. Regression source compares paged output
+with the materialized strategy across demographic/page boundaries, sparse series,
+default and oversized windows, singleton groups, lineage fallback and non-finite
+source refusals. Output, graph and per-metric workspace remain explicit memory
+costs. Native DSR qualification and measured performance evidence remain open.
 
 **Source implementation update — Codex, 2026-11-05:** Table export now supports
 bounded Parquet/Arrow production and full-data readback. Storage exposes

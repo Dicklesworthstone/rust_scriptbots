@@ -1105,6 +1105,25 @@ event capacity during a run are also refused; unrelated authenticated configurat
 revisions are supported. The report does not use saved narrative outputs to supply
 its reconstructed events.
 
+### Streaming demographic and metric summaries
+
+```bash
+sb-analyze runs/example.sqlite summarize --epoch-size 100 --rolling-window 10 --json summary.json --md summary.md
+```
+
+Summaries read agent, metric and lineage inputs in pages of at most 1,024 rows.
+Per-epoch diet and brain counts represent recorded agent observations; repeated
+observations of an agent contribute separately. Two agent passes preserve the
+existing source-order means and sample standard deviations without retaining
+every raw sample.
+
+The rolling window counts observations of each metric, including the current
+observation. Sparse tick gaps remain sparse. The pinned FrankenPandas rolling
+implementation processes each complete metric series, preserving its arithmetic
+across storage page boundaries. The final report, descendant graph and workspace
+for one metric series still require memory proportional to their sizes. Source
+paging does not impose a total-memory or SQL execution-time bound.
+
 ### Matched-seed endpoint comparisons
 
 Use `compare-runs` with a cohort manifest to compare independent simulation runs.

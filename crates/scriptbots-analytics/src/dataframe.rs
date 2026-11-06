@@ -1085,7 +1085,7 @@ pub struct RunSummaryReport {
     pub run_id: String,
     /// Epoch tick interval used for grouping.
     pub epoch_size: u64,
-    /// Rolling window tick duration used for metric smoothing.
+    /// Number of observations per metric in the trailing smoothing window.
     pub rolling_window: usize,
     /// Per-epoch diet demographic statistics.
     pub diet_summaries: Vec<EpochDietSummaryRow>,
@@ -1099,10 +1099,70 @@ pub struct RunSummaryReport {
     pub markdown_table: String,
 }
 
-/// Health, energy, and herbivore-tendency samples, each in source-row order.
-type DietGroupSamples = (Vec<f64>, Vec<f64>, Vec<f64>);
+/// Preserve the left-to-right additions used by `Iterator::sum::<f64>()`.
+struct OrderedSummarySums<const N: usize> {
+    population: usize,
+    values: [f64; N],
+}
+
+impl<const N: usize> Default for OrderedSummarySums<N> {
+    fn default() -> Self {
+        Self {
+            population: 0,
+            // The floating-point Sum identity is negative zero, including for
+            // groups containing only negative-zero observations.
+            values: [-0.0; N],
+        }
+    }
+}
+
+impl<const N: usize> OrderedSummarySums<N> {
+    fn observe(&mut self, values: [f64; N]) {
+        self.population += 1;
+        for (sum, value) in self.values.iter_mut().zip(values) {
+            *sum += value;
+        }
+    }
+
+    fn means(&self) -> [f64; N] {
+        self.values.map(|sum| sum / self.population as f64)
+    }
+}
+
+struct DietSummaryDeviations {
+    row: EpochDietSummaryRow,
+    squared_health: f64,
+    squared_energy: f64,
+}
+
+const fn summary_diet_class(herbivore_tendency: f32) -> &'static str {
+    if herbivore_tendency >= 0.7 {
+        "Herbivore"
+    } else if herbivore_tendency <= 0.3 {
+        "Carnivore"
+    } else {
+        "Omnivore"
+    }
+}
+
+fn require_finite_summary_value(value: f64, field: &str) -> Result<(), DataFrameError> {
+    if value.is_finite() {
+        Ok(())
+    } else {
+        Err(DataFrameError::InvalidParam(format!(
+            "Cannot summarize non-finite {field}: {value}"
+        )))
+    }
+}
 
 /// Compute per-epoch groupby aggregates and rolling-window smoothed metric series.
+///
+/// Source rows are visited in bounded export pages. Two agent passes retain only
+/// group aggregates and preserve the original source-order mean and sample-SD
+/// arithmetic. Metrics are retained directly as report rows; `fp-frame` processes
+/// one complete metric series at a time so its rolling compensation never resets
+/// at a page boundary. The report, per-metric dataframe work, and lineage graph
+/// still grow with their respective output/series/graph sizes.
 pub fn summarize_run(
     reader: &StorageReader,
     epoch_size: u64,
@@ -1115,107 +1175,165 @@ pub fn summarize_run(
         rolling_window
     };
 
-    let (_prov, agent_rows) = load_agent_rows(reader)?;
-    let (_prov, metric_rows) = load_metric_rows(reader)?;
-    let (_prov, lineage_rows) = load_lineage_rows(reader)?;
-
-    // 1. Groupby Diet: (epoch, diet_class) -> [health, energy, tendency]
-    let mut diet_groups: BTreeMap<(u64, String), DietGroupSamples> = BTreeMap::new();
-    // 2. Groupby Brain: (epoch, brain_binding) -> [health, energy]
-    let mut brain_groups: BTreeMap<(u64, String), (Vec<f64>, Vec<f64>)> = BTreeMap::new();
-
-    for r in &agent_rows {
-        let ep = r.tick / epoch_size;
-        let diet = if r.herbivore_tendency >= 0.7 {
-            "Herbivore".to_string()
-        } else if r.herbivore_tendency <= 0.3 {
-            "Carnivore".to_string()
-        } else {
-            "Omnivore".to_string()
+    // Count observations, rather than distinct agents, just as the original
+    // whole-table groupby did. Each group's additions follow canonical row order.
+    let mut diet_groups: BTreeMap<(u64, &'static str), OrderedSummarySums<3>> = BTreeMap::new();
+    let mut brain_groups: BTreeMap<(u64, String), OrderedSummarySums<2>> = BTreeMap::new();
+    visit_export_pages::<DataFrameError>(reader, ExportTable::Agent, |page| {
+        let ExportTablePage::Agent(rows) = page else {
+            return Err(DataFrameError::Verification(
+                "Expected agent export page".into(),
+            ));
         };
-
-        let entry = diet_groups.entry((ep, diet)).or_default();
-        entry.0.push(f64::from(r.health));
-        entry.1.push(f64::from(r.energy));
-        entry.2.push(f64::from(r.herbivore_tendency));
-
-        let b_entry = brain_groups
-            .entry((ep, r.brain_binding.clone()))
-            .or_default();
-        b_entry.0.push(f64::from(r.health));
-        b_entry.1.push(f64::from(r.energy));
-    }
-
-    let mut diet_summaries = Vec::new();
-    for ((epoch, diet_class), (healths, energies, tendencies)) in diet_groups {
-        let pop = healths.len();
-        let (mean_h, std_h) = compute_mean_std(&healths);
-        let (mean_e, std_e) = compute_mean_std(&energies);
-        let (mean_t, _) = compute_mean_std(&tendencies);
-        diet_summaries.push(EpochDietSummaryRow {
-            epoch,
-            diet_class,
-            population: pop,
-            mean_health: mean_h,
-            std_health: std_h,
-            mean_energy: mean_e,
-            std_energy: std_e,
-            mean_herbivore_tendency: mean_t,
-        });
-    }
-
-    let mut brain_summaries = Vec::new();
-    for ((epoch, brain_binding), (healths, energies)) in brain_groups {
-        let pop = healths.len();
-        let (mean_h, _) = compute_mean_std(&healths);
-        let (mean_e, _) = compute_mean_std(&energies);
-        brain_summaries.push(EpochBrainSummaryRow {
-            epoch,
-            brain_binding,
-            population: pop,
-            mean_health: mean_h,
-            mean_energy: mean_e,
-        });
-    }
-
-    // 3. Rolling window smoothed metrics: group metrics by name, compute rolling mean
-    let mut metric_series_map: BTreeMap<String, Vec<(u64, f64)>> = BTreeMap::new();
-    for m in &metric_rows {
-        metric_series_map
-            .entry(m.name.clone())
-            .or_default()
-            .push((m.tick, m.value));
-    }
-
-    let mut rolling_metrics = Vec::new();
-    for (name, series_points) in metric_series_map {
-        let n = series_points.len();
-        if n == 0 {
-            continue;
+        for row in rows {
+            // The former JSONL load refused non-finite mandatory floats, even
+            // fields that are not aggregated. Keep that refusal without JSON.
+            for (field, value) in [
+                ("agents.position_x", row.pos_x),
+                ("agents.position_y", row.pos_y),
+                ("agents.velocity_x", row.vel_x),
+                ("agents.velocity_y", row.vel_y),
+                ("agents.heading", row.heading),
+                ("agents.health", row.health),
+                ("agents.energy", row.energy),
+                ("agents.herbivore_tendency", row.herbivore_tendency),
+            ] {
+                require_finite_summary_value(f64::from(value), field)?;
+            }
+            let epoch = row.tick / epoch_size;
+            let health = f64::from(row.health);
+            let energy = f64::from(row.energy);
+            diet_groups
+                .entry((epoch, summary_diet_class(row.herbivore_tendency)))
+                .or_default()
+                .observe([health, energy, f64::from(row.herbivore_tendency)]);
+            brain_groups
+                .entry((epoch, row.brain_binding))
+                .or_default()
+                .observe([health, energy]);
         }
+        Ok(())
+    })?;
 
-        // Build fp-frame Series and apply .rolling(window, min_periods=1).mean()
-        let val_scalars: Vec<Scalar> = series_points
-            .iter()
-            .map(|&(_, v)| Scalar::Float64(v))
-            .collect();
-        let col = Column::from_values(val_scalars).map_err(DataFrameError::Column)?;
-        let idx = Index::from_range(0, n as i64, 1);
-        let s = Series::new(&name, idx, col)?;
-
-        let rolling_s = s.rolling(rolling_window, Some(1)).mean()?;
-        let rolled_vals = rolling_s.values();
-        for (i, &(tick, raw_value)) in series_points.iter().enumerate() {
-            let smoothed = match rolled_vals.get(i) {
-                Some(Scalar::Float64(v)) => *v,
-                _ => raw_value,
+    let mut diet_deviations: BTreeMap<_, _> = diet_groups
+        .into_iter()
+        .map(|((epoch, diet_class), sums)| {
+            let [mean_health, mean_energy, mean_herbivore_tendency] = sums.means();
+            (
+                (epoch, diet_class),
+                DietSummaryDeviations {
+                    row: EpochDietSummaryRow {
+                        epoch,
+                        diet_class: diet_class.to_owned(),
+                        population: sums.population,
+                        mean_health,
+                        std_health: 0.0,
+                        mean_energy,
+                        std_energy: 0.0,
+                        mean_herbivore_tendency,
+                    },
+                    squared_health: -0.0,
+                    squared_energy: -0.0,
+                },
+            )
+        })
+        .collect();
+    // A second immutable-source traversal retains the two-pass sample variance
+    // and its addition order, without storing every health/energy observation.
+    if !diet_deviations.is_empty() {
+        visit_export_pages::<DataFrameError>(reader, ExportTable::Agent, |page| {
+            let ExportTablePage::Agent(rows) = page else {
+                return Err(DataFrameError::Verification(
+                    "Expected agent export page".into(),
+                ));
             };
+            for row in rows {
+                let key = (
+                    row.tick / epoch_size,
+                    summary_diet_class(row.herbivore_tendency),
+                );
+                let group = diet_deviations.get_mut(&key).ok_or_else(|| {
+                    DataFrameError::Verification(
+                        "Agent groups changed during summary".into(),
+                    )
+                })?;
+                let squared_health = (f64::from(row.health) - group.row.mean_health).powi(2);
+                let squared_energy = (f64::from(row.energy) - group.row.mean_energy).powi(2);
+                group.squared_health += squared_health;
+                group.squared_energy += squared_energy;
+            }
+            Ok(())
+        })?;
+    }
+    let diet_summaries: Vec<_> = diet_deviations
+        .into_values()
+        .map(|mut group| {
+            if group.row.population > 1 {
+                let divisor = group.row.population as f64 - 1.0;
+                group.row.std_health = (group.squared_health / divisor).sqrt();
+                group.row.std_energy = (group.squared_energy / divisor).sqrt();
+            }
+            group.row
+        })
+        .collect();
+    let brain_summaries: Vec<_> = brain_groups
+        .into_iter()
+        .map(|((epoch, brain_binding), sums)| {
+            let [mean_health, mean_energy] = sums.means();
+            EpochBrainSummaryRow {
+                epoch,
+                brain_binding,
+                population: sums.population,
+                mean_health,
+                mean_energy,
+            }
+        })
+        .collect();
+
+    // These are the report's final rows, not a second all-metric input table.
+    let mut rolling_metrics = Vec::new();
+    visit_export_pages::<DataFrameError>(reader, ExportTable::Metric, |page| {
+        let ExportTablePage::Metric(rows) = page else {
+            return Err(DataFrameError::Verification(
+                "Expected metric export page".into(),
+            ));
+        };
+        for row in rows {
+            require_finite_summary_value(row.value, "metrics.value")?;
             rolling_metrics.push(RollingMetricRow {
-                metric_name: name.clone(),
-                tick,
-                raw_value,
-                smoothed_value: smoothed,
+                metric_name: row.name,
+                tick: row.tick,
+                raw_value: row.value,
+                smoothed_value: row.value,
             });
+        }
+        Ok(())
+    })?;
+    // Storage emits (tick, name); the report has always emitted (name, tick).
+    // Those keys are unique within the selected run/island, so an in-place
+    // unstable sort preserves the complete canonical report order.
+    rolling_metrics.sort_unstable_by(|left, right| {
+        left.metric_name
+            .cmp(&right.metric_name)
+            .then(left.tick.cmp(&right.tick))
+    });
+    for points in
+        rolling_metrics.chunk_by_mut(|left, right| left.metric_name == right.metric_name)
+    {
+        let values: Vec<Scalar> = points
+            .iter()
+            .map(|row| Scalar::Float64(row.raw_value))
+            .collect();
+        let column = Column::from_values(values)?;
+        let index = Index::from_range(0, points.len() as i64, 1);
+        let series = Series::new(&points[0].metric_name, index, column)?;
+        // fp-frame's compensated rolling state spans the complete metric, even
+        // for sparse ticks. The window counts observations, not elapsed ticks.
+        let rolled = series.rolling(rolling_window, Some(1)).mean()?;
+        for (row, value) in points.iter_mut().zip(rolled.values()) {
+            if let Scalar::Float64(value) = value {
+                row.smoothed_value = *value;
+            }
         }
     }
 
@@ -1224,14 +1342,22 @@ pub fn summarize_run(
     let mut all_children = HashSet::new();
     let mut all_parents = HashSet::new();
 
-    for edge in &lineage_rows {
-        parent_to_children
-            .entry(edge.parent_agent_uid)
-            .or_default()
-            .push(edge.child_agent_uid);
-        all_children.insert(edge.child_agent_uid);
-        all_parents.insert(edge.parent_agent_uid);
-    }
+    visit_export_pages::<DataFrameError>(reader, ExportTable::Lineage, |page| {
+        let ExportTablePage::Lineage(rows) = page else {
+            return Err(DataFrameError::Verification(
+                "Expected lineage export page".into(),
+            ));
+        };
+        for edge in rows {
+            parent_to_children
+                .entry(edge.parent_agent_uid)
+                .or_default()
+                .push(edge.child_agent_uid);
+            all_children.insert(edge.child_agent_uid);
+            all_parents.insert(edge.parent_agent_uid);
+        }
+        Ok(())
+    })?;
 
     // Founders: parents that were never children
     let mut founders: Vec<u64> = all_parents
@@ -1290,19 +1416,6 @@ pub fn summarize_run(
         founder_lineages,
         markdown_table,
     })
-}
-
-fn compute_mean_std(values: &[f64]) -> (f64, f64) {
-    if values.is_empty() {
-        return (0.0, 0.0);
-    }
-    let n = values.len() as f64;
-    let mean = values.iter().sum::<f64>() / n;
-    if values.len() <= 1 {
-        return (mean, 0.0);
-    }
-    let var = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n - 1.0);
-    (mean, var.sqrt())
 }
 
 fn render_summary_markdown(
@@ -1390,6 +1503,46 @@ mod tests {
             conservation_tolerances: None,
             schema_version: 1,
             exported_at_utc: "2026-09-03T12:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn ordered_summary_sums_preserve_signed_zero_and_cancellation() {
+        for observations in [
+            [[-0.0, -0.0, -0.0]; 5],
+            [
+                [1.0e30, 1.0, -0.0],
+                [1.0, 1.0e30, -0.0],
+                [-1.0e30, -1.0e30, 0.0],
+                [0.125, 2.0, -0.0],
+                [-0.125, 0.125, -0.0],
+            ],
+        ] {
+            let mut sums = OrderedSummarySums::<3>::default();
+            for page in observations.chunks(2) {
+                for &values in page {
+                    sums.observe(values);
+                }
+            }
+            assert_eq!(sums.population, observations.len());
+            for (column, actual) in sums.means().into_iter().enumerate() {
+                let expected = observations.iter().map(|row| row[column]).sum::<f64>()
+                    / observations.len() as f64;
+                assert_eq!(actual.to_bits(), expected.to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn summary_refuses_nonfinite_values_instead_of_defaulting_missing_numbers() {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let error = require_finite_summary_value(value, "metrics.value")
+                .expect_err("nonfinite raw observations were rejected by the JSON loader");
+            assert!(error.to_string().contains("metrics.value"));
+        }
+        for value in [-0.0, 0.0, f64::MIN, f64::MAX] {
+            require_finite_summary_value(value, "metrics.value")
+                .expect("all finite IEEE-754 observations remain valid");
         }
     }
 

@@ -11,16 +11,23 @@
 //!    and asserts exact agreement with DataFrame-derived summaries.
 //! 5. CLI invocation: tests `sb-analyze export` and `sb-analyze summarize` subcommands end-to-end.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 
 use arrow::array::RecordBatch;
 use arrow::ipc::reader::FileReader as ArrowFileReader;
+use fp_columnar::Column;
+use fp_frame::Series;
+use fp_index::Index;
+use fp_types::Scalar;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use scriptbots_analytics::{
-    AnalyticsExportFormat, agent_rows_to_batch, event_rows_to_batch, export_database_table,
-    lineage_rows_to_batch, metric_rows_to_batch, summarize_run, verify_record_batches,
+    AnalyticsExportFormat, EpochBrainSummaryRow, EpochDietSummaryRow, RollingMetricRow,
+    RunSummaryReport, agent_rows_to_batch, event_rows_to_batch, export_database_table,
+    lineage_rows_to_batch, load_agent_rows, load_metric_rows, metric_rows_to_batch,
+    summarize_run, verify_record_batches,
 };
 use scriptbots_core::{
     AgentData, AgentIdentity, AgentRuntime, AgentState, AgentUid, BirthOrigin, BirthRecord,
@@ -33,7 +40,8 @@ use scriptbots_storage::export_pipeline::{
     visit_export_pages,
 };
 use scriptbots_storage::{
-    Connection, ExportTable, Storage, StorageError, StorageReader, verify_export_receipt,
+    Connection, ExportTable, SqliteValue, Storage, StorageError, StorageReader,
+    verify_export_receipt,
 };
 
 fn make_agent(
@@ -333,6 +341,259 @@ fn build_multi_page_fixture_db(dir: &tempfile::TempDir) -> String {
     }
     storage.close().expect("durable paged fixture close");
     db_path
+}
+
+/// Several demographics and sparse metric series straddle storage page boundaries.
+/// Every agent is a seeded founder, so the summary must not invent lineage edges.
+fn build_summary_fixture_db(dir: &tempfile::TempDir) -> String {
+    let db_path = dir.path().join("summary_pages.sqlite").display().to_string();
+    let mut storage = Storage::create_unattributed_file(&db_path).expect("summary fixture");
+    let population = EXPORT_PAGE_ROWS / 2 + 3;
+    for (step, tick) in [0, 1, 100, 101, 1001].into_iter().enumerate() {
+        let agents: Vec<_> = (1..=population)
+            .map(|index| {
+                let uid = u64::try_from(index).expect("bounded fixture UID");
+                let (tendency, brain) = if index == 1 {
+                    (0.5, "singleton")
+                } else if index % 2 == 0 {
+                    (0.7, "mlp")
+                } else {
+                    (0.3, "neuroflow")
+                };
+                let mut agent = make_agent(uid, tick, 0, None, tendency, brain);
+                agent.data.health = if index == 1 {
+                    -0.0
+                } else {
+                    f32::from(u16::try_from(index % 7 + step).unwrap()) + 0.125
+                };
+                agent.runtime.energy = if index == 1 {
+                    -0.0
+                } else {
+                    [1.0e20, 1.0, 2.0, 0.125][(index + step) % 4]
+                };
+                agent
+            })
+            .collect();
+        let births = if step == 0 {
+            agents
+                .iter()
+                .map(|agent| {
+                    let index = usize::try_from(agent.identity.uid.0).unwrap();
+                    let brain = if index == 1 {
+                        "singleton"
+                    } else if index % 2 == 0 {
+                        "mlp"
+                    } else {
+                        "neuroflow"
+                    };
+                    let mut birth = make_birth(
+                        tick,
+                        agent.identity.uid.0,
+                        None,
+                        0,
+                        BirthOrigin::Seeded,
+                        agent.runtime.herbivore_tendency,
+                        brain,
+                    );
+                    birth.position = agent.data.position;
+                    birth
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut batch = fixture_batch(tick, population, 0, agents, births);
+        let count = f32::from(u16::try_from(population).unwrap());
+        batch.summary.total_energy = batch.agents.iter().map(|a| a.runtime.energy).sum();
+        batch.summary.average_energy = batch.summary.total_energy / count;
+        batch.summary.average_health =
+            batch.agents.iter().map(|a| a.data.health).sum::<f32>() / count;
+        batch.replay_events.clear();
+        batch.metrics.clear();
+        for index in 0..(EXPORT_PAGE_ROWS / 3 + 3) {
+            if index % 2 != 0 && step % 2 != 0 {
+                continue;
+            }
+            let value = match index {
+                0 => [1.0e16, 1.0, -1.0e16, 0.125, -0.0][step],
+                1 => -0.0,
+                2 => 0.1,
+                _ => {
+                    let step_delta = f64::from(u16::try_from(step).unwrap()) * 0.125;
+                    f64::from(u16::try_from(index).unwrap()) - step_delta
+                }
+            };
+            batch
+                .metrics
+                .push(MetricSample::new(format!("metric-{index:05}"), value));
+        }
+        storage.persist(&batch).expect("persist summary page fixture");
+    }
+    storage.close().expect("finish summary page fixture");
+    db_path
+}
+
+fn materialized_mean_std(values: &[f64]) -> (f64, f64) {
+    if values.is_empty() {
+        return (0.0, 0.0);
+    }
+    let count = f64::from(u32::try_from(values.len()).expect("bounded oracle samples"));
+    let mean = values.iter().sum::<f64>() / count;
+    let std = if values.len() > 1 {
+        (values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (count - 1.0)).sqrt()
+    } else {
+        0.0
+    };
+    (mean, std)
+}
+
+fn assert_float_identical(actual: f64, expected: f64) {
+    if expected.is_nan() {
+        assert!(actual.is_nan(), "expected upstream NaN, got {actual}");
+    } else {
+        assert_eq!(actual.to_bits(), expected.to_bits(), "{actual} != {expected}");
+    }
+}
+
+/// The former JSONL + whole-table strategy is a deliberately independent,
+/// small-fixture oracle for paging, group order, and floating-point operations.
+fn assert_summary_matches_materialized(
+    reader: &StorageReader,
+    epoch_size: u64,
+    rolling_window: usize,
+) -> RunSummaryReport {
+    let summary = summarize_run(reader, epoch_size, rolling_window).expect("paged summary");
+    let epoch_size = if epoch_size == 0 { 100 } else { epoch_size };
+    let rolling_window = if rolling_window == 0 {
+        10
+    } else {
+        rolling_window
+    };
+    let (_, agents) = load_agent_rows(reader).expect("materialized agent oracle");
+    let (_, metrics) = load_metric_rows(reader).expect("materialized metric oracle");
+    let classify = |tendency: f32| {
+        if tendency >= 0.7 {
+            "Herbivore"
+        } else if tendency <= 0.3 {
+            "Carnivore"
+        } else {
+            "Omnivore"
+        }
+    };
+    let diet_keys: BTreeSet<_> = agents
+        .iter()
+        .map(|row| (row.tick / epoch_size, classify(row.herbivore_tendency)))
+        .collect();
+    let mut expected_diet = Vec::new();
+    for (epoch, diet) in diet_keys {
+        let rows: Vec<_> = agents
+            .iter()
+            .filter(|row| {
+                row.tick / epoch_size == epoch && classify(row.herbivore_tendency) == diet
+            })
+            .collect();
+        let health: Vec<_> = rows.iter().map(|row| f64::from(row.health)).collect();
+        let energy: Vec<_> = rows.iter().map(|row| f64::from(row.energy)).collect();
+        let tendency: Vec<_> = rows
+            .iter()
+            .map(|row| f64::from(row.herbivore_tendency))
+            .collect();
+        let (mean_health, std_health) = materialized_mean_std(&health);
+        let (mean_energy, std_energy) = materialized_mean_std(&energy);
+        expected_diet.push(EpochDietSummaryRow {
+            epoch,
+            diet_class: diet.to_owned(),
+            population: rows.len(),
+            mean_health,
+            std_health,
+            mean_energy,
+            std_energy,
+            mean_herbivore_tendency: materialized_mean_std(&tendency).0,
+        });
+    }
+    assert_eq!(summary.diet_summaries.len(), expected_diet.len());
+    for (actual, expected) in summary.diet_summaries.iter().zip(&expected_diet) {
+        assert_eq!(actual.epoch, expected.epoch);
+        assert_eq!(actual.diet_class, expected.diet_class);
+        assert_eq!(actual.population, expected.population);
+        for (actual, expected) in [
+            (actual.mean_health, expected.mean_health),
+            (actual.std_health, expected.std_health),
+            (actual.mean_energy, expected.mean_energy),
+            (actual.std_energy, expected.std_energy),
+            (
+                actual.mean_herbivore_tendency,
+                expected.mean_herbivore_tendency,
+            ),
+        ] {
+            assert_float_identical(actual, expected);
+        }
+    }
+
+    let brain_keys: BTreeSet<_> = agents
+        .iter()
+        .map(|row| (row.tick / epoch_size, row.brain_binding.as_str()))
+        .collect();
+    let mut expected_brain = Vec::new();
+    for (epoch, brain) in brain_keys {
+        let rows: Vec<_> = agents
+            .iter()
+            .filter(|row| row.tick / epoch_size == epoch && row.brain_binding == brain)
+            .collect();
+        let health: Vec<_> = rows.iter().map(|row| f64::from(row.health)).collect();
+        let energy: Vec<_> = rows.iter().map(|row| f64::from(row.energy)).collect();
+        expected_brain.push(EpochBrainSummaryRow {
+            epoch,
+            brain_binding: brain.to_owned(),
+            population: rows.len(),
+            mean_health: materialized_mean_std(&health).0,
+            mean_energy: materialized_mean_std(&energy).0,
+        });
+    }
+    assert_eq!(summary.brain_summaries.len(), expected_brain.len());
+    for (actual, expected) in summary.brain_summaries.iter().zip(&expected_brain) {
+        assert_eq!(actual.epoch, expected.epoch);
+        assert_eq!(actual.brain_binding, expected.brain_binding);
+        assert_eq!(actual.population, expected.population);
+        assert_float_identical(actual.mean_health, expected.mean_health);
+        assert_float_identical(actual.mean_energy, expected.mean_energy);
+    }
+
+    let metric_names: BTreeSet<_> = metrics.iter().map(|row| row.name.as_str()).collect();
+    let mut expected_metrics = Vec::new();
+    for name in metric_names {
+        let rows: Vec<_> = metrics.iter().filter(|row| row.name == name).collect();
+        let values: Vec<Scalar> = rows.iter().map(|row| Scalar::Float64(row.value)).collect();
+        let series = Series::new(
+            name,
+            Index::from_range(0, i64::try_from(rows.len()).unwrap(), 1),
+            Column::from_values(values).unwrap(),
+        )
+        .unwrap();
+        let rolled = series.rolling(rolling_window, Some(1)).mean().unwrap();
+        for (index, row) in rows.iter().enumerate() {
+            let smoothed_value = match rolled.values().get(index) {
+                Some(Scalar::Float64(value)) => *value,
+                _ => row.value,
+            };
+            expected_metrics.push(RollingMetricRow {
+                metric_name: name.to_owned(),
+                tick: row.tick,
+                raw_value: row.value,
+                smoothed_value,
+            });
+        }
+    }
+    assert_eq!(summary.rolling_metrics.len(), expected_metrics.len());
+    for (actual, expected) in summary.rolling_metrics.iter().zip(&expected_metrics) {
+        assert_eq!(actual.metric_name, expected.metric_name);
+        assert_eq!(actual.tick, expected.tick);
+        assert_float_identical(actual.raw_value, expected.raw_value);
+        assert_float_identical(actual.smoothed_value, expected.smoothed_value);
+    }
+    assert_eq!(summary.epoch_size, epoch_size);
+    assert_eq!(summary.rolling_window, rolling_window);
+    summary
 }
 
 fn read_columnar_pages(path: &Path, format: AnalyticsExportFormat) -> Vec<RecordBatch> {
@@ -645,6 +906,135 @@ fn test_bd_2z0_11_8_summarize_and_sql_conformance_agreement() {
         sql_mean_pop, df_mean_pop,
         "SQL population mean must match DataFrame raw metric mean"
     );
+}
+
+#[test]
+fn paged_summary_matches_materialized_statistics_and_upstream_rolling() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = build_summary_fixture_db(&dir);
+    let reader = StorageReader::open_finished(&db_path).expect("finished source lease");
+    let summary = assert_summary_matches_materialized(&reader, 10, 3);
+    assert!(summary.rolling_metrics.len() > EXPORT_PAGE_ROWS);
+    assert_eq!(
+        summary
+            .diet_summaries
+            .iter()
+            .map(|row| row.population)
+            .sum::<usize>(),
+        (EXPORT_PAGE_ROWS / 2 + 3) * 5
+    );
+    assert!(
+        summary.founder_lineages.is_empty(),
+        "seeded agents have no parent edges"
+    );
+
+    let singleton = summary
+        .diet_summaries
+        .iter()
+        .find(|row| row.epoch == 100 && row.diet_class == "Omnivore")
+        .expect("last epoch has one omnivore observation");
+    assert_eq!(singleton.population, 1);
+    assert_float_identical(singleton.std_health, 0.0);
+    assert_float_identical(singleton.std_energy, 0.0);
+    let sparse = summary
+        .rolling_metrics
+        .iter()
+        .find(|row| row.metric_name == "metric-00003" && row.tick == 100)
+        .expect("sparse metric's second observation");
+    assert_float_identical(sparse.smoothed_value, 2.875);
+    assert!(
+        summary
+            .rolling_metrics
+            .iter()
+            .filter(|row| row.metric_name == "metric-00002")
+            .all(|row| row.smoothed_value.to_bits() == 0.1_f64.to_bits()),
+        "upstream rolling preserves a repeated constant exactly"
+    );
+
+    // Exercise singleton windows, default normalization, and a window larger
+    // than the source page/series without resetting upstream rolling state.
+    for (epoch_size, window) in [(1, 1), (0, 0), (10, EXPORT_PAGE_ROWS + 1)] {
+        assert_summary_matches_materialized(&reader, epoch_size, window);
+    }
+}
+
+#[test]
+fn paged_summary_preserves_both_parents_and_legacy_lineage_fallback() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = build_multi_page_fixture_db(&dir);
+    let reader = StorageReader::open_finished(&db_path).expect("finished source lease");
+    let summary = assert_summary_matches_materialized(&reader, 2, 2);
+    let population = EXPORT_PAGE_ROWS / 2 + 3;
+    assert_eq!(summary.founder_lineages.len(), 2);
+    for (row, founder, children) in [
+        (&summary.founder_lineages[0], 1, population - 2),
+        (&summary.founder_lineages[1], 2, population - 3),
+    ] {
+        assert_eq!(row.founder_uid, founder);
+        assert_eq!(row.direct_offspring, children);
+        assert_eq!(row.total_descendants, children);
+        assert_eq!(row.max_generation_depth, 1);
+    }
+    reader.close().expect("release source lease");
+    let connection = Connection::open_existing(&db_path).expect("legacy fixture writer");
+    connection
+        .execute("DELETE FROM lineage_edges")
+        .expect("retain parent information in births");
+    connection.close().expect("close legacy fixture writer");
+    let reader = StorageReader::open_finished(&db_path).expect("legacy source lease");
+    let legacy = summarize_run(&reader, 2, 2).expect("summary through birth-parent fallback");
+    assert_eq!(legacy, summary, "fallback must retain the complete report");
+}
+
+#[test]
+fn empty_summary_has_defaults_and_no_fabricated_observations() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("empty_summary.sqlite").display().to_string();
+    Storage::create_unattributed_file(&db_path)
+        .expect("create empty source")
+        .close()
+        .expect("finish empty source");
+    let reader = StorageReader::open_finished(&db_path).expect("finished source lease");
+    let summary = assert_summary_matches_materialized(&reader, 0, 0);
+    assert!(summary.diet_summaries.is_empty());
+    assert!(summary.brain_summaries.is_empty());
+    assert!(summary.rolling_metrics.is_empty());
+    assert!(summary.founder_lineages.is_empty());
+    assert!(summary.markdown_table.contains("(no agents recorded)"));
+    assert!(summary.markdown_table.contains("| - | 0 | 0 | 0 |"));
+}
+
+#[test]
+fn summary_preserves_nonfinite_source_refusal_without_json_staging() {
+    for (sql, value, field) in [
+        (
+            "UPDATE agents SET position_x = ?1 WHERE tick = 0",
+            f64::MAX,
+            "agents.position_x",
+        ),
+        (
+            "UPDATE metrics SET value = ?1 WHERE tick = 0",
+            f64::INFINITY,
+            "metrics.value",
+        ),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = build_fixture_db(&dir);
+        let connection = Connection::open_existing(&db_path).expect("legacy fixture writer");
+        connection
+            .execute_with_params(sql, &[SqliteValue::from(value)])
+            .expect("construct nonfinite legacy export values");
+        connection.close().expect("close fixture writer");
+        let reader = StorageReader::open_finished(&db_path).expect("finished source lease");
+        let old_load_refused = if field == "metrics.value" {
+            load_metric_rows(&reader).is_err()
+        } else {
+            load_agent_rows(&reader).is_err()
+        };
+        assert!(old_load_refused, "old JSONL summary refused nonfinite {field}");
+        let error = summarize_run(&reader, 10, 3).expect_err("nonfinite source refusal");
+        assert!(error.to_string().contains(field), "{error}");
+    }
 }
 
 #[test]
