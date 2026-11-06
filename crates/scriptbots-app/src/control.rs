@@ -950,15 +950,110 @@ pub fn compute_blake3(data: &[u8]) -> String {
 }
 
 fn read_artifact_file_bounded(path: &Path, max_bytes: usize) -> Result<Vec<u8>, ControlError> {
-    let file = fs::File::open(path).map_err(|error| ControlError::NotFound(error.to_string()))?;
+    open_artifact_file_bounded(path, max_bytes, false).map(|(_, bytes)| bytes)
+}
+
+fn same_artifact_identity(expected: &fs::Metadata, actual: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        expected.dev() == actual.dev() && expected.ino() == actual.ino()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        expected.volume_serial_number().is_some()
+            && expected.volume_serial_number() == actual.volume_serial_number()
+            && expected.file_index().is_some()
+            && expected.file_index() == actual.file_index()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (expected, actual);
+        false
+    }
+}
+
+fn artifact_is_singly_linked(metadata: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        metadata.nlink() == 1
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.number_of_links() == Some(1)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = metadata;
+        false
+    }
+}
+
+fn verify_artifact_identity(
+    expected: &fs::Metadata,
+    actual: &fs::Metadata,
+) -> Result<(), ControlError> {
+    if expected.file_type().is_symlink()
+        || actual.file_type().is_symlink()
+        || !expected.is_file()
+        || !actual.is_file()
+        || !artifact_is_singly_linked(expected)
+        || !artifact_is_singly_linked(actual)
+        || !same_artifact_identity(expected, actual)
+    {
+        return Err(ControlError::BadRequest(
+            "artifact must remain the same singly linked regular file".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn verify_open_artifact(path: &Path, file: &fs::File) -> Result<(), ControlError> {
+    let current =
+        fs::symlink_metadata(path).map_err(|error| ControlError::NotFound(error.to_string()))?;
+    let opened = file
+        .metadata()
+        .map_err(|error| ControlError::Serialization(error.to_string()))?;
+    verify_artifact_identity(&opened, &current)
+}
+
+/// Keep the verified descriptor available to callers that must sync the exact
+/// bytes they read. A second pathname open could encounter a replacement FIFO.
+fn open_artifact_file_bounded(
+    path: &Path,
+    max_bytes: usize,
+    for_sync: bool,
+) -> Result<(fs::File, Vec<u8>), ControlError> {
+    let before =
+        fs::symlink_metadata(path).map_err(|error| ControlError::NotFound(error.to_string()))?;
+    verify_artifact_identity(&before, &before)?;
+    let mut options = fs::OpenOptions::new();
+    // Windows FlushFileBuffers needs write access. Downloads and acknowledged
+    // retries remain read-only; Unix permits syncing a read-only descriptor.
+    options.read(true).write(cfg!(windows) && for_sync);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // The preflight is not sufficient: a special file can replace the path
+        // between metadata and open. Neither symlinks nor FIFOs may be followed.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| ControlError::NotFound(error.to_string()))?;
     let metadata = file
         .metadata()
         .map_err(|error| ControlError::Serialization(error.to_string()))?;
-    if !metadata.is_file() {
-        return Err(ControlError::BadRequest(
-            "artifact is not a regular file".to_owned(),
-        ));
-    }
+    verify_artifact_identity(&before, &metadata)?;
     let limit = u64::try_from(max_bytes).expect("artifact limit fits u64");
     if metadata.len() > limit {
         return Err(ControlError::PayloadTooLarge(
@@ -966,7 +1061,8 @@ fn read_artifact_file_bounded(path: &Path, max_bytes: usize) -> Result<Vec<u8>, 
         ));
     }
     let mut bytes = Vec::new();
-    file.take(limit.saturating_add(1))
+    (&file)
+        .take(limit.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|error| ControlError::Serialization(error.to_string()))?;
     if bytes.len() > max_bytes {
@@ -974,7 +1070,33 @@ fn read_artifact_file_bounded(path: &Path, max_bytes: usize) -> Result<Vec<u8>, 
             "artifact grew beyond the download byte bound".to_owned(),
         ));
     }
-    Ok(bytes)
+    verify_open_artifact(path, &file)?;
+    Ok((file, bytes))
+}
+
+#[cfg(unix)]
+fn sync_checkpoint_directory(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let before = fs::symlink_metadata(path)?;
+    let directory = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let opened = directory.metadata()?;
+    if !before.is_dir() || !opened.is_dir() || !same_artifact_identity(&before, &opened) {
+        return Err(std::io::Error::other(
+            "checkpoint parent directory changed before sync",
+        ));
+    }
+    directory.sync_all()?;
+    let after = fs::symlink_metadata(path)?;
+    if !after.is_dir() || !same_artifact_identity(&opened, &after) {
+        return Err(std::io::Error::other(
+            "checkpoint parent directory changed during sync",
+        ));
+    }
+    Ok(())
 }
 
 const MAX_EXPERIMENT_DEFINITION_BYTES: u64 = 1024 * 1024;
@@ -1326,6 +1448,18 @@ impl CheckpointRetentionState {
         // Keep room for the initial service root and an explicitly configured root even when
         // capture is disabled. Beyond those roots, the checkpoint count budget bounds leases.
         limits.max_count.max(2)
+    }
+
+    fn verify_directory(&self, path: &Path) -> Result<(), ControlError> {
+        self.directories
+            .get(path)
+            .ok_or_else(|| {
+                ControlError::CheckpointRetentionUnavailable(
+                    "the retained artifact directory is not leased".to_owned(),
+                )
+            })?
+            .verify()
+            .map_err(|error| ControlError::CheckpointRetentionUnavailable(error.to_string()))
     }
 
     fn add_directory(&mut self, path: &Path) -> Result<PathBuf, ControlError> {
@@ -1730,17 +1864,18 @@ impl DataServices {
                     .map(|entry| (entry.relative_path.as_str(), Some(entry))),
             ) {
                 let relative = relative_bundle.join(relative_path);
-                let canonical = root
-                    .join(&relative)
+                let artifact_path = root.join(&relative);
+                let canonical = artifact_path
                     .canonicalize()
                     .map_err(|error| ControlError::Serialization(error.to_string()))?;
                 if !canonical.starts_with(root)
+                    || canonical != artifact_path
                     || relative
                         .components()
                         .any(|component| !matches!(component, std::path::Component::Normal(_)))
                 {
                     return Err(ControlError::BadRequest(
-                        "bundle artifact escapes its source root".to_owned(),
+                        "bundle artifact is aliased or escapes its source root".to_owned(),
                     ));
                 }
                 let bytes = if let Some(entry) = expected {
@@ -2664,10 +2799,17 @@ impl ControlHandle {
         identity: &str,
         mut retained: RetainedCheckpoint,
     ) -> Result<CheckpointMetadataDto, ControlError> {
-        let bytes = read_artifact_file_bounded(
-            &retained.directory.join(&retained.artifact.relative_path),
+        retention.verify_directory(&retained.directory)?;
+        let path = retained.directory.join(&retained.artifact.relative_path);
+        let (file, bytes) = open_artifact_file_bounded(
+            &path,
             MAX_ARTIFACT_DOWNLOAD_BYTES,
-        )?;
+            !retained.acknowledged,
+        )
+            .map_err(|error| ControlError::CheckpointRetentionUnavailable(format!(
+                "checkpoint {} retained artifact could not be verified: {error}; retained data and request identity are preserved",
+                retained.metadata.checkpoint_id,
+            )))?;
         if bytes.len() as u64 != retained.metadata.byte_size
             || compute_blake3(&bytes) != retained.metadata.checksum_blake3
             || compute_sha256(&bytes) != retained.metadata.checksum_sha256
@@ -2678,12 +2820,25 @@ impl ControlHandle {
             )));
         }
         if !retained.acknowledged {
-            fs::File::open(retained.directory.join(&retained.artifact.relative_path))
-                .and_then(|file| file.sync_all())
+            file.sync_all()
                 .map_err(|error| ControlError::CheckpointRetentionUnavailable(format!(
                     "checkpoint {} file durability is unconfirmed: {error}; retained data permits exact retry",
                     retained.metadata.checkpoint_id,
                 )))?;
+            // File fsync does not persist a newly created directory entry. Do
+            // this before either the SQL receipt or public catalogs can succeed.
+            #[cfg(unix)]
+            sync_checkpoint_directory(&retained.directory)
+                .map_err(|error| ControlError::CheckpointRetentionUnavailable(format!(
+                    "checkpoint {} directory durability is unconfirmed: {error}; retained data permits exact retry",
+                    retained.metadata.checkpoint_id,
+                )))?;
+            verify_open_artifact(&path, &file)
+                .map_err(|error| ControlError::CheckpointRetentionUnavailable(format!(
+                    "checkpoint {} retained artifact changed before publication: {error}; retained data permits exact retry",
+                    retained.metadata.checkpoint_id,
+                )))?;
+            retention.verify_directory(&retained.directory)?;
             let checkpoint = scriptbots_core::WorldCheckpointV1::decode(&bytes)
                 .map_err(|error| ControlError::Serialization(error.to_string()))?;
             if let Some(writer) = &self.checkpoint_writer {
@@ -2931,12 +3086,12 @@ impl ControlHandle {
         let canonical_file = file_path
             .canonicalize()
             .map_err(|error| ControlError::NotFound(format!("artifact file not found: {error}")))?;
-        if !canonical_file.starts_with(&dir) {
+        if !canonical_file.starts_with(&dir) || canonical_file != file_path {
             return Err(ControlError::BadRequest(
-                "path traversal detected: outside artifacts dir".to_owned(),
+                "artifact path is aliased or outside its source directory".to_owned(),
             ));
         }
-        let bytes = read_artifact_file_bounded(&canonical_file, MAX_ARTIFACT_DOWNLOAD_BYTES)?;
+        let bytes = read_artifact_file_bounded(&file_path, MAX_ARTIFACT_DOWNLOAD_BYTES)?;
 
         if bytes.len() > MAX_ARTIFACT_DOWNLOAD_BYTES {
             return Err(ControlError::PayloadTooLarge(format!(
@@ -3304,11 +3459,17 @@ impl ControlHandle {
                         .map_err(|error| ControlError::InvalidPatch(error.to_string()))?;
                     continue;
                 }
-                if !edits.peek().is_some_and(|entry| entry.tick == world.tick().0) {
+                if !edits
+                    .peek()
+                    .is_some_and(|entry| entry.tick == world.tick().0)
+                {
                     return Err(mismatch());
                 }
             }
-            if !edits.peek().is_some_and(|entry| entry.tick == world.tick().0) {
+            if !edits
+                .peek()
+                .is_some_and(|entry| entry.tick == world.tick().0)
+            {
                 return Ok(());
             }
             // Commands partition the config audit by the revision they observed,
@@ -6934,7 +7095,10 @@ pub(crate) mod tests {
             ));
             let review = handle.event_canvas(pending.world.tick).unwrap();
             assert_eq!(review.snapshot.world.tick, pending.world.tick);
-            assert_eq!(review.snapshot.world.agents.len(), pending.world.agents.len());
+            assert_eq!(
+                review.snapshot.world.agents.len(),
+                pending.world.agents.len()
+            );
             assert_eq!(
                 review.snapshot.config.food_growth_rate.to_bits(),
                 pending.config.food_growth_rate.to_bits()
@@ -6970,7 +7134,9 @@ pub(crate) mod tests {
             let mut changed = current.clone();
             if duplicate {
                 let entry = changed.scientific_commands[intervention_index].clone();
-                changed.scientific_commands.insert(intervention_index, entry);
+                changed
+                    .scientific_commands
+                    .insert(intervention_index, entry);
             } else {
                 changed.scientific_commands.remove(intervention_index);
             }
@@ -7042,7 +7208,12 @@ pub(crate) mod tests {
             Err(ControlError::BadRequest(message)) if message.contains("source-bound behavioral archive")
         ));
         assert_eq!(
-            handle.event_canvas(checkpoint.tick).unwrap().snapshot.world.tick,
+            handle
+                .event_canvas(checkpoint.tick)
+                .unwrap()
+                .snapshot
+                .world
+                .tick,
             checkpoint.tick,
             "the independently verified source cut remains directly inspectable"
         );
@@ -7107,7 +7278,10 @@ pub(crate) mod tests {
             assert_eq!(review.checkpoint_id, checkpoint_id);
             assert_eq!(review.base_tick, saved.tick().0);
             assert_eq!(review.snapshot.world.tick, oracle.world.tick);
-            assert_eq!(review.snapshot.world.agents.len(), oracle.world.agents.len());
+            assert_eq!(
+                review.snapshot.world.agents.len(),
+                oracle.world.agents.len()
+            );
             assert_eq!(
                 review.snapshot.config.food_growth_rate.to_bits(),
                 oracle.config.food_growth_rate.to_bits()
@@ -7510,7 +7684,10 @@ pub(crate) mod tests {
         let after_intervention = host.port.scientific_digest_v1().unwrap();
         let review = handle.event_canvas(later_oracle.tick.0).unwrap();
         assert_eq!(review.base_tick, later.tick);
-        assert_eq!(host.port.scientific_digest_v1().unwrap(), after_intervention);
+        assert_eq!(
+            host.port.scientific_digest_v1().unwrap(),
+            after_intervention
+        );
         // Oversized provenance still applies through the real owner but cannot enter
         // bounded replay history. Its scientific revision must expose that missing input.
         let oversized = handle
@@ -8473,10 +8650,210 @@ pub(crate) mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_aliases_are_refused_without_blocking_exact_retry_or_control() {
+        use std::os::unix::fs::symlink;
+
+        for kind in ["symlink", "hardlink"] {
+            let directory = tempfile::tempdir().expect("checkpoint directory").keep();
+            let (handle, host) = checkpoint_test_handle(&directory, 1, 1024 * 1024);
+            let request = CheckpointCreateRequest {
+                idempotency_key: Some(kind.to_owned()),
+                description: Some("immutable checkpoint source cut".to_owned()),
+            };
+            let checkpoint = handle.create_checkpoint(request.clone()).expect("capture");
+            let (artifact, original) = handle
+                .read_artifact_bytes(&checkpoint.checkpoint_id)
+                .expect("original download");
+            let path = directory.join(&artifact.relative_path);
+            let preserved = directory.join("original.checkpoint");
+            fs::rename(&path, &preserved).expect("preserve original inode and bytes");
+            match kind {
+                "symlink" => symlink(&preserved, &path).expect("same-directory symlink"),
+                "hardlink" => fs::hard_link(&preserved, &path).expect("hardlink"),
+                _ => unreachable!(),
+            }
+            assert!(matches!(
+                handle.create_checkpoint(request.clone()),
+                Err(ControlError::CheckpointRetentionUnavailable(_))
+            ));
+            assert!(matches!(
+                handle.read_artifact_bytes(&checkpoint.checkpoint_id),
+                Err(ControlError::BadRequest(_))
+            ));
+            let usage = handle
+                .checkpoint_retention_usage()
+                .expect("responsive quota read");
+            assert_eq!(usage.request_entries, 1);
+            assert_eq!(usage.pending_entries, 0);
+            assert_eq!(handle.list_checkpoints(None, None).unwrap().total, 1);
+            host.wait_applied(&handle.step().expect("responsive owner command"));
+            let live = host.port.scientific_digest_v1().expect("advanced world");
+            assert!(handle.status().unwrap().tick > checkpoint.tick);
+
+            // Retain both the refused alias and its target. Repair only the
+            // now-vacant pathname with the exact original checkpoint bytes.
+            fs::rename(&path, directory.join("refused.alias")).expect("preserve alias");
+            let mut repaired = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .expect("reserve repaired pathname");
+            repaired.write_all(&original).expect("restore exact bytes");
+            repaired.sync_all().expect("sync restored bytes");
+            drop(repaired);
+            let retried = handle
+                .create_checkpoint(request)
+                .expect("exact repaired retry");
+            assert_eq!(
+                serde_json::to_value(&retried).unwrap(),
+                serde_json::to_value(&checkpoint).unwrap(),
+                "repair must not capture the advanced world or allocate another identity"
+            );
+            assert_eq!(
+                handle
+                    .read_artifact_bytes(&checkpoint.checkpoint_id)
+                    .unwrap()
+                    .1,
+                original
+            );
+            assert_eq!(fs::read(&preserved).unwrap(), original);
+            let usage = handle
+                .checkpoint_retention_usage()
+                .expect("repaired quota read");
+            assert_eq!(usage.file_count, 1);
+            assert_eq!(usage.file_bytes, original.len() as u64);
+            assert_eq!(usage.request_entries, 1);
+            assert!(usage.inventory_error.is_none());
+            assert!(matches!(
+                handle.create_checkpoint(CheckpointCreateRequest::default()),
+                Err(ControlError::CheckpointCapacity(_))
+            ));
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), live);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_fifo_refusal_keeps_control_responsive() {
+        use std::os::unix::fs::FileTypeExt;
+        use std::process::Command;
+        use std::time::Duration;
+
+        const CHILD_DIRECTORY: &str = "SCRIPTBOTS_CHECKPOINT_FIFO_TEST_DIRECTORY";
+        if let Some(root) = std::env::var_os(CHILD_DIRECTORY) {
+            let root = PathBuf::from(root);
+            let directory = root.join("artifacts");
+            let (handle, host) = checkpoint_test_handle(&directory, 1, 1024 * 1024);
+            let request = CheckpointCreateRequest {
+                idempotency_key: Some("fifo-exact-retry".to_owned()),
+                description: None,
+            };
+            let checkpoint = handle
+                .create_checkpoint(request.clone())
+                .expect("real capture");
+            let (artifact, original) = handle
+                .read_artifact_bytes(&checkpoint.checkpoint_id)
+                .expect("real checkpoint bytes");
+            let path = directory.join(&artifact.relative_path);
+            fs::rename(&path, root.join("original.checkpoint")).expect("preserve original");
+            assert!(
+                Command::new("mkfifo")
+                    .arg(&path)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            assert!(matches!(
+                handle.create_checkpoint(request.clone()),
+                Err(ControlError::CheckpointRetentionUnavailable(_))
+            ));
+            assert!(matches!(
+                handle.read_artifact_bytes(&checkpoint.checkpoint_id),
+                Err(ControlError::BadRequest(_))
+            ));
+            let usage = handle
+                .checkpoint_retention_usage()
+                .expect("retention lock released");
+            assert!(usage.inventory_error.is_some());
+            assert_eq!(usage.request_entries, 1);
+            assert_eq!(usage.pending_entries, 0);
+            assert!(matches!(
+                handle.create_checkpoint(CheckpointCreateRequest::default()),
+                Err(ControlError::CheckpointRetentionUnavailable(_))
+            ));
+            host.wait_applied(&handle.step().expect("owner remains responsive"));
+            assert!(handle.status().unwrap().tick > checkpoint.tick);
+            assert_eq!(handle.list_checkpoints(None, None).unwrap().total, 1);
+            assert!(fs::symlink_metadata(&path).unwrap().file_type().is_fifo());
+            fs::rename(&path, root.join("refused.fifo")).expect("preserve refused FIFO");
+            let mut repaired = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .expect("reserve repaired checkpoint");
+            repaired.write_all(&original).unwrap();
+            repaired.sync_all().unwrap();
+            drop(repaired);
+            assert_eq!(
+                serde_json::to_value(handle.create_checkpoint(request).expect("exact retry"))
+                    .unwrap(),
+                serde_json::to_value(&checkpoint).unwrap()
+            );
+            assert_eq!(
+                handle
+                    .read_artifact_bytes(&checkpoint.checkpoint_id)
+                    .unwrap()
+                    .1,
+                original
+            );
+            let usage = handle.checkpoint_retention_usage().unwrap();
+            assert_eq!(usage.file_count, 1);
+            assert_eq!(usage.file_bytes, original.len() as u64);
+            assert!(usage.inventory_error.is_none());
+            fs::write(
+                root.join("refused.txt"),
+                b"FIFO refused; control and exact retry responsive",
+            )
+            .unwrap();
+            return;
+        }
+
+        let root = tempfile::tempdir().expect("bounded FIFO probe").keep();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "control::tests::checkpoint_fifo_refusal_keeps_control_responsive",
+                "--nocapture",
+            ])
+            .env(CHILD_DIRECTORY, &root);
+        // A regression to blocking open must fail in a killed/reaped child,
+        // never strand the test harness behind the checkpoint retention mutex.
+        crate::experiment_runner::MatchedSeedExperimentRunner::run_bounded_child(
+            &mut command,
+            Duration::from_secs(10),
+        )
+        .expect("checkpoint readers must refuse FIFOs without waiting for a writer");
+        assert_eq!(
+            fs::read(root.join("refused.txt")).unwrap(),
+            b"FIFO refused; control and exact retry responsive",
+            "the child must execute the complete real-checkpoint journey"
+        );
+        assert!(
+            fs::symlink_metadata(root.join("refused.fifo"))
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+    }
+
     #[test]
     fn checkpoint_pending_storage_refusal_retries_the_same_artifact_after_capacity_changes() {
-        let directory = tempfile::tempdir().expect("checkpoint directory").keep();
-        let (handle, _host) = checkpoint_test_handle(&directory, 1, 1024 * 1024);
+        let root = tempfile::tempdir().expect("checkpoint fixture").keep();
+        let directory = root.join("artifacts");
+        let (handle, host) = checkpoint_test_handle(&directory, 1, 1024 * 1024);
         let mut pipeline =
             scriptbots_storage::StoragePipeline::unattributed_memory().expect("real storage owner");
         let writer = pipeline.checkpoint_writer();
@@ -8528,10 +8905,38 @@ pub(crate) mod tests {
                 max_bytes: 1024 * 1024,
             })
             .expect("additional configured capacity");
+        let source = scriptbots_core::WorldCheckpointV1::decode(&original).expect("source cut");
+        host.wait_applied(&handle.step().expect("advance beyond the retained cut"));
+        let live = host.port.scientific_digest_v1().expect("advanced science");
+        assert!(handle.status().unwrap().tick > source.tick().0);
+
+        // Matching bytes at the same pathname do not transfer a directory's
+        // writer lease. A pending retry must not publish from a substituted root.
+        let leased_directory = root.join("preserved-artifacts");
+        fs::rename(&directory, &leased_directory).expect("preserve leased directory");
+        fs::create_dir(&directory).expect("unleased replacement directory");
+        fs::write(directory.join(format!("{pending_id}.bin")), &original)
+            .expect("same bytes in replacement root");
+        assert!(matches!(
+            handle.create_checkpoint(request.clone()),
+            Err(ControlError::CheckpointRetentionUnavailable(_))
+        ));
+        let unavailable = handle
+            .checkpoint_retention_usage()
+            .expect("responsive usage");
+        assert!(unavailable.inventory_error.is_some());
+        assert_eq!(unavailable.pending_entries, 1);
+        assert_eq!(unavailable.sql_count, Some(0));
+        assert_eq!(handle.list_checkpoints(None, None).unwrap().total, 0);
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), live);
+        fs::rename(&directory, root.join("refused-artifacts")).expect("preserve replacement");
+        fs::rename(&leased_directory, &directory).expect("restore original leased root");
         let acknowledged = handle
             .create_checkpoint(request.clone())
             .expect("exact pending retry");
         assert_eq!(acknowledged.checkpoint_id, pending_id);
+        assert_eq!(acknowledged.tick, source.tick().0);
+        assert_eq!(acknowledged.world_digest_v1, source.source_digest().overall);
         assert_eq!(
             handle
                 .create_checkpoint(request)
@@ -8546,6 +8951,8 @@ pub(crate) mod tests {
         assert_eq!(after.file_bytes, before.file_bytes);
         assert_eq!(after.sql_count, Some(1));
         assert_eq!(after.pending_entries, 0);
+        assert!(after.inventory_error.is_none());
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), live);
         assert_eq!(
             handle
                 .read_artifact_bytes(&pending_id)

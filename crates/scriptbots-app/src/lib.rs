@@ -1,5 +1,6 @@
 //! Shared application plumbing for ScriptBots control surfaces.
 #![doc = include_str!("../../../docs/ARCHITECTURE.md")]
+#![cfg_attr(windows, feature(windows_by_handle))]
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
