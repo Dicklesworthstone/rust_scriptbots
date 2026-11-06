@@ -83,17 +83,110 @@ original `bd-2z0.14.1.18.1`; verify existing `bd-2z0.14.1.18.4`, scopes unchange
 - [x] Retain the failed `5c01922f` 19/25 result. Its replay command selected
   the binary harness and ran zero tests; correct it to the library harness and
   require observed nonzero replay passes before admitting the release build.
-- [ ] Requalify combined source `55c305b2` with full Bevy/runtime suites, required
-  workspace gates, incoming scientific regressions, UBS and an optimized build.
+- [x] Retain clean `55c305b2`'s failed 22/25 result: its actual nine-test replay
+  lane found an obsolete recorded-config refusal, and the release stayed blocked.
+- [x] Preserve upstream `4fb8324c` and restore both analytics merge conflicts;
+  retain borrowed-run selection and the complete shared-database cohort oracle.
+- [x] Distinguish all eight known-world endpoint values in `cb3dccd5` and derive
+  the summary diagnostic bound from its declaration; runner execution is pending.
+- [x] Correct the recorded-config replay contract in `2d99f1f5`; its focused
+  controller/terminal probe actually runs and passes all nine tests.
+- [x] Fix the fixture-only import and extract the unchanged rolling-summary
+  comparison helper. Clean `e09c9d16` passes the required six-check preflight.
+- [x] Preserve the canceled `e09c9d16` full run as incomplete; retain its raw
+  Bevy test output without claiming a complete suite or a new release binary.
+- [x] On explicit user assignment, take over the interrupted shared merge.
+  Preserve the original working patch and index; merge all eight upstream commits
+  through `72a40efb` in `45e97bde`, retaining their original author attribution.
+- [x] Restore the preserved controller resolution immediately after the canonical
+  merge: remove the duplicate replay loop and use the current scientific-input API.
+- [x] Retain actual incoming compilation/format/lint failures. Fix the missing
+  test-only Path import, extract unchanged config/audit publication and schedule
+  assertions, and retain all empty-output checks as equality comparisons.
+- [x] Adjust the missing-input negative for the newly supported interventions:
+  use a real oversized input omitted by bounded history; preserve the owner-state
+  assertions and the separate ordinary-intervention positive oracles.
+- [x] Pass the exact working-source eight-check probe at patch `b51421a7`:
+  required compiler/lint/format checks, runtime 262 passed/six existing ignored,
+  and all eleven controller/terminal replay tests. This is authoring evidence.
+- [x] Retain the expanded scanner's one diagnosed test-executable false positive;
+  make Cargo's compile-time executable authority explicit without suppression.
+- [ ] Qualify the newer monitoring source and corrective patch with required
+  compiler/lint checks, actual server tests, CLI reproduction and the full scanner.
+- [x] Retain the nine-check monitoring authoring result: real CLI reproduction
+  passes all 16 cases and UBS reports zero critical findings over 27 files;
+  required compiler/lint and server tests fail compilation on the new owner's
+  immutable port binding. Correct that binding without changing its assertions.
+- [x] Re-run required compiler/strict lint checks and the complete server module
+  after the port fix; resolve any newly exposed diagnostics before committing.
+- [x] Correct REST array admission on original malformed-request/owner-barrier
+  tests (`bd-qjh2`); pass all 64 server cases and the required compiler/lint
+  checks at exact patch `2033c411`, then commit the reviewed source as `6c8472dc`.
+- [x] Review and preserve upstream browser, live comparison and MCP increments
+  through pinned `2aa22513` in canonical merge `04ea1ada`; restore their plan
+  entries explicitly after the plan-only favor-ours resolution.
+- [x] Execute the actual browser lifecycle suite at clean upstream `0002dada`
+  using existing Playwright/Chromium: four browser cases pass, including 18
+  candidate refusals, three recovery paths and a one-timer observation. Its WASM
+  double qualifies browser lifecycle behavior, not the checkpoint codec.
+- [ ] Qualify the final formatting and explicit outgoing static-header fixture
+  with the combined 32-file Rust/JavaScript scanner and required lint checks.
+- [x] Retain the integrated compiler-pass/strict-Clippy failure: the new inline
+  comparison DTO expands `ShellMessage`'s largest variant to at least 400 bytes,
+  versus 152 for the next variant. Box the optional comparison payload and
+  preserve the same result-value, rendering and refresh assertions.
+- [x] Re-run required checks, eleven focused application regressions and the
+  changed-file scanner before committing the corrective source as `386f0b1a`.
+  The complete application library suite remains mandatory on the clean commit.
+- [x] Retain and diagnose the real comparison-suite failures: its common
+  fixture sets four unregistered knobs and fails before running science.
+  Preserve production knob admission, use the supported reproduction threshold,
+  and assert the short horizon precedes the declared default food-respawn interval.
+- [x] Execute the corrected real comparison cases and retain all final-state,
+  contrast, extinct-cohort, provenance, rejection and nonmutation assertions.
+- [x] Diagnose the broader authoring run (769 passed, ten failed, one existing
+  live-provider ignore): correct escaped-report expectations and the table-row
+  selector without weakening their scientific assertions. Keep the correct
+  dirty-source tournament-publication refusal for clean-source qualification.
+- [x] Wire the existing HUD-only owner read when the terminal probe is off;
+  retain the 5 ms budget and full probe attribution when on. All eleven focused
+  real comparison/report/terminal regressions pass, including unchanged brain
+  cache assertions and the capability golden. Stop parallel diagnostic workloads.
+- [ ] Review and commit the corrective source, then qualify the clean combined
+  revision with all original gates, added API/checkpoint/reproduction checks and
+  one optimized build. Working-source probes cannot substitute for that result.
+- [x] Retain clean `386f0b1a`'s complete application result: 778 passed, one
+  failed, one existing live-provider ignore. The unchanged full-publication
+  guard refused missing compile-time cleanliness/status/diff provenance in my
+  DSR profile. Stop the remaining known-red run; derive the missing inputs from
+  an actually clean checkout before the next full application run.
+- [ ] Preserve and qualify the later browser-only `3eb330f1` contribution:
+  execute the eight IndexedDB adapter tests, actual Chromium lifecycle cases,
+  and the real freshly packaged WASM save/reload/restore journey. Retain abort,
+  corruption, stale-owner and exact-next-tick assertions and evidence classes.
+- [ ] Correct the second-pass duplicate-key regression in `bd-qjh2`: check the
+  original body's object shape and deserialize it directly, retaining Serde's
+  duplicate-field refusal. Exercise raw repeated and escaped count keys on both
+  REST aliases under the existing no-admission owner barrier; run required
+  checks, the complete server module and scanner before committing this fix.
+- [ ] Build the final optimized app with the duplicate-key correction, bind its
+  actual source and binary hashes, and use that binary for the native 1×/2× run.
+- [ ] Preserve the later native GPUI Lab and Bevy AgentUid contributions through
+  pinned `e8afd206`; review the application callbacks, worker cancellation,
+  projections, native button regressions and original incoming plan entries.
+- [ ] Format and qualify the integrated GPUI source, including the actual new
+  provider and native-button tests plus the `gui` application feature, required
+  workspace checks and full Bevy/application suites with observed provenance.
 - [ ] Execute matched-seed comparison, columnar/text export and observed-order
   historical replay regressions against the combined source; leave broader
   original scientific acceptance open unless its full requirements are observed.
 - [x] Reopen original `bd-2z0.11.8` on the observed Parquet provenance readback
   regression; preserve strict schema equality and restore actual file-footer
   metadata in both full-table and bounded streaming readers.
-- [ ] Verify the corrected readers against actual files, including a foreign
-  provenance file, multi-page exports, empty schemas and the real CLI pipeline.
-- [ ] Audit `.11.8` against its complete original acceptance; retain unobserved
+- [x] Verify the corrected readers against actual files, including a foreign
+  provenance file, multi-page exports, empty schemas and both full CLI pipelines
+  at `55c305b2`; later summary additions have separate pending qualification.
+- [x] Audit `.11.8` against its complete original acceptance; retain unobserved
   large-run/memory and schema/multi-run requirements on the original item.
 - [ ] Drive and visually inspect the new card's optimized native window at both
   scales before closing the reopened original HUD/text tasks again.
@@ -134,6 +227,97 @@ the same criteria; `.3.9` remains closed. No independent verifier was available.
 Hardware, Metal, broader HUD/terrain, science and performance parents remain
 open. Later integration and publication remain pending below; this native binary
 is explicitly `4f0f3db8`, not the later merged revision.
+
+**Experiment consumers and browser recovery (2026-11-06):** [Currently In Progress — Codex]
+
+Extend the verified experiment service to MCP and the supported GPUI Lab, with
+paged checkpoint discovery/review in that Lab. Add explicit browser-local saved
+continuations using the existing full-owner checkpoint codec and atomic IndexedDB
+replacement. This contributes to Phase 4.3, Phase 5.2 and `bd-2z0.7.6.1`; the
+saved-continuation slice does not complete `bd-ywtv`'s SQLite-image/batch-journal
+durability architecture or promote volatile journal receipts to Durable.
+
+**Browser saved continuations (2026-11-06):** [Implemented in source — browser
+runtime qualification pending]
+
+The browser saves one explicit full-owner continuation in IndexedDB and
+discovers its tick/time after reload. Restore validates a bounded Blob before
+installing a paused owner, including recovery from an invalid startup permalink.
+Transactions acknowledge only on completion; abort/quota failures preserve the
+previous record. Reset, permalink and remote transitions invalidate delayed
+restores; a saved tick mismatch rejects and frees the candidate. Blocked database
+opens retain one pending request rather than accumulating retries. The original
+author reported eight adapter tests and five JavaScript syntax checks through
+DSR, with Chromium unavailable. GentleDuck preserved this contribution in
+`66ec9237`; fresh adapter, actual DOM ownership-race and freshly packaged WASM
+reload/next-tick/abort/corruption execution is pending below. This contribution
+does not qualify Durable receipts or the SQLite-image/batch-journal architecture.
+
+**MCP comparison increment (2026-11-06):** [Implemented in source — native
+qualification remains blocked]
+
+`experiment_compare` now exposes the same verified endpoint comparison as REST
+and the terminal. Its strict argument object requires experiment, baseline,
+challenger and metric identities; tool discovery derives metric names from the
+runner's canonical endpoint contract. Schema/version discovery includes the
+comparison route, tool and DTO. Regression coverage is authored against actual
+completed run bundles and the real MCP dispatcher for REST parity, single-pair
+results, changed evidence, malformed arguments and unchanged live science. The
+existing compilation capacity blocker remains; no native execution pass is
+claimed for this increment.
+
+**Live experiment comparison (2026-11-05):** [Implemented in source — Codex;
+native qualification blocked]
+
+The Experiments screen now submits a real background comparison through the
+existing matched-seed statistics engine. Enter pins a baseline; C selects a
+distinct challenger, with all admitted variants visible within the bounded
+projection even for large seed cohorts. Request identities, cancellation and
+refresh checks prevent stale results from replacing the current observation.
+The display reports population, endpoint tick, paired sample count, measured
+difference, optional uncertainty and explicit single-pair/degenerate outcomes.
+
+`POST /api/v1/experiments/{id}/compare` uses the same control authority for one
+explicit endpoint metric. Both complete cohorts must match the planned seeds
+and horizon; each final checkpoint is restored and its digest and endpoint CSV
+verified before analysis. One shared analysis permit and one pre-offload HTTP
+request permit bound concurrent work; JSON bodies are limited to 4 KiB. Added
+regressions exercise real run bundles, reverse contrasts, one-seed/extinct
+cohorts, changed status and rehashed false evidence, UI dispatch and retention,
+large projections, and HTTP refusals. These regressions are authored, not run.
+
+**Browser owner recovery (2026-11-05):** [Source landed — `42149db`; browser
+runtime qualification blocked]
+
+Reset, permalink loading and continuation import validate a candidate before
+replacing the active owner, release rejected and retired WASM owners, and keep
+one simulation timer. Failed replacements preserve stopped clocks; Reset can
+recover an invalid startup permalink. Existing stale-import and remote/local
+ownership guards remain in force. The lifecycle fixture now covers these
+failure and recovery boundaries with explicit owner/disposal/timer observations.
+
+**Remote monitoring continuity (2026-11-05):** [Source landed — `72a40ef`;
+native qualification blocked]
+
+SSE/NDJSON publication-revision resume now includes same-tick owner changes,
+session-bound cursors and explicit coalescing. Tick-history streams report empty
+and sparse retention gaps without consuming a reset summary's cursor early.
+WebSocket acknowledgements remain responsive while one owner control request
+waits; further requests receive explicit backpressure and disconnected clients
+cancel still-queued control work. This contributes to Phase 5.2 and `bd-ac4l`;
+the original throughput, soak and full DSR acceptance remain open.
+
+**Upstream authoring-session verification:** DSR JavaScript syntax checks passed
+for all three edited browser files; the existing remote consumer suite passed
+13/13 tests. Rust formatting was limited to changed regions and their enclosing
+constructs, with independent source review across the three feature contributions.
+Both a clean-baseline compiler check and a one-job candidate check were terminated
+by SIGKILL while compiling unchanged `asupersync 0.5.0`, before app code was reached.
+Native tests and Clippy therefore did not run in that authoring session.
+Playwright's Chromium provisioning returned truncated archives there, so its DOM
+lifecycle suite also remained unexecuted. The subsequent integration session's
+source-bound results are recorded separately above; no scientific baseline or
+original Bead acceptance is changed by these source contributions.
 
 **Large-run export and scientific evidence (2026-11-05):** [Currently In Progress —
 Codex; source contributions landed, original acceptance remains open]
