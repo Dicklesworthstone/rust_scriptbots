@@ -2215,6 +2215,7 @@ impl ControlHandle {
                 "simulation_control".into(),
                 "config_patching".into(),
                 "experiments_batch".into(),
+                "experiment_comparisons".into(),
                 "checkpoints_v1".into(),
                 "artifacts_storage".into(),
                 "map_generation".into(),
@@ -2243,6 +2244,7 @@ impl ControlHandle {
                 "/api/speed".into(),
                 "/api/v1/experiments".into(),
                 "/api/v1/experiments/{experiment_id}".into(),
+                "/api/v1/experiments/{experiment_id}/compare".into(),
                 "/api/v1/experiments/{experiment_id}/cancel".into(),
                 "/api/v1/experiments/{experiment_id}/resume".into(),
                 "/api/v1/checkpoints".into(),
@@ -2275,6 +2277,7 @@ impl ControlHandle {
                 "experiment_create".into(),
                 "experiment_list".into(),
                 "experiment_status".into(),
+                "experiment_compare".into(),
                 "experiment_cancel".into(),
                 "experiment_resume".into(),
                 "checkpoint_create".into(),
@@ -2288,6 +2291,8 @@ impl ControlHandle {
                 "ApiSchemaDto".into(),
                 "ExperimentBatchStatusDto".into(),
                 "ExperimentSummaryDto".into(),
+                "ExperimentComparisonDto".into(),
+                "ExperimentComparisonRequest".into(),
                 "ExperimentCreateRequest".into(),
                 "ExperimentVariantDto".into(),
                 "ScenarioInterventionV1".into(),
@@ -5371,7 +5376,7 @@ pub(crate) mod tests {
         directory.join("definition.json")
     }
 
-    fn comparison_catalog_runner(
+    pub(crate) fn comparison_catalog_runner(
         root: &Path,
         id: &str,
         seeds: Vec<u64>,

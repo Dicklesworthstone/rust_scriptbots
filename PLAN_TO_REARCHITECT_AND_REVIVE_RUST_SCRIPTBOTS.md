@@ -2,6 +2,28 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Experiment consumers and browser recovery (2026-11-06):** [Currently In Progress — Codex]
+
+Extend the verified experiment service to MCP and the supported GPUI Lab, with
+paged checkpoint discovery/review in that Lab. Add explicit browser-local saved
+continuations using the existing full-owner checkpoint codec and atomic IndexedDB
+replacement. This contributes to Phase 4.3, Phase 5.2 and `bd-2z0.7.6.1`; the
+saved-continuation slice does not complete `bd-ywtv`'s SQLite-image/batch-journal
+durability architecture or promote volatile journal receipts to Durable.
+
+**MCP comparison increment (2026-11-06):** [Implemented in source — native
+qualification remains blocked]
+
+`experiment_compare` now exposes the same verified endpoint comparison as REST
+and the terminal. Its strict argument object requires experiment, baseline,
+challenger and metric identities; tool discovery derives metric names from the
+runner's canonical endpoint contract. Schema/version discovery includes the
+comparison route, tool and DTO. Regression coverage is authored against actual
+completed run bundles and the real MCP dispatcher for REST parity, single-pair
+results, changed evidence, malformed arguments and unchanged live science. The
+existing compilation capacity blocker remains; no native execution pass is
+claimed for this increment.
+
 **Live experiment comparison (2026-11-05):** [Implemented in source — Codex;
 native qualification blocked]
 
