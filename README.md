@@ -1954,6 +1954,17 @@ We maintain a sibling browser-targeted crate, `scriptbots-web`, that reuses core
 
 > Quick peek: `crates/scriptbots-web/web/` ships a Canvas demo harness that consumes the wasm snapshots, surfaces live metrics, and can be served locally via `python -m http.server`. Binary snapshots (`snapshot_format: "binary"`) and custom seeding strategies are already wired in for experimentation.
 
+The browser supports explicit saved continuations for MLP and Unbound worlds.
+Choose the brain for a new world, Reset, then use **Save in This Browser** to
+replace one IndexedDB slot. Reload shows the saved tick and time; **Restore Saved
+World** validates that checkpoint and resumes it paused, without offline ticks.
+Save acknowledgement waits for transaction completion. Failed writes preserve
+the prior save, and failed or stale restores preserve the active world. The
+download/import controls remain available for portable continuation files.
+Saves are manual, browser storage can be cleared or evicted, and remote mode
+disables these local controls. This stores complete owner checkpoint bytes; the
+full SQLite-image and ordered batch-journal durability path remains separate.
+
 Helpful docs:
 - `docs/wasm/adrs/ADR-001-wasm-rendering.md` — rendering stack decision record
 - `docs/wasm/adrs/ADR-002-browser-persistence.md` — browser persistence approach

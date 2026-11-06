@@ -2,6 +2,7 @@ import initWasm, * as wasm from "./pkg/scriptbots_web.js";
 import { CanvasRenderer } from "./renderers/canvas.js";
 import { WebGpuRenderer } from "./renderers/webgpu.js";
 import { RemoteStreamClient } from "./remote.js";
+import { BrowserContinuationStore } from "./continuation-store.js";
 
 const {
   init_sim,
@@ -40,6 +41,11 @@ const checkpointSaveButton = document.getElementById("checkpoint-save");
 const checkpointLoadInput = document.getElementById("checkpoint-load");
 const checkpointStatus = document.getElementById("checkpoint-status");
 let checkpointLoadPending = false;
+const browserSaveButton = document.getElementById("checkpoint-browser-save");
+const browserRestoreButton = document.getElementById("checkpoint-browser-restore");
+const browserCheckpointStatus = document.getElementById("checkpoint-browser-status");
+let browserContinuationStore = null;
+let browserStorePending = false;
 const stepsSlider = document.getElementById("steps-per-frame");
 const populationSlider = document.getElementById("population");
 const logView = document.getElementById("log");
@@ -169,8 +175,11 @@ function updateRemoteControls() {
 
 function updateCheckpointControls() {
   if (brainPresetSelect) brainPresetSelect.disabled = remoteMode;
-  if (checkpointSaveButton) checkpointSaveButton.disabled = remoteMode || !simHandle;
-  if (checkpointLoadInput) checkpointLoadInput.disabled = remoteMode || !simHandle || checkpointLoadPending;
+  if (checkpointSaveButton) checkpointSaveButton.disabled = remoteMode || !simHandle || checkpointLoadPending;
+  if (checkpointLoadInput) checkpointLoadInput.disabled = remoteMode || !wasmInitialized || checkpointLoadPending || browserStorePending;
+  const storageBusy = remoteMode || !browserContinuationStore || checkpointLoadPending || browserStorePending;
+  if (browserSaveButton) browserSaveButton.disabled = storageBusy || !simHandle;
+  if (browserRestoreButton) browserRestoreButton.disabled = storageBusy;
 }
 
 function remoteEventLine(text) {
@@ -616,7 +625,7 @@ function releaseSimulation(handle) {
   }
 }
 
-function replaceSimulation(next, { continuation = false, permalink = null } = {}) {
+function replaceSimulation(next, { continuation = false, permalink = null, expectedTick = null } = {}) {
   const nextSpeed = continuation ? 0 : speedMultiplier;
   let frame;
   let brainPreset;
@@ -626,6 +635,9 @@ function replaceSimulation(next, { continuation = false, permalink = null } = {}
     next.setSpeed(document.hidden ? 0 : nextSpeed);
     frame = next.frame();
     validateFrameIdentity(frame);
+    if (expectedTick !== null && frame.identity.tick !== expectedTick) {
+      throw new Error("Saved continuation tick does not match its checkpoint bytes");
+    }
     if (continuation) {
       brainPreset = next.brainPreset();
     } else if (permalink_of) {
@@ -993,7 +1005,7 @@ async function resetSimulation(populationOverride) {
 }
 
 checkpointSaveButton?.addEventListener("click", () => {
-  if (remoteMode || !simHandle) return;
+  if (remoteMode || !simHandle || checkpointLoadPending) return;
   try {
     driveSimulation();
     const bytes = simHandle.checkpoint();
@@ -1010,10 +1022,113 @@ checkpointSaveButton?.addEventListener("click", () => {
   }
 });
 
+function installContinuation(bytes, expectedTick = null) {
+  const installed = replaceSimulation(wasm.restore_checkpoint(bytes), { continuation: true, expectedTick });
+  currentPermalink = null;
+  if (permalinkInput) permalinkInput.value = "";
+  latestForkedLink = null;
+  if (forkOutput) forkOutput.style.display = "none";
+  updateMismatchBanner(null);
+  updateDiffTable(null);
+  try {
+    const url = new URL(window.location.href);
+    url.searchParams.delete("world");
+    url.searchParams.delete("permalink");
+    window.history.replaceState({}, "", url.toString());
+  } catch (_) {}
+  return installed;
+}
+
+function continuationReadIsStale(generation, original) {
+  return remoteMode || queuedReset || simulationGeneration !== generation || simHandle !== original;
+}
+
+function storedContinuationDescription(record) {
+  return `tick ${record.tick}, saved ${new Date(record.savedAt).toLocaleString()}`;
+}
+
+async function discoverBrowserContinuation() {
+  if (browserStorePending || checkpointLoadPending || !browserContinuationStore) return;
+  browserStorePending = true;
+  browserCheckpointStatus.textContent = "Checking for a saved browser continuation…";
+  updateCheckpointControls();
+  try {
+    const record = await browserContinuationStore.read();
+    browserCheckpointStatus.textContent = record
+      ? `Saved continuation found: ${storedContinuationDescription(record)}. Restore validates and pauses this world.`
+      : "No continuation saved in this browser. Save replaces the one saved slot.";
+  } catch (error) {
+    browserCheckpointStatus.textContent = `Browser save discovery failed: ${error.message || error}`;
+  } finally {
+    browserStorePending = false;
+    updateCheckpointControls();
+  }
+}
+
+browserSaveButton?.addEventListener("click", async () => {
+  if (remoteMode || !simHandle || !browserContinuationStore || browserStorePending || checkpointLoadPending) return;
+  const generation = simulationGeneration;
+  browserStorePending = true;
+  browserCheckpointStatus.textContent = "Saving continuation in this browser…";
+  updateCheckpointControls();
+  try {
+    driveSimulation();
+    const bytes = simHandle.checkpoint();
+    const frame = simHandle.frame();
+    validateFrameIdentity(frame);
+    const record = await browserContinuationStore.save(
+      new Blob([bytes], { type: "application/octet-stream" }), frame.identity.tick,
+    );
+    browserCheckpointStatus.textContent = `Saved continuation in this browser: ${storedContinuationDescription(record)}.`
+      + (generation !== simulationGeneration || remoteMode ? " The displayed world has since changed." : "");
+  } catch (error) {
+    browserCheckpointStatus.textContent = `Browser save failed: ${error.message || error}`;
+  } finally {
+    browserStorePending = false;
+    updateCheckpointControls();
+  }
+});
+
+browserRestoreButton?.addEventListener("click", async () => {
+  if (remoteMode || !wasmInitialized || !browserContinuationStore || browserStorePending || checkpointLoadPending) return;
+  const generation = simulationGeneration;
+  const original = simHandle;
+  browserStorePending = true;
+  checkpointLoadPending = true;
+  browserCheckpointStatus.textContent = "Reading the saved browser continuation…";
+  updateCheckpointControls();
+  try {
+    const record = await browserContinuationStore.read();
+    if (continuationReadIsStale(generation, original)) {
+      browserCheckpointStatus.textContent = "Browser restore cancelled because the active world changed.";
+      return;
+    }
+    if (!record) {
+      browserCheckpointStatus.textContent = "No continuation saved in this browser.";
+      return;
+    }
+    // read() checks Blob.size before allocating its contents. A second identity
+    // check after the read prevents reset or remote mode losing their new owner.
+    const bytes = new Uint8Array(await record.blob.arrayBuffer());
+    if (continuationReadIsStale(generation, original)) {
+      browserCheckpointStatus.textContent = "Browser restore cancelled because the active world changed.";
+      return;
+    }
+    const installed = installContinuation(bytes, record.tick);
+    browserCheckpointStatus.textContent = `Restored browser continuation at tick ${installed.frame.identity.tick}; paused.`;
+  } catch (error) {
+    browserCheckpointStatus.textContent = `Browser restore failed: ${error.message || error}`;
+  } finally {
+    browserStorePending = false;
+    checkpointLoadPending = false;
+    updateCheckpointControls();
+  }
+});
+
 checkpointLoadInput?.addEventListener("change", async () => {
   const file = checkpointLoadInput.files?.[0];
   checkpointLoadInput.value = "";
-  if (!file || remoteMode || !simHandle || checkpointLoadPending) return;
+  if (!file || remoteMode || !wasmInitialized || checkpointLoadPending || browserStorePending) return;
   const generation = simulationGeneration;
   const original = simHandle;
   checkpointLoadPending = true;
@@ -1022,23 +1137,11 @@ checkpointLoadInput?.addEventListener("change", async () => {
   try {
     if (file.size > wasm.checkpoint_byte_limit()) throw new Error("Continuation file exceeds the browser size limit");
     const bytes = new Uint8Array(await file.arrayBuffer());
-    if (remoteMode || queuedReset || simulationGeneration !== generation || simHandle !== original) {
+    if (continuationReadIsStale(generation, original)) {
       checkpointStatus.textContent = "Load cancelled because the active world changed.";
       return;
     }
-    const installed = replaceSimulation(wasm.restore_checkpoint(bytes), { continuation: true });
-    currentPermalink = null;
-    if (permalinkInput) permalinkInput.value = "";
-    latestForkedLink = null;
-    if (forkOutput) forkOutput.style.display = "none";
-    updateMismatchBanner(null);
-    updateDiffTable(null);
-    try {
-      const url = new URL(window.location.href);
-      url.searchParams.delete("world");
-      url.searchParams.delete("permalink");
-      window.history.replaceState({}, "", url.toString());
-    } catch (_) {}
+    const installed = installContinuation(bytes);
     checkpointStatus.textContent = `Loaded continuation at tick ${installed.frame.identity.tick}; paused.`;
   } catch (error) {
     checkpointStatus.textContent = `Load failed: ${error.message || error}`;
@@ -1052,6 +1155,7 @@ async function bootstrap() {
   try {
     await initWasm();
     wasmInitialized = true;
+    browserContinuationStore = new BrowserContinuationStore(wasm.checkpoint_byte_limit());
     // GPU initialization must not hold up science or the first visible frame.
     await selectRenderer("canvas");
     if (rendererSelect.value !== "canvas") {
@@ -1075,6 +1179,7 @@ async function bootstrap() {
     scheduleSimulation();
     remoteConnect.disabled = false;
     requestAnimationFrame(presentSimulation);
+    void discoverBrowserContinuation();
   } catch (err) {
     console.error("Failed to initialise wasm module", err);
     appendLog(`Bootstrap failed: ${err}`);
