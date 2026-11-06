@@ -93,10 +93,11 @@ pub use archipelago::{
     MAX_ISLANDS, MigrationBarrierReport, StepTopology, Topology,
 };
 pub use host_core::{
-    AppliedAgentCommand, HOST_CHECKPOINT_V1_CODEC, HOST_CHECKPOINT_V1_CODEC_VERSION,
+    AppliedScientificCommand, HOST_CHECKPOINT_V1_CODEC, HOST_CHECKPOINT_V1_CODEC_VERSION,
     HOST_CHECKPOINT_V1_SCHEMA, HostCheckpointBusy, HostCheckpointError, HostCheckpointV1, HostCore,
     HostCoreBuildError, HostCoreOptions, HostJournalCutV1, LocalHostPort,
-    MAX_HOST_CHECKPOINT_BYTES, MAX_VOLATILE_HOST_CHECKPOINT_BYTES, MigrationArrival,
+    MAX_HOST_CHECKPOINT_BYTES, MAX_SCIENTIFIC_COMMAND_HISTORY_BYTES,
+    MAX_VOLATILE_HOST_CHECKPOINT_BYTES, MigrationArrival,
     PreparedConfigPatchResolver, VolatileHostCheckpointV1, VolatileJournal,
     VolatileJournalCheckpointV1, WorldCheckpointCut, WorldDigestCut,
 };

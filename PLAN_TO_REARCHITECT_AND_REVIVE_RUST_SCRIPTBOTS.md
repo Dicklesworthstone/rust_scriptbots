@@ -3564,6 +3564,19 @@ It supports matched seeds, bounded parallelism, checkpoint/branch experiments, r
 
 ### 7.8 offline analysis integrations
 
+**Source implementation extension — Codex, 2026-11-06 UTC:** Historical canvas
+review now retains successful intervention commands alongside spawn/crossover and
+mutation edits, merges them with configuration edits by their observed revisions,
+and uses the common core applier. Entry count and a 1 MiB entry/payload cap bound
+volatile command retention; oversized commands execute but leave detectable gaps.
+A quiescent target precursor and its existing core continuity companion preserve
+derived food profiles and pending target-boundary inputs after the complete current
+digest has been checked, without a second science replay. Archive resurrection,
+map replacement and migration remain unsupported because their complete source
+authority is not present in saved science checkpoints. Real-owner effect, ordering,
+retention and refusal regression controls are authored; native DSR qualification
+remains pending in this session.
+
 **Source implementation extension — Codex, 2026-11-05:** Cohort and descriptive
 comparisons now support explicitly selected runs inside one finished database.
 Borrowed run views retain the original connection and file lease, preserve the

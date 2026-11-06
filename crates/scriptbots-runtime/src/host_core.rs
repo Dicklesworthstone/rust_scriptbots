@@ -52,6 +52,12 @@ const DEFAULT_VOLATILE_EVENT_HISTORY_CAPACITY: usize = 512;
 const RECEIPT_POLL_LIMIT: usize = 4_096;
 const LIFECYCLE_COMMAND_NAMESPACE: u64 = u64::MAX;
 
+/// Maximum retained scientific command entries plus their owned payload allocations.
+///
+/// The history also obeys `HostCoreOptions::archived_command_capacity`. Container spare
+/// slots are separate from this payload accounting and remain bounded by that entry limit.
+pub const MAX_SCIENTIFIC_COMMAND_HISTORY_BYTES: usize = 1024 * 1024;
+
 /// Full owner checkpoint schema; distinct from the science-only core schema.
 pub const HOST_CHECKPOINT_V1_SCHEMA: &str = "scriptbots.host-checkpoint.v1";
 /// Canonical envelope revision for [`HostCheckpointV1`].
@@ -113,35 +119,77 @@ pub struct WorldDigestCut {
     pub config_revision: ConfigRevision,
     /// Total declared schedule inputs, including completed entries; an empty queue is zero.
     pub scheduled_input_count: u64,
-    /// Bounded successful agent-command observations from this live owner.
+    /// Bounded successful scientific-command observations from this live owner.
     /// This is volatile application evidence, not journal durability or a complete history.
-    pub agent_commands: Vec<AppliedAgentCommand>,
+    pub scientific_commands: Vec<AppliedScientificCommand>,
 }
 
-/// One successfully applied spawn, crossover or mutation-rate command.
+/// One successfully applied spawn, crossover, mutation-rate or intervention command.
 ///
 /// Only the owner constructs these observations, after the common core applier succeeds.
-/// Retention shares `HostCoreOptions::archived_command_capacity`; callers must prove that
-/// the retained suffix covers their requested interval. Host checkpoint restore starts an
-/// empty presentation history rather than claiming to recover discarded input evidence.
+/// Retention shares `HostCoreOptions::archived_command_capacity` and obeys
+/// [`MAX_SCIENTIFIC_COMMAND_HISTORY_BYTES`]. Oversized commands still apply but leave an
+/// observable revision gap in this history; consumers must prove interval completeness.
+/// Host checkpoint restore starts an empty presentation history rather than claiming to
+/// recover discarded input evidence. Intervention application queues its actual effect
+/// for the next science tick, preserving the ordinary core command semantics.
 #[derive(Debug, Clone)]
-pub struct AppliedAgentCommand {
+pub struct AppliedScientificCommand {
     boundary: AppliedCommand,
     command: ControlCommand,
 }
 
-impl AppliedAgentCommand {
+impl AppliedScientificCommand {
     /// Actual tick and revisions after the command applied.
     #[must_use]
     pub const fn boundary(&self) -> AppliedCommand {
         self.boundary
     }
 
-    /// Exact small command passed to the scientific core.
+    /// Exact bounded command passed to the scientific core.
     #[must_use]
     pub const fn command(&self) -> &ControlCommand {
         &self.command
     }
+
+    fn retained_bytes(&self) -> usize {
+        scientific_command_retained_bytes(&self.command)
+            .expect("only supported scientific commands enter this history")
+    }
+}
+
+fn scientific_command_retained_bytes(command: &ControlCommand) -> Option<usize> {
+    let heap = match command {
+        ControlCommand::AdjustAgentMutationRates { .. }
+        | ControlCommand::SpawnAgent { .. }
+        | ControlCommand::SpawnCrossover { .. } => 0,
+        ControlCommand::Intervention(command) => {
+            use scriptbots_core::{CellId, CellSelector, Intervention, InterventionCommand};
+            let selector = match &command.intervention {
+                Intervention::SpawnFromArchive { selector, .. } => match selector {
+                    CellSelector::AxisRange(axes) => axes
+                        .capacity()
+                        .saturating_mul(size_of::<(usize, f32, f32)>()),
+                    CellSelector::Explicit(cells) => {
+                        cells.capacity().saturating_mul(size_of::<CellId>())
+                    }
+                    CellSelector::All | CellSelector::TopKByQuality(_) => 0,
+                },
+                Intervention::Drought { .. }
+                | Intervention::Embargo { .. }
+                | Intervention::Bloom { .. }
+                | Intervention::Meteor { .. }
+                | Intervention::PaintTerrain { .. }
+                | Intervention::InjectCohort { .. }
+                | Intervention::SetClosedWorld { .. } => 0,
+            };
+            size_of::<InterventionCommand>()
+                .saturating_add(command.actor.capacity())
+                .saturating_add(selector)
+        }
+        _ => return None,
+    };
+    Some(size_of::<AppliedScientificCommand>().saturating_add(heap))
 }
 
 /// Capture, wire or continued-owner reconstruction refusal.
@@ -472,10 +520,51 @@ impl HostCheckpointV1 {
         self.state.schedule.is_some()
     }
 
+    /// Exact pending suffix of the installed schedule, in execution order.
+    ///
+    /// `None` means no schedule was installed; `Some(&[])` preserves the identity of
+    /// an installed empty or exhausted schedule. The statements remain owned by this cut.
+    #[must_use]
+    pub fn remaining_schedule(&self) -> Option<&[ScheduledConfigPatch]> {
+        self.state.schedule.as_deref()
+    }
+
+    /// Last completed schedule sequence, independently of retained outcome history.
+    ///
+    /// `None` means no schedule was installed. An installed schedule starts at `Some(0)`;
+    /// eviction from [`Self::scheduled_patch_history`] never moves this cursor backward.
+    #[must_use]
+    pub const fn completed_schedule_sequence(&self) -> Option<u64> {
+        self.state.completed_schedule_sequence
+    }
+
+    /// Bounded chronological suffix of completed schedule outcomes and journal observations.
+    ///
+    /// This is not necessarily the complete applied prefix. Consumers that require every
+    /// completed input must compare its length with [`Self::completed_schedule_sequence`].
+    /// Each retained receipt satisfies this cut's own journal commitment requirement;
+    /// a volatile receipt does not establish file-backed durability.
+    #[must_use]
+    pub fn scheduled_patch_history(&self) -> &[ScheduledPatchStatus] {
+        &self.state.scheduled_patches
+    }
+
+    /// Configured retention bound for completed schedule outcomes at this owner cut.
+    #[must_use]
+    pub const fn scheduled_patch_history_capacity(&self) -> usize {
+        self.state.options.archived_command_capacity
+    }
+
     /// Raw recording and control configuration retained by the full host boundary.
     #[must_use]
     pub const fn config(&self) -> &ScriptBotsConfig {
         self.state.continuity.config()
+    }
+
+    /// Actual configuration revision retained at the owner cut.
+    #[must_use]
+    pub const fn config_revision(&self) -> ConfigRevision {
+        self.state.revisions.config
     }
 
     /// Actual playback state retained at the owner cut.
@@ -3048,7 +3137,8 @@ pub struct HostCore {
     last_published_intervention_seq: u64,
     latest_completed_summary: Option<TickSummary>,
     step_traces: VecDeque<WorldStepTrace>,
-    agent_commands: VecDeque<AppliedAgentCommand>,
+    scientific_commands: VecDeque<AppliedScientificCommand>,
+    scientific_command_bytes: usize,
     next_journal_sequence: u64,
     next_lifecycle_command_sequence: u64,
     active_command: Option<AdmittedEnvelope>,
@@ -3085,6 +3175,17 @@ struct ScheduledConfigQueue {
     // Advance only after the patch reaches the adapter's required commitment.
     completed_sequence: u64,
     resolve: PreparedConfigPatchResolver,
+}
+
+/// Sorted structural paths changed between serialized configuration objects.
+///
+/// Existing objects are compared recursively. Replacing a value, including changing
+/// `null` into an object, reports the containing path rather than invented child edits.
+#[must_use]
+pub fn config_changed_paths(before: &serde_json::Value, after: &serde_json::Value) -> Vec<String> {
+    let mut changed = Vec::new();
+    changed_config_paths(before, after, "", &mut changed);
+    changed
 }
 
 fn changed_config_paths(
@@ -3358,7 +3459,8 @@ impl HostCore {
             last_published_intervention_seq,
             latest_completed_summary,
             step_traces: VecDeque::new(),
-            agent_commands: VecDeque::new(),
+            scientific_commands: VecDeque::new(),
+            scientific_command_bytes: 0,
             next_journal_sequence: 1,
             next_lifecycle_command_sequence: session_id.get(),
             active_command: None,
@@ -3541,8 +3643,7 @@ impl HostCore {
                 Ok(()) => {
                     self.revisions.control = next_control;
                     self.revisions.config = ConfigRevision::new(self.world.config_revision());
-                    let mut changed_paths = Vec::new();
-                    changed_config_paths(&before, &after, "", &mut changed_paths);
+                    let changed_paths = config_changed_paths(&before, &after);
                     ScheduledPatchOutcome::Applied { changed_paths }
                 }
                 Err(error) => ScheduledPatchOutcome::Failed(ApplicationFailure {
@@ -3833,7 +3934,7 @@ impl HostCore {
             scientific_revision: self.revisions.scientific,
             config_revision: self.revisions.config,
             scheduled_input_count: self.scheduled_input_count(),
-            agent_commands: self.agent_commands.iter().cloned().collect(),
+            scientific_commands: self.scientific_commands.iter().cloned().collect(),
         })
     }
 
@@ -5449,12 +5550,16 @@ impl HostCore {
                     .ok_or_else(|| protocol_violation("scientific revision exhausted"))
             })
             .transpose()?;
-        let retained_agent_command = match &command {
-            ControlCommand::AdjustAgentMutationRates { .. }
-            | ControlCommand::SpawnAgent { .. }
-            | ControlCommand::SpawnCrossover { .. } => Some(command.clone()),
-            _ => None,
-        };
+        // Bound dynamic intervention allocations before cloning, then account the actual
+        // clone as well. An omitted input still advances science, so replay cannot mistake
+        // the remaining observations for a complete input interval.
+        let retained_scientific_command = scientific_command_retained_bytes(&command)
+            .filter(|bytes| *bytes <= MAX_SCIENTIFIC_COMMAND_HISTORY_BYTES)
+            .map(|_| command.clone())
+            .filter(|command| {
+                scientific_command_retained_bytes(command)
+                    .is_some_and(|bytes| bytes <= MAX_SCIENTIFIC_COMMAND_HISTORY_BYTES)
+            });
         let is_apply_map = matches!(command, ControlCommand::ApplyMap { .. });
         match apply_control_command(&mut self.world, command) {
             Ok(ControlDisposition::WorldApplied) => {
@@ -5483,14 +5588,23 @@ impl HostCore {
         }
         let applied = self.applied_boundary();
         self.complete_applied_with(envelope.command_id, admission, applied)?;
-        if let Some(command) = retained_agent_command {
-            if self.agent_commands.len() >= self.options.archived_command_capacity {
-                self.agent_commands.pop_front();
-            }
-            self.agent_commands.push_back(AppliedAgentCommand {
+        if let Some(command) = retained_scientific_command {
+            let retained = AppliedScientificCommand {
                 boundary: applied,
                 command,
-            });
+            };
+            let bytes = retained.retained_bytes();
+            while self.scientific_commands.len() >= self.options.archived_command_capacity
+                || self.scientific_command_bytes > MAX_SCIENTIFIC_COMMAND_HISTORY_BYTES - bytes
+            {
+                let evicted = self
+                    .scientific_commands
+                    .pop_front()
+                    .expect("a count or byte limit requires a retained entry");
+                self.scientific_command_bytes -= evicted.retained_bytes();
+            }
+            self.scientific_command_bytes += bytes;
+            self.scientific_commands.push_back(retained);
         }
         let blocked = self.offer_journal(envelope, applied, None, None)?;
         Ok(ApplyResult::completed(blocked))
@@ -6688,6 +6802,10 @@ mod tests {
             settle_continuation_command(&mut oracle, repeated, completed * 10 + 1);
             let paired = original.capture_volatile_host_checkpoint_v1().unwrap();
             assert_eq!(paired.host_checkpoint().tick(), Tick(completed));
+            assert!(!paired.host_checkpoint().has_schedule());
+            assert_eq!(paired.host_checkpoint().remaining_schedule(), None);
+            assert_eq!(paired.host_checkpoint().completed_schedule_sequence(), None);
+            assert!(paired.host_checkpoint().scheduled_patch_history().is_empty());
             assert_eq!(
                 paired.journal.scientific_entries.len(),
                 usize::try_from(completed.min(3)).unwrap()
@@ -6890,6 +7008,13 @@ mod tests {
             1,
             "declared inputs must be counted before they run"
         );
+        let pending = scheduled_owner.capture_host_checkpoint_v1().unwrap();
+        assert_eq!(pending.completed_schedule_sequence(), Some(0));
+        assert_eq!(
+            pending.remaining_schedule().unwrap(),
+            [scheduled(1, 0, serde_json::json!({"food_max": 0.61}))]
+        );
+        assert!(pending.scheduled_patch_history().is_empty());
         settle_continuation_command(
             &mut scheduled_owner,
             CommandEnvelope::new(CommandId::new(5), HostCommand::Step),
@@ -6912,6 +7037,14 @@ mod tests {
             1,
             "completed inputs do not become an empty schedule"
         );
+        let completed = scheduled_owner.capture_host_checkpoint_v1().unwrap();
+        assert_eq!(completed.completed_schedule_sequence(), Some(1));
+        assert!(completed.remaining_schedule().unwrap().is_empty());
+        assert_eq!(completed.scheduled_patch_history().len(), 1);
+        assert_eq!(
+            completed.scheduled_patch_history()[0].evidence.scheduled,
+            pending.remaining_schedule().unwrap()[0]
+        );
         let mut empty = HostCore::new(HostSessionId::new(0xc073), world(0), options(true)).unwrap();
         empty
             .install_schedule(Vec::new(), resolve_test_schedule)
@@ -6931,6 +7064,11 @@ mod tests {
                 .scheduled_input_count,
             0
         );
+        let empty_cut = empty.capture_host_checkpoint_v1().unwrap();
+        assert!(empty_cut.has_schedule());
+        assert!(empty_cut.remaining_schedule().unwrap().is_empty());
+        assert_eq!(empty_cut.completed_schedule_sequence(), Some(0));
+        assert!(empty_cut.scheduled_patch_history().is_empty());
     }
 
     #[test]
@@ -6957,7 +7095,7 @@ mod tests {
             owner
                 .scientific_digest_cut()
                 .unwrap()
-                .agent_commands
+                .scientific_commands
                 .is_empty()
         );
         for (id, tendency) in [(1_u128, 0.25), (2, 0.5), (3, 0.75)] {
@@ -6974,11 +7112,11 @@ mod tests {
         }
         let captured = owner.scientific_digest_cut().unwrap();
         assert_eq!(
-            captured.agent_commands.len(),
+            captured.scientific_commands.len(),
             configured.archived_command_capacity
         );
         assert_eq!(
-            captured.agent_commands[0]
+            captured.scientific_commands[0]
                 .boundary()
                 .revisions
                 .scientific
@@ -6986,11 +7124,15 @@ mod tests {
             2
         );
         assert_eq!(
-            captured.agent_commands[1].boundary().revisions.scientific,
+            captured.scientific_commands[1].boundary().revisions.scientific,
             captured.scientific_revision
         );
         assert!(
-            matches!(captured.agent_commands[0].command(), ControlCommand::SpawnAgent { herbivore_tendency } if herbivore_tendency.to_bits() == 0.5_f32.to_bits())
+            matches!(
+                captured.scientific_commands[0].command(),
+                ControlCommand::SpawnAgent { herbivore_tendency }
+                    if herbivore_tendency.to_bits() == 0.5_f32.to_bits()
+            )
         );
         settle_continuation_command(
             &mut owner,
@@ -7004,12 +7146,12 @@ mod tests {
         );
         let cut = owner.scientific_digest_cut().unwrap();
         assert_eq!(
-            cut.agent_commands[0].boundary().revisions.scientific.get(),
+            cut.scientific_commands[0].boundary().revisions.scientific.get(),
             3
         );
         assert_eq!(owner.world().agents().len(), 4);
         assert_eq!(
-            captured.agent_commands[0]
+            captured.scientific_commands[0]
                 .boundary()
                 .revisions
                 .scientific
@@ -7058,7 +7200,7 @@ mod tests {
             owner
                 .scientific_digest_cut()
                 .unwrap()
-                .agent_commands
+                .scientific_commands
                 .is_empty()
         );
         let before_noop = owner.scientific_digest_v1().unwrap();
@@ -7078,13 +7220,13 @@ mod tests {
         let publication = owner.latest_snapshot();
         let journal = owner.next_journal_sequence;
         let cut = owner.scientific_digest_cut().unwrap();
-        assert_eq!(cut.agent_commands.len(), 1);
+        assert_eq!(cut.scientific_commands.len(), 1);
         assert_eq!(
-            cut.agent_commands[0].boundary().revisions.scientific.get(),
+            cut.scientific_commands[0].boundary().revisions.scientific.get(),
             1
         );
         assert!(matches!(
-            cut.agent_commands[0].command(),
+            cut.scientific_commands[0].command(),
             ControlCommand::AdjustAgentMutationRates {
                 agent_uid: AgentUid(900),
                 ..
@@ -7093,6 +7235,169 @@ mod tests {
         assert_eq!(owner.next_journal_sequence, journal);
         assert!(Arc::ptr_eq(&publication, &owner.latest_snapshot()));
         assert_eq!(cut.digest, before_noop);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one actual owner journey checks byte eviction, pending input settlement and oversized omission"
+    )]
+    fn scientific_history_caps_intervention_allocations_without_rejecting_commands() {
+        use scriptbots_core::{Intervention, InterventionCommand, InterventionSurface, Region};
+        let mut configured = options(true);
+        configured.archived_command_capacity = 16;
+        let mut owner = HostCore::new(HostSessionId::new(0xa6e9), world(0), configured).unwrap();
+        let intervention = |actor| {
+            HostCommand::Intervention(Box::new(InterventionCommand::new(
+                Intervention::Embargo {
+                    region: Region::All,
+                    ticks: 2,
+                },
+                InterventionSurface::Script,
+                actor,
+            )))
+        };
+        let mut older_cut = None;
+        for sequence in 1_u64..=2 {
+            let command_id = CommandId::new(u128::from(sequence * 2));
+            settle_continuation_command(
+                &mut owner,
+                CommandEnvelope::new(
+                    command_id,
+                    intervention("x".repeat(MAX_SCIENTIFIC_COMMAND_HISTORY_BYTES / 2)),
+                ),
+                sequence * 2,
+            );
+            assert!(matches!(
+                owner.scientific_digest_cut(),
+                Err(CharacterizationError::NonQuiescent {
+                    simulation_commands: 1,
+                    ..
+                })
+            ));
+            settle_continuation_command(
+                &mut owner,
+                CommandEnvelope::new(
+                    CommandId::new(u128::from(sequence * 2 + 1)),
+                    HostCommand::Step,
+                ),
+                sequence * 2 + 1,
+            );
+            let cut = owner.scientific_digest_cut().unwrap();
+            assert_eq!(
+                cut.scientific_commands.len(),
+                1,
+                "byte bound precedes count bound"
+            );
+            assert!(owner.scientific_command_bytes <= MAX_SCIENTIFIC_COMMAND_HISTORY_BYTES);
+            assert_eq!(
+                owner.scientific_command_bytes,
+                owner
+                    .scientific_commands
+                    .iter()
+                    .map(AppliedScientificCommand::retained_bytes)
+                    .sum::<usize>()
+            );
+            assert_eq!(
+                cut.scientific_commands[0].boundary().revisions.scientific.get(),
+                sequence * 2 - 1
+            );
+            if sequence == 1 {
+                older_cut = Some(cut);
+            }
+        }
+        assert_eq!(
+            older_cut.unwrap().scientific_commands[0]
+                .boundary()
+                .revisions
+                .scientific
+                .get(),
+            1,
+            "later eviction does not mutate an earlier captured cut"
+        );
+        let oversized_id = CommandId::new(9);
+        settle_continuation_command(
+            &mut owner,
+            CommandEnvelope::new(
+                oversized_id,
+                intervention("x".repeat(MAX_SCIENTIFIC_COMMAND_HISTORY_BYTES + 1)),
+            ),
+            9,
+        );
+        assert!(matches!(
+            owner
+                .local_port()
+                .command_status(oversized_id)
+                .unwrap()
+                .unwrap()
+                .application(),
+            ApplicationState::Applied(_)
+        ));
+        settle_continuation_command(
+            &mut owner,
+            CommandEnvelope::new(CommandId::new(10), HostCommand::Step),
+            10,
+        );
+        let cut = owner.scientific_digest_cut().unwrap();
+        assert_eq!(cut.scientific_revision.get(), 6);
+        assert_eq!(cut.scientific_commands.len(), 1);
+        assert_eq!(
+            cut.scientific_commands[0].boundary().revisions.scientific.get(),
+            3
+        );
+        assert!(
+            owner
+                .latest_snapshot()
+                .applied_interventions
+                .iter()
+                .any(|record| record.kind == "embargo" && !record.expired)
+        );
+    }
+
+    #[test]
+    fn scientific_history_accounts_reserved_actor_and_archive_selector_capacity() {
+        use scriptbots_core::{
+            CellId, CellSelector, Intervention, InterventionCommand, InterventionSurface,
+            Placement, Region,
+        };
+        for selector in [
+            CellSelector::AxisRange(Vec::with_capacity(
+                MAX_SCIENTIFIC_COMMAND_HISTORY_BYTES / size_of::<(usize, f32, f32)>() + 1,
+            )),
+            CellSelector::Explicit(Vec::<CellId>::with_capacity(
+                MAX_SCIENTIFIC_COMMAND_HISTORY_BYTES / size_of::<CellId>() + 1,
+            )),
+        ] {
+            let command = ControlCommand::Intervention(Box::new(InterventionCommand::new(
+                Intervention::SpawnFromArchive {
+                    selector,
+                    placement: Placement::Seeded {
+                        region: Region::All,
+                        seed: 1,
+                    },
+                    headroom: None,
+                    herbivore_tendency: None,
+                },
+                InterventionSurface::Script,
+                "archive-capacity",
+            )));
+            assert!(
+                scientific_command_retained_bytes(&command).unwrap()
+                    > MAX_SCIENTIFIC_COMMAND_HISTORY_BYTES,
+                "reserved selector allocation must be bounded before cloning"
+            );
+        }
+        let mut actor = String::with_capacity(MAX_SCIENTIFIC_COMMAND_HISTORY_BYTES + 1);
+        actor.push('x');
+        let command = ControlCommand::Intervention(Box::new(InterventionCommand::new(
+            Intervention::SetClosedWorld { closed: true },
+            InterventionSurface::Script,
+            actor,
+        )));
+        assert!(
+            scientific_command_retained_bytes(&command).unwrap()
+                > MAX_SCIENTIFIC_COMMAND_HISTORY_BYTES
+        );
     }
 
     #[test]
@@ -7125,6 +7430,10 @@ mod tests {
 
     #[test]
     fn full_host_checkpoint_continues_nonempty_owner_schedule_counters_and_exact_retries() {
+        let declared = [
+            scheduled(1, 1, serde_json::json!({"food_max": 0.61})),
+            scheduled(2, 3, serde_json::json!({"food_max": 0.72})),
+        ];
         for completed_steps in [1_u64, 3] {
             let mut original = continuation_owner(0xc013);
             let mut oracle = continuation_owner(0xc013);
@@ -7153,13 +7462,33 @@ mod tests {
             );
             assert!(checkpoint.has_schedule());
             assert_retained_step_traces(&checkpoint, completed_steps);
+            let completed_patches = usize::from(completed_steps > 1);
             assert_eq!(
-                checkpoint.state.scheduled_patches.len(),
-                usize::from(completed_steps > 1)
+                checkpoint.completed_schedule_sequence(),
+                Some(u64::from(completed_steps > 1))
             );
+            assert_eq!(
+                checkpoint.remaining_schedule().unwrap(),
+                &declared[completed_patches..],
+                "a patch due at the captured tick stays pending until the next science step"
+            );
+            assert_eq!(checkpoint.scheduled_patch_history().len(), completed_patches);
+            for (status, expected) in checkpoint
+                .scheduled_patch_history()
+                .iter()
+                .zip(&declared[..completed_patches])
+            {
+                assert_eq!(&status.evidence.scheduled, expected);
+                assert_eq!(status.journal, JournalState::CommittedVolatile);
+            }
             let wire = checkpoint.encode().expect("bounded owner encoding");
             let decoded = HostCheckpointV1::decode(&wire).expect("full owner decoding");
             assert_eq!(decoded.encode().expect("canonical re-encoding"), wire);
+            assert_eq!(decoded.remaining_schedule(), checkpoint.remaining_schedule());
+            assert_eq!(
+                decoded.scheduled_patch_history(),
+                checkpoint.scheduled_patch_history()
+            );
             let restored_world = decoded
                 .restore_world(scriptbots_core::BrainRegistry::new())
                 .expect("caller-prepared empty registry matches actual unbound founders");
@@ -7203,7 +7532,7 @@ mod tests {
                 .expect("actual oracle cut");
             assert_eq!(after.step_traces(), uninterrupted.step_traces());
             assert_eq!(
-                after.state.scheduled_patches.len(),
+                after.scheduled_patch_history().len(),
                 if completed_steps == 1 { 1 } else { 2 }
             );
             assert!(
@@ -7288,12 +7617,14 @@ mod tests {
             let checkpoint = original.capture_host_checkpoint_v1().unwrap();
             assert_eq!(checkpoint.tick(), Tick(1));
             assert_eq!(checkpoint.world_checkpoint().agent_count(), 3);
-            assert_eq!(checkpoint.state.completed_schedule_sequence, Some(3));
+            assert_eq!(checkpoint.completed_schedule_sequence(), Some(3));
+            assert_eq!(checkpoint.scheduled_patch_history_capacity(), capacity);
+            assert_eq!(checkpoint.scheduled_patch_history().len(), 3.min(capacity));
             assert_eq!(
-                checkpoint.state.scheduled_patches.len(),
-                3.min(capacity.max(1))
+                checkpoint.scheduled_patch_history()[0].evidence.scheduled.sequence,
+                4 - u64::try_from(3.min(capacity)).unwrap()
             );
-            assert_eq!(checkpoint.state.schedule.as_ref().unwrap()[0].sequence, 4);
+            assert_eq!(checkpoint.remaining_schedule().unwrap()[0].sequence, 4);
             let bytes = checkpoint.encode().unwrap();
             let decoded = HostCheckpointV1::decode(&bytes).unwrap();
             assert_eq!(decoded.encode().unwrap(), bytes);
@@ -7332,8 +7663,9 @@ mod tests {
             assert_eq!(restored.world().config().food_max, 0.94);
             let after = restored.capture_host_checkpoint_v1().unwrap();
             let uninterrupted = oracle.capture_host_checkpoint_v1().unwrap();
-            assert_eq!(after.state.completed_schedule_sequence, Some(4));
-            assert_eq!(after.state.schedule.as_ref().unwrap().as_slice(), []);
+            assert_eq!(after.completed_schedule_sequence(), Some(4));
+            assert!(after.remaining_schedule().unwrap().is_empty());
+            assert_eq!(after.scheduled_patch_history_capacity(), capacity);
             assert_eq!(after.step_traces(), uninterrupted.step_traces());
             assert_eq!(after.encode().unwrap(), uninterrupted.encode().unwrap());
         }

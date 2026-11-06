@@ -253,12 +253,19 @@ RUST_LOG=info cargo run -p scriptbots-app
   history; future, incomplete, failed or pruned schedules refuse review. Empty
   installed queues are supported. It checks the reconstructed current digest
   before showing the requested event as `CHECKPOINT REPLAY`; `g` returns live.
-  Agent spawns, manual crossovers and mutation-rate edits also have an implemented
-  replay path when configuration stays unchanged throughout the interval and the
-  live owner's bounded command history is complete. That history is volatile;
-  eviction or host restore without the required inputs refuses review. Mixed
-  configuration/agent-command intervals, interventions, map replacements and
-  migrations still require general recorded-input replay. Native qualification
+  Agent spawns, manual crossovers, mutation-rate edits and self-contained
+  interventions also have an implemented replay path, including mixed configuration
+  edits at the same tick. The live owner's complete command history and each command's
+  observed configuration revision preserve execution order. Intervention effects use
+  the ordinary core queue and apply at the next science tick; target-boundary inputs
+  are reconstructed after the complete current-digest check. The retained history
+  obeys both the owner entry limit and a 1 MiB entry/payload budget; container spare
+  slots have a separate entry bound. Oversized inputs still execute but leave a
+  revision gap, so review refuses an incomplete interval. This history is volatile;
+  eviction or host restore without the required inputs also refuses review. Archive
+  resurrection requires a source-bound behavioral archive, which the saved science
+  checkpoint does not carry. It, map replacements and migrations remain outside
+  this replay path. Native qualification
   status is recorded in [the reality check](REALITY_CHECK_2026-09-03.md). Loading,
   duplicate bounds, cancellation and stale selection checks use the same worker
   slot as direct checkpoint review. Live controls continue to address the owner.
