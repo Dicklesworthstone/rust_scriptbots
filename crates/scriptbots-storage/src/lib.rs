@@ -10216,6 +10216,97 @@ fn load_archive_cells(
     Ok(cells)
 }
 
+fn max_tick_for_run(
+    connection: &Connection,
+    run_id: RunId,
+) -> Result<Option<u64>, StorageError> {
+    let row = connection.query_row_with_params(
+        "SELECT MAX(tick) FROM tick_summaries WHERE run_id = ?1",
+        &[sqlite_run_id(run_id)],
+    )?;
+    decode::<Option<i64>>(&row, 0, "tick_summaries.max_tick")?
+        .map(|tick| checked_u64("tick_summaries.max_tick", tick))
+        .transpose()
+}
+
+fn require_island_zero_science_for_run(
+    connection: &Connection,
+    run_id: RunId,
+    context: &'static str,
+) -> Result<(), StorageError> {
+    let rows = connection.query_with_params(
+        "SELECT island_id FROM replay_events WHERE run_id = ?1 AND island_id <> 0
+         UNION SELECT island_id FROM interactions WHERE run_id = ?1 AND island_id <> 0
+         UNION SELECT island_id FROM tick_summaries WHERE run_id = ?1 AND island_id <> 0
+         UNION SELECT island_id FROM islands WHERE run_id = ?1 AND island_id <> 0
+         UNION SELECT island_id FROM lineage_edges WHERE run_id = ?1 AND island_id <> 0
+         UNION SELECT island_id FROM agents WHERE run_id = ?1 AND island_id <> 0
+         UNION SELECT island_id FROM metrics WHERE run_id = ?1 AND island_id <> 0
+         UNION SELECT island_id FROM births WHERE run_id = ?1 AND island_id <> 0
+         UNION SELECT island_id FROM deaths WHERE run_id = ?1 AND island_id <> 0
+         UNION SELECT island_id FROM events WHERE run_id = ?1 AND island_id <> 0
+         UNION SELECT island_id FROM run_events WHERE run_id = ?1 AND island_id <> 0
+         UNION SELECT island_id FROM genomes WHERE run_id = ?1 AND island_id <> 0
+         LIMIT 1",
+        &[sqlite_run_id(run_id)],
+    )?;
+    if !rows.is_empty() {
+        return Err(StorageError::InvalidData {
+            context,
+            reason: "this reader has no island dimension and requires an island-zero run; use the archipelago report or explicit island-scoped readers".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn metrics_at_tick_for_run(
+    connection: &Connection,
+    run_id: RunId,
+    tick: u64,
+    limit: usize,
+) -> Result<Vec<PersistedMetric>, StorageError> {
+    let tick_sql = encode_u64("metrics_at_tick.tick", tick)?;
+    let limit_sql = checked_query_limit("metrics_at_tick.limit", limit)?;
+    if limit == 0 {
+        return Err(StorageError::InvalidData {
+            context: "metrics_at_tick.limit",
+            reason: "a complete endpoint read requires a positive row limit".to_owned(),
+        });
+    }
+    require_island_zero_science_for_run(connection, run_id, "metrics_at_tick.island_scope")?;
+    let rows = connection.query_with_params(
+        "SELECT name, value FROM metrics
+         WHERE run_id = ?1 AND tick = ?2
+         ORDER BY name ASC LIMIT ?3",
+        &[
+            sqlite_run_id(run_id),
+            tick_sql.into(),
+            (limit_sql + 1).into(),
+        ],
+    )?;
+    if rows.len() > limit {
+        return Err(StorageError::InvalidData {
+            context: "metrics_at_tick.limit",
+            reason: format!(
+                "tick {tick} contains more than {limit} metrics; refusing an incomplete endpoint"
+            ),
+        });
+    }
+    rows.into_iter()
+        .map(|row| {
+            let name: String = decode(&row, 0, "metrics.name")?;
+            let value: f64 = decode(&row, 1, "metrics.value")?;
+            if !value.is_finite() {
+                return Err(StorageError::InvalidData {
+                    context: "metrics.value",
+                    reason: format!("metric {name:?} at tick {tick} is not finite"),
+                });
+            }
+            Ok(PersistedMetric { tick, name, value })
+        })
+        .collect()
+}
+
 pub(crate) struct FinishedRunReaderLease {
     _path: StoragePathLease,
     _writer: StorageWriterLease,
@@ -10233,6 +10324,54 @@ pub struct StorageReader {
     run_id: RunId,
     narrative_input_binding_v1: OnceLock<NarrativeInputBindingV1>,
     _finished_run_lease: Option<FinishedRunReaderLease>,
+}
+
+/// A run-scoped endpoint view borrowing one finished reader's connection and file lease.
+///
+/// Select it with [`StorageReader::select_finished_run`]. Several views can inspect different
+/// runs in the same immutable database without reopening the file or changing the reader's
+/// selected run or narrative cache. The owner cannot close while a view is borrowed, and the
+/// connection remains confined to its owning thread. Result limits do not bound execution time.
+pub struct FinishedRunView<'reader> {
+    connection: &'reader Connection,
+    lease: &'reader FinishedRunReaderLease,
+    run_id: RunId,
+}
+
+impl FinishedRunView<'_> {
+    /// Durable run identity bound to every query on this view.
+    #[must_use]
+    pub const fn run_id(&self) -> RunId {
+        self.run_id
+    }
+
+    /// Load and revalidate this run's complete manifest and its stored digest.
+    pub fn run_manifest(&self) -> Result<RunManifestRecord, StorageError> {
+        load_run_manifest(self.connection, self.run_id)
+    }
+
+    /// Return the maximum durable tick in this run.
+    pub fn max_tick(&self) -> Result<Option<u64>, StorageError> {
+        max_tick_for_run(self.connection, self.run_id)
+    }
+
+    /// Read a complete exact-tick metric set, preserving the island and row-limit refusals of
+    /// [`StorageReader::metrics_at_tick`].
+    pub fn metrics_at_tick(
+        &self,
+        tick: u64,
+        limit: usize,
+    ) -> Result<Vec<PersistedMetric>, StorageError> {
+        metrics_at_tick_for_run(self.connection, self.run_id, tick, limit)
+    }
+
+    /// Verify that a source path still names this leased database before reporting provenance.
+    ///
+    /// This uses the existing connection and identity lease. It rejects symbolic links,
+    /// multiply linked files, and replacement identities without opening another database.
+    pub fn verify_database_path(&self, path: &str) -> Result<(), StorageError> {
+        self.lease._identity.bind_connection(self.connection, path)
+    }
 }
 
 impl StorageReader {
@@ -10646,6 +10785,32 @@ impl StorageReader {
     /// Load and revalidate the complete queryable provenance record for this run.
     pub fn run_manifest(&self) -> Result<RunManifestRecord, StorageError> {
         load_run_manifest(self.connection()?, self.run_id)
+    }
+
+    /// Borrow an explicitly selected run from this reader's already-leased finished database.
+    ///
+    /// The finished open validated persistence and journal invariants for every run. Selection
+    /// uses that same immutable connection; each view revalidates its own manifest on read and
+    /// never reuses another run's narrative binding. `None` is accepted only for a single-run
+    /// database. Live readers and missing or ambiguous run identities are refused.
+    pub fn select_finished_run(
+        &self,
+        run_id: Option<RunId>,
+    ) -> Result<FinishedRunView<'_>, StorageError> {
+        let lease = self._finished_run_lease.as_ref().ok_or_else(|| {
+            StorageError::InvalidData {
+                context: "storage.finished_run_selection",
+                reason: "run selection requires StorageReader::open_finished or StorageReader::open_finished_for_run"
+                    .to_owned(),
+            }
+        })?;
+        let connection = self.connection()?;
+        let run_id = Self::resolve_run_id(connection, run_id)?;
+        Ok(FinishedRunView {
+            connection,
+            lease,
+            run_id,
+        })
     }
 
     pub(crate) fn connection(&self) -> Result<&Connection, StorageError> {
@@ -11892,13 +12057,7 @@ impl StorageReader {
 
     /// Return the maximum durable tick, if the database contains tick rows.
     pub fn max_tick(&self) -> Result<Option<u64>, StorageError> {
-        let row = self.connection()?.query_row_with_params(
-            "SELECT MAX(tick) FROM tick_summaries WHERE run_id = ?1",
-            &[sqlite_run_id(self.run_id)],
-        )?;
-        decode::<Option<i64>>(&row, 0, "tick_summaries.max_tick")?
-            .map(|tick| checked_u64("tick_summaries.max_tick", tick))
-            .transpose()
+        max_tick_for_run(self.connection()?, self.run_id)
     }
 
     /// Return durable outbox progress from an independent read connection.
@@ -12397,29 +12556,7 @@ impl StorageReader {
     }
 
     fn require_island_zero_science(&self, context: &'static str) -> Result<(), StorageError> {
-        let rows = self.connection()?.query_with_params(
-            "SELECT island_id FROM replay_events WHERE run_id = ?1 AND island_id <> 0
-             UNION SELECT island_id FROM interactions WHERE run_id = ?1 AND island_id <> 0
-             UNION SELECT island_id FROM tick_summaries WHERE run_id = ?1 AND island_id <> 0
-             UNION SELECT island_id FROM islands WHERE run_id = ?1 AND island_id <> 0
-             UNION SELECT island_id FROM lineage_edges WHERE run_id = ?1 AND island_id <> 0
-             UNION SELECT island_id FROM agents WHERE run_id = ?1 AND island_id <> 0
-             UNION SELECT island_id FROM metrics WHERE run_id = ?1 AND island_id <> 0
-             UNION SELECT island_id FROM births WHERE run_id = ?1 AND island_id <> 0
-             UNION SELECT island_id FROM deaths WHERE run_id = ?1 AND island_id <> 0
-             UNION SELECT island_id FROM events WHERE run_id = ?1 AND island_id <> 0
-             UNION SELECT island_id FROM run_events WHERE run_id = ?1 AND island_id <> 0
-             UNION SELECT island_id FROM genomes WHERE run_id = ?1 AND island_id <> 0
-             LIMIT 1",
-            &[sqlite_run_id(self.run_id)],
-        )?;
-        if !rows.is_empty() {
-            return Err(StorageError::InvalidData {
-                context,
-                reason: "this reader has no island dimension and requires an island-zero run; use the archipelago report or explicit island-scoped readers".to_owned(),
-            });
-        }
-        Ok(())
+        require_island_zero_science_for_run(self.connection()?, self.run_id, context)
     }
 
     /// Load every directed interaction edge in a complete half-open tick window.
@@ -13815,46 +13952,7 @@ impl StorageReader {
         tick: u64,
         limit: usize,
     ) -> Result<Vec<PersistedMetric>, StorageError> {
-        let tick_sql = encode_u64("metrics_at_tick.tick", tick)?;
-        let limit_sql = checked_query_limit("metrics_at_tick.limit", limit)?;
-        if limit == 0 {
-            return Err(StorageError::InvalidData {
-                context: "metrics_at_tick.limit",
-                reason: "a complete endpoint read requires a positive row limit".to_owned(),
-            });
-        }
-        self.require_island_zero_science("metrics_at_tick.island_scope")?;
-        let rows = self.connection()?.query_with_params(
-            "SELECT name, value FROM metrics
-             WHERE run_id = ?1 AND tick = ?2
-             ORDER BY name ASC LIMIT ?3",
-            &[
-                sqlite_run_id(self.run_id),
-                tick_sql.into(),
-                (limit_sql + 1).into(),
-            ],
-        )?;
-        if rows.len() > limit {
-            return Err(StorageError::InvalidData {
-                context: "metrics_at_tick.limit",
-                reason: format!(
-                    "tick {tick} contains more than {limit} metrics; refusing an incomplete endpoint"
-                ),
-            });
-        }
-        rows.into_iter()
-            .map(|row| {
-                let name: String = decode(&row, 0, "metrics.name")?;
-                let value: f64 = decode(&row, 1, "metrics.value")?;
-                if !value.is_finite() {
-                    return Err(StorageError::InvalidData {
-                        context: "metrics.value",
-                        reason: format!("metric {name:?} at tick {tick} is not finite"),
-                    });
-                }
-                Ok(PersistedMetric { tick, name, value })
-            })
-            .collect()
+        metrics_at_tick_for_run(self.connection()?, self.run_id, tick, limit)
     }
 
     /// Read up to `limit` recent metric rows for the selected run.
@@ -31729,6 +31827,129 @@ mod tests {
             })
         ));
         reader.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn finished_run_views_preserve_selection_cache_and_writer_exclusion()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-finished-run-views");
+        let path_string = path.to_string_lossy().to_string();
+        let first_id = RunId::new(101);
+        let second_id = RunId::new(202);
+        let mut storage = Storage::create_new_file_for_run(
+            &path_string,
+            RunManifestRecord::unattributed(first_id),
+        )?;
+        let mut first_batch = sample_batch(1, 10.0);
+        first_batch.replay_events.push(sample_narrative_event(
+            sample_narrative_record(1, 10.0, 0, 0, 64),
+        ));
+        storage.persist(&first_batch)?;
+        storage.flush()?;
+        storage.close()?;
+        let mut second =
+            Storage::append_run(&path_string, RunManifestRecord::unattributed(second_id))?;
+        second.persist(&sample_batch(1, 20.0))?;
+        second.persist(&sample_batch(9, 30.0))?;
+        second.flush()?;
+        second.close()?;
+
+        let live = StorageReader::open_for_run(&path_string, first_id)?;
+        assert!(matches!(
+            live.select_finished_run(Some(second_id)),
+            Err(StorageError::InvalidData {
+                context: "storage.finished_run_selection",
+                ..
+            })
+        ));
+        live.close()?;
+
+        let reader = StorageReader::open_finished_for_run(&path_string, first_id)?;
+        let binding = reader.narrative_input_binding_v1(0)?;
+        let first = reader.select_finished_run(Some(first_id))?;
+        let selected = reader.select_finished_run(Some(second_id))?;
+        assert_eq!(first.run_manifest()?.run_id, first_id);
+        assert_eq!(first.max_tick()?, Some(1));
+        assert_eq!(first.metrics_at_tick(1, 3)?[0].value, 10.0);
+        assert_eq!(selected.run_id(), second_id);
+        assert_eq!(selected.run_manifest()?.run_id, second_id);
+        assert_eq!(selected.max_tick()?, Some(9));
+        assert_eq!(selected.metrics_at_tick(1, 3)?[0].value, 20.0);
+        assert_eq!(selected.metrics_at_tick(9, 3)?[0].value, 30.0);
+        assert!(selected.metrics_at_tick(8, 3)?.is_empty());
+        assert!(selected.metrics_at_tick(9, 2).is_err());
+        selected.verify_database_path(&path_string)?;
+        assert!(matches!(
+            reader.select_finished_run(None),
+            Err(StorageError::InvalidData { context: "runs.run_id", .. })
+        ));
+        assert!(matches!(
+            reader.select_finished_run(Some(RunId::new(999))),
+            Err(StorageError::InvalidData { context: "runs.run_id", .. })
+        ));
+        assert!(matches!(
+            Storage::append_run(&path_string, RunManifestRecord::unattributed(RunId::new(303))),
+            Err(StorageError::InvalidData { context: "storage.path_lease", .. })
+        ));
+        assert_eq!(reader.run_id(), first_id);
+        assert_eq!(reader.max_tick()?, Some(1));
+        assert_eq!(reader.narrative_input_binding_v1(0)?, binding);
+        reader.close()?;
+
+        // The view did not transfer or leak ownership of the connection or its writer lease.
+        let third =
+            Storage::append_run(&path_string, RunManifestRecord::unattributed(RunId::new(303)))?;
+        third.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn finished_run_views_keep_secondary_run_island_and_manifest_refusals()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-finished-view-secondary-refusals");
+        let path_string = path.to_string_lossy().to_string();
+        let first_id = RunId::new(101);
+        let second_id = RunId::new(202);
+        let mut first = Storage::create_new_file_for_run(
+            &path_string,
+            RunManifestRecord::unattributed(first_id),
+        )?;
+        first.persist(&sample_batch(1, 10.0))?;
+        first.flush()?;
+        first.close()?;
+        let mut second =
+            Storage::append_run(&path_string, RunManifestRecord::unattributed(second_id))?;
+        second.persist(&sample_batch(1, 20.0))?;
+        second.persist(&sample_batch(9, 30.0))?;
+        second.flush()?;
+        second.close()?;
+
+        let connection = Connection::open_existing(&path_string)?;
+        connection.execute_with_params(
+            "UPDATE metrics SET island_id = 7 WHERE run_id = ?1 AND tick = 1",
+            &[sqlite_run_id(second_id)],
+        )?;
+        connection.close()?;
+        let reader = StorageReader::open_finished_for_run(&path_string, first_id)?;
+        assert_eq!(reader.metrics_at_tick(1, 3)?[0].value, 10.0);
+        let selected = reader.select_finished_run(Some(second_id))?;
+        assert!(matches!(
+            selected.metrics_at_tick(9, 3),
+            Err(StorageError::InvalidData { context: "metrics_at_tick.island_scope", .. })
+        ));
+        reader.close()?;
+
+        let connection = Connection::open_existing(&path_string)?;
+        connection.execute_with_params(
+            "UPDATE runs SET manifest_digest = 'blake3:tampered' WHERE run_id = ?1",
+            &[sqlite_run_id(second_id)],
+        )?;
+        connection.close()?;
+        assert!(matches!(
+            StorageReader::open_finished_for_run(&path_string, first_id),
+            Err(StorageError::InvalidData { context: "runs.manifest_digest", .. })
+        ));
         Ok(())
     }
 

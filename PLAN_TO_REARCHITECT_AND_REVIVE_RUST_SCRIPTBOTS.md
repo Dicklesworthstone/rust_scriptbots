@@ -3509,6 +3509,14 @@ clean source-status and source-diff digests plus Cargo.lock digest
 
 ### 7.7 experiment runner
 
+**[Currently In Progress — Codex, 2026-11-05]:** Extend the portable runner/Lab
+measurement contract beyond final population. A shared typed endpoint projection
+will derive energy, health, age, generation and food observations from the restored
+final world, bind the canonical summary artifact to that observation, and feed
+verified values to the existing matched-seed statistics. Empty-population means
+remain unavailable. This does not add fabricated per-tick database history or a
+second statistics implementation; original native qualification remains open.
+
 The headless experiment runner accepts a declarative experiment:
 
 ```toml
@@ -3529,6 +3537,22 @@ brain_families = ["dwraon"]
 It supports matched seeds, bounded parallelism, checkpoint/branch experiments, resumable runs, and machine-readable progress. It never launches a renderer unless asked.
 
 ### 7.8 offline analysis integrations
+
+**Source implementation extension — Codex, 2026-11-05:** Cohort and descriptive
+comparisons now support explicitly selected runs inside one finished database.
+Borrowed run views retain the original connection and file lease, preserve the
+reader's selected run and narrative cache, and keep per-run manifest, exact-endpoint,
+island and path-identity validation. The selected context run itself must appear
+among cohort controls. Regression source covers a 12-seed cohort repacked into one
+database, explicit and ambiguous selections, writer exclusion, symlink aliases,
+secondary-run corruption and unchanged source observations/statistics. Native DSR
+qualification remains open; no inference thresholds or scientific baselines changed.
+
+**[Currently In Progress — Codex, 2026-11-05]:** Stream summary inputs through the
+existing typed pages, retaining group accumulators and required output/lineage
+state rather than full agent tables and duplicate raw sample vectors. Preserve
+source-order numerical reductions and the pinned FrankenPandas rolling kernel.
+Output size and per-metric rolling workspace remain explicit memory costs.
 
 **Source implementation update — Codex, 2026-11-05:** Table export now supports
 bounded Parquet/Arrow production and full-data readback. Storage exposes

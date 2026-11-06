@@ -1145,8 +1145,10 @@ also refused. Within each arm, launch configuration other than `rng_seed`,
 population recipe, scheduled interventions, brain roster, build identity and
 execution policy must agree. The selected CLI database/run
 must be one of the declared controls. Add `"run_id": "<32 lowercase hex digits>"`
-to an entry when its database contains multiple runs; the already selected
-context database can contribute only its selected run.
+to each entry when its database contains multiple runs. A finished database can
+contribute several runs to either arm. Runs in the selected CLI database borrow
+its existing connection and file lease; inspecting them leaves the CLI's selected
+run unchanged. The selected run itself must appear among the declared controls.
 
 The manifest is limited to 1 MiB, 128 pairs and 64 metrics. With at least two
 matched pairs, the report bootstraps paired endpoint differences, uses paired
@@ -1159,6 +1161,11 @@ For a descriptive comparison of just two runs, the existing form remains useful:
 ```bash
 sb-analyze runs/control.sqlite run compare-runs --params treatment_db=runs/treatment.sqlite --params endpoint_tick=600 --json pair.json
 ```
+
+For two runs in one database, use `--run-id` to select the control and
+`--params treatment_run_id=<run-id>` to select the treatment, with the same
+database path in `treatment_db`. The two run IDs must differ. Omitting a run ID
+in a multi-run source is refused, including when that source is already open.
 
 `endpoint_tick` can be omitted when both runs share a terminal tick. This mode,
 and a cohort with only one matched pair, reports endpoint differences with

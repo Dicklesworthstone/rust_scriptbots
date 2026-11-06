@@ -84,6 +84,18 @@ fn compare(control: &str, params: &[String]) -> Result<ReportOutput, AnalyticsEr
     result
 }
 
+fn compare_selected(
+    db: &str,
+    run_id: RunId,
+    params: &[String],
+) -> Result<ReportOutput, AnalyticsError> {
+    let cx = ReaderCtx::open_for_run(db, run_id)?;
+    let params = ReportParams::from_pairs(params.iter().cloned())?;
+    let result = Registry::builtin().run("compare-runs", &cx, &params);
+    cx.reader.close()?;
+    result
+}
+
 fn metric<'a>(machine: &'a serde_json::Value, name: &str) -> Option<&'a serde_json::Value> {
     machine["metrics"]
         .as_array()
@@ -236,6 +248,31 @@ fn attributed_run(
     path
 }
 
+fn append_attributed_run(
+    path: &str,
+    record: RunManifestRecord,
+    observations: &[(u64, f64, f64)],
+) {
+    let mut storage = Storage::append_run(path, record).expect("append attributed run");
+    persist_endpoints(&mut storage, observations);
+    storage.close().expect("close appended run");
+}
+
+fn shared_pair(dir: &Path) -> String {
+    let path = attributed_run(
+        dir,
+        "shared-pair.sqlite",
+        manifest(RunId::new(107), 7, "control", 2),
+        &[(1, -1000.0, 7.0), (2, 10.0, 7.0)],
+    );
+    append_attributed_run(
+        &path,
+        manifest(RunId::new(207), 7, "treatment", 2),
+        &[(1, 1000.0, 7.0), (2, 15.0, 7.0)],
+    );
+    path
+}
+
 fn persist_endpoints(storage: &mut Storage, observations: &[(u64, f64, f64)]) {
     let mut previous = 0;
     for &(tick, shifting, flat) in observations {
@@ -290,6 +327,61 @@ fn compare_cohort(control: &str, cohort: &str) -> Result<ReportOutput, Analytics
 fn assert_refused(control: &str, cohort: &str, reason: &str) {
     let error = compare_cohort(control, cohort).expect_err("invalid cohort must be refused");
     assert!(error.to_string().contains(reason), "unexpected refusal: {error}");
+}
+
+/// Repack an established independent-seed oracle into one database with overlapping ticks.
+/// Only each run's manifested endpoint is copied; earlier trajectory rows cannot affect inference.
+fn assert_shared_database_cohort_matches(dir: &Path, machine: &serde_json::Value) {
+    let file = "shared-cohort.sqlite";
+    let shared = fs::canonicalize(dir).unwrap().join(file).display().to_string();
+    let endpoint = machine["endpoint_tick"].as_u64().unwrap();
+    let mut expected_pairs = machine["pairs"].clone();
+    let mut cohort = serde_json::json!({
+        "schema": RUN_COMPARISON_COHORT_SCHEMA_V1,
+        "endpoint_tick": endpoint,
+        "metrics": ["shifting", "flat"],
+        "control": [],
+        "treatment": [],
+    });
+    let pairs = expected_pairs.as_array_mut().unwrap();
+    for (index, pair) in pairs.iter_mut().enumerate() {
+        for arm in ["control", "treatment"] {
+            let source = &mut pair[arm];
+            let reader = StorageReader::open_finished(source["db"].as_str().unwrap()).unwrap();
+            let record = reader.run_manifest().unwrap();
+            reader.close().unwrap();
+            let observations = [(
+                endpoint,
+                source["values"]["shifting"].as_f64().unwrap(),
+                source["values"]["flat"].as_f64().unwrap(),
+            )];
+            if index == 0 && arm == "control" {
+                attributed_run(dir, file, record, &observations);
+            } else {
+                append_attributed_run(&shared, record, &observations);
+            }
+            cohort[arm].as_array_mut().unwrap().push(serde_json::json!({
+                "db": file,
+                "run_id": source["run_id"],
+            }));
+            source["db"] = serde_json::json!(shared);
+        }
+    }
+    cohort["control"].as_array_mut().unwrap().reverse();
+    let path = write_cohort(dir, "shared-cohort.json", &cohort);
+    let selected: RunId = pairs[0]["control"]["run_id"].as_str().unwrap().parse().unwrap();
+    let cx = ReaderCtx::open_for_run(&shared, selected).unwrap();
+    let params = ReportParams::from_pairs([format!("cohort_file={path}")]).unwrap();
+    let result = Registry::builtin().run("compare-runs", &cx, &params).unwrap();
+    assert_eq!(result.machine["mode"], "matched_seed_cohort");
+    assert_eq!(result.machine["inference_status"], "computed");
+    assert_eq!(result.machine["independent_pairs"], 12);
+    assert_eq!(result.machine["metrics"], machine["metrics"]);
+    assert_eq!(result.machine["pairs"], expected_pairs);
+    assert_eq!(cx.reader.run_id(), selected);
+    assert_eq!(cx.reader.run_manifest().unwrap().run_id, selected);
+    assert_eq!(cx.reader.metrics_at_tick(endpoint, 2).unwrap()[1].value, 25.0);
+    cx.reader.close().unwrap();
 }
 
 #[test]
@@ -385,6 +477,7 @@ fn independent_seed_endpoints_detect_the_planted_effect_and_preserve_the_null() 
     let again = compare_cohort(&control[0], &reordered_path).expect("reordered cohort");
     assert_eq!(machine["metrics"], again.machine["metrics"]);
     assert_eq!(machine["pairs"], again.machine["pairs"]);
+    assert_shared_database_cohort_matches(dir.path(), &machine);
 }
 
 #[test]
@@ -595,6 +688,100 @@ fn explicit_run_ids_select_the_correct_run_in_a_multi_run_input() {
     let output = compare_cohort(&control, &path).unwrap();
     assert_eq!(output.machine["pairs"][0]["treatment"]["run_id"], RunId::new(207).to_string());
     assert_eq!(metric(&output.machine, "shifting").unwrap()["mean_difference"], 5.0);
+}
+
+#[test]
+fn descriptive_pairs_can_select_two_runs_in_the_context_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = shared_pair(dir.path());
+    let control_id = RunId::new(107);
+    let treatment_id = RunId::new(207);
+    let params = vec![
+        format!("treatment_db={db}"),
+        format!("treatment_run_id={treatment_id}"),
+    ];
+    let output = compare_selected(&db, control_id, &params).unwrap();
+    assert_eq!(output.machine["mode"], "descriptive_pair");
+    assert_eq!(output.machine["seed_pairing"], "matched");
+    assert_eq!(output.machine["inference_status"], "insufficient_independent_pairs");
+    assert_eq!(output.machine["pairs"][0]["control"]["run_id"], control_id.to_string());
+    assert_eq!(output.machine["pairs"][0]["treatment"]["run_id"], treatment_id.to_string());
+    let shifting = metric(&output.machine, "shifting").unwrap();
+    assert_eq!(shifting["mean_difference"], 5.0);
+    assert!(shifting["p_value"].is_null());
+    assert!(shifting["ci_lower"].is_null());
+
+    let mut earlier_params = params;
+    earlier_params.push("endpoint_tick=1".to_owned());
+    let earlier = compare_selected(&db, control_id, &earlier_params).unwrap();
+    assert_eq!(earlier.machine["endpoint_tick"], 1);
+    assert_eq!(metric(&earlier.machine, "shifting").unwrap()["mean_difference"], 2000.0);
+
+    for (selection, reason) in [
+        (None, "multiple runs"),
+        (Some(control_id), "distinct run identities"),
+        (Some(RunId::new(999)), "does not exist"),
+    ] {
+        let mut params = vec![format!("treatment_db={db}")];
+        if let Some(run_id) = selection {
+            params.push(format!("treatment_run_id={run_id}"));
+        }
+        let error = compare_selected(&db, control_id, &params).unwrap_err();
+        assert!(error.to_string().contains(reason), "unexpected refusal: {error}");
+    }
+}
+
+#[test]
+fn cohort_selection_is_explicit_and_preserves_the_context_run_binding() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = shared_pair(dir.path());
+    let control_id = RunId::new(107);
+    let treatment_id = RunId::new(207);
+    let mut value = cohort_value(2, std::slice::from_ref(&db), std::slice::from_ref(&db));
+    value["control"][0]["run_id"] = serde_json::to_value(control_id).unwrap();
+    value["treatment"][0]["run_id"] = serde_json::to_value(treatment_id).unwrap();
+    let path = write_cohort(dir.path(), "selected-shared.json", &value);
+    let params = [format!("cohort_file={path}")];
+    let output = compare_selected(&db, control_id, &params).unwrap();
+    assert_eq!(metric(&output.machine, "shifting").unwrap()["mean_difference"], 5.0);
+    let error = compare_selected(&db, treatment_id, &params).unwrap_err();
+    assert!(error.to_string().contains("must be a declared control"));
+
+    for (file, arm, run_id, reason) in [
+        ("ambiguous-shared.json", "control", None, "multiple runs"),
+        ("absent-shared.json", "treatment", Some(RunId::new(999)), "does not exist"),
+        ("reused-shared.json", "treatment", Some(control_id), "reused run identity"),
+    ] {
+        let mut invalid = value.clone();
+        invalid[arm][0]["run_id"] = serde_json::to_value(run_id).unwrap();
+        let path = write_cohort(dir.path(), file, &invalid);
+        let error = compare_selected(&db, control_id, &[format!("cohort_file={path}")]).unwrap_err();
+        assert!(error.to_string().contains(reason), "unexpected refusal: {error}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn same_database_aliases_preserve_finished_reader_path_refusals() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = shared_pair(dir.path());
+    let alias = dir.path().join("shared-alias.sqlite");
+    std::os::unix::fs::symlink(&db, &alias).unwrap();
+    let alias = alias.display().to_string();
+    let control_id = RunId::new(107);
+    let treatment_id = RunId::new(207);
+    let error = compare_selected(&db, control_id, &[
+        format!("treatment_db={alias}"),
+        format!("treatment_run_id={treatment_id}"),
+    ]).unwrap_err();
+    assert!(error.to_string().contains("SYMLINK"), "unexpected refusal: {error}");
+
+    let mut value = cohort_value(2, std::slice::from_ref(&db), &[alias]);
+    value["control"][0]["run_id"] = serde_json::to_value(control_id).unwrap();
+    value["treatment"][0]["run_id"] = serde_json::to_value(treatment_id).unwrap();
+    let path = write_cohort(dir.path(), "alias-shared.json", &value);
+    let error = compare_selected(&db, control_id, &[format!("cohort_file={path}")]).unwrap_err();
+    assert!(error.to_string().contains("SYMLINK"), "unexpected refusal: {error}");
 }
 
 #[test]
