@@ -47,6 +47,8 @@ original `bd-2z0.14.1.18.1`; verify existing `bd-2z0.14.1.18.4`, scopes unchange
   their saved SHA256 digests; no missing or mismatched bytes and no cleanup credit.
 - [x] Relocate seven inactive build artifacts (1,234,037,196 bytes) to protected
   RAM-backed storage; verify every hash and original-path symlink before reuse.
+- [x] Preserve two later completed test executables (849,538,736 bytes) with
+  verified hashes; Cargo may replace original-path links during subsequent builds.
 - [x] Drive the optimized native window through selection, actual resize/scale,
   panel scroll, toggle and controls; verify owner receipts/identity and images.
 - [ ] Qualify the canonical merge of later storage/analytics source through
@@ -64,8 +66,35 @@ original `bd-2z0.14.1.18.1`; verify existing `bd-2z0.14.1.18.4`, scopes unchange
   persistence was enabled. Fix both without relaxing the original assertions.
 - [x] Pass the corrected working-source seven-check DSR probe: Bevy 299+7,
   narrative integration ten, both complete pipeline tests and storage schema 26.
-- [ ] Requalify committed `0237f3d7` with full Bevy/runtime suites, required
+- [x] Preserve and review upstream replay/cohort/export contributions through
+  `38345ffb` in a conflict-free canonical merge; retain incoming attribution.
+- [x] Retain the superseded `0237f3d7` run as canceled before release, and apply
+  standard formatting to the incoming source without changing assertions.
+- [x] Correct the incoming const-branch compiler error, extract the unchanged
+  cohort fixture setup and remove an unused provenance clone; the four required
+  compiler/lint/format probes pass without new lint suppressions.
+- [x] Retain clean `5c01922f` compiler/lint and Bevy/runtime successes plus its
+  actual Parquet library/CLI failures; keep partial results separate.
+- [x] Commit actual-footer Parquet readback and the foreign-file negative in
+  `8087d2fa`; retain every strict schema/value/null/EOF comparison.
+- [x] Replace the scanner-flagged panic workaround with a page-source enum that
+  cannot represent the run manifest (`55c305b2`); keep the manifest visitor and
+  all five paged sources' SQL/cursors unchanged.
+- [x] Retain the failed `5c01922f` 19/25 result. Its replay command selected
+  the binary harness and ran zero tests; correct it to the library harness and
+  require observed nonzero replay passes before admitting the release build.
+- [ ] Requalify combined source `55c305b2` with full Bevy/runtime suites, required
   workspace gates, incoming scientific regressions, UBS and an optimized build.
+- [ ] Execute matched-seed comparison, columnar/text export and observed-order
+  historical replay regressions against the combined source; leave broader
+  original scientific acceptance open unless its full requirements are observed.
+- [x] Reopen original `bd-2z0.11.8` on the observed Parquet provenance readback
+  regression; preserve strict schema equality and restore actual file-footer
+  metadata in both full-table and bounded streaming readers.
+- [ ] Verify the corrected readers against actual files, including a foreign
+  provenance file, multi-page exports, empty schemas and the real CLI pipeline.
+- [ ] Audit `.11.8` against its complete original acceptance; retain unobserved
+  large-run/memory and schema/multi-run requirements on the original item.
 - [ ] Drive and visually inspect the new card's optimized native window at both
   scales before closing the reopened original HUD/text tasks again.
 - [x] Review/commit source, re-execute the committed source in a fresh solo pass,
