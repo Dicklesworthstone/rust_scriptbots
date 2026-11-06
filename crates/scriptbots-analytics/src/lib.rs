@@ -30,7 +30,7 @@ use scriptbots_core::narrative::{EventRecord, NarrativeInputRecordV1, NarrativeR
 use scriptbots_core::{AgentUid, Tick};
 use scriptbots_runtime::RunId;
 use scriptbots_storage::{
-    NarrativeInputBindingV1, NarrativeInputStreamError, PersistedAgentObservation,
+    FinishedRunView, NarrativeInputBindingV1, NarrativeInputStreamError, PersistedAgentObservation,
     PersistedInteraction, PersistedInteractionCapture, PersistedMetric, PersistedRunEvent,
     PersistenceBatchId, RunEventIdentity, RunManifestRecord, StorageError, StorageReader,
 };
@@ -2279,12 +2279,13 @@ fn comparison_condition_digest(
 }
 
 fn read_comparison_source(
-    reader: &StorageReader,
+    reader: &FinishedRunView<'_>,
     db: &str,
     endpoint_tick: u64,
     metrics: Option<&[String]>,
     require_cohort_evidence: bool,
 ) -> Result<(Option<u64>, RunComparisonSource), AnalyticsError> {
+    reader.verify_database_path(db)?;
     let manifest = reader.run_manifest()?;
     let manifest_value: serde_json::Value = serde_json::from_str(&manifest.manifest_json)?;
     let config: serde_json::Value = serde_json::from_str(&manifest.normalized_config_json)?;
@@ -2341,6 +2342,7 @@ fn read_comparison_source(
     let condition_digest =
         comparison_condition_digest(&manifest, &manifest_value, config, require_cohort_evidence)?;
     let manifest_digest = manifest.manifest_digest()?;
+    reader.verify_database_path(db)?;
     Ok((
         seed,
         RunComparisonSource {
@@ -2386,23 +2388,10 @@ impl ComparisonInputReader<'_> {
         let db = path
             .to_str()
             .ok_or_else(|| comparison_error("database path is not UTF-8"))?;
-        let is_context = canonical_path == self.context_path;
-        let observation = if is_context {
-            if input
-                .run_id
-                .is_some_and(|run_id| run_id != self.context.reader.run_id())
-            {
-                return Err(comparison_error(
-                    "the context database is already leased for its selected run; use a separate database for another run in this cohort",
-                ));
-            }
-            if input.run_id.is_none() && StorageReader::catalog_page(db, 0, 2)?.len() != 1 {
-                return Err(comparison_error(
-                    "a cohort input in a multi-run database must specify run_id",
-                ));
-            }
+        let same_database = canonical_path == self.context_path;
+        let observation = if same_database {
             read_comparison_source(
-                &self.context.reader,
+                &self.context.reader.select_finished_run(input.run_id)?,
                 db,
                 self.endpoint_tick,
                 Some(self.metrics),
@@ -2782,6 +2771,61 @@ fn render_run_comparison_markdown(machine: &RunComparisonMachine) -> String {
     md
 }
 
+fn read_descriptive_pair(
+    control_reader: &FinishedRunView<'_>,
+    control_db: &str,
+    treatment_reader: &FinishedRunView<'_>,
+    treatment_db: &str,
+    endpoint_tick: Option<u64>,
+    comparison_params: &compare::CompareParams,
+) -> Result<RunComparisonMachine, AnalyticsError> {
+    let endpoint_tick = match endpoint_tick {
+        Some(tick) => tick,
+        None => match (control_reader.max_tick()?, treatment_reader.max_tick()?) {
+            (Some(control), Some(treatment)) if control == treatment => control,
+            _ => {
+                return Err(comparison_error(
+                    "runs have no shared terminal tick; declare endpoint_tick explicitly or use cohort_file",
+                ));
+            }
+        },
+    };
+    let (control_seed, control) =
+        read_comparison_source(control_reader, control_db, endpoint_tick, None, false)?;
+    let (treatment_seed, treatment) =
+        read_comparison_source(treatment_reader, treatment_db, endpoint_tick, None, false)?;
+    if control_seed.is_some() && treatment_seed.is_some() && control.run_id == treatment.run_id {
+        return Err(comparison_error(
+            "control and treatment reuse the same attributed run identity",
+        ));
+    }
+    let names: Vec<String> = control
+        .values
+        .keys()
+        .filter(|name| treatment.values.contains_key(*name))
+        .cloned()
+        .collect();
+    if names.is_empty() {
+        return Err(comparison_error(
+            "the exact endpoint has no metrics shared by both runs",
+        ));
+    }
+    let seed_hex = control_seed
+        .filter(|seed| Some(*seed) == treatment_seed)
+        .map(|seed| format!("{seed:016x}"));
+    comparison_machine(
+        vec![RunComparisonPair {
+            seed_hex,
+            control,
+            treatment,
+        }],
+        &names,
+        endpoint_tick,
+        comparison_params,
+        None,
+    )
+}
+
 fn compare_descriptive_pair(
     cx: &ReaderCtx,
     params: &ReportParams,
@@ -2795,10 +2839,23 @@ fn compare_descriptive_pair(
         .map(str::parse::<RunId>)
         .transpose()
         .map_err(|error| comparison_error(format!("invalid treatment_run_id: {error}")))?;
+    let endpoint_tick = params.get_u64("endpoint_tick")?;
+    let control = cx.reader.select_finished_run(Some(cx.reader.run_id()))?;
     if std::fs::canonicalize(path)? == std::fs::canonicalize(&cx.db_path)? {
-        return Err(comparison_error(
-            "treatment_db must be distinct from the already leased context database",
-        ));
+        let treatment = cx.reader.select_finished_run(run_id)?;
+        if treatment.run_id() == control.run_id() {
+            return Err(comparison_error(
+                "control and treatment in the same database must select distinct run identities",
+            ));
+        }
+        return read_descriptive_pair(
+            &control,
+            &cx.db_path,
+            &treatment,
+            path,
+            endpoint_tick,
+            comparison_params,
+        );
     }
     let reader = run_id.map_or_else(
         || StorageReader::open_finished(path),
@@ -2849,7 +2906,6 @@ fn compare_descriptive_pair(
             &names,
             endpoint_tick,
             comparison_params,
-            None,
         )
     })();
     let close_result = reader.close();

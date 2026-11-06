@@ -36,6 +36,8 @@ pub(crate) const MAX_STATUS_BYTES: u64 = 16 * 1024 * 1024;
 pub(crate) const MAX_BUNDLE_ARTIFACTS: usize = 32;
 pub(crate) const MAX_BUNDLE_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024;
 pub(crate) const MAX_BUNDLE_TOTAL_ARTIFACT_BYTES: u64 = 32 * 1024 * 1024;
+pub(crate) const MAX_EXPERIMENT_SUMMARY_BYTES: usize = 4_096;
+const EXPERIMENT_SUMMARY_SCHEMA_VERSION: u16 = 2;
 const MAX_BATCH_RUNS: usize = 4_096;
 const MAX_RUN_COMPONENT_BYTES: usize = 128;
 const MAX_TICKS_PER_RUN: u64 = 10_000_000;
@@ -658,8 +660,9 @@ impl ExperimentStatusWriterLease {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct RunEvidenceV1 {
+struct RunEvidenceV2 {
     schema: String,
+    summary_schema_version: u16,
     plan_digest: String,
     experiment_id: String,
     cohort_id: String,
@@ -672,8 +675,179 @@ struct RunEvidenceV1 {
     manifest_digest: String,
 }
 
+/// Final-state metrics emitted by the runner and accepted by the Lab proposal schema.
+///
+/// These describe one completed boundary. They are not time averages, cumulative
+/// lifecycle counts, or observations over the run's unretained history.
+pub const EXPERIMENT_ENDPOINT_METRICS: [&str; 8] = [
+    "alive_agents",
+    "total_energy",
+    "average_energy",
+    "average_health",
+    "mean_age",
+    "max_age",
+    "max_generation",
+    "total_food",
+];
+
+/// Canonical V2 experiment summary, recomputable from the final checkpoint alone.
+///
+/// Agent values are reduced in ascending stable `AgentUid` order using `f64`;
+/// food cells are reduced in row-major order. No renderer snapshot or retained
+/// tick history participates. For an extinct population, the population and
+/// total energy are zero while all population means and maxima are unavailable.
+/// Those `None` values become empty CSV cells and are omitted from analysis,
+/// causing an explicitly requested unavailable endpoint to fail closed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ExperimentEndpointSummaryV2 {
+    /// Exact completed simulation boundary.
+    pub tick: u64,
+    /// Number of living agents at that boundary.
+    pub alive_agents: u32,
+    /// The matched-seed axis that produced the run.
+    pub seed: u64,
+    /// Canonical registered family identifier.
+    pub brain_family: String,
+    /// Scientific digest of the same final owner state.
+    pub final_digest: String,
+    /// Summary wire and reduction semantics version, currently 2.
+    pub schema_version: u16,
+    /// Sum of current live-agent energy reserves.
+    pub total_energy: f64,
+    /// Mean current live-agent energy; unavailable when the population is empty.
+    pub average_energy: Option<f64>,
+    /// Mean current live-agent health; unavailable when the population is empty.
+    pub average_health: Option<f64>,
+    /// Mean live-agent age counter, advanced at the configured aging cadence.
+    /// Unavailable when the population is empty.
+    pub mean_age: Option<f64>,
+    /// Largest live-agent age counter; unavailable when the population is empty.
+    pub max_age: Option<u32>,
+    /// Largest living lineage generation; unavailable when the population is empty.
+    pub max_generation: Option<u32>,
+    /// Sum of the current food grid's cell energy values.
+    pub total_food: f64,
+}
+
+impl ExperimentEndpointSummaryV2 {
+    fn from_world(
+        world: &WorldState,
+        seed: u64,
+        brain_family: &str,
+        final_digest: String,
+    ) -> Result<Self, String> {
+        let arena = world.agents();
+        let alive_agents = u32::try_from(arena.len())
+            .map_err(|_| "final population exceeds the u32 endpoint representation".to_owned())?;
+        let columns = arena.columns();
+        let mut ordered = arena
+            .iter_handles()
+            .enumerate()
+            .map(|(index, id)| {
+                world
+                    .agent_uid(id)
+                    .map(|uid| (uid, index, id))
+                    .ok_or_else(|| format!("endpoint agent at dense index {index} has no stable UID"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        ordered.sort_unstable_by_key(|(uid, _, _)| *uid);
+        if ordered.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return Err("endpoint population contains duplicate stable UIDs".to_owned());
+        }
+        let mut total_energy = 0.0;
+        let mut total_health = 0.0;
+        let mut total_age = 0.0;
+        let mut max_age = None;
+        let mut max_generation = None;
+        for (uid, index, id) in ordered {
+            let runtime = world
+                .agent_runtime(id)
+                .ok_or_else(|| format!("endpoint agent UID {uid} has no runtime state"))?;
+            let energy = f64::from(runtime.energy);
+            let health = f64::from(columns.health()[index]);
+            if !energy.is_finite() || !health.is_finite() {
+                return Err(format!("endpoint agent UID {uid} has non-finite energy or health"));
+            }
+            let age = columns.ages()[index];
+            let generation = columns.generations()[index].0;
+            total_energy += energy;
+            total_health += health;
+            total_age += f64::from(age);
+            max_age = Some(max_age.map_or(age, |previous: u32| previous.max(age)));
+            max_generation =
+                Some(max_generation.map_or(generation, |previous: u32| previous.max(generation)));
+        }
+        let mut total_food = 0.0;
+        for (index, &food) in world.food().cells().iter().enumerate() {
+            if !food.is_finite() {
+                return Err(format!("endpoint food cell {index} has non-finite energy"));
+            }
+            total_food += f64::from(food);
+        }
+        if [total_energy, total_health, total_age, total_food]
+            .iter()
+            .any(|value| !value.is_finite())
+        {
+            return Err("final endpoint reduction produced a non-finite total".to_owned());
+        }
+        let population = (alive_agents != 0).then_some(f64::from(alive_agents));
+        Ok(Self {
+            tick: world.tick().0,
+            alive_agents,
+            seed,
+            brain_family: brain_family.to_owned(),
+            final_digest,
+            schema_version: EXPERIMENT_SUMMARY_SCHEMA_VERSION,
+            total_energy,
+            average_energy: population.map(|count| total_energy / count),
+            average_health: population.map(|count| total_health / count),
+            mean_age: population.map(|count| total_age / count),
+            max_age,
+            max_generation,
+            total_food,
+        })
+    }
+
+    /// Available observed endpoints, under the same names offered by the Lab schema.
+    #[must_use]
+    pub fn available_metrics(&self) -> BTreeMap<String, f64> {
+        let values: [Option<f64>; EXPERIMENT_ENDPOINT_METRICS.len()] = [
+            Some(f64::from(self.alive_agents)),
+            Some(self.total_energy),
+            self.average_energy,
+            self.average_health,
+            self.mean_age,
+            self.max_age.map(f64::from),
+            self.max_generation.map(f64::from),
+            Some(self.total_food),
+        ];
+        EXPERIMENT_ENDPOINT_METRICS
+            .iter()
+            .zip(values)
+            .filter_map(|(name, value)| value.map(|value| ((*name).to_owned(), value)))
+            .collect()
+    }
+
+    fn canonical_csv_bytes(&self) -> Result<Vec<u8>, String> {
+        let mut writer = csv::WriterBuilder::new()
+            .terminator(csv::Terminator::Any(b'\n'))
+            .from_writer(Vec::new());
+        writer
+            .serialize(self)
+            .map_err(|error| format!("serialize V2 endpoint summary: {error}"))?;
+        let bytes = writer
+            .into_inner()
+            .map_err(|error| format!("finish V2 endpoint summary: {error}"))?;
+        if bytes.len() > MAX_EXPERIMENT_SUMMARY_BYTES {
+            return Err("V2 endpoint summary exceeds the 4096-byte artifact bound".to_owned());
+        }
+        Ok(bytes)
+    }
+}
+
 /// Scientific observations computed from a restored final experiment checkpoint.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct VerifiedExperimentFinalState {
     /// Experiment-local identity read from the verified evidence and cut.
     pub run_id: String,
@@ -683,6 +857,10 @@ pub struct VerifiedExperimentFinalState {
     pub alive_agents: usize,
     /// Scientific digest recomputed by the restored owner.
     pub scientific_digest: String,
+    /// Typed endpoints recomputed by that owner and matched to the exact CSV bytes.
+    pub summary: ExperimentEndpointSummaryV2,
+    /// BLAKE3 of the summary bytes actually checked against the restored state.
+    pub summary_artifact_digest: String,
 }
 
 /// Artifact integrity and, when declared, the separately observed final science.
@@ -690,6 +868,8 @@ pub struct VerifiedExperimentFinalState {
 pub struct PortableRunBundleVerification {
     /// Canonical byte/database verification result.
     pub artifacts: RunBundleVerificationResult,
+    /// BLAKE3 of the exact manifest bytes selected for these semantic checks.
+    pub bundle_manifest_digest: String,
     /// Restored observations only for a declared matched-seed experiment run.
     pub final_state: Option<VerifiedExperimentFinalState>,
 }
@@ -713,6 +893,7 @@ pub fn verify_portable_run_bundle(
             operation: "decode portable bundle manifest",
             source,
         })?;
+    let bundle_manifest_digest = blake3::hash(&bytes).to_hex().to_string();
     let manifest_value: serde_json::Value = serde_json::from_str(&bundle.manifest.manifest_json)
         .map_err(|source| ExperimentRunnerError::Json {
             operation: "decode embedded portable manifest",
@@ -750,6 +931,7 @@ pub fn verify_portable_run_bundle(
     if !declares_experiment {
         return Ok(PortableRunBundleVerification {
             artifacts,
+            bundle_manifest_digest,
             final_state: None,
         });
     }
@@ -772,7 +954,7 @@ pub fn verify_portable_run_bundle(
             operation: "decode experiment run manifest",
             source,
         })?;
-    let evidence: RunEvidenceV1 = serde_json::from_slice(&read_experiment_file_bounded(
+    let evidence: RunEvidenceV2 = serde_json::from_slice(&read_experiment_file_bounded(
         &bundle_dir.join("evidence/run.json"),
         MAX_STATUS_BYTES,
     )?)
@@ -790,7 +972,8 @@ pub fn verify_portable_run_bundle(
         run_id: evidence.run_id.clone(),
         reason: reason.to_owned(),
     };
-    if evidence.schema != "scriptbots.experiment-run-evidence.v1"
+    if evidence.schema != "scriptbots.experiment-run-evidence.v2"
+        || evidence.summary_schema_version != EXPERIMENT_SUMMARY_SCHEMA_VERSION
         || manifest.identity.run_id != MatchedSeedExperimentRunner::bundle_run_id(&evidence.run_id)
         || manifest.identity.experiment_id.as_deref() != Some(evidence.experiment_id.as_str())
         || manifest.identity.variant_id.as_deref() != Some(evidence.variant_id.as_str())
@@ -832,6 +1015,7 @@ pub fn verify_portable_run_bundle(
         verify_restored_final_checkpoint(bundle_dir, &checkpoint, &manifest, &evidence, family)?;
     Ok(PortableRunBundleVerification {
         artifacts,
+        bundle_manifest_digest,
         final_state: Some(final_state),
     })
 }
@@ -840,7 +1024,7 @@ fn verify_restored_final_checkpoint(
     bundle_dir: &Path,
     checkpoint: &RunCheckpointV1,
     manifest: &RunManifestV3,
-    evidence: &RunEvidenceV1,
+    evidence: &RunEvidenceV2,
     family: ResolvedBrainFamily,
 ) -> Result<VerifiedExperimentFinalState, ExperimentRunnerError> {
     let path = bundle_dir.join(FINAL_CHECKPOINT_ARTIFACT.0);
@@ -887,19 +1071,24 @@ fn verify_restored_final_checkpoint(
         ));
     }
     let summary_path = bundle_dir.join("exports/summary.csv");
-    let summary = read_experiment_file_bounded(&summary_path, MAX_BUNDLE_ARTIFACT_BYTES)?;
-    let expected_summary = format!(
-        "tick,alive_agents,seed,brain_family,final_digest\n{},{},{},{},{}\n",
-        core.world_tick().0,
-        core.world().agents().len(),
+    let summary_bytes = read_experiment_file_bounded(
+        &summary_path,
+        u64::try_from(MAX_EXPERIMENT_SUMMARY_BYTES).unwrap_or(u64::MAX),
+    )?;
+    let summary = ExperimentEndpointSummaryV2::from_world(
+        core.world(),
         evidence.seed,
         family.canonical_name(),
-        digest.overall
-    );
-    if summary != expected_summary.as_bytes() {
+        digest.overall.clone(),
+    )
+    .map_err(|error| invalid_checkpoint(&summary_path, error))?;
+    let expected_summary = summary
+        .canonical_csv_bytes()
+        .map_err(|error| invalid_checkpoint(&summary_path, error))?;
+    if summary_bytes != expected_summary {
         return Err(invalid_checkpoint(
             &summary_path,
-            "summary differs from the restored final population, tick, family, seed or digest",
+            "V2 endpoint summary differs from the restored final state, schema, family, seed or digest",
         ));
     }
     Ok(VerifiedExperimentFinalState {
@@ -907,6 +1096,8 @@ fn verify_restored_final_checkpoint(
         tick: core.world_tick().0,
         alive_agents: core.world().agents().len(),
         scientific_digest: digest.overall,
+        summary,
+        summary_artifact_digest: blake3::hash(&summary_bytes).to_hex().to_string(),
     })
 }
 
@@ -2320,7 +2511,23 @@ impl MatchedSeedExperimentRunner {
                 reason: source.to_string(),
             })?;
         let digest_hex = digest.overall;
-        let alive_agents = core.world().agents().len();
+        let summary = if cancelled {
+            None
+        } else {
+            Some(
+                ExperimentEndpointSummaryV2::from_world(
+                    core.world(),
+                    seed,
+                    family.canonical_name(),
+                    digest_hex.clone(),
+                )
+                .map_err(|reason| ExperimentRunnerError::Host {
+                    run_id: run_id.to_owned(),
+                    operation: "capture final endpoints",
+                    reason,
+                })?,
+            )
+        };
 
         let submitted = frontend
             .submit_envelope(CommandEnvelope::new(
@@ -2386,8 +2593,9 @@ impl MatchedSeedExperimentRunner {
             .to_storage_record()
             .map_err(|error| invalid_checkpoint(&path, error))?;
         let manifest_digest = blake3::hash(&manifest_bytes).to_hex().to_string();
-        let evidence = RunEvidenceV1 {
-            schema: "scriptbots.experiment-run-evidence.v1".to_owned(),
+        let evidence = RunEvidenceV2 {
+            schema: "scriptbots.experiment-run-evidence.v2".to_owned(),
+            summary_schema_version: EXPERIMENT_SUMMARY_SCHEMA_VERSION,
             plan_digest: plan_digest.to_owned(),
             experiment_id: self.experiment_id.clone(),
             cohort_id: self.cohort.cohort_id.clone(),
@@ -2404,14 +2612,17 @@ impl MatchedSeedExperimentRunner {
                 operation: "serialize run evidence",
                 source,
             })?;
-        let summary_csv = format!(
-            "tick,alive_agents,seed,brain_family,final_digest\n{},{},{},{},{}\n",
-            self.max_ticks,
-            alive_agents,
-            seed,
-            family.canonical_name(),
-            digest_hex
-        );
+        let summary_csv = summary
+            .ok_or_else(|| ExperimentRunnerError::Host {
+                run_id: run_id.to_owned(),
+                operation: "publish final endpoints",
+                reason: "completed run has no observed endpoint summary".to_owned(),
+            })?
+            .canonical_csv_bytes()
+            .map_err(|reason| ExperimentRunnerError::Bundle {
+                run_id: run_id.to_owned(),
+                reason,
+            })?;
         // Export the exact sealed pre-shutdown cut, including evaluator/RNG and
         // owner-journal state. Reporting its digest alone is not portable state.
         let final_checkpoint_bytes = checkpoint.encode(&path)?;
@@ -2437,7 +2648,7 @@ impl MatchedSeedExperimentRunner {
                 (
                     "exports/summary.csv",
                     "experiment-summary",
-                    summary_csv.as_bytes(),
+                    &summary_csv,
                 ),
                 (
                     "evidence/run.json",
@@ -2614,7 +2825,7 @@ impl MatchedSeedExperimentRunner {
         let evidence_path = bundle_dir.join("evidence/run.json");
         let evidence_bytes =
             read_bounded_file(&evidence_path, MAX_STATUS_BYTES, "read recovery evidence")?;
-        let evidence: RunEvidenceV1 =
+        let evidence: RunEvidenceV2 =
             serde_json::from_slice(&evidence_bytes).map_err(|source| {
                 ExperimentRunnerError::Bundle {
                     run_id: record.run_id.clone(),
@@ -2754,15 +2965,16 @@ impl MatchedSeedExperimentRunner {
         let evidence_path = bundle_dir.join("evidence/run.json");
         let evidence_bytes =
             read_bounded_file(&evidence_path, MAX_STATUS_BYTES, "read run evidence")?;
-        let evidence: RunEvidenceV1 =
+        let evidence: RunEvidenceV2 =
             serde_json::from_slice(&evidence_bytes).map_err(|source| {
                 ExperimentRunnerError::Bundle {
                     run_id: record.run_id.clone(),
                     reason: format!("run evidence JSON is invalid: {source}"),
                 }
             })?;
-        let expected_evidence = RunEvidenceV1 {
-            schema: "scriptbots.experiment-run-evidence.v1".to_owned(),
+        let expected_evidence = RunEvidenceV2 {
+            schema: "scriptbots.experiment-run-evidence.v2".to_owned(),
+            summary_schema_version: EXPERIMENT_SUMMARY_SCHEMA_VERSION,
             plan_digest: plan_digest.to_owned(),
             experiment_id: self.experiment_id.clone(),
             cohort_id: self.cohort.cohort_id.clone(),
@@ -3285,6 +3497,84 @@ pub(crate) fn insert_dotted_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn endpoint_summary_reports_observed_state_and_preserves_unavailable_empty_statistics() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 40,
+            world_height: 40,
+            food_cell_size: 20,
+            initial_food: 0.0,
+            rng_seed: Some(7),
+            ..ScriptBotsConfig::default()
+        })
+        .unwrap();
+        world
+            .try_update_food(|cells| cells.copy_from_slice(&[1.0, 2.0, 4.0, 8.0]))
+            .unwrap();
+        let empty = ExperimentEndpointSummaryV2::from_world(
+            &world,
+            7,
+            "mlp.baseline",
+            "observed-empty-state".into(),
+        )
+        .unwrap();
+        assert_eq!(
+            empty.available_metrics(),
+            BTreeMap::from([
+                ("alive_agents".into(), 0.0),
+                ("total_energy".into(), 0.0),
+                ("total_food".into(), 15.0),
+            ])
+        );
+        assert_eq!(empty.average_energy, None);
+        assert_eq!(empty.average_health, None);
+        assert_eq!(empty.mean_age, None);
+        assert_eq!(empty.max_age, None);
+        assert_eq!(empty.max_generation, None);
+
+        for (energy, health, age, generation) in [(2.0, 1.0, 3, 1), (6.0, 3.0, 9, 4)] {
+            world
+                .try_spawn_agent_with(
+                    scriptbots_core::AgentData {
+                        health,
+                        age,
+                        generation: scriptbots_core::Generation(generation),
+                        ..scriptbots_core::AgentData::default()
+                    },
+                    |runtime| runtime.energy = energy,
+                )
+                .unwrap();
+        }
+        let populated = ExperimentEndpointSummaryV2::from_world(
+            &world,
+            7,
+            "mlp.baseline",
+            "observed-populated-state".into(),
+        )
+        .unwrap();
+        assert_eq!(
+            populated.available_metrics(),
+            BTreeMap::from([
+                ("alive_agents".into(), 2.0),
+                ("total_energy".into(), 8.0),
+                ("average_energy".into(), 4.0),
+                ("average_health".into(), 2.0),
+                ("mean_age".into(), 6.0),
+                ("max_age".into(), 9.0),
+                ("max_generation".into(), 4.0),
+                ("total_food".into(), 15.0),
+            ])
+        );
+        for summary in [empty, populated] {
+            let bytes = summary.canonical_csv_bytes().unwrap();
+            assert!(bytes.len() <= MAX_EXPERIMENT_SUMMARY_BYTES);
+            let mut reader = csv::Reader::from_reader(bytes.as_slice());
+            let mut rows = reader.deserialize::<ExperimentEndpointSummaryV2>();
+            assert_eq!(rows.next().unwrap().unwrap(), summary);
+            assert!(rows.next().is_none());
+        }
+    }
 
     #[test]
     fn experiment_status_snapshot_is_plan_bound_and_read_only() {
@@ -4836,7 +5126,7 @@ mod tests {
         let false_digest = forged.final_digest.as_ref().unwrap();
         let bundle_dir = runner.output_dir.join(&forged.run_id);
         let evidence_path = bundle_dir.join("evidence/run.json");
-        let mut evidence: RunEvidenceV1 =
+        let mut evidence: RunEvidenceV2 =
             serde_json::from_slice(&fs::read(&evidence_path).unwrap()).unwrap();
         evidence.final_digest.clone_from(false_digest);
         fs::write(&evidence_path, serde_json::to_vec(&evidence).unwrap()).unwrap();
@@ -5047,15 +5337,14 @@ mod tests {
 
         let summary_path = bundle_dir.join("exports/summary.csv");
         let original_summary = fs::read(&summary_path).unwrap();
-        let summary = format!(
-            "tick,alive_agents,seed,brain_family,final_digest\n{},{},{},{},{}\n",
-            record.total_ticks,
-            usize::MAX,
-            record.seed,
-            record.brain_family,
-            record.final_digest.as_ref().unwrap()
-        );
-        fs::write(&summary_path, summary.as_bytes()).unwrap();
+        let mut summary = verify_portable_run_bundle(&bundle_dir)
+            .unwrap()
+            .final_state
+            .unwrap()
+            .summary;
+        summary.alive_agents = u32::MAX;
+        let summary = summary.canonical_csv_bytes().unwrap();
+        fs::write(&summary_path, &summary).unwrap();
         let mut changed: RunBundleV1 = serde_json::from_slice(&original_manifest).unwrap();
         let entry = changed
             .artifacts
@@ -5063,7 +5352,7 @@ mod tests {
             .find(|entry| entry.relative_path == "exports/summary.csv")
             .unwrap();
         entry.bytes_len = u64::try_from(summary.len()).unwrap();
-        entry.blake3_hex = blake3::hash(summary.as_bytes()).to_hex().to_string();
+        entry.blake3_hex = blake3::hash(&summary).to_hex().to_string();
         fs::write(&manifest_path, serde_json::to_vec(&changed).unwrap()).unwrap();
         scriptbots_storage::verify_run_bundle(&bundle_dir)
             .expect("a forged population still has valid artifact hashes");

@@ -50,6 +50,7 @@ FrankenPandas (`fp-frame`, `fp-columnar`) and Apache Arrow resolve this at the a
 ### 4.2 Metric Series & Rolling Aggregations
 - **Irregular Ticks:** Metrics sampled at variable frequencies remain sparse in storage. When constructing regular time series in FrankenPandas, missing intervals are populated with `NULL`.
 - **Rolling Windows:**
+  - `sb-analyze summarize --rolling-window N` uses the last `N` recorded observations of each metric, including the current observation. It does not fill gaps or interpret `N` as elapsed ticks; sparse series remain sparse.
   - Rolling aggregations default to `min_periods = 1` during warmup epochs to compute expanding means without producing `NaN` or `NULL` during the ramp-up phase.
   - When `min_periods > window_size`, periods with insufficient observations evaluate to `NULL` (masked by validity bitmap), ensuring statistical rigor.
 - **Variance and Standard Deviation:**
@@ -90,4 +91,18 @@ payloads, SQL engine working memory, file footer metadata or wall-clock duration
 When rendering human-readable markdown summaries (`sb-analyze summarize`):
 - Unobserved groups display a hyphen `"-"` or explicit `0` count with `(no agents recorded)`.
 - Valid float quantities are formatted with fixed precision (e.g. `{:>6.2}`).
-- If an arithmetic `NaN` is detected in any summary metric, the CLI emits a warning diagnostic, identifying potential simulation math anomalies (e.g. division by zero in energy conservation).
+- Non-finite mandatory agent fields or metric observations are refused before aggregation. They are not converted to missing observations or silently dropped.
+
+Summary inputs use the same finished-reader lease and 1,024-row export pages.
+Per-epoch `population` counts agent observations within that epoch, including
+repeat observations of the same agent; it is not a distinct-agent count. Two
+agent traversals preserve the original source-order means and sample standard
+deviations while retaining group accumulators instead of every input sample.
+
+Rolling rows are collected directly into the report and ordered by metric name
+and tick. Each metric is passed to the pinned upstream FrankenPandas rolling
+implementation as one complete series, so page boundaries cannot reset its
+compensated arithmetic. Lineage pages feed the existing descendant graph directly.
+The report, lineage graph and one metric's rolling workspace still grow with their
+respective sizes; paging bounds source-row buffers, not total report memory or
+SQL execution time.

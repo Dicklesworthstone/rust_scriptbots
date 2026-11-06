@@ -79,7 +79,7 @@ enum Command {
         /// Epoch tick interval for demographic grouping (default: 100).
         #[arg(long, default_value_t = 100)]
         epoch_size: u64,
-        /// Rolling window tick duration for metric smoothing (default: 10).
+        /// Observations per metric in the trailing smoothing window (default: 10).
         #[arg(long, default_value_t = 10)]
         rolling_window: usize,
         /// Optional directory to write summary.json and summary.md.

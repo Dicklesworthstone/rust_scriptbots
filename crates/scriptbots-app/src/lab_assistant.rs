@@ -1,10 +1,12 @@
 //! Autonomous LLM lab assistant: canonical proposal -> validation -> matched-seed execution.
 
 use crate::experiment_runner::{
-    ExperimentBatchStatus, MAX_BUNDLE_ARTIFACT_BYTES, MAX_BUNDLE_ARTIFACTS,
-    MAX_BUNDLE_TOTAL_ARTIFACT_BYTES, MatchedSeedCohort, MatchedSeedExperimentRunner,
-    ScenarioVariant, validate_scenario_arm,
+    ExperimentBatchStatus, MAX_EXPERIMENT_SUMMARY_BYTES, MatchedSeedCohort,
+    MatchedSeedExperimentRunner, RunState, ScenarioVariant, validate_scenario_arm,
+    verify_portable_run_bundle,
 };
+#[cfg(test)]
+use crate::experiment_runner::MAX_BUNDLE_ARTIFACT_BYTES;
 use crate::lab::llm::{
     LlmClient, LlmError, LlmMessage, LlmRequest, PROPOSE_EXPERIMENT_TOOL_NAME, StopReason,
     propose_experiment_tool,
@@ -17,16 +19,13 @@ use crate::lab::stats::{
     AnalysisParams, MatchedSeedAnalysis, RunSummary, RunSummaryParts, StatsError,
     analyze_matched_seed_runs,
 };
-use scriptbots_storage::{
-    RunBundleV1, bundle::RunBundleVerificationLimits, bundle::verify_run_bundle_bounded,
-};
+use scriptbots_storage::RunBundleV1;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
 
-const MAX_ANALYSIS_SUMMARY_BYTES: usize = 4_096;
 const MAX_ANALYSIS_BUNDLE_MANIFEST_BYTES: usize = 512 * 1_024;
 
 /// State machine phases for autonomous lab execution.
@@ -278,16 +277,6 @@ fn execution_receipt(
     })
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ExperimentSummaryRow {
-    tick: u64,
-    alive_agents: usize,
-    seed: u64,
-    brain_family: String,
-    final_digest: String,
-}
-
 fn read_bounded_analysis_file(path: &std::path::Path, limit: usize) -> Result<Vec<u8>, String> {
     let file = File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
     let metadata = file
@@ -318,6 +307,12 @@ pub(crate) fn completed_run_summaries(
 ) -> Result<Vec<RunSummary>, String> {
     let mut summaries = Vec::with_capacity(status.runs.len());
     for record in &status.runs {
+        if record.state != RunState::Completed {
+            return Err(format!(
+                "experiment run {} is not completed and cannot supply final endpoints",
+                record.run_id
+            ));
+        }
         let arm_id = record
             .variant_id
             .strip_prefix("arm-")
@@ -390,7 +385,7 @@ pub(crate) fn completed_run_summaries(
         }
 
         let summary_path = bundle_dir.join("exports/summary.csv");
-        let bytes = read_bounded_analysis_file(&summary_path, MAX_ANALYSIS_SUMMARY_BYTES)?;
+        let bytes = read_bounded_analysis_file(&summary_path, MAX_EXPERIMENT_SUMMARY_BYTES)?;
         if summary_entry.bytes_len != u64::try_from(bytes.len()).unwrap_or(u64::MAX)
             || summary_entry.blake3_hex != blake3::hash(&bytes).to_hex().as_str()
         {
@@ -399,20 +394,33 @@ pub(crate) fn completed_run_summaries(
                 summary_path.display()
             ));
         }
-        let mut reader = csv::ReaderBuilder::new()
-            .has_headers(true)
-            .from_reader(bytes.as_slice());
-        let mut rows = reader.deserialize::<ExperimentSummaryRow>();
-        let row = rows
-            .next()
-            .ok_or_else(|| format!("summary {} has no data row", summary_path.display()))?
-            .map_err(|error| format!("parse {}: {error}", summary_path.display()))?;
-        if rows.next().is_some() {
+        let verified = verify_portable_run_bundle(&bundle_dir).map_err(|error| {
+            format!(
+                "bundle {} failed final-state endpoint verification: {error}",
+                bundle_dir.display()
+            )
+        })?;
+        if verified.bundle_manifest_digest != blake3::hash(&bundle_bytes).to_hex().as_str() {
             return Err(format!(
-                "summary {} must contain exactly one data row",
+                "bundle {} manifest changed during analysis ingestion",
+                bundle_dir.display()
+            ));
+        }
+        let final_state = verified.final_state.ok_or_else(|| {
+            format!(
+                "bundle {} has no verified experiment endpoint summary",
+                bundle_dir.display()
+            )
+        })?;
+        if final_state.run_id != record.run_id
+            || final_state.summary_artifact_digest != summary_entry.blake3_hex
+        {
+            return Err(format!(
+                "summary {} no longer matches its verified run or bundle artifact entry",
                 summary_path.display()
             ));
         }
+        let row = final_state.summary;
         let final_digest = record.final_digest.as_ref().ok_or_else(|| {
             format!(
                 "completed experiment run {} has no final digest",
@@ -433,29 +441,6 @@ pub(crate) fn completed_run_summaries(
                 ));
             }
         }
-        let alive_agents = u32::try_from(row.alive_agents).map_err(|_| {
-            format!(
-                "summary {} alive_agents {} exceeds the bounded reporting representation",
-                summary_path.display(),
-                row.alive_agents
-            )
-        })?;
-        verify_run_bundle_bounded(
-            &bundle_dir,
-            RunBundleVerificationLimits {
-                max_manifest_bytes: u64::try_from(MAX_ANALYSIS_BUNDLE_MANIFEST_BYTES)
-                    .unwrap_or(u64::MAX),
-                max_artifacts: MAX_BUNDLE_ARTIFACTS,
-                max_artifact_bytes: MAX_BUNDLE_ARTIFACT_BYTES,
-                max_total_artifact_bytes: MAX_BUNDLE_TOTAL_ARTIFACT_BYTES,
-            },
-        )
-        .map_err(|error| {
-            format!(
-                "bundle {} changed before analysis: {error}",
-                bundle_dir.display()
-            )
-        })?;
         // The arm's actual overrides, not just its ordinal. An out-of-range arm is a hard
         // error rather than an empty map: empty overrides are a VALID config (the defaults),
         // so defaulting here would digest a broken run as a clean default-config run.
@@ -469,6 +454,7 @@ pub(crate) fn completed_run_summaries(
                 )
             })?
             .clone();
+        let metrics = row.available_metrics();
         summaries.push(RunSummary::from_verified_parts(RunSummaryParts {
             run_id: record.run_id.clone(),
             arm_id,
@@ -476,7 +462,7 @@ pub(crate) fn completed_run_summaries(
             config_digest: bundle.manifest.config_digest.clone(),
             digest: row.final_digest,
             ticks: row.tick,
-            metrics: BTreeMap::from([("alive_agents".to_owned(), f64::from(alive_agents))]),
+            metrics,
             summary_artifact_digest: summary_entry.blake3_hex.clone(),
             summary_path: Some(summary_path.to_string_lossy().into_owned()),
             variant_id: record.variant_id.clone(),
@@ -1661,6 +1647,133 @@ mod tests {
     }
 
     #[test]
+    fn real_lab_pipeline_analyzes_and_reports_verified_energy_and_food_endpoints() {
+        let temp = tempfile::tempdir().expect("temporary experiment root");
+        let root = temp.path().canonicalize().expect("canonical fixture root");
+        let mut input = valid_input();
+        input["metrics"] = serde_json::json!(["average_energy", "total_food"]);
+        let client = ScriptedClient::new("offline-scripted", vec![tool_turn(input)]);
+        let mut lab = LabStateMachine::new(
+            Box::new(client),
+            LabBudget {
+                max_runs: 4,
+                max_ticks: 8,
+                max_tokens: 1_000,
+                max_iterations: 10,
+            },
+            root,
+        );
+        for expected in [
+            LabPhase::Validate,
+            LabPhase::Execute,
+            LabPhase::Analyze,
+            LabPhase::Report,
+            LabPhase::Finished,
+        ] {
+            assert_eq!(lab.step().expect("real endpoint pipeline"), expected);
+        }
+        let analysis = lab.analysis.as_ref().expect("analysis retained");
+        assert_eq!(analysis.effects.len(), 2);
+        assert_eq!(
+            analysis
+                .effects
+                .iter()
+                .map(|effect| effect.metric.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["average_energy", "total_food"])
+        );
+        for run in &lab.run_summaries {
+            assert_eq!(run.metrics.len(), crate::lab::spec::KNOWN_METRICS.len());
+            assert!(run.metrics.values().all(|value| value.is_finite()));
+            let summary_path = std::path::Path::new(run.summary_path.as_ref().unwrap());
+            let bundle = summary_path.parent().unwrap().parent().unwrap();
+            let observed = verify_portable_run_bundle(bundle)
+                .unwrap()
+                .final_state
+                .unwrap();
+            assert_eq!(run.metrics, observed.summary.available_metrics());
+            assert_eq!(run.summary_artifact_digest, observed.summary_artifact_digest);
+        }
+        let notebook = lab.rendered_notebook.as_ref().expect("report retained");
+        assert!(notebook.contains("average_energy"));
+        assert!(notebook.contains("total_food"));
+        assert!(notebook.contains("Matched Pairs**: 2"));
+    }
+
+    #[test]
+    fn extinct_cohorts_keep_totals_but_refuse_unobserved_population_endpoints() {
+        let temp = tempfile::tempdir().unwrap();
+        let common = BTreeMap::from([
+            ("food_intake_rate".to_owned(), serde_json::json!(0.0)),
+            ("movement_drain".to_owned(), serde_json::json!(0.0)),
+            ("spike_damage".to_owned(), serde_json::json!(0.0)),
+            ("temperature_discomfort_rate".to_owned(), serde_json::json!(0.0)),
+            ("population_minimum".to_owned(), serde_json::json!(0)),
+            ("population_spawn_interval".to_owned(), serde_json::json!(0)),
+        ]);
+        let arms = [0.0, 1.0]
+            .into_iter()
+            .map(|drain| {
+                let mut arm = common.clone();
+                arm.insert("metabolism_drain".to_owned(), serde_json::json!(drain));
+                arm
+            })
+            .collect::<Vec<_>>();
+        let variants = arms
+            .iter()
+            .enumerate()
+            .map(|(index, arm)| ScenarioVariant {
+                variant_id: format!("arm-{index:03}"),
+                brain_family: "mlp".to_owned(),
+                config_overrides: arm.clone(),
+            })
+            .collect();
+        let runner = MatchedSeedExperimentRunner::new(
+            "extinct-endpoints",
+            MatchedSeedCohort {
+                cohort_id: "matched-seeds".to_owned(),
+                seeds: vec![41, 42],
+            },
+            variants,
+            3,
+            2,
+            temp.path().join("bundles"),
+        );
+        let status = runner.execute_batch(&temp.path().join("status.json")).unwrap();
+        assert_eq!(status.completed_runs, 4);
+        assert_eq!(status.failed_runs, 0);
+        let summaries = completed_run_summaries(&arms, &status).unwrap();
+        for run in summaries.iter().filter(|run| run.arm_id == 1) {
+            assert_eq!(run.metrics["alive_agents"].to_bits(), 0.0_f64.to_bits());
+            assert_eq!(run.metrics["total_energy"].to_bits(), 0.0_f64.to_bits());
+            for missing in [
+                "average_energy",
+                "average_health",
+                "mean_age",
+                "max_age",
+                "max_generation",
+            ] {
+                assert!(!run.metrics.contains_key(missing), "{missing} was imputed");
+            }
+        }
+        analyze_matched_seed_runs(
+            &summaries,
+            &["alive_agents".to_owned(), "total_energy".to_owned()],
+            AnalysisParams::default(),
+        )
+        .expect("observed zero totals remain valid endpoints");
+        assert_eq!(
+            analyze_matched_seed_runs(
+                &summaries,
+                &["average_energy".to_owned()],
+                AnalysisParams::default(),
+            )
+            .unwrap_err(),
+            StatsError::MissingMetric("average_energy".to_owned())
+        );
+    }
+
+    #[test]
     fn analysis_ingestion_rejects_a_summary_changed_after_bundle_verification() {
         let proposed: ExperimentSpec =
             serde_json::from_value(valid_input()).expect("canonical proposal");
@@ -1724,6 +1837,49 @@ mod tests {
             error.contains("no longer matches its verified bundle artifact entry"),
             "unexpected refusal: {error}"
         );
+
+        // Coherent outer checksums cannot turn invented endpoints, missing values,
+        // non-finite observations or a legacy schema into scientific evidence.
+        let original: RunBundleV1 = serde_json::from_slice(&manifest_bytes).unwrap();
+        let headers = header.split(',').collect::<Vec<_>>();
+        let original_cells = row.split(',').map(str::to_owned).collect::<Vec<_>>();
+        for (field, value) in [
+            ("total_energy", "123456789.5"),
+            ("average_energy", "123456789.5"),
+            ("average_health", "123456789.5"),
+            ("mean_age", "123456789.5"),
+            ("max_age", "123456789"),
+            ("max_generation", "123456789"),
+            ("total_food", "123456789.5"),
+            ("average_energy", ""),
+            ("average_health", "NaN"),
+            ("schema_version", "1"),
+        ] {
+            let index = headers.iter().position(|header| *header == field).unwrap();
+            let mut cells = original_cells.clone();
+            cells[index] = value.to_owned();
+            let forged = format!("{header}\n{}\n", cells.join(","));
+            fs::write(&summary_path, forged.as_bytes()).unwrap();
+            let mut manifest = original.clone();
+            let entry = manifest
+                .artifacts
+                .iter_mut()
+                .find(|entry| entry.relative_path == "exports/summary.csv")
+                .unwrap();
+            entry.bytes_len = u64::try_from(forged.len()).unwrap();
+            entry.blake3_hex = blake3::hash(forged.as_bytes()).to_hex().to_string();
+            fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+            scriptbots_storage::verify_run_bundle(&bundle_dir)
+                .expect("forged endpoint retains coherent artifact hashes");
+            let error = completed_run_summaries(&validated.arms, &status)
+                .expect_err("only restored observations may enter cohort analysis");
+            assert!(
+                error.contains("V2 endpoint summary differs"),
+                "{field}={value:?}: {error}"
+            );
+        }
+        fs::write(&summary_path, summary.as_bytes()).unwrap();
+        fs::write(&manifest_path, manifest_bytes).unwrap();
     }
 
     #[test]

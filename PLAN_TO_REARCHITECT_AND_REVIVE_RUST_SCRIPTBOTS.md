@@ -3647,6 +3647,22 @@ clean source-status and source-diff digests plus Cargo.lock digest
 
 ### 7.7 experiment runner
 
+**Source implementation extension — Codex, 2026-11-05:** The runner and Lab now
+share eight final-state endpoints: population, total/mean live-agent energy,
+mean health, mean/max current age counter, max living generation and total food.
+Agent-UID-ordered `f64` reductions and row-major food reduction feed a typed V2
+summary and canonical CSV. V2 run evidence binds the summary schema; the portable
+verifier recomputes the complete summary from the restored final owner cut. Lab
+consumes those verified values, pins the selected manifest/summary digests, and
+uses the existing matched-seed statistics and notebook path. Proposal schema and
+validation share the same metric catalog. Extinction retains zero population and
+energy totals while population means/maxima remain unavailable, causing refusal
+when explicitly requested. Regression source covers known-world endpoints, CSV
+round trips, real energy/food analysis and reports, extinction, and checksum-valid
+semantic forgeries. V1 experiment summaries/evidence are deliberately refused.
+Native DSR qualification remains open; the extension adds no per-tick persistence
+history, dependencies, statistical thresholds or scientific-baseline changes.
+
 The headless experiment runner accepts a declarative experiment:
 
 ```toml
@@ -3667,6 +3683,28 @@ brain_families = ["dwraon"]
 It supports matched seeds, bounded parallelism, checkpoint/branch experiments, resumable runs, and machine-readable progress. It never launches a renderer unless asked.
 
 ### 7.8 offline analysis integrations
+
+**Source implementation extension — Codex, 2026-11-05:** Cohort and descriptive
+comparisons now support explicitly selected runs inside one finished database.
+Borrowed run views retain the original connection and file lease, preserve the
+reader's selected run and narrative cache, and keep per-run manifest, exact-endpoint,
+island and path-identity validation. The selected context run itself must appear
+among cohort controls. Regression source covers a 12-seed cohort repacked into one
+database, explicit and ambiguous selections, writer exclusion, symlink aliases,
+secondary-run corruption and unchanged source observations/statistics. Native DSR
+qualification remains open; no inference thresholds or scientific baselines changed.
+
+**Source implementation extension — Codex, 2026-11-05:** Summary inputs now stream
+through the existing typed pages. Two agent traversals retain group accumulators
+and preserve source-order means and sample deviations, including signed-zero sum
+identities. Metrics are collected directly into final report rows and passed one
+complete series at a time to the unchanged pinned FrankenPandas rolling kernel;
+lineage pages feed the existing graph. Observation-count windows and population
+counts retain their original meaning. Regression source compares paged output
+with the materialized strategy across demographic/page boundaries, sparse series,
+default and oversized windows, singleton groups, lineage fallback and non-finite
+source refusals. Output, graph and per-metric workspace remain explicit memory
+costs. Native DSR qualification and measured performance evidence remain open.
 
 **Source implementation update — Codex, 2026-11-05:** Table export now supports
 bounded Parquet/Arrow production and full-data readback. Storage exposes

@@ -668,8 +668,9 @@ export does not checkpoint or rewrite the source. The copied database is indepen
 and compared with the manifest, events, checkpoints, maximum tick and persistence watermarks
 before the final bundle manifest is written. `--verify-bundle DIRECTORY` repeats those logical
 checks alongside artifact hashes. For matched-seed experiment bundles it also restores the
-included final HostCore checkpoint and compares the actual scientific digest and population
-with the reports. The printed `Scientific final state` line names those observed values;
+included final HostCore checkpoint and compares the actual scientific digest, population
+and complete V2 endpoint summary with the reports. The printed `Scientific final state`
+line names the observed digest and population;
 renaming or moving the bundle does not require its external continuation file or status.
 This checks the saved result, not the whole cohort plan or source authenticity, and does not
 promote incomplete build provenance to reproducibility. Database-free experiment bundles
@@ -1105,6 +1106,25 @@ event capacity during a run are also refused; unrelated authenticated configurat
 revisions are supported. The report does not use saved narrative outputs to supply
 its reconstructed events.
 
+### Streaming demographic and metric summaries
+
+```bash
+sb-analyze runs/example.sqlite summarize --epoch-size 100 --rolling-window 10 --json summary.json --md summary.md
+```
+
+Summaries read agent, metric and lineage inputs in pages of at most 1,024 rows.
+Per-epoch diet and brain counts represent recorded agent observations; repeated
+observations of an agent contribute separately. Two agent passes preserve the
+existing source-order means and sample standard deviations without retaining
+every raw sample.
+
+The rolling window counts observations of each metric, including the current
+observation. Sparse tick gaps remain sparse. The pinned FrankenPandas rolling
+implementation processes each complete metric series, preserving its arithmetic
+across storage page boundaries. The final report, descendant graph and workspace
+for one metric series still require memory proportional to their sizes. Source
+paging does not impose a total-memory or SQL execution-time bound.
+
 ### Matched-seed endpoint comparisons
 
 Use `compare-runs` with a cohort manifest to compare independent simulation runs.
@@ -1145,8 +1165,10 @@ also refused. Within each arm, launch configuration other than `rng_seed`,
 population recipe, scheduled interventions, brain roster, build identity and
 execution policy must agree. The selected CLI database/run
 must be one of the declared controls. Add `"run_id": "<32 lowercase hex digits>"`
-to an entry when its database contains multiple runs; the already selected
-context database can contribute only its selected run.
+to each entry when its database contains multiple runs. A finished database can
+contribute several runs to either arm. Runs in the selected CLI database borrow
+its existing connection and file lease; inspecting them leaves the CLI's selected
+run unchanged. The selected run itself must appear among the declared controls.
 
 The manifest is limited to 1 MiB, 128 pairs and 64 metrics. With at least two
 matched pairs, the report bootstraps paired endpoint differences, uses paired
@@ -1159,6 +1181,11 @@ For a descriptive comparison of just two runs, the existing form remains useful:
 ```bash
 sb-analyze runs/control.sqlite run compare-runs --params treatment_db=runs/treatment.sqlite --params endpoint_tick=600 --json pair.json
 ```
+
+For two runs in one database, use `--run-id` to select the control and
+`--params treatment_run_id=<run-id>` to select the treatment, with the same
+database path in `treatment_db`. The two run IDs must differ. Omitting a run ID
+in a multi-run source is refused, including when that source is already open.
 
 `endpoint_tick` can be omitted when both runs share a terminal tick. This mode,
 and a cohort with only one matched pair, reports endpoint differences with
@@ -1445,6 +1472,36 @@ counts existing binary artifacts without labelling them current-run checkpoints.
 `SCRIPTBOTS_ARTIFACTS_DIR` for an explicit directory; otherwise each control service reserves
 a unique temporary directory. Files, including partial failed captures, are never automatically
 removed or overwritten.
+
+Completed experiment bundles expose these final-state outcomes in
+`exports/summary.csv`. The same metric names are available to Lab proposals,
+paired analysis and notebook reports:
+
+| Metric | Observation at the final tick | Empty population |
+| --- | --- | --- |
+| `alive_agents` | Number of living agents | `0` |
+| `total_energy` | Sum of living agents' energy reserves | `0` |
+| `average_energy` | Mean living-agent energy | Unavailable |
+| `average_health` | Mean living-agent health | Unavailable |
+| `mean_age` | Mean current age counter | Unavailable |
+| `max_age` | Largest current age counter | Unavailable |
+| `max_generation` | Largest living lineage generation | Unavailable |
+| `total_food` | Sum of current food-grid cell values | Observed grid total |
+
+Age counters advance at the configured aging cadence. Agent measurements use
+`f64` reductions in stable agent-UID order; food uses row-major cell order.
+The portable verifier recomputes these observations from the final checkpoint
+and requires exact canonical summary bytes. Lab takes its analysis values from
+that verified projection and checks the selected manifest and summary digests.
+A proposal can request, for example, `"metrics": ["average_energy", "total_food"]`.
+Every requested endpoint must be available in every matched run. Unavailable
+population statistics use empty CSV cells and cause analysis to refuse that
+requested metric; they are never replaced with zero.
+
+The summary now declares `schema_version=2`, bound by
+`scriptbots.experiment-run-evidence.v2`. Verification and completed-run recovery
+refuse earlier V1 experiment summaries/evidence. Existing files are preserved;
+there is no implicit conversion to the new measurement contract.
 
 For experiment recovery after a server restart, configure the same explicit
 `SCRIPTBOTS_ARTIFACTS_DIR`. Experiment creation saves a versioned, checksummed
