@@ -1843,10 +1843,220 @@ async fn get_hydrology_snapshot(
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StreamResumeQuery {
     after_tick: Option<u64>,
-    #[allow(dead_code)]
     after_revision: Option<u64>,
+    session_id: Option<u64>,
+}
+
+impl StreamResumeQuery {
+    fn with_sse_cursor(mut self, headers: &HeaderMap) -> Result<Self, AppError> {
+        self.validate()?;
+        // EventSource reconnects with its original URL. Its last consumed
+        // publication must supersede that URL's bootstrap after_revision=0.
+        // The existing explicit after_tick override remains tick-only.
+        if self.after_tick.is_none()
+            && let Some(value) = headers.get("last-event-id")
+        {
+            let value = value.to_str().map_err(|_| {
+                AppError::bad_request("Last-Event-ID must be a tick or pub:session:revision cursor")
+            })?;
+            if let Some(cursor) = value.strip_prefix("pub:") {
+                let (session, revision) = cursor.split_once(':').ok_or_else(|| {
+                    AppError::bad_request("publication cursor must be pub:session:revision")
+                })?;
+                let session = parse_tick_stream_cursor(session)?;
+                if self.session_id.is_some_and(|expected| expected != session) {
+                    return Err(AppError::bad_request(
+                        "session_id conflicts with Last-Event-ID",
+                    ));
+                }
+                self.session_id = Some(session);
+                self.after_revision = Some(parse_tick_stream_cursor(revision)?);
+            } else {
+                if self.after_revision.is_some() {
+                    return Err(AppError::bad_request(
+                        "publication mode requires a pub:session:revision Last-Event-ID",
+                    ));
+                }
+                self.after_tick = Some(parse_tick_stream_cursor(value)?);
+            }
+        }
+        self.validate()?;
+        Ok(self)
+    }
+
+    fn validate(&self) -> Result<(), AppError> {
+        if self.after_tick.is_some() && self.after_revision.is_some() {
+            return Err(AppError::bad_request(
+                "after_tick and after_revision select different stream modes; supply only one",
+            ));
+        }
+        if self.session_id.is_some() && self.after_revision.is_none() {
+            return Err(AppError::bad_request(
+                "session_id requires an after_revision cursor",
+            ));
+        }
+        if self.session_id == Some(0) {
+            return Err(AppError::bad_request("session_id must be nonzero"));
+        }
+        Ok(())
+    }
+
+    fn publication_subscription(
+        &self,
+        snapshot: &RenderSnapshot,
+    ) -> Result<Option<RemoteSubscription>, AppError> {
+        self.validate()?;
+        let Some(revision) = self.after_revision else {
+            return Ok(None);
+        };
+        let request = RemoteSubscriptionRequest {
+            protocol_version: REMOTE_PROTOCOL_VERSION,
+            request_id: None,
+            command: "subscribe".to_owned(),
+            channels: vec![RemoteChannel::Telemetry],
+            max_fps: 4,
+            resume: Some(
+                scriptbots_runtime::remote_subscription::RemoteResumeRequest {
+                    session_id: self
+                        .session_id
+                        .unwrap_or(snapshot.session_id.get())
+                        .to_string(),
+                    after_revision: Some(revision.to_string()),
+                    after_event: None,
+                },
+            ),
+        };
+        RemoteSubscription::new(&request, snapshot)
+            .map(Some)
+            .map_err(remote_subscription_error)
+    }
+}
+
+fn parse_tick_stream_cursor(value: &str) -> Result<u64, AppError> {
+    let parsed = value.parse::<u64>().map_err(|_| {
+        AppError::bad_request("stream cursors must be canonical unsigned decimal integers")
+    })?;
+    if parsed.to_string() != value {
+        return Err(AppError::bad_request(
+            "stream cursors must be canonical unsigned decimal integers",
+        ));
+    }
+    Ok(parsed)
+}
+
+struct TickPublicationMessage {
+    event: &'static str,
+    id: Option<String>,
+    data: String,
+}
+
+impl TickPublicationMessage {
+    fn error(error: AppError) -> Self {
+        Self {
+            event: "error",
+            id: None,
+            data: json!({
+                "type": "error", "status": error.status.as_u16(), "message": error.message,
+            })
+            .to_string(),
+        }
+    }
+
+    fn into_sse(self) -> Result<Event, Infallible> {
+        let mut event = Event::default().event(self.event).data(self.data);
+        if let Some(id) = self.id {
+            event = event.id(id);
+        }
+        Ok(event)
+    }
+
+    fn into_ndjson(self) -> Result<axum::body::Bytes, Infallible> {
+        Ok(axum::body::Bytes::from(format!("{}\n", self.data)))
+    }
+}
+
+fn poll_tick_publication(
+    snapshot: &RenderSnapshot,
+    subscription: &mut RemoteSubscription,
+) -> Result<Option<TickPublicationMessage>, AppError> {
+    let Some(frame) = subscription
+        .next_frame(RemoteChannel::Telemetry, snapshot)
+        .map_err(remote_subscription_error)?
+    else {
+        return Ok(None);
+    };
+    let scriptbots_runtime::remote::RemoteFramePayload::Telemetry(summary) = &frame.payload else {
+        return Err(AppError::internal(
+            "tick publication returned a non-telemetry frame",
+        ));
+    };
+    let identity = frame.identity;
+    let data = json!({
+        "schema": "scriptbots.tick-publication.v1",
+        "session_id": identity.session_id.to_string(),
+        "publication_revision": identity.publication_revision.to_string(),
+        "scientific_revision": identity.scientific_revision.to_string(),
+        "control_revision": identity.control_revision.to_string(),
+        "config_revision": identity.config_revision.to_string(),
+        "coalesced_publications": frame.coalesced_publications,
+        "playback": frame.playback,
+        "lifecycle": snapshot.lifecycle,
+        "health": snapshot.health,
+        "summary": summary,
+    })
+    .to_string();
+    subscription
+        .delivered(&frame)
+        .map_err(remote_subscription_error)?;
+    Ok(Some(TickPublicationMessage {
+        event: "publication",
+        id: Some(format!(
+            "pub:{}:{}",
+            identity.session_id, identity.publication_revision
+        )),
+        data,
+    }))
+}
+
+fn tick_publication_stream(
+    handle: ControlHandle,
+    subscription: RemoteSubscription,
+) -> impl Stream<Item = TickPublicationMessage> {
+    let mut interval = tokio::time::interval(Duration::from_millis(250));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    futures_util::stream::unfold(Some((handle, subscription, interval)), |state| async move {
+        let (handle, mut subscription, mut interval) = state?;
+        interval.tick().await;
+        let reader = handle.clone();
+        // The initial summary can scan the population; keep it, serialization,
+        // and protocol validation off the async worker. A slow reader retains
+        // only this one prepared publication, never a per-tick outbound queue.
+        let result = tokio::task::spawn_blocking(move || {
+            let result = reader
+                .read_snapshot()
+                .map_err(AppError::from)
+                .and_then(|snapshot| poll_tick_publication(&snapshot, &mut subscription));
+            (subscription, result)
+        })
+        .await;
+        match result {
+            Ok((subscription, Ok(message))) => Some((
+                message.into_iter().collect::<Vec<_>>(),
+                Some((handle, subscription, interval)),
+            )),
+            Ok((_, Err(error))) => Some((vec![TickPublicationMessage::error(error)], None)),
+            Err(error) => Some((
+                vec![TickPublicationMessage::error(AppError::internal(format!(
+                    "tick publication task failed: {error}"
+                )))],
+                None,
+            )),
+        }
+    })
+    .flat_map(futures_util::stream::iter)
 }
 
 fn current_tick_summary_from_snapshot(snapshot: &RenderSnapshot) -> scriptbots_core::TickSummary {
@@ -1873,92 +2083,95 @@ fn current_tick_summary_from_snapshot(snapshot: &RenderSnapshot) -> scriptbots_c
         })
 }
 
+fn tick_history_messages(
+    snapshot: &RenderSnapshot,
+    after_tick: Option<u64>,
+) -> Vec<TickPublicationMessage> {
+    let current = current_tick_summary_from_snapshot(snapshot);
+    let current_tick = current.tick.0;
+    let mut messages = Vec::new();
+    let summary_message = |summary: &scriptbots_core::TickSummary| TickPublicationMessage {
+        event: "tick",
+        id: Some(summary.tick.0.to_string()),
+        data: json!(TickSummaryDto::from(summary.clone())).to_string(),
+    };
+    let Some(last) = after_tick else {
+        messages.push(summary_message(&current));
+        return messages;
+    };
+    if last > current_tick {
+        messages.push(TickPublicationMessage {
+            event: "gap",
+            // Only receiving the following summary advances the client cursor.
+            id: None,
+            data: json!({
+                "gap": true, "resumed_from": last, "current": current_tick,
+                "reason": "world_reset_or_future_cursor",
+            }).to_string(),
+        });
+        messages.push(summary_message(&current));
+        return messages;
+    }
+    if last == current_tick {
+        return messages;
+    }
+
+    let mut previous = last;
+    for summary in snapshot
+        .summary_history
+        .iter()
+        .filter(|summary| summary.tick.0 > last && summary.tick.0 < current_tick)
+        .chain(std::iter::once(&current))
+    {
+        if summary.tick.0.saturating_sub(previous) > 1 {
+            messages.push(TickPublicationMessage {
+                event: "gap",
+                id: Some(previous.to_string()),
+                data: json!({
+                    "gap": true, "resumed_from": previous,
+                    "first_missing": previous + 1, "last_missing": summary.tick.0 - 1,
+                    "earliest_retained": summary.tick.0, "current": current_tick,
+                })
+                .to_string(),
+            });
+        }
+        messages.push(summary_message(summary));
+        previous = summary.tick.0;
+    }
+    messages
+}
+
+fn poll_tick_summaries(
+    handle: &ControlHandle,
+    last_sent_tick: &std::sync::atomic::AtomicU64,
+    has_filter: &std::sync::atomic::AtomicBool,
+) -> Vec<TickPublicationMessage> {
+    let snapshot = match handle.read_snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(_) => return Vec::new(),
+    };
+    let after_tick = has_filter
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .then(|| last_sent_tick.load(std::sync::atomic::Ordering::Relaxed));
+    let messages = tick_history_messages(&snapshot, after_tick);
+    if let Some(id) = messages.last().and_then(|message| message.id.as_deref())
+        && let Ok(tick) = id.parse()
+    {
+        last_sent_tick.store(tick, std::sync::atomic::Ordering::Relaxed);
+        has_filter.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    messages
+}
+
 fn poll_tick_summaries_for_sse(
     handle: &ControlHandle,
     last_sent_tick: &std::sync::atomic::AtomicU64,
     has_filter: &std::sync::atomic::AtomicBool,
 ) -> Vec<Result<Event, Infallible>> {
-    let mut events = Vec::new();
-    let snapshot = match handle.read_snapshot() {
-        Ok(s) => s,
-        Err(_) => return events,
-    };
-    let current_summary = current_tick_summary_from_snapshot(&snapshot);
-    let current_tick = current_summary.tick.0;
-
-    if !has_filter.load(std::sync::atomic::Ordering::Relaxed) {
-        let json = serde_json::to_string(&TickSummaryDto::from(current_summary))
-            .unwrap_or_else(|_| "{}".to_string());
-        events.push(Ok(Event::default()
-            .event("tick")
-            .id(current_tick.to_string())
-            .data(json)));
-        last_sent_tick.store(current_tick, std::sync::atomic::Ordering::Relaxed);
-        has_filter.store(true, std::sync::atomic::Ordering::Relaxed);
-        return events;
-    }
-
-    let last = last_sent_tick.load(std::sync::atomic::Ordering::Relaxed);
-    if last > current_tick {
-        let gap_data = serde_json::json!({
-            "gap": true,
-            "resumed_from": last,
-            "current": current_tick,
-            "reason": "world_reset_or_future_cursor",
-        });
-        events.push(Ok(Event::default()
-            .event("gap")
-            .id(current_tick.to_string())
-            .data(gap_data.to_string())));
-        let json = serde_json::to_string(&TickSummaryDto::from(current_summary))
-            .unwrap_or_else(|_| "{}".to_string());
-        events.push(Ok(Event::default()
-            .event("tick")
-            .id(current_tick.to_string())
-            .data(json)));
-        last_sent_tick.store(current_tick, std::sync::atomic::Ordering::Relaxed);
-        return events;
-    }
-    if current_tick <= last {
-        return events;
-    }
-
-    let oldest_tick_in_history = snapshot.summary_history.first().map(|s| s.tick.0);
-    if let Some(oldest) = oldest_tick_in_history
-        && last + 1 < oldest
-    {
-        let gap_data = serde_json::json!({
-            "gap": true,
-            "resumed_from": last,
-            "earliest_retained": oldest,
-            "current": current_tick,
-        });
-        events.push(Ok(Event::default()
-            .event("gap")
-            .id(last.to_string())
-            .data(gap_data.to_string())));
-    }
-
-    for summary in snapshot.summary_history.iter() {
-        if summary.tick.0 > last && summary.tick.0 < current_tick {
-            let json = serde_json::to_string(&TickSummaryDto::from(summary.clone()))
-                .unwrap_or_else(|_| "{}".to_string());
-            events.push(Ok(Event::default()
-                .event("tick")
-                .id(summary.tick.0.to_string())
-                .data(json)));
-        }
-    }
-
-    let json = serde_json::to_string(&TickSummaryDto::from(current_summary))
-        .unwrap_or_else(|_| "{}".to_string());
-    events.push(Ok(Event::default()
-        .event("tick")
-        .id(current_tick.to_string())
-        .data(json)));
-
-    last_sent_tick.store(current_tick, std::sync::atomic::Ordering::Relaxed);
-    events
+    poll_tick_summaries(handle, last_sent_tick, has_filter)
+        .into_iter()
+        .map(TickPublicationMessage::into_sse)
+        .collect()
 }
 
 fn poll_tick_summaries_for_ndjson(
@@ -1966,81 +2179,23 @@ fn poll_tick_summaries_for_ndjson(
     last_sent_tick: &std::sync::atomic::AtomicU64,
     has_filter: &std::sync::atomic::AtomicBool,
 ) -> Vec<Result<axum::body::Bytes, Infallible>> {
-    let mut lines = Vec::new();
-    let snapshot = match handle.read_snapshot() {
-        Ok(s) => s,
-        Err(_) => return lines,
-    };
-    let current_summary = current_tick_summary_from_snapshot(&snapshot);
-    let current_tick = current_summary.tick.0;
-
-    if !has_filter.load(std::sync::atomic::Ordering::Relaxed) {
-        let json = serde_json::to_string(&TickSummaryDto::from(current_summary))
-            .unwrap_or_else(|_| "{}".to_string());
-        lines.push(Ok(axum::body::Bytes::from(format!("{json}\n"))));
-        last_sent_tick.store(current_tick, std::sync::atomic::Ordering::Relaxed);
-        has_filter.store(true, std::sync::atomic::Ordering::Relaxed);
-        return lines;
-    }
-
-    let last = last_sent_tick.load(std::sync::atomic::Ordering::Relaxed);
-    if last > current_tick {
-        let gap_data = serde_json::json!({
-            "gap": true,
-            "resumed_from": last,
-            "current": current_tick,
-            "reason": "world_reset_or_future_cursor",
-        });
-        lines.push(Ok(axum::body::Bytes::from(format!("{gap_data}\n"))));
-        let json = serde_json::to_string(&TickSummaryDto::from(current_summary))
-            .unwrap_or_else(|_| "{}".to_string());
-        lines.push(Ok(axum::body::Bytes::from(format!("{json}\n"))));
-        last_sent_tick.store(current_tick, std::sync::atomic::Ordering::Relaxed);
-        return lines;
-    }
-    if current_tick <= last {
-        return lines;
-    }
-
-    let oldest_tick_in_history = snapshot.summary_history.first().map(|s| s.tick.0);
-    if let Some(oldest) = oldest_tick_in_history
-        && last + 1 < oldest
-    {
-        let gap_data = serde_json::json!({
-            "gap": true,
-            "resumed_from": last,
-            "earliest_retained": oldest,
-            "current": current_tick,
-        });
-        lines.push(Ok(axum::body::Bytes::from(format!("{gap_data}\n"))));
-    }
-
-    for summary in snapshot.summary_history.iter() {
-        if summary.tick.0 > last && summary.tick.0 < current_tick {
-            let json = serde_json::to_string(&TickSummaryDto::from(summary.clone()))
-                .unwrap_or_else(|_| "{}".to_string());
-            lines.push(Ok(axum::body::Bytes::from(format!("{json}\n"))));
-        }
-    }
-
-    let json = serde_json::to_string(&TickSummaryDto::from(current_summary))
-        .unwrap_or_else(|_| "{}".to_string());
-    lines.push(Ok(axum::body::Bytes::from(format!("{json}\n"))));
-
-    last_sent_tick.store(current_tick, std::sync::atomic::Ordering::Relaxed);
-    lines
+    poll_tick_summaries(handle, last_sent_tick, has_filter)
+        .into_iter()
+        .map(TickPublicationMessage::into_ndjson)
+        .collect()
 }
 
 /// Stream latest tick summaries as Server-Sent Events (SSE).
 ///
-/// Supports reconnection and gap detection via `Last-Event-ID` header or `?after_tick=`.
+/// Supports retained tick history or session-bound latest-publication cursors.
 #[utoipa::path(
     get,
     path = "/api/ticks/stream",
     tag = "control",
     params(
         ("after_tick" = Option<u64>, Query, description = "Resume strictly after tick"),
-        ("after_revision" = Option<u64>, Query, description = "Resume strictly after publication revision")
+        ("after_revision" = Option<u64>, Query, description = "Select latest-publication mode and resume strictly after this revision; includes same-tick control changes and coalesced counts"),
+        ("session_id" = Option<u64>, Query, description = "Bind after_revision to its originating host session; a mismatch returns 409")
     ),
     responses((status = 200, description = "SSE stream of tick summaries"))
 )]
@@ -2048,16 +2203,25 @@ async fn stream_ticks_sse(
     State(state): State<ApiState>,
     headers: HeaderMap,
     axum::extract::Query(query): axum::extract::Query<StreamResumeQuery>,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
+) -> Result<Response, AppError> {
     let handle = state.handle.clone();
-    let requested_after = query.after_tick.or_else(|| {
-        headers
-            .get("last-event-id")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok())
-    });
+    let query = query.with_sse_cursor(&headers)?;
+    if query.after_revision.is_some() {
+        let snapshot = handle.read_snapshot().map_err(AppError::from)?;
+        if let Some(subscription) = query.publication_subscription(&snapshot)? {
+            let stream =
+                tick_publication_stream(handle, subscription).map(TickPublicationMessage::into_sse);
+            return Ok(Sse::new(stream)
+                .keep_alive(
+                    axum::response::sse::KeepAlive::new()
+                        .interval(Duration::from_secs(15))
+                        .text("keep-alive"),
+                )
+                .into_response());
+        }
+    }
 
-    let (initial_tick, has_filter) = match requested_after {
+    let (initial_tick, has_filter) = match query.after_tick {
         Some(tick) => (tick, true),
         None => (0, false),
     };
@@ -2084,7 +2248,7 @@ async fn stream_ticks_sse(
         axum::response::sse::KeepAlive::new()
             .interval(Duration::from_secs(15))
             .text("keep-alive"),
-    ))
+    ).into_response())
 }
 
 /// Upgrade HTTP connection to a WebSocket binary/text real-time stream.
@@ -2210,12 +2374,22 @@ fn parse_ws_control_message(text: &str) -> Result<WsControlRequest, AppError> {
 }
 
 async fn apply_ws_control_message(handle: ControlHandle, text: String) -> WsControlReply {
+    struct AbortQueuedControl(tokio::task::JoinHandle<Result<CommandStatusDto, ControlError>>);
+    impl Drop for AbortQueuedControl {
+        fn drop(&mut self) {
+            // A disconnected client must not leave queued blocking work behind.
+            // Work already running may have reached owner admission and cannot
+            // be retracted; its exact request identity remains safe to retry.
+            self.0.abort();
+        }
+    }
+
     let request = match parse_ws_control_message(&text) {
         Ok(request) => request,
         Err(error) => return WsControlReply::error(None, error),
     };
     let request_id = request.request_id.clone();
-    let outcome = run_control(move || {
+    let mut operation = AbortQueuedControl(tokio::task::spawn_blocking(move || {
         use scriptbots_core::ControlCommand;
         let command = match request.command.as_str() {
             "pause" => ControlCommand::Pause,
@@ -2233,8 +2407,11 @@ async fn apply_ws_control_message(handle: ControlHandle, text: String) -> WsCont
         // The host owns retry identity and conflicting-payload refusal. A reconnect
         // must not create a second Step after the first receipt was lost.
         handle.submit_command(command, request.request_id.as_deref())
-    })
-    .await;
+    }));
+    let outcome = (&mut operation.0)
+        .await
+        .map_err(|error| AppError::internal(format!("WebSocket control task failed: {error}")))
+        .and_then(|result| result.map_err(AppError::from));
     match outcome {
         Ok(receipt) => WsControlReply {
             protocol_version: WS_CONTROL_PROTOCOL_VERSION,
@@ -2407,11 +2584,30 @@ async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
     let mut interval = ws_interval(Duration::from_millis(50));
     let mut subscription: Option<RemoteSubscription> = None;
     let mut delivery: Option<RemoteDeliveryWindow> = None;
+    // Owner admission may wait longer than a presentation acknowledgement's
+    // deadline. Poll one retained request alongside socket reads, with no
+    // command queue, so that wait never prevents returning stream credit.
+    let mut pending_control: Option<futures_util::future::BoxFuture<'static, WsControlReply>> =
+        None;
     let mut cadence = WsStreamCadence::new(Duration::from_millis(50));
     let connected_at = tokio::time::Instant::now();
     debug!(connection_id, "WebSocket connected");
     loop {
         tokio::select! {
+            reply = async {
+                match pending_control.as_mut() {
+                    Some(operation) => operation.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                pending_control = None;
+                let Ok(text) = serde_json::to_string(&reply) else {
+                    break;
+                };
+                if !send_ws_message(&mut socket, WsMessage::Text(text.into())).await {
+                    break;
+                }
+            }
             _ = interval.tick() => {
                 if let Some(stream) = &mut subscription {
                     let started = tokio::time::Instant::now();
@@ -2554,12 +2750,24 @@ async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
                             }
                             continue;
                         }
-                        let reply = apply_ws_control_message(handle.clone(), text.to_string()).await;
-                        let Ok(text) = serde_json::to_string(&reply) else {
-                            break;
-                        };
-                        if !send_ws_message(&mut socket, WsMessage::Text(text.into())).await {
-                            break;
+                        if pending_control.is_some() {
+                            let reply = match parse_ws_control_message(&text) {
+                                Ok(request) => WsControlReply::error(request.request_id, AppError {
+                                    status: StatusCode::TOO_MANY_REQUESTS,
+                                    message: "one WebSocket control request is already awaiting its owner receipt; retry after its reply".to_owned(),
+                                }),
+                                Err(error) => WsControlReply::error(None, error),
+                            };
+                            let Ok(text) = serde_json::to_string(&reply) else {
+                                break;
+                            };
+                            if !send_ws_message(&mut socket, WsMessage::Text(text.into())).await {
+                                break;
+                            }
+                        } else {
+                            pending_control = Some(Box::pin(apply_ws_control_message(
+                                handle.clone(), text.to_string(),
+                            )));
                         }
                     }
                     Some(Ok(WsMessage::Binary(_))) => {
@@ -2691,14 +2899,15 @@ async fn screenshot_png(State(state): State<ApiState>) -> Result<Response, AppEr
 
 // NDJSON tick stream for simple clients.
 ///
-/// Supports reconnection and gap detection via `?after_tick=`.
+/// Supports retained tick history or session-bound latest-publication cursors.
 #[utoipa::path(
     get,
     path = "/api/ticks/ndjson",
     tag = "control",
     params(
         ("after_tick" = Option<u64>, Query, description = "Resume strictly after tick"),
-        ("after_revision" = Option<u64>, Query, description = "Resume strictly after publication revision")
+        ("after_revision" = Option<u64>, Query, description = "Select latest-publication mode and resume strictly after this revision; includes same-tick control changes and coalesced counts"),
+        ("session_id" = Option<u64>, Query, description = "Bind after_revision to its originating host session; a mismatch returns 409")
     ),
     responses((status = 200, description = "NDJSON stream of tick summaries"))
 )]
@@ -2707,6 +2916,20 @@ async fn stream_ticks_ndjson(
     axum::extract::Query(query): axum::extract::Query<StreamResumeQuery>,
 ) -> Result<Response, AppError> {
     let handle = state.handle.clone();
+    query.validate()?;
+    if query.after_revision.is_some() {
+        let snapshot = handle.read_snapshot().map_err(AppError::from)?;
+        if let Some(subscription) = query.publication_subscription(&snapshot)? {
+            let stream = tick_publication_stream(handle, subscription)
+                .map(TickPublicationMessage::into_ndjson);
+            let mut response = Response::new(axum::body::Body::from_stream(stream));
+            response.headers_mut().insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/x-ndjson"),
+            );
+            return Ok(response);
+        }
+    }
     let (initial_tick, has_filter) = match query.after_tick {
         Some(tick) => (tick, true),
         None => (0, false),
@@ -8898,6 +9121,63 @@ mod tests {
         );
     }
 
+    #[test]
+    fn websocket_disconnect_cancels_control_work_still_queued_on_the_blocking_pool() {
+        let (handle, owner) = handle();
+        let envelope = handle
+            .prepare_control_command(
+                scriptbots_core::ControlCommand::Step,
+                Some("disconnected-queued-step"),
+            )
+            .expect("stable disconnected request identity");
+        let command_id = envelope.command_id.to_string();
+        let request_handle = handle.clone();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("one-slot WebSocket blocking pool");
+        let (entered, started) = mpsc::sync_channel(1);
+        let (release, wait) = mpsc::channel();
+        let occupied = runtime.spawn_blocking(move || {
+            entered.send(()).expect("blocking slot occupied");
+            let _ = wait.recv();
+        });
+        started
+            .recv_timeout(Duration::from_secs(5))
+            .expect("blocking work started");
+        let (was_waiting, cancelled) = runtime.block_on(async {
+            let mut request = tokio::spawn(apply_ws_control_message(
+                request_handle,
+                r#"{"protocol_version":1,"command":"step","request_id":"disconnected-queued-step"}"#
+                    .to_owned(),
+            ));
+            let was_waiting = tokio::time::timeout(Duration::from_millis(100), &mut request)
+                .await
+                .is_err();
+            request.abort();
+            let cancelled = request.await.is_err_and(|error| error.is_cancelled());
+            (was_waiting, cancelled)
+        });
+        // Unblock and join before asserting, including on the old detached-task
+        // implementation, so the failing control cannot strand runtime teardown.
+        release.send(()).expect("release occupied blocking slot");
+        runtime.block_on(occupied).expect("blocking work joined");
+        runtime
+            .block_on(runtime.spawn_blocking(|| ()))
+            .expect("blocking queue drained after cancellation");
+        let status = handle
+            .command_status(&command_id)
+            .expect("authoritative absent-command lookup");
+        assert!(was_waiting, "the command must encounter the occupied pool");
+        assert!(cancelled, "disconnect must drop the pending command future");
+        assert!(
+            status.is_none(),
+            "queued work survived disconnect: {status:?}"
+        );
+        assert_eq!(owner.handle().status().unwrap().tick, 0);
+    }
+
     fn connect_websocket(address: SocketAddr) -> TcpStream {
         let mut socket = TcpStream::connect(address).expect("connect WebSocket client");
         socket
@@ -9029,6 +9309,180 @@ mod tests {
             ack["after_event"] = json!(page.next_after_event().to_string());
         }
         send_websocket_text(socket, &ack.to_string());
+    }
+
+    #[test]
+    fn websocket_pending_owner_admission_keeps_acknowledgements_and_backpressure_live() {
+        use scriptbots_runtime::{
+            CommandEnvelope, CommandId, FixedDeadlineHost, HostCommand, HostCore, HostCoreOptions,
+            HostPort, HostSessionId, ManualInstant, PlaybackSnapshot,
+            channel::{ChannelHostDriver, ChannelHostOptions},
+        };
+
+        let (ready, receive) = mpsc::sync_channel(1);
+        let (release, wait) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut world = WorldState::new(ScriptBotsConfig {
+                world_width: 64,
+                world_height: 64,
+                food_cell_size: 16,
+                rng_seed: Some(42),
+                persistence_interval: 0,
+                closed: true,
+                ..ScriptBotsConfig::default()
+            })
+            .expect("blocked-admission world");
+            world
+                .try_spawn_agent(scriptbots_core::AgentData::default())
+                .expect("nonempty canvas");
+            let core = HostCore::new(
+                HostSessionId::new(0x5b05),
+                world,
+                HostCoreOptions {
+                    initial_playback: PlaybackSnapshot {
+                        paused: true,
+                        speed_multiplier: 1.0,
+                    },
+                    ..HostCoreOptions::default()
+                },
+            )
+            .expect("blocked-admission owner");
+            let (mut driver, port) =
+                ChannelHostDriver::new(FixedDeadlineHost::new(core), ChannelHostOptions::default())
+                    .expect("real channel owner");
+            ready.send(port).expect("published initial owner snapshot");
+            // No ingress, including the actual Step request, can be admitted
+            // until the client-side assertions explicitly release this gate.
+            let _ = wait.recv();
+            let epoch = std::time::Instant::now();
+            driver
+                .run(|| {
+                    ManualInstant::from_nanos(
+                        u64::try_from(epoch.elapsed().as_nanos()).expect("bounded test clock"),
+                    )
+                })
+                .expect("released channel owner");
+        });
+        let port = receive
+            .recv_timeout(Duration::from_secs(5))
+            .expect("blocked owner port");
+        let reservation = ControlServerReservation::prepare(ControlServerConfig {
+            rest_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            mcp_transport: McpTransportConfig::Disabled,
+            ..ControlServerConfig::default()
+        })
+        .expect("reserve real WebSocket server");
+        let address = reservation.rest_address().unwrap();
+        let (server, _) = reservation.launch(port.clone(), false).unwrap();
+        let handle = server.control_handle().unwrap();
+        let mut socket = connect_websocket(address);
+        let blocked_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            send_websocket_text(
+                &mut socket,
+                r#"{"protocol_version":1,"command":"subscribe","request_id":"before-block","channels":["canvas"],"max_fps":60}"#,
+            );
+            assert_eq!(read_remote_json(&mut socket, false)["type"], "subscribed");
+            let (opcode, payload) = read_remote_websocket_message(&mut socket);
+            assert_eq!(opcode, 2);
+            let initial = scriptbots_runtime::remote::decode_remote_frame(&payload).unwrap();
+            assert_eq!(initial.identity.tick, 0);
+            // The owner wait starts before this outstanding frame's ACK reaches
+            // the server. An inline wait therefore blocks both following replies.
+            send_websocket_text(
+                &mut socket,
+                r#"{"protocol_version":1,"command":"step","request_id":"blocked-step"}"#,
+            );
+            acknowledge_remote_frame(&mut socket, &initial);
+            send_websocket_text(
+                &mut socket,
+                r#"{"protocol_version":1,"command":"step","request_id":"overflow-step"}"#,
+            );
+            socket
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .expect("response deadline shorter than the owner's admission deadline");
+            let overflow = read_remote_json(&mut socket, true);
+            assert_eq!(overflow["type"], "error");
+            assert_eq!(overflow["status"], 429);
+            assert_eq!(overflow["request_id"], "overflow-step");
+            send_websocket_text(&mut socket, r#"{"command":"speed","speed":-1}"#);
+            assert_eq!(read_remote_json(&mut socket, true)["status"], 400);
+            send_websocket_text(
+                &mut socket,
+                r#"{"protocol_version":1,"command":"subscribe","request_id":"while-blocked","channels":["canvas"],"max_fps":60}"#,
+            );
+            let replacement = read_remote_json(&mut socket, true);
+            assert_eq!(replacement["type"], "subscribed");
+            assert_eq!(replacement["request_id"], "while-blocked");
+            // Replacement is allowed only after the first ACK released credit.
+            // It also proves fresh projection work can proceed during admission.
+            let projected = read_remote_binary(&mut socket);
+            assert_eq!(projected.identity, initial.identity);
+            assert_eq!(handle.status().unwrap().tick, 0);
+        }));
+        // Always release the actual owner before surfacing a failed assertion;
+        // the negative control must not leave an unjoinable test owner behind.
+        release.send(()).expect("release actual owner admission");
+        let completion_result = if blocked_result.is_ok() {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let reply = read_remote_json(&mut socket, true);
+                assert_eq!(reply["type"], "receipt");
+                assert_eq!(reply["request_id"], "blocked-step");
+                let first: CommandStatusDto =
+                    serde_json::from_value(reply["receipt"].clone()).unwrap();
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while handle.status().unwrap().tick != 1 {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "first Step did not apply"
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
+                send_websocket_text(
+                    &mut socket,
+                    r#"{"protocol_version":1,"command":"step","request_id":"overflow-step"}"#,
+                );
+                let retry = read_remote_json(&mut socket, true);
+                assert_eq!(retry["type"], "receipt");
+                assert_eq!(retry["request_id"], "overflow-step");
+                let second: CommandStatusDto =
+                    serde_json::from_value(retry["receipt"].clone()).unwrap();
+                assert_eq!(
+                    second.admission_sequence,
+                    first.admission_sequence.map(|sequence| sequence + 1),
+                    "backpressure must not enqueue or reorder the rejected command"
+                );
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while handle.status().unwrap().tick != 2 {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "retried Step did not apply"
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
+                send_websocket_text(
+                    &mut socket,
+                    r#"{"protocol_version":1,"command":"step","request_id":"blocked-step"}"#,
+                );
+                let duplicate = read_remote_json(&mut socket, true);
+                assert_eq!(duplicate["receipt"]["command_id"], first.command_id);
+                assert_eq!(handle.status().unwrap().tick, 2, "retry applied Step twice");
+            }))
+        } else {
+            Ok(())
+        };
+        drop(socket);
+        let server_result = server.shutdown();
+        let owner_result = port.submit(CommandEnvelope::new(
+            CommandId::new(u128::MAX - 1),
+            HostCommand::Shutdown,
+        ));
+        let joined = worker.join();
+        if let Err(failure) = blocked_result.and(completion_result) {
+            std::panic::resume_unwind(failure);
+        }
+        server_result.expect("WebSocket server shutdown");
+        owner_result.expect("owner shutdown admission");
+        joined.expect("real owner joined");
     }
 
     #[test]
@@ -9429,6 +9883,289 @@ mod tests {
             1,
             "initial NDJSON poll must yield current summary line"
         );
+    }
+
+    #[test]
+    fn tick_history_reports_each_missing_range_including_an_empty_ring() {
+        let (handle, _owner) = handle();
+        let mut snapshot = (*handle.read_snapshot().unwrap()).clone();
+        let mut current = current_tick_summary_from_snapshot(&snapshot);
+        current.tick = Tick(10);
+        snapshot.world.tick = 10;
+        snapshot.completed_summary = Some(current.clone());
+        snapshot.summary_history = Arc::new(Vec::new());
+        let messages = tick_history_messages(&snapshot, Some(3));
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].event, "gap");
+        let gap: Value = serde_json::from_str(&messages[0].data).unwrap();
+        assert_eq!(gap["first_missing"], 4);
+        assert_eq!(gap["last_missing"], 9);
+        assert_eq!(messages[1].id.as_deref(), Some("10"));
+
+        snapshot.summary_history = Arc::new(
+            [4, 7, 8]
+                .into_iter()
+                .map(|tick| {
+                    let mut summary = current.clone();
+                    summary.tick = Tick(tick);
+                    summary
+                })
+                .collect(),
+        );
+        let messages = tick_history_messages(&snapshot, Some(3));
+        let kinds: Vec<_> = messages.iter().map(|message| message.event).collect();
+        assert_eq!(kinds, ["tick", "gap", "tick", "tick", "gap", "tick"]);
+        let first: Value = serde_json::from_str(&messages[1].data).unwrap();
+        let second: Value = serde_json::from_str(&messages[4].data).unwrap();
+        assert_eq!(
+            (
+                first["first_missing"].as_u64(),
+                first["last_missing"].as_u64()
+            ),
+            (Some(5), Some(6))
+        );
+        assert_eq!(
+            (
+                second["first_missing"].as_u64(),
+                second["last_missing"].as_u64()
+            ),
+            (Some(9), Some(9))
+        );
+        assert!(tick_history_messages(&snapshot, Some(10)).is_empty());
+        let reset = tick_history_messages(&snapshot, Some(u64::MAX));
+        assert_eq!(reset.len(), 2);
+        assert!(reset[0].data.contains("world_reset_or_future_cursor"));
+        assert_eq!(reset[0].id, None);
+        assert_eq!(reset[1].id.as_deref(), Some("10"));
+        assert_eq!(tick_history_messages(&snapshot, None).len(), 1);
+    }
+
+    #[test]
+    fn tick_stream_cursor_modes_reject_conflicts_and_bind_reconnect_identity() {
+        let (handle, _owner) = handle();
+        let snapshot = handle.read_snapshot().unwrap();
+        let cursor = format!(
+            "pub:{}:{}",
+            snapshot.session_id.get(),
+            snapshot.revision.get()
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("last-event-id", cursor.parse().unwrap());
+        let query = StreamResumeQuery::default()
+            .with_sse_cursor(&headers)
+            .unwrap();
+        assert_eq!(query.session_id, Some(snapshot.session_id.get()));
+        assert_eq!(query.after_revision, Some(snapshot.revision.get()));
+        let event_source = StreamResumeQuery {
+            after_revision: Some(0),
+            ..StreamResumeQuery::default()
+        }
+        .with_sse_cursor(&headers)
+        .unwrap();
+        assert_eq!(event_source.after_revision, query.after_revision);
+        assert_eq!(event_source.session_id, query.session_id);
+        let mut subscription = query.publication_subscription(&snapshot).unwrap().unwrap();
+        assert!(
+            poll_tick_publication(&snapshot, &mut subscription)
+                .unwrap()
+                .is_none()
+        );
+
+        for query in [
+            StreamResumeQuery {
+                after_tick: Some(0),
+                after_revision: Some(0),
+                session_id: None,
+            },
+            StreamResumeQuery {
+                after_tick: Some(0),
+                after_revision: None,
+                session_id: Some(1),
+            },
+            StreamResumeQuery {
+                after_tick: None,
+                after_revision: Some(0),
+                session_id: Some(0),
+            },
+        ] {
+            assert_eq!(
+                query.validate().unwrap_err().status,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        for bad_cursor in [
+            "bad",
+            "+1",
+            "01",
+            "pub:0:1",
+            "pub:1:",
+            "pub:1:2:3",
+            "pub:1:18446744073709551616",
+        ] {
+            headers.insert("last-event-id", bad_cursor.parse().unwrap());
+            assert!(
+                StreamResumeQuery::default()
+                    .with_sse_cursor(&headers)
+                    .is_err(),
+                "{bad_cursor}"
+            );
+        }
+        // A deliberately supplied tick cursor overrides a stale reconnect header.
+        let explicit = StreamResumeQuery {
+            after_tick: Some(3),
+            ..StreamResumeQuery::default()
+        }
+        .with_sse_cursor(&headers)
+        .unwrap();
+        assert_eq!(explicit.after_tick, Some(3));
+        for query in [
+            StreamResumeQuery {
+                after_revision: Some(snapshot.revision.get() + 1),
+                ..StreamResumeQuery::default()
+            },
+            StreamResumeQuery {
+                after_revision: Some(0),
+                session_id: Some(snapshot.session_id.get() + 1),
+                ..StreamResumeQuery::default()
+            },
+        ] {
+            assert_eq!(
+                query
+                    .publication_subscription(&snapshot)
+                    .unwrap_err()
+                    .status,
+                StatusCode::CONFLICT
+            );
+        }
+    }
+
+    async fn read_tick_publication_response(
+        response: &mut reqwest::Response,
+        buffer: &mut Vec<u8>,
+        sse: bool,
+    ) -> Value {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let delimiter: &[u8] = if sse { b"\n\n" } else { b"\n" };
+            loop {
+                if let Some(end) = buffer
+                    .windows(delimiter.len())
+                    .position(|part| part == delimiter)
+                {
+                    assert!(end < 16 * 1024, "bounded publication message");
+                    let record = String::from_utf8(buffer.drain(..end + delimiter.len()).collect())
+                        .expect("complete publication is UTF-8");
+                    let record = &record[..end];
+                    let json = if sse {
+                        assert!(record.lines().any(|line| line == "event: publication"));
+                        assert!(record.lines().any(|line| line.starts_with("id: pub:")));
+                        record
+                            .lines()
+                            .find_map(|line| line.strip_prefix("data: "))
+                            .unwrap()
+                    } else {
+                        record
+                    };
+                    return serde_json::from_str(json).unwrap();
+                }
+                assert!(buffer.len() < 16 * 1024, "bounded publication message");
+                let chunk = response
+                    .chunk()
+                    .await
+                    .unwrap()
+                    .expect("stream remains open");
+                buffer.extend_from_slice(&chunk);
+            }
+        })
+        .await
+        .expect("actual HTTP stream produced a publication")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sse_and_ndjson_revision_resume_deliver_same_tick_owner_changes() {
+        let owner = test_host();
+        let reservation = ControlServerReservation::prepare(ControlServerConfig {
+            rest_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            mcp_transport: McpTransportConfig::Disabled,
+            ..ControlServerConfig::default()
+        })
+        .unwrap();
+        let address = reservation.rest_address().unwrap();
+        let (server, _) = reservation.launch(owner.port.clone(), false).unwrap();
+        let handle = server.control_handle().unwrap();
+        let client = reqwest::Client::new();
+        for (route, sse, speed) in [("stream", true, 2.0), ("ndjson", false, 3.0)] {
+            let url = format!("http://{address}/api/ticks/{route}");
+            let mut response = client
+                .get(format!("{url}?after_revision=0"))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap();
+            let mut buffer = Vec::new();
+            let first = read_tick_publication_response(&mut response, &mut buffer, sse).await;
+            assert_eq!(first["schema"], "scriptbots.tick-publication.v1");
+            assert_eq!(first["playback"]["paused"], true);
+            let receipt = handle
+                .submit_command(
+                    scriptbots_core::ControlCommand::SetSpeed(speed),
+                    Some(&format!("revision-stream-{route}")),
+                )
+                .unwrap();
+            owner.wait_applied(&receipt);
+            let second = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let observed =
+                        read_tick_publication_response(&mut response, &mut buffer, sse).await;
+                    if observed["playback"]["speed_multiplier"] == f64::from(speed) {
+                        break observed;
+                    }
+                }
+            })
+            .await
+            .expect("stream observes applied owner speed");
+            assert_eq!(second["summary"]["tick"], first["summary"]["tick"]);
+            assert_eq!(second["scientific_revision"], first["scientific_revision"]);
+            assert_eq!(second["playback"]["speed_multiplier"], f64::from(speed));
+            assert_ne!(second["control_revision"], first["control_revision"]);
+            assert_ne!(
+                second["publication_revision"],
+                first["publication_revision"]
+            );
+
+            let session = first["session_id"].as_str().unwrap();
+            let revision = first["publication_revision"].as_str().unwrap();
+            let reconnect = if sse {
+                client
+                    .get(format!("{url}?after_revision=0"))
+                    .header("Last-Event-ID", format!("pub:{session}:{revision}"))
+            } else {
+                client.get(format!(
+                    "{url}?after_revision={revision}&session_id={session}"
+                ))
+            };
+            let mut resumed = reconnect.send().await.unwrap().error_for_status().unwrap();
+            let resumed = read_tick_publication_response(&mut resumed, &mut Vec::new(), sse).await;
+            assert_eq!(
+                resumed["publication_revision"],
+                second["publication_revision"]
+            );
+            assert_eq!(resumed["summary"], second["summary"]);
+            for query in [
+                "after_revision=18446744073709551615",
+                "after_revision=0&session_id=1",
+                "after_revision=0&after_tick=0",
+            ] {
+                let refused = client.get(format!("{url}?{query}")).send().await.unwrap();
+                assert!(matches!(refused.status().as_u16(), 400 | 409), "{query}");
+            }
+        }
+        assert_eq!(
+            handle.status().unwrap().tick,
+            0,
+            "monitoring never advances science"
+        );
+        server.shutdown().unwrap();
     }
 
     #[test]

@@ -1357,6 +1357,43 @@ reply ID because no validated identity was admitted. Client binary control frame
 receive an explicit refusal. Before a subscription is negotiated, the server sends
 Postcard-encoded `TickSummaryDto` values at a 50 ms sampling cadence.
 
+#### Resumable SSE and NDJSON monitoring
+
+`GET /api/ticks/stream` (SSE) and `GET /api/ticks/ndjson` provide two explicit
+monitoring modes. With no cursor, or with `after_tick=N`, they send canonical
+tick summaries and catch up from the bounded retained history. Every unavailable
+tick range is reported as a `gap` with inclusive `first_missing`/`last_missing`
+values, including an empty history ring or gaps between retained samples. These
+streams are observations, not durable replay journals.
+
+Use `after_revision=0` to select **latest-publication mode**. It includes owner
+changes while science remains paused, such as speed, control revision, health
+and lifecycle. Each JSON record has `schema: "scriptbots.tick-publication.v1"`,
+the canonical tick `summary`, observed `playback`, `health` and `lifecycle`, plus
+decimal-string session, publication, scientific, control and config revisions.
+`coalesced_publications` counts revisions skipped since the previous cursor;
+the server does not invent historical publications from tick summaries.
+
+```bash
+curl -N 'http://127.0.0.1:8088/api/ticks/stream?after_revision=0'
+curl -N 'http://127.0.0.1:8088/api/ticks/ndjson?after_revision=42&session_id=891'
+```
+
+SSE publication records use event name `publication` and an ID such as
+`pub:891:42`. An `EventSource` reconnect's `Last-Event-ID` supersedes its original
+revision query, preserving the consumed session and revision. Manual clients
+resume using both `after_revision` and its original `session_id`. An omitted
+session binds a new connection to the current owner; it does not establish
+cross-session continuity. A foreign session or future revision returns HTTP
+409 before streaming. Conflicting cursor modes, malformed reconnect IDs and
+zero session identities return 400. The legacy explicit `after_tick` query
+continues to override a tick reconnect header.
+
+Publication mode samples at 250 ms and retains at most one prepared publication
+per consumer. Same-revision polls produce nothing. If the source becomes
+unavailable or changes session after connection, the stream emits a typed
+`error` record and closes; clients must handle that refusal explicitly.
+
 #### Remote browser viewing and stream subscriptions
 
 The web demo's **Remote Server** controls connect its existing Canvas 2D or WebGPU
@@ -1422,6 +1459,13 @@ must omit that field. The supplied browser client sends this acknowledgment only
 after synchronous validation and consumption. A wrong, duplicate or expired
 acknowledgment closes the stream; it never releases another channel's credit.
 Subscription replacement requires all outstanding frames to be acknowledged.
+
+One control request per connection may wait for its owner receipt while frame
+acknowledgments and subscription messages continue to be processed. A further
+valid control request receives a correlated 429 response; retry it after the
+pending reply, preserving its request identity. Disconnect cancels control work
+that is still queued for a blocking worker. Work already admitted by the owner
+may finish, so recover its outcome with the same retry identity after reconnect.
 
 Each connection prepares at most one frame per selected channel from an immutable
 publication and has one socket write in flight. Until the browser consumes that

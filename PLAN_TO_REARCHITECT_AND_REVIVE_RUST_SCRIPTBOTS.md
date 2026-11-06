@@ -2,6 +2,15 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Remote monitoring continuity (2026-11-05):** [Currently In Progress — Codex]
+
+Complete the advertised SSE/NDJSON publication-revision resume path and preserve
+same-tick owner changes with session-bound cursors and explicit coalescing. Check
+tick-history gap reporting at empty and sparse retention boundaries. Keep
+WebSocket consumer acknowledgements responsive while a bounded owner control
+request waits. This contributes to the external-agent contracts in Phase 5.2
+and `bd-ac4l`; the original throughput, soak and DSR acceptance remain open.
+
 **Large-run export and scientific evidence (2026-11-05):** [Currently In Progress —
 Codex; source contributions landed, original acceptance remains open]
 
