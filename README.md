@@ -221,6 +221,16 @@ RUST_LOG=info cargo run -p scriptbots-app
   envelope; application and journal durability are shown separately. Under render pressure,
   the runtime may select a labeled reduced-detail view. These paths are implemented; their
   current native and cross-platform qualification is tracked in the linked reality check.
+- In Experiments (`6`), select a variant row and press Enter to pin it as the
+  baseline, then select a different variant and press `C` to compare their
+  verified final populations across matched seeds. Without a pinned baseline,
+  `C` compares the selected variant with the next distinct variant, skipping its
+  other seed rows. The result shows the endpoint tick, paired sample count,
+  challenger-minus-baseline difference, available 95% interval and paired
+  statistical evidence. A single seed is descriptive only; undefined effect
+  sizes remain unavailable. Verification and analysis run in the background;
+  `x`, Escape or navigation discards a pending result. Live simulation controls
+  continue to address the live owner.
 - In Replay (`7`), press `K` to save a checkpoint and use Up/Down to select a
   catalog row. It shows that saved cut's population and first twelve characters
   of its `WorldDigestV1`, separately from the live tick and artifact checksums.
@@ -1320,6 +1330,8 @@ For an interactive run, ScriptBots parses the control environment and transactio
     accept `ft` or `frankentorch`, recorded canonically as `ft`. The same compiled
     adapter restores continuation cuts and independently verifies the final bundle state.
     A build without `brain-ft` refuses these arms before starting a worker or writing files.
+  - `POST /api/v1/experiments/{id}/compare` → compare one canonical endpoint metric
+    across two completed variant cohorts using verified bundles and exact matched seeds.
   - `POST /api/v1/checkpoints` → capture a `WorldCheckpointV1` and record it in the run database (usable by
     `--checkpoint-start`); `GET /api/v1/checkpoints`, `/api/v1/artifacts`
   - Playback aliases (two-axis command status): `POST /api/pause`, `POST /api/resume`,
@@ -1674,6 +1686,45 @@ released. Exact keyed retries of an existing job remain readable at capacity.
 of simultaneous science activity. This budget does not bound Rayon threads,
 other processes, disk bytes or executing filesystem/host-call duration.
 
+Completed experiment variants can be compared directly through the terminal's
+Experiments screen, MCP `experiment_compare`, or this read-only analysis endpoint:
+
+```bash
+curl -s -X POST http://127.0.0.1:8088/api/v1/experiments/food-pause-recovery/compare \
+  -H 'content-type: application/json' \
+  -d '{"baseline_variant":"control","challenger_variant":"pause-recovery","metric":"alive_agents"}'
+```
+
+For MCP, call `experiment_compare` with the same three fields plus
+`"experiment_id": "food-pause-recovery"`. `tools/list` publishes the supported
+metric names from the runner's canonical endpoint contract. All four fields are
+required; unknown fields, invalid IDs and equal variants are refused. The result
+has the same comparison and provenance fields as REST, so an agent can create a
+batch, observe completion and compare its outcomes through one MCP connection.
+
+Both selected variants must contain the complete planned seed cohort at the
+same final tick. Each retained bundle is verified and its final checkpoint is
+restored before observed endpoint values enter the existing matched-seed
+statistics engine. Missing, incomplete, changed or non-finite evidence is
+refused. The request requires an explicit supported metric; the terminal uses
+`alive_agents`, including the measured zero population after extinction.
+
+The response identifies the experiment, plan digest, status generation, exact
+matched seeds and endpoint tick. It reports challenger minus baseline as
+`mean_difference`, optional `ci_95`, optional paired Cohen's dz as
+`standardized_effect`, and paired sign-flip p-values with the existing
+multiplicity adjustment. A one-seed result has `descriptive_only: true` and
+null inferential fields. Zero-spread standardized effects and small cohorts
+retain their explicit undefined/underpowered reasons. Each request analyzes
+one metric and one variant pair; separate requests are separate analyses.
+
+Comparison work shares a single admission slot across terminal, REST and MCP
+callers. An occupied slot returns REST 503 or an actionable MCP tool result with
+`isError: true`; the slot remains held until admitted work finishes, including
+after a client disconnects. REST also bounds requests before its blocking-worker
+queue and limits the JSON body to 4 KiB. MCP uses the server's existing serialized
+session dispatch. Analysis does not advance or modify the live world.
+
 `GET /api/status` and MCP `get_status` report one immutable owner publication:
 `paused`, `lifecycle`, tagged `health` (including blocker/fault detail),
 `last_applied_command`, `command_queue_depth`, and `snapshot_revision`, alongside
@@ -1807,7 +1858,7 @@ digest evidence within its window.
 - Default: `127.0.0.1:8090` over HTTP; disable with `SCRIPTBOTS_CONTROL_MCP=disabled`.
 - Override bind address: `SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR=127.0.0.1:9090`.
 - Implemented with `fastmcp-rust`; the server shares the same `ControlHandle` as REST.
-- Tools exposed (30):
+- Tools exposed (31):
   - Configuration: `list_knobs` → array of knob entries; `get_config` → full config snapshot;
     `apply_updates` → accepts `{ updates: [{ path, value }, ...] }`; `apply_patch` → accepts `{ patch: { ... } }`
   - Scenarios: `list_presets` → available scenario presets; `apply_preset` → accepts `{ name }`; `intervene` → scheduled intervention
@@ -1823,6 +1874,9 @@ digest evidence within its window.
     and unfinished runs from validated owner/journal cuts, and recovers verified completed
     bundles saved before their final status write; missing or incompatible cuts are refused).
     The same saved-definition discovery supports status/list/resume by ID after restart.
+    `experiment_compare` verifies two completed cohorts at their declared endpoint
+    and returns the matched-seed contrast, uncertainty and provenance; one-seed
+    cohorts explicitly return descriptive results without inferential claims.
   - Checkpoints and artifacts: `checkpoint_create` (captured from the world owner and recorded in the run database
     through the storage worker), `checkpoint_list`, `checkpoint_status`, `artifact_list`, `artifact_get`
 Notes: Only HTTP transport is supported here; stdio/SSE are not used.

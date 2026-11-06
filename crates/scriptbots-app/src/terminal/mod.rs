@@ -370,6 +370,35 @@ impl CanvasReviewTarget {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExperimentComparisonTarget {
+    experiment_id: String,
+    baseline: String,
+    challenger: String,
+}
+
+impl ExperimentComparisonTarget {
+    fn matches(&self, app: &TerminalApp<'_>) -> bool {
+        app.frankentui.route == frankentui_shell::ShellRoute::Experiments
+            && app
+                .frankentui
+                .science
+                .experiments
+                .data()
+                .is_some_and(|data| {
+                    data.experiment_id == self.experiment_id
+                        && data
+                            .active_arms
+                            .iter()
+                            .any(|arm| arm.variant_id == self.baseline)
+                        && data
+                            .active_arms
+                            .iter()
+                            .any(|arm| arm.variant_id == self.challenger)
+                })
+    }
+}
+
 enum LiveTerminalMessage {
     Event(ftui::core::event::Event),
     Refresh,
@@ -386,6 +415,11 @@ enum LiveTerminalMessage {
         request: u64,
         target: CanvasReviewTarget,
         result: std::result::Result<crate::control::EventCanvasReview, String>,
+    },
+    ExperimentComparison {
+        request: u64,
+        target: ExperimentComparisonTarget,
+        result: std::result::Result<crate::control::ExperimentComparisonDto, String>,
     },
 }
 
@@ -411,6 +445,9 @@ struct LiveTerminalModel<'a> {
     checkpoint_review_in_flight: Option<(u64, CanvasReviewTarget)>,
     checkpoint_review_generation: u64,
     checkpoint_review_cancelled: bool,
+    experiment_comparison_in_flight: Option<(u64, ExperimentComparisonTarget)>,
+    experiment_comparison_generation: u64,
+    experiment_comparison_cancelled: bool,
     pending_checkpoints: RefCell<VecDeque<String>>,
     presented_checkpoint: RefCell<Option<String>>,
     active_request: RefCell<Option<PendingTerminalRequest>>,
@@ -494,6 +531,9 @@ impl<'a> LiveTerminalModel<'a> {
             checkpoint_review_in_flight: None,
             checkpoint_review_generation: 0,
             checkpoint_review_cancelled: false,
+            experiment_comparison_in_flight: None,
+            experiment_comparison_generation: 0,
+            experiment_comparison_cancelled: false,
             pending_checkpoints: RefCell::new(VecDeque::new()),
             presented_checkpoint: RefCell::new(None),
             active_request: RefCell::new(None),
@@ -654,6 +694,21 @@ impl Model for LiveTerminalModel<'_> {
             let mut app = self.app.borrow_mut();
             match message {
                 LiveTerminalMessage::Event(event) => {
+                    if self.experiment_comparison_in_flight.is_some()
+                        && !app.palette_open
+                        && !app.help_visible
+                        && matches!(&event, ftui::core::event::Event::Key(key)
+                            if key.kind == ftui::core::event::KeyEventKind::Press
+                                && key.modifiers == ftui::core::event::Modifiers::NONE
+                                && matches!(key.code,
+                                    ftui::core::event::KeyCode::Char('x')
+                                        | ftui::core::event::KeyCode::Escape))
+                    {
+                        self.experiment_comparison_cancelled = true;
+                        app.frankentui.status_message = Some(
+                            "Comparison cancelled; its running result will be discarded".into(),
+                        );
+                    }
                     if self.checkpoint_review_in_flight.is_some()
                         && !app.palette_open
                         && !app.help_visible
@@ -772,8 +827,46 @@ impl Model for LiveTerminalModel<'_> {
                     }
                     Ok(false)
                 }
+                LiveTerminalMessage::ExperimentComparison { request, target, result } => {
+                    if self.experiment_comparison_in_flight.as_ref() == Some(&(request, target.clone())) {
+                        self.experiment_comparison_in_flight = None;
+                        if !self.experiment_comparison_cancelled && target.matches(&app) {
+                            match result {
+                                Ok(comparison) if comparison.experiment_id == target.experiment_id
+                                    && comparison.baseline_variant == target.baseline
+                                    && comparison.challenger_variant == target.challenger
+                                    && comparison.metric == "alive_agents" => {
+                                    app.frankentui.status_message = Some(format!(
+                                        "Compared {} / {} across {} matched seeds at tick {}",
+                                        target.baseline, target.challenger,
+                                        comparison.matched_seeds.len(), comparison.endpoint_tick,
+                                    ));
+                                    if let science_screens::ScreenDataState::Data(data) = &mut app.frankentui.science.experiments {
+                                        data.comparison_summary = Some(comparison);
+                                    }
+                                }
+                                Ok(_) => app.frankentui.status_message = Some(
+                                    "Comparison refused: result identity does not match this request".into(),
+                                ),
+                                Err(error) => app.frankentui.status_message = Some(format!(
+                                    "Comparison unavailable: {error}"
+                                )),
+                            }
+                        }
+                    }
+                    Ok(false)
+                }
             }
             .inspect(|_| {
+                if let Some((_, target)) = &self.experiment_comparison_in_flight
+                    && !target.matches(&app)
+                    && !self.experiment_comparison_cancelled
+                {
+                    self.experiment_comparison_cancelled = true;
+                    app.frankentui.status_message = Some(
+                        "Comparison cancelled after the experiment or screen changed".into(),
+                    );
+                }
                 if let Some((_, target)) = &self.checkpoint_review_in_flight
                     && !target.matches(&app)
                     && !self.checkpoint_review_cancelled
@@ -1277,12 +1370,41 @@ impl LiveTerminalModel<'_> {
                     )));
                 }
                 ShellEffect::CompareExperiments {
+                    experiment_id,
                     baseline,
                     challenger,
                 } => {
-                    app.frankentui.update(ShellMessage::SetStatus(format!(
-                        "Comparison {baseline} / {challenger} requires measured matched-seed report data; no result computed"
-                    )));
+                    let target = ExperimentComparisonTarget { experiment_id, baseline, challenger };
+                    if self.experiment_comparison_in_flight.is_some() {
+                        app.frankentui.status_message = Some(
+                            "A comparison is still running; wait for its result".into(),
+                        );
+                    } else if !target.matches(&app) || target.baseline == target.challenger {
+                        app.frankentui.status_message = Some(
+                            "Comparison cancelled: two distinct variants from the current batch are required".into(),
+                        );
+                    } else if let Some(request) = self.experiment_comparison_generation.checked_add(1) {
+                        if let Some(handle) = app.control.control_handle() {
+                            self.experiment_comparison_generation = request;
+                            self.experiment_comparison_cancelled = false;
+                            self.experiment_comparison_in_flight = Some((request, target.clone()));
+                            if let science_screens::ScreenDataState::Data(data) = &mut app.frankentui.science.experiments {
+                                data.comparison_summary = None;
+                            }
+                            commands.push(Cmd::task(move || {
+                                let result = handle.compare_experiment_variants(
+                                    &target.experiment_id, &target.baseline, &target.challenger, "alive_agents",
+                                ).map_err(|error| error.to_string());
+                                LiveTerminalMessage::ExperimentComparison { request, target, result }
+                            }));
+                        } else {
+                            app.frankentui.status_message = Some(
+                                "Comparison unavailable: control data services are disabled".into(),
+                            );
+                        }
+                    } else {
+                        app.frankentui.status_message = Some("Comparison request identities exhausted".into());
+                    }
                 }
                 ShellEffect::ExportScreenData { format } => {
                     if matches!(format.as_str(), "ascii" | "ansi" | "txt") {
@@ -1545,6 +1667,32 @@ impl LiveLineages {
     }
 }
 
+fn experiment_arms_for_view(
+    mut runs: Vec<crate::control::ExperimentRunRecordDto>,
+) -> Vec<science_screens::ExperimentArmView> {
+    // The runner groups records by variant. Retain a complete seed cohort
+    // before later seeds so a large baseline cannot hide every challenger.
+    // Admission permits at most 64 variants; the view remains bounded.
+    runs.sort_by(|left, right| {
+        left.seed
+            .cmp(&right.seed)
+            .then_with(|| left.variant_id.cmp(&right.variant_id))
+    });
+    runs.into_iter()
+        .take(64)
+        .map(|run| science_screens::ExperimentArmView {
+            variant_id: run.variant_id,
+            brain_family: run.brain_family,
+            seed: run.seed,
+            current_tick: (run.state == "completed").then_some(run.total_ticks),
+            target_ticks: run.total_ticks,
+            mean_fitness: None,
+            uncertainty_ci_95: None,
+            digest: run.final_digest.unwrap_or_else(|| "unavailable".into()),
+        })
+        .collect()
+}
+
 fn science_service_messages(
     handle: &crate::control::ControlHandle,
     route: frankentui_shell::ShellRoute,
@@ -1566,22 +1714,9 @@ fn science_service_messages(
                     batch_status: batch
                         .error_reason
                         .map_or(batch.status, |error| format!("Failed: {error}")),
-                    active_arms: batch
-                        .runs
-                        .into_iter()
-                        .take(32)
-                        .map(|run| ExperimentArmView {
-                            variant_id: run.variant_id,
-                            brain_family: run.brain_family,
-                            seed: run.seed,
-                            current_tick: (run.state == "completed").then_some(run.total_ticks),
-                            target_ticks: run.total_ticks,
-                            mean_fitness: None,
-                            uncertainty_ci_95: None,
-                            digest: run.final_digest.unwrap_or_else(|| "unavailable".into()),
-                        })
-                        .collect(),
+                    active_arms: experiment_arms_for_view(batch.runs),
                     selected_arm_index: 0,
+                    comparison_baseline: None,
                     comparison_summary: None,
                 }),
                 Ok(None) => ScreenDataState::empty(
@@ -3388,6 +3523,12 @@ impl<'a> TerminalApp<'a> {
                             K::Enter if self.frankentui.route == ShellRoute::Replay => {
                                 Some(ShellMessage::ReviewSelectedCheckpoint)
                             }
+                            K::Enter if self.frankentui.route == ShellRoute::Experiments => {
+                                Some(ShellMessage::PinComparisonBaseline)
+                            }
+                            K::Char('c' | 'C') if self.frankentui.route == ShellRoute::Experiments => {
+                                Some(ShellMessage::CompareSelectedExperiments)
+                            }
                             K::Char('x') => Some(ShellMessage::CancelActiveQuery),
                             K::Escape => Some(ShellMessage::Navigate(ShellRoute::Dashboard)),
                             _ => None,
@@ -3595,13 +3736,22 @@ impl<'a> TerminalApp<'a> {
                 data.selected_index = previous.min(data.founder_rows.len().saturating_sub(1));
             }
             ShellMessage::SetExperimentsData(ScreenDataState::Data(data)) => {
-                let previous = self
-                    .frankentui
-                    .science
-                    .experiments
-                    .data()
-                    .map_or(0, |previous| previous.selected_arm_index);
-                data.selected_arm_index = previous.min(data.active_arms.len().saturating_sub(1));
+                if let Some(previous) = self.frankentui.science.experiments.data()
+                    && previous.experiment_id == data.experiment_id
+                {
+                    data.selected_arm_index = previous.selected_arm_index
+                        .min(data.active_arms.len().saturating_sub(1));
+                    data.comparison_baseline = previous.comparison_baseline.clone()
+                        .filter(|baseline| data.active_arms.iter().any(|arm| &arm.variant_id == baseline));
+                    // Selected cohorts can be complete while another variant is
+                    // running or failed. Preserve verified evidence for an unchanged
+                    // batch observation, and clear it when status or run data changes.
+                    if previous.batch_status == data.batch_status
+                        && previous.active_arms == data.active_arms
+                    {
+                        data.comparison_summary = previous.comparison_summary.clone();
+                    }
+                }
             }
             ShellMessage::SetReplayData(ScreenDataState::Data(data)) => {
                 let previous = self
@@ -18830,12 +18980,80 @@ for case in ('panic', 'subscription', 'renderer'):
     }
 
     #[test]
+    fn experiment_projection_keeps_distinct_variants_when_seed_rows_exceed_the_view_bound() {
+        for (variants, seeds) in [(2, 128), (64, 2)] {
+            let runs = (0..variants)
+                .flat_map(|variant| {
+                    (0..seeds)
+                        .rev()
+                        .map(move |seed| crate::control::ExperimentRunRecordDto {
+                            run_id: format!("fixture-{variant}-{seed}"),
+                            variant_id: format!("variant-{variant:02}"),
+                            brain_family: "mlp.baseline".into(),
+                            seed,
+                            state: "completed".into(),
+                            total_ticks: 2,
+                            final_digest: Some(format!("fixture-digest-{variant}-{seed}")),
+                            bundle_path: None,
+                            error_reason: None,
+                        })
+                })
+                .collect();
+            let mut view = science_screens::ExperimentsViewData {
+                active_arms: experiment_arms_for_view(runs),
+                ..science_screens::ExperimentsViewData::default()
+            };
+            assert_eq!(view.active_arms.len(), 64, "projection remains bounded");
+            let represented: std::collections::BTreeSet<_> = view
+                .active_arms
+                .iter()
+                .map(|arm| arm.variant_id.as_str())
+                .collect();
+            assert_eq!(
+                represented.len(),
+                variants,
+                "baseline seed rows must not hide other declared variants"
+            );
+            let (baseline, challenger) = view
+                .comparison_pair()
+                .expect("distinct variants are selectable");
+            assert_ne!(baseline, challenger);
+            view.comparison_baseline = Some(format!("variant-{:02}", variants - 1));
+            assert!(
+                view.comparison_pair().is_some(),
+                "the last admitted variant remains selectable"
+            );
+            assert!(
+                view.active_arms
+                    .iter()
+                    .all(|arm| arm.mean_fitness.is_none() && arm.uncertainty_ci_95.is_none())
+            );
+        }
+    }
+
+    #[test]
     fn live_science_provider_records_match_real_checkpoint_and_completed_experiment() {
-        use crate::control::{
-            CheckpointCreateRequest, ControlHandle, ExperimentCreateRequest, ExperimentVariantDto,
-        };
+        use crate::control::{CheckpointCreateRequest, ExperimentCreateRequest, ExperimentVariantDto};
         use frankentui_shell::{ShellMessage, ShellRoute};
         use science_screens::ScreenDataState;
+
+        fn comparison_task(
+            command: Cmd<LiveTerminalMessage>,
+        ) -> Box<dyn FnOnce() -> LiveTerminalMessage + Send> {
+            match command {
+                Cmd::Task(_, work) => work,
+                Cmd::Batch(mut commands) => {
+                    assert_eq!(commands.len(), 1, "one actual comparison task");
+                    comparison_task(commands.pop().unwrap())
+                }
+                _ => panic!("C did not dispatch the actual comparison task"),
+            }
+        }
+        fn comparison_key(code: ftui::core::event::KeyCode) -> LiveTerminalMessage {
+            LiveTerminalMessage::Event(ftui::core::event::Event::Key(
+                ftui::core::event::KeyEvent::new(code),
+            ))
+        }
 
         const FOUNDERS: usize = 4;
 
@@ -18859,7 +19077,16 @@ for case in ('panic', 'subscription', 'renderer'):
                 .expect("actual nonempty checkpoint population");
         }
         let host = TerminalTestHost::take(world);
-        let handle = ControlHandle::new(host.port())
+        let (comparison_runtime, _) = ControlRuntime::launch(
+            host.port(),
+            crate::servers::ControlServerConfig {
+                rest_enabled: false,
+                mcp_transport: crate::servers::McpTransportConfig::Disabled,
+                ..crate::servers::ControlServerConfig::default()
+            },
+        )
+        .unwrap();
+        let handle = comparison_runtime.control_handle().unwrap()
             .with_artifacts_dir(artifacts.clone())
             .expect("reserve unique real data-service artifacts");
         let owner_before = host
@@ -19004,6 +19231,7 @@ for case in ('panic', 'subscription', 'renderer'):
         assert_eq!(experiment.batch_status, "completed");
         assert_eq!(experiment.active_arms.len(), completed.runs.len());
         assert!(experiment.comparison_summary.is_none());
+        let comparison_view = experiment.clone();
         for run in &completed.runs {
             assert_eq!(run.state, "completed");
             assert_eq!(run.seed, seed);
@@ -19091,6 +19319,173 @@ for case in ('panic', 'subscription', 'renderer'):
                 _ => unreachable!("only the two observed provider routes are tested"),
             }
         }
+
+        // Exercise the real live C adapter against the independently verified
+        // completed batch. Creating an intent must not fabricate a result, and
+        // its detached read must not mutate the live simulation.
+        let mut comparison_app = TerminalApp::new(&renderer, host.context(&comparison_runtime));
+        comparison_app
+            .frankentui
+            .update(ShellMessage::Navigate(ShellRoute::Experiments));
+        comparison_app
+            .frankentui
+            .update(ShellMessage::SetExperimentsData(ScreenDataState::Data(
+                comparison_view.clone(),
+            )));
+        let mut comparison_model = LiveTerminalModel::new(comparison_app).unwrap();
+        // Isolate this worker from the independently covered periodic catalog task.
+        comparison_model.cancelled_service_route = Some(ShellRoute::Experiments);
+        let work = comparison_task(
+            comparison_model.update(comparison_key(ftui::core::event::KeyCode::Char('c'))),
+        );
+        assert!(
+            comparison_model
+                .app
+                .borrow()
+                .frankentui
+                .science
+                .experiments
+                .data()
+                .unwrap()
+                .comparison_summary
+                .is_none()
+        );
+        let request = comparison_model.experiment_comparison_generation;
+        let _ = comparison_model.update(comparison_key(ftui::core::event::KeyCode::Char('c')));
+        assert_eq!(
+            comparison_model.experiment_comparison_generation, request,
+            "repeated input cannot create concurrent comparison workers"
+        );
+        let message = std::thread::spawn(work).join().unwrap();
+        let LiveTerminalMessage::ExperimentComparison {
+            result: Ok(comparison),
+            ..
+        } = &message
+        else {
+            panic!("real verified experiment comparison did not complete");
+        };
+        assert_eq!(comparison.metric, "alive_agents");
+        assert_eq!(comparison.matched_seeds, [seed]);
+        assert_eq!(comparison.endpoint_tick, ticks);
+        assert!(comparison.descriptive_only);
+        assert!(comparison.p_value.is_none());
+        let observed = comparison.clone();
+        let _ = comparison_model.update(message);
+        {
+            let mut app = comparison_model.app.borrow_mut();
+            assert_eq!(
+                app.frankentui
+                    .science
+                    .experiments
+                    .data()
+                    .unwrap()
+                    .comparison_summary
+                    .as_ref(),
+                Some(&observed)
+            );
+            app.frankentui.update(ShellMessage::PinComparisonBaseline);
+            app.frankentui.update(ShellMessage::SelectNextItem);
+            let mut refresh =
+                ShellMessage::SetExperimentsData(ScreenDataState::Data(comparison_view.clone()));
+            app.preserve_science_selection(&mut refresh);
+            app.frankentui.update(refresh);
+            let refreshed = app.frankentui.science.experiments.data().unwrap();
+            assert_eq!(refreshed.selected_arm_index, 1);
+            assert_eq!(refreshed.comparison_baseline.as_deref(), Some("baseline"));
+            assert_eq!(
+                refreshed.comparison_summary.as_ref(),
+                Some(&observed),
+                "periodic catalog refresh must preserve the verified comparison"
+            );
+            // A completed selected pair remains valid when another variant's
+            // batch status is unchanged but not completed. This is a view-state
+            // regression; the result above still comes from actual verified runs.
+            for status in ["running", "Failed: another variant failed"] {
+                let mut previous = app.frankentui.science.experiments.data().unwrap().clone();
+                previous.batch_status = status.into();
+                app.frankentui
+                    .update(ShellMessage::SetExperimentsData(ScreenDataState::Data(
+                        previous.clone(),
+                    )));
+                let mut next = previous;
+                next.comparison_summary = None;
+                let mut refresh = ShellMessage::SetExperimentsData(ScreenDataState::Data(next));
+                app.preserve_science_selection(&mut refresh);
+                app.frankentui.update(refresh);
+                assert_eq!(
+                    app.frankentui
+                        .science
+                        .experiments
+                        .data()
+                        .unwrap()
+                        .comparison_summary
+                        .as_ref(),
+                    Some(&observed)
+                );
+            }
+            let mut changed = comparison_view.clone();
+            changed.batch_status = "cancelled".into();
+            let mut refresh = ShellMessage::SetExperimentsData(ScreenDataState::Data(changed));
+            app.preserve_science_selection(&mut refresh);
+            let ShellMessage::SetExperimentsData(ScreenDataState::Data(changed)) = refresh else {
+                unreachable!("an experiment refresh keeps its message type");
+            };
+            assert!(
+                changed.comparison_summary.is_none(),
+                "changed batch evidence clears prior results"
+            );
+        }
+        let mut rendered = ftui::runtime::ProgramSimulator::new(comparison_model);
+        let text = frankentui_shell::buffer_to_string(rendered.capture_frame(100, 24));
+        assert!(text.contains("Population (agents) at tick 2: paired n=1"));
+        assert!(text.contains("Descriptive only; no significance claim"));
+        assert!(!text.contains("Hedges' g"));
+        let comparison_model = rendered.model_mut();
+        let work = comparison_task(
+            comparison_model.update(comparison_key(ftui::core::event::KeyCode::Char('c'))),
+        );
+        let (request, target) = comparison_model
+            .experiment_comparison_in_flight
+            .clone()
+            .unwrap();
+        let _ = comparison_model.update(LiveTerminalMessage::ExperimentComparison {
+            request: request - 1,
+            target,
+            result: Ok(observed),
+        });
+        assert!(
+            comparison_model.experiment_comparison_in_flight.is_some(),
+            "a stale completion cannot retire the active worker"
+        );
+        assert!(
+            comparison_model
+                .app
+                .borrow()
+                .frankentui
+                .science
+                .experiments
+                .data()
+                .unwrap()
+                .comparison_summary
+                .is_none()
+        );
+        let _ = comparison_model.update(comparison_key(ftui::core::event::KeyCode::Escape));
+        assert!(comparison_model.experiment_comparison_cancelled);
+        let _ = comparison_model.update(std::thread::spawn(work).join().unwrap());
+        assert!(comparison_model.experiment_comparison_in_flight.is_none());
+        assert!(
+            comparison_model
+                .app
+                .borrow()
+                .frankentui
+                .science
+                .experiments
+                .data()
+                .unwrap()
+                .comparison_summary
+                .is_none(),
+            "a navigation-cancelled result must not reappear"
+        );
         assert_eq!(
             host.port()
                 .scientific_digest_v1()

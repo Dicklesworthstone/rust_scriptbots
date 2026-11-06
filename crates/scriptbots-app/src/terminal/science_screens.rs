@@ -203,15 +203,8 @@ pub struct ExperimentArmView {
     pub digest: String,
 }
 
-/// Pairwise statistical comparison between baseline and challenger arms.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ExperimentComparisonSummary {
-    pub baseline_arm: String,
-    pub challenger_arm: String,
-    pub effect_size_hedges_g: f32,
-    pub p_value_estimate: f32,
-    pub verdict: String,
-}
+/// Verified matched-seed endpoint comparison, including its artifact provenance.
+pub type ExperimentComparisonSummary = crate::control::ExperimentComparisonDto;
 
 /// View data for the Experiments science screen.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -220,6 +213,9 @@ pub struct ExperimentsViewData {
     pub batch_status: String,
     pub active_arms: Vec<ExperimentArmView>,
     pub selected_arm_index: usize,
+    /// Optional baseline pinned with Enter; C compares the selected variant against it.
+    #[serde(default)]
+    pub comparison_baseline: Option<String>,
     pub comparison_summary: Option<ExperimentComparisonSummary>,
 }
 
@@ -230,8 +226,31 @@ impl Default for ExperimentsViewData {
             batch_status: "Idle".into(),
             active_arms: Vec::new(),
             selected_arm_index: 0,
+            comparison_baseline: None,
             comparison_summary: None,
         }
+    }
+}
+
+impl ExperimentsViewData {
+    /// Resolve two distinct variants, never two seed rows of the same treatment.
+    pub fn comparison_pair(&self) -> Option<(String, String)> {
+        let selected = &self.active_arms.get(self.selected_arm_index)?.variant_id;
+        if let Some(baseline) = &self.comparison_baseline {
+            return (baseline != selected
+                && self
+                    .active_arms
+                    .iter()
+                    .any(|arm| &arm.variant_id == baseline))
+            .then(|| (baseline.clone(), selected.clone()));
+        }
+        self.active_arms
+            .iter()
+            .cycle()
+            .skip(self.selected_arm_index + 1)
+            .take(self.active_arms.len())
+            .find(|arm| &arm.variant_id != selected)
+            .map(|arm| (selected.clone(), arm.variant_id.clone()))
     }
 }
 
@@ -770,6 +789,10 @@ pub fn render_experiments_screen(
             );
             print_text(frame, 2, y_start + 2, &status);
 
+            let baseline = data.comparison_baseline.as_deref().unwrap_or("selected row");
+            print_text(frame, 2, y_start + 3, &format!(
+                "  [Enter] pin baseline ({baseline}); [C] compare a different variant"
+            ));
             print_text(frame, 2, y_start + 4, "  ACTIVE EXPERIMENTAL ARMS:");
             print_text(
                 frame,
@@ -788,7 +811,8 @@ pub fn render_experiments_screen(
                 print_text(frame, 6, y_start + 7, "(No experiment arms defined)");
             } else {
                 let content_end = u32::from(frame.height().saturating_sub(SHELL_FOOTER_ROWS));
-                let rows = (y_start.saturating_add(7)..content_end).take(SCIENCE_TABLE_ROWS);
+                let rows = (y_start.saturating_add(7)..content_end.min(y_start + 12))
+                    .take(SCIENCE_TABLE_ROWS);
                 let visible_rows = rows.clone().count();
                 let arms = data
                     .active_arms
@@ -822,28 +846,47 @@ pub fn render_experiments_screen(
             }
 
             let comp_y = y_start + 12;
-            print_text(frame, 2, comp_y, "  STATISTICAL EFFECT SIZE & VERDICT:");
+            print_text(frame, 2, comp_y, "  MATCHED-SEED ENDPOINT COMPARISON:");
             if let Some(comp) = &data.comparison_summary {
-                let comp_line = format!(
-                    "  Baseline: {:<12} Challenger: {:<12} Hedges' g: {:+.3} (p ~= {:.3})",
-                    comp.baseline_arm,
-                    comp.challenger_arm,
-                    comp.effect_size_hedges_g,
-                    comp.p_value_estimate
-                );
-                print_text(frame, 4, comp_y + 1, &comp_line);
+                print_text(frame, 4, comp_y + 1, &format!(
+                    "Baseline: {}  Challenger: {}", comp.baseline_variant, comp.challenger_variant
+                ));
+                let metric = if comp.metric == "alive_agents" { "Population (agents)" } else { &comp.metric };
+                print_text(frame, 4, comp_y + 2, &format!(
+                    "{metric} at tick {}: paired n={}", comp.endpoint_tick, comp.matched_seeds.len()
+                ));
+                let interval = observation_text(comp.ci_95, |(low, high)| format!("[{low:+.3}, {high:+.3}]"));
+                print_text(frame, 4, comp_y + 3, &format!(
+                    "Challenger - baseline: {:+.3}; 95% CI: {interval}", comp.mean_difference
+                ));
                 print_text(
                     frame,
                     4,
-                    comp_y + 2,
-                    &format!("  Verdict: {}", comp.verdict),
+                    comp_y + 4,
+                    &format!("Paired p: {}; adjusted p: {}; Cohen dz: {}",
+                        observation_text(comp.p_value, |value| format!("{value:.4}")),
+                        observation_text(comp.adjusted_p_value, |value| format!("{value:.4}")),
+                        observation_text(comp.standardized_effect, |value| format!("{value:+.3}"))),
                 );
+                let inference = if comp.descriptive_only {
+                    "Descriptive only; no significance claim"
+                } else if comp.significant == Some(true) {
+                    "Difference detected at alpha=0.05"
+                } else if comp.significant == Some(false) {
+                    "No detected difference at alpha=0.05"
+                } else {
+                    "Inferential result unavailable"
+                };
+                print_text(frame, 4, comp_y + 5, inference);
+                if let Some(reason) = comp.undefined_effect_reason.as_ref().or(comp.underpowered_reason.as_ref()) {
+                    print_text(frame, 4, comp_y + 6, reason);
+                }
             } else {
                 print_text(
                     frame,
                     4,
                     comp_y + 1,
-                    "  (Select two arms and press [C] to run paired comparison)",
+                    "[C] compares selected/next distinct variant; Enter pins a baseline.",
                 );
             }
         }

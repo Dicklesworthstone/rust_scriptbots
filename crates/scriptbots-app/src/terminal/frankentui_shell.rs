@@ -62,6 +62,7 @@ pub enum ShellEffect {
         branch_name: String,
     },
     CompareExperiments {
+        experiment_id: String,
         baseline: String,
         challenger: String,
     },
@@ -404,6 +405,10 @@ pub enum ShellMessage {
         baseline: String,
         challenger: String,
     },
+    /// Pin the selected variant as the baseline for the next comparison.
+    PinComparisonBaseline,
+    /// Resolve distinct baseline/challenger variants from the experiment selection.
+    CompareSelectedExperiments,
     /// Export screen or replay artifact.
     ExportScreenData {
         format: String,
@@ -733,26 +738,7 @@ impl Model for FrankenTuiModel {
                     }
                 }
                 KeyCode::Char('c') | KeyCode::Char('C') => {
-                    let arms = self.science.experiments.data().and_then(|e| {
-                        if e.active_arms.len() >= 2 {
-                            Some((
-                                e.active_arms[0].variant_id.clone(),
-                                e.active_arms[1].variant_id.clone(),
-                            ))
-                        } else {
-                            None
-                        }
-                    });
-                    if let Some((baseline, challenger)) = arms {
-                        self.update(ShellMessage::CompareExperiments {
-                            baseline,
-                            challenger,
-                        })
-                    } else {
-                        self.status_message =
-                            Some("Comparison unavailable: two experiment arms are required".into());
-                        Cmd::none()
-                    }
+                    self.update(ShellMessage::CompareSelectedExperiments)
                 }
                 KeyCode::Down | KeyCode::Char('j') => self.update(ShellMessage::SelectNextItem),
                 KeyCode::Up => self.update(ShellMessage::SelectPreviousItem),
@@ -761,6 +747,9 @@ impl Model for FrankenTuiModel {
                 }
                 KeyCode::Enter if self.route == ShellRoute::Replay => {
                     self.update(ShellMessage::ReviewSelectedCheckpoint)
+                }
+                KeyCode::Enter if self.route == ShellRoute::Experiments => {
+                    self.update(ShellMessage::PinComparisonBaseline)
                 }
                 KeyCode::Enter => self.update(ShellMessage::FocusSelectedEvent),
                 KeyCode::Char('?') => self.update(ShellMessage::ToggleHelp),
@@ -1101,7 +1090,19 @@ impl Model for FrankenTuiModel {
                 baseline,
                 challenger,
             } => {
+                let experiment_id = self.science.experiments.data().filter(|data| {
+                    baseline != challenger
+                        && data.active_arms.iter().any(|arm| arm.variant_id == baseline)
+                        && data.active_arms.iter().any(|arm| arm.variant_id == challenger)
+                }).map(|data| data.experiment_id.clone());
+                let Some(experiment_id) = experiment_id else {
+                    self.status_message = Some(
+                        "Comparison unavailable: select two distinct variants in this experiment".into()
+                    );
+                    return Cmd::none();
+                };
                 if self.enqueue_effect(ShellEffect::CompareExperiments {
+                    experiment_id,
                     baseline,
                     challenger,
                 }) {
@@ -1109,6 +1110,29 @@ impl Model for FrankenTuiModel {
                         Some("Pending: comparison awaiting measured statistical result".into());
                 }
                 Cmd::none()
+            }
+            ShellMessage::PinComparisonBaseline => {
+                if let ScreenDataState::Data(data) = &mut self.science.experiments
+                    && let Some(arm) = data.active_arms.get(data.selected_arm_index)
+                {
+                    data.comparison_baseline = Some(arm.variant_id.clone());
+                    self.status_message = Some(format!(
+                        "Baseline {} pinned; select a different variant and press C", arm.variant_id
+                    ));
+                }
+                Cmd::none()
+            }
+            ShellMessage::CompareSelectedExperiments => {
+                if let Some((baseline, challenger)) = self.science.experiments.data()
+                    .and_then(ExperimentsViewData::comparison_pair)
+                {
+                    self.update(ShellMessage::CompareExperiments { baseline, challenger })
+                } else {
+                    self.status_message = Some(
+                        "Comparison unavailable: select a variant different from the baseline".into()
+                    );
+                    Cmd::none()
+                }
             }
             ShellMessage::ExportScreenData { format } => {
                 if self.enqueue_effect(ShellEffect::ExportScreenData { format }) {
@@ -1355,7 +1379,7 @@ impl Model for FrankenTuiModel {
                     frame,
                     4,
                     19,
-                    "  [C]      Compare Experiment Arms (Hedges' g)",
+                    "  [C]      Compare matched-seed endpoint populations",
                 );
                 print_to_frame(frame, 4, 20, "  [Esc]    Cancel In-Flight Query / Dismiss");
                 print_to_frame(frame, 4, 21, "  [?]      Toggle help overlay");
@@ -1691,6 +1715,128 @@ impl FrankenTuiSimulatorHarness {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn observed_comparison_fixture(effect: f64, p_value: f64) -> ExperimentComparisonSummary {
+        ExperimentComparisonSummary {
+            experiment_id: "exp-darwin-01".into(),
+            baseline_variant: "arm-mlp".into(),
+            challenger_variant: "arm-dwraon".into(),
+            metric: "alive_agents".into(),
+            endpoint_tick: 1000,
+            matched_seeds: vec![1001, 1002, 1003],
+            mean_difference: 5.0,
+            ci_95: Some(if p_value < 0.05 {
+                (2.0, 8.0)
+            } else {
+                (-2.0, 12.0)
+            }),
+            standardized_effect: Some(effect),
+            p_value: Some(p_value),
+            adjusted_p_value: Some(p_value),
+            significant: Some(p_value < 0.05),
+            descriptive_only: false,
+            underpowered_reason: None,
+            undefined_effect_reason: None,
+            plan_digest: "fixture-plan".into(),
+            status_generation: 1,
+        }
+    }
+
+    #[test]
+    fn experiment_comparison_selects_distinct_variants_and_supports_a_pinned_baseline() {
+        let mut harness = FrankenTuiSimulatorHarness::new();
+        harness.dispatch(ShellMessage::Navigate(ShellRoute::Experiments));
+        let arms = ["baseline", "baseline", "treatment", "treatment", "third"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, variant)| ExperimentArmView {
+                variant_id: variant.into(),
+                brain_family: "mlp".into(),
+                seed: index as u64,
+                current_tick: Some(10),
+                target_ticks: 10,
+                mean_fitness: None,
+                uncertainty_ci_95: None,
+                digest: format!("fixture-{index}"),
+            })
+            .collect();
+        harness.dispatch(ShellMessage::SetExperimentsData(ScreenDataState::Data(
+            ExperimentsViewData {
+                experiment_id: "distinct-variants".into(),
+                batch_status: "completed".into(),
+                active_arms: arms,
+                ..ExperimentsViewData::default()
+            },
+        )));
+        harness.inject_key(KeyCode::Char('c'));
+        let effects: Vec<_> = harness.model_mut().drain_effects().collect();
+        assert!(matches!(effects.as_slice(),
+            [ShellEffect::CompareExperiments { experiment_id, baseline, challenger }]
+                if experiment_id == "distinct-variants" && baseline == "baseline" && challenger == "treatment"));
+
+        harness.inject_key(KeyCode::Enter);
+        assert_eq!(
+            harness
+                .model()
+                .science
+                .experiments
+                .data()
+                .unwrap()
+                .comparison_baseline
+                .as_deref(),
+            Some("baseline")
+        );
+        harness.inject_key(KeyCode::Down);
+        harness.inject_key(KeyCode::Char('c'));
+        assert_eq!(
+            harness.model_mut().drain_effects().count(),
+            0,
+            "a second seed from the pinned variant is not a different treatment"
+        );
+        for _ in 0..3 {
+            harness.inject_key(KeyCode::Down);
+        }
+        harness.inject_key(KeyCode::Char('c'));
+        let effects: Vec<_> = harness.model_mut().drain_effects().collect();
+        assert!(matches!(effects.as_slice(),
+            [ShellEffect::CompareExperiments { baseline, challenger, .. }]
+                if baseline == "baseline" && challenger == "third"));
+        harness.dispatch(ShellMessage::CompareExperiments {
+            baseline: "baseline".into(),
+            challenger: "missing-variant".into(),
+        });
+        assert_eq!(harness.model_mut().drain_effects().count(), 0);
+
+        let mut data = harness.model().science.experiments.data().unwrap().clone();
+        data.comparison_summary = Some(ExperimentComparisonSummary {
+            experiment_id: data.experiment_id.clone(),
+            baseline_variant: "baseline".into(),
+            challenger_variant: "third".into(),
+            metric: "alive_agents".into(),
+            endpoint_tick: 10,
+            matched_seeds: vec![42],
+            mean_difference: 0.0,
+            ci_95: None,
+            standardized_effect: None,
+            p_value: None,
+            adjusted_p_value: None,
+            significant: None,
+            descriptive_only: true,
+            underpowered_reason: Some("One matched seed cannot support inference".into()),
+            undefined_effect_reason: Some("Paired variance is unavailable".into()),
+            plan_digest: "fixture-plan".into(),
+            status_generation: 1,
+        });
+        harness.dispatch(ShellMessage::SetExperimentsData(ScreenDataState::Data(
+            data,
+        )));
+        let frame = harness.capture_frame_str(100, 24);
+        assert!(frame.contains("paired n=1"));
+        assert!(frame.contains("Descriptive only; no significance claim"));
+        assert!(frame.contains("Paired variance is unavailable"));
+        assert!(!frame.contains("Hedges' g"));
+        assert!(!frame.contains("Paired p: 0.0000"));
+    }
 
     #[test]
     fn test_frankentui_model_route_navigation_and_receipts() {
@@ -2911,6 +3057,7 @@ mod tests {
                 },
             ],
             selected_arm_index: 0,
+            comparison_baseline: None,
             comparison_summary: None,
         };
         harness.dispatch(ShellMessage::SetExperimentsData(ScreenDataState::Data(
@@ -2922,8 +3069,8 @@ mod tests {
         let effects: Vec<_> = harness.model_mut().drain_effects().collect();
         assert!(matches!(
             effects.as_slice(),
-            [ShellEffect::CompareExperiments { baseline, challenger }]
-                if baseline == "arm-mlp" && challenger == "arm-dwraon"
+            [ShellEffect::CompareExperiments { experiment_id, baseline, challenger }]
+                if experiment_id == "exp-darwin-01" && baseline == "arm-mlp" && challenger == "arm-dwraon"
         ));
         assert!(
             harness
@@ -2940,19 +3087,14 @@ mod tests {
         assert!(!exp_frame.contains("Significant advantage"));
 
         let mut observed_experiments = harness.model().science.experiments.data().unwrap().clone();
-        observed_experiments.comparison_summary = Some(ExperimentComparisonSummary {
-            baseline_arm: "arm-mlp".into(),
-            challenger_arm: "arm-dwraon".into(),
-            effect_size_hedges_g: 0.38,
-            p_value_estimate: 0.16,
-            verdict: "Observed comparison fixture".into(),
-        });
+        observed_experiments.comparison_summary = Some(observed_comparison_fixture(0.38, 0.16));
         harness.dispatch(ShellMessage::SetExperimentsData(ScreenDataState::Data(
             observed_experiments,
         )));
         let exp_frame = harness.capture_frame_str(100, 24);
-        assert!(exp_frame.contains("Hedges' g: +0.380"));
-        assert!(exp_frame.contains("Observed comparison fixture"));
+        assert!(exp_frame.contains("Cohen dz: +0.380"));
+        assert!(exp_frame.contains("No detected difference at alpha=0.05"));
+        assert!(exp_frame.contains("Population (agents) at tick 1000: paired n=3"));
 
         // Test cursor navigation in experiments table
         harness.inject_key(KeyCode::Down);
@@ -3132,13 +3274,8 @@ mod tests {
                 },
             ],
             selected_arm_index: 0,
-            comparison_summary: Some(ExperimentComparisonSummary {
-                baseline_arm: "arm-mlp".into(),
-                challenger_arm: "arm-dwraon".into(),
-                effect_size_hedges_g: 1.88,
-                p_value_estimate: 0.002,
-                verdict: "Significant advantage (Large effect)".into(),
-            }),
+            comparison_baseline: None,
+            comparison_summary: Some(observed_comparison_fixture(1.88, 0.002)),
         };
         harness.dispatch(ShellMessage::SetExperimentsData(ScreenDataState::Data(
             exp_data,
@@ -3149,8 +3286,9 @@ mod tests {
         assert!(exp_frame.contains("exp-darwin-01"));
         assert!(exp_frame.contains("arm-mlp"));
         assert!(exp_frame.contains("arm-dwraon"));
-        assert!(exp_frame.contains("Hedges' g: +1.880"));
-        assert!(exp_frame.contains("Significant advantage (Large effect)"));
+        assert!(exp_frame.contains("Cohen dz: +1.880"));
+        assert!(exp_frame.contains("Difference detected at alpha=0.05"));
+        assert!(!exp_frame.contains("Hedges' g"));
 
         // Screen 4: Replay Data Golden
         let replay_data = ReplayViewData {
@@ -3478,6 +3616,7 @@ mod tests {
                 },
             ],
             selected_arm_index: 0,
+            comparison_baseline: None,
             comparison_summary: None,
         };
         harness.dispatch(ShellMessage::SetExperimentsData(ScreenDataState::Data(

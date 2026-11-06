@@ -1,6 +1,7 @@
 // crates/scriptbots-web/web/tests/permalink_fork_dom.test.js
 // Real-browser Playwright test for permalink loading, fork-this-world UX,
-// parent-diff display, and honest build mismatch banner (bd-16g.8.2).
+// parent-diff display, honest build mismatch banner, and local owner replacement.
+// The WASM double exercises browser lifecycle behavior, not checkpoint codec proof.
 
 import fs from "node:fs";
 import http from "node:http";
@@ -17,7 +18,19 @@ const mockWasmModule = `
   export function version() { return "0.1.0-permalink-fork-test"; }
   export function default_init_options() { return { world_width: 1280, world_height: 720 }; }
   
-  let currentWorldLink = "sbw1.root_world_link";
+  const currentWorldLink = "sbw1.root_world_link";
+  const owners = window.__ownerTest = { records: [], nextFailure: null, failDriveId: null };
+  const timers = window.__ownerTimers = { pending: new Set(), maximum: 0 };
+  const schedule = window.setTimeout.bind(window);
+  const cancel = window.clearTimeout.bind(window);
+  window.setTimeout = (callback, delay, ...args) => {
+    if (callback?.name !== "pumpSimulation") return schedule(callback, delay, ...args);
+    const id = schedule(() => { timers.pending.delete(id); callback(...args); }, delay);
+    timers.pending.add(id);
+    timers.maximum = Math.max(timers.maximum, timers.pending.size);
+    return id;
+  };
+  window.clearTimeout = (id) => { timers.pending.delete(id); cancel(id); };
 
   export function build_identity() {
     return {
@@ -72,7 +85,7 @@ const mockWasmModule = `
   }
 
   export function permalink_of(handle) {
-    return handle.__link || currentWorldLink;
+    return handle.permalinkOf();
   }
 
   export function fork(handle, patch) {
@@ -83,90 +96,305 @@ const mockWasmModule = `
     if (link.startsWith("invalid") || link.includes("corrupt")) {
       throw new Error("permalink magic mismatch (first bytes: " + link.slice(0, 8) + ")");
     }
-    let tick = 0;
-    return {
-      __link: link,
-      permalinkOf() { return link; },
-      setSpeed(value) { this.__speed = value; },
-      drive(now) {
-        const steps = Math.floor(now * (this.__speed ?? 1) * 60 / 1000) - tick;
-        this.tick(Math.max(0, steps));
-        return { scientific_steps: Math.max(0, steps), automatic_steps_skipped: 0 };
-      },
-      snapshot() { return this.tick(0); },
-      frame() {
-        const snapshot = this.snapshot();
-        return { schema: "scriptbots.browser-frame.v1", snapshot, identity: {
-          sessionId: "2001", publicationRevision: String(snapshot.tick + 400),
-          scientificRevision: String(snapshot.tick + 100), controlRevision: "20",
-          configRevision: "10", tick: String(snapshot.tick)
-        } };
-      },
-      tick(steps) {
-        tick += steps;
-        return {
-          tick: tick,
-          world: { width: 1280, height: 720, closed: true },
-          summary: {
-            agentCount: 150,
-            births: 5,
-            deaths: 2,
-            totalEnergy: 300,
-            averageEnergy: 2.0,
-            averageHealth: 0.95
-          },
-          agents: [
-            {
-              position: [200.0, 200.0],
-              health: 0.95,
-              color: [0.1, 0.7, 0.3],
-              boost: false
-            }
-          ]
-        };
-      }
-    };
+    return createHandle("permalink", link);
   }
 
   export function init_sim(opts) {
-    let tick = 0;
+    return createHandle("reset", currentWorldLink);
+  }
+
+  export function checkpoint_byte_limit() { return 1024; }
+  export function restore_checkpoint(bytes) {
+    if (bytes.length !== 1 || bytes[0] !== 42) throw new Error("intentional checkpoint refusal");
+    return createHandle("checkpoint", "sbw1.continuation", 37);
+  }
+  export function decode_remote_frame_binary() { throw new Error("No remote frame in this lifecycle fixture"); }
+
+  function createHandle(kind, link, initialTick = 0) {
+    const failure = owners.nextFailure;
+    owners.nextFailure = null;
+    if (failure === "create") throw new Error("intentional create failure");
+    const record = { id: owners.records.length + 1, kind, tick: initialTick,
+      freeCalls: 0, driveCalls: 0, elapsed: 0, speed: 1 };
+    owners.records.push(record);
+    let credit = 0;
+    function check(stage) {
+      if (record.freeCalls !== 0) throw new Error("owner used after free: " + record.id);
+      if (failure === stage) throw new Error("intentional " + stage + " failure");
+    }
     return {
-      __link: currentWorldLink,
-      permalinkOf() { return currentWorldLink; },
-      setSpeed(value) { this.__speed = value; },
-      drive(now) {
-        const steps = Math.floor(now * (this.__speed ?? 1) * 60 / 1000) - tick;
-        this.tick(Math.max(0, steps));
-        return { scientific_steps: Math.max(0, steps), automatic_steps_skipped: 0 };
+      free() {
+        record.freeCalls += 1;
+        if (record.freeCalls !== 1) throw new Error("owner freed twice: " + record.id);
       },
-      snapshot() { return this.tick(0); },
+      permalinkOf() { check("permalink"); return link; },
+      brainPreset() { check("preset"); return kind === "checkpoint" ? "mlp" : "wander"; },
+      setSpeed(value) { check("speed"); record.speed = value; },
+      drive(now) {
+        check("drive");
+        record.driveCalls += 1;
+        if (owners.failDriveId === record.id) throw new Error("intentional clock failure");
+        if (now < record.elapsed) throw new Error("owner clock rewound");
+        credit += (now - record.elapsed) * record.speed * 60 / 1000;
+        record.elapsed = now;
+        const steps = Math.floor(credit);
+        credit -= steps;
+        record.tick += steps;
+        return { scientific_steps: steps, automatic_steps_skipped: 0 };
+      },
       frame() {
+        check("frame");
         const snapshot = this.snapshot();
         return { schema: "scriptbots.browser-frame.v1", snapshot, identity: {
-          sessionId: "2002", publicationRevision: String(snapshot.tick + 400),
+          sessionId: String(2000 + record.id), publicationRevision: String(snapshot.tick + 400),
           scientificRevision: String(snapshot.tick + 100), controlRevision: "20",
-          configRevision: "10", tick: String(snapshot.tick)
+          configRevision: "10", tick: String(snapshot.tick + (failure === "identity" ? 1 : 0))
         } };
       },
       tick(steps) {
-        tick += steps;
+        check("tick");
+        record.tick += steps;
+        return this.snapshot();
+      },
+      snapshot() {
+        check("snapshot");
+        const fromPermalink = kind === "permalink";
         return {
-          tick: tick,
+          tick: record.tick,
           world: { width: 1280, height: 720, closed: true },
           summary: {
-            agentCount: 200,
-            births: 10,
-            deaths: 4,
-            totalEnergy: 400,
+            agentCount: fromPermalink ? 150 : 200,
+            births: fromPermalink ? 5 : 10,
+            deaths: fromPermalink ? 2 : 4,
+            totalEnergy: fromPermalink ? 300 : 400,
             averageEnergy: 2.0,
-            averageHealth: 0.9
+            averageHealth: fromPermalink ? 0.95 : 0.9
           },
-          agents: []
+          agents: fromPermalink ? [{ position: [200.0, 200.0], health: 0.95,
+            color: [0.1, 0.7, 0.3], boost: false }] : []
         };
       }
     };
   }
 `;
+
+async function runOwnerLifecycleCases(page, context) {
+  const observations = { refusals: [], recoveries: [], replacements: [] };
+  await page.evaluate(() => {
+    const read = File.prototype.arrayBuffer;
+    File.prototype.arrayBuffer = function () {
+      window.__ownerFileRead = read.call(this);
+      return window.__ownerFileRead;
+    };
+  });
+  const state = () => page.evaluate(() => ({
+    records: window.__ownerTest.records,
+    session: document.getElementById("renderer-status").dataset.sessionId,
+    pendingTimers: window.__ownerTimers.pending.size,
+    maximumTimers: window.__ownerTimers.maximum,
+    speed: document.getElementById("steps-per-frame").value,
+    preset: document.getElementById("brain-preset").value,
+  }));
+  const activeOwner = (value) => {
+    const live = value.records.filter((owner) => owner.freeCalls === 0);
+    if (live.length !== 1 || value.records.some((owner) => owner.freeCalls > 1)
+        || value.session !== String(2000 + live[0].id)) {
+      throw new Error(`Expected one live, presented owner: ${JSON.stringify(value)}`);
+    }
+    return live[0];
+  };
+  const setSpeed = (speed) => page.evaluate((value) => {
+    const input = document.getElementById("steps-per-frame");
+    input.value = String(value);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  }, speed);
+  const checkpointFile = { name: "lifecycle.sbcheckpoint", mimeType: "application/octet-stream", buffer: Buffer.from([42]) };
+  const replace = async (operation) => {
+    if (operation === "checkpoint") {
+      await page.evaluate(() => { window.__ownerFileRead = null; });
+      await page.setInputFiles("#checkpoint-load", checkpointFile);
+      await page.evaluate(async () => {
+        if (!window.__ownerFileRead) throw new Error("Checkpoint import did not read its file");
+        await window.__ownerFileRead;
+        if (document.getElementById("checkpoint-load").disabled) throw new Error("Checkpoint import did not finish");
+      });
+    } else {
+      await page.evaluate((kind) => {
+        if (kind === "permalink") {
+          document.getElementById("permalink-input").value = "sbw1.replacement";
+          document.getElementById("load-permalink-btn").click();
+        } else {
+          document.getElementById("reset-btn").click();
+        }
+      }, operation);
+    }
+    await context.clock.runFor(32);
+  };
+
+  // Refusals after allocation are different from a decoder rejecting input:
+  // each failed candidate must be freed without moving the paused old world.
+  await setSpeed(0);
+  for (const operation of ["reset", "permalink", "checkpoint"]) {
+    for (const failure of ["create", "speed", "frame", "snapshot", "identity",
+      operation === "checkpoint" ? "preset" : "permalink"]) {
+      const before = await state();
+      const previous = activeOwner(before);
+      await page.evaluate((stage) => { window.__ownerTest.nextFailure = stage; }, failure);
+      await replace(operation);
+      const after = await state();
+      const retained = activeOwner(after);
+      const candidates = after.records.slice(before.records.length);
+      if (retained.id !== previous.id || retained.tick !== previous.tick
+          || after.speed !== before.speed || after.preset !== before.preset
+          || after.pendingTimers !== 1 || after.maximumTimers !== 1
+          || candidates.length !== (failure === "create" ? 0 : 1)
+          || candidates.some((owner) => owner.freeCalls !== 1)) {
+        throw new Error(`${operation}/${failure} changed the active world or leaked its candidate: ${JSON.stringify(after)}`);
+      }
+      observations.refusals.push({ operation, failure, retainedOwner: retained.id,
+        rejectedOwner: candidates[0]?.id ?? null, retainedTick: retained.tick });
+    }
+  }
+
+  // A stopped pump must stay stopped until a replacement succeeds. Check drive
+  // calls as well as ticks: duplicate timers can drive the same elapsed boundary
+  // without producing additional science, so tick progress alone is insufficient.
+  for (const operation of ["reset", "permalink", "checkpoint"]) {
+    await setSpeed(1);
+    await context.clock.runFor(64);
+    const previous = activeOwner(await state());
+    await page.evaluate((id) => { window.__ownerTest.failDriveId = id; }, previous.id);
+    await context.clock.runFor(32);
+    const stopped = await state();
+    if (stopped.pendingTimers !== 0) throw new Error("Clock fault left a pump scheduled");
+    await context.clock.runFor(80);
+    if (activeOwner(await state()).driveCalls !== activeOwner(stopped).driveCalls) {
+      throw new Error("Stopped clock continued to drive the old world");
+    }
+    await page.evaluate(() => {
+      // The clock fault was transient. Refusing a candidate must still preserve
+      // the old owner's stopped state rather than implicitly trying it again.
+      window.__ownerTest.failDriveId = null;
+      window.__ownerTest.nextFailure = "speed";
+    });
+    await replace(operation);
+    const refused = await state();
+    if (activeOwner(refused).id !== previous.id || refused.pendingTimers !== 0
+        || activeOwner(refused).driveCalls !== activeOwner(stopped).driveCalls
+        || activeOwner(refused).tick !== activeOwner(stopped).tick) {
+      throw new Error(`${operation} refusal restarted or changed the stopped owner`);
+    }
+    await replace(operation);
+    const replaced = await state();
+    const next = activeOwner(replaced);
+    if (next.id === previous.id || replaced.records[previous.id - 1].freeCalls !== 1
+        || replaced.pendingTimers !== 1 || replaced.maximumTimers !== 1
+        || (operation === "checkpoint" && (next.tick !== 37 || replaced.speed !== "0" || replaced.preset !== "mlp"))) {
+      throw new Error(`${operation} failed to replace the stopped world: ${JSON.stringify(replaced)}`);
+    }
+    await setSpeed(1);
+    await context.clock.runFor(96);
+    const resumed = await state();
+    const running = activeOwner(resumed);
+    if (running.tick <= next.tick || running.driveCalls <= next.driveCalls
+        || resumed.records[previous.id - 1].driveCalls !== activeOwner(stopped).driveCalls
+        || resumed.pendingTimers !== 1 || resumed.maximumTimers !== 1) {
+      throw new Error(`${operation} did not resume exactly one new clock: ${JSON.stringify(resumed)}`);
+    }
+    observations.recoveries.push({ operation, previousOwner: previous.id, newOwner: next.id,
+      tickBeforeResume: next.tick, tickAfterResume: running.tick, pendingTimers: resumed.pendingTimers });
+  }
+
+  for (const operation of ["permalink", "reset", "checkpoint", "reset"]) {
+    const previous = activeOwner(await state());
+    await replace(operation);
+    const after = await state();
+    const next = activeOwner(after);
+    if (next.id === previous.id || after.records[previous.id - 1].freeCalls !== 1
+        || after.pendingTimers !== 1 || after.maximumTimers !== 1) {
+      throw new Error(`Running ${operation} replacement leaked an owner or duplicated its timer`);
+    }
+    observations.replacements.push({ operation, previousOwner: previous.id, newOwner: next.id });
+  }
+
+  const beginDelayedImport = async () => {
+    await page.evaluate(() => {
+      const read = File.prototype.arrayBuffer;
+      window.__releaseOwnerRead = null;
+      File.prototype.arrayBuffer = function () {
+        return new Promise((resolve, reject) => {
+          window.__releaseOwnerRead = () => {
+            File.prototype.arrayBuffer = read;
+            return read.call(this).then(resolve, reject);
+          };
+        });
+      };
+    });
+    await page.setInputFiles("#checkpoint-load", checkpointFile);
+    if (!await page.evaluate(() => typeof window.__releaseOwnerRead === "function")) {
+      throw new Error("Delayed import did not reach its asynchronous read boundary");
+    }
+  };
+  const releaseCancelledImport = async () => {
+    await page.evaluate(() => window.__releaseOwnerRead());
+    if (!await page.evaluate(() => document.getElementById("checkpoint-status").textContent.startsWith("Load cancelled"))) {
+      throw new Error("Stale continuation read was not cancelled");
+    }
+  };
+
+  await setSpeed(0);
+  await beginDelayedImport();
+  await replace("reset");
+  const reset = await state();
+  await releaseCancelledImport();
+  await context.clock.runFor(32);
+  const afterStaleReset = await state();
+  if (activeOwner(afterStaleReset).id !== activeOwner(reset).id
+      || activeOwner(afterStaleReset).tick !== activeOwner(reset).tick
+      || afterStaleReset.records.length !== reset.records.length) {
+    throw new Error("Stale continuation replaced or allocated over the reset world");
+  }
+  observations.staleResetPreservedOwner = activeOwner(reset).id;
+
+  // A connecting remote transport is enough to leave local mode. No server or
+  // remote protocol behavior is asserted by this inert socket double.
+  await beginDelayedImport();
+  await page.evaluate(() => {
+    window.WebSocket = class { addEventListener() {} close() {} };
+    document.getElementById("remote-connect").click();
+  });
+  const remote = await state();
+  if (remote.pendingTimers !== 0 || !await page.isDisabled("#reset-btn")) {
+    throw new Error("Remote mode did not suspend local scheduling and replacement controls");
+  }
+  await releaseCancelledImport();
+  await page.evaluate(() => {
+    // Dispatch directly to exercise the guards even though the controls are disabled.
+    document.getElementById("reset-btn").dispatchEvent(new Event("click"));
+    document.getElementById("load-permalink-btn").dispatchEvent(new Event("click"));
+  });
+  await context.clock.runFor(64);
+  const remoteAfter = await state();
+  if (activeOwner(remoteAfter).id !== activeOwner(remote).id
+      || activeOwner(remoteAfter).tick !== activeOwner(remote).tick
+      || activeOwner(remoteAfter).driveCalls !== activeOwner(remote).driveCalls
+      || remoteAfter.records.length !== remote.records.length || remoteAfter.pendingTimers !== 0) {
+    throw new Error("Remote mode changed, freed, or drove the retained local owner");
+  }
+  await page.evaluate(() => document.getElementById("remote-local").click());
+  await setSpeed(1);
+  await context.clock.runFor(96);
+  const returned = await state();
+  if (activeOwner(returned).id !== activeOwner(remote).id
+      || activeOwner(returned).tick <= activeOwner(remote).tick
+      || returned.pendingTimers !== 1 || returned.maximumTimers !== 1) {
+    throw new Error("Return to local failed to resume its retained world with one timer");
+  }
+  observations.staleRemotePreservedOwner = activeOwner(returned).id;
+  observations.releasedOwners = returned.records.filter((owner) => owner.freeCalls === 1).length;
+  observations.maximumPendingTimers = returned.maximumTimers;
+  return observations;
+}
 
 function createServer() {
   return http.createServer((req, res) => {
@@ -199,6 +427,7 @@ async function runTests() {
   });
 
   try {
+    let ownerLifecycle;
     // =========================================================================
     // Test 1: Honest Build Mismatch Warning Banner & Simulation Execution
     // =========================================================================
@@ -349,10 +578,13 @@ async function runTests() {
     }
 
     // =========================================================================
-    // Test 4: Negative Control: Rejected Bad Permalink Leaves Instance Functional
+    // Test 4: Rejected Inputs, Atomic Owner Replacement, and Clock Recovery
     // =========================================================================
     {
       const context = await browser.newContext();
+      const epoch = Date.UTC(2026, 0, 1);
+      await context.clock.install({ time: epoch });
+      await context.clock.pauseAt(epoch + 1_000);
       const page = await context.newPage();
       const pageErrors = [];
       page.on("pageerror", (err) => pageErrors.push(err.message));
@@ -365,11 +597,26 @@ async function runTests() {
         }),
       );
 
-      await page.goto(`${baseUrl}/`);
+      await page.goto(`${baseUrl}/?world=invalid_startup_link`);
+      await context.clock.runFor(32);
+      if (!await page.evaluate(() => document.getElementById("permalink-status").textContent.startsWith("Error:")
+          && window.__ownerTest.records.length === 0 && window.__ownerTimers.pending.size === 0)) {
+        throw new Error("Invalid startup permalink did not leave a recoverable ownerless page");
+      }
+      await page.evaluate(() => document.getElementById("reset-btn").click());
+      await context.clock.runFor(32);
+      if (!await page.evaluate(() => window.__ownerTest.records.length === 1
+          && window.__ownerTest.records[0].freeCalls === 0 && window.__ownerTest.records[0].driveCalls > 0
+          && document.getElementById("renderer-status").dataset.sessionId === "2001"
+          && window.__ownerTimers.pending.size === 1)) {
+        throw new Error("Reset failed to recover from an invalid startup permalink");
+      }
 
       // Attempt to load an invalid permalink
-      await page.fill("#permalink-input", "invalid_corrupted_link");
-      await page.click("#load-permalink-btn");
+      await page.evaluate(() => {
+        document.getElementById("permalink-input").value = "invalid_corrupted_link";
+        document.getElementById("load-permalink-btn").click();
+      });
 
       // Verify error in status
       const statusText = await page.textContent("#permalink-status");
@@ -383,12 +630,18 @@ async function runTests() {
       }
 
       // Assert simulation can reset normally and runs without poison
-      await page.click("#reset-btn");
+      await page.evaluate(() => document.getElementById("reset-btn").click());
+      await context.clock.runFor(32);
       const postResetStatus = await page.textContent("#permalink-status");
       if (postResetStatus.toLowerCase().includes("error")) {
         throw new Error(`Instance remained poisoned after reset: ${postResetStatus}`);
       }
 
+      ownerLifecycle = await runOwnerLifecycleCases(page, context);
+      ownerLifecycle.invalidStartupRecovered = true;
+      if (pageErrors.length > 0) {
+        throw new Error(`Unhandled page errors during owner replacement: ${pageErrors.join("; ")}`);
+      }
       await context.close();
     }
 
@@ -398,6 +651,7 @@ async function runTests() {
       status: "pass",
       cases_passed: 4,
       cases_failed: 0,
+      observations: { ownerLifecycle },
     };
 
     console.log(JSON.stringify(result));

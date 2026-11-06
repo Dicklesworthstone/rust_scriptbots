@@ -39,13 +39,13 @@ use crate::control::{
     AgentScoreEntry, ApiSchemaDto, ApiVersionDto, AppliedInterventionDto, ArtifactMetadataDto,
     CheckpointCreateRequest, CheckpointMetadataDto, CheckpointRetentionDto, CommandStatusDto,
     ConfigSnapshot, ControlError, ControlHandle, DietClassDto, EventEntry, EventKind,
-    ExperimentBatchStatusDto, ExperimentCreateRequest, ExperimentExecutionCapacityDto,
-    ExperimentRunRecordDto, ExperimentSummaryDto, ExperimentVariantDto, HydrologySnapshot,
-    InterveneRequestBody, InterventionsPollDto, KnobEntry, KnobUpdate, MAX_STEP_BATCH,
-    MapApplyAgentPolicy, MapApplyRequestBody, MapGenerateRequestBody, PaginatedArtifactsResponse,
-    PaginatedCheckpointsResponse, PaginatedExperimentsResponse, Scoreboard, SelectionModeDto,
-    SelectionSnapshotDto, SelectionStateDto, SimulationStatusDto, SpeedRequest,
-    parse_intervention_command, parse_map_artifact,
+    ExperimentBatchStatusDto, ExperimentComparisonDto, ExperimentCreateRequest,
+    ExperimentExecutionCapacityDto, ExperimentRunRecordDto, ExperimentSummaryDto,
+    ExperimentVariantDto, HydrologySnapshot, InterveneRequestBody, InterventionsPollDto, KnobEntry,
+    KnobUpdate, MAX_STEP_BATCH, MapApplyAgentPolicy, MapApplyRequestBody, MapGenerateRequestBody,
+    PaginatedArtifactsResponse, PaginatedCheckpointsResponse, PaginatedExperimentsResponse,
+    Scoreboard, SelectionModeDto, SelectionSnapshotDto, SelectionStateDto, SimulationStatusDto,
+    SpeedRequest, parse_intervention_command, parse_map_artifact,
 };
 use crate::narrative_search::{NarrativeAroundQuery, NarrativeSearchHitDto, NarrativeSearchQuery};
 use crate::{ScenarioIdentityV0, ScenarioInterventionV1};
@@ -1548,6 +1548,7 @@ pub struct SpeedRequestBody {
         post_v1_experiments,
         get_v1_experiments,
         get_v1_experiment_by_id,
+        post_v1_experiment_compare,
         post_v1_experiment_cancel,
         post_v1_experiment_resume,
         post_v1_checkpoints,
@@ -1601,6 +1602,8 @@ pub struct SpeedRequestBody {
             ExperimentCreateRequest,
             ExperimentRunRecordDto,
             ExperimentBatchStatusDto,
+            ExperimentComparisonRequest,
+            ExperimentComparisonDto,
             ExperimentExecutionCapacityDto,
             ExperimentSummaryDto,
             CheckpointCreateRequest,
@@ -1715,6 +1718,9 @@ impl From<ControlError> for AppError {
             ControlError::ExperimentWorkerFailed(message) => Self::internal(message),
             capacity @ ControlError::ExperimentCapacity(_) => {
                 Self::service_unavailable(capacity.to_string())
+            }
+            busy @ ControlError::ExperimentComparisonBusy => {
+                Self::service_unavailable(busy.to_string())
             }
             ControlError::CheckpointCapacity(message) => Self {
                 status: StatusCode::INSUFFICIENT_STORAGE,
@@ -3772,6 +3778,73 @@ async fn get_v1_experiment_by_id(
     Ok(Json(status))
 }
 
+/// Compare one measured endpoint across two verified completed variant cohorts.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+struct ExperimentComparisonRequest {
+    /// Exact variant ID used as the control arm.
+    baseline_variant: String,
+    /// Distinct variant ID; differences are challenger minus baseline.
+    challenger_variant: String,
+    /// Canonical endpoint metric, for example `alive_agents`.
+    metric: String,
+}
+
+/// MCP carries the experiment identity in its argument object rather than a URL.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct McpExperimentComparisonRequest {
+    experiment_id: String,
+    baseline_variant: String,
+    challenger_variant: String,
+    metric: String,
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/experiments/{experiment_id}/compare",
+    tag = "experiments",
+    params(("experiment_id" = String, Path, description = "Unique experiment identifier")),
+    request_body = ExperimentComparisonRequest,
+    responses(
+        (status = 200, description = "Verified matched-seed endpoint comparison; one-pair cohorts are explicitly descriptive only", body = ExperimentComparisonDto),
+        (status = 400, description = "Invalid identities, equal variants or unsupported metric"),
+        (status = 404, description = "Experiment or variant not found"),
+        (status = 409, description = "Incomplete cohort or unavailable endpoint metric"),
+        (status = 413, description = "Request exceeds the 4 KiB body limit"),
+        (status = 422, description = "Malformed request fields"),
+        (status = 500, description = "Saved status or artifact evidence failed verification"),
+        (status = 503, description = "Comparison capacity is already in use")
+    )
+)]
+async fn post_v1_experiment_compare(
+    State(state): State<ApiState>,
+    axum::extract::Path(experiment_id): axum::extract::Path<String>,
+    Json(body): Json<ExperimentComparisonRequest>,
+) -> Result<Json<ExperimentComparisonDto>, AppError> {
+    // Bound requests before offloading, including while the blocking pool is
+    // occupied. The shared control service separately bounds actual analysis
+    // across HTTP and terminal callers. Hold this permit in the worker so a
+    // dropped HTTP response cannot release admission while work still runs.
+    static REQUEST_SLOT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+    let permit = REQUEST_SLOT.try_acquire().map_err(|_| {
+        AppError::service_unavailable(
+            "an experiment comparison request is already waiting or running; retry after it finishes",
+        )
+    })?;
+    let comparison = run_control(move || {
+        let _permit = permit;
+        state.handle.compare_experiment_variants(
+            &experiment_id,
+            &body.baseline_variant,
+            &body.challenger_variant,
+            &body.metric,
+        )
+    })
+    .await?;
+    Ok(Json(comparison))
+}
+
 #[utoipa::path(
     post,
     path = "/api/v1/experiments/{experiment_id}/cancel",
@@ -4004,6 +4077,10 @@ fn prepare_rest_server(
         .route(
             "/api/v1/experiments/{experiment_id}",
             get(get_v1_experiment_by_id),
+        )
+        .route(
+            "/api/v1/experiments/{experiment_id}/compare",
+            post(post_v1_experiment_compare).layer(DefaultBodyLimit::max(4096)),
         )
         .route(
             "/api/v1/experiments/{experiment_id}/cancel",
@@ -4559,6 +4636,39 @@ fn register_control_tools(builder: ServerBuilder, handle: ControlHandle) -> Serv
 
     builder = register_tool(
         builder,
+        "experiment_compare",
+        "Compare one final-state metric across two completed matched-seed variants. Revalidates every retained bundle and final owner checkpoint. Differences are challenger minus baseline; one seed is descriptive only. Does not advance or modify the live world. Retry a busy result after the active comparison finishes.",
+        json!({
+            "type": "object",
+            "properties": {
+                "experiment_id": {
+                    "type": "string", "minLength": 1,
+                    "maxLength": crate::experiment_runner::MAX_RUN_COMPONENT_BYTES
+                },
+                "baseline_variant": {
+                    "type": "string", "minLength": 1,
+                    "maxLength": crate::experiment_runner::MAX_RUN_COMPONENT_BYTES
+                },
+                "challenger_variant": {
+                    "type": "string", "minLength": 1,
+                    "maxLength": crate::experiment_runner::MAX_RUN_COMPONENT_BYTES,
+                    "description": "A distinct variant in the same experiment"
+                },
+                "metric": {
+                    "type": "string",
+                    "enum": crate::experiment_runner::EXPERIMENT_ENDPOINT_METRICS,
+                    "description": "Observed endpoint at the declared final tick; unavailable metrics are refused"
+                }
+            },
+            "required": ["experiment_id", "baseline_variant", "challenger_variant", "metric"],
+            "additionalProperties": false
+        }),
+        ControlToolKind::ExperimentCompare,
+        handle.clone(),
+    );
+
+    builder = register_tool(
+        builder,
         "experiment_cancel",
         "Cancel an active or pending experiment",
         json!({
@@ -4906,6 +5016,7 @@ enum ControlToolKind {
     ExperimentCreate,
     ExperimentList,
     ExperimentStatus,
+    ExperimentCompare,
     ExperimentCancel,
     ExperimentResume,
     CheckpointCreate,
@@ -4930,10 +5041,14 @@ impl ToolHandler for ControlTool {
     }
 
     fn call(&self, _ctx: &fastmcp_rust::McpContext, arguments: Value) -> McpResult<Vec<Content>> {
-        if matches!(self.kind, ControlToolKind::Step) && !arguments.is_object() {
+        if matches!(
+            self.kind,
+            ControlToolKind::Step | ControlToolKind::ExperimentCompare
+        ) && !arguments.is_object()
+        {
             return Err(McpError::new(
                 McpErrorCode::InvalidParams,
-                "step arguments must be a JSON object",
+                format!("{} arguments must be a JSON object", self.name),
             ));
         }
         let arguments = arguments.as_object().cloned().unwrap_or_default();
@@ -5281,6 +5396,25 @@ impl ToolHandler for ControlTool {
                 let res = run_control_mcp_sync(move || handle.get_experiment(&experiment_id))?;
                 make_tool_result(res)
             }
+            ControlToolKind::ExperimentCompare => {
+                let request: McpExperimentComparisonRequest =
+                    serde_json::from_value(Value::Object(arguments)).map_err(|error| {
+                        McpError::new(
+                            McpErrorCode::InvalidParams,
+                            format!("invalid experiment_compare parameters: {error}"),
+                        )
+                    })?;
+                let handle = self.handle.clone();
+                let comparison = run_control_mcp_sync(move || {
+                    handle.compare_experiment_variants(
+                        &request.experiment_id,
+                        &request.baseline_variant,
+                        &request.challenger_variant,
+                        &request.metric,
+                    )
+                })?;
+                make_tool_result(comparison)
+            }
             ControlToolKind::ExperimentCancel => {
                 let experiment_id = arguments
                     .get("experiment_id")
@@ -5451,6 +5585,9 @@ fn map_control_error(err: ControlError) -> McpError {
             // its actionable text with isError=true, while InternalError would
             // become a masked protocol failure.
             McpError::new(McpErrorCode::ToolExecutionError, capacity.to_string())
+        }
+        busy @ ControlError::ExperimentComparisonBusy => {
+            McpError::new(McpErrorCode::ToolExecutionError, busy.to_string())
         }
         ControlError::CheckpointCapacity(message)
         | ControlError::CheckpointRetentionUnavailable(message) => {
@@ -7293,6 +7430,206 @@ mod tests {
         );
     }
 
+    async fn experiment_comparison_mcp(handle: ControlHandle) -> McpHttpState {
+        let state = mcp_http_test_state(handle, ServerBuilder::new("experiment-comparison", "0"));
+        let initialized = map_policy_mcp_request(
+            &state,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                    "clientInfo": {"name": "experiment-comparison", "version": "0"}}}),
+        )
+        .await;
+        assert!(initialized.get("error").is_none(), "{initialized}");
+        state
+    }
+
+    #[tokio::test]
+    #[serial(experiment_comparison_http)]
+    async fn mcp_experiment_comparison_matches_rest_and_reverifies_saved_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        let (handle, host) = handle();
+        let handle = handle
+            .with_artifacts_dir(root.path().to_path_buf())
+            .unwrap();
+        let runner = crate::control::tests::comparison_catalog_runner(
+            root.path(),
+            "mcp-comparison",
+            vec![7],
+            0.0,
+        );
+        let status_path = runner.output_dir.join("status.json");
+        let completed = runner.execute_batch(&status_path).unwrap();
+        assert_eq!(
+            completed.completed_runs, completed.total_runs,
+            "{completed:?}"
+        );
+        let saved_status = std::fs::read(&status_path).unwrap();
+        let live_digest = host.port.scientific_digest_v1().unwrap();
+        let live = handle.read_snapshot().unwrap();
+        let mcp = experiment_comparison_mcp(handle.clone()).await;
+        let arguments = json!({
+            "experiment_id": "mcp-comparison", "baseline_variant": "baseline",
+            "challenger_variant": "challenger", "metric": "total_food"
+        });
+        let response = map_policy_mcp_request(
+            &mcp,
+            json!({"jsonrpc":"2.0", "id":2, "method":"tools/call",
+                "params":{"name":"experiment_compare", "arguments":arguments}}),
+        )
+        .await;
+        assert!(response.get("error").is_none(), "{response}");
+        assert_ne!(response["result"]["isError"], true, "{response}");
+        let observed: ExperimentComparisonDto =
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert!(observed.mean_difference > 0.0, "{observed:?}");
+        assert_eq!(observed.matched_seeds, [7]);
+        assert!(observed.descriptive_only);
+        assert_eq!(observed.p_value, None);
+        assert_eq!(observed.ci_95, None);
+        assert_eq!(observed.plan_digest, completed.plan_digest);
+        assert_eq!(observed.status_generation, completed.generation);
+        assert_eq!(observed.endpoint_tick, runner.max_ticks);
+        let Json(rest) = post_v1_experiment_compare(
+            State(ApiState {
+                handle: handle.clone(),
+                scenario: None,
+                presented_frame: empty_presented_frame(),
+            }),
+            axum::extract::Path("mcp-comparison".to_owned()),
+            Json(ExperimentComparisonRequest {
+                baseline_variant: "baseline".into(),
+                challenger_variant: "challenger".into(),
+                metric: "total_food".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rest, observed);
+
+        // A second request must inspect the retained bytes again, rather than
+        // returning an earlier successful analysis from the catalog cache.
+        let bundle = Path::new(completed.runs[0].bundle_path.as_ref().unwrap());
+        std::fs::write(bundle.join("exports/summary.csv"), b"corrupted endpoint\n").unwrap();
+        let refused = map_policy_mcp_request(
+            &mcp,
+            json!({"jsonrpc":"2.0", "id":3, "method":"tools/call",
+                "params":{"name":"experiment_compare", "arguments":arguments}}),
+        )
+        .await;
+        assert_eq!(
+            refused["error"]["code"],
+            i32::from(McpErrorCode::InternalError),
+            "{refused}"
+        );
+        assert_eq!(std::fs::read(&status_path).unwrap(), saved_status);
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), live_digest);
+        let after = handle.read_snapshot().unwrap();
+        assert_eq!(after.world, live.world);
+        assert_eq!(after.revisions, live.revisions);
+        assert_eq!(after.last_applied_command, live.last_applied_command);
+    }
+
+    #[tokio::test]
+    async fn mcp_experiment_comparison_rejects_malformed_arguments_before_analysis() {
+        let root = tempfile::tempdir().unwrap();
+        let (handle, host) = handle();
+        let handle = handle
+            .with_artifacts_dir(root.path().to_path_buf())
+            .unwrap();
+        let live = handle.read_snapshot().unwrap();
+        let tool = ControlTool {
+            handle: handle.clone(),
+            kind: ControlToolKind::ExperimentCompare,
+            name: "experiment_compare".into(),
+            description: "Compare endpoints".into(),
+            schema: json!({"type":"object"}),
+        };
+        let runtime = mcp_context_test_runtime();
+        let cx = runtime.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        let ctx = fastmcp_rust::McpContext::new(cx, 1);
+        let mcp = experiment_comparison_mcp(handle.clone()).await;
+        let valid = json!({
+            "experiment_id": "missing", "baseline_variant": "baseline",
+            "challenger_variant": "challenger", "metric": "alive_agents"
+        });
+        let mut cases = vec![json!(null), json!([]), json!(false), json!("compare")];
+        for field in [
+            "experiment_id",
+            "baseline_variant",
+            "challenger_variant",
+            "metric",
+        ] {
+            let mut missing = valid.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            cases.push(missing);
+            let mut wrong_type = valid.clone();
+            wrong_type[field] = json!(7);
+            cases.push(wrong_type);
+        }
+        let mut unknown = valid.clone();
+        unknown["metirc"] = json!("alive_agents");
+        cases.push(unknown);
+        for (field, value) in [
+            ("experiment_id", "../outside".to_owned()),
+            ("baseline_variant", String::new()),
+            ("challenger_variant", "baseline".to_owned()),
+            ("metric", "fitness".to_owned()),
+            (
+                "experiment_id",
+                "x".repeat(crate::experiment_runner::MAX_RUN_COMPONENT_BYTES + 1),
+            ),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[field] = json!(value);
+            cases.push(invalid);
+        }
+        for (index, arguments) in cases.into_iter().enumerate() {
+            let direct = tool
+                .call(&ctx, arguments.clone())
+                .expect_err("strict direct tool input");
+            assert_eq!(
+                direct.code,
+                McpErrorCode::InvalidParams,
+                "{arguments}: {direct}"
+            );
+            assert!(
+                !direct.message.contains("not found"),
+                "validation must precede catalog access: {direct}"
+            );
+            let response = map_policy_mcp_request(
+                &mcp,
+                json!({"jsonrpc":"2.0", "id":index + 2, "method":"tools/call",
+                    "params":{"name":"experiment_compare", "arguments":arguments}}),
+            )
+            .await;
+            if arguments["experiment_id"] == "../outside"
+                || arguments["challenger_variant"] == "baseline"
+            {
+                // These shapes satisfy JSON Schema; the shared service rejects
+                // their semantics. FastMCP returns handler refusals as tool
+                // results, while schema refusals are protocol InvalidParams.
+                assert!(response.get("error").is_none(), "{arguments}: {response}");
+                assert_eq!(
+                    response["result"]["isError"], true,
+                    "{arguments}: {response}"
+                );
+                assert_eq!(response["result"]["content"][0]["text"], direct.message);
+            } else {
+                assert_eq!(
+                    response["error"]["code"],
+                    i32::from(McpErrorCode::InvalidParams),
+                    "{arguments}: {response}"
+                );
+            }
+        }
+        assert!(!root.path().join("experiments").exists());
+        let after = host.handle().read_snapshot().unwrap();
+        assert_eq!(after.world, live.world);
+        assert_eq!(after.revisions, live.revisions);
+        assert_eq!(after.last_applied_command, live.last_applied_command);
+    }
+
     #[tokio::test]
     async fn rest_patch_rejects_non_finite_value_with_field_path_before_admission() {
         let (handle, receiver) = handle();
@@ -8653,6 +8990,7 @@ mod tests {
     #[test]
     fn mcp_tool_roster_is_complete() {
         let (control, _receiver) = handle();
+        let discovery = control.schema();
         let server = register_control_tools(
             ServerBuilder::new("scriptbots-control-test", "0.0.0"),
             control,
@@ -8685,6 +9023,7 @@ mod tests {
             "experiment_create",
             "experiment_list",
             "experiment_status",
+            "experiment_compare",
             "experiment_cancel",
             "experiment_resume",
             "checkpoint_create",
@@ -8704,6 +9043,49 @@ mod tests {
             expected.difference(&registered).collect::<Vec<_>>(),
             registered.difference(&expected).collect::<Vec<_>>()
         );
+        assert_eq!(
+            discovery.mcp_tools.into_iter().collect::<BTreeSet<_>>(),
+            registered
+        );
+        assert!(
+            discovery
+                .routes
+                .iter()
+                .any(|path| path == "/api/v1/experiments/{experiment_id}/compare")
+        );
+        assert!(
+            discovery
+                .schemas
+                .iter()
+                .any(|name| name == "ExperimentComparisonDto")
+        );
+        let tools = server.tools();
+        let schema = &tools
+            .iter()
+            .find(|tool| tool.name == "experiment_compare")
+            .unwrap()
+            .input_schema;
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(
+            schema["required"],
+            json!([
+                "experiment_id",
+                "baseline_variant",
+                "challenger_variant",
+                "metric"
+            ])
+        );
+        assert_eq!(
+            schema["properties"]["metric"]["enum"],
+            json!(crate::experiment_runner::EXPERIMENT_ENDPOINT_METRICS)
+        );
+        for field in ["experiment_id", "baseline_variant", "challenger_variant"] {
+            assert_eq!(schema["properties"][field]["minLength"], 1);
+            assert_eq!(
+                schema["properties"][field]["maxLength"],
+                crate::experiment_runner::MAX_RUN_COMPONENT_BYTES
+            );
+        }
     }
 
     /// Collect the `/api/...` literal that follows each occurrence of `marker`.
@@ -10255,6 +10637,85 @@ mod tests {
             handle.status().unwrap().tick,
             0,
             "monitoring never advances science"
+        );
+        server.shutdown().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial(experiment_comparison_http)]
+    async fn experiment_comparison_http_refuses_invalid_requests_without_advancing_science() {
+        let owner = test_host();
+        let reservation = ControlServerReservation::prepare(ControlServerConfig {
+            rest_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            mcp_transport: McpTransportConfig::Disabled,
+            ..ControlServerConfig::default()
+        })
+        .unwrap();
+        let address = reservation.rest_address().unwrap();
+        let (server, _) = reservation.launch(owner.port.clone(), false).unwrap();
+        let handle = server.control_handle().unwrap();
+        let client = reqwest::Client::new();
+        let url = format!("http://{address}/api/v1/experiments/not-created/compare");
+        let valid = json!({
+            "baseline_variant": "baseline",
+            "challenger_variant": "treatment",
+            "metric": "alive_agents",
+        });
+        let missing = client.post(&url).json(&valid).send().await.unwrap();
+        assert_eq!(missing.status().as_u16(), 404);
+        for (body, expected_status) in [
+            (
+                json!({"baseline_variant":"same", "challenger_variant":"same", "metric":"alive_agents"}),
+                400,
+            ),
+            (
+                json!({"baseline_variant":"baseline", "challenger_variant":"treatment", "metric":"invented_fitness"}),
+                400,
+            ),
+            (
+                json!({"baseline_variant":"baseline", "challenger_variant":"treatment", "metric":"alive_agents", "after_tick":1}),
+                422,
+            ),
+            (
+                json!({"baseline_variant":"baseline", "challenger_variant":"treatment"}),
+                422,
+            ),
+        ] {
+            let response = client.post(&url).json(&body).send().await.unwrap();
+            assert_eq!(response.status().as_u16(), expected_status, "{body}");
+        }
+        let oversized = json!({
+            "baseline_variant": "b".repeat(4096),
+            "challenger_variant": "treatment",
+            "metric": "alive_agents",
+        });
+        assert_eq!(
+            client
+                .post(&url)
+                .json(&oversized)
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16(),
+            413
+        );
+        assert_eq!(
+            client
+                .post(&url)
+                .header("content-type", "text/plain")
+                .body(valid.to_string())
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16(),
+            415
+        );
+        assert_eq!(
+            handle.status().unwrap().tick,
+            0,
+            "analysis requests never step the owner"
         );
         server.shutdown().unwrap();
     }
