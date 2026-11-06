@@ -3128,8 +3128,8 @@ pub struct HostCore {
     cadence_credit: u128,
     next_snapshot: SnapshotRevision,
     last_published_scientific: ScientificRevision,
-    /// Config and audit published with the last snapshot, reused while
-    /// `revisions.config` is unchanged so a tick costs a pointer clone.
+    /// Config and audit published with the last snapshot. Config also observes the
+    /// tick-applied closed flag; ordinary ticks reuse both immutable payloads.
     config: Arc<ScriptBotsConfig>,
     config_audit: Arc<Vec<ConfigAuditEntry>>,
     last_published_config: ConfigRevision,
@@ -5097,16 +5097,19 @@ impl HostCore {
             &layers,
             refresh,
         );
-        // Config and its audit move only when revisions.config moves, so this
-        // is a pointer clone on every tick that does not change configuration.
-        let config_changed = self.revisions.config != self.last_published_config;
-        let (config, config_audit) = if config_changed {
-            (
-                Arc::new(self.world.config().clone()),
-                Arc::new(self.world.config_audit().to_vec()),
-            )
+        // SetClosedWorld is the sole tick-stage config mutation outside the config
+        // revision domain. Observe its actual effect without inventing a config edit
+        // or audit entry; queued interventions leave both cached payloads untouched.
+        let config_revision_changed = self.revisions.config != self.last_published_config;
+        let config = if config_revision_changed || self.config.closed != self.world.is_closed() {
+            Arc::new(self.world.config().clone())
         } else {
-            (Arc::clone(&self.config), Arc::clone(&self.config_audit))
+            Arc::clone(&self.config)
+        };
+        let config_audit = if config_revision_changed {
+            Arc::new(self.world.config_audit().to_vec())
+        } else {
+            Arc::clone(&self.config_audit)
         };
         // Same revision-gating shape as config, keyed on the ring's monotonic
         // seq: interventions are rare, so this is a pointer clone on almost
@@ -6441,6 +6444,7 @@ impl ManualHostDriver for HostCore {
         let presentation_changed = latest.revisions.control != self.revisions.control
             || !Arc::ptr_eq(&latest.scheduled_patches, &self.scheduled_patches)
             || latest.revisions.config != self.revisions.config
+            || latest.config.closed != self.world.is_closed()
             || latest.playback != self.playback
             || latest.lifecycle != self.lifecycle
             || latest.health != self.health
@@ -8774,6 +8778,113 @@ mod tests {
             Arc::ptr_eq(&third.applied_interventions, &fourth.applied_interventions),
             "an unchanged non-empty ring must also reuse its payload"
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one real owner journey checks queued and applied closure, sparse cadence, cache reuse and publication purity"
+    )]
+    fn queued_closure_publishes_its_actual_tick_without_config_revision_or_audit_changes() {
+        let world = WorldState::new(ScriptBotsConfig {
+            world_width: 40,
+            world_height: 40,
+            food_cell_size: 10,
+            rng_seed: Some(0x00c1_05ed),
+            persistence_interval: 0,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            closed: false,
+            ..ScriptBotsConfig::default()
+        })
+        .unwrap();
+        let mut configured = options(false);
+        configured.snapshot_interval_ticks = 3;
+        let mut core = HostCore::new(HostSessionId::new(81), world, configured).unwrap();
+        core.drive(ManualInstant::from_nanos(0)).unwrap();
+        let initial = core.latest_snapshot();
+        let initial_config_revision = core.world.config_revision();
+
+        for (sequence, closed) in [(1_u64, true), (2, false)] {
+            let start = (sequence - 1) * 40;
+            let before = core.latest_snapshot();
+            assert_ne!(before.config.closed, closed);
+            settle_continuation_command(
+                &mut core,
+                CommandEnvelope::new(
+                    CommandId::new(u128::from(sequence)),
+                    HostCommand::Intervention(Box::new(
+                        scriptbots_core::InterventionCommand::new(
+                            scriptbots_core::Intervention::SetClosedWorld { closed },
+                            scriptbots_core::InterventionSurface::Script,
+                            "closure-publication",
+                        ),
+                    )),
+                ),
+                start + 1,
+            );
+            let queued = core.latest_snapshot();
+            assert_eq!(queued.world.tick, before.world.tick);
+            assert_eq!(queued.config.closed, before.config.closed);
+            assert_eq!(core.world.is_closed(), before.config.closed);
+            assert!(Arc::ptr_eq(&queued.config, &before.config));
+            assert!(Arc::ptr_eq(&queued.config_audit, &before.config_audit));
+
+            let receipt = core.drive(ManualInstant::from_nanos(start + 10)).unwrap();
+            assert_eq!(receipt.scientific_steps, 1);
+            assert_eq!(
+                receipt.snapshots_published, 1,
+                "an actual closure effect must publish before the three-tick science cadence"
+            );
+            let applied = core.latest_snapshot();
+            assert_eq!(applied.world.tick, before.world.tick + 1);
+            assert_eq!(applied.config.closed, closed);
+            assert_eq!(applied.world.world.closed, closed);
+            assert_eq!(core.world.is_closed(), closed);
+            assert_eq!(applied.revisions.control, queued.revisions.control);
+            assert_eq!(applied.revisions.config, queued.revisions.config);
+            assert_eq!(
+                applied.revisions.scientific,
+                queued.revisions.scientific.checked_next().unwrap()
+            );
+            assert!(!Arc::ptr_eq(&applied.config, &queued.config));
+            assert!(Arc::ptr_eq(&applied.config_audit, &queued.config_audit));
+            assert_eq!(core.world.config_revision(), initial_config_revision);
+            assert_eq!(core.world.config_audit(), initial.config_audit.as_slice());
+            assert_eq!(
+                before.config.closed, !closed,
+                "older publications stay immutable"
+            );
+
+            let digest = core.scientific_digest_v1().unwrap();
+            let revisions = core.revisions;
+            let journal = core.next_journal_sequence;
+            core.publish_snapshot().unwrap();
+            assert_eq!(core.scientific_digest_v1().unwrap(), digest);
+            assert_eq!(core.revisions, revisions);
+            assert_eq!(core.next_journal_sequence, journal);
+            assert_eq!(core.world.config_revision(), initial_config_revision);
+            assert_eq!(core.world.config_audit(), initial.config_audit.as_slice());
+            assert!(Arc::ptr_eq(&core.latest_snapshot().config, &applied.config));
+
+            // Settle the actual volatile tick receipt without advancing time. The full
+            // owner artifact requires its published config to equal the captured world.
+            core.drive(ManualInstant::from_nanos(start + 10)).unwrap();
+            let checkpoint = core.capture_host_checkpoint_v1().unwrap();
+            assert_eq!(checkpoint.config().closed, closed);
+            assert_eq!(checkpoint.config_revision(), initial.revisions.config);
+            for offset in [20_u64, 30, 40] {
+                let receipt = core
+                    .drive(ManualInstant::from_nanos(start + offset))
+                    .unwrap();
+                assert_eq!(receipt.scientific_steps, 1);
+                assert_eq!(receipt.snapshots_published, usize::from(offset == 40));
+                let ordinary = core.latest_snapshot();
+                assert!(Arc::ptr_eq(&ordinary.config, &applied.config));
+                assert!(Arc::ptr_eq(&ordinary.config_audit, &applied.config_audit));
+                assert_eq!(ordinary.config.closed, closed);
+            }
+        }
     }
 
     #[test]

@@ -3572,6 +3572,15 @@ It supports matched seeds, bounded parallelism, checkpoint/branch experiments, r
 
 ### 7.8 offline analysis integrations
 
+**Source correctness extension — Codex, 2026-11-06 UTC:** Tick-applied
+`SetClosedWorld` interventions now invalidate the published config's closed flag
+and request publication even between sparse snapshot intervals. Configuration
+audit/revision semantics remain unchanged; ordinary ticks retain cached config
+and audit Arcs. This keeps live control status consistent with actual closure
+while preserving replay inputs. Actual-owner regression source covers queued and
+applied effects, both directions, sparse automatic ticks and read-only publication
+invariants. Native DSR qualification remains pending.
+
 **Source implementation extension — Codex, 2026-11-06 UTC:** Historical canvas
 review now retains successful intervention commands alongside spawn/crossover and
 mutation edits, merges them with configuration edits by their observed revisions,
