@@ -40,13 +40,13 @@ use crate::control::{
     AgentScoreEntry, ApiSchemaDto, ApiVersionDto, AppliedInterventionDto, ArtifactMetadataDto,
     CheckpointCreateRequest, CheckpointMetadataDto, CheckpointRetentionDto, CommandStatusDto,
     ConfigSnapshot, ControlError, ControlHandle, DietClassDto, EventEntry, EventKind,
-    ExperimentBatchStatusDto, ExperimentCreateRequest, ExperimentExecutionCapacityDto,
-    ExperimentRunRecordDto, ExperimentSummaryDto, ExperimentVariantDto, HydrologySnapshot,
-    InterveneRequestBody, InterventionsPollDto, KnobEntry, KnobUpdate, MAX_STEP_BATCH,
-    MapApplyAgentPolicy, MapApplyRequestBody, MapGenerateRequestBody, PaginatedArtifactsResponse,
-    PaginatedCheckpointsResponse, PaginatedExperimentsResponse, Scoreboard, SelectionModeDto,
-    SelectionSnapshotDto, SelectionStateDto, SimulationStatusDto, SpeedRequest,
-    parse_intervention_command, parse_map_artifact,
+    ExperimentBatchStatusDto, ExperimentComparisonDto, ExperimentCreateRequest,
+    ExperimentExecutionCapacityDto, ExperimentRunRecordDto, ExperimentSummaryDto,
+    ExperimentVariantDto, HydrologySnapshot, InterveneRequestBody, InterventionsPollDto, KnobEntry,
+    KnobUpdate, MAX_STEP_BATCH, MapApplyAgentPolicy, MapApplyRequestBody, MapGenerateRequestBody,
+    PaginatedArtifactsResponse, PaginatedCheckpointsResponse, PaginatedExperimentsResponse,
+    Scoreboard, SelectionModeDto, SelectionSnapshotDto, SelectionStateDto, SimulationStatusDto,
+    SpeedRequest, parse_intervention_command, parse_map_artifact,
 };
 use crate::narrative_search::{NarrativeAroundQuery, NarrativeSearchHitDto, NarrativeSearchQuery};
 use scriptbots_core::{
@@ -1534,6 +1534,7 @@ pub struct SpeedRequestBody {
         post_v1_experiments,
         get_v1_experiments,
         get_v1_experiment_by_id,
+        post_v1_experiment_compare,
         post_v1_experiment_cancel,
         post_v1_experiment_resume,
         post_v1_checkpoints,
@@ -1587,6 +1588,8 @@ pub struct SpeedRequestBody {
             ExperimentCreateRequest,
             ExperimentRunRecordDto,
             ExperimentBatchStatusDto,
+            ExperimentComparisonRequest,
+            ExperimentComparisonDto,
             ExperimentExecutionCapacityDto,
             ExperimentSummaryDto,
             CheckpointCreateRequest,
@@ -1701,6 +1704,9 @@ impl From<ControlError> for AppError {
             ControlError::ExperimentWorkerFailed(message) => Self::internal(message),
             capacity @ ControlError::ExperimentCapacity(_) => {
                 Self::service_unavailable(capacity.to_string())
+            }
+            busy @ ControlError::ExperimentComparisonBusy => {
+                Self::service_unavailable(busy.to_string())
             }
             ControlError::CheckpointCapacity(message) => Self {
                 status: StatusCode::INSUFFICIENT_STORAGE,
@@ -3769,6 +3775,63 @@ async fn get_v1_experiment_by_id(
     Ok(Json(status))
 }
 
+/// Compare one measured endpoint across two verified completed variant cohorts.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+struct ExperimentComparisonRequest {
+    /// Exact variant ID used as the control arm.
+    baseline_variant: String,
+    /// Distinct variant ID; differences are challenger minus baseline.
+    challenger_variant: String,
+    /// Canonical endpoint metric, for example `alive_agents`.
+    metric: String,
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/experiments/{experiment_id}/compare",
+    tag = "experiments",
+    params(("experiment_id" = String, Path, description = "Unique experiment identifier")),
+    request_body = ExperimentComparisonRequest,
+    responses(
+        (status = 200, description = "Verified matched-seed endpoint comparison; one-pair cohorts are explicitly descriptive only", body = ExperimentComparisonDto),
+        (status = 400, description = "Invalid identities, equal variants or unsupported metric"),
+        (status = 404, description = "Experiment or variant not found"),
+        (status = 409, description = "Incomplete cohort or unavailable endpoint metric"),
+        (status = 413, description = "Request exceeds the 4 KiB body limit"),
+        (status = 422, description = "Malformed request fields"),
+        (status = 500, description = "Saved status or artifact evidence failed verification"),
+        (status = 503, description = "Comparison capacity is already in use")
+    )
+)]
+async fn post_v1_experiment_compare(
+    State(state): State<ApiState>,
+    axum::extract::Path(experiment_id): axum::extract::Path<String>,
+    Json(body): Json<ExperimentComparisonRequest>,
+) -> Result<Json<ExperimentComparisonDto>, AppError> {
+    // Bound requests before offloading, including while the blocking pool is
+    // occupied. The shared control service separately bounds actual analysis
+    // across HTTP and terminal callers. Hold this permit in the worker so a
+    // dropped HTTP response cannot release admission while work still runs.
+    static REQUEST_SLOT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+    let permit = REQUEST_SLOT.try_acquire().map_err(|_| {
+        AppError::service_unavailable(
+            "an experiment comparison request is already waiting or running; retry after it finishes",
+        )
+    })?;
+    let comparison = run_control(move || {
+        let _permit = permit;
+        state.handle.compare_experiment_variants(
+            &experiment_id,
+            &body.baseline_variant,
+            &body.challenger_variant,
+            &body.metric,
+        )
+    })
+    .await?;
+    Ok(Json(comparison))
+}
+
 #[utoipa::path(
     post,
     path = "/api/v1/experiments/{experiment_id}/cancel",
@@ -4001,6 +4064,10 @@ fn prepare_rest_server(
         .route(
             "/api/v1/experiments/{experiment_id}",
             get(get_v1_experiment_by_id),
+        )
+        .route(
+            "/api/v1/experiments/{experiment_id}/compare",
+            post(post_v1_experiment_compare).layer(DefaultBodyLimit::max(4096)),
         )
         .route(
             "/api/v1/experiments/{experiment_id}/cancel",
@@ -5448,6 +5515,9 @@ fn map_control_error(err: ControlError) -> McpError {
             // its actionable text with isError=true, while InternalError would
             // become a masked protocol failure.
             McpError::new(McpErrorCode::ToolExecutionError, capacity.to_string())
+        }
+        busy @ ControlError::ExperimentComparisonBusy => {
+            McpError::new(McpErrorCode::ToolExecutionError, busy.to_string())
         }
         ControlError::CheckpointCapacity(message)
         | ControlError::CheckpointRetentionUnavailable(message) => {
@@ -10164,6 +10234,84 @@ mod tests {
             handle.status().unwrap().tick,
             0,
             "monitoring never advances science"
+        );
+        server.shutdown().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn experiment_comparison_http_refuses_invalid_requests_without_advancing_science() {
+        let owner = test_host();
+        let reservation = ControlServerReservation::prepare(ControlServerConfig {
+            rest_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            mcp_transport: McpTransportConfig::Disabled,
+            ..ControlServerConfig::default()
+        })
+        .unwrap();
+        let address = reservation.rest_address().unwrap();
+        let (server, _) = reservation.launch(owner.port.clone(), false).unwrap();
+        let handle = server.control_handle().unwrap();
+        let client = reqwest::Client::new();
+        let url = format!("http://{address}/api/v1/experiments/not-created/compare");
+        let valid = json!({
+            "baseline_variant": "baseline",
+            "challenger_variant": "treatment",
+            "metric": "alive_agents",
+        });
+        let missing = client.post(&url).json(&valid).send().await.unwrap();
+        assert_eq!(missing.status().as_u16(), 404);
+        for (body, expected_status) in [
+            (
+                json!({"baseline_variant":"same", "challenger_variant":"same", "metric":"alive_agents"}),
+                400,
+            ),
+            (
+                json!({"baseline_variant":"baseline", "challenger_variant":"treatment", "metric":"invented_fitness"}),
+                400,
+            ),
+            (
+                json!({"baseline_variant":"baseline", "challenger_variant":"treatment", "metric":"alive_agents", "after_tick":1}),
+                422,
+            ),
+            (
+                json!({"baseline_variant":"baseline", "challenger_variant":"treatment"}),
+                422,
+            ),
+        ] {
+            let response = client.post(&url).json(&body).send().await.unwrap();
+            assert_eq!(response.status().as_u16(), expected_status, "{body}");
+        }
+        let oversized = json!({
+            "baseline_variant": "b".repeat(4096),
+            "challenger_variant": "treatment",
+            "metric": "alive_agents",
+        });
+        assert_eq!(
+            client
+                .post(&url)
+                .json(&oversized)
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16(),
+            413
+        );
+        assert_eq!(
+            client
+                .post(&url)
+                .header("content-type", "text/plain")
+                .body(valid.to_string())
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16(),
+            415
+        );
+        assert_eq!(
+            handle.status().unwrap().tick,
+            0,
+            "analysis requests never step the owner"
         );
         server.shutdown().unwrap();
     }

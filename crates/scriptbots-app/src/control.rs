@@ -182,6 +182,8 @@ pub struct KnobUpdate {
 pub enum ControlError {
     #[error("experiment execution capacity exhausted: {0}")]
     ExperimentCapacity(String),
+    #[error("an experiment comparison is already running; retry after it completes")]
+    ExperimentComparisonBusy,
     #[error("experiment service is shutting down; resume retained work in a new control runtime")]
     ExperimentShuttingDown,
     #[error("experiment worker failed: {0}")]
@@ -629,6 +631,31 @@ pub struct ExperimentBatchStatusDto {
     pub error_reason: Option<String>,
     pub created_at_utc: String,
     pub updated_at_utc: String,
+}
+
+/// One source-verified, matched-seed endpoint comparison within an experiment.
+/// Differences are challenger minus baseline; a larger value is not a fitness verdict.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ExperimentComparisonDto {
+    pub experiment_id: String,
+    pub baseline_variant: String,
+    pub challenger_variant: String,
+    pub metric: String,
+    pub endpoint_tick: u64,
+    pub matched_seeds: Vec<u64>,
+    pub mean_difference: f64,
+    pub ci_95: Option<(f64, f64)>,
+    /// Paired Cohen's d_z, unavailable for a single pair or zero-spread differences.
+    pub standardized_effect: Option<f64>,
+    /// Inference is deliberately absent when only one independent seed pair exists.
+    pub p_value: Option<f64>,
+    pub adjusted_p_value: Option<f64>,
+    pub significant: Option<bool>,
+    pub descriptive_only: bool,
+    pub underpowered_reason: Option<String>,
+    pub undefined_effect_reason: Option<String>,
+    pub plan_digest: String,
+    pub status_generation: u64,
 }
 
 /// Summary of an experiment for paginated listings.
@@ -1388,6 +1415,8 @@ impl ExperimentJob {
 #[derive(Debug)]
 pub struct DataServices {
     experiments: Mutex<BTreeMap<String, ExperimentJob>>,
+    /// A nonblocking, shared admission slot for bundle restoration and statistics.
+    experiment_comparison: Mutex<()>,
     /// Once closed, retained handles may inspect work but cannot start or resume it.
     experiment_shutdown_requested: std::sync::atomic::AtomicBool,
     execution_capacity: Arc<Mutex<ExperimentExecutionCapacityDto>>,
@@ -1606,6 +1635,7 @@ impl DataServices {
         };
         Self {
             experiments: Mutex::new(BTreeMap::new()),
+            experiment_comparison: Mutex::new(()),
             experiment_shutdown_requested: std::sync::atomic::AtomicBool::new(false),
             execution_capacity: Arc::new(Mutex::new(ExperimentExecutionCapacityDto {
                 max_run_slots: crate::experiment_runner::MAX_CONCURRENT_RUNS,
@@ -2511,6 +2541,190 @@ impl ControlHandle {
             ControlError::NotFound(format!("experiment '{experiment_id}' not found"))
         })?;
         job.status_dto()
+    }
+
+    /// Compare one declared endpoint across two complete, distinct variant cohorts.
+    ///
+    /// Bundle restoration and the canonical Lab statistics run on the caller's
+    /// background worker, without holding the experiment catalog lock or touching
+    /// the live simulation. Each seed contributes exactly one final observation.
+    /// Uses the existing Lab's default two-sided paired analysis and 95% interval;
+    /// a one-pair cohort returns only its descriptive difference and provenance.
+    pub fn compare_experiment_variants(
+        &self,
+        experiment_id: &str,
+        baseline_variant: &str,
+        challenger_variant: &str,
+        metric: &str,
+    ) -> Result<ExperimentComparisonDto, ControlError> {
+        use crate::experiment_runner::{
+            EXPERIMENT_ENDPOINT_METRICS, MAX_RUN_COMPONENT_BYTES, RunState, validate_path_component,
+        };
+        use crate::lab::stats::{
+            AnalysisParams, RunSummary, RunSummaryParts, analyze_matched_seed_runs,
+        };
+
+        for (label, value) in [
+            ("experiment_id", experiment_id),
+            ("baseline_variant", baseline_variant),
+            ("challenger_variant", challenger_variant),
+        ] {
+            if value.len() > MAX_RUN_COMPONENT_BYTES {
+                return Err(ControlError::BadRequest(format!(
+                    "{label} exceeds the {MAX_RUN_COMPONENT_BYTES}-byte experiment identity bound"
+                )));
+            }
+            validate_path_component(label, value)
+                .map_err(|error| ControlError::BadRequest(error.to_string()))?;
+        }
+        if baseline_variant == challenger_variant {
+            return Err(ControlError::BadRequest(
+                "comparison requires two distinct variants".into(),
+            ));
+        }
+        if !EXPERIMENT_ENDPOINT_METRICS.contains(&metric) {
+            return Err(ControlError::BadRequest(format!(
+                "unsupported experiment endpoint metric; expected one of {}",
+                EXPERIMENT_ENDPOINT_METRICS.join(", ")
+            )));
+        }
+        // The slot protects only read/analysis capacity, not mutable science.
+        // Recover its empty value after a panic; RAII releases it on every return.
+        let _comparison = match self.data_services.experiment_comparison.try_lock() {
+            Ok(permit) => permit,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(ControlError::ExperimentComparisonBusy);
+            }
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        };
+        self.data_services.recover_experiment(experiment_id)?;
+        let (runner, state_file) = {
+            let jobs = self
+                .data_services
+                .experiments
+                .lock()
+                .map_err(|_| ControlError::Lock)?;
+            let job = jobs.get(experiment_id).ok_or_else(|| {
+                ControlError::NotFound(format!("experiment '{experiment_id}' not found"))
+            })?;
+            (Arc::clone(&job.runner), job.state_file.clone())
+        };
+        let variants = [baseline_variant, challenger_variant]
+            .map(|id| {
+                runner
+                    .variants
+                    .iter()
+                    .find(|variant| variant.variant_id == id)
+                    .ok_or_else(|| {
+                        ControlError::NotFound(format!(
+                            "variant '{id}' is not in experiment '{experiment_id}'"
+                        ))
+                    })
+            })
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
+        let status = runner
+            .status_snapshot(&state_file)
+            .map_err(|error| ControlError::Serialization(error.to_string()))?;
+        if let Some(run) = status.runs.iter().find(|run| {
+            (run.variant_id == baseline_variant || run.variant_id == challenger_variant)
+                && run.state != RunState::Completed
+        }) {
+            return Err(ControlError::Conflict(format!(
+                "comparison run '{}' is {:?}; every declared seed must be completed",
+                run.run_id, run.state
+            )));
+        }
+        let endpoints = runner
+            .verified_comparison_endpoints(
+                &state_file,
+                &status,
+                baseline_variant,
+                challenger_variant,
+            )
+            .map_err(|error| ControlError::Serialization(error.to_string()))?;
+        let matched_seeds = endpoints[0]
+            .iter()
+            .map(|state| state.summary.seed)
+            .collect::<Vec<_>>();
+        let mut summaries = Vec::with_capacity(matched_seeds.len().saturating_mul(2));
+        for (arm, states) in endpoints.into_iter().enumerate() {
+            let variant = variants[arm];
+            for state in states {
+                let metrics = state.summary.available_metrics();
+                if !metrics.get(metric).is_some_and(|value| value.is_finite()) {
+                    return Err(ControlError::Conflict(format!(
+                        "endpoint '{metric}' is unavailable for run '{}' at tick {}; missing values are not replaced with zero",
+                        state.run_id, state.tick
+                    )));
+                }
+                summaries.push(RunSummary::from_verified_parts(RunSummaryParts {
+                    summary_path: Some(
+                        runner
+                            .output_dir
+                            .join(&state.run_id)
+                            .join("exports/summary.csv")
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
+                    run_id: state.run_id,
+                    arm_id: u16::try_from(arm).expect("two comparison arms fit u16"),
+                    seed: state.summary.seed,
+                    config_digest: state.config_digest,
+                    digest: state.scientific_digest,
+                    ticks: state.tick,
+                    metrics,
+                    summary_artifact_digest: state.summary_artifact_digest,
+                    variant_id: variant.variant_id.clone(),
+                    config_overrides: variant.config_overrides.clone(),
+                    brain_family: state.summary.brain_family,
+                }));
+            }
+        }
+        let mut analysis =
+            analyze_matched_seed_runs(&summaries, &[metric.to_owned()], AnalysisParams::default())
+                .map_err(|error| {
+                    ControlError::Conflict(format!("comparison unavailable: {error}"))
+                })?;
+        let effect = analysis.effects.pop().ok_or_else(|| {
+            ControlError::Serialization("comparison produced no endpoint effect".into())
+        })?;
+        if !effect.mean_difference.is_finite()
+            || effect
+                .standardized_effect
+                .is_some_and(|value| !value.is_finite())
+            || effect
+                .ci_95
+                .is_some_and(|(low, high)| !low.is_finite() || !high.is_finite())
+            || !effect.raw_p_value.is_finite()
+            || !effect.adjusted.adjusted_p_value.is_finite()
+        {
+            return Err(ControlError::Serialization(
+                "comparison produced a non-finite endpoint estimate".into(),
+            ));
+        }
+        let descriptive_only = effect.n_pairs < 2;
+        Ok(ExperimentComparisonDto {
+            experiment_id: experiment_id.to_owned(),
+            baseline_variant: baseline_variant.to_owned(),
+            challenger_variant: challenger_variant.to_owned(),
+            metric: metric.to_owned(),
+            endpoint_tick: runner.max_ticks,
+            matched_seeds,
+            mean_difference: effect.mean_difference,
+            ci_95: effect.ci_95,
+            standardized_effect: effect.standardized_effect,
+            p_value: (!descriptive_only).then_some(effect.raw_p_value),
+            adjusted_p_value: (!descriptive_only).then_some(effect.adjusted.adjusted_p_value),
+            significant: (!descriptive_only).then_some(effect.adjusted.rejected),
+            descriptive_only,
+            underpowered_reason: effect
+                .underpowered_reason
+                .map(|reason| reason.description()),
+            undefined_effect_reason: effect.undefined_reason.map(|reason| reason.description()),
+            plan_digest: status.plan_digest,
+            status_generation: status.generation,
+        })
     }
 
     /// Request cooperative cancellation at the next durable tick boundary.
@@ -5155,6 +5369,333 @@ pub(crate) mod tests {
         .persist(&directory)
         .unwrap();
         directory.join("definition.json")
+    }
+
+    fn comparison_catalog_runner(
+        root: &Path,
+        id: &str,
+        seeds: Vec<u64>,
+        metabolism_drain: f64,
+    ) -> crate::experiment_runner::MatchedSeedExperimentRunner {
+        use crate::experiment_runner::{
+            MatchedSeedCohort, MatchedSeedExperimentRunner, ScenarioVariant,
+        };
+        // The two conditions differ in actual retained food. No ingestion,
+        // locomotion or reproduction can turn that fixture into another outcome.
+        let common = BTreeMap::from([
+            ("world_width".into(), serde_json::json!(480)),
+            ("world_height".into(), serde_json::json!(480)),
+            ("food_cell_size".into(), serde_json::json!(120)),
+            ("population_minimum".into(), serde_json::json!(0)),
+            ("population_spawn_interval".into(), serde_json::json!(0)),
+            ("food_max".into(), serde_json::json!(10.0)),
+            ("food_growth_rate".into(), serde_json::json!(0.0)),
+            ("food_decay_rate".into(), serde_json::json!(0.0)),
+            ("food_diffusion_rate".into(), serde_json::json!(0.0)),
+            ("food_intake_rate".into(), serde_json::json!(0.0)),
+            ("food_waste_rate".into(), serde_json::json!(0.0)),
+            ("food_respawn_interval".into(), serde_json::json!(0)),
+            ("bot_speed".into(), serde_json::json!(0.0)),
+            ("movement_drain".into(), serde_json::json!(0.0)),
+            (
+                "metabolism_drain".into(),
+                serde_json::json!(metabolism_drain),
+            ),
+            ("metabolism_ramp_rate".into(), serde_json::json!(0.0)),
+            ("metabolism_boost_penalty".into(), serde_json::json!(0.0)),
+            ("temperature_discomfort_rate".into(), serde_json::json!(0.0)),
+            ("spike_damage".into(), serde_json::json!(0.0)),
+            ("spike_energy_cost".into(), serde_json::json!(0.0)),
+            ("reproduction_attempt_chance".into(), serde_json::json!(0.0)),
+        ]);
+        let variants = [("baseline", 0.0), ("challenger", 10.0)]
+            .into_iter()
+            .map(|(variant_id, initial_food)| {
+                let mut config_overrides = common.clone();
+                config_overrides.insert("initial_food".into(), serde_json::json!(initial_food));
+                ScenarioVariant {
+                    variant_id: variant_id.into(),
+                    brain_family: "mlp".into(),
+                    config_overrides,
+                    interventions: Vec::new(),
+                }
+            })
+            .collect();
+        let directory = root.canonicalize().unwrap().join("experiments").join(id);
+        let runner = MatchedSeedExperimentRunner::new(
+            id,
+            MatchedSeedCohort {
+                cohort_id: id.into(),
+                seeds,
+            },
+            variants,
+            2,
+            1,
+            &directory,
+        );
+        ExperimentDefinitionV1 {
+            schema_version: 1,
+            experiment_id: id.into(),
+            cohort: runner.cohort.clone(),
+            variants: runner.variants.clone(),
+            max_ticks: runner.max_ticks,
+            max_concurrency: runner.max_concurrency,
+            plan_digest: runner.plan_digest().unwrap(),
+            created_at_utc: "123456".into(),
+            request_identity: None,
+        }
+        .persist(&directory)
+        .unwrap();
+        runner
+    }
+
+    #[test]
+    fn experiment_comparison_uses_verified_matched_endpoints_without_advancing_live_science() {
+        let root = tempfile::tempdir().unwrap();
+        let (handle, host) = handle();
+        let handle = handle
+            .with_artifacts_dir(root.path().to_path_buf())
+            .unwrap();
+        let runner = comparison_catalog_runner(root.path(), "comparison", vec![29, 7, 11], 0.0);
+        let path = runner.output_dir.join("status.json");
+        assert!(matches!(
+            handle.compare_experiment_variants(
+                "comparison",
+                "baseline",
+                "challenger",
+                "total_food"
+            ),
+            Err(ControlError::Conflict(_))
+        ));
+        let completed = runner.execute_batch(&path).unwrap();
+        assert_eq!(
+            completed.completed_runs, completed.total_runs,
+            "{completed:?}"
+        );
+        let before = fs::read(&path).unwrap();
+        let live = host.port.scientific_digest_v1().unwrap();
+        let forward = handle
+            .compare_experiment_variants("comparison", "baseline", "challenger", "total_food")
+            .unwrap();
+        assert_eq!(forward.matched_seeds, [7, 11, 29]);
+        assert_eq!(forward.endpoint_tick, runner.max_ticks);
+        assert_eq!(forward.plan_digest, completed.plan_digest);
+        assert_eq!(forward.status_generation, completed.generation);
+        assert!(
+            forward.mean_difference > 0.0,
+            "different food conditions collapsed: {forward:?}"
+        );
+        assert!(forward.ci_95.is_some());
+        assert!(forward.p_value.is_some_and(|p| (0.0..=1.0).contains(&p)));
+        assert!(!forward.descriptive_only);
+        let reverse = handle
+            .compare_experiment_variants("comparison", "challenger", "baseline", "total_food")
+            .unwrap();
+        assert_eq!(reverse.mean_difference, -forward.mean_difference);
+        assert_eq!(reverse.matched_seeds, forward.matched_seeds);
+        let population = handle
+            .compare_experiment_variants("comparison", "baseline", "challenger", "alive_agents")
+            .unwrap();
+        assert_eq!(population.mean_difference, 0.0);
+        assert_eq!(population.ci_95, Some((0.0, 0.0)));
+        assert_eq!(population.standardized_effect, None);
+        assert_eq!(
+            population.undefined_effect_reason.as_deref(),
+            Some("zero_variance")
+        );
+        assert_eq!(population.p_value, Some(1.0));
+        assert_eq!(population.significant, Some(false));
+        assert!(population.underpowered_reason.is_some());
+        assert_eq!(
+            serde_json::from_value::<ExperimentComparisonDto>(
+                serde_json::to_value(&forward).unwrap()
+            )
+            .unwrap(),
+            forward
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), live);
+    }
+
+    #[test]
+    fn experiment_comparison_preserves_descriptive_and_extinct_endpoint_boundaries() {
+        let root = tempfile::tempdir().unwrap();
+        let (handle, _host) = handle();
+        let handle = handle
+            .with_artifacts_dir(root.path().to_path_buf())
+            .unwrap();
+        let single = comparison_catalog_runner(root.path(), "single-pair", vec![7], 0.0);
+        single
+            .execute_batch(&single.output_dir.join("status.json"))
+            .unwrap();
+        let descriptive = handle
+            .compare_experiment_variants("single-pair", "baseline", "challenger", "total_food")
+            .unwrap();
+        assert!(descriptive.mean_difference > 0.0);
+        assert!(descriptive.descriptive_only);
+        assert_eq!(descriptive.matched_seeds, [7]);
+        assert_eq!(descriptive.ci_95, None);
+        assert_eq!(descriptive.standardized_effect, None);
+        assert_eq!(descriptive.p_value, None);
+        assert_eq!(descriptive.adjusted_p_value, None);
+        assert_eq!(descriptive.significant, None);
+        assert_eq!(
+            descriptive.undefined_effect_reason.as_deref(),
+            Some("insufficient_pairs(have=1, need=2)")
+        );
+
+        let extinct = comparison_catalog_runner(root.path(), "extinct-pair", vec![7, 11], 1.0);
+        let completed = extinct
+            .execute_batch(&extinct.output_dir.join("status.json"))
+            .unwrap();
+        for run in &completed.runs {
+            let observed = crate::experiment_runner::verify_portable_run_bundle(Path::new(
+                run.bundle_path.as_ref().unwrap(),
+            ))
+            .unwrap()
+            .final_state
+            .unwrap();
+            assert_eq!(
+                observed.alive_agents, 0,
+                "extinction fixture did not become extinct"
+            );
+        }
+        let error = handle
+            .compare_experiment_variants("extinct-pair", "baseline", "challenger", "average_energy")
+            .unwrap_err();
+        assert!(error.to_string().contains("unavailable"), "{error}");
+        let zero = handle
+            .compare_experiment_variants("extinct-pair", "baseline", "challenger", "total_energy")
+            .unwrap();
+        assert_eq!(zero.mean_difference, 0.0);
+        assert_eq!(zero.standardized_effect, None);
+    }
+
+    #[test]
+    fn experiment_comparison_bounds_admission_and_rejects_changed_plan_or_bundle_evidence() {
+        use crate::experiment_runner::{ExperimentBatchStatus, MAX_RUN_COMPONENT_BYTES};
+        let root = tempfile::tempdir().unwrap();
+        let (handle, _host) = handle();
+        let handle = handle
+            .with_artifacts_dir(root.path().to_path_buf())
+            .unwrap();
+        let runner = comparison_catalog_runner(root.path(), "guarded", vec![11, 7], 0.0);
+        let path = runner.output_dir.join("status.json");
+        let completed = runner.execute_batch(&path).unwrap();
+        assert_eq!(
+            completed.completed_runs, completed.total_runs,
+            "{completed:?}"
+        );
+        let compare = || {
+            handle.compare_experiment_variants("guarded", "baseline", "challenger", "total_food")
+        };
+        let expected = compare().unwrap();
+        let oversized = "x".repeat(MAX_RUN_COMPONENT_BYTES + 1);
+        for invalid in ["", "../outside", oversized.as_str()] {
+            for result in [
+                handle.compare_experiment_variants(invalid, "baseline", "challenger", "total_food"),
+                handle.compare_experiment_variants("guarded", invalid, "challenger", "total_food"),
+                handle.compare_experiment_variants("guarded", "baseline", invalid, "total_food"),
+            ] {
+                assert!(matches!(result, Err(ControlError::BadRequest(_))));
+            }
+        }
+        for (baseline, challenger, metric) in [
+            ("baseline", "baseline", "total_food"),
+            ("baseline", "challenger", "fitness"),
+            ("baseline", "challenger", ""),
+        ] {
+            assert!(matches!(
+                handle.compare_experiment_variants("guarded", baseline, challenger, metric),
+                Err(ControlError::BadRequest(_))
+            ));
+        }
+        assert!(matches!(
+            handle.compare_experiment_variants("guarded", "unknown", "challenger", "total_food"),
+            Err(ControlError::NotFound(_))
+        ));
+        let held = handle.data_services.experiment_comparison.lock().unwrap();
+        assert!(matches!(
+            handle.clone().compare_experiment_variants(
+                "guarded",
+                "baseline",
+                "challenger",
+                "total_food"
+            ),
+            Err(ControlError::ExperimentComparisonBusy)
+        ));
+        drop(held);
+        assert_eq!(compare().unwrap(), expected);
+
+        let original_status = fs::read(&path).unwrap();
+        for defect in ["seed", "horizon", "missing_run"] {
+            let mut changed: ExperimentBatchStatus =
+                serde_json::from_slice(&original_status).unwrap();
+            match defect {
+                "seed" => changed.runs.last_mut().unwrap().seed = 999,
+                "horizon" => changed.runs.last_mut().unwrap().total_ticks += 1,
+                "missing_run" => {
+                    changed.runs.pop();
+                }
+                _ => unreachable!(),
+            }
+            let bytes = serde_json::to_vec(&changed).unwrap();
+            fs::write(&path, &bytes).unwrap();
+            assert!(compare().is_err(), "accepted altered {defect} evidence");
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                bytes,
+                "analysis rewrote refused evidence"
+            );
+            fs::write(&path, &original_status).unwrap();
+        }
+        assert_eq!(
+            compare().unwrap(),
+            expected,
+            "refusal retained the admission permit"
+        );
+
+        // Rehash a false endpoint so the ordinary byte-integrity verifier accepts
+        // it. Comparison must still reconstruct the actual final checkpoint.
+        let bundle_dir = Path::new(completed.runs[0].bundle_path.as_ref().unwrap());
+        let summary_path = bundle_dir.join("exports/summary.csv");
+        let original_summary = fs::read(&summary_path).unwrap();
+        let mut summary: crate::experiment_runner::ExperimentEndpointSummaryV2 =
+            csv::Reader::from_reader(original_summary.as_slice())
+                .deserialize()
+                .next()
+                .unwrap()
+                .unwrap();
+        summary.total_food += 1.0;
+        let mut csv = csv::WriterBuilder::new()
+            .terminator(csv::Terminator::Any(b'\n'))
+            .from_writer(Vec::new());
+        csv.serialize(summary).unwrap();
+        let changed_summary = csv.into_inner().unwrap();
+        fs::write(&summary_path, &changed_summary).unwrap();
+        let manifest_path = bundle_dir.join("bundle_manifest.json");
+        let original_manifest = fs::read(&manifest_path).unwrap();
+        let mut manifest: scriptbots_storage::RunBundleV1 =
+            serde_json::from_slice(&original_manifest).unwrap();
+        let entry = manifest
+            .artifacts
+            .iter_mut()
+            .find(|entry| entry.relative_path == "exports/summary.csv")
+            .unwrap();
+        entry.bytes_len = u64::try_from(changed_summary.len()).unwrap();
+        entry.blake3_hex = compute_blake3(&changed_summary);
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        scriptbots_storage::verify_run_bundle(bundle_dir)
+            .expect("false summary remains byte-valid");
+        let error = compare().unwrap_err();
+        assert!(
+            error.to_string().contains("restored final checkpoint"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&summary_path).unwrap(), changed_summary);
+        fs::write(&summary_path, original_summary).unwrap();
+        fs::write(&manifest_path, original_manifest).unwrap();
+        assert_eq!(compare().unwrap(), expected);
     }
 
     #[test]

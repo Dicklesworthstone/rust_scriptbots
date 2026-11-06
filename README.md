@@ -221,6 +221,16 @@ RUST_LOG=info cargo run -p scriptbots-app
   envelope; application and journal durability are shown separately. Under render pressure,
   the runtime may select a labeled reduced-detail view. These paths are implemented; their
   current native and cross-platform qualification is tracked in the linked reality check.
+- In Experiments (`6`), select a variant row and press Enter to pin it as the
+  baseline, then select a different variant and press `C` to compare their
+  verified final populations across matched seeds. Without a pinned baseline,
+  `C` compares the selected variant with the next distinct variant, skipping its
+  other seed rows. The result shows the endpoint tick, paired sample count,
+  challenger-minus-baseline difference, available 95% interval and paired
+  statistical evidence. A single seed is descriptive only; undefined effect
+  sizes remain unavailable. Verification and analysis run in the background;
+  `x`, Escape or navigation discards a pending result. Live simulation controls
+  continue to address the live owner.
 - In Replay (`7`), press `K` to save a checkpoint and use Up/Down to select a
   catalog row. It shows that saved cut's population and first twelve characters
   of its `WorldDigestV1`, separately from the live tick and artifact checksums.
@@ -1320,6 +1330,8 @@ For an interactive run, ScriptBots parses the control environment and transactio
     accept `ft` or `frankentorch`, recorded canonically as `ft`. The same compiled
     adapter restores continuation cuts and independently verifies the final bundle state.
     A build without `brain-ft` refuses these arms before starting a worker or writing files.
+  - `POST /api/v1/experiments/{id}/compare` → compare one canonical endpoint metric
+    across two completed variant cohorts using verified bundles and exact matched seeds.
   - `POST /api/v1/checkpoints` → capture a `WorldCheckpointV1` and record it in the run database (usable by
     `--checkpoint-start`); `GET /api/v1/checkpoints`, `/api/v1/artifacts`
   - Playback aliases (two-axis command status): `POST /api/pause`, `POST /api/resume`,
@@ -1673,6 +1685,37 @@ released. Exact keyed retries of an existing job remain readable at capacity.
 `reserved_run_slots` and `reserved_batches`. Reservations are not a measurement
 of simultaneous science activity. This budget does not bound Rayon threads,
 other processes, disk bytes or executing filesystem/host-call duration.
+
+Completed experiment variants can be compared directly through the terminal's
+Experiments screen or this read-only analysis endpoint:
+
+```bash
+curl -s -X POST http://127.0.0.1:8088/api/v1/experiments/food-pause-recovery/compare \
+  -H 'content-type: application/json' \
+  -d '{"baseline_variant":"control","challenger_variant":"pause-recovery","metric":"alive_agents"}'
+```
+
+Both selected variants must contain the complete planned seed cohort at the
+same final tick. Each retained bundle is verified and its final checkpoint is
+restored before observed endpoint values enter the existing matched-seed
+statistics engine. Missing, incomplete, changed or non-finite evidence is
+refused. The request requires an explicit supported metric; the terminal uses
+`alive_agents`, including the measured zero population after extinction.
+
+The response identifies the experiment, plan digest, status generation, exact
+matched seeds and endpoint tick. It reports challenger minus baseline as
+`mean_difference`, optional `ci_95`, optional paired Cohen's dz as
+`standardized_effect`, and paired sign-flip p-values with the existing
+multiplicity adjustment. A one-seed result has `descriptive_only: true` and
+null inferential fields. Zero-spread standardized effects and small cohorts
+retain their explicit undefined/underpowered reasons. Each request analyzes
+one metric and one variant pair; separate requests are separate analyses.
+
+Comparison requests share a single admission slot with terminal comparisons.
+A busy service returns 503 without queuing another restore/analysis job; the
+slot remains held until admitted work finishes, including after a client
+disconnects. The JSON request body is limited to 4 KiB. Analysis does not advance
+or modify the live world.
 
 `GET /api/status` and MCP `get_status` report one immutable owner publication:
 `paused`, `lifecycle`, tagged `health` (including blocker/fault detail),

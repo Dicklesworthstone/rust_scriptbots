@@ -40,7 +40,7 @@ pub(crate) const MAX_BUNDLE_TOTAL_ARTIFACT_BYTES: u64 = 32 * 1024 * 1024;
 pub(crate) const MAX_EXPERIMENT_SUMMARY_BYTES: usize = 4_096;
 const EXPERIMENT_SUMMARY_SCHEMA_VERSION: u16 = 2;
 const MAX_BATCH_RUNS: usize = 4_096;
-const MAX_RUN_COMPONENT_BYTES: usize = 128;
+pub(crate) const MAX_RUN_COMPONENT_BYTES: usize = 128;
 const MAX_TICKS_PER_RUN: u64 = 10_000_000;
 pub(crate) const MAX_CONCURRENT_RUNS: usize = 64;
 pub(crate) const MAX_EXPERIMENT_INTERVENTIONS: usize = 64;
@@ -885,6 +885,8 @@ pub struct VerifiedExperimentFinalState {
     pub alive_agents: usize,
     /// Scientific digest recomputed by the restored owner.
     pub scientific_digest: String,
+    /// Canonical launch configuration digest from the verified run manifest.
+    pub config_digest: String,
     /// Typed endpoints recomputed by that owner and matched to the exact CSV bytes.
     pub summary: ExperimentEndpointSummaryV2,
     /// BLAKE3 of the summary bytes actually checked against the restored state.
@@ -1136,6 +1138,7 @@ fn verify_restored_final_checkpoint(
         tick: core.world_tick().0,
         alive_agents: core.world().agents().len(),
         scientific_digest: digest.overall,
+        config_digest: manifest.config_digest.clone(),
         summary,
         summary_artifact_digest: blake3::hash(&summary_bytes).to_hex().to_string(),
     })
@@ -1281,6 +1284,77 @@ impl MatchedSeedExperimentRunner {
             self.verify_completed_bundle(record, variant, *family, &plan.digest)?;
         }
         Ok(())
+    }
+
+    /// Restore both complete variant cohorts from one plan-validated status.
+    ///
+    /// Every call rechecks the bounded bundle bytes, run/plan/family/config
+    /// identities and final owner state. Published artifact-cache membership is
+    /// not evidence for a later analysis. Results are ordered by the exact seed
+    /// schedule, independently of the order in which workers completed.
+    pub(crate) fn verified_comparison_endpoints(
+        &self,
+        state_file: &Path,
+        status: &ExperimentBatchStatus,
+        baseline_variant: &str,
+        challenger_variant: &str,
+    ) -> Result<[Vec<VerifiedExperimentFinalState>; 2], ExperimentRunnerError> {
+        if baseline_variant == challenger_variant {
+            return Err(ExperimentRunnerError::InvalidPlan {
+                reason: "comparison requires two distinct variants".to_owned(),
+            });
+        }
+        let plan = self.validated_plan()?;
+        self.validate_status(state_file, status, &plan)?;
+        let mut expected_seeds = self.cohort.seeds.clone();
+        expected_seeds.sort_unstable();
+        let mut endpoints = [Vec::new(), Vec::new()];
+        for (arm, variant_id) in [baseline_variant, challenger_variant]
+            .into_iter()
+            .enumerate()
+        {
+            let (variant, family) = plan.variants.get(variant_id).ok_or_else(|| {
+                ExperimentRunnerError::InvalidPlan {
+                    reason: format!("comparison variant `{variant_id}` is not in this batch"),
+                }
+            })?;
+            let records = status
+                .runs
+                .iter()
+                .filter(|run| run.variant_id == variant_id)
+                .collect::<Vec<_>>();
+            if let Some(run) = records.iter().find(|run| run.state != RunState::Completed) {
+                return Err(ExperimentRunnerError::InvalidStatus {
+                    path: state_file.to_path_buf(),
+                    reason: format!(
+                        "comparison run `{}` is {:?}; every declared seed must be completed",
+                        run.run_id, run.state
+                    ),
+                });
+            }
+            for record in records {
+                endpoints[arm].push(self.verify_completed_bundle(
+                    record,
+                    variant,
+                    *family,
+                    &plan.digest,
+                )?);
+            }
+            endpoints[arm].sort_by_key(|state| state.summary.seed);
+            if endpoints[arm]
+                .iter()
+                .map(|state| state.summary.seed)
+                .ne(expected_seeds.iter().copied())
+            {
+                return Err(ExperimentRunnerError::InvalidStatus {
+                    path: state_file.to_path_buf(),
+                    reason: format!(
+                        "comparison variant `{variant_id}` does not contain the exact declared seed cohort"
+                    ),
+                });
+            }
+        }
+        Ok(endpoints)
     }
 
     fn initial_status(&self, plan: &ValidatedPlan) -> ExperimentBatchStatus {
@@ -2934,7 +3008,7 @@ impl MatchedSeedExperimentRunner {
         variant: &ScenarioVariant,
         family: ResolvedBrainFamily,
         plan_digest: &str,
-    ) -> Result<(), ExperimentRunnerError> {
+    ) -> Result<VerifiedExperimentFinalState, ExperimentRunnerError> {
         let bundle_dir = self.output_dir.join(&record.run_id);
         self.verify_completed_bundle_at(&bundle_dir, record, variant, family, plan_digest)
     }
@@ -2946,7 +3020,7 @@ impl MatchedSeedExperimentRunner {
         variant: &ScenarioVariant,
         family: ResolvedBrainFamily,
         plan_digest: &str,
-    ) -> Result<(), ExperimentRunnerError> {
+    ) -> Result<VerifiedExperimentFinalState, ExperimentRunnerError> {
         verify_run_bundle_bounded(
             bundle_dir,
             RunBundleVerificationLimits {
@@ -3085,31 +3159,31 @@ impl MatchedSeedExperimentRunner {
             });
         }
         let checkpoint_path = bundle_dir.join(FINAL_CHECKPOINT_ARTIFACT.0);
-        let verify_final_checkpoint = || -> Result<(), ExperimentRunnerError> {
-            let bytes = read_experiment_file_bounded(&checkpoint_path, MAX_RUN_CHECKPOINT_BYTES)?;
-            let checkpoint = RunCheckpointV1::decode(&bytes, &checkpoint_path)?;
-            self.validate_run_checkpoint(
-                &checkpoint_path,
-                &checkpoint,
-                variant,
-                record.seed,
-                &record.run_id,
-                plan_digest,
-            )?;
-            verify_restored_final_checkpoint(
-                bundle_dir,
-                &checkpoint,
-                &full_manifest,
-                &evidence,
-                family,
-            )?;
-            Ok(())
-        };
+        let verify_final_checkpoint =
+            || -> Result<VerifiedExperimentFinalState, ExperimentRunnerError> {
+                let bytes =
+                    read_experiment_file_bounded(&checkpoint_path, MAX_RUN_CHECKPOINT_BYTES)?;
+                let checkpoint = RunCheckpointV1::decode(&bytes, &checkpoint_path)?;
+                self.validate_run_checkpoint(
+                    &checkpoint_path,
+                    &checkpoint,
+                    variant,
+                    record.seed,
+                    &record.run_id,
+                    plan_digest,
+                )?;
+                verify_restored_final_checkpoint(
+                    bundle_dir,
+                    &checkpoint,
+                    &full_manifest,
+                    &evidence,
+                    family,
+                )
+            };
         verify_final_checkpoint().map_err(|error| ExperimentRunnerError::Bundle {
             run_id: record.run_id.clone(),
             reason: format!("restored final checkpoint verification failed: {error}"),
-        })?;
-        Ok(())
+        })
     }
 }
 
@@ -3208,7 +3282,10 @@ fn validate_staged_bundle_layout(staged: &Path, run_id: &str) -> Result<(), Expe
     Ok(())
 }
 
-fn validate_path_component(label: &str, value: &str) -> Result<(), ExperimentRunnerError> {
+pub(crate) fn validate_path_component(
+    label: &str,
+    value: &str,
+) -> Result<(), ExperimentRunnerError> {
     if value.is_empty()
         || value == "."
         || value == ".."

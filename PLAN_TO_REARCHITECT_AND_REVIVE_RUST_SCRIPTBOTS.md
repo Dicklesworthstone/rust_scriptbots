@@ -2,14 +2,57 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
-**Remote monitoring continuity (2026-11-05):** [Currently In Progress — Codex]
+**Live experiment comparison (2026-11-05):** [Implemented in source — Codex;
+native qualification blocked]
 
-Complete the advertised SSE/NDJSON publication-revision resume path and preserve
-same-tick owner changes with session-bound cursors and explicit coalescing. Check
-tick-history gap reporting at empty and sparse retention boundaries. Keep
-WebSocket consumer acknowledgements responsive while a bounded owner control
-request waits. This contributes to the external-agent contracts in Phase 5.2
-and `bd-ac4l`; the original throughput, soak and DSR acceptance remain open.
+The Experiments screen now submits a real background comparison through the
+existing matched-seed statistics engine. Enter pins a baseline; C selects a
+distinct challenger, with all admitted variants visible within the bounded
+projection even for large seed cohorts. Request identities, cancellation and
+refresh checks prevent stale results from replacing the current observation.
+The display reports population, endpoint tick, paired sample count, measured
+difference, optional uncertainty and explicit single-pair/degenerate outcomes.
+
+`POST /api/v1/experiments/{id}/compare` uses the same control authority for one
+explicit endpoint metric. Both complete cohorts must match the planned seeds
+and horizon; each final checkpoint is restored and its digest and endpoint CSV
+verified before analysis. One shared analysis permit and one pre-offload HTTP
+request permit bound concurrent work; JSON bodies are limited to 4 KiB. Added
+regressions exercise real run bundles, reverse contrasts, one-seed/extinct
+cohorts, changed status and rehashed false evidence, UI dispatch and retention,
+large projections, and HTTP refusals. These regressions are authored, not run.
+
+**Browser owner recovery (2026-11-05):** [Source landed — `42149db`; browser
+runtime qualification blocked]
+
+Reset, permalink loading and continuation import validate a candidate before
+replacing the active owner, release rejected and retired WASM owners, and keep
+one simulation timer. Failed replacements preserve stopped clocks; Reset can
+recover an invalid startup permalink. Existing stale-import and remote/local
+ownership guards remain in force. The lifecycle fixture now covers these
+failure and recovery boundaries with explicit owner/disposal/timer observations.
+
+**Remote monitoring continuity (2026-11-05):** [Source landed — `72a40ef`;
+native qualification blocked]
+
+SSE/NDJSON publication-revision resume now includes same-tick owner changes,
+session-bound cursors and explicit coalescing. Tick-history streams report empty
+and sparse retention gaps without consuming a reset summary's cursor early.
+WebSocket acknowledgements remain responsive while one owner control request
+waits; further requests receive explicit backpressure and disconnected clients
+cancel still-queued control work. This contributes to Phase 5.2 and `bd-ac4l`;
+the original throughput, soak and full DSR acceptance remain open.
+
+**Session verification:** DSR JavaScript syntax checks passed for all three
+edited browser files; the existing remote consumer suite passed 13/13 tests.
+Rust formatting was limited to changed regions and their enclosing constructs,
+with independent source review across the three feature contributions. Both a
+clean-baseline compiler check and a one-job candidate check were terminated by
+SIGKILL while compiling the unchanged `asupersync 0.5.0` dependency, before app
+code was reached. Native tests and Clippy therefore did not run. Playwright's
+Chromium provisioning returned truncated archives, so the DOM lifecycle suite
+also remains unexecuted. No scientific baseline or original Bead acceptance is
+changed by these source contributions.
 
 **Large-run export and scientific evidence (2026-11-05):** [Currently In Progress —
 Codex; source contributions landed, original acceptance remains open]
