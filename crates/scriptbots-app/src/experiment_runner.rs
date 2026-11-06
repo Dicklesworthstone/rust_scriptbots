@@ -1,9 +1,8 @@
 //! Deterministic matched-seed experiment runner and batch execution engine (bd-2z0.5.11).
 
 use crate::{
-    BuildProvenanceV0, RunIdentityV1, RunManifestV3, ScenarioIdentityV0,
-    ScenarioInterventionV1, ThreadPolicyV0, resolve_scheduled_config_patch,
-    seed_founding_population,
+    BuildProvenanceV0, RunIdentityV1, RunManifestV3, ScenarioIdentityV0, ScenarioInterventionV1,
+    ThreadPolicyV0, resolve_scheduled_config_patch, seed_founding_population,
 };
 use scriptbots_brain::{
     AssemblyBrain, DwraonBrain, MlpBrain, assembly::AssemblyFamilyAdapter,
@@ -18,8 +17,7 @@ use scriptbots_core::{
 use scriptbots_runtime::{
     ApplicationState, CommandEnvelope, CommandId, HostCheckpointV1, HostCommand, HostCore,
     HostCoreOptions, HostLifecycle, HostSessionId, JournalState, ManualInstant, NullFrontend,
-    PlaybackSnapshot, RunId, ScheduledConfigPatch, ScheduledPatchOutcome,
-    VolatileHostCheckpointV1,
+    PlaybackSnapshot, RunId, ScheduledConfigPatch, ScheduledPatchOutcome, VolatileHostCheckpointV1,
 };
 use scriptbots_storage::{
     RunBundleV1, RunBundleVerificationResult, bundle::RunBundleVerificationLimits,
@@ -774,7 +772,9 @@ impl ExperimentEndpointSummaryV2 {
                 world
                     .agent_uid(id)
                     .map(|uid| (uid, index, id))
-                    .ok_or_else(|| format!("endpoint agent at dense index {index} has no stable UID"))
+                    .ok_or_else(|| {
+                        format!("endpoint agent at dense index {index} has no stable UID")
+                    })
             })
             .collect::<Result<Vec<_>, _>>()?;
         ordered.sort_unstable_by_key(|(uid, _, _)| *uid);
@@ -793,7 +793,9 @@ impl ExperimentEndpointSummaryV2 {
             let energy = f64::from(runtime.energy);
             let health = f64::from(columns.health()[index]);
             if !energy.is_finite() || !health.is_finite() {
-                return Err(format!("endpoint agent UID {uid} has non-finite energy or health"));
+                return Err(format!(
+                    "endpoint agent UID {uid} has non-finite energy or health"
+                ));
             }
             let age = columns.ages()[index];
             let generation = columns.generations()[index].0;
@@ -1056,8 +1058,9 @@ fn verify_restored_final_checkpoint(
 ) -> Result<VerifiedExperimentFinalState, ExperimentRunnerError> {
     let path = bundle_dir.join(FINAL_CHECKPOINT_ARTIFACT.0);
     let host = checkpoint.owner.host_checkpoint();
-    let initial_config: ScriptBotsConfig = serde_json::from_value(manifest.normalized_config.clone())
-        .map_err(|error| invalid_checkpoint(&path, error))?;
+    let initial_config: ScriptBotsConfig =
+        serde_json::from_value(manifest.normalized_config.clone())
+            .map_err(|error| invalid_checkpoint(&path, error))?;
     initial_config
         .validate()
         .map_err(|error| invalid_checkpoint(&path, error))?;
@@ -1311,8 +1314,16 @@ impl MatchedSeedExperimentRunner {
             }
         }
 
-        if state_file.exists() {
-            return self.load_existing_status(state_file, plan);
+        match fs::symlink_metadata(state_file) {
+            Ok(_) => return self.load_existing_status(state_file, plan),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(ExperimentRunnerError::Io {
+                    operation: "inspect experiment status",
+                    path: state_file.to_path_buf(),
+                    source,
+                });
+            }
         }
 
         let status = self.initial_status(plan);
@@ -1848,7 +1859,10 @@ impl MatchedSeedExperimentRunner {
                 self.max_ticks,
             )
             .map_err(|reason| ExperimentRunnerError::InvalidPlan {
-                reason: format!("variant `{}` is not executable: {reason}", variant.variant_id),
+                reason: format!(
+                    "variant `{}` is not executable: {reason}",
+                    variant.variant_id
+                ),
             })?;
             let config_bytes = serde_json::to_vec(&(&normalized_config, &interventions.patches))
                 .map_err(|source| ExperimentRunnerError::Json {
@@ -2190,12 +2204,9 @@ impl MatchedSeedExperimentRunner {
         let host = checkpoint.owner.host_checkpoint();
         let expected_config = config_for_run(&variant.config_overrides, seed)
             .map_err(|error| invalid_checkpoint(path, error))?;
-        let interventions = PreparedInterventions::new(
-            &expected_config,
-            &variant.interventions,
-            self.max_ticks,
-        )
-        .map_err(|error| invalid_checkpoint(path, error))?;
+        let interventions =
+            PreparedInterventions::new(&expected_config, &variant.interventions, self.max_ticks)
+                .map_err(|error| invalid_checkpoint(path, error))?;
         let expected_config = serde_json::to_value(&expected_config)
             .map_err(|error| invalid_checkpoint(path, error))?;
         if metadata.plan_digest != plan_digest
@@ -2395,11 +2406,13 @@ impl MatchedSeedExperimentRunner {
                 reason,
             }
         })?;
-        let interventions = PreparedInterventions::new(&config, &variant.interventions, self.max_ticks)
-            .map_err(|reason| ExperimentRunnerError::Construction {
-                run_id: run_id.to_owned(),
-                reason,
-            })?;
+        let interventions =
+            PreparedInterventions::new(&config, &variant.interventions, self.max_ticks).map_err(
+                |reason| ExperimentRunnerError::Construction {
+                    run_id: run_id.to_owned(),
+                    reason,
+                },
+            )?;
         let mut world =
             WorldState::new(config).map_err(|source| ExperimentRunnerError::Construction {
                 run_id: run_id.to_owned(),
@@ -2499,12 +2512,9 @@ impl MatchedSeedExperimentRunner {
             })?;
         let initial_config = config_for_run(&variant.config_overrides, seed)
             .map_err(|error| invalid_checkpoint(&path, error))?;
-        let interventions = PreparedInterventions::new(
-            &initial_config,
-            &variant.interventions,
-            self.max_ticks,
-        )
-        .map_err(|error| invalid_checkpoint(&path, error))?;
+        let interventions =
+            PreparedInterventions::new(&initial_config, &variant.interventions, self.max_ticks)
+                .map_err(|error| invalid_checkpoint(&path, error))?;
         if experiment_path_exists(
             &self.staged_bundle_path(run_id),
             "inspect bundle staging before continuation",
@@ -2724,11 +2734,7 @@ impl MatchedSeedExperimentRunner {
             plan_digest,
             manifest_record,
             &[
-                (
-                    "exports/summary.csv",
-                    "experiment-summary",
-                    &summary_csv,
-                ),
+                ("exports/summary.csv", "experiment-summary", &summary_csv),
                 (
                     "evidence/run.json",
                     "experiment-run-evidence",
@@ -3279,11 +3285,33 @@ fn read_bounded_file(
     max_bytes: u64,
     operation: &'static str,
 ) -> Result<Vec<u8>, ExperimentRunnerError> {
-    let file = File::open(path).map_err(|source| ExperimentRunnerError::Io {
+    let before = fs::symlink_metadata(path).map_err(|source| ExperimentRunnerError::Io {
         operation,
         path: path.to_path_buf(),
         source,
     })?;
+    if before.file_type().is_symlink() || !before.is_file() {
+        return Err(ExperimentRunnerError::InvalidStatus {
+            path: path.to_path_buf(),
+            reason: "expected a regular file without a symlink alias".to_owned(),
+        });
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // A path can change after inspection. In particular, opening a FIFO
+        // without NONBLOCK could stall every API caller holding the job registry.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .map_err(|source| ExperimentRunnerError::Io {
+            operation,
+            path: path.to_path_buf(),
+            source,
+        })?;
     let metadata = file
         .metadata()
         .map_err(|source| ExperimentRunnerError::Io {
@@ -3291,6 +3319,16 @@ fn read_bounded_file(
             path: path.to_path_buf(),
             source,
         })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() > 1 {
+            return Err(ExperimentRunnerError::InvalidStatus {
+                path: path.to_path_buf(),
+                reason: "multiply linked status or evidence files are refused".to_owned(),
+            });
+        }
+    }
     if !metadata.is_file() || metadata.len() > max_bytes {
         return Err(ExperimentRunnerError::InvalidStatus {
             path: path.to_path_buf(),
@@ -3315,6 +3353,10 @@ fn read_bounded_file(
             reason: format!("file exceeded the hard {max_bytes}-byte read cap"),
         });
     }
+    // Status writers publish by atomic rename while readers hold this descriptor.
+    // The old inode may now have zero links and the pathname may name a newer
+    // generation. Return the complete opened snapshot; requiring the pathname
+    // to remain unchanged would reject healthy concurrent status publication.
     Ok(bytes)
 }
 
@@ -3591,10 +3633,13 @@ impl PreparedInterventions {
             ));
         }
         if interventions.len() > HostCoreOptions::default().archived_command_capacity {
-            return Err("intervention schedule exceeds complete owner receipt retention".to_owned());
+            return Err(
+                "intervention schedule exceeds complete owner receipt retention".to_owned(),
+            );
         }
         let mut current = initial.clone();
-        let mut current_value = serde_json::to_value(&current).map_err(|error| error.to_string())?;
+        let mut current_value =
+            serde_json::to_value(&current).map_err(|error| error.to_string())?;
         let mut prepared = Self {
             patches: Vec::with_capacity(interventions.len()),
             config_digests: vec![config_value_digest(&current_value)?],
@@ -3610,8 +3655,10 @@ impl PreparedInterventions {
                 ));
             }
             if intervention.tick < previous_tick {
-                return Err("intervention ticks must be nondecreasing; same-tick order is preserved"
-                    .to_owned());
+                return Err(
+                    "intervention ticks must be nondecreasing; same-tick order is preserved"
+                        .to_owned(),
+                );
             }
             let sequence = u64::try_from(index + 1).map_err(|error| error.to_string())?;
             let patch = ScheduledConfigPatch::new(
@@ -3633,14 +3680,20 @@ impl PreparedInterventions {
             if next.rng_seed != initial.rng_seed
                 || next.persistence_interval != initial.persistence_interval
             {
-                return Err("interventions cannot change the matched seed or recording policy"
-                    .to_owned());
+                return Err(
+                    "interventions cannot change the matched seed or recording policy".to_owned(),
+                );
             }
             let next_value = serde_json::to_value(&next).map_err(|error| error.to_string())?;
-            prepared.config_digests.push(config_value_digest(&next_value)?);
-            prepared.changed_paths.push(
-                scriptbots_runtime::host_core::config_changed_paths(&current_value, &next_value),
-            );
+            prepared
+                .config_digests
+                .push(config_value_digest(&next_value)?);
+            prepared
+                .changed_paths
+                .push(scriptbots_runtime::host_core::config_changed_paths(
+                    &current_value,
+                    &next_value,
+                ));
             prepared.patches.push(patch);
             current = next;
             current_value = next_value;
@@ -3650,7 +3703,8 @@ impl PreparedInterventions {
     }
 
     fn completed_at(&self, tick: u64) -> usize {
-        self.patches.partition_point(|patch| patch.due_tick.0 < tick)
+        self.patches
+            .partition_point(|patch| patch.due_tick.0 < tick)
     }
 
     fn due_at(&self, tick: u64) -> usize {
@@ -3671,18 +3725,17 @@ fn config_value_digest(value: &serde_json::Value) -> Result<blake3::Hash, String
 /// Interventions use nested config-layer objects, not dotted override keys. Only
 /// the registered live numeric knobs are executable; launch-only geometry, seed,
 /// recording policy and unknown fields cannot be changed by a scheduled patch.
-fn validate_live_intervention_patch(
-    value: &serde_json::Value,
-    path: &str,
-) -> Result<(), String> {
+fn validate_live_intervention_patch(value: &serde_json::Value, path: &str) -> Result<(), String> {
     if let Some(object) = value.as_object() {
         if object.is_empty() {
             return Err("intervention patch objects must not be empty".to_owned());
         }
         for (key, child) in object {
             if key.is_empty() || key.contains('.') {
-                return Err("intervention patches require nested objects with ordinary config keys"
-                    .to_owned());
+                return Err(
+                    "intervention patches require nested objects with ordinary config keys"
+                        .to_owned(),
+                );
             }
             let child_path = if path.is_empty() {
                 key.clone()
@@ -3719,8 +3772,8 @@ fn validate_checkpoint_interventions(
     prepared: &PreparedInterventions,
 ) -> Result<(), ExperimentRunnerError> {
     let completed = prepared.completed_at(host.tick().0);
-    let completed_sequence = u64::try_from(completed)
-        .map_err(|error| invalid_checkpoint(path, error))?;
+    let completed_sequence =
+        u64::try_from(completed).map_err(|error| invalid_checkpoint(path, error))?;
     let history = host.scheduled_patch_history();
     let expected_remaining = if prepared.patches.is_empty() {
         None
@@ -3728,15 +3781,14 @@ fn validate_checkpoint_interventions(
         Some(&prepared.patches[completed..])
     };
     let expected_sequence = expected_remaining.map(|_| completed_sequence);
-    let actual_config = serde_json::to_value(host.config())
-        .map_err(|error| invalid_checkpoint(path, error))?;
+    let actual_config =
+        serde_json::to_value(host.config()).map_err(|error| invalid_checkpoint(path, error))?;
     if prepared.patches.len() > host.scheduled_patch_history_capacity()
         || host.remaining_schedule() != expected_remaining
         || host.completed_schedule_sequence() != expected_sequence
         || history.len() != completed
         || host.config_revision().get() != completed_sequence
-        || config_value_digest(&actual_config)
-            .map_err(|error| invalid_checkpoint(path, error))?
+        || config_value_digest(&actual_config).map_err(|error| invalid_checkpoint(path, error))?
             != prepared.config_digests[completed]
     {
         return Err(invalid_checkpoint(
@@ -3942,6 +3994,170 @@ mod tests {
             names_before, names_after,
             "read must not create recovery or lock files"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn experiment_status_reads_refuse_aliases_without_reinitializing_them() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let runner = interrupted_status_runner(directory.path());
+        let original_path = directory.path().join("original.json");
+        let original = runner.load_or_create_status(&original_path).unwrap();
+        let bytes = fs::read(&original_path).unwrap();
+        let linked = directory.path().join("linked.json");
+        symlink(&original_path, &linked).unwrap();
+        let missing_target = directory.path().join("missing.json");
+        let dangling = directory.path().join("dangling.json");
+        symlink(&missing_target, &dangling).unwrap();
+        let hardlinked = directory.path().join("hardlinked.json");
+        let aliased_target = directory.path().join("aliased-target.json");
+        fs::write(&aliased_target, &bytes).unwrap();
+        fs::hard_link(&aliased_target, &hardlinked).unwrap();
+        let non_file = directory.path().join("directory.json");
+        fs::create_dir(&non_file).unwrap();
+
+        for path in [&linked, &dangling, &hardlinked, &non_file] {
+            assert!(
+                matches!(
+                    runner.status_snapshot(path),
+                    Err(ExperimentRunnerError::InvalidStatus { .. })
+                ),
+                "reader admitted {}",
+                path.display()
+            );
+            assert!(
+                matches!(
+                    runner.load_or_create_status(path),
+                    Err(ExperimentRunnerError::InvalidStatus { .. })
+                ),
+                "writer admitted or reinitialized {}",
+                path.display()
+            );
+            assert!(!status_temporary_path(path).unwrap().exists());
+        }
+        assert_eq!(fs::read_link(&linked).unwrap(), original_path);
+        assert_eq!(fs::read_link(&dangling).unwrap(), missing_target);
+        assert!(!missing_target.exists());
+        assert_eq!(fs::read(&hardlinked).unwrap(), bytes);
+        assert_eq!(fs::read(&original_path).unwrap(), bytes);
+        assert_eq!(runner.status_snapshot(&original_path).unwrap(), original);
+        assert!(!runner.output_dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn experiment_status_fifo_refusal_does_not_wait_for_a_writer() {
+        use std::os::unix::fs::FileTypeExt;
+        use std::process::Command;
+        use std::time::Duration;
+
+        const CHILD_DIRECTORY: &str = "SCRIPTBOTS_STATUS_FIFO_TEST_DIRECTORY";
+        if let Some(directory) = std::env::var_os(CHILD_DIRECTORY) {
+            let directory = PathBuf::from(directory);
+            let runner = interrupted_status_runner(&directory);
+            let state_file = directory.join("status.json");
+            assert!(matches!(
+                runner.status_snapshot(&state_file),
+                Err(ExperimentRunnerError::InvalidStatus { .. })
+            ));
+            assert!(matches!(
+                runner.load_or_create_status(&state_file),
+                Err(ExperimentRunnerError::InvalidStatus { .. })
+            ));
+            assert!(!runner.output_dir.exists());
+            fs::write(
+                directory.join("refused.txt"),
+                b"reader and writer refused FIFO",
+            )
+            .unwrap();
+            return;
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let state_file = directory.path().join("status.json");
+        assert!(
+            Command::new("mkfifo")
+                .arg(&state_file)
+                .status()
+                .unwrap()
+                .success()
+        );
+        // Isolate the actual reader so restoring the blocking-open defect fails
+        // with a reaped timeout instead of hanging the test harness indefinitely.
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "experiment_runner::tests::experiment_status_fifo_refusal_does_not_wait_for_a_writer",
+                "--nocapture",
+            ])
+            .env(CHILD_DIRECTORY, directory.path());
+        MatchedSeedExperimentRunner::run_bounded_child(&mut command, Duration::from_secs(10))
+            .expect("status reads must refuse a FIFO without an external writer");
+        assert_eq!(
+            fs::read(directory.path().join("refused.txt")).unwrap(),
+            b"reader and writer refused FIFO",
+            "the child must execute both refusals, not merely match zero tests"
+        );
+        assert!(
+            fs::symlink_metadata(&state_file)
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+    }
+
+    #[test]
+    fn experiment_status_reads_accept_complete_atomic_replacements() {
+        const REPLACEMENTS: u64 = 128;
+
+        let directory = tempfile::tempdir().unwrap();
+        let runner = interrupted_status_runner(directory.path());
+        let state_file = directory.path().join("status.json");
+        let initial = runner.load_or_create_status(&state_file).unwrap();
+        let mut running = initial.clone();
+        running.runs[0].state = RunState::Running;
+        runner.save_status(&state_file, &mut running).unwrap();
+        let mut failed = running.clone();
+        failed.runs[0].state = RunState::Failed;
+        failed.runs[0].error_reason = Some("retained test failure".to_owned());
+        recompute_status_counts(&mut failed);
+        let last_generation = running.generation + REPLACEMENTS;
+
+        let start = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                let mut status = failed.clone();
+                start.wait();
+                for _ in 0..REPLACEMENTS {
+                    // Exercise actual atomic publication while the reader opens
+                    // either complete generation. No partial in-place writes.
+                    runner.save_status(&state_file, &mut status).unwrap();
+                }
+                status
+            });
+            start.wait();
+            for _ in 0..REPLACEMENTS {
+                let observed = runner.status_snapshot(&state_file).unwrap();
+                if observed.generation == running.generation {
+                    assert_eq!(observed, running);
+                } else {
+                    assert!(
+                        (running.generation + 1..=last_generation).contains(&observed.generation),
+                        "{observed:?}"
+                    );
+                    let mut expected = failed.clone();
+                    expected.generation = observed.generation;
+                    assert_eq!(observed, expected);
+                }
+            }
+            let committed = writer.join().unwrap();
+            assert_eq!(committed.generation, last_generation);
+            assert_eq!(runner.status_snapshot(&state_file).unwrap(), committed);
+        });
+        assert!(!runner.output_dir.exists());
     }
 
     #[test]
@@ -4270,7 +4486,9 @@ mod tests {
             ),
         ] {
             runner.variants = vec![intervention_test_variant("invalid-timing", interventions)];
-            let error = runner.plan_batch().expect_err("valid patches have invalid scheduling");
+            let error = runner
+                .plan_batch()
+                .expect_err("valid patches have invalid scheduling");
             assert!(error.to_string().contains(diagnostic), "{error}");
             assert!(!output.exists());
         }
@@ -4282,7 +4500,10 @@ mod tests {
             vec![at(0, serde_json::json!({"food_max": true}))],
             vec![at(0, serde_json::json!({"food_max": 101}))],
             vec![at(0, serde_json::json!({"population_minimum": 1.5}))],
-            vec![at(0, serde_json::json!({"render.post.bloom.intensity": 0.5}))],
+            vec![at(
+                0,
+                serde_json::json!({"render.post.bloom.intensity": 0.5}),
+            )],
             vec![at(0, serde_json::json!({}))],
             vec![at(0, serde_json::json!([]))],
             vec![at(
@@ -4386,9 +4607,10 @@ mod tests {
             let bundle_dir = runner.output_dir.join(&record.run_id);
             let verified = verify_portable_run_bundle(&bundle_dir).unwrap();
             let final_state = verified.final_state.unwrap();
-            let checkpoint = read_optional_run_checkpoint(&runner.run_checkpoint_path(&record.run_id))
-                .unwrap()
-                .unwrap();
+            let checkpoint =
+                read_optional_run_checkpoint(&runner.run_checkpoint_path(&record.run_id))
+                    .unwrap()
+                    .unwrap();
             let declared = &checkpoint.metadata.manifest.scenario.interventions;
             let host = checkpoint.owner.host_checkpoint();
             let expected_count = u64::try_from(declared.len()).unwrap();
@@ -4491,7 +4713,8 @@ mod tests {
                 runner.max_ticks,
             )
             .unwrap();
-            let mut oracle = restore_run_owner(&checkpoint, *family, &record.run_id, &path).unwrap();
+            let mut oracle =
+                restore_run_owner(&checkpoint, *family, &record.run_id, &path).unwrap();
             let (_, namespace) = host_identifiers(&record.run_id);
             let mut frontend = NullFrontend::new(oracle.local_port(), namespace);
             let mut now = 0;
@@ -4515,9 +4738,8 @@ mod tests {
                 .unwrap();
                 seal_run_checkpoint(&record.run_id, &mut frontend, &mut oracle, &mut now).unwrap();
                 if tick <= completed_ticks {
-                    checkpoint.metadata.parent_digest = Some(
-                        blake3::hash(&fs::read(&path).unwrap()).to_hex().to_string(),
-                    );
+                    checkpoint.metadata.parent_digest =
+                        Some(blake3::hash(&fs::read(&path).unwrap()).to_hex().to_string());
                     checkpoint.owner = oracle.capture_volatile_host_checkpoint_v1().unwrap();
                     runner
                         .validate_run_checkpoint(
@@ -4563,7 +4785,10 @@ mod tests {
             runner.save_status(&state_file, &mut status).unwrap();
             runner.max_concurrency = 2;
             let resumed = runner.execute_batch(&state_file).unwrap();
-            assert_eq!(resumed.completed_runs, 1, "cut {completed_ticks}: {resumed:?}");
+            assert_eq!(
+                resumed.completed_runs, 1,
+                "cut {completed_ticks}: {resumed:?}"
+            );
             assert_eq!(
                 resumed.runs[0].final_digest.as_deref(),
                 Some(expected_digest.as_str())
@@ -4574,7 +4799,8 @@ mod tests {
                 final_cut.owner.host_checkpoint().journal_cut(),
                 expected_journal
             );
-            let verified = verify_portable_run_bundle(&runner.output_dir.join(&record.run_id)).unwrap();
+            let verified =
+                verify_portable_run_bundle(&runner.output_dir.join(&record.run_id)).unwrap();
             assert_eq!(verified.final_state.unwrap().summary, expected_summary);
         }
     }
@@ -4630,7 +4856,10 @@ mod tests {
             metadata: initial.metadata.clone(),
             owner: initial.owner.clone(),
         };
-        changed.metadata.plan_digest.clone_from(&altered_plan.digest);
+        changed
+            .metadata
+            .plan_digest
+            .clone_from(&altered_plan.digest);
         changed
             .metadata
             .manifest
@@ -4658,7 +4887,9 @@ mod tests {
         assert_eq!(status.completed_runs, 1, "{status:?}");
         let bundle_dir = runner.output_dir.join(&record.run_id);
         let checkpoint_path = bundle_dir.join(FINAL_CHECKPOINT_ARTIFACT.0);
-        let final_checkpoint = read_optional_run_checkpoint(&checkpoint_path).unwrap().unwrap();
+        let final_checkpoint = read_optional_run_checkpoint(&checkpoint_path)
+            .unwrap()
+            .unwrap();
         changed.owner = final_checkpoint.owner.clone();
         changed.metadata = final_checkpoint.metadata.clone();
         changed
@@ -4691,7 +4922,9 @@ mod tests {
         let error = verify_portable_run_bundle(&bundle_dir)
             .expect_err("same final config does not justify forged completed treatment inputs");
         assert!(
-            error.to_string().contains("ordered applied and committed owner receipt"),
+            error
+                .to_string()
+                .contains("ordered applied and committed owner receipt"),
             "{error}"
         );
     }
