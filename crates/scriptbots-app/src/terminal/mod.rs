@@ -18953,11 +18953,13 @@ for case in ('panic', 'subscription', 'renderer'):
                         variant_id: "baseline".into(),
                         brain_family: "mlp".into(),
                         config_overrides: Some(overrides.clone()),
+                        interventions: Vec::new(),
                     },
                     ExperimentVariantDto {
                         variant_id: "challenger".into(),
                         brain_family: "dwraon".into(),
                         config_overrides: Some(overrides),
+                        interventions: Vec::new(),
                     },
                 ],
                 seeds: vec![seed],

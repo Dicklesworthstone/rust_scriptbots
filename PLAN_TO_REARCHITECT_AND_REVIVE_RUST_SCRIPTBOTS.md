@@ -3647,6 +3647,32 @@ clean source-status and source-diff digests plus Cargo.lock digest
 
 ### 7.7 experiment runner
 
+**Source implementation extension — Codex, 2026-11-06 UTC:** Lab proposals now
+expose installed brain families as a bounded treatment axis. Typed expanded arms
+use the runner's canonical family resolver, include the family/configuration product
+in admission costs, and bind actual family and launch configuration through result
+ingestion and notebook reproduction. Family-only studies require two distinct
+executable families. Every treatment compares against the first arm with matched
+seeds; factorial interaction effects are not estimated. Real two-family pipeline
+and emitted-script regression controls are authored. Native qualification remains
+pending because the required DSR execution path is unavailable in this session.
+
+**Source implementation extension — Codex, 2026-11-06 UTC:** Experiment variants
+now carry ordered timed numeric configuration interventions through REST/MCP,
+saved definitions and the existing HostCore scheduler. Admission bounds each arm
+to 64 statements and each canonical patch to 4,096 bytes, validates every cumulative
+config, and includes schedules in treatment identity. Continuation and portable
+verification bind the exact declared schedule, successful committed receipts,
+remaining inputs, config revisions and observed config at every saved cut. Prepared
+prefix hashes and shared structural changed paths avoid repeatedly resolving old
+patches. Regression source covers same-tick effects, the full schedule bound,
+optional nested settings, interrupted continuation, coherently rechecksummed input
+forgeries and REST/MCP retries. Lab refuses scheduled evidence until its own arm
+provenance represents schedules. Native DSR qualification remains pending.
+The atomic paired volatile-owner continuation boundary is preserved; durable
+database history still requires recovery of a database prefix committed beyond
+the last saved owner cut.
+
 **Source implementation extension — Codex, 2026-11-05:** The runner and Lab now
 share eight final-state endpoints: population, total/mean live-agent energy,
 mean health, mean/max current age counter, max living generation and total food.
@@ -3683,6 +3709,28 @@ brain_families = ["dwraon"]
 It supports matched seeds, bounded parallelism, checkpoint/branch experiments, resumable runs, and machine-readable progress. It never launches a renderer unless asked.
 
 ### 7.8 offline analysis integrations
+
+**Source correctness extension — Codex, 2026-11-06 UTC:** Tick-applied
+`SetClosedWorld` interventions now invalidate the published config's closed flag
+and request publication even between sparse snapshot intervals. Configuration
+audit/revision semantics remain unchanged; ordinary ticks retain cached config
+and audit Arcs. This keeps live control status consistent with actual closure
+while preserving replay inputs. Actual-owner regression source covers queued and
+applied effects, both directions, sparse automatic ticks and read-only publication
+invariants. Native DSR qualification remains pending.
+
+**Source implementation extension — Codex, 2026-11-06 UTC:** Historical canvas
+review now retains successful intervention commands alongside spawn/crossover and
+mutation edits, merges them with configuration edits by their observed revisions,
+and uses the common core applier. Entry count and a 1 MiB entry/payload cap bound
+volatile command retention; oversized commands execute but leave detectable gaps.
+A quiescent target precursor and its existing core continuity companion preserve
+derived food profiles and pending target-boundary inputs after the complete current
+digest has been checked, without a second science replay. Archive resurrection,
+map replacement and migration remain unsupported because their complete source
+authority is not present in saved science checkpoints. Real-owner effect, ordering,
+retention and refusal regression controls are authored; native DSR qualification
+remains pending in this session.
 
 **Source implementation extension — Codex, 2026-11-05:** Cohort and descriptive
 comparisons now support explicitly selected runs inside one finished database.

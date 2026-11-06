@@ -253,12 +253,19 @@ RUST_LOG=info cargo run -p scriptbots-app
   history; future, incomplete, failed or pruned schedules refuse review. Empty
   installed queues are supported. It checks the reconstructed current digest
   before showing the requested event as `CHECKPOINT REPLAY`; `g` returns live.
-  Agent spawns, manual crossovers and mutation-rate edits also have an implemented
-  replay path when configuration stays unchanged throughout the interval and the
-  live owner's bounded command history is complete. That history is volatile;
-  eviction or host restore without the required inputs refuses review. Mixed
-  configuration/agent-command intervals, interventions, map replacements and
-  migrations still require general recorded-input replay. Native qualification
+  Agent spawns, manual crossovers, mutation-rate edits and self-contained
+  interventions also have an implemented replay path, including mixed configuration
+  edits at the same tick. The live owner's complete command history and each command's
+  observed configuration revision preserve execution order. Intervention effects use
+  the ordinary core queue and apply at the next science tick; target-boundary inputs
+  are reconstructed after the complete current-digest check. The retained history
+  obeys both the owner entry limit and a 1 MiB entry/payload budget; container spare
+  slots have a separate entry bound. Oversized inputs still execute but leave a
+  revision gap, so review refuses an incomplete interval. This history is volatile;
+  eviction or host restore without the required inputs also refuses review. Archive
+  resurrection requires a source-bound behavioral archive, which the saved science
+  checkpoint does not carry. It, map replacements and migrations remain outside
+  this replay path. Native qualification
   status is recorded in [the reality check](REALITY_CHECK_2026-09-03.md). Loading,
   duplicate bounds, cancellation and stale selection checks use the same worker
   slot as direct checkpoint review. Live controls continue to address the owner.
@@ -1350,6 +1357,43 @@ reply ID because no validated identity was admitted. Client binary control frame
 receive an explicit refusal. Before a subscription is negotiated, the server sends
 Postcard-encoded `TickSummaryDto` values at a 50 ms sampling cadence.
 
+#### Resumable SSE and NDJSON monitoring
+
+`GET /api/ticks/stream` (SSE) and `GET /api/ticks/ndjson` provide two explicit
+monitoring modes. With no cursor, or with `after_tick=N`, they send canonical
+tick summaries and catch up from the bounded retained history. Every unavailable
+tick range is reported as a `gap` with inclusive `first_missing`/`last_missing`
+values, including an empty history ring or gaps between retained samples. These
+streams are observations, not durable replay journals.
+
+Use `after_revision=0` to select **latest-publication mode**. It includes owner
+changes while science remains paused, such as speed, control revision, health
+and lifecycle. Each JSON record has `schema: "scriptbots.tick-publication.v1"`,
+the canonical tick `summary`, observed `playback`, `health` and `lifecycle`, plus
+decimal-string session, publication, scientific, control and config revisions.
+`coalesced_publications` counts revisions skipped since the previous cursor;
+the server does not invent historical publications from tick summaries.
+
+```bash
+curl -N 'http://127.0.0.1:8088/api/ticks/stream?after_revision=0'
+curl -N 'http://127.0.0.1:8088/api/ticks/ndjson?after_revision=42&session_id=891'
+```
+
+SSE publication records use event name `publication` and an ID such as
+`pub:891:42`. An `EventSource` reconnect's `Last-Event-ID` supersedes its original
+revision query, preserving the consumed session and revision. Manual clients
+resume using both `after_revision` and its original `session_id`. An omitted
+session binds a new connection to the current owner; it does not establish
+cross-session continuity. A foreign session or future revision returns HTTP
+409 before streaming. Conflicting cursor modes, malformed reconnect IDs and
+zero session identities return 400. The legacy explicit `after_tick` query
+continues to override a tick reconnect header.
+
+Publication mode samples at 250 ms and retains at most one prepared publication
+per consumer. Same-revision polls produce nothing. If the source becomes
+unavailable or changes session after connection, the stream emits a typed
+`error` record and closes; clients must handle that refusal explicitly.
+
 #### Remote browser viewing and stream subscriptions
 
 The web demo's **Remote Server** controls connect its existing Canvas 2D or WebGPU
@@ -1415,6 +1459,13 @@ must omit that field. The supplied browser client sends this acknowledgment only
 after synchronous validation and consumption. A wrong, duplicate or expired
 acknowledgment closes the stream; it never releases another channel's credit.
 Subscription replacement requires all outstanding frames to be acknowledged.
+
+One control request per connection may wait for its owner receipt while frame
+acknowledgments and subscription messages continue to be processed. A further
+valid control request receives a correlated 429 response; retry it after the
+pending reply, preserving its request identity. Disconnect cancels control work
+that is still queued for a blocking worker. Work already admitted by the owner
+may finish, so recover its outcome with the same retry identity after reconnect.
 
 Each connection prepares at most one frame per selected channel from an immutable
 publication and has one socket write in flight. Until the browser consumes that
@@ -1497,6 +1548,73 @@ A proposal can request, for example, `"metrics": ["average_energy", "total_food"
 Every requested endpoint must be available in every matched run. Unavailable
 population statistics use empty CSV cells and cause analysis to refuse that
 requested metric; they are never replaced with zero.
+
+Lab proposals can also compare executable brain families directly:
+
+```json
+{
+  "hypothesis": "MLP and DWRAON differ in final energy under the same environment",
+  "falsifier": "The paired energy difference remains compatible with zero",
+  "factors": [],
+  "brain_families": ["mlp", "dwraon"],
+  "seeds": {"base": 41, "count": 8},
+  "ticks_per_run": 1000,
+  "metrics": ["average_energy", "total_food"],
+  "budget": {"runs": 16, "ticks": 16000}
+}
+```
+
+Omitting `brain_families` selects the existing MLP default. The proposal tool lists
+the canonical families installed in the current build; accepted aliases resolve
+through the runner's registry. Unknown or unavailable families and duplicate aliases
+are refused before execution. Configuration-factor combinations expand in declaration
+order, with the requested families inside each combination, and every arm receives
+the same seed cohort. Run and tick budgets include the full product, subject to the
+existing 32-arm ceiling. Empty `factors` requires at least two distinct families.
+The first expanded arm is the statistical control; every later arm is compared
+with it through the existing matched-seed analysis. Result ingestion and notebook
+reproduction bind each arm to its actual family and launch configuration.
+
+The experiment REST API (`POST /api/v1/experiments`) and MCP `experiment_create`
+also accept timed configuration treatments on each variant:
+
+```json
+{
+  "experiment_id": "food-pause-recovery",
+  "variants": [
+    {"variant_id": "control", "brain_family": "mlp", "config_overrides": {}},
+    {
+      "variant_id": "pause-recovery",
+      "brain_family": "mlp",
+      "config_overrides": {},
+      "interventions": [
+        {"tick": 0, "set": {"food_growth_rate": 0.0}},
+        {"tick": 500, "set": {"food_growth_rate": 0.04}}
+      ]
+    }
+  ],
+  "seeds": [41, 42],
+  "ticks_per_run": 1000,
+  "max_concurrency": 2
+}
+```
+
+`tick` names a completed-tick boundary: tick 0 applies before the first science
+step. Statements must be in nondecreasing tick order, with every tick strictly
+before `ticks_per_run`; statements at the same tick execute in document order.
+Each arm admits at most 64 statements, each at most 4,096 canonical JSON bytes.
+The `set` object uses nested configuration keys and accepts exposed numeric live
+knobs. Every cumulative patch must satisfy the existing type, range and complete
+configuration constraints before the batch creates files or starts workers.
+
+Schedules participate in arm identity and saved plan checks. The original launch
+configuration stays in the manifest alongside the full treatment declaration.
+Resume verifies completed input receipts and the exact remaining queue, then
+continues it without reapplying completed treatments. Portable verification checks
+that same evidence and the resulting config before recomputing the final science
+digest and endpoint summary. Lab proposal arms currently describe brain families
+and launch factors only, so Lab ingestion and reproduction explicitly refuse
+scheduled bundles rather than discard their treatment provenance.
 
 The summary now declares `schema_version=2`, bound by
 `scriptbots.experiment-run-evidence.v2`. Verification and completed-run recovery

@@ -1559,7 +1559,7 @@ enum ExportPageSource {
 }
 
 impl ExportPageSource {
-    const fn query(self) -> (&'static str, &'static str, &'static str) {
+    fn query(self) -> (&'static str, &'static str, &'static str) {
         match self {
             Self::Agent => (
                 "SELECT run_id, tick, agent_uid, generation, age, position_x, position_y,

@@ -31,6 +31,9 @@
 //! product surface, rendered as one actionable line each and fed verbatim back to
 //! the model as a repair prompt.
 
+use crate::experiment_runner::{
+    DEFAULT_EXPERIMENT_BRAIN_FAMILY, EXPERIMENT_BRAIN_FAMILIES, canonical_experiment_brain_family,
+};
 use scriptbots_core::{KNOB_RANGES, knob_range};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -41,7 +44,7 @@ use utoipa::{PartialSchema, ToSchema};
 pub const MAX_FACTORS: usize = 4;
 /// Most values one factor may take.
 pub const MAX_VALUES_PER_FACTOR: usize = 8;
-/// Most arms (the cartesian product of the factors) one spec may expand to.
+/// Most arms (configuration factors times brain families) one spec may expand to.
 pub const MAX_ARMS: usize = 32;
 /// Most seeds in a cohort.
 pub const MAX_SEEDS: u16 = 64;
@@ -108,8 +111,15 @@ pub struct ExperimentSpec {
     /// hypothesis, and a lab that accepted one would be generating confident
     /// prose rather than science.
     pub falsifier: String,
-    /// The knobs to vary.
+    /// The knobs to vary. May be empty when comparing at least two brain families.
     pub factors: Vec<Factor>,
+    /// Registered brain families to compare, in declaration order. Defaults to
+    /// the runner's MLP family. Each configuration assignment runs every family
+    /// with the same seed cohort; aliases normalize before arm identity checks.
+    /// The first configuration and family form the baseline for every other
+    /// arm; the analysis does not estimate factorial interaction effects.
+    #[serde(default = "default_brain_families")]
+    pub brain_families: Vec<String>,
     /// The matched seed cohort.
     pub seeds: SeedPlan,
     /// How long each run lasts.
@@ -122,8 +132,19 @@ pub struct ExperimentSpec {
     pub budget: SpecBudget,
 }
 
-/// One arm of the experiment: a complete assignment of every factor.
-pub type Arm = BTreeMap<String, serde_json::Value>;
+fn default_brain_families() -> Vec<String> {
+    vec![DEFAULT_EXPERIMENT_BRAIN_FAMILY.to_owned()]
+}
+
+/// One complete treatment assignment, including its canonical registered family.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Arm {
+    /// Canonical family name resolved against the adapters compiled into this build.
+    pub brain_family: String,
+    /// Configuration factors, kept separate from the family selection.
+    pub config_overrides: BTreeMap<String, serde_json::Value>,
+}
 
 /// A spec that has been checked and expanded.
 ///
@@ -132,13 +153,16 @@ pub type Arm = BTreeMap<String, serde_json::Value>;
 /// seeds ascend, and no `HashMap` appears anywhere in the expansion.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ValidatedSpec {
-    /// The original proposal.
+    /// The proposal with brain-family aliases resolved to canonical names.
     pub spec: ExperimentSpec,
-    /// Every arm, in declaration order.
+    /// Every configuration assignment in factor declaration order, with families
+    /// in declaration order inside each assignment. The first arm is the control
+    /// for every treatment comparison, not a factorial interaction model.
     pub arms: Vec<Arm>,
     /// The cohort, ascending.
     pub seeds: Vec<u64>,
-    /// Whether any arm touches a knob that cannot be changed on a live world.
+    /// Whether an arm changes the launch family or touches a knob that cannot
+    /// be changed on a live world.
     ///
     /// Such a spec may still run — the lab starts fresh worlds — but it may NEVER
     /// be applied to a user's running simulation.
@@ -182,6 +206,24 @@ pub enum SpecError {
     EmptyHypothesis,
     /// No treatment axis was supplied.
     EmptyFactors,
+    /// No brain family was selected.
+    EmptyBrainFamilies,
+    /// A requested family has no executable adapter in this build.
+    InvalidBrainFamily {
+        /// Requested name or alias.
+        name: String,
+        /// Canonical resolver's actionable refusal.
+        reason: String,
+    },
+    /// Two requested names resolve to the same family.
+    DuplicateBrainFamily {
+        /// Canonical registered family.
+        name: String,
+        /// First position in the family axis.
+        first: usize,
+        /// Repeated position in the family axis.
+        second: usize,
+    },
     /// No output was selected for comparison.
     EmptyMetrics,
     /// No such knob.
@@ -305,7 +347,19 @@ impl fmt::Display for SpecError {
             ),
             Self::EmptyFactors => write!(
                 f,
-                "`factors` must contain at least one treatment axis: an empty arm cannot compare a treatment."
+                "`factors` must contain a treatment axis unless `brain_families` selects at least two distinct executable families."
+            ),
+            Self::EmptyBrainFamilies => write!(
+                f,
+                "`brain_families` must select at least one executable family; omit it to use the default MLP family."
+            ),
+            Self::InvalidBrainFamily { name, reason } => write!(
+                f,
+                "`brain_families` contains unsupported `{name}`: {reason}. Choose a family from the tool schema's installed-family list."
+            ),
+            Self::DuplicateBrainFamily { name, first, second } => write!(
+                f,
+                "brain families {first} and {second} both resolve to `{name}`. Select each family once so aliases do not duplicate treatment arms."
             ),
             Self::EmptyMetrics => write!(
                 f,
@@ -352,8 +406,8 @@ impl fmt::Display for SpecError {
             } => write!(f, "`{path}` expects {expected}, but got {got}."),
             Self::TooManyArms { arms, max } => write!(
                 f,
-                "these factors expand to {arms} arms, over the limit of {max}. Use fewer factors, \
-                 or fewer values per factor."
+                "configuration factors and brain families expand to {arms} arms, over the limit of {max}. \
+                 Use fewer families, factors, or values per factor."
             ),
             Self::DuplicateArm { first, second } => write!(
                 f,
@@ -416,6 +470,9 @@ impl SpecError {
         match self {
             Self::EmptyHypothesis => "empty_hypothesis",
             Self::EmptyFactors => "empty_factors",
+            Self::EmptyBrainFamilies => "empty_brain_families",
+            Self::InvalidBrainFamily { .. } => "invalid_brain_family",
+            Self::DuplicateBrainFamily { .. } => "duplicate_brain_family",
             Self::EmptyMetrics => "empty_metrics",
             Self::UnknownKnob { .. } => "unknown_knob",
             Self::NotSweepable { .. } => "not_sweepable",
@@ -467,6 +524,25 @@ pub fn tool_input_schema() -> Result<serde_json::Value, serde_json::Error> {
         .and_then(serde_json::Value::as_object_mut)
     {
         items.insert("enum".to_owned(), serde_json::json!(KNOWN_METRICS));
+    }
+    if let Some(families) = root
+        .pointer_mut("/properties/brain_families")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        families.insert(
+            "items".to_owned(),
+            serde_json::json!({"type": "string", "enum": EXPERIMENT_BRAIN_FAMILIES}),
+        );
+        families.insert("minItems".to_owned(), serde_json::json!(1));
+        families.insert(
+            "maxItems".to_owned(),
+            serde_json::json!(EXPERIMENT_BRAIN_FAMILIES.len()),
+        );
+        families.insert("uniqueItems".to_owned(), serde_json::json!(true));
+        families.insert(
+            "default".to_owned(),
+            serde_json::json!(default_brain_families()),
+        );
     }
     let mut referenced = Vec::new();
     <ExperimentSpec as ToSchema>::schemas(&mut referenced);
@@ -520,10 +596,15 @@ pub fn tool_input_schema() -> Result<serde_json::Value, serde_json::Error> {
             serde_json::json!(KNOWN_METRICS),
         );
         object.insert(
+            "x-scriptbots-brain-families".to_owned(),
+            serde_json::json!(EXPERIMENT_BRAIN_FAMILIES),
+        );
+        object.insert(
             "x-scriptbots-validation-limits".to_owned(),
             serde_json::json!({
                 "max_factors": MAX_FACTORS,
                 "max_values_per_factor": MAX_VALUES_PER_FACTOR,
+                "max_brain_families": EXPERIMENT_BRAIN_FAMILIES.len(),
                 "max_arms": MAX_ARMS,
                 "max_seeds": MAX_SEEDS,
                 "max_ticks_per_run": MAX_TICKS_PER_RUN,
@@ -564,7 +645,8 @@ pub fn validate_spec(
     if spec.falsifier.trim().is_empty() {
         errors.push(SpecError::EmptyFalsifier);
     }
-    if spec.factors.is_empty() {
+    let families = resolve_brain_families(&spec.brain_families, &mut errors);
+    if spec.factors.is_empty() && families.len() < 2 {
         errors.push(SpecError::EmptyFactors);
     }
     if spec.metrics.is_empty() {
@@ -612,7 +694,9 @@ pub fn validate_spec(
         }
     }
 
-    let mut fresh_world_only = false;
+    let mut fresh_world_only = families
+        .iter()
+        .any(|family| *family != DEFAULT_EXPERIMENT_BRAIN_FAMILY);
     let mut factor_positions = BTreeMap::new();
     for (factor_index, factor) in spec.factors.iter().enumerate() {
         if let Some(first) = factor_positions.get(&factor.knob_path).copied() {
@@ -668,6 +752,7 @@ pub fn validate_spec(
         .try_fold(1_usize, |count, factor| {
             count.checked_mul(factor.values.len())
         })
+        .and_then(|count| count.checked_mul(spec.brain_families.len()))
         .unwrap_or(usize::MAX);
     if arm_count > MAX_ARMS {
         errors.push(SpecError::TooManyArms {
@@ -675,7 +760,10 @@ pub fn validate_spec(
             max: MAX_ARMS,
         });
     }
-    let can_expand = !spec.factors.is_empty()
+    let can_expand = (!spec.factors.is_empty() || families.len() >= 2)
+        && !families.is_empty()
+        && families.len() == spec.brain_families.len()
+        && families.len() <= EXPERIMENT_BRAIN_FAMILIES.len()
         && spec.factors.len() <= MAX_FACTORS
         && factor_positions.len() == spec.factors.len()
         && spec.factors.iter().all(|factor| {
@@ -683,7 +771,7 @@ pub fn validate_spec(
         })
         && arm_count <= MAX_ARMS;
     let arms = if can_expand {
-        expand(&spec.factors)
+        expand(&spec.factors, &families)
     } else {
         Vec::new()
     };
@@ -736,14 +824,63 @@ pub fn validate_spec(
         return Err(errors);
     }
 
-    let spec_id = content_hash(spec, &arms, &seeds);
+    let mut canonical_spec = spec.clone();
+    canonical_spec.brain_families = families.into_iter().map(str::to_owned).collect();
+    let spec_id = content_hash(&canonical_spec, &arms, &seeds);
     Ok(ValidatedSpec {
-        spec: spec.clone(),
+        spec: canonical_spec,
         arms,
         seeds,
         fresh_world_only,
         spec_id,
     })
+}
+
+fn resolve_brain_families(
+    requested: &[String],
+    errors: &mut Vec<SpecError>,
+) -> Vec<&'static str> {
+    if requested.is_empty() {
+        errors.push(SpecError::EmptyBrainFamilies);
+    }
+    check_len(
+        "brain_families",
+        requested.len(),
+        EXPERIMENT_BRAIN_FAMILIES.len(),
+        errors,
+    );
+    let mut families = Vec::with_capacity(requested.len().min(EXPERIMENT_BRAIN_FAMILIES.len()));
+    let mut positions = BTreeMap::new();
+    for (index, name) in requested.iter().enumerate() {
+        if name.len() > MAX_STRING_LEN {
+            check_len(
+                &format!("brain_families[{index}]"),
+                name.len(),
+                MAX_STRING_LEN,
+                errors,
+            );
+            continue;
+        }
+        match canonical_experiment_brain_family("lab-arm", name) {
+            Ok(family) => {
+                if let Some(&first) = positions.get(family) {
+                    errors.push(SpecError::DuplicateBrainFamily {
+                        name: family.to_owned(),
+                        first,
+                        second: index,
+                    });
+                } else {
+                    positions.insert(family, index);
+                    families.push(family);
+                }
+            }
+            Err(error) => errors.push(SpecError::InvalidBrainFamily {
+                name: name.clone(),
+                reason: error.to_string(),
+            }),
+        }
+    }
+    families
 }
 
 fn check_len(field: &str, got: usize, max: usize, errors: &mut Vec<SpecError>) {
@@ -880,15 +1017,16 @@ fn describe(value: &serde_json::Value) -> String {
     .to_owned()
 }
 
-/// The cartesian product of the factors, in declaration order.
+/// The cartesian product of the configuration factors, with the family axis
+/// inside each configuration assignment. The first arm is the common baseline.
 ///
 /// `BTreeMap` and `Vec` only: a `HashMap` anywhere in here would make the arm
 /// order — and therefore the spec id — depend on the hasher's seed.
-fn expand(factors: &[Factor]) -> Vec<Arm> {
-    let mut arms: Vec<Arm> = vec![Arm::new()];
+fn expand(factors: &[Factor], families: &[&str]) -> Vec<Arm> {
+    let mut assignments = vec![BTreeMap::new()];
     for factor in factors {
-        let mut next = Vec::with_capacity(arms.len() * factor.values.len().max(1));
-        for arm in &arms {
+        let mut next = Vec::with_capacity(assignments.len() * factor.values.len().max(1));
+        for arm in &assignments {
             for value in &factor.values {
                 let mut extended = arm.clone();
                 extended.insert(factor.knob_path.clone(), value.clone());
@@ -896,10 +1034,18 @@ fn expand(factors: &[Factor]) -> Vec<Arm> {
             }
         }
         if !next.is_empty() {
-            arms = next;
+            assignments = next;
         }
     }
-    arms
+    assignments
+        .into_iter()
+        .flat_map(|config_overrides| {
+            families.iter().map(move |family| Arm {
+                brain_family: (*family).to_owned(),
+                config_overrides: config_overrides.clone(),
+            })
+        })
+        .collect()
 }
 
 /// FNV-1a over the canonical JSON encoding of the validated content.
@@ -948,6 +1094,7 @@ mod tests {
                     serde_json::json!(0.1),
                 ],
             }],
+            brain_families: default_brain_families(),
             seeds: SeedPlan { base: 1, count: 4 },
             ticks_per_run: 2_000,
             metrics: vec!["alive_agents".to_owned()],
@@ -974,6 +1121,184 @@ mod tests {
         let again = validate_spec(&spec(), OPERATOR_BUDGET).expect("valid");
         assert_eq!(validated.spec_id, again.spec_id);
         assert_eq!(validated.arms, again.arms);
+    }
+
+    #[test]
+    fn brain_family_axis_expands_after_config_factors_and_charges_every_run() {
+        let mut proposed = spec();
+        proposed.brain_families = vec!["mlp".to_owned(), "dwraon".to_owned()];
+        let validated = validate_spec(&proposed, OPERATOR_BUDGET).unwrap();
+        let expected = [
+            ("mlp.baseline", 0.01),
+            ("dwraon.baseline", 0.01),
+            ("mlp.baseline", 0.05),
+            ("dwraon.baseline", 0.05),
+            ("mlp.baseline", 0.1),
+            ("dwraon.baseline", 0.1),
+        ];
+        assert_eq!(validated.arms.len(), expected.len());
+        for (arm, (family, growth)) in validated.arms.iter().zip(expected) {
+            assert_eq!(arm.brain_family, family);
+            assert_eq!(
+                arm.config_overrides["food_growth_rate"],
+                serde_json::json!(growth)
+            );
+        }
+        assert!(validated.fresh_world_only);
+        assert_eq!(
+            validated.cost(),
+            RunCost {
+                runs: 24,
+                ticks: 48_000,
+            }
+        );
+        let errors = validate_spec(
+            &proposed,
+            SpecBudget {
+                runs: 12,
+                ticks: 48_000,
+            },
+        )
+        .expect_err("family axis must count toward operator admission");
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            SpecError::CostExceedsBudget {
+                runs: 24,
+                ticks: 48_000,
+                max_runs: 12,
+                ..
+            }
+        )));
+
+        proposed.factors.push(Factor {
+            knob_path: "food_max".to_owned(),
+            values: (1..=8)
+                .map(|value| serde_json::json!(f64::from(value) * 0.1))
+                .collect(),
+        });
+        let errors = validate_spec(&proposed, OPERATOR_BUDGET)
+            .expect_err("3 configurations times 8 levels times 2 families exceeds the arm cap");
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            SpecError::TooManyArms {
+                arms: 48,
+                max: MAX_ARMS,
+            }
+        )));
+    }
+
+    #[test]
+    fn family_only_studies_require_distinct_executable_families() {
+        let mut proposed = spec();
+        proposed.factors.clear();
+        assert!(
+            validate_spec(&proposed, OPERATOR_BUDGET)
+                .unwrap_err()
+                .contains(&SpecError::EmptyFactors)
+        );
+
+        proposed.brain_families = vec!["mlp".to_owned(), "dwraon.baseline".to_owned()];
+        let validated = validate_spec(&proposed, OPERATOR_BUDGET).unwrap();
+        assert_eq!(validated.arms.len(), 2);
+        assert!(
+            validated
+                .arms
+                .iter()
+                .all(|arm| arm.config_overrides.is_empty())
+        );
+        assert_eq!(
+            validated.cost(),
+            RunCost {
+                runs: 8,
+                ticks: 16_000,
+            }
+        );
+
+        proposed.brain_families = vec!["mlp".to_owned(), "mlp.baseline".to_owned()];
+        let errors = validate_spec(&proposed, OPERATOR_BUDGET).unwrap_err();
+        assert!(errors.contains(&SpecError::DuplicateBrainFamily {
+            name: "mlp.baseline".to_owned(),
+            first: 0,
+            second: 1,
+        }));
+        assert!(errors.contains(&SpecError::EmptyFactors));
+        proposed.brain_families.clear();
+        assert!(
+            validate_spec(&proposed, OPERATOR_BUDGET)
+                .unwrap_err()
+                .contains(&SpecError::EmptyBrainFamilies)
+        );
+    }
+
+    #[test]
+    fn canonical_family_selection_participates_in_the_spec_identity() {
+        let proposed = spec();
+        let baseline = validate_spec(&proposed, OPERATOR_BUDGET).unwrap();
+        let mut alias = proposed.clone();
+        alias.brain_families = vec!["mlp".to_owned()];
+        let alias = validate_spec(&alias, OPERATOR_BUDGET).unwrap();
+        assert_eq!(baseline.spec_id, alias.spec_id);
+        assert_eq!(baseline.arms, alias.arms);
+        assert_eq!(baseline.spec, alias.spec);
+
+        let mut changed = proposed.clone();
+        changed.brain_families = vec!["dwraon".to_owned()];
+        let changed = validate_spec(&changed, OPERATOR_BUDGET).unwrap();
+        assert_ne!(baseline.spec_id, changed.spec_id);
+        assert_eq!(baseline.cost(), changed.cost());
+        assert_eq!(
+            baseline.arms[0].config_overrides,
+            changed.arms[0].config_overrides
+        );
+        assert_eq!(changed.spec.brain_families, ["dwraon.baseline"]);
+
+        let mut json = serde_json::to_value(proposed).unwrap();
+        json.as_object_mut().unwrap().remove("brain_families");
+        let defaulted: ExperimentSpec = serde_json::from_value(json).unwrap();
+        assert_eq!(defaulted.brain_families, [DEFAULT_EXPERIMENT_BRAIN_FAMILY]);
+        assert_eq!(
+            validate_spec(&defaulted, OPERATOR_BUDGET).unwrap().spec_id,
+            baseline.spec_id
+        );
+    }
+
+    #[test]
+    fn brain_family_validation_uses_the_compiled_runner_catalog() {
+        for requested in ["imaginary", "neuroflow"] {
+            let mut proposed = spec();
+            proposed.brain_families = vec![requested.to_owned()];
+            let errors = validate_spec(&proposed, OPERATOR_BUDGET).unwrap_err();
+            assert!(errors.iter().any(|error| matches!(
+                error,
+                SpecError::InvalidBrainFamily { name, .. } if name == requested
+            )));
+        }
+        for &family in EXPERIMENT_BRAIN_FAMILIES {
+            let mut proposed = spec();
+            proposed.brain_families = vec![family.to_owned()];
+            let validated = validate_spec(&proposed, OPERATOR_BUDGET).unwrap();
+            assert!(validated.arms.iter().all(|arm| arm.brain_family == family));
+        }
+        let mut optional = spec();
+        optional.brain_families = vec!["frankentorch".to_owned()];
+        #[cfg(feature = "brain-ft")]
+        assert!(
+            validate_spec(&optional, OPERATOR_BUDGET)
+                .unwrap()
+                .arms
+                .iter()
+                .all(|arm| arm.brain_family == "ft")
+        );
+        #[cfg(not(feature = "brain-ft"))]
+        assert!(
+            validate_spec(&optional, OPERATOR_BUDGET)
+                .unwrap_err()
+                .iter()
+                .any(|error| matches!(
+                    error,
+                    SpecError::InvalidBrainFamily { reason, .. } if reason.contains("brain-ft")
+                ))
+        );
     }
 
     #[test]
@@ -1144,11 +1469,11 @@ mod tests {
         assert_eq!(validated.arms.len(), 4);
         // Declaration order, every time.
         assert_eq!(
-            validated.arms[0].get("food_growth_rate"),
+            validated.arms[0].config_overrides.get("food_growth_rate"),
             Some(&serde_json::json!(0.01))
         );
         assert_eq!(
-            validated.arms[3].get("food_max"),
+            validated.arms[3].config_overrides.get("food_max"),
             Some(&serde_json::json!(0.6))
         );
 
@@ -1347,6 +1672,23 @@ mod tests {
         assert_eq!(
             schema.pointer("/properties/metrics/items/enum"),
             Some(&serde_json::json!(KNOWN_METRICS))
+        );
+        assert_eq!(
+            schema.pointer("/properties/brain_families/items/enum"),
+            Some(&serde_json::json!(EXPERIMENT_BRAIN_FAMILIES))
+        );
+        assert_eq!(
+            schema.pointer("/properties/brain_families/default"),
+            Some(&serde_json::json!([DEFAULT_EXPERIMENT_BRAIN_FAMILY]))
+        );
+        assert_eq!(
+            schema.pointer("/x-scriptbots-brain-families"),
+            Some(&serde_json::json!(EXPERIMENT_BRAIN_FAMILIES))
+        );
+        assert!(
+            !required
+                .iter()
+                .any(|field| field.as_str() == Some("brain_families"))
         );
         assert!(
             schema
