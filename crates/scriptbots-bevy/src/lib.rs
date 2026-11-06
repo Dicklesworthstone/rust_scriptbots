@@ -944,7 +944,11 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
             update_follow_button_colors,
             update_tonemap_button_colors,
             update_auto_exposure_button_colors,
-            update_exposure_button_colors,
+            (
+                update_exposure_button_colors,
+                update_inspector_page_button_colors,
+            )
+                .chain(),
             control_camera,
             sync_camera_tonemapping,
             (
@@ -4454,13 +4458,51 @@ fn setup_scene(
                         });
                     }
                 });
-                card_page_status = card
-                    .spawn((
-                        Text::default(),
-                        TextFont::from_font_size(11.0),
-                        TextColor(Color::srgb(0.66, 0.81, 0.73)),
-                    ))
-                    .id();
+                card.spawn(Node {
+                    flex_direction: FlexDirection::Row,
+                    flex_wrap: FlexWrap::Wrap,
+                    align_items: AlignItems::Center,
+                    column_gap: Val::Px(6.0),
+                    row_gap: Val::Px(4.0),
+                    ..default()
+                })
+                .with_children(|row| {
+                    for (direction, label) in [
+                        (InspectorPageButton::Previous, "Previous"),
+                        (InspectorPageButton::Next, "Next"),
+                    ] {
+                        row.spawn((
+                            Button,
+                            Node {
+                                min_width: Val::Px(0.0),
+                                padding: UiRect::axes(Val::Px(8.0), Val::Px(3.0)),
+                                ..button_node.clone()
+                            },
+                            BackgroundColor(follow_idle_color()),
+                            BorderRadius::all(Val::Px(5.0)),
+                            BorderColor::all(button_border_color),
+                            direction,
+                        ))
+                        .with_children(|button| {
+                            button.spawn((
+                                Text::new(label),
+                                TextFont::from_font_size(12.0),
+                                TextColor(secondary_text_color),
+                            ));
+                        });
+                    }
+                    card_page_status = row
+                        .spawn((
+                            Text::default(),
+                            TextFont::from_font_size(11.0),
+                            TextColor(Color::srgb(0.66, 0.81, 0.73)),
+                            Node {
+                                flex_grow: 1.0,
+                                ..default()
+                            },
+                        ))
+                        .id();
+                });
                 card_page_title = card
                     .spawn((
                         Text::default(),
@@ -6926,6 +6968,51 @@ mod adaptive_governor_tests {
     }
 
     #[test]
+    fn creature_card_places_page_controls_with_the_page_status() {
+        let mut app = App::new();
+        app.insert_resource(Assets::<Mesh>::default())
+            .insert_resource(Assets::<Image>::default())
+            .insert_resource(auto_launch(RenderQuality::High))
+            .add_systems(Startup, setup_scene)
+            .add_systems(Update, update_inspector_page_button_colors);
+        app.update();
+
+        let card = app.world().resource::<CreatureCardElements>();
+        let root = card.root;
+        let status = card.page_status;
+        let world = app.world_mut();
+        let row = world.get::<ChildOf>(status).expect("status row").parent();
+        assert_eq!(
+            world.get::<ChildOf>(row).expect("card parent").parent(),
+            root
+        );
+        let mut query = world.query::<(Entity, &InspectorPageButton, &ChildOf)>();
+        let controls: Vec<_> = query
+            .iter(world)
+            .filter(|(_, _, parent)| parent.parent() == row)
+            .map(|(entity, direction, _)| (entity, *direction))
+            .collect();
+        assert_eq!(controls.len(), 2);
+        assert!(
+            controls
+                .iter()
+                .any(|(_, d)| matches!(d, InspectorPageButton::Previous))
+        );
+        let next = controls
+            .iter()
+            .find_map(|(entity, d)| matches!(d, InspectorPageButton::Next).then_some(*entity))
+            .expect("next page button");
+        app.world_mut()
+            .entity_mut(next)
+            .insert(Interaction::Hovered);
+        app.update();
+        assert_eq!(
+            app.world().get::<BackgroundColor>(next).unwrap().0,
+            follow_hover_color()
+        );
+    }
+
+    #[test]
     fn hud_camera_preserves_the_world_camera_output() {
         let mut app = App::new();
         app.insert_resource(Assets::<Mesh>::default())
@@ -8675,6 +8762,19 @@ struct OwnerInspectorSample {
     pages: Vec<String>,
 }
 
+impl OwnerInspectorSample {
+    fn page_count(&self) -> usize {
+        self.pages.len() + 1
+    }
+
+    fn page(&self, frame: &WorldSnapshot, index: usize) -> String {
+        self.pages
+            .get(index)
+            .cloned()
+            .unwrap_or_else(|| format_brain_overlay(&frame.brain))
+    }
+}
+
 struct OwnerInspectorJob {
     target: InspectorTarget,
     result: mpsc::Receiver<std::result::Result<Option<OwnerInspectorSample>, String>>,
@@ -8814,7 +8914,7 @@ impl OwnerInspector {
             return format!("Owner detail: {}", self.status);
         };
         let source = sample.target.source;
-        let index = page % sample.pages.len();
+        let index = page % sample.page_count();
         let provenance = self.last_failure.as_ref().map_or_else(
             || {
                 format!(
@@ -8834,9 +8934,9 @@ impl OwnerInspector {
             source.inspected_tick.0,
             current.source.inspected_tick.0 - source.inspected_tick.0,
             index + 1,
-            sample.pages.len(),
+            sample.page_count(),
             provenance,
-            sample.pages[index],
+            sample.page(frame, index),
         )
     }
 
@@ -8859,21 +8959,20 @@ impl OwnerInspector {
                 self.status.clone(),
             );
         };
-        let index = page % sample.pages.len();
+        let index = page % sample.page_count();
         let age = current.source.inspected_tick.0 - sample.target.source.inspected_tick.0;
         let mut status = format!(
             "PAGE {}/{} | SAMPLE TICK {} | {} ticks old | I / SHIFT+I",
             index + 1,
-            sample.pages.len(),
+            sample.page_count(),
             sample.target.source.inspected_tick.0,
             age
         );
         if let Some(error) = &self.last_failure {
             status.push_str(&format!("\nREFRESH FAILED: {error} (I to retry)"));
         }
-        let (title, body) = sample.pages[index]
-            .split_once('\n')
-            .unwrap_or((&sample.pages[index], ""));
+        let content = sample.page(frame, index);
+        let (title, body) = content.split_once('\n').unwrap_or((&content, ""));
         (status, title.to_owned(), body.to_owned())
     }
 }
@@ -9122,7 +9221,12 @@ fn handle_inspector_page(
     {
         let count = inspector
             .as_ref()
-            .and_then(|inspector| inspector.sample.as_ref().map(|sample| sample.pages.len()))
+            .and_then(|inspector| {
+                inspector
+                    .sample
+                    .as_ref()
+                    .map(OwnerInspectorSample::page_count)
+            })
             .unwrap_or(1)
             .max(1);
         page.0 %= count;
@@ -9141,6 +9245,24 @@ fn handle_inspector_page(
         {
             inspector.last_attempt = None;
             inspector.status = "retry queued".into();
+        }
+    }
+}
+
+fn update_inspector_page_button_colors(
+    mut buttons: Query<
+        (&Interaction, &mut BackgroundColor),
+        (Changed<Interaction>, With<InspectorPageButton>),
+    >,
+) {
+    for (interaction, mut color) in &mut buttons {
+        let target = if matches!(interaction, Interaction::Hovered | Interaction::Pressed) {
+            follow_hover_color()
+        } else {
+            follow_idle_color()
+        };
+        if color.0 != target {
+            *color = target.into();
         }
     }
 }
@@ -9416,6 +9538,52 @@ mod owner_inspector_tests {
                 .0
                 .contains("REFRESH FAILED: test timeout")
         );
+        let brain_page = app
+            .world()
+            .non_send_resource::<OwnerInspector>()
+            .sample
+            .as_ref()
+            .unwrap()
+            .pages
+            .len();
+        app.world_mut().resource_mut::<InspectorPage>().0 = brain_page;
+        app.world_mut()
+            .resource_mut::<SnapshotState>()
+            .latest
+            .as_mut()
+            .unwrap()
+            .brain = BrainOverlay {
+            status: BrainOverlayStatus::Ready,
+            source_tick: 37,
+            layers: vec![BrainOverlayLayer {
+                name: "hidden".into(),
+                shown: vec![0.2, -0.4],
+                total: 3,
+            }],
+            truncated: true,
+        };
+        app.update();
+        assert!(
+            app.world()
+                .get::<Text>(title)
+                .unwrap()
+                .0
+                .contains("tick 37")
+        );
+        assert!(
+            app.world()
+                .get::<Text>(title)
+                .unwrap()
+                .0
+                .contains("clipped")
+        );
+        assert!(
+            app.world()
+                .get::<Text>(body)
+                .unwrap()
+                .0
+                .contains("hidden [2/3]")
+        );
         app.world_mut().resource_mut::<HudDiagnostics>().0 = true;
         app.update();
         assert_eq!(
@@ -9592,8 +9760,7 @@ mod owner_inspector_tests {
             .sample
             .as_ref()
             .unwrap()
-            .pages
-            .len();
+            .page_count();
         let previous = app
             .world_mut()
             .spawn((InspectorPageButton::Previous, Interaction::Pressed))
