@@ -5385,8 +5385,11 @@ pub(crate) mod tests {
         use crate::experiment_runner::{
             MatchedSeedCohort, MatchedSeedExperimentRunner, ScenarioVariant,
         };
-        // The two conditions differ in actual retained food. No ingestion,
-        // locomotion or reproduction can turn that fixture into another outcome.
+        // The two conditions differ in actual retained food. The two-tick
+        // horizon precedes the default respawn; every override must remain
+        // executable through the production runner's registered knob contract.
+        let max_ticks = 2;
+        assert!(u64::from(ScriptBotsConfig::default().food_respawn_interval) > max_ticks);
         let common = BTreeMap::from([
             ("world_width".into(), serde_json::json!(480)),
             ("world_height".into(), serde_json::json!(480)),
@@ -5399,19 +5402,19 @@ pub(crate) mod tests {
             ("food_diffusion_rate".into(), serde_json::json!(0.0)),
             ("food_intake_rate".into(), serde_json::json!(0.0)),
             ("food_waste_rate".into(), serde_json::json!(0.0)),
-            ("food_respawn_interval".into(), serde_json::json!(0)),
             ("bot_speed".into(), serde_json::json!(0.0)),
             ("movement_drain".into(), serde_json::json!(0.0)),
             (
                 "metabolism_drain".into(),
                 serde_json::json!(metabolism_drain),
             ),
-            ("metabolism_ramp_rate".into(), serde_json::json!(0.0)),
-            ("metabolism_boost_penalty".into(), serde_json::json!(0.0)),
             ("temperature_discomfort_rate".into(), serde_json::json!(0.0)),
             ("spike_damage".into(), serde_json::json!(0.0)),
             ("spike_energy_cost".into(), serde_json::json!(0.0)),
-            ("reproduction_attempt_chance".into(), serde_json::json!(0.0)),
+            (
+                "reproduction_energy_threshold".into(),
+                serde_json::json!(2.0),
+            ),
         ]);
         let variants = [("baseline", 0.0), ("challenger", 10.0)]
             .into_iter()
@@ -5434,7 +5437,7 @@ pub(crate) mod tests {
                 seeds,
             },
             variants,
-            2,
+            max_ticks,
             1,
             &directory,
         );

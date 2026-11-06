@@ -10703,7 +10703,10 @@ mod tests {
         assert_eq!(
             client
                 .post(&url)
-                .header("content-type", "text/plain")
+                .headers(HeaderMap::from_iter([(
+                    reqwest::header::CONTENT_TYPE,
+                    reqwest::header::HeaderValue::from_static("text/plain"),
+                )]))
                 .body(valid.to_string())
                 .send()
                 .await

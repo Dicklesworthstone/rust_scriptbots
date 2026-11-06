@@ -842,7 +842,7 @@ impl Model for LiveTerminalModel<'_> {
                                         comparison.matched_seeds.len(), comparison.endpoint_tick,
                                     ));
                                     if let science_screens::ScreenDataState::Data(data) = &mut app.frankentui.science.experiments {
-                                        data.comparison_summary = Some(comparison);
+                                        data.comparison_summary = Some(Box::new(comparison));
                                     }
                                 }
                                 Ok(_) => app.frankentui.status_message = Some(
@@ -1374,28 +1374,44 @@ impl LiveTerminalModel<'_> {
                     baseline,
                     challenger,
                 } => {
-                    let target = ExperimentComparisonTarget { experiment_id, baseline, challenger };
+                    let target = ExperimentComparisonTarget {
+                        experiment_id,
+                        baseline,
+                        challenger,
+                    };
                     if self.experiment_comparison_in_flight.is_some() {
-                        app.frankentui.status_message = Some(
-                            "A comparison is still running; wait for its result".into(),
-                        );
+                        app.frankentui.status_message =
+                            Some("A comparison is still running; wait for its result".into());
                     } else if !target.matches(&app) || target.baseline == target.challenger {
                         app.frankentui.status_message = Some(
                             "Comparison cancelled: two distinct variants from the current batch are required".into(),
                         );
-                    } else if let Some(request) = self.experiment_comparison_generation.checked_add(1) {
+                    } else if let Some(request) =
+                        self.experiment_comparison_generation.checked_add(1)
+                    {
                         if let Some(handle) = app.control.control_handle() {
                             self.experiment_comparison_generation = request;
                             self.experiment_comparison_cancelled = false;
                             self.experiment_comparison_in_flight = Some((request, target.clone()));
-                            if let science_screens::ScreenDataState::Data(data) = &mut app.frankentui.science.experiments {
+                            if let science_screens::ScreenDataState::Data(data) =
+                                &mut app.frankentui.science.experiments
+                            {
                                 data.comparison_summary = None;
                             }
                             commands.push(Cmd::task(move || {
-                                let result = handle.compare_experiment_variants(
-                                    &target.experiment_id, &target.baseline, &target.challenger, "alive_agents",
-                                ).map_err(|error| error.to_string());
-                                LiveTerminalMessage::ExperimentComparison { request, target, result }
+                                let result = handle
+                                    .compare_experiment_variants(
+                                        &target.experiment_id,
+                                        &target.baseline,
+                                        &target.challenger,
+                                        "alive_agents",
+                                    )
+                                    .map_err(|error| error.to_string());
+                                LiveTerminalMessage::ExperimentComparison {
+                                    request,
+                                    target,
+                                    result,
+                                }
                             }));
                         } else {
                             app.frankentui.status_message = Some(
@@ -1403,7 +1419,8 @@ impl LiveTerminalModel<'_> {
                             );
                         }
                     } else {
-                        app.frankentui.status_message = Some("Comparison request identities exhausted".into());
+                        app.frankentui.status_message =
+                            Some("Comparison request identities exhausted".into());
                     }
                 }
                 ShellEffect::ExportScreenData { format } => {
@@ -3526,7 +3543,9 @@ impl<'a> TerminalApp<'a> {
                             K::Enter if self.frankentui.route == ShellRoute::Experiments => {
                                 Some(ShellMessage::PinComparisonBaseline)
                             }
-                            K::Char('c' | 'C') if self.frankentui.route == ShellRoute::Experiments => {
+                            K::Char('c' | 'C')
+                                if self.frankentui.route == ShellRoute::Experiments =>
+                            {
                                 Some(ShellMessage::CompareSelectedExperiments)
                             }
                             K::Char('x') => Some(ShellMessage::CancelActiveQuery),
@@ -3739,10 +3758,15 @@ impl<'a> TerminalApp<'a> {
                 if let Some(previous) = self.frankentui.science.experiments.data()
                     && previous.experiment_id == data.experiment_id
                 {
-                    data.selected_arm_index = previous.selected_arm_index
+                    data.selected_arm_index = previous
+                        .selected_arm_index
                         .min(data.active_arms.len().saturating_sub(1));
-                    data.comparison_baseline = previous.comparison_baseline.clone()
-                        .filter(|baseline| data.active_arms.iter().any(|arm| &arm.variant_id == baseline));
+                    data.comparison_baseline =
+                        previous.comparison_baseline.clone().filter(|baseline| {
+                            data.active_arms
+                                .iter()
+                                .any(|arm| &arm.variant_id == baseline)
+                        });
                     // Selected cohorts can be complete while another variant is
                     // running or failed. Preserve verified evidence for an unchanged
                     // batch observation, and clear it when status or run data changes.
@@ -7647,15 +7671,20 @@ impl<'a> TerminalApp<'a> {
         if let Some(agent_uid) = agent_id_opt.map(|agent| agent.uid) {
             snap.focused_agent_uid = Some(agent_uid.get());
             let inspection_deadline = Instant::now() + Duration::from_millis(5);
-            match self.client.port().inspect_agent_before(
-                agent_uid,
-                if self.probe_enabled {
-                    PROBE_MAX_CONTRIBUTORS
-                } else {
-                    0
-                },
-                inspection_deadline,
-            ) {
+            let detail = if self.probe_enabled {
+                self.client.port().inspect_agent_before(
+                    agent_uid,
+                    PROBE_MAX_CONTRIBUTORS,
+                    inspection_deadline,
+                )
+            } else {
+                // A zero-row attribution still computes the sensor explanation.
+                // Use the existing HUD read so the brain pull retains its budget.
+                self.client
+                    .port()
+                    .inspect_agent_for_hud_before(agent_uid, inspection_deadline)
+            };
+            match detail {
                 Ok(Some(detail)) if detail.source.matches_snapshot(&world) => {
                     snap.focused_brain_bound = detail.brain_bound;
                     snap.focused_outputs = Some(detail.outputs);
@@ -19033,7 +19062,9 @@ for case in ('panic', 'subscription', 'renderer'):
 
     #[test]
     fn live_science_provider_records_match_real_checkpoint_and_completed_experiment() {
-        use crate::control::{CheckpointCreateRequest, ExperimentCreateRequest, ExperimentVariantDto};
+        use crate::control::{
+            CheckpointCreateRequest, ExperimentCreateRequest, ExperimentVariantDto,
+        };
         use frankentui_shell::{ShellMessage, ShellRoute};
         use science_screens::ScreenDataState;
 
@@ -19086,7 +19117,9 @@ for case in ('panic', 'subscription', 'renderer'):
             },
         )
         .unwrap();
-        let handle = comparison_runtime.control_handle().unwrap()
+        let handle = comparison_runtime
+            .control_handle()
+            .unwrap()
             .with_artifacts_dir(artifacts.clone())
             .expect("reserve unique real data-service artifacts");
         let owner_before = host
@@ -19308,7 +19341,14 @@ for case in ('panic', 'subscription', 'renderer'):
                     for run in &completed.runs {
                         let row = text
                             .lines()
-                            .find(|line| line.contains(&run.variant_id))
+                            .find(|line| {
+                                let row = line.trim_start();
+                                row.strip_prefix('>')
+                                    .unwrap_or(row)
+                                    .split_whitespace()
+                                    .next()
+                                    == Some(run.variant_id.as_str())
+                            })
                             .expect("real completed variant is visibly rendered");
                         assert!(row.contains(&run.brain_family));
                         assert!(row.contains("77"));
@@ -19380,7 +19420,7 @@ for case in ('panic', 'subscription', 'renderer'):
                     .data()
                     .unwrap()
                     .comparison_summary
-                    .as_ref(),
+                    .as_deref(),
                 Some(&observed)
             );
             app.frankentui.update(ShellMessage::PinComparisonBaseline);
@@ -19393,7 +19433,7 @@ for case in ('panic', 'subscription', 'renderer'):
             assert_eq!(refreshed.selected_arm_index, 1);
             assert_eq!(refreshed.comparison_baseline.as_deref(), Some("baseline"));
             assert_eq!(
-                refreshed.comparison_summary.as_ref(),
+                refreshed.comparison_summary.as_deref(),
                 Some(&observed),
                 "periodic catalog refresh must preserve the verified comparison"
             );
@@ -19419,7 +19459,7 @@ for case in ('panic', 'subscription', 'renderer'):
                         .data()
                         .unwrap()
                         .comparison_summary
-                        .as_ref(),
+                        .as_deref(),
                     Some(&observed)
                 );
             }

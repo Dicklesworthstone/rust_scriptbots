@@ -1090,14 +1090,26 @@ impl Model for FrankenTuiModel {
                 baseline,
                 challenger,
             } => {
-                let experiment_id = self.science.experiments.data().filter(|data| {
-                    baseline != challenger
-                        && data.active_arms.iter().any(|arm| arm.variant_id == baseline)
-                        && data.active_arms.iter().any(|arm| arm.variant_id == challenger)
-                }).map(|data| data.experiment_id.clone());
+                let experiment_id = self
+                    .science
+                    .experiments
+                    .data()
+                    .filter(|data| {
+                        baseline != challenger
+                            && data
+                                .active_arms
+                                .iter()
+                                .any(|arm| arm.variant_id == baseline)
+                            && data
+                                .active_arms
+                                .iter()
+                                .any(|arm| arm.variant_id == challenger)
+                    })
+                    .map(|data| data.experiment_id.clone());
                 let Some(experiment_id) = experiment_id else {
                     self.status_message = Some(
-                        "Comparison unavailable: select two distinct variants in this experiment".into()
+                        "Comparison unavailable: select two distinct variants in this experiment"
+                            .into(),
                     );
                     return Cmd::none();
                 };
@@ -1117,19 +1129,27 @@ impl Model for FrankenTuiModel {
                 {
                     data.comparison_baseline = Some(arm.variant_id.clone());
                     self.status_message = Some(format!(
-                        "Baseline {} pinned; select a different variant and press C", arm.variant_id
+                        "Baseline {} pinned; select a different variant and press C",
+                        arm.variant_id
                     ));
                 }
                 Cmd::none()
             }
             ShellMessage::CompareSelectedExperiments => {
-                if let Some((baseline, challenger)) = self.science.experiments.data()
+                if let Some((baseline, challenger)) = self
+                    .science
+                    .experiments
+                    .data()
                     .and_then(ExperimentsViewData::comparison_pair)
                 {
-                    self.update(ShellMessage::CompareExperiments { baseline, challenger })
+                    self.update(ShellMessage::CompareExperiments {
+                        baseline,
+                        challenger,
+                    })
                 } else {
                     self.status_message = Some(
-                        "Comparison unavailable: select a variant different from the baseline".into()
+                        "Comparison unavailable: select a variant different from the baseline"
+                            .into(),
                     );
                     Cmd::none()
                 }
@@ -1808,7 +1828,7 @@ mod tests {
         assert_eq!(harness.model_mut().drain_effects().count(), 0);
 
         let mut data = harness.model().science.experiments.data().unwrap().clone();
-        data.comparison_summary = Some(ExperimentComparisonSummary {
+        data.comparison_summary = Some(Box::new(ExperimentComparisonSummary {
             experiment_id: data.experiment_id.clone(),
             baseline_variant: "baseline".into(),
             challenger_variant: "third".into(),
@@ -1826,7 +1846,7 @@ mod tests {
             undefined_effect_reason: Some("Paired variance is unavailable".into()),
             plan_digest: "fixture-plan".into(),
             status_generation: 1,
-        });
+        }));
         harness.dispatch(ShellMessage::SetExperimentsData(ScreenDataState::Data(
             data,
         )));
@@ -3087,7 +3107,8 @@ mod tests {
         assert!(!exp_frame.contains("Significant advantage"));
 
         let mut observed_experiments = harness.model().science.experiments.data().unwrap().clone();
-        observed_experiments.comparison_summary = Some(observed_comparison_fixture(0.38, 0.16));
+        observed_experiments.comparison_summary =
+            Some(Box::new(observed_comparison_fixture(0.38, 0.16)));
         harness.dispatch(ShellMessage::SetExperimentsData(ScreenDataState::Data(
             observed_experiments,
         )));
@@ -3275,7 +3296,7 @@ mod tests {
             ],
             selected_arm_index: 0,
             comparison_baseline: None,
-            comparison_summary: Some(observed_comparison_fixture(1.88, 0.002)),
+            comparison_summary: Some(Box::new(observed_comparison_fixture(1.88, 0.002))),
         };
         harness.dispatch(ShellMessage::SetExperimentsData(ScreenDataState::Data(
             exp_data,
