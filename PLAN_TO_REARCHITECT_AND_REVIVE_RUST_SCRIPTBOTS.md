@@ -3519,13 +3519,21 @@ seeds; factorial interaction effects are not estimated. Real two-family pipeline
 and emitted-script regression controls are authored. Native qualification remains
 pending because the required DSR execution path is unavailable in this session.
 
-**[Currently In Progress — Codex, 2026-11-06 UTC]:** Extend experiment variants
-with ordered, bounded timed interventions
-executed by the existing HostCore schedule. Continuation and portable verification
-must bind the exact declared schedule, completed receipts, remaining inputs and
-observed configuration at each cut. Preserve the current atomic volatile-owner
-continuation boundary; durable database history still requires a solution for a
-database prefix committed beyond the last saved owner cut.
+**Source implementation extension — Codex, 2026-11-06 UTC:** Experiment variants
+now carry ordered timed numeric configuration interventions through REST/MCP,
+saved definitions and the existing HostCore scheduler. Admission bounds each arm
+to 64 statements and each canonical patch to 4,096 bytes, validates every cumulative
+config, and includes schedules in treatment identity. Continuation and portable
+verification bind the exact declared schedule, successful committed receipts,
+remaining inputs, config revisions and observed config at every saved cut. Prepared
+prefix hashes and shared structural changed paths avoid repeatedly resolving old
+patches. Regression source covers same-tick effects, the full schedule bound,
+optional nested settings, interrupted continuation, coherently rechecksummed input
+forgeries and REST/MCP retries. Lab refuses scheduled evidence until its own arm
+provenance represents schedules. Native DSR qualification remains pending.
+The atomic paired volatile-owner continuation boundary is preserved; durable
+database history still requires recovery of a database prefix committed beyond
+the last saved owner cut.
 
 **Source implementation extension — Codex, 2026-11-05:** The runner and Lab now
 share eight final-state endpoints: population, total/mean live-agent energy,

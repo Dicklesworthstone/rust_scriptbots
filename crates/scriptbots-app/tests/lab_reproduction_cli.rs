@@ -283,6 +283,19 @@ fn tampered_build_identity_is_refused_before_execution() {
 }
 
 #[test]
+fn scheduled_treatment_is_refused_before_reproduction_allocates_any_worker_output() {
+    assert_semantic_refusal(
+        |input| {
+            input["variants"][0]["interventions"] = serde_json::json!([{
+                "tick": 0,
+                "set": {"food_growth_rate": 0.01}
+            }]);
+        },
+        "Lab reproduction cannot execute scheduled interventions",
+    );
+}
+
+#[test]
 fn shuffled_cohort_rerender_preserves_retained_artifacts() {
     let temp = tempfile::tempdir().expect("temp root");
     let notebook = materialize_real_notebook(temp.path(), true, spec_input());

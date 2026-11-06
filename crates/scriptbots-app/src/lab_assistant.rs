@@ -233,6 +233,7 @@ impl ExperimentExecutor for MatchedSeedExecutor {
                 variant_id: format!("arm-{index:03}"),
                 brain_family: arm.brain_family.clone(),
                 config_overrides: arm.config_overrides.clone(),
+                interventions: Vec::new(),
             })
             .collect();
         let output_dir = self.output_root.join(&spec.spec_id);
@@ -355,6 +356,19 @@ pub(crate) fn completed_run_summaries(
             read_bounded_analysis_file(&bundle_manifest_path, MAX_ANALYSIS_BUNDLE_MANIFEST_BYTES)?;
         let bundle: RunBundleV1 = serde_json::from_slice(&bundle_bytes)
             .map_err(|error| format!("parse {}: {error}", bundle_manifest_path.display()))?;
+        let manifest: crate::RunManifestV3 =
+            serde_json::from_str(&bundle.manifest.manifest_json).map_err(|error| {
+                format!(
+                    "parse {} embedded run manifest: {error}",
+                    bundle_manifest_path.display()
+                )
+            })?;
+        if !manifest.scenario.interventions.is_empty() {
+            return Err(format!(
+                "bundle {} contains scheduled interventions absent from planned Lab arm {arm_id}",
+                bundle_dir.display()
+            ));
+        }
         let expected_config = config_for_run(&arm.config_overrides, record.seed)
             .map_err(|error| format!("derive planned arm {arm_id} configuration: {error}"))?;
         let expected_config = serde_json::to_value(expected_config)
@@ -1825,6 +1839,52 @@ mod tests {
     }
 
     #[test]
+    fn real_scheduled_bundle_cannot_be_attributed_to_an_unscheduled_lab_arm() {
+        let temp = tempfile::tempdir().expect("temporary scheduled experiment root");
+        let arm = Arm {
+            brain_family: crate::experiment_runner::DEFAULT_EXPERIMENT_BRAIN_FAMILY.to_owned(),
+            config_overrides: BTreeMap::new(),
+        };
+        let runner = MatchedSeedExperimentRunner::new(
+            "scheduled-outside-lab",
+            MatchedSeedCohort {
+                cohort_id: "matched-seeds".to_owned(),
+                seeds: vec![41],
+            },
+            vec![ScenarioVariant {
+                variant_id: "arm-000".to_owned(),
+                brain_family: arm.brain_family.clone(),
+                config_overrides: arm.config_overrides.clone(),
+                interventions: vec![crate::ScenarioInterventionV1 {
+                    tick: 0,
+                    set: serde_json::json!({"food_growth_rate": 0.01}),
+                }],
+            }],
+            2,
+            1,
+            temp.path().join("bundles"),
+        );
+        let status = runner.execute_batch(&temp.path().join("status.json")).unwrap();
+        assert_eq!(status.completed_runs, 1, "{status:?}");
+        assert_eq!(status.failed_runs, 0, "{status:?}");
+        let record = &status.runs[0];
+        let verified = verify_portable_run_bundle(std::path::Path::new(
+            record.bundle_path.as_ref().unwrap(),
+        ))
+        .expect("the scheduled bundle has valid restored scientific evidence");
+        assert_eq!(
+            verified.final_state.unwrap().scientific_digest,
+            record.final_digest.as_ref().unwrap().as_str()
+        );
+        let error = completed_run_summaries(&[arm], &status)
+            .expect_err("Lab provenance cannot discard a real scheduled treatment");
+        assert!(
+            error.contains("scheduled interventions absent from planned Lab arm 0"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn extinct_cohorts_keep_totals_but_refuse_unobserved_population_endpoints() {
         let temp = tempfile::tempdir().unwrap();
         let common = BTreeMap::from([
@@ -1854,6 +1914,7 @@ mod tests {
                 variant_id: format!("arm-{index:03}"),
                 brain_family: arm.brain_family.clone(),
                 config_overrides: arm.config_overrides.clone(),
+                interventions: Vec::new(),
             })
             .collect();
         let runner = MatchedSeedExperimentRunner::new(

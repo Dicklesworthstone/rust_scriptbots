@@ -1531,6 +1531,47 @@ The first expanded arm is the statistical control; every later arm is compared
 with it through the existing matched-seed analysis. Result ingestion and notebook
 reproduction bind each arm to its actual family and launch configuration.
 
+The experiment REST API (`POST /api/v1/experiments`) and MCP `experiment_create`
+also accept timed configuration treatments on each variant:
+
+```json
+{
+  "experiment_id": "food-pause-recovery",
+  "variants": [
+    {"variant_id": "control", "brain_family": "mlp", "config_overrides": {}},
+    {
+      "variant_id": "pause-recovery",
+      "brain_family": "mlp",
+      "config_overrides": {},
+      "interventions": [
+        {"tick": 0, "set": {"food_growth_rate": 0.0}},
+        {"tick": 500, "set": {"food_growth_rate": 0.04}}
+      ]
+    }
+  ],
+  "seeds": [41, 42],
+  "ticks_per_run": 1000,
+  "max_concurrency": 2
+}
+```
+
+`tick` names a completed-tick boundary: tick 0 applies before the first science
+step. Statements must be in nondecreasing tick order, with every tick strictly
+before `ticks_per_run`; statements at the same tick execute in document order.
+Each arm admits at most 64 statements, each at most 4,096 canonical JSON bytes.
+The `set` object uses nested configuration keys and accepts exposed numeric live
+knobs. Every cumulative patch must satisfy the existing type, range and complete
+configuration constraints before the batch creates files or starts workers.
+
+Schedules participate in arm identity and saved plan checks. The original launch
+configuration stays in the manifest alongside the full treatment declaration.
+Resume verifies completed input receipts and the exact remaining queue, then
+continues it without reapplying completed treatments. Portable verification checks
+that same evidence and the resulting config before recomputing the final science
+digest and endpoint summary. Lab proposal arms currently describe brain families
+and launch factors only, so Lab ingestion and reproduction explicitly refuse
+scheduled bundles rather than discard their treatment provenance.
+
 The summary now declares `schema_version=2`, bound by
 `scriptbots.experiment-run-evidence.v2`. Verification and completed-run recovery
 refuse earlier V1 experiment summaries/evidence. Existing files are preserved;

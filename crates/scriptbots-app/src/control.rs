@@ -575,11 +575,16 @@ pub struct ApiSchemaDto {
 
 /// Scenario variant arm within an experiment plan.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ExperimentVariantDto {
     pub variant_id: String,
     pub brain_family: String,
     #[schema(value_type = Option<Object>)]
     pub config_overrides: Option<Value>,
+    /// Ordered live numeric configuration patches at completed-tick boundaries.
+    /// Each tick must precede the run horizon; statements at the same tick keep order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interventions: Vec<crate::ScenarioInterventionV1>,
 }
 
 /// Request payload for creating a matched-seed experiment batch.
@@ -2119,6 +2124,8 @@ impl ControlHandle {
                 "ExperimentBatchStatusDto".into(),
                 "ExperimentSummaryDto".into(),
                 "ExperimentCreateRequest".into(),
+                "ExperimentVariantDto".into(),
+                "ScenarioInterventionV1".into(),
                 "CheckpointCreateRequest".into(),
                 "CheckpointMetadataDto".into(),
                 "CheckpointRetentionDto".into(),
@@ -2272,6 +2279,7 @@ impl ControlHandle {
                 variant_id: v.variant_id.trim().to_string(),
                 brain_family: v.brain_family.trim().to_lowercase(),
                 config_overrides,
+                interventions: v.interventions.clone(),
             });
         }
         let default_concurrency = std::thread::available_parallelism()
@@ -4941,6 +4949,7 @@ pub(crate) mod tests {
                     "population_minimum": 2,
                     "population_spawn_interval": 0
                 })),
+                interventions: Vec::new(),
             }],
             seeds: vec![7],
             ticks_per_run: Some(2),
@@ -4965,6 +4974,7 @@ pub(crate) mod tests {
                 variant_id: "mlp".into(),
                 brain_family: "mlp".into(),
                 config_overrides: BTreeMap::new(),
+                interventions: Vec::new(),
             }],
             2,
             1,
@@ -6351,6 +6361,7 @@ pub(crate) mod tests {
                     variant_id: v.variant_id.clone(),
                     brain_family: v.brain_family.clone(),
                     config_overrides: Some(serde_json::to_value(&v.config_overrides).unwrap()),
+                    interventions: v.interventions.clone(),
                 })
                 .collect(),
             seeds: definition.cohort.seeds.clone(),

@@ -1,7 +1,8 @@
 //! Deterministic matched-seed experiment runner and batch execution engine (bd-2z0.5.11).
 
 use crate::{
-    BuildProvenanceV0, RunIdentityV1, RunManifestV3, ScenarioIdentityV0, ThreadPolicyV0,
+    BuildProvenanceV0, RunIdentityV1, RunManifestV3, ScenarioIdentityV0,
+    ScenarioInterventionV1, ThreadPolicyV0, resolve_scheduled_config_patch,
     seed_founding_population,
 };
 use scriptbots_brain::{
@@ -11,12 +12,14 @@ use scriptbots_brain::{
 #[cfg(feature = "brain-ft")]
 use scriptbots_brain_ml::{FT_BRAIN_KIND, FtBrainFamily};
 use scriptbots_core::{
-    BrainFamilyAdapter, BrainRegistry, NullPersistence, ScriptBotsConfig, WorldState, knob_range,
+    BrainFamilyAdapter, BrainRegistry, NullPersistence, ScriptBotsConfig, Tick, WorldState,
+    knob_range,
 };
 use scriptbots_runtime::{
-    ApplicationState, CommandEnvelope, CommandId, HostCommand, HostCore, HostCoreOptions,
-    HostLifecycle, HostSessionId, JournalState, ManualInstant, NullFrontend, PlaybackSnapshot,
-    RunId, VolatileHostCheckpointV1,
+    ApplicationState, CommandEnvelope, CommandId, HostCheckpointV1, HostCommand, HostCore,
+    HostCoreOptions, HostLifecycle, HostSessionId, JournalState, ManualInstant, NullFrontend,
+    PlaybackSnapshot, RunId, ScheduledConfigPatch, ScheduledPatchOutcome,
+    VolatileHostCheckpointV1,
 };
 use scriptbots_storage::{
     RunBundleV1, RunBundleVerificationResult, bundle::RunBundleVerificationLimits,
@@ -42,6 +45,8 @@ const MAX_BATCH_RUNS: usize = 4_096;
 const MAX_RUN_COMPONENT_BYTES: usize = 128;
 const MAX_TICKS_PER_RUN: u64 = 10_000_000;
 pub(crate) const MAX_CONCURRENT_RUNS: usize = 64;
+pub(crate) const MAX_EXPERIMENT_INTERVENTIONS: usize = 64;
+pub(crate) const MAX_EXPERIMENT_INTERVENTION_PATCH_BYTES: usize = 4_096;
 const HOST_RECEIPT_DRIVE_LIMIT: usize = 16;
 const RUN_CHECKPOINT_MAGIC: &[u8] = b"SBRUNCH1";
 const MAX_RUN_CHECKPOINT_BYTES: u64 = MAX_BUNDLE_ARTIFACT_BYTES;
@@ -155,12 +160,17 @@ pub struct MatchedSeedCohort {
 
 /// Scenario variant specification defining a brain family and configuration tuning overrides.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ScenarioVariant {
     pub variant_id: String,
     pub brain_family: String,
     /// Canonical validated arm. JSON values preserve integer-vs-float types
     /// until strict `ScriptBotsConfig` deserialization.
     pub config_overrides: BTreeMap<String, serde_json::Value>,
+    /// Ordered live numeric config treatments, applied by the owner before the next tick.
+    /// Ticks must be nondecreasing; statements at the same tick retain document order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interventions: Vec<ScenarioInterventionV1>,
 }
 
 /// Execution status of an individual experiment run.
@@ -433,7 +443,9 @@ fn restore_run_owner(
         &checkpoint.owner,
         world,
         persistence,
-        None,
+        checkpoint.owner.host_checkpoint().has_schedule().then_some(
+            resolve_scheduled_config_patch as scriptbots_runtime::PreparedConfigPatchResolver,
+        ),
         ManualInstant::from_nanos(0),
     )
     .map_err(|error| invalid_checkpoint(path, error))
@@ -460,6 +472,7 @@ fn seal_run_checkpoint(
         core,
         submitted.command_id(),
         tick,
+        0,
         next_nanos,
     )
 }
@@ -979,6 +992,7 @@ pub fn verify_portable_run_bundle(
         variant_id: evidence.variant_id.clone(),
         brain_family: evidence.brain_family.clone(),
         config_overrides: BTreeMap::new(),
+        interventions: Vec::new(),
     };
     let family = ResolvedBrainFamily::resolve(&selector)?;
     let fail = |reason: &str| ExperimentRunnerError::Bundle {
@@ -1042,15 +1056,24 @@ fn verify_restored_final_checkpoint(
 ) -> Result<VerifiedExperimentFinalState, ExperimentRunnerError> {
     let path = bundle_dir.join(FINAL_CHECKPOINT_ARTIFACT.0);
     let host = checkpoint.owner.host_checkpoint();
-    let actual_config =
-        serde_json::to_value(host.config()).map_err(|error| invalid_checkpoint(&path, error))?;
+    let initial_config: ScriptBotsConfig = serde_json::from_value(manifest.normalized_config.clone())
+        .map_err(|error| invalid_checkpoint(&path, error))?;
+    initial_config
+        .validate()
+        .map_err(|error| invalid_checkpoint(&path, error))?;
+    let interventions = PreparedInterventions::new(
+        &initial_config,
+        &manifest.scenario.interventions,
+        evidence.total_ticks,
+    )
+    .map_err(|error| invalid_checkpoint(&path, error))?;
     if checkpoint.metadata.manifest != *manifest
         || checkpoint.metadata.run_id != evidence.run_id
         || checkpoint.metadata.plan_digest != evidence.plan_digest
         || host.tick().0 != evidence.total_ticks
         || host.session_id() != host_identifiers(&evidence.run_id).0
-        || actual_config != manifest.normalized_config
-        || host.has_schedule()
+        || initial_config.rng_seed != Some(evidence.seed)
+        || initial_config.persistence_interval != 1
         || host.playback()
             != (PlaybackSnapshot {
                 paused: true,
@@ -1073,6 +1096,7 @@ fn verify_restored_final_checkpoint(
             "final cut differs from the bundle manifest, evidence, session or exact completion tick",
         ));
     }
+    validate_checkpoint_interventions(&path, host, &interventions)?;
     let core = restore_run_owner(checkpoint, family, &evidence.run_id, &path)?;
     let digest = core
         .scientific_digest_v1()
@@ -1818,17 +1842,24 @@ impl MatchedSeedExperimentRunner {
                         ),
                     }
                 })?;
-            let config_bytes = serde_json::to_vec(&normalized_config).map_err(|source| {
-                ExperimentRunnerError::Json {
+            let interventions = PreparedInterventions::new(
+                &normalized_config,
+                &variant.interventions,
+                self.max_ticks,
+            )
+            .map_err(|reason| ExperimentRunnerError::InvalidPlan {
+                reason: format!("variant `{}` is not executable: {reason}", variant.variant_id),
+            })?;
+            let config_bytes = serde_json::to_vec(&(&normalized_config, &interventions.patches))
+                .map_err(|source| ExperimentRunnerError::Json {
                     operation: "serialize normalized scenario arm",
                     source,
-                }
-            })?;
+                })?;
             let semantic_key = (family, blake3::hash(&config_bytes).to_hex().to_string());
             if !semantic_arms.insert(semantic_key) {
                 return Err(ExperimentRunnerError::InvalidPlan {
                     reason: format!(
-                        "variant `{}` duplicates an existing `{}` arm after canonical config normalization",
+                        "variant `{}` duplicates an existing `{}` arm after canonical config and intervention normalization",
                         variant.variant_id,
                         family.canonical_name()
                     ),
@@ -2159,10 +2190,14 @@ impl MatchedSeedExperimentRunner {
         let host = checkpoint.owner.host_checkpoint();
         let expected_config = config_for_run(&variant.config_overrides, seed)
             .map_err(|error| invalid_checkpoint(path, error))?;
-        let expected_config = serde_json::to_value(expected_config)
+        let interventions = PreparedInterventions::new(
+            &expected_config,
+            &variant.interventions,
+            self.max_ticks,
+        )
+        .map_err(|error| invalid_checkpoint(path, error))?;
+        let expected_config = serde_json::to_value(&expected_config)
             .map_err(|error| invalid_checkpoint(path, error))?;
-        let actual_config =
-            serde_json::to_value(host.config()).map_err(|error| invalid_checkpoint(path, error))?;
         if metadata.plan_digest != plan_digest
             || metadata.run_id != run_id
             || manifest.identity.run_id != Self::bundle_run_id(run_id)
@@ -2173,7 +2208,7 @@ impl MatchedSeedExperimentRunner {
             || manifest.root_seed != seed
             || manifest.build != BuildProvenanceV0::current()
             || manifest.normalized_config != expected_config
-            || actual_config != expected_config
+            || manifest.scenario.interventions != variant.interventions
             || manifest.brain_roster.len() != 1
             || manifest.brain_roster[0].kind != family.canonical_name()
             || manifest.scenario.id != run_id
@@ -2184,7 +2219,6 @@ impl MatchedSeedExperimentRunner {
                 )
             || host.session_id() != host_identifiers(run_id).0
             || host.tick().0 > self.max_ticks
-            || host.has_schedule()
             || host.playback()
                 != (PlaybackSnapshot {
                     paused: true,
@@ -2203,6 +2237,7 @@ impl MatchedSeedExperimentRunner {
                 "checkpoint differs from the validated plan, build, manifest, family, config, session or execution boundary",
             ));
         }
+        validate_checkpoint_interventions(path, host, &interventions)?;
         manifest
             .to_storage_record()
             .map_err(|error| invalid_checkpoint(path, error))?;
@@ -2360,6 +2395,11 @@ impl MatchedSeedExperimentRunner {
                 reason,
             }
         })?;
+        let interventions = PreparedInterventions::new(&config, &variant.interventions, self.max_ticks)
+            .map_err(|reason| ExperimentRunnerError::Construction {
+                run_id: run_id.to_owned(),
+                reason,
+            })?;
         let mut world =
             WorldState::new(config).map_err(|source| ExperimentRunnerError::Construction {
                 run_id: run_id.to_owned(),
@@ -2383,6 +2423,10 @@ impl MatchedSeedExperimentRunner {
         identity.experiment_id = Some(self.experiment_id.clone());
         identity.variant_id = Some(variant.variant_id.clone());
         let mut scenario = ScenarioIdentityV0::caller_seeded(run_id);
+        scenario.interventions = variant.interventions.clone();
+        for intervention in &mut scenario.interventions {
+            intervention.set.sort_all_objects();
+        }
         scenario.population_recipe = format!(
             "fixed-4x4-registered-brain-grid-v1;brain={}",
             family.canonical_name()
@@ -2413,6 +2457,13 @@ impl MatchedSeedExperimentRunner {
                 reason: format!("HostCore construction failed: {source}"),
             }
         })?;
+        if !interventions.patches.is_empty() {
+            core.install_schedule(interventions.patches, resolve_scheduled_config_patch)
+                .map_err(|source| ExperimentRunnerError::Construction {
+                    run_id: run_id.to_owned(),
+                    reason: format!("owner intervention schedule installation failed: {source}"),
+                })?;
+        }
         let mut frontend = NullFrontend::new(core.local_port(), client_namespace);
         let mut next_nanos = 0_u64;
         seal_run_checkpoint(run_id, &mut frontend, &mut core, &mut next_nanos)?;
@@ -2446,6 +2497,14 @@ impl MatchedSeedExperimentRunner {
                 run_id: run_id.to_owned(),
                 completed_ticks: 0,
             })?;
+        let initial_config = config_for_run(&variant.config_overrides, seed)
+            .map_err(|error| invalid_checkpoint(&path, error))?;
+        let interventions = PreparedInterventions::new(
+            &initial_config,
+            &variant.interventions,
+            self.max_ticks,
+        )
+        .map_err(|error| invalid_checkpoint(&path, error))?;
         if experiment_path_exists(
             &self.staged_bundle_path(run_id),
             "inspect bundle staging before continuation",
@@ -2492,12 +2551,18 @@ impl MatchedSeedExperimentRunner {
                 &mut core,
                 submitted.command_id(),
                 expected_tick,
+                interventions.due_at(expected_tick - 1),
                 &mut next_nanos,
             )?;
             seal_run_checkpoint(run_id, &mut frontend, &mut core, &mut next_nanos)?;
             checkpoint.owner = core
                 .capture_volatile_host_checkpoint_v1()
                 .map_err(|error| invalid_checkpoint(&path, error))?;
+            validate_checkpoint_interventions(
+                &path,
+                checkpoint.owner.host_checkpoint(),
+                &interventions,
+            )?;
             checkpoint.metadata.parent_digest = Some(parent_digest);
             let bytes = checkpoint.encode(&path)?;
             write_run_checkpoint(&path, &bytes)?;
@@ -2559,6 +2624,7 @@ impl MatchedSeedExperimentRunner {
             &mut core,
             submitted.command_id(),
             completed_ticks,
+            0,
             &mut next_nanos,
         )?;
         if core.latest_snapshot().lifecycle != HostLifecycle::Stopped {
@@ -2955,6 +3021,7 @@ impl MatchedSeedExperimentRunner {
             || full_manifest.identity.variant_id.as_deref() != Some(variant.variant_id.as_str())
             || full_manifest.root_seed != record.seed
             || full_manifest.normalized_config != expected_config_value
+            || full_manifest.scenario.interventions != variant.interventions
             || full_manifest.brain_roster.len() != 1
             || full_manifest.brain_roster[0].kind != family.canonical_name()
             || full_manifest.scenario.population_recipe
@@ -3311,6 +3378,10 @@ fn host_identifiers(run_id: &str) -> (HostSessionId, u64) {
     )
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the bounded declared intervention work accompanies the exact command and tick receipt"
+)]
 fn drive_command_to_volatile_commit(
     run_id: &str,
     operation: &'static str,
@@ -3318,10 +3389,22 @@ fn drive_command_to_volatile_commit(
     core: &mut HostCore,
     command_id: scriptbots_runtime::CommandId,
     expected_tick: u64,
+    due_interventions: usize,
     next_nanos: &mut u64,
 ) -> Result<(), ExperimentRunnerError> {
+    if due_interventions > MAX_EXPERIMENT_INTERVENTIONS {
+        return Err(ExperimentRunnerError::Host {
+            run_id: run_id.to_owned(),
+            operation,
+            reason: "command exceeds bounded intervention work allowance".to_owned(),
+        });
+    }
+    // The real VolatileJournal acknowledges each patch on the next drive. The
+    // owner then clears that barrier and starts the next patch or original Step,
+    // so N due inputs add N drives; unrelated commands keep the original bound.
+    let drive_limit = HOST_RECEIPT_DRIVE_LIMIT + due_interventions;
     let mut last_status = None;
-    for _ in 0..HOST_RECEIPT_DRIVE_LIMIT {
+    for _ in 0..drive_limit {
         frontend
             .drive_at(core, ManualInstant::from_nanos(*next_nanos))
             .map_err(|source| ExperimentRunnerError::Host {
@@ -3390,7 +3473,7 @@ fn drive_command_to_volatile_commit(
         run_id: run_id.to_owned(),
         operation,
         reason: format!(
-            "command did not reach Applied + CommittedVolatile within {HOST_RECEIPT_DRIVE_LIMIT} drives; last status: {last_status:?}"
+            "command did not reach Applied + CommittedVolatile within {drive_limit} drives; last status: {last_status:?}"
         ),
     })
 }
@@ -3435,6 +3518,7 @@ pub(crate) fn canonical_experiment_brain_family(
         variant_id: variant_id.to_owned(),
         brain_family: requested.to_owned(),
         config_overrides: BTreeMap::new(),
+        interventions: Vec::new(),
     })
     .map(ResolvedBrainFamily::canonical_name)
 }
@@ -3484,6 +3568,211 @@ pub(crate) fn config_for_run(
         .validate()
         .map_err(|error| format!("validated arm produces an invalid config: {error}"))?;
     Ok(config)
+}
+
+/// Pure preparation of the immutable inputs and expected configuration at every
+/// schedule prefix. Only small hashes and changed paths are retained, so checking
+/// each committed tick does not repeatedly resolve the whole treatment schedule.
+struct PreparedInterventions {
+    patches: Vec<ScheduledConfigPatch>,
+    config_digests: Vec<blake3::Hash>,
+    changed_paths: Vec<Vec<String>>,
+}
+
+impl PreparedInterventions {
+    fn new(
+        initial: &ScriptBotsConfig,
+        interventions: &[ScenarioInterventionV1],
+        max_ticks: u64,
+    ) -> Result<Self, String> {
+        if interventions.len() > MAX_EXPERIMENT_INTERVENTIONS {
+            return Err(format!(
+                "intervention count exceeds the {MAX_EXPERIMENT_INTERVENTIONS}-statement cap"
+            ));
+        }
+        if interventions.len() > HostCoreOptions::default().archived_command_capacity {
+            return Err("intervention schedule exceeds complete owner receipt retention".to_owned());
+        }
+        let mut current = initial.clone();
+        let mut current_value = serde_json::to_value(&current).map_err(|error| error.to_string())?;
+        let mut prepared = Self {
+            patches: Vec::with_capacity(interventions.len()),
+            config_digests: vec![config_value_digest(&current_value)?],
+            changed_paths: Vec::with_capacity(interventions.len()),
+        };
+        let mut previous_tick = 0;
+        for (index, intervention) in interventions.iter().enumerate() {
+            if intervention.tick >= max_ticks {
+                return Err(format!(
+                    "intervention {} tick {} must precede the {max_ticks}-tick completion boundary",
+                    index + 1,
+                    intervention.tick
+                ));
+            }
+            if intervention.tick < previous_tick {
+                return Err("intervention ticks must be nondecreasing; same-tick order is preserved"
+                    .to_owned());
+            }
+            let sequence = u64::try_from(index + 1).map_err(|error| error.to_string())?;
+            let patch = ScheduledConfigPatch::new(
+                sequence,
+                Tick(intervention.tick),
+                intervention.set.clone(),
+            )?;
+            if patch.patch.len() > MAX_EXPERIMENT_INTERVENTION_PATCH_BYTES {
+                return Err(format!(
+                    "intervention {sequence} exceeds the {MAX_EXPERIMENT_INTERVENTION_PATCH_BYTES}-byte canonical patch cap"
+                ));
+            }
+            validate_live_intervention_patch(&intervention.set, "")?;
+            let next = resolve_scheduled_config_patch(&current, &intervention.set)
+                .map_err(|error| format!("intervention {sequence} cannot resolve: {error}"))?;
+            next.validate().map_err(|error| {
+                format!("intervention {sequence} produces an invalid config: {error}")
+            })?;
+            if next.rng_seed != initial.rng_seed
+                || next.persistence_interval != initial.persistence_interval
+            {
+                return Err("interventions cannot change the matched seed or recording policy"
+                    .to_owned());
+            }
+            let next_value = serde_json::to_value(&next).map_err(|error| error.to_string())?;
+            prepared.config_digests.push(config_value_digest(&next_value)?);
+            prepared.changed_paths.push(
+                scriptbots_runtime::host_core::config_changed_paths(&current_value, &next_value),
+            );
+            prepared.patches.push(patch);
+            current = next;
+            current_value = next_value;
+            previous_tick = intervention.tick;
+        }
+        Ok(prepared)
+    }
+
+    fn completed_at(&self, tick: u64) -> usize {
+        self.patches.partition_point(|patch| patch.due_tick.0 < tick)
+    }
+
+    fn due_at(&self, tick: u64) -> usize {
+        let completed = self.completed_at(tick);
+        self.patches[completed..]
+            .iter()
+            .take_while(|patch| patch.due_tick.0 == tick)
+            .count()
+    }
+}
+
+fn config_value_digest(value: &serde_json::Value) -> Result<blake3::Hash, String> {
+    serde_json::to_vec(value)
+        .map(|bytes| blake3::hash(&bytes))
+        .map_err(|error| error.to_string())
+}
+
+/// Interventions use nested config-layer objects, not dotted override keys. Only
+/// the registered live numeric knobs are executable; launch-only geometry, seed,
+/// recording policy and unknown fields cannot be changed by a scheduled patch.
+fn validate_live_intervention_patch(
+    value: &serde_json::Value,
+    path: &str,
+) -> Result<(), String> {
+    if let Some(object) = value.as_object() {
+        if object.is_empty() {
+            return Err("intervention patch objects must not be empty".to_owned());
+        }
+        for (key, child) in object {
+            if key.is_empty() || key.contains('.') {
+                return Err("intervention patches require nested objects with ordinary config keys"
+                    .to_owned());
+            }
+            let child_path = if path.is_empty() {
+                key.clone()
+            } else {
+                format!("{path}.{key}")
+            };
+            validate_live_intervention_patch(child, &child_path)?;
+        }
+        return Ok(());
+    }
+    let range = knob_range(path)
+        .ok_or_else(|| format!("intervention contains unknown or unsupported knob `{path}`"))?;
+    if range.fresh_world_only {
+        return Err(format!("intervention knob `{path}` requires a fresh world"));
+    }
+    let number = value
+        .as_f64()
+        .ok_or_else(|| format!("intervention knob `{path}` requires a finite numeric value"))?;
+    if !number.is_finite() || number < range.min || number > range.max {
+        return Err(format!(
+            "intervention knob `{path}` value {number} is outside its accepted range [{}, {}]",
+            range.min, range.max
+        ));
+    }
+    Ok(())
+}
+
+/// Bind the complete observed prefix and pending suffix to the declared inputs.
+/// A final config alone cannot establish that noncommuting same-tick statements
+/// actually ran in their declared order, and a cursor alone proves neither half.
+fn validate_checkpoint_interventions(
+    path: &Path,
+    host: &HostCheckpointV1,
+    prepared: &PreparedInterventions,
+) -> Result<(), ExperimentRunnerError> {
+    let completed = prepared.completed_at(host.tick().0);
+    let completed_sequence = u64::try_from(completed)
+        .map_err(|error| invalid_checkpoint(path, error))?;
+    let history = host.scheduled_patch_history();
+    let expected_remaining = if prepared.patches.is_empty() {
+        None
+    } else {
+        Some(&prepared.patches[completed..])
+    };
+    let expected_sequence = expected_remaining.map(|_| completed_sequence);
+    let actual_config = serde_json::to_value(host.config())
+        .map_err(|error| invalid_checkpoint(path, error))?;
+    if prepared.patches.len() > host.scheduled_patch_history_capacity()
+        || host.remaining_schedule() != expected_remaining
+        || host.completed_schedule_sequence() != expected_sequence
+        || history.len() != completed
+        || host.config_revision().get() != completed_sequence
+        || config_value_digest(&actual_config)
+            .map_err(|error| invalid_checkpoint(path, error))?
+            != prepared.config_digests[completed]
+    {
+        return Err(invalid_checkpoint(
+            path,
+            "owner schedule cursor, retained receipts, pending inputs or current config differ from the declared intervention prefix",
+        ));
+    }
+    let mut previous_journal_sequence = 0;
+    for (index, status) in history.iter().enumerate() {
+        let expected = &prepared.patches[index];
+        let outcome_matches = matches!(
+            &status.evidence.outcome,
+            ScheduledPatchOutcome::Applied { changed_paths }
+                if changed_paths == &prepared.changed_paths[index]
+        );
+        if status.evidence.scheduled != *expected
+            || status.evidence.boundary.tick != expected.due_tick
+            || status.evidence.boundary.revisions.scientific.get() != expected.due_tick.0
+            || status.evidence.boundary.revisions.config.get() != expected.sequence
+            || status.batch_id.session_id() != host.session_id()
+            || status.batch_id.sequence() <= previous_journal_sequence
+            || status.batch_id.sequence() > host.journal_cut().last_journal_sequence
+            || status.journal != JournalState::CommittedVolatile
+            || !outcome_matches
+        {
+            return Err(invalid_checkpoint(
+                path,
+                format!(
+                    "intervention {} lacks its exact ordered applied and committed owner receipt",
+                    expected.sequence
+                ),
+            ));
+        }
+        previous_journal_sequence = status.batch_id.sequence();
+    }
+    Ok(())
 }
 
 pub(crate) fn insert_dotted_value(
@@ -3612,6 +3901,7 @@ mod tests {
                 variant_id: "baseline".into(),
                 brain_family: "mlp".into(),
                 config_overrides: BTreeMap::new(),
+                interventions: Vec::new(),
             }],
             2,
             1,
@@ -3703,11 +3993,13 @@ mod tests {
                 variant_id: "mlp_base".into(),
                 brain_family: "mlp".into(),
                 config_overrides: BTreeMap::new(),
+                interventions: Vec::new(),
             },
             ScenarioVariant {
                 variant_id: "dwraon_base".into(),
                 brain_family: "dwraon".into(),
                 config_overrides: BTreeMap::new(),
+                interventions: Vec::new(),
             },
         ];
 
@@ -3730,6 +4022,7 @@ mod tests {
                 variant_id: "torch".into(),
                 brain_family: requested_family.into(),
                 config_overrides: BTreeMap::new(),
+                interventions: Vec::new(),
             };
             let runner = MatchedSeedExperimentRunner::new(
                 "torch-plan",
@@ -3756,6 +4049,7 @@ mod tests {
                             variant_id: "same-science".into(),
                             brain_family: "ft".into(),
                             config_overrides: BTreeMap::new(),
+                            interventions: Vec::new(),
                         },
                     ],
                     ..runner
@@ -3789,6 +4083,7 @@ mod tests {
             variant_id: "mlp_base".into(),
             brain_family: "mlp".into(),
             config_overrides: BTreeMap::new(),
+            interventions: Vec::new(),
         };
         let runner = MatchedSeedExperimentRunner::new(
             "exp-immutable-arm",
@@ -3818,6 +4113,7 @@ mod tests {
             variant_id: "baseline".into(),
             brain_family: "mlp".into(),
             config_overrides: BTreeMap::new(),
+            interventions: Vec::new(),
         };
         let output = PathBuf::from("/tmp/unused-experiment-output");
 
@@ -3915,6 +4211,492 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_intervention_preflight_preserves_identity_and_refuses_invalid_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("not-created");
+        let control = intervention_test_variant("control", Vec::new());
+        let treatment = intervention_test_variant(
+            "treatment",
+            vec![
+                ScenarioInterventionV1 {
+                    tick: 0,
+                    set: serde_json::json!({"food_max": 0.5, "initial_food": 0.5}),
+                },
+                ScenarioInterventionV1 {
+                    tick: 1,
+                    set: serde_json::json!({"food_max": 10.0}),
+                },
+            ],
+        );
+        let mut runner = MatchedSeedExperimentRunner::new(
+            "intervention-preflight",
+            MatchedSeedCohort {
+                cohort_id: "cohort".into(),
+                seeds: vec![7],
+            },
+            vec![control, treatment.clone()],
+            2,
+            1,
+            &output,
+        );
+        assert_eq!(runner.plan_batch().unwrap().len(), 2);
+        let original_digest = runner.plan_digest().unwrap();
+        runner.variants[1].interventions[1].tick = 0;
+        assert_ne!(runner.plan_digest().unwrap(), original_digest);
+        let same_tick_digest = runner.plan_digest().unwrap();
+        runner.variants[1].interventions.swap(0, 1);
+        assert_ne!(runner.plan_digest().unwrap(), same_tick_digest);
+        runner.variants.push(ScenarioVariant {
+            variant_id: "duplicate-treatment".into(),
+            ..runner.variants[1].clone()
+        });
+        assert!(matches!(
+            runner.plan_batch(),
+            Err(ExperimentRunnerError::InvalidPlan { .. })
+        ));
+
+        let at = |tick, set| ScenarioInterventionV1 { tick, set };
+        for (interventions, diagnostic) in [
+            (
+                vec![at(2, serde_json::json!({"food_growth_rate": 0.01}))],
+                "must precede",
+            ),
+            (
+                vec![
+                    at(1, serde_json::json!({"food_growth_rate": 0.01})),
+                    at(0, serde_json::json!({"food_growth_rate": 0.02})),
+                ],
+                "nondecreasing",
+            ),
+        ] {
+            runner.variants = vec![intervention_test_variant("invalid-timing", interventions)];
+            let error = runner.plan_batch().expect_err("valid patches have invalid scheduling");
+            assert!(error.to_string().contains(diagnostic), "{error}");
+            assert!(!output.exists());
+        }
+        let invalid_schedules = [
+            vec![at(0, serde_json::json!({"world_width": 80}))],
+            vec![at(0, serde_json::json!({"rng_seed": 9}))],
+            vec![at(0, serde_json::json!({"persistence_interval": 0}))],
+            vec![at(0, serde_json::json!({"unknown_knob": 1}))],
+            vec![at(0, serde_json::json!({"food_max": true}))],
+            vec![at(0, serde_json::json!({"food_max": 101}))],
+            vec![at(0, serde_json::json!({"population_minimum": 1.5}))],
+            vec![at(0, serde_json::json!({"render.post.bloom.intensity": 0.5}))],
+            vec![at(0, serde_json::json!({}))],
+            vec![at(0, serde_json::json!([]))],
+            vec![at(
+                0,
+                serde_json::json!({
+                    "food_max": "x".repeat(MAX_EXPERIMENT_INTERVENTION_PATCH_BYTES),
+                }),
+            )],
+            vec![
+                at(0, serde_json::json!({"food_growth_rate": 0.01}));
+                MAX_EXPERIMENT_INTERVENTIONS + 1
+            ],
+        ];
+        for interventions in invalid_schedules {
+            runner.variants = vec![intervention_test_variant("invalid", interventions)];
+            assert!(matches!(
+                runner.plan_batch(),
+                Err(ExperimentRunnerError::InvalidPlan { .. })
+            ));
+            assert!(
+                !output.exists(),
+                "refused planning must not create execution artifacts"
+            );
+        }
+        runner.variants = vec![treatment];
+        runner.max_ticks = 0;
+        assert!(runner.plan_batch().is_err());
+        assert!(!output.exists());
+    }
+
+    fn intervention_test_variant(
+        variant_id: &str,
+        interventions: Vec<ScenarioInterventionV1>,
+    ) -> ScenarioVariant {
+        ScenarioVariant {
+            variant_id: variant_id.into(),
+            brain_family: "mlp".into(),
+            config_overrides: BTreeMap::from([
+                ("world_width".into(), serde_json::json!(40)),
+                ("world_height".into(), serde_json::json!(40)),
+                ("food_cell_size".into(), serde_json::json!(10)),
+                ("food_max".into(), serde_json::json!(10.0)),
+                ("initial_food".into(), serde_json::json!(2.0)),
+                ("food_growth_rate".into(), serde_json::json!(0.0)),
+                ("food_decay_rate".into(), serde_json::json!(0.0)),
+                ("food_intake_rate".into(), serde_json::json!(0.0)),
+                ("population_minimum".into(), serde_json::json!(0)),
+            ]),
+            interventions,
+        }
+    }
+
+    #[test]
+    fn scheduled_interventions_execute_ordered_owner_barriers_and_preserve_real_effects() {
+        let directory = tempfile::tempdir().unwrap();
+        let patch = |value| ScenarioInterventionV1 {
+            tick: 0,
+            set: serde_json::json!({"food_max": value, "initial_food": 0.5}),
+        };
+        let variants = vec![
+            intervention_test_variant("clamp-restore", vec![patch(0.5), patch(10.0)]),
+            intervention_test_variant("restore-clamp", vec![patch(10.0), patch(0.5)]),
+            intervention_test_variant("no-clamp", vec![patch(10.0), patch(10.0)]),
+            intervention_test_variant(
+                "nested-render",
+                vec![
+                    ScenarioInterventionV1 {
+                        tick: 0,
+                        set: serde_json::json!({"render": {"post": {"bloom": {"intensity": 0.5}}}}),
+                    },
+                    ScenarioInterventionV1 {
+                        tick: 0,
+                        set: serde_json::json!({"render": {"post": {"bloom": {"intensity": 0.75}}}}),
+                    },
+                ],
+            ),
+            intervention_test_variant(
+                "maximum-schedule",
+                (0..MAX_EXPERIMENT_INTERVENTIONS)
+                    .map(|index| patch(if index % 2 == 0 { 0.5 } else { 10.0 }))
+                    .collect(),
+            ),
+        ];
+        let runner = MatchedSeedExperimentRunner::new(
+            "owner-interventions",
+            MatchedSeedCohort {
+                cohort_id: "cohort".into(),
+                seeds: vec![23],
+            },
+            variants,
+            2,
+            2,
+            directory.path().join("bundles"),
+        );
+        let completed = runner
+            .execute_batch(&directory.path().join("status.json"))
+            .unwrap();
+        assert_eq!(completed.completed_runs, 5, "{completed:?}");
+        let mut observed = BTreeMap::new();
+        for record in &completed.runs {
+            let bundle_dir = runner.output_dir.join(&record.run_id);
+            let verified = verify_portable_run_bundle(&bundle_dir).unwrap();
+            let final_state = verified.final_state.unwrap();
+            let checkpoint = read_optional_run_checkpoint(&runner.run_checkpoint_path(&record.run_id))
+                .unwrap()
+                .unwrap();
+            let declared = &checkpoint.metadata.manifest.scenario.interventions;
+            let host = checkpoint.owner.host_checkpoint();
+            let expected_count = u64::try_from(declared.len()).unwrap();
+            assert_eq!(host.completed_schedule_sequence(), Some(expected_count));
+            assert_eq!(host.scheduled_patch_history().len(), declared.len());
+            assert_eq!(host.remaining_schedule(), Some([].as_slice()));
+            assert_eq!(host.config_revision().get(), expected_count);
+            for (index, receipt) in host.scheduled_patch_history().iter().enumerate() {
+                assert_eq!(
+                    receipt.evidence.scheduled.decode_patch().unwrap(),
+                    declared[index].set
+                );
+                assert_eq!(
+                    receipt.evidence.scheduled.sequence,
+                    u64::try_from(index + 1).unwrap()
+                );
+            }
+            if record.variant_id == "nested-render" {
+                let history = host.scheduled_patch_history();
+                assert_eq!(
+                    history[0].evidence.outcome,
+                    ScheduledPatchOutcome::Applied {
+                        changed_paths: vec!["render.post".into()],
+                    }
+                );
+                assert_eq!(
+                    history[1].evidence.outcome,
+                    ScheduledPatchOutcome::Applied {
+                        changed_paths: vec!["render.post.bloom.intensity".into()],
+                    }
+                );
+            }
+            observed.insert(
+                record.variant_id.clone(),
+                (host.config().clone(), final_state),
+            );
+        }
+        // Clamping food then restoring capacity changes the real food state even
+        // though both arms finish with identical configs and config revisions.
+        assert_eq!(observed["clamp-restore"].0, observed["no-clamp"].0);
+        assert!(
+            observed["clamp-restore"].1.summary.total_food
+                < observed["no-clamp"].1.summary.total_food
+        );
+        assert_ne!(
+            observed["clamp-restore"].1.scientific_digest,
+            observed["no-clamp"].1.scientific_digest
+        );
+        assert_ne!(observed["clamp-restore"].0, observed["restore-clamp"].0);
+        assert_ne!(
+            observed["clamp-restore"].1.scientific_digest,
+            observed["restore-clamp"].1.scientific_digest
+        );
+    }
+
+    #[test]
+    fn scheduled_interventions_resume_before_and_after_exact_due_boundaries() {
+        for completed_ticks in [0_u64, 1, 2, 3, 4] {
+            let directory = tempfile::tempdir().unwrap();
+            let variant = intervention_test_variant(
+                "drought-recovery",
+                vec![
+                    ScenarioInterventionV1 {
+                        tick: 0,
+                        set: serde_json::json!({"food_max": 0.5, "initial_food": 0.5}),
+                    },
+                    ScenarioInterventionV1 {
+                        tick: 2,
+                        set: serde_json::json!({"food_max": 10.0}),
+                    },
+                    ScenarioInterventionV1 {
+                        tick: 4,
+                        set: serde_json::json!({"food_growth_rate": 0.01}),
+                    },
+                ],
+            );
+            let mut runner = MatchedSeedExperimentRunner::new(
+                "scheduled-continuation",
+                MatchedSeedCohort {
+                    cohort_id: "cohort".into(),
+                    seeds: vec![71],
+                },
+                vec![variant],
+                5,
+                1,
+                directory.path().join("bundles"),
+            );
+            let plan = runner.validated_plan().unwrap();
+            let record = &plan.runs[0];
+            let (variant, family) = &plan.variants[&record.variant_id];
+            let path = runner.run_checkpoint_path(&record.run_id);
+            runner
+                .prepare_run_checkpoint(variant, *family, record.seed, &record.run_id, &plan.digest)
+                .unwrap();
+            let mut checkpoint = read_optional_run_checkpoint(&path).unwrap().unwrap();
+            let original_manifest = checkpoint.metadata.manifest.clone();
+            let prepared = PreparedInterventions::new(
+                &config_for_run(&variant.config_overrides, record.seed).unwrap(),
+                &variant.interventions,
+                runner.max_ticks,
+            )
+            .unwrap();
+            let mut oracle = restore_run_owner(&checkpoint, *family, &record.run_id, &path).unwrap();
+            let (_, namespace) = host_identifiers(&record.run_id);
+            let mut frontend = NullFrontend::new(oracle.local_port(), namespace);
+            let mut now = 0;
+            for tick in 1..=runner.max_ticks {
+                let submitted = frontend
+                    .submit_envelope(CommandEnvelope::new(
+                        CommandId::from_client_sequence(namespace, tick),
+                        HostCommand::Step,
+                    ))
+                    .unwrap();
+                drive_command_to_volatile_commit(
+                    &record.run_id,
+                    "scheduled oracle step",
+                    &mut frontend,
+                    &mut oracle,
+                    submitted.command_id(),
+                    tick,
+                    prepared.due_at(tick - 1),
+                    &mut now,
+                )
+                .unwrap();
+                seal_run_checkpoint(&record.run_id, &mut frontend, &mut oracle, &mut now).unwrap();
+                if tick <= completed_ticks {
+                    checkpoint.metadata.parent_digest = Some(
+                        blake3::hash(&fs::read(&path).unwrap()).to_hex().to_string(),
+                    );
+                    checkpoint.owner = oracle.capture_volatile_host_checkpoint_v1().unwrap();
+                    runner
+                        .validate_run_checkpoint(
+                            &path,
+                            &checkpoint,
+                            variant,
+                            record.seed,
+                            &record.run_id,
+                            &plan.digest,
+                        )
+                        .unwrap();
+                    write_run_checkpoint(&path, &checkpoint.encode(&path).unwrap()).unwrap();
+                }
+            }
+            let expected_digest = oracle.scientific_digest_v1().unwrap().overall;
+            let expected_summary = ExperimentEndpointSummaryV2::from_world(
+                oracle.world(),
+                record.seed,
+                family.canonical_name(),
+                expected_digest.clone(),
+            )
+            .unwrap();
+            let expected_journal = oracle
+                .capture_volatile_host_checkpoint_v1()
+                .unwrap()
+                .host_checkpoint()
+                .journal_cut();
+            drop(frontend);
+            drop(oracle);
+            let saved = read_optional_run_checkpoint(&path).unwrap().unwrap();
+            let saved_host = saved.owner.host_checkpoint();
+            assert_eq!(saved_host.tick().0, completed_ticks);
+            assert_eq!(
+                saved_host.completed_schedule_sequence(),
+                Some(u64::try_from(prepared.completed_at(completed_ticks)).unwrap())
+            );
+            if let Some(pending) = saved_host.remaining_schedule().unwrap().first() {
+                assert!(pending.due_tick.0 >= completed_ticks);
+            }
+            let state_file = directory.path().join("status.json");
+            let mut status = runner.load_or_create_status(&state_file).unwrap();
+            status.runs[0].state = RunState::Running;
+            runner.save_status(&state_file, &mut status).unwrap();
+            runner.max_concurrency = 2;
+            let resumed = runner.execute_batch(&state_file).unwrap();
+            assert_eq!(resumed.completed_runs, 1, "cut {completed_ticks}: {resumed:?}");
+            assert_eq!(
+                resumed.runs[0].final_digest.as_deref(),
+                Some(expected_digest.as_str())
+            );
+            let final_cut = read_optional_run_checkpoint(&path).unwrap().unwrap();
+            assert_eq!(final_cut.metadata.manifest, original_manifest);
+            assert_eq!(
+                final_cut.owner.host_checkpoint().journal_cut(),
+                expected_journal
+            );
+            let verified = verify_portable_run_bundle(&runner.output_dir.join(&record.run_id)).unwrap();
+            assert_eq!(verified.final_state.unwrap().summary, expected_summary);
+        }
+    }
+
+    #[test]
+    fn checksummed_intervention_forgeries_fail_pending_and_completed_schedule_binding() {
+        let directory = tempfile::tempdir().unwrap();
+        let variant = intervention_test_variant(
+            "ordered-treatment",
+            vec![
+                ScenarioInterventionV1 {
+                    tick: 0,
+                    set: serde_json::json!({"food_max": 0.5, "initial_food": 0.5}),
+                },
+                ScenarioInterventionV1 {
+                    tick: 0,
+                    set: serde_json::json!({"food_max": 10.0}),
+                },
+            ],
+        );
+        let runner = MatchedSeedExperimentRunner::new(
+            "schedule-forgery",
+            MatchedSeedCohort {
+                cohort_id: "cohort".into(),
+                seeds: vec![23],
+            },
+            vec![variant.clone()],
+            2,
+            1,
+            directory.path().join("bundles"),
+        );
+        let plan = runner.validated_plan().unwrap();
+        let record = &plan.runs[0];
+        let family = ResolvedBrainFamily::resolve(&variant).unwrap();
+        let path = runner.run_checkpoint_path(&record.run_id);
+        runner
+            .prepare_run_checkpoint(&variant, family, record.seed, &record.run_id, &plan.digest)
+            .unwrap();
+        let initial = read_optional_run_checkpoint(&path).unwrap().unwrap();
+        let mut declared_other = variant.clone();
+        declared_other.interventions[0].set =
+            serde_json::json!({"food_max": 0.75, "initial_food": 0.5});
+        let altered_runner = MatchedSeedExperimentRunner::new(
+            runner.experiment_id.clone(),
+            runner.cohort.clone(),
+            vec![declared_other.clone()],
+            runner.max_ticks,
+            runner.max_concurrency,
+            &runner.output_dir,
+        );
+        let altered_plan = altered_runner.validated_plan().unwrap();
+        let mut changed = RunCheckpointV1 {
+            metadata: initial.metadata.clone(),
+            owner: initial.owner.clone(),
+        };
+        changed.metadata.plan_digest.clone_from(&altered_plan.digest);
+        changed
+            .metadata
+            .manifest
+            .scenario
+            .interventions
+            .clone_from(&declared_other.interventions);
+        let framed = RunCheckpointV1::decode(&changed.encode(&path).unwrap(), &path).unwrap();
+        assert!(
+            altered_runner
+                .validate_run_checkpoint(
+                    &path,
+                    &framed,
+                    &declared_other,
+                    record.seed,
+                    &record.run_id,
+                    &altered_plan.digest,
+                )
+                .is_err(),
+            "tick-zero future inputs must be bound before any patch executes"
+        );
+
+        let status = runner
+            .execute_batch(&directory.path().join("status.json"))
+            .unwrap();
+        assert_eq!(status.completed_runs, 1, "{status:?}");
+        let bundle_dir = runner.output_dir.join(&record.run_id);
+        let checkpoint_path = bundle_dir.join(FINAL_CHECKPOINT_ARTIFACT.0);
+        let final_checkpoint = read_optional_run_checkpoint(&checkpoint_path).unwrap().unwrap();
+        changed.owner = final_checkpoint.owner.clone();
+        changed.metadata = final_checkpoint.metadata.clone();
+        changed
+            .metadata
+            .manifest
+            .scenario
+            .interventions
+            .clone_from(&declared_other.interventions);
+        let forged_manifest = changed.metadata.manifest.clone();
+        fs::write(&checkpoint_path, changed.encode(&checkpoint_path).unwrap()).unwrap();
+        let evidence_path = bundle_dir.join("evidence/run.json");
+        let mut evidence: RunEvidenceV2 =
+            serde_json::from_slice(&fs::read(&evidence_path).unwrap()).unwrap();
+        evidence.manifest_digest = blake3::hash(&forged_manifest.canonical_json_bytes().unwrap())
+            .to_hex()
+            .to_string();
+        fs::write(&evidence_path, serde_json::to_vec(&evidence).unwrap()).unwrap();
+        let manifest_path = bundle_dir.join("bundle_manifest.json");
+        let mut bundle: RunBundleV1 =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        bundle.manifest = forged_manifest.to_storage_record().unwrap();
+        for entry in &mut bundle.artifacts {
+            let bytes = fs::read(bundle_dir.join(&entry.relative_path)).unwrap();
+            entry.bytes_len = u64::try_from(bytes.len()).unwrap();
+            entry.blake3_hex = blake3::hash(&bytes).to_hex().to_string();
+        }
+        fs::write(&manifest_path, serde_json::to_vec(&bundle).unwrap()).unwrap();
+        scriptbots_storage::verify_run_bundle(&bundle_dir)
+            .expect("coherent metadata and fresh artifact checksums are byte-valid");
+        let error = verify_portable_run_bundle(&bundle_dir)
+            .expect_err("same final config does not justify forged completed treatment inputs");
+        assert!(
+            error.to_string().contains("ordered applied and committed owner receipt"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn malformed_and_interrupted_status_fail_closed() {
         let temp_dir = tempfile::tempdir().expect("temporary status directory");
         let state_file = temp_dir.path().join("status.json");
@@ -3928,6 +4710,7 @@ mod tests {
                 variant_id: "mlp".into(),
                 brain_family: "mlp".into(),
                 config_overrides: BTreeMap::new(),
+                interventions: Vec::new(),
             }],
             1,
             1,
@@ -3965,6 +4748,7 @@ mod tests {
                 variant_id: "mlp".into(),
                 brain_family: "mlp".into(),
                 config_overrides: BTreeMap::new(),
+                interventions: Vec::new(),
             }],
             3,
             1,
@@ -4471,6 +5255,7 @@ mod tests {
                 variant_id: "mlp".into(),
                 brain_family: "mlp".into(),
                 config_overrides: BTreeMap::new(),
+                interventions: Vec::new(),
             }],
             1,
             1,
@@ -4513,6 +5298,7 @@ mod tests {
                         variant_id: family_name.into(),
                         brain_family: family_name.into(),
                         config_overrides: BTreeMap::new(),
+                        interventions: Vec::new(),
                     }],
                     5,
                     1,
@@ -4553,6 +5339,7 @@ mod tests {
                         &mut oracle,
                         submitted.command_id(),
                         tick,
+                        0,
                         &mut now,
                     )
                     .unwrap();
@@ -4629,6 +5416,7 @@ mod tests {
                     variant_id: family.into(),
                     brain_family: family.into(),
                     config_overrides: BTreeMap::new(),
+                    interventions: Vec::new(),
                 }],
                 TICKS,
                 1,
@@ -4771,6 +5559,7 @@ mod tests {
             variant_id: family.into(),
             brain_family: family.into(),
             config_overrides: BTreeMap::new(),
+            interventions: Vec::new(),
         })
         .to_vec();
         let mut outcomes = Vec::new();
@@ -4835,6 +5624,7 @@ mod tests {
                 variant_id: "mlp".into(),
                 brain_family: "mlp".into(),
                 config_overrides: BTreeMap::new(),
+                interventions: Vec::new(),
             }],
             4,
             1,
@@ -4955,6 +5745,7 @@ mod tests {
             &mut core,
             submitted.command_id(),
             1,
+            0,
             &mut now,
         )
         .unwrap();
@@ -5250,6 +6041,7 @@ mod tests {
                 variant_id: "mlp".into(),
                 brain_family: "mlp".into(),
                 config_overrides: BTreeMap::new(),
+                interventions: Vec::new(),
             }],
             0,
             1,
@@ -5514,6 +6306,7 @@ mod tests {
                 variant_id: "mlp".into(),
                 brain_family: "mlp".into(),
                 config_overrides: BTreeMap::new(),
+                interventions: Vec::new(),
             }],
             2,
             2,
@@ -5568,6 +6361,7 @@ mod tests {
                             ("world_height".into(), serde_json::json!(40)),
                             ("food_cell_size".into(), serde_json::json!(10)),
                         ]),
+                        interventions: Vec::new(),
                     }],
                     40,
                     concurrency,
@@ -5727,6 +6521,7 @@ mod tests {
                 variant_id: "mlp".into(),
                 brain_family: "mlp".into(),
                 config_overrides: BTreeMap::new(),
+                interventions: Vec::new(),
             }],
             3,
             1,
@@ -5775,6 +6570,7 @@ mod tests {
                 variant_id: "mlp".into(),
                 brain_family: "mlp".into(),
                 config_overrides: BTreeMap::new(),
+                interventions: Vec::new(),
             }],
             1,
             1,
@@ -5837,22 +6633,26 @@ mod tests {
                 variant_id: "variant_a".into(),
                 brain_family: "mlp".into(),
                 config_overrides: BTreeMap::new(),
+                interventions: Vec::new(),
             },
             ScenarioVariant {
                 variant_id: "variant_b".into(),
                 brain_family: "dwraon".into(),
                 config_overrides: BTreeMap::new(),
+                interventions: Vec::new(),
             },
             ScenarioVariant {
                 variant_id: "variant_c".into(),
                 brain_family: "assembly".into(),
                 config_overrides: BTreeMap::new(),
+                interventions: Vec::new(),
             },
             #[cfg(feature = "brain-ft")]
             ScenarioVariant {
                 variant_id: "variant_d".into(),
                 brain_family: "frankentorch".into(),
                 config_overrides: BTreeMap::new(),
+                interventions: Vec::new(),
             },
         ];
 

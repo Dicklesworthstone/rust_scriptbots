@@ -34,7 +34,7 @@ use tracing::{debug, error, info, warn};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
-use crate::ScenarioIdentityV0;
+use crate::{ScenarioIdentityV0, ScenarioInterventionV1};
 use crate::command::CommandSubmit;
 use crate::control::{
     AgentScoreEntry, ApiSchemaDto, ApiVersionDto, AppliedInterventionDto, ArtifactMetadataDto,
@@ -1582,6 +1582,7 @@ pub struct SpeedRequestBody {
             InterveneRequestBody,
             ApiVersionDto,
             ApiSchemaDto,
+            ScenarioInterventionV1,
             ExperimentVariantDto,
             ExperimentCreateRequest,
             ExperimentRunRecordDto,
@@ -4247,7 +4248,7 @@ fn register_control_tools(builder: ServerBuilder, handle: ControlHandle) -> Serv
     builder = register_tool(
         builder,
         "experiment_create",
-        "Create a matched-seed batch experiment across scenario variants and seeds",
+        "Create a matched-seed batch experiment with brain-family arms and ordered timed configuration interventions",
         json!({
             "type": "object",
             "properties": {
@@ -4261,8 +4262,26 @@ fn register_control_tools(builder: ServerBuilder, handle: ControlHandle) -> Serv
                         "properties": {
                             "variant_id": {"type": "string"},
                             "brain_family": {"type": "string"},
-                            "config_overrides": {"type": "object"}
-                        }
+                            "config_overrides": {"type": "object"},
+                            "interventions": {
+                                "type": "array",
+                                "maxItems": crate::experiment_runner::MAX_EXPERIMENT_INTERVENTIONS,
+                                "description": format!(
+                                    "Ordered patches at completed-tick boundaries before ticks_per_run; each nonempty patch is at most {} canonical JSON bytes and may change exposed numeric live configuration knobs",
+                                    crate::experiment_runner::MAX_EXPERIMENT_INTERVENTION_PATCH_BYTES
+                                ),
+                                "items": {
+                                    "type": "object",
+                                    "required": ["tick", "set"],
+                                    "properties": {
+                                        "tick": {"type": "integer", "minimum": 0},
+                                        "set": {"type": "object", "minProperties": 1}
+                                    },
+                                    "additionalProperties": false
+                                }
+                            }
+                        },
+                        "additionalProperties": false
                     }
                 },
                 "seeds": {
@@ -6863,6 +6882,163 @@ mod tests {
                 "missing {status}"
             );
         }
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one actual batch proves treatment identity across both transports and the portable owner cut"
+    )]
+    async fn timed_experiment_inputs_survive_rest_mcp_retry_and_portable_verification() {
+        let temp = tempfile::tempdir().expect("transport experiment root");
+        let (handle, _host) = handle();
+        let handle = handle
+            .with_artifacts_dir(temp.path().join("artifacts"))
+            .expect("isolated experiment artifacts");
+        let state = ApiState {
+            handle: handle.clone(),
+            scenario: None,
+            presented_frame: empty_presented_frame(),
+        };
+        let input = json!({
+            "experiment_id": "scheduled-transports",
+            "variants": [{
+                "variant_id": "food-treatment", "brain_family": "mlp",
+                "config_overrides": {
+                    "world_width": 40, "world_height": 40, "food_cell_size": 10,
+                    "population_minimum": 2, "population_spawn_interval": 0
+                },
+                "interventions": [
+                    {"tick": 0, "set": {"food_growth_rate": 0.05}},
+                    {"tick": 1, "set": {"food_growth_rate": 0.02}}
+                ]
+            }],
+            "seeds": [7], "ticks_per_run": 2, "max_concurrency": 1,
+            "idempotency_key": "scheduled-transport-retry"
+        });
+        let request = serde_json::from_value::<ExperimentCreateRequest>(input.clone())
+            .expect("typed timed treatment");
+        let expected = request.variants[0].interventions.clone();
+        let (status_code, Json(created)) = post_v1_experiments(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(request),
+        )
+        .await
+        .expect("REST admits actual timed experiment");
+        assert_eq!(status_code, StatusCode::CREATED);
+
+        let mcp = mcp_http_test_state(handle.clone(), ServerBuilder::new("timed-experiment", "0"));
+        let initialized = map_policy_mcp_request(
+            &mcp,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                    "clientInfo": {"name": "timed-experiment", "version": "0"}}}),
+        )
+        .await;
+        assert!(initialized.get("error").is_none(), "{initialized}");
+        let listed = map_policy_mcp_request(
+            &mcp,
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+        )
+        .await;
+        let schema = &listed["result"]["tools"]
+            .as_array()
+            .expect("registered tools")
+            .iter()
+            .find(|tool| tool["name"] == "experiment_create")
+            .expect("experiment tool")["inputSchema"];
+        let patch_schema = &schema["properties"]["variants"]["items"]["properties"]["interventions"];
+        assert_eq!(
+            patch_schema["maxItems"],
+            crate::experiment_runner::MAX_EXPERIMENT_INTERVENTIONS
+        );
+        assert_eq!(patch_schema["items"]["required"], json!(["tick", "set"]));
+        assert_eq!(patch_schema["items"]["additionalProperties"], false);
+        let openapi = serde_json::to_value(ApiDoc::openapi()).expect("OpenAPI");
+        assert_eq!(
+            openapi["components"]["schemas"]["ExperimentVariantDto"]["properties"]
+                ["interventions"]["items"]["$ref"],
+            "#/components/schemas/ScenarioInterventionV1"
+        );
+
+        let retry = map_policy_mcp_request(
+            &mcp,
+            json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": {"name": "experiment_create", "arguments": input}}),
+        )
+        .await;
+        assert!(retry.get("error").is_none(), "{retry}");
+        let retried: ExperimentBatchStatusDto = serde_json::from_str(
+            retry["result"]["content"][0]["text"].as_str().expect("batch status"),
+        )
+        .expect("typed MCP retry response");
+        assert_eq!(retried.experiment_id, created.experiment_id);
+        assert_eq!(retried.plan_digest, created.plan_digest);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let completed = loop {
+            let status = handle.get_experiment(&created.experiment_id).expect("batch status");
+            if status.status == "completed" {
+                break status;
+            }
+            assert_ne!(status.status, "failed", "{status:?}");
+            assert!(std::time::Instant::now() < deadline, "{status:?}");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        };
+        assert_eq!(completed.completed_runs, 1);
+        let run = &completed.runs[0];
+        let bundle_dir = Path::new(run.bundle_path.as_ref().expect("completed bundle"));
+        let bundle: scriptbots_storage::RunBundleV1 = serde_json::from_slice(
+            &std::fs::read(bundle_dir.join("bundle_manifest.json")).unwrap(),
+        )
+        .expect("portable manifest");
+        let manifest: crate::RunManifestV3 = serde_json::from_str(&bundle.manifest.manifest_json)
+            .expect("original launch and treatment declaration");
+        assert_eq!(manifest.scenario.interventions, expected);
+        let verified = crate::experiment_runner::verify_portable_run_bundle(bundle_dir)
+            .expect("portable owner schedule and science verification")
+            .final_state
+            .expect("restored final science");
+        assert_eq!(Some(&verified.scientific_digest), run.final_digest.as_ref());
+        assert_eq!(verified.summary.tick, 2);
+
+        let mut changed = input.clone();
+        changed["variants"][0]["interventions"][0]["set"]["food_growth_rate"] = json!(0.04);
+        let conflict = map_policy_mcp_request(
+            &mcp,
+            json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                "params": {"name": "experiment_create", "arguments": changed}}),
+        )
+        .await;
+        assert!(conflict.get("error").is_none(), "{conflict}");
+        assert_eq!(conflict["result"]["isError"], true, "{conflict}");
+        assert!(
+            conflict["result"]["content"][0]["text"]
+                .as_str()
+                .expect("idempotency refusal")
+                .contains("idempotency key reused with different payload"),
+            "{conflict}"
+        );
+
+        let mut misspelled = input.clone();
+        let variant = misspelled["variants"][0].as_object_mut().unwrap();
+        let schedule = variant.remove("interventions").unwrap();
+        variant.insert("interventons".to_owned(), schedule);
+        assert!(serde_json::from_value::<ExperimentCreateRequest>(misspelled).is_err());
+
+        let mut invalid = input;
+        invalid["experiment_id"] = json!("invalid-schedule");
+        invalid["idempotency_key"] = json!("invalid-schedule");
+        invalid["variants"][0]["interventions"][1]["tick"] = json!(2);
+        let refused = post_v1_experiments(
+            State(state),
+            HeaderMap::new(),
+            Json(serde_json::from_value(invalid).unwrap()),
+        )
+        .await
+        .expect_err("a patch at the completed horizon must fail before admission");
+        assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+        assert!(!handle.artifacts_dir().join("experiments/invalid-schedule").exists());
     }
 
     #[tokio::test]

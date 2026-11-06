@@ -208,7 +208,29 @@ fn same_build_identity(recorded: &BuildProvenanceV0) -> bool {
     recorded == &expected
 }
 
+fn validate_lab_variants(variants: &[ScenarioVariant]) -> Result<()> {
+    ensure!(
+        variants
+            .iter()
+            .all(|variant| variant.interventions.is_empty()),
+        "Lab reproduction cannot execute scheduled interventions absent from its arm provenance"
+    );
+    Ok(())
+}
+
+fn read_lab_manifest(bundle: &Path, run_id: &str) -> Result<RunManifestV3> {
+    let wire: scriptbots_storage::RunBundleV1 =
+        serde_json::from_slice(&checked_file(&bundle.join("bundle_manifest.json"))?)?;
+    let manifest: RunManifestV3 = serde_json::from_str(&wire.manifest.manifest_json)?;
+    ensure!(
+        manifest.scenario.interventions.is_empty(),
+        "retained run={run_id} contains scheduled interventions absent from Lab arm provenance"
+    );
+    Ok(manifest)
+}
+
 fn verify_rows(input: &ReproductionInput, run_records: Vec<RunRecord>) -> Result<Vec<RunSummary>> {
+    validate_lab_variants(&input.variants)?;
     let arms = input
         .variants
         .iter()
@@ -225,9 +247,7 @@ fn verify_rows(input: &ReproductionInput, run_records: Vec<RunRecord>) -> Result
         .collect::<Result<Vec<_>>>()?;
     for record in &run_records {
         let bundle = Path::new(record.bundle_path.as_deref().context("missing bundle")?);
-        let wire: scriptbots_storage::RunBundleV1 =
-            serde_json::from_slice(&checked_file(&bundle.join("bundle_manifest.json"))?)?;
-        let manifest: RunManifestV3 = serde_json::from_str(&wire.manifest.manifest_json)?;
+        let manifest = read_lab_manifest(bundle, &record.run_id)?;
         ensure!(
             same_build_identity(&manifest.build),
             "build provenance mismatch run={} arm={} seed={}",
@@ -366,6 +386,7 @@ pub(crate) fn emit(
                 variant_id: run.variant_id.clone(),
                 brain_family: run.brain_family.clone(),
                 config_overrides: run.config_overrides.clone(),
+                interventions: Vec::new(),
             };
             if let Some(old) = variants.insert(run.arm_id, variant.clone()) {
                 ensure!(old == variant, "arm config differs between seeds");
@@ -459,6 +480,7 @@ pub fn run(args: &ReproduceArgs) -> Result<()> {
     );
     let input: ReproductionInput = serde_json::from_slice(&bytes)?;
     ensure!(input.schema == SCHEMA, "reproduction schema mismatch");
+    validate_lab_variants(&input.variants)?;
     ensure!(
         same_build_identity(&input.context.build),
         "expected source/build provenance mismatch"
@@ -491,11 +513,6 @@ pub fn run(args: &ReproduceArgs) -> Result<()> {
         "retained raw/adjusted analysis table mismatch"
     );
     if let (Some(output), Some(index)) = (&args.child_output, args.run_index) {
-        let output = confined_directory(output)?;
-        ensure!(
-            output.starts_with(&root) && output != root,
-            "worker output escapes reproduction directory"
-        );
         let expected = input
             .runs
             .get(index)
@@ -504,6 +521,16 @@ pub fn run(args: &ReproduceArgs) -> Result<()> {
             .variants
             .get(usize::from(expected.reference.arm_id))
             .context("worker arm outside plan")?;
+        // A directly invoked worker must enforce the same schedule boundary
+        // before creating output, without rereading every other cohort bundle.
+        let retained = records(std::slice::from_ref(&expected.reference))?;
+        let bundle = Path::new(retained[0].bundle_path.as_deref().context("missing bundle")?);
+        read_lab_manifest(bundle, &expected.reference.run_id)?;
+        let output = confined_directory(output)?;
+        ensure!(
+            output.starts_with(&root) && output != root,
+            "worker output escapes reproduction directory"
+        );
         let record =
             runner(&input, &output).execute_single_run(variant, expected.reference.seed)?;
         retain_file(

@@ -449,13 +449,14 @@ pub struct ScenarioEnvelopeV1 {
 /// One tick-scheduled config patch: applied by the validation runner at the exact
 /// completed-tick boundary, validated by the same finite/range machinery as any
 /// configuration layer, and replayed identically on every rerun of the scenario.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ScenarioInterventionV1 {
     /// The completed-tick boundary at which the patch applies (0 = before tick 1).
     /// Patches at the same tick execute in document order.
     pub tick: u64,
     /// Config patch object (same semantics as a configuration layer body).
+    #[schema(value_type = Object)]
     pub set: serde_json::Value,
 }
 
