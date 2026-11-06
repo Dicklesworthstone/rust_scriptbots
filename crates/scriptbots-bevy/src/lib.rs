@@ -5084,13 +5084,13 @@ fn update_hud(
         let world_size = snapshot.world_size;
         let agent_radius = snapshot.agent_radius;
         let mut selected_count = 0usize;
-        let mut primary: Option<(AgentId, u32, f32)> = None;
+        let mut primary: Option<(AgentUid, u32, f32)> = None;
         let mut primary_agent: Option<&AgentVisual> = None;
         for agent in &snapshot.agents {
             if matches!(agent.selection, SelectionState::Selected) {
                 selected_count += 1;
                 if primary.is_none() {
-                    primary = Some((agent.id, agent.age, agent.health));
+                    primary = Some((agent.uid, agent.age, agent.health));
                     primary_agent = Some(agent);
                 }
             }
@@ -5147,15 +5147,15 @@ fn update_hud(
         "Running"
     };
 
-    let selection_text = if let Some((id, age, health)) = primary_selection {
+    let selection_text = if let Some((uid, age, health)) = primary_selection {
         let extra = if selected_count > 1 {
             format!(" | +{}", selected_count - 1)
         } else {
             String::new()
         };
         format!(
-            "Selection: {:?} | age {:>4} | health {:>5.1}{}",
-            id, age, health, extra
+            "Selection: #{} | age {} | health {:.2}{}",
+            uid.0, age, health, extra
         )
     } else {
         "Selection: none".to_string()
@@ -17011,7 +17011,15 @@ mod tests {
                 .step()
                 .expect("HUD test world should accept each simulation step");
         }
-        let snapshot = WorldSnapshot::from_world(&world).expect("world snapshot");
+        let mut snapshot = WorldSnapshot::from_world(&world).expect("world snapshot");
+        for agent in &mut snapshot.agents {
+            agent.selection = SelectionState::None;
+        }
+        let selected = snapshot.agents.first_mut().expect("a creature to select");
+        selected.uid = AgentUid(4242);
+        selected.selection = SelectionState::Selected;
+        let selected_age = selected.age;
+        let selected_health = selected.health;
 
         let state = SnapshotState {
             latest: Some(snapshot.clone()),
@@ -17100,9 +17108,9 @@ mod tests {
             .expect("selection text exists")
             .as_str()
             .to_string();
-        assert!(
-            selection_text.starts_with("Selection:"),
-            "selection text missing prefix: {selection_text}"
+        assert_eq!(
+            selection_text,
+            format!("Selection: #4242 | age {selected_age} | health {selected_health:.2}")
         );
 
         let follow_text = world
