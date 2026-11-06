@@ -3,11 +3,11 @@
 #![recursion_limit = "256"]
 
 mod camera;
-pub mod lab_workflows;
 /// Headless GPUI HUD capture (bd-abu3). Test-only: it depends on GPUI's
 /// `test-support` feature, which is a dev-dependency and must not reach production.
 #[cfg(test)]
 mod hud_capture;
+pub mod lab_workflows;
 #[expect(
     dead_code,
     reason = "bd-bufm: projection and paint helpers await the core's positioned tick-event stream; there is no production VFX consumer yet"
