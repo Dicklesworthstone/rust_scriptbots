@@ -17011,6 +17011,9 @@ mod tests {
                 .step()
                 .expect("HUD test world should accept each simulation step");
         }
+        world
+            .try_spawn_agent(scriptbots_core::AgentData::default())
+            .expect("spawn a creature for HUD selection");
         let mut snapshot = WorldSnapshot::from_world(&world).expect("world snapshot");
         for agent in &mut snapshot.agents {
             agent.selection = SelectionState::None;
