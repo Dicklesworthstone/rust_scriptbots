@@ -356,13 +356,13 @@ pub(crate) fn completed_run_summaries(
             read_bounded_analysis_file(&bundle_manifest_path, MAX_ANALYSIS_BUNDLE_MANIFEST_BYTES)?;
         let bundle: RunBundleV1 = serde_json::from_slice(&bundle_bytes)
             .map_err(|error| format!("parse {}: {error}", bundle_manifest_path.display()))?;
-        let manifest: crate::RunManifestV3 =
-            serde_json::from_str(&bundle.manifest.manifest_json).map_err(|error| {
-                format!(
-                    "parse {} embedded run manifest: {error}",
-                    bundle_manifest_path.display()
-                )
-            })?;
+        let manifest: crate::RunManifestV3 = serde_json::from_str(&bundle.manifest.manifest_json)
+            .map_err(|error| {
+            format!(
+                "parse {} embedded run manifest: {error}",
+                bundle_manifest_path.display()
+            )
+        })?;
         if !manifest.scenario.interventions.is_empty() {
             return Err(format!(
                 "bundle {} contains scheduled interventions absent from planned Lab arm {arm_id}",
@@ -383,7 +383,8 @@ pub(crate) fn completed_run_summaries(
         if observed_config != expected_config {
             return Err(format!(
                 "bundle {} normalized configuration differs from planned arm {arm_id} at seed {}",
-                bundle_dir.display(), record.seed
+                bundle_dir.display(),
+                record.seed
             ));
         }
         let summary_entries = bundle
@@ -1311,8 +1312,8 @@ mod tests {
             for (arm_index, arm) in spec.arms.iter().enumerate() {
                 let arm_id = u16::try_from(arm_index)
                     .map_err(|_| "arm index does not fit u16".to_owned())?;
-                let config_bytes = serde_json::to_vec(&arm.config_overrides)
-                    .map_err(|error| error.to_string())?;
+                let config_bytes =
+                    serde_json::to_vec(&arm.config_overrides).map_err(|error| error.to_string())?;
                 let config_digest = blake3::hash(&config_bytes).to_hex().to_string();
                 for &seed in &spec.seeds {
                     let seed_component = u32::try_from(seed % 17)
@@ -1814,12 +1815,14 @@ mod tests {
             assert!(notebook.contains(family));
         }
         let notebook_dir = lab.notebook_path.as_ref().unwrap().parent().unwrap();
-        let reproduction: serde_json::Value = serde_json::from_slice(
-            &fs::read(notebook_dir.join("reproduction.json")).unwrap(),
-        )
-        .unwrap();
+        let reproduction: serde_json::Value =
+            serde_json::from_slice(&fs::read(notebook_dir.join("reproduction.json")).unwrap())
+                .unwrap();
         assert_eq!(reproduction["variants"][0]["brain_family"], "mlp.baseline");
-        assert_eq!(reproduction["variants"][1]["brain_family"], "dwraon.baseline");
+        assert_eq!(
+            reproduction["variants"][1]["brain_family"],
+            "dwraon.baseline"
+        );
 
         // Unchanged, internally consistent bundles still cannot be attributed
         // to a different family or configuration than the validated plan.
@@ -1830,7 +1833,10 @@ mod tests {
         let mut wrong_family = validated.arms.clone();
         wrong_family[0].brain_family = "dwraon.baseline".to_owned();
         let error = completed_run_summaries(&wrong_family, &status).unwrap_err();
-        assert!(error.contains("differs from planned arm 0 family"), "{error}");
+        assert!(
+            error.contains("differs from planned arm 0 family"),
+            "{error}"
+        );
         let mut wrong_config = validated.arms.clone();
         wrong_config[0]
             .config_overrides
@@ -1868,14 +1874,15 @@ mod tests {
             1,
             temp.path().join("bundles"),
         );
-        let status = runner.execute_batch(&temp.path().join("status.json")).unwrap();
+        let status = runner
+            .execute_batch(&temp.path().join("status.json"))
+            .unwrap();
         assert_eq!(status.completed_runs, 1, "{status:?}");
         assert_eq!(status.failed_runs, 0, "{status:?}");
         let record = &status.runs[0];
-        let verified = verify_portable_run_bundle(std::path::Path::new(
-            record.bundle_path.as_ref().unwrap(),
-        ))
-        .expect("the scheduled bundle has valid restored scientific evidence");
+        let verified =
+            verify_portable_run_bundle(std::path::Path::new(record.bundle_path.as_ref().unwrap()))
+                .expect("the scheduled bundle has valid restored scientific evidence");
         assert_eq!(
             verified.final_state.unwrap().scientific_digest,
             record.final_digest.as_ref().unwrap().as_str()
@@ -2143,7 +2150,9 @@ mod tests {
         input["brain_families"] = serde_json::json!(["neuroflow"]);
         let mut lab = state_machine(input, marker.clone(), Arc::clone(&calls));
         assert_eq!(lab.step().expect("proposal"), LabPhase::Validate);
-        let error = lab.step().expect_err("unexecutable family must fail preflight");
+        let error = lab
+            .step()
+            .expect_err("unexecutable family must fail preflight");
         let LabError::Validation { errors, .. } = error else {
             panic!("expected canonical validation refusal, got {error:?}");
         };

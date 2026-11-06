@@ -34,7 +34,6 @@ use tracing::{debug, error, info, warn};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
-use crate::{ScenarioIdentityV0, ScenarioInterventionV1};
 use crate::command::CommandSubmit;
 use crate::control::{
     AgentScoreEntry, ApiSchemaDto, ApiVersionDto, AppliedInterventionDto, ArtifactMetadataDto,
@@ -49,6 +48,7 @@ use crate::control::{
     parse_intervention_command, parse_map_artifact,
 };
 use crate::narrative_search::{NarrativeAroundQuery, NarrativeSearchHitDto, NarrativeSearchQuery};
+use crate::{ScenarioIdentityV0, ScenarioInterventionV1};
 use scriptbots_core::{
     AgentDebugInfo, AgentDebugQuery, AgentDebugSort, ConfigAuditEntry, Position, SelectionUpdate,
     Tick, TickSummaryDto,
@@ -1482,6 +1482,20 @@ fn default_step_count() -> u64 {
     1
 }
 
+fn parse_step_count(bytes: &[u8]) -> Result<u64, AppError> {
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        return Ok(default_step_count());
+    }
+    let payload: Value = serde_json::from_slice(bytes)
+        .map_err(|error| AppError::bad_request(format!("invalid step request payload: {error}")))?;
+    if !payload.is_object() {
+        return Err(AppError::bad_request("step request must be a JSON object"));
+    }
+    let body: StepRequestBody = serde_json::from_value(payload)
+        .map_err(|error| AppError::bad_request(format!("invalid step request payload: {error}")))?;
+    Ok(body.count)
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SpeedRequestBody {
     pub speed: f32,
@@ -2107,7 +2121,8 @@ fn tick_history_messages(
             data: json!({
                 "gap": true, "resumed_from": last, "current": current_tick,
                 "reason": "world_reset_or_future_cursor",
-            }).to_string(),
+            })
+            .to_string(),
         });
         messages.push(summary_message(&current));
         return messages;
@@ -2244,11 +2259,13 @@ async fn stream_ticks_sse(
         })
         .flat_map(futures_util::stream::iter);
 
-    Ok(Sse::new(stream).keep_alive(
-        axum::response::sse::KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("keep-alive"),
-    ).into_response())
+    Ok(Sse::new(stream)
+        .keep_alive(
+            axum::response::sse::KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keep-alive"),
+        )
+        .into_response())
 }
 
 /// Upgrade HTTP connection to a WebSocket binary/text real-time stream.
@@ -3381,14 +3398,7 @@ async fn post_control_step(
     bytes: axum::body::Bytes,
 ) -> Result<Json<CommandStatusDto>, AppError> {
     require_json_content_type(&headers, &bytes)?;
-    let count = if bytes.iter().all(u8::is_ascii_whitespace) {
-        1
-    } else {
-        let body: StepRequestBody = serde_json::from_slice(&bytes).map_err(|error| {
-            AppError::bad_request(format!("invalid step request payload: {error}"))
-        })?;
-        body.count
-    };
+    let count = parse_step_count(&bytes)?;
     let key = idempotency_key(&headers);
     let status = run_control(move || state.handle.step_count(count, key.as_deref())).await?;
     Ok(Json(status))
@@ -3614,14 +3624,7 @@ async fn post_step(
     bytes: axum::body::Bytes,
 ) -> Result<Json<CommandStatusDto>, AppError> {
     require_json_content_type(&headers, &bytes)?;
-    let count = if bytes.iter().all(u8::is_ascii_whitespace) {
-        1
-    } else {
-        let body: StepRequestBody = serde_json::from_slice(&bytes).map_err(|error| {
-            AppError::bad_request(format!("invalid step request payload: {error}"))
-        })?;
-        body.count
-    };
+    let count = parse_step_count(&bytes)?;
     // `step_count` submits `count` commands and returns the LAST receipt. The
     // reported id therefore identifies the final step, not the batch; a caller
     // polling it learns about that one command. Saying so beats implying the
@@ -5500,6 +5503,7 @@ mod tests {
         ffi::OsString,
         io::{Read, Write},
         net::{TcpListener, TcpStream},
+        path::Path,
         sync::atomic::{AtomicBool, Ordering},
     };
 
@@ -5534,7 +5538,18 @@ mod tests {
             .iter()
             .map(|opener| format!("let status = {opener}"))
             .collect();
+        // Rustfmt can wrap a bound call after `=`. Join only that continuation
+        // before classifying statements; the receipt is still actually bound.
+        let normalize_bindings = |candidate: &str| {
+            candidate
+                .lines()
+                .map(str::trim)
+                .collect::<Vec<_>>()
+                .join("\n")
+                .replace("=\n", "= ")
+        };
         let receipt_forms = |candidate: &str| {
+            let candidate = normalize_bindings(candidate);
             let bound = candidate
                 .lines()
                 .map(str::trim)
@@ -5553,7 +5568,7 @@ mod tests {
 
         // Deleting every observed binding must invalidate the positive control.
         // The test module is excluded, so its own assertions cannot keep it green.
-        let deleted = source
+        let deleted = normalize_bindings(source)
             .lines()
             .filter(|line| {
                 !bound_openers
@@ -5563,6 +5578,13 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert_eq!(receipt_forms(&deleted), (false, false));
+
+        for opener in &openers {
+            let wrapped = format!("let status =\n    {opener}pause(None))?;");
+            assert_eq!(receipt_forms(&wrapped), (true, false));
+            let discarded = format!("{opener}pause(None))?;");
+            assert_eq!(receipt_forms(&discarded), (false, true));
+        }
 
         // A genuine discard must fail even when valid production bindings remain.
         for opener in &openers {
@@ -7142,13 +7164,10 @@ mod tests {
         let request = serde_json::from_value::<ExperimentCreateRequest>(input.clone())
             .expect("typed timed treatment");
         let expected = request.variants[0].interventions.clone();
-        let (status_code, Json(created)) = post_v1_experiments(
-            State(state.clone()),
-            HeaderMap::new(),
-            Json(request),
-        )
-        .await
-        .expect("REST admits actual timed experiment");
+        let (status_code, Json(created)) =
+            post_v1_experiments(State(state.clone()), HeaderMap::new(), Json(request))
+                .await
+                .expect("REST admits actual timed experiment");
         assert_eq!(status_code, StatusCode::CREATED);
 
         let mcp = mcp_http_test_state(handle.clone(), ServerBuilder::new("timed-experiment", "0"));
@@ -7171,7 +7190,8 @@ mod tests {
             .iter()
             .find(|tool| tool["name"] == "experiment_create")
             .expect("experiment tool")["inputSchema"];
-        let patch_schema = &schema["properties"]["variants"]["items"]["properties"]["interventions"];
+        let patch_schema =
+            &schema["properties"]["variants"]["items"]["properties"]["interventions"];
         assert_eq!(
             patch_schema["maxItems"],
             crate::experiment_runner::MAX_EXPERIMENT_INTERVENTIONS
@@ -7180,8 +7200,8 @@ mod tests {
         assert_eq!(patch_schema["items"]["additionalProperties"], false);
         let openapi = serde_json::to_value(ApiDoc::openapi()).expect("OpenAPI");
         assert_eq!(
-            openapi["components"]["schemas"]["ExperimentVariantDto"]["properties"]
-                ["interventions"]["items"]["$ref"],
+            openapi["components"]["schemas"]["ExperimentVariantDto"]["properties"]["interventions"]
+                ["items"]["$ref"],
             "#/components/schemas/ScenarioInterventionV1"
         );
 
@@ -7193,14 +7213,18 @@ mod tests {
         .await;
         assert!(retry.get("error").is_none(), "{retry}");
         let retried: ExperimentBatchStatusDto = serde_json::from_str(
-            retry["result"]["content"][0]["text"].as_str().expect("batch status"),
+            retry["result"]["content"][0]["text"]
+                .as_str()
+                .expect("batch status"),
         )
         .expect("typed MCP retry response");
         assert_eq!(retried.experiment_id, created.experiment_id);
         assert_eq!(retried.plan_digest, created.plan_digest);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let completed = loop {
-            let status = handle.get_experiment(&created.experiment_id).expect("batch status");
+            let status = handle
+                .get_experiment(&created.experiment_id)
+                .expect("batch status");
             if status.status == "completed" {
                 break status;
             }
@@ -7261,7 +7285,12 @@ mod tests {
         .await
         .expect_err("a patch at the completed horizon must fail before admission");
         assert_eq!(refused.status, StatusCode::BAD_REQUEST);
-        assert!(!handle.artifacts_dir().join("experiments/invalid-schedule").exists());
+        assert!(
+            !handle
+                .artifacts_dir()
+                .join("experiments/invalid-schedule")
+                .exists()
+        );
     }
 
     #[tokio::test]
@@ -7309,6 +7338,26 @@ mod tests {
             .await
             .expect("MCP response body");
         serde_json::from_slice(&bytes).expect("MCP response JSON")
+    }
+
+    fn assert_mcp_handler_refusal(response: &Value, diagnostic: &str) {
+        // FastMCP 0.10 returns schema errors as JSON-RPC errors, but an
+        // executed handler's business refusal as a marked tool result.
+        let matches = |value: &Value| {
+            value.get("error").is_none()
+                && value["result"]["isError"] == true
+                && value["result"]["content"][0]["text"].as_str() == Some(diagnostic)
+        };
+        assert!(matches(response), "{response}");
+        let mut unmarked = response.clone();
+        unmarked["result"]["isError"] = json!(false);
+        assert!(!matches(&unmarked), "an unmarked refusal is not an error");
+        let mut unrelated = response.clone();
+        unrelated["result"]["content"][0]["text"] = json!("unrelated failure");
+        assert!(
+            !matches(&unrelated),
+            "the refusal must name its actual cause"
+        );
     }
 
     #[tokio::test]
@@ -8388,10 +8437,12 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(
-            conflict["error"]["code"],
-            i32::from(McpErrorCode::InvalidParams),
-            "{conflict}"
+        assert_mcp_handler_refusal(
+            &conflict,
+            &format!(
+                "command id {} was already used for a different command envelope",
+                first.command_id
+            ),
         );
 
         let websocket = websocket_receipt(
@@ -8450,7 +8501,11 @@ mod tests {
             json!({"count":2}),
             json!({"cout":2}),
             json!([]),
+            json!([1]),
+            json!([1, 2]),
             json!(null),
+            json!(false),
+            json!("step"),
         ] {
             let body = axum::body::Bytes::from(serde_json::to_vec(&value).unwrap());
             let control = post_control_step(State(state.clone()), headers.clone(), body.clone())
@@ -8483,23 +8538,29 @@ mod tests {
         )
         .await;
         assert!(initialized.get("error").is_none(), "{initialized}");
-        for (index, arguments) in [
-            json!({"count":0}),
-            json!({"count":-1}),
-            json!({"count":1.5}),
-            json!({"count":"2"}),
-            json!({"count":null}),
-            json!({"count":true}),
-            json!({"count":u64::MAX}),
-            json!({"count":2, "idempotency_key":"refused-step"}),
-            json!({"cout":2}),
-            json!({"idempotency_key":7}),
-            json!({"idempotency_key":" "}),
-            json!({"idempotency_key":"k".repeat(1025)}),
-            json!([]),
-            json!(null),
-            json!(false),
-            json!("step"),
+        for (index, (arguments, handler_diagnostic)) in [
+            (json!({"count":0}), None),
+            (json!({"count":-1}), None),
+            (json!({"count":1.5}), None),
+            (json!({"count":"2"}), None),
+            (json!({"count":null}), None),
+            (json!({"count":true}), None),
+            (json!({"count":u64::MAX}), None),
+            (
+                json!({"count":2, "idempotency_key":"refused-step"}),
+                Some("idempotency keys require count=1; submit individually keyed steps for retryable batches"),
+            ),
+            (json!({"cout":2}), None),
+            (json!({"idempotency_key":7}), None),
+            (
+                json!({"idempotency_key":" "}),
+                Some("idempotency_key must contain 1..=1024 bytes"),
+            ),
+            (json!({"idempotency_key":"k".repeat(1025)}), None),
+            (json!([]), None),
+            (json!(null), None),
+            (json!(false), None),
+            (json!("step"), None),
         ]
         .into_iter()
         .enumerate()
@@ -8513,11 +8574,16 @@ mod tests {
                 }),
             )
             .await;
-            assert_eq!(
-                response["error"]["code"],
-                i32::from(McpErrorCode::InvalidParams),
-                "{arguments}: {response}"
-            );
+            if let Some(diagnostic) = handler_diagnostic {
+                assert_mcp_handler_refusal(&response, diagnostic);
+            } else {
+                assert!(response.get("result").is_none(), "{arguments}: {response}");
+                assert_eq!(
+                    response["error"]["code"],
+                    i32::from(McpErrorCode::InvalidParams),
+                    "{arguments}: {response}"
+                );
+            }
         }
         let after = host.handle().read_snapshot().unwrap();
         assert_eq!(after.world, before.world);
@@ -8550,6 +8616,31 @@ mod tests {
         .expect("owner receipt");
         host.wait_applied(&receipt);
         assert_eq!(handle.status().unwrap().tick, before.world.tick + 1);
+        let mut expected_tick = before.world.tick + 1;
+        let mut unkeyed = HeaderMap::new();
+        unkeyed.insert("Content-Type", "application/json".parse().unwrap());
+        for body in [b"".as_slice(), b" \n", b"{}"] {
+            let Json(receipt) = post_control_step(
+                State(state.clone()),
+                unkeyed.clone(),
+                axum::body::Bytes::copy_from_slice(body),
+            )
+            .await
+            .expect("canonical default still admits one Step");
+            host.wait_applied(&receipt);
+            expected_tick += 1;
+            assert_eq!(handle.status().unwrap().tick, expected_tick);
+            let Json(receipt) = post_step(
+                State(state.clone()),
+                unkeyed.clone(),
+                axum::body::Bytes::copy_from_slice(body),
+            )
+            .await
+            .expect("alias default still admits one Step");
+            host.wait_applied(&receipt);
+            expected_tick += 1;
+            assert_eq!(handle.status().unwrap().tick, expected_tick);
+        }
     }
 
     /// The MCP roster README documents and that `ControlToolKind` dispatches.
@@ -9363,7 +9454,7 @@ mod tests {
                 })
                 .expect("released channel owner");
         });
-        let port = receive
+        let mut port = receive
             .recv_timeout(Duration::from_secs(5))
             .expect("blocked owner port");
         let reservation = ControlServerReservation::prepare(ControlServerConfig {

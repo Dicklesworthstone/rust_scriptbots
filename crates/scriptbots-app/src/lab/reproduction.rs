@@ -270,11 +270,9 @@ fn verify_rows(input: &ReproductionInput, run_records: Vec<RunRecord>) -> Result
         let arm_overrides = arms.get(arm_index).ok_or_else(|| {
             anyhow::anyhow!("variant {} outside the cited plan", record.variant_id)
         })?;
-        let expected_config = crate::experiment_runner::config_for_run(
-            &arm_overrides.config_overrides,
-            record.seed,
-        )
-        .map_err(anyhow::Error::msg)?;
+        let expected_config =
+            crate::experiment_runner::config_for_run(&arm_overrides.config_overrides, record.seed)
+                .map_err(anyhow::Error::msg)?;
         let expected_value = serde_json::to_value(&expected_config)?;
         ensure!(
             manifest.normalized_config == expected_value,
@@ -524,7 +522,12 @@ pub fn run(args: &ReproduceArgs) -> Result<()> {
         // A directly invoked worker must enforce the same schedule boundary
         // before creating output, without rereading every other cohort bundle.
         let retained = records(std::slice::from_ref(&expected.reference))?;
-        let bundle = Path::new(retained[0].bundle_path.as_deref().context("missing bundle")?);
+        let bundle = Path::new(
+            retained[0]
+                .bundle_path
+                .as_deref()
+                .context("missing bundle")?,
+        );
         read_lab_manifest(bundle, &expected.reference.run_id)?;
         let output = confined_directory(output)?;
         ensure!(

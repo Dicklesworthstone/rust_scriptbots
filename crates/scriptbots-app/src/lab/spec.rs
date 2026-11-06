@@ -357,7 +357,11 @@ impl fmt::Display for SpecError {
                 f,
                 "`brain_families` contains unsupported `{name}`: {reason}. Choose a family from the tool schema's installed-family list."
             ),
-            Self::DuplicateBrainFamily { name, first, second } => write!(
+            Self::DuplicateBrainFamily {
+                name,
+                first,
+                second,
+            } => write!(
                 f,
                 "brain families {first} and {second} both resolve to `{name}`. Select each family once so aliases do not duplicate treatment arms."
             ),
@@ -836,10 +840,7 @@ pub fn validate_spec(
     })
 }
 
-fn resolve_brain_families(
-    requested: &[String],
-    errors: &mut Vec<SpecError>,
-) -> Vec<&'static str> {
+fn resolve_brain_families(requested: &[String], errors: &mut Vec<SpecError>) -> Vec<&'static str> {
     if requested.is_empty() {
         errors.push(SpecError::EmptyBrainFamilies);
     }

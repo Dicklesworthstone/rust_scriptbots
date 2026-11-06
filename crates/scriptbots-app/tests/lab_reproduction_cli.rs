@@ -569,7 +569,8 @@ fn autonomous_lab_subcommand_produces_notebook_and_passes_reproduction() {
     let temp = tempfile::tempdir().expect("temp root");
     let out_dir = temp.path().join("lab_out");
 
-    let status = std::process::Command::new(EXE)
+    // Cargo fixes this test executable path at compile time.
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_scriptbots-app"))
         .arg("lab")
         .arg("--goal")
         .arg("characterize how food_regrowth_rate affects carnivore/herbivore equilibrium")

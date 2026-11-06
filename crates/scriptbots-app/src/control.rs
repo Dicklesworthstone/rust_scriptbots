@@ -3326,60 +3326,6 @@ impl ControlHandle {
         let mut commands = scientific_commands.iter().peekable();
         let mut target = None;
         loop {
-            loop {
-                if let Some(entry) = commands
-                    .peek()
-                    .filter(|entry| entry.boundary().tick == world.tick())
-                {
-                    let mismatch = || {
-                        ControlError::InvalidPatch(
-                            "recorded agent command configuration differs".into(),
-                        )
-                    };
-                    let replayed_config_revision = world
-                        .config_revision()
-                        .checked_sub(restored_config_revision)
-                        .and_then(|delta| source_config_revision.get().checked_add(delta))
-                        .ok_or_else(mismatch)?;
-                    let command_config_revision = entry.boundary().revisions.config.get();
-                    if replayed_config_revision > command_config_revision {
-                        return Err(mismatch());
-                    }
-                    if replayed_config_revision == command_config_revision {
-                        let entry = commands.next().expect("peeked agent command");
-                        scriptbots_core::apply_control_command(&mut world, entry.command().clone())
-                            .map_err(|error| ControlError::InvalidPatch(error.to_string()))?;
-                        continue;
-                    }
-                    if !edits
-                        .peek()
-                        .is_some_and(|entry| entry.tick == world.tick().0)
-                    {
-                        return Err(mismatch());
-                    }
-                }
-                if !edits
-                    .peek()
-                    .is_some_and(|entry| entry.tick == world.tick().0)
-                {
-                    break;
-                }
-                // Commands at this tick name their observed config revision. Apply only
-                // preceding edits before each command, then any remaining same-tick edits.
-                let expected = world.config_revision().checked_add(1).ok_or_else(|| {
-                    ControlError::InvalidPatch("replayed configuration revision saturated".into())
-                })?;
-                Self::apply_event_review_config(
-                    &mut world,
-                    edits.next().expect("peeked audit entry"),
-                    source_persistence_interval,
-                )?;
-                if world.config_revision() != expected {
-                    return Err(ControlError::InvalidPatch(
-                        "recorded config edit did not advance its revision".into(),
-                    ));
-                }
-            }
             if world.tick().0 == target_tick {
                 // Capture before this boundary's inputs can enqueue interventions. A
                 // previous tick must have consumed its pending inputs; the unchanged
@@ -7415,11 +7361,11 @@ pub(crate) mod tests {
                 );
             }
             assert!(
-                ControlHandle::event_review_agent_commands(
+                ControlHandle::event_review_scientific_commands(
                     &source,
                     &current,
                     target_tick,
-                    &changed
+                    &changed,
                 )
                 .is_err(),
                 "{fault}"
@@ -8244,9 +8190,9 @@ pub(crate) mod tests {
                 assert_eq!(review.checkpoint_id, fresh.checkpoint_id);
                 assert_eq!(review.snapshot.world.tick, fresh_target);
 
-                // Preserve the missing-input refusal with an actual unsupported input,
-                // rather than treating the complete configuration audit as missing.
-                let unsupported = handle
+                // Oversized inputs still apply but are omitted from bounded replay
+                // history. The resulting revision gap must refuse historical review.
+                let omitted = handle
                     .submit_control_command(ControlCommand::Intervention(Box::new(
                         scriptbots_core::interventions::InterventionCommand::new(
                             scriptbots_core::interventions::Intervention::Embargo {
@@ -8254,16 +8200,18 @@ pub(crate) mod tests {
                                 ticks: 2,
                             },
                             scriptbots_core::interventions::InterventionSurface::Script,
-                            "event-canvas-missing-input",
+                            "x".repeat(
+                                scriptbots_runtime::MAX_SCIENTIFIC_COMMAND_HISTORY_BYTES + 1,
+                            ),
                         ),
                     )))
                     .unwrap();
-                host.wait_applied(&unsupported);
+                host.wait_applied(&omitted);
                 host.wait_applied(&handle.step().unwrap());
-                let after_unsupported = host.port.scientific_digest_v1().unwrap();
-                let after_unsupported_publication = handle.read_snapshot().unwrap();
+                let after_omitted = host.port.scientific_digest_v1().unwrap();
+                let after_omitted_publication = handle.read_snapshot().unwrap();
                 assert!(
-                    after_unsupported_publication
+                    after_omitted_publication
                         .applied_interventions
                         .iter()
                         .any(|record| record.kind == "embargo" && !record.expired)
@@ -8271,16 +8219,16 @@ pub(crate) mod tests {
                 let refusal = handle
                     .event_canvas(fresh_target)
                     .err()
-                    .expect("an applied unsupported input must refuse event review");
+                    .expect("an applied input omitted from history must refuse event review");
                 assert!(
                     matches!(&refusal, ControlError::BadRequest(message)
                         if message.contains("scientific revisions")),
                     "{refusal}"
                 );
-                assert_eq!(host.port.scientific_digest_v1().unwrap(), after_unsupported);
+                assert_eq!(host.port.scientific_digest_v1().unwrap(), after_omitted);
                 assert!(Arc::ptr_eq(
                     &handle.read_snapshot().unwrap(),
-                    &after_unsupported_publication
+                    &after_omitted_publication
                 ));
             }
             fs::write(

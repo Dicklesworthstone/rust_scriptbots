@@ -167,9 +167,10 @@ fn scientific_command_retained_bytes(command: &ControlCommand) -> Option<usize> 
             use scriptbots_core::{CellId, CellSelector, Intervention, InterventionCommand};
             let selector = match &command.intervention {
                 Intervention::SpawnFromArchive { selector, .. } => match selector {
-                    CellSelector::AxisRange(axes) => axes
-                        .capacity()
-                        .saturating_mul(size_of::<(usize, f32, f32)>()),
+                    CellSelector::AxisRange(axes) => {
+                        axes.capacity()
+                            .saturating_mul(size_of::<(usize, f32, f32)>())
+                    }
                     CellSelector::Explicit(cells) => {
                         cells.capacity().saturating_mul(size_of::<CellId>())
                     }
@@ -5097,20 +5098,7 @@ impl HostCore {
             &layers,
             refresh,
         );
-        // SetClosedWorld is the sole tick-stage config mutation outside the config
-        // revision domain. Observe its actual effect without inventing a config edit
-        // or audit entry; queued interventions leave both cached payloads untouched.
-        let config_revision_changed = self.revisions.config != self.last_published_config;
-        let config = if config_revision_changed || self.config.closed != self.world.is_closed() {
-            Arc::new(self.world.config().clone())
-        } else {
-            Arc::clone(&self.config)
-        };
-        let config_audit = if config_revision_changed {
-            Arc::new(self.world.config_audit().to_vec())
-        } else {
-            Arc::clone(&self.config_audit)
-        };
+        let (config, config_audit) = self.snapshot_config();
         // Same revision-gating shape as config, keyed on the ring's monotonic
         // seq: interventions are rare, so this is a pointer clone on almost
         // every publication rather than a copy of the ring.
@@ -5173,6 +5161,24 @@ impl HostCore {
         self.last_published_scientific = self.revisions.scientific;
         self.shared.borrow_mut().visible_boundary = self.applied_boundary();
         Ok(())
+    }
+
+    fn snapshot_config(&self) -> (Arc<ScriptBotsConfig>, Arc<Vec<ConfigAuditEntry>>) {
+        // SetClosedWorld is the sole tick-stage config mutation outside the config
+        // revision domain. Observe its actual effect without inventing a config edit
+        // or audit entry; queued interventions leave both cached payloads untouched.
+        let config_revision_changed = self.revisions.config != self.last_published_config;
+        let config = if config_revision_changed || self.config.closed != self.world.is_closed() {
+            Arc::new(self.world.config().clone())
+        } else {
+            Arc::clone(&self.config)
+        };
+        let config_audit = if config_revision_changed {
+            Arc::new(self.world.config_audit().to_vec())
+        } else {
+            Arc::clone(&self.config_audit)
+        };
+        (config, config_audit)
     }
 
     fn snapshot_scheduled(&self, build: &mut SnapshotBuildStats) -> Arc<Vec<ScheduledPatchStatus>> {
@@ -6809,7 +6815,7 @@ mod tests {
             assert!(!paired.host_checkpoint().has_schedule());
             assert_eq!(paired.host_checkpoint().remaining_schedule(), None);
             assert_eq!(paired.host_checkpoint().completed_schedule_sequence(), None);
-            assert!(paired.host_checkpoint().scheduled_patch_history().is_empty());
+            assert_eq!(paired.host_checkpoint().scheduled_patch_history(), []);
             assert_eq!(
                 paired.journal.scientific_entries.len(),
                 usize::try_from(completed.min(3)).unwrap()
@@ -7018,7 +7024,7 @@ mod tests {
             pending.remaining_schedule().unwrap(),
             [scheduled(1, 0, serde_json::json!({"food_max": 0.61}))]
         );
-        assert!(pending.scheduled_patch_history().is_empty());
+        assert_eq!(pending.scheduled_patch_history(), []);
         settle_continuation_command(
             &mut scheduled_owner,
             CommandEnvelope::new(CommandId::new(5), HostCommand::Step),
@@ -7043,7 +7049,7 @@ mod tests {
         );
         let completed = scheduled_owner.capture_host_checkpoint_v1().unwrap();
         assert_eq!(completed.completed_schedule_sequence(), Some(1));
-        assert!(completed.remaining_schedule().unwrap().is_empty());
+        assert_eq!(completed.remaining_schedule().unwrap(), []);
         assert_eq!(completed.scheduled_patch_history().len(), 1);
         assert_eq!(
             completed.scheduled_patch_history()[0].evidence.scheduled,
@@ -7070,9 +7076,9 @@ mod tests {
         );
         let empty_cut = empty.capture_host_checkpoint_v1().unwrap();
         assert!(empty_cut.has_schedule());
-        assert!(empty_cut.remaining_schedule().unwrap().is_empty());
+        assert_eq!(empty_cut.remaining_schedule().unwrap(), []);
         assert_eq!(empty_cut.completed_schedule_sequence(), Some(0));
-        assert!(empty_cut.scheduled_patch_history().is_empty());
+        assert_eq!(empty_cut.scheduled_patch_history(), []);
     }
 
     #[test]
@@ -7128,16 +7134,17 @@ mod tests {
             2
         );
         assert_eq!(
-            captured.scientific_commands[1].boundary().revisions.scientific,
+            captured.scientific_commands[1]
+                .boundary()
+                .revisions
+                .scientific,
             captured.scientific_revision
         );
-        assert!(
-            matches!(
-                captured.scientific_commands[0].command(),
-                ControlCommand::SpawnAgent { herbivore_tendency }
-                    if herbivore_tendency.to_bits() == 0.5_f32.to_bits()
-            )
-        );
+        assert!(matches!(
+            captured.scientific_commands[0].command(),
+            ControlCommand::SpawnAgent { herbivore_tendency }
+                if herbivore_tendency.to_bits() == 0.5_f32.to_bits()
+        ));
         settle_continuation_command(
             &mut owner,
             CommandEnvelope::new(
@@ -7150,7 +7157,11 @@ mod tests {
         );
         let cut = owner.scientific_digest_cut().unwrap();
         assert_eq!(
-            cut.scientific_commands[0].boundary().revisions.scientific.get(),
+            cut.scientific_commands[0]
+                .boundary()
+                .revisions
+                .scientific
+                .get(),
             3
         );
         assert_eq!(owner.world().agents().len(), 4);
@@ -7226,7 +7237,11 @@ mod tests {
         let cut = owner.scientific_digest_cut().unwrap();
         assert_eq!(cut.scientific_commands.len(), 1);
         assert_eq!(
-            cut.scientific_commands[0].boundary().revisions.scientific.get(),
+            cut.scientific_commands[0]
+                .boundary()
+                .revisions
+                .scientific
+                .get(),
             1
         );
         assert!(matches!(
@@ -7303,7 +7318,11 @@ mod tests {
                     .sum::<usize>()
             );
             assert_eq!(
-                cut.scientific_commands[0].boundary().revisions.scientific.get(),
+                cut.scientific_commands[0]
+                    .boundary()
+                    .revisions
+                    .scientific
+                    .get(),
                 sequence * 2 - 1
             );
             if sequence == 1 {
@@ -7346,7 +7365,11 @@ mod tests {
         assert_eq!(cut.scientific_revision.get(), 6);
         assert_eq!(cut.scientific_commands.len(), 1);
         assert_eq!(
-            cut.scientific_commands[0].boundary().revisions.scientific.get(),
+            cut.scientific_commands[0]
+                .boundary()
+                .revisions
+                .scientific
+                .get(),
             3
         );
         assert!(
@@ -7432,6 +7455,43 @@ mod tests {
         );
     }
 
+    fn assert_pending_schedule_cut(
+        checkpoint: &HostCheckpointV1,
+        declared: &[ScheduledConfigPatch],
+        completed_steps: u64,
+    ) {
+        assert_eq!(checkpoint.tick(), Tick(completed_steps));
+        assert_eq!(checkpoint.world_checkpoint().agent_count(), 4);
+        assert_eq!(
+            checkpoint.state.revisions.scientific.get(),
+            completed_steps + 1
+        );
+        assert!(checkpoint.has_schedule());
+        assert_retained_step_traces(checkpoint, completed_steps);
+        let completed_patches = usize::from(completed_steps > 1);
+        assert_eq!(
+            checkpoint.completed_schedule_sequence(),
+            Some(u64::from(completed_steps > 1))
+        );
+        assert_eq!(
+            checkpoint.remaining_schedule().unwrap(),
+            &declared[completed_patches..],
+            "a patch due at the captured tick stays pending until the next science step"
+        );
+        assert_eq!(
+            checkpoint.scheduled_patch_history().len(),
+            completed_patches
+        );
+        for (status, expected) in checkpoint
+            .scheduled_patch_history()
+            .iter()
+            .zip(&declared[..completed_patches])
+        {
+            assert_eq!(&status.evidence.scheduled, expected);
+            assert_eq!(status.journal, JournalState::CommittedVolatile);
+        }
+    }
+
     #[test]
     fn full_host_checkpoint_continues_nonempty_owner_schedule_counters_and_exact_retries() {
         let declared = [
@@ -7458,37 +7518,14 @@ mod tests {
             let checkpoint = original
                 .capture_host_checkpoint_v1()
                 .expect("actual settled host cut");
-            assert_eq!(checkpoint.tick(), Tick(completed_steps));
-            assert_eq!(checkpoint.world_checkpoint().agent_count(), 4);
-            assert_eq!(
-                checkpoint.state.revisions.scientific.get(),
-                completed_steps + 1
-            );
-            assert!(checkpoint.has_schedule());
-            assert_retained_step_traces(&checkpoint, completed_steps);
-            let completed_patches = usize::from(completed_steps > 1);
-            assert_eq!(
-                checkpoint.completed_schedule_sequence(),
-                Some(u64::from(completed_steps > 1))
-            );
-            assert_eq!(
-                checkpoint.remaining_schedule().unwrap(),
-                &declared[completed_patches..],
-                "a patch due at the captured tick stays pending until the next science step"
-            );
-            assert_eq!(checkpoint.scheduled_patch_history().len(), completed_patches);
-            for (status, expected) in checkpoint
-                .scheduled_patch_history()
-                .iter()
-                .zip(&declared[..completed_patches])
-            {
-                assert_eq!(&status.evidence.scheduled, expected);
-                assert_eq!(status.journal, JournalState::CommittedVolatile);
-            }
+            assert_pending_schedule_cut(&checkpoint, &declared, completed_steps);
             let wire = checkpoint.encode().expect("bounded owner encoding");
             let decoded = HostCheckpointV1::decode(&wire).expect("full owner decoding");
             assert_eq!(decoded.encode().expect("canonical re-encoding"), wire);
-            assert_eq!(decoded.remaining_schedule(), checkpoint.remaining_schedule());
+            assert_eq!(
+                decoded.remaining_schedule(),
+                checkpoint.remaining_schedule()
+            );
             assert_eq!(
                 decoded.scheduled_patch_history(),
                 checkpoint.scheduled_patch_history()
@@ -7625,7 +7662,10 @@ mod tests {
             assert_eq!(checkpoint.scheduled_patch_history_capacity(), capacity);
             assert_eq!(checkpoint.scheduled_patch_history().len(), 3.min(capacity));
             assert_eq!(
-                checkpoint.scheduled_patch_history()[0].evidence.scheduled.sequence,
+                checkpoint.scheduled_patch_history()[0]
+                    .evidence
+                    .scheduled
+                    .sequence,
                 4 - u64::try_from(3.min(capacity)).unwrap()
             );
             assert_eq!(checkpoint.remaining_schedule().unwrap()[0].sequence, 4);
@@ -7668,7 +7708,7 @@ mod tests {
             let after = restored.capture_host_checkpoint_v1().unwrap();
             let uninterrupted = oracle.capture_host_checkpoint_v1().unwrap();
             assert_eq!(after.completed_schedule_sequence(), Some(4));
-            assert!(after.remaining_schedule().unwrap().is_empty());
+            assert_eq!(after.remaining_schedule().unwrap(), []);
             assert_eq!(after.scheduled_patch_history_capacity(), capacity);
             assert_eq!(after.step_traces(), uninterrupted.step_traces());
             assert_eq!(after.encode().unwrap(), uninterrupted.encode().unwrap());
@@ -8813,13 +8853,11 @@ mod tests {
                 &mut core,
                 CommandEnvelope::new(
                     CommandId::new(u128::from(sequence)),
-                    HostCommand::Intervention(Box::new(
-                        scriptbots_core::InterventionCommand::new(
-                            scriptbots_core::Intervention::SetClosedWorld { closed },
-                            scriptbots_core::InterventionSurface::Script,
-                            "closure-publication",
-                        ),
-                    )),
+                    HostCommand::Intervention(Box::new(scriptbots_core::InterventionCommand::new(
+                        scriptbots_core::Intervention::SetClosedWorld { closed },
+                        scriptbots_core::InterventionSurface::Script,
+                        "closure-publication",
+                    ))),
                 ),
                 start + 1,
             );
