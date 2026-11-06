@@ -7598,7 +7598,8 @@ pub(crate) mod tests {
                     &handle.read_snapshot().unwrap(),
                     &after_spawn_publication
                 ));
-                // Real config edits have their own revision domain, including a round trip.
+                // Complete recorded config edits remain replayable, including a round trip
+                // after a recorded agent command at the same live boundary.
                 let food_max = current.config.food_max;
                 host.wait_applied(
                     &handle
@@ -7610,10 +7611,20 @@ pub(crate) mod tests {
                         .apply_patch(serde_json::json!({"food_max": food_max}))
                         .unwrap(),
                 );
-                assert!(
-                    matches!(handle.event_canvas(target_tick), Err(ControlError::BadRequest(message))
-                    if message.contains("scientific revisions"))
+                let after_config = host.port.scientific_digest_v1().unwrap();
+                let after_config_publication = handle.read_snapshot().unwrap();
+                let replayed = handle.event_canvas(target_tick).unwrap_or_else(|error| {
+                    panic!("complete recorded config round trip must replay: {error}")
+                });
+                assert_eq!(
+                    logical(serde_json::to_value(&replayed.snapshot.world).unwrap()),
+                    logical(serde_json::to_value(&oracle.world).unwrap())
                 );
+                assert_eq!(host.port.scientific_digest_v1().unwrap(), after_config);
+                assert!(Arc::ptr_eq(
+                    &handle.read_snapshot().unwrap(),
+                    &after_config_publication
+                ));
                 let fresh = handle
                     .create_checkpoint(CheckpointCreateRequest::default())
                     .unwrap();
@@ -7625,6 +7636,45 @@ pub(crate) mod tests {
                 assert_eq!(review.base_tick, fresh.tick);
                 assert_eq!(review.checkpoint_id, fresh.checkpoint_id);
                 assert_eq!(review.snapshot.world.tick, fresh_target);
+
+                // Preserve the missing-input refusal with an actual unsupported input,
+                // rather than treating the complete configuration audit as missing.
+                let unsupported = handle
+                    .submit_control_command(ControlCommand::Intervention(Box::new(
+                        scriptbots_core::interventions::InterventionCommand::new(
+                            scriptbots_core::interventions::Intervention::Embargo {
+                                region: scriptbots_core::Region::All,
+                                ticks: 2,
+                            },
+                            scriptbots_core::interventions::InterventionSurface::Script,
+                            "event-canvas-missing-input",
+                        ),
+                    )))
+                    .unwrap();
+                host.wait_applied(&unsupported);
+                host.wait_applied(&handle.step().unwrap());
+                let after_unsupported = host.port.scientific_digest_v1().unwrap();
+                let after_unsupported_publication = handle.read_snapshot().unwrap();
+                assert!(
+                    after_unsupported_publication
+                        .applied_interventions
+                        .iter()
+                        .any(|record| record.kind == "embargo" && !record.expired)
+                );
+                let refusal = handle
+                    .event_canvas(fresh_target)
+                    .err()
+                    .expect("an applied unsupported input must refuse event review");
+                assert!(
+                    matches!(&refusal, ControlError::BadRequest(message)
+                        if message.contains("scientific revisions")),
+                    "{refusal}"
+                );
+                assert_eq!(host.port.scientific_digest_v1().unwrap(), after_unsupported);
+                assert!(Arc::ptr_eq(
+                    &handle.read_snapshot().unwrap(),
+                    &after_unsupported_publication
+                ));
             }
             fs::write(
                 directory.join("target-oracle.json"),
@@ -7651,7 +7701,7 @@ pub(crate) mod tests {
                 Err(ControlError::InvalidPatch(_))
             ));
             eprintln!(
-                "event canvas preset {preset:?}: base={} target={target_tick} current={} actual science={}; distinct state, matching projection, source guards and corrupt bytes checked",
+                "event canvas preset {preset:?}: base={} target={target_tick} captured_current={} captured_science={}; distinct state, matching projection, source guards and corrupt bytes checked",
                 checkpoint.tick, current.world.tick, current_digest.overall
             );
         }
