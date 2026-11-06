@@ -66,6 +66,7 @@ const camelCaseWasmModule = `
     let speed = 1;
     let credit = 0;
     return {
+      free() {},
       setSpeed(value) { speed = value; },
       drive(now) {
         credit += (now - elapsed) * speed * 60 / 1000;
@@ -125,6 +126,7 @@ const snakeCaseWasmModule = `
     let elapsed = 0;
     let speed = 1;
     return {
+      free() {},
       setSpeed(value) { speed = value; },
       drive(now) {
         const steps = Math.floor((now - elapsed) * speed * 60 / 1000);

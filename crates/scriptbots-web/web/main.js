@@ -95,6 +95,7 @@ const perfWindow = {
 };
 
 let simHandle = null;
+let wasmInitialized = false;
 let simulationGeneration = 0;
 let speedMultiplier = Number(stepsSlider.value);
 let simulationStartedAt = null;
@@ -124,12 +125,22 @@ populationSlider.addEventListener("input", () => {
 
 resetButton.addEventListener("click", () => {
   if (remoteMode) return;
-  queuedReset = true;
   if (permalinkStatus) {
     permalinkStatus.textContent = "";
   }
   appendLog("Reset requested");
-  if (simulationStartedAt !== null && simulationTimer === null) pumpSimulation();
+  if (wasmInitialized && simulationTimer === null) {
+    // A failed startup has no owner to drive, and a stopped owner's clock must
+    // stay stopped if its replacement is refused. Only a successful install
+    // schedules a new pump in either case.
+    queuedReset = false;
+    resetSimulation(population).catch((err) => {
+      console.error(err);
+      appendLog(`Reset failed: ${err}`);
+    });
+  } else {
+    queuedReset = true;
+  }
 });
 
 function appendLog(message) {
@@ -290,7 +301,7 @@ remoteLocal.addEventListener("click", () => {
   resetPerformanceWindows();
   updateRemoteControls();
   applyPlaybackSpeed();
-  if (simulationTimer === null) pumpSimulation();
+  scheduleSimulation();
 });
 
 function sendRemoteControl(command) {
@@ -325,11 +336,11 @@ remoteRetry.addEventListener("click", () => {
   } catch (error) { remoteReceipt.textContent = `Retry failed: ${error.message}`; }
 });
 
-function resetPerformanceWindows() {
+function resetPerformanceWindows(snapshot = null) {
   const now = performance.now();
   metrics.lastFrameTs = now;
   metrics.lastStatsTs = now;
-  metrics.previousTick = remoteMode ? remoteFrame?.snapshot.tick ?? null : simHandle ? simHandle.snapshot().tick : null;
+  metrics.previousTick = snapshot?.tick ?? (remoteMode ? remoteFrame?.snapshot.tick ?? null : simHandle ? simHandle.snapshot().tick : null);
   metrics.fps = 0;
   metrics.tps = 0;
   metrics.tick = 0;
@@ -596,12 +607,60 @@ function applyPlaybackSpeed() {
   simHandle.setSpeed(document.hidden ? 0 : speedMultiplier);
 }
 
-function startSimulationClock(applySpeed = true) {
+function releaseSimulation(handle) {
+  try {
+    handle.free();
+  } catch (error) {
+    console.error("Failed to release simulation", error);
+    appendLog(`Failed to release simulation: ${error.message || error}`);
+  }
+}
+
+function replaceSimulation(next, { continuation = false, permalink = null } = {}) {
+  const nextSpeed = continuation ? 0 : speedMultiplier;
+  let frame;
+  let brainPreset;
+  try {
+    // All fallible owner reads happen before the active world, clock, or UI is
+    // changed. Refusing a candidate must leave the previous owner usable.
+    next.setSpeed(document.hidden ? 0 : nextSpeed);
+    frame = next.frame();
+    validateFrameIdentity(frame);
+    if (continuation) {
+      brainPreset = next.brainPreset();
+    } else if (permalink_of) {
+      permalink = permalink_of(next);
+    } else if (next.permalinkOf) {
+      permalink = next.permalinkOf();
+    }
+  } catch (error) {
+    releaseSimulation(next);
+    throw error;
+  }
+
+  const previous = simHandle;
+  simHandle = next;
   simulationGeneration += 1;
   simulationStartedAt = performance.now();
-  if (applySpeed) simHandle.setSpeed(document.hidden ? 0 : speedMultiplier);
+  lastPaintedFrame = null;
+  if (continuation) {
+    speedMultiplier = 0;
+    stepsSlider.value = "0";
+    if (brainPresetSelect) brainPresetSelect.value = brainPreset;
+  }
+  resetPerformanceWindows(frame.snapshot);
+  if (captureRequest) finishCapture(captureRequest, new Error("World changed during capture; try again"));
   captureButton.disabled = !!captureRequest || !!encodingRequest;
   updateCheckpointControls();
+  if (previous) releaseSimulation(previous);
+  scheduleSimulation();
+  return { frame, permalink };
+}
+
+function scheduleSimulation() {
+  if (!remoteMode && simHandle && simulationTimer === null) {
+    simulationTimer = setTimeout(pumpSimulation, 1000 / 60);
+  }
 }
 
 function pumpSimulation() {
@@ -609,11 +668,11 @@ function pumpSimulation() {
   if (remoteMode) return;
 
   if (queuedReset) {
+    queuedReset = false;
     resetSimulation(population).catch((err) => {
       console.error(err);
       appendLog(`Reset failed: ${err}`);
     });
-    queuedReset = false;
   }
 
   try {
@@ -621,11 +680,13 @@ function pumpSimulation() {
   } catch (err) {
     console.error("Simulation clock stopped", err);
     appendLog(`Simulation clock stopped: ${err}`);
+    if (simulationTimer !== null) clearTimeout(simulationTimer);
+    simulationTimer = null;
     return;
   }
   // One outstanding callback, no snapshot queue. HostCore owns deadlines and
   // its unchanged catch-up bound; timer jitter never becomes a render tick.
-  simulationTimer = setTimeout(pumpSimulation, 1000 / 60);
+  scheduleSimulation();
 }
 
 function bannerLine(parent, text, className = "") {
@@ -746,25 +807,14 @@ async function loadWorldFromPermalink(linkStr) {
       throw new Error("init_from_permalink is not exported by wasm module");
     }
 
-    const handle = init_from_permalink(linkStr);
-    simHandle = handle;
-    startSimulationClock();
-    currentPermalink = linkStr;
+    const installed = replaceSimulation(init_from_permalink(linkStr), { permalink: linkStr });
+    currentPermalink = installed.permalink;
     if (permalinkInput) {
       permalinkInput.value = linkStr;
     }
 
-    try {
-      if (permalink_of) {
-        currentPermalink = permalink_of(simHandle);
-      } else if (simHandle.permalinkOf) {
-        currentPermalink = simHandle.permalinkOf();
-      }
-    } catch (_) {}
-
     updateMismatchBanner(matchResult);
     updateDiffTable(linkStr);
-    resetPerformanceWindows();
 
     if (permalinkStatus) {
       permalinkStatus.textContent = "World loaded from permalink";
@@ -916,21 +966,11 @@ async function resetSimulation(populationOverride) {
     seed_strategy: brainPresetSelect?.value === "none" || brainPresetSelect?.value === "mlp" ? "none" : "wander",
   };
 
-  simHandle = init_sim(options);
-  startSimulationClock();
-  resetPerformanceWindows();
-
-  currentPermalink = null;
-  try {
-    if (permalink_of) {
-      currentPermalink = permalink_of(simHandle);
-    } else if (simHandle && simHandle.permalinkOf) {
-      currentPermalink = simHandle.permalinkOf();
-    }
-    if (currentPermalink && permalinkInput) {
-      permalinkInput.value = currentPermalink;
-    }
-  } catch (_) {}
+  const installed = replaceSimulation(init_sim(options));
+  currentPermalink = installed.permalink;
+  if (currentPermalink && permalinkInput) {
+    permalinkInput.value = currentPermalink;
+  }
 
   updateMismatchBanner(null);
   updateDiffTable(currentPermalink);
@@ -986,33 +1026,20 @@ checkpointLoadInput?.addEventListener("change", async () => {
       checkpointStatus.textContent = "Load cancelled because the active world changed.";
       return;
     }
-    const next = wasm.restore_checkpoint(bytes);
-    try {
-      next.setSpeed(0);
-    } catch (error) {
-      next.free();
-      throw error;
-    }
-    simHandle = next;
-    speedMultiplier = 0;
-    stepsSlider.value = "0";
-    if (brainPresetSelect) brainPresetSelect.value = next.brainPreset();
-    startSimulationClock(false);
-    resetPerformanceWindows();
+    const installed = replaceSimulation(wasm.restore_checkpoint(bytes), { continuation: true });
     currentPermalink = null;
     if (permalinkInput) permalinkInput.value = "";
     latestForkedLink = null;
     if (forkOutput) forkOutput.style.display = "none";
     updateMismatchBanner(null);
     updateDiffTable(null);
-    original.free();
     try {
       const url = new URL(window.location.href);
       url.searchParams.delete("world");
       url.searchParams.delete("permalink");
       window.history.replaceState({}, "", url.toString());
     } catch (_) {}
-    checkpointStatus.textContent = `Loaded continuation at tick ${next.frame().identity.tick}; paused.`;
+    checkpointStatus.textContent = `Loaded continuation at tick ${installed.frame.identity.tick}; paused.`;
   } catch (error) {
     checkpointStatus.textContent = `Load failed: ${error.message || error}`;
   } finally {
@@ -1024,6 +1051,7 @@ checkpointLoadInput?.addEventListener("change", async () => {
 async function bootstrap() {
   try {
     await initWasm();
+    wasmInitialized = true;
     // GPU initialization must not hold up science or the first visible frame.
     await selectRenderer("canvas");
     if (rendererSelect.value !== "canvas") {
@@ -1037,13 +1065,14 @@ async function bootstrap() {
 
     const urlParams = new URLSearchParams(window.location.search);
     const worldParam = urlParams.get("world") || urlParams.get("permalink");
-    if (worldParam && init_from_permalink) {
+    if (worldParam && init_from_permalink && !queuedReset) {
       await loadWorldFromPermalink(worldParam);
     } else {
+      queuedReset = false;
       await resetSimulation(population);
     }
 
-    if (simulationTimer === null) pumpSimulation();
+    scheduleSimulation();
     remoteConnect.disabled = false;
     requestAnimationFrame(presentSimulation);
   } catch (err) {
