@@ -695,9 +695,29 @@ report zero database-persisted events/checkpoints even though their final owner 
 A failed export retains partial files without a success manifest.
 
 ### Dual-window mode (GUI)
-- ScriptBots opens two GPUI windows as one transactional launch and tiles them inside the primary display's visible frame: a flexible World window and a narrow `ScriptBots Lab` companion. The Lab does not duplicate the canvas; its Overview, Inspect, Analytics, and Timeline tabs keep one task-focused surface visible at a time, with dense diagnostics closed by default and the active section vertically scrollable. On narrow displays the pair stacks without overlap.
+- ScriptBots opens two GPUI windows as one transactional launch and tiles them inside the primary display's visible frame: a flexible World window and a narrow `ScriptBots Lab` companion. The Lab's Overview, Inspect, Analytics, Timeline, Experiments, Checkpoints and Maps tabs keep one task-focused surface visible at a time, with dense diagnostics closed by default and the active section vertically scrollable. On narrow displays the pair stacks without overlap. This is the optional GPUI route, built with `--features gui` and selected with `--mode gui`.
 - Display-local controls—agents, food, outlines, follow, camera fit, zoom, pan, debug overlays, palette, narration, and settings—stay in the World window they affect. Shared run controls—pause, step, speed, spawning, environment, and presets—live in the Lab. If either window cannot be created (for example because of window-manager or remote-session limits), ScriptBots terminates the partial application lifetime and returns an actionable error; it never silently changes the requested layout. GPUI uses `QuitMode::LastWindowClosed`, and closing either member of the pair closes the application rather than leaving an orphaned window or hidden process.
 - Both GPUI windows read immutable publications from the same `HostCore` on the application owner thread. Run controls submit commands to that owner; painting and window refresh rates do not advance scientific time.
+- **Experiments** lists retained batches in pages of 12. Select one to see completed,
+  running and failed counts for every variant, stop active execution or resume
+  unfinished runs. Catalog and active-batch observations refresh every two seconds;
+  manual Refresh is also available. Variant paging keeps all 64 admitted arms
+  reachable even when each has many seeds. Choose a baseline and challenger, then
+  **Compare verified population endpoints** to analyze `alive_agents` through the
+  shared bundle/checkpoint verifier. The result shows challenger minus baseline,
+  endpoint tick, paired sample count, confidence interval, p values and paired
+  effect size, including explicit descriptive-only and undefined outcomes.
+- **Checkpoints** lists retained scientific cuts in pages of 12. Select a cut and
+  **Review selected checkpoint in World** to reconstruct its verified historical
+  frame. **Return World to live** restores the current view; a later World-window
+  live/seek/step action also discards an outstanding checkpoint result. Save new
+  cuts through Timeline's **Save replay checkpoint** action. This reviews saved
+  science without replacing or branching the live simulation owner.
+- Both new panes share one background worker. Discarding a pending result keeps
+  its slot occupied until work finishes; submitted experiment stop/resume actions
+  still take effect. Session, selection and source-generation checks prevent
+  stale results from replacing newer observations, and failed evidence clears an
+  earlier displayed comparison. File and statistics work stays outside painting.
 
 ## Simulation overview
 Deterministic, staged tick pipeline (six seeded, domain-separated RNG streams; explicit staged ordering):

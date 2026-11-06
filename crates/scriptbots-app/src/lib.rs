@@ -4108,6 +4108,138 @@ pub mod renderer {
         })
     }
 
+    /// Project existing application services into the optional GPUI Lab. All I/O,
+    /// verification and statistics execute on the renderer's single Lab worker.
+    #[cfg(any(feature = "gui", test))]
+    #[must_use]
+    pub fn lab_workflow_submit(
+        control: crate::control::ControlHandle,
+    ) -> scriptbots_render::lab_workflows::LabWorkflowSubmit {
+        use scriptbots_render::lab_workflows::{
+            LAB_PAGE_SIZE, LabCheckpoint, LabCheckpointPage, LabComparison,
+            LabExperimentPage, LabWorkflowRequest, LabWorkflowResponse,
+        };
+        Arc::new(move |request| {
+            let result = match request {
+                LabWorkflowRequest::ListExperiments { cursor } => control
+                    .list_experiments(Some(LAB_PAGE_SIZE), cursor.as_deref())
+                    .map(|page| LabWorkflowResponse::Experiments(LabExperimentPage {
+                        items: page.items.into_iter().map(|row| {
+                            scriptbots_render::lab_workflows::LabExperimentSummary {
+                                experiment_id: row.experiment_id,
+                                status: row.status,
+                                total_runs: row.total_runs,
+                                completed_runs: row.completed_runs,
+                                failed_runs: row.failed_runs,
+                            }
+                        }).collect(),
+                        total: page.total,
+                        offset: page.offset,
+                        next_cursor: page.next_cursor,
+                        reserved_run_slots: page.execution_capacity.reserved_run_slots,
+                        max_run_slots: page.execution_capacity.max_run_slots,
+                    })),
+                LabWorkflowRequest::GetExperiment { experiment_id } => control
+                    .get_experiment(&experiment_id)
+                    .and_then(project_lab_experiment)
+                    .map(LabWorkflowResponse::Experiment),
+                LabWorkflowRequest::CancelExperiment { experiment_id } => control
+                    .cancel_experiment(&experiment_id)
+                    .and_then(project_lab_experiment)
+                    .map(LabWorkflowResponse::Experiment),
+                LabWorkflowRequest::ResumeExperiment { experiment_id } => control
+                    .resume_experiment(&experiment_id)
+                    .and_then(project_lab_experiment)
+                    .map(LabWorkflowResponse::Experiment),
+                LabWorkflowRequest::Compare { experiment_id, baseline_variant, challenger_variant } => control
+                    .compare_experiment_variants(&experiment_id, &baseline_variant, &challenger_variant, "alive_agents")
+                    .map(|comparison| LabWorkflowResponse::Comparison(LabComparison {
+                        experiment_id: comparison.experiment_id,
+                        baseline_variant: comparison.baseline_variant,
+                        challenger_variant: comparison.challenger_variant,
+                        endpoint_tick: comparison.endpoint_tick,
+                        matched_seeds: comparison.matched_seeds,
+                        mean_difference: comparison.mean_difference,
+                        ci_95: comparison.ci_95,
+                        standardized_effect: comparison.standardized_effect,
+                        p_value: comparison.p_value,
+                        adjusted_p_value: comparison.adjusted_p_value,
+                        descriptive_only: comparison.descriptive_only,
+                        underpowered_reason: comparison.underpowered_reason,
+                        undefined_effect_reason: comparison.undefined_effect_reason,
+                        plan_digest: comparison.plan_digest,
+                        status_generation: comparison.status_generation,
+                    })),
+                LabWorkflowRequest::ListCheckpoints { cursor } => control
+                    .list_checkpoints(Some(LAB_PAGE_SIZE), cursor.as_deref())
+                    .map(|page| LabWorkflowResponse::Checkpoints(LabCheckpointPage {
+                        items: page.items.into_iter().map(|checkpoint| LabCheckpoint {
+                            checkpoint_id: checkpoint.checkpoint_id,
+                            tick: checkpoint.tick,
+                            agent_count: checkpoint.agent_count,
+                            byte_size: checkpoint.byte_size,
+                            world_digest: checkpoint.world_digest_v1,
+                        }).collect(),
+                        total: page.total,
+                        offset: page.offset,
+                        next_cursor: page.next_cursor,
+                        retained_bytes: page.retention.file_bytes,
+                        max_bytes: page.retention.max_bytes,
+                    })),
+                LabWorkflowRequest::ReviewCheckpoint { checkpoint_id } => control
+                    .checkpoint_canvas(&checkpoint_id)
+                    .map(|snapshot| LabWorkflowResponse::CheckpointFrame { checkpoint_id, snapshot }),
+            };
+            result.map_err(|error| error.to_string())
+        })
+    }
+
+    #[cfg(any(feature = "gui", test))]
+    fn project_lab_experiment(
+        batch: crate::control::ExperimentBatchStatusDto,
+    ) -> Result<scriptbots_render::lab_workflows::LabExperiment, crate::control::ControlError> {
+        use scriptbots_render::lab_workflows::{
+            LAB_MAX_VARIANTS, LabExperiment, LabExperimentSummary, LabVariantProgress,
+        };
+        if batch.runs.len() > 4096 {
+            return Err(crate::control::ControlError::PayloadTooLarge("experiment exceeds Lab run projection bound".into()));
+        }
+        let mut variants = std::collections::BTreeMap::<String, LabVariantProgress>::new();
+        for run in batch.runs {
+            let row = variants.entry(run.variant_id.clone()).or_insert_with(|| LabVariantProgress {
+                variant_id: run.variant_id,
+                brain_family: run.brain_family,
+                total_runs: 0,
+                completed_runs: 0,
+                failed_runs: 0,
+                running_runs: 0,
+            });
+            row.total_runs += 1;
+            match run.state.as_str() {
+                "completed" => row.completed_runs += 1,
+                "failed" => row.failed_runs += 1,
+                "running" => row.running_runs += 1,
+                _ => {}
+            }
+            if variants.len() > LAB_MAX_VARIANTS {
+                return Err(crate::control::ControlError::PayloadTooLarge("experiment exceeds Lab variant projection bound".into()));
+            }
+        }
+        Ok(LabExperiment {
+            summary: LabExperimentSummary {
+                experiment_id: batch.experiment_id,
+                status: batch.status,
+                total_runs: batch.total_runs,
+                completed_runs: batch.completed_runs,
+                failed_runs: batch.failed_runs,
+            },
+            plan_digest: batch.plan_digest,
+            generation: batch.generation,
+            variants: variants.into_values().collect(),
+            error_reason: batch.error_reason.map(|reason| reason.chars().take(2048).collect()),
+        })
+    }
+
     /// Shared context passed to renderer implementations.
     pub struct RendererContext<'a> {
         pub host: ChannelHostPort,
@@ -4134,6 +4266,100 @@ pub mod renderer {
         use scriptbots_render::{
             TimelineReviewRequest, TimelineReviewResponse, render_png_offscreen,
         };
+
+        #[test]
+        fn gui_lab_provider_uses_verified_experiment_bundles_and_saved_checkpoint_cuts() {
+            use scriptbots_render::lab_workflows::{LabWorkflowRequest as Request, LabWorkflowResponse as Response};
+            let root = tempfile::tempdir().unwrap();
+            let world = scriptbots_core::WorldState::new(ScriptBotsConfig {
+                rng_seed: Some(42), world_width: 120, world_height: 120, food_cell_size: 20,
+                population_minimum: 0, persistence_interval: 0, closed: true,
+                ..ScriptBotsConfig::default()
+            }).unwrap();
+            let host = TestHost::spawn(world);
+            let handle = host.handle().with_artifacts_dir(root.path().to_path_buf()).unwrap();
+            let runner = crate::control::tests::comparison_catalog_runner(root.path(), "gui-lab", vec![29, 7], 0.0);
+            runner.execute_batch(&runner.output_dir.join("status.json")).unwrap();
+            let checkpoint = handle.create_checkpoint(crate::control::CheckpointCreateRequest::default()).unwrap();
+            host.wait_applied(&handle.step().unwrap());
+            let before = host.port.scientific_digest_v1().unwrap();
+            let provider = lab_workflow_submit(handle.clone());
+            match provider(Request::ListExperiments { cursor: None }).unwrap() {
+                Response::Experiments(page) => {
+                    assert_eq!(page.total, 1);
+                    assert_eq!(page.items[0].experiment_id, "gui-lab");
+                    assert_eq!(page.items[0].completed_runs, 4);
+                }
+                _ => panic!("wrong catalog response"),
+            }
+            match provider(Request::GetExperiment { experiment_id: "gui-lab".into() }).unwrap() {
+                Response::Experiment(batch) => {
+                    assert_eq!(batch.variants.len(), 2);
+                    assert_eq!(batch.variants[0].variant_id, "baseline");
+                    assert_eq!(batch.variants[1].variant_id, "challenger");
+                    assert!(batch.variants.iter().all(|variant| variant.completed_runs == 2));
+                }
+                _ => panic!("wrong details response"),
+            }
+            let direct = handle.compare_experiment_variants("gui-lab", "baseline", "challenger", "alive_agents").unwrap();
+            match provider(Request::Compare { experiment_id: "gui-lab".into(), baseline_variant: "baseline".into(), challenger_variant: "challenger".into() }).unwrap() {
+                Response::Comparison(comparison) => {
+                    assert_eq!(comparison.matched_seeds, vec![7, 29]);
+                    assert_eq!(comparison.mean_difference.to_bits(), direct.mean_difference.to_bits());
+                    assert_eq!(comparison.ci_95, direct.ci_95);
+                    assert_eq!(comparison.p_value, direct.p_value);
+                    assert_eq!(comparison.adjusted_p_value, direct.adjusted_p_value);
+                    assert_eq!(comparison.standardized_effect, direct.standardized_effect);
+                    assert_eq!(comparison.plan_digest, direct.plan_digest);
+                    assert_eq!(comparison.status_generation, direct.status_generation);
+                    assert_eq!(comparison.endpoint_tick, 2);
+                }
+                _ => panic!("wrong comparison response"),
+            }
+            assert!(provider(Request::Compare { experiment_id: "gui-lab".into(), baseline_variant: "baseline".into(), challenger_variant: "baseline".into() }).is_err());
+            assert!(provider(Request::ResumeExperiment { experiment_id: "gui-lab".into() }).is_err(), "a completed batch has no unfinished runs");
+            assert!(provider(Request::CancelExperiment { experiment_id: "unknown".into() }).is_err());
+            match provider(Request::ListCheckpoints { cursor: None }).unwrap() {
+                Response::Checkpoints(page) => {
+                    assert_eq!(page.total, 1);
+                    assert_eq!(page.items[0].checkpoint_id, checkpoint.checkpoint_id);
+                    assert_eq!(page.items[0].world_digest, checkpoint.world_digest_v1);
+                }
+                _ => panic!("wrong checkpoint catalog response"),
+            }
+            match provider(Request::ReviewCheckpoint { checkpoint_id: checkpoint.checkpoint_id.clone() }).unwrap() {
+                Response::CheckpointFrame { checkpoint_id, snapshot } => {
+                    assert_eq!(checkpoint_id, checkpoint.checkpoint_id);
+                    assert_eq!(snapshot.world.tick, 0);
+                    assert_eq!(snapshot.world.agents.len(), checkpoint.agent_count);
+                }
+                _ => panic!("wrong checkpoint review response"),
+            }
+            let artifact = handle.get_artifact(&checkpoint.checkpoint_id).unwrap();
+            let path = root.path().join(artifact.relative_path);
+            std::fs::copy(&path, path.with_extension("preserved-original")).unwrap();
+            std::fs::write(&path, b"intentional checkpoint tamper").unwrap();
+            assert!(provider(Request::ReviewCheckpoint { checkpoint_id: checkpoint.checkpoint_id }).is_err(), "native review must retain artifact-integrity refusal");
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+            assert_eq!(host.port.snapshot_hub().latest().world.tick, 1);
+        }
+
+        #[test]
+        fn gui_lab_projection_aggregates_every_variant_before_paging() {
+            let runs = (0..64).flat_map(|variant| (0..64).map(move |seed| crate::control::ExperimentRunRecordDto {
+                run_id: format!("arm-{variant}-{seed}"), variant_id: format!("arm-{variant:02}"), brain_family: "mlp".into(), seed,
+                state: if seed == 0 { "completed" } else { "pending" }.into(), total_ticks: if seed == 0 { 2 } else { 0 },
+                final_digest: None, bundle_path: None, error_reason: None,
+            })).collect();
+            let batch = project_lab_experiment(crate::control::ExperimentBatchStatusDto {
+                schema_version: 1, generation: 1, plan_digest: "projection-test".into(), experiment_id: "all-variants".into(),
+                status: "running".into(), total_runs: 4096, completed_runs: 64, failed_runs: 0, runs,
+                error_reason: None, created_at_utc: "0".into(), updated_at_utc: "0".into(),
+            }).unwrap();
+            assert_eq!(batch.variants.len(), 64);
+            assert_eq!(batch.variants.last().unwrap().variant_id, "arm-63");
+            assert!(batch.variants.iter().all(|row| row.total_runs == 64 && row.completed_runs == 1));
+        }
 
         #[test]
         // One real owner, retained artifact, historical oracle and refusal journey.
