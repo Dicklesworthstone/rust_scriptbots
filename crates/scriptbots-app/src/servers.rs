@@ -1483,15 +1483,14 @@ fn default_step_count() -> u64 {
 }
 
 fn parse_step_count(bytes: &[u8]) -> Result<u64, AppError> {
-    if bytes.iter().all(u8::is_ascii_whitespace) {
+    let Some(first) = bytes.iter().find(|byte| !byte.is_ascii_whitespace()) else {
         return Ok(default_step_count());
-    }
-    let payload: Value = serde_json::from_slice(bytes)
-        .map_err(|error| AppError::bad_request(format!("invalid step request payload: {error}")))?;
-    if !payload.is_object() {
+    };
+    if *first != b'{' {
         return Err(AppError::bad_request("step request must be a JSON object"));
     }
-    let body: StepRequestBody = serde_json::from_value(payload)
+    // Decode the original object so duplicate fields cannot collapse in Value.
+    let body: StepRequestBody = serde_json::from_slice(bytes)
         .map_err(|error| AppError::bad_request(format!("invalid step request payload: {error}")))?;
     Ok(body.count)
 }
@@ -8853,6 +8852,23 @@ mod tests {
                 .await
                 .expect_err("invalid legacy step must be refused");
             assert_eq!(alias.status, StatusCode::BAD_REQUEST, "{value}");
+        }
+        // A Value fixture would collapse these keys before the request arrived.
+        // Every final count is valid, so only the duplicate-field guard refuses it.
+        for body in [
+            br#"{"count":1,"count":1}"#.as_slice(),
+            br#"{"count":0,"count":1}"#,
+            br#"{"count":1,"\u0063ount":1}"#,
+        ] {
+            let body = axum::body::Bytes::copy_from_slice(body);
+            let control = post_control_step(State(state.clone()), headers.clone(), body.clone())
+                .await
+                .expect_err("duplicate fields must be refused before canonical admission");
+            assert_eq!(control.status, StatusCode::BAD_REQUEST);
+            let alias = post_step(State(state.clone()), headers.clone(), body)
+                .await
+                .expect_err("duplicate fields must be refused before alias admission");
+            assert_eq!(alias.status, StatusCode::BAD_REQUEST);
         }
         let tool = ControlTool {
             handle: handle.clone(),
