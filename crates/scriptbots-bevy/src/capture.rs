@@ -807,7 +807,7 @@ fn apply_capture_corruption(
     registry: Res<TerrainChunkRegistry>,
     originals: Query<&CaptureMaterialBeforeCorruption>,
     mut commands: Commands,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut materials: ResMut<Assets<crate::TerrainMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut cached_texture: Local<Option<Handle<Image>>>,
 ) {
@@ -844,6 +844,7 @@ fn apply_capture_corruption(
         let Some(material) = materials.get_mut(&chunk.material) else {
             continue;
         };
+        let material = &mut material.base;
         if let Some(texture) = &texture {
             if originals.get(chunk.entity).is_err() {
                 commands
@@ -1376,6 +1377,7 @@ fn build_capture_app(config: &OffscreenCaptureConfig) -> Result<App> {
                 }),
         ),
     )
+    .add_plugins(crate::TerrainMaterialPlugin)
     .add_systems(
         Startup,
         (setup_capture_rig, setup_capture_resources).chain(),
@@ -1876,6 +1878,7 @@ mod tests {
         app.insert_resource(Assets::<Mesh>::default());
         app.insert_resource(Assets::<Image>::default());
         app.insert_resource(Assets::<StandardMaterial>::default());
+        app.insert_resource(Assets::<crate::TerrainMaterial>::default());
         app.insert_resource(AmbientLight::default());
         app.insert_resource(CaptureTarget(Handle::default()));
         app.insert_resource(CaptureCorrupt(corrupt));
@@ -1966,8 +1969,8 @@ mod tests {
     fn capture_corruption_binds_a_nonuniform_texture_to_real_terrain_materials() {
         let honest = corruption_app(false);
         let corrupt = corruption_app(true);
-        let honest_materials = honest.world().resource::<Assets<StandardMaterial>>();
-        let materials = corrupt.world().resource::<Assets<StandardMaterial>>();
+        let honest_materials = honest.world().resource::<Assets<crate::TerrainMaterial>>();
+        let materials = corrupt.world().resource::<Assets<crate::TerrainMaterial>>();
         let images = corrupt.world().resource::<Assets<Image>>();
         let chunks = corrupt.world().resource::<TerrainChunkRegistry>();
         assert!(
@@ -1976,9 +1979,9 @@ mod tests {
         );
         for (key, chunk) in &chunks.chunks {
             let honest_chunk = &honest.world().resource::<TerrainChunkRegistry>().chunks[key];
-            let original = honest_materials.get(&honest_chunk.material).unwrap();
+            let original = &honest_materials.get(&honest_chunk.material).unwrap().base;
             assert!(original.emissive_texture.is_none());
-            let material = materials.get(&chunk.material).unwrap();
+            let material = &materials.get(&chunk.material).unwrap().base;
             let texture = material
                 .emissive_texture
                 .as_ref()
@@ -2022,8 +2025,10 @@ mod tests {
         // Retain a genuine existing image as a preexisting emission texture,
         // so restoration must preserve Some(handle) as well as None.
         {
-            let mut materials = app.world_mut().resource_mut::<Assets<StandardMaterial>>();
-            let material = materials.get_mut(&handles[0]).unwrap();
+            let mut materials = app
+                .world_mut()
+                .resource_mut::<Assets<crate::TerrainMaterial>>();
+            let material = &mut materials.get_mut(&handles[0]).unwrap().base;
             material.emissive_texture = material.metallic_roughness_texture.clone();
         }
         let originals: Vec<_> = handles
@@ -2031,9 +2036,10 @@ mod tests {
             .map(|handle| {
                 let material = app
                     .world()
-                    .resource::<Assets<StandardMaterial>>()
+                    .resource::<Assets<crate::TerrainMaterial>>()
                     .get(handle)
                     .unwrap();
+                let material = &material.base;
                 (material.emissive, material.emissive_texture.clone())
             })
             .collect();
@@ -2042,9 +2048,10 @@ mod tests {
         app.update();
         let texture = app
             .world()
-            .resource::<Assets<StandardMaterial>>()
+            .resource::<Assets<crate::TerrainMaterial>>()
             .get(&handles[0])
             .unwrap()
+            .base
             .emissive_texture
             .clone()
             .unwrap();
@@ -2057,9 +2064,10 @@ mod tests {
             for handle in &handles {
                 let material = app
                     .world()
-                    .resource::<Assets<StandardMaterial>>()
+                    .resource::<Assets<crate::TerrainMaterial>>()
                     .get(handle)
                     .unwrap();
+                let material = &material.base;
                 assert_eq!(material.emissive_texture.as_ref(), Some(&texture));
             }
         }
@@ -2068,9 +2076,10 @@ mod tests {
         for (handle, original) in handles.iter().zip(originals) {
             let material = app
                 .world()
-                .resource::<Assets<StandardMaterial>>()
+                .resource::<Assets<crate::TerrainMaterial>>()
                 .get(handle)
                 .unwrap();
+            let material = &material.base;
             assert_eq!(
                 (material.emissive, material.emissive_texture.clone()),
                 original
@@ -2092,9 +2101,10 @@ mod tests {
         );
         assert_eq!(
             app.world()
-                .resource::<Assets<StandardMaterial>>()
+                .resource::<Assets<crate::TerrainMaterial>>()
                 .get(&handles[0])
                 .unwrap()
+                .base
                 .emissive_texture
                 .as_ref(),
             Some(&texture)
@@ -2120,9 +2130,10 @@ mod tests {
         let old_entity = old_chunk.entity;
         let cached = app
             .world()
-            .resource::<Assets<StandardMaterial>>()
+            .resource::<Assets<crate::TerrainMaterial>>()
             .get(&old_chunk.material)
             .unwrap()
+            .base
             .emissive_texture
             .clone()
             .unwrap();
@@ -2143,9 +2154,10 @@ mod tests {
             assert_ne!(chunk.entity, old_entity);
             let material = app
                 .world()
-                .resource::<Assets<StandardMaterial>>()
+                .resource::<Assets<crate::TerrainMaterial>>()
                 .get(&chunk.material)
                 .unwrap();
+            let material = &material.base;
             assert!(material.emissive_texture.is_none());
             assert!(
                 app.world()
@@ -2165,9 +2177,10 @@ mod tests {
         {
             let material = app
                 .world()
-                .resource::<Assets<StandardMaterial>>()
+                .resource::<Assets<crate::TerrainMaterial>>()
                 .get(&chunk.material)
                 .unwrap();
+            let material = &material.base;
             assert_eq!(material.emissive_texture.as_ref(), Some(&cached));
         }
     }
@@ -2183,6 +2196,7 @@ mod tests {
         app.insert_resource(Assets::<Mesh>::default());
         app.insert_resource(Assets::<Image>::default());
         app.insert_resource(Assets::<StandardMaterial>::default());
+        app.insert_resource(Assets::<crate::TerrainMaterial>::default());
         app.add_systems(Startup, setup_capture_resources);
         add_capture_scene_systems(&mut app);
         assert!(

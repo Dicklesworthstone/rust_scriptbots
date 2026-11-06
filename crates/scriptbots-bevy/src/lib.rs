@@ -9,7 +9,7 @@ pub mod particles;
 
 use anyhow::{Context, Result, anyhow};
 use bevy::app::AppExit;
-use bevy::asset::RenderAssetUsages;
+use bevy::asset::{RenderAssetUsages, embedded_asset};
 use bevy::camera::RenderTarget;
 use bevy::camera::prelude::*;
 use bevy::core_pipeline::prepass::{DepthPrepass, NormalPrepass};
@@ -23,11 +23,12 @@ use bevy::light::{
     EnvironmentMapLight, LightProbe,
 };
 use bevy::math::primitives::{Capsule3d, Cone, Rectangle, Sphere, Torus};
-use bevy::pbr::ScreenSpaceAmbientOcclusion;
 use bevy::pbr::prelude::*;
+use bevy::pbr::{ExtendedMaterial, MaterialExtension, ScreenSpaceAmbientOcclusion};
 use bevy::prelude::*;
-use bevy::render::render_resource::PrimitiveTopology;
+use bevy::render::render_resource::{AsBindGroup, PrimitiveTopology};
 use bevy::render::view::{ColorGrading, Hdr};
+use bevy::shader::ShaderRef;
 use bevy::ui::{BorderColor, BorderRadius, FocusPolicy};
 use bevy::window::{PresentMode, PrimaryWindow, WindowPlugin, WindowRef};
 use bevy_mesh::{Indices, Mesh};
@@ -894,6 +895,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
     ))
     .insert_resource(effective_render_settings)
     .add_plugins(renderer_plugins(logging))
+    .add_plugins(TerrainMaterialPlugin)
     .add_plugins(AutoExposurePlugin)
     .add_systems(Startup, (initialize_ssao_support, setup_scene).chain())
     .add_systems(
@@ -2517,6 +2519,9 @@ const CAMERA_SCROLL_PIXELS_PER_LINE: f64 = 40.0;
 const CAMERA_ZOOM_LOG_STEP: f64 = 0.1;
 const FIT_WORLD_FACTOR: f32 = 0.38;
 const FIT_SELECTION_FACTOR: f32 = 0.55;
+// Bring a world-scale view close enough to make the selected creature legible,
+// while leaving an operator's already closer zoom alone.
+const FOLLOW_CREATURE_RADIUS_FACTOR: f32 = 25.0;
 
 #[derive(Resource, Debug)]
 struct DiagnosticsTicker {
@@ -2682,6 +2687,15 @@ impl CameraRig {
             pending_fit: Some(FitCommand::World),
             ..default()
         }
+    }
+
+    fn follow_clicked_creature(&mut self, radius: f32) {
+        let close_distance = (radius.max(1.0) * FOLLOW_CREATURE_RADIUS_FACTOR)
+            .clamp(CAMERA_MIN_DISTANCE, CAMERA_MAX_DISTANCE);
+        self.distance = self.distance.min(close_distance);
+        self.follow_mode = FollowMode::Selected;
+        self.pan = Vec2::ZERO;
+        self.recenter_now = true;
     }
 
     fn toggle_follow_mode(&mut self, mode: FollowMode) {
@@ -3252,13 +3266,47 @@ struct TerrainChunkKey {
 struct TerrainChunkRecord {
     entity: Entity,
     mesh: Handle<Mesh>,
-    material: Handle<StandardMaterial>,
+    material: Handle<TerrainMaterial>,
     bounds: TerrainChunkBounds,
     signature: TerrainChunkSignature,
     last_tick: u64,
     probe: Option<Entity>,
     stats: TerrainChunkStats,
     palette: ColorPaletteMode,
+}
+
+type TerrainMaterial = ExtendedMaterial<StandardMaterial, TerrainBlend>;
+
+#[derive(Asset, AsBindGroup, Reflect, Debug, Clone, Default)]
+struct TerrainBlend {
+    #[texture(100)]
+    #[sampler(101)]
+    water: Option<Handle<Image>>,
+    #[texture(102)]
+    #[sampler(103)]
+    grass: Option<Handle<Image>>,
+    #[texture(104)]
+    #[sampler(105)]
+    rock: Option<Handle<Image>>,
+}
+
+impl MaterialExtension for TerrainBlend {
+    fn fragment_shader() -> ShaderRef {
+        "embedded://scriptbots_bevy/terrain_blend.wgsl".into()
+    }
+
+    fn deferred_fragment_shader() -> ShaderRef {
+        "embedded://scriptbots_bevy/terrain_blend.wgsl".into()
+    }
+}
+
+struct TerrainMaterialPlugin;
+
+impl Plugin for TerrainMaterialPlugin {
+    fn build(&self, app: &mut App) {
+        embedded_asset!(app, "terrain_blend.wgsl");
+        app.add_plugins(MaterialPlugin::<TerrainMaterial>::default());
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -3275,6 +3323,7 @@ impl TerrainChunkSignature {
         positions: &[[f32; 3]],
         normals: &[[f32; 3]],
         colors: &[[f32; 4]],
+        blend_weights: &[[f32; 2]],
         material_inputs: &[f32],
         detail_layer: usize,
     ) -> Self {
@@ -3296,6 +3345,12 @@ impl TerrainChunkSignature {
         for color in colors {
             for channel in color {
                 hasher.update(&channel.to_bits().to_le_bytes());
+            }
+        }
+        hasher.update(&(blend_weights.len() as u64).to_le_bytes());
+        for weights in blend_weights {
+            for weight in weights {
+                hasher.update(&weight.to_bits().to_le_bytes());
             }
         }
         hasher.update(&(material_inputs.len() as u64).to_le_bytes());
@@ -3341,11 +3396,11 @@ pub(crate) struct WorldSnapshot {
 /// vector is never transiently large.
 const HUD_EVENT_FEED_CAPACITY: usize = 6;
 
-/// Layers the brain overlay will render, and values shown per layer
-/// (bd-2z0.14.1.15). Core already bounds the payload it hands back; these are
-/// the presentation budgets on top of that.
+/// Preview limits for the brain summary. The full core-bounded payload remains
+/// available on the inspector's signed-value pages.
 const BRAIN_OVERLAY_MAX_LAYERS: usize = 4;
 const BRAIN_OVERLAY_MAX_VALUES: usize = 12;
+const BRAIN_VALUES_PER_PAGE: usize = 8;
 
 /// Stable client identity for this frontend's inspection requests, so core can
 /// distinguish Bevy's requests from GPUI's and the TUI's.
@@ -3371,7 +3426,7 @@ enum BrainOverlayStatus {
     NoStableIdentity,
 }
 
-/// One rendered activation layer, already clipped to the presentation budget.
+/// One activation layer from the core-bounded inspection response.
 #[derive(Debug, Clone, PartialEq)]
 struct BrainOverlayLayer {
     name: String,
@@ -3385,8 +3440,7 @@ struct BrainOverlay {
     status: BrainOverlayStatus,
     source_tick: u64,
     layers: Vec<BrainOverlayLayer>,
-    /// Set when core clipped the payload, or when this projection clipped it
-    /// further. An inspector showing a truncated view must say so.
+    /// Set when core clipped the payload. An inspector must say so.
     truncated: bool,
 }
 
@@ -3537,27 +3591,16 @@ impl BrainOverlay {
         let source_tick = response.source_tick.0;
         match response.telemetry.into_iter().next() {
             Some(SelectedBrainTelemetryOutcome::Ready { telemetry }) => {
-                let activations = &telemetry.inspection.activations;
-                let mut truncated = activations.truncated;
-                let mut layers = Vec::with_capacity(BRAIN_OVERLAY_MAX_LAYERS);
-                for layer in activations.layers.iter().take(BRAIN_OVERLAY_MAX_LAYERS) {
+                let activations = telemetry.inspection.activations;
+                let truncated = activations.truncated;
+                let mut layers = Vec::with_capacity(activations.layers.len());
+                for layer in activations.layers {
                     let total = layer.values.len();
-                    if total > BRAIN_OVERLAY_MAX_VALUES {
-                        truncated = true;
-                    }
                     layers.push(BrainOverlayLayer {
-                        name: layer.name.clone(),
-                        shown: layer
-                            .values
-                            .iter()
-                            .take(BRAIN_OVERLAY_MAX_VALUES)
-                            .copied()
-                            .collect(),
+                        name: layer.name,
+                        shown: layer.values,
                         total,
                     });
-                }
-                if activations.layers.len() > BRAIN_OVERLAY_MAX_LAYERS {
-                    truncated = true;
                 }
                 Self {
                     status: BrainOverlayStatus::Ready,
@@ -3587,23 +3630,71 @@ fn format_brain_overlay(overlay: &BrainOverlay) -> String {
         }
         BrainOverlayStatus::Ready => {
             let mut out = format!(
-                "Brain @ tick {} (magnitude levels 0-7)",
+                "Brain @ tick {} (preview: magnitude levels 0-7)",
                 overlay.source_tick
             );
             if overlay.truncated {
                 out.push_str(" (clipped)");
             }
-            for layer in &overlay.layers {
+            for layer in overlay.layers.iter().take(BRAIN_OVERLAY_MAX_LAYERS) {
+                let preview = &layer.shown[..layer.shown.len().min(BRAIN_OVERLAY_MAX_VALUES)];
                 out.push_str(&format!(
                     "\n  {} [{}/{}] {}",
                     layer.name,
-                    layer.shown.len(),
+                    preview.len(),
                     layer.total,
-                    format_sparkline_signed(&layer.shown)
+                    format_sparkline_signed(preview)
                 ));
             }
             out
         }
+    }
+}
+
+impl BrainOverlay {
+    fn value_page_count(&self) -> usize {
+        if self.status != BrainOverlayStatus::Ready {
+            return 0;
+        }
+        self.layers
+            .iter()
+            .map(|layer| layer.shown.len().div_ceil(BRAIN_VALUES_PER_PAGE))
+            .sum()
+    }
+
+    fn value_page(&self, mut index: usize) -> Option<String> {
+        if self.status != BrainOverlayStatus::Ready {
+            return None;
+        }
+        for layer in &self.layers {
+            let count = layer.shown.len().div_ceil(BRAIN_VALUES_PER_PAGE);
+            if index < count {
+                let start = index * BRAIN_VALUES_PER_PAGE;
+                let end = (start + BRAIN_VALUES_PER_PAGE).min(layer.shown.len());
+                let clipped = if self.truncated {
+                    " | source clipped"
+                } else {
+                    ""
+                };
+                let rows = layer.shown[start..end]
+                    .iter()
+                    .enumerate()
+                    .map(|(offset, value)| format!("{:03}: {value:+.4}", start + offset))
+                    .collect::<Vec<_>>();
+                return Some(format!(
+                    "Brain {} | indices {}-{} of {} | tick {}{}\n{}",
+                    bounded_inspector_text(&layer.name),
+                    start,
+                    end - 1,
+                    layer.total,
+                    self.source_tick,
+                    clipped,
+                    rows.join("\n")
+                ));
+            }
+            index -= count;
+        }
+        None
     }
 }
 
@@ -4461,6 +4552,43 @@ fn setup_scene(
                 card.spawn(Node {
                     flex_direction: FlexDirection::Row,
                     flex_wrap: FlexWrap::Wrap,
+                    column_gap: Val::Px(4.0),
+                    row_gap: Val::Px(4.0),
+                    ..default()
+                })
+                .with_children(|row| {
+                    for (section, label) in [
+                        (InspectorSection::Life, "Life"),
+                        (InspectorSection::Senses, "Senses"),
+                        (InspectorSection::Actions, "Actions"),
+                        (InspectorSection::Body, "Body"),
+                        (InspectorSection::Genome, "Genome"),
+                        (InspectorSection::Brain, "Brain"),
+                    ] {
+                        row.spawn((
+                            Button,
+                            Node {
+                                min_width: Val::Px(0.0),
+                                padding: UiRect::axes(Val::Px(8.0), Val::Px(3.0)),
+                                ..button_node.clone()
+                            },
+                            BackgroundColor(follow_idle_color()),
+                            BorderRadius::all(Val::Px(5.0)),
+                            BorderColor::all(button_border_color),
+                            InspectorPageButton::Section(section),
+                        ))
+                        .with_children(|button| {
+                            button.spawn((
+                                Text::new(label),
+                                TextFont::from_font_size(12.0),
+                                TextColor(secondary_text_color),
+                            ));
+                        });
+                    }
+                });
+                card.spawn(Node {
+                    flex_direction: FlexDirection::Row,
+                    flex_wrap: FlexWrap::Wrap,
                     align_items: AlignItems::Center,
                     column_gap: Val::Px(6.0),
                     row_gap: Val::Px(4.0),
@@ -4918,6 +5046,7 @@ pub(crate) fn sync_world(
     agent_meshes: Res<AgentMeshes>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut terrain_materials: ResMut<Assets<TerrainMaterial>>,
     probe_assets: Res<ReflectionProbeAssets>,
     accessibility: Res<AccessibilityState>,
 ) {
@@ -4977,7 +5106,7 @@ pub(crate) fn sync_world(
         &mut commands,
         &mut terrain_registry,
         meshes.as_mut(),
-        materials.as_mut(),
+        terrain_materials.as_mut(),
         probe_assets.as_ref(),
         palette,
     );
@@ -6338,6 +6467,7 @@ mod adaptive_governor_tests {
         app.insert_resource(AgentMeshes::default());
         app.insert_resource(Assets::<Mesh>::default());
         app.insert_resource(Assets::<StandardMaterial>::default());
+        app.insert_resource(Assets::<TerrainMaterial>::default());
         let mut images = Assets::<Image>::default();
         app.insert_resource(ReflectionProbeAssets::fallback(&mut images));
         app.insert_resource(images);
@@ -6406,11 +6536,11 @@ mod adaptive_governor_tests {
             .as_ref()
             .unwrap();
         let registry = app.world().resource::<TerrainChunkRegistry>();
-        let materials = app.world().resource::<Assets<StandardMaterial>>();
+        let materials = app.world().resource::<Assets<TerrainMaterial>>();
         let images = app.world().resource::<Assets<Image>>();
         let mut per_kind = HashMap::new();
         let mut patterns = HashSet::new();
-        let mut albedo_by_group = HashMap::new();
+        let mut shared_albedos = None;
         for chunk in registry.chunks.values() {
             let kind = snapshot
                 .terrain_height
@@ -6418,6 +6548,7 @@ mod adaptive_governor_tests {
                 .kind;
             let material = materials.get(&chunk.material).unwrap();
             let handle = material
+                .base
                 .metallic_roughness_texture
                 .as_ref()
                 .expect("real material texture");
@@ -6435,30 +6566,33 @@ mod adaptive_governor_tests {
                     .to_string(),
             );
             assert_eq!(
-                material.base_color,
+                material.base.base_color,
                 Color::WHITE,
                 "do not double-tint vertex albedo"
             );
-            let albedo = material
-                .base_color_texture
-                .as_ref()
-                .expect("photo albedo bound");
-            let group = terrain_albedo_layer(visual::terrain_kind_index(kind));
-            if let Some(previous) = albedo_by_group.insert(group, albedo.id()) {
-                assert_eq!(previous, albedo.id(), "similar biomes share one image");
+            let albedos = [
+                material.extension.water.as_ref().unwrap(),
+                material.extension.grass.as_ref().unwrap(),
+                material.extension.rock.as_ref().unwrap(),
+            ];
+            let ids = albedos.map(|handle| handle.id());
+            if let Some(previous) = shared_albedos.replace(ids) {
+                assert_eq!(previous, ids, "chunks must share all three photos");
             }
-            let image = images.get(albedo).expect("bound albedo exists");
-            assert!(
-                image
-                    .data
-                    .as_ref()
-                    .unwrap()
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .any(|pixel| pixel[0] != pixel[1] || pixel[1] != pixel[2]),
-                "photo detail must retain color"
-            );
+            for albedo in albedos {
+                let image = images.get(albedo).expect("bound albedo exists");
+                assert!(
+                    image
+                        .data
+                        .as_ref()
+                        .unwrap()
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .any(|pixel| pixel[0] != pixel[1] || pixel[1] != pixel[2]),
+                    "photo detail must retain color"
+                );
+            }
         }
         assert_eq!(
             per_kind.len(),
@@ -6475,9 +6609,12 @@ mod adaptive_governor_tests {
             per_kind.len(),
             "bindings must contain distinct pixel patterns"
         );
-        assert_eq!(albedo_by_group.len(), TERRAIN_ALBEDO_LAYERS);
         assert_eq!(
-            albedo_by_group.values().collect::<HashSet<_>>().len(),
+            shared_albedos
+                .unwrap()
+                .into_iter()
+                .collect::<HashSet<_>>()
+                .len(),
             TERRAIN_ALBEDO_LAYERS
         );
     }
@@ -6550,6 +6687,59 @@ mod adaptive_governor_tests {
     }
 
     #[test]
+    fn terrain_blend_weights_follow_biomes_and_match_shared_chunk_vertices() {
+        use bevy_mesh::VertexAttributeValues;
+        let mut app = terrain_detail_app();
+        app.update();
+        let terrain = &app
+            .world()
+            .resource::<SnapshotState>()
+            .latest
+            .as_ref()
+            .unwrap()
+            .terrain_height;
+        let registry = app.world().resource::<TerrainChunkRegistry>();
+        let meshes = app.world().resource::<Assets<Mesh>>();
+        let weights = |x| {
+            let mesh = meshes
+                .get(&registry.chunks[&TerrainChunkKey { x, y: 0 }].mesh)
+                .unwrap();
+            let Some(VertexAttributeValues::Float32x2(values)) =
+                mesh.attribute(Mesh::ATTRIBUTE_UV_1)
+            else {
+                panic!("terrain must carry biome blend weights");
+            };
+            values
+        };
+        for x in 0..5 {
+            let left = weights(x);
+            let right = weights(x + 1);
+            assert_eq!(
+                left[1], right[0],
+                "shared top vertex must blend identically"
+            );
+            assert_eq!(
+                left[3], right[2],
+                "shared bottom vertex must blend identically"
+            );
+            let sample = terrain.sample_tile(x, 0);
+            let splat = terrain_sample_splat(sample, compute_tile_slope(terrain, x, 0));
+            assert_eq!(left[0], [splat[0] + splat[1], splat[3] + splat[4]]);
+            assert!(
+                left[0]
+                    .iter()
+                    .all(|weight| weight.is_finite() && *weight >= 0.0)
+            );
+            assert!(left[0][0] + left[0][1] <= 1.000_001);
+        }
+        assert_ne!(
+            weights(0)[0],
+            weights(3)[0],
+            "water and grass must not use one chunk-wide photo"
+        );
+    }
+
+    #[test]
     fn terrain_albedo_preserves_accessibility_palette_hues() {
         let mut app = terrain_detail_app();
         app.update();
@@ -6557,14 +6747,15 @@ mod adaptive_governor_tests {
         let material = app.world().resource::<TerrainChunkRegistry>().chunks[&key]
             .material
             .clone();
-        let natural = app
-            .world()
-            .resource::<Assets<StandardMaterial>>()
-            .get(&material)
-            .unwrap()
-            .base_color_texture
-            .clone()
-            .unwrap();
+        let natural = {
+            let materials = app.world().resource::<Assets<TerrainMaterial>>();
+            let blend = &materials.get(&material).unwrap().extension;
+            [
+                blend.water.clone().unwrap(),
+                blend.grass.clone().unwrap(),
+                blend.rock.clone().unwrap(),
+            ]
+        };
         let image_count = app.world().resource::<Assets<Image>>().len();
         for palette in [
             ColorPaletteMode::Deuteranopia,
@@ -6574,45 +6765,48 @@ mod adaptive_governor_tests {
         ] {
             app.world_mut().resource_mut::<AccessibilityState>().palette = palette;
             app.update();
-            let materials = app.world().resource::<Assets<StandardMaterial>>();
-            let neutral = materials
-                .get(&material)
-                .unwrap()
-                .base_color_texture
-                .as_ref()
-                .unwrap();
-            assert_ne!(neutral, &natural);
+            let materials = app.world().resource::<Assets<TerrainMaterial>>();
+            let blend = &materials.get(&material).unwrap().extension;
+            let neutral = [
+                blend.water.as_ref().unwrap(),
+                blend.grass.as_ref().unwrap(),
+                blend.rock.as_ref().unwrap(),
+            ];
             let images = app.world().resource::<Assets<Image>>();
             assert_eq!(images.len(), image_count);
-            assert!(
-                images
-                    .get(neutral)
-                    .unwrap()
-                    .data
-                    .as_ref()
-                    .unwrap()
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .all(|pixel| pixel[0] == pixel[1] && pixel[1] == pixel[2])
-            );
-            if palette == ColorPaletteMode::HighContrast {
-                assert_eq!(
-                    images.get(neutral).unwrap().data.as_deref(),
-                    Some(&[255; 4][..])
+            for (neutral, natural) in neutral.into_iter().zip(&natural) {
+                assert_ne!(neutral, natural);
+                assert!(
+                    images
+                        .get(neutral)
+                        .unwrap()
+                        .data
+                        .as_ref()
+                        .unwrap()
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .all(|pixel| pixel[0] == pixel[1] && pixel[1] == pixel[2])
                 );
+                if palette == ColorPaletteMode::HighContrast {
+                    assert_eq!(
+                        images.get(neutral).unwrap().data.as_deref(),
+                        Some(&[255; 4][..])
+                    );
+                }
             }
         }
         app.world_mut().resource_mut::<AccessibilityState>().palette = ColorPaletteMode::Natural;
         app.update();
+        let materials = app.world().resource::<Assets<TerrainMaterial>>();
+        let blend = &materials.get(&material).unwrap().extension;
         assert_eq!(
-            app.world()
-                .resource::<Assets<StandardMaterial>>()
-                .get(&material)
-                .unwrap()
-                .base_color_texture
-                .as_ref(),
-            Some(&natural)
+            [
+                blend.water.as_ref().unwrap(),
+                blend.grass.as_ref().unwrap(),
+                blend.rock.as_ref().unwrap()
+            ],
+            [&natural[0], &natural[1], &natural[2]]
         );
         assert_eq!(app.world().resource::<Assets<Image>>().len(), image_count);
     }
@@ -6667,17 +6861,19 @@ mod adaptive_governor_tests {
             .clone();
         let initial = app
             .world()
-            .resource::<Assets<StandardMaterial>>()
+            .resource::<Assets<TerrainMaterial>>()
             .get(&material)
             .unwrap()
+            .base
             .metallic_roughness_texture
             .clone()
             .unwrap();
         let other_image = app
             .world()
-            .resource::<Assets<StandardMaterial>>()
+            .resource::<Assets<TerrainMaterial>>()
             .get(&other_material)
             .unwrap()
+            .base
             .metallic_roughness_texture
             .clone()
             .unwrap();
@@ -6691,9 +6887,10 @@ mod adaptive_governor_tests {
         app.update();
         let changed = app
             .world()
-            .resource::<Assets<StandardMaterial>>()
+            .resource::<Assets<TerrainMaterial>>()
             .get(&material)
             .unwrap()
+            .base
             .metallic_roughness_texture
             .clone()
             .unwrap();
@@ -6715,9 +6912,10 @@ mod adaptive_governor_tests {
         app.update();
         let repaired = app
             .world()
-            .resource::<Assets<StandardMaterial>>()
+            .resource::<Assets<TerrainMaterial>>()
             .get(&material)
             .unwrap()
+            .base
             .metallic_roughness_texture
             .clone()
             .unwrap();
@@ -6731,9 +6929,10 @@ mod adaptive_governor_tests {
         assert_eq!(app.world().resource::<Assets<Image>>().len(), image_count);
         assert_eq!(
             app.world()
-                .resource::<Assets<StandardMaterial>>()
+                .resource::<Assets<TerrainMaterial>>()
                 .get(&other_material)
                 .unwrap()
+                .base
                 .metallic_roughness_texture
                 .as_ref(),
             Some(&other_image),
@@ -6741,18 +6940,20 @@ mod adaptive_governor_tests {
         );
         let albedo = app
             .world()
-            .resource::<Assets<StandardMaterial>>()
+            .resource::<Assets<TerrainMaterial>>()
             .get(&material)
             .unwrap()
-            .base_color_texture
+            .extension
+            .water
             .clone()
             .unwrap();
         let other_albedo = app
             .world()
-            .resource::<Assets<StandardMaterial>>()
+            .resource::<Assets<TerrainMaterial>>()
             .get(&other_material)
             .unwrap()
-            .base_color_texture
+            .extension
+            .grass
             .clone()
             .unwrap();
         assert_ne!(albedo, other_albedo);
@@ -6761,11 +6962,12 @@ mod adaptive_governor_tests {
             .remove(&albedo)
             .unwrap();
         app.update();
-        let materials = app.world().resource::<Assets<StandardMaterial>>();
+        let materials = app.world().resource::<Assets<TerrainMaterial>>();
         let repaired = materials
             .get(&material)
             .unwrap()
-            .base_color_texture
+            .extension
+            .water
             .as_ref()
             .unwrap();
         assert_ne!(repaired, &albedo);
@@ -6779,7 +6981,8 @@ mod adaptive_governor_tests {
             materials
                 .get(&other_material)
                 .unwrap()
-                .base_color_texture
+                .extension
+                .grass
                 .as_ref(),
             Some(&other_albedo)
         );
@@ -6795,20 +6998,22 @@ mod adaptive_governor_tests {
         let material_handle = chunk.material.clone();
         let material = app
             .world()
-            .resource::<Assets<StandardMaterial>>()
+            .resource::<Assets<TerrainMaterial>>()
             .get(&material_handle)
             .unwrap();
         let original = (
-            material.base_color,
-            material.metallic,
-            material.perceptual_roughness,
+            material.base.base_color,
+            material.base.metallic,
+            material.base.perceptual_roughness,
         );
         let texture = material
+            .base
             .metallic_roughness_texture
             .clone()
             .expect("production material must bind texture");
         let albedo = material
-            .base_color_texture
+            .extension
+            .grass
             .clone()
             .expect("photo albedo bound");
         let albedo_pixels = app
@@ -6847,16 +7052,19 @@ mod adaptive_governor_tests {
             );
             let material = app
                 .world()
-                .resource::<Assets<StandardMaterial>>()
+                .resource::<Assets<TerrainMaterial>>()
                 .get(&material_handle)
                 .unwrap();
-            assert_eq!(material.metallic_roughness_texture.as_ref(), Some(&texture));
-            assert_eq!(material.base_color_texture.as_ref(), Some(&albedo));
+            assert_eq!(
+                material.base.metallic_roughness_texture.as_ref(),
+                Some(&texture)
+            );
+            assert_eq!(material.extension.grass.as_ref(), Some(&albedo));
             assert_eq!(
                 (
-                    material.base_color,
-                    material.metallic,
-                    material.perceptual_roughness
+                    material.base.base_color,
+                    material.base.metallic,
+                    material.base.perceptual_roughness
                 ),
                 original
             );
@@ -7010,6 +7218,30 @@ mod adaptive_governor_tests {
             app.world().get::<BackgroundColor>(next).unwrap().0,
             follow_hover_color()
         );
+        let world = app.world_mut();
+        let mut query = world.query::<(&InspectorPageButton, &ChildOf)>();
+        let sections: Vec<_> = query
+            .iter(world)
+            .filter_map(|(button, parent)| match button {
+                InspectorPageButton::Section(section)
+                    if world.get::<ChildOf>(parent.parent()).map(ChildOf::parent) == Some(root) =>
+                {
+                    Some(*section)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sections.len(), 6);
+        for section in [
+            InspectorSection::Life,
+            InspectorSection::Senses,
+            InspectorSection::Actions,
+            InspectorSection::Body,
+            InspectorSection::Genome,
+            InspectorSection::Brain,
+        ] {
+            assert!(sections.contains(&section));
+        }
     }
 
     #[test]
@@ -7710,6 +7942,30 @@ mod quality_tier_consumer_tests {
         assert!(!hud_pointer_captured([&Interaction::None].into_iter()));
         assert!(hud_pointer_captured([&Interaction::Hovered].into_iter()));
         assert!(hud_pointer_captured([&Interaction::Pressed].into_iter()));
+    }
+
+    #[test]
+    fn clicked_creature_frames_from_world_scale_without_zooming_out() {
+        let mut rig = CameraRig {
+            distance: 2200.0,
+            pan: Vec2::new(12.0, -8.0),
+            recenter_now: false,
+            ..default()
+        };
+        rig.follow_clicked_creature(12.0);
+        assert_eq!(rig.follow_mode, FollowMode::Selected);
+        assert_eq!(rig.distance, 300.0);
+        assert_eq!(rig.pan, Vec2::ZERO);
+        assert!(rig.recenter_now);
+
+        // Larger creatures get enough room, but a deliberate close-up is not
+        // pulled away when the operator selects another creature.
+        rig.distance = 400.0;
+        rig.follow_clicked_creature(32.0);
+        assert_eq!(rig.distance, 400.0);
+        rig.distance = 2200.0;
+        rig.follow_clicked_creature(32.0);
+        assert_eq!(rig.distance, 800.0);
     }
 
     /// A camera that renders off-screen has no pointer window at all.
@@ -8510,6 +8766,38 @@ mod hud_brain_overlay_tests {
         assert_eq!(format_sparkline_signed(&[0.0, 0.0]), "00");
         assert_eq!(format_sparkline_signed(&[]), "");
     }
+
+    #[test]
+    fn signed_value_pages_cover_all_retained_values_and_report_source_clipping() {
+        let mut overlay = ready_overlay();
+        overlay.layers = vec![
+            BrainOverlayLayer {
+                name: "first".into(),
+                shown: (0..200).map(|i| (i as f32) - 100.0).collect(),
+                total: 200,
+            },
+            BrainOverlayLayer {
+                name: "second".into(),
+                shown: vec![-0.25, 0.5],
+                total: 2,
+            },
+        ];
+        assert_eq!(overlay.value_page_count(), 26);
+        let first = overlay.value_page(0).unwrap();
+        assert!(first.contains("first | indices 0-7 of 200 | tick 42 | source clipped"));
+        assert!(first.contains("000: -100.0000"));
+        let last_first_layer = overlay.value_page(24).unwrap();
+        assert!(last_first_layer.contains("indices 192-199 of 200"));
+        assert!(last_first_layer.contains("199: +99.0000"));
+        let second = overlay.value_page(25).unwrap();
+        assert!(second.contains("second | indices 0-1 of 2"));
+        assert!(second.contains("000: -0.2500"));
+        assert!(second.contains("001: +0.5000"));
+        assert!(overlay.value_page(26).is_none());
+        overlay.status = BrainOverlayStatus::Unavailable;
+        assert_eq!(overlay.value_page_count(), 0);
+        assert!(overlay.value_page(0).is_none());
+    }
 }
 
 #[cfg(test)]
@@ -8714,10 +9002,21 @@ const INSPECTOR_ROWS_PER_PAGE: usize = 8;
 #[derive(Resource, Default)]
 struct InspectorPage(usize);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InspectorSection {
+    Life,
+    Senses,
+    Actions,
+    Body,
+    Genome,
+    Brain,
+}
+
 #[derive(Component, Clone, Copy)]
 enum InspectorPageButton {
     Previous,
     Next,
+    Section(InspectorSection),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8760,18 +9059,58 @@ impl InspectorTarget {
 struct OwnerInspectorSample {
     target: InspectorTarget,
     pages: Vec<String>,
+    sections: InspectorSectionStarts,
+}
+
+#[derive(Default)]
+struct InspectorSectionStarts {
+    senses: usize,
+    actions: usize,
+    body: usize,
+    genome: usize,
 }
 
 impl OwnerInspectorSample {
-    fn page_count(&self) -> usize {
-        self.pages.len() + 1
+    fn section_start(&self, section: InspectorSection) -> usize {
+        match section {
+            InspectorSection::Life => 0,
+            InspectorSection::Senses => self.sections.senses,
+            InspectorSection::Actions => self.sections.actions,
+            InspectorSection::Body => self.sections.body,
+            InspectorSection::Genome => self.sections.genome,
+            InspectorSection::Brain => self.pages.len(),
+        }
+    }
+
+    fn section_at(&self, page: usize) -> InspectorSection {
+        [
+            InspectorSection::Brain,
+            InspectorSection::Genome,
+            InspectorSection::Body,
+            InspectorSection::Actions,
+            InspectorSection::Senses,
+            InspectorSection::Life,
+        ]
+        .into_iter()
+        .find(|section| page >= self.section_start(*section))
+        .unwrap_or(InspectorSection::Life)
+    }
+
+    fn page_count(&self, frame: &WorldSnapshot) -> usize {
+        self.pages.len() + 1 + frame.brain.value_page_count()
     }
 
     fn page(&self, frame: &WorldSnapshot, index: usize) -> String {
-        self.pages
-            .get(index)
-            .cloned()
-            .unwrap_or_else(|| format_brain_overlay(&frame.brain))
+        if let Some(page) = self.pages.get(index) {
+            page.clone()
+        } else if index == self.pages.len() {
+            format_brain_overlay(&frame.brain)
+        } else {
+            frame
+                .brain
+                .value_page(index.saturating_sub(self.pages.len() + 1))
+                .unwrap_or_else(|| format_brain_overlay(&frame.brain))
+        }
     }
 }
 
@@ -8914,7 +9253,7 @@ impl OwnerInspector {
             return format!("Owner detail: {}", self.status);
         };
         let source = sample.target.source;
-        let index = page % sample.page_count();
+        let index = page % sample.page_count(frame);
         let provenance = self.last_failure.as_ref().map_or_else(
             || {
                 format!(
@@ -8934,7 +9273,7 @@ impl OwnerInspector {
             source.inspected_tick.0,
             current.source.inspected_tick.0 - source.inspected_tick.0,
             index + 1,
-            sample.page_count(),
+            sample.page_count(frame),
             provenance,
             sample.page(frame, index),
         )
@@ -8959,12 +9298,12 @@ impl OwnerInspector {
                 self.status.clone(),
             );
         };
-        let index = page % sample.page_count();
+        let index = page % sample.page_count(frame);
         let age = current.source.inspected_tick.0 - sample.target.source.inspected_tick.0;
         let mut status = format!(
             "PAGE {}/{} | SAMPLE TICK {} | {} ticks old | I / SHIFT+I",
             index + 1,
-            sample.page_count(),
+            sample.page_count(frame),
             sample.target.source.inspected_tick.0,
             age
         );
@@ -8999,9 +9338,11 @@ fn capture_owner_inspector(
     };
     let latest = host.snapshot_hub().latest();
     let captured = inspector_target_for_detail(&detail, target, &latest)?;
+    let (pages, sections) = owner_inspector_pages(&detail);
     Ok(Some(OwnerInspectorSample {
         target: captured,
-        pages: owner_inspector_pages(&detail),
+        pages,
+        sections,
     }))
 }
 
@@ -9031,7 +9372,9 @@ fn inspector_target_for_detail(
     Ok(captured)
 }
 
-fn owner_inspector_pages(detail: &scriptbots_runtime::channel::AgentInspectorData) -> Vec<String> {
+fn owner_inspector_pages(
+    detail: &scriptbots_runtime::channel::AgentInspectorData,
+) -> (Vec<String>, InspectorSectionStarts) {
     let life = &detail.life;
     let mut pages = vec![format!(
         "Life and lineage | {} | bound {}\nParents {:?} | hybrid {}\n\
@@ -9056,6 +9399,10 @@ fn owner_inspector_pages(detail: &scriptbots_runtime::channel::AgentInspectorDat
         detail.trait_modifiers.eye,
         detail.trait_modifiers.blood,
     )];
+    let mut sections = InspectorSectionStarts {
+        senses: pages.len(),
+        ..default()
+    };
     let sensors = scriptbots_core::SENSOR_LAYOUT
         .iter()
         .zip(detail.sensors)
@@ -9070,6 +9417,7 @@ fn owner_inspector_pages(detail: &scriptbots_runtime::channel::AgentInspectorDat
             rows.join("\n")
         ));
     }
+    sections.actions = pages.len();
     let outputs = OutputChannel::ALL
         .iter()
         .map(|channel| {
@@ -9090,6 +9438,7 @@ fn owner_inspector_pages(detail: &scriptbots_runtime::channel::AgentInspectorDat
             rows.join("\n")
         ));
     }
+    sections.body = pages.len();
     let eyes = detail
         .eye_direction
         .iter()
@@ -9137,6 +9486,7 @@ fn owner_inspector_pages(detail: &scriptbots_runtime::channel::AgentInspectorDat
         combat.was_spiked_by_carnivore,
         combat.was_spiked_by_herbivore,
     ));
+    sections.genome = pages.len();
     pages.push(detail.genome_browser.as_ref().map_or_else(
         || "Genome summary: unavailable for this family".into(),
         |genome| {
@@ -9177,7 +9527,7 @@ fn owner_inspector_pages(detail: &scriptbots_runtime::channel::AgentInspectorDat
                 .join("\n")
         ));
     }
-    pages
+    (pages, sections)
 }
 
 fn bounded_inspector_text(text: &str) -> String {
@@ -9201,6 +9551,7 @@ fn poll_owner_inspector(state: Res<SnapshotState>, inspector: Option<NonSendMut<
 fn handle_inspector_page(
     page: Option<ResMut<InspectorPage>>,
     inspector: Option<NonSendMut<OwnerInspector>>,
+    state: Option<Res<SnapshotState>>,
     keys: Option<Res<ButtonInput<KeyCode>>>,
     buttons: Query<(&InspectorPageButton, &Interaction), Changed<Interaction>>,
 ) {
@@ -9219,15 +9570,15 @@ fn handle_inspector_page(
     if let Some(direction) = button.or(keyboard)
         && let Some(mut page) = page
     {
-        let count = inspector
-            .as_ref()
-            .and_then(|inspector| {
-                inspector
-                    .sample
-                    .as_ref()
-                    .map(OwnerInspectorSample::page_count)
-            })
-            .unwrap_or(1)
+        let frame = state.as_ref().and_then(|state| state.latest.as_ref());
+        let sample = inspector.as_ref().and_then(|inspector| {
+            let sample = inspector.sample.as_ref()?;
+            let current = InspectorTarget::from_frame(frame?)?;
+            sample.target.visible_at(current).then_some(sample)
+        });
+        let count = sample
+            .zip(frame)
+            .map_or(1, |(sample, frame)| sample.page_count(frame))
             .max(1);
         page.0 %= count;
         page.0 = match direction {
@@ -9239,9 +9590,12 @@ fn handle_inspector_page(
                 }
             }
             InspectorPageButton::Next => (page.0 + 1) % count,
+            InspectorPageButton::Section(section) => {
+                sample.map_or(0, |sample| sample.section_start(section))
+            }
         };
         if let Some(mut inspector) = inspector
-            && inspector.sample.is_none()
+            && (inspector.sample.is_none() || inspector.last_failure.is_some())
         {
             inspector.last_attempt = None;
             inspector.status = "retry queued".into();
@@ -9250,14 +9604,26 @@ fn handle_inspector_page(
 }
 
 fn update_inspector_page_button_colors(
-    mut buttons: Query<
-        (&Interaction, &mut BackgroundColor),
-        (Changed<Interaction>, With<InspectorPageButton>),
-    >,
+    page: Option<Res<InspectorPage>>,
+    inspector: Option<NonSend<OwnerInspector>>,
+    state: Option<Res<SnapshotState>>,
+    mut buttons: Query<(&InspectorPageButton, &Interaction, &mut BackgroundColor)>,
 ) {
-    for (interaction, mut color) in &mut buttons {
+    let active = page.as_ref().and_then(|page| {
+        let frame = state.as_ref()?.latest.as_ref()?;
+        let sample = inspector.as_ref()?.sample.as_ref()?;
+        let current = InspectorTarget::from_frame(frame)?;
+        sample
+            .target
+            .visible_at(current)
+            .then(|| sample.section_at(page.0 % sample.page_count(frame)))
+    });
+    for (direction, interaction, mut color) in &mut buttons {
         let target = if matches!(interaction, Interaction::Hovered | Interaction::Pressed) {
             follow_hover_color()
+        } else if matches!(direction, InspectorPageButton::Section(section) if Some(*section) == active)
+        {
+            follow_active_color()
         } else {
             follow_idle_color()
         };
@@ -9438,6 +9804,7 @@ mod owner_inspector_tests {
                 handle_inspector_page,
                 update_hud,
                 update_creature_card,
+                update_inspector_page_button_colors,
             )
                 .chain(),
         );
@@ -9760,7 +10127,13 @@ mod owner_inspector_tests {
             .sample
             .as_ref()
             .unwrap()
-            .page_count();
+            .page_count(
+                app.world()
+                    .resource::<SnapshotState>()
+                    .latest
+                    .as_ref()
+                    .unwrap(),
+            );
         let previous = app
             .world_mut()
             .spawn((InspectorPageButton::Previous, Interaction::Pressed))
@@ -9782,6 +10155,54 @@ mod owner_inspector_tests {
                 .0
                 .contains("Life and lineage")
         );
+        app.world_mut().entity_mut(button).insert(Interaction::None);
+        app.world_mut()
+            .resource_mut::<SnapshotState>()
+            .latest
+            .as_mut()
+            .unwrap()
+            .brain = BrainOverlay {
+            status: BrainOverlayStatus::Ready,
+            source_tick: 42,
+            layers: vec![BrainOverlayLayer {
+                name: "working".into(),
+                shown: vec![-0.25; 200],
+                total: 200,
+            }],
+            truncated: false,
+        };
+        for (section, expected) in [
+            (InspectorSection::Brain, "Brain @ tick 42"),
+            (InspectorSection::Senses, "Sensors 1-8/"),
+            (InspectorSection::Actions, "Outputs 1-8/"),
+            (InspectorSection::Body, "Eyes (radians)"),
+            (InspectorSection::Genome, "Genome summary: unavailable"),
+            (InspectorSection::Life, "Life and lineage"),
+        ] {
+            let section_button = app
+                .world_mut()
+                .spawn((
+                    InspectorPageButton::Section(section),
+                    Interaction::Pressed,
+                    BackgroundColor(follow_idle_color()),
+                ))
+                .id();
+            app.update();
+            let shown = &app.world().get::<Text>(text).unwrap().0;
+            assert!(shown.contains(expected), "{section:?}: {shown}");
+            app.world_mut()
+                .entity_mut(section_button)
+                .insert(Interaction::None);
+            app.update();
+            assert_eq!(
+                app.world()
+                    .get::<BackgroundColor>(section_button)
+                    .unwrap()
+                    .0,
+                follow_active_color(),
+                "{section:?} should remain highlighted"
+            );
+        }
     }
 
     #[test]
@@ -10124,6 +10545,105 @@ mod owner_inspector_tests {
                 .is_some()
         );
     }
+
+    #[test]
+    fn stalled_owner_timeout_is_truthful_and_can_be_retried_in_the_hud() {
+        let mut owner = TestOwner::new();
+        let (mut app, text) = inspector_app(&owner);
+        let deadline = Instant::now() + Duration::from_secs(4);
+        loop {
+            app.update();
+            let shown = &app.world().get::<Text>(text).unwrap().0;
+            if shown.contains("owner read timed out before the detail was available") {
+                assert!(!shown.contains("protocol violation"), "{shown}");
+                break;
+            }
+            assert!(Instant::now() < deadline, "timeout not displayed: {shown}");
+            thread::sleep(Duration::from_millis(1));
+        }
+        for _ in 0..4 {
+            app.update();
+        }
+        assert!(
+            app.world()
+                .non_send_resource::<OwnerInspector>()
+                .job
+                .is_none()
+        );
+
+        owner.serve();
+        let button = app
+            .world_mut()
+            .spawn((InspectorPageButton::Next, Interaction::Pressed))
+            .id();
+        app.update();
+        app.world_mut().entity_mut(button).insert(Interaction::None);
+        loop {
+            app.update();
+            let shown = &app.world().get::<Text>(text).unwrap().0;
+            if shown.contains("Reproduction counter 0.375") {
+                assert!(!shown.contains("timed out"), "{shown}");
+                break;
+            }
+            assert!(Instant::now() < deadline, "retry did not recover: {shown}");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn retry_button_requeues_a_failed_refresh_with_a_stale_sample() {
+        let mut owner = TestOwner::new();
+        owner.serve();
+        let (mut app, text) = inspector_app(&owner);
+        let mut frame = owner.frame();
+        let original = InspectorTarget::from_frame(&frame).unwrap();
+        let sample = capture_owner_inspector(&owner.port, original)
+            .unwrap()
+            .unwrap();
+        let mut later = original;
+        later.source.inspected_tick = scriptbots_core::Tick(3);
+        later.source.inspected_host.scientific = scriptbots_runtime::ScientificRevision::new(3);
+        later.source.published_host = later.source.inspected_host;
+        frame.owner_source = Some((later.source, later.epoch));
+        app.world_mut().resource_mut::<SnapshotState>().latest = Some(frame);
+        let inspector = &mut *app.world_mut().non_send_resource_mut::<OwnerInspector>();
+        inspector.sample = Some(sample);
+        inspector.last_attempt = Some(later);
+        inspector.last_failure = Some("owner read timed out".into());
+        inspector.last_request = Some(Instant::now() - OWNER_INSPECTOR_REFRESH);
+
+        let button = app
+            .world_mut()
+            .spawn((InspectorPageButton::Next, Interaction::Pressed))
+            .id();
+        app.update();
+        assert!(
+            app.world()
+                .non_send_resource::<OwnerInspector>()
+                .last_attempt
+                .is_none(),
+            "retry must be queued even while stale detail is visible"
+        );
+        app.world_mut().entity_mut(button).insert(Interaction::None);
+        let deadline = Instant::now() + Duration::from_secs(4);
+        loop {
+            app.update();
+            let inspector = app.world().non_send_resource::<OwnerInspector>();
+            if inspector.last_failure.is_none() {
+                assert!(inspector.sample.is_some());
+                assert!(
+                    !app.world()
+                        .get::<Text>(text)
+                        .unwrap()
+                        .0
+                        .contains("timed out")
+                );
+                break;
+            }
+            assert!(Instant::now() < deadline, "stale detail did not refresh");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
 }
 
 /// The primary selection's vitals, projected for the inspector overlay.
@@ -10437,9 +10957,7 @@ fn handle_selection_input(
         };
         info!(agent_id, intent, %command_id, "Bevy selection enqueued");
         if !extend {
-            rig.follow_mode = FollowMode::Selected;
-            rig.pan = Vec2::ZERO;
-            rig.recenter_now = true;
+            rig.follow_clicked_creature(snapshot.agent_radius);
         }
     } else if !extend {
         let command = ControlCommand::UpdateSelection(SelectionUpdate {
@@ -11609,7 +12127,7 @@ fn sync_terrain(
     commands: &mut Commands,
     registry: &mut TerrainChunkRegistry,
     meshes: &mut Assets<Mesh>,
-    materials: &mut Assets<StandardMaterial>,
+    materials: &mut Assets<TerrainMaterial>,
     probe_assets: &ReflectionProbeAssets,
     palette: ColorPaletteMode,
 ) {
@@ -11678,7 +12196,10 @@ fn sync_terrain(
                 }
                 None => {
                     let mesh_handle = meshes.add(built.mesh);
-                    let material_handle = materials.add(create_chunk_material(&built.stats));
+                    let material_handle = materials.add(TerrainMaterial {
+                        base: create_chunk_material(&built.stats),
+                        extension: TerrainBlend::default(),
+                    });
                     let entity = commands
                         .spawn((
                             Mesh3d(mesh_handle.clone()),
@@ -11970,7 +12491,7 @@ pub(crate) fn apply_tier_to_terrain_detail(
     accessibility: Res<AccessibilityState>,
     mut active: Local<TerrainDetailTextures>,
     mut images: ResMut<Assets<Image>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut materials: ResMut<Assets<TerrainMaterial>>,
 ) {
     let divisor = effective.features.terrain_detail_divisor.max(1);
     let changed = active.divisor != divisor;
@@ -12008,35 +12529,39 @@ pub(crate) fn apply_tier_to_terrain_detail(
     // material parameters and vertex palette colors remain authoritative.
     for chunk in registry.chunks.values() {
         let handle = &active.handles[chunk.stats.detail_layer];
-        if materials
-            .get(&chunk.material)
-            .is_some_and(|material| material.metallic_roughness_texture.as_ref() != Some(handle))
-            && let Some(material) = materials.get_mut(&chunk.material)
+        if materials.get(&chunk.material).is_some_and(|material| {
+            material.base.metallic_roughness_texture.as_ref() != Some(handle)
+        }) && let Some(material) = materials.get_mut(&chunk.material)
         {
-            material.metallic_roughness_texture = Some(handle.clone());
+            material.base.metallic_roughness_texture = Some(handle.clone());
         }
-        let variant = match accessibility.palette() {
-            ColorPaletteMode::Natural => terrain_albedo_layer(chunk.stats.detail_layer),
-            ColorPaletteMode::HighContrast => TERRAIN_ALBEDO_LAYERS * 2,
-            _ => terrain_albedo_layer(chunk.stats.detail_layer) + TERRAIN_ALBEDO_LAYERS,
+        let natural = [0, 3, 2].map(terrain_albedo_layer);
+        let variants = match accessibility.palette() {
+            ColorPaletteMode::Natural => natural,
+            ColorPaletteMode::HighContrast => [TERRAIN_ALBEDO_LAYERS * 2; 3],
+            _ => natural.map(|index| index + TERRAIN_ALBEDO_LAYERS),
         };
-        let albedo = &active.albedo_handles[variant];
-        if materials
-            .get(&chunk.material)
-            .is_some_and(|material| material.base_color_texture.as_ref() != Some(albedo))
+        let [water, grass, rock] = variants.map(|index| active.albedo_handles[index].clone());
+        if let Some(material) = materials.get(&chunk.material)
+            && (material.extension.water.as_ref() != Some(&water)
+                || material.extension.grass.as_ref() != Some(&grass)
+                || material.extension.rock.as_ref() != Some(&rock))
             && let Some(material) = materials.get_mut(&chunk.material)
         {
-            material.base_color_texture = Some(albedo.clone());
+            material.extension.water = Some(water);
+            material.extension.grass = Some(grass);
+            material.extension.rock = Some(rock);
         }
     }
 }
 
 fn update_chunk_material(
-    materials: &mut Assets<StandardMaterial>,
-    handle: &Handle<StandardMaterial>,
+    materials: &mut Assets<TerrainMaterial>,
+    handle: &Handle<TerrainMaterial>,
     stats: &TerrainChunkStats,
 ) {
     if let Some(material) = materials.get_mut(handle) {
+        let material = &mut material.base;
         let roughness = (0.45 + stats.mean_moisture * 0.4).clamp(0.1, 0.95);
         let metallic = (stats.mean_slope * 0.35).clamp(0.0, 0.5);
         let emissive_intensity =
@@ -12217,6 +12742,7 @@ fn build_chunk_mesh(
     let mut positions = Vec::with_capacity(vertex_count);
     let mut normals = Vec::with_capacity(vertex_count);
     let mut uvs = Vec::with_capacity(vertex_count);
+    let mut blend_weights = Vec::with_capacity(vertex_count);
     let mut colors = Vec::with_capacity(vertex_count);
     let mut sum_moisture = 0.0f64;
     let mut sum_slope = 0.0f64;
@@ -12246,7 +12772,10 @@ fn build_chunk_mesh(
 
             let sample = terrain.sample_tile(global_x, global_z);
             let slope = compute_tile_slope(terrain, global_x, global_z);
-            let color = terrain_vertex_color_from_sample(sample, slope, terrain.daylight, palette);
+            let splat = terrain_sample_splat(sample, slope);
+            blend_weights.push([splat[0] + splat[1], splat[3] + splat[4]]);
+            let color =
+                terrain_vertex_color_from_splat(sample, slope, splat, terrain.daylight, palette);
             colors.push(color);
 
             if vx < bounds.size.x && vz < bounds.size.y {
@@ -12292,6 +12821,7 @@ fn build_chunk_mesh(
         &positions,
         &normals,
         &colors,
+        &blend_weights,
         &[
             mean_moisture,
             mean_slope,
@@ -12311,6 +12841,7 @@ fn build_chunk_mesh(
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
     mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
     mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_1, blend_weights);
     mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
     mesh.insert_indices(Indices::U32(indices));
 
@@ -12398,14 +12929,33 @@ fn terrain_tile_surface_srgb_from_sample(
     daylight: f32,
     palette: ColorPaletteMode,
 ) -> [f32; 3] {
-    let weights = visual::splat_weights(&SplatInput {
+    terrain_surface_srgb_from_splat(
+        sample,
+        slope,
+        terrain_sample_splat(sample, slope),
+        daylight,
+        palette,
+    )
+}
+
+fn terrain_sample_splat(sample: TerrainTileSample, slope: f32) -> [f32; visual::SPLAT_LAYERS] {
+    visual::splat_weights(&SplatInput {
         kind: sample.kind,
         elevation: sample.elevation,
         slope,
         water_depth: sample.water_depth,
         moisture: sample.moisture,
         temperature: sample.temperature,
-    });
+    })
+}
+
+fn terrain_surface_srgb_from_splat(
+    sample: TerrainTileSample,
+    slope: f32,
+    weights: [f32; visual::SPLAT_LAYERS],
+    daylight: f32,
+    palette: ColorPaletteMode,
+) -> [f32; 3] {
     visual::terrain_surface_srgb(&TerrainSurfaceInput {
         splat_weights: weights,
         moisture: sample.moisture,
@@ -12430,13 +12980,30 @@ fn terrain_vertex_color(
     terrain_vertex_color_from_sample(sample, slope, terrain.daylight, palette)
 }
 
+#[cfg(test)]
 fn terrain_vertex_color_from_sample(
     sample: TerrainTileSample,
     slope: f32,
     daylight: f32,
     palette: ColorPaletteMode,
 ) -> [f32; 4] {
-    let mapped = terrain_tile_surface_srgb_from_sample(sample, slope, daylight, palette);
+    terrain_vertex_color_from_splat(
+        sample,
+        slope,
+        terrain_sample_splat(sample, slope),
+        daylight,
+        palette,
+    )
+}
+
+fn terrain_vertex_color_from_splat(
+    sample: TerrainTileSample,
+    slope: f32,
+    splat: [f32; visual::SPLAT_LAYERS],
+    daylight: f32,
+    palette: ColorPaletteMode,
+) -> [f32; 4] {
+    let mapped = terrain_surface_srgb_from_splat(sample, slope, splat, daylight, palette);
     let linear = srgb_to_linear_rgb(mapped);
     [linear[0], linear[1], linear[2], 1.0]
 }
@@ -12601,6 +13168,7 @@ mod terrain_tests {
             })
             .init_resource::<Assets<Mesh>>()
             .init_resource::<Assets<StandardMaterial>>()
+            .init_resource::<Assets<TerrainMaterial>>()
             .init_resource::<AccessibilityState>()
             .insert_resource(AgentMotionSettings { enabled: true });
         app
@@ -13638,8 +14206,8 @@ mod terrain_tests {
         let colors_b = [colors_a[1], colors_a[0]];
 
         assert_ne!(
-            TerrainChunkSignature::from_render_inputs(&positions_a, &[], &colors_a, &[0.2], 0),
-            TerrainChunkSignature::from_render_inputs(&positions_b, &[], &colors_b, &[0.2], 0),
+            TerrainChunkSignature::from_render_inputs(&positions_a, &[], &colors_a, &[], &[0.2], 0),
+            TerrainChunkSignature::from_render_inputs(&positions_b, &[], &colors_b, &[], &[0.2], 0),
             "equal height/color aggregates must not preserve a stale spatial mesh"
         );
     }
@@ -13649,13 +14217,41 @@ mod terrain_tests {
         let positions = [[0.0, 1.0, 0.0], [1.0, 1.0, 0.0]];
         let colors = [[0.8, 0.7, 0.2, 1.0]; 2];
         assert_ne!(
-            TerrainChunkSignature::from_render_inputs(&positions, &[], &colors, &[0.1, 0.0], 0),
-            TerrainChunkSignature::from_render_inputs(&positions, &[], &colors, &[0.9, 0.0], 0),
+            TerrainChunkSignature::from_render_inputs(
+                &positions,
+                &[],
+                &colors,
+                &[],
+                &[0.1, 0.0],
+                0
+            ),
+            TerrainChunkSignature::from_render_inputs(
+                &positions,
+                &[],
+                &colors,
+                &[],
+                &[0.9, 0.0],
+                0
+            ),
             "moisture/slope material changes must not preserve a stale PBR material"
         );
         assert_ne!(
-            TerrainChunkSignature::from_render_inputs(&positions, &[], &colors, &[0.1, 0.0], 0),
-            TerrainChunkSignature::from_render_inputs(&positions, &[], &colors, &[0.1, 0.0], 1),
+            TerrainChunkSignature::from_render_inputs(
+                &positions,
+                &[],
+                &colors,
+                &[],
+                &[0.1, 0.0],
+                0
+            ),
+            TerrainChunkSignature::from_render_inputs(
+                &positions,
+                &[],
+                &colors,
+                &[],
+                &[0.1, 0.0],
+                1
+            ),
             "texture layer alone must invalidate a chunk even when other render inputs agree"
         );
         assert_ne!(
@@ -13663,6 +14259,7 @@ mod terrain_tests {
                 &positions,
                 &[[0.0, 1.0, 0.0]],
                 &colors,
+                &[],
                 &[0.1, 0.0],
                 0,
             ),
@@ -13670,10 +14267,30 @@ mod terrain_tests {
                 &positions,
                 &[[0.1, 0.99, 0.0]],
                 &colors,
+                &[],
                 &[0.1, 0.0],
                 0,
             ),
             "neighboring height changes must invalidate edge normals"
+        );
+        assert_ne!(
+            TerrainChunkSignature::from_render_inputs(
+                &positions,
+                &[],
+                &colors,
+                &[[1.0, 0.0]],
+                &[],
+                0
+            ),
+            TerrainChunkSignature::from_render_inputs(
+                &positions,
+                &[],
+                &colors,
+                &[[0.0, 1.0]],
+                &[],
+                0
+            ),
+            "changed biome weights must invalidate the visible mesh"
         );
     }
 
@@ -18670,6 +19287,7 @@ mod tests {
         });
         app.insert_resource(meshes);
         app.insert_resource(Assets::<StandardMaterial>::default());
+        app.insert_resource(Assets::<TerrainMaterial>::default());
         let mut images = Assets::<Image>::default();
         app.insert_resource(ReflectionProbeAssets::fallback(&mut images));
         app.insert_resource(images);
@@ -18825,6 +19443,7 @@ mod tests {
         app.insert_resource(AgentMeshes::default());
         app.insert_resource(Assets::<Mesh>::default());
         app.insert_resource(Assets::<StandardMaterial>::default());
+        app.insert_resource(Assets::<TerrainMaterial>::default());
         let mut images = Assets::<Image>::default();
         app.insert_resource(ReflectionProbeAssets::fallback(&mut images));
         app.insert_resource(images);
