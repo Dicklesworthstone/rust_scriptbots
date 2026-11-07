@@ -20,6 +20,7 @@
 @group(#{MATERIAL_BIND_GROUP}) @binding(103) var grass_sampler: sampler;
 @group(#{MATERIAL_BIND_GROUP}) @binding(104) var rock_texture: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(105) var rock_sampler: sampler;
+@group(#{MATERIAL_BIND_GROUP}) @binding(106) var<uniform> dry_light_strength: f32;
 
 @fragment
 fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> FragmentOutput {
@@ -37,7 +38,14 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     // The square-root curve lifts shadows more than highlights, stays within
     // the base biome tint, and leaves the white accessibility texture white.
     let detail = mix(photo_detail, sqrt(max(photo_detail, vec3<f32>(0.0))), 0.6);
-    pbr_input.material.base_color = vec4<f32>(pbr_input.material.base_color.rgb * detail,
+    // Rock and sand share this texture group. Lift their natural-palette light
+    // response while retaining hue and avoiding channel clipping; the uniform
+    // disables the lift for every accessibility palette.
+    let base = pbr_input.material.base_color.rgb;
+    let peak = max(max(base.r, base.g), base.b);
+    let max_gain = max(1.0, 1.0 / max(peak, 0.00001));
+    let gain = min(1.0 + dry_light_strength * rock_weight / total, max_gain);
+    pbr_input.material.base_color = vec4<f32>(base * gain * detail,
                                             pbr_input.material.base_color.a);
 #endif
 #endif

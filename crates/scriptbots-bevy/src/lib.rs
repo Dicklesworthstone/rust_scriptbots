@@ -3352,6 +3352,15 @@ struct TerrainBlend {
     #[texture(104)]
     #[sampler(105)]
     rock: Option<Handle<Image>>,
+    #[uniform(106)]
+    dry_light_strength: f32,
+}
+
+const fn dry_ground_light_strength(palette: ColorPaletteMode) -> f32 {
+    match palette {
+        ColorPaletteMode::Natural => 1.2,
+        _ => 0.0,
+    }
 }
 
 impl MaterialExtension for TerrainBlend {
@@ -6814,6 +6823,7 @@ mod adaptive_governor_tests {
         let natural = {
             let materials = app.world().resource::<Assets<TerrainMaterial>>();
             let blend = &materials.get(&material).unwrap().extension;
+            assert_eq!(blend.dry_light_strength.to_bits(), 1.2_f32.to_bits());
             [
                 blend.water.clone().unwrap(),
                 blend.grass.clone().unwrap(),
@@ -6831,6 +6841,7 @@ mod adaptive_governor_tests {
             app.update();
             let materials = app.world().resource::<Assets<TerrainMaterial>>();
             let blend = &materials.get(&material).unwrap().extension;
+            assert_eq!(blend.dry_light_strength.to_bits(), 0.0_f32.to_bits());
             let neutral = [
                 blend.water.as_ref().unwrap(),
                 blend.grass.as_ref().unwrap(),
@@ -6864,6 +6875,7 @@ mod adaptive_governor_tests {
         app.update();
         let materials = app.world().resource::<Assets<TerrainMaterial>>();
         let blend = &materials.get(&material).unwrap().extension;
+        assert_eq!(blend.dry_light_strength.to_bits(), 1.2_f32.to_bits());
         assert_eq!(
             [
                 blend.water.as_ref().unwrap(),
@@ -12262,7 +12274,10 @@ fn sync_terrain(
                     let mesh_handle = meshes.add(built.mesh);
                     let material_handle = materials.add(TerrainMaterial {
                         base: create_chunk_material(&built.stats),
-                        extension: TerrainBlend::default(),
+                        extension: TerrainBlend {
+                            dry_light_strength: dry_ground_light_strength(palette),
+                            ..Default::default()
+                        },
                     });
                     let entity = commands
                         .spawn((
@@ -12606,15 +12621,18 @@ pub(crate) fn apply_tier_to_terrain_detail(
             _ => natural.map(|index| index + TERRAIN_ALBEDO_LAYERS),
         };
         let [water, grass, rock] = variants.map(|index| active.albedo_handles[index].clone());
+        let dry_light_strength = dry_ground_light_strength(accessibility.palette());
         if let Some(material) = materials.get(&chunk.material)
             && (material.extension.water.as_ref() != Some(&water)
                 || material.extension.grass.as_ref() != Some(&grass)
-                || material.extension.rock.as_ref() != Some(&rock))
+                || material.extension.rock.as_ref() != Some(&rock)
+                || material.extension.dry_light_strength.to_bits() != dry_light_strength.to_bits())
             && let Some(material) = materials.get_mut(&chunk.material)
         {
             material.extension.water = Some(water);
             material.extension.grass = Some(grass);
             material.extension.rock = Some(rock);
+            material.extension.dry_light_strength = dry_light_strength;
         }
     }
 }
