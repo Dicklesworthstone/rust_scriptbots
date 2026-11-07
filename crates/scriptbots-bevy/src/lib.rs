@@ -889,7 +889,9 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
     .insert_resource(AgentMotionSettings {
         enabled: !initial_render_settings.reduced_motion.unwrap_or(false),
     })
-    .insert_resource(AccessibilityState::new())
+    .insert_resource(AccessibilityState::from_render_settings(
+        &initial_render_settings,
+    ))
     .insert_resource(TonemappingState::from_render_settings(
         &initial_render_settings,
     ))
@@ -1469,6 +1471,16 @@ enum ColorPaletteMode {
 }
 
 impl ColorPaletteMode {
+    const fn from_accessibility(palette: AccessibilityPalette) -> Self {
+        match palette {
+            AccessibilityPalette::Natural => Self::Natural,
+            AccessibilityPalette::Deuteranopia => Self::Deuteranopia,
+            AccessibilityPalette::Protanopia => Self::Protanopia,
+            AccessibilityPalette::Tritanopia => Self::Tritanopia,
+            AccessibilityPalette::HighContrast => Self::HighContrast,
+        }
+    }
+
     fn next(self) -> Self {
         match self {
             Self::Natural => Self::Deuteranopia,
@@ -1512,12 +1524,64 @@ impl AccessibilityState {
         }
     }
 
+    fn from_render_settings(settings: &RenderSettings) -> Self {
+        Self {
+            palette: ColorPaletteMode::from_accessibility(settings.palette.unwrap_or_default()),
+        }
+    }
+
     fn cycle(&mut self) {
         self.palette = self.palette.next();
     }
 
     fn palette(&self) -> ColorPaletteMode {
         self.palette
+    }
+}
+
+#[cfg(test)]
+mod accessibility_settings_tests {
+    use super::*;
+
+    #[test]
+    fn configured_palette_is_the_initial_live_palette_and_cycles_from_it() {
+        for (palette, next) in [
+            (
+                AccessibilityPalette::Natural,
+                AccessibilityPalette::Deuteranopia,
+            ),
+            (
+                AccessibilityPalette::Deuteranopia,
+                AccessibilityPalette::Protanopia,
+            ),
+            (
+                AccessibilityPalette::Protanopia,
+                AccessibilityPalette::Tritanopia,
+            ),
+            (
+                AccessibilityPalette::Tritanopia,
+                AccessibilityPalette::HighContrast,
+            ),
+            (
+                AccessibilityPalette::HighContrast,
+                AccessibilityPalette::Natural,
+            ),
+        ] {
+            let settings = RenderSettings {
+                palette: Some(palette),
+                ..Default::default()
+            };
+            let mut state = AccessibilityState::from_render_settings(&settings);
+            assert_eq!(state.palette().accessibility(), palette);
+            state.cycle();
+            assert_eq!(state.palette().accessibility(), next);
+        }
+        assert_eq!(
+            AccessibilityState::from_render_settings(&RenderSettings::default())
+                .palette()
+                .accessibility(),
+            AccessibilityPalette::Natural
+        );
     }
 }
 

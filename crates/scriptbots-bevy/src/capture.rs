@@ -1637,6 +1637,7 @@ fn configure_session<'a>(
     reset_capture_scene(app.world_mut());
     app.insert_resource(CaptureCorrupt(config.corrupt));
     app.insert_resource(effective.clone());
+    configure_capture_palette(app.world_mut(), &config.render_settings);
     configure_capture_camera_effects(
         app.world_mut(),
         &config.render_settings,
@@ -1687,6 +1688,10 @@ fn configure_session<'a>(
         corrupt: config.corrupt,
         next_snapshot_revision: 1,
     })
+}
+
+fn configure_capture_palette(world: &mut World, settings: &RenderSettings) {
+    world.insert_resource(AccessibilityState::from_render_settings(settings));
 }
 
 fn reset_capture_scene(world: &mut World) {
@@ -2294,6 +2299,48 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn capture_palette_consumes_settings_and_resets_between_sessions() {
+        let mut world = World::new();
+        for palette in [
+            scriptbots_core::AccessibilityPalette::HighContrast,
+            scriptbots_core::AccessibilityPalette::Deuteranopia,
+            scriptbots_core::AccessibilityPalette::Protanopia,
+            scriptbots_core::AccessibilityPalette::Tritanopia,
+            scriptbots_core::AccessibilityPalette::Natural,
+        ] {
+            configure_capture_palette(
+                &mut world,
+                &RenderSettings {
+                    palette: Some(palette),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                world
+                    .resource::<AccessibilityState>()
+                    .palette()
+                    .accessibility(),
+                palette
+            );
+        }
+        configure_capture_palette(
+            &mut world,
+            &RenderSettings {
+                palette: Some(scriptbots_core::AccessibilityPalette::HighContrast),
+                ..Default::default()
+            },
+        );
+        configure_capture_palette(&mut world, &RenderSettings::default());
+        assert_eq!(
+            world
+                .resource::<AccessibilityState>()
+                .palette()
+                .accessibility(),
+            scriptbots_core::AccessibilityPalette::Natural
+        );
     }
 
     #[test]
