@@ -63,6 +63,8 @@ pub const DEFAULT_CHANNEL_SUBMIT_DEADLINE: Duration = Duration::from_millis(10_0
 pub const DEFAULT_CHANNEL_MAINTENANCE_PERIOD: Duration = Duration::from_millis(20);
 /// Maximum retained contributors in an on-demand focused-agent explanation.
 pub const MAX_INSPECTOR_CONTRIBUTORS: usize = 64;
+/// Maximum genome nodes returned in one owner inspection.
+pub const INSPECTOR_GENOME_PAGE_SIZE: usize = 20;
 
 /// Bounds and deadlines for one channel host driver and its ports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,6 +152,7 @@ enum IngressMessage {
     AgentInspection {
         uid: AgentUid,
         max_contributors: Option<usize>,
+        genome_offset: usize,
         expires_at: Instant,
         reply: Sender<Result<Option<AgentInspectorData>, HostAccessError>>,
     },
@@ -573,18 +576,27 @@ impl ChannelHostPort {
                 "sensor explanation contributor limit exceeded before enqueue",
             ));
         }
-        self.inspect_agent_with_attribution(uid, Some(max_contributors))
+        self.inspect_agent_with_attribution(uid, Some(max_contributors), 0)
     }
 
     fn inspect_agent_with_attribution(
         &self,
         uid: AgentUid,
         max_contributors: Option<usize>,
+        genome_offset: usize,
     ) -> Result<Option<AgentInspectorData>, HostAccessError> {
+        if !genome_offset.is_multiple_of(INSPECTOR_GENOME_PAGE_SIZE)
+            || genome_offset
+                .checked_add(INSPECTOR_GENOME_PAGE_SIZE)
+                .is_none()
+        {
+            return Err(Self::protocol_violation("invalid genome page offset"));
+        }
         let expires_at = self.inspection_deadline()?;
         self.read_owner(|reply| IngressMessage::AgentInspection {
             uid,
             max_contributors,
+            genome_offset,
             expires_at,
             reply,
         })
@@ -607,8 +619,18 @@ impl ChannelHostPort {
         uid: AgentUid,
         deadline: Instant,
     ) -> Result<Option<AgentInspectorData>, HostAccessError> {
+        self.inspect_agent_for_hud_page_before(uid, 0, deadline)
+    }
+
+    /// Read a bounded genome slice without computing sensor explanations.
+    pub fn inspect_agent_for_hud_page_before(
+        &self,
+        uid: AgentUid,
+        genome_offset: usize,
+        deadline: Instant,
+    ) -> Result<Option<AgentInspectorData>, HostAccessError> {
         self.bounded_before_with_error(deadline, HostAccessError::OwnerReadTimeout)?
-            .inspect_agent_with_attribution(uid, None)
+            .inspect_agent_with_attribution(uid, None, genome_offset)
     }
 
     /// Query the owner's debug rows, preserving the query's filters and limit.
@@ -1443,6 +1465,7 @@ impl ChannelHostDriver {
             IngressMessage::AgentInspection {
                 uid,
                 max_contributors,
+                genome_offset,
                 expires_at,
                 reply,
             } => {
@@ -1450,11 +1473,11 @@ impl ChannelHostDriver {
                     let _ = reply.send(Err(HostAccessError::OwnerReadTimeout));
                     return;
                 }
-                let _ = reply.send(
-                    self.host
-                        .core()
-                        .inspect_agent_with_attribution(uid, max_contributors),
-                );
+                let _ = reply.send(self.host.core().inspect_agent_with_attribution(
+                    uid,
+                    max_contributors,
+                    genome_offset,
+                ));
             }
             IngressMessage::DebugAgents { query, reply } => {
                 let _ = reply.send(Ok(self.host.core().world().agent_debug_view(query)));
@@ -1929,6 +1952,7 @@ mod tests {
         driver.process_ingress(IngressMessage::AgentInspection {
             uid: AgentUid(1),
             max_contributors: None,
+            genome_offset: 0,
             expires_at: Instant::now(),
             reply,
         });
@@ -1944,6 +1968,16 @@ mod tests {
             port.inspect_agent_for_hud_before(AgentUid(1), Instant::now()),
             Err(HostAccessError::OwnerReadTimeout)
         ));
+        for invalid in [1, usize::MAX] {
+            assert!(matches!(
+                port.inspect_agent_for_hud_page_before(
+                    AgentUid(1),
+                    invalid,
+                    Instant::now() + Duration::from_secs(1)
+                ),
+                Err(HostAccessError::ProtocolViolation { .. })
+            ));
+        }
         let (_stalled_driver, stalled_port) = ChannelHostDriver::new(
             test_host(true),
             ChannelHostOptions {
@@ -3819,6 +3853,7 @@ mod tests {
         driver.process_ingress(IngressMessage::AgentInspection {
             uid: AgentUid(u64::MAX),
             max_contributors: Some(0),
+            genome_offset: 0,
             expires_at: Instant::now(),
             reply,
         });
@@ -3831,6 +3866,7 @@ mod tests {
         driver.process_ingress(IngressMessage::AgentInspection {
             uid: AgentUid(u64::MAX),
             max_contributors: Some(0),
+            genome_offset: 0,
             expires_at: Instant::now() + Duration::from_secs(1),
             reply,
         });

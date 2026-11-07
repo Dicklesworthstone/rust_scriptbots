@@ -5637,6 +5637,7 @@ mod tests {
         ffi::OsString,
         io::{Read, Write},
         net::{TcpListener, TcpStream},
+        path::Path,
         sync::atomic::{AtomicBool, Ordering},
     };
 
@@ -9745,7 +9746,7 @@ mod tests {
                 })
                 .expect("released channel owner");
         });
-        let port = receive
+        let mut port = receive
             .recv_timeout(Duration::from_secs(5))
             .expect("blocked owner port");
         let reservation = ControlServerReservation::prepare(ControlServerConfig {

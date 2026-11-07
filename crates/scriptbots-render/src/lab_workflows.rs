@@ -877,7 +877,7 @@ mod tests {
         let mut lab = gpui::VisualTestContext::from_window(windows.hud.into(), &context);
         lab.simulate_resize(size(px(1000.0), px(1800.0)));
         let draw = |lab: &mut gpui::VisualTestContext| lab.update(|window, app| { window.refresh(); window.draw(app).clear(); });
-        let click = |lab: &mut gpui::VisualTestContext, selector: &str| {
+        let click = |lab: &mut gpui::VisualTestContext, selector: &'static str| {
             draw(lab);
             let bounds = lab.debug_bounds(selector).unwrap_or_else(|| panic!("missing production button {selector}"));
             lab.simulate_click(bounds.center(), gpui::Modifiers::default());

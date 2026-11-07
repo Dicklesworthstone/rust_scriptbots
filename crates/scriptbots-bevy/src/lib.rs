@@ -908,6 +908,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
                 sync_world,
                 smooth_agent_poses,
                 conform_agent_wheels,
+                conform_wheel_joints,
                 smooth_spike_poses,
                 animate_idle_bodies,
             )
@@ -958,6 +959,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
             (
                 poll_owner_inspector,
                 handle_inspector_page,
+                update_genome_slice_button_visibility,
                 update_hud,
                 update_creature_card,
             )
@@ -1214,6 +1216,12 @@ struct WheelGroundContact {
     side: f32,
 }
 
+/// A visible joint follows its wheel after suspension has been solved.
+#[derive(Component)]
+struct WheelSuspensionJoint {
+    wheel: Entity,
+}
+
 // Approximately 95% convergence in 100 ms, independent of render frame rate.
 const AGENT_POSE_RESPONSE: f32 = 30.0;
 
@@ -1451,7 +1459,9 @@ fn animate_idle_bodies(
 pub(crate) struct AgentMeshes {
     base_radius: f32,
     body: Handle<Mesh>,
+    stripe: Handle<Mesh>,
     wheel: Handle<Mesh>,
+    joint: Handle<Mesh>,
     spike: Handle<Mesh>,
     sphere: Handle<Mesh>,
     quad: Handle<Mesh>,
@@ -1459,6 +1469,69 @@ pub(crate) struct AgentMeshes {
 }
 
 pub(crate) const AGENT_BODY_CAPSULE: Capsule3d = Capsule3d::new(0.5, 1.6);
+
+/// Low-poly shared joint; the body material supplies the agent's live color.
+pub(crate) fn creature_joint_mesh() -> Mesh {
+    Sphere::new(0.5)
+        .mesh()
+        .ico(1)
+        .expect("one-subdivision sphere is valid")
+}
+
+/// A narrow band just above the upper capsule surface, in agent-radius units.
+/// Its profile matches the rendered capsule's scaled cylindrical and cap radii.
+pub(crate) fn creature_stripe_mesh() -> Mesh {
+    const LONGITUDINAL: u32 = 24;
+    const ACROSS: u32 = 2;
+    const HALF_CYLINDER: f32 = 2.35 * 0.8 / 2.6;
+    const CAP_LENGTH: f32 = 2.35 * 0.5 - HALF_CYLINDER;
+    const RADIUS: f32 = 0.88;
+    let mut positions = Vec::new();
+    let mut normals = Vec::new();
+    let mut uvs = Vec::new();
+    for row in 0..=LONGITUDINAL {
+        let u = row as f32 / LONGITUDINAL as f32;
+        let x = 1.10 * ((u * 2.0 - 1.0) * std::f32::consts::FRAC_PI_2).sin();
+        let cap_x = (x.abs() - HALF_CYLINDER).max(0.0);
+        let radial = (1.0 - (cap_x / CAP_LENGTH).powi(2)).max(0.0).sqrt();
+        // The tiny offset avoids depth fighting with the underlying capsule.
+        let r = RADIUS * radial * 1.018;
+        for col in 0..=ACROSS {
+            let v = col as f32 / ACROSS as f32;
+            let theta = (v * 2.0 - 1.0) * 0.22;
+            let (sin, cos) = theta.sin_cos();
+            let axial_normal = if cap_x > 0.0 {
+                x.signum() * cap_x / CAP_LENGTH.powi(2)
+            } else {
+                0.0
+            };
+            let normal =
+                Vec3::new(axial_normal, radial * cos / RADIUS, radial * sin / RADIUS).normalize();
+            positions.push([x, r * cos, r * sin]);
+            normals.push(normal.to_array());
+            uvs.push([u, v]);
+        }
+    }
+    let mut indices = Vec::new();
+    for row in 0..LONGITUDINAL {
+        for col in 0..ACROSS {
+            let a = row * (ACROSS + 1) + col;
+            let b = a + ACROSS + 1;
+            let c = a + 1;
+            let d = b + 1;
+            indices.extend_from_slice(&[a, c, b, b, c, d]);
+        }
+    }
+    let mut mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+    );
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+    mesh.insert_indices(Indices::U32(indices));
+    mesh
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum ColorPaletteMode {
@@ -1640,7 +1713,13 @@ fn spawn_part(
 }
 
 fn update_part_transform(commands: &mut Commands, part: &PartRef, transform: Transform) {
-    commands.entity(part.entity).insert(transform);
+    commands
+        .entity(part.entity)
+        .queue(move |mut entity: bevy::ecs::world::EntityWorldMut| {
+            if entity.get::<Transform>() != Some(&transform) {
+                entity.insert(transform);
+            }
+        });
 }
 
 fn update_part_colors(
@@ -1669,7 +1748,13 @@ fn set_part_visibility(commands: &mut Commands, part: &PartRef, visible: bool) {
     } else {
         Visibility::Hidden
     };
-    commands.entity(part.entity).insert(visibility);
+    commands
+        .entity(part.entity)
+        .queue(move |mut entity: bevy::ecs::world::EntityWorldMut| {
+            if entity.get::<Visibility>() != Some(&visibility) {
+                entity.insert(visibility);
+            }
+        });
 }
 
 fn apply_palette_rgb(rgb: Vec3, palette: ColorPaletteMode) -> Vec3 {
@@ -3297,7 +3382,7 @@ impl TerrainHeightSnapshot {
             moisture: self.moisture[idx],
             accent: self.accent[idx],
             water_depth: self.water_depth[idx],
-            _fertility: self.fertility[idx],
+            fertility: self.fertility[idx],
             temperature: self.temperature[idx],
         }
     }
@@ -3310,7 +3395,7 @@ struct TerrainTileSample {
     moisture: f32,
     accent: f32,
     water_depth: f32,
-    _fertility: f32,
+    fertility: f32,
     temperature: f32,
 }
 
@@ -3333,6 +3418,7 @@ struct TerrainChunkRecord {
     material: Handle<TerrainMaterial>,
     bounds: TerrainChunkBounds,
     signature: TerrainChunkSignature,
+    daylight_colors_dirty: bool,
     last_tick: u64,
     probe: Option<Entity>,
     stats: TerrainChunkStats,
@@ -4327,7 +4413,9 @@ fn setup_scene(
     ));
 
     let body_mesh = meshes.add(Mesh::from(AGENT_BODY_CAPSULE));
+    let stripe_mesh = meshes.add(creature_stripe_mesh());
     let wheel_mesh = meshes.add(Mesh::from(Torus::new(0.3, 0.6)));
+    let joint_mesh = meshes.add(creature_joint_mesh());
     let spike_mesh = meshes.add(Mesh::from(Cone {
         radius: 0.45,
         height: 1.0,
@@ -4338,7 +4426,9 @@ fn setup_scene(
     commands.insert_resource(AgentMeshes {
         base_radius: 1.0,
         body: body_mesh,
+        stripe: stripe_mesh,
         wheel: wheel_mesh,
+        joint: joint_mesh,
         spike: spike_mesh,
         sphere: sphere_mesh,
         quad: quad_mesh,
@@ -4671,12 +4761,23 @@ fn setup_scene(
                     for (direction, label) in [
                         (InspectorPageButton::Previous, "Previous"),
                         (InspectorPageButton::Next, "Next"),
+                        (InspectorPageButton::PreviousGenomeSlice, "Earlier nodes"),
+                        (InspectorPageButton::NextGenomeSlice, "Later nodes"),
                     ] {
                         row.spawn((
                             Button,
                             Node {
                                 min_width: Val::Px(0.0),
                                 padding: UiRect::axes(Val::Px(8.0), Val::Px(3.0)),
+                                display: if matches!(
+                                    direction,
+                                    InspectorPageButton::PreviousGenomeSlice
+                                        | InspectorPageButton::NextGenomeSlice
+                                ) {
+                                    Display::None
+                                } else {
+                                    Display::Flex
+                                },
                                 ..button_node.clone()
                             },
                             BackgroundColor(follow_idle_color()),
@@ -5110,6 +5211,52 @@ fn camera_motion_lead(velocity: Vec2, radius: f32, world_size: Vec2) -> Vec2 {
     velocity.clamp_length_max(limit / HORIZON_TICKS) * HORIZON_TICKS
 }
 
+#[derive(Clone, PartialEq)]
+struct TerrainSyncInput {
+    terrain: TerrainHeightSnapshot,
+    world_size: Vec2,
+    chunk_size: u32,
+    height_scale: f32,
+    palette: ColorPaletteMode,
+}
+
+fn same_terrain_except_daylight(a: &TerrainHeightSnapshot, b: &TerrainHeightSnapshot) -> bool {
+    a.dims == b.dims
+        && a.cell_size == b.cell_size
+        && a.elevation == b.elevation
+        && a.moisture == b.moisture
+        && a.accent == b.accent
+        && a.water_depth == b.water_depth
+        && a.fertility == b.fertility
+        && a.temperature == b.temperature
+        && a.kinds == b.kinds
+}
+
+fn terrain_chunk_colors(
+    terrain: &TerrainHeightSnapshot,
+    bounds: TerrainChunkBounds,
+    palette: ColorPaletteMode,
+) -> Vec<[f32; 4]> {
+    let mut colors = Vec::with_capacity(((bounds.size.x + 1) * (bounds.size.y + 1)) as usize);
+    for z in 0..=bounds.size.y {
+        for x in 0..=bounds.size.x {
+            let x = bounds.origin.x + x;
+            let z = bounds.origin.y + z;
+            let sample = terrain.sample_tile(x, z);
+            let slope = compute_tile_slope(terrain, x, z);
+            let splat = terrain_sample_splat(sample, slope);
+            colors.push(terrain_vertex_color_from_splat(
+                sample,
+                slope,
+                splat,
+                terrain.daylight,
+                palette,
+            ));
+        }
+    }
+    colors
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn sync_world(
     mut commands: Commands,
@@ -5122,6 +5269,7 @@ pub(crate) fn sync_world(
     mut terrain_materials: ResMut<Assets<TerrainMaterial>>,
     probe_assets: Res<ReflectionProbeAssets>,
     accessibility: Res<AccessibilityState>,
+    mut last_terrain: Local<Option<TerrainSyncInput>>,
 ) {
     let Some(snapshot) = state.latest.as_ref() else {
         return;
@@ -5174,15 +5322,74 @@ pub(crate) fn sync_world(
     let selection_center = selection_bounds.map(|(min, max)| (min + max) * 0.5);
     let focus_point = selection_center.or(first_agent).unwrap_or(world_center);
 
-    sync_terrain(
-        snapshot,
-        &mut commands,
-        &mut terrain_registry,
-        meshes.as_mut(),
-        terrain_materials.as_mut(),
-        probe_assets.as_ref(),
-        palette,
-    );
+    // Daylight may change every tick while the terrain surface stays still.
+    // Keep its geometry and recompute the same canonical vertex colors.
+    let chunk_size = terrain_registry.chunk_size.max(1);
+    let dims = snapshot.terrain_height.dims;
+    let expected_chunks =
+        (dims.x.div_ceil(chunk_size) as usize).saturating_mul(dims.y.div_ceil(chunk_size) as usize);
+    let same_layout = last_terrain.as_ref().is_some_and(|previous| {
+        previous.world_size == snapshot.world_size
+            && previous.chunk_size == chunk_size
+            && previous.height_scale == terrain_registry.height_scale
+            && previous.palette == palette
+    }) && terrain_registry.chunks.len() == expected_chunks
+        && terrain_registry
+            .chunks
+            .values()
+            .all(|chunk| meshes.get(&chunk.mesh).is_some());
+    let terrain_unchanged = same_layout
+        && last_terrain
+            .as_ref()
+            .is_some_and(|previous| previous.terrain == snapshot.terrain_height);
+    let only_daylight_changed = same_layout
+        && last_terrain.as_ref().is_some_and(|previous| {
+            same_terrain_except_daylight(&previous.terrain, &snapshot.terrain_height)
+        });
+    if terrain_unchanged {
+        for chunk in terrain_registry.chunks.values_mut() {
+            chunk.last_tick = snapshot.tick;
+        }
+    } else if only_daylight_changed {
+        for chunk in terrain_registry.chunks.values_mut() {
+            let colors = terrain_chunk_colors(&snapshot.terrain_height, chunk.bounds, palette);
+            let changed = !matches!(
+                meshes.get(&chunk.mesh).and_then(|mesh| mesh.attribute(Mesh::ATTRIBUTE_COLOR)),
+                Some(bevy_mesh::VertexAttributeValues::Float32x4(existing)) if existing == &colors
+            );
+            if changed {
+                meshes
+                    .get_mut(&chunk.mesh)
+                    .expect("mesh checked above")
+                    .insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
+                // A later full build must refresh the stored signature.
+                chunk.daylight_colors_dirty = true;
+            }
+            chunk.last_tick = snapshot.tick;
+        }
+        last_terrain
+            .as_mut()
+            .expect("cache checked above")
+            .terrain
+            .daylight = snapshot.terrain_height.daylight;
+    } else {
+        sync_terrain(
+            snapshot,
+            &mut commands,
+            &mut terrain_registry,
+            meshes.as_mut(),
+            terrain_materials.as_mut(),
+            probe_assets.as_ref(),
+            palette,
+        );
+        *last_terrain = Some(TerrainSyncInput {
+            terrain: snapshot.terrain_height.clone(),
+            world_size: snapshot.world_size,
+            chunk_size,
+            height_scale: terrain_registry.height_scale,
+            palette,
+        });
+    }
     sync_agents(
         snapshot,
         &mut commands,
@@ -6256,9 +6463,13 @@ mod visual_authority_consumer_guard {
         // Bevy's production loader is external to visual.rs. Its real consumer
         // must not turn visual.rs's own test calls into internal production uses.
         assert!(
-            !internal.contains("verify_biome_atlas"),
+            !internal.contains("verify_biome_atlas("),
             "visual.rs has no internal production call to verify_biome_atlas; \
              its tests must not enter the production-only sweep"
+        );
+        assert!(
+            internal.contains("verify_biome_atlas_against("),
+            "the helper call must remain visible without being mistaken for its public wrapper"
         );
     }
 
@@ -6551,6 +6762,192 @@ mod adaptive_governor_tests {
     }
 
     #[test]
+    fn stable_terrain_does_not_rewrite_reflection_probe_on_new_revision() {
+        let mut app = terrain_detail_app();
+        app.update();
+        let key = TerrainChunkKey { x: 0, y: 0 };
+        let probe = app.world().resource::<TerrainChunkRegistry>().chunks[&key]
+            .probe
+            .unwrap();
+        let before = app
+            .world()
+            .entity(probe)
+            .get_ref::<Transform>()
+            .unwrap()
+            .last_changed();
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            let snapshot = state.latest.as_mut().unwrap();
+            snapshot.revision += 1;
+            snapshot.tick += 1;
+        }
+        app.update();
+        let after = app
+            .world()
+            .entity(probe)
+            .get_ref::<Transform>()
+            .unwrap()
+            .last_changed();
+        assert_eq!(before, after);
+        assert_eq!(
+            app.world().resource::<TerrainChunkRegistry>().chunks[&key].last_tick,
+            1
+        );
+    }
+
+    #[test]
+    fn stable_terrain_rebuilds_after_registry_reset_and_extent_change() {
+        let mut app = terrain_detail_app();
+        app.update();
+        let key = TerrainChunkKey { x: 0, y: 0 };
+        let old = app.world().resource::<TerrainChunkRegistry>().chunks[&key]
+            .mesh
+            .clone();
+        app.world_mut()
+            .resource_mut::<TerrainChunkRegistry>()
+            .chunks
+            .clear();
+        app.world_mut()
+            .resource_mut::<SnapshotState>()
+            .latest
+            .as_mut()
+            .unwrap()
+            .revision += 1;
+        app.update();
+        let rebuilt = app.world().resource::<TerrainChunkRegistry>().chunks[&key]
+            .mesh
+            .clone();
+        assert_ne!(old.id(), rebuilt.id());
+        let probe = app.world().resource::<TerrainChunkRegistry>().chunks[&key]
+            .probe
+            .unwrap();
+        let before = *app.world().get::<Transform>(probe).unwrap();
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            let snapshot = state.latest.as_mut().unwrap();
+            snapshot.world_size.x += 100.0;
+            snapshot.revision += 1;
+        }
+        app.update();
+        assert_ne!(*app.world().get::<Transform>(probe).unwrap(), before);
+    }
+
+    #[test]
+    fn daylight_clamped_to_same_colors_does_not_dirty_mesh() {
+        let mut app = terrain_detail_app();
+        app.world_mut()
+            .resource_mut::<SnapshotState>()
+            .latest
+            .as_mut()
+            .unwrap()
+            .terrain_height
+            .daylight = 2.0;
+        app.update();
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            let snapshot = state.latest.as_mut().unwrap();
+            snapshot.terrain_height.daylight = 3.0;
+            snapshot.revision += 1;
+        }
+        app.update();
+        let registry = app.world().resource::<TerrainChunkRegistry>();
+        assert!(
+            registry
+                .chunks
+                .values()
+                .all(|chunk| !chunk.daylight_colors_dirty)
+        );
+    }
+
+    #[test]
+    fn daylight_only_colors_match_fresh_mesh_and_rebuild_after_terrain_edit() {
+        use bevy_mesh::VertexAttributeValues;
+        let mut app = terrain_detail_app();
+        app.update();
+        let key = TerrainChunkKey { x: 0, y: 0 };
+        let (handle, bounds) = {
+            let registry = app.world().resource::<TerrainChunkRegistry>();
+            (
+                registry.chunks[&key].mesh.clone(),
+                registry.chunks[&key].bounds,
+            )
+        };
+        let original = app
+            .world()
+            .resource::<SnapshotState>()
+            .latest
+            .as_ref()
+            .unwrap()
+            .terrain_height
+            .daylight;
+        for daylight in [0.15, 0.85, original] {
+            {
+                let mut state = app.world_mut().resource_mut::<SnapshotState>();
+                let snapshot = state.latest.as_mut().unwrap();
+                snapshot.terrain_height.daylight = daylight;
+                snapshot.revision += 1;
+            }
+            app.update();
+            let snapshot = app
+                .world()
+                .resource::<SnapshotState>()
+                .latest
+                .as_ref()
+                .unwrap();
+            let fresh = build_chunk_mesh(
+                snapshot,
+                bounds,
+                TERRAIN_HEIGHT_SCALE,
+                ColorPaletteMode::Natural,
+            );
+            let actual = app.world().resource::<Assets<Mesh>>().get(&handle).unwrap();
+            let Some(VertexAttributeValues::Float32x4(a)) = actual.attribute(Mesh::ATTRIBUTE_COLOR)
+            else {
+                panic!("colors missing")
+            };
+            let Some(VertexAttributeValues::Float32x4(b)) =
+                fresh.mesh.attribute(Mesh::ATTRIBUTE_COLOR)
+            else {
+                panic!("fresh colors missing")
+            };
+            assert_eq!(a, b);
+            assert_eq!(
+                actual.attribute(Mesh::ATTRIBUTE_POSITION),
+                fresh.mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+            );
+        }
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            let snapshot = state.latest.as_mut().unwrap();
+            snapshot.terrain_height.elevation[0] += 0.2;
+            snapshot.revision += 1;
+        }
+        app.update();
+        let snapshot = app
+            .world()
+            .resource::<SnapshotState>()
+            .latest
+            .as_ref()
+            .unwrap();
+        let fresh = build_chunk_mesh(
+            snapshot,
+            bounds,
+            TERRAIN_HEIGHT_SCALE,
+            ColorPaletteMode::Natural,
+        );
+        let actual = app.world().resource::<Assets<Mesh>>().get(&handle).unwrap();
+        assert_eq!(
+            actual.attribute(Mesh::ATTRIBUTE_COLOR),
+            fresh.mesh.attribute(Mesh::ATTRIBUTE_COLOR)
+        );
+        assert_eq!(
+            actual.attribute(Mesh::ATTRIBUTE_POSITION),
+            fresh.mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+        );
+        assert!(!app.world().resource::<TerrainChunkRegistry>().chunks[&key].daylight_colors_dirty);
+    }
+
+    #[test]
     fn live_terrain_updates_keep_the_mesh_handle_and_change_its_vertices() {
         use bevy_mesh::VertexAttributeValues;
 
@@ -6596,6 +6993,64 @@ mod adaptive_governor_tests {
             panic!("terrain positions must be Float32x3");
         };
         assert_ne!(positions[0][1], first_height);
+    }
+
+    #[test]
+    fn fertility_only_update_changes_live_terrain_without_moving_it() {
+        use bevy_mesh::VertexAttributeValues;
+
+        let mut app = terrain_detail_app();
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            let terrain = &mut state.latest.as_mut().unwrap().terrain_height;
+            terrain.kinds.fill(TerrainKind::Grass);
+            terrain.moisture.fill(0.6);
+            terrain.fertility.fill(-1.0);
+            terrain.water_depth.fill(0.0);
+        }
+        app.update();
+        let key = TerrainChunkKey { x: 0, y: 0 };
+        let record = &app.world().resource::<TerrainChunkRegistry>().chunks[&key];
+        let handle = record.mesh.clone();
+        let signature = record.signature;
+        let read = |app: &App| {
+            let meshes = app.world().resource::<Assets<Mesh>>();
+            let mesh = meshes.get(&handle).unwrap();
+            let Some(VertexAttributeValues::Float32x3(positions)) =
+                mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+            else {
+                panic!("terrain positions missing");
+            };
+            let Some(VertexAttributeValues::Float32x4(colors)) =
+                mesh.attribute(Mesh::ATTRIBUTE_COLOR)
+            else {
+                panic!("terrain colors missing");
+            };
+            (positions.clone(), colors.clone())
+        };
+        let (before_positions, before_colors) = read(&app);
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            let snapshot = state.latest.as_mut().unwrap();
+            snapshot.terrain_height.fertility.fill(1.0);
+            snapshot.revision += 1;
+        }
+        app.update();
+        let record = &app.world().resource::<TerrainChunkRegistry>().chunks[&key];
+        assert_eq!(record.mesh.id(), handle.id());
+        assert_ne!(
+            record.signature, signature,
+            "fertility must invalidate the chunk"
+        );
+        let (after_positions, after_colors) = read(&app);
+        assert_eq!(
+            before_positions, after_positions,
+            "fertility must not move terrain"
+        );
+        assert_ne!(
+            before_colors, after_colors,
+            "fertility must affect the visible mesh"
+        );
     }
 
     #[test]
@@ -6724,7 +7179,12 @@ mod adaptive_governor_tests {
         let mut pixels = [0, 0, 0, 255].repeat(9);
         pixels[8 * 4] = 255;
         assert_eq!(append_terrain_albedo_mips(&mut pixels, 3), 2);
-        assert_eq!(&pixels[36..40], &[28, 0, 0, 255]);
+        assert_eq!(&pixels[36..40], &[94, 0, 0, 255]);
+        let mut checker = vec![
+            0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 255, 255, 255, 255, 255,
+        ];
+        assert_eq!(append_terrain_albedo_mips(&mut checker, 2), 2);
+        assert_eq!(&checker[16..20], &[188, 188, 188, 255]);
     }
 
     #[test]
@@ -7276,12 +7736,25 @@ mod adaptive_governor_tests {
             .filter(|(_, _, parent)| parent.parent() == row)
             .map(|(entity, direction, _)| (entity, *direction))
             .collect();
-        assert_eq!(controls.len(), 2);
+        assert_eq!(controls.len(), 4);
         assert!(
             controls
                 .iter()
                 .any(|(_, d)| matches!(d, InspectorPageButton::Previous))
         );
+        for slice in [
+            InspectorPageButton::PreviousGenomeSlice,
+            InspectorPageButton::NextGenomeSlice,
+        ] {
+            let entity = controls
+                .iter()
+                .find_map(|(entity, direction)| {
+                    (std::mem::discriminant(direction) == std::mem::discriminant(&slice))
+                        .then_some(*entity)
+                })
+                .expect("genome slice button");
+            assert_eq!(world.get::<Node>(entity).unwrap().display, Display::None);
+        }
         let next = controls
             .iter()
             .find_map(|(entity, d)| matches!(d, InspectorPageButton::Next).then_some(*entity))
@@ -9092,6 +9565,8 @@ enum InspectorSection {
 enum InspectorPageButton {
     Previous,
     Next,
+    PreviousGenomeSlice,
+    NextGenomeSlice,
     Section(InspectorSection),
 }
 
@@ -9136,6 +9611,8 @@ struct OwnerInspectorSample {
     target: InspectorTarget,
     pages: Vec<String>,
     sections: InspectorSectionStarts,
+    genome_paging: Option<scriptbots_core::genome_browser::BrowserPagingMeta>,
+    genome_deltas: Vec<scriptbots_core::genome_diff::GenomeDelta>,
 }
 
 #[derive(Default)]
@@ -9154,7 +9631,7 @@ impl OwnerInspectorSample {
             InspectorSection::Actions => self.sections.actions,
             InspectorSection::Body => self.sections.body,
             InspectorSection::Genome => self.sections.genome,
-            InspectorSection::Brain => self.pages.len(),
+            InspectorSection::Brain => self.pages.len() + self.genome_delta_page_count(),
         }
     }
 
@@ -9173,18 +9650,25 @@ impl OwnerInspectorSample {
     }
 
     fn page_count(&self, frame: &WorldSnapshot) -> usize {
-        self.pages.len() + 1 + frame.brain.value_page_count()
+        self.section_start(InspectorSection::Brain) + 1 + frame.brain.value_page_count()
+    }
+
+    fn genome_delta_page_count(&self) -> usize {
+        self.genome_deltas.len().div_ceil(INSPECTOR_ROWS_PER_PAGE)
     }
 
     fn page(&self, frame: &WorldSnapshot, index: usize) -> String {
         if let Some(page) = self.pages.get(index) {
             page.clone()
-        } else if index == self.pages.len() {
+        } else if index < self.section_start(InspectorSection::Brain) {
+            genome_delta_page(&self.genome_deltas, index - self.pages.len())
+                .unwrap_or_else(|| "Mutation differences unavailable".into())
+        } else if index == self.section_start(InspectorSection::Brain) {
             format_brain_overlay(&frame.brain)
         } else {
             frame
                 .brain
-                .value_page(index.saturating_sub(self.pages.len() + 1))
+                .value_page(index.saturating_sub(self.section_start(InspectorSection::Brain) + 1))
                 .unwrap_or_else(|| format_brain_overlay(&frame.brain))
         }
     }
@@ -9192,6 +9676,7 @@ impl OwnerInspectorSample {
 
 struct OwnerInspectorJob {
     target: InspectorTarget,
+    genome_offset: usize,
     result: mpsc::Receiver<std::result::Result<Option<OwnerInspectorSample>, String>>,
     worker: thread::JoinHandle<()>,
 }
@@ -9204,6 +9689,8 @@ struct OwnerInspector {
     sample: Option<OwnerInspectorSample>,
     last_request: Option<Instant>,
     last_attempt: Option<InspectorTarget>,
+    last_attempt_offset: usize,
+    genome_offset: usize,
     status: String,
     last_failure: Option<String>,
 }
@@ -9216,12 +9703,25 @@ impl OwnerInspector {
             sample: None,
             last_request: None,
             last_attempt: None,
+            last_attempt_offset: 0,
+            genome_offset: 0,
             status: "select a living agent".into(),
             last_failure: None,
         }
     }
 
     fn poll(&mut self, target: Option<InspectorTarget>, now: Instant) {
+        let previous = self
+            .sample
+            .as_ref()
+            .map(|sample| sample.target)
+            .or_else(|| self.job.as_ref().map(|job| job.target))
+            .or(self.last_attempt);
+        if previous.is_some_and(|old| target.is_none_or(|new| !old.same_subject(new))) {
+            self.genome_offset = 0;
+            self.last_attempt = None;
+            self.last_request = None;
+        }
         if self
             .sample
             .as_ref()
@@ -9239,11 +9739,17 @@ impl OwnerInspector {
         {
             let job = self.job.take().expect("finished inspection job exists");
             let joined = job.worker.join();
-            if target.is_some_and(|target| job.target.same_subject(target)) {
+            if job.genome_offset == self.genome_offset
+                && target.is_some_and(|target| job.target.same_subject(target))
+            {
                 match (joined, job.result.try_recv()) {
                     (Ok(()), Ok(Ok(Some(sample))))
                         if target.is_some_and(|target| sample.target.same_subject(target)) =>
                     {
+                        if sample.genome_paging.is_none() {
+                            self.genome_offset = 0;
+                            self.last_attempt_offset = 0;
+                        }
                         self.sample = Some(sample);
                         self.last_failure = None;
                         self.status = "waiting for detail matching this frame".into();
@@ -9274,11 +9780,12 @@ impl OwnerInspector {
             return;
         };
         if self.job.is_some()
-            || self.last_attempt == Some(target)
-            || self
-                .sample
-                .as_ref()
-                .is_some_and(|sample| sample.target == target)
+            || (self.last_attempt == Some(target) && self.last_attempt_offset == self.genome_offset)
+            || self.sample.as_ref().is_some_and(|sample| {
+                sample.target == target
+                    && sample.genome_paging.map_or(0, |paging| paging.page_offset)
+                        == self.genome_offset
+            })
             || self
                 .last_request
                 .is_some_and(|at| now.duration_since(at) < OWNER_INSPECTOR_REFRESH)
@@ -9291,15 +9798,18 @@ impl OwnerInspector {
         // Do not enqueue another read for a stationary failed source unless
         // the user explicitly retries; new publications naturally re-enable it.
         self.last_attempt = Some(target);
+        self.last_attempt_offset = self.genome_offset;
+        let genome_offset = self.genome_offset;
         match thread::Builder::new()
             .name("scriptbots-bevy-inspector".into())
             .spawn(move || {
-                let response = capture_owner_inspector(&host, target);
+                let response = capture_owner_inspector_at(&host, target, genome_offset);
                 let _ = send.send(response);
             }) {
             Ok(worker) => {
                 self.job = Some(OwnerInspectorJob {
                     target,
+                    genome_offset,
                     result,
                     worker,
                 });
@@ -9383,6 +9893,16 @@ impl OwnerInspector {
             sample.target.source.inspected_tick.0,
             age
         );
+        if sample
+            .genome_paging
+            .is_some_and(|paging| paging.page_offset != self.genome_offset)
+            && self.last_failure.is_none()
+        {
+            status.push_str(&format!(
+                "\nLoading node slice starting at {}",
+                self.genome_offset.saturating_add(1)
+            ));
+        }
         if let Some(error) = &self.last_failure {
             status.push_str(&format!("\nREFRESH FAILED: {error} (I to retry)"));
         }
@@ -9402,12 +9922,25 @@ impl Drop for OwnerInspector {
     }
 }
 
+#[cfg(test)]
 fn capture_owner_inspector(
     host: &ChannelHostPort,
     target: InspectorTarget,
 ) -> std::result::Result<Option<OwnerInspectorSample>, String> {
+    capture_owner_inspector_at(host, target, 0)
+}
+
+fn capture_owner_inspector_at(
+    host: &ChannelHostPort,
+    target: InspectorTarget,
+    genome_offset: usize,
+) -> std::result::Result<Option<OwnerInspectorSample>, String> {
     let Some(detail) = host
-        .inspect_agent_for_hud_before(target.uid, Instant::now() + OWNER_INSPECTOR_DEADLINE)
+        .inspect_agent_for_hud_page_before(
+            target.uid,
+            genome_offset,
+            Instant::now() + OWNER_INSPECTOR_DEADLINE,
+        )
         .map_err(|error| error.to_string())?
     else {
         return Ok(None);
@@ -9415,10 +9948,19 @@ fn capture_owner_inspector(
     let latest = host.snapshot_hub().latest();
     let captured = inspector_target_for_detail(&detail, target, &latest)?;
     let (pages, sections) = owner_inspector_pages(&detail);
+    let genome_paging = detail.genome_browser.as_ref().map(|genome| genome.paging);
+    if genome_paging.is_some_and(|paging| paging.page_offset != genome_offset) {
+        return Err("owner returned the wrong genome slice".to_owned());
+    }
+    let genome_deltas = detail
+        .genome_browser
+        .map_or_else(Vec::new, |genome| genome.deltas);
     Ok(Some(OwnerInspectorSample {
         target: captured,
         pages,
         sections,
+        genome_paging,
+        genome_deltas,
     }))
 }
 
@@ -9577,21 +10119,49 @@ fn owner_inspector_pages(
                     format!("unavailable: {}", bounded_inspector_text(reason))
                 }
             };
+            let slice = if genome.nodes.is_empty() {
+                format!(
+                    "No nodes retained of {}{}",
+                    genome.paging.total_nodes,
+                    if genome.paging.total_nodes > 0 {
+                        " | other nodes not loaded"
+                    } else {
+                        ""
+                    }
+                )
+            } else {
+                format!(
+                    "Owner slice {}-{} of {}{}",
+                    genome.paging.page_offset.saturating_add(1),
+                    genome.paging.page_offset.saturating_add(genome.nodes.len()),
+                    genome.paging.total_nodes,
+                    if genome.paging.page_offset > 0 || genome.paging.is_truncated {
+                        " | other nodes not loaded"
+                    } else {
+                        ""
+                    },
+                )
+            };
             format!(
                 "Genome summary | {} schema {}\nDigest {}\n\
-                 Retained nodes {}/{} | loci {} | truncated {}\nParents {:?}\nMutation diff {}",
+                 {} | loci {}\nParents {:?}\nMutation diff {}",
                 genome.family_id,
                 genome.schema_version,
                 genome.genome_digest,
-                genome.nodes.len(),
-                genome.paging.total_nodes,
+                slice,
                 genome.paging.total_loci,
-                genome.paging.is_truncated,
                 genome.parent_uids,
                 mutation,
             )
         },
     ));
+    if let Some(genome) = &detail.genome_browser {
+        pages.extend(genome_node_pages(
+            &genome.nodes,
+            genome.paging.page_offset,
+            genome.paging.total_nodes,
+        ));
+    }
     for rows in life.mutation_log.chunks(3) {
         pages.push(format!(
             "Recent mutation log ({}/{})\n{}",
@@ -9604,6 +10174,116 @@ fn owner_inspector_pages(
         ));
     }
     (pages, sections)
+}
+
+/// Display every connection in the owner-provided slice without suggesting
+/// that nodes outside that slice have been loaded.
+fn genome_node_pages(
+    nodes: &[scriptbots_core::genome_browser::BrowserNodeView],
+    offset: usize,
+    total: usize,
+) -> Vec<String> {
+    let scalar =
+        |value: Option<f32>| value.map_or_else(|| "unavailable".to_owned(), |v| format!("{v:+.4}"));
+    let mut pages = Vec::new();
+    for (index, node) in nodes.iter().enumerate() {
+        let title = format!(
+            "Genome node {} | retained {} of {}",
+            node.node_index,
+            offset.saturating_add(index).saturating_add(1),
+            total
+        );
+        let properties = format!(
+            "Bias {} | damping {} | gain {}",
+            scalar(node.bias),
+            scalar(node.damping),
+            scalar(node.gain)
+        );
+        if node.connections.is_empty() {
+            pages.push(format!("{title}\n{properties}\nNo retained connections"));
+            continue;
+        }
+        // Reserve one body row for node properties; the card has eight rows.
+        for connections in node.connections.chunks(INSPECTOR_ROWS_PER_PAGE - 1) {
+            let rows = connections
+                .iter()
+                .map(|connection| {
+                    let kind = connection.kind.as_deref().map_or_else(
+                        || "unavailable".to_owned(),
+                        |kind| bounded_inspector_text(&kind.lines().collect::<Vec<_>>().join(" ")),
+                    );
+                    format!(
+                        "Slot {} | target {} | weight {:+.4} | kind {}",
+                        connection.conn_slot, connection.target_node, connection.weight, kind
+                    )
+                })
+                .collect::<Vec<_>>();
+            pages.push(format!("{title}\n{properties}\n{}", rows.join("\n")));
+        }
+    }
+    pages
+}
+
+/// Format one page on demand rather than materializing a second copy of a
+/// potentially large mutation diff during each owner refresh.
+fn genome_delta_page(
+    deltas: &[scriptbots_core::genome_diff::GenomeDelta],
+    page: usize,
+) -> Option<String> {
+    use scriptbots_core::genome_diff::GenomeDelta;
+
+    let start = page.checked_mul(INSPECTOR_ROWS_PER_PAGE)?;
+    let rows = deltas
+        .get(start..)?
+        .iter()
+        .take(INSPECTOR_ROWS_PER_PAGE)
+        .map(|delta| match delta {
+            GenomeDelta::Scalar {
+                locus,
+                before,
+                after,
+            } => {
+                let a = format!("{before:?}");
+                let b = format!("{after:?}");
+                if a == b {
+                    format!(
+                        "{}: {} [0x{:08x}] -> {} [0x{:08x}]",
+                        locus.human(),
+                        a,
+                        before.to_bits(),
+                        b,
+                        after.to_bits()
+                    )
+                } else {
+                    format!("{}: {} -> {}", locus.human(), a, b)
+                }
+            }
+            GenomeDelta::Retarget {
+                locus,
+                before,
+                after,
+            } => {
+                format!("{}: target {} -> {}", locus.human(), before, after)
+            }
+            GenomeDelta::KindFlip {
+                locus,
+                before,
+                after,
+            } => {
+                format!("{}: kind {} -> {}", locus.human(), before, after)
+            }
+        })
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Mutation differences {}-{}/{} | parent -> child\n{}",
+        start + 1,
+        start + rows.len(),
+        deltas.len(),
+        rows.join("\n")
+    ))
 }
 
 fn bounded_inspector_text(text: &str) -> String {
@@ -9647,6 +10327,45 @@ fn handle_inspector_page(
         && let Some(mut page) = page
     {
         let frame = state.as_ref().and_then(|state| state.latest.as_ref());
+        if matches!(
+            direction,
+            InspectorPageButton::PreviousGenomeSlice | InspectorPageButton::NextGenomeSlice
+        ) {
+            if let Some(mut inspector) = inspector {
+                let data = inspector.sample.as_ref().and_then(|sample| {
+                    let current = InspectorTarget::from_frame(frame?)?;
+                    if !sample.target.visible_at(current) {
+                        return None;
+                    }
+                    Some((
+                        sample.section_start(InspectorSection::Genome),
+                        sample.genome_paging?,
+                    ))
+                });
+                if let Some((section, paging)) = data {
+                    let size = scriptbots_runtime::channel::INSPECTOR_GENOME_PAGE_SIZE;
+                    let desired = match direction {
+                        InspectorPageButton::PreviousGenomeSlice => {
+                            inspector.genome_offset.checked_sub(size)
+                        }
+                        InspectorPageButton::NextGenomeSlice => inspector
+                            .genome_offset
+                            .checked_add(size)
+                            .filter(|offset| *offset < paging.total_nodes),
+                        _ => None,
+                    };
+                    if let Some(desired) = desired {
+                        inspector.genome_offset = desired;
+                        inspector.last_attempt = None;
+                        inspector.last_request = None;
+                        inspector.last_failure = None;
+                        inspector.status = "genome slice queued".into();
+                        page.0 = section;
+                    }
+                }
+            }
+            return;
+        }
         let sample = inspector.as_ref().and_then(|inspector| {
             let sample = inspector.sample.as_ref()?;
             let current = InspectorTarget::from_frame(frame?)?;
@@ -9669,12 +10388,56 @@ fn handle_inspector_page(
             InspectorPageButton::Section(section) => {
                 sample.map_or(0, |sample| sample.section_start(section))
             }
+            InspectorPageButton::PreviousGenomeSlice | InspectorPageButton::NextGenomeSlice => {
+                page.0
+            }
         };
         if let Some(mut inspector) = inspector
             && (inspector.sample.is_none() || inspector.last_failure.is_some())
         {
             inspector.last_attempt = None;
             inspector.status = "retry queued".into();
+        }
+    }
+}
+
+fn update_genome_slice_button_visibility(
+    page: Option<Res<InspectorPage>>,
+    inspector: Option<NonSend<OwnerInspector>>,
+    state: Option<Res<SnapshotState>>,
+    mut buttons: Query<(&InspectorPageButton, &mut Node)>,
+) {
+    let context = (|| {
+        let frame = state.as_ref()?.latest.as_ref()?;
+        let inspector = inspector.as_ref()?;
+        let sample = inspector.sample.as_ref()?;
+        let target = InspectorTarget::from_frame(frame)?;
+        if !sample.target.visible_at(target) {
+            return None;
+        }
+        let index = page.as_ref()?.0 % sample.page_count(frame);
+        (sample.section_at(index) == InspectorSection::Genome)
+            .then_some((inspector.genome_offset, sample.genome_paging?))
+    })();
+    for (button, mut node) in &mut buttons {
+        let visible = match button {
+            InspectorPageButton::PreviousGenomeSlice => {
+                context.is_some_and(|(offset, _)| offset > 0)
+            }
+            InspectorPageButton::NextGenomeSlice => context.is_some_and(|(offset, paging)| {
+                offset
+                    .checked_add(scriptbots_runtime::channel::INSPECTOR_GENOME_PAGE_SIZE)
+                    .is_some_and(|next| next < paging.total_nodes)
+            }),
+            _ => continue,
+        };
+        let desired = if visible {
+            Display::Flex
+        } else {
+            Display::None
+        };
+        if node.display != desired {
+            node.display = desired;
         }
     }
 }
@@ -9718,6 +10481,316 @@ mod owner_inspector_tests {
         ManualInstant, PlaybackSnapshot,
         channel::{ChannelHostDriver, ChannelHostOptions},
     };
+
+    #[test]
+    fn retained_genome_nodes_show_every_connection_in_bounded_pages() {
+        use scriptbots_core::genome_browser::{BrowserConnectionView, BrowserNodeView};
+
+        let nodes = vec![
+            BrowserNodeView {
+                node_index: 47,
+                bias: Some(-0.5),
+                damping: None,
+                gain: Some(1.25),
+                connections: (0..9)
+                    .map(|slot| BrowserConnectionView {
+                        conn_slot: slot,
+                        target_node: 100 + u32::from(slot),
+                        weight: f32::from(slot) / 10.0,
+                        kind: (slot == 0).then(|| "recurrent\nunsafe line".to_owned()),
+                    })
+                    .collect(),
+            },
+            BrowserNodeView {
+                node_index: 81,
+                bias: None,
+                damping: Some(0.75),
+                gain: None,
+                connections: vec![],
+            },
+        ];
+        let pages = genome_node_pages(&nodes, 20, 200);
+        assert_eq!(pages.len(), 3);
+        assert!(pages[0].starts_with("Genome node 47 | retained 21 of 200\n"));
+        assert!(pages[0].contains("Bias -0.5000 | damping unavailable | gain +1.2500"));
+        assert!(
+            pages[0].contains("Slot 0 | target 100 | weight +0.0000 | kind recurrent unsafe line")
+        );
+        for slot in 0..9 {
+            let expected = format!("Slot {slot} | target {} |", 100 + slot);
+            assert_eq!(
+                pages.iter().filter(|page| page.contains(&expected)).count(),
+                1
+            );
+        }
+        assert!(pages[1].contains("Slot 8 | target 108"));
+        assert!(pages[2].contains("Genome node 81 | retained 22 of 200"));
+        assert!(pages[2].contains("No retained connections"));
+        assert!(
+            pages
+                .iter()
+                .all(|page| page.lines().count() <= INSPECTOR_ROWS_PER_PAGE + 1)
+        );
+        assert!(genome_node_pages(&[], 0, 0).is_empty());
+    }
+
+    #[test]
+    fn genome_mutation_pages_preserve_types_values_and_page_bounds() {
+        use scriptbots_core::genome_diff::{GenomeDelta, Locus};
+        let mut deltas = vec![
+            GenomeDelta::Scalar {
+                locus: Locus::NodeBias(1),
+                before: -0.5,
+                after: 0.25,
+            },
+            GenomeDelta::Retarget {
+                locus: Locus::NodeTarget { node: 2, conn: 3 },
+                before: 4,
+                after: 9,
+            },
+            GenomeDelta::KindFlip {
+                locus: Locus::NodeKind { node: 2, conn: 3 },
+                before: 1,
+                after: 2,
+            },
+            GenomeDelta::Scalar {
+                locus: Locus::NodeGain(4),
+                before: f32::from_bits(0x7fc00001),
+                after: f32::from_bits(0x7fc00002),
+            },
+        ];
+        deltas.extend((5..10).map(|node| GenomeDelta::Scalar {
+            locus: Locus::NodeBias(node),
+            before: 1.0,
+            after: 2.0,
+        }));
+        let first = genome_delta_page(&deltas, 0).unwrap();
+        let second = genome_delta_page(&deltas, 1).unwrap();
+        assert!(first.starts_with("Mutation differences 1-8/9 | parent -> child\n"));
+        assert!(first.contains("node 1 bias: -0.5 -> 0.25"));
+        assert!(first.contains("node 2 conn 3 target: target 4 -> 9"));
+        assert!(first.contains("node 2 conn 3 kind: kind 1 -> 2"));
+        assert!(first.contains("0x7fc00001") && first.contains("0x7fc00002"));
+        assert!(second.starts_with("Mutation differences 9-9/9 | parent -> child\n"));
+        assert!(second.contains("node 9 bias: 1.0 -> 2.0"));
+        assert!(first.lines().count() <= INSPECTOR_ROWS_PER_PAGE + 1);
+        assert!(genome_delta_page(&deltas, 2).is_none());
+        assert!(genome_delta_page(&deltas, usize::MAX).is_none());
+    }
+
+    #[test]
+    fn genome_slice_is_wired_into_owner_inspector_section() {
+        use scriptbots_core::genome_browser::{
+            BrowserConnectionView, BrowserNodeView, BrowserPagingMeta, GenomeBrowserViewModel,
+            MutationDiffStatus,
+        };
+
+        let mut owner = TestOwner::new();
+        let frame = owner.frame();
+        let target = InspectorTarget::from_frame(&frame).unwrap();
+        owner.serve();
+        let mut detail = owner
+            .port
+            .inspect_agent_for_hud_before(target.uid, Instant::now() + Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        detail.genome_browser = Some(GenomeBrowserViewModel {
+            selected_agent: target.uid,
+            generation: 0,
+            tick: detail.source.inspected_tick,
+            family_id: scriptbots_core::BrainFamilyId::new("test-family").unwrap(),
+            schema_version: 1,
+            genome_digest: "example-digest".to_owned(),
+            provenance: Default::default(),
+            parent_uids: vec![],
+            nodes: vec![BrowserNodeView {
+                node_index: 12,
+                bias: Some(0.5),
+                damping: None,
+                gain: None,
+                connections: vec![BrowserConnectionView {
+                    conn_slot: 2,
+                    target_node: 8,
+                    weight: -0.75,
+                    kind: None,
+                }],
+            }],
+            paging: BrowserPagingMeta {
+                page_offset: 0,
+                page_limit: 20,
+                total_nodes: 100,
+                total_loci: 400,
+                is_truncated: true,
+            },
+            mutation_diff: MutationDiffStatus::FounderNoParent,
+            deltas: vec![],
+            locus_plot: None,
+            build_duration_us: 0,
+        });
+        let (pages, sections) = owner_inspector_pages(&detail);
+        let summary = &pages[sections.genome];
+        assert!(summary.contains("Owner slice 1-1 of 100 | other nodes not loaded"));
+        let node = &pages[sections.genome + 1];
+        assert!(node.contains("Genome node 12 | retained 1 of 100"));
+        assert!(node.contains("Slot 2 | target 8 | weight -0.7500 | kind unavailable"));
+        let mut sample = OwnerInspectorSample {
+            target,
+            pages,
+            sections,
+            genome_paging: detail.genome_browser.as_ref().map(|genome| genome.paging),
+            genome_deltas: vec![],
+        };
+        assert_eq!(
+            sample.section_at(sample.section_start(InspectorSection::Genome) + 1),
+            InspectorSection::Genome
+        );
+        sample
+            .genome_deltas
+            .push(scriptbots_core::genome_diff::GenomeDelta::Scalar {
+                locus: scriptbots_core::genome_diff::Locus::NodeBias(12),
+                before: 0.25,
+                after: 0.5,
+            });
+        let delta_index = sample.pages.len();
+        assert_eq!(sample.section_at(delta_index), InspectorSection::Genome);
+        assert!(
+            sample
+                .page(&frame, delta_index)
+                .contains("node 12 bias: 0.25 -> 0.5")
+        );
+        assert_eq!(
+            sample.section_start(InspectorSection::Brain),
+            delta_index + 1
+        );
+    }
+
+    #[test]
+    fn genome_slice_controls_request_bounded_pages_and_reject_stale_jobs() {
+        use scriptbots_core::genome_browser::BrowserPagingMeta;
+
+        let mut owner = TestOwner::new();
+        let frame = owner.frame();
+        let target = InspectorTarget::from_frame(&frame).unwrap();
+        let paging = BrowserPagingMeta {
+            page_offset: 0,
+            page_limit: 20,
+            total_nodes: 45,
+            total_loci: 200,
+            is_truncated: true,
+        };
+        let make_sample = |label: &str| OwnerInspectorSample {
+            target,
+            pages: vec!["Life".into(), label.into()],
+            sections: InspectorSectionStarts {
+                senses: 1,
+                actions: 1,
+                body: 1,
+                genome: 1,
+            },
+            genome_paging: Some(paging),
+            genome_deltas: vec![],
+        };
+        let mut inspector = OwnerInspector::new(owner.port.clone());
+        inspector.sample = Some(make_sample("original genome"));
+        let mut app = App::new();
+        app.insert_resource(SnapshotState {
+            latest: Some(frame.clone()),
+            ..default()
+        });
+        app.insert_resource(InspectorPage(1));
+        app.insert_non_send_resource(inspector);
+        let earlier = app
+            .world_mut()
+            .spawn((
+                InspectorPageButton::PreviousGenomeSlice,
+                Interaction::None,
+                Node::default(),
+            ))
+            .id();
+        let later = app
+            .world_mut()
+            .spawn((
+                InspectorPageButton::NextGenomeSlice,
+                Interaction::None,
+                Node::default(),
+            ))
+            .id();
+        app.add_systems(
+            Update,
+            (handle_inspector_page, update_genome_slice_button_visibility).chain(),
+        );
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(earlier).unwrap().display,
+            Display::None
+        );
+        assert_eq!(
+            app.world().get::<Node>(later).unwrap().display,
+            Display::Flex
+        );
+        app.world_mut()
+            .entity_mut(later)
+            .insert(Interaction::Pressed);
+        app.update();
+        {
+            let inspector = app.world().non_send_resource::<OwnerInspector>();
+            assert_eq!(inspector.genome_offset, 20);
+            assert!(
+                inspector
+                    .card_page(&frame, 1)
+                    .0
+                    .contains("Loading node slice starting at 21")
+            );
+        }
+        assert_eq!(
+            app.world().get::<Node>(earlier).unwrap().display,
+            Display::Flex
+        );
+        app.world_mut().entity_mut(later).insert(Interaction::None);
+        app.update();
+        app.world_mut()
+            .entity_mut(later)
+            .insert(Interaction::Pressed);
+        app.update();
+        assert_eq!(
+            app.world()
+                .non_send_resource::<OwnerInspector>()
+                .genome_offset,
+            40
+        );
+        assert_eq!(
+            app.world().get::<Node>(later).unwrap().display,
+            Display::None
+        );
+        {
+            let mut inspector = app.world_mut().non_send_resource_mut::<OwnerInspector>();
+            let (send, result) = mpsc::sync_channel(1);
+            let stale = make_sample("stale genome");
+            let worker = thread::spawn(move || send.send(Ok(Some(stale))).unwrap());
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !worker.is_finished() {
+                assert!(Instant::now() < deadline, "stale worker did not finish");
+                thread::yield_now();
+            }
+            inspector.job = Some(OwnerInspectorJob {
+                target,
+                genome_offset: 0,
+                result,
+                worker,
+            });
+            inspector.last_attempt = Some(target);
+            inspector.last_attempt_offset = 40;
+            inspector.poll(Some(target), Instant::now());
+            assert_eq!(
+                inspector.sample.as_ref().unwrap().pages[1],
+                "original genome"
+            );
+            inspector.poll(None, Instant::now());
+            assert_eq!(inspector.genome_offset, 0);
+            assert!(inspector.sample.is_none());
+        }
+        owner.serve();
+    }
 
     struct TestOwner {
         port: ChannelHostPort,
@@ -10429,6 +11502,7 @@ mod owner_inspector_tests {
         let worker = thread::spawn(move || send.send(Err("simulated timeout".into())).unwrap());
         inspector.job = Some(OwnerInspectorJob {
             target: later,
+            genome_offset: 0,
             result,
             worker,
         });
@@ -12244,7 +13318,11 @@ fn sync_terrain(
             match registry.chunks.get_mut(&key) {
                 Some(record) => {
                     // ubs:ignore[rust.security.constant-time-compare] — public terrain geometry/material digest for mesh cache invalidation, not authentication.
-                    if record.palette != palette || record.signature != built.stats.signature {
+                    if record.palette != palette
+                        || record.daylight_colors_dirty
+                        || record.signature != built.stats.signature
+                        || meshes.get(&record.mesh).is_none()
+                    {
                         if let Some(existing) = meshes.get_mut(&record.mesh) {
                             *existing = built.mesh;
                         } else {
@@ -12256,6 +13334,7 @@ fn sync_terrain(
                         }
                         update_chunk_material(materials, &record.material, &built.stats);
                         record.signature = built.stats.signature;
+                        record.daylight_colors_dirty = false;
                         record.bounds = bounds;
                         record.stats = built.stats;
                         record.palette = palette;
@@ -12304,6 +13383,7 @@ fn sync_terrain(
                             material: material_handle,
                             bounds,
                             signature: built.stats.signature,
+                            daylight_colors_dirty: false,
                             last_tick: snapshot.tick,
                             probe: Some(probe),
                             stats: built.stats,
@@ -12504,6 +13584,11 @@ fn terrain_albedo_image(variant: usize) -> Image {
 }
 
 fn append_terrain_albedo_mips(pixels: &mut Vec<u8>, side: u32) -> u32 {
+    // These images are sampled as sRGB textures: filter their color in linear
+    // light so distance does not darken high-contrast details. Alpha is linear.
+    static DECODE: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
+    let decode =
+        DECODE.get_or_init(|| std::array::from_fn(|i| srgb_to_linear_component(i as f32 / 255.0)));
     let mut previous_side = side;
     let mut previous_offset = 0;
     let mut levels = 1;
@@ -12512,18 +13597,29 @@ fn append_terrain_albedo_mips(pixels: &mut Vec<u8>, side: u32) -> u32 {
         let next_offset = pixels.len();
         for y in 0..next_side {
             for x in 0..next_side {
-                let mut sum = [0_u32; 4];
+                let mut sum = [0.0_f32; 3];
+                let mut alpha = 0_u32;
                 let mut count = 0_u32;
                 for sy in y * previous_side / next_side..(y + 1) * previous_side / next_side {
                     for sx in x * previous_side / next_side..(x + 1) * previous_side / next_side {
                         let offset = previous_offset + ((sy * previous_side + sx) * 4) as usize;
-                        for channel in 0..4 {
-                            sum[channel] += u32::from(pixels[offset + channel]);
+                        for channel in 0..3 {
+                            sum[channel] += decode[usize::from(pixels[offset + channel])];
                         }
+                        alpha += u32::from(pixels[offset + 3]);
                         count += 1;
                     }
                 }
-                pixels.extend(sum.map(|value| ((value + count / 2) / count) as u8));
+                pixels.extend(sum.map(|value| {
+                    let linear = value / count as f32;
+                    let srgb = if linear <= 0.003_130_8 {
+                        linear * 12.92
+                    } else {
+                        1.055 * linear.powf(1.0 / 2.4) - 0.055
+                    };
+                    (srgb * 255.0).round().clamp(0.0, 255.0) as u8
+                }));
+                pixels.push(((alpha + count / 2) / count) as u8);
             }
         }
         previous_side = next_side;
@@ -13026,7 +14122,7 @@ fn terrain_sample_splat(sample: TerrainTileSample, slope: f32) -> [f32; visual::
         elevation: sample.elevation,
         slope,
         water_depth: sample.water_depth,
-        moisture: sample.moisture,
+        moisture: visual::terrain_lushness(sample.moisture, sample.fertility),
         temperature: sample.temperature,
     })
 }
@@ -13040,7 +14136,7 @@ fn terrain_surface_srgb_from_splat(
 ) -> [f32; 3] {
     visual::terrain_surface_srgb(&TerrainSurfaceInput {
         splat_weights: weights,
-        moisture: sample.moisture,
+        moisture: visual::terrain_lushness(sample.moisture, sample.fertility),
         elevation: sample.elevation,
         slope,
         accent: sample.accent,
@@ -13254,6 +14350,494 @@ mod terrain_tests {
             .init_resource::<AccessibilityState>()
             .insert_resource(AgentMotionSettings { enabled: true });
         app
+    }
+
+    fn eye_geometry_test_app() -> App {
+        let mut app = presentation_test_app();
+        let mut snapshot = sample_world_snapshot();
+        let mut agent = sample_agent_visual();
+        agent.eye_dirs = [0.0; NUM_EYES];
+        agent.eye_fov = [std::f32::consts::PI; NUM_EYES];
+        snapshot.agents.push(agent);
+        app.insert_resource(SnapshotState {
+            latest: Some(snapshot),
+            ..default()
+        });
+        app.add_systems(Update, sync_world);
+        app.update();
+        app
+    }
+
+    #[test]
+    fn stripe_mesh_tracks_capsule_upper_surface_without_flat_fin() {
+        let mesh = creature_stripe_mesh();
+        let VertexAttributeValues::Float32x3(points) =
+            mesh.attribute(Mesh::ATTRIBUTE_POSITION).unwrap()
+        else {
+            panic!("stripe positions missing");
+        };
+        assert_eq!(points.len(), 75);
+        for &[x, y, z] in points {
+            let cap = (x.abs() - 2.35 * 0.8 / 2.6).max(0.0) / (2.35 * 0.5 - 2.35 * 0.8 / 2.6);
+            let radial = (y * y + z * z).sqrt() / 0.88;
+            let body_distance = cap * cap + radial * radial;
+            assert!(
+                y > 0.0 && body_distance > 1.0 && body_distance < 1.04,
+                "stripe detached from capsule: {body_distance}"
+            );
+        }
+    }
+
+    #[test]
+    fn stripe_triangle_samples_clear_capsule_surface() {
+        let mesh = creature_stripe_mesh();
+        let VertexAttributeValues::Float32x3(points) =
+            mesh.attribute(Mesh::ATTRIBUTE_POSITION).unwrap()
+        else {
+            panic!("stripe positions missing");
+        };
+        let Indices::U32(indices) = mesh.indices().unwrap() else {
+            panic!("stripe indices missing");
+        };
+        assert_eq!(indices.len() / 3, 96);
+        let half = 2.35 * 0.8 / 2.6;
+        let cap_length = 2.35 * 0.5 - half;
+        for triangle in indices.as_chunks::<3>().0 {
+            let [a, b, c] = triangle.map(|i| Vec3::from_array(points[i as usize]));
+            for i in 0..=8 {
+                for j in 0..=8 - i {
+                    let u = i as f32 / 8.0;
+                    let v = j as f32 / 8.0;
+                    let p = a * u + b * v + c * (1.0 - u - v);
+                    let cap = (p.x.abs() - half).max(0.0) / cap_length;
+                    let distance = cap * cap + (p.y * p.y + p.z * p.z) / 0.88_f32.powi(2);
+                    assert!(distance > 1.0, "stripe sample intersects body: {distance}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stripe_mesh_samples_clear_uneven_terrain_at_idle_extremes() {
+        let mesh = creature_stripe_mesh();
+        let VertexAttributeValues::Float32x3(points) =
+            mesh.attribute(Mesh::ATTRIBUTE_POSITION).unwrap()
+        else {
+            panic!("stripe positions missing");
+        };
+        let Indices::U32(indices) = mesh.indices().unwrap() else {
+            panic!("stripe indices missing");
+        };
+        let mut snapshot = sample_world_snapshot();
+        snapshot.world_size = Vec2::splat(300.0);
+        snapshot.agent_radius = 10.0;
+        snapshot.terrain_height.dims = UVec2::splat(4);
+        snapshot.terrain_height.cell_size = 100;
+        snapshot.terrain_height.elevation = vec![
+            0.1, 0.2, 0.1, 0.2, 0.3, 0.6, 0.2, 0.4, 0.1, 0.4, 0.8, 0.3, 0.2, 0.1, 0.4, 0.2,
+        ];
+        let mut agent = sample_agent_visual();
+        let coordinates = [
+            0.0, 1.0, 25.0, 75.0, 95.0, 100.0, 105.0, 150.0, 195.0, 200.0, 205.0, 255.0, 299.0,
+        ];
+        let mut worst = 0.0_f32;
+        for x in coordinates {
+            for y in coordinates {
+                agent.position = Vec2::new(x, y);
+                for heading in [0.0, 0.8, -1.7, 2.4] {
+                    agent.heading = heading;
+                    let (root, rotation) = agent_surface_pose(&snapshot, &agent);
+                    for breathing in [1.0 - BODY_IDLE_AMPLITUDE, 1.0 + BODY_IDLE_AMPLITUDE] {
+                        for triangle in indices.as_chunks::<3>().0 {
+                            let [a, b, c] = triangle.map(|i| {
+                                rotation
+                                    * Vec3::from_array(points[i as usize])
+                                    * snapshot.agent_radius
+                                    * breathing
+                            });
+                            for offset in [a, b, c, (a + b + c) / 3.0] {
+                                let p = agent.position + Vec2::new(offset.x, -offset.z);
+                                let height = sample_height_world(
+                                    &snapshot.terrain_height,
+                                    p,
+                                    TERRAIN_HEIGHT_SCALE,
+                                );
+                                worst = worst.max(height - root.y - offset.y);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            worst <= 0.01,
+            "sampled stripe penetrates terrain by {worst}"
+        );
+    }
+
+    #[test]
+    fn stripe_and_body_share_idle_motion_phase() {
+        let app = eye_geometry_test_app();
+        let record = &app.world().resource::<AgentRegistry>().records[&AgentUid(1)];
+        let body = app
+            .world()
+            .get::<IdleBodyTarget>(record.body.entity)
+            .unwrap();
+        let stripe = app
+            .world()
+            .get::<IdleBodyTarget>(record.stripe.entity)
+            .unwrap();
+        assert_eq!(body.phase, stripe.phase);
+        assert_eq!(stripe.transform.translation, Vec3::ZERO);
+    }
+
+    #[test]
+    fn spike_pbr_emission_retains_readiness_and_canonical_hue() {
+        let mut app = eye_geometry_test_app();
+        let material = app.world().resource::<AgentRegistry>().records[&AgentUid(1)]
+            .spike
+            .material
+            .clone()
+            .unwrap();
+        for palette in [
+            ColorPaletteMode::Natural,
+            ColorPaletteMode::Deuteranopia,
+            ColorPaletteMode::Protanopia,
+            ColorPaletteMode::Tritanopia,
+            ColorPaletteMode::HighContrast,
+        ] {
+            app.world_mut().resource_mut::<AccessibilityState>().palette = palette;
+            for (length, extended, readiness) in [
+                (0.0, false, 0.0),
+                (0.25, false, 0.25),
+                (1.0, false, 1.0),
+                (0.0, true, 1.0),
+            ] {
+                {
+                    let mut state = app.world_mut().resource_mut::<SnapshotState>();
+                    let snapshot = state.latest.as_mut().unwrap();
+                    snapshot.revision += 1;
+                    snapshot.agents[0].spike_length = length;
+                    snapshot.agents[0].spiked = extended;
+                }
+                app.update();
+                let snapshot = app
+                    .world()
+                    .resource::<SnapshotState>()
+                    .latest
+                    .as_ref()
+                    .unwrap();
+                let visuals = canonical_agent_visual_params(&snapshot.agents[0]);
+                let expected_color =
+                    srgb_from_vec_with_palette(Vec3::from_array(visuals.spike_color), 1.0, palette);
+                let expected_emission = palette_hdr_emissive_from_srgb(
+                    visuals.spike_color,
+                    visuals.spike_emissive_gain * readiness * 0.12,
+                    palette,
+                )
+                .to_linear();
+                let material = app
+                    .world()
+                    .resource::<Assets<StandardMaterial>>()
+                    .get(&material)
+                    .unwrap();
+                assert_eq!(material.base_color, expected_color);
+                assert!((material.emissive.red - expected_emission.red).abs() < 0.00001);
+                assert!((material.emissive.green - expected_emission.green).abs() < 0.00001);
+                assert!((material.emissive.blue - expected_emission.blue).abs() < 0.00001);
+            }
+        }
+    }
+
+    #[test]
+    fn unchanged_agent_snapshot_does_not_dirty_part_components() {
+        let mut app = eye_geometry_test_app();
+        let (body, indicator, eye) = {
+            let record = &app.world().resource::<AgentRegistry>().records[&AgentUid(1)];
+            (
+                record.body.entity,
+                record.indicator.entity,
+                record.eyes[0].sclera.entity,
+            )
+        };
+        let ticks = |app: &App| {
+            let w = app.world();
+            (
+                w.entity(body)
+                    .get_ref::<Transform>()
+                    .unwrap()
+                    .last_changed(),
+                w.entity(indicator)
+                    .get_ref::<Visibility>()
+                    .unwrap()
+                    .last_changed(),
+                w.entity(eye).get_ref::<Transform>().unwrap().last_changed(),
+            )
+        };
+        let before = ticks(&app);
+        app.world_mut()
+            .resource_mut::<SnapshotState>()
+            .latest
+            .as_mut()
+            .unwrap()
+            .revision += 1;
+        app.update();
+        let after = ticks(&app);
+        assert_eq!(before, after, "unchanged visual components were dirtied");
+    }
+
+    #[test]
+    fn changed_agent_snapshot_updates_pupil_and_sound_visibility() {
+        let mut app = eye_geometry_test_app();
+        let (pupil, sound) = {
+            let record = &app.world().resource::<AgentRegistry>().records[&AgentUid(1)];
+            (record.eyes[0].pupil.entity, record.sound_inner.entity)
+        };
+        let before = app.world().get::<Transform>(pupil).unwrap().translation;
+        assert_eq!(
+            *app.world().get::<Visibility>(sound).unwrap(),
+            Visibility::Visible
+        );
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            let snapshot = state.latest.as_mut().unwrap();
+            snapshot.revision += 1;
+            snapshot.agents[0].eye_dirs[0] = 0.8;
+            snapshot.agents[0].sound_output = 0.0;
+            snapshot.agents[0].sound_level = 0.0;
+        }
+        app.update();
+        assert_ne!(
+            app.world().get::<Transform>(pupil).unwrap().translation,
+            before
+        );
+        assert_eq!(
+            *app.world().get::<Visibility>(sound).unwrap(),
+            Visibility::Hidden
+        );
+    }
+
+    #[test]
+    fn coincident_sensor_bearings_keep_eye_sockets_distinct() {
+        let app = eye_geometry_test_app();
+        let record = &app.world().resource::<AgentRegistry>().records[&AgentUid(1)];
+        assert_eq!(record.eyes.len(), NUM_EYES);
+        let eyes: Vec<_> = record
+            .eyes
+            .iter()
+            .map(|eye| *app.world().get::<Transform>(eye.sclera.entity).unwrap())
+            .collect();
+        for i in 0..eyes.len() {
+            for j in i + 1..eyes.len() {
+                let distance = eyes[i].translation.distance(eyes[j].translation);
+                let radii = (eyes[i].scale.x + eyes[j].scale.x) * 0.5;
+                assert!(
+                    distance >= radii,
+                    "eyes {i} and {j} overlap: separation {distance}, radii {radii}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wide_fov_pupils_extend_beyond_sclera() {
+        let app = eye_geometry_test_app();
+        let record = &app.world().resource::<AgentRegistry>().records[&AgentUid(1)];
+        for (index, eye) in record.eyes.iter().enumerate() {
+            let sclera = app.world().get::<Transform>(eye.sclera.entity).unwrap();
+            let pupil = app.world().get::<Transform>(eye.pupil.entity).unwrap();
+            let extent = pupil.translation.distance(sclera.translation) + pupil.scale.x * 0.5;
+            assert!(
+                extent > sclera.scale.x * 0.5,
+                "pupil {index} is entirely inside sclera: outer extent {extent}, sclera radius {}",
+                sclera.scale.x * 0.5
+            );
+        }
+    }
+
+    #[test]
+    fn sensor_bearings_move_pupils_without_moving_sockets() {
+        let mut app = eye_geometry_test_app();
+        let before: Vec<_> = {
+            let record = &app.world().resource::<AgentRegistry>().records[&AgentUid(1)];
+            record
+                .eyes
+                .iter()
+                .map(|eye| {
+                    app.world()
+                        .get::<Transform>(eye.sclera.entity)
+                        .unwrap()
+                        .translation
+                })
+                .collect()
+        };
+        let bearings = [0.0, 0.7, -1.2, 2.4];
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            let snapshot = state.latest.as_mut().unwrap();
+            snapshot.revision += 1;
+            snapshot.agents[0].eye_dirs = bearings;
+        }
+        app.update();
+        let record = &app.world().resource::<AgentRegistry>().records[&AgentUid(1)];
+        for (index, eye) in record.eyes.iter().enumerate() {
+            let sclera = app.world().get::<Transform>(eye.sclera.entity).unwrap();
+            let pupil = app.world().get::<Transform>(eye.pupil.entity).unwrap();
+            assert_eq!(
+                sclera.translation, before[index],
+                "socket {index} moved with gaze"
+            );
+            let displacement = pupil.translation - sclera.translation;
+            assert!(
+                displacement.y > 0.0,
+                "pupil {index} must face above the body"
+            );
+            let actual = Vec2::new(displacement.x, displacement.z).normalize();
+            let expected = Quat::from_rotation_y(bearings[index]) * Vec3::X;
+            assert!(
+                actual.dot(Vec2::new(expected.x, expected.z)) > 0.9999,
+                "eye {index} lost its sensor bearing"
+            );
+        }
+    }
+
+    #[test]
+    fn pupil_tips_clear_the_breathing_body_at_sampled_bearings() {
+        let mut app = eye_geometry_test_app();
+        for trait_eye in [0.0, 1.0] {
+            for fov in [0.0, std::f32::consts::PI] {
+                for step in 0..16 {
+                    let bearing = step as f32 * std::f32::consts::TAU / 16.0;
+                    {
+                        let mut state = app.world_mut().resource_mut::<SnapshotState>();
+                        let snapshot = state.latest.as_mut().unwrap();
+                        snapshot.revision += 1;
+                        snapshot.agents[0].trait_modifiers.eye = trait_eye;
+                        snapshot.agents[0].eye_dirs.fill(bearing);
+                        snapshot.agents[0].eye_fov.fill(fov);
+                    }
+                    app.update();
+                    let record = &app.world().resource::<AgentRegistry>().records[&AgentUid(1)];
+                    let mut body = *app.world().get::<Transform>(record.body.entity).unwrap();
+                    body.scale *= 1.0 + BODY_IDLE_AMPLITUDE;
+                    let inverse = body.compute_affine().inverse();
+                    for (index, eye) in record.eyes.iter().enumerate() {
+                        let sclera = app.world().get::<Transform>(eye.sclera.entity).unwrap();
+                        let pupil = app.world().get::<Transform>(eye.pupil.entity).unwrap();
+                        let out = (pupil.translation - sclera.translation).normalize();
+                        let tip = pupil.translation + out * (pupil.scale.x * 0.5);
+                        let local = inverse.transform_point3(tip);
+                        let axial = (local.y.abs() - AGENT_BODY_CAPSULE.half_length).max(0.0);
+                        let radius_squared = local.x * local.x + local.z * local.z + axial * axial;
+                        assert!(
+                            radius_squared > AGENT_BODY_CAPSULE.radius.powi(2),
+                            "pupil {index} tip behind body for trait={trait_eye}, fov={fov}, bearing={bearing}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn eye_sclera_clear_the_nose_and_ears_at_maximum_traits() {
+        let mut app = eye_geometry_test_app();
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            let snapshot = state.latest.as_mut().unwrap();
+            snapshot.revision += 1;
+            snapshot.agents[0].trait_modifiers.eye = 1.0;
+            snapshot.agents[0].trait_modifiers.hearing = 1.0;
+        }
+        app.update();
+        let record = &app.world().resource::<AgentRegistry>().records[&AgentUid(1)];
+        let other_parts = [&record.nose, &record.ear_left, &record.ear_right];
+        for (index, eye) in record.eyes.iter().enumerate() {
+            let sclera = app.world().get::<Transform>(eye.sclera.entity).unwrap();
+            for part in other_parts {
+                let other = app.world().get::<Transform>(part.entity).unwrap();
+                let conservative_radius = other.scale.max_element() * 0.5;
+                let distance = sclera.translation.distance(other.translation);
+                assert!(
+                    distance >= sclera.scale.x * 0.5 + conservative_radius,
+                    "eye {index} overlaps another facial part: separation {distance}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn eye_mesh_samples_clear_uneven_terrain() {
+        let mut app = eye_geometry_test_app();
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            let snapshot = state.latest.as_mut().unwrap();
+            snapshot.revision += 1;
+            snapshot.agent_radius = 10.0;
+            snapshot.agents[0].trait_modifiers.eye = 1.0;
+            snapshot.agents[0].eye_dirs = [0.0, 0.7, -1.2, 2.4];
+            snapshot.agents[0].eye_fov.fill(std::f32::consts::PI);
+        }
+        app.update();
+        let record = &app.world().resource::<AgentRegistry>().records[&AgentUid(1)];
+        let parts: Vec<_> = record
+            .eyes
+            .iter()
+            .flat_map(|eye| [eye.sclera.entity, eye.pupil.entity])
+            .map(|entity| *app.world().get::<Transform>(entity).unwrap())
+            .collect();
+        let mesh = Mesh::from(Sphere::new(0.5));
+        let VertexAttributeValues::Float32x3(points) =
+            mesh.attribute(Mesh::ATTRIBUTE_POSITION).unwrap()
+        else {
+            panic!("sphere positions missing");
+        };
+        let indices: Vec<usize> = match mesh.indices().unwrap() {
+            Indices::U16(values) => values.iter().map(|&i| usize::from(i)).collect(),
+            Indices::U32(values) => values.iter().map(|&i| i as usize).collect(),
+        };
+        let mut snapshot = sample_world_snapshot();
+        snapshot.world_size = Vec2::splat(300.0);
+        snapshot.agent_radius = 10.0;
+        snapshot.terrain_height.dims = UVec2::splat(4);
+        snapshot.terrain_height.cell_size = 100;
+        snapshot.terrain_height.elevation = vec![
+            0.1, 0.2, 0.1, 0.2, 0.3, 0.6, 0.2, 0.4, 0.1, 0.4, 0.8, 0.3, 0.2, 0.1, 0.4, 0.2,
+        ];
+        let mut agent = sample_agent_visual();
+        let coordinates = [
+            0.0, 1.0, 25.0, 75.0, 95.0, 100.0, 105.0, 150.0, 195.0, 200.0, 205.0, 255.0, 299.0,
+        ];
+        let mut worst = 0.0_f32;
+        for x in coordinates {
+            for y in coordinates {
+                agent.position = Vec2::new(x, y);
+                for heading in [0.0, 0.8, -1.7, 2.4] {
+                    agent.heading = heading;
+                    let (root, rotation) = agent_surface_pose(&snapshot, &agent);
+                    for part in &parts {
+                        for tri in indices.as_chunks::<3>().0 {
+                            let [a, b, c] = [tri[0], tri[1], tri[2]].map(|i| {
+                                rotation * part.transform_point(Vec3::from_array(points[i]))
+                            });
+                            for offset in [a, b, c, (a + b + c) / 3.0] {
+                                let p = agent.position + Vec2::new(offset.x, -offset.z);
+                                let height = sample_height_world(
+                                    &snapshot.terrain_height,
+                                    p,
+                                    TERRAIN_HEIGHT_SCALE,
+                                );
+                                worst = worst.max(height - root.y - offset.y);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            worst <= 0.01,
+            "sampled eye penetrates rendered terrain by {worst}"
+        );
     }
 
     #[test]
@@ -13972,7 +15556,7 @@ mod terrain_tests {
             elevation: 0.9,
             moisture: 0.37,
             accent: 0.63,
-            fertility_bias: 0.0,
+            fertility_bias: 0.4,
             temperature_bias: 0.0,
             palette_index: 0,
         };
@@ -14070,12 +15654,13 @@ mod terrain_tests {
         );
 
         let sample = terrain.sample_tile(1, 1);
+        let lushness = visual::terrain_lushness(sample.moisture, sample.fertility);
         let weights = visual::splat_weights(&SplatInput {
             kind: sample.kind,
             elevation: sample.elevation,
             slope: expected_slope,
             water_depth: sample.water_depth,
-            moisture: sample.moisture,
+            moisture: lushness,
             temperature: sample.temperature,
         });
         for palette in [
@@ -14087,7 +15672,7 @@ mod terrain_tests {
         ] {
             let expected_srgb = visual::terrain_surface_srgb(&TerrainSurfaceInput {
                 splat_weights: weights,
-                moisture: sample.moisture,
+                moisture: lushness,
                 elevation: sample.elevation,
                 slope: expected_slope,
                 accent: sample.accent,
@@ -14146,8 +15731,8 @@ mod terrain_tests {
         }
         assert_eq!(
             terrain.fertility[4].to_bits(),
-            0.0_f32.to_bits(),
-            "agreement fixture deliberately avoids blessing the shared unwired fertility input"
+            0.4_f32.to_bits(),
+            "agreement fixture must exercise the fertility input"
         );
         assert_eq!(
             terrain.daylight.to_bits(),
@@ -14169,12 +15754,13 @@ mod terrain_tests {
             for x in 0..terrain.dims.x {
                 let sample = terrain.sample_tile(x, z);
                 let slope = compute_tile_slope(terrain, x, z);
+                let lushness = visual::terrain_lushness(sample.moisture, sample.fertility);
                 let weights = visual::splat_weights(&SplatInput {
                     kind: sample.kind,
                     elevation: sample.elevation,
                     slope,
                     water_depth: sample.water_depth,
-                    moisture: sample.moisture,
+                    moisture: lushness,
                     temperature: sample.temperature,
                 });
                 for palette in [
@@ -14186,7 +15772,7 @@ mod terrain_tests {
                 ] {
                     let expected_srgb = visual::terrain_surface_srgb(&TerrainSurfaceInput {
                         splat_weights: weights,
-                        moisture: sample.moisture,
+                        moisture: lushness,
                         elevation: sample.elevation,
                         slope,
                         accent: sample.accent,
@@ -14951,6 +16537,267 @@ mod terrain_tests {
     }
 
     #[test]
+    fn wheel_joint_joins_body_to_suspended_wheel_without_sampled_ground_intersections() {
+        let mut snapshot = sample_world_snapshot();
+        snapshot.world_size = Vec2::splat(300.0);
+        snapshot.agent_radius = 10.0;
+        snapshot.terrain_height.dims = UVec2::splat(4);
+        snapshot.terrain_height.cell_size = 100;
+        snapshot.terrain_height.elevation = vec![
+            0.1, 0.2, 0.1, 0.2, 0.3, 0.6, 0.2, 0.4, 0.1, 0.4, 0.8, 0.3, 0.2, 0.1, 0.4, 0.2,
+        ];
+        let mut agent = sample_agent_visual();
+        agent.spike_length = 0.0;
+        let footprint = agent_ground_footprint(&snapshot, &agent);
+        let initial = AgentPoseTarget {
+            translation: Vec3::ZERO,
+            rotation: Quat::IDENTITY,
+            tick: 1,
+        };
+        let mut app = App::new();
+        app.insert_resource(SnapshotState {
+            latest: Some(snapshot.clone()),
+            ..default()
+        })
+        .add_systems(Update, (conform_agent_wheels, conform_wheel_joints).chain());
+        let root = app
+            .world_mut()
+            .spawn((
+                Transform::default(),
+                footprint,
+                AgentDisplayPose {
+                    translation: initial.translation,
+                    rotation: initial.rotation,
+                    previous_target: initial,
+                },
+            ))
+            .id();
+        let wheels = [-1.0, 1.0].map(|side| {
+            app.world_mut()
+                .spawn((Transform::default(), WheelGroundContact { root, side }))
+                .id()
+        });
+        let joints = wheels.map(|wheel| {
+            app.world_mut()
+                .spawn((Transform::default(), WheelSuspensionJoint { wheel }))
+                .id()
+        });
+        let mesh = creature_joint_mesh();
+        let VertexAttributeValues::Float32x3(vertices) =
+            mesh.attribute(Mesh::ATTRIBUTE_POSITION).unwrap()
+        else {
+            panic!("joint positions missing");
+        };
+        let indices: Vec<usize> = match mesh.indices().unwrap() {
+            Indices::U16(values) => values.iter().map(|&i| usize::from(i)).collect(),
+            Indices::U32(values) => values.iter().map(|&i| i as usize).collect(),
+        };
+        assert_eq!(indices.len() / 3, 80);
+        let faces = indices.as_chunks::<3>().0.to_vec();
+        let mut edges = Vec::new();
+        for &[a, b, c] in &faces {
+            for (u, v) in [(a, b), (b, c), (c, a)] {
+                edges.push([u.min(v), u.max(v)]);
+            }
+        }
+        edges.sort_unstable();
+        edges.dedup();
+        let support = GroundSupportMesh {
+            vertices: vertices.iter().copied().map(Vec3::from_array).collect(),
+            edges,
+            faces,
+        };
+        let mut worst = 0.0_f32;
+        let mut overlay_worst = 0.0_f32;
+        let mut moved = false;
+        let coordinates = [
+            0.0, 1.0, 25.0, 75.0, 95.0, 100.0, 105.0, 150.0, 195.0, 200.0, 205.0, 255.0, 299.0,
+        ];
+        for radius in [2.0_f32, 10.0, 30.0] {
+            snapshot.agent_radius = radius;
+            for spike in [0.0_f32, 20.0, 40.0] {
+                agent.spike_length = spike;
+                *app.world_mut()
+                    .get_mut::<AgentGroundFootprint>(root)
+                    .unwrap() = agent_ground_footprint(&snapshot, &agent);
+                for position in coordinates
+                    .into_iter()
+                    .flat_map(|x| coordinates.into_iter().map(move |y| Vec2::new(x, y)))
+                {
+                    for heading in [0.0, 0.8, -1.7, 2.4] {
+                        agent.position = position;
+                        agent.heading = heading;
+                        let (translation, rotation) = agent_surface_pose(&snapshot, &agent);
+                        *app.world_mut().get_mut::<Transform>(root).unwrap() =
+                            Transform::from_translation(translation).with_rotation(rotation);
+                        app.update();
+                        for ((side, wheel), joint) in
+                            [-1.0, 1.0].into_iter().zip(wheels).zip(joints)
+                        {
+                            let wheel = app.world().get::<Transform>(wheel).unwrap();
+                            let joint = app.world().get::<Transform>(joint).unwrap();
+                            let anchor = Vec3::new(0.0, 0.0, side * 0.65 * radius);
+                            let span = wheel.translation - anchor;
+                            assert!(
+                                joint
+                                    .translation
+                                    .distance((anchor + wheel.translation) * 0.5)
+                                    < 0.001
+                            );
+                            assert!((joint.rotation * Vec3::Y).dot(span.normalize()) > 0.9999);
+                            let nominal = Vec3::new(0.0, -0.46, side * 0.9856) * radius;
+                            let travel = rotation * (nominal - wheel.translation);
+                            assert!(travel.y >= -0.001 && travel.y <= radius * 0.65 + 0.001);
+                            moved |= travel.y > 0.05;
+                            include_ground_mesh(
+                                &support,
+                                *joint,
+                                rotation,
+                                position,
+                                &snapshot.terrain_height,
+                                |offset| {
+                                    let at = position + Vec2::new(offset.x, -offset.z);
+                                    let height = sample_height_world(
+                                        &snapshot.terrain_height,
+                                        at,
+                                        TERRAIN_HEIGHT_SCALE,
+                                    );
+                                    overlay_worst =
+                                        overlay_worst.max(height - translation.y - offset.y);
+                                },
+                            );
+                            for triangle in indices.as_chunks::<3>().0 {
+                                let [a, b, c] = triangle.map(|i| Vec3::from_array(vertices[i]));
+                                for p in [
+                                    a,
+                                    b,
+                                    c,
+                                    (a + b) * 0.5,
+                                    (b + c) * 0.5,
+                                    (c + a) * 0.5,
+                                    (a + b + c) / 3.0,
+                                ] {
+                                    let offset = rotation * joint.transform_point(p);
+                                    let at = position + Vec2::new(offset.x, -offset.z);
+                                    let height = sample_height_world(
+                                        &snapshot.terrain_height,
+                                        at,
+                                        TERRAIN_HEIGHT_SCALE,
+                                    );
+                                    worst = worst.max(height - translation.y - offset.y);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(moved, "fixture must exercise suspension");
+        assert!(worst <= 0.01, "sampled joint penetrates terrain by {worst}");
+        assert!(
+            overlay_worst <= 0.01,
+            "joint/terrain triangle overlay penetrates by {overlay_worst}"
+        );
+    }
+
+    #[test]
+    fn wheel_joints_share_the_body_material_and_follow_the_wheels() {
+        let mut app = eye_geometry_test_app();
+        let body_material = app.world().resource::<AgentRegistry>().records[&AgentUid(1)]
+            .body
+            .material
+            .clone()
+            .unwrap();
+        let mut query = app
+            .world_mut()
+            .query::<(&WheelSuspensionJoint, &MeshMaterial3d<StandardMaterial>)>();
+        let joints: Vec<_> = query.iter(app.world()).collect();
+        assert_eq!(joints.len(), 2);
+        for (joint, material) in joints {
+            assert_eq!(material.0, body_material);
+            assert!(app.world().get::<WheelGroundContact>(joint.wheel).is_some());
+        }
+    }
+
+    #[test]
+    fn wheel_joint_static_transform_does_not_churn_but_tracks_motion() {
+        let mut app = App::new();
+        app.add_systems(Update, conform_wheel_joints);
+        let root = app
+            .world_mut()
+            .spawn(AgentGroundFootprint {
+                radius: 10.0,
+                spike_extension: 0.0,
+                spike: None,
+            })
+            .id();
+        let wheel = app
+            .world_mut()
+            .spawn((
+                Transform::from_translation(Vec3::new(0.0, -4.6, 9.856)),
+                WheelGroundContact { root, side: 1.0 },
+            ))
+            .id();
+        let joint = app
+            .world_mut()
+            .spawn((Transform::default(), WheelSuspensionJoint { wheel }))
+            .id();
+        app.update();
+        let first = app
+            .world()
+            .entity(joint)
+            .get_ref::<Transform>()
+            .unwrap()
+            .last_changed();
+        app.update();
+        let unchanged = app
+            .world()
+            .entity(joint)
+            .get_ref::<Transform>()
+            .unwrap()
+            .last_changed();
+        assert_eq!(first, unchanged, "stationary joint dirtied its transform");
+        app.world_mut()
+            .get_mut::<Transform>(wheel)
+            .unwrap()
+            .translation
+            .y -= 1.0;
+        app.update();
+        let changed = app
+            .world()
+            .entity(joint)
+            .get_ref::<Transform>()
+            .unwrap()
+            .last_changed();
+        assert_ne!(unchanged, changed, "moving wheel did not update its joint");
+    }
+
+    #[test]
+    fn wheel_joints_are_despawned_with_their_agent() {
+        let mut app = eye_geometry_test_app();
+        let entities = {
+            let mut query = app
+                .world_mut()
+                .query_filtered::<Entity, With<WheelSuspensionJoint>>();
+            query.iter(app.world()).collect::<Vec<_>>()
+        };
+        assert_eq!(entities.len(), 2);
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            let snapshot = state.latest.as_mut().unwrap();
+            snapshot.revision += 1;
+            snapshot.agents.clear();
+        }
+        app.update();
+        for entity in entities {
+            assert!(
+                app.world().get_entity(entity).is_err(),
+                "joint survived its agent"
+            );
+        }
+    }
+
+    #[test]
     fn wheel_suspension_closes_ground_gap_without_accumulating_or_penetrating() {
         let mut snapshot = sample_world_snapshot();
         snapshot.agent_radius = 10.0;
@@ -15424,7 +17271,7 @@ fn spawn_agent_entity(
 
     let stripe = spawn_part(
         commands,
-        &meshes.quad,
+        &meshes.stripe,
         materials,
         Color::srgb(0.4, 0.62, 0.2),
         Color::linear_rgb(0.2, 0.4, 0.12),
@@ -15466,6 +17313,24 @@ fn spawn_agent_entity(
     commands
         .entity(wheel_right.entity)
         .insert(WheelGroundContact { root, side: -1.0 });
+
+    // A body-colored ellipsoid bridges the shell and the wheel hub. Reusing
+    // the body material keeps the joint synchronized with live palette/state.
+    if let Some(material) = &body.material {
+        for wheel in [&wheel_left, &wheel_right] {
+            let joint = commands
+                .spawn((
+                    Mesh3d(meshes.joint.clone()),
+                    MeshMaterial3d(material.clone()),
+                    Transform::default(),
+                    WheelSuspensionJoint {
+                        wheel: wheel.entity,
+                    },
+                ))
+                .id();
+            commands.entity(root).add_child(joint);
+        }
+    }
 
     let mouth = spawn_part(
         commands,
@@ -15740,16 +17605,15 @@ fn apply_agent_visuals(
         visuals.body_emissive_gain,
         palette,
     );
-    let stripe_transform = Transform {
-        translation: Vec3::new(0.0, body_radius * 0.16, 0.0),
-        rotation: Quat::from_rotation_y(FRAC_PI_2) * Quat::from_rotation_z(FRAC_PI_2),
-        scale: Vec3::new(
-            (body_length * 1.04).max(0.05),
-            (body_radius * 0.3).max(0.05),
-            (body_radius * 0.3).max(0.05),
-        ),
-    };
+    let stripe_transform = Transform::from_scale(Vec3::splat(scale_factor));
     update_part_transform(commands, &record.stripe, stripe_transform);
+    commands
+        .entity(record.stripe.entity)
+        .insert(IdleBodyTarget {
+            transform: stripe_transform,
+            phase: (agent.uid.0.wrapping_mul(2_654_435_761) % 1024) as f32
+                * (std::f32::consts::TAU / 1024.0),
+        });
     update_part_colors(materials, &record.stripe, stripe_color, stripe_emissive);
 
     let wheel_offset = body_radius * 1.12;
@@ -15853,7 +17717,9 @@ fn apply_agent_visuals(
     let spike_color = srgb_from_vec_with_palette(spike_rgb, 1.0, palette);
     let spike_emissive = palette_hdr_emissive_from_srgb(
         visuals.spike_color,
-        visuals.spike_emissive_gain * spike_ready,
+        // The shared style targets a dark 2D field; in the lit 3D scene its
+        // full HDR gain clips the spike to white and hides all shape shading.
+        visuals.spike_emissive_gain * spike_ready * 0.12,
         palette,
     );
     update_part_colors(materials, &record.spike, spike_color, spike_emissive);
@@ -16047,9 +17913,7 @@ fn apply_agent_visuals(
         update_part_colors(materials, &record.sound_outer, outer_color, outer_emissive);
     }
 
-    let eye_base = scale_factor * (0.22 + clamp01(agent.trait_modifiers.eye) * 0.15);
-    let eye_vertical = body_radius * 0.35;
-    let eye_forward = body_length * 0.42;
+    let eye_base = scale_factor * (0.12 + clamp01(agent.trait_modifiers.eye) * 0.07);
     let pupil_scale = eye_base * 0.45;
 
     for (idx, eye) in record.eyes.iter().enumerate() {
@@ -16057,9 +17921,15 @@ fn apply_agent_visuals(
         let fov = agent.eye_fov[idx];
         let fov_scale = clamp01(fov / std::f32::consts::PI);
 
-        let lateral = Vec3::new(0.0, 0.0, -rel_dir.sin() * body_radius * 0.42);
-        let forward_bias = Vec3::new(rel_dir.cos().max(0.0) * body_radius * 0.15, 0.0, 0.0);
-        let sclera_translation = Vec3::new(eye_forward, eye_vertical, 0.0) + lateral + forward_bias;
+        // Stable sockets prevent equal-bearing sensors from overlapping.
+        // The two rows follow the top of the capsule at its front and midbody.
+        let (forward, height) = if idx < NUM_EYES / 2 {
+            (0.95, 0.73)
+        } else {
+            (0.55, 0.85)
+        };
+        let side = if idx % 2 == 0 { 1.0 } else { -1.0 };
+        let sclera_translation = Vec3::new(forward, height, side * 0.23) * scale_factor;
         let sclera_scale = Vec3::splat((eye_base * (0.88 + fov_scale * 0.4)).max(0.03));
         let sclera_transform = Transform {
             translation: sclera_translation,
@@ -16068,10 +17938,13 @@ fn apply_agent_visuals(
         };
         update_part_transform(commands, &eye.sclera, sclera_transform);
 
-        let look_dir = Quat::from_rotation_y(rel_dir)
-            .mul_vec3(Vec3::X)
-            .normalize_or_zero();
-        let pupil_translation = sclera_translation + look_dir * (eye_base * 0.35);
+        let horizontal = Quat::from_rotation_y(rel_dir) * Vec3::X;
+        // Raise the pupil toward the visible upper hemisphere while its
+        // horizontal projection retains the exact sensor bearing.
+        let look_dir = (horizontal * 0.55 + Vec3::Y * 0.835).normalize_or_zero();
+        // Seat the pupil into the sclera while leaving it above the surface
+        // at every supported field of view.
+        let pupil_translation = sclera_translation + look_dir * (sclera_scale.x * 0.45);
         let pupil_transform = Transform {
             translation: pupil_translation,
             rotation: Quat::IDENTITY,
@@ -16384,6 +18257,39 @@ fn conform_agent_wheels(
         if support.is_finite() {
             let travel = (root.translation.y - support).clamp(0.0, radius * 0.65);
             wheel.translation = center - root.rotation.inverse() * Vec3::Y * travel;
+        }
+    }
+}
+
+/// Recompute the attachment from the actual conformed wheel on every frame.
+fn conform_wheel_joints(
+    roots: Query<&AgentGroundFootprint>,
+    wheels: Query<(&Transform, &WheelGroundContact), Without<WheelSuspensionJoint>>,
+    mut joints: Query<(&WheelSuspensionJoint, &mut Transform), Without<WheelGroundContact>>,
+) {
+    for (joint, mut transform) in &mut joints {
+        let Ok((wheel, contact)) = wheels.get(joint.wheel) else {
+            continue;
+        };
+        let Ok(footprint) = roots.get(contact.root) else {
+            continue;
+        };
+        let radius = footprint.radius;
+        let anchor = Vec3::new(0.0, 0.0, contact.side * 0.65) * radius;
+        let span = wheel.translation - anchor;
+        let length = span.length();
+        let target = Transform {
+            translation: (anchor + wheel.translation) * 0.5,
+            rotation: if length > 0.0001 {
+                Quat::from_rotation_arc(Vec3::Y, span / length)
+            } else {
+                Quat::IDENTITY
+            },
+            scale: Vec3::new(radius * 0.30, length + radius * 0.30, radius * 0.30),
+        };
+        // Static joints should not trigger transform propagation every frame.
+        if *transform != target {
+            *transform = target;
         }
     }
 }

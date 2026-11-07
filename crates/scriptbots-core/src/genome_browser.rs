@@ -239,9 +239,52 @@ fn mutation_diff(
     parent_envelope: Option<&BrainGenomeEnvelope>,
     parent_uids: &[AgentUid],
 ) -> (MutationDiffStatus, Vec<GenomeDelta>) {
-    parent_envelope.map_or_else(
-        || (MutationDiffStatus::FounderNoParent, Vec::new()),
-        |parent| match diff_genomes(codec, parent, envelope) {
+    let supplied = parent_uids.first().copied();
+    if !envelope
+        .provenance()
+        .parents
+        .iter()
+        .flatten()
+        .copied()
+        .eq(parent_uids.iter().copied())
+    {
+        let reason = if supplied.is_none() {
+            "primary parent identity is unavailable"
+        } else {
+            "primary parent identity does not match genome provenance"
+        };
+        return (
+            MutationDiffStatus::Unavailable {
+                reason: reason.to_owned(),
+            },
+            Vec::new(),
+        );
+    }
+    match (parent_envelope, parent_uids.first().copied()) {
+        (None, None) => (MutationDiffStatus::FounderNoParent, Vec::new()),
+        (None, Some(_)) => (
+            MutationDiffStatus::Unavailable {
+                reason: "primary parent genome is unavailable".to_owned(),
+            },
+            Vec::new(),
+        ),
+        (Some(_), None) => (
+            MutationDiffStatus::Unavailable {
+                reason: "primary parent identity is unavailable".to_owned(),
+            },
+            Vec::new(),
+        ),
+        (Some(parent), Some(_))
+            if envelope.provenance().parent_genome_hashes[0] != Some(parent.material_hash()) =>
+        {
+            (
+                MutationDiffStatus::Unavailable {
+                    reason: "primary parent genome does not match recorded material".to_owned(),
+                },
+                Vec::new(),
+            )
+        }
+        (Some(parent), Some(parent_uid)) => match diff_genomes(codec, parent, envelope) {
             Ok(diff) => {
                 let status = if parent_uids.len() > 1 {
                     MutationDiffStatus::SexualPrimary {
@@ -250,7 +293,6 @@ fn mutation_diff(
                         summary: diff.summary,
                     }
                 } else {
-                    let parent_uid = parent_uids.first().copied().unwrap_or(AgentUid(0));
                     MutationDiffStatus::Computed {
                         parent_uid,
                         total_deltas: diff.deltas.len(),
@@ -266,7 +308,7 @@ fn mutation_diff(
                 Vec::new(),
             ),
         },
-    )
+    }
 }
 
 impl GenomeBrowserViewModel {
@@ -654,9 +696,19 @@ mod tests {
         let parent_env =
             BrainGenomeEnvelope::new(family.clone(), 1, 1, vec![1, 2, 3], founder_provenance())
                 .expect("envelope");
-        let child_env =
-            BrainGenomeEnvelope::new(family.clone(), 1, 1, vec![1, 2, 4], founder_provenance())
-                .expect("envelope");
+        let child_env = BrainGenomeEnvelope::new(
+            family.clone(),
+            1,
+            1,
+            vec![1, 2, 4],
+            BrainProvenance {
+                parents: [Some(AgentUid(10)), None],
+                parent_genome_hashes: [Some(parent_env.material_hash()), None],
+                created_at: Tick(200),
+                derivation: BrainGenomeDerivation::MutationOnly,
+            },
+        )
+        .expect("envelope");
         let codec = DynamicMockCodec {
             family,
             parent_loci,
@@ -737,6 +789,63 @@ mod tests {
             }
             other => panic!("unexpected diff status: {other:?}"),
         }
+    }
+
+    #[test]
+    fn missing_parent_data_never_claims_founder_or_invents_an_identity() {
+        let (codec, parent, child) = delta_kind_fixture();
+        let build = |parent_envelope, parent_uids| {
+            GenomeBrowserViewModel::build(
+                &codec,
+                AgentUid(42),
+                2,
+                Tick(200),
+                &child,
+                parent_envelope,
+                parent_uids,
+                None,
+                None,
+                0,
+                20,
+            )
+            .unwrap()
+        };
+        let missing_genome = build(None, vec![AgentUid(10)]);
+        assert!(matches!(
+            &missing_genome.mutation_diff,
+            MutationDiffStatus::Unavailable { reason } if reason == "primary parent genome is unavailable"
+        ));
+        assert_eq!(missing_genome.deltas, []);
+        let missing_identity = build(Some(&parent), vec![]);
+        assert!(matches!(
+            &missing_identity.mutation_diff,
+            MutationDiffStatus::Unavailable { reason } if reason == "primary parent identity is unavailable"
+        ));
+        assert_eq!(missing_identity.deltas, []);
+        let omitted_identity = build(None, vec![]);
+        assert!(matches!(
+            &omitted_identity.mutation_diff,
+            MutationDiffStatus::Unavailable { reason } if reason == "primary parent identity is unavailable"
+        ));
+        let wrong_identity = build(Some(&parent), vec![AgentUid(11)]);
+        assert!(matches!(
+            &wrong_identity.mutation_diff,
+            MutationDiffStatus::Unavailable { reason } if reason == "primary parent identity does not match genome provenance"
+        ));
+        let different_parent = BrainGenomeEnvelope::new(
+            parent.family_id().clone(),
+            parent.schema_version(),
+            parent.codec_version(),
+            vec![9, 9, 9],
+            founder_provenance(),
+        )
+        .unwrap();
+        let changed_material = build(Some(&different_parent), vec![AgentUid(10)]);
+        assert!(matches!(
+            &changed_material.mutation_diff,
+            MutationDiffStatus::Unavailable { reason } if reason == "primary parent genome does not match recorded material"
+        ));
+        assert_eq!(changed_material.deltas, []);
     }
 
     #[test]
@@ -837,15 +946,28 @@ mod tests {
             family: family.clone(),
             loci,
         };
-        let env = BrainGenomeEnvelope::new(family, 1, 1, vec![1, 2], founder_provenance())
+        let env = BrainGenomeEnvelope::new(family.clone(), 1, 1, vec![1, 2], founder_provenance())
             .expect("envelope");
+        let child = BrainGenomeEnvelope::new(
+            family,
+            1,
+            1,
+            vec![1, 2],
+            BrainProvenance {
+                parents: [Some(AgentUid(1)), None],
+                parent_genome_hashes: [Some(env.material_hash()), None],
+                created_at: Tick(10),
+                derivation: BrainGenomeDerivation::Clone,
+            },
+        )
+        .expect("child envelope");
 
         let vm = GenomeBrowserViewModel::build(
             &codec,
             AgentUid(2),
             1,
             Tick(10),
-            &env,
+            &child,
             Some(&env), // Same parent envelope
             vec![AgentUid(1)],
             None,

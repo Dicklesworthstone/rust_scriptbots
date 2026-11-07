@@ -1416,6 +1416,7 @@ fn add_capture_scene_systems(app: &mut App) {
             // Captures use the snapshot pose directly, but the wheel
             // suspension must still match the interactive scene.
             crate::conform_agent_wheels,
+            crate::conform_wheel_joints,
             crate::apply_tier_to_reflection_probes,
             crate::apply_tier_to_terrain_detail,
             apply_capture_corruption,
@@ -1839,7 +1840,9 @@ fn setup_capture_resources(
     commands.insert_resource(AgentMeshes {
         base_radius: 1.0,
         body: meshes.add(Mesh::from(crate::AGENT_BODY_CAPSULE)),
+        stripe: meshes.add(crate::creature_stripe_mesh()),
         wheel: meshes.add(Mesh::from(Torus::new(0.3, 0.6))),
+        joint: meshes.add(crate::creature_joint_mesh()),
         spike: meshes.add(Mesh::from(Cone {
             radius: 0.45,
             height: 1.0,
@@ -1931,11 +1934,24 @@ mod tests {
             ))
             .id();
 
+        let joint = app
+            .world_mut()
+            .spawn((Transform::default(), crate::WheelSuspensionJoint { wheel }))
+            .id();
         app.update();
         let first = *app.world().get::<Transform>(wheel).unwrap();
+        let first_joint = *app.world().get::<Transform>(joint).unwrap();
+        let anchor = Vec3::new(0.0, 0.0, 6.5);
+        assert!(
+            first_joint
+                .translation
+                .distance((anchor + first.translation) * 0.5)
+                < 0.001
+        );
         assert!((first.translation.y - (-4.6 - 6.5)).abs() < 0.001);
         app.update();
         assert_eq!(*app.world().get::<Transform>(wheel).unwrap(), first);
+        assert_eq!(*app.world().get::<Transform>(joint).unwrap(), first_joint);
     }
 
     #[test]

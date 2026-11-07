@@ -3,11 +3,11 @@
 #![recursion_limit = "256"]
 
 mod camera;
-pub mod lab_workflows;
 /// Headless GPUI HUD capture (bd-abu3). Test-only: it depends on GPUI's
 /// `test-support` feature, which is a dev-dependency and must not reach production.
 #[cfg(test)]
 mod hud_capture;
+pub mod lab_workflows;
 #[expect(
     dead_code,
     reason = "bd-bufm: projection and paint helpers await the core's positioned tick-event stream; there is no production VFX consumer yet"
@@ -22683,17 +22683,18 @@ fn terrain_surface_color(
     daylight: f32,
     palette: ColorPaletteMode,
 ) -> Rgba {
+    let lushness = visual::terrain_lushness(tile.moisture, tile.fertility_bias);
     let weights = visual::splat_weights(&SplatInput {
         kind: tile.kind,
         elevation: tile.elevation,
         slope: tile.slope,
         water_depth: tile.water_depth,
-        moisture: tile.moisture,
+        moisture: lushness,
         temperature: tile.temperature,
     });
     let srgb = visual::terrain_surface_srgb(&TerrainSurfaceInput {
         splat_weights: weights,
-        moisture: tile.moisture,
+        moisture: lushness,
         elevation: tile.elevation,
         slope: tile.slope,
         accent: tile.accent,
@@ -23012,7 +23013,6 @@ fn rasterize_terrain_input_region_cancellable(
 
     let mut kinds = Vec::with_capacity(expected_tiles);
     let mut moisture = Vec::with_capacity(expected_tiles);
-    let mut fertility = Vec::with_capacity(expected_tiles);
     let mut elevation = Vec::with_capacity(expected_tiles);
     let mut slope = Vec::with_capacity(expected_tiles);
     let mut water_depth = Vec::with_capacity(expected_tiles);
@@ -23022,8 +23022,8 @@ fn rasterize_terrain_input_region_cancellable(
     let mut temperatures = Vec::with_capacity(expected_tiles);
     for tile in frame.terrain.tiles.iter().take(expected_tiles) {
         kinds.push(tile.kind);
-        moisture.push(tile.moisture);
-        fertility.push(tile.fertility_bias);
+        let lushness = visual::terrain_lushness(tile.moisture, tile.fertility_bias);
+        moisture.push(lushness);
         elevation.push(tile.elevation);
         slope.push(tile.slope);
         water_depth.push(tile.water_depth);
@@ -23035,7 +23035,7 @@ fn rasterize_terrain_input_region_cancellable(
             elevation: tile.elevation,
             slope: tile.slope,
             water_depth: tile.water_depth,
-            moisture: tile.moisture,
+            moisture: lushness,
             temperature: tile.temperature,
         }));
     }
@@ -23105,7 +23105,6 @@ fn rasterize_terrain_input_region_cancellable(
             let corners = terrain_field.sample_corners(world_x, world_y);
             let weights = blend_channels(&splats, &corners);
             let sampled_moisture = blend_scalar(&moisture, &corners);
-            let _sampled_fertility = blend_scalar(&fertility, &corners);
             let sampled_elevation = blend_scalar(&elevation, &corners);
             let sampled_slope = blend_scalar(&slope, &corners);
             let sampled_accent = blend_scalar(&accent, &corners);
@@ -24534,16 +24533,17 @@ mod continuous_world_raster_tests {
             for (index, (tile, actual)) in
                 frame.terrain.tiles.iter().copied().zip(actual).enumerate()
             {
+                let lushness = visual::terrain_lushness(tile.moisture, tile.fertility_bias);
                 let expected = visual::terrain_surface_srgb(&TerrainSurfaceInput {
                     splat_weights: visual::splat_weights(&SplatInput {
                         kind: tile.kind,
                         elevation: tile.elevation,
                         slope: tile.slope,
                         water_depth: tile.water_depth,
-                        moisture: tile.moisture,
+                        moisture: lushness,
                         temperature: tile.temperature,
                     }),
-                    moisture: tile.moisture,
+                    moisture: lushness,
                     elevation: tile.elevation,
                     slope: tile.slope,
                     accent: tile.accent,
@@ -24590,6 +24590,36 @@ mod continuous_world_raster_tests {
         assert_ne!(
             color_lush, color_arid,
             "GPUI terrain color must distinguish lush vs arid"
+        );
+    }
+
+    #[test]
+    fn fertility_only_changes_the_gpu_projection_and_continuous_raster() {
+        let mut dry = tile(TerrainKind::Grass);
+        dry.moisture = 0.6;
+        dry.fertility_bias = -1.0;
+        let mut fertile = dry;
+        fertile.fertility_bias = 1.0;
+        let dry_frame = frame((1, 1), 10, vec![dry], (1, 1), 10, vec![0.0]);
+        let fertile_frame = frame((1, 1), 10, vec![fertile], (1, 1), 10, vec![0.0]);
+        assert_ne!(
+            world_raster_key(&dry_frame, 0.5),
+            world_raster_key(&fertile_frame, 0.5)
+        );
+        assert_ne!(
+            canonical_gpu_terrain_colors(&dry_frame),
+            canonical_gpu_terrain_colors(&fertile_frame),
+            "fertility must reach the GPU terrain color projection"
+        );
+        let dry_pixels = rasterize_world_fields(&dry_frame, 0.5).unwrap();
+        let fertile_pixels = rasterize_world_fields(&fertile_frame, 0.5).unwrap();
+        assert_eq!(
+            (dry_pixels.width, dry_pixels.height),
+            (fertile_pixels.width, fertile_pixels.height)
+        );
+        assert_ne!(
+            dry_pixels.bgra, fertile_pixels.bgra,
+            "fertility must reach the actual raster"
         );
     }
 

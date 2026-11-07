@@ -167,9 +167,10 @@ fn scientific_command_retained_bytes(command: &ControlCommand) -> Option<usize> 
             use scriptbots_core::{CellId, CellSelector, Intervention, InterventionCommand};
             let selector = match &command.intervention {
                 Intervention::SpawnFromArchive { selector, .. } => match selector {
-                    CellSelector::AxisRange(axes) => axes
-                        .capacity()
-                        .saturating_mul(size_of::<(usize, f32, f32)>()),
+                    CellSelector::AxisRange(axes) => {
+                        axes.capacity()
+                            .saturating_mul(size_of::<(usize, f32, f32)>())
+                    }
                     CellSelector::Explicit(cells) => {
                         cells.capacity().saturating_mul(size_of::<CellId>())
                     }
@@ -4311,18 +4312,27 @@ impl HostCore {
         uid: AgentUid,
         max_contributors: usize,
     ) -> Result<Option<crate::channel::AgentInspectorData>, HostAccessError> {
-        self.inspect_agent_with_attribution(uid, Some(max_contributors))
+        self.inspect_agent_with_attribution(uid, Some(max_contributors), 0)
     }
 
     pub(crate) fn inspect_agent_with_attribution(
         &self,
         uid: AgentUid,
         max_contributors: Option<usize>,
+        genome_offset: usize,
     ) -> Result<Option<crate::channel::AgentInspectorData>, HostAccessError> {
         if max_contributors.is_some_and(|limit| limit > crate::channel::MAX_INSPECTOR_CONTRIBUTORS)
         {
             return Err(HostAccessError::ProtocolViolation {
                 message: "sensor explanation contributor limit exceeded".to_owned(),
+            });
+        }
+        let page_size = crate::channel::INSPECTOR_GENOME_PAGE_SIZE;
+        if !genome_offset.is_multiple_of(page_size)
+            || genome_offset.checked_add(page_size).is_none()
+        {
+            return Err(HostAccessError::ProtocolViolation {
+                message: "invalid genome page offset".to_owned(),
             });
         }
         let Some(id) = self
@@ -4371,8 +4381,8 @@ impl HostCore {
                         parents,
                         None,
                         None,
-                        0,
-                        20,
+                        genome_offset,
+                        page_size,
                     )
                 })
                 .transpose()
@@ -5065,6 +5075,14 @@ impl HostCore {
         }
     }
 
+    fn snapshot_applied_interventions(&self, sequence: u64) -> Arc<Vec<AppliedInterventionRecord>> {
+        if sequence == self.last_published_intervention_seq {
+            Arc::clone(&self.applied_interventions)
+        } else {
+            Arc::new(self.world.applied_interventions().iter().cloned().collect())
+        }
+    }
+
     fn publish_snapshot(&mut self) -> Result<(), HostAccessError> {
         self.refresh_open_genesis_origins();
         let revision = self.next_snapshot;
@@ -5115,17 +5133,7 @@ impl HostCore {
         // seq: interventions are rare, so this is a pointer clone on almost
         // every publication rather than a copy of the ring.
         let intervention_seq = latest_intervention_seq(&self.world);
-        let applied_interventions = if intervention_seq == self.last_published_intervention_seq {
-            Arc::clone(&self.applied_interventions)
-        } else {
-            Arc::new(
-                self.world
-                    .applied_interventions()
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>(),
-            )
-        };
+        let applied_interventions = self.snapshot_applied_interventions(intervention_seq);
         let (command_queue_depth, last_applied_command) = {
             let shared = self.shared.borrow();
             (
@@ -6809,7 +6817,12 @@ mod tests {
             assert!(!paired.host_checkpoint().has_schedule());
             assert_eq!(paired.host_checkpoint().remaining_schedule(), None);
             assert_eq!(paired.host_checkpoint().completed_schedule_sequence(), None);
-            assert!(paired.host_checkpoint().scheduled_patch_history().is_empty());
+            assert!(
+                paired
+                    .host_checkpoint()
+                    .scheduled_patch_history()
+                    .is_empty()
+            );
             assert_eq!(
                 paired.journal.scientific_entries.len(),
                 usize::try_from(completed.min(3)).unwrap()
@@ -7128,16 +7141,17 @@ mod tests {
             2
         );
         assert_eq!(
-            captured.scientific_commands[1].boundary().revisions.scientific,
+            captured.scientific_commands[1]
+                .boundary()
+                .revisions
+                .scientific,
             captured.scientific_revision
         );
-        assert!(
-            matches!(
-                captured.scientific_commands[0].command(),
-                ControlCommand::SpawnAgent { herbivore_tendency }
-                    if herbivore_tendency.to_bits() == 0.5_f32.to_bits()
-            )
-        );
+        assert!(matches!(
+            captured.scientific_commands[0].command(),
+            ControlCommand::SpawnAgent { herbivore_tendency }
+                if herbivore_tendency.to_bits() == 0.5_f32.to_bits()
+        ));
         settle_continuation_command(
             &mut owner,
             CommandEnvelope::new(
@@ -7150,7 +7164,11 @@ mod tests {
         );
         let cut = owner.scientific_digest_cut().unwrap();
         assert_eq!(
-            cut.scientific_commands[0].boundary().revisions.scientific.get(),
+            cut.scientific_commands[0]
+                .boundary()
+                .revisions
+                .scientific
+                .get(),
             3
         );
         assert_eq!(owner.world().agents().len(), 4);
@@ -7226,7 +7244,11 @@ mod tests {
         let cut = owner.scientific_digest_cut().unwrap();
         assert_eq!(cut.scientific_commands.len(), 1);
         assert_eq!(
-            cut.scientific_commands[0].boundary().revisions.scientific.get(),
+            cut.scientific_commands[0]
+                .boundary()
+                .revisions
+                .scientific
+                .get(),
             1
         );
         assert!(matches!(
@@ -7303,7 +7325,11 @@ mod tests {
                     .sum::<usize>()
             );
             assert_eq!(
-                cut.scientific_commands[0].boundary().revisions.scientific.get(),
+                cut.scientific_commands[0]
+                    .boundary()
+                    .revisions
+                    .scientific
+                    .get(),
                 sequence * 2 - 1
             );
             if sequence == 1 {
@@ -7346,7 +7372,11 @@ mod tests {
         assert_eq!(cut.scientific_revision.get(), 6);
         assert_eq!(cut.scientific_commands.len(), 1);
         assert_eq!(
-            cut.scientific_commands[0].boundary().revisions.scientific.get(),
+            cut.scientific_commands[0]
+                .boundary()
+                .revisions
+                .scientific
+                .get(),
             3
         );
         assert!(
@@ -7476,7 +7506,10 @@ mod tests {
                 &declared[completed_patches..],
                 "a patch due at the captured tick stays pending until the next science step"
             );
-            assert_eq!(checkpoint.scheduled_patch_history().len(), completed_patches);
+            assert_eq!(
+                checkpoint.scheduled_patch_history().len(),
+                completed_patches
+            );
             for (status, expected) in checkpoint
                 .scheduled_patch_history()
                 .iter()
@@ -7488,7 +7521,10 @@ mod tests {
             let wire = checkpoint.encode().expect("bounded owner encoding");
             let decoded = HostCheckpointV1::decode(&wire).expect("full owner decoding");
             assert_eq!(decoded.encode().expect("canonical re-encoding"), wire);
-            assert_eq!(decoded.remaining_schedule(), checkpoint.remaining_schedule());
+            assert_eq!(
+                decoded.remaining_schedule(),
+                checkpoint.remaining_schedule()
+            );
             assert_eq!(
                 decoded.scheduled_patch_history(),
                 checkpoint.scheduled_patch_history()
@@ -7625,7 +7661,10 @@ mod tests {
             assert_eq!(checkpoint.scheduled_patch_history_capacity(), capacity);
             assert_eq!(checkpoint.scheduled_patch_history().len(), 3.min(capacity));
             assert_eq!(
-                checkpoint.scheduled_patch_history()[0].evidence.scheduled.sequence,
+                checkpoint.scheduled_patch_history()[0]
+                    .evidence
+                    .scheduled
+                    .sequence,
                 4 - u64::try_from(3.min(capacity)).unwrap()
             );
             assert_eq!(checkpoint.remaining_schedule().unwrap()[0].sequence, 4);
@@ -8813,13 +8852,11 @@ mod tests {
                 &mut core,
                 CommandEnvelope::new(
                     CommandId::new(u128::from(sequence)),
-                    HostCommand::Intervention(Box::new(
-                        scriptbots_core::InterventionCommand::new(
-                            scriptbots_core::Intervention::SetClosedWorld { closed },
-                            scriptbots_core::InterventionSurface::Script,
-                            "closure-publication",
-                        ),
-                    )),
+                    HostCommand::Intervention(Box::new(scriptbots_core::InterventionCommand::new(
+                        scriptbots_core::Intervention::SetClosedWorld { closed },
+                        scriptbots_core::InterventionSurface::Script,
+                        "closure-publication",
+                    ))),
                 ),
                 start + 1,
             );

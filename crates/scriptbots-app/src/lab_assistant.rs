@@ -21,7 +21,7 @@ use crate::lab::stats::{
 };
 use scriptbots_storage::RunBundleV1;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
@@ -1289,6 +1289,7 @@ fn stable_value_id(value: &serde_json::Value) -> String {
 mod tests {
     use super::*;
     use crate::lab::llm::{ScriptedClient, ScriptedTurn};
+    use std::collections::BTreeMap;
     use std::fs;
     use std::sync::{Arc, Mutex};
 
