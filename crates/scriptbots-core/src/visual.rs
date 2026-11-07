@@ -2227,6 +2227,19 @@ pub enum AtlasVerificationError {
         /// `TerrainKind` layer index corresponding to the first mismatching byte.
         mismatch_layer: TerrainKind,
     },
+    /// The current atlas generator no longer produces the pinned reference.
+    /// Without the pinned bytes, a mismatch cannot be attributed to a layer.
+    #[error(
+        "atlas reference digest mismatch: expected {expected}, generated {reference}; input digest {actual} (byte and layer unavailable)"
+    )]
+    ReferenceDigestMismatch {
+        /// Expected BLAKE3 digest in lowercase hex.
+        expected: String,
+        /// Digest of the locally generated reference atlas.
+        reference: String,
+        /// Digest of the supplied atlas.
+        actual: String,
+    },
 }
 
 /// Bake the canonical 6-layer biome atlas.
@@ -2237,6 +2250,13 @@ pub fn bake_canonical_biome_atlas() -> Vec<u8> {
 
 /// Verify an atlas against the canonical fixture parameters and digest.
 pub fn verify_biome_atlas(atlas: &[u8]) -> Result<(), AtlasVerificationError> {
+    verify_biome_atlas_against(atlas, CANONICAL_BIOME_ATLAS_DIGEST)
+}
+
+fn verify_biome_atlas_against(
+    atlas: &[u8],
+    expected_digest: &str,
+) -> Result<(), AtlasVerificationError> {
     const KINDS: [TerrainKind; 6] = [
         TerrainKind::DeepWater,
         TerrainKind::ShallowWater,
@@ -2253,20 +2273,28 @@ pub fn verify_biome_atlas(atlas: &[u8]) -> Result<(), AtlasVerificationError> {
         });
     }
     let actual_digest = blake3::hash(atlas).to_hex().to_string();
-    if actual_digest != CANONICAL_BIOME_ATLAS_DIGEST {
+    if actual_digest != expected_digest {
         let reference = bake_canonical_biome_atlas();
-        let mut mismatch_offset = 0;
-        for (i, (&a, &b)) in atlas.iter().zip(reference.iter()).enumerate() {
-            if a != b {
-                mismatch_offset = i;
-                break;
-            }
+        let reference_digest = blake3::hash(&reference).to_hex().to_string();
+        if reference_digest != expected_digest {
+            return Err(AtlasVerificationError::ReferenceDigestMismatch {
+                expected: expected_digest.to_owned(),
+                reference: reference_digest,
+                actual: actual_digest,
+            });
         }
+        // The equal-length inputs have different hashes, so at least one byte
+        // must differ. Only a reference that matches the pin can locate it.
+        let mismatch_offset = atlas
+            .iter()
+            .zip(&reference)
+            .position(|(actual, expected)| actual != expected)
+            .expect("different deterministic hashes imply different bytes");
         let pixel_index = mismatch_offset / 4;
         let x_pixel = pixel_index % (CANONICAL_BIOME_ATLAS_WIDTH as usize);
         let layer_index = (x_pixel / (CANONICAL_BIOME_ATLAS_TILE_SIZE as usize)).min(5);
         return Err(AtlasVerificationError::DigestMismatch {
-            expected: CANONICAL_BIOME_ATLAS_DIGEST.to_string(),
+            expected: expected_digest.to_owned(),
             actual: actual_digest,
             first_mismatch_offset: mismatch_offset,
             mismatch_layer: KINDS[layer_index],
@@ -3644,9 +3672,35 @@ mod tests {
                 assert_eq!(first_mismatch_offset, target_byte);
                 assert_eq!(mismatch_layer, TerrainKind::Grass);
             }
-            other @ AtlasVerificationError::LengthMismatch { .. } => {
+            other => {
                 panic!("expected DigestMismatch, got {other:?}")
             }
+        }
+    }
+
+    #[test]
+    fn atlas_reference_drift_never_invents_a_byte_or_layer() {
+        let atlas = bake_canonical_biome_atlas();
+        let reference_digest = blake3::hash(&atlas).to_hex().to_string();
+        let other_digest = blake3::hash(b"a different pinned atlas")
+            .to_hex()
+            .to_string();
+        assert_ne!(reference_digest, other_digest);
+
+        for input in [atlas.clone(), {
+            let mut damaged = atlas;
+            damaged[800] ^= 0xFF;
+            damaged
+        }] {
+            let input_digest = blake3::hash(&input).to_hex().to_string();
+            assert_eq!(
+                verify_biome_atlas_against(&input, &other_digest),
+                Err(AtlasVerificationError::ReferenceDigestMismatch {
+                    expected: other_digest.clone(),
+                    reference: reference_digest.clone(),
+                    actual: input_digest,
+                }),
+            );
         }
     }
 
