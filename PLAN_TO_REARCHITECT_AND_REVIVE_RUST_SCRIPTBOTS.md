@@ -5972,6 +5972,18 @@ resume, replay, and first-divergence verification remain separate open work in t
 
 #### 4.5 intervention studies
 
+**Source functionality extension — Codex, 2026-11-08:** `branch-study --example`
+and `branch-study --plan ... --out ...` expose paired checkpoint studies through
+the application CLI. Strict JSON and configuration/brain/workload preflight run
+before output reservation. New/empty destinations are exclusively claimed;
+completed and partial studies are never silently replaced. Restoration uses the
+configured brain registry. Regression source exercises the actual CLI, digest
+repeatability, retained artifact verification, output preservation and bounded
+input refusal. Tournament reporting separately retains descriptive ratings while
+withholding intervals and winner decisions for insufficient independent seeds or
+incomplete bootstrap fitting. Native DSR qualification is still pending; these
+increments do not close the original end-to-end acceptance requirements.
+
 **Source correctness extension — Codex, 2026-11-08:** Branch studies now apply
 interventions at their declared completed-tick boundaries, reject unobservable
 or overflowing schedules, and compare divergence against the control at the

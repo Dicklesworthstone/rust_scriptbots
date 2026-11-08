@@ -460,6 +460,11 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    if let Some(AppSubcommand::BranchStudy(ref study_args)) = cli.subcommand {
+        run_branch_study_subcommand(study_args)?;
+        return Ok(());
+    }
+
     if let Some(AppSubcommand::Replay(ref replay_args)) = cli.subcommand {
         run_replay_subcommand(replay_args)?;
         return Ok(());
@@ -3752,12 +3757,83 @@ enum AppSubcommand {
     MapApply(MapApplyArgs),
     /// Round-robin brain tournament, rating estimation, and leaderboard generation (bd-16g.12.3).
     Tournament(scriptbots_app::tournament::TournamentArgs),
+    /// Compare ecological interventions restored from one shared scientific checkpoint.
+    BranchStudy(BranchStudyArgs),
     /// Replay an intervention journal or scripted experiment and verify against world characterization digest.
     Replay(ReplayArgs),
     /// Headless highlight reel montage exporter (ASCII/GIF) (bd-16g.9.2).
     Reel(ReelArgs),
     /// Deterministic offline soundtrack render for reels + tick-rate impact gate (bd-16g.14.2).
     RenderAudio(scriptbots_app::render_audio::RenderAudioArgs),
+}
+
+#[derive(clap::Args, Debug, Clone, PartialEq)]
+pub struct BranchStudyArgs {
+    /// JSON study plan, including seed, checkpoint, horizon, configuration, and branches.
+    #[arg(long, required_unless_present = "example", conflicts_with = "example")]
+    pub plan: Option<PathBuf>,
+    /// New or empty output directory. Existing study artifacts are never replaced.
+    #[arg(
+        long,
+        short = 'o',
+        required_unless_present = "example",
+        conflicts_with = "example"
+    )]
+    pub out: Option<PathBuf>,
+    /// Print an editable five-intervention example plan as JSON without running a study.
+    #[arg(long, conflicts_with_all = ["plan", "out"])]
+    pub example: bool,
+}
+
+fn run_branch_study_subcommand(args: &BranchStudyArgs) -> Result<()> {
+    use scriptbots_app::branch_study::{BranchStudyOrchestrator, BranchStudyPlan};
+    use std::io::Read as _;
+
+    if args.example {
+        let plan = BranchStudyPlan::standard_five_branch("checkpoint-study", 42, 120, 240);
+        let mut stdout = io::stdout().lock();
+        serde_json::to_writer_pretty(&mut stdout, &plan)?;
+        writeln!(stdout)?;
+        return Ok(());
+    }
+
+    let plan_path = args.plan.as_ref().context("--plan is required")?;
+    let output_dir = args.out.as_ref().context("--out is required")?;
+    // Bound the bytes before deserializing vectors and configuration. Take also
+    // protects against a regular file growing after the metadata observation.
+    const MAX_PLAN_BYTES: u64 = 1024 * 1024;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    // Opening a FIFO must not wait indefinitely before the regular-file check.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(plan_path)
+        .with_context(|| format!("failed to open study plan {}", plan_path.display()))?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > MAX_PLAN_BYTES {
+        bail!("study plan must be a regular file of at most {MAX_PLAN_BYTES} bytes");
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_PLAN_BYTES + 1).read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_PLAN_BYTES {
+        bail!("study plan exceeds {MAX_PLAN_BYTES} bytes");
+    }
+    let plan: BranchStudyPlan = serde_json::from_slice(&bytes)
+        .with_context(|| format!("invalid study plan {}", plan_path.display()))?;
+    let report = BranchStudyOrchestrator::new(plan, output_dir.clone())
+        .execute_study(None)
+        .context("checkpoint branch study failed; any existing artifacts were preserved")?;
+    print!("{}", report.summary_markdown);
+    println!(
+        "\nReport: {}",
+        output_dir.join("study_report.json").display()
+    );
+    println!("Plan: {}", output_dir.join("study_plan.json").display());
+    Ok(())
 }
 
 #[derive(clap::Args, Debug, Clone, PartialEq)]
@@ -7829,6 +7905,58 @@ mod tests {
 
     fn default_cli() -> AppCli {
         AppCli::parse_from(["scriptbots-app"])
+    }
+
+    #[test]
+    fn branch_study_cli_requires_a_plan_and_output_or_the_example_mode() {
+        let example = AppCli::try_parse_from(["scriptbots-app", "branch-study", "--example"])
+            .expect("example mode");
+        assert!(matches!(
+            example.subcommand,
+            Some(AppSubcommand::BranchStudy(BranchStudyArgs {
+                example: true,
+                plan: None,
+                out: None
+            }))
+        ));
+        let run = AppCli::try_parse_from([
+            "scriptbots-app",
+            "branch-study",
+            "--plan",
+            "plan.json",
+            "--out",
+            "study-output",
+        ])
+        .expect("planned study");
+        assert!(matches!(
+            run.subcommand,
+            Some(AppSubcommand::BranchStudy(BranchStudyArgs {
+                example: false,
+                plan: Some(_),
+                out: Some(_)
+            }))
+        ));
+        for arguments in [
+            vec!["scriptbots-app", "branch-study"],
+            vec!["scriptbots-app", "branch-study", "--plan", "plan.json"],
+            vec!["scriptbots-app", "branch-study", "--out", "study-output"],
+            vec![
+                "scriptbots-app",
+                "branch-study",
+                "--example",
+                "--plan",
+                "plan.json",
+            ],
+            vec![
+                "scriptbots-app",
+                "branch-study",
+                "--example",
+                "--out",
+                "study-output",
+            ],
+        ] {
+            assert!(AppCli::try_parse_from(arguments).is_err());
+        }
     }
 
     #[test]

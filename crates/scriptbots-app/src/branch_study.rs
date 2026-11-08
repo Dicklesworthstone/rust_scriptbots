@@ -55,9 +55,24 @@ use crate::{resolve_scheduled_config_patch, seed_founding_population};
 /// Report revision with observed command boundaries and an explicit statistical analysis basis.
 pub const BRANCH_STUDY_REPORT_SCHEMA_VERSION: u16 = 2;
 
+/// Maximum branches retained in one study, including its control.
+pub const MAX_STUDY_BRANCHES: usize = 32;
+/// Maximum recorded transitions per branch.
+pub const MAX_STUDY_HORIZON_TICKS: u64 = 10_000;
+/// Maximum baseline plus branch transitions admitted by one study.
+pub const MAX_STUDY_TOTAL_TRANSITIONS: u64 = 1_000_000;
+/// Maximum food/terrain grid cells, using the core constructor's validated dimensions.
+pub const MAX_STUDY_GRID_CELLS: u64 = 262_144;
+/// Maximum population floor, per-tick injection count, or observed live population.
+pub const MAX_STUDY_POPULATION: u64 = 10_000;
+const MAX_STUDY_HISTORY_ENTRIES: u64 = 10_000;
+const MAX_STUDY_IDENTIFIER_BYTES: usize = 128;
+const MAX_STUDY_DESCRIPTION_BYTES: usize = 4096;
+const MAX_STUDY_ARTIFACT_BYTES: u64 = 50 * 1024 * 1024;
+
 /// Specific intervention perturbations for branch studies.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", content = "params")]
+#[serde(tag = "type", content = "params", deny_unknown_fields)]
 pub enum StudyIntervention {
     /// Suppress food regrowth in a region for a specified duration.
     Drought {
@@ -99,6 +114,7 @@ pub enum StudyIntervention {
 
 /// Parameters for cooperation and altruistic sharing studies.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CooperationParams {
     /// Fraction of energy shared per neighbor when donating `[0.0, 1.0]`.
     pub food_sharing_rate: f32,
@@ -276,6 +292,7 @@ impl StudyIntervention {
 
 /// Specification for one branch in a paired checkpoint study.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StudyBranchSpec {
     /// Unique identifier for this branch (e.g. "control", "drought_severe").
     pub branch_id: String,
@@ -291,6 +308,7 @@ pub struct StudyBranchSpec {
 
 /// Complete plan for a paired checkpoint-branch study.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BranchStudyPlan {
     /// Unique identifier for this study.
     pub study_id: String,
@@ -311,6 +329,13 @@ pub struct BranchStudyPlan {
 }
 
 impl BranchStudyPlan {
+    fn effective_config(&self) -> ScriptBotsConfig {
+        let mut config = self.config.clone();
+        config.persistence_interval = 0;
+        config.rng_seed = Some(self.base_seed);
+        config
+    }
+
     fn final_tick(&self) -> Result<u64, BranchStudyError> {
         self.checkpoint_tick
             .checked_add(self.horizon_ticks)
@@ -616,6 +641,16 @@ pub enum BranchStudyError {
     /// Plan validation error.
     #[error("study plan validation failed: {0}")]
     InvalidPlan(String),
+    /// Requested work or retained evidence exceeds the supported study envelope.
+    #[error("study {resource} requests {requested}, exceeding the limit of {limit}")]
+    CapacityExceeded {
+        /// Resource whose limit was exceeded.
+        resource: &'static str,
+        /// Requested count or byte length.
+        requested: u64,
+        /// Maximum supported count or byte length.
+        limit: u64,
+    },
     /// Paired observations are incomplete, unaligned, or non-finite.
     #[error("invalid paired comparison: {0}")]
     InvalidComparison(String),
@@ -687,6 +722,61 @@ fn study_output_error(path: &Path, error: std::io::Error) -> BranchStudyError {
     } else {
         BranchStudyError::Io(error)
     }
+}
+
+fn enforce_study_limit(
+    resource: &'static str,
+    requested: u64,
+    limit: u64,
+) -> Result<(), BranchStudyError> {
+    if requested > limit {
+        return Err(BranchStudyError::CapacityExceeded {
+            resource,
+            requested,
+            limit,
+        });
+    }
+    Ok(())
+}
+
+fn validate_study_config(config: &ScriptBotsConfig) -> Result<(), BranchStudyError> {
+    let (width, height) = config.food_dimensions()?;
+    enforce_study_limit(
+        "grid cells",
+        u64::from(width) * u64::from(height),
+        MAX_STUDY_GRID_CELLS,
+    )?;
+    enforce_study_limit(
+        "history entries",
+        config.history_capacity as u64,
+        MAX_STUDY_HISTORY_ENTRIES,
+    )?;
+    enforce_study_limit(
+        "population floor",
+        config.population_minimum as u64,
+        MAX_STUDY_POPULATION,
+    )?;
+    enforce_study_limit(
+        "population injection count",
+        u64::from(config.population_spawn_count),
+        MAX_STUDY_POPULATION,
+    )?;
+    if config.archive_enabled {
+        enforce_study_limit(
+            "archive bytes",
+            config.archive_max_bytes as u64,
+            scriptbots_core::map_elites::DEFAULT_MAX_ARCHIVE_BYTES as u64,
+        )?;
+    }
+    Ok(())
+}
+
+fn enforce_study_population(world: &WorldState) -> Result<(), BranchStudyError> {
+    enforce_study_limit(
+        "live population",
+        world.agents().len() as u64,
+        MAX_STUDY_POPULATION,
+    )
 }
 
 fn write_new_study_artifact(path: &Path, bytes: &[u8]) -> Result<(), BranchStudyError> {
@@ -938,7 +1028,8 @@ impl BranchStudyOrchestrator {
     ///
     /// # Errors
     ///
-    /// Returns [`BranchStudyError::InvalidPlan`] or [`BranchStudyError::InvalidIntervention`] on failure.
+    /// Returns a typed [`BranchStudyError`] for malformed plans, unsupported brains,
+    /// invalid configurations/interventions, or exceeded resource limits.
     pub fn validate(&self) -> Result<(), BranchStudyError> {
         if self.plan.study_id.trim().is_empty() {
             return Err(BranchStudyError::InvalidPlan(
@@ -957,12 +1048,59 @@ impl BranchStudyOrchestrator {
         }
         let final_tick = self.plan.final_tick()?;
         self.plan.sample_count()?;
+        enforce_study_limit(
+            "branch count",
+            self.plan.branches.len() as u64,
+            MAX_STUDY_BRANCHES as u64,
+        )?;
+        enforce_study_limit(
+            "horizon ticks",
+            self.plan.horizon_ticks,
+            MAX_STUDY_HORIZON_TICKS,
+        )?;
+        let total_transitions = self
+            .plan
+            .horizon_ticks
+            .checked_mul(self.plan.branches.len() as u64)
+            .and_then(|ticks| ticks.checked_add(self.plan.checkpoint_tick))
+            .ok_or_else(|| {
+                BranchStudyError::InvalidPlan("study work count overflows".to_owned())
+            })?;
+        enforce_study_limit(
+            "total transitions",
+            total_transitions,
+            MAX_STUDY_TOTAL_TRANSITIONS,
+        )?;
+        enforce_study_limit(
+            "study identifier bytes",
+            self.plan.study_id.len() as u64,
+            MAX_STUDY_IDENTIFIER_BYTES as u64,
+        )?;
+        enforce_study_limit(
+            "study description bytes",
+            self.plan.description.len() as u64,
+            MAX_STUDY_DESCRIPTION_BYTES as u64,
+        )?;
+        let config = self.plan.effective_config();
+        validate_study_config(&config)?;
+        crate::brains::create_brain_registry_for_config(self.plan.brain_preset, &config)
+            .map_err(|error| BranchStudyError::Registry(error.to_string()))?;
         if !self.plan.branches.iter().any(|b| b.intervention.is_none()) {
             return Err(BranchStudyError::MissingControlBranch);
         }
 
         let mut branch_ids = std::collections::BTreeSet::new();
         for branch in &self.plan.branches {
+            enforce_study_limit(
+                "branch identifier bytes",
+                branch.branch_id.len() as u64,
+                MAX_STUDY_IDENTIFIER_BYTES as u64,
+            )?;
+            enforce_study_limit(
+                "branch description bytes",
+                branch.description.len() as u64,
+                MAX_STUDY_DESCRIPTION_BYTES as u64,
+            )?;
             if branch.branch_id.trim().is_empty() {
                 return Err(BranchStudyError::InvalidPlan(
                     "branch_id cannot be empty".to_string(),
@@ -996,6 +1134,37 @@ impl BranchStudyOrchestrator {
                 }
                 intervention
                     .validate(self.plan.config.world_width, self.plan.config.world_height)?;
+                if let StudyIntervention::ConfigPatch(patch) = intervention {
+                    let patched =
+                        resolve_scheduled_config_patch(&config, patch).map_err(|error| {
+                            BranchStudyError::InvalidIntervention {
+                                branch_id: branch.branch_id.clone(),
+                                reason: error.to_string(),
+                            }
+                        })?;
+                    patched
+                        .validate()
+                        .map_err(|error| BranchStudyError::InvalidIntervention {
+                            branch_id: branch.branch_id.clone(),
+                            reason: error.to_string(),
+                        })?;
+                    validate_study_config(&patched)?;
+                    if (
+                        patched.world_width,
+                        patched.world_height,
+                        patched.food_cell_size,
+                    ) != (
+                        config.world_width,
+                        config.world_height,
+                        config.food_cell_size,
+                    ) || patched.persistence_interval != 0
+                    {
+                        return Err(BranchStudyError::InvalidIntervention {
+                            branch_id: branch.branch_id.clone(),
+                            reason: "checkpoint branches require unchanged world geometry and disabled persistence".to_owned(),
+                        });
+                    }
+                }
             } else if branch.scheduled_tick.is_some() {
                 return Err(BranchStudyError::InvalidPlan(format!(
                     "control branch `{}` cannot schedule an absent intervention",
@@ -1023,11 +1192,7 @@ impl BranchStudyOrchestrator {
         self.reserve_output_directory()?;
 
         // 1. Pre-intervention baseline execution to checkpoint_tick.
-        let mut base_config = self.plan.config.clone();
-        base_config.persistence_interval = 0;
-        base_config.rng_seed = Some(self.plan.base_seed);
-
-        let mut world = WorldState::new(base_config)?;
+        let mut world = WorldState::new(self.plan.effective_config())?;
         let installed = install_brains(&mut world, self.plan.brain_preset)
             .map_err(|e| BranchStudyError::Registry(e.to_string()))?;
         seed_founding_population(&mut world, installed.population())
@@ -1043,6 +1208,7 @@ impl BranchStudyOrchestrator {
                 tick,
                 reason: e.to_string(),
             })?;
+            enforce_study_population(&world)?;
         }
 
         let checkpoint = world.checkpoint_v1()?;
@@ -1210,8 +1376,13 @@ impl BranchStudyOrchestrator {
             self.validate_control_observations(control, expected_pre_digest)?;
         }
         // Restore from shared checkpoint.
-        let brain_registry = create_brain_registry(self.plan.brain_preset)?;
+        let brain_registry = crate::brains::create_brain_registry_for_config(
+            self.plan.brain_preset,
+            &self.plan.effective_config(),
+        )
+        .map_err(|error| BranchStudyError::Registry(error.to_string()))?;
         let mut branch_world = WorldState::restore_checkpoint_v1(checkpoint, brain_registry)?;
+        enforce_study_population(&branch_world)?;
 
         let restored_digest =
             branch_world
@@ -1292,6 +1463,7 @@ impl BranchStudyOrchestrator {
                         tick: current_tick,
                         reason: e.to_string(),
                     })?;
+            enforce_study_population(&branch_world)?;
 
             let digest =
                 branch_world
@@ -1638,9 +1810,6 @@ impl BranchStudyOrchestrator {
         hysteresis: &HysteresisMeasure,
         effect_sizes: &BTreeMap<String, BranchEffectSize>,
     ) -> Result<(PathBuf, bool), BranchStudyError> {
-        let bundle_dir = self.output_dir.join(format!("bundle_{}", branch.branch_id));
-        fs::create_dir(&bundle_dir).map_err(|error| study_output_error(&bundle_dir, error))?;
-
         // 1. Summary CSV
         let mut csv_buf = Vec::new();
         writeln!(
@@ -1682,6 +1851,19 @@ impl BranchStudyOrchestrator {
             "effect_sizes": effect_sizes,
         }))?;
 
+        enforce_study_limit(
+            "trajectory artifact bytes",
+            csv_buf.len() as u64,
+            MAX_STUDY_ARTIFACT_BYTES,
+        )?;
+        enforce_study_limit(
+            "evidence artifact bytes",
+            evidence_json.len() as u64,
+            MAX_STUDY_ARTIFACT_BYTES,
+        )?;
+        let bundle_dir = self.output_dir.join(format!("bundle_{}", branch.branch_id));
+        fs::create_dir(&bundle_dir).map_err(|error| study_output_error(&bundle_dir, error))?;
+
         // 3. Manifest
         let mut manifest = RunManifestRecord::unattributed(RunId::new(u128::from(
             self.plan.base_seed.wrapping_add(100),
@@ -1707,7 +1889,7 @@ impl BranchStudyOrchestrator {
         let limits = RunBundleVerificationLimits {
             max_manifest_bytes: 10 * 1024 * 1024,
             max_artifacts: 100,
-            max_artifact_bytes: 50 * 1024 * 1024,
+            max_artifact_bytes: MAX_STUDY_ARTIFACT_BYTES,
             max_total_artifact_bytes: 100 * 1024 * 1024,
         };
 
@@ -1881,6 +2063,157 @@ mod tests {
             orchestrator2.validate(),
             Err(BranchStudyError::MissingControlBranch)
         ));
+    }
+
+    #[test]
+    fn study_preflight_enforces_work_and_grid_limits_before_creating_outputs() {
+        let dir = tempdir().unwrap();
+        let output = dir.path().join("never-created");
+        let base = BranchStudyPlan::standard_five_branch("bounded-study", 42, 2, 3);
+        let mut too_many_branches = base.clone();
+        too_many_branches.branches = (0..=MAX_STUDY_BRANCHES)
+            .map(|index| StudyBranchSpec {
+                branch_id: format!("control-{index}"),
+                ..base.branches[0].clone()
+            })
+            .collect();
+        let mut too_long = base.clone();
+        too_long.horizon_ticks = MAX_STUDY_HORIZON_TICKS + 1;
+        let mut too_much_work = base.clone();
+        too_much_work.checkpoint_tick = MAX_STUDY_TOTAL_TRANSITIONS;
+        let mut too_large_grid = base.clone();
+        too_large_grid.config.world_width = 513;
+        too_large_grid.config.world_height = 512;
+        too_large_grid.config.food_cell_size = 1;
+        for (plan, resource) in [
+            (too_many_branches, "branch count"),
+            (too_long, "horizon ticks"),
+            (too_much_work, "total transitions"),
+            (too_large_grid, "grid cells"),
+        ] {
+            assert!(matches!(
+                BranchStudyOrchestrator::new(plan, output.clone()).execute_study(None),
+                Err(BranchStudyError::CapacityExceeded { resource: actual, .. }) if actual == resource
+            ));
+            assert!(
+                !output.exists(),
+                "preflight must not reserve output on refusal"
+            );
+        }
+
+        // Boundary admission only: do not allocate or simulate this large valid plan.
+        let mut at_limits = base;
+        at_limits.branches = (0..MAX_STUDY_BRANCHES)
+            .map(|index| StudyBranchSpec {
+                branch_id: format!("control-{index}"),
+                description: "Unperturbed control".to_owned(),
+                intervention: None,
+                scheduled_tick: None,
+            })
+            .collect();
+        at_limits.horizon_ticks = MAX_STUDY_HORIZON_TICKS;
+        at_limits.checkpoint_tick =
+            MAX_STUDY_TOTAL_TRANSITIONS - MAX_STUDY_BRANCHES as u64 * MAX_STUDY_HORIZON_TICKS;
+        at_limits.config.world_width = 512;
+        at_limits.config.world_height = 512;
+        at_limits.config.food_cell_size = 1;
+        BranchStudyOrchestrator::new(at_limits, output.clone())
+            .validate()
+            .expect("exact supported limits admitted without constructing a world");
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn study_preflight_rejects_invalid_config_patches_and_unsupported_brains() {
+        let dir = tempdir().unwrap();
+        let output = dir.path().join("never-created");
+        let base = BranchStudyPlan::standard_five_branch("invalid-input", 42, 2, 3);
+        let mut invalid_config = base.clone();
+        invalid_config.config.food_cell_size = 0;
+        assert!(matches!(
+            BranchStudyOrchestrator::new(invalid_config, output.clone()).execute_study(None),
+            Err(BranchStudyError::WorldState(_))
+        ));
+        let mut unsupported = base.clone();
+        unsupported.brain_preset = BrainPreset::Neuro;
+        assert!(matches!(
+            BranchStudyOrchestrator::new(unsupported, output.clone()).execute_study(None),
+            Err(BranchStudyError::Registry(_))
+        ));
+        for patch in [
+            serde_json::json!({"food_cell_size": 0}),
+            serde_json::json!({"world_width": 400}),
+            serde_json::json!({"persistence_interval": 1}),
+            serde_json::json!({"food_growht_rate": 0.25}),
+        ] {
+            let mut invalid = base.clone();
+            invalid.branches[1].intervention = Some(StudyIntervention::ConfigPatch(patch));
+            assert!(matches!(
+                BranchStudyOrchestrator::new(invalid, output.clone()).execute_study(None),
+                Err(BranchStudyError::InvalidIntervention { .. })
+            ));
+        }
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn json_study_plans_reject_misspelled_fields_instead_of_ignoring_them() {
+        let plan = BranchStudyPlan::standard_five_branch("strict-json", 42, 2, 3);
+        let value = serde_json::to_value(&plan).unwrap();
+        assert_eq!(
+            serde_json::from_value::<BranchStudyPlan>(value.clone()).unwrap(),
+            plan
+        );
+        let mut bad_plan = value.clone();
+        bad_plan["horizion_ticks"] = serde_json::json!(30);
+        let mut bad_branch = value.clone();
+        bad_branch["branches"][1]["scheduld_tick"] = serde_json::json!(3);
+        let mut bad_intervention = value.clone();
+        bad_intervention["branches"][1]["intervention"]["params"]["growth_sacle"] =
+            serde_json::json!(0.5);
+        let mut bad_cooperation = value;
+        bad_cooperation["branches"][5]["intervention"]["params"]["food_sharing_distnace"] =
+            serde_json::json!(10.0);
+        for malformed in [bad_plan, bad_branch, bad_intervention, bad_cooperation] {
+            assert!(serde_json::from_value::<BranchStudyPlan>(malformed).is_err());
+        }
+    }
+
+    #[test]
+    fn scalar_allocation_and_injection_limits_apply_to_base_and_patched_configs() {
+        let dir = tempdir().unwrap();
+        let output = dir.path().join("never-created");
+        let base = BranchStudyPlan::standard_five_branch("bounded-config", 42, 2, 3);
+        for (patch, resource) in [
+            (
+                serde_json::json!({"history_capacity": usize::MAX}),
+                "history entries",
+            ),
+            (
+                serde_json::json!({"population_minimum": usize::MAX}),
+                "population floor",
+            ),
+            (
+                serde_json::json!({"population_spawn_count": u32::MAX}),
+                "population injection count",
+            ),
+            (
+                serde_json::json!({"archive_enabled": true, "archive_max_bytes": usize::MAX}),
+                "archive bytes",
+            ),
+        ] {
+            let mut invalid_base = base.clone();
+            invalid_base.config = resolve_scheduled_config_patch(&base.config, &patch).unwrap();
+            let mut invalid_patch = base.clone();
+            invalid_patch.branches[1].intervention = Some(StudyIntervention::ConfigPatch(patch));
+            for plan in [invalid_base, invalid_patch] {
+                assert!(matches!(
+                    BranchStudyOrchestrator::new(plan, output.clone()).execute_study(None),
+                    Err(BranchStudyError::CapacityExceeded { resource: actual, .. }) if actual == resource
+                ));
+                assert!(!output.exists());
+            }
+        }
     }
 
     #[test]

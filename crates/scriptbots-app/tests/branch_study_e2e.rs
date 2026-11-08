@@ -8,14 +8,22 @@
 //! - Descriptive single-seed comparisons without fabricated independent replicates or inference.
 //! - Self-contained run bundle creation and bounded canonical verification.
 //! - Retention of configs, commands, digests, reports, timings, and logs on disk.
+//! - Real CLI execution, repeatable artifacts, and refusal without overwriting evidence.
 
+use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::fs;
-use std::path::PathBuf;
+use std::io::Read as _;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Duration;
 
 use scriptbots_app::branch_study::{
     BRANCH_STUDY_REPORT_SCHEMA_VERSION, BranchAnalysisBasis, BranchStudyOrchestrator,
     BranchStudyPlan, BranchStudyReport, CooperationParams, StudyBranchSpec, StudyIntervention,
 };
+use scriptbots_app::experiment_runner::MatchedSeedExperimentRunner;
+use scriptbots_storage::bundle::{RunBundleVerificationLimits, verify_run_bundle_bounded};
 use serde::Deserialize;
 use tempfile::tempdir;
 
@@ -326,4 +334,367 @@ fn test_seeded_checkpoint_branch_intervention_study_e2e() {
     assert!(summary_md.contains("One independent matched seed pair"));
     assert!(summary_md.contains("Repeated ticks are not independent replicates"));
     assert!(!summary_md.contains("Pop Mean Diff (95% CI)"));
+}
+
+struct CliCapture {
+    stdout: PathBuf,
+    stderr: PathBuf,
+}
+
+fn diagnostic(path: &Path) -> String {
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .expect("open CLI log")
+        .take(64 * 1024)
+        .read_to_end(&mut bytes)
+        .expect("read bounded CLI log");
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn run_branch_cli(root: &Path, label: &str, args: &[&OsStr], succeed: bool) -> CliCapture {
+    let capture = CliCapture {
+        stdout: root.join(format!("{label}.stdout.log")),
+        stderr: root.join(format!("{label}.stderr.log")),
+    };
+    let mut command = Command::new(env!("CARGO_BIN_EXE_scriptbots-app"));
+    command
+        .current_dir(root)
+        .env("RAYON_NUM_THREADS", "1")
+        .env("SCRIPTBOTS_MAX_THREADS", "1")
+        .env("RUST_LOG", "warn")
+        .arg("branch-study")
+        .args(args)
+        .stdout(fs::File::create(&capture.stdout).expect("capture CLI stdout"))
+        .stderr(fs::File::create(&capture.stderr).expect("capture CLI stderr"));
+    let result =
+        MatchedSeedExperimentRunner::run_bounded_child(&mut command, Duration::from_secs(60));
+    if let Err(error) = &result {
+        assert!(
+            error.kind() == std::io::ErrorKind::Other
+                && error.to_string().contains("canonical child exit=")
+                && error.to_string().contains("timeout=false"),
+            "{label} did not reach an actual CLI exit: {error}; stdout={} stderr={}",
+            diagnostic(&capture.stdout),
+            diagnostic(&capture.stderr),
+        );
+    }
+    assert_eq!(
+        result.is_ok(),
+        succeed,
+        "{label}: {result:?}; stdout={} stderr={}",
+        diagnostic(&capture.stdout),
+        diagnostic(&capture.stderr),
+    );
+    capture
+}
+
+fn tiny_cli_plan(mut plan: BranchStudyPlan) -> BranchStudyPlan {
+    plan.study_id = "cli-checkpoint-study".to_owned();
+    plan.checkpoint_tick = 2;
+    plan.horizon_ticks = 4;
+    // Keep the application's real 4x4 founder recipe inside the world while
+    // reducing the field to 144 cells and suppressing population growth.
+    plan.config.world_width = 480;
+    plan.config.world_height = 480;
+    plan.config.food_cell_size = 40;
+    plan.config.initial_food = plan.config.food_max;
+    plan.config.population_minimum = 0;
+    plan.config.population_spawn_interval = 0;
+    plan.config.reproduction_attempt_chance = 0.0;
+    let shock = plan
+        .branches
+        .iter_mut()
+        .find(|branch| branch.branch_id == "resource_shock")
+        .expect("example contains its resource-shock branch");
+    shock.intervention = Some(StudyIntervention::ResourceShock {
+        region: None,
+        bloom_amount: 0.0,
+        scorch: 0.5,
+    });
+    shock.scheduled_tick = Some(plan.checkpoint_tick + 2);
+    plan
+}
+
+fn retained_study_bytes(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    fn collect(root: &Path, directory: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
+        for entry in fs::read_dir(directory).expect("read retained study") {
+            let entry = entry.expect("study entry");
+            let kind = entry.file_type().expect("study entry type");
+            let path = entry.path();
+            if kind.is_dir() {
+                collect(root, &path, files);
+            } else {
+                assert!(kind.is_file(), "study artifact must be a regular file");
+                files.insert(
+                    path.strip_prefix(root)
+                        .expect("contained artifact")
+                        .to_owned(),
+                    fs::read(&path).expect("retained artifact bytes"),
+                );
+            }
+        }
+    }
+    let mut files = BTreeMap::new();
+    collect(root, root, &mut files);
+    files
+}
+
+fn verify_cli_study(output: &Path, plan: &BranchStudyPlan) -> BranchStudyReport {
+    let persisted_plan: BranchStudyPlan = serde_json::from_slice(
+        &fs::read(output.join("study_plan.json")).expect("retained CLI plan"),
+    )
+    .expect("typed persisted plan");
+    assert_eq!(&persisted_plan, plan);
+    let report: BranchStudyReport = serde_json::from_slice(
+        &fs::read(output.join("study_report.json")).expect("retained CLI report"),
+    )
+    .expect("typed persisted report");
+    assert_eq!(report.schema_version, BRANCH_STUDY_REPORT_SCHEMA_VERSION);
+    assert_eq!(report.study_id, plan.study_id);
+    assert_eq!(report.base_seed, plan.base_seed);
+    assert_eq!(report.checkpoint_tick, plan.checkpoint_tick);
+    assert_eq!(report.horizon_ticks, plan.horizon_ticks);
+    assert_eq!(report.branch_reports.len(), plan.branches.len());
+    for spec in &plan.branches {
+        assert_eq!(
+            report
+                .branch_reports
+                .iter()
+                .filter(|branch| branch.branch_id == spec.branch_id)
+                .count(),
+            1,
+            "each planned branch must be reported exactly once",
+        );
+    }
+    assert_eq!(report.control_branch_id, "control");
+    assert!(report.pre_intervention_digest_verified_for_all_branches);
+    assert!(!report.pre_intervention_digest.is_empty());
+    assert_eq!(
+        fs::read_to_string(output.join("study_summary.md")).expect("retained CLI summary"),
+        report.summary_markdown,
+    );
+
+    let control = report
+        .branch_reports
+        .iter()
+        .find(|branch| branch.branch_id == "control")
+        .expect("reported control");
+    assert_eq!(control.command_applied_tick, None);
+    assert_eq!(control.first_divergence, None);
+    let control_samples = read_samples(control.bundle_path.as_deref().expect("control bundle"));
+    for branch in &report.branch_reports {
+        let spec = plan
+            .branches
+            .iter()
+            .find(|spec| spec.branch_id == branch.branch_id)
+            .expect("reported branch belongs to requested plan");
+        let expected_bundle = output.join(format!("bundle_{}", branch.branch_id));
+        assert_eq!(
+            Path::new(branch.bundle_path.as_deref().expect("reported bundle path")),
+            expected_bundle,
+        );
+        assert!(branch.bundle_verified);
+        let verified = verify_run_bundle_bounded(
+            &expected_bundle,
+            RunBundleVerificationLimits {
+                max_manifest_bytes: 1024 * 1024,
+                max_artifacts: 8,
+                max_artifact_bytes: 1024 * 1024,
+                max_total_artifact_bytes: 2 * 1024 * 1024,
+            },
+        )
+        .expect("independently verify actual CLI bundle bytes");
+        assert_eq!(verified.max_tick, plan.checkpoint_tick + plan.horizon_ticks);
+        assert_eq!(verified.total_artifacts_verified, 2);
+
+        let samples = read_samples(branch.bundle_path.as_deref().unwrap());
+        assert_eq!(samples.len(), (plan.horizon_ticks + 1) as usize);
+        assert_eq!(samples[0].tick, plan.checkpoint_tick);
+        assert!(samples[0].population > 0);
+        assert_eq!(samples[0].digest, report.pre_intervention_digest);
+        assert_eq!(samples.last().unwrap().digest, branch.final_digest);
+        assert_eq!(
+            samples.iter().map(|sample| sample.tick).collect::<Vec<_>>(),
+            (plan.checkpoint_tick..=plan.checkpoint_tick + plan.horizon_ticks).collect::<Vec<_>>(),
+        );
+        let evidence: serde_json::Value = serde_json::from_slice(
+            &fs::read(expected_bundle.join("evidence/branch_evidence.json"))
+                .expect("CLI branch evidence"),
+        )
+        .expect("typed branch evidence JSON");
+        assert_eq!(evidence["schema_version"], report.schema_version);
+        assert_eq!(evidence["branch_id"], branch.branch_id);
+        assert_eq!(evidence["base_seed"], plan.base_seed);
+        assert_eq!(evidence["checkpoint_tick"], plan.checkpoint_tick);
+        assert_eq!(
+            evidence["intervention"],
+            serde_json::to_value(&spec.intervention).unwrap()
+        );
+        assert_eq!(
+            evidence["command_applied_tick"],
+            serde_json::to_value(branch.command_applied_tick).unwrap(),
+        );
+
+        if spec.intervention.is_some() {
+            let due = spec.scheduled_tick.unwrap_or(plan.checkpoint_tick);
+            assert_eq!(branch.command_applied_tick, Some(due));
+            let first = branch
+                .first_divergence
+                .as_ref()
+                .expect("observed intervention effect");
+            assert_eq!(first.tick, due + 1);
+            assert_eq!(first.command_applied_tick, due);
+            assert_ne!(first.control_digest, first.branch_digest);
+            for (observed, control) in samples.iter().zip(&control_samples) {
+                if observed.tick <= due {
+                    assert_eq!(observed.digest, control.digest);
+                } else if observed.tick == due + 1 {
+                    assert_ne!(observed.digest, control.digest);
+                }
+            }
+            assert!(!branch.effect_sizes.is_empty());
+            for effect in branch.effect_sizes.values() {
+                assert_eq!(
+                    effect.analysis_basis,
+                    BranchAnalysisBasis::SingleSeedTrajectory {
+                        seed: plan.base_seed
+                    },
+                );
+                assert!(effect.ci_95.is_none() && effect.p_value.is_none());
+            }
+        }
+    }
+    report
+}
+
+#[test]
+fn branch_study_cli_runs_its_example_reproducibly_and_preserves_occupied_output() {
+    let root = tempdir().expect("CLI study test directory");
+    let example = run_branch_cli(root.path(), "example", &[OsStr::new("--example")], true);
+    let example_plan: BranchStudyPlan =
+        serde_json::from_slice(&fs::read(example.stdout).expect("example JSON output"))
+            .expect("--example writes only a complete editable plan");
+    assert_eq!(example_plan.branches.len(), 6);
+    assert!(!root.path().join("study_plan.json").exists());
+    assert!(!root.path().join("study_report.json").exists());
+    let plan = tiny_cli_plan(example_plan);
+    let plan_path = root.path().join("tiny_plan.json");
+    fs::write(&plan_path, serde_json::to_vec_pretty(&plan).unwrap()).expect("tiny editable plan");
+
+    let first_dir = root.path().join("first");
+    let first_run = run_branch_cli(
+        root.path(),
+        "first",
+        &[
+            OsStr::new("--plan"),
+            plan_path.as_os_str(),
+            OsStr::new("--out"),
+            first_dir.as_os_str(),
+        ],
+        true,
+    );
+    let mut first = verify_cli_study(&first_dir, &plan);
+    assert!(diagnostic(&first_run.stdout).contains("Report:"));
+
+    let second_dir = root.path().join("second");
+    fs::create_dir(&second_dir).expect("existing empty output directory");
+    run_branch_cli(
+        root.path(),
+        "second",
+        &[
+            OsStr::new("--plan"),
+            plan_path.as_os_str(),
+            OsStr::new("--out"),
+            second_dir.as_os_str(),
+        ],
+        true,
+    );
+    let mut second = verify_cli_study(&second_dir, &plan);
+    for branch in &plan.branches {
+        for artifact in ["exports/summary.csv", "evidence/branch_evidence.json"] {
+            let relative = PathBuf::from(format!("bundle_{}", branch.branch_id)).join(artifact);
+            assert_eq!(
+                fs::read(first_dir.join(&relative)).expect("first scientific artifact"),
+                fs::read(second_dir.join(relative)).expect("repeated scientific artifact"),
+            );
+        }
+    }
+    // Destination paths differ; all scientific report fields must remain exact.
+    for branch in &mut first.branch_reports {
+        branch.bundle_path = None;
+    }
+    for branch in &mut second.branch_reports {
+        branch.bundle_path = None;
+    }
+    assert_eq!(first, second);
+
+    let retained = retained_study_bytes(&first_dir);
+    let refused = run_branch_cli(
+        root.path(),
+        "occupied",
+        &[
+            OsStr::new("--plan"),
+            plan_path.as_os_str(),
+            OsStr::new("--out"),
+            first_dir.as_os_str(),
+        ],
+        false,
+    );
+    assert!(diagnostic(&refused.stderr).contains("already occupied"));
+    assert_eq!(retained_study_bytes(&first_dir), retained);
+}
+
+#[test]
+fn branch_study_cli_refuses_invalid_and_oversized_plans_before_creating_output() {
+    let root = tempdir().expect("CLI refusal test directory");
+    let valid = tiny_cli_plan(BranchStudyPlan::standard_five_branch(
+        "invalid-input",
+        42,
+        2,
+        4,
+    ));
+    let malformed = root.path().join("malformed.json");
+    fs::write(&malformed, b"{\"study_id\":").expect("malformed plan fixture");
+
+    let unknown = root.path().join("unknown.json");
+    let mut unknown_value = serde_json::to_value(&valid).unwrap();
+    unknown_value["horizon_tickss"] = serde_json::json!(4);
+    fs::write(&unknown, serde_json::to_vec(&unknown_value).unwrap()).expect("unknown-field plan");
+
+    let work_limit = root.path().join("work_limit.json");
+    let mut excessive = valid;
+    excessive.horizon_ticks = scriptbots_app::branch_study::MAX_STUDY_HORIZON_TICKS + 1;
+    fs::write(&work_limit, serde_json::to_vec(&excessive).unwrap()).expect("bounded invalid plan");
+
+    let oversized = root.path().join("oversized.json");
+    fs::File::create(&oversized)
+        .expect("sparse oversized plan")
+        .set_len(2 * 1024 * 1024)
+        .expect("oversized input without a large memory allocation");
+
+    for (label, path, message) in [
+        ("malformed", malformed, "invalid study plan"),
+        ("unknown", unknown, "unknown field"),
+        ("work_limit", work_limit, "horizon ticks"),
+        ("oversized", oversized, "regular file of at most"),
+    ] {
+        let output = root.path().join(format!("{label}_output"));
+        let capture = run_branch_cli(
+            root.path(),
+            label,
+            &[
+                OsStr::new("--plan"),
+                path.as_os_str(),
+                OsStr::new("--out"),
+                output.as_os_str(),
+            ],
+            false,
+        );
+        let stderr = diagnostic(&capture.stderr);
+        assert!(stderr.contains(message), "wrong refusal: {stderr}");
+        assert!(
+            !output.exists(),
+            "invalid plans must not reserve study output"
+        );
+    }
 }

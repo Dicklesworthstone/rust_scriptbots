@@ -756,8 +756,39 @@ Deterministic, staged tick pipeline (six seeded, domain-separated RNG streams; e
 
 #### Paired checkpoint branch studies
 
-The library's `branch_study::BranchStudyOrchestrator` restores each branch from
-one shared checkpoint. An intervention's `scheduled_tick` names the completed
+Run a study directly from an editable JSON plan:
+
+```bash
+cargo run -p scriptbots-app --no-default-features --bin scriptbots-app -- \
+  branch-study --example > study-plan.json
+# Edit the seed, checkpoint, horizon, configuration and interventions as needed.
+cargo run -p scriptbots-app --no-default-features --bin scriptbots-app -- \
+  branch-study --plan study-plan.json --out runs/checkpoint-study
+```
+
+The example includes a control and five treatments: drought, resource shock,
+temperature shift, closed-world policy and cooperation. The command prints its
+summary and saves `study_plan.json`, `study_report.json`, `study_summary.md`, and
+one `bundle_<branch_id>` directory per branch containing trajectory CSV and
+intervention evidence. Use a new or empty output directory. Completed and partial
+studies are preserved; a second writer or rerun cannot replace their artifacts.
+To repeat a study, choose a different output directory.
+
+JSON plans reject unknown fields. Before reserving output, the runner validates
+the configuration, brain support, schedules and resource envelope: at most 32
+branches, 10,000 transitions per branch, 1,000,000 total baseline-plus-branch
+transitions, and 262,144 grid cells. History capacity, population floors and
+per-tick injection counts are each limited to 10,000; enabled archives are
+limited to 64 MiB. Resolved configuration treatments receive the same checks and
+cannot change world geometry or enable persistence. Execution stops with an
+explicit error if an observed population exceeds 10,000, retaining any partial
+artifacts. Plans must be regular files no larger than 1 MiB. These limits bound
+individual resources, not total memory use or completion time.
+
+The command uses the library's `branch_study::BranchStudyOrchestrator`, which
+restores each branch from one shared checkpoint. `base_seed` controls world and
+founder initialization, and persistence is disabled for the study. An
+intervention's `scheduled_tick` names the completed
 boundary after which it applies, before the next transition. It must fall in
 `[checkpoint_tick, checkpoint_tick + horizon_ticks)`; omitting it applies at the
 checkpoint. The report records the observed application tick. Divergence compares
