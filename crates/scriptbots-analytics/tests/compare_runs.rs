@@ -385,6 +385,10 @@ fn assert_shared_database_cohort_matches(dir: &Path, machine: &serde_json::Value
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "end-to-end test constructs paired control and treatment arms over twelve seeds and asserts both the planted effect and the preserved null"
+)]
 fn independent_seed_endpoints_detect_the_planted_effect_and_preserve_the_null() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut control = Vec::new();
