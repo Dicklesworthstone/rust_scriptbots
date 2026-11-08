@@ -40,6 +40,9 @@ set -euo pipefail
 # Golden ordering must not depend on the runner's locale (BSD/macOS and GNU
 # `sort` otherwise disagree about '-' versus '_' in crate names).
 export LC_ALL=C
+# ci.yml sets CARGO_TERM_COLOR=always (workflow scope); cargo then colorizes the ' (*)'
+# dedup marker, defeating brain_ft_graph's plain-text strip. Parse cargo output without color.
+export CARGO_TERM_COLOR=never
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SNAPSHOT="${REPO_ROOT}/ci/fixtures/wasm_graph_snapshot.txt"
