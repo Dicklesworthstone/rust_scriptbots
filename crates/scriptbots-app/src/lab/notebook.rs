@@ -46,6 +46,10 @@ pub struct RunRef {
     pub variant_id: String,
     /// The arm's exact config overrides.
     pub config_overrides: BTreeMap<String, serde_json::Value>,
+    /// The arm's exact ordered timed treatment, required for reproduction.
+    /// Older references decode so their provenance version can be refused explicitly.
+    #[serde(default)]
+    pub interventions: Vec<crate::ScenarioInterventionV1>,
     /// Canonical brain family that produced the run; the reproduce script pins it
     /// via SCRIPTBOTS_BRAIN so the child's founding population matches the parent's.
     pub brain_family: String,
@@ -150,6 +154,7 @@ impl From<&RunSummary> for RunRef {
             summary_path: summary.summary_path.clone(),
             variant_id: summary.variant_id.clone(),
             config_overrides: summary.config_overrides.clone(),
+            interventions: summary.interventions.clone(),
             brain_family: summary.brain_family.clone(),
             provenance_version: summary.provenance_version,
         }
@@ -467,6 +472,10 @@ impl NotebookRenderer {
                         known.config_overrides == run_ref.config_overrides,
                         "config_overrides",
                     ),
+                    (
+                        known.interventions == run_ref.interventions,
+                        "interventions",
+                    ),
                     (known.brain_family == run_ref.brain_family, "brain_family"),
                     (
                         known.provenance_version == run_ref.provenance_version,
@@ -527,7 +536,14 @@ impl NotebookRenderer {
                 markdown_literal("config_digest", &run.config_digest)?, markdown_literal("world_digest", &run.digest)?,
                 markdown_literal("summary_artifact_digest", &run.summary_artifact_digest)?,
                 markdown_literal("analysis_input_digest", &run.analysis_input_digest)?));
-            markdown.push_str("  - Full effective config layer (core defaults, arm overrides, then cohort seed):\n");
+            let schedule = serde_json::to_value(&run.interventions)
+                .map_err(|error| NotebookRenderError::Io(error.to_string()))?;
+            validate_metadata_value("interventions", &schedule)?;
+            markdown.push_str(&format!(
+                "  - Ordered intervention schedule (completed-tick boundaries; empty means untreated): {}\n",
+                markdown_literal("interventions", &canonical_metadata(&schedule)?)?
+            ));
+            markdown.push_str("  - Full launch config layer (core defaults, arm overrides, then cohort seed; scheduled patches apply later):\n");
             for line in reproduction_config(run)?.lines() {
                 markdown.push_str(&format!("    - {}\n", markdown_literal("config", line)?));
             }
@@ -817,27 +833,13 @@ impl NotebookRenderer {
 }
 
 fn reproduction_config(run: &RunRef) -> Result<String, NotebookRenderError> {
-    // The child runner composes its world from the FULL effective config: core
-    // defaults + the arm's overrides + the pinned seed. Emitting only the override
-    // delta let the child silently fall back to the app's DIFFERENT defaults
-    // (persistence_interval 60 vs 0, history_capacity 600 vs 256), so the
-    // re-executed world was structurally not the simulated one and every cited
-    // digest differed on re-execution (bd-16g.1.7).
-    let mut encoded = serde_json::to_value(scriptbots_core::ScriptBotsConfig::default())
-        .map_err(|error| NotebookRenderError::Io(error.to_string()))?;
-    let root = encoded.as_object_mut().ok_or_else(|| {
-        NotebookRenderError::Io("default config did not serialize as an object".to_owned())
-    })?;
-    for (path, value) in &run.config_overrides {
-        crate::experiment_runner::insert_dotted_value(root, path, value.clone())
-            .map_err(NotebookRenderError::Io)?;
-    }
-    let seed = i64::try_from(run.seed).map_err(|error| {
-        NotebookRenderError::Io(format!("seed {} exceeds i64: {error}", run.seed))
-    })?;
-    // The matched-seed axis is owned by the cohort: the seed wins over any
-    // override, exactly as experiment_runner::config_for_run applies it.
-    root.insert("rng_seed".to_owned(), serde_json::json!(seed));
+    // Export the canonical launch config, including the runner-owned recording
+    // cadence and cohort seed. Scheduled patches are retained separately and
+    // must not be flattened into a misleading initial or final configuration.
+    let config = crate::experiment_runner::config_for_run(&run.config_overrides, run.seed)
+        .map_err(NotebookRenderError::Io)?;
+    let encoded =
+        serde_json::to_value(config).map_err(|error| NotebookRenderError::Io(error.to_string()))?;
     // TOML cannot express null, and serde_json's arbitrary-precision Numbers must
     // never reach toml::to_string directly (json_to_toml_value documents that
     // trap): strip the defaulted Option nulls, then convert field by field.
@@ -1187,6 +1189,7 @@ mod tests {
                 "food_growth_rate".to_owned(),
                 serde_json::json!(0.1 * f64::from(arm_id + 1)),
             )]),
+            interventions: Vec::new(),
             brain_family: "mlp.baseline".to_owned(),
             provenance_version: super::super::stats::LAB_RUN_SUMMARY_VERSION,
         }
@@ -1248,6 +1251,7 @@ mod tests {
                 "food_growth_rate".to_owned(),
                 serde_json::json!(0.1 * f64::from(arm_id + 1)),
             )]),
+            interventions: Vec::new(),
             brain_family: "mlp.baseline".to_owned(),
         })
     }
@@ -1258,6 +1262,33 @@ mod tests {
             support: Support::Effect(Box::new(effect_ref(runs, effect()))),
             falsifier: "The adjusted interval and test show no change".to_owned(),
         }
+    }
+
+    #[test]
+    fn claims_cannot_change_a_retained_run_intervention_schedule() {
+        let known = run("scheduled-run", 0, 42);
+        let mut detached = known.clone();
+        detached.interventions.push(crate::ScenarioInterventionV1 {
+            tick: 0,
+            set: serde_json::json!({"food_growth_rate": 0.01}),
+        });
+        let unsupported = Claim {
+            text: "The timed treatment changed the observed population".to_owned(),
+            support: Support::Descriptive(vec![detached]),
+            falsifier: "The retained run did not receive the cited treatment".to_owned(),
+        };
+        assert_eq!(
+            NotebookRenderer::render_markdown(
+                "timed treatment study",
+                &[unsupported],
+                &[known],
+                &notebook_context()
+            ),
+            Err(NotebookRenderError::RunProvenanceMismatch {
+                run_id: "scheduled-run".to_owned(),
+                field: "interventions",
+            })
+        );
     }
 
     #[test]
@@ -1777,52 +1808,45 @@ mod tests {
     fn reproduction_config_roundtrips_through_cli_toml_format() {
         let mut reference = run("arm-1", 1, 42);
         reference.config_overrides = BTreeMap::from([
-            ("rng_seed".to_owned(), serde_json::json!(999)),
             ("food_growth_rate".to_owned(), serde_json::json!(0.02)),
             (
-                "neuroflow".to_owned(),
-                serde_json::json!({"enabled": false}),
+                "render.post.bloom.intensity".to_owned(),
+                serde_json::json!(0.5),
             ),
         ]);
         let encoded = reproduction_config(&reference).expect("serialize config");
         let decoded: serde_json::Value = toml::from_str(&encoded).expect("CLI TOML parser");
-        // The layer must be the FULL effective config (core defaults + overrides +
-        // pinned seed), because the child composes its world from the full config.
-        // Asserting the exact parent-side values proves the layer reproduces the
-        // simulated world instead of silently re-defaulting app-only knobs.
-        // The layer is the FULL effective config (core defaults + overrides +
-        // pinned seed); assert the load-bearing fields rather than every key:
-        // the overrides must survive, the cohort seed must win, and the two
-        // app-default knobs that once diverged from the parent run must carry
-        // the parent's (core-default) values, not the app's.
         assert_eq!(decoded["rng_seed"], serde_json::json!(42));
         assert_eq!(decoded["food_growth_rate"], serde_json::json!(0.02));
-        assert_eq!(decoded["neuroflow"], serde_json::json!({"enabled": false}));
         assert_eq!(
-            decoded["persistence_interval"],
-            serde_json::json!(0),
-            "emitted layer must carry the parent's core default, not the app's 60"
+            decoded["render"]["post"]["bloom"]["intensity"],
+            serde_json::json!(0.5)
         );
+        assert_eq!(decoded["persistence_interval"], serde_json::json!(1));
         assert_eq!(
             decoded["history_capacity"],
             serde_json::json!(256),
             "emitted layer must carry the parent's core default, not the app's 600"
         );
+        let reconstructed: scriptbots_core::ScriptBotsConfig =
+            toml::from_str(&encoded).expect("reconstruct typed launch configuration");
+        let expected =
+            crate::experiment_runner::config_for_run(&reference.config_overrides, reference.seed)
+                .expect("canonical runner launch configuration");
+        assert_eq!(
+            serde_json::to_value(reconstructed).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
     }
 
-    /// The pinned seed must win over any override carrying rng_seed, mirroring
-    /// experiment_runner::config_for_run's cohort-owned seed axis.
+    /// A notebook cannot export an arm the canonical runner would refuse.
     #[test]
-    fn reproduction_config_pins_seed_over_override() {
+    fn reproduction_config_refuses_seed_overrides_outside_the_canonical_action_space() {
         let mut reference = run("arm-1", 1, 42);
         reference.config_overrides =
             BTreeMap::from([("rng_seed".to_owned(), serde_json::json!(999))]);
-        let encoded = reproduction_config(&reference).expect("serialize config");
-        let decoded: serde_json::Value = toml::from_str(&encoded).expect("CLI TOML parser");
-        assert_eq!(
-            decoded.get("rng_seed").and_then(serde_json::Value::as_i64),
-            Some(42),
-            "cohort seed must win over the override: {encoded}"
-        );
+        let error =
+            reproduction_config(&reference).expect_err("seed overrides are not executable arms");
+        assert!(matches!(error, NotebookRenderError::Io(reason) if reason.contains("rng_seed")));
     }
 }

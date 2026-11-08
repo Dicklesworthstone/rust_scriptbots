@@ -3113,6 +3113,7 @@ impl ControlHandle {
                     summary_artifact_digest: state.summary_artifact_digest,
                     variant_id: variant.variant_id.clone(),
                     config_overrides: variant.config_overrides.clone(),
+                    interventions: variant.interventions.clone(),
                     brain_family: state.summary.brain_family,
                 }));
             }

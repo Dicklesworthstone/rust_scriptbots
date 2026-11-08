@@ -283,7 +283,7 @@ fn tampered_build_identity_is_refused_before_execution() {
 }
 
 #[test]
-fn scheduled_treatment_is_refused_before_reproduction_allocates_any_worker_output() {
+fn unrecorded_scheduled_treatment_is_refused_before_reproduction_allocates_any_worker_output() {
     assert_semantic_refusal(
         |input| {
             input["variants"][0]["interventions"] = serde_json::json!([{
@@ -291,7 +291,42 @@ fn scheduled_treatment_is_refused_before_reproduction_allocates_any_worker_outpu
                 "set": {"food_growth_rate": 0.01}
             }]);
         },
-        "Lab reproduction cannot execute scheduled interventions",
+        "reproduction intervention schedule differs from retained run=",
+    );
+}
+
+#[test]
+fn rehashed_plan_and_summary_schedule_must_still_match_retained_run_manifests() {
+    assert_semantic_refusal(
+        |input| {
+            let schedule = serde_json::json!([{
+                "tick": 0,
+                "set": {"food_growth_rate": 0.01}
+            }]);
+            input["variants"][0]["interventions"] = schedule.clone();
+            for row in input["runs"].as_array_mut().unwrap() {
+                if row["reference"]["arm_id"] == 0 {
+                    row["reference"]["interventions"] = schedule.clone();
+                }
+            }
+        },
+        "intervention schedule differs from Lab arm provenance",
+    );
+}
+
+#[test]
+fn older_summary_provenance_is_refused_explicitly_after_missing_schedule_decodes() {
+    assert_semantic_refusal(
+        |input| {
+            for row in input["runs"].as_array_mut().unwrap() {
+                row["reference"]["provenance_version"] = 3.into();
+                row["reference"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("interventions");
+            }
+        },
+        "Lab run-summary provenance schema mismatch",
     );
 }
 
@@ -434,6 +469,103 @@ fn family_only_cohort_reproduces_each_executed_family_at_every_matched_seed() {
     assert_eq!(
         actual, expected,
         "all scientific family provenance must reproduce"
+    );
+}
+
+#[test]
+fn scheduled_control_and_treatment_reproduce_exact_ordered_inputs_and_scientific_effects() {
+    let temp = tempfile::tempdir().expect("temporary scheduled experiment root");
+    let root = temp.path().canonicalize().expect("canonical fixture root");
+    let schedule = serde_json::json!([
+        {"tick": 0, "set": {"metabolism_drain": 0.1}},
+        {"tick": 0, "set": {"metabolism_drain": 0.2}},
+        {"tick": 1, "set": {"metabolism_drain": 0.1}}
+    ]);
+    let mut proposal = spec_input();
+    proposal["hypothesis"] = "timed metabolic stress reduces final energy at matched seeds".into();
+    proposal["falsifier"] = "final total energy is unchanged by the timed treatment".into();
+    proposal["factors"] = serde_json::json!([]);
+    proposal["intervention_schedules"] = serde_json::json!([[], schedule]);
+    proposal["metrics"] = serde_json::json!(["total_energy"]);
+    let notebook = materialize_real_notebook(&root, false, proposal);
+    let input = read_json(&notebook.join("reproduction.json"));
+    assert_eq!(input["schema"], 2);
+    assert_eq!(input["variants"][1]["interventions"], schedule);
+    assert_eq!(
+        input["variants"][0]["config_overrides"],
+        input["variants"][1]["config_overrides"]
+    );
+    let markdown = std::fs::read_to_string(notebook.join("notebook.md")).unwrap();
+    assert!(markdown.contains("Ordered intervention schedule"));
+    for index in 0..4 {
+        let config =
+            std::fs::read_to_string(notebook.join(format!("config-{index:04}.toml"))).unwrap();
+        let config: serde_json::Value = toml::from_str(&config).unwrap();
+        assert_eq!(
+            config["persistence_interval"], 1,
+            "exported launch config must carry the actual runner recording policy"
+        );
+    }
+    let output = run_script(&notebook);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "scheduled emitted-script reproduction must pass:\n{}",
+        log(&output)
+    );
+    let regenerated = notebook.join("rerun-000000");
+    assert_eq!(
+        read_json(&regenerated.join("analysis.json")),
+        read_json(&notebook.join("analysis.json"))
+    );
+    let mut expected = read_json(&notebook.join("summaries.json"));
+    let mut actual = read_json(&regenerated.join("summaries.json"));
+    let expected_rows = expected.as_array_mut().unwrap();
+    let actual_rows = actual.as_array_mut().unwrap();
+    assert_eq!(actual_rows.len(), 4);
+    for (index, (arm, seed)) in [(0, 41), (0, 42), (1, 41), (1, 42)].into_iter().enumerate() {
+        let reference = &actual_rows[index]["reference"];
+        assert_eq!(reference["arm_id"], arm);
+        assert_eq!(reference["seed"], seed);
+        assert_eq!(reference["provenance_version"], 4);
+        assert_eq!(
+            reference["interventions"],
+            if arm == 0 {
+                serde_json::json!([])
+            } else {
+                schedule.clone()
+            }
+        );
+        let record = read_json(&regenerated.join(format!("record-{index:04}.json")));
+        assert_eq!(record["state"], "Completed");
+        assert_eq!(record["final_digest"], reference["digest"]);
+    }
+    for (control, treatment) in [(0, 2), (1, 3)] {
+        assert_eq!(
+            actual_rows[control]["reference"]["config_digest"],
+            actual_rows[treatment]["reference"]["config_digest"]
+        );
+        assert_ne!(
+            actual_rows[control]["reference"]["digest"],
+            actual_rows[treatment]["reference"]["digest"]
+        );
+        assert_ne!(
+            actual_rows[control]["metrics"]["total_energy"],
+            actual_rows[treatment]["metrics"]["total_energy"],
+            "the scheduled treatment must change the observed endpoint"
+        );
+    }
+    for rows in [expected_rows, actual_rows] {
+        for row in rows {
+            assert!(
+                std::path::Path::new(row["reference"]["summary_path"].as_str().unwrap()).is_file()
+            );
+            row["reference"]["summary_path"] = serde_json::Value::Null;
+        }
+    }
+    assert_eq!(
+        actual, expected,
+        "every scheduled scientific row must reproduce"
     );
 }
 

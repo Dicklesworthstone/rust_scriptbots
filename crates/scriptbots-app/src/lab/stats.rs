@@ -36,6 +36,8 @@ pub struct RunSummary {
     pub variant_id: String,
     /// The arm's exact config overrides, so the run can be rebuilt rather than recognized.
     pub config_overrides: BTreeMap<String, serde_json::Value>,
+    /// Exact ordered timed treatment that produced the observed endpoints.
+    pub interventions: Vec<crate::ScenarioInterventionV1>,
     /// Canonical brain family that produced the run (e.g. `mlp.baseline`).
     ///
     /// REQUIRED FOR REPRODUCTION (bd-16g.1.7). The child runner composes its founding
@@ -61,6 +63,7 @@ pub(crate) struct RunSummaryParts {
     pub(crate) config_digest: String,
     pub(crate) digest: String,
     pub(crate) config_overrides: BTreeMap<String, serde_json::Value>,
+    pub(crate) interventions: Vec<crate::ScenarioInterventionV1>,
     pub(crate) ticks: u64,
     pub(crate) metrics: BTreeMap<String, f64>,
     pub(crate) summary_artifact_digest: String,
@@ -75,9 +78,11 @@ pub(crate) struct RunSummaryParts {
 /// Bumped 2 -> 3 when `brain_family` joined (bd-16g.1.7): the child runner composes its
 /// founding population from the brain preset, so a reproduce script without it executes
 /// a structurally different world.
+/// Bumped 3 -> 4 when exact ordered timed interventions joined: identical launch
+/// configs can produce different scientific outcomes under different schedules.
 /// Per the policy this does not invalidate retained older artifacts; it makes them
 /// NotComparable, which [`RunSummary::verify_analysis_input`] reports as its own outcome.
-pub const LAB_RUN_SUMMARY_VERSION: u32 = 3;
+pub const LAB_RUN_SUMMARY_VERSION: u32 = 4;
 
 /// Whether a row's analysis-input digest can be checked, and if so whether it held.
 ///
@@ -124,6 +129,7 @@ impl RunSummary {
             summary_path: parts.summary_path,
             variant_id: parts.variant_id,
             config_overrides: parts.config_overrides,
+            interventions: parts.interventions,
             brain_family: parts.brain_family,
             provenance_version: LAB_RUN_SUMMARY_VERSION,
             analysis_input_digest: String::new(),
@@ -182,11 +188,10 @@ fn analysis_input_digest(summary: &RunSummary) -> String {
         ..
     } = summary;
     let mut hasher = blake3::Hasher::new();
-    // v3 (bd-16g.1.7): brain_family joined the digest after variant_id/config_overrides
-    // (v2). Per bd-2z0.5.6 the new reproduction inputs go INSIDE the digest -- provenance
-    // the integrity digest does not cover is not provenance -- and the version tag is
-    // what keeps older artifacts reported as NotComparable rather than corrupt.
-    hasher.update(b"scriptbots.lab-run-summary.v3\0");
+    // Every reproduction input belongs inside the integrity digest. v4 binds
+    // ordered timed treatments as well as the launch configuration and family;
+    // the version keeps older artifacts NotComparable rather than corrupt.
+    hasher.update(b"scriptbots.lab-run-summary.v4\0");
     hash_len_prefixed(&mut hasher, run_id.as_bytes());
     hasher.update(&arm_id.to_le_bytes());
     hasher.update(&seed.to_le_bytes());
@@ -217,6 +222,17 @@ fn analysis_input_digest(summary: &RunSummary) -> String {
             serde_json::to_string(&canonical)
                 .unwrap_or_default()
                 .as_bytes(),
+        );
+    }
+    let intervention_count = u64::try_from(summary.interventions.len())
+        .expect("schedule length fits u64 on supported targets");
+    hasher.update(&intervention_count.to_le_bytes());
+    for intervention in &summary.interventions {
+        hasher.update(&intervention.tick.to_le_bytes());
+        let canonical = crate::precedence::canonical_value(&intervention.set);
+        hash_len_prefixed(
+            &mut hasher,
+            &serde_json::to_vec(&canonical).expect("JSON intervention patch is serializable"),
         );
     }
     hasher.finalize().to_hex().to_string()
@@ -1286,6 +1302,7 @@ mod tests {
                 "food_regrowth_rate".to_owned(),
                 serde_json::json!(0.1 * f64::from(arm_id + 1)),
             )]),
+            interventions: Vec::new(),
             brain_family: "mlp.baseline".to_owned(),
         })
     }
@@ -2196,6 +2213,78 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ordered_interventions_are_bound_but_patch_object_key_order_is_canonical() {
+        let first_patch = serde_json::json!({"food_growth_rate": 0.01, "food_decay_rate": 0.02});
+        let reordered_patch =
+            serde_json::json!({"food_decay_rate": 0.02, "food_growth_rate": 0.01});
+        assert_ne!(
+            serde_json::to_vec(&first_patch).unwrap(),
+            serde_json::to_vec(&reordered_patch).unwrap(),
+            "the fixture must exercise different JSON insertion orders"
+        );
+        let build = |first| {
+            RunSummary::from_verified_parts(RunSummaryParts {
+                run_id: "scheduled-run".to_owned(),
+                arm_id: 1,
+                seed: 7,
+                config_digest: "launch-config".to_owned(),
+                digest: "observed-world".to_owned(),
+                ticks: 2,
+                metrics: BTreeMap::from([("alive_agents".to_owned(), 100.0)]),
+                summary_artifact_digest: "retained-summary".to_owned(),
+                summary_path: None,
+                variant_id: "arm-001".to_owned(),
+                config_overrides: BTreeMap::new(),
+                interventions: vec![
+                    crate::ScenarioInterventionV1 {
+                        tick: 0,
+                        set: first,
+                    },
+                    crate::ScenarioInterventionV1 {
+                        tick: 0,
+                        set: serde_json::json!({"food_growth_rate": 0.03}),
+                    },
+                ],
+                brain_family: "mlp.baseline".to_owned(),
+            })
+        };
+        let base = build(first_patch);
+        assert_eq!(base.verify_analysis_input(), AnalysisInputVerdict::Valid);
+        assert_eq!(base.provenance_version, 4);
+        assert_eq!(
+            base.analysis_input_digest(),
+            build(reordered_patch).analysis_input_digest()
+        );
+        let mut removed = base.clone();
+        removed.interventions.clear();
+        let mut reordered = base.clone();
+        reordered.interventions.swap(0, 1);
+        let mut retimed = base.clone();
+        retimed.interventions[1].tick = 1;
+        let mut repatched = base.clone();
+        repatched.interventions[1].set = serde_json::json!({"food_growth_rate": 0.04});
+        for detached in [removed, reordered, retimed, repatched] {
+            assert_eq!(
+                detached.verify_analysis_input(),
+                AnalysisInputVerdict::Mismatch
+            );
+            assert_eq!(
+                detached.config_digest, base.config_digest,
+                "launch config equality must not hide a changed treatment"
+            );
+        }
+        let mut old = base;
+        old.provenance_version = 3;
+        assert_eq!(
+            old.verify_analysis_input(),
+            AnalysisInputVerdict::NotComparable {
+                written: 3,
+                current: LAB_RUN_SUMMARY_VERSION,
+            }
+        );
+    }
+
     /// Key ORDER inside a nested config value must not change the digest.
     ///
     /// `serde_json`'s `preserve_order` is enabled workspace-wide, so a nested object
@@ -2240,6 +2329,7 @@ mod tests {
                 summary_path: None,
                 variant_id: "arm-000".to_owned(),
                 config_overrides: BTreeMap::from([("nested".to_owned(), nested)]),
+                interventions: Vec::new(),
                 brain_family: "mlp.baseline".to_owned(),
             })
         };

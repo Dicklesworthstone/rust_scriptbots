@@ -3665,9 +3665,17 @@ clean source-status and source-diff digests plus Cargo.lock digest
 
 ### 7.7 experiment runner
 
-[Currently In Progress — Codex, 2026-11-08: make ordered intervention schedules
-an explicit Lab treatment axis, preserve them through execution and notebook
-provenance, and reproduce valid scheduled cohorts with exact plan/evidence checks.]
+**Source implementation extension — Codex, 2026-11-08:** Lab proposals expose
+ordered intervention schedules as a bounded treatment axis. Configuration factors,
+canonical families and schedules form the admitted arm product, with the first
+arm as the matched-seed baseline. Pure runner preflight checks each expanded
+treatment before execution. The exact schedule is carried through execution,
+verified bundle ingestion, version-4 scientific-row digests, notebook references
+and version-2 reproduction inputs. Reproduction refuses schedule substitution
+and oversized inputs before output writes; exported launch config now uses the
+canonical runner config. Regression source includes a real scheduled-cohort
+reproduction and schedule/provenance tampering. Native DSR qualification remains
+pending under the dependency-fetch and shared-storage limits recorded in Phase 4.5.
 
 **Source implementation extension — Codex, 2026-11-06 UTC:** Lab proposals now
 expose installed brain families as a bounded treatment axis. Typed expanded arms

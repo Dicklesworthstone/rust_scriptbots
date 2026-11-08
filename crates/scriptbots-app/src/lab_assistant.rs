@@ -1,12 +1,12 @@
 //! Autonomous LLM lab assistant: canonical proposal -> validation -> matched-seed execution.
 
+#[cfg(test)]
+use crate::experiment_runner::MAX_BUNDLE_ARTIFACT_BYTES;
 use crate::experiment_runner::{
     ExperimentBatchStatus, MAX_EXPERIMENT_SUMMARY_BYTES, MatchedSeedCohort,
     MatchedSeedExperimentRunner, RunState, ScenarioVariant, config_for_run, validate_scenario_arm,
     verify_portable_run_bundle,
 };
-#[cfg(test)]
-use crate::experiment_runner::MAX_BUNDLE_ARTIFACT_BYTES;
 use crate::lab::llm::{
     LlmClient, LlmError, LlmMessage, LlmRequest, PROPOSE_EXPERIMENT_TOOL_NAME, StopReason,
     propose_experiment_tool,
@@ -233,7 +233,7 @@ impl ExperimentExecutor for MatchedSeedExecutor {
                 variant_id: format!("arm-{index:03}"),
                 brain_family: arm.brain_family.clone(),
                 config_overrides: arm.config_overrides.clone(),
-                interventions: Vec::new(),
+                interventions: arm.interventions.clone(),
             })
             .collect();
         let output_dir = self.output_root.join(&spec.spec_id);
@@ -356,16 +356,16 @@ pub(crate) fn completed_run_summaries(
             read_bounded_analysis_file(&bundle_manifest_path, MAX_ANALYSIS_BUNDLE_MANIFEST_BYTES)?;
         let bundle: RunBundleV1 = serde_json::from_slice(&bundle_bytes)
             .map_err(|error| format!("parse {}: {error}", bundle_manifest_path.display()))?;
-        let manifest: crate::RunManifestV3 =
-            serde_json::from_str(&bundle.manifest.manifest_json).map_err(|error| {
-                format!(
-                    "parse {} embedded run manifest: {error}",
-                    bundle_manifest_path.display()
-                )
-            })?;
-        if !manifest.scenario.interventions.is_empty() {
+        let manifest: crate::RunManifestV3 = serde_json::from_str(&bundle.manifest.manifest_json)
+            .map_err(|error| {
+            format!(
+                "parse {} embedded run manifest: {error}",
+                bundle_manifest_path.display()
+            )
+        })?;
+        if manifest.scenario.interventions != arm.interventions {
             return Err(format!(
-                "bundle {} contains scheduled interventions absent from planned Lab arm {arm_id}",
+                "bundle {} intervention schedule differs from planned Lab arm {arm_id}",
                 bundle_dir.display()
             ));
         }
@@ -383,7 +383,8 @@ pub(crate) fn completed_run_summaries(
         if observed_config != expected_config {
             return Err(format!(
                 "bundle {} normalized configuration differs from planned arm {arm_id} at seed {}",
-                bundle_dir.display(), record.seed
+                bundle_dir.display(),
+                record.seed
             ));
         }
         let summary_entries = bundle
@@ -491,6 +492,7 @@ pub(crate) fn completed_run_summaries(
             summary_path: Some(summary_path.to_string_lossy().into_owned()),
             variant_id: record.variant_id.clone(),
             config_overrides: arm.config_overrides.clone(),
+            interventions: arm.interventions.clone(),
             brain_family: row.brain_family,
         }));
     }
@@ -718,7 +720,10 @@ impl LabStateMachine {
         };
         let request = LlmRequest {
             system: "You propose bounded, falsifiable ScriptBots experiments. Call the offered \
-                     tool exactly once; prose is not an experiment."
+                     tool exactly once; prose is not an experiment. Config factors, brain families \
+                     and intervention_schedules form a full treatment product over matched seeds. \
+                     The first expanded arm is the baseline; put an empty schedule first to compare \
+                     an untreated control with timed numeric config patches. Same-tick patch order matters."
                 .to_owned(),
             messages: vec![LlmMessage {
                 role: "user".to_owned(),
@@ -1311,8 +1316,8 @@ mod tests {
             for (arm_index, arm) in spec.arms.iter().enumerate() {
                 let arm_id = u16::try_from(arm_index)
                     .map_err(|_| "arm index does not fit u16".to_owned())?;
-                let config_bytes = serde_json::to_vec(&arm.config_overrides)
-                    .map_err(|error| error.to_string())?;
+                let config_bytes =
+                    serde_json::to_vec(&arm.config_overrides).map_err(|error| error.to_string())?;
                 let config_digest = blake3::hash(&config_bytes).to_hex().to_string();
                 for &seed in &spec.seeds {
                     let seed_component = u32::try_from(seed % 17)
@@ -1336,6 +1341,7 @@ mod tests {
                         summary_path: None,
                         variant_id: format!("arm-{arm_id:03}"),
                         config_overrides: arm.config_overrides.clone(),
+                        interventions: arm.interventions.clone(),
                         brain_family: arm.brain_family.clone(),
                     }));
                 }
@@ -1664,6 +1670,7 @@ mod tests {
             summary_path: None,
             variant_id: treatment.variant_id.clone(),
             config_overrides: treatment.config_overrides.clone(),
+            interventions: treatment.interventions.clone(),
             brain_family: treatment.brain_family.clone(),
         });
         assert_ne!(
@@ -1719,7 +1726,10 @@ mod tests {
                 .final_state
                 .unwrap();
             assert_eq!(run.metrics, observed.summary.available_metrics());
-            assert_eq!(run.summary_artifact_digest, observed.summary_artifact_digest);
+            assert_eq!(
+                run.summary_artifact_digest,
+                observed.summary_artifact_digest
+            );
         }
         let notebook = lab.rendered_notebook.as_ref().expect("report retained");
         assert!(notebook.contains("average_energy"));
@@ -1811,12 +1821,14 @@ mod tests {
             assert!(notebook.contains(family));
         }
         let notebook_dir = lab.notebook_path.as_ref().unwrap().parent().unwrap();
-        let reproduction: serde_json::Value = serde_json::from_slice(
-            &fs::read(notebook_dir.join("reproduction.json")).unwrap(),
-        )
-        .unwrap();
+        let reproduction: serde_json::Value =
+            serde_json::from_slice(&fs::read(notebook_dir.join("reproduction.json")).unwrap())
+                .unwrap();
         assert_eq!(reproduction["variants"][0]["brain_family"], "mlp.baseline");
-        assert_eq!(reproduction["variants"][1]["brain_family"], "dwraon.baseline");
+        assert_eq!(
+            reproduction["variants"][1]["brain_family"],
+            "dwraon.baseline"
+        );
 
         // Unchanged, internally consistent bundles still cannot be attributed
         // to a different family or configuration than the validated plan.
@@ -1827,7 +1839,10 @@ mod tests {
         let mut wrong_family = validated.arms.clone();
         wrong_family[0].brain_family = "dwraon.baseline".to_owned();
         let error = completed_run_summaries(&wrong_family, &status).unwrap_err();
-        assert!(error.contains("differs from planned arm 0 family"), "{error}");
+        assert!(
+            error.contains("differs from planned arm 0 family"),
+            "{error}"
+        );
         let mut wrong_config = validated.arms.clone();
         wrong_config[0]
             .config_overrides
@@ -1840,12 +1855,27 @@ mod tests {
     }
 
     #[test]
-    fn real_scheduled_bundle_cannot_be_attributed_to_an_unscheduled_lab_arm() {
+    fn real_scheduled_bundle_requires_exact_ordered_lab_arm_provenance() {
         let temp = tempfile::tempdir().expect("temporary scheduled experiment root");
         let arm = Arm {
             brain_family: crate::experiment_runner::DEFAULT_EXPERIMENT_BRAIN_FAMILY.to_owned(),
             config_overrides: BTreeMap::new(),
+            interventions: Vec::new(),
         };
+        let interventions = vec![
+            crate::ScenarioInterventionV1 {
+                tick: 0,
+                set: serde_json::json!({"food_growth_rate": 0.01}),
+            },
+            crate::ScenarioInterventionV1 {
+                tick: 0,
+                set: serde_json::json!({"food_growth_rate": 0.02}),
+            },
+            crate::ScenarioInterventionV1 {
+                tick: 1,
+                set: serde_json::json!({"food_growth_rate": 0.03}),
+            },
+        ];
         let runner = MatchedSeedExperimentRunner::new(
             "scheduled-outside-lab",
             MatchedSeedCohort {
@@ -1856,33 +1886,49 @@ mod tests {
                 variant_id: "arm-000".to_owned(),
                 brain_family: arm.brain_family.clone(),
                 config_overrides: arm.config_overrides.clone(),
-                interventions: vec![crate::ScenarioInterventionV1 {
-                    tick: 0,
-                    set: serde_json::json!({"food_growth_rate": 0.01}),
-                }],
+                interventions: interventions.clone(),
             }],
             2,
             1,
             temp.path().join("bundles"),
         );
-        let status = runner.execute_batch(&temp.path().join("status.json")).unwrap();
+        let status = runner
+            .execute_batch(&temp.path().join("status.json"))
+            .unwrap();
         assert_eq!(status.completed_runs, 1, "{status:?}");
         assert_eq!(status.failed_runs, 0, "{status:?}");
         let record = &status.runs[0];
-        let verified = verify_portable_run_bundle(std::path::Path::new(
-            record.bundle_path.as_ref().unwrap(),
-        ))
-        .expect("the scheduled bundle has valid restored scientific evidence");
+        let verified =
+            verify_portable_run_bundle(std::path::Path::new(record.bundle_path.as_ref().unwrap()))
+                .expect("the scheduled bundle has valid restored scientific evidence");
         assert_eq!(
             verified.final_state.unwrap().scientific_digest,
             record.final_digest.as_ref().unwrap().as_str()
         );
-        let error = completed_run_summaries(&[arm], &status)
+        let error = completed_run_summaries(std::slice::from_ref(&arm), &status)
             .expect_err("Lab provenance cannot discard a real scheduled treatment");
         assert!(
-            error.contains("scheduled interventions absent from planned Lab arm 0"),
+            error.contains("intervention schedule differs from planned Lab arm 0"),
             "{error}"
         );
+        let mut declared = arm;
+        declared.interventions = interventions.clone();
+        let summaries = completed_run_summaries(std::slice::from_ref(&declared), &status)
+            .expect("the exact planned schedule admits verified scientific evidence");
+        assert_eq!(summaries[0].interventions, interventions);
+        assert!(summaries[0].verify_analysis_input().is_valid());
+        let mut reordered = declared.clone();
+        reordered.interventions.swap(0, 1);
+        let mut retimed = declared;
+        retimed.interventions[1].tick = 1;
+        for different in [reordered, retimed] {
+            let error = completed_run_summaries(&[different], &status)
+                .expect_err("matching final configuration cannot hide changed timing or ordering");
+            assert!(
+                error.contains("intervention schedule differs from planned Lab arm 0"),
+                "{error}"
+            );
+        }
     }
 
     #[test]
@@ -1892,7 +1938,10 @@ mod tests {
             ("food_intake_rate".to_owned(), serde_json::json!(0.0)),
             ("movement_drain".to_owned(), serde_json::json!(0.0)),
             ("spike_damage".to_owned(), serde_json::json!(0.0)),
-            ("temperature_discomfort_rate".to_owned(), serde_json::json!(0.0)),
+            (
+                "temperature_discomfort_rate".to_owned(),
+                serde_json::json!(0.0),
+            ),
             ("population_minimum".to_owned(), serde_json::json!(0)),
             ("population_spawn_interval".to_owned(), serde_json::json!(0)),
         ]);
@@ -1905,6 +1954,7 @@ mod tests {
                     brain_family: crate::experiment_runner::DEFAULT_EXPERIMENT_BRAIN_FAMILY
                         .to_owned(),
                     config_overrides,
+                    interventions: Vec::new(),
                 }
             })
             .collect::<Vec<_>>();
@@ -1929,7 +1979,9 @@ mod tests {
             2,
             temp.path().join("bundles"),
         );
-        let status = runner.execute_batch(&temp.path().join("status.json")).unwrap();
+        let status = runner
+            .execute_batch(&temp.path().join("status.json"))
+            .unwrap();
         assert_eq!(status.completed_runs, 4);
         assert_eq!(status.failed_runs, 0);
         let summaries = completed_run_summaries(&arms, &status).unwrap();
@@ -2135,7 +2187,9 @@ mod tests {
         input["brain_families"] = serde_json::json!(["neuroflow"]);
         let mut lab = state_machine(input, marker.clone(), Arc::clone(&calls));
         assert_eq!(lab.step().expect("proposal"), LabPhase::Validate);
-        let error = lab.step().expect_err("unexecutable family must fail preflight");
+        let error = lab
+            .step()
+            .expect_err("unexecutable family must fail preflight");
         let LabError::Validation { errors, .. } = error else {
             panic!("expected canonical validation refusal, got {error:?}");
         };

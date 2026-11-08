@@ -1622,12 +1622,13 @@ Omitting `brain_families` selects the existing MLP default. The proposal tool li
 the canonical families installed in the current build; accepted aliases resolve
 through the runner's registry. Unknown or unavailable families and duplicate aliases
 are refused before execution. Configuration-factor combinations expand in declaration
-order, with the requested families inside each combination, and every arm receives
-the same seed cohort. Run and tick budgets include the full product, subject to the
-existing 32-arm ceiling. Empty `factors` requires at least two distinct families.
-The first expanded arm is the statistical control; every later arm is compared
-with it through the existing matched-seed analysis. Result ingestion and notebook
-reproduction bind each arm to its actual family and launch configuration.
+order, with families and then intervention schedules inside each combination.
+Every arm receives the same seed cohort. Run and tick budgets include the full
+product, subject to the existing 32-arm ceiling. Empty `factors` requires at least
+two distinct families or schedules. The first expanded arm is the statistical
+control; every later arm is compared with it through the existing matched-seed
+analysis. Result ingestion and notebook reproduction bind each arm to its actual
+family, launch configuration and exact ordered schedule.
 
 The experiment REST API (`POST /api/v1/experiments`) and MCP `experiment_create`
 also accept timed configuration treatments on each variant:
@@ -1666,9 +1667,39 @@ configuration stays in the manifest alongside the full treatment declaration.
 Resume verifies completed input receipts and the exact remaining queue, then
 continues it without reapplying completed treatments. Portable verification checks
 that same evidence and the resulting config before recomputing the final science
-digest and endpoint summary. Lab proposal arms currently describe brain families
-and launch factors only, so Lab ingestion and reproduction explicitly refuse
-scheduled bundles rather than discard their treatment provenance.
+digest and endpoint summary.
+
+Lab proposals expose the same treatments through `intervention_schedules`, an
+ordered list of at most eight schedules. Omission defaults to `[[]]`, one
+untreated schedule. Put an empty schedule first to compare delayed treatments
+against an untreated control. For example:
+
+```json
+{
+  "hypothesis": "Pausing food growth changes final food availability",
+  "falsifier": "Matched-seed total-food differences remain compatible with zero",
+  "factors": [],
+  "brain_families": ["mlp"],
+  "intervention_schedules": [
+    [],
+    [
+      {"tick": 0, "set": {"food_growth_rate": 0.0}},
+      {"tick": 500, "set": {"food_growth_rate": 0.04}}
+    ]
+  ],
+  "seeds": {"base": 41, "count": 8},
+  "ticks_per_run": 1000,
+  "metrics": ["total_food", "alive_agents"],
+  "budget": {"runs": 16, "ticks": 16000}
+}
+```
+
+The runner preflights every expanded treatment before execution. Lab ingestion
+requires the bundle's schedule to equal the planned arm, and notebook reproduction
+re-executes that schedule. Lab scientific-row provenance is now version **4** and
+the reproduction input envelope is version **2**. Earlier provenance is explicitly
+not comparable; changing a schedule cannot be hidden by retaining the same launch
+configuration. Reproduction inputs are bounded to 32 MiB before output is written.
 
 The summary now declares `schema_version=2`, bound by
 `scriptbots.experiment-run-evidence.v2`. Verification and completed-run recovery
