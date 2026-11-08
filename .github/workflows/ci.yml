@@ -834,6 +834,7 @@ jobs:
           WGPU_BACKEND: gl
           WGPU_POWER_PREFERENCE: low_power
           WGPU_ALLOW_SOFTWARE: "1"
+          SB_WGPU_ALLOW_SOFTWARE_ADAPTER: "1"
           BEVY_ASSET_ROOT: ${{ github.workspace }}
         run: |
           set -euo pipefail
