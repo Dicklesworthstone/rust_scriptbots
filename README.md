@@ -1938,6 +1938,37 @@ for the observed outcome. Resume uses the validated saved owner/journal cuts and
 does not start an unrelated run. Reuse the original create payload and
 `--idempotency-key` after a lost create response.
 
+#### Checkpoints and artifacts from the shell
+
+The same control CLI captures checkpoints and discovers retained artifacts. Use
+the identifiers returned in the JSON output for status and download requests:
+
+```bash
+cargo run -p scriptbots-app --bin control_cli -- \
+  --idempotency-key baseline-cut-1 checkpoint create --description "Before treatment"
+cargo run -p scriptbots-app --bin control_cli -- checkpoint list --limit 20
+cargo run -p scriptbots-app --bin control_cli -- checkpoint status CHECKPOINT_ID
+cargo run -p scriptbots-app --bin control_cli -- checkpoint download CHECKPOINT_ID \
+  --out runs/baseline.checkpoint
+cargo run -p scriptbots-app --bin control_cli -- artifact list --limit 20
+cargo run -p scriptbots-app --bin control_cli -- artifact status ARTIFACT_ID
+cargo run -p scriptbots-app --bin control_cli -- artifact download ARTIFACT_ID \
+  --out runs/retained-artifact.bin
+cargo run -p scriptbots-app --bin control_cli -- schema
+```
+
+Checkpoint and artifact lists preserve opaque cursors with the same `--cursor`
+option as experiment lists. Downloads require an explicit new `--out` path,
+enforce the server's 64 MiB ceiling, and verify the returned identity, byte count,
+content type, BLAKE3 and SHA-256 checksums before creating the output. Checkpoint
+downloads additionally bind the artifact to the checkpoint metadata. Success
+prints the path, byte count and both hashes as JSON.
+
+Existing files and symlinks are refused, including a destination created during
+the request. Validation failures create no destination file; write or sync errors
+report and preserve any partial output. A downloaded checkpoint contains the core
+science state; complete application-owner continuation remains a separate workflow.
+
 Interactive dashboard:
 ```bash
 # Live TUI dashboard of knobs and their current values; press 'q' to quit, 'r' to refresh

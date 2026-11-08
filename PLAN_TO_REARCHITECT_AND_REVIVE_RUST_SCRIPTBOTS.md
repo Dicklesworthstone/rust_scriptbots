@@ -3944,11 +3944,17 @@ Normal/error cleanup uses RAII. Release builds use `panic = "abort"`, so unwindi
 
 ### 8.7 control CLI convergence
 
-[Currently In Progress — Codex, 2026-11-08: expose the existing bounded experiment,
-checkpoint and artifact REST workflows through `scriptbots-control`, including
-matched-seed comparison, cancellation/resume and explicit artifact downloads.
-Preserve server-owned receipts and scientific verification; this does not replace
-the original native acceptance requirements in `bd-2z0.12.2`.]
+**Source implementation extension — Codex, 2026-11-08:** The control CLI exposes
+experiment create/list/status/cancel/resume/compare, checkpoint create/list/status/
+download, artifact list/status/download and schema discovery. Commands preserve
+server-owned state and verified comparison provenance, bound input and response
+bytes, validate URL identities and retain pagination cursors. Explicit-path
+downloads verify metadata, response headers, byte count and both checksums before
+creating a new destination; existing files and symlinks are never overwritten.
+Regression source covers real owner/REST experiment and checkpoint journeys,
+payload bounds, corruption and destination races. Pinned DSR formatting and
+whitespace checks pass. Native execution remains unqualified under the baseline
+dependency-fetch/storage limits; `bd-2z0.12.2`'s original acceptance stays open.
 
 The separate `control_cli watch` loop currently duplicates Ratatui/Crossterm behavior and defaults to a different server port. After the main frontend is stable, reuse the same model/widgets or replace watch with the shared TUI client. All control surfaces default to 8088 or one centrally defined value.
 

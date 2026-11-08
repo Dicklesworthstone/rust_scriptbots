@@ -24,8 +24,10 @@ use ratatui::{
 };
 use reqwest::{Client, StatusCode};
 use scriptbots_app::control::{
+    ApiSchemaDto, ArtifactMetadataDto, CheckpointCreateRequest, CheckpointMetadataDto,
     ExperimentBatchStatusDto, ExperimentComparisonDto, ExperimentCreateRequest,
-    MapApplyAgentPolicy, PaginatedExperimentsResponse,
+    MAX_ARTIFACT_DOWNLOAD_BYTES, MapApplyAgentPolicy, PaginatedArtifactsResponse,
+    PaginatedCheckpointsResponse, PaginatedExperimentsResponse, compute_blake3, compute_sha256,
 };
 use scriptbots_app::experiment_runner::EXPERIMENT_ENDPOINT_METRICS;
 use scriptbots_app::{
@@ -209,6 +211,18 @@ enum Command {
         #[command(subcommand)]
         sub: ExperimentSubcommand,
     },
+    /// Capture and inspect saved scientific checkpoints, or download verified bytes.
+    Checkpoint {
+        #[command(subcommand)]
+        sub: CheckpointSubcommand,
+    },
+    /// Discover run artifacts and download them with checksum verification.
+    Artifact {
+        #[command(subcommand)]
+        sub: ArtifactSubcommand,
+    },
+    /// Print the server's versioned REST, MCP and data-schema discovery as JSON.
+    Schema,
 }
 
 /// Fetch one bounded catalog page; the response retains the server's next cursor.
@@ -251,6 +265,47 @@ enum ExperimentSubcommand {
         /// Canonical final-state metric; a larger value is not a fitness verdict.
         #[arg(long, default_value = "alive_agents", value_parser = clap::builder::PossibleValuesParser::new(EXPERIMENT_ENDPOINT_METRICS))]
         metric: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum CheckpointSubcommand {
+    /// Save the current owner boundary; prints actual saved metadata, not a resume guarantee.
+    Create {
+        #[arg(long)]
+        description: Option<String>,
+    },
+    /// List saved checkpoints, retention usage and the next-page cursor as JSON.
+    List {
+        #[command(flatten)]
+        page: CatalogPageArgs,
+    },
+    /// Read metadata for one saved checkpoint.
+    Status { id: String },
+    /// Download one checkpoint after verifying its metadata and both checksums.
+    Download {
+        id: String,
+        /// New destination file; existing files and symbolic links are refused.
+        #[arg(long, short)]
+        out: PathBuf,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ArtifactSubcommand {
+    /// List artifacts, byte counts, checksums and the next-page cursor as JSON.
+    List {
+        #[command(flatten)]
+        page: CatalogPageArgs,
+    },
+    /// Read metadata for one artifact.
+    Status { id: String },
+    /// Download at most 64 MiB and verify BLAKE3 and SHA-256 before opening --out.
+    Download {
+        id: String,
+        /// New destination file; the remote filename never selects a local path.
+        #[arg(long, short)]
+        out: PathBuf,
     },
 }
 
@@ -487,6 +542,21 @@ async fn main() -> Result<()> {
                     let response = experiment_request(&client, &cli.base_url, sub, key).await?;
                     println!("{}", serde_json::to_string_pretty(&response)?);
                 }
+                Command::Checkpoint { sub } => {
+                    let response = checkpoint_request(&client, &cli.base_url, sub, key).await?;
+                    println!("{}", serde_json::to_string_pretty(&response)?);
+                }
+                Command::Artifact { sub } => {
+                    let response = artifact_request(&client, &cli.base_url, sub).await?;
+                    println!("{}", serde_json::to_string_pretty(&response)?);
+                }
+                Command::Schema => {
+                    let response = data_json::<ApiSchemaDto>(
+                        client.get(data_api_url(&cli.base_url, &["schema"])?),
+                    )
+                    .await?;
+                    println!("{}", serde_json::to_string_pretty(&response)?);
+                }
             }
         }
     }
@@ -578,6 +648,11 @@ async fn data_json<T>(request: reqwest::RequestBuilder) -> Result<Value>
 where
     T: DeserializeOwned + serde::Serialize,
 {
+    serde_json::to_value(data_response::<T>(request).await?)
+        .context("failed to encode control data response")
+}
+
+async fn data_response<T: DeserializeOwned>(request: reqwest::RequestBuilder) -> Result<T> {
     let response =
         request.timeout(DATA_REQUEST_TIMEOUT).send().await.context(
             "control data request failed; inspect saved status before retrying a mutation",
@@ -597,9 +672,7 @@ where
             String::from_utf8_lossy(&bytes)
         );
     }
-    let decoded: T = serde_json::from_slice(&bytes)
-        .context("failed to decode the expected control data response")?;
-    serde_json::to_value(decoded).context("failed to encode control data response")
+    serde_json::from_slice(&bytes).context("failed to decode the expected control data response")
 }
 
 fn read_experiment_request(file: &Path, key: Option<&str>) -> Result<ExperimentCreateRequest> {
@@ -716,6 +789,250 @@ async fn experiment_request(
             .await
         }
     }
+}
+
+async fn checkpoint_request(
+    client: &Client,
+    base_url: &str,
+    command: CheckpointSubcommand,
+    key: Option<&str>,
+) -> Result<Value> {
+    match command {
+        CheckpointSubcommand::Create { description } => {
+            if description.as_ref().is_some_and(|value| value.len() > 4096) {
+                bail!("checkpoint description exceeds the API's 4096-byte limit");
+            }
+            if key.is_some_and(|value| value.is_empty() || value.len() > 1024) {
+                bail!("checkpoint idempotency key must contain 1..=1024 bytes");
+            }
+            let body = CheckpointCreateRequest {
+                description,
+                idempotency_key: key.map(str::to_owned),
+            };
+            let mut request = client
+                .post(data_api_url(base_url, &["checkpoints"])?)
+                .json(&body);
+            if let Some(key) = key {
+                request = request.header("Idempotency-Key", key);
+            }
+            data_json::<CheckpointMetadataDto>(request).await
+        }
+        CheckpointSubcommand::List { page } => {
+            data_json::<PaginatedCheckpointsResponse>(catalog_request(
+                client,
+                base_url,
+                "checkpoints",
+                &page,
+            )?)
+            .await
+        }
+        CheckpointSubcommand::Status { id } => {
+            data_json::<CheckpointMetadataDto>(
+                client.get(data_api_url(base_url, &["checkpoints", &id])?),
+            )
+            .await
+        }
+        CheckpointSubcommand::Download { id, out } => {
+            ensure_new_download_destination(&out)?;
+            let checkpoint: CheckpointMetadataDto =
+                data_response(client.get(data_api_url(base_url, &["checkpoints", &id])?)).await?;
+            if checkpoint.checkpoint_id != id {
+                bail!("checkpoint response identity differs from the requested checkpoint");
+            }
+            download_artifact(client, base_url, &id, &out, Some(&checkpoint)).await
+        }
+    }
+}
+
+async fn artifact_request(
+    client: &Client,
+    base_url: &str,
+    command: ArtifactSubcommand,
+) -> Result<Value> {
+    match command {
+        ArtifactSubcommand::List { page } => {
+            data_json::<PaginatedArtifactsResponse>(catalog_request(
+                client,
+                base_url,
+                "artifacts",
+                &page,
+            )?)
+            .await
+        }
+        ArtifactSubcommand::Status { id } => {
+            data_json::<ArtifactMetadataDto>(
+                client.get(data_api_url(base_url, &["artifacts", &id])?),
+            )
+            .await
+        }
+        ArtifactSubcommand::Download { id, out } => {
+            download_artifact(client, base_url, &id, &out, None).await
+        }
+    }
+}
+
+fn ensure_new_download_destination(out: &Path) -> Result<()> {
+    if out.file_name().is_none() {
+        bail!("download destination must name a new file");
+    }
+    match fs::symlink_metadata(out) {
+        Ok(_) => bail!(
+            "download destination {} already exists; choose a new path",
+            out.display()
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to inspect download destination {}", out.display())),
+    }
+}
+
+fn artifact_download_size(metadata: &ArtifactMetadataDto) -> Result<usize> {
+    let size =
+        usize::try_from(metadata.byte_size).context("artifact byte count exceeds this platform")?;
+    if size > MAX_ARTIFACT_DOWNLOAD_BYTES {
+        bail!("artifact exceeds the {MAX_ARTIFACT_DOWNLOAD_BYTES}-byte download limit");
+    }
+    for (name, digest) in [
+        ("BLAKE3", &metadata.checksum_blake3),
+        ("SHA-256", &metadata.checksum_sha256),
+    ] {
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            bail!("artifact metadata contains an invalid {name} checksum");
+        }
+    }
+    Ok(size)
+}
+
+fn verify_artifact_headers(
+    response: &reqwest::Response,
+    metadata: &ArtifactMetadataDto,
+) -> Result<()> {
+    if response
+        .content_length()
+        .is_some_and(|size| size != metadata.byte_size)
+    {
+        bail!("artifact Content-Length differs from the saved metadata");
+    }
+    for (name, expected) in [
+        (
+            "x-scriptbots-checksum-blake3",
+            metadata.checksum_blake3.as_str(),
+        ),
+        (
+            "x-scriptbots-checksum-sha256",
+            metadata.checksum_sha256.as_str(),
+        ),
+        ("content-type", metadata.content_type.as_str()),
+    ] {
+        let actual = response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok());
+        if actual != Some(expected) {
+            bail!("artifact {name} header differs from the saved metadata");
+        }
+    }
+    Ok(())
+}
+
+fn verify_artifact_payload(metadata: &ArtifactMetadataDto, bytes: &[u8]) -> Result<()> {
+    if bytes.len() as u64 != metadata.byte_size {
+        bail!("downloaded artifact length differs from the saved metadata");
+    }
+    if compute_blake3(bytes) != metadata.checksum_blake3 {
+        bail!("downloaded artifact BLAKE3 checksum mismatch");
+    }
+    if compute_sha256(bytes) != metadata.checksum_sha256 {
+        bail!("downloaded artifact SHA-256 checksum mismatch");
+    }
+    Ok(())
+}
+
+fn save_verified_download(out: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = out.parent().filter(|path| !path.as_os_str().is_empty());
+    if let Some(parent) = parent {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create download directory {}", parent.display()))?;
+    }
+    // create_new is the authority, including if a file or symlink appeared
+    // after the read-only preflight. Neither remote filenames nor paths are used.
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(out)
+        .with_context(|| {
+            format!(
+                "cannot create new download {}; existing paths are never overwritten",
+                out.display()
+            )
+        })?;
+    let written = (|| -> io::Result<()> {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        #[cfg(unix)]
+        fs::File::open(parent.unwrap_or_else(|| Path::new(".")))?.sync_all()?;
+        Ok(())
+    })();
+    written.with_context(|| {
+        format!(
+            "download write or sync failed; partial or unconfirmed data is preserved at {}",
+            out.display()
+        )
+    })
+}
+
+async fn download_artifact(
+    client: &Client,
+    base_url: &str,
+    id: &str,
+    out: &Path,
+    checkpoint: Option<&CheckpointMetadataDto>,
+) -> Result<Value> {
+    ensure_new_download_destination(out)?;
+    let metadata: ArtifactMetadataDto =
+        data_response(client.get(data_api_url(base_url, &["artifacts", id])?)).await?;
+    if metadata.artifact_id != id {
+        bail!("artifact response identity differs from the requested artifact");
+    }
+    let size = artifact_download_size(&metadata)?;
+    if let Some(checkpoint) = checkpoint
+        && (metadata.artifact_id != checkpoint.checkpoint_id
+            || metadata.byte_size != checkpoint.byte_size
+            || metadata.checksum_blake3 != checkpoint.checksum_blake3
+            || metadata.checksum_sha256 != checkpoint.checksum_sha256)
+    {
+        bail!("artifact metadata does not describe the requested saved checkpoint");
+    }
+    let response = client
+        .get(data_api_url(base_url, &["artifacts", id, "download"])?)
+        .timeout(DATA_REQUEST_TIMEOUT)
+        .send()
+        .await
+        .context("artifact download request failed")?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = bounded_response_bytes(response, MAX_DATA_ERROR_BYTES).await?;
+        bail!(
+            "artifact download failed ({status}): {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+    verify_artifact_headers(&response, &metadata)?;
+    let bytes = bounded_response_bytes(response, size).await?;
+    verify_artifact_payload(&metadata, &bytes)?;
+    // Network, metadata and checksum failures leave no final-name output.
+    save_verified_download(out, &bytes)?;
+    Ok(serde_json::json!({
+        "artifact_id": metadata.artifact_id,
+        "path": out.display().to_string(),
+        "byte_size": bytes.len(),
+        "checksum_blake3": metadata.checksum_blake3,
+        "checksum_sha256": metadata.checksum_sha256,
+    }))
 }
 
 fn export_command(
@@ -2408,6 +2725,20 @@ mod tests {
         body: Vec<u8>,
         length: Option<usize>,
     ) -> (String, std::thread::JoinHandle<Result<String>>) {
+        data_wire_peer_with_headers(
+            status,
+            body,
+            length,
+            "Content-Type: application/json\r\n".into(),
+        )
+    }
+
+    fn data_wire_peer_with_headers(
+        status: &'static str,
+        body: Vec<u8>,
+        length: Option<usize>,
+        headers: String,
+    ) -> (String, std::thread::JoinHandle<Result<String>>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("wire listener");
         let address = listener.local_addr().unwrap();
         let worker = std::thread::spawn(move || -> Result<String> {
@@ -2450,7 +2781,7 @@ mod tests {
             });
             write!(
                 stream,
-                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{length_header}Connection: close\r\n\r\n"
+                "HTTP/1.1 {status}\r\n{headers}{length_header}Connection: close\r\n\r\n"
             )?;
             stream.write_all(&body)?;
             stream.flush()?;
@@ -2666,7 +2997,6 @@ mod tests {
 
     #[tokio::test]
     async fn experiment_cli_drives_real_host_backed_rest_and_verified_comparison() -> Result<()> {
-        use scriptbots_runtime::HostPort;
         let root = tempdir()?;
         let mut server = LiveDataServer::start(&root.path().join("artifacts"))?;
         let before = server
@@ -2781,6 +3111,326 @@ mod tests {
             .is_err(),
             "a completed batch must not restart"
         );
+        assert_eq!(
+            server
+                .host
+                .as_ref()
+                .unwrap()
+                .port()
+                .scientific_digest_v1()?,
+            before
+        );
+        server.stop()?;
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_and_artifact_cli_require_explicit_outputs_and_bounded_pages() {
+        assert!(Cli::try_parse_from(["control", "schema"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "control",
+                "checkpoint",
+                "create",
+                "--description",
+                "before treatment"
+            ])
+            .is_ok()
+        );
+        for collection in ["checkpoint", "artifact"] {
+            assert!(Cli::try_parse_from(["control", collection, "status", "saved-1"]).is_ok());
+            assert!(
+                Cli::try_parse_from([
+                    "control",
+                    collection,
+                    "download",
+                    "saved-1",
+                    "--out",
+                    "saved.bin"
+                ])
+                .is_ok()
+            );
+            assert!(Cli::try_parse_from(["control", collection, "download", "saved-1"]).is_err());
+            assert!(
+                Cli::try_parse_from([
+                    "control", collection, "list", "--limit", "100", "--cursor", "20"
+                ])
+                .is_ok()
+            );
+            for limit in ["0", "101"] {
+                assert!(
+                    Cli::try_parse_from(["control", collection, "list", "--limit", limit]).is_err()
+                );
+            }
+        }
+    }
+
+    fn artifact_metadata_fixture() -> ArtifactMetadataDto {
+        // Independent published hash vectors for the three-byte input "abc".
+        ArtifactMetadataDto {
+            artifact_id: "artifact-1".into(),
+            filename: "../remote-name-is-not-a-local-path".into(),
+            content_type: "application/octet-stream".into(),
+            byte_size: 3,
+            checksum_blake3: "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85"
+                .into(),
+            checksum_sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+                .into(),
+            created_at_utc: "123".into(),
+            relative_path: "../remote-path-is-not-a-local-path".into(),
+        }
+    }
+
+    #[test]
+    fn artifact_verification_rejects_size_and_independent_checksum_failures() -> Result<()> {
+        let metadata = artifact_metadata_fixture();
+        assert_eq!(artifact_download_size(&metadata)?, 3);
+        verify_artifact_payload(&metadata, b"abc")?;
+        assert!(verify_artifact_payload(&metadata, b"ab").is_err());
+        assert!(verify_artifact_payload(&metadata, b"abd").is_err());
+        let mut sha_mismatch = metadata.clone();
+        sha_mismatch.checksum_sha256 = "0".repeat(64);
+        assert!(
+            verify_artifact_payload(&sha_mismatch, b"abc")
+                .unwrap_err()
+                .to_string()
+                .contains("SHA-256")
+        );
+        let mut invalid = metadata.clone();
+        invalid.byte_size = MAX_ARTIFACT_DOWNLOAD_BYTES as u64 + 1;
+        assert!(artifact_download_size(&invalid).is_err());
+        invalid = metadata;
+        invalid.checksum_blake3 = "not-a-checksum".into();
+        assert!(artifact_download_size(&invalid).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn artifact_download_headers_bind_saved_content_type_length_and_both_hashes() -> Result<()>
+    {
+        let metadata = artifact_metadata_fixture();
+        let client = Client::new();
+        for failure in [
+            None,
+            Some("sha256"),
+            Some("blake3"),
+            Some("type"),
+            Some("length"),
+        ] {
+            let headers = format!(
+                "Content-Type: {}\r\nX-Scriptbots-Checksum-Blake3: {}\r\nX-Scriptbots-Checksum-Sha256: {}\r\n",
+                if failure == Some("type") {
+                    "text/plain"
+                } else {
+                    &metadata.content_type
+                },
+                if failure == Some("blake3") {
+                    "bad"
+                } else {
+                    &metadata.checksum_blake3
+                },
+                if failure == Some("sha256") {
+                    "bad"
+                } else {
+                    &metadata.checksum_sha256
+                },
+            );
+            let length = Some(if failure == Some("length") { 4 } else { 3 });
+            let (base, worker) =
+                data_wire_peer_with_headers("200 OK", b"abc".to_vec(), length, headers);
+            let response = client.get(base).send().await?;
+            assert_eq!(
+                verify_artifact_headers(&response, &metadata).is_ok(),
+                failure.is_none(),
+                "{failure:?}"
+            );
+            worker.join().expect("wire peer joined")?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn verified_download_never_overwrites_files_or_symlinks_even_after_preflight() -> Result<()> {
+        let directory = tempdir()?;
+        let output = directory.path().join("nested/checkpoint.bin");
+        ensure_new_download_destination(&output)?;
+        save_verified_download(&output, b"verified")?;
+        assert!(ensure_new_download_destination(&output).is_err());
+        assert!(save_verified_download(&output, b"replacement").is_err());
+        assert_eq!(fs::read(&output)?, b"verified");
+        let raced = directory.path().join("appeared-after-preflight.bin");
+        ensure_new_download_destination(&raced)?;
+        fs::write(&raced, b"user data")?;
+        assert!(save_verified_download(&raced, b"replacement").is_err());
+        assert_eq!(fs::read(&raced)?, b"user data");
+        #[cfg(unix)]
+        {
+            let target = directory.path().join("absent-target");
+            let link = directory.path().join("dangling-link");
+            std::os::unix::fs::symlink(&target, &link)?;
+            assert!(ensure_new_download_destination(&link).is_err());
+            assert!(save_verified_download(&link, b"replacement").is_err());
+            assert!(!target.exists());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn checkpoint_cli_captures_downloads_and_decodes_an_actual_owner_boundary() -> Result<()>
+    {
+        use scriptbots_core::WorldCheckpointV1;
+        let root = tempdir()?;
+        let mut server = LiveDataServer::start(&root.path().join("artifacts"))?;
+        let before = server
+            .host
+            .as_ref()
+            .unwrap()
+            .port()
+            .scientific_digest_v1()?;
+        let client = Client::new();
+        let created = checkpoint_request(
+            &client,
+            &server.base_url,
+            CheckpointSubcommand::Create {
+                description: Some("before treatment".into()),
+            },
+            Some("save-once"),
+        )
+        .await?;
+        let checkpoint: CheckpointMetadataDto = serde_json::from_value(created.clone())?;
+        assert_eq!(checkpoint.tick, 0);
+        assert_eq!(checkpoint.agent_count, 2);
+        assert_eq!(checkpoint.world_digest_v1, before.overall);
+        let retried = checkpoint_request(
+            &client,
+            &server.base_url,
+            CheckpointSubcommand::Create {
+                description: Some("before treatment".into()),
+            },
+            Some("save-once"),
+        )
+        .await?;
+        assert_eq!(retried, created);
+        let id = checkpoint.checkpoint_id;
+        let status = checkpoint_request(
+            &client,
+            &server.base_url,
+            CheckpointSubcommand::Status { id: id.clone() },
+            None,
+        )
+        .await?;
+        assert_eq!(status, created);
+        let page = checkpoint_request(
+            &client,
+            &server.base_url,
+            CheckpointSubcommand::List {
+                page: CatalogPageArgs {
+                    limit: 1,
+                    cursor: None,
+                },
+            },
+            None,
+        )
+        .await?;
+        assert_eq!(page["total"], 1);
+        assert_eq!(page["items"][0], created);
+        assert!(page["retention"].is_object());
+        let artifacts = artifact_request(
+            &client,
+            &server.base_url,
+            ArtifactSubcommand::List {
+                page: CatalogPageArgs {
+                    limit: 1,
+                    cursor: None,
+                },
+            },
+        )
+        .await?;
+        assert_eq!(artifacts["total"], 1);
+        assert_eq!(artifacts["items"][0]["artifact_id"], id);
+        let metadata = artifact_request(
+            &client,
+            &server.base_url,
+            ArtifactSubcommand::Status { id: id.clone() },
+        )
+        .await?;
+        let metadata: ArtifactMetadataDto = serde_json::from_value(metadata)?;
+        let output = root.path().join("downloads/owner.checkpoint");
+        let receipt = checkpoint_request(
+            &client,
+            &server.base_url,
+            CheckpointSubcommand::Download {
+                id: id.clone(),
+                out: output.clone(),
+            },
+            None,
+        )
+        .await?;
+        assert_eq!(receipt["artifact_id"], id);
+        assert_eq!(receipt["checksum_blake3"], created["checksum_blake3"]);
+        assert_eq!(receipt["checksum_sha256"], created["checksum_sha256"]);
+        let bytes = fs::read(&output)?;
+        let decoded = WorldCheckpointV1::decode(&bytes)?;
+        assert_eq!(decoded.tick().0, 0);
+        assert_eq!(decoded.agent_count(), 2);
+        assert_eq!(decoded.source_digest(), &before);
+        let copy = root.path().join("downloads/artifact-copy.bin");
+        artifact_request(
+            &client,
+            &server.base_url,
+            ArtifactSubcommand::Download {
+                id: id.clone(),
+                out: copy.clone(),
+            },
+        )
+        .await?;
+        assert_eq!(fs::read(copy)?, bytes);
+        assert!(
+            checkpoint_request(
+                &client,
+                &server.base_url,
+                CheckpointSubcommand::Download {
+                    id: id.clone(),
+                    out: output.clone()
+                },
+                None
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(fs::read(&output)?, bytes);
+        let schema: ApiSchemaDto =
+            data_response(client.get(data_api_url(&server.base_url, &["schema"])?)).await?;
+        assert!(
+            schema
+                .routes
+                .contains(&"/api/v1/artifacts/{artifact_id}/download".into())
+        );
+        assert!(schema.schemas.contains(&"CheckpointMetadataDto".into()));
+        let artifact_file = server
+            .handle
+            .as_ref()
+            .unwrap()
+            .artifacts_dir()
+            .join(metadata.relative_path);
+        let mut corrupted = bytes.clone();
+        corrupted[0] ^= 1;
+        fs::write(artifact_file, corrupted)?;
+        let rejected = root.path().join("rejected/download.bin");
+        assert!(
+            artifact_request(
+                &client,
+                &server.base_url,
+                ArtifactSubcommand::Download {
+                    id,
+                    out: rejected.clone()
+                }
+            )
+            .await
+            .is_err()
+        );
+        assert!(!rejected.exists());
+        assert!(!rejected.parent().unwrap().exists());
         assert_eq!(
             server
                 .host
