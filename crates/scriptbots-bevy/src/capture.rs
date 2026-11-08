@@ -1207,7 +1207,7 @@ impl<'a> OffscreenCapture<'a> {
         // `Readback` component's completion depends on extraction/plugin
         // wiring, while this path drives the copy, submission, and device
         // poll directly and fails loudly at each step.
-        let data = self.readback_target();
+        let data = ensure_capture_pipelines(self.app).and_then(|()| self.readback_target());
         self.set_camera_active(false);
         let data = data?;
         let (width, height) = self.viewport;
@@ -1413,6 +1413,9 @@ fn add_capture_scene_systems(app: &mut App) {
         Update,
         (
             sync_world,
+            crate::apply_daynight_lighting,
+            crate::apply_tier_to_fog,
+            crate::conform_selection_ring,
             // Captures use the snapshot pose directly, but the wheel
             // suspension must still match the interactive scene.
             crate::conform_agent_wheels,
@@ -1622,6 +1625,44 @@ fn resolve_capture_quality(
     Ok((effective, actual_device_type))
 }
 
+fn terminal_pipeline_error(error: &bevy::shader::PipelineCacheError) -> bool {
+    matches!(
+        error,
+        bevy::shader::PipelineCacheError::ProcessShaderError(_)
+            | bevy::shader::PipelineCacheError::CreateShaderModule(_)
+    )
+}
+
+/// Refuse a partially drawn image when a render or compute shader is broken.
+/// Not-yet-loaded shader imports are transient and are handled by Bevy's retry.
+fn ensure_capture_pipelines(app: &mut App) -> Result<()> {
+    use bevy::render::render_resource::{CachedPipelineState, PipelineCache, PipelineDescriptor};
+    let render = app
+        .get_sub_app_mut(RenderApp)
+        .ok_or_else(|| anyhow!("capture render sub-app unavailable while checking pipelines"))?;
+    let cache = render
+        .world()
+        .get_resource::<PipelineCache>()
+        .ok_or_else(|| anyhow!("capture pipeline cache unavailable"))?;
+    for pipeline in cache.pipelines() {
+        if let CachedPipelineState::Err(error) = &pipeline.state
+            && terminal_pipeline_error(error)
+        {
+            let label = match &pipeline.descriptor {
+                PipelineDescriptor::RenderPipelineDescriptor(descriptor) => {
+                    descriptor.label.as_deref()
+                }
+                PipelineDescriptor::ComputePipelineDescriptor(descriptor) => {
+                    descriptor.label.as_deref()
+                }
+            }
+            .unwrap_or("unlabeled pipeline");
+            return Err(anyhow!("capture GPU pipeline {label} failed: {error}"));
+        }
+    }
+    Ok(())
+}
+
 fn warmup_capture_app(app: &mut App, effective: crate::EffectiveRenderSettings) {
     app.insert_resource(effective);
     app.update();
@@ -1812,6 +1853,7 @@ fn setup_capture_rig(mut commands: Commands, target: Res<CaptureTarget>) {
         bevy::render::view::ColorGrading::default(),
         bevy::render::view::Hdr,
         CaptureCamera,
+        crate::WorldLightingCamera,
     ));
 
     let light_transform =
@@ -1822,6 +1864,7 @@ fn setup_capture_rig(mut commands: Commands, target: Res<CaptureTarget>) {
             shadows_enabled: true,
             ..default()
         },
+        crate::TierDrivenSunLight,
         light_transform,
         GlobalTransform::default(),
         Visibility::default(),
@@ -1849,7 +1892,7 @@ fn setup_capture_resources(
         })),
         sphere: meshes.add(Mesh::from(Sphere::new(0.5))),
         quad: meshes.add(Mesh::from(Rectangle::new(1.0, 1.0))),
-        ring: meshes.add(Mesh::from(Torus::new(0.7, 1.0))),
+        ring: meshes.add(crate::selection_ring_mesh()),
     });
     commands.insert_resource(TerrainChunkRegistry {
         chunk_size: crate::TERRAIN_CHUNK_SIZE,
@@ -1900,6 +1943,94 @@ mod tests {
         warmup_capture_app(&mut app, effective);
         configure_capture_rig(app.world_mut(), &Handle::default(), false);
         app
+    }
+
+    #[test]
+    fn capture_uses_the_same_selection_ring_mesh_as_live_rendering() {
+        let app = corruption_app(false);
+        let handle = &app.world().resource::<AgentMeshes>().ring;
+        let actual = app.world().resource::<Assets<Mesh>>().get(handle).unwrap();
+        let expected = crate::selection_ring_mesh();
+        assert_eq!(
+            actual.attribute(Mesh::ATTRIBUTE_POSITION),
+            expected.attribute(Mesh::ATTRIBUTE_POSITION)
+        );
+        assert_eq!(
+            actual.attribute(Mesh::ATTRIBUTE_COLOR),
+            expected.attribute(Mesh::ATTRIBUTE_COLOR)
+        );
+        assert_eq!(actual.indices(), expected.indices());
+        let Some(bevy_mesh::VertexAttributeValues::Float32x3(points)) =
+            actual.attribute(Mesh::ATTRIBUTE_POSITION)
+        else {
+            panic!("selection ring positions missing")
+        };
+        assert_eq!(points.len(), 390);
+    }
+
+    #[test]
+    fn capture_pipeline_error_classifier_keeps_retryable_imports_distinct() {
+        use bevy::shader::PipelineCacheError;
+        assert!(!terminal_pipeline_error(
+            &PipelineCacheError::ShaderImportNotYetAvailable
+        ));
+        assert!(terminal_pipeline_error(
+            &PipelineCacheError::CreateShaderModule("invalid shader".to_string())
+        ));
+    }
+
+    #[test]
+    fn capture_pipeline_check_fails_closed_without_render_subapp() {
+        let mut app = App::new();
+        let error =
+            ensure_capture_pipelines(&mut app).expect_err("missing renderer must be reported");
+        assert!(error.to_string().contains("render sub-app unavailable"));
+    }
+
+    #[test]
+    fn capture_uses_the_shared_daynight_lighting_system() {
+        let mut app = corruption_app(false);
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            let snapshot = state.latest.as_mut().unwrap();
+            snapshot.day_night_active = true;
+            snapshot.night_ambient = 0.2;
+            snapshot.terrain_height.daylight = scriptbots_core::visual::DAYLIGHT_NIGHT_FLOOR;
+        }
+        app.update();
+        assert!((app.world().resource::<AmbientLight>().brightness - 160.0).abs() < 1e-4);
+        let world = app.world_mut();
+        let mut lights =
+            world.query_filtered::<&DirectionalLight, With<crate::TierDrivenSunLight>>();
+        assert_eq!(lights.single(world).unwrap().illuminance, 9000.0 * 0.18);
+        let mut cameras = world.query_filtered::<&Camera, With<crate::WorldLightingCamera>>();
+        assert!(
+            matches!(cameras.single(world).unwrap().clear_color, ClearColorConfig::Custom(color) if color != crate::terrain_sky_color())
+        );
+    }
+
+    #[test]
+    fn capture_scene_updates_default_fog_with_its_sky() {
+        let mut app = corruption_app(false);
+        app.world_mut()
+            .resource_mut::<crate::EffectiveRenderSettings>()
+            .features
+            .fog = true;
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            let snapshot = state.latest.as_mut().unwrap();
+            snapshot.day_night_active = true;
+            snapshot.terrain_height.daylight = scriptbots_core::visual::DAYLIGHT_NIGHT_FLOOR;
+        }
+        app.update();
+        let world = app.world_mut();
+        let mut cameras =
+            world.query_filtered::<(&Camera, &crate::DistanceFog), With<CaptureCamera>>();
+        let (camera, fog) = cameras.single(world).unwrap();
+        assert!(
+            matches!(camera.clear_color, ClearColorConfig::Custom(color) if color == fog.color)
+        );
+        assert_ne!(fog.color, crate::terrain_sky_color());
     }
 
     #[test]

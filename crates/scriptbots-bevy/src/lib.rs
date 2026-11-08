@@ -29,7 +29,7 @@ use bevy::prelude::*;
 use bevy::render::render_resource::{AsBindGroup, PrimitiveTopology};
 use bevy::render::view::{ColorGrading, Hdr};
 use bevy::shader::ShaderRef;
-use bevy::ui::{BorderColor, BorderRadius, FocusPolicy};
+use bevy::ui::{BorderColor, BorderRadius, FocusPolicy, RelativeCursorPosition};
 use bevy::window::{PresentMode, PrimaryWindow, WindowPlugin, WindowRef};
 use bevy_mesh::{Indices, Mesh};
 use bevy_post_process::auto_exposure::{AutoExposure, AutoExposurePlugin};
@@ -906,7 +906,9 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
             poll_snapshots,
             (
                 sync_world,
+                apply_daynight_lighting,
                 smooth_agent_poses,
+                conform_selection_ring,
                 conform_agent_wheels,
                 conform_wheel_joints,
                 smooth_spike_poses,
@@ -1035,6 +1037,9 @@ fn parse_env_flag(value: &str) -> Option<bool> {
 
 #[derive(Component)]
 struct PrimaryCamera;
+
+#[derive(Component)]
+struct WorldLightingCamera;
 
 struct SnapshotInbox {
     pending: Arc<Mutex<Option<WorldSnapshot>>>,
@@ -1207,6 +1212,12 @@ struct AgentGroundFootprint {
     radius: f32,
     spike_extension: f32,
     spike: Option<Entity>,
+}
+
+/// A visible selection marker follows the displayed root over terrain.
+#[derive(Component)]
+struct SelectionRingGroundContact {
+    root: Entity,
 }
 
 /// A wheel may extend independently below the chassis to follow uneven ground.
@@ -1469,6 +1480,52 @@ pub(crate) struct AgentMeshes {
 }
 
 pub(crate) const AGENT_BODY_CAPSULE: Capsule3d = Capsule3d::new(0.5, 1.6);
+
+/// Flat two-tone marker: a light center flanked by dark edges stays legible
+/// over both bright and dark ground. The same mesh drives terrain support.
+pub(crate) fn selection_ring_mesh() -> Mesh {
+    const SEGMENTS: u32 = 64;
+    const STRIDE: u32 = 6;
+    let mut positions = Vec::with_capacity(((SEGMENTS + 1) * STRIDE) as usize);
+    let mut normals = Vec::with_capacity(positions.capacity());
+    let mut colors = Vec::with_capacity(positions.capacity());
+    let mut indices = Vec::with_capacity((SEGMENTS * 18) as usize);
+    for i in 0..=SEGMENTS {
+        let angle = i as f32 / SEGMENTS as f32 * std::f32::consts::TAU;
+        let (sin, cos) = angle.sin_cos();
+        // Duplicate boundary vertices to prevent color interpolation across bands.
+        for (radius, value) in [
+            (0.90, 0.0),
+            (0.93, 0.0),
+            (0.93, 1.0),
+            (0.97, 1.0),
+            (0.97, 0.0),
+            (1.0, 0.0),
+        ] {
+            positions.push([radius * cos, 0.0, radius * sin]);
+            normals.push([0.0, 1.0, 0.0]);
+            colors.push([value, value, value, 1.0]);
+        }
+    }
+    for i in 0..SEGMENTS {
+        for band in [0, 2, 4] {
+            let a = i * STRIDE + band;
+            let b = a + 1;
+            let c = a + STRIDE;
+            let d = c + 1;
+            indices.extend_from_slice(&[a, c, b, b, c, d]);
+        }
+    }
+    let mut mesh = Mesh::new(
+        bevy::render::render_resource::PrimitiveTopology::TriangleList,
+        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+    );
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
+    mesh.insert_indices(Indices::U32(indices));
+    mesh
+}
 
 /// Low-poly shared joint; the body material supplies the agent's live color.
 pub(crate) fn creature_joint_mesh() -> Mesh {
@@ -2413,6 +2470,7 @@ mod native_command_feedback_tests {
                     .chain(),
             );
         let label = app.world_mut().spawn(Text::default()).id();
+        let summary = app.world_mut().spawn(Text::default()).id();
         app.insert_resource(HudElements {
             tick: Entity::PLACEHOLDER,
             agents: Entity::PLACEHOLDER,
@@ -2421,7 +2479,7 @@ mod native_command_feedback_tests {
             camera: Entity::PLACEHOLDER,
             playback: Entity::PLACEHOLDER,
             command_feedback: label,
-            command_summary: Entity::PLACEHOLDER,
+            command_summary: summary,
             fps: Entity::PLACEHOLDER,
             world: Entity::PLACEHOLDER,
             tonemap: Entity::PLACEHOLDER,
@@ -2471,6 +2529,29 @@ mod native_command_feedback_tests {
         app.world_mut().entity_mut(button).insert(Interaction::None);
         wait_for_hud_receipt(&mut app, label, 6, 5, "Pause");
         assert_eq!(port.snapshot_hub().latest().world.tick, 5);
+
+        app.world_mut()
+            .resource_mut::<CameraRig>()
+            .clicked_follow_notice = Some("Click follow: confirmation not observed");
+        app.update();
+        assert!(
+            app.world()
+                .get::<Text>(summary)
+                .unwrap()
+                .0
+                .contains("Click follow: confirmation not observed")
+        );
+        app.world_mut()
+            .resource_mut::<CameraRig>()
+            .clicked_follow_notice = None;
+        app.update();
+        assert!(
+            !app.world()
+                .get::<Text>(summary)
+                .unwrap()
+                .0
+                .contains("Click follow: confirmation not observed")
+        );
 
         drop(app);
         drop(port);
@@ -2785,6 +2866,17 @@ enum FitCommand {
     Selection,
 }
 
+/// A click is only an intent until the owner both applies it and publishes
+/// a frame showing the requested individual selected.
+struct PendingClickedFollow {
+    command_id: CommandId,
+    uid: AgentUid,
+    session: scriptbots_runtime::HostSessionId,
+    epoch: u64,
+    applied: Option<scriptbots_runtime::AppliedCommand>,
+    deadline: Instant,
+}
+
 #[derive(Resource)]
 struct CameraRig {
     yaw: f32,
@@ -2805,6 +2897,8 @@ struct CameraRig {
     // when leaving follow, without allowing panning any farther outward.
     free_edge_anchor: Option<Vec2>,
     follow_mode: FollowMode,
+    pending_clicked_follow: Option<PendingClickedFollow>,
+    clicked_follow_notice: Option<&'static str>,
     pending_fit: Option<FitCommand>,
     recenter_now: bool,
 }
@@ -2824,6 +2918,8 @@ impl Default for CameraRig {
             free_height_bias: 0.0,
             free_edge_anchor: None,
             follow_mode: FollowMode::Off,
+            pending_clicked_follow: None,
+            clicked_follow_notice: None,
             pending_fit: None,
             recenter_now: true,
         }
@@ -2848,6 +2944,8 @@ impl CameraRig {
     }
 
     fn toggle_follow_mode(&mut self, mode: FollowMode) {
+        self.pending_clicked_follow = None;
+        self.clicked_follow_notice = None;
         if mode == FollowMode::Off && self.follow_mode == FollowMode::Off {
             return;
         }
@@ -2866,6 +2964,8 @@ impl CameraRig {
     }
 
     fn cycle_follow_mode(&mut self) {
+        self.pending_clicked_follow = None;
+        self.clicked_follow_notice = None;
         self.follow_mode = self.follow_mode.cycle();
         if self.follow_mode != FollowMode::Off {
             self.pan = Vec2::ZERO;
@@ -2874,6 +2974,8 @@ impl CameraRig {
     }
 
     fn queue_fit(&mut self, command: FitCommand) {
+        self.pending_clicked_follow = None;
+        self.clicked_follow_notice = None;
         self.pending_fit = Some(command);
         self.pan = Vec2::ZERO;
         self.recenter_now = true;
@@ -2947,7 +3049,10 @@ fn hud_diagnostic_node() -> Node {
 /// its own message reader and ignores wheel events captured by a HUD node.
 fn scroll_hud_panel(
     mut wheels: MessageReader<MouseWheel>,
-    mut panels: Query<(&Interaction, &ComputedNode, &mut ScrollPosition), With<HudScenePanel>>,
+    mut panels: Query<
+        (&RelativeCursorPosition, &ComputedNode, &mut ScrollPosition),
+        With<HudScenePanel>,
+    >,
 ) {
     let scroll_pixels: f32 = wheels
         .read()
@@ -2960,8 +3065,10 @@ fn scroll_hud_panel(
     if scroll_pixels == 0.0 {
         return;
     }
-    for (interaction, computed, mut scroll) in &mut panels {
-        if !matches!(interaction, Interaction::Hovered | Interaction::Pressed) {
+    for (cursor, computed, mut scroll) in &mut panels {
+        // Child buttons capture Interaction, but the cursor still lies within
+        // the panel. Bevy updates RelativeCursorPosition independently of focus.
+        if !cursor.cursor_over() {
             continue;
         }
         let limit = ((computed.content_size.y - computed.size.y).max(0.0)
@@ -3034,6 +3141,10 @@ mod hud_diagnostics_tests {
                     ..default()
                 },
                 Interaction::Hovered,
+                RelativeCursorPosition {
+                    cursor_over: true,
+                    normalized: Some(Vec2::ZERO),
+                },
                 ScrollPosition::default(),
                 HudScenePanel,
             ))
@@ -3062,9 +3173,26 @@ mod hud_diagnostics_tests {
         assert_eq!(app.world().get::<ScrollPosition>(panel).unwrap().0.y, 0.0);
         send_wheel(&mut app, MouseScrollUnit::Pixel, f32::NAN);
         assert_eq!(app.world().get::<ScrollPosition>(panel).unwrap().0.y, 0.0);
+        // A child button captures interaction before the panel, but wheel
+        // gestures over it must scroll the panel, not zoom the world.
         *app.world_mut().get_mut::<Interaction>(panel).unwrap() = Interaction::None;
+        let child = app
+            .world_mut()
+            .spawn((Node::default(), Interaction::Hovered))
+            .id();
         send_wheel(&mut app, MouseScrollUnit::Line, -1.0);
-        assert_eq!(app.world().get::<ScrollPosition>(panel).unwrap().0.y, 0.0);
+        assert_eq!(app.world().get::<ScrollPosition>(panel).unwrap().0.y, 40.0);
+        assert_eq!(
+            app.world().resource::<CameraRig>().distance,
+            original_distance
+        );
+        *app.world_mut().get_mut::<Interaction>(child).unwrap() = Interaction::None;
+        app.world_mut()
+            .get_mut::<RelativeCursorPosition>(panel)
+            .unwrap()
+            .cursor_over = false;
+        send_wheel(&mut app, MouseScrollUnit::Line, -1.0);
+        assert_eq!(app.world().get::<ScrollPosition>(panel).unwrap().0.y, 40.0);
         assert_ne!(
             app.world().resource::<CameraRig>().distance,
             original_distance
@@ -3533,6 +3661,8 @@ pub(crate) struct WorldSnapshot {
     agent_radius: f32,
     terrain_color: TerrainColorMap,
     terrain_height: TerrainHeightSnapshot,
+    day_night_active: bool,
+    night_ambient: f32,
     agents: Vec<AgentVisual>,
     /// Decimated population/birth/death series for the HUD sparklines
     /// (bd-2z0.14.1.16). Bounded by [`HUD_SPARKLINE_SAMPLES`] at construction.
@@ -4143,6 +4273,8 @@ impl WorldSnapshot {
                 pixels,
             },
             terrain_height,
+            day_night_active: config.render.day_night_active(),
+            night_ambient: night_ambient_floor(&config.render),
             agents,
             events: HudEvent::recent_from_history(snapshot.summary_history.iter()),
             history: HudHistory::from_history(snapshot.summary_history.iter()),
@@ -4158,6 +4290,8 @@ impl WorldSnapshot {
             && self.agent_radius == other.agent_radius
             && self.terrain_color == other.terrain_color
             && self.terrain_height == other.terrain_height
+            && self.day_night_active == other.day_night_active
+            && self.night_ambient == other.night_ambient
             && self.agents == other.agents
             && self.events == other.events
             && self.history == other.history
@@ -4328,6 +4462,8 @@ impl WorldSnapshot {
                 pixels: terrain_pixels,
             },
             terrain_height,
+            day_night_active: config.render.day_night_active(),
+            night_ambient: night_ambient_floor(&config.render),
             agents,
             events: HudEvent::recent_from_history(world.history()),
             history: HudHistory::from_history(world.history()),
@@ -4353,6 +4489,67 @@ fn assign_presentation_revision(
         .checked_add(1)
         .ok_or_else(|| anyhow!("Bevy presentation revision overflow"))?;
     Ok(true)
+}
+
+/// Default night ambient fraction when no explicit floor is configured.
+const DEFAULT_NIGHT_AMBIENT: f32 = 0.55;
+
+fn night_ambient_floor(settings: &RenderSettings) -> f32 {
+    settings
+        .day_night
+        .as_ref()
+        .and_then(|v| v.night_ambient)
+        .filter(|v| v.is_finite())
+        .unwrap_or(DEFAULT_NIGHT_AMBIENT)
+        .clamp(0.0, 1.0)
+}
+
+fn daylight_intensity(snapshot: &WorldSnapshot) -> f32 {
+    if !snapshot.day_night_active {
+        return 1.0;
+    }
+    ((snapshot.terrain_height.daylight - visual::DAYLIGHT_NIGHT_FLOOR)
+        / (1.0 - visual::DAYLIGHT_NIGHT_FLOOR))
+        .clamp(0.0, 1.0)
+}
+
+fn apply_daynight_lighting(
+    state: Res<SnapshotState>,
+    ambient: Option<ResMut<AmbientLight>>,
+    mut suns: Query<&mut DirectionalLight, With<TierDrivenSunLight>>,
+    mut cameras: Query<&mut Camera, With<WorldLightingCamera>>,
+) {
+    let Some(snapshot) = &state.latest else {
+        return;
+    };
+    let day = daylight_intensity(snapshot);
+    let ambient_target = 800.0 * (snapshot.night_ambient + (1.0 - snapshot.night_ambient) * day);
+    let sun_target = 9000.0 * (0.18 + 0.82 * day);
+    if let Some(mut ambient) = ambient
+        && ambient.brightness != ambient_target
+    {
+        ambient.brightness = ambient_target;
+    }
+    for mut sun in &mut suns {
+        if sun.illuminance != sun_target {
+            sun.illuminance = sun_target;
+        }
+    }
+    let sky = sky_color_at_daylight(day);
+    for mut camera in &mut cameras {
+        if !matches!(camera.clear_color, ClearColorConfig::Custom(current) if current == sky) {
+            camera.clear_color = ClearColorConfig::Custom(sky);
+        }
+    }
+}
+
+fn sky_color_at_daylight(day: f32) -> Color {
+    let [r, g, b] = visual::visual_style().atmosphere.fog_srgb;
+    Color::srgb(
+        0.16 + (r - 0.16) * day,
+        0.21 + (g - 0.21) * day,
+        0.30 + (b - 0.30) * day,
+    )
 }
 
 fn terrain_sky_color() -> Color {
@@ -4382,6 +4579,7 @@ fn setup_scene(
             ColorGrading::default(),
             Hdr,
             PrimaryCamera,
+            WorldLightingCamera,
         ))
         .id();
     // Inserted separately rather than in the tuple because it is CONDITIONAL:
@@ -4422,7 +4620,7 @@ fn setup_scene(
     }));
     let sphere_mesh = meshes.add(Mesh::from(Sphere::new(0.5)));
     let quad_mesh = meshes.add(Mesh::from(Rectangle::new(1.0, 1.0)));
-    let ring_mesh = meshes.add(Mesh::from(Torus::new(0.7, 1.0)));
+    let ring_mesh = meshes.add(selection_ring_mesh());
     commands.insert_resource(AgentMeshes {
         base_radius: 1.0,
         body: body_mesh,
@@ -4539,6 +4737,7 @@ fn setup_scene(
             BorderRadius::all(Val::Px(10.0)),
             Interaction::default(),
             FocusPolicy::Pass,
+            RelativeCursorPosition::default(),
             ScrollPosition::default(),
             HudScenePanel,
         ))
@@ -5461,7 +5660,9 @@ fn update_creature_card(
         .count();
     let detail = InspectorDetail::from_agent(agent, selected_count.saturating_sub(1));
     let context = format!(
-        "{} | position {:.0}, {:.0}{}{}",
+        "{} | position {:.0}, {:.0}{}{}\n\
+         Speed {:.2}/tick | heading {:.2} rad\n\
+         Drive L {:+.2} / R {:+.2} | spike {:.2} | boost {}",
         detail.diet(),
         agent.position.x,
         agent.position.y,
@@ -5471,6 +5672,12 @@ fn update_creature_card(
         } else {
             String::new()
         },
+        agent.velocity.length(),
+        agent.heading,
+        agent.wheel_left,
+        agent.wheel_right,
+        agent.spike_length,
+        if agent.boost > 0.5 { "on" } else { "off" },
     );
     let (status, title, body) = owner.as_ref().map_or_else(
         || {
@@ -5670,7 +5877,13 @@ fn update_hud(
                 set_hud_text_if_changed(&mut text, message.clone());
             }
             if let Ok(mut text) = texts.get_mut(hud_elements.command_summary) {
-                set_hud_text_if_changed(&mut text, compact_command_feedback(&message));
+                let summary = compact_command_feedback(&message);
+                let summary = match (summary.is_empty(), rig.clicked_follow_notice) {
+                    (true, Some(notice)) => notice.to_owned(),
+                    (false, Some(notice)) => format!("{summary} | {notice}"),
+                    (_, None) => summary,
+                };
+                set_hud_text_if_changed(&mut text, summary);
             }
         }
         if let Ok(mut text) = texts.get_mut(hud_elements.fps) {
@@ -7185,6 +7398,34 @@ mod adaptive_governor_tests {
         ];
         assert_eq!(append_terrain_albedo_mips(&mut checker, 2), 2);
         assert_eq!(&checker[16..20], &[188, 188, 188, 255]);
+    }
+
+    #[test]
+    fn water_albedo_smallest_mip_represents_linear_average() {
+        for variant in [0, TERRAIN_ALBEDO_LAYERS * 2] {
+            let image = terrain_albedo_image(variant);
+            let side = image.texture_descriptor.size.width as usize;
+            let bytes = image.data.as_ref().unwrap();
+            let original = &bytes[..side * side * 4];
+            let last = &bytes[bytes.len() - 4..];
+            for channel in 0..3 {
+                let average = original
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|pixel| {
+                        f64::from(srgb_to_linear_component(f32::from(pixel[channel]) / 255.0))
+                    })
+                    .sum::<f64>()
+                    / (side * side) as f64;
+                let final_mip =
+                    f64::from(srgb_to_linear_component(f32::from(last[channel]) / 255.0));
+                assert!(
+                    (average - final_mip).abs() < 0.01,
+                    "variant {variant} channel {channel}: average {average}, mip {final_mip}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -9028,6 +9269,106 @@ mod quality_tier_consumer_tests {
     }
 
     #[test]
+    fn default_fog_tracks_sky_without_overriding_explicit_fog_color() {
+        use scriptbots_core::{RenderFogMode, RenderFogSettings};
+
+        let world = WorldState::new(scriptbots_core::ScriptBotsConfig::default()).unwrap();
+        let mut snapshot = WorldSnapshot::from_world(&world).unwrap();
+        snapshot.day_night_active = true;
+        let mut app = App::new();
+        app.insert_resource(SnapshotState {
+            latest: Some(snapshot),
+            ..default()
+        });
+        app.insert_resource(resolve_effective_render_settings_for_gpu(
+            &RenderSettings {
+                quality: Some(RenderQuality::Medium),
+                ..default()
+            },
+            Some(gpu_info("fog-phase-test", GpuClass::Discrete)),
+        ));
+        app.add_systems(Update, (apply_daynight_lighting, apply_tier_to_fog).chain());
+        let native = app
+            .world_mut()
+            .spawn((Camera::default(), PrimaryCamera, WorldLightingCamera))
+            .id();
+        let capture = app
+            .world_mut()
+            .spawn((Camera::default(), WorldLightingCamera))
+            .id();
+        let unrelated = app.world_mut().spawn(DistanceFog::default()).id();
+
+        for daylight in [visual::DAYLIGHT_NIGHT_FLOOR, 0.6, 1.0] {
+            app.world_mut()
+                .resource_mut::<SnapshotState>()
+                .latest
+                .as_mut()
+                .unwrap()
+                .terrain_height
+                .daylight = daylight;
+            app.update();
+            for camera in [native, capture] {
+                let clear = app.world().get::<Camera>(camera).unwrap().clear_color;
+                let fog = app.world().get::<DistanceFog>(camera).unwrap();
+                assert!(matches!(clear, ClearColorConfig::Custom(color) if color == fog.color));
+            }
+        }
+        assert_eq!(
+            app.world().get::<DistanceFog>(native).unwrap().color,
+            terrain_sky_color()
+        );
+        let before = app
+            .world()
+            .entity(native)
+            .get_ref::<DistanceFog>()
+            .unwrap()
+            .last_changed();
+        app.update();
+        assert_eq!(
+            before,
+            app.world()
+                .entity(native)
+                .get_ref::<DistanceFog>()
+                .unwrap()
+                .last_changed(),
+            "unchanged phase must not rewrite fog each frame"
+        );
+        assert_eq!(
+            app.world().get::<DistanceFog>(unrelated).unwrap().color,
+            DistanceFog::default().color
+        );
+
+        app.world_mut()
+            .resource_mut::<EffectiveRenderSettings>()
+            .fog_settings = Some(RenderFogSettings {
+            mode: Some(RenderFogMode::High),
+            color: Some([0.2, 0.4, 0.6]),
+        });
+        app.world_mut()
+            .resource_mut::<SnapshotState>()
+            .latest
+            .as_mut()
+            .unwrap()
+            .terrain_height
+            .daylight = visual::DAYLIGHT_NIGHT_FLOOR;
+        app.update();
+        for camera in [native, capture] {
+            let fog = app.world().get::<DistanceFog>(camera).unwrap();
+            assert_eq!(fog.color, Color::linear_rgb(0.2, 0.4, 0.6));
+            assert!(
+                matches!(fog.falloff, FogFalloff::Exponential { density } if density == 0.0006)
+            );
+        }
+        app.world_mut()
+            .resource_mut::<EffectiveRenderSettings>()
+            .features
+            .fog = false;
+        app.update();
+        assert!(app.world().get::<DistanceFog>(native).is_none());
+        assert!(app.world().get::<DistanceFog>(capture).is_none());
+    }
+
+    #[test]
     fn fog_overrides_reach_the_camera_and_preserve_the_software_tier_clamp() {
         use scriptbots_core::{RenderFogMode, RenderFogSettings};
         let mut app = App::new();
@@ -10483,6 +10824,326 @@ mod owner_inspector_tests {
     };
 
     #[test]
+    fn clicked_follow_waits_for_application_and_matching_published_selection() {
+        use scriptbots_runtime::{AppliedCommand, ControlRevision};
+        let owner = TestOwner::new();
+        let mut frame = owner.frame();
+        let (mut source, epoch) = frame.owner_source.unwrap();
+        let session = source.session_id;
+        let mut target = frame.agents[0].clone();
+        target.uid = AgentUid(999);
+        target.selection = SelectionState::None;
+        frame.agents.push(target);
+        let now = Instant::now();
+        let boundary = AppliedCommand {
+            tick: source.inspected_tick,
+            revisions: scriptbots_runtime::HostRevisions {
+                control: ControlRevision::new(source.published_host.control.get() + 1),
+                ..source.published_host
+            },
+        };
+        let pending = || PendingClickedFollow {
+            command_id: CommandId::new(123),
+            uid: AgentUid(999),
+            session,
+            epoch,
+            applied: None,
+            deadline: now + Duration::from_secs(5),
+        };
+        let mut state = SnapshotState {
+            latest: Some(frame),
+            ..default()
+        };
+        let mut rig = CameraRig {
+            follow_mode: FollowMode::Off,
+            recenter_now: false,
+            pending_clicked_follow: Some(pending()),
+            ..default()
+        };
+        settle_clicked_follow(&mut rig, &state, None, now);
+        assert_eq!(rig.follow_mode, FollowMode::Off);
+        assert!(rig.pending_clicked_follow.is_some());
+        settle_clicked_follow(&mut rig, &state, Some(&ApplicationState::Admitted), now);
+        assert_eq!(rig.follow_mode, FollowMode::Off);
+        settle_clicked_follow(
+            &mut rig,
+            &state,
+            Some(&ApplicationState::Applied(boundary)),
+            now,
+        );
+        assert_eq!(
+            rig.follow_mode,
+            FollowMode::Off,
+            "old frame cannot authorize follow"
+        );
+        assert!(rig.pending_clicked_follow.is_some());
+
+        source.published_host = boundary.revisions;
+        source.inspected_host = boundary.revisions;
+        source.inspected_tick = scriptbots_core::Tick(boundary.tick.0 + 10_000);
+        let frame = state.latest.as_mut().unwrap();
+        frame.owner_source = Some((source, epoch + 1));
+        frame.tick = source.inspected_tick.0;
+        frame.agent_radius = 20.0;
+        frame.agents[0].selection = SelectionState::None;
+        frame.agents[1].selection = SelectionState::Selected;
+        // Applied evidence survives a temporary status-mirror miss.
+        settle_clicked_follow(&mut rig, &state, None, now);
+        assert_eq!(rig.follow_mode, FollowMode::Selected);
+        assert_eq!(
+            rig.distance, 500.0,
+            "use the confirmed frame's creature scale"
+        );
+        assert!(rig.pending_clicked_follow.is_none());
+        assert!(rig.recenter_now);
+        assert!(rig.clicked_follow_notice.is_none());
+
+        // A later selection, rejection, session change, or unobserved deadline
+        // cannot turn a stale click into a new follow action.
+        for scenario in 0..5 {
+            rig.follow_mode = FollowMode::Off;
+            rig.recenter_now = false;
+            let mut request = pending();
+            if scenario == 4 {
+                request.epoch = epoch + 1;
+            }
+            rig.pending_clicked_follow = Some(request);
+            let status = match scenario {
+                0 => Some(ApplicationState::Applied(boundary)),
+                1 => Some(ApplicationState::Rejected(RejectionReason::HostStopping)),
+                _ => None,
+            };
+            let frame = state.latest.as_mut().unwrap();
+            frame.agents[1].selection = if scenario == 0 {
+                SelectionState::None
+            } else {
+                SelectionState::Selected
+            };
+            let mut observed_source = source;
+            if scenario == 2 {
+                observed_source.session_id =
+                    scriptbots_runtime::HostSessionId::new(session.get() + 1);
+            }
+            frame.owner_source = Some((
+                observed_source,
+                if scenario == 4 { epoch } else { epoch + 1 },
+            ));
+            settle_clicked_follow(
+                &mut rig,
+                &state,
+                status.as_ref(),
+                if scenario == 3 {
+                    now + Duration::from_secs(5)
+                } else {
+                    now
+                },
+            );
+            assert_eq!(rig.follow_mode, FollowMode::Off, "scenario {scenario}");
+            assert!(rig.pending_clicked_follow.is_none(), "scenario {scenario}");
+            assert_eq!(
+                rig.clicked_follow_notice,
+                Some(
+                    [
+                        "Click follow: selection changed",
+                        "Click follow: selection rejected",
+                        "Click follow: world changed",
+                        "Click follow: confirmation not observed",
+                        "Click follow: world changed",
+                    ][scenario]
+                ),
+            );
+        }
+        rig.pending_clicked_follow = Some(pending());
+        rig.toggle_follow_mode(FollowMode::Oldest);
+        assert!(rig.pending_clicked_follow.is_none());
+        assert!(rig.clicked_follow_notice.is_none());
+    }
+
+    #[test]
+    fn clicked_follow_freezes_camera_until_receipt_and_survives_old_selection_loss() {
+        let owner = TestOwner::new();
+        let frame = owner.frame();
+        let (source, epoch) = frame.owner_source.unwrap();
+        let original = Vec2::new(100.0, 100.0);
+        let mut time = Time::<()>::default();
+        time.advance_by(Duration::from_secs_f32(1.0 / 60.0));
+        let mut app = App::new();
+        app.insert_resource(time)
+            .insert_resource(AgentMotionSettings { enabled: true })
+            .insert_resource(CameraRig {
+                follow_mode: FollowMode::Selected,
+                focus_smoothed: original,
+                recenter_now: false,
+                pending_clicked_follow: Some(PendingClickedFollow {
+                    command_id: CommandId::new(123),
+                    uid: AgentUid(999),
+                    session: source.session_id,
+                    epoch,
+                    applied: None,
+                    deadline: Instant::now() + Duration::from_secs(5),
+                }),
+                ..default()
+            })
+            .insert_resource(SnapshotState {
+                latest: Some(frame),
+                world_size: Vec2::splat(1000.0),
+                selection_center: Some(Vec2::splat(800.0)),
+                ..default()
+            })
+            .insert_resource(ButtonInput::<MouseButton>::default())
+            .insert_resource(ButtonInput::<KeyCode>::default())
+            .insert_resource(Messages::<MouseMotion>::default())
+            .insert_resource(Messages::<MouseWheel>::default())
+            .add_systems(Update, control_camera);
+        app.world_mut().spawn((PrimaryCamera, Transform::default()));
+        app.update();
+        assert_eq!(app.world().resource::<CameraRig>().focus_smoothed, original);
+        app.world_mut()
+            .resource_mut::<SnapshotState>()
+            .selection_center = None;
+        app.update();
+        let rig = app.world().resource::<CameraRig>();
+        assert_eq!(rig.follow_mode, FollowMode::Off);
+        assert!(rig.pending_clicked_follow.is_some());
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::KeyW);
+        app.update();
+        assert!(
+            app.world()
+                .resource::<CameraRig>()
+                .pending_clicked_follow
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn clicked_follow_uses_real_owner_receipt_and_published_selection() {
+        let mut owner = TestOwner::new();
+        owner.serve();
+        let mut port = owner.port.clone();
+        port.submit(CommandEnvelope::new(
+            CommandId::from_client_sequence(717, 2),
+            HostCommand::SpawnAgent {
+                herbivore_tendency: 0.5,
+            },
+        ))
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let before = loop {
+            let frame = owner.frame();
+            if frame.agents.len() >= 2 {
+                break frame;
+            }
+            assert!(Instant::now() < deadline, "spawn was not published");
+            thread::sleep(Duration::from_millis(5));
+        };
+        let old = before
+            .agents
+            .iter()
+            .find(|a| a.selection == SelectionState::Selected)
+            .unwrap();
+        let target = before
+            .agents
+            .iter()
+            .find(|a| a.selection != SelectionState::Selected)
+            .unwrap();
+        let old_position = old.position;
+        let target_uid = target.uid;
+        let target_id = encode_agent_id(target.id);
+        let (source, epoch) = before.owner_source.unwrap();
+        let command_id = CommandId::from_client_sequence(717, 3);
+        let submitted = port
+            .submit(CommandEnvelope::new(
+                command_id,
+                HostCommand::UpdateSelection(SelectionUpdate {
+                    mode: SelectionMode::Replace,
+                    agent_ids: vec![target_id],
+                    state: SelectionState::Selected,
+                }),
+            ))
+            .unwrap();
+        assert!(matches!(
+            submitted.application(),
+            ApplicationState::Admitted | ApplicationState::Applied(_)
+        ));
+
+        let mut time = Time::<()>::default();
+        time.advance_by(Duration::from_secs_f32(1.0 / 60.0));
+        let mut app = App::new();
+        app.insert_resource(time)
+            .insert_resource(AgentMotionSettings { enabled: true })
+            .insert_resource(NativeCommandFeedback {
+                host: owner.port.clone(),
+                requests: Arc::new(Mutex::new(VecDeque::new())),
+            })
+            .insert_resource(CameraRig {
+                follow_mode: FollowMode::Selected,
+                focus_smoothed: old_position,
+                recenter_now: false,
+                pending_clicked_follow: Some(PendingClickedFollow {
+                    command_id,
+                    uid: target_uid,
+                    session: source.session_id,
+                    epoch,
+                    applied: None,
+                    deadline: Instant::now() + Duration::from_secs(5),
+                }),
+                ..default()
+            })
+            .insert_resource(SnapshotState {
+                world_size: before.world_size,
+                selection_center: Some(old_position),
+                latest: Some(before),
+                ..default()
+            })
+            .insert_resource(ButtonInput::<MouseButton>::default())
+            .insert_resource(ButtonInput::<KeyCode>::default())
+            .insert_resource(Messages::<MouseMotion>::default())
+            .insert_resource(Messages::<MouseWheel>::default())
+            .add_systems(Update, control_camera);
+        app.world_mut().spawn((PrimaryCamera, Transform::default()));
+        app.update();
+        assert_eq!(
+            app.world().resource::<CameraRig>().focus_smoothed,
+            old_position
+        );
+        assert!(
+            app.world()
+                .resource::<CameraRig>()
+                .pending_clicked_follow
+                .is_some()
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let frame = owner.frame();
+            if let Some(selected) = frame.agents.iter().find(|agent| {
+                agent.uid == target_uid && agent.selection == SelectionState::Selected
+            }) {
+                let target_position = selected.position;
+                {
+                    let mut state = app.world_mut().resource_mut::<SnapshotState>();
+                    state.selection_center = Some(target_position);
+                    state.latest = Some(frame);
+                }
+                app.update();
+                let rig = app.world().resource::<CameraRig>();
+                if rig.pending_clicked_follow.is_none() {
+                    assert_eq!(rig.follow_mode, FollowMode::Selected);
+                    assert_eq!(rig.focus_smoothed, target_position);
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "applied selection and camera follow were not observed"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
     fn retained_genome_nodes_show_every_connection_in_bounded_pages() {
         use scriptbots_core::genome_browser::{BrowserConnectionView, BrowserNodeView};
 
@@ -11122,6 +11783,65 @@ mod owner_inspector_tests {
             app.world().get::<Node>(root).unwrap().display,
             Display::None
         );
+    }
+
+    #[test]
+    fn creature_card_motion_follows_selected_snapshot_without_owner_detail() {
+        let owner = TestOwner::new();
+        let mut frame = owner.frame();
+        let agent = frame.agents.first_mut().expect("selected test creature");
+        agent.velocity = Vec2::new(3.0, 4.0);
+        agent.heading = 1.25;
+        agent.wheel_left = -0.35;
+        agent.wheel_right = 0.65;
+        agent.spike_length = 7.5;
+        agent.boost = 1.0;
+
+        let mut app = App::new();
+        app.insert_resource(SnapshotState {
+            latest: Some(frame),
+            ..default()
+        });
+        let root = app.world_mut().spawn(Node::default()).id();
+        let mut label = || app.world_mut().spawn(Text::default()).id();
+        let card = CreatureCardElements {
+            root,
+            identity: label(),
+            context: label(),
+            health: label(),
+            energy: label(),
+            age: label(),
+            generation: label(),
+            page_status: label(),
+            page_title: label(),
+            page_body: label(),
+        };
+        let context = card.context;
+        let status = card.page_status;
+        app.insert_resource(card)
+            .add_systems(Update, update_creature_card);
+        app.update();
+        let text = &app.world().get::<Text>(context).unwrap().0;
+        assert!(text.contains("Speed 5.00/tick | heading 1.25 rad"));
+        assert!(text.contains("Drive L -0.35 / R +0.65 | spike 7.50 | boost on"));
+        assert_eq!(
+            app.world().get::<Text>(status).unwrap().0,
+            "DETAIL UNAVAILABLE"
+        );
+
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            let agent = &mut state.latest.as_mut().unwrap().agents[0];
+            agent.velocity = Vec2::ZERO;
+            agent.wheel_left = 0.2;
+            agent.wheel_right = -0.4;
+            agent.spike_length = 0.0;
+            agent.boost = 0.0;
+        }
+        app.update();
+        let text = &app.world().get::<Text>(context).unwrap().0;
+        assert!(text.contains("Speed 0.00/tick"));
+        assert!(text.contains("Drive L +0.20 / R -0.40 | spike 0.00 | boost off"));
     }
 
     #[test]
@@ -11984,6 +12704,8 @@ fn handle_selection_input(
     };
 
     if keys.just_pressed(KeyCode::Escape) {
+        rig.pending_clicked_follow = None;
+        rig.clicked_follow_notice = None;
         let command = ControlCommand::UpdateSelection(SelectionUpdate {
             mode: SelectionMode::Clear,
             agent_ids: Vec::new(),
@@ -11991,9 +12713,8 @@ fn handle_selection_input(
         });
         if let Some(command_id) = (submitter.submit)(command) {
             info!(%command_id, "Bevy clear-selection enqueued via Escape");
-            rig.follow_mode = FollowMode::Off;
-            rig.pan = Vec2::ZERO;
-            rig.recenter_now = true;
+        } else {
+            warn!("clear-selection command could not be enqueued via Escape");
         }
         return;
     }
@@ -12073,6 +12794,10 @@ fn handle_selection_input(
     }
 
     let extend = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+    // A later click supersedes a still-pending follow intent, even if the
+    // new command cannot be enqueued.
+    rig.pending_clicked_follow = None;
+    rig.clicked_follow_notice = None;
 
     if let Some(agent) = best {
         let agent_id = encode_agent_id(agent.id);
@@ -12107,7 +12832,24 @@ fn handle_selection_input(
         };
         info!(agent_id, intent, %command_id, "Bevy selection enqueued");
         if !extend {
-            rig.follow_clicked_creature(snapshot.agent_radius);
+            let deserializer =
+                serde::de::value::StrDeserializer::<serde::de::value::Error>::new(&command_id);
+            if let (Ok(command_id), Some((source, epoch))) =
+                (CommandId::deserialize(deserializer), snapshot.owner_source)
+            {
+                rig.pending_clicked_follow = Some(PendingClickedFollow {
+                    command_id,
+                    uid: agent.uid,
+                    session: source.session_id,
+                    epoch,
+                    applied: None,
+                    deadline: Instant::now() + Duration::from_secs(5),
+                });
+                rig.clicked_follow_notice = Some("Click follow: awaiting selection confirmation");
+            } else {
+                rig.clicked_follow_notice = Some("Click follow: receipt could not be correlated");
+                warn!("selection was enqueued without a correlatable follow receipt");
+            }
         }
     } else if !extend {
         let command = ControlCommand::UpdateSelection(SelectionUpdate {
@@ -12117,9 +12859,8 @@ fn handle_selection_input(
         });
         if let Some(command_id) = (submitter.submit)(command) {
             info!(%command_id, "Bevy clear-selection enqueued via empty click");
-            rig.follow_mode = FollowMode::Off;
-            rig.pan = Vec2::ZERO;
-            rig.recenter_now = true;
+        } else {
+            warn!("clear-selection command could not be enqueued via empty click");
         }
     }
 }
@@ -12343,30 +13084,21 @@ fn handle_clear_selection_button(
     };
     for interaction in buttons.iter_mut() {
         if *interaction == Interaction::Pressed {
+            rig.pending_clicked_follow = None;
+            rig.clicked_follow_notice = None;
             let command = ControlCommand::UpdateSelection(SelectionUpdate {
                 mode: SelectionMode::Clear,
                 agent_ids: Vec::new(),
                 state: SelectionState::Selected,
             });
-            // The return value is CHECKED here (bd-2z0.7.14). It used to be
-            // discarded, so a full command queue silently dropped the clear
-            // while the camera below still stopped following — the UI acting on
-            // a request the simulation never received. The other three
-            // selection paths already gated on it; this one did not, which made
-            // the failure mode inconsistent as well as invisible.
-            // `continue`, not `return`: the loop body is the unit of work. This
-            // bead is making interaction per-window, so more than one clear
-            // button will exist, and bailing out of the whole system would drop
-            // the other windows' presses on the floor — the same class of silent
-            // loss this fix exists to remove.
+            // Enqueueing is not application: the camera continues following
+            // until a published snapshot actually loses its selection. This
+            // also preserves the view if the owner rejects the command.
             let Some(command_id) = (submitter.submit)(command) else {
                 warn!("clear-selection command could not be enqueued; leaving the camera as it is");
                 continue;
             };
             info!(%command_id, "Bevy clear selection enqueued");
-            rig.follow_mode = FollowMode::Off;
-            rig.pan = Vec2::ZERO;
-            rig.recenter_now = true;
         }
     }
 }
@@ -12718,14 +13450,27 @@ fn apply_tier_to_ssao(world: &mut World) {
     }
 }
 
+type WorldFogCameraFilter = Or<(With<PrimaryCamera>, With<WorldLightingCamera>)>;
+
 fn apply_tier_to_fog(
     mut commands: Commands,
     effective: Res<EffectiveRenderSettings>,
-    cameras: Query<(Entity, Option<&DistanceFog>), With<PrimaryCamera>>,
+    state: Option<Res<SnapshotState>>,
+    cameras: Query<(Entity, Option<&DistanceFog>), WorldFogCameraFilter>,
 ) {
     // Also inspect newly added cameras when the tier has not changed. Repeated
     // frames leave existing components untouched, preserving change detection.
-    let desired = tier_distance_fog(effective.features.fog, effective.fog_settings.as_ref());
+    let mut desired = tier_distance_fog(effective.features.fog, effective.fog_settings.as_ref());
+    if effective
+        .fog_settings
+        .as_ref()
+        .and_then(|settings| settings.color)
+        .is_none()
+        && let Some(fog) = &mut desired
+        && let Some(snapshot) = state.as_ref().and_then(|state| state.latest.as_ref())
+    {
+        fog.color = sky_color_at_daylight(daylight_intensity(snapshot));
+    }
     for (entity, current) in &cameras {
         match (&desired, current) {
             (Some(fog), None) => {
@@ -12901,6 +13646,67 @@ fn update_follow_button_colors(
     }
 }
 
+fn settle_clicked_follow(
+    rig: &mut CameraRig,
+    state: &SnapshotState,
+    status: Option<&ApplicationState>,
+    now: Instant,
+) {
+    let Some(mut pending) = rig.pending_clicked_follow.take() else {
+        return;
+    };
+    if now >= pending.deadline {
+        rig.clicked_follow_notice = Some("Click follow: confirmation not observed");
+        warn!(command_id = %pending.command_id, "selection follow confirmation was not observed before the deadline");
+        return;
+    }
+    match status {
+        Some(ApplicationState::Applied(boundary)) => pending.applied = Some(*boundary),
+        Some(ApplicationState::Rejected(_)) => {
+            rig.clicked_follow_notice = Some("Click follow: selection rejected");
+            return;
+        }
+        Some(ApplicationState::Failed(_)) => {
+            rig.clicked_follow_notice = Some("Click follow: selection failed");
+            return;
+        }
+        Some(ApplicationState::Admitted) | None => {}
+    }
+    if let Some(frame) = state.latest.as_ref()
+        && let Some((source, epoch)) = frame.owner_source
+    {
+        if source.session_id != pending.session || epoch < pending.epoch {
+            rig.clicked_follow_notice = Some("Click follow: world changed");
+            return;
+        }
+        if let Some(boundary) = pending.applied {
+            let host = source.published_host;
+            if source.inspected_tick.0 >= boundary.tick.0
+                && host.control >= boundary.revisions.control
+                && host.scientific >= boundary.revisions.scientific
+                && host.config >= boundary.revisions.config
+            {
+                let mut selected = frame
+                    .agents
+                    .iter()
+                    .filter(|agent| agent.selection == SelectionState::Selected);
+                if selected
+                    .next()
+                    .is_some_and(|agent| agent.uid == pending.uid)
+                    && selected.next().is_none()
+                {
+                    rig.clicked_follow_notice = None;
+                    rig.follow_clicked_creature(frame.agent_radius);
+                } else {
+                    rig.clicked_follow_notice = Some("Click follow: selection changed");
+                }
+                return;
+            }
+        }
+    }
+    rig.pending_clicked_follow = Some(pending);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn control_camera(
     time: Res<Time>,
@@ -12908,6 +13714,7 @@ fn control_camera(
     state: Res<SnapshotState>,
     mut observed_selection: Local<bool>,
     motion: Option<Res<AgentMotionSettings>>,
+    feedback: Option<Res<NativeCommandFeedback>>,
     buttons: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
     mut mouse_motion: MessageReader<MouseMotion>,
@@ -12934,7 +13741,11 @@ fn control_camera(
         && rig.follow_mode == FollowMode::Selected
         && !rig.recenter_now
     {
+        let pending = rig.pending_clicked_follow.take();
+        let notice = rig.clicked_follow_notice;
         rig.toggle_follow_mode(FollowMode::Off);
+        rig.pending_clicked_follow = pending;
+        rig.clicked_follow_notice = notice;
     }
     *observed_selection = has_selection;
 
@@ -13026,6 +13837,8 @@ fn control_camera(
     }
     let mut target_velocity = Vec2::ZERO;
     if pan_input.length_squared() > 0.0 {
+        rig.pending_clicked_follow = None;
+        rig.clicked_follow_notice = None;
         pan_input = pan_input.normalize();
         let forward = Vec2::new(rig.yaw.cos(), rig.yaw.sin());
         let right = Vec2::new(-forward.y, forward.x);
@@ -13050,6 +13863,24 @@ fn control_camera(
         };
         rig.pan += displacement;
     }
+
+    let status = rig.pending_clicked_follow.as_ref().and_then(|pending| {
+        feedback
+            .as_ref()
+            .and_then(|feedback| {
+                feedback
+                    .host
+                    .try_published_command_status(pending.command_id)
+                    .ok()
+            })
+            .flatten()
+    });
+    settle_clicked_follow(
+        &mut rig,
+        &state,
+        status.as_ref().map(CommandStatus::application),
+        Instant::now(),
+    );
 
     let mut focus_override = None;
     if state.latest.is_some()
@@ -13125,6 +13956,7 @@ fn control_camera(
             .or(state.first_agent_position),
     };
 
+    let follow_waiting = rig.pending_clicked_follow.is_some();
     let mut target_focus = if rig.follow_mode == FollowMode::Off {
         if let Some(focus) = focus_override {
             rig.free_focus = Some(focus);
@@ -13137,12 +13969,17 @@ fn control_camera(
         anchor + rig.pan
     } else {
         rig.free_focus = None;
-        focus_override
-            .or(follow_target)
-            .unwrap_or(state.focus_point)
+        if follow_waiting && focus_override.is_none() {
+            rig.focus_smoothed
+        } else {
+            focus_override
+                .or(follow_target)
+                .unwrap_or(state.focus_point)
+        }
     };
 
-    if !rig.recenter_now
+    if !follow_waiting
+        && !rig.recenter_now
         && focus_override.is_none()
         && state
             .latest
@@ -14322,6 +15159,8 @@ mod terrain_tests {
             agent_radius: 12.0,
             terrain_color: color,
             terrain_height: height,
+            day_night_active: true,
+            night_ambient: 0.35,
             agents: Vec::new(),
             events: Vec::new(),
             history: HudHistory::default(),
@@ -14363,9 +15202,283 @@ mod terrain_tests {
             latest: Some(snapshot),
             ..default()
         });
-        app.add_systems(Update, sync_world);
+        app.add_systems(Update, (sync_world, conform_selection_ring).chain());
         app.update();
         app
+    }
+
+    #[test]
+    fn selection_ring_is_flat_thin_shadowless_and_tracks_selection() {
+        let mut app = eye_geometry_test_app();
+        let (entity, handle) = {
+            let record = &app.world().resource::<AgentRegistry>().records[&AgentUid(1)];
+            (
+                record.selection.entity,
+                record.selection.material.clone().unwrap(),
+            )
+        };
+        let pose = app.world().get::<Transform>(entity).unwrap();
+        assert!(pose.rotation.abs_diff_eq(Quat::IDENTITY, 1e-6));
+        assert!(
+            app.world()
+                .get::<bevy::light::NotShadowCaster>(entity)
+                .is_some()
+        );
+        assert_eq!(
+            *app.world().get::<Visibility>(entity).unwrap(),
+            Visibility::Visible
+        );
+        let selected = app
+            .world()
+            .resource::<Assets<StandardMaterial>>()
+            .get(&handle)
+            .unwrap()
+            .base_color
+            .to_srgba()
+            .alpha;
+        for (state, visible) in [
+            (SelectionState::Hovered, true),
+            (SelectionState::None, false),
+        ] {
+            {
+                let mut snapshots = app.world_mut().resource_mut::<SnapshotState>();
+                let snapshot = snapshots.latest.as_mut().unwrap();
+                snapshot.agents[0].selection = state;
+                snapshot.revision += 1;
+            }
+            app.update();
+            assert_eq!(
+                *app.world().get::<Visibility>(entity).unwrap() == Visibility::Visible,
+                visible
+            );
+            if visible {
+                let hovered = app
+                    .world()
+                    .resource::<Assets<StandardMaterial>>()
+                    .get(&handle)
+                    .unwrap()
+                    .base_color
+                    .to_srgba()
+                    .alpha;
+                assert!(hovered > 0.0 && hovered < selected);
+            }
+        }
+    }
+
+    #[test]
+    fn selection_ring_has_contrasting_bands_and_high_contrast_opacity() {
+        let mesh = selection_ring_mesh();
+        let VertexAttributeValues::Float32x4(colors) =
+            mesh.attribute(Mesh::ATTRIBUTE_COLOR).unwrap()
+        else {
+            panic!("selection marker colors missing");
+        };
+        assert_eq!(colors.len(), 390);
+        for band in colors.as_chunks::<6>().0 {
+            assert_eq!(
+                band,
+                &[
+                    [0.0, 0.0, 0.0, 1.0],
+                    [0.0, 0.0, 0.0, 1.0],
+                    [1.0; 4],
+                    [1.0; 4],
+                    [0.0, 0.0, 0.0, 1.0],
+                    [0.0, 0.0, 0.0, 1.0]
+                ]
+            );
+        }
+        let mut app = eye_geometry_test_app();
+        let handle = app.world().resource::<AgentRegistry>().records[&AgentUid(1)]
+            .selection
+            .material
+            .clone()
+            .unwrap();
+        app.world_mut().resource_mut::<AccessibilityState>().palette =
+            ColorPaletteMode::HighContrast;
+        app.update();
+        let selected = app
+            .world()
+            .resource::<Assets<StandardMaterial>>()
+            .get(&handle)
+            .unwrap();
+        assert_eq!(selected.alpha_mode, AlphaMode::Blend);
+        assert_eq!(selected.base_color.to_srgba().alpha, 1.0);
+        {
+            let mut snapshots = app.world_mut().resource_mut::<SnapshotState>();
+            let snapshot = snapshots.latest.as_mut().unwrap();
+            snapshot.agents[0].selection = SelectionState::Hovered;
+            snapshot.revision += 1;
+        }
+        app.update();
+        let hovered = app
+            .world()
+            .resource::<Assets<StandardMaterial>>()
+            .get(&handle)
+            .unwrap();
+        assert!((hovered.base_color.to_srgba().alpha - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn selection_ring_follows_displayed_root_without_static_writes() {
+        let mut app = eye_geometry_test_app();
+        let (root, ring) = {
+            let record = &app.world().resource::<AgentRegistry>().records[&AgentUid(1)];
+            (record.root, record.selection.entity)
+        };
+        let before = app
+            .world()
+            .entity(ring)
+            .get_ref::<Transform>()
+            .unwrap()
+            .last_changed();
+        app.update();
+        assert_eq!(
+            before,
+            app.world()
+                .entity(ring)
+                .get_ref::<Transform>()
+                .unwrap()
+                .last_changed()
+        );
+        app.world_mut()
+            .get_mut::<Transform>(root)
+            .unwrap()
+            .translation
+            .x += 20.0;
+        app.update();
+        let root_pose = *app.world().get::<Transform>(root).unwrap();
+        let footprint = *app.world().get::<AgentGroundFootprint>(root).unwrap();
+        let snapshot = app
+            .world()
+            .resource::<SnapshotState>()
+            .latest
+            .as_ref()
+            .unwrap();
+        let expected = selection_ring_grounded_transform(snapshot, &root_pose, footprint.radius);
+        assert_eq!(*app.world().get::<Transform>(ring).unwrap(), expected);
+        assert_ne!(
+            before,
+            app.world()
+                .entity(ring)
+                .get_ref::<Transform>()
+                .unwrap()
+                .last_changed()
+        );
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            let snapshot = state.latest.as_mut().unwrap();
+            snapshot.agents[0].selection = SelectionState::None;
+            snapshot.revision += 1;
+        }
+        app.update();
+        let hidden = app
+            .world()
+            .entity(ring)
+            .get_ref::<Transform>()
+            .unwrap()
+            .last_changed();
+        app.world_mut()
+            .get_mut::<Transform>(root)
+            .unwrap()
+            .translation
+            .x += 10.0;
+        app.update();
+        assert_eq!(
+            hidden,
+            app.world()
+                .entity(ring)
+                .get_ref::<Transform>()
+                .unwrap()
+                .last_changed()
+        );
+    }
+
+    #[test]
+    fn selection_ring_clears_uneven_terrain_at_sampled_poses() {
+        let mut snapshot = sample_world_snapshot();
+        snapshot.world_size = Vec2::splat(400.0);
+        let terrain = &mut snapshot.terrain_height;
+        terrain.dims = UVec2::splat(4);
+        terrain.cell_size = 100;
+        terrain.elevation = vec![
+            0.2, 0.5, 0.1, 0.6, 0.3, 0.7, 0.25, 0.45, 0.6, 0.15, 0.65, 0.2, 0.4, 0.55, 0.1, 0.5,
+        ];
+        terrain.moisture = vec![0.5; 16];
+        terrain.accent = vec![0.1; 16];
+        terrain.water_depth = vec![0.0; 16];
+        terrain.fertility = vec![0.0; 16];
+        terrain.temperature = vec![0.0; 16];
+        terrain.kinds = vec![TerrainKind::Grass; 16];
+        let ring = selection_ring_mesh();
+        let VertexAttributeValues::Float32x3(vertices) =
+            ring.attribute(Mesh::ATTRIBUTE_POSITION).unwrap()
+        else {
+            panic!("ring positions missing")
+        };
+        let indices: Vec<usize> = match ring.indices().unwrap() {
+            Indices::U16(indices) => indices.iter().map(|&i| usize::from(i)).collect(),
+            Indices::U32(indices) => indices.iter().map(|&i| i as usize).collect(),
+        };
+        let mut minimum = f32::INFINITY;
+        let mut under = 0usize;
+        let mut total = 0usize;
+        for radius in [5.0, 10.0, 20.0] {
+            snapshot.agent_radius = radius;
+            for x in [65.0, 95.0, 105.0, 195.0, 205.0, 245.0] {
+                for z in [65.0, 95.0, 105.0, 195.0, 205.0, 245.0] {
+                    for heading in [0.0, 0.8, -1.7, 3.0] {
+                        let mut agent = sample_agent_visual();
+                        agent.position = Vec2::new(x, z);
+                        agent.heading = heading;
+                        agent.spike_length = 0.0;
+                        let (translation, rotation) = agent_surface_pose(&snapshot, &agent);
+                        let root = Transform::from_translation(translation).with_rotation(rotation);
+                        let local = selection_ring_grounded_transform(&snapshot, &root, radius);
+                        for point in vertices {
+                            let world = translation
+                                + rotation * local.transform_point(Vec3::from_array(*point));
+                            let pos = Vec2::new(world.x + 200.0, 200.0 - world.z);
+                            let ground = sample_height_world(
+                                &snapshot.terrain_height,
+                                pos,
+                                TERRAIN_HEIGHT_SCALE,
+                            );
+                            let clearance = world.y - ground;
+                            minimum = minimum.min(clearance);
+                            under += usize::from(clearance < -0.01);
+                            total += 1;
+                        }
+                        // Independently sample triangle interiors and edges, not just vertices.
+                        for triangle in indices.as_chunks::<3>().0 {
+                            let a = Vec3::from_array(vertices[triangle[0]]);
+                            let b = Vec3::from_array(vertices[triangle[1]]);
+                            let c = Vec3::from_array(vertices[triangle[2]]);
+                            for point in [
+                                (a + b + c) / 3.0,
+                                (a + b) * 0.5,
+                                (b + c) * 0.5,
+                                (c + a) * 0.5,
+                            ] {
+                                let world = translation + rotation * local.transform_point(point);
+                                let pos = Vec2::new(world.x + 200.0, 200.0 - world.z);
+                                let ground = sample_height_world(
+                                    &snapshot.terrain_height,
+                                    pos,
+                                    TERRAIN_HEIGHT_SCALE,
+                                );
+                                let clearance = world.y - ground;
+                                minimum = minimum.min(clearance);
+                                under += usize::from(clearance < -0.01);
+                                total += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(total > 800_000);
+        assert!(minimum >= -0.01, "minimum sampled clearance: {minimum}");
+        assert_eq!(under, 0, "sampled marker points intersect the terrain");
     }
 
     #[test]
@@ -15580,6 +16693,8 @@ mod terrain_tests {
                 pixels: vec![0; 3 * 3 * 4],
             },
             terrain_height: height,
+            day_night_active: true,
+            night_ambient: 0.35,
             agents: Vec::new(),
             events: Vec::new(),
             history: HudHistory::default(),
@@ -15614,6 +16729,148 @@ mod terrain_tests {
             high_contrast.map(f32::to_bits),
             "palette cycling must recolor terrain as well as agents and HUD labels"
         );
+    }
+
+    #[test]
+    fn daynight_lighting_tracks_phase_floor_and_static_mode_without_redundant_writes() {
+        let mut app = App::new();
+        app.insert_resource(AmbientLight {
+            brightness: 800.0,
+            ..default()
+        });
+        app.insert_resource(SnapshotState {
+            latest: Some(sample_world_snapshot()),
+            ..default()
+        });
+        app.add_systems(Update, apply_daynight_lighting);
+        let sun = app
+            .world_mut()
+            .spawn((
+                DirectionalLight {
+                    illuminance: 9000.0,
+                    shadows_enabled: true,
+                    ..default()
+                },
+                TierDrivenSunLight,
+            ))
+            .id();
+        let camera = app
+            .world_mut()
+            .spawn((
+                Camera {
+                    clear_color: ClearColorConfig::Custom(terrain_sky_color()),
+                    ..default()
+                },
+                WorldLightingCamera,
+            ))
+            .id();
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            let snapshot = state.latest.as_mut().unwrap();
+            snapshot.terrain_height.daylight = 1.0;
+        }
+        app.update();
+        assert_eq!(app.world().resource::<AmbientLight>().brightness, 800.0);
+        assert_eq!(
+            app.world()
+                .get::<DirectionalLight>(sun)
+                .unwrap()
+                .illuminance,
+            9000.0
+        );
+        let sun_change = app
+            .world()
+            .entity(sun)
+            .get_ref::<DirectionalLight>()
+            .unwrap()
+            .last_changed();
+        let camera_change = app
+            .world()
+            .entity(camera)
+            .get_ref::<Camera>()
+            .unwrap()
+            .last_changed();
+        app.update();
+        assert_eq!(
+            sun_change,
+            app.world()
+                .entity(sun)
+                .get_ref::<DirectionalLight>()
+                .unwrap()
+                .last_changed()
+        );
+        assert_eq!(
+            camera_change,
+            app.world()
+                .entity(camera)
+                .get_ref::<Camera>()
+                .unwrap()
+                .last_changed()
+        );
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            let snapshot = state.latest.as_mut().unwrap();
+            snapshot.terrain_height.daylight = visual::DAYLIGHT_NIGHT_FLOOR;
+            snapshot.night_ambient = 0.2;
+        }
+        app.update();
+        assert!((app.world().resource::<AmbientLight>().brightness - 160.0).abs() < 1e-4);
+        let light = app.world().get::<DirectionalLight>(sun).unwrap();
+        assert_eq!(light.illuminance, 9000.0 * 0.18);
+        assert!(light.shadows_enabled);
+        assert!(
+            matches!(app.world().get::<Camera>(camera).unwrap().clear_color, ClearColorConfig::Custom(color) if color != terrain_sky_color())
+        );
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            let snapshot = state.latest.as_mut().unwrap();
+            snapshot.day_night_active = false;
+            snapshot.terrain_height.daylight = visual::DAYLIGHT_STATIC;
+        }
+        app.update();
+        assert_eq!(app.world().resource::<AmbientLight>().brightness, 800.0);
+        assert_eq!(
+            app.world()
+                .get::<DirectionalLight>(sun)
+                .unwrap()
+                .illuminance,
+            9000.0
+        );
+        assert!(
+            matches!(app.world().get::<Camera>(camera).unwrap().clear_color, ClearColorConfig::Custom(color) if color == terrain_sky_color())
+        );
+    }
+
+    #[test]
+    fn daynight_lighting_keeps_updating_without_an_ambient_resource() {
+        let mut snapshot = sample_world_snapshot();
+        snapshot.terrain_height.daylight = visual::DAYLIGHT_NIGHT_FLOOR;
+        let mut app = App::new();
+        app.insert_resource(SnapshotState {
+            latest: Some(snapshot),
+            ..default()
+        });
+        app.add_systems(Update, apply_daynight_lighting);
+        let sun = app
+            .world_mut()
+            .spawn((DirectionalLight::default(), TierDrivenSunLight))
+            .id();
+        let camera = app
+            .world_mut()
+            .spawn((Camera::default(), WorldLightingCamera))
+            .id();
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<DirectionalLight>(sun)
+                .unwrap()
+                .illuminance,
+            9000.0 * 0.18
+        );
+        assert!(
+            matches!(app.world().get::<Camera>(camera).unwrap().clear_color, ClearColorConfig::Custom(color) if color != terrain_sky_color())
+        );
+        assert!(!app.world().contains_resource::<AmbientLight>());
     }
 
     #[test]
@@ -15997,6 +17254,32 @@ mod terrain_tests {
                 (actual - expected).abs() < 1.0e-6,
                 "Bevy {channel} channel {actual} disagrees with core authority {expected}"
             );
+        }
+    }
+
+    #[test]
+    fn natural_body_emission_keeps_core_hue_and_accessibility_palettes() {
+        let agent = sample_agent_visual();
+        let params = canonical_agent_visual_params(&agent);
+        for palette in [
+            ColorPaletteMode::Natural,
+            ColorPaletteMode::Deuteranopia,
+            ColorPaletteMode::Protanopia,
+            ColorPaletteMode::Tritanopia,
+            ColorPaletteMode::HighContrast,
+        ] {
+            let (_, actual) = agent_colors_from_params(&params, palette);
+            let gain = if palette == ColorPaletteMode::Natural {
+                0.3
+            } else {
+                1.0
+            };
+            let expected = palette_hdr_emissive_from_srgb(
+                params.body_emissive,
+                params.body_emissive_gain * gain,
+                palette,
+            );
+            assert_eq!(actual, expected);
         }
     }
 
@@ -17423,12 +18706,16 @@ fn spawn_agent_entity(
         materials,
         Color::srgb(0.24, 0.52, 1.0),
         Color::linear_rgb(0.22, 0.58, 1.2),
-        AlphaMode::Add,
+        AlphaMode::Blend,
         true,
         true,
         Transform::IDENTITY,
     );
     commands.entity(root).add_child(selection.entity);
+    commands.entity(selection.entity).insert((
+        bevy::light::NotShadowCaster,
+        SelectionRingGroundContact { root },
+    ));
 
     let indicator = spawn_part(
         commands,
@@ -17602,7 +18889,12 @@ fn apply_agent_visuals(
     let stripe_color = srgb_from_vec_with_palette(stripe_rgb, 0.9, palette);
     let stripe_emissive = palette_hdr_emissive_from_srgb(
         visuals.stripe_emissive,
-        visuals.body_emissive_gain,
+        visuals.body_emissive_gain
+            * if palette == ColorPaletteMode::Natural {
+                0.6
+            } else {
+                1.0
+            },
         palette,
     );
     let stripe_transform = Transform::from_scale(Vec3::splat(scale_factor));
@@ -17788,17 +19080,26 @@ fn apply_agent_visuals(
     update_part_colors(materials, &record.ear_left, ear_color, ear_emissive);
     update_part_colors(materials, &record.ear_right, ear_color, ear_emissive);
 
-    let ring_radius_scale = Vec3::splat((body_radius * 1.45).max(0.1));
-    let ring_transform = Transform {
-        translation: Vec3::new(0.0, -body_radius * 0.82, 0.0),
-        rotation: Quat::from_rotation_x(FRAC_PI_2),
-        scale: ring_radius_scale,
-    };
-    update_part_transform(commands, &record.selection, ring_transform);
+    // The visible ring is positioned after pose smoothing by
+    // `conform_selection_ring`, which uses the displayed terrain contact.
     let (ring_alpha, ring_emissive_scale) = match agent.selection {
         SelectionState::None => (0.0, 0.0),
-        SelectionState::Hovered => (0.35, 0.65),
-        SelectionState::Selected => (0.65, 0.95),
+        SelectionState::Hovered => (
+            if palette == ColorPaletteMode::HighContrast {
+                0.8
+            } else {
+                0.35
+            },
+            0.65,
+        ),
+        SelectionState::Selected => (
+            if palette == ColorPaletteMode::HighContrast {
+                1.0
+            } else {
+                0.65
+            },
+            0.95,
+        ),
     };
     let ring_rgb = Vec3::from_array(visuals.selection_rim_color);
     let ring_color = srgb_from_vec_with_palette(ring_rgb, ring_alpha, palette);
@@ -18055,6 +19356,7 @@ struct GroundMeshSamples {
     body: GroundSupportMesh,
     wheel: GroundSupportMesh,
     spike: GroundSupportMesh,
+    selection_ring: GroundSupportMesh,
 }
 
 fn ground_mesh_samples() -> &'static GroundMeshSamples {
@@ -18105,6 +19407,7 @@ fn ground_mesh_samples() -> &'static GroundMeshSamples {
         GroundMeshSamples {
             body: support_mesh(Mesh::from(AGENT_BODY_CAPSULE), body_transform),
             wheel: support_mesh(Mesh::from(Torus::new(0.3, 0.6)), wheel_transform),
+            selection_ring: support_mesh(selection_ring_mesh(), Transform::IDENTITY),
             spike: support_mesh(
                 Mesh::from(Cone {
                     radius: 0.45,
@@ -18221,6 +19524,68 @@ fn include_ground_mesh(
 /// surface above the rendered terrain. The motion is vertical in world space,
 /// so lowering a wheel does not also slide its contact patch sideways on a
 /// slope. Limit suspension travel to keep the wheel attached to the chassis.
+/// Place the UI marker beneath the displayed creature, lifting it only as
+/// needed to keep its geometry above the rendered piecewise-triangular field.
+fn selection_ring_grounded_transform(
+    snapshot: &WorldSnapshot,
+    root: &Transform,
+    radius: f32,
+) -> Transform {
+    let body_radius = radius * 0.88;
+    let mut ring = Transform::from_xyz(0.0, -body_radius * 0.82, 0.0)
+        .with_scale(Vec3::splat((body_radius * 1.75).max(0.1)));
+    let position = Vec2::new(
+        root.translation.x + snapshot.world_size.x * 0.5,
+        snapshot.world_size.y * 0.5 - root.translation.z,
+    );
+    let mut support = f32::NEG_INFINITY;
+    include_ground_mesh(
+        &ground_mesh_samples().selection_ring,
+        ring,
+        root.rotation,
+        position,
+        &snapshot.terrain_height,
+        |offset| {
+            let point = position + Vec2::new(offset.x, -offset.z);
+            support = support.max(
+                sample_height_world(&snapshot.terrain_height, point, TERRAIN_HEIGHT_SCALE)
+                    - offset.y,
+            );
+        },
+    );
+    if support.is_finite() {
+        let lift = (support - root.translation.y + radius * 0.02).max(0.0);
+        // Move in world Y; a local-Y offset would drift sideways on a slope.
+        ring.translation += root.rotation.inverse() * Vec3::Y * lift;
+    }
+    ring
+}
+
+fn conform_selection_ring(
+    state: Res<SnapshotState>,
+    roots: Query<(&Transform, &AgentGroundFootprint), With<AgentDisplayPose>>,
+    mut rings: Query<
+        (&SelectionRingGroundContact, &mut Transform, &Visibility),
+        Without<AgentDisplayPose>,
+    >,
+) {
+    let Some(snapshot) = &state.latest else {
+        return;
+    };
+    for (contact, mut transform, visibility) in &mut rings {
+        if *visibility == Visibility::Hidden {
+            continue;
+        }
+        let Ok((root, footprint)) = roots.get(contact.root) else {
+            continue;
+        };
+        let target = selection_ring_grounded_transform(snapshot, root, footprint.radius);
+        if *transform != target {
+            *transform = target;
+        }
+    }
+}
+
 fn conform_agent_wheels(
     state: Res<SnapshotState>,
     roots: Query<(&Transform, &AgentGroundFootprint), With<AgentDisplayPose>>,
@@ -18445,8 +19810,18 @@ fn agent_colors_from_params(
     palette: ColorPaletteMode,
 ) -> (Color, Color) {
     let base = srgb_from_vec_with_palette(Vec3::from_array(params.body_color), 1.0, palette);
-    let emissive =
-        palette_hdr_emissive_from_srgb(params.body_emissive, params.body_emissive_gain, palette);
+    // Natural lighting should shape the shell rather than being overwhelmed
+    // by the dark-field emission designed for the legacy flat renderer.
+    let gain = if palette == ColorPaletteMode::Natural {
+        0.3
+    } else {
+        1.0
+    };
+    let emissive = palette_hdr_emissive_from_srgb(
+        params.body_emissive,
+        params.body_emissive_gain * gain,
+        palette,
+    );
     (base, emissive)
 }
 
@@ -18568,6 +19943,11 @@ mod tests {
             rng_seed: Some(0xBEEF_F00D),
             render: RenderSettings {
                 reduced_motion: Some(true),
+                day_night: Some(scriptbots_core::RenderDayNightSettings {
+                    cycle_ticks: Some(240),
+                    night_ambient: Some(0.4),
+                    ..Default::default()
+                }),
                 ..RenderSettings::default()
             },
             ..ScriptBotsConfig::default()
@@ -18583,6 +19963,8 @@ mod tests {
         // The owned-world projection has no playback controller; this host is paused.
         expected.paused = true;
         assert!(expected.reduced_motion);
+        assert!(expected.day_night_active);
+        assert_eq!(expected.night_ambient, 0.4);
         assert!(
             !expected.agents.is_empty(),
             "fixture must exercise visual fields"
@@ -18602,6 +19984,19 @@ mod tests {
         .expect("drawing host");
         let before = host.scientific_digest_v1().expect("initial digest").overall;
         let published = host.latest_snapshot();
+        let mut lighting_changed = (*published).clone();
+        let lighting_config = Arc::make_mut(&mut lighting_changed.config)
+            .render
+            .day_night
+            .as_mut()
+            .unwrap();
+        lighting_config.night_ambient = Some(0.7);
+        lighting_config.cycle_ticks = Some(0);
+        let changed_lighting =
+            WorldSnapshot::from_snapshot(&lighting_changed).expect("changed lighting settings");
+        assert!(!changed_lighting.day_night_active);
+        assert_eq!(changed_lighting.night_ambient, 0.7);
+        assert!(!changed_lighting.same_render_content(&expected));
         let mut motion_changed = (*published).clone();
         Arc::make_mut(&mut motion_changed.config)
             .render
@@ -19422,8 +20817,7 @@ mod tests {
     /// has `recenter_now: true`, and letting `..default()` supply it made the
     /// first version of this test assert against the value it had silently
     /// inherited. `follow_mode` does coincide with the default, because
-    /// `Selected` is the only honest starting point for clearing a selection;
-    /// the accepted-case control below is what proves the handler moves it.
+    /// `Selected` is the relevant starting point for clearing a selection.
     ///
     /// Fields are returned individually because `CameraRig` is not `Clone`, and
     /// a production type should not grow a derive to suit a test.
@@ -19467,20 +20861,142 @@ mod tests {
         assert!(!recenter_now, "a refused clear must not trigger a recentre");
     }
 
-    /// Positive control: an ACCEPTED clear does move the camera.
-    ///
-    /// Without this, the test above would pass equally well against a handler
-    /// that had simply stopped touching the camera at all.
+    /// Enqueueing does not prove that the owner applied the clear.
     #[test]
-    fn an_accepted_clear_selection_releases_the_camera() {
+    fn an_enqueued_clear_selection_keeps_the_camera_until_published() {
         let (follow_mode, pan, recenter_now) = clear_selection_button_camera_after(true);
         assert_eq!(
             follow_mode,
-            FollowMode::Off,
-            "an accepted clear stops following the now-cleared selection"
+            FollowMode::Selected,
+            "enqueueing alone does not prove the owner cleared the selection"
         );
-        assert_eq!(pan, Vec2::ZERO, "an accepted clear resets the pan");
-        assert!(recenter_now, "an accepted clear recentres");
+        assert_eq!(pan, STARTING_PAN);
+        assert!(!recenter_now);
+    }
+
+    #[test]
+    fn escape_clear_preserves_follow_until_selection_changes() {
+        for accepted in [false, true] {
+            let mut app = App::new();
+            let submitted = Arc::new(Mutex::new(Vec::new()));
+            let sink = submitted.clone();
+            let mut keys = ButtonInput::<KeyCode>::default();
+            keys.press(KeyCode::Escape);
+            app.insert_resource(keys)
+                .insert_resource(Messages::<MouseButtonInput>::default())
+                .insert_resource(SnapshotState::default())
+                .insert_resource(CameraRig {
+                    follow_mode: FollowMode::Selected,
+                    pan: STARTING_PAN,
+                    recenter_now: false,
+                    ..default()
+                })
+                .insert_resource(CommandSubmitter {
+                    submit: Arc::new(move |command| {
+                        sink.lock().unwrap().push(command);
+                        accepted.then(|| "queued-clear".to_owned())
+                    }),
+                })
+                .add_systems(Update, handle_selection_input);
+            app.update();
+            assert!(matches!(
+                submitted.lock().unwrap().as_slice(),
+                [ControlCommand::UpdateSelection(SelectionUpdate {
+                    mode: SelectionMode::Clear,
+                    ..
+                })]
+            ));
+            let rig = app.world().resource::<CameraRig>();
+            assert_eq!(rig.follow_mode, FollowMode::Selected);
+            assert_eq!(rig.pan, STARTING_PAN);
+            assert!(!rig.recenter_now);
+        }
+    }
+
+    #[test]
+    fn clear_button_keeps_view_until_published_selection_disappears() {
+        let world = WorldState::new(ScriptBotsConfig::default()).expect("world init");
+        let snapshot = WorldSnapshot::from_world(&world).expect("snapshot generation");
+        let followed = snapshot.world_size * 0.4;
+        let unrelated = snapshot.world_size * 0.8;
+        let submitted = Arc::new(Mutex::new(Vec::new()));
+        let sink = submitted.clone();
+        let mut app = App::new();
+        app.insert_resource(Time::<()>::default())
+            .insert_resource(ButtonInput::<MouseButton>::default())
+            .insert_resource(ButtonInput::<KeyCode>::default())
+            .insert_resource(Messages::<MouseMotion>::default())
+            .insert_resource(Messages::<MouseWheel>::default())
+            .insert_resource(CommandSubmitter {
+                submit: Arc::new(move |command| {
+                    sink.lock().unwrap().push(command);
+                    Some("queued-clear".to_owned())
+                }),
+            })
+            .insert_resource(CameraRig {
+                follow_mode: FollowMode::Selected,
+                focus_smoothed: followed,
+                recenter_now: false,
+                ..default()
+            })
+            .insert_resource(SnapshotState {
+                world_size: snapshot.world_size,
+                world_center: snapshot.world_size * 0.5,
+                focus_point: followed,
+                selection_center: Some(followed),
+                first_agent_position: Some(unrelated),
+                latest: Some(snapshot),
+                ..default()
+            })
+            .add_systems(
+                Update,
+                (handle_clear_selection_button, control_camera).chain(),
+            );
+        let camera = app
+            .world_mut()
+            .spawn((PrimaryCamera, Transform::default()))
+            .id();
+        let button = app
+            .world_mut()
+            .spawn((Button, ClearSelectionButton, Interaction::None))
+            .id();
+        app.update();
+        let before = *app.world().get::<Transform>(camera).unwrap();
+        *app.world_mut().get_mut::<Interaction>(button).unwrap() = Interaction::Pressed;
+        app.update();
+        assert!(matches!(
+            submitted.lock().unwrap().as_slice(),
+            [ControlCommand::UpdateSelection(SelectionUpdate {
+                mode: SelectionMode::Clear,
+                ..
+            })]
+        ));
+        assert_eq!(
+            app.world().resource::<CameraRig>().follow_mode,
+            FollowMode::Selected
+        );
+        assert!(
+            before
+                .translation
+                .distance(app.world().get::<Transform>(camera).unwrap().translation)
+                < 0.001
+        );
+
+        // A later published clear, not the enqueue, releases follow without a
+        // jump to the unrelated agent or the world focus.
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            state.selection_center = None;
+            state.focus_point = unrelated;
+        }
+        app.update();
+        assert_eq!(
+            app.world().resource::<CameraRig>().follow_mode,
+            FollowMode::Off
+        );
+        let after = app.world().get::<Transform>(camera).unwrap();
+        assert!(before.translation.distance(after.translation) < 0.001);
+        assert!(before.rotation.dot(after.rotation).abs() > 0.99999);
     }
 
     #[test]

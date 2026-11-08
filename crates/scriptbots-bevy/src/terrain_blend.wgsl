@@ -31,7 +31,18 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     let weights = clamp(in.uv_b, vec2<f32>(0.0), vec2<f32>(1.0));
     let rock_weight = max(0.0, 1.0 - weights.x - weights.y);
     let total = max(weights.x + weights.y + rock_weight, 0.00001);
-    let photo_detail = (textureSample(water_texture, water_sampler, in.uv).rgb * weights.x
+    let water_photo = textureSample(water_texture, water_sampler, in.uv).rgb;
+    let water_luminance = dot(water_photo, vec3<f32>(0.2126, 0.7152, 0.0722));
+    // The smallest mip is the average color of this image in linear light.
+    // Preserve the simulation's water hue and amplify the photo's deviations
+    // from its own mean instead of multiplying two already-dark colors.
+    let last_mip = i32(textureNumLevels(water_texture)) - 1;
+    let water_mean_rgb = textureLoad(water_texture, vec2<i32>(0, 0), last_mip).rgb;
+    let water_mean = dot(water_mean_rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+    let water_modulation = vec3<f32>(clamp(1.0 + (water_luminance - water_mean) * 25.0, 0.3, 1.8));
+    let natural_palette = clamp(dry_light_strength / 1.2, 0.0, 1.0);
+    let water_detail = mix(water_photo, water_modulation, natural_palette);
+    let photo_detail = (water_detail * weights.x
         + textureSample(grass_texture, grass_sampler, in.uv).rgb * weights.y
         + textureSample(rock_texture, rock_sampler, in.uv).rgb * rock_weight) / total;
     // Ease the dark photo modulation without washing out its local detail.
