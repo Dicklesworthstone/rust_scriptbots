@@ -2,10 +2,10 @@
 //!
 //! Verifies:
 //! - Shared pre-intervention digest and tick across all branches.
-//! - Exact-tick command application at checkpoint boundary.
+//! - Exact-tick command application at immediate and delayed boundaries.
 //! - First divergence tracing to exact tick and stage.
 //! - Extinction, recovery, and hysteresis quantitative measures.
-//! - Effect sizes, 95% bootstrap confidence intervals, and Monte Carlo p-values.
+//! - Descriptive single-seed comparisons without fabricated independent replicates or inference.
 //! - Self-contained run bundle creation and bounded canonical verification.
 //! - Retention of configs, commands, digests, reports, timings, and logs on disk.
 
@@ -13,10 +13,28 @@ use std::fs;
 use std::path::PathBuf;
 
 use scriptbots_app::branch_study::{
-    BranchStudyOrchestrator, BranchStudyPlan, BranchStudyReport, CooperationParams,
-    StudyBranchSpec, StudyIntervention,
+    BRANCH_STUDY_REPORT_SCHEMA_VERSION, BranchAnalysisBasis, BranchStudyOrchestrator,
+    BranchStudyPlan, BranchStudyReport, CooperationParams, StudyBranchSpec, StudyIntervention,
 };
+use serde::Deserialize;
 use tempfile::tempdir;
+
+#[derive(Debug, Deserialize)]
+struct PersistedSample {
+    tick: u64,
+    population: usize,
+    total_energy: f32,
+    average_health: f32,
+    digest: String,
+}
+
+fn read_samples(bundle: &str) -> Vec<PersistedSample> {
+    csv::Reader::from_path(PathBuf::from(bundle).join("exports/summary.csv"))
+        .expect("open persisted trajectory")
+        .deserialize()
+        .collect::<Result<Vec<_>, _>>()
+        .expect("decode persisted trajectory")
+}
 
 #[test]
 fn test_seeded_checkpoint_branch_intervention_study_e2e() {
@@ -58,13 +76,13 @@ fn test_seeded_checkpoint_branch_intervention_study_e2e() {
             },
             StudyBranchSpec {
                 branch_id: "resource_shock".to_string(),
-                description: "Immediate food bloom (+3.5 per cell)".to_string(),
+                description: "Delayed food bloom (+3.5 per cell)".to_string(),
                 intervention: Some(StudyIntervention::ResourceShock {
                     region: None,
                     bloom_amount: 3.5,
                     scorch: 0.0,
                 }),
-                scheduled_tick: Some(checkpoint_tick),
+                scheduled_tick: Some(checkpoint_tick + 4),
             },
             StudyBranchSpec {
                 branch_id: "temperature_shift".to_string(),
@@ -119,13 +137,25 @@ fn test_seeded_checkpoint_branch_intervention_study_e2e() {
     assert!(control_rep.command_applied_tick.is_none());
     assert!(control_rep.first_divergence.is_none());
     assert!(control_rep.bundle_verified);
+    assert_eq!(control_rep.recovery.baseline_tick, checkpoint_tick);
+    let control_samples = read_samples(control_rep.bundle_path.as_deref().unwrap());
+    assert_eq!(control_samples.len(), (horizon_ticks + 1) as usize);
+    assert!(control_samples[0].total_energy > 0.0);
+    assert!(control_samples[0].average_health.is_finite());
 
     // 3. Detailed checks for each intervention branch
     for branch_rep in &report.branch_reports[1..] {
+        let expected_due_tick = plan
+            .branches
+            .iter()
+            .find(|branch| branch.branch_id == branch_rep.branch_id)
+            .unwrap()
+            .scheduled_tick
+            .unwrap_or(checkpoint_tick);
         assert_eq!(
             branch_rep.command_applied_tick,
-            Some(checkpoint_tick),
-            "command must be applied at exact scheduled checkpoint tick"
+            Some(expected_due_tick),
+            "command must be applied at the declared completed boundary"
         );
 
         // First divergence tracing: must identify the exact tick and stage
@@ -135,8 +165,8 @@ fn test_seeded_checkpoint_branch_intervention_study_e2e() {
             .unwrap_or_else(|| panic!("branch `{}` must detect divergence", branch_rep.branch_id));
         assert_eq!(
             div.tick,
-            checkpoint_tick + 1,
-            "branch `{}` first divergence must manifest at the next tick after checkpoint",
+            expected_due_tick + 1,
+            "branch `{}` first divergence must manifest on the transition after its due boundary",
             branch_rep.branch_id
         );
         assert!(
@@ -177,7 +207,7 @@ fn test_seeded_checkpoint_branch_intervention_study_e2e() {
         assert!(branch_rep.hysteresis.terminal_trajectory_gap.is_finite());
         assert!(branch_rep.hysteresis.hysteresis_index.is_finite());
 
-        // Effect sizes and confidence intervals
+        // Repeated ticks from one seed remain descriptive observations, not independent replicates.
         assert!(branch_rep.effect_sizes.contains_key("population"));
         assert!(branch_rep.effect_sizes.contains_key("food_total"));
         assert!(branch_rep.effect_sizes.contains_key("total_energy"));
@@ -186,7 +216,17 @@ fn test_seeded_checkpoint_branch_intervention_study_e2e() {
         assert_eq!(pop_eff.n_samples, (horizon_ticks + 1) as usize);
         assert!(pop_eff.mean_diff.is_finite());
         assert!(pop_eff.sd_diff.is_finite());
-        assert!(pop_eff.p_value >= 0.0 && pop_eff.p_value <= 1.0);
+        for effect in branch_rep.effect_sizes.values() {
+            assert_eq!(
+                effect.analysis_basis,
+                BranchAnalysisBasis::SingleSeedTrajectory { seed: base_seed }
+            );
+            assert_eq!(effect.n_samples, (horizon_ticks + 1) as usize);
+            assert!(effect.ci_95.is_none());
+            assert!(effect.p_value.is_none());
+            assert!(effect.cohens_d.is_none());
+            assert!(effect.hedges_g.is_none());
+        }
 
         // Bundle verification
         assert!(
@@ -203,6 +243,48 @@ fn test_seeded_checkpoint_branch_intervention_study_e2e() {
         assert!(bundle_dir.join("bundle_manifest.json").exists());
         assert!(bundle_dir.join("exports/summary.csv").exists());
         assert!(bundle_dir.join("evidence/branch_evidence.json").exists());
+
+        let samples = read_samples(bundle_path_str);
+        assert_eq!(samples.len(), control_samples.len());
+        let baseline_index = (expected_due_tick - checkpoint_tick) as usize;
+        for (control, branch) in control_samples
+            .iter()
+            .zip(&samples)
+            .take(baseline_index + 1)
+        {
+            assert_eq!(control.tick, branch.tick);
+            assert_eq!(
+                control.digest, branch.digest,
+                "{} changed before its declared boundary {}",
+                branch_rep.branch_id, expected_due_tick
+            );
+        }
+        assert_ne!(
+            control_samples[baseline_index + 1].digest,
+            samples[baseline_index + 1].digest
+        );
+        assert_eq!(branch_rep.recovery.baseline_tick, expected_due_tick);
+        assert_eq!(
+            branch_rep.recovery.pre_intervention_population,
+            samples[baseline_index].population
+        );
+
+        let evidence: serde_json::Value = serde_json::from_slice(
+            &fs::read(bundle_dir.join("evidence/branch_evidence.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            evidence["schema_version"],
+            BRANCH_STUDY_REPORT_SCHEMA_VERSION
+        );
+        assert_eq!(evidence["command_applied_tick"], expected_due_tick);
+        for effect in evidence["effect_sizes"].as_object().unwrap().values() {
+            assert_eq!(effect["analysis_basis"]["kind"], "single_seed_trajectory");
+            assert!(effect.get("ci_95").is_none());
+            assert!(effect.get("p_value").is_none());
+            assert!(effect.get("cohens_d").is_none());
+            assert!(effect.get("hedges_g").is_none());
+        }
     }
 
     // 4. Retained disk artifacts
@@ -228,6 +310,10 @@ fn test_seeded_checkpoint_branch_intervention_study_e2e() {
     let deserialized_report: BranchStudyReport =
         serde_json::from_str(&read_report_json).expect("report json must deserialize validly");
     assert_eq!(deserialized_report.study_id, "e2e_causal_interventions");
+    assert_eq!(
+        deserialized_report.schema_version,
+        BRANCH_STUDY_REPORT_SCHEMA_VERSION
+    );
     assert_eq!(deserialized_report.branch_reports.len(), 6);
 
     let summary_md = fs::read_to_string(&summary_md_path).expect("read summary md");
@@ -237,4 +323,7 @@ fn test_seeded_checkpoint_branch_intervention_study_e2e() {
     assert!(
         summary_md.contains("**Pre-Intervention Digest Verified Across All Branches**: `true`")
     );
+    assert!(summary_md.contains("One independent matched seed pair"));
+    assert!(summary_md.contains("Repeated ticks are not independent replicates"));
+    assert!(!summary_md.contains("Pop Mean Diff (95% CI)"));
 }

@@ -3665,6 +3665,10 @@ clean source-status and source-diff digests plus Cargo.lock digest
 
 ### 7.7 experiment runner
 
+[Currently In Progress — Codex, 2026-11-08: make ordered intervention schedules
+an explicit Lab treatment axis, preserve them through execution and notebook
+provenance, and reproduce valid scheduled cohorts with exact plan/evidence checks.]
+
 **Source implementation extension — Codex, 2026-11-06 UTC:** Lab proposals now
 expose installed brain families as a bounded treatment axis. Typed expanded arms
 use the runner's canonical family resolver, include the family/configuration product
@@ -5953,6 +5957,19 @@ resume, replay, and first-divergence verification remain separate open work in t
 **Exit:** UI and exported report explain one observed evolutionary change.
 
 #### 4.5 intervention studies
+
+**Source correctness extension — Codex, 2026-11-08:** Branch studies now apply
+interventions at their declared completed-tick boundaries, reject unobservable
+or overflowing schedules, and compare divergence against the control at the
+same tick. Initial energy/health and recovery baselines come from observed state.
+Report schema 2 declares a single-seed trajectory basis and omits inferential
+statistics that would incorrectly treat repeated ticks as independent trials.
+The independent-pair helper rejects mismatched/non-finite inputs. Timing, digest,
+report and real-study regression source is included; native DSR qualification
+remains pending because the pinned FrankenSQLite dependency's SQLite submodule
+was unavailable in the offline baseline and shared storage prevented completing
+the online dependency fetch. Bundle verification remains artifact integrity,
+not a complete application-owner restore or replay qualification.
 
 - [Completed — bd-tygg, TurquoiseLake, 2026-09-05, pinned DSR37 at 3c3ae1d] Preserve refused migration
   payloads and report interrupted transfers from observed ownership. Returning home is a new

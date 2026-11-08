@@ -754,6 +754,28 @@ Deterministic, staged tick pipeline (six seeded, domain-separated RNG streams; e
 - Both V1 and trace validation prove protocol self-consistency, not artifact authenticity. Their FNV-1a64 hashes are diagnostic first-divergence aids, not signatures or collision-resistant attestations; a durable run bundle will require separate provenance/authentication.
 - DeathCleanup and Population retain the ordered queue state immediately before consumption, while the final completed-boundary V1 and resource report prove traced/untraced parity after finalization. The literal six-point golden is enabled only by the `SCRIPTBOTS_WORLD_DIGEST_GOLDEN=1` environment guard in its pinned DSR test lane, so ordinary `--all-features` tests remain portable; there is no product CLI or replay-file claim yet.
 
+#### Paired checkpoint branch studies
+
+The library's `branch_study::BranchStudyOrchestrator` restores each branch from
+one shared checkpoint. An intervention's `scheduled_tick` names the completed
+boundary after which it applies, before the next transition. It must fall in
+`[checkpoint_tick, checkpoint_tick + horizon_ticks)`; omitting it applies at the
+checkpoint. The report records the observed application tick. Divergence compares
+control and treatment digests at the same tick and identifies a differing digest
+lane, without claiming to identify an internal transition stage.
+
+Branch reports use schema **2**. Each comparison declares
+`analysis_basis.kind = "single_seed_trajectory"`: one seed supplies one independent
+pair, even when many ticks are recorded. The report includes trajectory mean
+differences and temporal spread, and omits confidence intervals, standardized
+inferential effects and p-values. Recovery and extinction use the observed
+population at the actual intervention boundary. The separate
+`compute_paired_effect` helper accepts independent matched replicates and now
+returns a `Result`, refusing unequal or non-finite observations.
+
+Branch bundle verification checks retained artifact integrity. It does not claim
+to restore a complete application owner or reproduce the study from the bundle.
+
 #### Reproducible runs (seed control)
 - Set a fixed seed in config: `rng_seed = <u64>`. At runtime you can apply via REST:
   ```json

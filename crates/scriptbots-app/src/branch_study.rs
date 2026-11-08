@@ -12,19 +12,22 @@
 //!    from that identical checkpoint using a freshly prepared, bit-identical [`scriptbots_core::BrainRegistry`].
 //!    Every branch asserts and verifies `restored_digest == pre_intervention_digest` before any
 //!    intervention occurs.
-//! 3. **Exact Command Timing**: Interventions are applied at the exact scheduled tick boundary
-//!    (`checkpoint_tick`).
+//! 3. **Exact Command Timing**: Interventions are applied after the completed scheduled tick
+//!    boundary (defaulting to `checkpoint_tick`), before the transition to the next tick.
 //! 4. **First Divergence Tracing**: For every intervention branch, simulation transitions are traced
-//!    tick-by-tick against the control branch to locate the exact tick and specific pipeline lane/stage
+//!    tick-by-tick against the control branch to locate the first observed tick and differing digest lane
 //!    (e.g., `effects`, `config`, `food`, `agents`) where divergence first occurred.
 //! 5. **Quantitative Outcome Measures**:
 //!    - **Extinction**: Detects population collapse, records time to extinction, and minimum population.
 //!    - **Recovery**: Evaluates post-perturbation rebound against pre-intervention baseline and trough.
 //!    - **Hysteresis**: Evaluates path dependency, integrated trajectory deficit, and persistent terminal gap.
-//!    - **Effect Sizes & Uncertainty**: Computes paired mean differences, Cohen's $d$, Hedges' $g$,
-//!      95% bootstrap confidence intervals, and exact Monte Carlo sign-flip permutation p-values.
-//! 6. **Verifiable Run Bundles**: Every branch generates a self-contained artifact bundle validated
-//!    via bounded canonical verification ([`scriptbots_storage::verify_run_bundle_bounded`]).
+//!    - **Descriptive Trajectory Comparisons**: Computes paired mean differences and their temporal
+//!      standard deviation across the recorded horizon. One seed provides one independent pair;
+//!      repeated ticks do not justify confidence intervals or significance tests. The separate
+//!      [`compute_paired_effect`] helper supports inference for independent paired replicates.
+//! 6. **Verifiable Artifact Bundles**: Every branch packages its metrics and evidence, then checks
+//!    bounded manifest/artifact integrity ([`scriptbots_storage::verify_run_bundle_bounded`]). This
+//!    does not establish that the bundle contains a restorable simulation owner checkpoint.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -34,8 +37,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use rand::{Rng, SeedableRng};
 use scriptbots_core::{
-    BrainRegistry, ControlCommand, Intervention, Region, ScriptBotsConfig, WorldCheckpointError,
-    WorldDigestV1, WorldState, WorldStateError, apply_control_command,
+    BrainRegistry, ControlCommand, DynamicWorldSnapshot, Intervention, Region, ScriptBotsConfig,
+    WorldCheckpointError, WorldDigestV1, WorldState, WorldStateError, apply_control_command,
 };
 use scriptbots_runtime::RunId;
 use scriptbots_storage::{
@@ -48,6 +51,9 @@ use thiserror::Error;
 use crate::brains::{BrainPreset, install_brains};
 use crate::lab::stats::bootstrap_ci;
 use crate::{resolve_scheduled_config_patch, seed_founding_population};
+
+/// Report revision with observed command boundaries and an explicit statistical analysis basis.
+pub const BRANCH_STUDY_REPORT_SCHEMA_VERSION: u16 = 2;
 
 /// Specific intervention perturbations for branch studies.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -277,7 +283,9 @@ pub struct StudyBranchSpec {
     pub description: String,
     /// Intervention to apply. `None` defines an unperturbed Control branch.
     pub intervention: Option<StudyIntervention>,
-    /// Optional scheduled tick override (defaults to `plan.checkpoint_tick`).
+    /// Completed boundary after which the intervention is applied, before the next tick.
+    /// Defaults to `plan.checkpoint_tick`; must precede the final observed tick.
+    /// Unperturbed control branches cannot declare a scheduled tick.
     pub scheduled_tick: Option<u64>,
 }
 
@@ -290,7 +298,7 @@ pub struct BranchStudyPlan {
     pub description: String,
     /// Base RNG seed used for founding population and world initialization.
     pub base_seed: u64,
-    /// Simulation tick at which baseline is snapshotted and branches diverge.
+    /// Simulation tick at which the shared baseline is snapshotted.
     pub checkpoint_tick: u64,
     /// Number of simulation ticks to run each branch post-checkpoint.
     pub horizon_ticks: u64,
@@ -303,6 +311,27 @@ pub struct BranchStudyPlan {
 }
 
 impl BranchStudyPlan {
+    fn final_tick(&self) -> Result<u64, BranchStudyError> {
+        self.checkpoint_tick
+            .checked_add(self.horizon_ticks)
+            .ok_or_else(|| {
+                BranchStudyError::InvalidPlan(
+                    "checkpoint_tick + horizon_ticks exceeds the u64 tick range".to_string(),
+                )
+            })
+    }
+
+    fn sample_count(&self) -> Result<usize, BranchStudyError> {
+        usize::try_from(self.horizon_ticks)
+            .ok()
+            .and_then(|ticks| ticks.checked_add(1))
+            .ok_or_else(|| {
+                BranchStudyError::InvalidPlan(
+                    "the study horizon exceeds the addressable trajectory length".to_string(),
+                )
+            })
+    }
+
     /// Create a standard 5-branch study plus control covering:
     /// Drought, ResourceShock, TemperatureShift, ClosedWorld, and Cooperation.
     #[must_use]
@@ -394,28 +423,36 @@ pub struct BranchTickSample {
     pub population: usize,
     /// Total ground food remaining across the world.
     pub food_total: f64,
-    /// Offspring born during this tick.
+    /// Offspring born since the preceding study sample; zero at the checkpoint sample.
     pub births: usize,
-    /// Agent deaths during this tick.
+    /// Agent deaths since the preceding study sample; zero at the checkpoint sample.
     pub deaths: usize,
     /// Sum of all agent energy.
     pub total_energy: f32,
-    /// Mean health across living agents.
+    /// Mean health across living agents (zero for an empty population, as in core summaries).
     pub average_health: f32,
-    /// Spike hits recorded during this tick.
+    /// Spike hits since the preceding study sample; zero at the checkpoint sample.
     pub spike_hits: u32,
-    /// Canonical BLAKE3 world digest hex.
+    /// Canonical overall world digest under the core's declared digest protocol.
     pub digest_overall: String,
 }
 
-/// Record of the exact tick and stage where a branch diverged from Control.
+/// Keep lane evidence attached to its observed metrics without expanding the CSV schema.
+#[derive(Debug, Clone)]
+struct BranchObservation {
+    sample: BranchTickSample,
+    digest: WorldDigestV1,
+}
+
+/// Record of the first observed tick and differing digest lane against Control at that same tick.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FirstDivergence {
     /// Identifier of the diverged branch.
     pub branch_id: String,
     /// First simulation tick where the world digest differed from Control.
     pub tick: u64,
-    /// First pipeline lane/stage that differed (`config`, `effects`, `food`, `agents`, etc.).
+    /// First differing digest lane in diagnostic order (`config`, `effects`, `food`, `agents`, etc.).
+    /// This does not claim to locate the first internal transition within that tick.
     pub stage: String,
     /// Control world lane hash at divergence.
     pub control_digest: String,
@@ -430,11 +467,11 @@ pub struct FirstDivergence {
 /// Extinction outcome assessment for a branch.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExtinctionMeasure {
-    /// Whether the population reached 0 at any point post-intervention.
+    /// Whether the population was 0 at or after the recovery baseline boundary.
     pub extinct: bool,
     /// First tick where population reached 0 (if extinct).
     pub extinction_tick: Option<u64>,
-    /// Minimum population observed during the post-intervention horizon.
+    /// Minimum population from the intervention boundary through the final tick (checkpoint for controls).
     pub min_population: usize,
     /// Final population at the end of the horizon.
     pub final_population: usize,
@@ -443,9 +480,11 @@ pub struct ExtinctionMeasure {
 /// Population recovery assessment for a branch.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RecoveryMeasure {
-    /// Population at the checkpoint boundary before intervention.
+    /// Intervention boundary before the command was applied, or checkpoint boundary for controls.
+    pub baseline_tick: u64,
+    /// Observed population at `baseline_tick` before intervention.
     pub pre_intervention_population: usize,
-    /// Minimum population reached during the post-intervention horizon.
+    /// Minimum population from `baseline_tick` through the final tick.
     pub trough_population: usize,
     /// Simulation tick at which trough occurred.
     pub trough_tick: u64,
@@ -470,29 +509,52 @@ pub struct HysteresisMeasure {
     pub terminal_trajectory_gap: f64,
     /// Ratio of terminal gap to peak gap during horizon.
     pub hysteresis_index: f64,
-    /// Whether significant path dependency / persistent deficit was detected (> 5% terminal gap).
+    /// Whether the absolute terminal gap exceeded the descriptive 5% threshold (not a significance test).
     pub path_dependence_detected: bool,
 }
 
-/// Paired effect size comparison against Control.
+/// Statistical unit represented by a paired comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BranchAnalysisBasis {
+    /// Repeated observations of one matched seed pair; no replicated inference is supported.
+    SingleSeedTrajectory {
+        /// The sole independent simulation seed in this comparison.
+        seed: u64,
+    },
+    /// Independently sampled matched replicates supplied by the caller.
+    IndependentPairedReplicates {
+        /// Number of independent pairs, not the number of observations within a run.
+        pairs: usize,
+    },
+}
+
+/// Paired comparison against Control with an explicit distinction between description and inference.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BranchEffectSize {
     /// Name of the metric (e.g. "population", "food_total").
     pub metric: String,
-    /// Number of paired sample points across the post-intervention horizon.
+    /// Statistical unit and independence assumptions behind these observations.
+    pub analysis_basis: BranchAnalysisBasis,
+    /// Number of paired observations. For trajectories this includes the checkpoint and all recorded
+    /// timepoints, including any before a delayed intervention; it is not an independent replicate count.
     pub n_samples: usize,
     /// Mean difference (branch minus control).
     pub mean_diff: f64,
     /// Sample standard deviation of differences.
     pub sd_diff: f64,
-    /// Standardized effect size Cohen's d (None if variance is zero).
+    /// Cohen's d for independent pairs (absent for trajectories or zero variance).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cohens_d: Option<f64>,
-    /// Bias-corrected Hedges' g (None if variance is zero).
+    /// Bias-corrected Hedges' g for independent pairs (absent for trajectories or zero variance).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub hedges_g: Option<f64>,
-    /// 95% bootstrap confidence interval of the mean difference.
+    /// 95% bootstrap interval of the mean difference across independent pairs; absent for trajectories.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ci_95: Option<(f64, f64)>,
-    /// Exact Monte Carlo sign-flip permutation p-value.
-    pub p_value: f64,
+    /// Monte Carlo sign-flip p-value for independent pairs; absent for trajectories or fewer than two pairs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub p_value: Option<f64>,
 }
 
 /// Detailed outcome report for a single branch.
@@ -512,13 +574,14 @@ pub struct BranchOutcomeReport {
     pub recovery: RecoveryMeasure,
     /// Hysteresis measure.
     pub hysteresis: HysteresisMeasure,
-    /// Metric effect sizes compared to Control.
+    /// Descriptive metric comparisons against Control over the entire recorded trajectory.
     pub effect_sizes: BTreeMap<String, BranchEffectSize>,
     /// Final world digest overall hash.
     pub final_digest: String,
-    /// Path to verified run bundle directory.
+    /// Path to the metrics/evidence artifact bundle directory.
     pub bundle_path: Option<String>,
-    /// Whether the bundle passed bounded verification.
+    /// Whether the bundle passed bounded manifest/artifact integrity verification.
+    /// This does not establish executable checkpoint reconstruction.
     pub bundle_verified: bool,
 }
 
@@ -527,7 +590,7 @@ pub struct BranchOutcomeReport {
 pub struct BranchStudyReport {
     /// Study identifier.
     pub study_id: String,
-    /// Schema version (1).
+    /// Schema version ([`BRANCH_STUDY_REPORT_SCHEMA_VERSION`]).
     pub schema_version: u16,
     /// Base seed used.
     pub base_seed: u64,
@@ -553,6 +616,9 @@ pub enum BranchStudyError {
     /// Plan validation error.
     #[error("study plan validation failed: {0}")]
     InvalidPlan(String),
+    /// Paired observations are incomplete, unaligned, or non-finite.
+    #[error("invalid paired comparison: {0}")]
+    InvalidComparison(String),
     /// Intervention parameter error.
     #[error("branch `{branch_id}` intervention is invalid: {reason}")]
     InvalidIntervention {
@@ -617,7 +683,7 @@ pub fn create_brain_registry(preset: BrainPreset) -> Result<BrainRegistry, Branc
         .map_err(|e| BranchStudyError::Registry(e.to_string()))
 }
 
-/// Compare two world digests and return the first differing pipeline stage and lane values.
+/// Compare two world digests and return the first differing lane in fixed diagnostic order.
 #[must_use]
 pub fn find_first_divergence_stage(
     control: &WorldDigestV1,
@@ -638,11 +704,31 @@ pub fn find_first_divergence_stage(
     if control.terrain != branch.terrain {
         return Some(("terrain", control.terrain.clone(), branch.terrain.clone()));
     }
+    if control.hydrology != branch.hydrology {
+        return Some((
+            "hydrology",
+            control
+                .hydrology
+                .clone()
+                .unwrap_or_else(|| "absent".to_string()),
+            branch
+                .hydrology
+                .clone()
+                .unwrap_or_else(|| "absent".to_string()),
+        ));
+    }
     if control.agents != branch.agents {
         return Some(("agents", control.agents.clone(), branch.agents.clone()));
     }
     if control.brains != branch.brains {
         return Some(("brains", control.brains.clone(), branch.brains.clone()));
+    }
+    if control.brain_registry != branch.brain_registry {
+        return Some((
+            "brain_registry",
+            control.brain_registry.clone(),
+            branch.brain_registry.clone(),
+        ));
     }
     if control.counters != branch.counters {
         return Some((
@@ -671,78 +757,110 @@ pub fn find_first_divergence_stage(
     Some(("overall", control.overall.clone(), branch.overall.clone()))
 }
 
-/// Compute paired effect size and uncertainty between control series and branch series.
-#[must_use]
+/// Compute effect size and uncertainty across independent matched replicates.
+///
+/// Each paired entry must summarize a separate independent experimental replicate, for example
+/// the final endpoint from one matched seed. Consecutive ticks of one trajectory are not replicates.
+///
+/// # Errors
+///
+/// Returns [`BranchStudyError::InvalidComparison`] for unequal lengths or non-finite observations
+/// or reductions. Fewer than two pairs produce descriptive values with no inferential statistics.
 pub fn compute_paired_effect(
     control: &[f64],
     branch: &[f64],
     metric_name: &str,
     seed: u64,
-) -> BranchEffectSize {
-    let n = control.len().min(branch.len());
-    if n == 0 {
-        return BranchEffectSize {
-            metric: metric_name.to_string(),
-            n_samples: 0,
-            mean_diff: 0.0,
-            sd_diff: 0.0,
-            cohens_d: None,
-            hedges_g: None,
-            ci_95: None,
-            p_value: 1.0,
-        };
+) -> Result<BranchEffectSize, BranchStudyError> {
+    let (mut effect, diffs) = describe_paired_effect(
+        control,
+        branch,
+        metric_name,
+        BranchAnalysisBasis::IndependentPairedReplicates {
+            pairs: control.len(),
+        },
+    )?;
+    if effect.n_samples < 2 {
+        return Ok(effect);
     }
 
-    let diffs: Vec<f64> = (0..n).map(|i| branch[i] - control[i]).collect();
-    let sum_diff: f64 = diffs.iter().sum();
-    let mean_diff = sum_diff / n as f64;
-
-    if n < 2 {
-        return BranchEffectSize {
-            metric: metric_name.to_string(),
-            n_samples: n,
-            mean_diff,
-            sd_diff: 0.0,
-            cohens_d: None,
-            hedges_g: None,
-            ci_95: None,
-            p_value: 1.0,
-        };
-    }
-
-    let var_diff: f64 = diffs
-        .iter()
-        .map(|&d| {
-            let delta = d - mean_diff;
-            delta * delta
-        })
-        .sum::<f64>()
-        / (n - 1) as f64;
-    let sd_diff = var_diff.sqrt();
-
-    let (cohens_d, hedges_g) = if sd_diff > 1e-12 {
-        let d = mean_diff / sd_diff;
+    if effect.sd_diff > 1e-12 {
+        let d = effect.mean_diff / effect.sd_diff;
         #[allow(clippy::cast_precision_loss)]
-        let df = (n - 1) as f64;
+        let df = (effect.n_samples - 1) as f64;
         let j = 1.0 - 3.0 / (4.0 * df - 1.0).max(1.0);
-        (Some(d), Some(d * j))
-    } else {
-        (None, None)
-    };
-
-    let ci_95 = bootstrap_ci(&diffs, 1_000, seed).ok();
-    let p_value = monte_carlo_sign_flip_p_value(&diffs, 1_000, seed);
-
-    BranchEffectSize {
-        metric: metric_name.to_string(),
-        n_samples: n,
-        mean_diff,
-        sd_diff,
-        cohens_d,
-        hedges_g,
-        ci_95,
-        p_value,
+        effect.cohens_d = Some(d);
+        effect.hedges_g = Some(d * j);
     }
+    effect.ci_95 = Some(bootstrap_ci(&diffs, 1_000, seed).map_err(|error| {
+        BranchStudyError::InvalidComparison(format!("{metric_name} bootstrap failed: {error}"))
+    })?);
+    effect.p_value = Some(monte_carlo_sign_flip_p_value(&diffs, 1_000, seed));
+    Ok(effect)
+}
+
+fn describe_paired_effect(
+    control: &[f64],
+    branch: &[f64],
+    metric_name: &str,
+    analysis_basis: BranchAnalysisBasis,
+) -> Result<(BranchEffectSize, Vec<f64>), BranchStudyError> {
+    if control.len() != branch.len() {
+        return Err(BranchStudyError::InvalidComparison(format!(
+            "metric `{metric_name}` has {} control observations and {} branch observations",
+            control.len(),
+            branch.len()
+        )));
+    }
+    let diffs = control
+        .iter()
+        .zip(branch)
+        .enumerate()
+        .map(|(index, (&control, &branch))| {
+            let difference = branch - control;
+            if !control.is_finite() || !branch.is_finite() || !difference.is_finite() {
+                return Err(BranchStudyError::InvalidComparison(format!(
+                    "metric `{metric_name}` has a non-finite pair at index {index}"
+                )));
+            }
+            Ok(difference)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let n_samples = diffs.len();
+    let mean_diff = if n_samples == 0 {
+        0.0
+    } else {
+        diffs.iter().sum::<f64>() / n_samples as f64
+    };
+    let sd_diff = if n_samples < 2 {
+        0.0
+    } else {
+        (diffs
+            .iter()
+            .map(|&diff| (diff - mean_diff).powi(2))
+            .sum::<f64>()
+            / (n_samples - 1) as f64)
+            .sqrt()
+    };
+    if !mean_diff.is_finite() || !sd_diff.is_finite() {
+        return Err(BranchStudyError::InvalidComparison(format!(
+            "metric `{metric_name}` produced a non-finite paired reduction"
+        )));
+    }
+    Ok((
+        BranchEffectSize {
+            metric: metric_name.to_string(),
+            analysis_basis,
+            n_samples,
+            mean_diff,
+            sd_diff,
+            cohens_d: None,
+            hedges_g: None,
+            ci_95: None,
+            p_value: None,
+        },
+        diffs,
+    ))
 }
 
 /// Compute a two-sided Monte Carlo sign-flip permutation p-value for the paired difference mean.
@@ -810,6 +928,8 @@ impl BranchStudyOrchestrator {
                 "horizon_ticks must be >= 1".to_string(),
             ));
         }
+        let final_tick = self.plan.final_tick()?;
+        self.plan.sample_count()?;
         if !self.plan.branches.iter().any(|b| b.intervention.is_none()) {
             return Err(BranchStudyError::MissingControlBranch);
         }
@@ -840,8 +960,20 @@ impl BranchStudyOrchestrator {
                 )));
             }
             if let Some(intervention) = &branch.intervention {
+                let due_tick = branch.scheduled_tick.unwrap_or(self.plan.checkpoint_tick);
+                if due_tick < self.plan.checkpoint_tick || due_tick >= final_tick {
+                    return Err(BranchStudyError::InvalidPlan(format!(
+                        "branch `{}` scheduled boundary {due_tick} must be in [{}, {final_tick}) so its next transition is observed",
+                        branch.branch_id, self.plan.checkpoint_tick
+                    )));
+                }
                 intervention
                     .validate(self.plan.config.world_width, self.plan.config.world_height)?;
+            } else if branch.scheduled_tick.is_some() {
+                return Err(BranchStudyError::InvalidPlan(format!(
+                    "control branch `{}` cannot schedule an absent intervention",
+                    branch.branch_id
+                )));
             }
         }
 
@@ -939,7 +1071,7 @@ impl BranchStudyOrchestrator {
 
         let report = BranchStudyReport {
             study_id: self.plan.study_id.clone(),
-            schema_version: 1,
+            schema_version: BRANCH_STUDY_REPORT_SCHEMA_VERSION,
             base_seed: self.plan.base_seed,
             checkpoint_tick: self.plan.checkpoint_tick,
             horizon_ticks: self.plan.horizon_ticks,
@@ -963,14 +1095,60 @@ impl BranchStudyOrchestrator {
         Ok(report)
     }
 
+    fn validate_control_observations(
+        &self,
+        observations: &[BranchObservation],
+        expected_pre_digest: &str,
+    ) -> Result<(), BranchStudyError> {
+        let expected_count = self.plan.sample_count()?;
+        if observations.len() != expected_count {
+            return Err(BranchStudyError::InvalidComparison(format!(
+                "control trajectory contains {} observations; expected {expected_count}",
+                observations.len()
+            )));
+        }
+        for (offset, observation) in observations.iter().enumerate() {
+            let expected_tick = self.plan.checkpoint_tick + offset as u64;
+            let digest = &observation.digest;
+            if observation.sample.tick != expected_tick
+                || digest.tick.0 != expected_tick
+                || observation.sample.digest_overall != digest.overall
+            {
+                return Err(BranchStudyError::InvalidComparison(format!(
+                    "control observation {offset} does not describe the exact boundary {expected_tick}"
+                )));
+            }
+            digest.validate_contract().map_err(|error| {
+                BranchStudyError::InvalidComparison(format!(
+                    "control digest at tick {expected_tick} is invalid: {error}"
+                ))
+            })?;
+            if !digest.evaluator_state_covered || !digest.factory_state_covered {
+                return Err(BranchStudyError::InvalidComparison(format!(
+                    "control digest at tick {expected_tick} does not cover the complete brain state"
+                )));
+            }
+        }
+        if observations[0].digest.overall != expected_pre_digest {
+            return Err(BranchStudyError::InvalidComparison(
+                "control trajectory does not begin at the shared checkpoint digest".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     fn run_branch(
         &self,
         branch: &StudyBranchSpec,
         checkpoint: &scriptbots_core::WorldCheckpointV1,
         expected_pre_digest: &str,
-        control_samples: Option<&[BranchTickSample]>,
+        control_samples: Option<&[BranchObservation]>,
         cancellation: Option<&AtomicBool>,
-    ) -> Result<(Vec<BranchTickSample>, BranchOutcomeReport), BranchStudyError> {
+    ) -> Result<(Vec<BranchObservation>, BranchOutcomeReport), BranchStudyError> {
+        self.plan.final_tick()?;
+        if let Some(control) = control_samples {
+            self.validate_control_observations(control, expected_pre_digest)?;
+        }
         // Restore from shared checkpoint.
         let brain_registry = create_brain_registry(self.plan.brain_preset)?;
         let mut branch_world = WorldState::restore_checkpoint_v1(checkpoint, brain_registry)?;
@@ -990,8 +1168,14 @@ impl BranchStudyOrchestrator {
             });
         }
 
-        let pre_intervention_pop = branch_world.agent_count();
-        let mut samples = Vec::with_capacity((self.plan.horizon_ticks + 1) as usize);
+        let mut samples = Vec::new();
+        samples
+            .try_reserve_exact(self.plan.sample_count()?)
+            .map_err(|error| {
+                BranchStudyError::InvalidPlan(format!(
+                    "cannot retain the study trajectory: {error}"
+                ))
+            })?;
 
         // Record sample at checkpoint_tick.
         let initial_food = branch_world
@@ -1000,38 +1184,45 @@ impl BranchStudyOrchestrator {
             .iter()
             .map(|&c| f64::from(c))
             .sum::<f64>();
-        samples.push(BranchTickSample {
-            tick: self.plan.checkpoint_tick,
-            population: pre_intervention_pop,
-            food_total: initial_food,
-            births: 0,
-            deaths: 0,
-            total_energy: 0.0,
-            average_health: 1.0,
-            spike_hits: 0,
-            digest_overall: restored_digest.overall.clone(),
+        let initial_summary = DynamicWorldSnapshot::from_world(&branch_world)
+            .map_err(|error| BranchStudyError::SimulationStep {
+                tick: self.plan.checkpoint_tick,
+                reason: format!("failed to observe checkpoint state: {error}"),
+            })?
+            .summary;
+        samples.push(BranchObservation {
+            sample: BranchTickSample {
+                tick: self.plan.checkpoint_tick,
+                population: initial_summary.agent_count,
+                food_total: initial_food,
+                births: 0,
+                deaths: 0,
+                total_energy: initial_summary.total_energy,
+                average_health: initial_summary.average_health,
+                spike_hits: 0,
+                digest_overall: restored_digest.overall.clone(),
+            },
+            digest: restored_digest,
         });
 
-        // Apply scheduled intervention at checkpoint_tick if configured.
-        let command_applied_tick = if let Some(intervention) = &branch.intervention {
-            self.apply_intervention(&mut branch_world, intervention)?;
-            Some(branch.scheduled_tick.unwrap_or(self.plan.checkpoint_tick))
-        } else {
-            None
-        };
+        let due_tick = branch.scheduled_tick.unwrap_or(self.plan.checkpoint_tick);
+        let mut command_applied_tick = None;
 
         // Step through the horizon.
         let mut first_divergence: Option<FirstDivergence> = None;
-        let mut min_population = pre_intervention_pop;
-        let mut trough_population = pre_intervention_pop;
-        let mut trough_tick = self.plan.checkpoint_tick;
-        let mut extinction_tick: Option<u64> = None;
-
         for step in 1..=self.plan.horizon_ticks {
             if let Some(cancel) = cancellation
                 && cancel.load(Ordering::Relaxed)
             {
                 return Err(BranchStudyError::Cancelled);
+            }
+            let boundary_tick = branch_world.tick().0;
+            if boundary_tick == due_tick
+                && let Some(intervention) = &branch.intervention
+            {
+                self.apply_intervention(&mut branch_world, intervention)?;
+                // Record the boundary observed from the world, only after successful application.
+                command_applied_tick = Some(boundary_tick);
             }
             let current_tick = self.plan.checkpoint_tick + step;
             let outcome =
@@ -1059,65 +1250,84 @@ impl BranchStudyOrchestrator {
             let summary = &outcome.outcome.summary;
             let pop = summary.agent_count;
 
-            if pop < min_population {
-                min_population = pop;
-            }
-            if pop < trough_population {
-                trough_population = pop;
-                trough_tick = current_tick;
-            }
-            if pop == 0 && extinction_tick.is_none() {
-                extinction_tick = Some(current_tick);
-            }
-
             // Check first divergence against control if control samples are available.
             if let Some(ctrl_list) = control_samples
                 && first_divergence.is_none()
-                && let Some(ctrl_sample) = ctrl_list.get(step as usize)
-                && ctrl_sample.digest_overall != digest.overall
+                && let Some((stage, ctrl_lane, br_lane)) =
+                    find_first_divergence_stage(&ctrl_list[step as usize].digest, &digest)
             {
-                let stage_info = find_first_divergence_stage(checkpoint.source_digest(), &digest);
-                let (stage, ctrl_lane, br_lane) = stage_info.unwrap_or((
-                    "overall",
-                    ctrl_sample.digest_overall.clone(),
-                    digest.overall.clone(),
-                ));
+                let applied_tick = command_applied_tick.ok_or_else(|| {
+                    BranchStudyError::InvalidComparison(format!(
+                        "branch `{}` diverged from control at tick {current_tick} before any intervention was applied",
+                        branch.branch_id
+                    ))
+                })?;
                 first_divergence = Some(FirstDivergence {
                     branch_id: branch.branch_id.clone(),
                     tick: current_tick,
                     stage: stage.to_string(),
                     control_digest: ctrl_lane,
                     branch_digest: br_lane,
-                    command_applied_tick: command_applied_tick.unwrap_or(self.plan.checkpoint_tick),
+                    command_applied_tick: applied_tick,
                     details: format!(
-                        "First divergence detected in stage `{stage}` at tick {current_tick}"
+                        "First observed divergence in digest lane `{stage}` at tick {current_tick}, comparing control and branch at the same completed boundary"
                     ),
                 });
             }
 
-            samples.push(BranchTickSample {
-                tick: current_tick,
-                population: pop,
-                food_total,
-                births: summary.births,
-                deaths: summary.deaths,
-                total_energy: summary.total_energy,
-                average_health: summary.average_health,
-                spike_hits: summary.spike_hits,
-                digest_overall: digest.overall,
+            samples.push(BranchObservation {
+                sample: BranchTickSample {
+                    tick: current_tick,
+                    population: pop,
+                    food_total,
+                    births: summary.births,
+                    deaths: summary.deaths,
+                    total_energy: summary.total_energy,
+                    average_health: summary.average_health,
+                    spike_hits: summary.spike_hits,
+                    digest_overall: digest.overall.clone(),
+                },
+                digest,
             });
         }
 
-        let final_pop = samples.last().map_or(0, |s| s.population);
+        if branch.intervention.is_some() && command_applied_tick.is_none() {
+            return Err(BranchStudyError::InvalidPlan(format!(
+                "branch `{}` intervention was never applied within the observed horizon",
+                branch.branch_id
+            )));
+        }
+
+        let final_pop = samples.last().map_or(0, |s| s.sample.population);
         let final_digest = samples
             .last()
-            .map_or_else(String::new, |s| s.digest_overall.clone());
+            .map_or_else(String::new, |s| s.digest.overall.clone());
+
+        // Assess population outcomes from the actual pre-command boundary, not from an earlier
+        // checkpoint when the intervention was delayed. Control branches use the checkpoint.
+        let baseline_tick = command_applied_tick.unwrap_or(self.plan.checkpoint_tick);
+        let baseline_index = (baseline_tick - self.plan.checkpoint_tick) as usize;
+        let outcome_samples = &samples[baseline_index..];
+        let pre_intervention_pop = outcome_samples[0].sample.population;
+        let mut trough_population = pre_intervention_pop;
+        let mut trough_tick = baseline_tick;
+        let mut extinction_tick = None;
+        for observation in outcome_samples {
+            let sample = &observation.sample;
+            if sample.population < trough_population {
+                trough_population = sample.population;
+                trough_tick = sample.tick;
+            }
+            if sample.population == 0 && extinction_tick.is_none() {
+                extinction_tick = Some(sample.tick);
+            }
+        }
 
         // Extinction assessment.
         let extinction = ExtinctionMeasure {
-            extinct: min_population == 0,
+            extinct: trough_population == 0,
             extinction_tick,
-            min_population,
+            min_population: trough_population,
             final_population: final_pop,
         };
 
@@ -1130,7 +1340,8 @@ impl BranchStudyOrchestrator {
 
         let mut recovery_ticks = None;
         if recovered {
-            for sample in &samples {
+            for observation in outcome_samples {
+                let sample = &observation.sample;
                 if sample.tick > trough_tick && sample.population >= target_recovery_pop {
                     recovery_ticks = Some(sample.tick - trough_tick);
                     break;
@@ -1138,6 +1349,7 @@ impl BranchStudyOrchestrator {
             }
         }
         let recovery = RecoveryMeasure {
+            baseline_tick,
             pre_intervention_population: pre_intervention_pop,
             trough_population,
             trough_tick,
@@ -1154,17 +1366,23 @@ impl BranchStudyOrchestrator {
             let mut sum_ctrl_pop = 0.0;
             let mut max_pop_gap = 0.0;
 
-            let ctrl_pops: Vec<f64> = ctrl_list.iter().map(|s| s.population as f64).collect();
-            let br_pops: Vec<f64> = samples.iter().map(|s| s.population as f64).collect();
+            let ctrl_pops: Vec<f64> = ctrl_list
+                .iter()
+                .map(|s| s.sample.population as f64)
+                .collect();
+            let br_pops: Vec<f64> = samples.iter().map(|s| s.sample.population as f64).collect();
 
-            let ctrl_foods: Vec<f64> = ctrl_list.iter().map(|s| s.food_total).collect();
-            let br_foods: Vec<f64> = samples.iter().map(|s| s.food_total).collect();
+            let ctrl_foods: Vec<f64> = ctrl_list.iter().map(|s| s.sample.food_total).collect();
+            let br_foods: Vec<f64> = samples.iter().map(|s| s.sample.food_total).collect();
 
             let ctrl_energies: Vec<f64> = ctrl_list
                 .iter()
-                .map(|s| f64::from(s.total_energy))
+                .map(|s| f64::from(s.sample.total_energy))
                 .collect();
-            let br_energies: Vec<f64> = samples.iter().map(|s| f64::from(s.total_energy)).collect();
+            let br_energies: Vec<f64> = samples
+                .iter()
+                .map(|s| f64::from(s.sample.total_energy))
+                .collect();
 
             for (c, b) in ctrl_pops.iter().zip(&br_pops) {
                 let diff = c - b;
@@ -1198,27 +1416,26 @@ impl BranchStudyOrchestrator {
             };
 
             let mut effects = BTreeMap::new();
+            let analysis_basis = BranchAnalysisBasis::SingleSeedTrajectory {
+                seed: self.plan.base_seed,
+            };
             effects.insert(
                 "population".to_string(),
-                compute_paired_effect(&ctrl_pops, &br_pops, "population", self.plan.base_seed),
+                describe_paired_effect(&ctrl_pops, &br_pops, "population", analysis_basis)?.0,
             );
             effects.insert(
                 "food_total".to_string(),
-                compute_paired_effect(
-                    &ctrl_foods,
-                    &br_foods,
-                    "food_total",
-                    self.plan.base_seed + 1,
-                ),
+                describe_paired_effect(&ctrl_foods, &br_foods, "food_total", analysis_basis)?.0,
             );
             effects.insert(
                 "total_energy".to_string(),
-                compute_paired_effect(
+                describe_paired_effect(
                     &ctrl_energies,
                     &br_energies,
                     "total_energy",
-                    self.plan.base_seed + 2,
-                ),
+                    analysis_basis,
+                )?
+                .0,
             );
 
             (hyst, effects)
@@ -1240,6 +1457,7 @@ impl BranchStudyOrchestrator {
         let (bundle_path, bundle_verified) = self.create_and_verify_bundle(
             branch,
             &samples,
+            command_applied_tick,
             &first_divergence,
             &extinction,
             &recovery,
@@ -1352,7 +1570,8 @@ impl BranchStudyOrchestrator {
     fn create_and_verify_bundle(
         &self,
         branch: &StudyBranchSpec,
-        samples: &[BranchTickSample],
+        samples: &[BranchObservation],
+        command_applied_tick: Option<u64>,
         first_divergence: &Option<FirstDivergence>,
         extinction: &ExtinctionMeasure,
         recovery: &RecoveryMeasure,
@@ -1370,7 +1589,8 @@ impl BranchStudyOrchestrator {
             &mut csv_buf,
             "tick,population,food_total,births,deaths,total_energy,average_health,spike_hits,digest"
         )?;
-        for s in samples {
+        for observation in samples {
+            let s = &observation.sample;
             writeln!(
                 &mut csv_buf,
                 "{},{},{:.4},{},{},{:.4},{:.4},{},{}",
@@ -1388,8 +1608,15 @@ impl BranchStudyOrchestrator {
 
         // 2. Branch evidence JSON
         let evidence_json = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": BRANCH_STUDY_REPORT_SCHEMA_VERSION,
             "branch_id": branch.branch_id,
             "description": branch.description,
+            "base_seed": self.plan.base_seed,
+            "checkpoint_tick": self.plan.checkpoint_tick,
+            "horizon_ticks": self.plan.horizon_ticks,
+            "intervention": branch.intervention,
+            "scheduled_tick": branch.scheduled_tick,
+            "command_applied_tick": command_applied_tick,
             "first_divergence": first_divergence,
             "extinction": extinction,
             "recovery": recovery,
@@ -1405,7 +1632,7 @@ impl BranchStudyOrchestrator {
         manifest.experiment_id = Some(self.plan.study_id.clone());
         manifest.variant_id = Some(branch.branch_id.clone());
 
-        let max_tick = self.plan.checkpoint_tick + self.plan.horizon_ticks;
+        let max_tick = self.plan.final_tick()?;
 
         let _bundle: RunBundleV1 = create_run_bundle_from_artifacts(
             &bundle_dir,
@@ -1458,9 +1685,10 @@ impl BranchStudyOrchestrator {
             pre_intervention_digest
         ));
         md.push_str("- **Pre-Intervention Digest Verified Across All Branches**: `true`\n\n");
+        md.push_str("**Analysis basis**: One independent matched seed pair. Metric comparisons describe all recorded paired timepoints, including the shared checkpoint and any timepoints before a delayed intervention. Repeated ticks are not independent replicates; confidence intervals, standardized inferential effects, and p-values are omitted. Population recovery and extinction are assessed from the actual intervention boundary (the checkpoint for controls).\n\n");
 
         md.push_str("## Branch Outcomes Matrix\n\n");
-        md.push_str("| Branch ID | Applied Tick | First Divergence | Extinct | Final Pop | Recovered (Ratio) | Path Dependence | Pop Mean Diff (95% CI) | Bundle Verified |\n");
+        md.push_str("| Branch ID | Applied Tick | First Divergence | Extinct | Final Pop | Recovered (Ratio) | Path Dependence | Pop Trajectory Mean Diff | Artifact Integrity |\n");
         md.push_str("|---|---|---|---|---|---|---|---|---|\n");
 
         for r in reports {
@@ -1490,11 +1718,7 @@ impl BranchStudyOrchestrator {
                 "No".to_string()
             };
             let pop_diff_str = if let Some(eff) = r.effect_sizes.get("population") {
-                if let Some((low, high)) = eff.ci_95 {
-                    format!("{:.2} [{:.2}, {:.2}]", eff.mean_diff, low, high)
-                } else {
-                    format!("{:.2}", eff.mean_diff)
-                }
+                format!("{:.2}", eff.mean_diff)
             } else {
                 "0.00 (Control)".to_string()
             };
@@ -1524,11 +1748,15 @@ impl BranchStudyOrchestrator {
             ));
             if let Some(div) = &r.first_divergence {
                 md.push_str(&format!(
-                    "- **First Divergence**: Tick `{}`, Pipeline Stage `{}`\n",
+                    "- **First Divergence**: Tick `{}`, Digest Lane `{}`\n",
                     div.tick, div.stage
                 ));
                 md.push_str(&format!("- **Details**: {}\n", div.details));
             }
+            md.push_str(&format!(
+                "- **Recovery Baseline**: `{}` agents at completed tick `{}`, before the intervention\n",
+                r.recovery.pre_intervention_population, r.recovery.baseline_tick
+            ));
             md.push_str(&format!(
                 "- **Integrated Trajectory Deficit**: `{:.2}` agent-ticks\n",
                 r.hysteresis.integrated_trajectory_deficit
@@ -1543,12 +1771,11 @@ impl BranchStudyOrchestrator {
             ));
             for (metric, eff) in &r.effect_sizes {
                 md.push_str(&format!(
-                    "- **Metric `{}`**: Mean Diff `{:.4}`, Cohen's d: `{}`, Hedges' g: `{}`, p-value: `{:.4}`\n",
+                    "- **Metric `{}`**: Trajectory Mean Diff `{:.4}`, Temporal SD of Paired Differences `{:.4}`, Paired Timepoints `{}` (one independent seed pair)\n",
                     metric,
                     eff.mean_diff,
-                    eff.cohens_d.map_or("N/A".to_string(), |v| format!("{v:.4}")),
-                    eff.hedges_g.map_or("N/A".to_string(), |v| format!("{v:.4}")),
-                    eff.p_value
+                    eff.sd_diff,
+                    eff.n_samples
                 ));
             }
             md.push('\n');
@@ -1562,6 +1789,19 @@ impl BranchStudyOrchestrator {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn world_at_checkpoint(plan: &BranchStudyPlan) -> WorldState {
+        let mut config = plan.config.clone();
+        config.persistence_interval = 0;
+        config.rng_seed = Some(plan.base_seed);
+        let mut world = WorldState::new(config).expect("valid study world");
+        let installed = install_brains(&mut world, plan.brain_preset).expect("register brains");
+        seed_founding_population(&mut world, installed.population()).expect("seed founders");
+        for _ in 0..plan.checkpoint_tick {
+            world.step().expect("advance to checkpoint");
+        }
+        world
+    }
 
     #[test]
     fn test_plan_validation_rejects_empty_study_id_and_missing_control() {
@@ -1582,6 +1822,219 @@ mod tests {
         assert!(matches!(
             orchestrator2.validate(),
             Err(BranchStudyError::MissingControlBranch)
+        ));
+    }
+
+    #[test]
+    fn scheduled_boundaries_must_have_an_observed_next_transition_without_tick_overflow() {
+        let plan = BranchStudyPlan::standard_five_branch("schedule_bounds", 42, 6, 6);
+        for due_tick in [5, 12, 13, u64::MAX] {
+            let mut invalid = plan.clone();
+            invalid.branches[1].scheduled_tick = Some(due_tick);
+            let orchestrator = BranchStudyOrchestrator::new(invalid, PathBuf::from("unused"));
+            assert!(
+                matches!(
+                    orchestrator.validate(),
+                    Err(BranchStudyError::InvalidPlan(_))
+                ),
+                "invalid due boundary {due_tick} was admitted"
+            );
+        }
+        for due_tick in [6, 11] {
+            let mut valid = plan.clone();
+            valid.branches[1].scheduled_tick = Some(due_tick);
+            BranchStudyOrchestrator::new(valid, PathBuf::from("unused"))
+                .validate()
+                .expect("both the first and last observable command boundaries are allowed");
+        }
+
+        let mut scheduled_control = plan.clone();
+        scheduled_control.branches[0].scheduled_tick = Some(6);
+        assert!(matches!(
+            BranchStudyOrchestrator::new(scheduled_control, PathBuf::from("unused")).validate(),
+            Err(BranchStudyError::InvalidPlan(_))
+        ));
+        for (checkpoint_tick, horizon_ticks) in [(u64::MAX, 1), (u64::MAX - 2, 3)] {
+            let mut overflowing = plan.clone();
+            overflowing.checkpoint_tick = checkpoint_tick;
+            overflowing.horizon_ticks = horizon_ticks;
+            assert!(matches!(
+                BranchStudyOrchestrator::new(overflowing, PathBuf::from("unused")).validate(),
+                Err(BranchStudyError::InvalidPlan(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn independent_pair_inference_is_explicit_and_refuses_incomplete_or_nonfinite_pairs() {
+        let effect = compute_paired_effect(&[1.0, 2.0, 3.0], &[2.0, 4.0, 6.0], "energy", 42)
+            .expect("three independent matched replicates");
+        assert_eq!(
+            effect.analysis_basis,
+            BranchAnalysisBasis::IndependentPairedReplicates { pairs: 3 }
+        );
+        assert_eq!(effect.n_samples, 3);
+        assert_eq!(effect.mean_diff, 2.0);
+        assert_eq!(effect.sd_diff, 1.0);
+        assert_eq!(effect.cohens_d, Some(2.0));
+        let (low, high) = effect.ci_95.expect("replicated bootstrap interval");
+        assert!(low <= 2.0 && high >= 2.0);
+        assert!((0.0..=1.0).contains(&effect.p_value.expect("replicated sign-flip test")));
+
+        let singleton = compute_paired_effect(&[1.0], &[2.0], "energy", 42).unwrap();
+        assert_eq!(singleton.mean_diff, 1.0);
+        assert!(singleton.ci_95.is_none());
+        assert!(singleton.p_value.is_none());
+        for (control, branch) in [
+            (vec![1.0, 2.0], vec![3.0]),
+            (vec![1.0], vec![f64::NAN]),
+            (vec![f64::INFINITY], vec![1.0]),
+            (vec![-f64::MAX], vec![f64::MAX]),
+        ] {
+            assert!(matches!(
+                compute_paired_effect(&control, &branch, "energy", 42),
+                Err(BranchStudyError::InvalidComparison(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn delayed_intervention_preserves_state_until_due_and_reports_same_tick_lane_hashes() {
+        let dir = tempdir().expect("tempdir");
+        let mut plan = BranchStudyPlan::standard_five_branch("delayed_evidence", 54321, 2, 5);
+        plan.config.population_minimum = 0;
+        plan.config.population_spawn_interval = 1;
+        plan.config.population_spawn_count = 2;
+        plan.config.population_crossover_chance = 0.0;
+        plan.config.reproduction_attempt_chance = 0.0;
+        plan.branches.truncate(1);
+        plan.branches.push(StudyBranchSpec {
+            branch_id: "delayed_scorch".to_string(),
+            description: "Remove half of ground food after completed tick four".to_string(),
+            intervention: Some(StudyIntervention::ResourceShock {
+                region: None,
+                bloom_amount: 0.0,
+                scorch: 0.5,
+            }),
+            scheduled_tick: Some(4),
+        });
+        let mut world = world_at_checkpoint(&plan);
+        let agents = world.agents().iter_handles().collect::<Vec<_>>();
+        for id in agents {
+            assert!(
+                world
+                    .try_update_agent(id, |data, runtime| {
+                        data.health = 0.75;
+                        runtime.energy = 0.75;
+                    })
+                    .expect("edit observable checkpoint state")
+            );
+        }
+        let checkpoint = world.checkpoint_v1().expect("capture real checkpoint");
+        let source_digest = &checkpoint.source_digest().overall;
+        let orchestrator = BranchStudyOrchestrator::new(plan, dir.path().to_path_buf());
+        orchestrator.validate().expect("valid delayed study");
+        let (control, _) = orchestrator
+            .run_branch(
+                &orchestrator.plan.branches[0],
+                &checkpoint,
+                source_digest,
+                None,
+                None,
+            )
+            .expect("run control");
+        let (branch, report) = orchestrator
+            .run_branch(
+                &orchestrator.plan.branches[1],
+                &checkpoint,
+                source_digest,
+                Some(&control),
+                None,
+            )
+            .expect("run delayed branch");
+
+        assert_eq!(
+            control[0].sample.total_energy,
+            0.75 * world.agent_count() as f32
+        );
+        assert_eq!(control[0].sample.average_health, 0.75);
+        assert_eq!(branch[0].sample, control[0].sample);
+        for index in 0..=2 {
+            assert_eq!(
+                control[index].digest, branch[index].digest,
+                "completed tick {} must still match before the delayed command",
+                control[index].sample.tick
+            );
+        }
+        assert_eq!(report.command_applied_tick, Some(4));
+        let divergence = report
+            .first_divergence
+            .as_ref()
+            .expect("scorch changes food");
+        assert_eq!(divergence.tick, 5);
+        assert_eq!(divergence.command_applied_tick, 4);
+        assert_eq!(divergence.stage, "food");
+        assert_eq!(divergence.control_digest, control[3].digest.food);
+        assert_eq!(divergence.branch_digest, branch[3].digest.food);
+        assert_ne!(
+            divergence.control_digest,
+            checkpoint.source_digest().food,
+            "the control lane must be observed at divergence, not at the checkpoint"
+        );
+        assert_ne!(divergence.control_digest, divergence.branch_digest);
+
+        assert!(
+            branch[2].sample.population > branch[0].sample.population,
+            "newcomers must make the delayed baseline observably different from the checkpoint"
+        );
+        assert_eq!(report.recovery.baseline_tick, 4);
+        assert_eq!(
+            report.recovery.pre_intervention_population,
+            branch[2].sample.population
+        );
+        assert_eq!(report.recovery.trough_tick, 4);
+        assert_eq!(
+            report.recovery.trough_population,
+            branch[2].sample.population
+        );
+        assert_eq!(
+            report.extinction.min_population,
+            branch[2].sample.population
+        );
+        for effect in report.effect_sizes.values() {
+            assert_eq!(
+                effect.analysis_basis,
+                BranchAnalysisBasis::SingleSeedTrajectory { seed: 54321 }
+            );
+            assert_eq!(effect.n_samples, 6);
+            assert!(effect.ci_95.is_none());
+            assert!(effect.p_value.is_none());
+            assert!(effect.cohens_d.is_none());
+            assert!(effect.hedges_g.is_none());
+        }
+
+        // A missing or shifted control observation must fail instead of dropping a comparison.
+        assert!(matches!(
+            orchestrator.run_branch(
+                &orchestrator.plan.branches[1],
+                &checkpoint,
+                source_digest,
+                Some(&control[..control.len() - 1]),
+                None,
+            ),
+            Err(BranchStudyError::InvalidComparison(_))
+        ));
+        let mut misaligned = control.clone();
+        misaligned[3].sample.tick += 1;
+        assert!(matches!(
+            orchestrator.run_branch(
+                &orchestrator.plan.branches[1],
+                &checkpoint,
+                source_digest,
+                Some(&misaligned),
+                None,
+            ),
+            Err(BranchStudyError::InvalidComparison(_))
         ));
     }
 
@@ -1761,7 +2214,7 @@ mod tests {
     #[test]
     fn test_extinction_and_recovery_metrics_computation() {
         let dir = tempdir().expect("tempdir");
-        let mut plan = BranchStudyPlan::standard_five_branch("test_metrics", 8888, 5, 10);
+        let mut plan = BranchStudyPlan::standard_five_branch("test_metrics", u64::MAX, 5, 10);
         plan.branches = vec![
             StudyBranchSpec {
                 branch_id: "control".to_string(),
