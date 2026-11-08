@@ -30,9 +30,9 @@
 //!    does not establish that the bundle contains a restorable simulation owner checkpoint.
 
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use rand::{Rng, SeedableRng};
@@ -665,12 +665,39 @@ pub enum BranchStudyError {
     /// File system I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// An existing output must be retained rather than replaced by another study.
+    #[error("study output {path} is already occupied; choose a new or empty directory")]
+    OutputAlreadyExists {
+        /// Path whose existing contents were preserved.
+        path: PathBuf,
+    },
     /// JSON serialization/deserialization error.
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
     /// Study was cancelled by caller.
     #[error("study execution was cancelled")]
     Cancelled,
+}
+
+fn study_output_error(path: &Path, error: std::io::Error) -> BranchStudyError {
+    if error.kind() == std::io::ErrorKind::AlreadyExists {
+        BranchStudyError::OutputAlreadyExists {
+            path: path.to_path_buf(),
+        }
+    } else {
+        BranchStudyError::Io(error)
+    }
+}
+
+fn write_new_study_artifact(path: &Path, bytes: &[u8]) -> Result<(), BranchStudyError> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| study_output_error(path, error))?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
 }
 
 /// Create a fresh [`BrainRegistry`] matching the given preset for checkpoint restoration.
@@ -941,8 +968,8 @@ impl BranchStudyOrchestrator {
                     "branch_id cannot be empty".to_string(),
                 ));
             }
-            // The id names an output directory that is replaced on rerun
-            // (`bundle_<branch_id>`), so it must not be able to escape `output_dir`.
+            // The id names an output directory (`bundle_<branch_id>`), so it
+            // must not be able to escape `output_dir`.
             if !branch
                 .branch_id
                 .chars()
@@ -990,7 +1017,10 @@ impl BranchStudyOrchestrator {
         cancellation: Option<&AtomicBool>,
     ) -> Result<BranchStudyReport, BranchStudyError> {
         self.validate()?;
-        fs::create_dir_all(&self.output_dir)?;
+        if cancellation.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+            return Err(BranchStudyError::Cancelled);
+        }
+        self.reserve_output_directory()?;
 
         // 1. Pre-intervention baseline execution to checkpoint_tick.
         let mut base_config = self.plan.config.clone();
@@ -1082,17 +1112,47 @@ impl BranchStudyOrchestrator {
             summary_markdown,
         };
 
-        // 5. Persist master artifacts to output directory.
+        // 5. Publish the final report only after all branch bundles and the summary.
+        // The plan was reserved before execution, so failed or interrupted studies
+        // retain their inputs and cannot be silently replaced by a later invocation.
         let report_json = serde_json::to_string_pretty(&report)?;
-        fs::write(self.output_dir.join("study_report.json"), report_json)?;
-        fs::write(
-            self.output_dir.join("study_summary.md"),
-            &report.summary_markdown,
+        write_new_study_artifact(
+            &self.output_dir.join("study_summary.md"),
+            report.summary_markdown.as_bytes(),
         )?;
-        let plan_json = serde_json::to_string_pretty(&self.plan)?;
-        fs::write(self.output_dir.join("study_plan.json"), plan_json)?;
+        write_new_study_artifact(
+            &self.output_dir.join("study_report.json"),
+            report_json.as_bytes(),
+        )?;
 
         Ok(report)
+    }
+
+    fn reserve_output_directory(&self) -> Result<(), BranchStudyError> {
+        match fs::symlink_metadata(&self.output_dir) {
+            Ok(metadata) => {
+                if !metadata.is_dir()
+                    || metadata.file_type().is_symlink()
+                    || fs::read_dir(&self.output_dir)?
+                        .next()
+                        .transpose()?
+                        .is_some()
+                {
+                    return Err(BranchStudyError::OutputAlreadyExists {
+                        path: self.output_dir.clone(),
+                    });
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir_all(&self.output_dir)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+
+        // create_new is the writer claim, including when two invocations both
+        // observed an empty directory. A failed writer leaves its claim intact.
+        let plan_json = serde_json::to_vec_pretty(&self.plan)?;
+        write_new_study_artifact(&self.output_dir.join("study_plan.json"), &plan_json)
     }
 
     fn validate_control_observations(
@@ -1579,9 +1639,7 @@ impl BranchStudyOrchestrator {
         effect_sizes: &BTreeMap<String, BranchEffectSize>,
     ) -> Result<(PathBuf, bool), BranchStudyError> {
         let bundle_dir = self.output_dir.join(format!("bundle_{}", branch.branch_id));
-        if bundle_dir.exists() {
-            fs::remove_dir_all(&bundle_dir)?;
-        }
+        fs::create_dir(&bundle_dir).map_err(|error| study_output_error(&bundle_dir, error))?;
 
         // 1. Summary CSV
         let mut csv_buf = Vec::new();
@@ -2182,6 +2240,11 @@ mod tests {
             .execute_study(None)
             .expect("study execution succeeds");
 
+        let mut retained = BTreeMap::new();
+        for name in ["study_plan.json", "study_report.json", "study_summary.md"] {
+            let path = dir.path().join(name);
+            retained.insert(path.clone(), fs::read(path).expect("study artifact"));
+        }
         for branch_rep in &report.branch_reports {
             assert!(
                 branch_rep.bundle_verified,
@@ -2197,7 +2260,103 @@ mod tests {
             assert!(bundle_path.join("bundle_manifest.json").exists());
             assert!(bundle_path.join("exports/summary.csv").exists());
             assert!(bundle_path.join("evidence/branch_evidence.json").exists());
+            for name in [
+                "bundle_manifest.json",
+                "exports/summary.csv",
+                "evidence/branch_evidence.json",
+            ] {
+                let path = bundle_path.join(name);
+                retained.insert(path.clone(), fs::read(path).expect("branch artifact"));
+            }
         }
+
+        assert!(matches!(
+            orchestrator.execute_study(None),
+            Err(BranchStudyError::OutputAlreadyExists { .. })
+        ));
+        for (path, original) in retained {
+            assert_eq!(fs::read(&path).expect("retained output"), original);
+        }
+    }
+
+    #[test]
+    fn occupied_or_interrupted_study_outputs_are_preserved_before_execution() {
+        let dir = tempdir().expect("tempdir");
+        let bundle = dir.path().join("bundle_control");
+        fs::create_dir(&bundle).expect("prior partial bundle");
+        let evidence = bundle.join("prior-evidence.bin");
+        fs::write(&evidence, b"irreplaceable interrupted study").expect("prior evidence");
+        let plan = BranchStudyPlan::standard_five_branch("occupied", 42, 1, 1);
+        let orchestrator = BranchStudyOrchestrator::new(plan, dir.path().to_path_buf());
+
+        assert!(matches!(
+            orchestrator.execute_study(None),
+            Err(BranchStudyError::OutputAlreadyExists { .. })
+        ));
+        assert_eq!(
+            fs::read(evidence).expect("preserved evidence"),
+            b"irreplaceable interrupted study"
+        );
+        assert!(!dir.path().join("study_plan.json").exists());
+        assert!(!dir.path().join("study_report.json").exists());
+    }
+
+    #[test]
+    fn concurrent_studies_cannot_claim_the_same_empty_output() {
+        let dir = tempdir().expect("tempdir");
+        let plan = BranchStudyPlan::standard_five_branch("concurrent", 42, 1, 1);
+        let orchestrator = BranchStudyOrchestrator::new(plan.clone(), dir.path().to_path_buf());
+        let barrier = std::sync::Barrier::new(2);
+        let outcomes = std::thread::scope(|scope| {
+            let attempt = || {
+                barrier.wait();
+                orchestrator.reserve_output_directory()
+            };
+            let first = scope.spawn(attempt);
+            let second = scope.spawn(attempt);
+            [
+                first.join().expect("first writer"),
+                second.join().expect("second writer"),
+            ]
+        });
+        assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|result| matches!(
+                    result,
+                    Err(BranchStudyError::OutputAlreadyExists { .. })
+                ))
+                .count(),
+            1
+        );
+        let retained: BranchStudyPlan = serde_json::from_slice(
+            &fs::read(dir.path().join("study_plan.json")).expect("winning plan"),
+        )
+        .expect("complete retained plan");
+        assert_eq!(retained, plan);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn study_output_symlink_is_refused_without_writing_the_target() {
+        let dir = tempdir().expect("tempdir");
+        let target = dir.path().join("target");
+        fs::create_dir(&target).expect("empty target");
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&target, &alias).expect("output alias");
+        let plan = BranchStudyPlan::standard_five_branch("symlink", 42, 1, 1);
+        let orchestrator = BranchStudyOrchestrator::new(plan, alias);
+        assert!(matches!(
+            orchestrator.execute_study(None),
+            Err(BranchStudyError::OutputAlreadyExists { .. })
+        ));
+        assert!(
+            fs::read_dir(target)
+                .expect("target retained")
+                .next()
+                .is_none()
+        );
     }
 
     #[test]
@@ -2209,6 +2368,12 @@ mod tests {
         let cancel_flag = AtomicBool::new(true); // already cancelled
         let result = orchestrator.execute_study(Some(&cancel_flag));
         assert!(matches!(result, Err(BranchStudyError::Cancelled)));
+        assert!(
+            fs::read_dir(dir.path())
+                .expect("empty output")
+                .next()
+                .is_none()
+        );
     }
 
     #[test]
