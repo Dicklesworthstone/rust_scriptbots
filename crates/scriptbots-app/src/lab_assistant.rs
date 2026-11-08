@@ -1732,8 +1732,8 @@ mod tests {
             );
         }
         let notebook = lab.rendered_notebook.as_ref().expect("report retained");
-        assert!(notebook.contains("average_energy"));
-        assert!(notebook.contains("total_food"));
+        assert!(notebook.contains(r"**Metric**: average\_energy"));
+        assert!(notebook.contains(r"**Metric**: total\_food"));
         assert!(notebook.contains("Matched Pairs**: 2"));
     }
 
@@ -1817,7 +1817,7 @@ mod tests {
         let analysis = lab.analysis.as_ref().expect("matched family analysis");
         assert_eq!(analysis.effects.len(), 2);
         let notebook = lab.rendered_notebook.as_ref().expect("family report");
-        for family in ["mlp.baseline", "dwraon.baseline"] {
+        for family in [r"brain: mlp\.baseline", r"brain: dwraon\.baseline"] {
             assert!(notebook.contains(family));
         }
         let notebook_dir = lab.notebook_path.as_ref().unwrap().parent().unwrap();

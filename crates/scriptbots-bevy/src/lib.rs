@@ -775,74 +775,46 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
     let host_snapshots = host.snapshot_hub();
     let owner_inspector = OwnerInspector::new(host.clone());
 
+    // Brain inspection is an owner read and may wait for its deadline. Keep
+    // it off the snapshot publisher so a slow owner cannot freeze the world.
+    let (brain_requests, brain_request_inbox) = mpsc::sync_channel::<BrainOverlayJob>(1);
+    let (brain_results, brain_result_inbox) = mpsc::sync_channel::<BrainOverlaySample>(1);
+    let brain_host = host.clone();
+    let brain_running = Arc::clone(&running);
+    let brain_failures = failure_tx.clone();
+    let brain_worker = thread::Builder::new()
+        .name("scriptbots-bevy-brain".into())
+        .spawn(move || {
+            run_reported_worker("brain worker", &brain_failures, &brain_running, || {
+                run_brain_projection_worker(
+                    brain_host,
+                    &brain_running,
+                    brain_request_inbox,
+                    brain_results,
+                )
+            })
+        })
+        .context("failed to spawn Bevy brain worker")?;
+
     let snapshot_worker = thread::Builder::new()
         .name("scriptbots-bevy-snapshot".into())
         .spawn(move || {
             run_reported_worker("snapshot worker", &snapshot_failures, &worker_flag, || {
-                let mut client = HostClient::new(host);
-                let mut subscription = client.subscribe_snapshots();
-                let mut last_snapshot: Option<WorldSnapshot> = None;
-                let mut next_revision = 1_u64;
-                // Client identity and revision for brain inspection are owned
-                // here, not in the visual projection, because the revision must be
-                // monotonic per client across snapshots (bd-2z0.14.1.15).
-                let brain_client_id =
-                    scriptbots_runtime::ProjectionClientId::new(BRAIN_OVERLAY_CLIENT_ID);
-                let mut next_brain_revision = 0_u64;
-                while worker_flag.load(Ordering::Acquire) {
-                    let published = match client.poll_snapshot(&mut subscription) {
-                        Ok(Some(published)) => published,
-                        Ok(None) => {
-                            thread::sleep(Duration::from_millis(15));
-                            continue;
-                        }
-                        Err(HostAccessError::Disconnected) => break,
-                        Err(error) => return Err(error.into()),
-                    };
-                    controls_for_thread.update(|state| {
-                        state.paused = published.playback.paused;
-                        state.speed_multiplier = published.playback.speed_multiplier;
-                        state.pending_steps = 0;
-                        state.auto_pause_reason = if state.paused {
-                            snapshot_auto_pause_reason(&published)
-                                .map(|reason| format!("Pause condition met: {reason}"))
-                        } else {
-                            None
-                        };
-                    });
-                    let mut snapshot = WorldSnapshot::from_snapshot(&published).ok_or_else(|| {
-                        anyhow!(
-                            "Bevy snapshot worker rejected invalid dimensions or incomplete visual layers"
-                        )
-                    })?;
-                    snapshot.brain = BrainOverlay::capture_host(
-                        client.port_mut(),
-                        &published,
-                        brain_client_id,
-                        &mut next_brain_revision,
-                    );
-
-                    if assign_presentation_revision(
-                        &mut snapshot,
-                        last_snapshot.as_ref(),
-                        &mut next_revision,
-                    )? {
-                        last_snapshot = Some(snapshot.clone());
-                        if !snapshot_publisher.publish(snapshot) {
-                            break;
-                        }
-                    }
-
-                    thread::sleep(Duration::from_millis(15));
-                }
-                Ok(())
+                run_snapshot_publisher(
+                    host,
+                    &worker_flag,
+                    controls_for_thread,
+                    snapshot_publisher,
+                    brain_requests,
+                    brain_result_inbox,
+                )
             })
         })
         .context("failed to spawn Bevy snapshot worker")?;
 
     let workers = BevyWorkerGroup {
         running: Arc::clone(&running),
-        workers: vec![("snapshot", snapshot_worker)],
+        workers: vec![("snapshot", snapshot_worker), ("brain", brain_worker)],
     };
 
     let mut app = App::new();
@@ -3707,6 +3679,10 @@ enum BrainOverlayStatus {
     /// No selection, therefore no request was issued.
     #[default]
     NotRequested,
+    /// A selected creature has not yet received a matching owner response.
+    Pending,
+    /// The request deadline elapsed; retry waits for owner acknowledgement.
+    TimedOut,
     /// Core returned a payload.
     Ready,
     /// Core typed-refused this target.
@@ -3731,6 +3707,53 @@ struct BrainOverlay {
     layers: Vec<BrainOverlayLayer>,
     /// Set when core clipped the payload. An inspector must say so.
     truncated: bool,
+}
+
+struct BrainOverlayJob {
+    target: InspectorTarget,
+    snapshot: Arc<RenderSnapshot>,
+}
+
+struct BrainOverlaySample {
+    target: InspectorTarget,
+    overlay: BrainOverlay,
+}
+
+fn run_brain_projection_worker(
+    mut host: ChannelHostPort,
+    running: &AtomicBool,
+    requests: mpsc::Receiver<BrainOverlayJob>,
+    results: mpsc::SyncSender<BrainOverlaySample>,
+) -> Result<()> {
+    let client_id = scriptbots_runtime::ProjectionClientId::new(BRAIN_OVERLAY_CLIENT_ID);
+    let mut revision = 0_u64;
+    while running.load(Ordering::Acquire) {
+        match requests.recv_timeout(Duration::from_millis(15)) {
+            Ok(job) => {
+                let Some(overlay) = BrainOverlay::capture_host(
+                    &mut host,
+                    &job.snapshot,
+                    client_id,
+                    &mut revision,
+                    running,
+                ) else {
+                    break;
+                };
+                if results
+                    .send(BrainOverlaySample {
+                        target: job.target,
+                        overlay,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    Ok(())
 }
 
 /// Sample budget for each HUD sparkline (bd-2z0.14.1.16).
@@ -3790,20 +3813,21 @@ impl BrainOverlay {
         snapshot: &RenderSnapshot,
         client_id: scriptbots_runtime::ProjectionClientId,
         next_revision: &mut u64,
-    ) -> Self {
+        running: &AtomicBool,
+    ) -> Option<Self> {
         let Some((index, _)) = snapshot
             .agent_selection
             .iter()
             .enumerate()
             .find(|(_, selection)| matches!(selection, SelectionState::Selected))
         else {
-            return Self::default();
+            return Some(Self::default());
         };
         let Some(agent) = snapshot.world.agents.get(index) else {
-            return Self {
+            return Some(Self {
                 status: BrainOverlayStatus::NoStableIdentity,
                 ..Self::default()
-            };
+            });
         };
         *next_revision = next_revision.saturating_add(1);
         let request = scriptbots_runtime::BrainProjectionRequest {
@@ -3812,13 +3836,35 @@ impl BrainOverlay {
             targets: vec![agent.uid],
             limits: BrainInspectionLimits::default(),
         };
-        match host.project_brain(&request) {
+        let response = match host
+            .begin_brain_projection_before(&request, Instant::now() + OWNER_INSPECTOR_DEADLINE)
+        {
+            Ok(receiver) => loop {
+                if !running.load(Ordering::Acquire) {
+                    return None;
+                }
+                match receiver.recv_timeout(Duration::from_millis(15)) {
+                    Ok(response) => break response,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        break Err(HostAccessError::Disconnected);
+                    }
+                }
+            },
+            Err(error) => Err(error),
+        };
+        Some(match response {
             Ok(response) if response.source.matches_snapshot(snapshot) => {
                 Self::from_response(response.inspection)
             }
             Ok(response) => Self {
                 status: BrainOverlayStatus::Unavailable,
                 source_tick: response.source.inspected_tick.0,
+                ..Self::default()
+            },
+            Err(HostAccessError::OwnerReadTimeout) => Self {
+                status: BrainOverlayStatus::TimedOut,
+                source_tick: snapshot.world.tick,
                 ..Self::default()
             },
             Err(error) => {
@@ -3829,7 +3875,7 @@ impl BrainOverlay {
                     ..Self::default()
                 }
             }
-        }
+        })
     }
 
     /// Capture the primary selection's activations, or issue no request at all.
@@ -3911,6 +3957,8 @@ impl BrainOverlay {
 fn format_brain_overlay(overlay: &BrainOverlay) -> String {
     match overlay.status {
         BrainOverlayStatus::NotRequested => "Brain: select an agent".to_string(),
+        BrainOverlayStatus::Pending => "Brain: waiting for selected creature detail".to_string(),
+        BrainOverlayStatus::TimedOut => "Brain: waiting for owner; retry pending".to_string(),
         BrainOverlayStatus::NoStableIdentity => {
             "Brain: selection has no stable identity".to_string()
         }
@@ -5383,6 +5431,151 @@ fn setup_scene(
         page_title: card_page_title,
         page_body: card_page_body,
     });
+}
+
+fn run_snapshot_publisher(
+    host: ChannelHostPort,
+    running: &AtomicBool,
+    controls: SimulationControl,
+    publisher: SnapshotPublisher,
+    brain_requests: mpsc::SyncSender<BrainOverlayJob>,
+    brain_results: mpsc::Receiver<BrainOverlaySample>,
+) -> Result<()> {
+    let mut client = HostClient::new(host);
+    let mut subscription = client.subscribe_snapshots();
+    let mut last_snapshot: Option<WorldSnapshot> = None;
+    let mut next_revision = 1_u64;
+    let mut latest_published = None;
+    let mut brain_sample: Option<BrainOverlaySample> = None;
+    let mut brain_in_flight = false;
+    let mut brain_pending: Option<(InspectorTarget, Instant)> = None;
+    let mut brain_timeout_announced = false;
+    let mut brain_last_attempt: Option<InspectorTarget> = None;
+    let mut brain_last_request: Option<Instant> = None;
+    while running.load(Ordering::Acquire) {
+        let published = match client.poll_snapshot(&mut subscription) {
+            Ok(published) => published,
+            Err(HostAccessError::Disconnected) => break,
+            Err(error) => return Err(error.into()),
+        };
+        let result = match brain_results.try_recv() {
+            Ok(sample) => {
+                brain_in_flight = false;
+                brain_pending = None;
+                brain_timeout_announced = false;
+                if sample.overlay.status == BrainOverlayStatus::TimedOut {
+                    brain_last_attempt = None;
+                }
+                brain_sample = Some(sample);
+                true
+            }
+            Err(mpsc::TryRecvError::Empty) => false,
+            Err(mpsc::TryRecvError::Disconnected) if !running.load(Ordering::Acquire) => break,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err(anyhow!("Bevy brain worker disconnected"));
+            }
+        };
+        // The owner may not dequeue the request until long after its expiry.
+        // Publish a timeout once while retaining the outstanding request; the
+        // owner acknowledgement still gates the next enqueue.
+        let timeout_due = !brain_timeout_announced
+            && brain_pending.is_some_and(|(_, at)| at.elapsed() >= OWNER_INSPECTOR_DEADLINE);
+        if timeout_due {
+            brain_timeout_announced = true;
+        }
+        let mut snapshot = if let Some(published) = published {
+            controls.update(|state| {
+                state.paused = published.playback.paused;
+                state.speed_multiplier = published.playback.speed_multiplier;
+                state.pending_steps = 0;
+                state.auto_pause_reason = if state.paused {
+                    snapshot_auto_pause_reason(&published)
+                        .map(|reason| format!("Pause condition met: {reason}"))
+                } else {
+                    None
+                };
+            });
+            let snapshot = WorldSnapshot::from_snapshot(&published).ok_or_else(|| {
+                anyhow!(
+                    "Bevy snapshot worker rejected invalid dimensions or incomplete visual layers"
+                )
+            })?;
+            latest_published = Some(published);
+            Some(snapshot)
+        } else if result || timeout_due {
+            last_snapshot.clone()
+        } else {
+            None
+        };
+        if let Some(snapshot) = &mut snapshot {
+            let target = InspectorTarget::from_frame(snapshot);
+            if brain_sample.as_ref().is_some_and(|sample| {
+                target.is_none_or(|current| !sample.target.visible_at(current))
+            }) {
+                brain_sample = None;
+            }
+            if brain_last_attempt
+                .is_some_and(|old| target.is_none_or(|current| !old.same_subject(current)))
+            {
+                brain_last_attempt = None;
+                brain_last_request = None;
+            }
+            snapshot.brain = if brain_timeout_announced
+                && brain_pending.is_some_and(|(pending, _)| {
+                    target.is_some_and(|current| pending.same_subject(current))
+                }) {
+                BrainOverlay {
+                    status: BrainOverlayStatus::TimedOut,
+                    source_tick: snapshot.tick,
+                    ..default()
+                }
+            } else {
+                brain_sample.as_ref().map_or_else(
+                    || {
+                        if target.is_some() {
+                            BrainOverlay {
+                                status: BrainOverlayStatus::Pending,
+                                ..default()
+                            }
+                        } else {
+                            BrainOverlay::default()
+                        }
+                    },
+                    |sample| sample.overlay.clone(),
+                )
+            };
+            if assign_presentation_revision(snapshot, last_snapshot.as_ref(), &mut next_revision)? {
+                last_snapshot = Some(snapshot.clone());
+                if !publisher.publish(snapshot.clone()) {
+                    break;
+                }
+            }
+        }
+        let target = last_snapshot.as_ref().and_then(InspectorTarget::from_frame);
+        if !brain_in_flight
+            && brain_last_request.is_none_or(|at| at.elapsed() >= OWNER_INSPECTOR_REFRESH)
+            && let (Some(target), Some(published)) = (target, latest_published.as_ref())
+            && brain_last_attempt != Some(target)
+        {
+            match brain_requests.try_send(BrainOverlayJob {
+                target,
+                snapshot: Arc::clone(published),
+            }) {
+                Ok(()) => {}
+                Err(mpsc::TrySendError::Disconnected(_)) if !running.load(Ordering::Acquire) => {
+                    break;
+                }
+                Err(error) => return Err(anyhow!("Bevy brain worker request failed: {error}")),
+            }
+            brain_in_flight = true;
+            brain_pending = Some((target, Instant::now()));
+            brain_timeout_announced = false;
+            brain_last_attempt = Some(target);
+            brain_last_request = Some(Instant::now());
+        }
+        thread::sleep(Duration::from_millis(15));
+    }
+    Ok(())
 }
 
 fn poll_snapshots(
@@ -11573,6 +11766,403 @@ mod owner_inspector_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn snapshot_publication_continues_while_brain_inspection_is_delayed() {
+        let mut owner = TestOwner::new();
+        let running = Arc::new(AtomicBool::new(true));
+        let worker_running = Arc::clone(&running);
+        let (publisher, inbox) = SnapshotInbox::pair();
+        let (requests, request_inbox) = mpsc::sync_channel(1);
+        let (results, result_inbox) = mpsc::sync_channel(1);
+        let host = owner.port.clone();
+        let worker = thread::spawn(move || {
+            run_snapshot_publisher(
+                host,
+                &worker_running,
+                SimulationControl::new(),
+                publisher,
+                requests,
+                result_inbox,
+            )
+        });
+
+        let held_job = request_inbox
+            .recv_timeout(Duration::from_secs(3))
+            .expect("selected creature should request inspection");
+        let first = inbox
+            .take_latest()
+            .expect("world precedes inspection reply");
+        assert_eq!(first.brain.status, BrainOverlayStatus::Pending);
+        assert!(
+            request_inbox.try_recv().is_err(),
+            "only one request in flight"
+        );
+
+        owner.serve();
+        let mut port = owner.port.clone();
+        port.submit(CommandEnvelope::new(
+            CommandId::from_client_sequence(717, 2),
+            HostCommand::Step,
+        ))
+        .expect("step admitted");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let stepped = loop {
+            if let Some(frame) = inbox.take_latest()
+                && frame.tick > first.tick
+            {
+                break frame;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "world stalled behind brain reply"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(stepped.brain.status, BrainOverlayStatus::Pending);
+        assert!(
+            request_inbox.try_recv().is_err(),
+            "no second queued inspection"
+        );
+        assert!(
+            !held_job
+                .target
+                .visible_at(InspectorTarget::from_frame(&stepped).unwrap()),
+            "the step changes the control revision, so the old reply is stale"
+        );
+
+        results
+            .send(BrainOverlaySample {
+                target: held_job.target,
+                overlay: BrainOverlay {
+                    status: BrainOverlayStatus::Ready,
+                    source_tick: held_job.snapshot.world.tick,
+                    ..default()
+                },
+            })
+            .unwrap();
+        let next_job = request_inbox
+            .recv_timeout(Duration::from_secs(3))
+            .expect("the newer publication should be inspected");
+        if let Some(frame) = inbox.take_latest() {
+            assert_ne!(frame.brain.status, BrainOverlayStatus::Ready);
+        }
+        results
+            .send(BrainOverlaySample {
+                target: next_job.target,
+                overlay: BrainOverlay {
+                    status: BrainOverlayStatus::Ready,
+                    source_tick: next_job.snapshot.world.tick,
+                    ..default()
+                },
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(frame) = inbox.take_latest()
+                && frame.brain.status == BrainOverlayStatus::Ready
+            {
+                assert_eq!(frame.tick, stepped.tick);
+                assert_eq!(frame.brain.source_tick, stepped.tick);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "matching brain reply not published"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        running.store(false, Ordering::Release);
+        worker.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn clearing_selection_discards_a_delayed_brain_reply() {
+        let mut owner = TestOwner::new();
+        let running = Arc::new(AtomicBool::new(true));
+        let worker_running = Arc::clone(&running);
+        let (publisher, inbox) = SnapshotInbox::pair();
+        let (requests, request_inbox) = mpsc::sync_channel(1);
+        let (results, result_inbox) = mpsc::sync_channel(1);
+        let host = owner.port.clone();
+        let worker = thread::spawn(move || {
+            run_snapshot_publisher(
+                host,
+                &worker_running,
+                SimulationControl::new(),
+                publisher,
+                requests,
+                result_inbox,
+            )
+        });
+        let held_job = request_inbox.recv_timeout(Duration::from_secs(3)).unwrap();
+        owner.serve();
+        let mut port = owner.port.clone();
+        port.submit(CommandEnvelope::new(
+            CommandId::from_client_sequence(717, 4),
+            HostCommand::UpdateSelection(SelectionUpdate {
+                mode: SelectionMode::Clear,
+                agent_ids: Vec::new(),
+                state: SelectionState::Selected,
+            }),
+        ))
+        .expect("clear admitted");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(frame) = inbox.take_latest()
+                && InspectorTarget::from_frame(&frame).is_none()
+            {
+                assert_eq!(frame.brain.status, BrainOverlayStatus::NotRequested);
+                break;
+            }
+            assert!(Instant::now() < deadline, "selection did not clear");
+            thread::sleep(Duration::from_millis(10));
+        }
+        // The held request belongs to the old selection. Its deadline must
+        // not publish a timeout after selection has been cleared.
+        thread::sleep(OWNER_INSPECTOR_DEADLINE + Duration::from_millis(150));
+        if let Some(frame) = inbox.take_latest() {
+            assert_eq!(frame.brain.status, BrainOverlayStatus::NotRequested);
+            assert!(InspectorTarget::from_frame(&frame).is_none());
+        }
+        assert!(matches!(
+            request_inbox.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        results
+            .send(BrainOverlaySample {
+                target: held_job.target,
+                overlay: BrainOverlay {
+                    status: BrainOverlayStatus::Ready,
+                    ..default()
+                },
+            })
+            .unwrap();
+        assert!(matches!(
+            request_inbox.recv_timeout(Duration::from_millis(350)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        if let Some(frame) = inbox.take_latest() {
+            assert_eq!(frame.brain.status, BrainOverlayStatus::NotRequested);
+        }
+        running.store(false, Ordering::Release);
+        worker.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn brain_worker_disconnect_is_an_error_only_while_running() {
+        let owner = TestOwner::new();
+        let (publisher, _inbox) = SnapshotInbox::pair();
+        let (requests, _request_inbox) = mpsc::sync_channel(1);
+        let (results, result_inbox) = mpsc::sync_channel(1);
+        drop(results);
+        let error = run_snapshot_publisher(
+            owner.port.clone(),
+            &AtomicBool::new(true),
+            SimulationControl::new(),
+            publisher,
+            requests,
+            result_inbox,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("brain worker disconnected"));
+
+        let (publisher, _inbox) = SnapshotInbox::pair();
+        let (requests, _request_inbox) = mpsc::sync_channel(1);
+        let (results, result_inbox) = mpsc::sync_channel(1);
+        drop(results);
+        assert!(
+            run_snapshot_publisher(
+                owner.port.clone(),
+                &AtomicBool::new(false),
+                SimulationControl::new(),
+                publisher,
+                requests,
+                result_inbox,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn real_owner_brain_read_does_not_block_snapshot_publication() {
+        let mut owner = TestOwner::new();
+        let running = Arc::new(AtomicBool::new(true));
+        let (publisher, inbox) = SnapshotInbox::pair();
+        let (requests, request_inbox) = mpsc::sync_channel(1);
+        let (results, result_inbox) = mpsc::sync_channel(1);
+        let brain_host = owner.port.clone();
+        let brain_running = Arc::clone(&running);
+        let brain_worker = thread::spawn(move || {
+            run_brain_projection_worker(brain_host, &brain_running, request_inbox, results)
+        });
+        let snapshot_host = owner.port.clone();
+        let snapshot_running = Arc::clone(&running);
+        let snapshot_worker = thread::spawn(move || {
+            run_snapshot_publisher(
+                snapshot_host,
+                &snapshot_running,
+                SimulationControl::new(),
+                publisher,
+                requests,
+                result_inbox,
+            )
+        });
+
+        // The owner has not started servicing its queue, so an actual brain
+        // projection cannot return before the first published world frame.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let first = loop {
+            if let Some(frame) = inbox.take_latest() {
+                break frame;
+            }
+            assert!(Instant::now() < deadline, "initial world was not published");
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(first.brain.status, BrainOverlayStatus::Pending);
+        owner.serve();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(frame) = inbox.take_latest()
+                && matches!(
+                    frame.brain.status,
+                    BrainOverlayStatus::Ready | BrainOverlayStatus::Unavailable
+                )
+            {
+                assert_eq!(frame.tick, first.tick);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "real owner reply was not published"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        running.store(false, Ordering::Release);
+        snapshot_worker.join().unwrap().unwrap();
+        brain_worker.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn stalled_brain_timeout_does_not_enqueue_until_acknowledged() {
+        let owner = TestOwner::new();
+        let running = Arc::new(AtomicBool::new(true));
+        let worker_running = Arc::clone(&running);
+        let (publisher, inbox) = SnapshotInbox::pair();
+        let (requests, request_inbox) = mpsc::sync_channel(1);
+        let (results, result_inbox) = mpsc::sync_channel(1);
+        let host = owner.port.clone();
+        let worker = thread::spawn(move || {
+            run_snapshot_publisher(
+                host,
+                &worker_running,
+                SimulationControl::new(),
+                publisher,
+                requests,
+                result_inbox,
+            )
+        });
+        let first = request_inbox.recv_timeout(Duration::from_secs(3)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(frame) = inbox.take_latest()
+                && frame.brain.status == BrainOverlayStatus::TimedOut
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "timeout not published");
+            thread::sleep(Duration::from_millis(10));
+        }
+        thread::sleep(OWNER_INSPECTOR_REFRESH * 2);
+        assert!(matches!(
+            request_inbox.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        results
+            .send(BrainOverlaySample {
+                target: first.target,
+                overlay: BrainOverlay {
+                    status: BrainOverlayStatus::TimedOut,
+                    ..default()
+                },
+            })
+            .unwrap();
+        let retry = request_inbox.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(retry.target.same_subject(first.target));
+        running.store(false, Ordering::Release);
+        worker.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn paused_brain_recovers_after_owner_acknowledges_expired_request() {
+        let mut owner = TestOwner::new();
+        let running = Arc::new(AtomicBool::new(true));
+        let (publisher, inbox) = SnapshotInbox::pair();
+        let (requests, request_inbox) = mpsc::sync_channel(1);
+        let (results, result_inbox) = mpsc::sync_channel(1);
+        let brain_host = owner.port.clone();
+        let brain_running = Arc::clone(&running);
+        let brain_worker = thread::spawn(move || {
+            run_brain_projection_worker(brain_host, &brain_running, request_inbox, results)
+        });
+        let snapshot_host = owner.port.clone();
+        let snapshot_running = Arc::clone(&running);
+        let snapshot_worker = thread::spawn(move || {
+            run_snapshot_publisher(
+                snapshot_host,
+                &snapshot_running,
+                SimulationControl::new(),
+                publisher,
+                requests,
+                result_inbox,
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let initial = loop {
+            if let Some(frame) = inbox.take_latest() {
+                break frame;
+            }
+            assert!(Instant::now() < deadline, "initial frame missing");
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(initial.brain.status, BrainOverlayStatus::Pending);
+        // Without serving the owner, the deadline must become visible on a
+        // paused world; the worker still retains its single acknowledgement.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(frame) = inbox.take_latest()
+                && frame.brain.status == BrainOverlayStatus::TimedOut
+            {
+                assert_eq!(frame.tick, initial.tick);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "stalled brain timeout was not published"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        // Wait through multiple refresh periods before owner recovery.
+        thread::sleep(OWNER_INSPECTOR_REFRESH * 2);
+        owner.serve();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(frame) = inbox.take_latest()
+                && matches!(
+                    frame.brain.status,
+                    BrainOverlayStatus::Ready | BrainOverlayStatus::Unavailable
+                )
+            {
+                assert_eq!(frame.tick, initial.tick);
+                break;
+            }
+            assert!(Instant::now() < deadline, "paused brain did not recover");
+            thread::sleep(Duration::from_millis(10));
+        }
+        running.store(false, Ordering::Release);
+        snapshot_worker.join().unwrap().unwrap();
+        brain_worker.join().unwrap().unwrap();
     }
 
     fn inspector_app(owner: &TestOwner) -> (App, Entity) {

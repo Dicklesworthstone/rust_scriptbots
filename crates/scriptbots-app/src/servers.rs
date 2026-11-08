@@ -1482,6 +1482,22 @@ fn default_step_count() -> u64 {
     1
 }
 
+fn parse_step_count(bytes: &[u8]) -> Result<u64, AppError> {
+    let Some(first) = bytes.iter().find(|byte| !byte.is_ascii_whitespace()) else {
+        return Ok(1);
+    };
+    // Serde accepts sequences for structs, so `[]` otherwise becomes the
+    // default one-step request. Only an empty body or a JSON object is valid.
+    if *first != b'{' {
+        return Err(AppError::bad_request(
+            "invalid step request payload: expected a JSON object",
+        ));
+    }
+    let body: StepRequestBody = serde_json::from_slice(bytes)
+        .map_err(|error| AppError::bad_request(format!("invalid step request payload: {error}")))?;
+    Ok(body.count)
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SpeedRequestBody {
     pub speed: f32,
@@ -3387,14 +3403,7 @@ async fn post_control_step(
     bytes: axum::body::Bytes,
 ) -> Result<Json<CommandStatusDto>, AppError> {
     require_json_content_type(&headers, &bytes)?;
-    let count = if bytes.iter().all(u8::is_ascii_whitespace) {
-        1
-    } else {
-        let body: StepRequestBody = serde_json::from_slice(&bytes).map_err(|error| {
-            AppError::bad_request(format!("invalid step request payload: {error}"))
-        })?;
-        body.count
-    };
+    let count = parse_step_count(&bytes)?;
     let key = idempotency_key(&headers);
     let status = run_control(move || state.handle.step_count(count, key.as_deref())).await?;
     Ok(Json(status))
@@ -3620,14 +3629,7 @@ async fn post_step(
     bytes: axum::body::Bytes,
 ) -> Result<Json<CommandStatusDto>, AppError> {
     require_json_content_type(&headers, &bytes)?;
-    let count = if bytes.iter().all(u8::is_ascii_whitespace) {
-        1
-    } else {
-        let body: StepRequestBody = serde_json::from_slice(&bytes).map_err(|error| {
-            AppError::bad_request(format!("invalid step request payload: {error}"))
-        })?;
-        body.count
-    };
+    let count = parse_step_count(&bytes)?;
     // `step_count` submits `count` commands and returns the LAST receipt. The
     // reported id therefore identifies the final step, not the batch; a caller
     // polling it learns about that one command. Saying so beats implying the
@@ -5673,12 +5675,20 @@ mod tests {
             .map(|opener| format!("let status = {opener}"))
             .collect();
         let receipt_forms = |candidate: &str| {
-            let bound = candidate
-                .lines()
-                .map(str::trim)
-                .any(|line| bound_openers.iter().any(|opener| line.starts_with(opener)));
-            let discarded = candidate.lines().map(str::trim).any(|line| {
-                openers.iter().any(|opener| line.starts_with(opener)) && line.ends_with(';')
+            let lines: Vec<&str> = candidate.lines().map(str::trim).collect();
+            let bound_continuation = |index: usize, line: &str| {
+                index > 0
+                    && lines[index - 1] == "let status ="
+                    && openers.iter().any(|opener| line.starts_with(opener))
+            };
+            let bound = lines.iter().enumerate().any(|(index, line)| {
+                bound_openers.iter().any(|opener| line.starts_with(opener))
+                    || bound_continuation(index, line)
+            });
+            let discarded = lines.iter().enumerate().any(|(index, line)| {
+                openers.iter().any(|opener| line.starts_with(opener))
+                    && line.ends_with(';')
+                    && !bound_continuation(index, line)
             });
             (bound, discarded)
         };
@@ -5691,13 +5701,22 @@ mod tests {
 
         // Deleting every observed binding must invalidate the positive control.
         // The test module is excluded, so its own assertions cannot keep it green.
-        let deleted = source
-            .lines()
-            .filter(|line| {
-                !bound_openers
-                    .iter()
-                    .any(|opener| line.trim().starts_with(opener))
+        let source_lines: Vec<&str> = source.lines().collect();
+        let deleted = source_lines
+            .iter()
+            .enumerate()
+            .filter(|(index, line)| {
+                let line = line.trim();
+                let next_is_call = source_lines.get(*index + 1).is_some_and(|next| {
+                    openers.iter().any(|opener| next.trim().starts_with(opener))
+                });
+                let follows_binding =
+                    *index > 0 && source_lines[*index - 1].trim() == "let status =";
+                !bound_openers.iter().any(|opener| line.starts_with(opener))
+                    && !(line == "let status =" && next_is_call)
+                    && !(follows_binding && openers.iter().any(|opener| line.starts_with(opener)))
             })
+            .map(|(_, line)| *line)
             .collect::<Vec<_>>()
             .join("\n");
         assert_eq!(receipt_forms(&deleted), (false, false));
@@ -5706,6 +5725,10 @@ mod tests {
         for opener in &openers {
             let discarded = format!("{source}\n{opener}pause(None));");
             assert_eq!(receipt_forms(&discarded), (true, true));
+            let split_binding = format!("let status =\n    {opener}pause(None))?;");
+            assert_eq!(receipt_forms(&split_binding), (true, false));
+            let split_discard = format!("let status = unrelated();\n{opener}pause(None))?;");
+            assert_eq!(receipt_forms(&split_discard), (false, true));
         }
         assert_eq!(
             receipt_forms(""),
@@ -8726,9 +8749,12 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(
-            conflict["error"]["code"],
-            i32::from(McpErrorCode::InvalidParams),
+        assert!(conflict.get("error").is_none(), "{conflict}");
+        assert_eq!(conflict["result"]["isError"], true, "{conflict}");
+        assert!(
+            conflict["result"]["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("used for a different command envelope")),
             "{conflict}"
         );
 
@@ -8763,6 +8789,59 @@ mod tests {
         .expect("existing unkeyed batch");
         host.wait_applied(&batch);
         assert_eq!(handle.status().unwrap().tick, 3);
+    }
+
+    #[tokio::test]
+    async fn rest_step_requires_object_without_changing_empty_or_batch_behavior() {
+        let (handle, host) = handle();
+        let state = ApiState {
+            handle: handle.clone(),
+            scenario: None,
+            presented_frame: empty_presented_frame(),
+        };
+        let before = handle.read_snapshot().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("Content-Type", "application/json".parse().unwrap());
+        for value in [
+            json!([]),
+            json!([1]),
+            json!(null),
+            json!(true),
+            json!("step"),
+        ] {
+            let body = axum::body::Bytes::from(serde_json::to_vec(&value).unwrap());
+            let canonical = post_control_step(State(state.clone()), headers.clone(), body.clone())
+                .await
+                .expect_err("non-object canonical request must be refused");
+            assert_eq!(canonical.status, StatusCode::BAD_REQUEST, "{value}");
+            let alias = post_step(State(state.clone()), headers.clone(), body)
+                .await
+                .expect_err("non-object legacy request must be refused");
+            assert_eq!(alias.status, StatusCode::BAD_REQUEST, "{value}");
+        }
+        let after = handle.read_snapshot().unwrap();
+        assert_eq!(after.world, before.world);
+        assert_eq!(after.revisions, before.revisions);
+        assert_eq!(after.last_applied_command, before.last_applied_command);
+        assert_eq!(after.command_queue_depth, 0);
+
+        let Json(single) = post_control_step(
+            State(state.clone()),
+            headers.clone(),
+            axum::body::Bytes::new(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("empty-body step refused: {}", error.message));
+        host.wait_applied(&single);
+        let Json(batch) = post_step(
+            State(state),
+            headers,
+            axum::body::Bytes::from_static(br#"{"count":2}"#),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("unkeyed batch refused: {}", error.message));
+        host.wait_applied(&batch);
+        assert_eq!(handle.status().unwrap().tick, before.world.tick + 3);
     }
 
     #[tokio::test]
@@ -8842,7 +8921,9 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            assert!(tool.call(&ctx, arguments.clone()).is_err(), "{arguments}");
+            let direct = tool
+                .call(&ctx, arguments.clone())
+                .expect_err("invalid step must be refused directly");
             let response = map_policy_mcp_request(
                 &mcp,
                 json!({
@@ -8851,11 +8932,23 @@ mod tests {
                 }),
             )
             .await;
-            assert_eq!(
-                response["error"]["code"],
-                i32::from(McpErrorCode::InvalidParams),
-                "{arguments}: {response}"
-            );
+            if arguments["idempotency_key"] == "refused-step" || arguments["idempotency_key"] == " "
+            {
+                // These shapes satisfy the schema but fail the tool's semantic
+                // checks; FastMCP reports handler refusals as tool errors.
+                assert!(response.get("error").is_none(), "{arguments}: {response}");
+                assert_eq!(
+                    response["result"]["isError"], true,
+                    "{arguments}: {response}"
+                );
+                assert_eq!(response["result"]["content"][0]["text"], direct.message);
+            } else {
+                assert_eq!(
+                    response["error"]["code"],
+                    i32::from(McpErrorCode::InvalidParams),
+                    "{arguments}: {response}"
+                );
+            }
         }
         let after = host.handle().read_snapshot().unwrap();
         assert_eq!(after.world, before.world);

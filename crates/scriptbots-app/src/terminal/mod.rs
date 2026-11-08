@@ -19308,7 +19308,10 @@ for case in ('panic', 'subscription', 'renderer'):
                     for run in &completed.runs {
                         let row = text
                             .lines()
-                            .find(|line| line.contains(&run.variant_id))
+                            .find(|line| {
+                                line.split_whitespace().find(|cell| *cell != ">")
+                                    == Some(run.variant_id.as_str())
+                            })
                             .expect("real completed variant is visibly rendered");
                         assert!(row.contains(&run.brain_family));
                         assert!(row.contains("77"));

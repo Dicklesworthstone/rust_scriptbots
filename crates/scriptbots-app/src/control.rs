@@ -5879,6 +5879,18 @@ pub(crate) mod tests {
         use crate::experiment_runner::{
             MatchedSeedCohort, MatchedSeedExperimentRunner, ScenarioVariant,
         };
+        const FIXTURE_TICKS: u64 = 2;
+        let defaults = ScriptBotsConfig::default();
+        // These values are not exposed as experiment knobs. The default
+        // cadences cannot fire during this two-tick fixture, and both default
+        // metabolism modifiers are zero, preserving the intended controls.
+        assert!(
+            defaults.food_respawn_interval == 0
+                || u64::from(defaults.food_respawn_interval) > FIXTURE_TICKS
+        );
+        assert!(u64::from(defaults.reproduction_attempt_interval) > FIXTURE_TICKS);
+        assert_eq!(defaults.metabolism_ramp_rate, 0.0);
+        assert_eq!(defaults.metabolism_boost_penalty, 0.0);
         // The two conditions differ in actual retained food. No ingestion,
         // locomotion or reproduction can turn that fixture into another outcome.
         let common = BTreeMap::from([
@@ -5893,19 +5905,15 @@ pub(crate) mod tests {
             ("food_diffusion_rate".into(), serde_json::json!(0.0)),
             ("food_intake_rate".into(), serde_json::json!(0.0)),
             ("food_waste_rate".into(), serde_json::json!(0.0)),
-            ("food_respawn_interval".into(), serde_json::json!(0)),
             ("bot_speed".into(), serde_json::json!(0.0)),
             ("movement_drain".into(), serde_json::json!(0.0)),
             (
                 "metabolism_drain".into(),
                 serde_json::json!(metabolism_drain),
             ),
-            ("metabolism_ramp_rate".into(), serde_json::json!(0.0)),
-            ("metabolism_boost_penalty".into(), serde_json::json!(0.0)),
             ("temperature_discomfort_rate".into(), serde_json::json!(0.0)),
             ("spike_damage".into(), serde_json::json!(0.0)),
             ("spike_energy_cost".into(), serde_json::json!(0.0)),
-            ("reproduction_attempt_chance".into(), serde_json::json!(0.0)),
         ]);
         let variants = [("baseline", 0.0), ("challenger", 10.0)]
             .into_iter()
@@ -5928,7 +5936,7 @@ pub(crate) mod tests {
                 seeds,
             },
             variants,
-            2,
+            FIXTURE_TICKS,
             1,
             &directory,
         );
@@ -9260,10 +9268,23 @@ pub(crate) mod tests {
                         .apply_patch(serde_json::json!({"food_max": food_max}))
                         .unwrap(),
                 );
-                assert!(
-                    matches!(handle.event_canvas(target_tick), Err(ControlError::BadRequest(message))
-                    if message.contains("scientific revisions"))
+                let after_edits_digest = host.port.scientific_digest_v1().unwrap();
+                let after_edits_publication = handle.read_snapshot().unwrap();
+                let replayed = handle
+                    .event_canvas(target_tick)
+                    .expect("complete committed config history can be replayed");
+                assert_eq!(
+                    logical(serde_json::to_value(&replayed.snapshot.world).unwrap()),
+                    logical(serde_json::to_value(&oracle.world).unwrap())
                 );
+                assert_eq!(
+                    host.port.scientific_digest_v1().unwrap(),
+                    after_edits_digest
+                );
+                assert!(Arc::ptr_eq(
+                    &handle.read_snapshot().unwrap(),
+                    &after_edits_publication
+                ));
                 let fresh = handle
                     .create_checkpoint(CheckpointCreateRequest::default())
                     .unwrap();
@@ -10324,7 +10345,11 @@ pub(crate) mod tests {
         assert!(unavailable.inventory_error.is_some());
         assert_eq!(unavailable.pending_entries, 1);
         assert_eq!(unavailable.sql_count, Some(0));
-        assert_eq!(handle.list_checkpoints(None, None).unwrap().total, 0);
+        assert!(matches!(
+            handle.list_checkpoints(None, None),
+            Err(ControlError::CheckpointRetentionUnavailable(message))
+                if message.contains("artifact directory identity changed")
+        ));
         assert_eq!(host.port.scientific_digest_v1().unwrap(), live);
         fs::rename(&directory, root.join("refused-artifacts")).expect("preserve replacement");
         fs::rename(&leased_directory, &directory).expect("restore original leased root");

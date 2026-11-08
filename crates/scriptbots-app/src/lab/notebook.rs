@@ -1809,19 +1809,13 @@ mod tests {
         let mut reference = run("arm-1", 1, 42);
         reference.config_overrides = BTreeMap::from([
             ("food_growth_rate".to_owned(), serde_json::json!(0.02)),
-            (
-                "render.post.bloom.intensity".to_owned(),
-                serde_json::json!(0.5),
-            ),
+            ("movement_drain".to_owned(), serde_json::json!(0.005)),
         ]);
         let encoded = reproduction_config(&reference).expect("serialize config");
         let decoded: serde_json::Value = toml::from_str(&encoded).expect("CLI TOML parser");
         assert_eq!(decoded["rng_seed"], serde_json::json!(42));
         assert_eq!(decoded["food_growth_rate"], serde_json::json!(0.02));
-        assert_eq!(
-            decoded["render"]["post"]["bloom"]["intensity"],
-            serde_json::json!(0.5)
-        );
+        assert_eq!(decoded["movement_drain"], serde_json::json!(0.005));
         assert_eq!(decoded["persistence_interval"], serde_json::json!(1));
         assert_eq!(
             decoded["history_capacity"],
@@ -1836,6 +1830,29 @@ mod tests {
         assert_eq!(
             serde_json::to_value(reconstructed).unwrap(),
             serde_json::to_value(expected).unwrap()
+        );
+    }
+
+    #[test]
+    fn nested_json_values_roundtrip_through_cli_toml_format() {
+        let input = serde_json::json!({"render": {"post": {"bloom": {"intensity": 0.5}}}});
+        let value = json_to_toml_value(input.clone()).expect("convert nested values");
+        let encoded = toml::to_string(&value).expect("encode nested values");
+        let decoded: serde_json::Value = toml::from_str(&encoded).expect("CLI TOML parser");
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn reproduction_config_refuses_unavailable_nested_overrides() {
+        let mut reference = run("arm-1", 1, 42);
+        reference.config_overrides = BTreeMap::from([(
+            "render.post.bloom.intensity".to_owned(),
+            serde_json::json!(0.5),
+        )]);
+        let error = reproduction_config(&reference).expect_err("unset nested block must be refused");
+        assert!(
+            error.to_string().contains("unknown segment `bloom`"),
+            "{error}"
         );
     }
 

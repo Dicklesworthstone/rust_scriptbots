@@ -147,6 +147,7 @@ pub enum ChannelHostOptionsError {
 enum IngressMessage {
     BrainProjection {
         request: BrainProjectionRequest,
+        expires_at: Instant,
         reply: Sender<Result<BrainProjection, HostAccessError>>,
     },
     AgentInspection {
@@ -549,8 +550,10 @@ impl ChannelHostPort {
                 "brain target limit exceeded before enqueue",
             ));
         }
+        let expires_at = self.inspection_deadline()?;
         self.read_owner(|reply| IngressMessage::BrainProjection {
             request: request.clone(),
+            expires_at,
             reply,
         })
     }
@@ -563,6 +566,39 @@ impl ChannelHostPort {
     ) -> Result<BrainProjection, HostAccessError> {
         self.bounded_before_with_error(deadline, HostAccessError::OwnerReadTimeout)?
             .project_brain(request)
+    }
+
+    /// Enqueue one bounded brain request and retain its owner acknowledgement.
+    ///
+    /// The caller must retain this receiver until it resolves before enqueuing
+    /// another request for the same consumer. Expiry prevents stale owner work;
+    /// it does not remove a message from the bounded ingress queue.
+    pub fn begin_brain_projection_before(
+        &self,
+        request: &BrainProjectionRequest,
+        deadline: Instant,
+    ) -> Result<std::sync::mpsc::Receiver<Result<BrainProjection, HostAccessError>>, HostAccessError>
+    {
+        if request.targets.len() > scriptbots_core::ACTIVATION_CAPTURE_BUDGET {
+            return Err(Self::protocol_violation(
+                "brain target limit exceeded before enqueue",
+            ));
+        }
+        let bounded =
+            self.bounded_before_with_error(deadline, HostAccessError::OwnerReadTimeout)?;
+        let expires_at = bounded.inspection_deadline()?;
+        let started = Instant::now();
+        let (reply, receiver) = std::sync::mpsc::channel();
+        bounded.enqueue_with_error(
+            IngressMessage::BrainProjection {
+                request: request.clone(),
+                expires_at,
+                reply,
+            },
+            started,
+            HostAccessError::OwnerReadTimeout,
+        )?;
+        Ok(receiver)
     }
 
     /// Read one living agent's inspector detail; a deceased UID returns `None`.
@@ -1454,7 +1490,15 @@ impl ChannelHostDriver {
             return;
         }
         match message {
-            IngressMessage::BrainProjection { request, reply } => {
+            IngressMessage::BrainProjection {
+                request,
+                expires_at,
+                reply,
+            } => {
+                if Instant::now() >= expires_at {
+                    let _ = reply.send(Err(HostAccessError::OwnerReadTimeout));
+                    return;
+                }
                 let result = self
                     .host
                     .core()
@@ -3834,14 +3878,77 @@ mod tests {
             AgentUid(1),
         );
         let started = Instant::now();
+        let deadline = started + Duration::from_millis(20);
         assert!(matches!(
-            port.project_brain_before(&request, started + Duration::from_millis(20)),
+            port.project_brain_before(&request, deadline),
             Err(HostAccessError::OwnerReadTimeout)
         ));
         assert!(started.elapsed() < Duration::from_secs(1));
         assert!(matches!(
             driver.receiver.try_recv().expect("actual brain ingress"),
-            IngressMessage::BrainProjection { .. }
+            IngressMessage::BrainProjection { expires_at, .. }
+                if expires_at <= deadline && expires_at <= Instant::now()
+        ));
+    }
+
+    #[test]
+    fn expired_queued_brain_projection_is_discarded_before_owner_work() {
+        let (mut driver, _) =
+            ChannelHostDriver::new(test_host(true), fast_options()).expect("driver");
+        let request = BrainProjectionRequest::focused(
+            crate::ProjectionClientId::new(615),
+            crate::ProjectionRequestRevision::new(1),
+            AgentUid(u64::MAX),
+        );
+        let (reply, receive) = std::sync::mpsc::channel();
+        driver.process_ingress(IngressMessage::BrainProjection {
+            request: request.clone(),
+            expires_at: Instant::now(),
+            reply,
+        });
+        assert!(matches!(
+            receive.recv().expect("expired brain reply"),
+            Err(HostAccessError::OwnerReadTimeout)
+        ));
+
+        let (reply, receive) = std::sync::mpsc::channel();
+        driver.process_ingress(IngressMessage::BrainProjection {
+            request,
+            expires_at: Instant::now() + Duration::from_secs(1),
+            reply,
+        });
+        assert!(receive.recv().expect("live brain reply").is_ok());
+    }
+
+    #[test]
+    fn retained_brain_acknowledgement_survives_caller_deadline() {
+        let (mut driver, port) =
+            ChannelHostDriver::new(test_host(true), fast_options()).expect("driver");
+        let request = BrainProjectionRequest::focused(
+            crate::ProjectionClientId::new(616),
+            crate::ProjectionRequestRevision::new(1),
+            AgentUid(u64::MAX),
+        );
+        let deadline = Instant::now() + Duration::from_millis(20);
+        let receiver = port
+            .begin_brain_projection_before(&request, deadline)
+            .expect("request enqueued");
+        while Instant::now() < deadline {
+            std::thread::park_timeout(deadline.saturating_duration_since(Instant::now()));
+        }
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        let queued = driver.receiver.try_recv().expect("one request queued");
+        assert!(matches!(
+            driver.receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        driver.process_ingress(queued);
+        assert!(matches!(
+            receiver.recv().expect("owner acknowledgement"),
+            Err(HostAccessError::OwnerReadTimeout)
         ));
     }
 
