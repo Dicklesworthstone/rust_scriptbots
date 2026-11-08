@@ -6620,7 +6620,7 @@ mod tests {
 
     #[test]
     fn test_execute_leaderboard_tournament_three_families_barrier() {
-        use crate::BuildProvenanceV0;
+        use crate::characterization_tests::complete_test_build;
         use leaderboard::{TournamentSpecFile, execute_leaderboard_tournament};
         use scriptbots_core::ScriptBotsConfig;
 
@@ -6635,7 +6635,7 @@ mod tests {
         spec_file.tournament.order_policy = "balanced_latin_square".into();
 
         let base_config = ScriptBotsConfig::default();
-        let build = BuildProvenanceV0::current();
+        let build = complete_test_build();
 
         let outcome = execute_leaderboard_tournament(
             &spec_file,
