@@ -2526,14 +2526,27 @@ pub struct ControlHandle {
     data_services: std::sync::Arc<DataServices>,
 }
 
+fn allocate_control_command_namespace() -> u64 {
+    // A continued host retains its command ledger across processes. Process-local
+    // counters and wall clocks cannot identify a new control client after restart.
+    // Keep the high bit clear so unkeyed commands cannot collide with keyed IDs
+    // or the runtime's reserved lifecycle/bootstrap namespaces. This RNG is not
+    // the world's seeded scientific stream.
+    loop {
+        let namespace = rand::random::<u64>() & (u64::MAX >> 1);
+        if namespace != 0 {
+            return namespace;
+        }
+    }
+}
+
 impl ControlHandle {
     pub fn new(host: ChannelHostPort) -> Self {
-        static NEXT_NAMESPACE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Self {
             host,
             knobs_cache: std::sync::Arc::new(Mutex::new(None)),
             command_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            command_namespace: NEXT_NAMESPACE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            command_namespace: allocate_control_command_namespace(),
             database_path: None,
             checkpoint_writer: None,
             data_services: std::sync::Arc::new(DataServices::default()),
@@ -11693,6 +11706,277 @@ pub(crate) mod tests {
 
         receiver.wait_applied(&second);
         assert_eq!(handle.status().expect("status").tick, 2);
+    }
+
+    /// A process restart must preserve explicit retries without recycling new
+    /// commands into the continued owner's existing idempotency ledger.
+    #[test]
+    fn unkeyed_commands_advance_after_checkpoint_continuation_in_a_new_process() {
+        const DIRECTORY: &str = "SCRIPTBOTS_TEST_CONTROL_RESTART_DIRECTORY";
+        const PHASE: &str = "SCRIPTBOTS_TEST_CONTROL_RESTART_PHASE";
+        if let Some(directory) = std::env::var_os(DIRECTORY) {
+            let restore = match std::env::var(PHASE).as_deref() {
+                Ok("create") => false,
+                Ok("restore") => true,
+                phase => panic!("invalid continuation fixture phase: {phase:?}"),
+            };
+            run_control_restart_phase(&PathBuf::from(directory), restore);
+            return;
+        }
+
+        let directory = tempfile::tempdir().expect("cross-process continuation directory");
+        for phase in ["create", "restore"] {
+            let stdout_path = directory.path().join(format!("{phase}.stdout.log"));
+            let stderr_path = directory.path().join(format!("{phase}.stderr.log"));
+            let mut command = std::process::Command::new(
+                std::env::current_exe().expect("current control test executable"),
+            );
+            command
+                .args([
+                    "--exact",
+                    "control::tests::unkeyed_commands_advance_after_checkpoint_continuation_in_a_new_process",
+                    "--nocapture",
+                ])
+                .env(DIRECTORY, directory.path())
+                .env(PHASE, phase)
+                .stdout(fs::File::create(&stdout_path).expect("phase stdout log"))
+                .stderr(fs::File::create(&stderr_path).expect("phase stderr log"));
+            if let Err(error) =
+                crate::experiment_runner::MatchedSeedExperimentRunner::run_bounded_child(
+                    &mut command,
+                    std::time::Duration::from_secs(30),
+                )
+            {
+                let read_log = |path: &Path| {
+                    let mut text = String::new();
+                    fs::File::open(path)
+                        .expect("open phase log")
+                        .take(64 * 1024)
+                        .read_to_string(&mut text)
+                        .expect("read bounded phase log");
+                    text
+                };
+                panic!(
+                    "continuation phase {phase} failed: {error}; stdout={} stderr={}",
+                    read_log(&stdout_path),
+                    read_log(&stderr_path),
+                );
+            }
+            let (artifact, tick) = if phase == "create" {
+                ("owner.checkpoint", 2)
+            } else {
+                ("continued.checkpoint", 3)
+            };
+            let bytes = fs::read(directory.path().join(artifact))
+                .expect("child actually executed and retained its owner cut");
+            let checkpoint = scriptbots_runtime::VolatileHostCheckpointV1::decode(&bytes)
+                .expect("independently reopen the child artifact");
+            assert_eq!(checkpoint.host_checkpoint().tick().0, tick);
+        }
+    }
+
+    fn run_control_restart_phase(directory: &Path, restore: bool) {
+        use scriptbots_runtime::{
+            FixedDeadlineHost, HostCore, HostCoreOptions, HostSessionId, ManualInstant,
+            PlaybackSnapshot, VolatileHostCheckpointV1,
+            channel::{ChannelHostDriver, ChannelHostOptions, ChannelRunOutcome},
+        };
+        use std::time::{Duration, Instant};
+
+        fn wait_settled(control: &ControlHandle, admitted: &CommandStatusDto) -> CommandStatusDto {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let observed = control
+                    .command_status(&admitted.command_id)
+                    .expect("actual owner status")
+                    .expect("retained command identity");
+                if observed.application_state != "admitted" && observed.journal_state != "pending" {
+                    assert_eq!(observed.application_state, "applied");
+                    assert_eq!(observed.journal_state, "committed_volatile");
+                    return observed;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "continued command did not settle"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        let checkpoint_path = directory.join("owner.checkpoint");
+        let receipts_path = directory.join("receipts.json");
+        let saved = restore.then(|| fs::read(&checkpoint_path).expect("saved owner artifact"));
+        let (ready, receive) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let core = if let Some(bytes) = saved {
+                let checkpoint =
+                    VolatileHostCheckpointV1::decode(&bytes).expect("decode actual owner cut");
+                let world = checkpoint
+                    .host_checkpoint()
+                    .restore_world(scriptbots_core::BrainRegistry::new())
+                    .expect("restore actual scientific world");
+                let persistence = world
+                    .bind_persistence(Box::new(scriptbots_core::NullPersistence))
+                    .expect("bind continued persistence");
+                HostCore::restore_volatile_host_checkpoint_v1(
+                    &checkpoint,
+                    world,
+                    persistence,
+                    None,
+                    ManualInstant::from_nanos(0),
+                )
+                .expect("restore the complete owner and command authority")
+            } else {
+                let mut world = WorldState::new(ScriptBotsConfig {
+                    world_width: 200,
+                    world_height: 200,
+                    food_cell_size: 20,
+                    rng_seed: Some(42),
+                    persistence_interval: 1,
+                    closed: true,
+                    population_spawn_interval: 0,
+                    reproduction_energy_threshold: f32::MAX,
+                    history_capacity: 16,
+                    ..ScriptBotsConfig::default()
+                })
+                .expect("nonempty continuation world");
+                for _ in 0..3 {
+                    world
+                        .try_spawn_agent(scriptbots_core::AgentData::default())
+                        .expect("real founder");
+                }
+                HostCore::new(
+                    HostSessionId::new(0xc017),
+                    world,
+                    HostCoreOptions {
+                        initial_playback: PlaybackSnapshot {
+                            paused: true,
+                            speed_multiplier: 1.0,
+                        },
+                        ..HostCoreOptions::default()
+                    },
+                )
+                .expect("real original owner")
+            };
+            let (mut driver, port) =
+                ChannelHostDriver::new(FixedDeadlineHost::new(core), ChannelHostOptions::default())
+                    .expect("actual owner channel");
+            ready.send(port).expect("publish owner port");
+            let epoch = Instant::now();
+            let receipt = driver
+                .run(|| {
+                    ManualInstant::from_nanos(
+                        u64::try_from(epoch.elapsed().as_nanos()).expect("test duration"),
+                    )
+                })
+                .expect("owner handoff");
+            assert_eq!(receipt.outcome, ChannelRunOutcome::HandedOff);
+            driver
+                .host()
+                .core()
+                .capture_volatile_host_checkpoint_v1()
+                .expect("joint owner and journal cut")
+                .encode()
+                .expect("encode actual continuation artifact")
+        });
+        let port = receive.recv().expect("owner ready");
+        let control = ControlHandle::new(port.clone());
+
+        if restore {
+            let [old_step, old_pause, old_keyed]: [CommandStatusDto; 3] = serde_json::from_slice(
+                &fs::read(&receipts_path).expect("original process receipts"),
+            )
+            .expect("decode original receipts");
+            assert_eq!(control.status().expect("restored science").tick, 2);
+
+            // Do not obtain fresh command identities by dropping the old ledger.
+            let old_id: CommandId =
+                serde_json::from_value(Value::String(old_step.command_id.clone()))
+                    .expect("old unkeyed identity");
+            let old_retry = control
+                .host
+                .clone()
+                .submit(CommandEnvelope::new(old_id, HostCommand::Step))
+                .expect("an explicit old envelope still retries");
+            assert_eq!(
+                old_retry
+                    .admission_sequence()
+                    .map(|sequence| sequence.get()),
+                old_step.admission_sequence,
+            );
+            assert!(matches!(
+                control
+                    .host
+                    .clone()
+                    .submit(CommandEnvelope::new(old_id, HostCommand::Pause)),
+                Err(scriptbots_runtime::HostAccessError::CommandIdCollision { .. })
+            ));
+            let keyed = control
+                .submit_command(ControlCommand::Step, Some("control-restart-key"))
+                .expect("keyed retry across processes");
+            assert_eq!(keyed.command_id, old_keyed.command_id);
+            assert_eq!(keyed.admission_sequence, old_keyed.admission_sequence);
+            wait_settled(&control, &keyed);
+            assert_eq!(control.status().expect("retry did not advance").tick, 2);
+
+            let step = control.step().expect("new unkeyed step after restart");
+            assert_ne!(step.command_id, old_step.command_id);
+            wait_settled(&control, &step);
+            assert_eq!(control.status().expect("fresh step advanced").tick, 3);
+
+            // The old process's second command was Pause. Reusing its namespace
+            // here would collide with that payload instead of changing speed.
+            let speed = control
+                .clone()
+                .set_speed(2.0, None)
+                .expect("new command does not collide with the original Pause");
+            assert_ne!(speed.command_id, old_pause.command_id);
+            wait_settled(&control, &speed);
+            let snapshot = control.read_snapshot().expect("continued playback");
+            assert_eq!(snapshot.world.tick, 3);
+            assert!(snapshot.playback.paused);
+            assert_eq!(snapshot.playback.speed_multiplier, 2.0);
+            let fresh: CommandId = serde_json::from_value(Value::String(step.command_id))
+                .expect("fresh unkeyed identity");
+            let cloned: CommandId = serde_json::from_value(Value::String(speed.command_id))
+                .expect("cloned control identity");
+            assert_ne!(fresh.client_namespace(), 0);
+            assert_eq!(fresh.client_namespace(), cloned.client_namespace());
+            assert_eq!(fresh.client_sequence(), 0);
+            assert_eq!(cloned.client_sequence(), 1);
+            assert_eq!(fresh.get() >> 127, 0);
+        } else {
+            let step = wait_settled(&control, &control.step().expect("original unkeyed step"));
+            let pause = wait_settled(&control, &control.pause(None).expect("original pause"));
+            let keyed = wait_settled(
+                &control,
+                &control
+                    .submit_command(ControlCommand::Step, Some("control-restart-key"))
+                    .expect("original keyed step"),
+            );
+            assert_eq!(control.status().expect("original science").tick, 2);
+            fs::write(
+                &receipts_path,
+                serde_json::to_vec(&[step, pause, keyed]).expect("encode original receipts"),
+            )
+            .expect("retain original process receipts");
+        }
+        let handoff = port
+            .handoff_host_checkpoint_v1()
+            .expect("settled actual host handoff");
+        let bytes = worker.join().expect("original owner actually retired");
+        let paired = VolatileHostCheckpointV1::decode(&bytes).expect("final joint artifact");
+        assert_eq!(
+            paired.host_checkpoint().encode().expect("paired owner"),
+            handoff.encode().expect("acknowledged handoff"),
+        );
+        assert_eq!(handoff.tick().0, if restore { 3 } else { 2 });
+        let output = if restore {
+            directory.join("continued.checkpoint")
+        } else {
+            checkpoint_path
+        };
+        fs::write(output, bytes).expect("retain actual continuation artifact");
     }
 
     /// A selection submission must hand back a receipt a client can follow.
