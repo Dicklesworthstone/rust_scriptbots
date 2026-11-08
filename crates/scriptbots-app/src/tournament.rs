@@ -23,10 +23,10 @@ pub use leaderboard::{
     save_tournament_artifacts, to_brain_kind,
 };
 pub use rating::{
-    AxisRatingOutcome, AxisRatings, BtPrior, FamilyRating, OrderEffectReport, PairwiseComparison,
-    PairwiseResult, PairwiseVerdict, RatingAxis, RatingError, RatingOptions, RatingTable,
-    analyze_order_effect, elo_to_theta, fit_bradley_terry, rate_reports, rate_tournament,
-    reduce_pairwise, theta_to_elo,
+    AxisRatingOutcome, AxisRatings, BtPrior, FamilyRating, InferenceStatus, OrderEffectReport,
+    PairwiseComparison, PairwiseResult, PairwiseVerdict, RatingAxis, RatingError, RatingOptions,
+    RatingTable, analyze_order_effect, elo_to_theta, fit_bradley_terry, rate_reports,
+    rate_tournament, reduce_pairwise, theta_to_elo,
 };
 
 /// Largest match count one spec may emit (orders × seeds).
@@ -1585,10 +1585,12 @@ pub mod rating {
     #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
     pub struct RatingOptions {
         pub prior: BtPrior,
+        /// Requested seed-cluster resamples; fewer than two disables inference.
         pub bootstrap_replicates: usize,
         pub ci_seed: u64,
         pub tolerance: f64,
         pub max_iterations: u32,
+        /// Minimum distinct seeds for inference, with an unconditional floor of two.
         pub min_seeds: usize,
     }
 
@@ -1657,6 +1659,8 @@ pub mod rating {
         AWins,
         BWins,
         Parity,
+        /// The evidence cannot support a confidence interval or a winner decision.
+        Unavailable,
     }
 
     impl PairwiseVerdict {
@@ -1666,6 +1670,7 @@ pub mod rating {
                 Self::AWins => "a_wins",
                 Self::BWins => "b_wins",
                 Self::Parity => "parity",
+                Self::Unavailable => "unavailable",
             }
         }
     }
@@ -1676,13 +1681,67 @@ pub mod rating {
         }
     }
 
+    /// Whether independent replication and complete resampling support inference.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "status", rename_all = "snake_case")]
+    pub enum InferenceStatus {
+        Computed,
+        Unavailable { reason: String },
+    }
+
+    impl InferenceStatus {
+        #[must_use]
+        pub const fn is_computed(&self) -> bool {
+            matches!(self, Self::Computed)
+        }
+
+        #[must_use]
+        pub fn unavailable_reason(&self) -> Option<&str> {
+            match self {
+                Self::Computed => None,
+                Self::Unavailable { reason } => Some(reason),
+            }
+        }
+    }
+
+    fn inference_requirements(
+        n_seeds: usize,
+        min_seeds: usize,
+        bootstrap_replicates: usize,
+    ) -> InferenceStatus {
+        let required_seeds = min_seeds.max(2);
+        if n_seeds < required_seeds {
+            InferenceStatus::Unavailable {
+                reason: format!(
+                    "{n_seeds} independent seed(s); at least {required_seeds} are required for inference"
+                ),
+            }
+        } else if bootstrap_replicates < 2 {
+            InferenceStatus::Unavailable {
+                reason: format!(
+                    "{bootstrap_replicates} bootstrap replicate(s) requested; at least 2 are required for inference"
+                ),
+            }
+        } else {
+            InferenceStatus::Computed
+        }
+    }
+
+    pub(super) fn format_interval(interval: Option<(f64, f64)>, precision: usize) -> String {
+        interval.map_or_else(
+            || "CI unavailable".to_owned(),
+            |(low, high)| format!("[{low:.precision$}, {high:.precision$}]"),
+        )
+    }
+
     /// Detailed pairwise comparison including bootstrap CI, verdict, and effect sizes.
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub struct PairwiseComparison {
         pub a: BrainKind,
         pub b: BrainKind,
         pub theta_diff: f64,
-        pub ci95: (f64, f64),
+        /// Absent when the enclosing axis has unavailable inference.
+        pub ci95: Option<(f64, f64)>,
         pub verdict: PairwiseVerdict,
         pub effect_size_win_rate_diff: f64,
         pub cliffs_delta: f64,
@@ -1697,9 +1756,9 @@ pub mod rating {
         pub family: BrainKind,
         pub theta: f64,
         pub elo: f64,
-        pub se: f64,
-        pub ci95: (f64, f64),
-        pub elo_ci95: (f64, f64),
+        pub se: Option<f64>,
+        pub ci95: Option<(f64, f64)>,
+        pub elo_ci95: Option<(f64, f64)>,
         pub n_matches: usize,
         pub wins: u32,
         pub losses: u32,
@@ -1715,7 +1774,11 @@ pub mod rating {
         pub iterations: u32,
         pub converged: bool,
         pub ci_seed: u64,
+        /// Requested replicates; may exceed the successfully fitted count below.
         pub bootstrap_replicates: usize,
+        pub successful_bootstrap_replicates: usize,
+        pub min_seeds: usize,
+        pub inference: InferenceStatus,
         pub tolerance: f64,
         pub interval_method: String,
         pub ratings: BTreeMap<BrainKind, FamilyRating>,
@@ -1734,7 +1797,9 @@ pub mod rating {
     pub struct OrderEffectReport {
         pub position_means: BTreeMap<u32, f64>,
         pub position_ci95: BTreeMap<u32, (f64, f64)>,
-        pub detected: bool,
+        /// `None` means the diagnostic could not be evaluated, rather than no effect.
+        pub detected: Option<bool>,
+        pub inference: InferenceStatus,
     }
 
     /// Multi-axis tournament rating table.
@@ -1772,17 +1837,24 @@ pub mod rating {
                 match outcome {
                     AxisRatingOutcome::Rated(ratings) => {
                         out.push_str(&format!(
-                            "*Matches: {}, Seeds: {}, Iterations: {} ({}), Bootstrap Replicates: {}*\n\n",
+                            "*Matches: {}, Seeds: {} (minimum for inference: {}), Iterations: {} ({}), Bootstrap Fits: {} / {} requested*\n\n",
                             ratings.n_matches,
                             ratings.n_seeds,
+                            ratings.min_seeds,
                             ratings.iterations,
                             if ratings.converged {
                                 "converged"
                             } else {
                                 "unconverged"
                             },
+                            ratings.successful_bootstrap_replicates,
                             ratings.bootstrap_replicates,
                         ));
+                        if let Some(reason) = ratings.inference.unavailable_reason() {
+                            out.push_str(&format!(
+                                "**Inference unavailable: {reason}.** Ratings and match counts below are descriptive; confidence intervals and winner decisions are unavailable.\n\n"
+                            ));
+                        }
 
                         out.push_str(
                             "| Rank | Family | Elo Rating (95% CI) | Theta (95% CI) | SE | Matches | W / L / D |\n\
@@ -1799,17 +1871,18 @@ pub mod rating {
                         for (rank, r) in sorted_ratings.iter().enumerate() {
                             let sign = if r.theta >= 0.0 { "+" } else { "" };
                             out.push_str(&format!(
-                                "| {} | {} | {:.1} [{:.1}, {:.1}] | {}{:.3} [{:.3}, {:.3}] | {:.3} | {} | {} / {} / {} |\n",
+                                "| {} | {} | {:.1} {} | {}{:.3} {} | {} | {} | {} / {} / {} |\n",
                                 rank + 1,
                                 r.family.as_str(),
                                 r.elo,
-                                r.elo_ci95.0,
-                                r.elo_ci95.1,
+                                format_interval(r.elo_ci95, 1),
                                 sign,
                                 r.theta,
-                                r.ci95.0,
-                                r.ci95.1,
-                                r.se,
+                                format_interval(r.ci95, 3),
+                                r.se.map_or_else(
+                                    || "unavailable".to_owned(),
+                                    |se| format!("{se:.3}")
+                                ),
                                 r.n_matches,
                                 r.wins,
                                 r.losses,
@@ -1827,14 +1900,13 @@ pub mod rating {
                             for pair in &ratings.pairwise {
                                 let sign = if pair.theta_diff >= 0.0 { "+" } else { "" };
                                 out.push_str(&format!(
-                                    "| {} | {} | `{}` | {}{:.3} [{:.3}, {:.3}] | {:+.3} | {:+.3} | {} / {} / {} |\n",
+                                    "| {} | {} | `{}` | {}{:.3} {} | {:+.3} | {:+.3} | {} / {} / {} |\n",
                                     pair.a.as_str(),
                                     pair.b.as_str(),
                                     pair.verdict.as_str(),
                                     sign,
                                     pair.theta_diff,
-                                    pair.ci95.0,
-                                    pair.ci95.1,
+                                    format_interval(pair.ci95, 3),
                                     pair.effect_size_win_rate_diff,
                                     pair.cliffs_delta,
                                     pair.wins_a,
@@ -1846,8 +1918,13 @@ pub mod rating {
                         }
 
                         if let Some(order_effect) = self.order_effects.get(axis) {
-                            if order_effect.detected {
+                            if order_effect.detected == Some(true) {
                                 out.push_str("> ⚠️ **Spawn-Order Effect Detected**: Spawn order significantly affected performance on this axis.\n\n");
+                            }
+                            if let Some(reason) = order_effect.inference.unavailable_reason() {
+                                out.push_str(&format!(
+                                    "*Spawn-order inference unavailable: {reason}.*\n\n"
+                                ));
                             }
                             out.push_str("#### Spawn-Order Position Performance\n");
                             for (pos, mean) in &order_effect.position_means {
@@ -2260,6 +2337,7 @@ pub mod rating {
     }
 
     /// Analyze whether spawn order significantly affected family performance on an axis.
+    /// Inference requires [`DEFAULT_MIN_SEEDS`] distinct seeds and at least two resamples.
     pub fn analyze_order_effect(
         outcomes: &[MatchOutcome],
         axis: RatingAxis,
@@ -2271,7 +2349,14 @@ pub mod rating {
             seeds_set.insert(m.seed);
         }
         let seeds: Vec<u64> = seeds_set.into_iter().collect();
-        analyze_order_effect_internal(outcomes, axis, &seeds, ci_seed, bootstrap_replicates)
+        analyze_order_effect_internal(
+            outcomes,
+            axis,
+            &seeds,
+            ci_seed,
+            bootstrap_replicates,
+            DEFAULT_MIN_SEEDS,
+        )
     }
 
     fn analyze_order_effect_internal(
@@ -2280,9 +2365,11 @@ pub mod rating {
         seeds: &[u64],
         ci_seed: u64,
         bootstrap_replicates: usize,
+        min_seeds: usize,
     ) -> OrderEffectReport {
         let mut values_by_pos: BTreeMap<u32, Vec<f64>> = BTreeMap::new();
         let mut seed_by_pos_val: BTreeMap<u32, Vec<(u64, f64)>> = BTreeMap::new();
+        let mut complete_inputs = true;
 
         for m in outcomes {
             for (pos, family) in m.spawn_order.iter().enumerate() {
@@ -2296,6 +2383,8 @@ pub mod rating {
                         .entry(pos_u32)
                         .or_default()
                         .push((m.seed, val));
+                } else {
+                    complete_inputs = false;
                 }
             }
         }
@@ -2310,8 +2399,27 @@ pub mod rating {
             position_means.insert(*pos, mean);
         }
 
+        let mut inference = inference_requirements(seeds.len(), min_seeds, bootstrap_replicates);
+        if inference.is_computed()
+            && (!complete_inputs
+                || seed_by_pos_val.len() < 2
+                || seed_by_pos_val.values().any(|values| {
+                    values
+                        .iter()
+                        .map(|(seed, _)| *seed)
+                        .collect::<BTreeSet<_>>()
+                        .len()
+                        != seeds.len()
+                }))
+        {
+            inference = InferenceStatus::Unavailable {
+                reason: "complete position observations from every seed are required for order-effect inference"
+                    .to_owned(),
+            };
+        }
+
         let mut position_ci95 = BTreeMap::new();
-        if !seeds.is_empty() && bootstrap_replicates > 0 {
+        if inference.is_computed() {
             let mut rng = SmallRng::seed_from_u64(ci_seed ^ 0x08D3_85E7);
             let s_count = seeds.len();
 
@@ -2348,20 +2456,19 @@ pub mod rating {
             }
         }
 
-        let mut detected = false;
-        if let Some(ci_zero) = position_ci95.get(&0) {
-            for (pos, ci) in &position_ci95 {
-                if *pos != 0 && (ci_zero.0 > ci.1 || ci_zero.1 < ci.0) {
-                    detected = true;
-                    break;
-                }
-            }
-        }
+        let detected = inference.is_computed().then(|| {
+            position_ci95.get(&0).is_some_and(|ci_zero| {
+                position_ci95
+                    .iter()
+                    .any(|(pos, ci)| *pos != 0 && (ci_zero.0 > ci.1 || ci_zero.1 < ci.0))
+            })
+        });
 
         OrderEffectReport {
             position_means,
             position_ci95,
             detected,
+            inference,
         }
     }
 
@@ -2408,12 +2515,12 @@ pub mod rating {
         let mut order_effects = BTreeMap::new();
         let mut warnings = Vec::new();
 
-        if n_seeds < options.min_seeds {
-            let warn_msg = format!(
-                "tournament ran only {n_seeds} seed(s) (< {}); bootstrap CIs are wide and comparisons should be treated with caution",
-                options.min_seeds
-            );
-            warnings.push(warn_msg);
+        let design_inference =
+            inference_requirements(n_seeds, options.min_seeds, options.bootstrap_replicates);
+        if let Some(reason) = design_inference.unavailable_reason() {
+            warnings.push(format!(
+                "Inference unavailable: {reason}. Point estimates and match counts are descriptive."
+            ));
         }
 
         for axis in RatingAxis::ALL {
@@ -2536,15 +2643,6 @@ pub mod rating {
                 }
             }
 
-            if n_seeds < options.min_seeds {
-                tracing::warn!(
-                    target: "scriptbots::tournament::rating",
-                    axis = axis.as_str(),
-                    n_seeds,
-                    "CI is wide and this comparison should not be cited (fewer than 8 seeds)"
-                );
-            }
-
             // Fit point estimate
             let fit = fit_bradley_terry(
                 &families,
@@ -2587,23 +2685,38 @@ pub mod rating {
                 "fitted Bradley-Terry model for axis"
             );
 
-            // Clustered bootstrap over seeds
+            // Clustered bootstrap over seeds. Repeating one seed cannot estimate
+            // between-seed uncertainty, regardless of the match or resample count.
+            let axis_design_inference = if design_inference.is_computed() && any_missing {
+                InferenceStatus::Unavailable {
+                    reason: "incomplete family outcomes do not establish a complete independently replicated match matrix"
+                        .to_owned(),
+                }
+            } else {
+                design_inference.clone()
+            };
+            let attempted_replicates = if axis_design_inference.is_computed() {
+                options.bootstrap_replicates
+            } else {
+                0
+            };
+            let mut successful_bootstrap_replicates = 0;
             let mut rep_thetas: BTreeMap<BrainKind, Vec<f64>> = BTreeMap::new();
             let mut rep_diffs: BTreeMap<(BrainKind, BrainKind), Vec<f64>> = BTreeMap::new();
             for f in &families {
-                rep_thetas.insert(f.clone(), Vec::with_capacity(options.bootstrap_replicates));
+                rep_thetas.insert(f.clone(), Vec::with_capacity(attempted_replicates));
             }
             for i in 0..families.len() {
                 for j in (i + 1)..families.len() {
                     rep_diffs.insert(
                         (families[i].clone(), families[j].clone()),
-                        Vec::with_capacity(options.bootstrap_replicates),
+                        Vec::with_capacity(attempted_replicates),
                     );
                 }
             }
 
             let mut rng = SmallRng::seed_from_u64(options.ci_seed ^ 0x5EED_0001);
-            for _ in 0..options.bootstrap_replicates {
+            for _ in 0..attempted_replicates {
                 let mut resampled_matches = Vec::with_capacity(outcomes.len());
                 for _ in 0..n_seeds {
                     let s_idx = rng.random_range(0..n_seeds);
@@ -2623,7 +2736,14 @@ pub mod rating {
                         options.max_iterations,
                     )
                     && fit_b.converged
+                    && families.iter().all(|family| {
+                        fit_b
+                            .theta
+                            .get(family)
+                            .is_some_and(|theta| theta.is_finite())
+                    })
                 {
+                    successful_bootstrap_replicates += 1;
                     for f in &families {
                         if let Some(th) = fit_b.theta.get(f) {
                             rep_thetas.entry(f.clone()).or_default().push(*th);
@@ -2640,6 +2760,38 @@ pub mod rating {
                             }
                         }
                     }
+                }
+            }
+
+            // Failed fits are not missing at random (perfectly separated samples
+            // can fail while the original fit converges). Conditioning the interval
+            // on only successful fits would silently change its sampling distribution.
+            let inference = if axis_design_inference.is_computed()
+                && successful_bootstrap_replicates != options.bootstrap_replicates
+            {
+                InferenceStatus::Unavailable {
+                    reason: format!(
+                        "only {successful_bootstrap_replicates} of {} bootstrap fits converged with complete finite estimates; incomplete resampling cannot support inference",
+                        options.bootstrap_replicates
+                    ),
+                }
+            } else {
+                axis_design_inference
+            };
+            if let Some(reason) = inference.unavailable_reason() {
+                tracing::warn!(
+                    target: "scriptbots::tournament::rating",
+                    axis = axis.as_str(),
+                    n_seeds,
+                    successful_bootstrap_replicates,
+                    reason,
+                    "inference unavailable; retaining descriptive ratings"
+                );
+                if design_inference.is_computed() {
+                    warnings.push(format!(
+                        "{}: inference unavailable: {reason}",
+                        axis.as_str()
+                    ));
                 }
             }
 
@@ -2664,26 +2816,25 @@ pub mod rating {
                     }
                 }
 
-                let (se, ci95) = if let Some(vals) = rep_thetas.get_mut(f) {
-                    if vals.len() > 1 {
-                        vals.sort_by(|a, b| a.total_cmp(b));
-                        let mean = vals.iter().sum::<f64>() / vals.len() as f64;
-                        let var = vals.iter().map(|v| (v - mean).powi(2)).sum::<f64>()
-                            / (vals.len() - 1) as f64;
-                        let se = var.sqrt();
-                        let low_idx =
-                            ((0.025 * vals.len() as f64).floor() as usize).min(vals.len() - 1);
-                        let high_idx =
-                            ((0.975 * vals.len() as f64).floor() as usize).min(vals.len() - 1);
-                        (se, (vals[low_idx], vals[high_idx]))
-                    } else {
-                        (0.0, (theta, theta))
-                    }
+                let (se, ci95) = if inference.is_computed()
+                    && let Some(vals) = rep_thetas.get_mut(f)
+                    && vals.len() > 1
+                {
+                    vals.sort_by(|a, b| a.total_cmp(b));
+                    let mean = vals.iter().sum::<f64>() / vals.len() as f64;
+                    let var = vals.iter().map(|v| (v - mean).powi(2)).sum::<f64>()
+                        / (vals.len() - 1) as f64;
+                    let se = var.sqrt();
+                    let low_idx =
+                        ((0.025 * vals.len() as f64).floor() as usize).min(vals.len() - 1);
+                    let high_idx =
+                        ((0.975 * vals.len() as f64).floor() as usize).min(vals.len() - 1);
+                    (Some(se), Some((vals[low_idx], vals[high_idx])))
                 } else {
-                    (0.0, (theta, theta))
+                    (None, None)
                 };
 
-                let elo_ci95 = (theta_to_elo(ci95.0), theta_to_elo(ci95.1));
+                let elo_ci95 = ci95.map(|(low, high)| (theta_to_elo(low), theta_to_elo(high)));
 
                 let fam_rating = FamilyRating {
                     family: f.clone(),
@@ -2703,8 +2854,8 @@ pub mod rating {
                     family = f.as_str(),
                     theta = fam_rating.theta,
                     elo = fam_rating.elo,
-                    ci95_low = fam_rating.ci95.0,
-                    ci95_high = fam_rating.ci95.1,
+                    ci95_low = ?fam_rating.ci95.map(|ci| ci.0),
+                    ci95_high = ?fam_rating.ci95.map(|ci| ci.1),
                     n_matches = fam_rating.n_matches,
                     wins = fam_rating.wins,
                     losses = fam_rating.losses,
@@ -2737,27 +2888,25 @@ pub mod rating {
                         (0.0, 0.0)
                     };
 
-                    let ci95 = if let Some(diffs) = rep_diffs.get_mut(&(a.clone(), b.clone())) {
-                        if diffs.len() > 1 {
-                            diffs.sort_by(|x, y| x.total_cmp(y));
-                            let low_idx = ((0.025 * diffs.len() as f64).floor() as usize)
-                                .min(diffs.len() - 1);
-                            let high_idx = ((0.975 * diffs.len() as f64).floor() as usize)
-                                .min(diffs.len() - 1);
-                            (diffs[low_idx], diffs[high_idx])
-                        } else {
-                            (theta_diff, theta_diff)
-                        }
+                    let ci95 = if inference.is_computed()
+                        && let Some(diffs) = rep_diffs.get_mut(&(a.clone(), b.clone()))
+                        && diffs.len() > 1
+                    {
+                        diffs.sort_by(|x, y| x.total_cmp(y));
+                        let low_idx =
+                            ((0.025 * diffs.len() as f64).floor() as usize).min(diffs.len() - 1);
+                        let high_idx =
+                            ((0.975 * diffs.len() as f64).floor() as usize).min(diffs.len() - 1);
+                        Some((diffs[low_idx], diffs[high_idx]))
                     } else {
-                        (theta_diff, theta_diff)
+                        None
                     };
 
-                    let verdict = if ci95.0 > 0.0 {
-                        PairwiseVerdict::AWins
-                    } else if ci95.1 < 0.0 {
-                        PairwiseVerdict::BWins
-                    } else {
-                        PairwiseVerdict::Parity
+                    let verdict = match ci95 {
+                        Some((low, _)) if low > 0.0 => PairwiseVerdict::AWins,
+                        Some((_, high)) if high < 0.0 => PairwiseVerdict::BWins,
+                        Some(_) => PairwiseVerdict::Parity,
+                        None => PairwiseVerdict::Unavailable,
                     };
 
                     let comp = PairwiseComparison {
@@ -2778,8 +2927,8 @@ pub mod rating {
                         a = a.as_str(),
                         b = b.as_str(),
                         theta_diff = comp.theta_diff,
-                        ci95_low = comp.ci95.0,
-                        ci95_high = comp.ci95.1,
+                        ci95_low = ?comp.ci95.map(|ci| ci.0),
+                        ci95_high = ?comp.ci95.map(|ci| ci.1),
                         verdict = comp.verdict.as_str(),
                         effect_size = comp.effect_size_win_rate_diff,
                         "pairwise comparison on axis"
@@ -2796,8 +2945,9 @@ pub mod rating {
                 &seeds,
                 options.ci_seed,
                 options.bootstrap_replicates,
+                options.min_seeds,
             );
-            if order_effect.detected {
+            if order_effect.detected == Some(true) {
                 tracing::warn!(
                     target: "scriptbots::tournament::rating",
                     axis = axis.as_str(),
@@ -2817,6 +2967,9 @@ pub mod rating {
                     converged: fit.converged,
                     ci_seed: options.ci_seed,
                     bootstrap_replicates: options.bootstrap_replicates,
+                    successful_bootstrap_replicates,
+                    min_seeds: options.min_seeds.max(2),
+                    inference,
                     tolerance: options.tolerance,
                     interval_method: "clustered_seed_percentile_bootstrap".to_string(),
                     ratings: ratings_map,
@@ -2848,7 +3001,8 @@ pub mod leaderboard {
     use super::{
         FamilyOutcome, MatchId, MatchOutcome, MatchRunReport, OrderPolicy, RatingAxis,
         RatingOptions, RatingTable, TournamentError, TournamentSpec,
-        execution::run_tournament_with_jobs, rating::rate_tournament,
+        execution::run_tournament_with_jobs,
+        rating::{format_interval, rate_tournament},
     };
     use crate::BuildProvenanceV0;
     use scriptbots_brain::BrainKind;
@@ -3730,17 +3884,24 @@ pub mod leaderboard {
             match rating_table.axes.get(axis) {
                 Some(super::AxisRatingOutcome::Rated(ratings)) => {
                     out.push_str(&format!(
-                        "*Matches: {}, Seeds: {}, Iterations: {} ({}), Bootstrap Replicates: {}*\n\n",
+                        "*Matches: {}, Seeds: {} (minimum for inference: {}), Iterations: {} ({}), Bootstrap Fits: {} / {} requested*\n\n",
                         ratings.n_matches,
                         ratings.n_seeds,
+                        ratings.min_seeds,
                         ratings.iterations,
                         if ratings.converged {
                             "converged"
                         } else {
                             "unconverged"
                         },
+                        ratings.successful_bootstrap_replicates,
                         ratings.bootstrap_replicates
                     ));
+                    if let Some(reason) = ratings.inference.unavailable_reason() {
+                        out.push_str(&format!(
+                            "**Inference unavailable: {reason}.** Ratings and match counts below are descriptive; confidence intervals and winner decisions are unavailable.\n\n"
+                        ));
+                    }
 
                     out.push_str(
                         "| Rank | Family | Elo Rating (95% CI) | Theta (95% CI) | SE | Matches | W / L / D | Evidence Provenance |\n\
@@ -3758,17 +3919,15 @@ pub mod leaderboard {
                         let sign = if r.theta >= 0.0 { "+" } else { "" };
                         let prov_tag = format!("[^{}-{}]", r.family.as_str(), axis.as_str());
                         out.push_str(&format!(
-                            "| {} | {} | {:.1} [{:.1}, {:.1}] | {}{:.3} [{:.3}, {:.3}] | {:.3} | {} | {} / {} / {} | {} |\n",
+                            "| {} | {} | {:.1} {} | {}{:.3} {} | {} | {} | {} / {} / {} | {} |\n",
                             rank + 1,
                             r.family.as_str(),
                             r.elo,
-                            r.elo_ci95.0,
-                            r.elo_ci95.1,
+                            format_interval(r.elo_ci95, 1),
                             sign,
                             r.theta,
-                            r.ci95.0,
-                            r.ci95.1,
-                            r.se,
+                            format_interval(r.ci95, 3),
+                            r.se.map_or_else(|| "unavailable".to_owned(), |se| format!("{se:.3}")),
                             r.n_matches,
                             r.wins,
                             r.losses,
@@ -3787,14 +3946,13 @@ pub mod leaderboard {
                         for pair in &ratings.pairwise {
                             let sign = if pair.theta_diff >= 0.0 { "+" } else { "" };
                             out.push_str(&format!(
-                                "| {} | {} | `{}` | {}{:.3} [{:.3}, {:.3}] | {:+.3} | {:+.3} | {} / {} / {} |\n",
+                                "| {} | {} | `{}` | {}{:.3} {} | {:+.3} | {:+.3} | {} / {} / {} |\n",
                                 pair.a.as_str(),
                                 pair.b.as_str(),
                                 pair.verdict.as_str(),
                                 sign,
                                 pair.theta_diff,
-                                pair.ci95.0,
-                                pair.ci95.1,
+                                format_interval(pair.ci95, 3),
                                 pair.effect_size_win_rate_diff,
                                 pair.cliffs_delta,
                                 pair.wins_a,
@@ -3806,8 +3964,13 @@ pub mod leaderboard {
                     }
 
                     if let Some(order_effect) = rating_table.order_effects.get(axis) {
-                        if order_effect.detected {
+                        if order_effect.detected == Some(true) {
                             out.push_str("> ⚠️ **Spawn-Order Effect Detected**: Spawn order significantly affected performance on this axis.\n\n");
+                        }
+                        if let Some(reason) = order_effect.inference.unavailable_reason() {
+                            out.push_str(&format!(
+                                "*Spawn-order inference unavailable: {reason}.*\n\n"
+                            ));
                         }
                         out.push_str("#### Spawn-Order Position Performance\n");
                         for (pos, mean) in &order_effect.position_means {
@@ -5071,6 +5234,269 @@ mod tests {
             res1, res2,
             "rate_tournament must be bit-identical across runs"
         );
+        let survival = res1
+            .axis(RatingAxis::SurvivalShare)
+            .expect("survival rating");
+        assert_eq!(survival.inference, InferenceStatus::Computed);
+        assert_eq!(survival.successful_bootstrap_replicates, 500);
+        assert!(survival.ratings.values().all(|rating| {
+            rating.se.is_some() && rating.ci95.is_some() && rating.elo_ci95.is_some()
+        }));
+        assert!(survival.pairwise[0].ci95.is_some());
+        assert!(matches!(
+            survival.pairwise[0].verdict,
+            PairwiseVerdict::AWins | PairwiseVerdict::BWins
+        ));
+    }
+
+    fn rating_fixture(seed_shares: &[(u64, f64)]) -> Vec<MatchOutcome> {
+        let mut outcomes = Vec::new();
+        for (index, &(seed, share_a)) in seed_shares.iter().enumerate() {
+            for order in 0..2_u32 {
+                let per_family = [("arm-a", share_a), ("arm-b", 1.0 - share_a)]
+                    .into_iter()
+                    .map(|(family, share)| {
+                        (
+                            family.to_owned(),
+                            FamilyOutcome {
+                                survival_share: share,
+                                biomass_share: share,
+                                mean_lineage_depth: share * 10.0,
+                                max_lineage_depth: 10,
+                                extinct_at: None,
+                                novelty_coverage: None,
+                            },
+                        )
+                    })
+                    .collect();
+                let mut spawn_order = vec![BrainKind::new("arm-a"), BrainKind::new("arm-b")];
+                if order == 1 {
+                    spawn_order.reverse();
+                }
+                outcomes.push(MatchOutcome {
+                    match_id: MatchId(index as u64 * 2 + u64::from(order)),
+                    seed,
+                    ticks_run: 100,
+                    spawn_order_index: order,
+                    spawn_order,
+                    per_family,
+                    warnings: Vec::new(),
+                });
+            }
+        }
+        outcomes
+    }
+
+    #[test]
+    fn tournament_single_seed_retains_descriptive_ratings_without_inference() {
+        // Many winning matches from the same seed still provide only one cluster.
+        let outcomes = rating_fixture(&[(7, 0.75); 16]);
+        for min_seeds in [0, 1] {
+            let options = RatingOptions {
+                min_seeds,
+                bootstrap_replicates: 64,
+                ..RatingOptions::default()
+            };
+            let table = rate_tournament(&outcomes, &options).expect("descriptive rating");
+            let axis = table
+                .axis(RatingAxis::SurvivalShare)
+                .expect("point ratings retained");
+            assert_eq!((axis.n_seeds, axis.n_matches, axis.min_seeds), (1, 32, 2));
+            assert_eq!(axis.successful_bootstrap_replicates, 0);
+            assert!(
+                axis.inference
+                    .unavailable_reason()
+                    .expect("reason")
+                    .contains("independent seed")
+            );
+            let winner = &axis.ratings[&BrainKind::new("arm-a")];
+            assert!(winner.theta > 0.0 && winner.elo > 1500.0);
+            assert_eq!((winner.wins, winner.losses, winner.draws), (32, 0, 0));
+            assert!(axis.ratings.values().all(|rating| {
+                rating.se.is_none() && rating.ci95.is_none() && rating.elo_ci95.is_none()
+            }));
+            assert_eq!(axis.pairwise[0].ci95, None);
+            assert_eq!(axis.pairwise[0].verdict, PairwiseVerdict::Unavailable);
+            let order_effect = &table.order_effects[&RatingAxis::SurvivalShare];
+            assert_eq!(order_effect.detected, None);
+            assert!(order_effect.position_ci95.is_empty());
+            assert!(order_effect.inference.unavailable_reason().is_some());
+
+            let json = serde_json::to_value(&table).expect("rating JSON");
+            let rated = &json["axes"]["SurvivalShare"]["Rated"];
+            assert_eq!(rated["inference"]["status"], "unavailable");
+            assert!(rated["inference"]["reason"].as_str().is_some());
+            assert!(
+                rated["ratings"]["arm-a"]
+                    .get("ci95")
+                    .is_some_and(serde_json::Value::is_null)
+            );
+            assert!(
+                rated["pairwise"][0]
+                    .get("ci95")
+                    .is_some_and(serde_json::Value::is_null)
+            );
+            assert_eq!(rated["pairwise"][0]["verdict"], "Unavailable");
+            assert_eq!(
+                serde_json::from_value::<RatingTable>(json).expect("round trip"),
+                table
+            );
+
+            let markdown = table.generate_markdown();
+            assert!(markdown.contains("Inference unavailable:"));
+            assert!(markdown.contains("CI unavailable"));
+            assert!(markdown.contains("`unavailable`"));
+            assert!(markdown.contains("32 / 0 / 0"));
+            assert!(!markdown.contains("`a_wins`"));
+            assert!(!markdown.contains("`b_wins`"));
+            assert!(!markdown.contains("`parity`"));
+        }
+    }
+
+    #[test]
+    fn tournament_inference_respects_the_configured_seed_minimum() {
+        let outcomes = rating_fixture(&[(1, 0.7), (2, 0.7), (3, 0.7), (4, 0.7)]);
+        for (min_seeds, available) in [(8, false), (4, true)] {
+            let table = rate_tournament(
+                &outcomes,
+                &RatingOptions {
+                    min_seeds,
+                    bootstrap_replicates: 32,
+                    ..RatingOptions::default()
+                },
+            )
+            .expect("point fit");
+            let axis = table
+                .axis(RatingAxis::SurvivalShare)
+                .expect("survival axis");
+            assert_eq!(axis.inference.is_computed(), available);
+            assert_eq!(axis.min_seeds, min_seeds);
+            assert_eq!(axis.pairwise[0].ci95.is_some(), available);
+            assert_eq!(
+                axis.pairwise[0].verdict,
+                if available {
+                    PairwiseVerdict::AWins
+                } else {
+                    PairwiseVerdict::Unavailable
+                }
+            );
+            assert_eq!(
+                table.order_effects[&RatingAxis::SurvivalShare].detected,
+                available.then_some(false)
+            );
+        }
+    }
+
+    #[test]
+    fn tournament_zero_or_one_bootstrap_replicate_cannot_declare_a_winner() {
+        let seed_shares: Vec<_> = (1..=8).map(|seed| (seed, 0.7)).collect();
+        let outcomes = rating_fixture(&seed_shares);
+        for bootstrap_replicates in [0, 1] {
+            let table = rate_tournament(
+                &outcomes,
+                &RatingOptions {
+                    bootstrap_replicates,
+                    ..RatingOptions::default()
+                },
+            )
+            .expect("point fit");
+            let axis = table
+                .axis(RatingAxis::SurvivalShare)
+                .expect("survival axis");
+            assert_eq!(axis.successful_bootstrap_replicates, 0);
+            assert!(
+                axis.inference
+                    .unavailable_reason()
+                    .expect("reason")
+                    .contains("at least 2")
+            );
+            assert!(
+                axis.ratings
+                    .values()
+                    .all(|rating| rating.se.is_none() && rating.ci95.is_none())
+            );
+            assert_eq!(axis.pairwise[0].ci95, None);
+            assert_eq!(axis.pairwise[0].verdict, PairwiseVerdict::Unavailable);
+            assert_eq!(
+                table.order_effects[&RatingAxis::SurvivalShare].detected,
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn tournament_incomplete_bootstrap_cannot_condition_on_converged_fits() {
+        // The balanced original sample fits without a prior. Resamples containing
+        // just one seed separate perfectly and fail, so retaining only converged
+        // resamples would spuriously report a zero-width interval around parity.
+        let outcomes = rating_fixture(&[(1, 0.7), (2, 0.3)]);
+        let table = rate_tournament(
+            &outcomes,
+            &RatingOptions {
+                prior: BtPrior::none(),
+                min_seeds: 2,
+                bootstrap_replicates: 64,
+                ..RatingOptions::default()
+            },
+        )
+        .expect("balanced point fit converges");
+        let axis = table
+            .axis(RatingAxis::SurvivalShare)
+            .expect("point ratings retained");
+        assert!(axis.converged);
+        assert!(axis.successful_bootstrap_replicates > 0);
+        assert!(axis.successful_bootstrap_replicates < axis.bootstrap_replicates);
+        assert!(
+            axis.inference
+                .unavailable_reason()
+                .expect("reason")
+                .contains("incomplete resampling")
+        );
+        assert!(
+            axis.ratings
+                .values()
+                .all(|rating| rating.se.is_none() && rating.ci95.is_none())
+        );
+        assert_eq!(axis.pairwise[0].ci95, None);
+        assert_eq!(axis.pairwise[0].verdict, PairwiseVerdict::Unavailable);
+        assert_eq!((axis.pairwise[0].wins_a, axis.pairwise[0].wins_b), (2, 2));
+    }
+
+    #[test]
+    fn tournament_missing_family_cells_cannot_supply_independent_replication() {
+        let seed_shares: Vec<_> = (1..=8).map(|seed| (seed, 0.7)).collect();
+        let mut outcomes = rating_fixture(&seed_shares);
+        for outcome in &mut outcomes {
+            if outcome.seed != 1 {
+                assert!(outcome.per_family.remove("arm-b").is_some());
+            }
+        }
+        let table = rate_tournament(
+            &outcomes,
+            &RatingOptions {
+                bootstrap_replicates: 32,
+                ..RatingOptions::default()
+            },
+        )
+        .expect("descriptive fit from observed comparisons");
+        let axis = table
+            .axis(RatingAxis::SurvivalShare)
+            .expect("point ratings retained");
+        assert_eq!(axis.n_seeds, 8);
+        assert_eq!(axis.pairwise[0].wins_a, 2);
+        assert_eq!(axis.pairwise[0].verdict, PairwiseVerdict::Unavailable);
+        assert_eq!(axis.pairwise[0].ci95, None);
+        assert_eq!(axis.successful_bootstrap_replicates, 0);
+        assert!(
+            axis.inference
+                .unavailable_reason()
+                .expect("reason")
+                .contains("incomplete family outcomes")
+        );
+        assert_eq!(
+            table.order_effects[&RatingAxis::SurvivalShare].detected,
+            None
+        );
     }
 
     #[test]
@@ -5142,7 +5568,8 @@ mod tests {
             .axis(RatingAxis::SurvivalShare)
             .expect("survival axis");
         let pair_c = &axis_c.pairwise[0];
-        let clustered_ci_width = pair_c.ci95.1 - pair_c.ci95.0;
+        let clustered_ci = pair_c.ci95.expect("supported clustered interval");
+        let clustered_ci_width = clustered_ci.1 - clustered_ci.0;
 
         // (2) Naive bootstrap (resampling matches directly)
         let mut rng = SmallRng::seed_from_u64(ci_seed ^ 0x5EED_0001);
@@ -5234,9 +5661,14 @@ mod tests {
             };
 
             let rated = rate_tournament(&matches, &options).expect("rated");
-            if let Some(axis) = rated.axis(RatingAxis::SurvivalShare)
-                && axis.pairwise[0].verdict != PairwiseVerdict::Parity
-            {
+            let axis = rated
+                .axis(RatingAxis::SurvivalShare)
+                .expect("nondegenerate null comparison");
+            assert_eq!(axis.inference, InferenceStatus::Computed);
+            if matches!(
+                axis.pairwise[0].verdict,
+                PairwiseVerdict::AWins | PairwiseVerdict::BWins
+            ) {
                 false_positives += 1;
             }
         }
@@ -5415,8 +5847,9 @@ mod tests {
         }
 
         let report = analyze_order_effect(&skewed_matches, RatingAxis::SurvivalShare, 0x1234, 500);
-        assert!(
+        assert_eq!(
             report.detected,
+            Some(true),
             "strong position advantage must be detected as an order effect"
         );
         assert!(report.position_means[&0] > 0.80);
@@ -5460,10 +5893,30 @@ mod tests {
         }
         let report_unif =
             analyze_order_effect(&uniform_matches, RatingAxis::SurvivalShare, 0x5678, 500);
-        assert!(
-            !report_unif.detected,
+        assert_eq!(
+            report_unif.detected,
+            Some(false),
             "equal position outcomes must not detect order effect"
         );
+
+        let one_seed =
+            analyze_order_effect(&skewed_matches[..2], RatingAxis::SurvivalShare, 42, 500);
+        assert_eq!(one_seed.detected, None);
+        assert!(one_seed.position_ci95.is_empty());
+        assert!(one_seed.position_means[&0] > 0.80);
+        assert!(
+            one_seed
+                .inference
+                .unavailable_reason()
+                .expect("reason")
+                .contains("independent seed")
+        );
+        for replicates in [0, 1] {
+            let insufficient_resampling =
+                analyze_order_effect(&skewed_matches, RatingAxis::SurvivalShare, 42, replicates);
+            assert_eq!(insufficient_resampling.detected, None);
+            assert!(insufficient_resampling.position_ci95.is_empty());
+        }
     }
 
     #[test]
@@ -5943,6 +6396,30 @@ mod tests {
         };
         let rebuilt_ratings = rate_tournament(&reconstructed, &rating_options)
             .expect("rate independently parsed execution rows");
+        let rated_axes: Vec<_> = rebuilt_ratings
+            .axes
+            .values()
+            .filter_map(|outcome| match outcome {
+                AxisRatingOutcome::Rated(ratings) => Some(ratings),
+                AxisRatingOutcome::Undetermined { .. } => None,
+            })
+            .collect();
+        assert!(
+            !rated_axes.is_empty(),
+            "the real smoke produces descriptive ratings"
+        );
+        assert!(rated_axes.iter().all(|axis| {
+            axis.n_seeds == 2
+                && axis.inference.unavailable_reason().is_some()
+                && axis
+                    .pairwise
+                    .iter()
+                    .all(|pair| pair.ci95.is_none() && pair.verdict == PairwiseVerdict::Unavailable)
+        }));
+        assert!(outcome.leaderboard_md.contains("Inference unavailable:"));
+        assert!(outcome.leaderboard_md.contains("CI unavailable"));
+        assert!(!outcome.leaderboard_md.contains("`a_wins`"));
+        assert!(!outcome.leaderboard_md.contains("`b_wins`"));
         let rebuilt_document = generate_leaderboard_document(
             &spec_file,
             &runtime_spec,
