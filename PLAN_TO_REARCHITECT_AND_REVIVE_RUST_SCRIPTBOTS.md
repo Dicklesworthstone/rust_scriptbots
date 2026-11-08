@@ -3932,6 +3932,12 @@ Normal/error cleanup uses RAII. Release builds use `panic = "abort"`, so unwindi
 
 ### 8.7 control CLI convergence
 
+[Currently In Progress — Codex, 2026-11-08: expose the existing bounded experiment,
+checkpoint and artifact REST workflows through `scriptbots-control`, including
+matched-seed comparison, cancellation/resume and explicit artifact downloads.
+Preserve server-owned receipts and scientific verification; this does not replace
+the original native acceptance requirements in `bd-2z0.12.2`.]
+
 The separate `control_cli watch` loop currently duplicates Ratatui/Crossterm behavior and defaults to a different server port. After the main frontend is stable, reuse the same model/widgets or replace watch with the shared TUI client. All control surfaces default to 8088 or one centrally defined value.
 
 ---

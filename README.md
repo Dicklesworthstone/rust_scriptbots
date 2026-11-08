@@ -1855,6 +1855,36 @@ against. If another client changes it before application, the owner returns
 `config_revision_conflict`; read the current configuration and submit a fresh patch
 to retain the intervening edit. Playback-only changes do not invalidate that guard.
 
+#### Experiments from the shell
+
+The control CLI exposes the same matched-seed experiment service as REST and MCP.
+Save an experiment request such as the `food-pause-recovery` example above to
+`experiment.json`, then submit it to a running server:
+
+```bash
+cargo run -p scriptbots-app --bin control_cli -- \
+  --idempotency-key food-study-1 experiment create --file experiment.json
+cargo run -p scriptbots-app --bin control_cli -- experiment list --limit 20
+cargo run -p scriptbots-app --bin control_cli -- experiment status food-pause-recovery
+cargo run -p scriptbots-app --bin control_cli -- experiment compare food-pause-recovery \
+  --baseline control --challenger pause-recovery --metric alive_agents
+```
+
+`create --file -` reads one bounded JSON request from standard input. List output
+retains the server's opaque `next_cursor`; pass that value unchanged with
+`--cursor` to request the next page. Successful commands print the complete JSON
+result so scripts can inspect run state, execution capacity and comparison
+provenance. Server refusals retain their status and response body in the reported
+error. Comparison requires both selected cohorts to be complete and passes
+through the existing bundle and checkpoint verification.
+
+Use `experiment cancel ID` to request a cooperative stop and `experiment resume ID`
+to continue the saved batch. Cancellation can return `cancelling`, and a batch
+that already finished can still report `completed`; inspect `experiment status ID`
+for the observed outcome. Resume uses the validated saved owner/journal cuts and
+does not start an unrelated run. Reuse the original create payload and
+`--idempotency-key` after a lost create response.
+
 Interactive dashboard:
 ```bash
 # Live TUI dashboard of knobs and their current values; press 'q' to quit, 'r' to refresh

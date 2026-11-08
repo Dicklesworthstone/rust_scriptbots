@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use crossterm::{
     cursor::{Hide, Show},
     event::{self, Event, KeyCode, KeyEventKind},
@@ -23,7 +23,11 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Row, Table},
 };
 use reqwest::{Client, StatusCode};
-use scriptbots_app::control::MapApplyAgentPolicy;
+use scriptbots_app::control::{
+    ExperimentBatchStatusDto, ExperimentComparisonDto, ExperimentCreateRequest,
+    MapApplyAgentPolicy, PaginatedExperimentsResponse,
+};
+use scriptbots_app::experiment_runner::EXPERIMENT_ENDPOINT_METRICS;
 use scriptbots_app::{
     CommandStatusDto, ConfigPatchRequest, ConfigSnapshot, HydrologySnapshot, KnobApplyRequest,
     KnobEntry, KnobKind, KnobUpdate, STORAGE_SIDECAR_SUFFIXES, default_control_rest_base_url,
@@ -200,6 +204,54 @@ enum Command {
         #[command(subcommand)]
         sub: NarrativeSubcommand,
     },
+    /// Create, inspect, stop, resume, or compare matched-seed experiments.
+    Experiment {
+        #[command(subcommand)]
+        sub: ExperimentSubcommand,
+    },
+}
+
+/// Fetch one bounded catalog page; the response retains the server's next cursor.
+#[derive(Args, Debug)]
+struct CatalogPageArgs {
+    /// Maximum records on this page (1..=100).
+    #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u16).range(1..=100))]
+    limit: u16,
+    /// Opaque next_cursor returned by the previous page.
+    #[arg(long)]
+    cursor: Option<String>,
+}
+
+#[derive(Subcommand, Debug)]
+enum ExperimentSubcommand {
+    /// Submit an ExperimentCreateRequest JSON file; prints the observed batch status.
+    Create {
+        /// JSON request file, or '-' for stdin (at most 1 MiB).
+        #[arg(long, short)]
+        file: PathBuf,
+    },
+    /// List experiments, including capacity and the next-page cursor, as JSON.
+    List {
+        #[command(flatten)]
+        page: CatalogPageArgs,
+    },
+    /// Read the saved status and per-run results as JSON.
+    Status { id: String },
+    /// Request a cooperative stop; returned status may still be 'cancelling'.
+    Cancel { id: String },
+    /// Resume a stopped batch from its verified saved progress.
+    Resume { id: String },
+    /// Compare verified completed cohorts (challenger minus baseline), as JSON.
+    Compare {
+        id: String,
+        #[arg(long)]
+        baseline: String,
+        #[arg(long)]
+        challenger: String,
+        /// Canonical final-state metric; a larger value is not a fitness verdict.
+        #[arg(long, default_value = "alive_agents", value_parser = clap::builder::PossibleValuesParser::new(EXPERIMENT_ENDPOINT_METRICS))]
+        metric: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -347,6 +399,7 @@ async fn main() -> Result<()> {
         } => export_command(kind, database, out, last)?,
         other => {
             let client = Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .context("failed to build HTTP client")?;
             let key = cli.idempotency_key.as_deref();
@@ -430,11 +483,239 @@ async fn main() -> Result<()> {
                 Command::Narrative { sub } => {
                     narrative_command(&client, &cli.base_url, sub).await?
                 }
+                Command::Experiment { sub } => {
+                    let response = experiment_request(&client, &cli.base_url, sub, key).await?;
+                    println!("{}", serde_json::to_string_pretty(&response)?);
+                }
             }
         }
     }
 
     Ok(())
+}
+
+/// Client-side bounds apply even when a peer omits or lies about Content-Length.
+const MAX_DATA_JSON_BYTES: usize = 16 * 1024 * 1024;
+const MAX_EXPERIMENT_REQUEST_BYTES: usize = 1024 * 1024;
+const MAX_DATA_ERROR_BYTES: usize = 64 * 1024;
+const DATA_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
+
+fn data_api_url(base: &str, segments: &[&str]) -> Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(base).context("invalid control API base URL")?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        bail!("control API base URL must be HTTP(S) without a query or fragment");
+    }
+    for segment in segments {
+        if segment.is_empty()
+            || segment.len() > 128
+            || segment.contains("..")
+            || *segment == "."
+            || !segment
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            bail!(
+                "API identity must be 1..=128 ASCII letters, digits, '.', '_' or '-', without traversal"
+            );
+        }
+    }
+    {
+        let mut path = url
+            .path_segments_mut()
+            .map_err(|()| anyhow::anyhow!("control API base URL cannot contain path segments"))?;
+        path.pop_if_empty().extend(["api", "v1"]);
+        path.extend(segments.iter().copied());
+    }
+    Ok(url)
+}
+
+fn catalog_request(
+    client: &Client,
+    base_url: &str,
+    collection: &str,
+    page: &CatalogPageArgs,
+) -> Result<reqwest::RequestBuilder> {
+    if !(1..=100).contains(&page.limit) {
+        bail!("catalog --limit must be in 1..=100");
+    }
+    let mut request = client
+        .get(data_api_url(base_url, &[collection])?)
+        .query(&[("limit", page.limit)]);
+    if let Some(cursor) = &page.cursor {
+        if cursor.is_empty() || cursor.len() > 1024 {
+            bail!("catalog --cursor must contain 1..=1024 bytes");
+        }
+        request = request.query(&[("cursor", cursor)]);
+    }
+    Ok(request)
+}
+
+async fn bounded_response_bytes(mut response: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|size| size > limit as u64)
+    {
+        bail!("control API response exceeds the {limit}-byte client limit");
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .context("failed to read control API response")?
+    {
+        if chunk.len() > limit.saturating_sub(bytes.len()) {
+            bail!("control API response exceeds the {limit}-byte client limit");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+async fn data_json<T>(request: reqwest::RequestBuilder) -> Result<Value>
+where
+    T: DeserializeOwned + serde::Serialize,
+{
+    let response =
+        request.timeout(DATA_REQUEST_TIMEOUT).send().await.context(
+            "control data request failed; inspect saved status before retrying a mutation",
+        )?;
+    let status = response.status();
+    let limit = if status.is_success() {
+        MAX_DATA_JSON_BYTES
+    } else {
+        MAX_DATA_ERROR_BYTES
+    };
+    let bytes = bounded_response_bytes(response, limit)
+        .await
+        .with_context(|| format!("failed to read control API response ({status})"))?;
+    if !status.is_success() {
+        bail!(
+            "control API request failed ({status}): {}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+    let decoded: T = serde_json::from_slice(&bytes)
+        .context("failed to decode the expected control data response")?;
+    serde_json::to_value(decoded).context("failed to encode control data response")
+}
+
+fn read_experiment_request(file: &Path, key: Option<&str>) -> Result<ExperimentCreateRequest> {
+    let mut bytes = Vec::new();
+    let limit = u64::try_from(MAX_EXPERIMENT_REQUEST_BYTES).expect("client input bound fits u64");
+    if file == Path::new("-") {
+        io::stdin()
+            .lock()
+            .take(limit + 1)
+            .read_to_end(&mut bytes)
+            .context("failed to read experiment JSON from stdin")?;
+    } else {
+        let metadata = fs::metadata(file)
+            .with_context(|| format!("failed to inspect experiment request {}", file.display()))?;
+        if !metadata.is_file() || metadata.len() > limit {
+            bail!("experiment request must be a regular file of at most {limit} bytes");
+        }
+        fs::File::open(file)
+            .with_context(|| format!("failed to open experiment request {}", file.display()))?
+            .take(limit + 1)
+            .read_to_end(&mut bytes)
+            .context("failed to read experiment request")?;
+    }
+    if bytes.len() > MAX_EXPERIMENT_REQUEST_BYTES {
+        bail!("experiment request exceeds the {limit}-byte input limit");
+    }
+    let mut request: ExperimentCreateRequest =
+        serde_json::from_slice(&bytes).context("invalid ExperimentCreateRequest JSON")?;
+    if let Some(key) = key {
+        if request
+            .idempotency_key
+            .as_deref()
+            .is_some_and(|body_key| body_key != key)
+        {
+            bail!("--idempotency-key conflicts with the key in the experiment request");
+        }
+        request.idempotency_key = Some(key.to_owned());
+    }
+    if serde_json::to_vec(&request)?.len() > MAX_EXPERIMENT_REQUEST_BYTES {
+        bail!("serialized experiment request exceeds the {limit}-byte input limit");
+    }
+    Ok(request)
+}
+
+async fn experiment_request(
+    client: &Client,
+    base_url: &str,
+    command: ExperimentSubcommand,
+    key: Option<&str>,
+) -> Result<Value> {
+    match command {
+        ExperimentSubcommand::Create { file } => {
+            let body = read_experiment_request(&file, key)?;
+            let mut request = client
+                .post(data_api_url(base_url, &["experiments"])?)
+                .json(&body);
+            if let Some(key) = key {
+                request = request.header("Idempotency-Key", key);
+            }
+            data_json::<ExperimentBatchStatusDto>(request).await
+        }
+        ExperimentSubcommand::List { page } => {
+            data_json::<PaginatedExperimentsResponse>(catalog_request(
+                client,
+                base_url,
+                "experiments",
+                &page,
+            )?)
+            .await
+        }
+        ExperimentSubcommand::Status { id } => {
+            data_json::<ExperimentBatchStatusDto>(
+                client.get(data_api_url(base_url, &["experiments", &id])?),
+            )
+            .await
+        }
+        ExperimentSubcommand::Cancel { id } => {
+            data_json::<ExperimentBatchStatusDto>(
+                client.post(data_api_url(base_url, &["experiments", &id, "cancel"])?),
+            )
+            .await
+        }
+        ExperimentSubcommand::Resume { id } => {
+            data_json::<ExperimentBatchStatusDto>(
+                client.post(data_api_url(base_url, &["experiments", &id, "resume"])?),
+            )
+            .await
+        }
+        ExperimentSubcommand::Compare {
+            id,
+            baseline,
+            challenger,
+            metric,
+        } => {
+            if !EXPERIMENT_ENDPOINT_METRICS.contains(&metric.as_str()) {
+                bail!(
+                    "unknown endpoint metric; expected {}",
+                    EXPERIMENT_ENDPOINT_METRICS.join(", ")
+                );
+            }
+            let body = serde_json::json!({
+                "baseline_variant": baseline,
+                "challenger_variant": challenger,
+                "metric": metric,
+            });
+            if serde_json::to_vec(&body)?.len() > 4096 {
+                bail!("comparison request exceeds the API's 4096-byte limit");
+            }
+            data_json::<ExperimentComparisonDto>(
+                client
+                    .post(data_api_url(base_url, &["experiments", &id, "compare"])?)
+                    .json(&body),
+            )
+            .await
+        }
+    }
 }
 
 fn export_command(
@@ -1971,6 +2252,547 @@ fn value_to_string(value: &Value, max_len: usize) -> String {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn experiment_cli_exposes_lifecycle_and_canonical_metric_choices() {
+        for action in ["status", "cancel", "resume"] {
+            assert!(Cli::try_parse_from(["control", "experiment", action, "study-1"]).is_ok());
+        }
+        for metric in EXPERIMENT_ENDPOINT_METRICS {
+            let parsed = Cli::try_parse_from([
+                "control",
+                "experiment",
+                "compare",
+                "study-1",
+                "--baseline",
+                "mlp",
+                "--challenger",
+                "dwraon",
+                "--metric",
+                metric,
+            ])
+            .expect("canonical metric is available to the shell");
+            assert!(matches!(parsed.command, Command::Experiment {
+                sub: ExperimentSubcommand::Compare { metric: actual, .. }
+            } if actual == metric));
+        }
+        assert!(
+            Cli::try_parse_from([
+                "control",
+                "experiment",
+                "compare",
+                "study-1",
+                "--baseline",
+                "mlp",
+                "--challenger",
+                "dwraon",
+                "--metric",
+                "invented_fitness",
+            ])
+            .is_err()
+        );
+        for limit in ["0", "101", "65536"] {
+            assert!(
+                Cli::try_parse_from(["control", "experiment", "list", "--limit", limit,]).is_err()
+            );
+        }
+        assert!(Cli::try_parse_from(["control", "experiment", "create"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "control",
+                "--idempotency-key",
+                "retry-1",
+                "experiment",
+                "create",
+                "--file",
+                "-",
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn data_urls_preserve_the_authority_and_refuse_path_or_query_injection() {
+        let url = data_api_url(
+            "http://127.0.0.1:4000/proxy/",
+            &["experiments", "study-1", "cancel"],
+        )
+        .expect("relative API under configured base path");
+        assert_eq!(
+            url.as_str(),
+            "http://127.0.0.1:4000/proxy/api/v1/experiments/study-1/cancel"
+        );
+        for id in [
+            "",
+            ".",
+            "..",
+            "../shutdown",
+            "a/b",
+            "a\\b",
+            "a?x=1",
+            "a#tail",
+            "%2e%2e",
+            "https://elsewhere",
+        ] {
+            assert!(
+                data_api_url("http://localhost:4000", &["experiments", id]).is_err(),
+                "identity {id:?}"
+            );
+        }
+        for base in [
+            "file:///tmp/api",
+            "http://localhost:4000/?q=1",
+            "http://localhost:4000/#fragment",
+        ] {
+            assert!(data_api_url(base, &["experiments"]).is_err());
+        }
+        let client = Client::new();
+        let request = catalog_request(
+            &client,
+            "http://localhost:4000",
+            "experiments",
+            &CatalogPageArgs {
+                limit: 7,
+                cursor: Some("offset&limit=100".into()),
+            },
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        let pairs = request.url().query_pairs().collect::<Vec<_>>();
+        assert_eq!(
+            pairs,
+            [
+                ("limit".into(), "7".into()),
+                ("cursor".into(), "offset&limit=100".into())
+            ]
+        );
+    }
+
+    fn experiment_request_fixture() -> Value {
+        serde_json::json!({
+            "experiment_id": "cli-study", "description": "retained input",
+            "variants": [{
+                "variant_id": "baseline", "brain_family": "mlp",
+                "config_overrides": {"population_minimum": 2},
+                "interventions": [{"tick": 1, "set": {"food_growth_rate": 0.02}}]
+            }],
+            "seeds": [7, 11], "ticks_per_run": 3, "max_concurrency": 1,
+            "idempotency_key": "same-request"
+        })
+    }
+
+    #[test]
+    fn experiment_input_is_bounded_and_retains_interventions_and_retry_identity() -> Result<()> {
+        let directory = tempdir()?;
+        let path = directory.path().join("request.json");
+        let original = experiment_request_fixture();
+        let mut bytes = serde_json::to_vec(&original)?;
+        bytes.resize(MAX_EXPERIMENT_REQUEST_BYTES, b' ');
+        fs::write(&path, &bytes)?;
+        let request = read_experiment_request(&path, Some("same-request"))?;
+        assert_eq!(serde_json::to_value(request)?, original);
+        assert!(read_experiment_request(&path, Some("different-request")).is_err());
+        bytes.push(b' ');
+        fs::write(&path, &bytes)?;
+        assert!(read_experiment_request(&path, None).is_err());
+        fs::write(&path, b"{\"variants\":")?;
+        assert!(read_experiment_request(&path, None).is_err());
+        assert!(read_experiment_request(directory.path(), None).is_err());
+        Ok(())
+    }
+
+    /// A wire peer records actual HTTP requests; it does not stand in for a successful owner.
+    fn data_wire_peer(
+        status: &'static str,
+        body: Vec<u8>,
+        length: Option<usize>,
+    ) -> (String, std::thread::JoinHandle<Result<String>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("wire listener");
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || -> Result<String> {
+            use std::io::BufRead;
+            let (mut stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+            stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+            let mut reader = io::BufReader::new(stream.try_clone()?);
+            let mut request = String::new();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line)? == 0 {
+                    bail!("client closed before HTTP request headers");
+                }
+                request.push_str(&line);
+                if line == "\r\n" {
+                    break;
+                }
+                if request.len() > MAX_DATA_ERROR_BYTES {
+                    bail!("unexpected request header size");
+                }
+            }
+            let request_size = request
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<u64>())
+                })
+                .transpose()?
+                .unwrap_or(0);
+            if request_size > MAX_EXPERIMENT_REQUEST_BYTES as u64 {
+                bail!("unexpected request body size");
+            }
+            let mut payload = Vec::new();
+            reader.take(request_size).read_to_end(&mut payload)?;
+            request.push_str(std::str::from_utf8(&payload)?);
+            let length_header = length.map_or(String::new(), |value| {
+                format!("Content-Length: {value}\r\n")
+            });
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{length_header}Connection: close\r\n\r\n"
+            )?;
+            stream.write_all(&body)?;
+            stream.flush()?;
+            Ok(request)
+        });
+        (format!("http://{address}"), worker)
+    }
+
+    fn experiment_status_fixture(status: &str) -> Value {
+        serde_json::json!({
+            "schema_version": 1, "generation": 7, "plan_digest": "observed-plan",
+            "experiment_id": "cli-study", "status": status, "total_runs": 2,
+            "completed_runs": 0, "failed_runs": 0, "runs": [], "error_reason": null,
+            "created_at_utc": "123", "updated_at_utc": "456"
+        })
+    }
+
+    #[tokio::test]
+    async fn experiment_http_preserves_observed_states_and_request_identity() -> Result<()> {
+        let client = Client::new();
+        for (command, method, path, state) in [
+            (
+                ExperimentSubcommand::Status {
+                    id: "cli-study".into(),
+                },
+                "GET",
+                "/api/v1/experiments/cli-study",
+                "pending",
+            ),
+            (
+                ExperimentSubcommand::Cancel {
+                    id: "cli-study".into(),
+                },
+                "POST",
+                "/api/v1/experiments/cli-study/cancel",
+                "cancelling",
+            ),
+            (
+                ExperimentSubcommand::Resume {
+                    id: "cli-study".into(),
+                },
+                "POST",
+                "/api/v1/experiments/cli-study/resume",
+                "running",
+            ),
+        ] {
+            let expected = experiment_status_fixture(state);
+            let bytes = serde_json::to_vec(&expected)?;
+            let (base, worker) = data_wire_peer("200 OK", bytes.clone(), Some(bytes.len()));
+            assert_eq!(
+                experiment_request(&client, &base, command, None).await?,
+                expected
+            );
+            let request = worker.join().expect("wire peer joined")?;
+            assert!(
+                request.starts_with(&format!("{method} {path} HTTP/1.1\r\n")),
+                "{request}"
+            );
+        }
+        let directory = tempdir()?;
+        let file = directory.path().join("request.json");
+        fs::write(&file, serde_json::to_vec(&experiment_request_fixture())?)?;
+        let expected = experiment_status_fixture("pending");
+        let bytes = serde_json::to_vec(&expected)?;
+        let (base, worker) = data_wire_peer("201 Created", bytes.clone(), Some(bytes.len()));
+        assert_eq!(
+            experiment_request(
+                &client,
+                &base,
+                ExperimentSubcommand::Create { file },
+                Some("same-request")
+            )
+            .await?,
+            expected
+        );
+        let request = worker.join().expect("wire peer joined")?;
+        assert!(request.starts_with("POST /api/v1/experiments HTTP/1.1\r\n"));
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("idempotency-key: same-request\r\n")
+        );
+        let body: Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1)?;
+        assert_eq!(body, experiment_request_fixture());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn data_responses_bound_unframed_bytes_and_keep_server_refusals() -> Result<()> {
+        let client = Client::new();
+        for length in [None, Some(7)] {
+            let (base, worker) = data_wire_peer("200 OK", b"1234567".to_vec(), length);
+            let response = client.get(&base).send().await?;
+            assert!(bounded_response_bytes(response, 3).await.is_err());
+            worker.join().expect("wire peer joined")?;
+        }
+        let (base, worker) =
+            data_wire_peer("409 Conflict", b"batch is still stopping".to_vec(), None);
+        let error = experiment_request(
+            &client,
+            &base,
+            ExperimentSubcommand::Resume {
+                id: "cli-study".into(),
+            },
+            None,
+        )
+        .await
+        .expect_err("HTTP conflict must not become a successful resume");
+        assert!(error.to_string().contains("409 Conflict"));
+        assert!(error.to_string().contains("batch is still stopping"));
+        worker.join().expect("wire peer joined")?;
+        Ok(())
+    }
+
+    struct LiveDataServer {
+        host: Option<scriptbots_app::host_thread::HostThread>,
+        runtime: Option<scriptbots_app::ControlRuntime>,
+        handle: Option<scriptbots_app::ControlHandle>,
+        submit: Option<scriptbots_app::CommandSubmit>,
+        base_url: String,
+    }
+
+    impl LiveDataServer {
+        fn start(artifacts: &Path) -> Result<Self> {
+            use scriptbots_app::{
+                BrainPreset, ControlServerConfig, ControlServerReservation, McpTransportConfig,
+            };
+            use scriptbots_core::{AgentData, NullPersistence, ScriptBotsConfig, WorldState};
+            use scriptbots_runtime::{
+                HostCoreOptions, HostSessionId, PlaybackSnapshot, VolatileJournal,
+                channel::ChannelHostOptions,
+            };
+            let (mut world, persistence) = WorldState::with_persistence(
+                ScriptBotsConfig {
+                    rng_seed: Some(42),
+                    world_width: 40,
+                    world_height: 40,
+                    food_cell_size: 10,
+                    population_minimum: 0,
+                    population_spawn_interval: 0,
+                    ..ScriptBotsConfig::default()
+                },
+                Box::new(NullPersistence),
+            )?;
+            let brains = scriptbots_app::brains::install_brains(&mut world, BrainPreset::Mlp)?;
+            for _ in 0..2 {
+                let id = world.try_spawn_agent(AgentData::default())?;
+                assert!(world.bind_agent_brain(id, brains.population()[0])?);
+            }
+            let host = scriptbots_app::host_thread::HostThread::spawn(
+                HostSessionId::new(901),
+                world,
+                persistence,
+                Box::new(VolatileJournal::default()),
+                HostCoreOptions {
+                    initial_playback: PlaybackSnapshot {
+                        paused: true,
+                        speed_multiplier: 1.0,
+                    },
+                    ..HostCoreOptions::default()
+                },
+                ChannelHostOptions::default(),
+            )?;
+            let reservation = ControlServerReservation::prepare(ControlServerConfig {
+                rest_address: "127.0.0.1:0".parse()?,
+                mcp_transport: McpTransportConfig::Disabled,
+                ..ControlServerConfig::default()
+            })?;
+            let base_url = format!(
+                "http://{}",
+                reservation.rest_address().expect("reserved REST listener")
+            );
+            let (runtime, submit) = reservation.launch(host.port(), false)?;
+            let handle = runtime
+                .control_handle()
+                .expect("actual control handle")
+                .with_artifacts_dir(artifacts.to_path_buf())?;
+            Ok(Self {
+                host: Some(host),
+                runtime: Some(runtime),
+                handle: Some(handle),
+                submit: Some(submit),
+                base_url,
+            })
+        }
+
+        fn stop(&mut self) -> Result<()> {
+            drop(self.submit.take());
+            drop(self.handle.take());
+            let server = self
+                .runtime
+                .take()
+                .map(scriptbots_app::ControlRuntime::shutdown)
+                .transpose();
+            let owner = self
+                .host
+                .take()
+                .map(scriptbots_app::host_thread::HostThread::join)
+                .transpose();
+            server?;
+            owner?;
+            Ok(())
+        }
+    }
+
+    impl Drop for LiveDataServer {
+        fn drop(&mut self) {
+            if let Err(error) = self.stop() {
+                eprintln!("live CLI test cleanup failed: {error:#}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn experiment_cli_drives_real_host_backed_rest_and_verified_comparison() -> Result<()> {
+        use scriptbots_runtime::HostPort;
+        let root = tempdir()?;
+        let mut server = LiveDataServer::start(&root.path().join("artifacts"))?;
+        let before = server
+            .host
+            .as_ref()
+            .unwrap()
+            .port()
+            .scientific_digest_v1()?;
+        let file = root.path().join("study.json");
+        let variants = ["baseline", "challenger"].into_iter().map(|id| serde_json::json!({
+            "variant_id": id, "brain_family": "mlp",
+            "config_overrides": {"world_width": 40, "world_height": 40, "food_cell_size": 10,
+                    "population_minimum": 2, "population_spawn_interval": 0,
+                    "food_growth_rate": if id == "baseline" { 0.0 } else { 0.01 }}
+        })).collect::<Vec<_>>();
+        fs::write(
+            &file,
+            serde_json::to_vec(&serde_json::json!({
+                "experiment_id": "cli-study", "variants": variants, "seeds": [7, 11],
+                "ticks_per_run": 2, "max_concurrency": 1
+            }))?,
+        )?;
+        let client = Client::new();
+        let created = experiment_request(
+            &client,
+            &server.base_url,
+            ExperimentSubcommand::Create { file: file.clone() },
+            Some("cli-retry"),
+        )
+        .await?;
+        assert_eq!(created["experiment_id"], "cli-study");
+        assert_eq!(created["total_runs"], 4);
+        let retried = experiment_request(
+            &client,
+            &server.base_url,
+            ExperimentSubcommand::Create { file },
+            Some("cli-retry"),
+        )
+        .await?;
+        assert_eq!(retried["experiment_id"], created["experiment_id"]);
+        assert_eq!(retried["plan_digest"], created["plan_digest"]);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let completed = loop {
+            let current = experiment_request(
+                &client,
+                &server.base_url,
+                ExperimentSubcommand::Status {
+                    id: "cli-study".into(),
+                },
+                None,
+            )
+            .await?;
+            assert_ne!(current["status"], "failed", "{current}");
+            if current["status"] == "completed" {
+                break current;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "actual experiment did not complete: {current}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(completed["completed_runs"], 4);
+        assert!(
+            completed["runs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|run| run["final_digest"].is_string())
+        );
+        let listed = experiment_request(
+            &client,
+            &server.base_url,
+            ExperimentSubcommand::List {
+                page: CatalogPageArgs {
+                    limit: 1,
+                    cursor: None,
+                },
+            },
+            None,
+        )
+        .await?;
+        assert_eq!(listed["total"], 1);
+        assert_eq!(listed["items"][0]["experiment_id"], "cli-study");
+        let comparison = experiment_request(
+            &client,
+            &server.base_url,
+            ExperimentSubcommand::Compare {
+                id: "cli-study".into(),
+                baseline: "baseline".into(),
+                challenger: "challenger".into(),
+                metric: "alive_agents".into(),
+            },
+            None,
+        )
+        .await?;
+        assert_eq!(comparison["matched_seeds"], serde_json::json!([7, 11]));
+        assert_eq!(comparison["endpoint_tick"], 2);
+        assert_eq!(comparison["mean_difference"], 0.0);
+        assert_eq!(comparison["plan_digest"], completed["plan_digest"]);
+        assert_eq!(comparison["descriptive_only"], false);
+        assert!(
+            experiment_request(
+                &client,
+                &server.base_url,
+                ExperimentSubcommand::Resume {
+                    id: "cli-study".into()
+                },
+                None
+            )
+            .await
+            .is_err(),
+            "a completed batch must not restart"
+        );
+        assert_eq!(
+            server
+                .host
+                .as_ref()
+                .unwrap()
+                .port()
+                .scientific_digest_v1()?,
+            before
+        );
+        server.stop()?;
+        Ok(())
+    }
 
     #[test]
     fn screenshot_accepts_ansi_and_rejects_conflicting_png() {
