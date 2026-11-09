@@ -178,6 +178,26 @@
         #brain-content table { font-size: 0.7rem; width: 100%; font-variant-numeric: tabular-nums; }
         #brain-content th, #brain-content td { text-align: right; overflow-wrap: anywhere; }
         #brain-content th:first-child, #brain-content td:first-child { text-align: left; }
+        #genome-inspector { border-top: 1px solid #334155; padding-top: 0.5rem; }
+        #genome-inspector p { font-size: 0.75rem; overflow-wrap: anywhere; }
+        #genome-content[hidden] { display: none; }
+        #genome-content { display: grid; gap: 0.5rem; min-width: 0; }
+        #genome-content .genome-table { max-height: 21rem; overflow: auto; }
+        #genome-content table { width: 100%; font-size: 0.7rem; font-variant-numeric: tabular-nums; }
+        #genome-content th, #genome-content td { text-align: left; overflow-wrap: anywhere; }
+        #genome-content th { position: sticky; top: 0; background: #0f172a; }
+        #intervention-toolbox { display: block; }
+        #intervention-toolbox summary { cursor: pointer; font-weight: 700; }
+        #intervention-toolbox p { font-size: 0.8rem; overflow-wrap: anywhere; }
+        #intervention-toolbox [hidden] { display: none; }
+        #intervention-form, #intervention-disc { display: grid; gap: 0.6rem; }
+        #intervention-form label { display: grid; gap: 0.25rem; }
+        #intervention-form input, #intervention-form select { box-sizing: border-box; width: 100%; }
+        #intervention-form input { color: #e2e8f0; background: #0f172a; border: 1px solid #475569; border-radius: 0.25rem; padding: 0.4rem; }
+        #intervention-form fieldset { border: 1px solid #334155; border-radius: 0.35rem; }
+        #intervention-history { max-height: 19rem; overflow: auto; padding-left: 1.25rem; font-size: 0.75rem; }
+        #intervention-history li { margin: 0.5rem 0; overflow-wrap: anywhere; }
+        #intervention-form-error, #intervention-history-gap { color: #fbbf24; }
         #inspector-signals { max-height: 24rem; overflow: auto; }
         #inspector-signals table { width: 100%; font-size: 0.75rem; border-collapse: collapse; }
         #inspector-signals th { text-align: left; font-weight: 400; }
@@ -399,6 +419,41 @@
                             <p id="brain-attribution-note"></p>
                         </div>
                     </details>
+                    <details id="genome-inspector" data-state="inactive">
+                        <summary>Inherited genome &amp; parent differences</summary>
+                        <p id="genome-status" role="status">Open this panel to browse the selected creature’s inherited genome.</p>
+                        <p id="genome-source"></p>
+                        <button id="genome-refresh" type="button" disabled>Refresh from first page</button>
+                        <div id="genome-content" hidden>
+                            <p id="genome-digest"></p>
+                            <p id="genome-provenance"></p>
+                            <h3>Canonical loci</h3>
+                            <p id="genome-locus-page"></p>
+                            <div class="inspector-actions">
+                                <button id="genome-locus-prev" type="button" disabled>Previous loci</button>
+                                <button id="genome-locus-next" type="button" disabled>Next loci</button>
+                            </div>
+                            <div class="genome-table">
+                                <table aria-label="Canonical inherited genome loci">
+                                    <thead><tr><th>Index</th><th>Locus</th><th>Type</th><th>Value</th></tr></thead>
+                                    <tbody id="genome-loci"></tbody>
+                                </table>
+                            </div>
+                            <h3>Parent comparison</h3>
+                            <p id="genome-parent"></p>
+                            <p id="genome-delta-page"></p>
+                            <div class="inspector-actions">
+                                <button id="genome-delta-prev" type="button" disabled>Previous changes</button>
+                                <button id="genome-delta-next" type="button" disabled>Next changes</button>
+                            </div>
+                            <div class="genome-table">
+                                <table aria-label="Parent to child genome differences">
+                                    <thead><tr><th>Locus</th><th>Change</th><th>Parent</th><th>Child</th></tr></thead>
+                                    <tbody id="genome-deltas"></tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </details>
                 </section>
                 <button id="capture-btn" type="button" disabled>Save Frame as PNG</button>
                 <div id="capture-status" role="status" aria-live="polite"></div>
@@ -445,6 +500,73 @@
                 <div id="remote-receipt" role="status" aria-live="polite"></div>
                 <ul id="remote-events" aria-label="Remote narrative events" aria-live="polite"></ul>
             </div>
+            <details id="intervention-toolbox" class="controls">
+                <summary>Scientific intervention toolbox</summary>
+                <p id="intervention-owner" role="status">Waiting for an observed world.</p>
+                <div class="inspector-actions">
+                    <button id="intervention-pause" type="button" disabled>Pause</button>
+                    <button id="intervention-step" type="button" disabled>Step once</button>
+                    <button id="intervention-resume" type="button" disabled>Resume</button>
+                </div>
+                <form id="intervention-form">
+                    <label for="intervention-kind">Experiment
+                        <select id="intervention-kind">
+                            <option value="drought">Drought — suppress food growth</option>
+                            <option value="embargo">Embargo — suppress food intake</option>
+                            <option value="bloom">Bloom — add food</option>
+                            <option value="meteor">Meteor — damage agents and scorch food</option>
+                            <option value="set_closed_world">Closed/open world — population injection policy</option>
+                        </select>
+                    </label>
+                    <fieldset data-intervention-kinds="drought embargo bloom meteor">
+                        <legend>Target region</legend>
+                        <label for="intervention-region">Extent
+                            <select id="intervention-region"><option value="all">Whole world</option><option value="disc">Toroidal disc</option></select>
+                        </label>
+                        <div id="intervention-disc" hidden>
+                            <label for="intervention-x">Center X <input id="intervention-x" type="number" step="any" value="0" required /></label>
+                            <label for="intervention-y">Center Y <input id="intervention-y" type="number" step="any" value="0" required /></label>
+                            <label for="intervention-radius">Radius <input id="intervention-radius" type="number" min="0.000001" step="any" value="100" required /></label>
+                            <button id="intervention-use-selected" type="button">Center on selected creature</button>
+                        </div>
+                    </fieldset>
+                    <label for="intervention-ticks" data-intervention-kinds="drought embargo">Duration in scientific ticks
+                        <input id="intervention-ticks" type="number" min="1" max="4294967295" step="1" value="300" required />
+                    </label>
+                    <label for="intervention-growth-scale" data-intervention-kinds="drought">Food growth multiplier (0 = none, 1 = unchanged)
+                        <input id="intervention-growth-scale" type="number" min="0" max="1" step="any" value="0.1" required />
+                    </label>
+                    <label for="intervention-amount" data-intervention-kinds="bloom" hidden>Food added to each cell
+                        <input id="intervention-amount" type="number" min="0" step="any" value="0.25" required />
+                    </label>
+                    <label for="intervention-lethality" data-intervention-kinds="meteor" hidden>Health removed from each agent
+                        <input id="intervention-lethality" type="number" min="0" step="any" value="0.5" required />
+                    </label>
+                    <label for="intervention-scorch" data-intervention-kinds="meteor" hidden>Fraction of food scorched (0–1)
+                        <input id="intervention-scorch" type="number" min="0" max="1" step="any" value="0.5" required />
+                    </label>
+                    <label for="intervention-closed" data-intervention-kinds="set_closed_world" hidden>Population injection policy
+                        <select id="intervention-closed"><option value="true">Closed — no automatic population injections</option><option value="false">Open — configured injections may occur</option></select>
+                    </label>
+                    <button id="intervention-stage" type="submit" disabled>Stage intervention at paused boundary</button>
+                    <p id="intervention-form-error" role="status"></p>
+                </form>
+                <p id="intervention-request">No intervention request in this owner session.</p>
+                <p id="intervention-receipt" role="status" aria-live="polite"></p>
+                <div class="inspector-actions">
+                    <button id="intervention-status-refresh" type="button" disabled>Refresh command outcome</button>
+                    <button id="intervention-retry" type="button" disabled>Retry original request with same ID</button>
+                </div>
+                <h3>Observed ecological effects</h3>
+                <p id="intervention-history-source">Open the toolbox to read global ecological effects.</p>
+                <p id="intervention-history-gap" role="status"></p>
+                <div class="inspector-actions">
+                    <button id="intervention-history-refresh" type="button" disabled>Refresh effects</button>
+                    <button id="intervention-history-first" type="button" disabled>Oldest retained effects</button>
+                    <button id="intervention-history-next" type="button" disabled>Next effects page</button>
+                </div>
+                <ul id="intervention-history" aria-label="Global observed ecological effects"></ul>
+            </details>
             <div class="controls">
                 <div class="chip">Share &amp; Fork</div>
                 <label>

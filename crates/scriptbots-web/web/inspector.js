@@ -48,7 +48,7 @@ const REVISION_FIELDS = ["scientific", "control", "config"];
 const NUMERIC_FIELDS = ["health", "energy", "foodBalanceTotal", "herbivoreTendency",
   "temperaturePreference", "soundOutput", "giveIntent", "reproductionCounter"];
 
-function validateInspectionSource(detail, request) {
+export function validateInspectionSource(detail, request) {
   if (detail.uid !== request.uid) throw new Error("Inspection subject changed");
   exactIdentity(detail.uid);
   const source = detail.source;
@@ -205,10 +205,13 @@ export function validateBrainInspection(detail, request) {
 /** One selected UID and at most one in-flight read. No history queue or timers drive science. */
 export class InspectionController {
   constructor({ read, validate = validateInspection, enabled = true,
+    autoRefresh = true, requestContext = () => ({}),
     onChange = () => {}, onFrame = () => {}, now = () => performance.now() }) {
     this.read = read;
     this.validate = validate;
     this.enabled = enabled;
+    this.autoRefresh = autoRefresh;
+    this.requestContext = requestContext;
     this.onChange = onChange;
     this.onFrame = onFrame;
     this.now = now;
@@ -278,7 +281,7 @@ export class InspectionController {
       }
       return;
     }
-    void this.refresh();
+    if (this.autoRefresh) void this.refresh();
   }
 
   select(uid) {
@@ -304,7 +307,7 @@ export class InspectionController {
         || !frame.snapshot.agents.some((agent) => agentUid(agent) === uid)) return;
     const key = `${this.context}/${uid}/${frame.identity.publicationRevision}`;
     if (!force && (this.lastRequested === key || this.now() - this.lastReadAt < 250)) return;
-    const request = { uid, sessionId: frame.identity.sessionId, epoch: epochOf(frame),
+    const request = { ...this.requestContext(), uid, sessionId: frame.identity.sessionId, epoch: epochOf(frame),
       identity: { ...frame.identity }, context: this.context, abort: new AbortController() };
     this.pending = request;
     this.lastRequested = key;

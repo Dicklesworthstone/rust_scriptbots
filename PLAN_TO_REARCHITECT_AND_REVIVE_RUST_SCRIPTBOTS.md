@@ -2,6 +2,21 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Browser laboratory controls and replicated branch studies (2026-11-09):**
+[Currently In Progress — Codex]
+
+Continue the actual browser functionality in `bd-2z0.12.3`: bounded canonical
+genome-locus and parent-difference pages, and source-bound local/remote scientific
+interventions with retry-stable command identities. Command application queues an
+intervention; observed ecological history remains a separate outcome. Reads and
+pages must retain exact owner identities and refuse oversized source material.
+
+Extend Phase 4.5 with independently seeded checkpoint pairs and aggregate terminal
+endpoints. Replication must count independent seeds, preserve every underlying run,
+and enforce the existing study work ceiling across the complete seed cohort.
+Implementation, focused execution and full frontend/native qualification will be
+reported separately; existing bead ownership and acceptance remain unchanged.
+
 **Shared native creature appearance (2026-11-09):** [Source implemented and
 independently reviewed — Codex; native/GPU execution and performance acceptance open]
 

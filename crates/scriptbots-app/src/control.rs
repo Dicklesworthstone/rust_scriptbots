@@ -224,6 +224,17 @@ impl ControlError {
     }
 }
 
+impl From<scriptbots_runtime::remote::BrowserInterventionError> for ControlError {
+    fn from(error: scriptbots_runtime::remote::BrowserInterventionError) -> Self {
+        use scriptbots_runtime::remote::BrowserInterventionError;
+        match error {
+            BrowserInterventionError::InvalidRequest(message) => Self::BadRequest(message),
+            error @ (BrowserInterventionError::SourceConflict(_)
+            | BrowserInterventionError::PauseRequired) => Self::Conflict(error.to_string()),
+        }
+    }
+}
+
 impl From<PoisonError<MutexGuard<'_, WorldState>>> for ControlError {
     fn from(_: PoisonError<MutexGuard<'_, WorldState>>) -> Self {
         ControlError::Lock
@@ -4641,6 +4652,35 @@ impl ControlHandle {
         Ok(detail)
     }
 
+    /// Read one complete bounded genome page from the selected scientific owner.
+    pub fn inspect_genome_page(
+        &self,
+        uid: scriptbots_core::AgentUid,
+        session_id: u64,
+        epoch: u64,
+        locus_offset: usize,
+        delta_offset: usize,
+    ) -> Result<scriptbots_runtime::inspector::GenomeInspection, ControlError> {
+        scriptbots_runtime::inspector::validate_genome_page_offsets(locus_offset, delta_offset)?;
+        if self.host.session_id().get() != session_id {
+            return Err(ControlError::Conflict(
+                "genome inspector host session changed".to_owned(),
+            ));
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        let detail =
+            self.host
+                .inspect_genome_page_before(uid, locus_offset, delta_offset, deadline)?;
+        if detail.source.session_id != session_id.to_string()
+            || detail.source.epoch != epoch.to_string()
+        {
+            return Err(ControlError::Conflict(
+                "genome inspector source epoch or session changed".to_owned(),
+            ));
+        }
+        Ok(detail)
+    }
+
     /// Submit a selection update and return its admission receipt.
     ///
     /// This used to return `Result<(), _>`, which made selection the only
@@ -5181,6 +5221,72 @@ impl ControlHandle {
         self.submit_control_command_with_key(
             ControlCommand::Intervention(Box::new(cmd)),
             idempotency_key,
+        )
+    }
+
+    /// Stage one bounded browser experiment at an observed paused boundary.
+    /// Retrying a retained request reuses its complete envelope and actual owner status.
+    pub fn browser_intervene(
+        &self,
+        request: &scriptbots_runtime::remote::BrowserInterventionRequest,
+    ) -> Result<scriptbots_runtime::remote::BrowserInterventionReceipt, ControlError> {
+        use scriptbots_runtime::remote::{
+            BrowserInterventionReceipt, validate_browser_intervention_session,
+        };
+        let envelope = request.envelope()?;
+        let snapshot = self.read_snapshot()?;
+        validate_browser_intervention_session(&snapshot, &request.session_id)?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        if self
+            .host
+            .command_status_before(envelope.command_id, deadline)?
+            .is_none()
+        {
+            request.validate_new_source(&snapshot)?;
+        }
+        // Always resubmit the original envelope, even when a receipt already exists:
+        // the owner must reject a changed body or guard reusing this identity.
+        let status = self.host.submit_before(envelope, deadline)?;
+        Ok(BrowserInterventionReceipt::from_status(
+            &status,
+            &self.read_snapshot()?,
+        ))
+    }
+
+    /// Read a retained browser command receipt without interpreting absence as non-admission.
+    pub fn browser_intervention_status(
+        &self,
+        command_id: &str,
+        session_id: &str,
+    ) -> Result<Option<scriptbots_runtime::remote::BrowserInterventionReceipt>, ControlError> {
+        use scriptbots_runtime::remote::{
+            BrowserInterventionReceipt, browser_intervention_command_id,
+            validate_browser_intervention_session,
+        };
+        let command_id = browser_intervention_command_id(command_id)?;
+        validate_browser_intervention_session(&self.read_snapshot()?, session_id)?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        let status = self.host.command_status_before(command_id, deadline)?;
+        let snapshot = self.read_snapshot()?;
+        Ok(status.map(|status| BrowserInterventionReceipt::from_status(&status, &snapshot)))
+    }
+
+    /// Read bounded global effect observations; the core ring has no per-command linkage.
+    pub fn browser_intervention_history(
+        &self,
+        session_id: &str,
+        epoch: &str,
+        after_seq: &str,
+        limit: usize,
+    ) -> Result<scriptbots_runtime::remote::BrowserInterventionHistory, ControlError> {
+        Ok(
+            scriptbots_runtime::remote::BrowserInterventionHistory::capture(
+                &self.read_snapshot()?,
+                session_id,
+                epoch,
+                after_seq,
+                limit,
+            )?,
         )
     }
 

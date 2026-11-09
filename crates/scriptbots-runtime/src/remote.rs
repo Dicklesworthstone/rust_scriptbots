@@ -5,7 +5,10 @@
 //! dynamic-world v2 codec unchanged and deliberately does not serialize an entire
 //! host snapshot, checkpoint, or JSON-oriented narrative record positionally.
 
-use crate::{PlaybackSnapshot, RenderSnapshot};
+use crate::{
+    ApplicationState, CommandEnvelope, CommandId, CommandStatus, ControlRevision, HostCommand,
+    JournalState, PlaybackSnapshot, RenderSnapshot,
+};
 use scriptbots_core::{
     DynamicAgentSnapshot, DynamicSnapshotSummary, DynamicSnapshotWorld, DynamicWorldSnapshot,
     Region, TerrainKind, Tick, TickSummaryDto,
@@ -34,6 +37,411 @@ pub const REMOTE_MAX_EVENT_LABEL_BYTES: usize = 256;
 pub const REMOTE_MAX_EVENT_TEXT_BYTES: usize = 4096;
 const MAGIC: &[u8; 4] = b"SBWS";
 const HEADER_BYTES: usize = MAGIC.len() + 2;
+
+/// Maximum applied-intervention records returned by one browser history read.
+pub const BROWSER_INTERVENTION_PAGE_LIMIT: usize = 64;
+
+/// A bounded experimental action with an identity retained across explicit retries.
+///
+/// A new request requires a paused owner. Its original control guard is checked again
+/// at ordered application, so a concurrent Step or Resume cannot silently change the
+/// chosen boundary. Application means queueing the effect for the next science tick.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BrowserInterventionRequest {
+    /// Caller-generated opaque retry identity, 1 through 128 ASCII identifier bytes.
+    pub request_id: String,
+    /// Exact host session from the displayed publication.
+    pub session_id: String,
+    /// Exact evolution epoch from the displayed publication.
+    pub epoch: String,
+    /// Original command-visible revision; retries must retain this value.
+    pub expected_control_revision: String,
+    /// Scalar ecological action; cohort/archive and terrain-edit payloads are refused.
+    pub intervention: scriptbots_core::Intervention,
+}
+
+/// Refusal before a browser intervention can be admitted to the owner.
+#[derive(Debug, Error)]
+pub enum BrowserInterventionError {
+    /// Malformed or unsupported request; no owner command has been submitted.
+    #[error("invalid browser intervention: {0}")]
+    InvalidRequest(String),
+    /// The displayed source is no longer the addressed owner boundary.
+    #[error("browser intervention source changed: {0}")]
+    SourceConflict(&'static str),
+    /// Staging requires an observed paused owner, not a queued pause request.
+    #[error("pause the simulation before staging an intervention; Step or Resume applies it")]
+    PauseRequired,
+}
+
+fn browser_decimal(value: &str, label: &str) -> Result<u64, BrowserInterventionError> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|parsed| parsed.to_string() == value)
+        .ok_or_else(|| {
+            BrowserInterventionError::InvalidRequest(format!(
+                "{label} must be a canonical u64 decimal string"
+            ))
+        })
+}
+
+/// Parse an exact command identity without accepting JavaScript numeric coercion.
+pub fn browser_intervention_command_id(value: &str) -> Result<CommandId, BrowserInterventionError> {
+    u128::from_str_radix(value, 16)
+        .ok()
+        .filter(|parsed| format!("{parsed:032x}") == value)
+        .map(CommandId::new)
+        .ok_or_else(|| {
+            BrowserInterventionError::InvalidRequest(
+                "command identity must contain exactly 32 lowercase hexadecimal digits".to_owned(),
+            )
+        })
+}
+
+/// Verify the immutable host session before reading or submitting a browser command.
+pub fn validate_browser_intervention_session(
+    snapshot: &RenderSnapshot,
+    session_id: &str,
+) -> Result<(), BrowserInterventionError> {
+    if browser_decimal(session_id, "session identity")? != snapshot.session_id.get() {
+        return Err(BrowserInterventionError::SourceConflict("host session"));
+    }
+    Ok(())
+}
+
+impl BrowserInterventionRequest {
+    /// Validate the bounded action and derive the same canonical envelope on every retry.
+    pub fn envelope(&self) -> Result<CommandEnvelope, BrowserInterventionError> {
+        if self.request_id.is_empty()
+            || self.request_id.len() > 128
+            || !self
+                .request_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"-_.:".contains(&byte))
+        {
+            return Err(BrowserInterventionError::InvalidRequest(
+                "requestId must contain 1..=128 ASCII letters, digits, '-', '_', '.', or ':'"
+                    .to_owned(),
+            ));
+        }
+        let session_id = browser_decimal(&self.session_id, "session identity")?;
+        browser_decimal(&self.epoch, "epoch")?;
+        let control = browser_decimal(&self.expected_control_revision, "control revision")?;
+        if !matches!(
+            self.intervention,
+            scriptbots_core::Intervention::Drought { .. }
+                | scriptbots_core::Intervention::Embargo { .. }
+                | scriptbots_core::Intervention::Bloom { .. }
+                | scriptbots_core::Intervention::Meteor { .. }
+                | scriptbots_core::Intervention::SetClosedWorld { .. }
+        ) {
+            return Err(BrowserInterventionError::InvalidRequest(
+                "supported actions are drought, embargo, bloom, meteor and set_closed_world"
+                    .to_owned(),
+            ));
+        }
+        let command =
+            HostCommand::Intervention(Box::new(scriptbots_core::InterventionCommand::new(
+                self.intervention.clone(),
+                scriptbots_core::InterventionSurface::Script,
+                // Bind the source epoch into canonical command provenance as well as
+                // preflight, so changing it on a known identity is a payload collision.
+                format!("browser:{}:epoch:{}", self.request_id, self.epoch),
+            )));
+        command
+            .validate()
+            .map_err(|error| BrowserInterventionError::InvalidRequest(error.to_string()))?;
+        let mut hasher = blake3::Hasher::new_derive_key("scriptbots.browser.intervention.id.v1");
+        hasher.update(&session_id.to_le_bytes());
+        hasher.update(self.request_id.as_bytes());
+        let mut bytes = [0_u8; 16];
+        bytes.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+        let id = u128::from_le_bytes(bytes) | (1_u128 << 127);
+        Ok(CommandEnvelope::new(CommandId::new(id), command)
+            .expecting_control_revision(ControlRevision::new(control)))
+    }
+
+    /// Verify a new request's source and pause precondition before owner submission.
+    ///
+    /// A previously known identity must instead be retried as its exact envelope: the
+    /// owner checks payload equality before returning its retained lifecycle receipt.
+    pub fn validate_new_source(
+        &self,
+        snapshot: &RenderSnapshot,
+    ) -> Result<(), BrowserInterventionError> {
+        validate_browser_intervention_session(snapshot, &self.session_id)?;
+        if browser_decimal(&self.epoch, "epoch")? != snapshot.world.epoch {
+            return Err(BrowserInterventionError::SourceConflict("evolution epoch"));
+        }
+        // A caller cannot pre-authorize a future revision that a queued Resume
+        // might produce after this paused snapshot. Older guards remain valid
+        // inputs so the owner can return its ordinary ordered conflict receipt.
+        if browser_decimal(&self.expected_control_revision, "control revision")?
+            > snapshot.revisions.control.get()
+        {
+            return Err(BrowserInterventionError::SourceConflict(
+                "control revision has not been observed",
+            ));
+        }
+        if !snapshot.playback.paused {
+            return Err(BrowserInterventionError::PauseRequired);
+        }
+        Ok(())
+    }
+}
+
+/// Exact immutable publication observed when returning a browser command or history page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserInterventionSource {
+    /// Owning session.
+    pub session_id: String,
+    /// Evolution epoch of this publication.
+    pub epoch: String,
+    /// Publication sequence.
+    pub publication_revision: String,
+    /// Scientific-state revision.
+    pub scientific_revision: String,
+    /// Command-visible revision.
+    pub control_revision: String,
+    /// Configuration revision.
+    pub config_revision: String,
+    /// Completed science tick.
+    pub tick: String,
+    /// Observed playback state.
+    pub paused: bool,
+}
+
+impl From<&RenderSnapshot> for BrowserInterventionSource {
+    fn from(snapshot: &RenderSnapshot) -> Self {
+        Self {
+            session_id: snapshot.session_id.get().to_string(),
+            epoch: snapshot.world.epoch.to_string(),
+            publication_revision: snapshot.revision.get().to_string(),
+            scientific_revision: snapshot.revisions.scientific.get().to_string(),
+            control_revision: snapshot.revisions.control.get().to_string(),
+            config_revision: snapshot.revisions.config.get().to_string(),
+            tick: snapshot.world.tick.to_string(),
+            paused: snapshot.playback.paused,
+        }
+    }
+}
+
+/// Owner boundary at which the intervention was queued, before its ecological effect.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserInterventionBoundary {
+    /// Completed tick at queue application; the ecological effect belongs to a later tick.
+    pub tick: String,
+    /// Control revision assigned by the owner.
+    pub control_revision: String,
+    /// Scientific-state revision assigned by the owner.
+    pub scientific_revision: String,
+    /// Configuration revision assigned by the owner.
+    pub config_revision: String,
+}
+
+/// Two independent owner receipt axes; neither asserts a per-command ecological outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserInterventionReceipt {
+    /// Versioned browser command contract.
+    pub schema: &'static str,
+    /// Canonical 32-character lowercase hexadecimal command retry/status identity.
+    pub command_id: String,
+    /// Owner-assigned admission order, absent for pre-admission refusal.
+    pub admission_sequence: Option<String>,
+    /// `admitted`, `applied`, `rejected`, or `failed` from the canonical receipt.
+    pub application_state: &'static str,
+    /// Independent canonical lifecycle journal commitment.
+    pub journal_state: &'static str,
+    /// Queue application boundary, only when observed by the owner.
+    pub application_boundary: Option<BrowserInterventionBoundary>,
+    /// Bounded human diagnostic for a rejected or failed command.
+    pub message: Option<String>,
+    /// Whether a diagnostic exceeded the retained 1,024-character bound.
+    pub message_truncated: bool,
+    /// A local owner drive error, when application status could still be read afterward.
+    pub owner_error: Option<String>,
+    /// Latest immutable publication observed separately from the command boundary.
+    pub source: BrowserInterventionSource,
+}
+
+impl BrowserInterventionReceipt {
+    /// Project actual owner state, preserving exact integer identities and both axes.
+    #[must_use]
+    pub fn from_status(status: &CommandStatus, snapshot: &RenderSnapshot) -> Self {
+        let (application_state, application_boundary, message) = match status.application() {
+            ApplicationState::Admitted => ("admitted", None, None),
+            ApplicationState::Applied(applied) => (
+                "applied",
+                Some(BrowserInterventionBoundary {
+                    tick: applied.tick.0.to_string(),
+                    control_revision: applied.revisions.control.get().to_string(),
+                    scientific_revision: applied.revisions.scientific.get().to_string(),
+                    config_revision: applied.revisions.config.get().to_string(),
+                }),
+                None,
+            ),
+            ApplicationState::Rejected(reason) => ("rejected", None, Some(format!("{reason:?}"))),
+            ApplicationState::Failed(reason) => ("failed", None, Some(format!("{reason:?}"))),
+        };
+        let (journal_state, journal_message) = match status.journal() {
+            JournalState::NotRequired => ("not_required", None),
+            JournalState::Pending => ("pending", None),
+            JournalState::CommittedVolatile => ("committed_volatile", None),
+            JournalState::Durable => ("durable", None),
+            JournalState::Failed(reason) => ("failed", Some(format!("{reason:?}"))),
+        };
+        let message = message.or(journal_message);
+        let message_truncated = message
+            .as_ref()
+            .is_some_and(|text| text.chars().count() > 1024);
+        Self {
+            schema: "scriptbots.browser-intervention-receipt.v1",
+            command_id: status.command_id().to_string(),
+            admission_sequence: status
+                .admission_sequence()
+                .map(|value| value.get().to_string()),
+            application_state,
+            journal_state,
+            application_boundary,
+            message: message.map(|text| text.chars().take(1024).collect()),
+            message_truncated,
+            owner_error: None,
+            source: snapshot.into(),
+        }
+    }
+}
+
+/// One observed global ecological effect; it is not correlated to a command identity.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserInterventionRecord {
+    /// Monotonic audit sequence within the owner session.
+    pub seq: String,
+    /// Tick at which the effect actually occurred.
+    pub tick: String,
+    /// Canonical effect or expiry label.
+    pub kind: &'static str,
+    /// Exact region acted upon.
+    pub region: Region,
+    /// Observed affected-agent count.
+    pub agents_affected: String,
+    /// Observed affected-cell count.
+    pub cells_affected: String,
+    /// Scheduled expiry tick for a timed effect.
+    pub expires_at: Option<String>,
+    /// Whether this record describes expiry rather than initial application.
+    pub expired: bool,
+}
+
+/// Exact missing prefix in the bounded applied-intervention ring.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserInterventionGap {
+    /// First unavailable sequence.
+    pub first_missing: String,
+    /// Last unavailable sequence.
+    pub last_missing: String,
+}
+
+/// Bounded page of global observed effects, independent of command lifecycle receipts.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserInterventionHistory {
+    /// Versioned browser effect-history contract.
+    pub schema: &'static str,
+    /// Exact publication used for the complete page.
+    pub source: BrowserInterventionSource,
+    /// Current observed closed-world configuration.
+    pub closed: bool,
+    /// Requested exclusive cursor.
+    pub after_seq: String,
+    /// Oldest retained sequence, or one past the latest sequence when empty.
+    pub earliest_retained: String,
+    /// Newest observed sequence.
+    pub latest_seq: String,
+    /// Cursor after this page, including an explicitly reported missing prefix.
+    pub next_after_seq: String,
+    /// Whether another retained page follows this one.
+    pub has_more: bool,
+    /// Explicit audit loss before the oldest retained record.
+    pub gap: Option<BrowserInterventionGap>,
+    /// Actual effects and expiries, at most [`BROWSER_INTERVENTION_PAGE_LIMIT`].
+    pub records: Vec<BrowserInterventionRecord>,
+}
+
+impl BrowserInterventionHistory {
+    /// Read one immutable ring page without owner ingress, science work, or durable-I/O claims.
+    pub fn capture(
+        snapshot: &RenderSnapshot,
+        session_id: &str,
+        epoch: &str,
+        after_seq: &str,
+        limit: usize,
+    ) -> Result<Self, BrowserInterventionError> {
+        validate_browser_intervention_session(snapshot, session_id)?;
+        if browser_decimal(epoch, "epoch")? != snapshot.world.epoch {
+            return Err(BrowserInterventionError::SourceConflict("evolution epoch"));
+        }
+        if !(1..=BROWSER_INTERVENTION_PAGE_LIMIT).contains(&limit) {
+            return Err(BrowserInterventionError::InvalidRequest(format!(
+                "history page limit must be between 1 and {BROWSER_INTERVENTION_PAGE_LIMIT}"
+            )));
+        }
+        let after = browser_decimal(after_seq, "history cursor")?;
+        let ring = &snapshot.applied_interventions;
+        let latest = ring.last().map_or(0, |record| record.seq);
+        if after > latest {
+            return Err(BrowserInterventionError::SourceConflict(
+                "history cursor is ahead of source",
+            ));
+        }
+        let earliest = ring.first().map_or(1, |record| record.seq);
+        let gap = after
+            .checked_add(1)
+            .filter(|next| *next < earliest)
+            .map(|next| BrowserInterventionGap {
+                first_missing: next.to_string(),
+                last_missing: (earliest - 1).to_string(),
+            });
+        let start = ring.partition_point(|record| record.seq <= after);
+        let records: Vec<_> = ring
+            .iter()
+            .skip(start)
+            .take(limit)
+            .map(|record| BrowserInterventionRecord {
+                seq: record.seq.to_string(),
+                tick: record.tick.0.to_string(),
+                kind: record.kind,
+                region: record.region,
+                agents_affected: record.agents_affected.to_string(),
+                cells_affected: record.cells_affected.to_string(),
+                expires_at: record.expires_at.map(|tick| tick.0.to_string()),
+                expired: record.expired,
+            })
+            .collect();
+        let next = records.last().map_or_else(
+            || after.max(earliest.saturating_sub(1)).to_string(),
+            |record| record.seq.clone(),
+        );
+        Ok(Self {
+            schema: "scriptbots.browser-intervention-history.v1",
+            source: snapshot.into(),
+            closed: snapshot.config.closed,
+            after_seq: after.to_string(),
+            earliest_retained: earliest.to_string(),
+            latest_seq: latest.to_string(),
+            next_after_seq: next,
+            has_more: start + records.len() < ring.len(),
+            gap,
+            records,
+        })
+    }
+}
 
 /// Exact host publication used to build every payload in a frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -781,6 +1189,318 @@ mod tests {
         HostSessionId, ManualHostDriver, ManualInstant,
     };
     use scriptbots_core::{AgentData, AgentUid, Intervention, ScriptBotsConfig, WorldState};
+
+    fn browser_intervention_host(retained_commands: usize) -> HostCore {
+        let world = WorldState::new(ScriptBotsConfig {
+            world_width: 80,
+            world_height: 80,
+            food_cell_size: 40,
+            closed: true,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            persistence_interval: 0,
+            rng_seed: Some(17),
+            ..ScriptBotsConfig::default()
+        })
+        .unwrap();
+        let mut host = HostCore::new(
+            HostSessionId::new(u64::MAX - 5),
+            world,
+            HostCoreOptions {
+                archived_command_capacity: retained_commands,
+                initial_playback: PlaybackSnapshot {
+                    paused: true,
+                    speed_multiplier: 1.0,
+                },
+                ..HostCoreOptions::default()
+            },
+        )
+        .unwrap();
+        host.drive(ManualInstant::from_nanos(0)).unwrap();
+        host
+    }
+
+    fn browser_intervention_request(host: &HostCore) -> BrowserInterventionRequest {
+        let source = host.latest_snapshot();
+        BrowserInterventionRequest {
+            request_id: "web-intervention-0123456789abcdef".to_owned(),
+            session_id: source.session_id.get().to_string(),
+            epoch: source.world.epoch.to_string(),
+            expected_control_revision: source.revisions.control.get().to_string(),
+            intervention: Intervention::Drought {
+                region: Region::All,
+                ticks: 5,
+                growth_scale: 0.0,
+            },
+        }
+    }
+
+    #[test]
+    fn browser_intervention_owner_queues_then_steps_and_retries_once() {
+        let mut host = browser_intervention_host(16);
+        let request = browser_intervention_request(&host);
+        request
+            .validate_new_source(&host.latest_snapshot())
+            .unwrap();
+        let envelope = request.envelope().unwrap();
+        let mut port = host.local_port();
+        let admitted = port.submit(envelope.clone()).unwrap();
+        host.drive(ManualInstant::from_nanos(0)).unwrap();
+        let queued = port.command_status(admitted.command_id()).unwrap().unwrap();
+        assert!(matches!(queued.application(), ApplicationState::Applied(_)));
+        assert_eq!(host.world_tick(), Tick(0));
+        assert!(host.latest_snapshot().applied_interventions.is_empty());
+        let receipt = BrowserInterventionReceipt::from_status(&queued, &host.latest_snapshot());
+        assert_eq!(receipt.application_boundary.as_ref().unwrap().tick, "0");
+        assert_eq!(receipt.source.session_id, (u64::MAX - 5).to_string());
+
+        port.submit(CommandEnvelope::new(CommandId::new(9), HostCommand::Step))
+            .unwrap();
+        host.drive(ManualInstant::from_nanos(0)).unwrap();
+        let source = host.latest_snapshot();
+        let page = BrowserInterventionHistory::capture(
+            &source,
+            &request.session_id,
+            &request.epoch,
+            "0",
+            32,
+        )
+        .unwrap();
+        assert_eq!(page.records.len(), 1);
+        assert_eq!(page.records[0].kind, "drought");
+        assert_eq!(page.records[0].tick, "1");
+        assert_eq!(page.records[0].cells_affected, "4");
+        assert_eq!(page.records[0].expires_at.as_deref(), Some("6"));
+        assert!(page.gap.is_none());
+        let control = source.revisions.control;
+
+        let retried = port.submit(envelope.clone()).unwrap();
+        host.drive(ManualInstant::from_nanos(0)).unwrap();
+        assert_eq!(retried.command_id(), admitted.command_id());
+        assert_eq!(retried.admission_sequence(), admitted.admission_sequence());
+        assert_eq!(host.world_tick(), Tick(1));
+        assert_eq!(host.latest_snapshot().revisions.control, control);
+        assert_eq!(host.latest_snapshot().applied_interventions.len(), 1);
+        let mut changed = envelope;
+        changed.command =
+            HostCommand::Intervention(Box::new(scriptbots_core::InterventionCommand::new(
+                Intervention::Bloom {
+                    region: Region::All,
+                    amount: 1.0,
+                },
+                scriptbots_core::InterventionSurface::Script,
+                "changed retry",
+            )));
+        assert!(matches!(
+            port.submit(changed),
+            Err(crate::HostAccessError::CommandIdCollision { .. })
+        ));
+    }
+
+    #[test]
+    fn browser_intervention_concurrent_step_refuses_the_original_guard() {
+        let mut host = browser_intervention_host(16);
+        let request = browser_intervention_request(&host);
+        let mut port = host.local_port();
+        port.submit(CommandEnvelope::new(CommandId::new(12), HostCommand::Step))
+            .unwrap();
+        let admitted = port.submit(request.envelope().unwrap()).unwrap();
+        host.drive(ManualInstant::from_nanos(0)).unwrap();
+        let status = port.command_status(admitted.command_id()).unwrap().unwrap();
+        assert!(matches!(
+            status.application(),
+            ApplicationState::Rejected(crate::RejectionReason::ControlRevisionConflict { .. })
+        ));
+        assert_eq!(host.world_tick(), Tick(1));
+        assert!(host.latest_snapshot().applied_interventions.is_empty());
+        assert!(host.world().active_effects().is_empty());
+    }
+
+    #[test]
+    fn browser_intervention_future_guard_cannot_pre_authorize_a_queued_resume() {
+        let mut host = browser_intervention_host(16);
+        let paused = host.latest_snapshot();
+        let mut request = browser_intervention_request(&host);
+        request.expected_control_revision = paused
+            .revisions
+            .control
+            .checked_next()
+            .unwrap()
+            .get()
+            .to_string();
+        let envelope = request.envelope().unwrap();
+        let mut port = host.local_port();
+        port.submit(CommandEnvelope::new(
+            CommandId::new(19),
+            HostCommand::Resume,
+        ))
+        .unwrap();
+        assert!(host.latest_snapshot().playback.paused);
+        assert!(matches!(
+            request.validate_new_source(&paused),
+            Err(BrowserInterventionError::SourceConflict(_))
+        ));
+        assert!(port.command_status(envelope.command_id).unwrap().is_none());
+        host.drive(ManualInstant::from_nanos(0)).unwrap();
+        let resumed = host.latest_snapshot();
+        assert!(!resumed.playback.paused);
+        assert_eq!(
+            resumed.revisions.control.get().to_string(),
+            request.expected_control_revision,
+            "the forged guard would match after the real queued Resume"
+        );
+        assert!(resumed.applied_interventions.is_empty());
+        assert!(host.world().active_effects().is_empty());
+        assert_eq!(host.world_tick(), Tick(0));
+    }
+
+    #[test]
+    fn browser_intervention_refuses_wrong_source_running_owner_and_unbounded_actions() {
+        let host = browser_intervention_host(16);
+        let snapshot = host.latest_snapshot();
+        let mut request = browser_intervention_request(&host);
+        request.epoch = "1".to_owned();
+        assert!(matches!(
+            request.validate_new_source(&snapshot),
+            Err(BrowserInterventionError::SourceConflict(_))
+        ));
+        request.epoch = "00".to_owned();
+        assert!(request.envelope().is_err());
+        request.epoch = "0".to_owned();
+        request.session_id = "17".to_owned();
+        assert!(matches!(
+            request.validate_new_source(&snapshot),
+            Err(BrowserInterventionError::SourceConflict(_))
+        ));
+        request.session_id = snapshot.session_id.get().to_string();
+        let mut running = (*snapshot).clone();
+        running.playback.paused = false;
+        assert!(matches!(
+            request.validate_new_source(&running),
+            Err(BrowserInterventionError::PauseRequired)
+        ));
+        request.request_id = "x".repeat(129);
+        assert!(request.envelope().is_err());
+        request.request_id = "bounded-action".to_owned();
+        request.intervention = Intervention::PaintTerrain {
+            region: Region::All,
+            terrain: TerrainKind::Grass,
+            fertility_bias: None,
+        };
+        assert!(request.envelope().is_err());
+        request.intervention = Intervention::Drought {
+            region: Region::All,
+            ticks: 0,
+            growth_scale: 0.0,
+        };
+        assert!(request.envelope().is_err());
+        assert!(browser_intervention_command_id("01").is_err());
+        assert!(browser_intervention_command_id(&format!("{:032x}", u128::MAX)).is_ok());
+    }
+
+    #[test]
+    fn browser_intervention_history_pages_real_ring_eviction_and_refuses_ahead_cursor() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 80,
+            world_height: 80,
+            food_cell_size: 40,
+            closed: true,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            persistence_interval: 0,
+            rng_seed: Some(17),
+            ..ScriptBotsConfig::default()
+        })
+        .unwrap();
+        for _ in 0..scriptbots_core::APPLIED_INTERVENTION_CAPACITY + 3 {
+            world
+                .enqueue_intervention(Intervention::Bloom {
+                    region: Region::All,
+                    amount: 0.1,
+                })
+                .unwrap();
+        }
+        world.step().unwrap();
+        let host =
+            HostCore::new(HostSessionId::new(17), world, HostCoreOptions::default()).unwrap();
+        let snapshot = host.latest_snapshot();
+        let first = BrowserInterventionHistory::capture(&snapshot, "17", "0", "0", 2).unwrap();
+        let gap = first.gap.as_ref().unwrap();
+        assert_eq!(gap.first_missing, "1");
+        assert_eq!(gap.last_missing, "3");
+        assert_eq!(first.earliest_retained, "4");
+        assert_eq!(
+            first
+                .records
+                .iter()
+                .map(|row| row.seq.as_str())
+                .collect::<Vec<_>>(),
+            ["4", "5"]
+        );
+        assert_eq!(first.next_after_seq, "5");
+        assert!(first.has_more);
+        let next =
+            BrowserInterventionHistory::capture(&snapshot, "17", "0", &first.next_after_seq, 2)
+                .unwrap();
+        assert!(next.gap.is_none());
+        assert_eq!(next.records[0].seq, "6");
+        let empty = BrowserInterventionHistory::capture(&snapshot, "17", "0", &first.latest_seq, 1)
+            .unwrap();
+        assert!(empty.records.is_empty());
+        assert!(!empty.has_more);
+        assert_eq!(empty.next_after_seq, first.latest_seq);
+        assert!(
+            BrowserInterventionHistory::capture(&snapshot, "17", "0", &u64::MAX.to_string(), 1)
+                .is_err()
+        );
+        assert!(BrowserInterventionHistory::capture(&snapshot, "17", "0", "0", 0).is_err());
+        assert!(
+            BrowserInterventionHistory::capture(
+                &snapshot,
+                "17",
+                "0",
+                "0",
+                BROWSER_INTERVENTION_PAGE_LIMIT + 1
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn browser_intervention_evicted_receipt_cannot_repeat_the_effect() {
+        let mut host = browser_intervention_host(1);
+        let request = browser_intervention_request(&host);
+        let envelope = request.envelope().unwrap();
+        let command_id = envelope.command_id;
+        let mut port = host.local_port();
+        port.submit(envelope.clone()).unwrap();
+        host.drive(ManualInstant::from_nanos(0)).unwrap();
+        host.drive(ManualInstant::from_nanos(0)).unwrap();
+        for id in 1..=3 {
+            port.submit(CommandEnvelope::new(CommandId::new(id), HostCommand::Step))
+                .unwrap();
+            host.drive(ManualInstant::from_nanos(0)).unwrap();
+            host.drive(ManualInstant::from_nanos(0)).unwrap();
+        }
+        assert!(
+            port.command_status(command_id).unwrap().is_none(),
+            "the negative must exercise a real authority-cache eviction"
+        );
+        assert_eq!(host.latest_snapshot().applied_interventions.len(), 1);
+        request
+            .validate_new_source(&host.latest_snapshot())
+            .unwrap();
+        port.submit(envelope).unwrap();
+        host.drive(ManualInstant::from_nanos(0)).unwrap();
+        let outcome = port.command_status(command_id).unwrap().unwrap();
+        assert!(matches!(
+            outcome.application(),
+            ApplicationState::Rejected(crate::RejectionReason::ControlRevisionConflict { .. })
+        ));
+        assert_eq!(host.latest_snapshot().applied_interventions.len(), 1);
+        assert_eq!(host.world_tick(), Tick(3));
+        assert_eq!(host.world().active_effects().len(), 1);
+    }
 
     fn host_with_narrative() -> HostCore {
         let mut world = WorldState::new(ScriptBotsConfig {

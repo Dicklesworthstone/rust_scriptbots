@@ -1524,6 +1524,7 @@ pub struct SpeedRequestBody {
         get_agents_debug,
         get_agent_inspection,
         get_brain_activity,
+        get_genome_inspection,
         get_config_audit,
         get_scenario,
         list_presets,
@@ -1545,6 +1546,9 @@ pub struct SpeedRequestBody {
         post_map_generate,
         post_map_apply,
         post_control_intervene,
+        post_browser_intervention,
+        get_browser_intervention_status,
+        get_browser_intervention_history,
         get_version,
         get_v1_version,
         get_schema,
@@ -3260,6 +3264,64 @@ async fn get_brain_activity(
         .map(Json)
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GenomeInspectionParams {
+    uid: String,
+    session_id: String,
+    epoch: String,
+    #[serde(default)]
+    locus_offset: usize,
+    #[serde(default)]
+    delta_offset: usize,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/agents/genome",
+    tag = "control",
+    params(
+        ("uid" = String, Query, description = "Exact canonical decimal creature UID"),
+        ("session_id" = String, Query, description = "Exact host session from the displayed frame"),
+        ("epoch" = String, Query, description = "Exact evolution epoch from the displayed frame"),
+        ("locus_offset" = Option<usize>, Query, description = "Canonical locus offset, a multiple of 64 up to 65536"),
+        ("delta_offset" = Option<usize>, Query, description = "Parent difference offset, a multiple of 32 up to 65536")
+    ),
+    responses(
+        (status = 200, body = Object, description = "Bounded scriptbots.genome-inspection.v1 canonical locus and parent-difference pages; unavailable source material is typed"),
+        (status = 400, body = ErrorResponse),
+        (status = 409, body = ErrorResponse, description = "Host session or epoch changed"),
+        (status = 503, body = ErrorResponse, description = "Owner read deadline or availability failure")
+    )
+)]
+async fn get_genome_inspection(
+    State(state): State<ApiState>,
+    axum::extract::Query(params): axum::extract::Query<GenomeInspectionParams>,
+) -> Result<Json<scriptbots_runtime::inspector::GenomeInspection>, AppError> {
+    scriptbots_runtime::inspector::validate_genome_page_offsets(
+        params.locus_offset,
+        params.delta_offset,
+    )
+    .map_err(|_| AppError::bad_request("invalid bounded genome locus or difference page offset"))?;
+    let identities = AgentInspectionParams {
+        uid: params.uid,
+        session_id: params.session_id,
+        epoch: params.epoch,
+    };
+    let (uid, session_id, epoch) = identities.identities()?;
+    run_control(move || {
+        state.handle.inspect_genome_page(
+            uid,
+            session_id,
+            epoch,
+            params.locus_offset,
+            params.delta_offset,
+        )
+    })
+    .await
+    .map(Json)
+}
+
 #[utoipa::path(
     post,
     path = "/api/selection",
@@ -3654,6 +3716,104 @@ async fn post_control_intervene(
     let status = run_control(move || state.handle.intervene(command, key.as_deref())).await?;
 
     Ok(Json(status))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/control/browser-intervention",
+    tag = "control",
+    request_body = Object,
+    responses(
+        (status = 200, body = Object, description = "Exact two-axis owner receipt; applied means queued for the next scientific tick"),
+        (status = 400, body = ErrorResponse),
+        (status = 409, body = ErrorResponse, description = "Source changed, owner is not paused, or retry payload conflicts"),
+        (status = 503, body = ErrorResponse, description = "Admission outcome may be unknown; retain and retry the identical request")
+    )
+)]
+async fn post_browser_intervention(
+    State(state): State<ApiState>,
+    Json(request): Json<scriptbots_runtime::remote::BrowserInterventionRequest>,
+) -> Result<Json<scriptbots_runtime::remote::BrowserInterventionReceipt>, AppError> {
+    run_control(move || state.handle.browser_intervene(&request))
+        .await
+        .map(Json)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrowserInterventionStatusQuery {
+    session_id: String,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/control/browser-intervention/{command_id}",
+    tag = "control",
+    params(
+        ("command_id" = String, Path, description = "Exact command identity returned by submission"),
+        ("session_id" = String, Query, description = "Exact immutable host session")
+    ),
+    responses(
+        (status = 200, body = Object, description = "Retained canonical application and journal status"),
+        (status = 404, body = ErrorResponse, description = "No retained receipt; absence does not prove non-admission"),
+        (status = 409, body = ErrorResponse),
+        (status = 503, body = ErrorResponse)
+    )
+)]
+async fn get_browser_intervention_status(
+    State(state): State<ApiState>,
+    axum::extract::Path(command_id): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<BrowserInterventionStatusQuery>,
+) -> Result<Json<scriptbots_runtime::remote::BrowserInterventionReceipt>, AppError> {
+    run_control(move || {
+        state
+            .handle
+            .browser_intervention_status(&command_id, &query.session_id)
+    })
+    .await?
+    .map(Json)
+    .ok_or_else(|| AppError::not_found("no retained command receipt; admission remains unknown"))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrowserInterventionHistoryQuery {
+    session_id: String,
+    epoch: String,
+    after_seq: String,
+    limit: usize,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/interventions/browser",
+    tag = "control",
+    params(
+        ("session_id" = String, Query, description = "Exact displayed host session"),
+        ("epoch" = String, Query, description = "Exact displayed evolution epoch"),
+        ("after_seq" = String, Query, description = "Exclusive exact audit cursor, initially 0"),
+        ("limit" = usize, Query, description = "Page size from 1 through 64")
+    ),
+    responses(
+        (status = 200, body = Object, description = "Bounded global observed effects and exact retention gap; no per-command attribution"),
+        (status = 400, body = ErrorResponse),
+        (status = 409, body = ErrorResponse)
+    )
+)]
+async fn get_browser_intervention_history(
+    State(state): State<ApiState>,
+    axum::extract::Query(query): axum::extract::Query<BrowserInterventionHistoryQuery>,
+) -> Result<Json<scriptbots_runtime::remote::BrowserInterventionHistory>, AppError> {
+    run_control(move || {
+        state.handle.browser_intervention_history(
+            &query.session_id,
+            &query.epoch,
+            &query.after_seq,
+            query.limit,
+        )
+    })
+    .await
+    .map(Json)
 }
 
 /// The client-supplied idempotency key from an MCP tool call, if any.
@@ -4119,6 +4279,7 @@ fn prepare_rest_server(
         .route("/api/agents/debug", get(get_agents_debug))
         .route("/api/agents/inspect", get(get_agent_inspection))
         .route("/api/agents/brain", get(get_brain_activity))
+        .route("/api/agents/genome", get(get_genome_inspection))
         .route("/api/selection", post(post_selection).get(get_selection))
         .route("/api/interventions", get(get_interventions))
         // Scenario identity and presets
@@ -4147,6 +4308,18 @@ fn prepare_rest_server(
         )
         // Interventions control commands
         .route("/api/control/intervene", post(post_control_intervene))
+        .route(
+            "/api/control/browser-intervention",
+            post(post_browser_intervention).layer(axum::extract::DefaultBodyLimit::max(4096)),
+        )
+        .route(
+            "/api/control/browser-intervention/{command_id}",
+            get(get_browser_intervention_status),
+        )
+        .route(
+            "/api/interventions/browser",
+            get(get_browser_intervention_history),
+        )
         .route("/api/interventions", post(post_control_intervene))
         // Version and schema discovery
         .route("/api/version", get(get_version))
@@ -5917,6 +6090,131 @@ mod tests {
             .read_to_string(&mut response)
             .expect("read HTTP test response");
         response
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one real HTTP experiment distinguishes admission, queue application, effect, retry and source refusal"
+    )]
+    fn browser_intervention_http_retains_identity_and_observes_later_ecological_effect() {
+        let host = crate::control::tests::TestHost::spawn(
+            WorldState::new(ScriptBotsConfig {
+                world_width: 80,
+                world_height: 80,
+                food_cell_size: 40,
+                closed: true,
+                population_minimum: 0,
+                population_spawn_interval: 0,
+                persistence_interval: 0,
+                rng_seed: Some(17),
+                ..ScriptBotsConfig::default()
+            })
+            .unwrap(),
+        );
+        let source = host.handle().read_snapshot().unwrap();
+        let reservation = ControlServerReservation::prepare(ControlServerConfig {
+            rest_enabled: true,
+            rest_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            mcp_transport: McpTransportConfig::Disabled,
+            allowed_origins: vec!["https://lab.example".to_owned()],
+            ..ControlServerConfig::default()
+        })
+        .unwrap();
+        let address = reservation.rest_address().unwrap();
+        let (runtime, _) = reservation.launch(host.port.clone(), false).unwrap();
+        let post = |body: &Value, origin: &str| {
+            let body = serde_json::to_string(body).unwrap();
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            write!(stream, "POST /api/control/browser-intervention HTTP/1.1\r\nHost: {address}\r\nOrigin: {origin}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            response
+        };
+        let decode = |response: &str| -> Value {
+            serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap()
+        };
+        let request = serde_json::json!({
+            "requestId": "web-intervention-http-regression",
+            "sessionId": source.session_id.get().to_string(),
+            "epoch": source.world.epoch.to_string(),
+            "expectedControlRevision": source.revisions.control.get().to_string(),
+            "intervention": {"kind": "drought", "region": {"shape": "all"}, "ticks": 5, "growth_scale": 0.0}
+        });
+        let before = host.port.scientific_digest_v1().unwrap();
+        assert!(post(&request, "https://unlisted.example").starts_with("HTTP/1.1 403"));
+        let mut wrong_source = request.clone();
+        wrong_source["sessionId"] = Value::from("0");
+        assert!(post(&wrong_source, "https://lab.example").starts_with("HTTP/1.1 409"));
+        let mut oversized = request.clone();
+        oversized["requestId"] = Value::from("x".repeat(4097));
+        assert!(post(&oversized, "https://lab.example").starts_with("HTTP/1.1 413"));
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        assert_eq!(
+            host.handle().read_snapshot().unwrap().revisions,
+            source.revisions
+        );
+
+        let admitted = post(&request, "https://lab.example");
+        assert!(admitted.starts_with("HTTP/1.1 200"), "{admitted}");
+        let admitted = decode(&admitted);
+        let command_id = admitted["commandId"].as_str().unwrap();
+        let queued = host.wait_finished(command_id);
+        assert_eq!(queued.application_state, "applied");
+        assert_eq!(queued.journal_state, "committed_volatile");
+        let status_path = format!(
+            "/api/control/browser-intervention/{command_id}?session_id={}",
+            source.session_id.get()
+        );
+        let observed = decode(&http_get(address, &status_path));
+        assert_eq!(observed["applicationState"], "applied");
+        assert_eq!(observed["applicationBoundary"]["tick"], "0");
+        assert_eq!(observed["journalState"], "committed_volatile");
+        let history_path = format!(
+            "/api/interventions/browser?session_id={}&epoch=0&after_seq=0&limit=32",
+            source.session_id.get()
+        );
+        let before_step = decode(&http_get(address, &history_path));
+        assert!(before_step["records"].as_array().unwrap().is_empty());
+
+        host.wait_applied(&host.handle().step().unwrap());
+        let after_step = decode(&http_get(address, &history_path));
+        assert_eq!(after_step["records"].as_array().unwrap().len(), 1);
+        assert_eq!(after_step["records"][0]["kind"], "drought");
+        assert_eq!(after_step["records"][0]["tick"], "1");
+        assert_eq!(after_step["records"][0]["cellsAffected"], "4");
+        let retry = decode(&post(&request, "https://lab.example"));
+        assert_eq!(retry["commandId"], admitted["commandId"]);
+        assert_eq!(retry["admissionSequence"], admitted["admissionSequence"]);
+        assert_eq!(
+            retry["applicationBoundary"],
+            observed["applicationBoundary"]
+        );
+        let mut conflict = request;
+        conflict["intervention"]["ticks"] = Value::from(7);
+        assert!(post(&conflict, "https://lab.example").starts_with("HTTP/1.1 409"));
+        assert_eq!(host.handle().read_snapshot().unwrap().world.tick, 1);
+        assert_eq!(
+            host.handle()
+                .read_snapshot()
+                .unwrap()
+                .applied_interventions
+                .len(),
+            1
+        );
+        let unknown = http_get(
+            address,
+            &format!(
+                "/api/control/browser-intervention/00000000000000000000000000000000?session_id={}",
+                source.session_id.get()
+            ),
+        );
+        assert!(unknown.starts_with("HTTP/1.1 404"), "{unknown}");
+        assert!(unknown.contains("admission remains unknown"));
+        runtime.shutdown().unwrap();
     }
 
     #[test]
@@ -10966,18 +11264,15 @@ mod tests {
                 .as_u16(),
             413
         );
-        assert_eq!(
-            client
-                .post(&url)
-                .header("content-type", "text/plain")
-                .body(valid.to_string())
-                .send()
-                .await
-                .unwrap()
-                .status()
-                .as_u16(),
-            415
-        );
+        let plain_request = client
+            .post(&url)
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                reqwest::header::HeaderValue::from_static("text/plain"),
+            )
+            .body(valid.to_string());
+        let plain_response = plain_request.send().await.unwrap();
+        assert_eq!(plain_response.status().as_u16(), 415);
         assert_eq!(
             handle.status().unwrap().tick,
             0,

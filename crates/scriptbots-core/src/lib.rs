@@ -10770,6 +10770,17 @@ pub trait BrainFamilyCodec: Send + Sync {
         })
     }
 
+    /// Upper bound on canonical loci for every genome accepted by this exact adapter.
+    ///
+    /// Inspection uses this allocation-free declaration before decoding an opaque genome.
+    /// A family with no declared producer bound remains available to offline diffing, but
+    /// cannot enter bounded interactive inspection. The declaration changes neither genome
+    /// semantics nor heredity eligibility. Implementations must derive it from their admitted
+    /// architecture, and inspection verifies the returned locus count against the declaration.
+    fn genome_loci_upper_bound(&self) -> Option<usize> {
+        None
+    }
+
     /// Validate generic versions and family-owned future-affecting state bytes.
     fn validate_evaluator_state(
         &self,

@@ -640,7 +640,6 @@ pub fn diff_genomes(
 ) -> Result<GenomeDiff, GenomeDiffError> {
     validate_diff_envelopes(parent, child)?;
     let family = parent.family_id().clone();
-    let schema_version = parent.schema_version();
     let parent_loci = codec
         .genome_loci(parent)
         .map_err(|error| GenomeDiffError::Unsupported {
@@ -653,6 +652,24 @@ pub fn diff_genomes(
             family: family.clone(),
             reason: error.to_string(),
         })?;
+    diff_genome_loci(parent, child, &parent_loci, &child_loci)
+}
+
+/// Compare canonical loci already decoded from the named protocol envelopes.
+///
+/// Interactive callers can bound each producer before decoding and reuse the selected
+/// genome's locus vector for both its page and its parent comparison. The address, shape,
+/// value-kind and envelope checks are identical to [`diff_genomes`]; this function performs
+/// no decoding, so callers must supply the exact unmodified codec results for each envelope.
+pub fn diff_genome_loci(
+    parent: &BrainGenomeEnvelope,
+    child: &BrainGenomeEnvelope,
+    parent_loci: &[(Locus, LocusValue)],
+    child_loci: &[(Locus, LocusValue)],
+) -> Result<GenomeDiff, GenomeDiffError> {
+    validate_diff_envelopes(parent, child)?;
+    let family = parent.family_id().clone();
+    let schema_version = parent.schema_version();
     if parent_loci.len() != child_loci.len() {
         return Err(GenomeDiffError::ShapeMismatch {
             a_loci: parent_loci.len(),
@@ -679,7 +696,7 @@ pub fn diff_genomes(
         match (before, after) {
             (LocusValue::Scalar(before), LocusValue::Scalar(after)) => {
                 if before.to_bits() != after.to_bits() {
-                    let magnitude = f64::from((*after - *before).abs());
+                    let magnitude = (f64::from(*after) - f64::from(*before)).abs();
                     l1 += magnitude;
                     linf = linf.max(magnitude);
                     *by_kind.entry(DeltaKind::Scalar).or_insert(0) += 1;
@@ -738,6 +755,58 @@ pub fn diff_genomes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn predecoded_diff_preserves_addresses_bits_and_finite_extreme_summaries() {
+        let family = BrainFamilyId::new("inspection-test").unwrap();
+        let parent = BrainGenomeEnvelope::new(
+            family.clone(),
+            1,
+            1,
+            vec![0],
+            crate::BrainProvenance::default(),
+        )
+        .unwrap();
+        let child =
+            BrainGenomeEnvelope::new(family, 1, 1, vec![1], crate::BrainProvenance::default())
+                .unwrap();
+        let parent_loci = [
+            (Locus::NodeBias(0), LocusValue::Scalar(-f32::MAX)),
+            (Locus::NodeBias(1), LocusValue::Scalar(-0.0)),
+            (
+                Locus::NodeTarget { node: 0, conn: 0 },
+                LocusValue::Target(1),
+            ),
+        ];
+        let child_loci = [
+            (Locus::NodeBias(0), LocusValue::Scalar(f32::MAX)),
+            (Locus::NodeBias(1), LocusValue::Scalar(0.0)),
+            (
+                Locus::NodeTarget { node: 0, conn: 0 },
+                LocusValue::Target(2),
+            ),
+        ];
+        let diff = diff_genome_loci(&parent, &child, &parent_loci, &child_loci).unwrap();
+        assert_eq!(diff.summary.changed_loci, 3);
+        assert_eq!(diff.summary.total_loci, 3);
+        assert_eq!(
+            diff.summary.l1.to_bits(),
+            (f64::from(f32::MAX) * 2.0).to_bits()
+        );
+        assert_eq!(diff.summary.linf.to_bits(), diff.summary.l1.to_bits());
+        assert!(serde_json::to_string(&diff).unwrap().contains("l1"));
+        let GenomeDelta::Scalar { before, after, .. } = diff.deltas[1] else {
+            panic!("signed-zero change must remain a scalar difference");
+        };
+        assert_eq!(before.to_bits(), (-0.0_f32).to_bits());
+        assert_eq!(after.to_bits(), 0.0_f32.to_bits());
+        let mut misaligned = child_loci;
+        misaligned.swap(0, 1);
+        assert!(matches!(
+            diff_genome_loci(&parent, &child, &parent_loci, &misaligned),
+            Err(GenomeDiffError::LocusMismatch { index: 0, .. })
+        ));
+    }
 
     #[test]
     fn locus_human_strings_name_the_gene() {

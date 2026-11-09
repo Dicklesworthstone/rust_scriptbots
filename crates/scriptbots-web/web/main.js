@@ -6,6 +6,8 @@ import { RemoteStreamClient } from "./remote.js";
 import { BrowserContinuationStore } from "./continuation-store.js";
 import { InspectionController, pickAgent, renderInspector, renderInspectorSource,
   validateBrainInspection, renderBrainInspector, renderBrainSource } from "./inspector.js";
+import { GenomeInspectionController, renderGenomeInspector, renderGenomeSource } from "./genome.js";
+import { InterventionController, renderInterventions, validateInterventionAction } from "./interventions.js";
 
 const {
   init_sim,
@@ -149,9 +151,140 @@ brainPanel?.addEventListener("toggle", updateBrainVisibility);
 document.addEventListener("visibilitychange", updateBrainVisibility);
 document.getElementById("brain-refresh")?.addEventListener("click", () => { void brainInspector.refresh(true); });
 
+const genomePanel = document.getElementById("genome-inspector");
+const genomeInspector = new GenomeInspectionController({
+  read: (uid, request, signal) => {
+    if (remoteMode) return remoteClient.inspectGenome(uid, { sessionId: request.sessionId,
+      epoch: request.epoch, locusOffset: request.locusOffset, deltaOffset: request.deltaOffset, signal });
+    if (!simHandle?.inspectGenome) throw new Error("This WASM package does not expose genome pages; rebuild the browser package");
+    return simHandle.inspectGenome(uid, request.locusOffset, request.deltaOffset);
+  },
+  onChange: (state, frame) => renderGenomeInspector(genomePanel, state, frame),
+  onFrame: (state, frame) => renderGenomeSource(genomePanel, state, frame),
+});
+const updateGenomeVisibility = () => genomeInspector.setEnabled(Boolean(genomePanel?.open) && !document.hidden);
+genomePanel?.addEventListener("toggle", updateGenomeVisibility);
+document.addEventListener("visibilitychange", updateGenomeVisibility);
+document.getElementById("genome-refresh")?.addEventListener("click", () => { void genomeInspector.restart(); });
+for (const [id, kind, direction] of [["locus-prev", "locus", -1], ["locus-next", "locus", 1],
+  ["delta-prev", "delta", -1], ["delta-next", "delta", 1]]) {
+  document.getElementById(`genome-${id}`)?.addEventListener("click", () => genomeInspector.navigate(kind, direction));
+}
+
+const interventionPanel = document.getElementById("intervention-toolbox");
+const interventionField = (id) => document.getElementById(`intervention-${id}`);
+let interventionRegionContext = null;
+let interventionResumeSpeed = 1;
+const interventions = new InterventionController({
+  send: (request, signal) => {
+    if (remoteMode) return remoteClient.intervene(request, { signal });
+    if (!simHandle?.intervene) throw new Error("This WASM package does not expose interventions; rebuild the browser package");
+    return simHandle.intervene(request);
+  },
+  status: (commandId, sessionId, signal) => {
+    if (remoteMode) return remoteClient.interventionStatus(commandId, { sessionId, signal });
+    if (!simHandle?.interventionStatus) throw new Error("This WASM package does not expose intervention receipts");
+    return simHandle.interventionStatus(commandId, sessionId);
+  },
+  history: (request, signal) => {
+    if (remoteMode) return remoteClient.interventionHistory({ ...request, signal });
+    if (!simHandle?.interventionHistory) throw new Error("This WASM package does not expose intervention history");
+    return simHandle.interventionHistory(request.sessionId, request.epoch, request.afterSeq, request.limit);
+  },
+  onChange: (controller) => {
+    if (controller.frame && interventionRegionContext !== controller.context) {
+      interventionRegionContext = controller.context;
+      const world = controller.frame.snapshot.world;
+      interventionField("x").value = String(world.width / 2);
+      interventionField("y").value = String(world.height / 2);
+      interventionField("radius").value = String(Math.min(100, world.width / 4, world.height / 4));
+    }
+    renderInterventions(interventionPanel, controller);
+  },
+});
+const updateInterventionVisibility = () => interventions.setEnabled(Boolean(interventionPanel?.open)
+  && !document.hidden && (!remoteMode || remoteConnected));
+interventionPanel?.addEventListener("toggle", updateInterventionVisibility);
+document.addEventListener("visibilitychange", updateInterventionVisibility);
+function updateInterventionFields() {
+  const kind = interventionField("kind").value;
+  for (const group of interventionPanel.querySelectorAll("[data-intervention-kinds]")) {
+    group.hidden = !group.dataset.interventionKinds.split(" ").includes(kind);
+    for (const input of group.querySelectorAll("input, select")) input.disabled = group.hidden;
+  }
+  const disc = kind !== "set_closed_world" && interventionField("region").value === "disc";
+  interventionField("disc").hidden = !disc;
+  for (const input of interventionField("disc").querySelectorAll("input")) input.disabled = !disc;
+}
+interventionField("kind")?.addEventListener("change", updateInterventionFields);
+interventionField("region")?.addEventListener("change", updateInterventionFields);
+if (interventionPanel) updateInterventionFields();
+function interventionNumber(id) {
+  const text = interventionField(id).value.trim();
+  if (!text || !Number.isFinite(Number(text))) throw new Error(`Enter a finite ${id.replaceAll("-", " ")}`);
+  return Number(text);
+}
+interventionField("use-selected")?.addEventListener("click", () => {
+  const creature = interventions.frame?.snapshot.agents.find((agent) => agent.uid === inspector.selectedUid);
+  if (!creature) { interventionField("form-error").textContent = "Select a creature in the displayed world first."; return; }
+  interventionField("x").value = String(creature.position[0]);
+  interventionField("y").value = String(creature.position[1]);
+  interventionField("form-error").textContent = "";
+});
+interventionField("form")?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  interventionField("form-error").textContent = "";
+  try {
+    const kind = interventionField("kind").value;
+    let action;
+    if (kind === "set_closed_world") action = { kind, closed: interventionField("closed").value === "true" };
+    else {
+      const region = interventionField("region").value === "all" ? { shape: "all" }
+        : { shape: "disc", x: interventionNumber("x"), y: interventionNumber("y"), radius: interventionNumber("radius") };
+      const world = interventions.frame?.snapshot.world;
+      if (region.shape === "disc" && region.radius > Math.min(world.width, world.height) / 2) {
+        throw new Error("Disc radius cannot exceed half the smaller world dimension");
+      }
+      action = { kind, region };
+      if (["drought", "embargo"].includes(kind)) action.ticks = interventionNumber("ticks");
+      if (kind === "drought") action.growth_scale = interventionNumber("growth-scale");
+      if (kind === "bloom") action.amount = interventionNumber("amount");
+      if (kind === "meteor") Object.assign(action, { lethality: interventionNumber("lethality"), scorch: interventionNumber("scorch") });
+    }
+    await interventions.stage(validateInterventionAction(action));
+  } catch (error) { interventionField("form-error").textContent = `Action was not submitted: ${error.message || error}`; }
+});
+interventionField("retry")?.addEventListener("click", () => { void interventions.retry(); });
+interventionField("status-refresh")?.addEventListener("click", () => { void interventions.refreshReceipt(); });
+interventionField("history-refresh")?.addEventListener("click", () => { void interventions.refreshHistory(true); });
+interventionField("history-first")?.addEventListener("click", () => { void interventions.historyPageAfter("0"); });
+interventionField("history-next")?.addEventListener("click", () => {
+  if (interventions.historyPage?.hasMore) void interventions.historyPageAfter(interventions.historyPage.nextAfterSeq);
+});
+for (const action of ["pause", "step", "resume"]) {
+  interventionField(action)?.addEventListener("click", () => {
+    interventionField("form-error").textContent = "";
+    if (remoteMode) { sendRemoteControl(action); return; }
+    try {
+      if (!simHandle) throw new Error("Wait for the local owner to start");
+      if (action === "step") {
+        if (simHandle.frame().playback?.paused !== true) throw new Error("Pause the local owner before stepping this experiment");
+        simHandle.tick(1);
+      } else {
+        if (action === "pause" && speedMultiplier > 0) interventionResumeSpeed = speedMultiplier;
+        speedMultiplier = action === "pause" ? 0 : interventionResumeSpeed;
+        stepsSlider.value = String(speedMultiplier);
+        applyPlaybackSpeed();
+      }
+      lastPaintedFrame = null;
+    } catch (error) { interventionField("form-error").textContent = `Playback request failed: ${error.message || error}`; }
+  });
+}
+
 function selectCreature(uid) {
   inspector.select(uid);
   brainInspector.select(uid);
+  genomeInspector.select(uid);
   // Selection is presentation-only, so paused frames also need repainting.
   lastPaintedFrame = null;
 }
@@ -223,6 +356,7 @@ function hasPresentationFrame() {
 }
 
 function updateRemoteControls() {
+  updateInterventionVisibility();
   for (const input of [stepsSlider, populationSlider, resetButton, permalinkInput,
     loadPermalinkBtn, copyPermalinkBtn, forkPatchInput, forkBtn, loadForkedBtn, copyForkBtn]) {
     if (input) input.disabled = remoteMode;
@@ -259,7 +393,7 @@ function receiveRemoteFrame(frame) {
   remotePlayback.textContent = `Observed server: ${frame.playback.paused ? "paused" : "running"}, ${frame.playback.speedMultiplier}× — tick ${frame.identity.tick}`;
   if (frame.kind === "canvas") {
     const browserFrame = { schema: "scriptbots.browser-frame.v1", identity: frame.identity,
-      snapshot: frame.payload, environment: frame.environment };
+      snapshot: frame.payload, environment: frame.environment, playback: frame.playback };
     validateFrameIdentity(browserFrame);
     remoteFrame = browserFrame;
     if (frame.coalescedPublications !== "0") {
@@ -333,6 +467,8 @@ function connectRemote() {
     simulationGeneration += 1;
     inspector.reset();
     brainInspector.reset();
+    genomeInspector.reset();
+    interventions.reset();
     lastPaintedFrame = null;
     if (captureRequest) finishCapture(captureRequest, new Error("Presentation source changed"));
     remoteEvents.replaceChildren();
@@ -370,6 +506,8 @@ remoteLocal.addEventListener("click", () => {
   simulationGeneration += 1;
   inspector.reset();
   brainInspector.reset();
+  genomeInspector.reset();
+  interventions.reset();
   lastPaintedFrame = null;
   if (captureRequest) finishCapture(captureRequest, new Error("Presentation source changed"));
   remoteStatus.textContent = "Running locally in this browser.";
@@ -512,6 +650,8 @@ function drawSnapshot(frame) {
       && (!captureRequest || captureRequest.encoding)) {
     inspector.observe(frame, simulationGeneration);
     brainInspector.observe(frame, simulationGeneration);
+    genomeInspector.observe(frame, simulationGeneration);
+    interventions.observe(frame, simulationGeneration);
     return true;
   }
   try {
@@ -533,6 +673,8 @@ function drawSnapshot(frame) {
       captureAdmittedFrame(frame.identity);
       inspector.observe(frame, simulationGeneration);
       brainInspector.observe(frame, simulationGeneration);
+      genomeInspector.observe(frame, simulationGeneration);
+      interventions.observe(frame, simulationGeneration);
       return true;
     }
   } catch (error) {
@@ -778,6 +920,8 @@ function replaceSimulation(next, { continuation = false, permalink = null, expec
   simulationGeneration += 1;
   inspector.reset();
   brainInspector.reset();
+  genomeInspector.reset();
+  interventions.reset();
   simulationStartedAt = performance.now();
   lastPaintedFrame = null;
   if (continuation) {

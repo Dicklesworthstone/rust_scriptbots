@@ -8,7 +8,7 @@
 #![cfg(any(target_arch = "wasm32", test))]
 //! Browser simulation controls, snapshots, and shareable world configuration.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -44,8 +44,10 @@ use serde_wasm_bindgen::{from_value, to_value};
 use wasm_bindgen::prelude::*;
 
 use scriptbots_runtime::remote::{
+    BrowserInterventionHistory, BrowserInterventionReceipt, BrowserInterventionRequest,
     RemoteEnvironmentCache, RemoteEnvironmentCell, RemoteEnvironmentSnapshot, RemoteEventPage,
-    RemoteEventRecord, RemoteFrame, RemoteFrameIdentity, RemoteFramePayload, decode_remote_frame,
+    RemoteEventRecord, RemoteFrame, RemoteFrameIdentity, RemoteFramePayload,
+    browser_intervention_command_id, decode_remote_frame, validate_browser_intervention_session,
 };
 use scriptbots_runtime::{
     ApplicationState, CommandStatus, DriveReceipt, HostCommand, HostCore, HostCoreOptions,
@@ -164,6 +166,7 @@ struct SimSpec {
 struct BrowserFrame<'a> {
     schema: &'static str,
     identity: BrowserFrameIdentity,
+    playback: BrowserRemotePlayback,
     #[serde(serialize_with = "serialize_browser_snapshot")]
     snapshot: &'a SimulationSnapshot,
     environment: Option<BrowserEnvironment<'a>>,
@@ -266,6 +269,10 @@ impl<'a> BrowserFrame<'a> {
         Self {
             schema: "scriptbots.browser-frame.v1",
             identity: RemoteFrameIdentity::from(publication).into(),
+            playback: BrowserRemotePlayback {
+                paused: publication.playback.paused,
+                speed_multiplier: publication.playback.speed_multiplier,
+            },
             snapshot: &publication.world,
             environment: None,
         }
@@ -636,6 +643,24 @@ impl SimSpec {
     }
 }
 
+std::thread_local! {
+    // Presentation/command identity is deliberately independent of the scientific
+    // RNG. A random namespace plus checked monotonic allocation prevents same-seed
+    // resets or concurrent handles on this browser thread from reusing authority.
+    static BROWSER_SESSION_SEQUENCE: Cell<Option<u64>> =
+        Cell::new(Some(rand::rng().random::<u64>()));
+}
+
+fn fresh_browser_session() -> Result<HostSessionId> {
+    BROWSER_SESSION_SEQUENCE.with(|sequence| {
+        let value = sequence
+            .get()
+            .context("browser session identities are exhausted")?;
+        sequence.set(value.checked_add(1));
+        Ok(HostSessionId::new(value))
+    })
+}
+
 impl Simulation {
     fn checkpoint(&mut self) -> Result<Vec<u8>> {
         // Complete the previous boundary's deferred volatile-journal receipt.
@@ -724,7 +749,7 @@ impl Simulation {
             spec.default_brain,
             &mut mlp_key,
         )?;
-        let session_id = HostSessionId::new(spec.effective_seed().unwrap_or(0));
+        let session_id = fresh_browser_session()?;
         let options = HostCoreOptions {
             initial_playback: PlaybackSnapshot {
                 paused: false,
@@ -760,7 +785,7 @@ impl Simulation {
             spec.default_brain,
             &mut self.mlp_key,
         )?;
-        let session_id = HostSessionId::new(spec.effective_seed().unwrap_or(0));
+        let session_id = fresh_browser_session()?;
         let options = HostCoreOptions {
             initial_playback: PlaybackSnapshot {
                 paused: false,
@@ -843,6 +868,48 @@ impl Simulation {
                 step_once: false,
             },
         ))
+    }
+
+    fn intervene(
+        &mut self,
+        request: &BrowserInterventionRequest,
+    ) -> Result<BrowserInterventionReceipt> {
+        let envelope = request.envelope()?;
+        let snapshot = self.core.latest_snapshot();
+        validate_browser_intervention_session(&snapshot, &request.session_id)?;
+        if self.controls.command_status(envelope.command_id)?.is_none() {
+            request.validate_new_source(&snapshot)?;
+        }
+        // The original guard remains part of the envelope on every retry. The owner
+        // returns its existing receipt first, or refuses a conflicting body.
+        let admitted = self.controls.submit_envelope(envelope)?;
+        let drive_error = self
+            .core
+            .drive(ManualInstant::from_nanos(self.now_nanos))
+            .err();
+        let status = self
+            .controls
+            .command_status(admitted.command_id())?
+            .context("admitted browser intervention has no retained receipt")?;
+        let mut receipt =
+            BrowserInterventionReceipt::from_status(&status, &self.core.latest_snapshot());
+        // A drive can observe a failure after command admission/application. Preserve
+        // the actual receipt rather than erasing that outcome behind a thrown error.
+        receipt.owner_error =
+            drive_error.map(|error| error.to_string().chars().take(1024).collect());
+        Ok(receipt)
+    }
+
+    fn intervention_status(
+        &mut self,
+        command_id: &str,
+        session_id: &str,
+    ) -> Result<Option<BrowserInterventionReceipt>> {
+        let command_id = browser_intervention_command_id(command_id)?;
+        validate_browser_intervention_session(&self.core.latest_snapshot(), session_id)?;
+        Ok(self.controls.command_status(command_id)?.map(|status| {
+            BrowserInterventionReceipt::from_status(&status, &self.core.latest_snapshot())
+        }))
     }
 
     fn apply_command(&mut self, command: HostCommand) -> Result<CommandStatus> {
@@ -986,6 +1053,57 @@ impl SimHandle {
         to_value(&status).map_err(js_error)
     }
 
+    /// Stage a bounded intervention through the canonical owner at an observed paused boundary.
+    /// Retain and retry the identical request after an uncertain result; application only queues
+    /// the ecological effect for a later Step or Resume.
+    #[wasm_bindgen(js_name = intervene)]
+    pub fn intervene_js(&self, request: JsValue) -> Result<JsValue, JsValue> {
+        let request: BrowserInterventionRequest = from_value(request).map_err(js_error)?;
+        self.inner
+            .borrow_mut()
+            .intervene(&request)
+            .map_err(js_error)?
+            .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+            .map_err(js_error)
+    }
+
+    /// Read the actual retained application/journal receipt; null means unknown, never unapplied.
+    #[wasm_bindgen(js_name = interventionStatus)]
+    pub fn intervention_status_js(
+        &self,
+        command_id: &str,
+        session_id: &str,
+    ) -> Result<JsValue, JsValue> {
+        self.inner
+            .borrow_mut()
+            .intervention_status(command_id, session_id)
+            .map_err(js_error)?
+            .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+            .map_err(js_error)
+    }
+
+    /// Read a bounded page of global observed ecological effects and expiries.
+    /// The ring has no per-command linkage; it cannot prove one request caused an observed row.
+    #[wasm_bindgen(js_name = interventionHistory)]
+    pub fn intervention_history_js(
+        &self,
+        session_id: &str,
+        epoch: &str,
+        after_seq: &str,
+        limit: u32,
+    ) -> Result<JsValue, JsValue> {
+        BrowserInterventionHistory::capture(
+            &self.inner.borrow().core.latest_snapshot(),
+            session_id,
+            epoch,
+            after_seq,
+            usize::try_from(limit).map_err(js_error)?,
+        )
+        .map_err(js_error)?
+        .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+        .map_err(js_error)
+    }
+
     /// Encode the latest snapshot without advancing scientific time.
     #[wasm_bindgen(js_name = snapshot)]
     pub fn snapshot_js(&self) -> Result<JsValue, JsValue> {
@@ -1055,6 +1173,37 @@ impl SimHandle {
             .borrow()
             .core
             .inspect_brain_activity(uid)
+            .map_err(js_error)?
+            .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+            .map_err(js_error)
+    }
+
+    /// Page complete canonical genome values and exact differences from the primary parent.
+    /// Scientific time, evaluator state and persistent selection are untouched.
+    #[wasm_bindgen(js_name = inspectGenome)]
+    pub fn inspect_genome_js(
+        &self,
+        uid: &str,
+        locus_offset: f64,
+        delta_offset: f64,
+    ) -> Result<JsValue, JsValue> {
+        let uid = scriptbots_runtime::inspector::parse_agent_uid(uid)
+            .ok_or_else(|| js_error("creature UID must be a canonical u64 decimal string"))?;
+        for offset in [locus_offset, delta_offset] {
+            if !offset.is_finite() || offset.fract() != 0.0 || !(0.0..=65536.0).contains(&offset) {
+                return Err(js_error(
+                    "genome page offsets must be bounded nonnegative integers",
+                ));
+            }
+        }
+        let locus_offset = locus_offset as usize;
+        let delta_offset = delta_offset as usize;
+        scriptbots_runtime::inspector::validate_genome_page_offsets(locus_offset, delta_offset)
+            .map_err(js_error)?;
+        self.inner
+            .borrow()
+            .core
+            .inspect_genome_page(uid, locus_offset, delta_offset)
             .map_err(js_error)?
             .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
             .map_err(js_error)
@@ -1760,6 +1909,123 @@ mod tests {
         .unwrap()
     }
 
+    fn web_intervention_request(simulation: &Simulation) -> BrowserInterventionRequest {
+        let source = simulation.core.latest_snapshot();
+        BrowserInterventionRequest {
+            request_id: "web-intervention-local-regression".to_owned(),
+            session_id: source.session_id.get().to_string(),
+            epoch: source.world.epoch.to_string(),
+            expected_control_revision: source.revisions.control.get().to_string(),
+            intervention: scriptbots_core::Intervention::Drought {
+                region: scriptbots_core::Region::All,
+                ticks: 5,
+                growth_scale: 0.0,
+            },
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_intervention_stages_paused_retries_and_observes_effect_after_step() {
+        let mut simulation = checkpoint_world(None, SeedStrategy::None);
+        let running_request = web_intervention_request(&simulation);
+        assert!(simulation.intervene(&running_request).is_err());
+        assert_eq!(simulation.core.world_tick().0, 0);
+        simulation.set_speed(0.0).unwrap();
+        let request = web_intervention_request(&simulation);
+        let first = simulation.intervene(&request).unwrap();
+        assert_eq!(first.application_state, "applied");
+        assert_eq!(first.application_boundary.as_ref().unwrap().tick, "0");
+        assert_eq!(first.journal_state, "pending");
+        assert!(
+            simulation
+                .core
+                .latest_snapshot()
+                .applied_interventions
+                .is_empty()
+        );
+        assert!(simulation.core.latest_snapshot().playback.paused);
+
+        let retry = simulation.intervene(&request).unwrap();
+        assert_eq!(retry.command_id, first.command_id);
+        assert_eq!(retry.admission_sequence, first.admission_sequence);
+        assert_eq!(retry.application_boundary, first.application_boundary);
+        assert_eq!(retry.journal_state, "committed_volatile");
+        assert_eq!(simulation.core.world_tick().0, 0);
+        let mut changed = request.clone();
+        changed.intervention = scriptbots_core::Intervention::Bloom {
+            region: scriptbots_core::Region::All,
+            amount: 0.1,
+        };
+        assert!(simulation.intervene(&changed).is_err());
+        assert!(
+            simulation
+                .intervention_status("00000000000000000000000000000000", &request.session_id)
+                .unwrap()
+                .is_none()
+        );
+
+        simulation.tick(1).unwrap();
+        let page = BrowserInterventionHistory::capture(
+            &simulation.core.latest_snapshot(),
+            &request.session_id,
+            &request.epoch,
+            "0",
+            32,
+        )
+        .unwrap();
+        assert_eq!(page.records.len(), 1);
+        assert_eq!(page.records[0].kind, "drought");
+        assert_eq!(page.records[0].tick, "1");
+        assert!(simulation.core.latest_snapshot().playback.paused);
+        simulation.set_speed(1.0).unwrap();
+        let running_retry = simulation.intervene(&request).unwrap();
+        assert_eq!(running_retry.command_id, first.command_id);
+        assert_eq!(
+            running_retry.application_boundary,
+            first.application_boundary
+        );
+        assert_eq!(
+            simulation
+                .core
+                .latest_snapshot()
+                .applied_interventions
+                .len(),
+            1
+        );
+        assert!(!simulation.core.latest_snapshot().playback.paused);
+        let mut fresh = web_intervention_request(&simulation);
+        fresh.request_id = "fresh-running-action".to_owned();
+        assert!(simulation.intervene(&fresh).is_err());
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn same_seed_browser_owners_have_distinct_authority_and_identical_science() {
+        let mut first = checkpoint_world(None, SeedStrategy::None);
+        let second = checkpoint_world(None, SeedStrategy::None);
+        let original_session = first.core.latest_snapshot().session_id;
+        let digest = first.core.world().world_digest_v1().unwrap();
+        assert_ne!(original_session, second.core.latest_snapshot().session_id);
+        assert_eq!(digest, second.core.world().world_digest_v1().unwrap());
+        first.set_speed(0.0).unwrap();
+        let request = web_intervention_request(&first);
+        first.intervene(&request).unwrap();
+        first.reset(Some(17)).unwrap();
+        first.set_speed(0.0).unwrap();
+        assert_ne!(original_session, first.core.latest_snapshot().session_id);
+        assert_eq!(digest, first.core.world().world_digest_v1().unwrap());
+        assert!(first.intervene(&request).is_err());
+        assert!(
+            first
+                .core
+                .latest_snapshot()
+                .applied_interventions
+                .is_empty()
+        );
+        assert!(first.core.world().active_effects().is_empty());
+    }
+
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
     #[cfg_attr(not(target_arch = "wasm32"), test)]
     fn browser_checkpoint_continues_exact_science_and_fresh_command_namespaces() {
@@ -2396,7 +2662,7 @@ mod tests {
 
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
     #[cfg_attr(not(target_arch = "wasm32"), test)]
-    fn nested_config_seed_controls_world_and_host_session_when_top_level_is_omitted() {
+    fn nested_config_seed_controls_world_when_top_level_is_omitted() {
         let simulation = Simulation::new(
             InitOptions {
                 population: 0,
@@ -2411,15 +2677,11 @@ mod tests {
         .expect("nested-seeded web simulation");
 
         assert_eq!(simulation.core.world().config().rng_seed, Some(11));
-        assert_eq!(
-            simulation.core.latest_snapshot().session_id,
-            HostSessionId::new(11)
-        );
     }
 
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
     #[cfg_attr(not(target_arch = "wasm32"), test)]
-    fn top_level_seed_overrides_nested_config_for_world_and_host_session() {
+    fn top_level_seed_overrides_nested_config_for_world() {
         let simulation = Simulation::new(
             InitOptions {
                 seed: Some(22),
@@ -2435,15 +2697,11 @@ mod tests {
         .expect("top-level-seeded web simulation");
 
         assert_eq!(simulation.core.world().config().rng_seed, Some(22));
-        assert_eq!(
-            simulation.core.latest_snapshot().session_id,
-            HostSessionId::new(22)
-        );
     }
 
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
     #[cfg_attr(not(target_arch = "wasm32"), test)]
-    fn omitted_seeds_keep_entropy_config_with_zero_host_session_sentinel() {
+    fn omitted_seeds_keep_entropy_config() {
         let simulation = Simulation::new(
             InitOptions {
                 population: 0,
@@ -2454,10 +2712,6 @@ mod tests {
         .expect("entropy-seeded web simulation");
 
         assert_eq!(simulation.core.world().config().rng_seed, None);
-        assert_eq!(
-            simulation.core.latest_snapshot().session_id,
-            HostSessionId::new(0)
-        );
     }
 
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
@@ -2481,19 +2735,19 @@ mod tests {
             .world()
             .world_digest_v1()
             .expect("nested-seed digest");
+        let nested_session = simulation.core.latest_snapshot().session_id;
 
         simulation.reset(Some(22)).expect("explicit-seed web reset");
         assert_eq!(simulation.core.world().config().rng_seed, Some(22));
-        assert_eq!(
-            simulation.core.latest_snapshot().session_id,
-            HostSessionId::new(22)
-        );
+        let explicit_session = simulation.core.latest_snapshot().session_id;
+        assert_ne!(explicit_session, nested_session);
 
         simulation.reset(None).expect("nested-seed web reset");
         assert_eq!(simulation.core.world().config().rng_seed, Some(11));
-        assert_eq!(
+        assert_ne!(simulation.core.latest_snapshot().session_id, nested_session);
+        assert_ne!(
             simulation.core.latest_snapshot().session_id,
-            HostSessionId::new(11)
+            explicit_session
         );
         assert_eq!(
             simulation
@@ -2531,7 +2785,7 @@ mod tests {
         simulation.spec.base_config.initial_food = 0.0;
         simulation.reset(Some(11)).unwrap();
         let replacement = simulation.core.latest_snapshot();
-        assert_eq!(replacement.session_id, initial.session_id);
+        assert_ne!(replacement.session_id, initial.session_id);
         assert_eq!(replacement.layers.revisions, initial.layers.revisions);
         let next = simulation.environment_cache.snapshot(&replacement).unwrap();
         assert_eq!(next.cells[0].food.to_bits(), 0.0_f32.to_bits());
@@ -2678,6 +2932,49 @@ mod tests {
             assert_eq!(observed.core.scientific_digest_v1().unwrap(), digest);
             assert_eq!(digest, twin.core.scientific_digest_v1().unwrap());
         }
+        observed.tick(1).unwrap();
+        twin.tick(1).unwrap();
+        assert_eq!(
+            observed.core.scientific_digest_v1().unwrap(),
+            twin.core.scientific_digest_v1().unwrap()
+        );
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_genome_pages_preserve_real_mlp_material_and_continuation() {
+        use scriptbots_runtime::inspector::{GenomeInspectionOutcome, GenomeParentDiff};
+        let mut observed = browser_clock_simulation();
+        let mut twin = browser_clock_simulation();
+        observed.tick(1).unwrap();
+        twin.tick(1).unwrap();
+        let uid = observed.core.latest_snapshot().world.agents[0].uid;
+        let before = observed.core.scientific_digest_v1().unwrap();
+        let mut offset = 0;
+        let mut digest = None;
+        let mut indices = Vec::new();
+        loop {
+            let page = observed.core.inspect_genome_page(uid, offset, 0).unwrap();
+            assert_eq!(page.uid, uid.get().to_string());
+            let GenomeInspectionOutcome::Ready { genome } = page.outcome else {
+                panic!("real registered MLP must expose bounded canonical loci");
+            };
+            assert_eq!(genome.family_id, "mlp-baseline");
+            assert!(matches!(genome.parent_diff, GenomeParentDiff::Founder));
+            if let Some(expected) = &digest {
+                assert_eq!(&genome.genome_digest, expected);
+            } else {
+                digest = Some(genome.genome_digest);
+            }
+            indices.extend(genome.loci.iter().map(|row| row.index));
+            assert_eq!(observed.core.scientific_digest_v1().unwrap(), before);
+            if !genome.paging.has_more {
+                assert_eq!(indices, (0..genome.paging.total).collect::<Vec<_>>());
+                break;
+            }
+            offset += genome.paging.limit;
+        }
+        assert!(indices.len() > scriptbots_runtime::inspector::GENOME_LOCUS_PAGE_SIZE);
         observed.tick(1).unwrap();
         twin.tick(1).unwrap();
         assert_eq!(

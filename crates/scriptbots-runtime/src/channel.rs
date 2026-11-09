@@ -145,6 +145,13 @@ pub enum ChannelHostOptionsError {
 
 /// One pre-admission message offered to the owner thread.
 enum IngressMessage {
+    GenomeInspection {
+        uid: AgentUid,
+        locus_offset: usize,
+        delta_offset: usize,
+        expires_at: Instant,
+        reply: Sender<Result<crate::inspector::GenomeInspection, HostAccessError>>,
+    },
     BrainActivity {
         uid: AgentUid,
         expires_at: Instant,
@@ -583,6 +590,27 @@ impl ChannelHostPort {
         let expires_at = bounded.inspection_deadline()?;
         bounded.read_owner(|reply| IngressMessage::BrainActivity {
             uid,
+            expires_at,
+            reply,
+        })
+    }
+
+    /// Read one genome page without installing a probe or sharing a live evaluator.
+    pub fn inspect_genome_page_before(
+        &self,
+        uid: AgentUid,
+        locus_offset: usize,
+        delta_offset: usize,
+        deadline: Instant,
+    ) -> Result<crate::inspector::GenomeInspection, HostAccessError> {
+        crate::inspector::validate_genome_page_offsets(locus_offset, delta_offset)?;
+        let bounded =
+            self.bounded_before_with_error(deadline, HostAccessError::OwnerReadTimeout)?;
+        let expires_at = bounded.inspection_deadline()?;
+        bounded.read_owner(|reply| IngressMessage::GenomeInspection {
+            uid,
+            locus_offset,
+            delta_offset,
             expires_at,
             reply,
         })
@@ -1468,6 +1496,9 @@ impl ChannelHostDriver {
         let error =
             || ChannelHostPort::protocol_violation("owner handoff refused later queued ingress");
         match message {
+            IngressMessage::GenomeInspection { reply, .. } => {
+                let _ = reply.send(Err(error()));
+            }
             IngressMessage::BrainActivity { reply, .. } => {
                 let _ = reply.send(Err(error()));
             }
@@ -1549,6 +1580,23 @@ impl ChannelHostDriver {
             return;
         }
         match message {
+            IngressMessage::GenomeInspection {
+                uid,
+                locus_offset,
+                delta_offset,
+                expires_at,
+                reply,
+            } => {
+                if Instant::now() >= expires_at {
+                    let _ = reply.send(Err(HostAccessError::OwnerReadTimeout));
+                    return;
+                }
+                let _ = reply.send(self.host.core().inspect_genome_page(
+                    uid,
+                    locus_offset,
+                    delta_offset,
+                ));
+            }
             IngressMessage::BrainActivity {
                 uid,
                 expires_at,
@@ -3782,6 +3830,7 @@ mod tests {
             }
             IngressMessage::CommandStatus { .. }
             | IngressMessage::Wake
+            | IngressMessage::GenomeInspection { .. }
             | IngressMessage::BrainActivity { .. }
             | IngressMessage::BrainProjection { .. }
             | IngressMessage::AgentInspection { .. }
@@ -3951,6 +4000,19 @@ mod tests {
             port.inspect_brain_activity_before(AgentUid(1), expired),
             Err(HostAccessError::OwnerReadTimeout)
         ));
+        assert!(matches!(
+            port.inspect_genome_page_before(AgentUid(1), 0, 0, expired),
+            Err(HostAccessError::OwnerReadTimeout)
+        ));
+        assert!(matches!(
+            port.inspect_genome_page_before(
+                AgentUid(1),
+                1,
+                0,
+                Instant::now() + Duration::from_secs(1)
+            ),
+            Err(HostAccessError::ProtocolViolation { .. })
+        ));
         let request = BrainProjectionRequest::focused(
             crate::ProjectionClientId::new(613),
             crate::ProjectionRequestRevision::new(1),
@@ -4086,6 +4148,51 @@ mod tests {
     }
 
     #[test]
+    fn browser_genome_expiry_and_absent_epoch_come_from_owner_ingress() {
+        let (mut driver, _) = ChannelHostDriver::new(test_host(true), fast_options()).unwrap();
+        let source = driver.host.core().latest_snapshot();
+        let digest = driver.host.core().scientific_digest_v1().unwrap();
+        let (reply, receive) = std::sync::mpsc::channel();
+        driver.process_ingress(IngressMessage::GenomeInspection {
+            uid: AgentUid(u64::MAX),
+            locus_offset: 0,
+            delta_offset: 0,
+            expires_at: Instant::now(),
+            reply,
+        });
+        assert!(matches!(
+            receive.recv().unwrap(),
+            Err(HostAccessError::OwnerReadTimeout)
+        ));
+        let (reply, receive) = std::sync::mpsc::channel();
+        driver.process_ingress(IngressMessage::GenomeInspection {
+            uid: AgentUid(u64::MAX),
+            locus_offset: 0,
+            delta_offset: 0,
+            expires_at: Instant::now() + Duration::from_secs(1),
+            reply,
+        });
+        let detail = receive.recv().unwrap().unwrap();
+        assert_eq!(detail.uid, u64::MAX.to_string());
+        assert_eq!(detail.source.epoch, source.world.epoch.to_string());
+        assert_eq!(
+            detail.source.session_id,
+            source.session_id.get().to_string()
+        );
+        assert!(matches!(
+            detail.outcome,
+            crate::inspector::GenomeInspectionOutcome::Unavailable {
+                reason: crate::inspector::GenomeInspectionUnavailable::MissingAgent
+            }
+        ));
+        assert_eq!(driver.host.core().scientific_digest_v1().unwrap(), digest);
+        assert_eq!(
+            driver.host.core().latest_snapshot().revision,
+            source.revision
+        );
+    }
+
+    #[test]
     fn retained_brain_acknowledgement_survives_caller_deadline() {
         let (mut driver, port) =
             ChannelHostDriver::new(test_host(true), fast_options()).expect("driver");
@@ -4202,6 +4309,7 @@ mod tests {
             }
             IngressMessage::Command { .. }
             | IngressMessage::Wake
+            | IngressMessage::GenomeInspection { .. }
             | IngressMessage::BrainActivity { .. }
             | IngressMessage::BrainProjection { .. }
             | IngressMessage::AgentInspection { .. }

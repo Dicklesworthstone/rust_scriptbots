@@ -15,6 +15,47 @@ const IDENTITY_FIELDS = ["sessionId", "publicationRevision", "scientificRevision
   "controlRevision", "configRevision", "tick"];
 const encoder = new TextEncoder();
 
+/** One deadline and one actual-byte ceiling cover every JSON owner response. */
+async function boundedOwnerJson(url, byteLimit, { signal, method = "GET", body, missingMessage } = {}) {
+  const abort = new AbortController();
+  const cancel = () => abort.abort();
+  if (signal?.aborted) cancel();
+  signal?.addEventListener("abort", cancel, { once: true });
+  const timeout = setTimeout(cancel, 2000);
+  try {
+    const response = await fetch(url, { method, body, cache: "no-store", credentials: "omit",
+      ...(body === undefined ? {} : { headers: { "Content-Type": "application/json" } }), signal: abort.signal });
+    const advertised = response.headers.get("content-length");
+    if (advertised !== null && (!/^\d+$/.test(advertised) || Number(advertised) > byteLimit)) {
+      await response.body?.cancel();
+      throw new Error(`Remote response exceeds its ${byteLimit / 1024} KiB bound`);
+    }
+    if (!response.body) throw new Error("Remote owner returned no response body");
+    const reader = response.body.getReader();
+    const chunks = [];
+    let length = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        length += value.byteLength;
+        if (length > byteLimit) { await reader.cancel(); throw new Error(`Remote response exceeds its ${byteLimit / 1024} KiB bound`); }
+        chunks.push(value);
+      }
+    } finally { reader.releaseLock(); }
+    const bytes = new Uint8Array(length);
+    let offset = 0;
+    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+    const detail = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+    if (response.status === 404 && missingMessage && detail.message === missingMessage) return null;
+    if (!response.ok) throw new Error(detail.error || detail.message || `Remote owner request failed (${response.status})`);
+    return detail;
+  } finally {
+    clearTimeout(timeout);
+    signal?.removeEventListener("abort", cancel);
+  }
+}
+
 function decimal(value, bits = 64) {
   const maxDigits = bits === 128 ? 39 : 20;
   if (typeof value !== "string" || value.length > maxDigits || !/^(0|[1-9][0-9]*)$/.test(value)) {
@@ -233,7 +274,53 @@ export class RemoteStreamClient {
     return this.readInspection("brain", MAX_BRAIN_ACTIVITY_BYTES, uid, { sessionId, epoch, signal });
   }
 
-  async readInspection(endpoint, byteLimit, uid, { sessionId, epoch, signal }) {
+  /** One explicit immutable genome page, independently bounded from activity reads. */
+  async inspectGenome(uid, { sessionId, epoch, locusOffset = 0, deltaOffset = 0, signal } = {}) {
+    if (!Number.isSafeInteger(locusOffset) || locusOffset < 0 || locusOffset > 65536 || locusOffset % 64 !== 0
+        || !Number.isSafeInteger(deltaOffset) || deltaOffset < 0 || deltaOffset > 65536 || deltaOffset % 32 !== 0) {
+      throw new Error("Invalid bounded genome page offsets");
+    }
+    return this.readInspection("genome", 65536, uid, { sessionId, epoch, signal,
+      query: { locus_offset: String(locusOffset), delta_offset: String(deltaOffset) } });
+  }
+
+  /** Stage or explicitly retry the same source-bound request through the canonical owner. */
+  async intervene(request, { signal } = {}) {
+    const url = this.apiUrl("/api/control/browser-intervention", request?.sessionId);
+    const body = JSON.stringify(request);
+    if (typeof body !== "string" || encoder.encode(body).length > 4096) throw new Error("Intervention request exceeds its 4 KiB bound");
+    return boundedOwnerJson(url, 16 * 1024, { signal, method: "POST", body });
+  }
+
+  async interventionStatus(commandId, { sessionId, signal } = {}) {
+    if (typeof commandId !== "string" || !/^[0-9a-f]{32}$/.test(commandId)) throw new Error("Invalid exact intervention command identity");
+    const url = this.apiUrl(`/api/control/browser-intervention/${commandId}`, sessionId, { session_id: sessionId });
+    return boundedOwnerJson(url, 16 * 1024, { signal, missingMessage: "no retained command receipt; admission remains unknown" });
+  }
+
+  async interventionHistory({ sessionId, epoch, afterSeq, limit = 32, signal } = {}) {
+    decimal(epoch); decimal(afterSeq);
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 64) throw new Error("Invalid bounded intervention history page size");
+    const url = this.apiUrl("/api/interventions/browser", sessionId,
+      { session_id: sessionId, epoch, after_seq: afterSeq, limit: String(limit) });
+    return boundedOwnerJson(url, 65536, { signal });
+  }
+
+  apiUrl(path, sessionId, query = {}) {
+    decimal(sessionId);
+    if (this.state !== "connected" || this.tracker.sessionId !== sessionId) {
+      throw new Error("Connect to the observed world’s host before reading or submitting an intervention");
+    }
+    const url = new URL(this.url);
+    if (!url.pathname.endsWith("/api/ws/stream")) throw new Error("Owner APIs require the host’s /api/ws/stream endpoint");
+    url.protocol = url.protocol === "wss:" ? "https:" : "http:";
+    url.pathname = `${url.pathname.slice(0, -"/api/ws/stream".length)}${path}`;
+    url.search = new URLSearchParams(query).toString();
+    url.hash = "";
+    return url;
+  }
+
+  async readInspection(endpoint, byteLimit, uid, { sessionId, epoch, signal, query = {} }) {
     decimal(uid);
     decimal(sessionId, 128);
     decimal(epoch);
@@ -246,49 +333,10 @@ export class RemoteStreamClient {
     }
     url.protocol = url.protocol === "wss:" ? "https:" : "http:";
     url.pathname = `${url.pathname.slice(0, -"/api/ws/stream".length)}/api/agents/${endpoint}`;
-    url.search = new URLSearchParams({ uid, session_id: sessionId, epoch }).toString();
+    url.search = new URLSearchParams({ ...query, uid, session_id: sessionId, epoch }).toString();
     url.hash = "";
-    const abort = new AbortController();
-    const cancel = () => abort.abort();
-    if (signal?.aborted) cancel();
-    signal?.addEventListener("abort", cancel, { once: true });
-    const timeout = setTimeout(cancel, 2000);
-    try {
-      const response = await fetch(url, { method: "GET", cache: "no-store", credentials: "omit", signal: abort.signal });
-      const advertised = response.headers.get("content-length");
-      if (advertised !== null && (!/^\d+$/.test(advertised) || Number(advertised) > byteLimit)) {
-        await response.body?.cancel();
-        throw new Error(`Remote inspection exceeds its ${byteLimit / 1024} KiB bound`);
-      }
-      if (!response.body) throw new Error("Remote creature inspection returned no body");
-      const reader = response.body.getReader();
-      const chunks = [];
-      let length = 0;
-      try {
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          length += value.byteLength;
-          if (length > byteLimit) {
-            await reader.cancel();
-            throw new Error(`Remote inspection exceeds its ${byteLimit / 1024} KiB bound`);
-          }
-          chunks.push(value);
-        }
-      } finally {
-        reader.releaseLock();
-      }
-      const bytes = new Uint8Array(length);
-      let offset = 0;
-      for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
-      const detail = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
-      if (endpoint === "inspect" && response.status === 404 && detail.message === "creature is no longer present in this host") return null;
-      if (!response.ok) throw new Error(detail.error || detail.message || `Remote inspection failed (${response.status})`);
-      return detail;
-    } finally {
-      clearTimeout(timeout);
-      signal?.removeEventListener("abort", cancel);
-    }
+    return boundedOwnerJson(url, byteLimit, { signal,
+      missingMessage: endpoint === "inspect" ? "creature is no longer present in this host" : undefined });
   }
 
   report(state, message, extra = {}) {

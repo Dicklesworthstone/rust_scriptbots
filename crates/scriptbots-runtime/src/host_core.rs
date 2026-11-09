@@ -3918,6 +3918,33 @@ impl HostCore {
         )
     }
 
+    /// Read complete canonical genome rows and a separately paged primary-parent diff.
+    ///
+    /// Both source decoders must declare work within the interactive budget. This explicit
+    /// read neither advances science nor installs a capture probe, and absent subjects retain
+    /// the exact owner epoch so clients can reject pages from retired worlds.
+    pub fn inspect_genome_page(
+        &self,
+        uid: AgentUid,
+        locus_offset: usize,
+        delta_offset: usize,
+    ) -> Result<crate::inspector::GenomeInspection, HostAccessError> {
+        let latest = self.latest_snapshot();
+        crate::inspector::GenomeInspection::from_world(
+            &self.world,
+            BrainProjectionSource {
+                session_id: self.session_id,
+                published_snapshot: latest.revision,
+                published_host: latest.revisions,
+                inspected_host: self.revisions,
+                inspected_tick: self.world.tick(),
+            },
+            uid,
+            locus_offset,
+            delta_offset,
+        )
+    }
+
     /// Current queryable health.
     #[must_use]
     pub const fn health(&self) -> &HostHealth {

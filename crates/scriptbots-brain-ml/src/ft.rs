@@ -1078,6 +1078,23 @@ impl BrainFamilyCodec for FtBrainFamily {
         Ok(loci)
     }
 
+    fn genome_loci_upper_bound(&self) -> Option<usize> {
+        std::iter::once(INPUT_SIZE)
+            .chain(self.config.hidden_layers.iter().copied())
+            .zip(
+                self.config
+                    .hidden_layers
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(OUTPUT_SIZE)),
+            )
+            .try_fold(0_usize, |total, (inputs, outputs)| {
+                // Each output owns one bias and a weight/source pair for each input.
+                let per_output = inputs.checked_mul(2)?.checked_add(1)?;
+                total.checked_add(per_output.checked_mul(outputs)?)
+            })
+    }
+
     fn validate_evaluator_state(
         &self,
         state: &BrainEvaluatorStateEnvelope,
@@ -1423,6 +1440,7 @@ mod tests {
         parameters[78] = 0.75;
         let genome = genome_with_parameters(&family, &parameters);
         let loci = family.genome_loci(&genome).unwrap();
+        assert_eq!(family.genome_loci_upper_bound(), Some(loci.len()));
         let by_locus: BTreeMap<_, _> = loci.iter().copied().collect();
         assert_eq!(
             by_locus.len(),
@@ -1460,6 +1478,16 @@ mod tests {
             vec![BrainMutationTrialGroupV1::new(79, 1, 1)]
         );
         let other = FtBrainFamily::new(FtBrainConfig::new(vec![3]).unwrap()).unwrap();
+        let other_count = validate_config(&other.config).unwrap();
+        let other_genome = genome_with_parameters(&other, &vec![0.0; other_count]);
+        assert_eq!(
+            other.genome_loci_upper_bound(),
+            Some(other.genome_loci(&other_genome).unwrap().len())
+        );
+        assert_ne!(
+            family.genome_loci_upper_bound(),
+            other.genome_loci_upper_bound()
+        );
         let BrainHeredityCapabilityV1::LocusCapable {
             locus_schema: other_schema,
             ..
