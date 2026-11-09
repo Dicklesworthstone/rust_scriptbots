@@ -8,21 +8,26 @@
 use crate::{PlaybackSnapshot, RenderSnapshot};
 use scriptbots_core::{
     DynamicAgentSnapshot, DynamicSnapshotSummary, DynamicSnapshotWorld, DynamicWorldSnapshot,
-    Region, Tick, TickSummaryDto,
+    Region, TerrainKind, Tick, TickSummaryDto,
     narrative::{EVENT_RECORD_SCHEMA_VERSION, EventKind, EventRecord, SubjectRef},
 };
 use serde::{Deserialize, Deserializer, Serialize, de};
-use std::{fmt, marker::PhantomData};
+use std::{fmt, marker::PhantomData, sync::Arc};
 use thiserror::Error;
 
 /// Version of the positional payload following the fixed header.
-pub const REMOTE_PROTOCOL_VERSION: u16 = 1;
+pub const REMOTE_PROTOCOL_VERSION: u16 = 2;
 /// Maximum complete binary frame, including its header.
 pub const REMOTE_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// Maximum narrative records in one event page.
 pub const REMOTE_MAX_EVENTS: usize = 64;
 /// Maximum dynamic agents in one canvas frame.
 pub const REMOTE_MAX_AGENTS: usize = 65_536;
+/// Largest side of a sampled environment overview. Large worlds retain their full extent.
+pub const REMOTE_ENVIRONMENT_MAX_SIDE: u32 = 128;
+/// Maximum environment cells allocated by either decoder or projection.
+pub const REMOTE_MAX_ENVIRONMENT_CELLS: usize =
+    (REMOTE_ENVIRONMENT_MAX_SIDE * REMOTE_ENVIRONMENT_MAX_SIDE) as usize;
 /// Maximum bytes in a narrative metric name or canonical subject reference.
 pub const REMOTE_MAX_EVENT_LABEL_BYTES: usize = 256;
 /// Maximum bytes in one canonical narrative description.
@@ -69,11 +74,14 @@ pub struct RemoteFrame {
     pub playback: PlaybackSnapshot,
     /// Earlier publication revisions skipped by this client's latest-value lane.
     pub coalesced_publications: u64,
+    /// Coherent bounded environment overview for canvas frames; absent on other channels.
+    #[serde(with = "crate::serde_optional_arc")]
+    pub environment: Option<Arc<RemoteEnvironmentSnapshot>>,
     /// Exactly one negotiated channel's payload.
     pub payload: RemoteFramePayload,
 }
 
-/// Positional v1 discriminants; changing their order changes the protocol.
+/// Positional payload discriminants; changing their order changes the protocol.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum RemoteFramePayload {
     /// The complete canonical aggregate for this scientific tick.
@@ -82,6 +90,206 @@ pub enum RemoteFramePayload {
     Canvas(#[serde(deserialize_with = "decode_canvas")] DynamicWorldSnapshot),
     /// Bounded canonical narrative records with explicit retention loss.
     Events(RemoteEventPage),
+}
+
+/// One actual source-grid sample, not an inferred scientific aggregate.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteEnvironmentCell {
+    /// Source terrain class.
+    pub terrain: TerrainKind,
+    /// Source elevation.
+    pub elevation: f32,
+    /// Source food quantity.
+    pub food: f32,
+    /// Source water depth, zero when hydrology is disabled.
+    pub water_depth: f32,
+}
+
+/// Bounded environment samples covering the entire authoritative grid.
+///
+/// Small grids are exact. Larger grids use the source cell at each overview cell's
+/// center; values are never described as averages or used for scientific metrics.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteEnvironmentSnapshot {
+    /// Overview width, at most [`REMOTE_ENVIRONMENT_MAX_SIDE`].
+    pub width: u32,
+    /// Overview height, at most [`REMOTE_ENVIRONMENT_MAX_SIDE`].
+    pub height: u32,
+    /// Original source grid width.
+    pub source_width: u32,
+    /// Original source grid height.
+    pub source_height: u32,
+    /// Source cell edge length in world units.
+    pub cell_size: u32,
+    /// Exact source terrain content revision.
+    pub terrain_revision: u64,
+    /// Exact source food content revision.
+    pub food_revision: u64,
+    /// Exact source hydrology content revision.
+    pub hydrology_revision: u64,
+    /// Configured food scale, captured with the same publication.
+    pub food_max: f32,
+    /// Whether water samples come from an active hydrology layer.
+    pub hydrology_enabled: bool,
+    /// Row-major source samples, bounded before allocation during decode.
+    #[serde(deserialize_with = "decode_environment_cells")]
+    pub cells: Vec<RemoteEnvironmentCell>,
+}
+
+impl RemoteEnvironmentSnapshot {
+    /// Sample one immutable publication without taking an owner lock or advancing science.
+    ///
+    /// # Errors
+    /// Refuses inconsistent geometry, incomplete layers and invalid sampled values.
+    pub fn capture(snapshot: &RenderSnapshot) -> Result<Self, RemoteProtocolError> {
+        let terrain = &snapshot.layers.terrain;
+        let food = &snapshot.layers.food;
+        let source_len = usize::try_from(u64::from(terrain.width) * u64::from(terrain.height))
+            .map_err(|_| RemoteProtocolError::InvalidPayload("environment source dimensions"))?;
+        if terrain.width == 0
+            || terrain.height == 0
+            || terrain.cell_size == 0
+            || terrain.tiles.len() != source_len
+            || food.width != terrain.width
+            || food.height != terrain.height
+            || food.cells.len() != source_len
+            || snapshot.layers.hydrology.as_ref().is_some_and(|water| {
+                water.width != terrain.width
+                    || water.height != terrain.height
+                    || water.water_depth.len() != source_len
+            })
+        {
+            return Err(RemoteProtocolError::InvalidPayload(
+                "environment source layers",
+            ));
+        }
+        let width = terrain.width.min(REMOTE_ENVIRONMENT_MAX_SIDE);
+        let height = terrain.height.min(REMOTE_ENVIRONMENT_MAX_SIDE);
+        let projection_len = usize::try_from(width * height)
+            .map_err(|_| RemoteProtocolError::InvalidPayload("environment overview dimensions"))?;
+        let source_width = usize::try_from(terrain.width)
+            .map_err(|_| RemoteProtocolError::InvalidPayload("environment source width"))?;
+        let mut cells = Vec::with_capacity(projection_len);
+        for y in 0..height {
+            let source_y = usize::try_from(
+                (2 * u64::from(y) + 1) * u64::from(terrain.height) / (2 * u64::from(height)),
+            )
+            .map_err(|_| RemoteProtocolError::InvalidPayload("environment source row"))?;
+            for x in 0..width {
+                let source_x = usize::try_from(
+                    (2 * u64::from(x) + 1) * u64::from(terrain.width) / (2 * u64::from(width)),
+                )
+                .map_err(|_| RemoteProtocolError::InvalidPayload("environment source column"))?;
+                let index = source_y * source_width + source_x;
+                let tile = terrain.tiles[index];
+                cells.push(RemoteEnvironmentCell {
+                    terrain: tile.kind,
+                    elevation: tile.elevation,
+                    food: food.cells[index],
+                    water_depth: snapshot
+                        .layers
+                        .hydrology
+                        .as_ref()
+                        .map_or(0.0, |water| water.water_depth[index]),
+                });
+            }
+        }
+        let result = Self {
+            width,
+            height,
+            source_width: terrain.width,
+            source_height: terrain.height,
+            cell_size: terrain.cell_size,
+            terrain_revision: snapshot.layers.revisions.terrain.get(),
+            food_revision: snapshot.layers.revisions.food.get(),
+            hydrology_revision: snapshot.layers.revisions.hydrology.get(),
+            food_max: snapshot.config.food_max,
+            hydrology_enabled: snapshot.layers.hydrology.is_some(),
+            cells,
+        };
+        result.validate(&snapshot.world.world)?;
+        Ok(result)
+    }
+
+    fn validate(&self, world: &DynamicSnapshotWorld) -> Result<(), RemoteProtocolError> {
+        require_limit(
+            "environment cells",
+            self.cells.len(),
+            REMOTE_MAX_ENVIRONMENT_CELLS,
+        )?;
+        if self.width == 0
+            || self.height == 0
+            || self.width != self.source_width.min(REMOTE_ENVIRONMENT_MAX_SIDE)
+            || self.height != self.source_height.min(REMOTE_ENVIRONMENT_MAX_SIDE)
+            || self.cell_size == 0
+            || u64::from(self.source_width) * u64::from(self.cell_size) != u64::from(world.width)
+            || u64::from(self.source_height) * u64::from(self.cell_size) != u64::from(world.height)
+            || usize::try_from(self.width * self.height).ok() != Some(self.cells.len())
+            || !self.food_max.is_finite()
+            || self.food_max <= 0.0
+            || self.cells.iter().any(|cell| {
+                !cell.elevation.is_finite()
+                    || !cell.food.is_finite()
+                    || cell.food < 0.0
+                    || !cell.water_depth.is_finite()
+                    || cell.water_depth < 0.0
+                    || (!self.hydrology_enabled && cell.water_depth != 0.0)
+            })
+        {
+            return Err(RemoteProtocolError::InvalidPayload(
+                "environment geometry or values",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EnvironmentSource {
+    session: u128,
+    epoch: u64,
+    world: (u32, u32),
+    terrain: u64,
+    food: u64,
+    hydrology: u64,
+    config: u64,
+}
+
+/// One bounded cached overview; no queue of past publications is retained.
+#[derive(Debug, Clone, Default)]
+pub struct RemoteEnvironmentCache {
+    cached: Option<(EnvironmentSource, Arc<RemoteEnvironmentSnapshot>)>,
+}
+
+impl RemoteEnvironmentCache {
+    /// Reuse exact revisioned layers, rebuilding only when their source changes.
+    ///
+    /// # Errors
+    /// Propagates the same source refusals as [`RemoteEnvironmentSnapshot::capture`].
+    pub fn snapshot(
+        &mut self,
+        source: &RenderSnapshot,
+    ) -> Result<Arc<RemoteEnvironmentSnapshot>, RemoteProtocolError> {
+        let key = EnvironmentSource {
+            session: u128::from(source.session_id.get()),
+            epoch: source.world.epoch,
+            world: (source.world.world.width, source.world.world.height),
+            terrain: source.layers.revisions.terrain.get(),
+            food: source.layers.revisions.food.get(),
+            hydrology: source.layers.revisions.hydrology.get(),
+            config: source.revisions.config.get(),
+        };
+        if let Some((previous, value)) = &self.cached
+            && *previous == key
+        {
+            return Ok(Arc::clone(value));
+        }
+        let value = Arc::new(RemoteEnvironmentSnapshot::capture(source)?);
+        self.cached = Some((key, Arc::clone(&value)));
+        Ok(value)
+    }
 }
 
 /// Missing narrative ordinals explicitly reported before the page's retained suffix.
@@ -242,7 +450,7 @@ impl RemoteEventRecord {
 /// Fail-closed framing, allocation, or source-coherence refusal.
 #[derive(Debug, Error)]
 pub enum RemoteProtocolError {
-    /// A binary frame did not begin with the complete v1 framing header.
+    /// A binary frame did not begin with the complete framing header.
     #[error("missing or invalid remote frame magic")]
     InvalidMagic,
     /// The version is not implemented by this decoder.
@@ -283,6 +491,14 @@ impl RemoteFrame {
             return Err(RemoteProtocolError::InvalidPayload(
                 "invalid playback speed",
             ));
+        }
+        if let Some(environment) = &self.environment {
+            let RemoteFramePayload::Canvas(snapshot) = &self.payload else {
+                return Err(RemoteProtocolError::InvalidPayload(
+                    "environment on non-canvas channel",
+                ));
+            };
+            environment.validate(&snapshot.world)?;
         }
         match &self.payload {
             RemoteFramePayload::Telemetry(summary) => {
@@ -511,6 +727,12 @@ fn decode_agents<'de, D: Deserializer<'de>>(
     bounded_vec::<D, DynamicAgentSnapshot, REMOTE_MAX_AGENTS>(deserializer)
 }
 
+fn decode_environment_cells<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<RemoteEnvironmentCell>, D::Error> {
+    bounded_vec::<D, RemoteEnvironmentCell, REMOTE_MAX_ENVIRONMENT_CELLS>(deserializer)
+}
+
 fn decode_events<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Vec<RemoteSequencedEvent>, D::Error> {
@@ -638,6 +860,9 @@ mod tests {
             identity: RemoteFrameIdentity::from(publication.as_ref()),
             playback: publication.playback,
             coalesced_publications: 0,
+            environment: Some(Arc::new(
+                RemoteEnvironmentSnapshot::capture(&publication).unwrap(),
+            )),
             payload: RemoteFramePayload::Canvas(publication.world.clone()),
         }
     }
@@ -684,6 +909,8 @@ mod tests {
                 identity: RemoteFrameIdentity::from(snapshot.as_ref()),
                 playback: snapshot.playback,
                 coalesced_publications: 7,
+                environment: matches!(&payload, RemoteFramePayload::Canvas(_))
+                    .then(|| Arc::new(RemoteEnvironmentSnapshot::capture(&snapshot).unwrap())),
                 payload,
             };
             let decoded = decode_remote_frame(&encode_remote_frame(&frame).unwrap()).unwrap();
@@ -736,6 +963,7 @@ mod tests {
                 subject,
                 human_text: "population fell 50%".to_owned(),
             };
+            frame.environment = None;
             frame.payload = RemoteFramePayload::Events(RemoteEventPage {
                 after_event: 0,
                 earliest_retained: 1,
@@ -768,10 +996,10 @@ mod tests {
             Err(RemoteProtocolError::InvalidMagic)
         ));
         bad = bytes.clone();
-        bad[4..6].copy_from_slice(&2_u16.to_le_bytes());
+        bad[4..6].copy_from_slice(&1_u16.to_le_bytes());
         assert!(matches!(
             decode_remote_frame(&bad),
-            Err(RemoteProtocolError::UnsupportedVersion(2))
+            Err(RemoteProtocolError::UnsupportedVersion(1))
         ));
         bad = bytes.clone();
         bad.push(0);
@@ -842,6 +1070,158 @@ mod tests {
     }
 
     #[test]
+    fn environment_exact_samples_revisions_and_cache_preserve_owner_science() {
+        let host = host_with_narrative();
+        let before = host.scientific_digest_v1().unwrap();
+        let publication = host.latest_snapshot();
+        let mut cache = RemoteEnvironmentCache::default();
+        let first = cache.snapshot(&publication).unwrap();
+        assert_eq!(first.cells.len(), publication.layers.food.cells.len());
+        for (index, cell) in first.cells.iter().enumerate() {
+            assert_eq!(cell.terrain, publication.layers.terrain.tiles[index].kind);
+            assert_eq!(
+                cell.elevation.to_bits(),
+                publication.layers.terrain.tiles[index].elevation.to_bits()
+            );
+            assert_eq!(
+                cell.food.to_bits(),
+                publication.layers.food.cells[index].to_bits()
+            );
+            assert_eq!(
+                cell.water_depth.to_bits(),
+                publication
+                    .layers
+                    .hydrology
+                    .as_ref()
+                    .map_or(0.0, |water| water.water_depth[index])
+                    .to_bits()
+            );
+        }
+        let repeated = cache.snapshot(&publication).unwrap();
+        assert!(Arc::ptr_eq(&first, &repeated));
+        let mut changed = (*publication).clone();
+        changed.revisions.control = crate::ControlRevision::new(100);
+        changed.revision = crate::SnapshotRevision::new(100);
+        assert!(Arc::ptr_eq(&first, &cache.snapshot(&changed).unwrap()));
+        changed.layers.revisions.food = crate::LayerRevision::new(first.food_revision + 1);
+        Arc::make_mut(&mut changed.layers.food).cells[0] = 0.125;
+        let next = cache.snapshot(&changed).unwrap();
+        assert!(!Arc::ptr_eq(&first, &next));
+        assert_eq!(next.cells[0].food.to_bits(), 0.125_f32.to_bits());
+        changed.session_id = HostSessionId::new(999);
+        let new_session = cache.snapshot(&changed).unwrap();
+        assert!(!Arc::ptr_eq(&next, &new_session));
+        changed.world.epoch += 1;
+        assert!(!Arc::ptr_eq(
+            &new_session,
+            &cache.snapshot(&changed).unwrap()
+        ));
+        assert_eq!(host.scientific_digest_v1().unwrap(), before);
+    }
+
+    #[test]
+    fn environment_overview_covers_large_non_square_grid_with_bounded_center_samples() {
+        let host = host_with_narrative();
+        let mut source = (*host.latest_snapshot()).clone();
+        source.world.world.width = 259;
+        source.world.world.height = 131;
+        let terrain = Arc::make_mut(&mut source.layers.terrain);
+        let tile = terrain.tiles[0];
+        terrain.width = 259;
+        terrain.height = 131;
+        terrain.cell_size = 1;
+        terrain.tiles = vec![tile; 259 * 131];
+        let food = Arc::make_mut(&mut source.layers.food);
+        food.width = 259;
+        food.height = 131;
+        food.cells = (0..259 * 131_u16).map(f32::from).collect();
+        source.layers.hydrology = None;
+        let view = RemoteEnvironmentSnapshot::capture(&source).unwrap();
+        assert_eq!((view.width, view.height), (128, 128));
+        assert_eq!(view.cells.len(), REMOTE_MAX_ENVIRONMENT_CELLS);
+        assert_eq!(
+            (view.source_width, view.source_height, view.cell_size),
+            (259, 131, 1)
+        );
+        assert_eq!(view.cells[0].food.to_bits(), 1.0_f32.to_bits());
+        assert_eq!(view.cells[127].food.to_bits(), 257.0_f32.to_bits());
+        assert_eq!(
+            view.cells[127 * 128].food.to_bits(),
+            f32::from(130 * 259 + 1_u16).to_bits()
+        );
+        assert_eq!(
+            view.cells[128 * 128 - 1].food.to_bits(),
+            f32::from(130 * 259 + 257_u16).to_bits()
+        );
+        assert_eq!(
+            postcard::from_bytes::<RemoteEnvironmentSnapshot>(
+                &postcard::to_allocvec(&view).unwrap()
+            )
+            .unwrap(),
+            view
+        );
+    }
+
+    #[test]
+    fn environment_decode_refuses_geometry_values_channel_mix_and_allocation_attacks() {
+        let valid = canvas_frame();
+        let mut invalid = valid.clone();
+        let env = Arc::make_mut(invalid.environment.as_mut().unwrap());
+        env.width = 1;
+        env.source_width = 1;
+        env.cells.truncate(2);
+        assert!(
+            encode_remote_frame(&invalid).is_err(),
+            "a coherent smaller grid must not hide half the world"
+        );
+        assert!(decode_remote_frame(&unchecked_frame(&invalid)).is_err());
+        for bad in [f32::NAN, f32::INFINITY, -0.5] {
+            let mut invalid = valid.clone();
+            Arc::make_mut(invalid.environment.as_mut().unwrap()).cells[0].food = bad;
+            assert!(encode_remote_frame(&invalid).is_err());
+            assert!(decode_remote_frame(&unchecked_frame(&invalid)).is_err());
+        }
+        let mut invalid = valid.clone();
+        Arc::make_mut(invalid.environment.as_mut().unwrap()).cells[0].water_depth = 1.0;
+        assert!(
+            encode_remote_frame(&invalid).is_err(),
+            "disabled hydrology cannot fabricate water"
+        );
+        invalid.payload = RemoteFramePayload::Events(RemoteEventPage {
+            after_event: 0,
+            earliest_retained: 1,
+            latest_event: 0,
+            gap: None,
+            events: Vec::new(),
+        });
+        assert!(
+            decode_remote_frame(&unchecked_frame(&invalid)).is_err(),
+            "non-canvas channel cannot carry environment"
+        );
+        let mut env = valid.environment.unwrap().as_ref().clone();
+        env.cells.clear();
+        let mut attack = postcard::to_allocvec(&env).unwrap();
+        assert_eq!(attack.pop(), Some(0));
+        attack.extend(postcard::to_allocvec(&usize::MAX).unwrap());
+        assert!(postcard::from_bytes::<RemoteEnvironmentSnapshot>(&attack).is_err());
+        env.cells = vec![
+            RemoteEnvironmentCell {
+                terrain: TerrainKind::Grass,
+                elevation: 0.0,
+                food: 0.0,
+                water_depth: 0.0
+            };
+            REMOTE_MAX_ENVIRONMENT_CELLS + 1
+        ];
+        assert!(
+            postcard::from_bytes::<RemoteEnvironmentSnapshot>(
+                &postcard::to_allocvec(&env).unwrap()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn event_caps_continuity_and_explicit_gaps_are_validated_on_both_sides() {
         let mut frame = canvas_frame();
         let record = RemoteEventRecord {
@@ -863,6 +1243,7 @@ mod tests {
             REMOTE_MAX_EVENTS,
             REMOTE_MAX_EVENTS + 1,
         ] {
+            frame.environment = None;
             frame.payload = RemoteFramePayload::Events(RemoteEventPage {
                 after_event: 2,
                 earliest_retained: 5,

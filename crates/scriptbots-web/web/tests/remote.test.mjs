@@ -3,13 +3,92 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { RemoteFrameTracker, RemoteStreamClient, consumeRemoteFrame } from "../remote.js";
+import { EnvironmentRaster, environmentDescription } from "../renderers/environment.js";
 
 const SESSION = "340282366920938463463374607431768211455";
 const COMMAND = "1234567890abcdef1234567890abcdef";
 
+function environment() {
+  return { width: 2, height: 2, sourceWidth: 2, sourceHeight: 2, cellSize: 40,
+    terrainRevision: "1", foodRevision: "2", hydrologyRevision: "3", foodMax: 0.5,
+    hydrologyEnabled: true, cells: [
+      { terrain: "Grass", elevation: 0, food: 0, waterDepth: 0 },
+      { terrain: "Sand", elevation: 1, food: 0.5, waterDepth: 0 },
+      { terrain: "DeepWater", elevation: 0, food: 0, waterDepth: 0.15 },
+      { terrain: "Rock", elevation: 0.5, food: 0.25, waterDepth: 1 },
+    ] };
+}
+
+test("environment modes show actual food and water while retaining the full source extent", () => {
+  const raster = new EnvironmentRaster();
+  const env = environment();
+  const world = { width: 80, height: 80 };
+  const identity = { sessionId: SESSION };
+  const food = raster.update(env, identity, world, "food");
+  assert.deepEqual(Array.from(food.pixels.slice(0, 8)), [18, 27, 37, 255, 120, 180, 48, 255]);
+  assert.deepEqual(food.coverage, [1, 1]);
+  const water = raster.update(env, identity, world, "water");
+  assert.deepEqual(Array.from(water.pixels.slice(8, 12)), [29, 80, 116, 255]);
+  const terrain = raster.update(env, identity, world, "terrain");
+  assert.deepEqual(Array.from(terrain.pixels.slice(0, 4)), [44, 65, 34, 255]);
+  assert.notDeepEqual(terrain.pixels, raster.update(env, identity, world, "combined").pixels);
+  assert.match(environmentDescription(env), /exact cell view/);
+});
+
+test("environment cache is bounded to one revisioned view and cannot leak another session", () => {
+  const raster = new EnvironmentRaster();
+  const env = environment();
+  const world = { width: 80, height: 80 };
+  const identity = { sessionId: SESSION };
+  const first = raster.update(env, identity, world);
+  assert.equal(raster.update(env, { ...identity, publicationRevision: "200" }, world), first);
+  const next = { ...env, foodRevision: "4", cells: env.cells.map((cell) => ({ ...cell, food: 0 })) };
+  const changed = raster.update(next, identity, world);
+  assert.notEqual(changed, first);
+  assert.notDeepEqual(changed.pixels, first.pixels);
+  const session = raster.update(next, { sessionId: "1" }, world);
+  assert.notEqual(session, changed);
+  assert.notEqual(raster.update(next, { sessionId: "1" }, world, "combined", 1), session);
+  assert.equal(raster.update(null, identity, world), null);
+  assert.equal(raster.current, null);
+  assert.equal(raster.update(env, identity, world, "agents"), null);
+  assert.match(environmentDescription(null), /unavailable/);
+});
+
+test("replacing a same-seed owner invalidates environment despite repeated revisions", () => {
+  const raster = new EnvironmentRaster();
+  const identity = { sessionId: "11" };
+  const world = { width: 80, height: 80 };
+  const first = raster.update(environment(), identity, world, "food", 0, 1);
+  const replacement = environment();
+  replacement.cells[1].food = 0;
+  const next = raster.update(replacement, identity, world, "food", 0, 2);
+  assert.notEqual(next, first);
+  assert.deepEqual(Array.from(next.pixels.slice(4, 8)), [18, 27, 37, 255]);
+  assert.equal(raster.update(replacement, identity, world, "food", 0, 2), next);
+});
+
+test("environment bounds reject shortened worlds, hostile cardinalities and invalid source values", () => {
+  const identity = { sessionId: SESSION };
+  const world = { width: 80, height: 80 };
+  const paint = (env) => new EnvironmentRaster().update(env, identity, world);
+  assert.throws(() => paint({ ...environment(), width: 1, sourceWidth: 1,
+    cells: environment().cells.slice(0, 2) }), /disagrees/);
+  assert.throws(() => paint({ ...environment(), cells: Array(128 * 128 + 1).fill(environment().cells[0]) }), /bounds/);
+  for (const value of [NaN, Infinity, -1]) {
+    const invalid = environment();
+    invalid.cells[0].food = value;
+    assert.throws(() => paint(invalid), /invalid source/);
+  }
+  assert.throws(() => paint({ ...environment(), terrainRevision: "18446744073709551616" }), /bounds/);
+  assert.throws(() => paint({ ...environment(), hydrologyEnabled: false }), /invalid source/);
+  const sampled = { ...environment(), width: 128, height: 128, sourceWidth: 1000, sourceHeight: 500 };
+  assert.match(environmentDescription(sampled), /center-sampled overview/);
+});
+
 function frame(kind, revision, { tick = 20, paused = true, payload } = {}) {
   return {
-    schema: "scriptbots.remote-frame.v1",
+    schema: "scriptbots.remote-frame.v2",
     kind,
     identity: { sessionId: SESSION, publicationRevision: String(revision),
       scientificRevision: String(tick), controlRevision: "4", configRevision: "2", tick: String(tick) },
@@ -166,7 +245,7 @@ test("publication identities and observed playback must remain coherent across s
   mismatchedTick.payload.tick = 19;
   assert.throws(() => value.accept(mismatchedTick, () => assert.fail()), /payload tick/);
   const wrongSchema = frame("canvas", "11");
-  wrongSchema.schema = "scriptbots.remote-frame.v2";
+  wrongSchema.schema = "scriptbots.remote-frame.v1";
   assert.throws(() => value.accept(wrongSchema, () => assert.fail()), /unnegotiated/);
   const rounded = frame("canvas", "11");
   rounded.identity.publicationRevision = 11;
@@ -253,7 +332,7 @@ test("subscription acknowledgement gates all binary decoding and refuses unrelat
   value.receive(JSON.stringify({ protocol_version: 1, type: "stream_rate",
     requested_interval_us: 16667, effective_interval_us: 66668, reason: "slow_consumer" }));
   assert.equal(value.state, "subscribing");
-  const ack = { protocol_version: 1, stream_protocol_version: 1, type: "subscribed",
+  const ack = { protocol_version: 1, stream_protocol_version: 2, type: "subscribed",
     request_id: "subscription-1", session_id: SESSION, channels: ["canvas", "events"], max_fps: 60 };
   assert.throws(() => value.receive(JSON.stringify({ ...ack, request_id: "unknown" })), /does not match/);
   assert.equal(value.state, "subscribing");

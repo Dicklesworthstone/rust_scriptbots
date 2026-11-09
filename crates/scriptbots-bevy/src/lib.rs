@@ -1023,6 +1023,9 @@ struct SnapshotInbox {
 /// The weak publisher also lets the worker notice when its consumer disappears.
 struct SnapshotPublisher {
     pending: Weak<Mutex<Option<WorldSnapshot>>>,
+    // This is producer history, not consumer history. A renderer which skips
+    // ten frames still receives the last two observed science cuts.
+    motion: Mutex<Option<SnapshotMotion>>,
 }
 
 impl SnapshotInbox {
@@ -1031,6 +1034,7 @@ impl SnapshotInbox {
         (
             SnapshotPublisher {
                 pending: Arc::downgrade(&pending),
+                motion: Mutex::new(None),
             },
             Self { pending },
         )
@@ -1046,9 +1050,23 @@ impl SnapshotInbox {
 
 impl SnapshotPublisher {
     fn publish(&self, snapshot: WorldSnapshot) -> bool {
+        self.publish_at(snapshot, Instant::now())
+    }
+
+    fn publish_at(&self, mut snapshot: WorldSnapshot, observed_at: Instant) -> bool {
         let Some(pending) = self.pending.upgrade() else {
             return false;
         };
+        // Pose extraction and old-vector destruction never hold the inbox
+        // lock. Only this publisher touches its compact two-cut history.
+        let mut history = self
+            .motion
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let motion = SnapshotMotion::advance(history.as_ref(), &snapshot, observed_at);
+        *history = Some(motion.clone());
+        snapshot.motion = Some(motion);
+        drop(history);
         // Only exchange ownership under the lock. Allocation, projection, and
         // destruction of the displaced world's vectors happen outside it.
         // No producer waits for the renderer to free queue capacity.
@@ -1060,6 +1078,250 @@ impl SnapshotPublisher {
         true
     }
 }
+
+/// A compact scientific pose, with no render-frame integration or arena-index
+/// association. Non-positional cues continue to switch at the committed cut.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MotionPose {
+    id: AgentId,
+    position: Vec2,
+    velocity: Vec2,
+    heading: f32,
+    spike_length: f32,
+}
+
+impl From<&AgentVisual> for MotionPose {
+    fn from(agent: &AgentVisual) -> Self {
+        Self {
+            id: agent.id,
+            position: agent.position,
+            velocity: agent.velocity,
+            heading: agent.heading,
+            spike_length: agent.spike_length,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq)]
+struct MotionCut {
+    source: Option<(scriptbots_runtime::BrainProjectionSource, u64)>,
+    tick: u64,
+    world_size: Vec2,
+    radius: f32,
+    paused: bool,
+    reduced_motion: bool,
+    observed_at: Instant,
+    poses: HashMap<AgentUid, MotionPose>,
+}
+
+impl MotionCut {
+    fn from_snapshot(snapshot: &WorldSnapshot, observed_at: Instant) -> Self {
+        Self {
+            source: snapshot.owner_source,
+            tick: snapshot.tick,
+            world_size: snapshot.world_size,
+            radius: snapshot.agent_radius,
+            paused: snapshot.paused,
+            reduced_motion: snapshot.reduced_motion,
+            observed_at,
+            poses: snapshot
+                .agents
+                .iter()
+                .map(|agent| (agent.uid, MotionPose::from(agent)))
+                .collect(),
+        }
+    }
+
+    fn same_science_cut(&self, snapshot: &WorldSnapshot) -> bool {
+        let same_source = match (self.source, snapshot.owner_source) {
+            (Some((a, ae)), Some((b, be))) => {
+                ae == be
+                    && a.session_id == b.session_id
+                    && a.inspected_tick.0 == self.tick
+                    && b.inspected_tick.0 == snapshot.tick
+                    && a.published_host == a.inspected_host
+                    && b.published_host == b.inspected_host
+                    && a.inspected_host.scientific == b.inspected_host.scientific
+                    && a.inspected_host.config == b.inspected_host.config
+                    && b.published_snapshot >= a.published_snapshot
+            }
+            (None, None) => true,
+            _ => false,
+        };
+        same_source
+            && self.tick == snapshot.tick
+            && self.world_size == snapshot.world_size
+            && self.radius == snapshot.agent_radius
+            && self.paused == snapshot.paused
+            && self.reduced_motion == snapshot.reduced_motion
+            && self.poses.len() == snapshot.agents.len()
+            && snapshot
+                .agents
+                .iter()
+                .all(|agent| self.poses.get(&agent.uid) == Some(&MotionPose::from(agent)))
+    }
+
+    fn can_follow(&self, previous: &Self) -> bool {
+        let Some(ticks) = self.tick.checked_sub(previous.tick).filter(|ticks| *ticks > 0) else {
+            return false;
+        };
+        let (Some((before, before_epoch)), Some((after, after_epoch))) =
+            (previous.source, self.source)
+        else {
+            // Standalone captures explicitly validate their two supplied
+            // worlds. A live producer must have an actual owner identity.
+            return false;
+        };
+        !self.paused
+            && !previous.paused
+            && !self.reduced_motion
+            && !previous.reduced_motion
+            && self.world_size == previous.world_size
+            && self.world_size.is_finite()
+            && self.world_size.min_element() > 0.0
+            && self.radius == previous.radius
+            && before.session_id == after.session_id
+            && before_epoch == after_epoch
+            && after.published_snapshot > before.published_snapshot
+            && before.inspected_tick.0 == previous.tick
+            && after.inspected_tick.0 == self.tick
+            && before.published_host == before.inspected_host
+            && after.published_host == after.inspected_host
+            && before.inspected_host.config == after.inspected_host.config
+            // A skipped optional publication is fine. An extra scientific
+            // revision means a non-tick edit happened between the cuts.
+            && after
+                .inspected_host
+                .scientific
+                .get()
+                .checked_sub(before.inspected_host.scientific.get())
+                == Some(ticks)
+            && self.observed_at > previous.observed_at
+    }
+}
+
+/// Exactly two compact producer-observed cuts. Latest-only delivery cannot
+/// grow this into a history; a late frame clamps to the committed endpoint.
+#[derive(Clone, PartialEq)]
+struct SnapshotMotion {
+    previous: Option<Arc<MotionCut>>,
+    current: Arc<MotionCut>,
+}
+
+impl SnapshotMotion {
+    fn advance(previous: Option<&Self>, snapshot: &WorldSnapshot, observed_at: Instant) -> Self {
+        if let Some(previous) = previous
+            && previous.current.same_science_cut(snapshot)
+        {
+            // Inspector, selection and other control-only publications must
+            // neither restart motion nor replace its measured time interval.
+            return previous.clone();
+        }
+        let current = Arc::new(MotionCut::from_snapshot(snapshot, observed_at));
+        let previous = previous
+            .map(|pair| &pair.current)
+            .filter(|previous| current.can_follow(previous))
+            .cloned();
+        Self { previous, current }
+    }
+
+    fn alpha_at(&self, now: Instant) -> f32 {
+        let Some(previous) = &self.previous else {
+            return 1.0;
+        };
+        let span = self.current.observed_at.duration_since(previous.observed_at);
+        let elapsed = now.saturating_duration_since(self.current.observed_at);
+        (elapsed.as_secs_f64() / span.as_secs_f64()).clamp(0.0, 1.0) as f32
+    }
+
+    fn pose(&self, uid: AgentUid, alpha: f32) -> Option<MotionPose> {
+        let current = *self.current.poses.get(&uid)?;
+        let previous = self
+            .previous
+            .as_ref()
+            .and_then(|cut| cut.poses.get(&uid))
+            .copied();
+        let Some(previous) = previous else {
+            return Some(current);
+        };
+        let ticks = self.current.tick.saturating_sub(self.previous.as_ref()?.tick);
+        Some(interpolate_motion_pose(
+            previous,
+            current,
+            self.current.world_size,
+            self.current.radius,
+            ticks,
+            alpha,
+        ))
+    }
+}
+
+fn interpolate_motion_pose(
+    previous: MotionPose,
+    current: MotionPose,
+    world_size: Vec2,
+    radius: f32,
+    ticks: u64,
+    alpha: f32,
+) -> MotionPose {
+    // UID continuity is checked by the map lookup; a changed arena handle for
+    // that UID is still a discontinuity, never permission to blend two lives.
+    if previous.id != current.id
+        || ticks == 0
+        || !alpha.is_finite()
+        || !previous.position.is_finite()
+        || !current.position.is_finite()
+        || !previous.velocity.is_finite()
+        || !current.velocity.is_finite()
+        || !previous.heading.is_finite()
+        || !current.heading.is_finite()
+        || !world_size.is_finite()
+        || world_size.min_element() <= 0.0
+        || !radius.is_finite()
+        || !previous.spike_length.is_finite()
+        || !current.spike_length.is_finite()
+    {
+        return current;
+    }
+    let alpha = alpha.clamp(0.0, 1.0);
+    if alpha >= 1.0 {
+        return current;
+    }
+    let delta = Vec2::new(
+        toroidal_delta(current.position.x, previous.position.x, world_size.x),
+        toroidal_delta(current.position.y, previous.position.y, world_size.y),
+    );
+    // Without the intermediate trajectory a multi-wrap jump is ambiguous.
+    // Snap instead of inventing a path. The velocity allowance permits fast
+    // valid motion and skipped frames; the radius allowance tolerates turns
+    // and collisions whose endpoint velocities differ from their mean.
+    let travel = previous.velocity.length().max(current.velocity.length()) * ticks as f32;
+    let allowance = (travel + radius.max(0.0) * 2.0).min(world_size.min_element() * 0.5);
+    if !travel.is_finite()
+        || travel >= world_size.min_element() * 0.5
+        || delta.length() > allowance
+    {
+        return current;
+    }
+    if alpha <= 0.0 {
+        return previous;
+    }
+    let position = previous.position + delta * alpha;
+    MotionPose {
+        position: Vec2::new(
+            position.x.rem_euclid(world_size.x),
+            position.y.rem_euclid(world_size.y),
+        ),
+        heading: previous.heading
+            + toroidal_delta(current.heading, previous.heading, std::f32::consts::TAU) * alpha,
+        spike_length: previous.spike_length
+            + (current.spike_length - previous.spike_length) * alpha,
+        ..current
+    }
+}
+
+#[derive(Component, Clone, Copy)]
+struct AgentMotionKey(AgentUid);
 
 #[derive(Default, Resource)]
 pub(crate) struct SnapshotState {
@@ -1185,7 +1447,6 @@ struct AgentDisplayPose {
 struct AgentGroundFootprint {
     radius: f32,
     spike_extension: f32,
-    spike: Option<Entity>,
 }
 
 /// A visible selection marker follows the displayed root over terrain.
@@ -1207,111 +1468,85 @@ struct WheelSuspensionJoint {
     wheel: Entity,
 }
 
-// Approximately 95% convergence in 100 ms, independent of render frame rate.
-const AGENT_POSE_RESPONSE: f32 = 30.0;
-
 #[derive(Resource)]
 struct AgentMotionSettings {
     enabled: bool,
 }
 
-fn smooth_toroidal_axis(current: f32, target: f32, extent: f32, blend: f32) -> f32 {
-    if !extent.is_finite() || extent <= 0.0 {
-        return current + (target - current) * blend;
-    }
-    let half = extent * 0.5;
-    let delta = toroidal_delta(target, current, extent);
-    (current + delta * blend + half).rem_euclid(extent) - half
-}
-
 fn smooth_agent_poses(
-    time: Res<Time>,
     state: Res<SnapshotState>,
     settings: Option<Res<AgentMotionSettings>>,
-    spikes: Query<(&SpikePoseTarget, Option<&SpikeDisplayPose>)>,
     mut agents: Query<(
         &AgentPoseTarget,
         &mut AgentDisplayPose,
         &mut Transform,
         Option<&AgentGroundFootprint>,
+        Option<&AgentMotionKey>,
     )>,
 ) {
-    let blend = -(-time.delta_secs() * AGENT_POSE_RESPONSE).exp_m1();
     let paused = state
         .latest
         .as_ref()
         .is_some_and(|snapshot| snapshot.paused);
-    for (target, mut display, mut transform, footprint) in &mut agents {
+    for (target, mut display, mut transform, footprint, key) in &mut agents {
         let snap_to_target = paused
             || settings.as_ref().is_some_and(|settings| !settings.enabled)
             || target.tick < display.previous_target.tick;
-        if snap_to_target {
-            // A committed pause (including a paused single step) presents the
-            // exact observed pose immediately. It must not keep converging
-            // while the inspector reports a stationary scientific tick.
-            display.translation = target.translation;
-            display.rotation = target.rotation;
-        } else {
-            // X/Z are toroidal world axes. Ease along their shortest wrapped
-            // displacement so crossing a seam does not teleport an otherwise
-            // continuously moving stable agent across the whole viewport.
-            let mut translation = display.translation.lerp(target.translation, blend);
-            translation.x = smooth_toroidal_axis(
-                display.translation.x,
-                target.translation.x,
-                state.world_size.x,
-                blend,
-            );
-            translation.z = smooth_toroidal_axis(
-                display.translation.z,
-                target.translation.z,
-                state.world_size.y,
-                blend,
-            );
-            display.translation = translation;
-            display.rotation = display.rotation.slerp(target.rotation, blend);
-        }
-        if !snap_to_target && let (Some(snapshot), Some(footprint)) = (&state.latest, footprint) {
-            let mut footprint = *footprint;
-            if let Some((spike_target, spike_display)) =
-                footprint.spike.and_then(|spike| spikes.get(spike).ok())
-            {
-                let length = spike_display.map_or(spike_target.transform.scale.y, |display| {
-                    if paused
-                        || settings.as_ref().is_some_and(|settings| !settings.enabled)
-                        || spike_target.tick < display.tick
-                    {
-                        spike_target.transform.scale.y
-                    } else {
-                        display.transform.scale.y
-                            + (spike_target.transform.scale.y - display.transform.scale.y) * blend
-                    }
-                });
-                footprint.spike_extension = (length - 0.65 * footprint.radius).max(0.0);
+        // Start from the endpoint every time. No prior displayed transform or
+        // render delta participates in a scientific pose sample.
+        display.translation = target.translation;
+        display.rotation = target.rotation;
+        if !snap_to_target
+            && let (Some(snapshot), Some(key)) = (&state.latest, key)
+            && target.tick == snapshot.tick
+            && let Some(pose) = sampled_motion_pose(snapshot, key.0)
+        {
+            display.translation.x = pose.position.x - snapshot.world_size.x * 0.5;
+            display.translation.z = snapshot.world_size.y * 0.5 - pose.position.y;
+            display.rotation = Quat::from_rotation_y(pose.heading);
+            if let Some(footprint) = footprint {
+                let footprint = AgentGroundFootprint {
+                    spike_extension: pose.spike_length.max(0.0),
+                    ..*footprint
+                };
+                display.rotation = terrain_agent_rotation(
+                    &snapshot.terrain_height,
+                    pose.position,
+                    pose.heading,
+                    footprint.radius,
+                );
+                display.translation.y = terrain_footprint_height(
+                    &snapshot.terrain_height,
+                    pose.position,
+                    display.rotation,
+                    footprint,
+                );
             }
-            let world_position = Vec2::new(
-                display.translation.x + snapshot.world_size.x * 0.5,
-                snapshot.world_size.y * 0.5 - display.translation.z,
-            );
-            let forward = display.rotation * Vec3::X;
-            let heading = (-forward.z).atan2(forward.x);
-            display.rotation = terrain_agent_rotation(
-                &snapshot.terrain_height,
-                world_position,
-                heading,
-                footprint.radius,
-            );
-            display.translation.y = terrain_footprint_height(
-                &snapshot.terrain_height,
-                world_position,
-                display.rotation,
-                footprint,
-            );
         }
         display.previous_target = *target;
         transform.translation = display.translation;
         transform.rotation = display.rotation;
     }
+}
+
+fn sampled_motion_pose(snapshot: &WorldSnapshot, uid: AgentUid) -> Option<MotionPose> {
+    let motion = snapshot.motion.as_ref()?;
+    if snapshot.paused
+        || snapshot.reduced_motion
+        || snapshot.motion_alpha >= 1.0
+        || motion.current.tick != snapshot.tick
+        || motion.current.world_size != snapshot.world_size
+    {
+        return None;
+    }
+    let pose = motion.pose(uid, snapshot.motion_alpha)?;
+    let current = motion.current.poses.get(&uid)?;
+    // New agents, teleports and completed intervals use the exact endpoint
+    // transform, including its terrain orientation, without round-trip math.
+    (pose.position != current.position
+        || pose.heading != current.heading
+        || pose.spike_length != current.spike_length)
+        .then_some(pose)
 }
 
 fn displayed_agent_position(
@@ -1325,6 +1560,46 @@ fn displayed_agent_position(
             world_size.y * 0.5 - pose.translation.z,
         )
     })
+}
+
+fn displayed_follow_target(
+    snapshot: &WorldSnapshot,
+    mode: FollowMode,
+    mut position: impl FnMut(&AgentVisual) -> Option<Vec2>,
+) -> Option<Vec2> {
+    if mode == FollowMode::Off {
+        return None;
+    }
+    let mut has_display = false;
+    let mut first = None;
+    let mut selected = None::<(Vec2, Vec2)>;
+    let mut oldest = None::<(u32, Vec2)>;
+    for agent in &snapshot.agents {
+        let displayed = position(agent);
+        has_display |= displayed.is_some();
+        let position = displayed.unwrap_or(agent.position);
+        first.get_or_insert(position);
+        if agent.selection == SelectionState::Selected {
+            selected = Some(selected.map_or((position, position), |(min, max)| {
+                (min.min(position), max.max(position))
+            }));
+        }
+        if oldest.is_none_or(|(age, _)| agent.age > age) {
+            oldest = Some((agent.age, position));
+        }
+    }
+    if !has_display {
+        return None;
+    }
+    let selected = selected.map(|(min, max)| (min + max) * 0.5);
+    match mode {
+        FollowMode::Off => None,
+        FollowMode::Selected => selected.or(first),
+        FollowMode::Oldest => oldest
+            .map(|(_, position)| position)
+            .or(selected)
+            .or(first),
+    }
 }
 
 /// Project a pointer ray onto the height of the displayed creature, then map
@@ -1363,7 +1638,6 @@ struct SpikeDisplayPose {
 
 fn smooth_spike_poses(
     mut commands: Commands,
-    time: Res<Time>,
     state: Option<Res<SnapshotState>>,
     settings: Option<Res<AgentMotionSettings>>,
     mut spikes: Query<(
@@ -1371,39 +1645,45 @@ fn smooth_spike_poses(
         &SpikePoseTarget,
         Option<&mut SpikeDisplayPose>,
         &mut Transform,
+        Option<&AgentMotionKey>,
     )>,
 ) {
-    let blend = -(-time.delta_secs() * AGENT_POSE_RESPONSE).exp_m1();
     let paused = state
         .as_ref()
         .and_then(|state| state.latest.as_ref())
         .is_some_and(|snapshot| snapshot.paused);
-    for (entity, target, display, mut transform) in &mut spikes {
-        let Some(mut display) = display else {
-            // First native frame starts at the exact snapshot pose. Capture
-            // never installs this system and therefore has no display state.
-            *transform = target.transform;
+    for (entity, target, display, mut transform, key) in &mut spikes {
+        let mut sampled = target.transform;
+        if !paused
+            && settings.as_ref().is_none_or(|settings| settings.enabled)
+            && display
+                .as_ref()
+                .is_none_or(|display| target.tick >= display.tick)
+            && let (Some(snapshot), Some(key)) =
+                (state.as_ref().and_then(|state| state.latest.as_ref()), key)
+            && target.tick == snapshot.tick
+            && let Some(pose) = sampled_motion_pose(snapshot, key.0)
+            && let Some(current) = snapshot
+                .motion
+                .as_ref()
+                .and_then(|motion| motion.current.poses.get(&key.0))
+        {
+            let extension = pose.spike_length.max(0.0) - current.spike_length.max(0.0);
+            sampled.translation.x += extension * 0.5;
+            sampled.scale.y += extension;
+        }
+        if let Some(mut display) = display {
+            display.transform = sampled;
+            display.tick = target.tick;
+        } else {
+            // A stalled renderer's first frame may already have a valid
+            // producer pair. Root and spike must use its same fraction.
             commands.entity(entity).insert(SpikeDisplayPose {
-                transform: target.transform,
+                transform: sampled,
                 tick: target.tick,
             });
-            continue;
-        };
-        if paused
-            || settings.as_ref().is_some_and(|settings| !settings.enabled)
-            || target.tick < display.tick
-        {
-            display.transform = target.transform;
-        } else {
-            display.transform.translation = display
-                .transform
-                .translation
-                .lerp(target.transform.translation, blend);
-            display.transform.scale = display.transform.scale.lerp(target.transform.scale, blend);
-            display.transform.rotation = target.transform.rotation;
         }
-        display.tick = target.tick;
-        *transform = display.transform;
+        *transform = sampled;
     }
 }
 
@@ -3743,6 +4023,10 @@ pub(crate) struct WorldSnapshot {
     tick: u64,
     /// Exact owner publication identity; standalone captures have no owner port.
     owner_source: Option<(scriptbots_runtime::BrainProjectionSource, u64)>,
+    /// Compact observed producer cuts, separate from scientific state.
+    motion: Option<SnapshotMotion>,
+    /// One shared presentation fraction for every pose reader this frame.
+    motion_alpha: f32,
     reduced_motion: bool,
     paused: bool,
     world_size: Vec2,
@@ -4427,6 +4711,8 @@ impl WorldSnapshot {
                 },
                 snapshot.world.epoch,
             )),
+            motion: None,
+            motion_alpha: 1.0,
             reduced_motion: config.render.reduced_motion.unwrap_or(false),
             paused: snapshot.playback.paused,
             world_size: Vec2::new(width, height),
@@ -4616,6 +4902,8 @@ impl WorldSnapshot {
             revision: 1,
             tick: world.tick().0,
             owner_source: None,
+            motion: None,
+            motion_alpha: 1.0,
             reduced_motion: config.render.reduced_motion.unwrap_or(false),
             paused: false,
             world_size: Vec2::new(width, height),
@@ -5746,6 +6034,12 @@ fn poll_snapshots(
     if let Some(snapshot) = inbox.take_latest() {
         motion.enabled = !snapshot.reduced_motion;
         state.latest = Some(snapshot);
+    }
+    if let Some(snapshot) = state.latest.as_mut() {
+        snapshot.motion_alpha = snapshot
+            .motion
+            .as_ref()
+            .map_or(1.0, |motion| motion.alpha_at(Instant::now()));
     }
 }
 
@@ -14783,7 +15077,11 @@ fn settle_clicked_follow(
 fn control_camera(
     time: Res<Time>,
     mut rig: ResMut<CameraRig>,
-    state: Res<SnapshotState>,
+    (state, registry, display_poses): (
+        Res<SnapshotState>,
+        Option<Res<AgentRegistry>>,
+        Query<&AgentDisplayPose>,
+    ),
     mut observed_selection: Local<bool>,
     motion: Option<Res<AgentMotionSettings>>,
     feedback: Option<Res<NativeCommandFeedback>>,
@@ -15019,7 +15317,7 @@ fn control_camera(
         rig.free_edge_anchor = Some(rig.focus_smoothed);
     }
 
-    let follow_target = match rig.follow_mode {
+    let authoritative_follow = match rig.follow_mode {
         FollowMode::Off => None,
         FollowMode::Selected => state.selection_center.or(state.first_agent_position),
         FollowMode::Oldest => state
@@ -15027,6 +15325,25 @@ fn control_camera(
             .or(state.selection_center)
             .or(state.first_agent_position),
     };
+
+    let follow_target = registry
+        .as_ref()
+        .and_then(|registry| {
+            state.latest.as_ref().and_then(|snapshot| {
+                displayed_follow_target(snapshot, rig.follow_mode, |agent| {
+                    registry.records.get(&agent.uid).and_then(|record| {
+                        display_poses.get(record.root).ok().map(|display| {
+                            displayed_agent_position(
+                                agent.position,
+                                Some(display),
+                                snapshot.world_size,
+                            )
+                        })
+                    })
+                })
+            })
+        })
+        .or(authoritative_follow);
 
     let follow_waiting = rig.pending_clicked_follow.is_some();
     let mut target_focus = if rig.follow_mode == FollowMode::Off {
@@ -16134,7 +16451,7 @@ mod terrain_tests {
         ]
     }
 
-    fn sample_agent_visual() -> AgentVisual {
+    pub(super) fn sample_agent_visual() -> AgentVisual {
         AgentVisual {
             id: AgentId::from(KeyData::from_ffi(1)),
             uid: AgentUid(1),
@@ -16209,7 +16526,7 @@ mod terrain_tests {
         TerrainLayer::from_tiles(2, 2, 50, tiles).expect("construct terrain layer")
     }
 
-    fn sample_world_snapshot() -> WorldSnapshot {
+    pub(super) fn sample_world_snapshot() -> WorldSnapshot {
         let layer = sample_layer();
         let height =
             TerrainHeightSnapshot::new(&layer, None, visual::DAYLIGHT_STATIC).expect("snapshot");
@@ -16225,6 +16542,8 @@ mod terrain_tests {
             revision: 1,
             tick: 42,
             owner_source: None,
+            motion: None,
+            motion_alpha: 1.0,
             reduced_motion: false,
             paused: false,
             world_size,
@@ -16238,6 +16557,44 @@ mod terrain_tests {
             history: HudHistory::default(),
             brain: BrainOverlay::default(),
         }
+    }
+
+    pub(super) fn motion_test_source(snapshot: &mut WorldSnapshot) {
+        use scriptbots_runtime::{
+            BrainProjectionSource, HostRevisions, HostSessionId, ScientificRevision,
+            SnapshotRevision,
+        };
+        let host = HostRevisions {
+            scientific: ScientificRevision::new(snapshot.tick),
+            ..default()
+        };
+        snapshot.owner_source = Some((
+            BrainProjectionSource {
+                session_id: HostSessionId::new(71),
+                published_snapshot: SnapshotRevision::new(snapshot.tick + 1),
+                published_host: host,
+                inspected_host: host,
+                inspected_tick: scriptbots_core::Tick(snapshot.tick),
+            },
+            0,
+        ));
+    }
+
+    pub(super) fn explicit_test_motion(
+        previous: &WorldSnapshot,
+        current: &mut WorldSnapshot,
+        alpha: f32,
+    ) {
+        let mut previous = previous.clone();
+        motion_test_source(&mut previous);
+        motion_test_source(current);
+        let at = Instant::now();
+        let before = SnapshotMotion::advance(None, &previous, at);
+        let pair =
+            SnapshotMotion::advance(Some(&before), current, at + Duration::from_millis(100));
+        assert!(pair.previous.is_some(), "fixture must admit a genuine pair");
+        current.motion = Some(pair);
+        current.motion_alpha = alpha;
     }
 
     fn presentation_test_app() -> App {
@@ -17755,6 +18112,8 @@ mod terrain_tests {
             revision: 1,
             tick: 42,
             owner_source: None,
+            motion: None,
+            motion_alpha: 1.0,
             reduced_motion: false,
             paused: false,
             world_size: Vec2::splat(150.0),
@@ -18475,7 +18834,7 @@ mod terrain_tests {
     }
 
     #[test]
-    fn same_tick_motion_preferences_reach_both_native_easing_systems() {
+    fn same_tick_motion_preferences_snap_without_reusing_an_old_motion_pair() {
         let mut app = App::new();
         let (publisher, inbox) = SnapshotInbox::pair();
         app.insert_non_send_resource(inbox);
@@ -18570,13 +18929,8 @@ mod terrain_tests {
                 .unwrap()
                 .scale
                 .x;
-            if reduced_motion {
-                assert_eq!(position, 10.0);
-                assert_eq!(scale, 3.0);
-            } else {
-                assert!(position > 0.0 && position < 10.0);
-                assert!(scale > 1.0 && scale < 3.0);
-            }
+            assert_eq!(position, 10.0, "no consecutive science pair to interpolate");
+            assert_eq!(scale, 3.0, "same-tick preferences cannot replay old motion");
             previous = snapshot;
         }
     }
@@ -19083,7 +19437,6 @@ mod terrain_tests {
             .spawn(AgentGroundFootprint {
                 radius: 10.0,
                 spike_extension: 0.0,
-                spike: None,
             })
             .id();
         let wheel = app
@@ -19461,6 +19814,7 @@ mod terrain_tests {
     #[test]
     fn retracting_displayed_spike_clears_terrain() {
         let mut snapshot = sample_world_snapshot();
+        snapshot.tick = 2;
         snapshot.world_size = Vec2::splat(300.0);
         snapshot.agent_radius = 10.0;
         snapshot.terrain_height.dims = UVec2::new(4, 4);
@@ -19472,6 +19826,11 @@ mod terrain_tests {
         agent.position = Vec2::new(195.0, 100.0);
         agent.heading = 0.8;
         agent.spike_length = 0.0;
+        snapshot.agents = vec![agent.clone()];
+        let mut previous = snapshot.clone();
+        previous.tick = 1;
+        previous.agents[0].spike_length = 9.0;
+        explicit_test_motion(&previous, &mut snapshot, 0.5);
         let (translation, rotation) = agent_surface_pose(&snapshot, &agent);
         let target = AgentPoseTarget {
             translation,
@@ -19508,6 +19867,7 @@ mod terrain_tests {
                     transform: spike_transform(0.0),
                     tick: 2,
                 },
+                AgentMotionKey(agent.uid),
             ))
             .id();
         let root = app
@@ -19520,10 +19880,8 @@ mod terrain_tests {
                     rotation,
                     previous_target: target,
                 },
-                AgentGroundFootprint {
-                    spike: Some(spike),
-                    ..agent_ground_footprint(&snapshot, &agent)
-                },
+                agent_ground_footprint(&snapshot, &agent),
+                AgentMotionKey(agent.uid),
             ))
             .id();
         app.update();
@@ -19598,6 +19956,7 @@ fn spawn_agent_entity(
         .spawn((
             root_transform,
             target,
+            AgentMotionKey(agent.uid),
             agent_ground_footprint(snapshot, agent),
             AgentDisplayPose {
                 translation: target.translation,
@@ -19919,8 +20278,7 @@ fn apply_agent_visuals(
 
     let visuals = canonical_agent_visual_params(agent);
     let (translation, rotation) = agent_surface_pose(snapshot, agent);
-    let mut footprint = agent_ground_footprint(snapshot, agent);
-    footprint.spike = Some(record.spike.entity);
+    let footprint = agent_ground_footprint(snapshot, agent);
     commands.entity(record.root).insert((
         Transform::from_translation(translation).with_rotation(rotation),
         footprint,
@@ -20073,10 +20431,13 @@ fn apply_agent_visuals(
     update_part_transform(commands, &record.spike, spike_transform);
     commands
         .entity(record.spike.entity)
-        .insert(SpikePoseTarget {
-            transform: spike_transform,
-            tick: snapshot.tick,
-        });
+        .insert((
+            SpikePoseTarget {
+                transform: spike_transform,
+                tick: snapshot.tick,
+            },
+            AgentMotionKey(agent.uid),
+        ));
     let spike_rgb = Vec3::from_array(visuals.spike_color);
     let spike_color = srgb_from_vec_with_palette(spike_rgb, 1.0, palette);
     let spike_emissive = palette_hdr_emissive_from_srgb(
@@ -20388,7 +20749,6 @@ fn agent_ground_footprint(snapshot: &WorldSnapshot, agent: &AgentVisual) -> Agen
     AgentGroundFootprint {
         radius: snapshot.agent_radius.clamp(0.2, 1024.0),
         spike_extension: agent.spike_length.max(0.0),
-        spike: None,
     }
 }
 
@@ -21000,10 +21360,192 @@ fn color_to_rgba(color: Color) -> [u8; 4] {
 
 #[cfg(test)]
 mod tests {
+    use super::terrain_tests::{
+        explicit_test_motion, motion_test_source, sample_agent_visual, sample_world_snapshot,
+    };
     use super::*;
     use bevy::{MinimalPlugins, prelude::Messages};
     use scriptbots_core::ScriptBotsConfig;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn motion_pair_uses_publication_time_and_keeps_control_only_updates_on_the_same_clock() {
+        use scriptbots_runtime::{ControlRevision, SnapshotRevision};
+        let at = Instant::now();
+        let mut snapshot = sample_world_snapshot();
+        snapshot.tick = 4;
+        snapshot.agents = vec![sample_agent_visual()];
+        motion_test_source(&mut snapshot);
+        let first = SnapshotMotion::advance(None, &snapshot, at);
+        // Missing three optional publications is allowed: the source proves
+        // that all four intervening scientific revisions were ticks.
+        snapshot.tick = 8;
+        motion_test_source(&mut snapshot);
+        let pair =
+            SnapshotMotion::advance(Some(&first), &snapshot, at + Duration::from_millis(80));
+        assert_eq!(pair.previous.as_ref().unwrap().tick, 4);
+        assert_eq!(pair.alpha_at(at + Duration::from_millis(80)), 0.0);
+        assert_eq!(pair.alpha_at(at + Duration::from_millis(100)), 0.25);
+        assert_eq!(pair.alpha_at(at + Duration::from_millis(120)), 0.5);
+        assert_eq!(pair.alpha_at(at + Duration::from_secs(2)), 1.0);
+        let source = &mut snapshot.owner_source.as_mut().unwrap().0;
+        source.published_snapshot = SnapshotRevision::new(20);
+        source.inspected_host.control = ControlRevision::new(3);
+        source.published_host = source.inspected_host;
+        snapshot.revision += 1;
+        let control =
+            SnapshotMotion::advance(Some(&pair), &snapshot, at + Duration::from_millis(120));
+        assert!(Arc::ptr_eq(&pair.current, &control.current));
+        assert_eq!(control.alpha_at(at + Duration::from_millis(120)), 0.5);
+        assert_eq!(control.current.observed_at, at + Duration::from_millis(80));
+    }
+
+    #[test]
+    fn motion_pair_snaps_source_discontinuities_and_drops_pause_history() {
+        use scriptbots_runtime::{
+            ConfigRevision, HostSessionId, ScientificRevision, SnapshotRevision,
+        };
+        let at = Instant::now();
+        let mut before = sample_world_snapshot();
+        before.tick = 1;
+        before.agents = vec![sample_agent_visual()];
+        motion_test_source(&mut before);
+        let first = SnapshotMotion::advance(None, &before, at);
+        let mut current = before.clone();
+        current.tick = 2;
+        motion_test_source(&mut current);
+        let pair =
+            SnapshotMotion::advance(Some(&first), &current, at + Duration::from_millis(10));
+        assert!(pair.previous.is_some());
+        for discontinuity in 0..10 {
+            let mut cut = current.clone();
+            match discontinuity {
+                0 => cut.owner_source = None,
+                1 => cut.owner_source.as_mut().unwrap().0.session_id = HostSessionId::new(72),
+                2 => cut.owner_source.as_mut().unwrap().1 = 1,
+                3 => {
+                    let source = &mut cut.owner_source.as_mut().unwrap().0;
+                    source.inspected_host.config = ConfigRevision::new(1);
+                    source.published_host = source.inspected_host;
+                }
+                4 => {
+                    let source = &mut cut.owner_source.as_mut().unwrap().0;
+                    source.inspected_host.scientific = ScientificRevision::new(3);
+                    source.published_host = source.inspected_host;
+                }
+                5 => {
+                    cut.owner_source.as_mut().unwrap().0.published_snapshot =
+                        SnapshotRevision::new(1);
+                }
+                6 => {
+                    cut.owner_source.as_mut().unwrap().0.inspected_tick = scriptbots_core::Tick(0);
+                }
+                7 => cut.paused = true,
+                8 => cut.reduced_motion = true,
+                9 => cut.world_size.x += 1.0,
+                _ => unreachable!(),
+            }
+            let snapped =
+                SnapshotMotion::advance(Some(&first), &cut, at + Duration::from_millis(20));
+            assert!(
+                snapped.previous.is_none(),
+                "source discontinuity {discontinuity}"
+            );
+            assert_eq!(snapped.alpha_at(at), 1.0);
+        }
+        current.paused = true;
+        let paused =
+            SnapshotMotion::advance(Some(&pair), &current, at + Duration::from_millis(20));
+        assert!(paused.previous.is_none());
+        current.paused = false;
+        let resumed =
+            SnapshotMotion::advance(Some(&paused), &current, at + Duration::from_millis(30));
+        assert!(
+            resumed.previous.is_none(),
+            "resume at the same tick cannot replay stale movement"
+        );
+        current.tick = 3;
+        motion_test_source(&mut current);
+        let next =
+            SnapshotMotion::advance(Some(&resumed), &current, at + Duration::from_millis(40));
+        assert_eq!(next.previous.as_ref().unwrap().tick, 2);
+    }
+
+    #[test]
+    fn stalled_snapshot_consumer_receives_the_last_two_producer_cuts() {
+        let (publisher, inbox) = SnapshotInbox::pair();
+        let at = Instant::now();
+        let mut snapshot = sample_world_snapshot();
+        snapshot.agents = vec![sample_agent_visual()];
+        for tick in 1..=128 {
+            snapshot.tick = tick;
+            motion_test_source(&mut snapshot);
+            assert!(publisher.publish_at(snapshot.clone(), at + Duration::from_millis(tick * 10)));
+        }
+        let latest = inbox.take_latest().unwrap();
+        assert!(inbox.take_latest().is_none());
+        let pair = latest.motion.unwrap();
+        assert_eq!(pair.current.tick, 128);
+        assert_eq!(pair.previous.as_ref().unwrap().tick, 127);
+        assert_eq!(pair.alpha_at(at + Duration::from_millis(1285)), 0.5);
+        assert_eq!(pair.alpha_at(at + Duration::from_millis(1300)), 1.0);
+    }
+
+    #[test]
+    fn motion_uses_stable_uids_short_toroidal_paths_and_snaps_teleports() {
+        let mut snapshot = sample_world_snapshot();
+        snapshot.tick = 2;
+        snapshot.world_size = Vec2::splat(1000.0);
+        let mut agent = sample_agent_visual();
+        agent.position = Vec2::splat(1.0);
+        agent.velocity = Vec2::splat(2.0);
+        snapshot.agents = vec![agent];
+        let mut previous = snapshot.clone();
+        previous.tick = 1;
+        previous.agents[0].position = Vec2::splat(999.0);
+        explicit_test_motion(&previous, &mut snapshot, 0.75);
+        let pair = snapshot.motion.as_ref().unwrap();
+        assert_eq!(
+            pair.pose(AgentUid(1), 0.75).unwrap().position,
+            Vec2::splat(0.5)
+        );
+        assert!(pair.pose(AgentUid(99), 0.5).is_none());
+        let before = MotionPose::from(&previous.agents[0]);
+        let current = MotionPose::from(&snapshot.agents[0]);
+        let sample = |before, current, alpha| {
+            interpolate_motion_pose(before, current, snapshot.world_size, 12.0, 1, alpha)
+        };
+        assert_eq!(sample(before, current, 0.0), before);
+        assert_eq!(sample(before, current, 1.0), current);
+        assert_eq!(sample(before, current, f32::NAN), current);
+        let teleported = MotionPose {
+            position: Vec2::splat(400.0),
+            ..current
+        };
+        assert_eq!(sample(before, teleported, 0.5), teleported);
+        let ambiguous = MotionPose {
+            velocity: Vec2::X * 600.0,
+            ..current
+        };
+        assert_eq!(sample(before, ambiguous, 0.5), ambiguous);
+        let replaced = MotionPose {
+            id: AgentId::from(slotmap::KeyData::from_ffi(2)),
+            ..current
+        };
+        assert_eq!(sample(before, replaced, 0.5), replaced);
+        let mut newborn = snapshot.agents[0].clone();
+        newborn.uid = AgentUid(2);
+        newborn.id = replaced.id;
+        newborn.position = Vec2::splat(700.0);
+        snapshot.agents.insert(0, newborn.clone());
+        explicit_test_motion(&previous, &mut snapshot, 0.5);
+        let pair = snapshot.motion.as_ref().unwrap();
+        assert_eq!(
+            pair.pose(newborn.uid, 0.5).unwrap().position,
+            newborn.position
+        );
+        assert_eq!(pair.pose(AgentUid(1), 0.5).unwrap().position, Vec2::ZERO);
+    }
 
     #[test]
     fn host_snapshot_matches_owned_world_visuals_without_advancing_science() {
@@ -22576,44 +23118,50 @@ mod tests {
     }
 
     #[test]
-    fn spike_easing_extends_retracts_and_snaps_without_changing_targets() {
-        fn run(dt: f32, frames: usize) -> Vec3 {
+    fn spike_interpolation_uses_the_pair_on_first_frame_and_snaps_discontinuities() {
+        fn run(fractions: &[f32]) -> Transform {
             let mut app = App::new();
-            let mut time = Time::<()>::default();
-            time.advance_by(Duration::from_secs_f32(dt));
-            app.insert_resource(time);
             app.add_systems(Update, smooth_spike_poses);
+            let mut snapshot = sample_world_snapshot();
+            snapshot.tick = 2;
+            let mut agent = sample_agent_visual();
+            agent.spike_length = 8.0;
+            snapshot.agents = vec![agent];
+            let mut previous = snapshot.clone();
+            previous.tick = 1;
+            previous.agents[0].spike_length = 0.0;
+            explicit_test_motion(&previous, &mut snapshot, 0.0);
+            app.insert_resource(SnapshotState {
+                latest: Some(snapshot),
+                ..default()
+            });
             let initial = Transform::from_translation(Vec3::X).with_scale(Vec3::ONE);
             let extended =
-                Transform::from_translation(Vec3::X * 5.0).with_scale(Vec3::new(9.0, 1.0, 1.0));
+                Transform::from_translation(Vec3::X * 5.0).with_scale(Vec3::new(1.0, 9.0, 1.0));
             let spike = app
                 .world_mut()
                 .spawn((
                     initial,
+                    AgentMotionKey(AgentUid(1)),
                     SpikePoseTarget {
-                        transform: initial,
-                        tick: 1,
+                        transform: extended,
+                        tick: 2,
                     },
                 ))
                 .id();
-            app.update();
-            assert_eq!(
-                *app.world().entity(spike).get::<Transform>().unwrap(),
-                initial
-            );
-            app.world_mut().entity_mut(spike).insert(SpikePoseTarget {
-                transform: extended,
-                tick: 2,
-            });
-            for _ in 0..frames {
+            for &alpha in fractions {
+                app.world_mut()
+                    .resource_mut::<SnapshotState>()
+                    .latest
+                    .as_mut()
+                    .unwrap()
+                    .motion_alpha = alpha;
                 app.update();
+                let displayed = app.world().get::<Transform>(spike).unwrap();
+                assert_eq!(displayed.scale.y, 1.0 + 8.0 * alpha);
+                assert_eq!(displayed.translation.x, 1.0 + 4.0 * alpha);
             }
             let pose = *app.world().entity(spike).get::<Transform>().unwrap();
-            assert!(pose.scale.x > initial.scale.x && pose.scale.x < extended.scale.x);
-            assert!(
-                pose.translation.x > initial.translation.x
-                    && pose.translation.x < extended.translation.x
-            );
             assert_eq!(
                 app.world()
                     .entity(spike)
@@ -22621,17 +23169,6 @@ mod tests {
                     .unwrap()
                     .transform,
                 extended
-            );
-            app.world_mut().entity_mut(spike).insert(SpikePoseTarget {
-                transform: initial,
-                tick: 3,
-            });
-            app.update();
-            let retracted = app.world().entity(spike).get::<Transform>().unwrap();
-            assert!(retracted.scale.x < pose.scale.x && retracted.scale.x > initial.scale.x);
-            assert!(
-                retracted.translation.x < pose.translation.x
-                    && retracted.translation.x > initial.translation.x
             );
             app.world_mut().entity_mut(spike).insert(SpikePoseTarget {
                 transform: extended,
@@ -22652,20 +23189,32 @@ mod tests {
                 *app.world().entity(spike).get::<Transform>().unwrap(),
                 initial
             );
-            pose.scale
+            pose
         }
-        assert!((run(1.0 / 30.0, 1) - run(1.0 / 60.0, 2)).length() < 0.0001);
+        assert_eq!(run(&[0.5]), run(&[0.0, 0.25, 0.5, 0.5]));
+        run(&[0.0, 1.0]);
     }
 
     #[test]
-    fn agent_pose_easing_uses_render_time_and_shortest_heading_arc() {
-        fn run(dt: f32, frames: usize) -> (Vec3, Quat) {
+    fn agent_pose_interpolation_is_independent_of_frame_cadence_and_uses_shortest_heading() {
+        fn run(fractions: &[f32]) -> (Vec3, Quat) {
             let mut app = App::new();
-            let mut time = Time::<()>::default();
-            time.advance_by(Duration::from_secs_f32(dt));
-            app.insert_resource(time);
+            let mut snapshot = sample_world_snapshot();
+            snapshot.tick = 2;
+            snapshot.world_size = Vec2::splat(1000.0);
+            let mut agent = sample_agent_visual();
+            agent.position = Vec2::new(600.0, 500.0);
+            agent.velocity = Vec2::X * 100.0;
+            agent.heading = 10.0_f32.to_radians();
+            snapshot.agents = vec![agent];
+            let mut previous = snapshot.clone();
+            previous.tick = 1;
+            previous.agents[0].position.x = 500.0;
+            previous.agents[0].heading = 350.0_f32.to_radians();
+            explicit_test_motion(&previous, &mut snapshot, 0.0);
             app.insert_resource(SnapshotState {
                 world_size: Vec2::splat(1000.0),
+                latest: Some(snapshot),
                 ..Default::default()
             });
             app.add_systems(Update, smooth_agent_poses);
@@ -22683,6 +23232,7 @@ mod tests {
                 .world_mut()
                 .spawn((
                     target,
+                    AgentMotionKey(AgentUid(1)),
                     AgentDisplayPose {
                         translation: start.translation,
                         rotation: start.rotation,
@@ -22691,7 +23241,13 @@ mod tests {
                     Transform::from_translation(target.translation).with_rotation(target.rotation),
                 ))
                 .id();
-            for _ in 0..frames {
+            for &alpha in fractions {
+                app.world_mut()
+                    .resource_mut::<SnapshotState>()
+                    .latest
+                    .as_mut()
+                    .unwrap()
+                    .motion_alpha = alpha;
                 app.update();
             }
             assert_eq!(
@@ -22705,27 +23261,37 @@ mod tests {
             let transform = app.world().entity(entity).get::<Transform>().unwrap();
             (transform.translation, transform.rotation)
         }
-        let (position, rotation) = run(1.0 / 60.0, 1);
-        assert!(position.x > 0.0 && position.x < 100.0);
-        assert!(rotation.angle_between(Quat::IDENTITY) < 10.0_f32.to_radians());
-        let whole = run(1.0 / 30.0, 1);
-        let split = run(1.0 / 60.0, 2);
-        assert!(whole.0.distance(split.0) < 0.001);
-        assert!(whole.1.angle_between(split.1) < 0.001);
+        let (position, rotation) = run(&[0.5]);
+        assert_eq!(position, Vec3::X * 50.0);
+        assert!(rotation.angle_between(Quat::IDENTITY) < 0.001);
+        assert_eq!(run(&[0.5]), run(&[0.0, 0.1, 0.25, 0.5, 0.5]));
+        assert_eq!(run(&[0.0]).0, Vec3::ZERO);
+        assert_eq!(run(&[1.0]).0, Vec3::X * 100.0);
     }
 
     #[test]
     fn interpolated_agent_stays_above_a_ridge_between_snapshot_positions() {
         let world = WorldState::new(ScriptBotsConfig::default()).expect("world init");
         let mut snapshot = WorldSnapshot::from_world(&world).expect("snapshot");
+        snapshot.tick = 2;
         snapshot.world_size = Vec2::splat(300.0);
+        snapshot.agent_radius = 10.0;
         snapshot.terrain_height.dims = UVec2::new(3, 3);
         snapshot.terrain_height.cell_size = 100;
         snapshot.terrain_height.elevation = vec![0.0, 0.8, 0.0, 0.0, 0.8, 0.0, 0.0, 0.8, 0.0];
+        let mut agent = sample_agent_visual();
+        agent.position = Vec2::splat(150.0);
+        agent.velocity = Vec2::X * 100.0;
+        agent.heading = 0.0;
+        agent.spike_length = 0.0;
+        snapshot.agents = vec![agent];
+        let mut previous = snapshot.clone();
+        previous.tick = 1;
+        previous.agents[0].position.x = 50.0;
+        explicit_test_motion(&previous, &mut snapshot, 0.5);
         let footprint = AgentGroundFootprint {
             radius: 10.0,
             spike_extension: 0.0,
-            spike: None,
         };
         let start = AgentPoseTarget {
             translation: Vec3::new(-100.0, 0.45 * TERRAIN_HEIGHT_SCALE + 0.1, 0.0),
@@ -22738,17 +23304,12 @@ mod tests {
             ..start
         };
         let mut app = App::new();
-        let mut time = Time::<()>::default();
-        time.advance_by(Duration::from_secs_f32(
-            std::f32::consts::LN_2 / AGENT_POSE_RESPONSE,
-        ));
-        app.insert_resource(time)
-            .insert_resource(SnapshotState {
-                world_size: snapshot.world_size,
-                latest: Some(snapshot),
-                ..default()
-            })
-            .add_systems(Update, smooth_agent_poses);
+        app.insert_resource(SnapshotState {
+            world_size: snapshot.world_size,
+            latest: Some(snapshot),
+            ..default()
+        })
+        .add_systems(Update, smooth_agent_poses);
         let entity = app
             .world_mut()
             .spawn((
@@ -22759,6 +23320,7 @@ mod tests {
                     previous_target: start,
                 },
                 footprint,
+                AgentMotionKey(AgentUid(1)),
                 Transform::default(),
             ))
             .id();
@@ -22777,11 +23339,21 @@ mod tests {
     #[test]
     fn agent_pose_wraps_smoothly_but_rewinds_snap_and_picking_uses_displayed_pose() {
         let mut app = App::new();
-        let mut time = Time::<()>::default();
-        time.advance_by(Duration::from_secs_f32(1.0 / 60.0));
-        app.insert_resource(time);
+        let mut snapshot = sample_world_snapshot();
+        snapshot.tick = 11;
+        snapshot.world_size = Vec2::splat(1000.0);
+        let mut agent = sample_agent_visual();
+        agent.position = Vec2::new(10.0, 500.0);
+        agent.velocity = Vec2::X * 20.0;
+        agent.heading = 0.0;
+        snapshot.agents = vec![agent];
+        let mut before = snapshot.clone();
+        before.tick = 10;
+        before.agents[0].position.x = 990.0;
+        explicit_test_motion(&before, &mut snapshot, 0.25);
         app.insert_resource(SnapshotState {
             world_size: Vec2::splat(1000.0),
+            latest: Some(snapshot),
             ..Default::default()
         });
         app.add_systems(Update, smooth_agent_poses);
@@ -22805,6 +23377,7 @@ mod tests {
                     previous_target: previous,
                 },
                 Transform::default(),
+                AgentMotionKey(AgentUid(1)),
             ))
             .id();
         app.update();
@@ -22814,18 +23387,39 @@ mod tests {
             .get::<Transform>()
             .unwrap()
             .translation;
-        assert!(
-            seam_pose.x > 490.0 && seam_pose.x < 500.0,
-            "seam crossing should ease along the short +20-unit toroidal path, got {seam_pose:?}"
+        assert_eq!(
+            seam_pose.x, 495.0,
+            "sample the short +20-unit toroidal path"
         );
         assert!(
             (seam_pose.x - target.translation.x).abs() > 900.0,
             "the first eased frame must not snap directly to the wrapped target"
         );
+        let display = app.world().get::<AgentDisplayPose>(entity).unwrap();
         assert_eq!(
-            smooth_toroidal_axis(499.0, -499.0, 1000.0, 0.75),
-            -499.5,
-            "crossing the centered boundary wraps only after following the short path"
+            displayed_agent_position(
+                Vec2::new(10.0, 500.0),
+                Some(display),
+                Vec2::splat(1000.0)
+            ),
+            Vec2::new(995.0, 500.0)
+        );
+        let snapshot = app
+            .world()
+            .resource::<SnapshotState>()
+            .latest
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            displayed_follow_target(snapshot, FollowMode::Selected, |_| {
+                Some(displayed_agent_position(
+                    Vec2::ZERO,
+                    Some(display),
+                    snapshot.world_size,
+                ))
+            }),
+            Some(Vec2::new(995.0, 500.0)),
+            "follow and picking must use the rendered position at the same fraction"
         );
         let rewind = AgentPoseTarget {
             translation: Vec3::ZERO,

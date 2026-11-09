@@ -1522,6 +1522,7 @@ pub struct SpeedRequestBody {
         get_narrative_around,
         get_scoreboard,
         get_agents_debug,
+        get_agent_inspection,
         get_config_audit,
         get_scenario,
         list_presets,
@@ -1935,7 +1936,8 @@ impl StreamResumeQuery {
             return Ok(None);
         };
         let request = RemoteSubscriptionRequest {
-            protocol_version: REMOTE_PROTOCOL_VERSION,
+            protocol_version:
+                scriptbots_runtime::remote_subscription::REMOTE_SUBSCRIPTION_PROTOCOL_VERSION,
             request_id: None,
             command: "subscribe".to_owned(),
             channels: vec![RemoteChannel::Telemetry],
@@ -3177,6 +3179,49 @@ async fn get_agents_debug(
     Ok(Json(AgentDebugResponse { agents }))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentInspectionParams {
+    uid: String,
+    session_id: String,
+    epoch: String,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/agents/inspect",
+    tag = "control",
+    params(
+        ("uid" = String, Query, description = "Exact canonical decimal stable creature UID"),
+        ("session_id" = String, Query, description = "Exact host session from the displayed frame"),
+        ("epoch" = String, Query, description = "Exact evolution epoch from the displayed frame")
+    ),
+    responses(
+        (status = 200, body = Object, description = "Bounded scriptbots.agent-inspection.v1 owner observation; all identities are decimal strings"),
+        (status = 400, body = ErrorResponse),
+        (status = 404, body = ErrorResponse, description = "Creature is no longer present"),
+        (status = 409, body = ErrorResponse, description = "Host session or epoch changed"),
+        (status = 503, body = ErrorResponse, description = "Owner read deadline or availability failure")
+    )
+)]
+async fn get_agent_inspection(
+    State(state): State<ApiState>,
+    axum::extract::Query(params): axum::extract::Query<AgentInspectionParams>,
+) -> Result<Json<scriptbots_runtime::inspector::AgentInspection>, AppError> {
+    let parse = |value: &str| {
+        scriptbots_runtime::inspector::parse_agent_uid(value).ok_or_else(|| {
+            AppError::bad_request("inspector identities must be canonical u64 decimal strings")
+        })
+    };
+    let uid = parse(&params.uid)?;
+    let session_id = parse(&params.session_id)?.get();
+    let epoch = parse(&params.epoch)?.get();
+    let detail = run_control(move || state.handle.inspect_agent(uid, session_id, epoch)).await?;
+    detail
+        .map(Json)
+        .ok_or_else(|| AppError::not_found("creature is no longer present in this host"))
+}
+
 #[utoipa::path(
     post,
     path = "/api/selection",
@@ -4034,6 +4079,7 @@ fn prepare_rest_server(
         .route("/api/narrative/around/{tick}", get(get_narrative_around))
         .route("/api/scoreboard", get(get_scoreboard))
         .route("/api/agents/debug", get(get_agents_debug))
+        .route("/api/agents/inspect", get(get_agent_inspection))
         .route("/api/selection", post(post_selection).get(get_selection))
         .route("/api/interventions", get(get_interventions))
         // Scenario identity and presets
@@ -5832,6 +5878,123 @@ mod tests {
             .read_to_string(&mut response)
             .expect("read HTTP test response");
         response
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one HTTP owner observation covers source binding, CORS refusals and unchanged science"
+    )]
+    fn creature_inspection_http_reads_owner_and_enforces_source_and_origin() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            rng_seed: Some(91),
+            persistence_interval: 0,
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 20,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            ..ScriptBotsConfig::default()
+        })
+        .unwrap();
+        let id = world
+            .try_spawn_agent(scriptbots_core::AgentData::default())
+            .unwrap();
+        let uid = world.agent_uid(id).unwrap();
+        let host = crate::control::tests::TestHost::spawn(world);
+        let before = host.port.scientific_digest_v1().unwrap();
+        let source = host.handle().read_snapshot().unwrap();
+        let reservation = ControlServerReservation::prepare(ControlServerConfig {
+            rest_enabled: true,
+            rest_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            mcp_transport: McpTransportConfig::Disabled,
+            allowed_origins: vec!["https://lab.example".to_owned()],
+            ..ControlServerConfig::default()
+        })
+        .unwrap();
+        let address = reservation.rest_address().unwrap();
+        let (runtime, _) = reservation.launch(host.port.clone(), false).unwrap();
+        let request = |query: &str, origin: &str| {
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            write!(stream, "GET /api/agents/inspect?{query} HTTP/1.1\r\nHost: {address}\r\nOrigin: {origin}\r\nConnection: close\r\n\r\n").unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            response
+        };
+        let query = format!(
+            "uid={uid}&session_id={}&epoch={}",
+            source.session_id.get(),
+            source.world.epoch
+        );
+        let response = request(&query, "https://lab.example");
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(
+            response
+                .to_ascii_lowercase()
+                .contains("access-control-allow-origin: https://lab.example")
+        );
+        let (_, body) = response.split_once("\r\n\r\n").unwrap();
+        let detail: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(detail["schema"], "scriptbots.agent-inspection.v1");
+        assert_eq!(detail["uid"], uid.to_string());
+        assert_eq!(
+            detail["source"]["sessionId"],
+            source.session_id.get().to_string()
+        );
+        assert_eq!(detail["source"]["epoch"], source.world.epoch.to_string());
+        assert_eq!(detail["source"]["tick"], source.world.tick.to_string());
+        assert_eq!(
+            detail["sensors"].as_array().unwrap().len(),
+            scriptbots_core::INPUT_SIZE
+        );
+        assert_eq!(detail["outputs"][6]["name"], "boost");
+        assert!(!detail.as_object().unwrap().contains_key("foodDelta"));
+        for (query, code) in [
+            (format!("uid={uid}&session_id=0&epoch=0"), "409"),
+            (
+                format!("uid={uid}&session_id={}&epoch=1", source.session_id.get()),
+                "409",
+            ),
+            (
+                format!(
+                    "uid={}&session_id={}&epoch=1",
+                    u64::MAX,
+                    source.session_id.get()
+                ),
+                "409",
+            ),
+            (
+                format!(
+                    "uid={}&session_id={}&epoch=0",
+                    u64::MAX,
+                    source.session_id.get()
+                ),
+                "404",
+            ),
+            (
+                format!("uid=01&session_id={}&epoch=0", source.session_id.get()),
+                "400",
+            ),
+        ] {
+            let refusal = request(&query, "https://lab.example");
+            assert!(
+                refusal.starts_with(&format!("HTTP/1.1 {code}")),
+                "{refusal}"
+            );
+            assert!(
+                refusal
+                    .to_ascii_lowercase()
+                    .contains("access-control-allow-origin: https://lab.example")
+            );
+        }
+        let forbidden = request(&query, "https://unlisted.example");
+        assert!(forbidden.starts_with("HTTP/1.1 403"), "{forbidden}");
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        assert_eq!(host.handle().read_snapshot().unwrap().revision, source.revision);
+        runtime.shutdown().unwrap();
     }
 
     fn http_post_json(address: SocketAddr, path: &str, body: &Value) -> String {
@@ -10008,7 +10171,7 @@ mod tests {
             assert_eq!(ack["type"], "subscribed");
             assert_eq!(ack["request_id"], id);
             assert_eq!(ack["channels"], channels);
-            assert_eq!(ack["stream_protocol_version"], 1);
+            assert_eq!(ack["stream_protocol_version"], REMOTE_PROTOCOL_VERSION);
             assert_eq!(ack["session_id"], initial.session_id.get().to_string());
         }
         send_websocket_text(
@@ -10024,6 +10187,12 @@ mod tests {
             panic!("canvas channel")
         };
         assert_eq!(world, initial.world);
+        assert_eq!(
+            image.environment.as_deref(),
+            Some(
+                &scriptbots_runtime::remote::RemoteEnvironmentSnapshot::capture(&initial).unwrap()
+            )
+        );
         let events = read_remote_binary(&mut canvas);
         let RemoteFramePayload::Events(page) = events.payload else {
             panic!("events channel")

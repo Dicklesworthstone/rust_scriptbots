@@ -84,6 +84,33 @@ history/credit handling; nonempty narrative delivery requires observed records.
   with boost rings. The canvas keeps its intrinsic aspect ratio when displayed
   beside the controls. The demo consumes one latest JSON snapshot per paint;
   binary bindings are separate from these controls.
+- **World layers**: choose the combined view, terrain, food, water, or agents
+  only. Canvas and WebGPU use the same overview captured with the agents'
+  committed publication, both locally and when connected to a server. Source
+  grids up to 128 cells per side retain every cell; larger grids use at most
+  128 × 128 center-cell samples covering the whole world. These samples are not
+  scientific averages. Food uses the configured food maximum and water uses
+  observed depth. The layer status identifies sampling and disabled hydrology.
+  Changing the view never submits a simulation command or advances a tick.
+- **Creature inspector**: click a creature on the canvas, or enter its stable
+  decimal UID in the inspector. Both renderers mark the selected creature with
+  a gold ring. The panel reads actual owner health, age, generation, energy,
+  accumulated net food/energy balance, reproduction progress, inherited traits,
+  parent UIDs, brain description, 25 named sensor values and nine named outputs.
+  These are recorded scientific values; inspection does not run the brain or
+  recompute its senses. Inputs and outputs follow the core's canonical channel
+  names. The lightweight read does not decode genomes or request topology, so
+  families without a genome-browser implementation can still be inspected.
+  Detail refreshes at most four times per second when publications advance,
+  with at most one request in flight. A paused publication is read once; use
+  **Refresh detail** for an explicit reread. The source line distinguishes the
+  inspected tick from a newer displayed frame immediately, including while a
+  remote request is pending. Clear the selection with the button, Escape, or an
+  empty part of the canvas. Selection survives a renderer switch and ordinary
+  creature motion; world/session/epoch changes clear it. A creature's death or
+  disappearance removes its old detail, and a reused arena handle cannot take
+  over its stable UID. Selection, highlights and inspection never advance science
+  or alter the simulation's selection state.
 - **Reset Simulation**: reseeds with a fresh RNG seed and reuses the slider settings. A rolling 5-second performance log is appended to the console pane (`FPS`, `TPS`, population).
 - **Saved continuations**: choose MLP or Unbound for a new world, then Reset.
   **Save Continuation File** downloads a portable full-owner checkpoint; **Load
@@ -99,6 +126,20 @@ history/credit handling; nonempty narrative delivery requires observed records.
 - Runtime brain presets can be toggled programmatically via `registerBrain("wander" | "mlp" | "none")` on the `SimHandle`.
 
 Snapshots returned to JS follow the selected `snapshot_format` (defaults to JSON). To switch to binary snapshots (Postcard-encoded `Uint8Array`), pass `snapshot_format: "binary"` to `init_sim`.
+
+`SimHandle.inspectAgent(uid)` accepts an exact decimal UID string and returns a
+bounded `scriptbots.agent-inspection.v1` observation, or an absent value when the
+creature is no longer alive in that owner. `frame()` and the remote Canvas decoder
+expose agent `uid`, arena `id`, optional `brainKey`, and `epoch` as decimal strings
+so identities above JavaScript's safe integer range remain distinct. This
+presentation projection does not change the core JSON/Postcard snapshot codecs.
+Remote inspection uses the stream host's protected
+`GET /api/agents/inspect?uid=...&session_id=...&epoch=...` endpoint, preserving any
+reverse-proxy prefix before `/api/ws/stream`. It shares the existing authority and
+Origin policy, a 250 ms owner-read deadline and a 16 KiB browser response cap.
+Browser fetches time out after two seconds; errors are shown with an explicit
+refresh action. Responses from a replaced owner, old epoch or previous selection
+cannot populate the current inspector.
 
 The log pane (bottom of the sidebar) captures bootstrap and performance events so that ad-hoc benchmarking runs can be recorded while iterating on the renderer.
 

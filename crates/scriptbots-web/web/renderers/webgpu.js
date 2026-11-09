@@ -1,3 +1,30 @@
+import { EnvironmentRaster } from "./environment.js";
+import { agentRadius, agentUid } from "../inspector.js";
+
+const ENVIRONMENT_WGSL = /* wgsl */ `
+@group(0) @binding(0) var grid: texture_2d<f32>;
+@group(0) @binding(1) var<uniform> coverage: vec4<f32>;
+struct VertexOutput {
+  @builtin(position) position: vec4<f32>,
+  @location(0) uv: vec2<f32>,
+}
+@vertex fn vs(@builtin(vertex_index) index: u32) -> VertexOutput {
+  let positions = array<vec2<f32>, 3>(vec2<f32>(0.0, 0.0), vec2<f32>(2.0, 0.0), vec2<f32>(0.0, 2.0));
+  var output: VertexOutput;
+  output.uv = positions[index];
+  output.position = vec4<f32>(output.uv.x * 2.0 - 1.0, 1.0 - output.uv.y * 2.0, 0.0, 1.0);
+  return output;
+}
+@fragment fn fs(input: VertexOutput) -> @location(0) vec4<f32> {
+  if (input.uv.x >= coverage.x || input.uv.y >= coverage.y) {
+    return vec4<f32>(0.043, 0.066, 0.126, 1.0);
+  }
+  let size = textureDimensions(grid);
+  let cell = min(vec2<u32>(input.uv / coverage.xy * vec2<f32>(size)), size - vec2<u32>(1u));
+  return textureLoad(grid, vec2<i32>(cell), 0);
+}
+`;
+
 const WGSL_SOURCE = /* wgsl */ `
 struct ViewUniforms {
     canvas : vec2<f32>,
@@ -7,7 +34,7 @@ struct ViewUniforms {
 struct Agent {
     position : vec2<f32>,
     radius : f32,
-    pad0 : f32,
+    selected : f32,
     color : vec4<f32>,
 }
 
@@ -23,6 +50,7 @@ struct VertexOutput {
     @location(1) offset : vec2<f32>,
     @location(2) @interpolate(flat) radius : f32,
     @location(3) @interpolate(flat) boost : f32,
+    @location(4) @interpolate(flat) selected : f32,
 }
 
 @vertex
@@ -39,7 +67,7 @@ fn vs(@builtin(vertex_index) vertexIndex : u32,
 
     let agent = agents[instanceIndex];
     let corner = positions[vertexIndex];
-    let extent = agent.radius + select(0.0, 2.6, agent.color.a > 0.5);
+    let extent = agent.radius + select(select(0.0, 2.6, agent.color.a > 0.5), 5.5, agent.selected > 0.5);
     let offset = corner * extent;
     let world = agent.position + offset;
     let clip_x = (world.x / view.canvas.x) * 2.0 - 1.0;
@@ -51,6 +79,7 @@ fn vs(@builtin(vertex_index) vertexIndex : u32,
     output.offset = offset;
     output.radius = agent.radius;
     output.boost = agent.color.a;
+    output.selected = agent.selected;
     return output;
 }
 
@@ -59,6 +88,9 @@ fn fs(input : VertexOutput) -> @location(0) vec4<f32> {
     let distance = length(input.offset);
     if (distance <= input.radius) {
         return vec4<f32>(input.color, 0.9);
+    }
+    if (input.selected > 0.5 && abs(distance - input.radius - 4.5) <= 1.0) {
+        return vec4<f32>(251.0 / 255.0, 191.0 / 255.0, 36.0 / 255.0, 1.0);
     }
     if (input.boost > 0.5 && abs(distance - input.radius - 2.0) <= 0.6) {
         return vec4<f32>(30.0 / 255.0, 144.0 / 255.0, 1.0, 0.65);
@@ -135,13 +167,23 @@ export class WebGpuRenderer {
         },
         primitive: { topology: "triangle-list" },
       });
+      const environmentShader = device.createShaderModule({ code: ENVIRONMENT_WGSL });
+      const environmentErrors = (await environmentShader.getCompilationInfo()).messages
+        .filter((message) => message.type === "error");
+      if (environmentErrors.length) throw new Error(`WebGPU environment shader: ${environmentErrors.map((error) => error.message).join("; ")}`);
+      const environmentPipeline = await device.createRenderPipelineAsync({
+        layout: "auto",
+        vertex: { module: environmentShader, entryPoint: "vs" },
+        fragment: { module: environmentShader, entryPoint: "fs", targets: [{ format }] },
+        primitive: { topology: "triangle-list" },
+      });
 
       const viewUniformBuffer = device.createBuffer({
         size: 16,
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       });
 
-      const renderer = new WebGpuRenderer(canvas, device, context, pipeline, viewUniformBuffer, format, onFailure);
+      const renderer = new WebGpuRenderer(canvas, device, context, pipeline, viewUniformBuffer, format, onFailure, environmentPipeline);
       renderer.updateViewUniform();
       return renderer;
     } catch (error) {
@@ -151,13 +193,21 @@ export class WebGpuRenderer {
     }
   }
 
-  constructor(canvas, device, context, pipeline, viewUniformBuffer, format, onFailure) {
+  constructor(canvas, device, context, pipeline, viewUniformBuffer, format, onFailure, environmentPipeline) {
     this.canvas = canvas;
     this.device = device;
     this.context = context;
     this.pipeline = pipeline;
     this.viewUniformBuffer = viewUniformBuffer;
     this.format = format;
+    this.environmentPipeline = environmentPipeline;
+    this.environment = new EnvironmentRaster();
+    this.environmentTexture = null;
+    this.environmentSize = "";
+    this.environmentKey = null;
+    this.environmentGroup = null;
+    this.environmentUniform = device.createBuffer({ size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.disposed = false;
     this.failure = null;
     const fail = (reason) => {
@@ -221,7 +271,7 @@ export class WebGpuRenderer {
     this.agentCapacity = capacity;
   }
 
-  render(snapshot) {
+  render(snapshot, presentation = {}) {
     if (!snapshot) {
       return false;
     }
@@ -230,14 +280,34 @@ export class WebGpuRenderer {
     // supplies the then-current snapshot after the existing frame completes.
     if (this.#pendingFrame) return false;
 
+    const environment = this.environment.update(presentation.environment, presentation.identity,
+      snapshot.world, presentation.layer, snapshot.epoch, presentation.generation);
+    if (environment && this.environmentKey !== environment.key) {
+      const size = `${environment.width}x${environment.height}`;
+      if (this.environmentSize !== size) {
+        this.environmentTexture?.destroy();
+        this.environmentTexture = this.device.createTexture({
+          size: [environment.width, environment.height], format: "rgba8unorm",
+          usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+        });
+        this.environmentGroup = this.device.createBindGroup({
+          layout: this.environmentPipeline.getBindGroupLayout(0), entries: [
+            { binding: 0, resource: this.environmentTexture.createView() },
+            { binding: 1, resource: { buffer: this.environmentUniform } },
+          ],
+        });
+        this.environmentSize = size;
+      }
+      this.device.queue.writeTexture({ texture: this.environmentTexture }, environment.pixels,
+        { bytesPerRow: environment.width * 4, rowsPerImage: environment.height },
+        { width: environment.width, height: environment.height });
+      this.device.queue.writeBuffer(this.environmentUniform, 0, new Float32Array([...environment.coverage, 0, 0]));
+      this.environmentKey = environment.key;
+    }
+
     this.updateViewUniform();
     const agents = snapshot.agents;
     this.ensureAgentCapacity(Math.max(agents.length, 1));
-
-    if (agents.length === 0) {
-      this.#clearFrame();
-      return true;
-    }
 
     const floatsPerAgent = AGENT_STRIDE_ALIGNED / FLOAT_BYTES;
     const scaleX = this.canvas.width / snapshot.world.width;
@@ -245,11 +315,12 @@ export class WebGpuRenderer {
     for (let i = 0; i < agents.length; i += 1) {
       const base = i * floatsPerAgent;
       const agent = agents[i];
-      const radius = Math.max(1.5, Math.sqrt(agent.health + 0.15) * 3.5);
+      const radius = agentRadius(agent);
       this.agentArray[base + 0] = agent.position[0] * scaleX;
       this.agentArray[base + 1] = agent.position[1] * scaleY;
       this.agentArray[base + 2] = radius;
-      this.agentArray[base + 3] = 0.0;
+      this.agentArray[base + 3] = typeof presentation.selectedUid === "string"
+        && agentUid(agent) === presentation.selectedUid ? 1.0 : 0.0;
       this.agentArray[base + 4] = agent.color[0];
       this.agentArray[base + 5] = agent.color[1];
       this.agentArray[base + 6] = agent.color[2];
@@ -257,7 +328,7 @@ export class WebGpuRenderer {
     }
 
     const byteLength = agents.length * AGENT_STRIDE_ALIGNED;
-    this.device.queue.writeBuffer(this.agentBuffer, 0, this.agentArray.buffer, 0, byteLength);
+    if (byteLength) this.device.queue.writeBuffer(this.agentBuffer, 0, this.agentArray.buffer, 0, byteLength);
 
     const textureView = this.context.getCurrentTexture().createView();
     const encoder = this.device.createCommandEncoder();
@@ -271,9 +342,16 @@ export class WebGpuRenderer {
         },
       ],
     });
-    pass.setPipeline(this.pipeline);
-    pass.setBindGroup(0, this.bindGroup);
-    pass.draw(6, agents.length, 0, 0);
+    if (environment) {
+      pass.setPipeline(this.environmentPipeline);
+      pass.setBindGroup(0, this.environmentGroup);
+      pass.draw(3);
+    }
+    if (agents.length) {
+      pass.setPipeline(this.pipeline);
+      pass.setBindGroup(0, this.bindGroup);
+      pass.draw(6, agents.length, 0, 0);
+    }
     pass.end();
     this.#submitFrame(encoder.finish());
     return true;
@@ -312,6 +390,8 @@ export class WebGpuRenderer {
     if (this.disposed) return;
     this.disposed = true;
     this.agentBuffer?.destroy();
+    this.environmentTexture?.destroy();
+    this.environmentUniform.destroy();
     this.viewUniformBuffer.destroy();
     this.context.unconfigure();
     this.device.destroy();

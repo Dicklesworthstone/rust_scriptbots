@@ -1,0 +1,38 @@
+schema = "scriptbots.scenario.v1"
+schema_version = 1
+id = "food_funded_meadow_v1"
+description = "A closed meadow where grazing and spiked-carcass meals fund reproduction; time alone earns no reproductive progress."
+hypothesis = "With no population injections or timer-funded births, food intake supports new generations within a bounded 10,000-tick study. Extinction remains a possible ecological outcome."
+seeds = [11, 42, 137]
+
+[config]
+world_width = 2000
+world_height = 1000
+food_cell_size = 50
+closed = true
+population_minimum = 0
+population_spawn_interval = 0
+population_crossover_chance = 0.0
+initial_food = 0.25
+food_max = 0.5
+food_growth_rate = 0.0005
+food_respawn_interval = 0
+reproduction_rate_herbivore = 0.0
+reproduction_rate_carnivore = 0.0
+# Seven units of earned progress, not seven elapsed ticks.
+reproduction_cooldown = 7
+reproduction_food_bonus = 3.0
+reproduction_attempt_interval = 15
+reproduction_attempt_chance = 0.1
+# The child's energy allocation is paid by its parent.
+reproduction_energy_threshold = 0.65
+reproduction_energy_cost = 0.25
+reproduction_child_energy = 0.25
+
+[envelope]
+# These are study acceptance bounds, not a claim of a measured stable equilibrium.
+ticks = 10000
+population_min = 0
+population_max = 512
+births_min = 1
+deaths_min = 1

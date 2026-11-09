@@ -127,6 +127,11 @@ pub struct CaptureProvenance {
     /// evidence of anything (bd-2z0.14.3.4).
     #[serde(default)]
     pub world_digest: Option<String>,
+    /// Explicit pose interpolation between two supplied science cuts. Such a
+    /// frame is not itself a scientific state: `world_digest` is absent and
+    /// both actual endpoint identities live here. Other cues use the later cut.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interpolation: Option<CaptureInterpolation>,
     /// Scene name from the manifest.
     pub scene: String,
     /// World RNG seed.
@@ -194,6 +199,24 @@ pub struct CaptureProvenance {
     pub lock_digest: Option<String>,
     /// Whether the alarm-test corruption mode was active.
     pub corrupt: bool,
+}
+
+/// Reproducible presentation inputs; this does not certify that independently
+/// supplied worlds belong to one verified replay or host session.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CaptureInterpolation {
+    /// Versioned presentation rule, distinct from the scientific schema.
+    pub schema: String,
+    /// Earlier completed tick.
+    pub previous_tick: u64,
+    /// Later completed tick whose population, terrain and state cues are shown.
+    pub current_tick: u64,
+    /// Finite interpolation fraction in `[0, 1]`; never extrapolated.
+    pub alpha: f32,
+    /// Exact earlier scientific-state digest.
+    pub previous_world_digest: String,
+    /// Exact later scientific-state digest.
+    pub current_world_digest: String,
 }
 
 /// One captured frame with its provenance.
@@ -1005,6 +1028,7 @@ impl<'a> OffscreenCapture<'a> {
             seed,
             tick,
             world_digest,
+            interpolation: None,
             frontend: "bevy_offscreen".to_string(),
             adapter_name: self.adapter_name.clone(),
             backend: self.backend.clone(),
@@ -1066,7 +1090,7 @@ impl<'a> OffscreenCapture<'a> {
         seed: u64,
         tick: u64,
     ) -> Result<CapturedFrame> {
-        let mut snapshot = WorldSnapshot::from_world(world)
+        let snapshot = WorldSnapshot::from_world(world)
             .ok_or_else(|| anyhow!("world snapshot unavailable at tick {tick}"))?;
         validate_capture_tick(snapshot.tick, tick)?;
         validate_capture_seed(world.agent_substream_protocol_v1().root_seed(), seed)?;
@@ -1082,6 +1106,51 @@ impl<'a> OffscreenCapture<'a> {
                 None
             }
         };
+        self.render_snapshot(snapshot, scene, seed, tick, world_digest, None)
+    }
+
+    /// Render a deterministic pose sample between two observed worlds.
+    ///
+    /// This uses the interactive renderer's stable-UID, shortest-torus and
+    /// discontinuity rules. Terrain, births/deaths and non-positional cues are
+    /// taken from `current`; no scientific state is synthesized or advanced.
+    /// Reduced motion and discontinuous agent paths use the current endpoint.
+    /// The frame records both endpoint digests and the explicit fraction,
+    /// rather than labeling an interpolated image as either endpoint state.
+    ///
+    /// # Errors
+    /// Refuses non-finite/out-of-range fractions, unordered ticks, changed
+    /// seed/configuration/epoch or unavailable scientific identities, as well
+    /// as normal renderer failures.
+    pub fn render_interpolated(
+        &mut self,
+        previous: &WorldState,
+        current: &WorldState,
+        scene: &str,
+        seed: u64,
+        alpha: f32,
+    ) -> Result<CapturedFrame> {
+        let (snapshot, interpolation) =
+            prepare_interpolated_capture(previous, current, seed, alpha)?;
+        self.render_snapshot(
+            snapshot,
+            scene,
+            seed,
+            current.tick().0,
+            None,
+            Some(interpolation),
+        )
+    }
+
+    fn render_snapshot(
+        &mut self,
+        mut snapshot: WorldSnapshot,
+        scene: &str,
+        seed: u64,
+        tick: u64,
+        world_digest: Option<String>,
+        interpolation: Option<CaptureInterpolation>,
+    ) -> Result<CapturedFrame> {
         snapshot.revision = self.next_snapshot_revision;
         self.next_snapshot_revision = self
             .next_snapshot_revision
@@ -1222,11 +1291,13 @@ impl<'a> OffscreenCapture<'a> {
         if rgba8_is_visually_blank(&rgba8) {
             return Err(blank_frame_error(self.effective.gpu.as_ref()));
         }
+        let mut provenance = self.provenance(scene, seed, tick, world_digest);
+        provenance.interpolation = interpolation;
         Ok(CapturedFrame {
             width,
             height,
             rgba8,
-            provenance: self.provenance(scene, seed, tick, world_digest),
+            provenance,
         })
     }
 
@@ -1308,6 +1379,72 @@ impl<'a> OffscreenCapture<'a> {
         debug!(bytes = data.len(), "offscreen readback complete");
         Ok(data)
     }
+}
+
+fn prepare_interpolated_capture(
+    previous: &WorldState,
+    current: &WorldState,
+    seed: u64,
+    alpha: f32,
+) -> Result<(WorldSnapshot, CaptureInterpolation)> {
+    if !alpha.is_finite() || !(0.0..=1.0).contains(&alpha) {
+        return Err(anyhow!(
+            "capture interpolation alpha must be finite and in [0, 1]"
+        ));
+    }
+    validate_capture_seed(previous.agent_substream_protocol_v1().root_seed(), seed)?;
+    validate_capture_seed(current.agent_substream_protocol_v1().root_seed(), seed)?;
+    let ticks = current
+        .tick()
+        .0
+        .checked_sub(previous.tick().0)
+        .filter(|ticks| *ticks > 0)
+        .ok_or_else(|| anyhow!("capture interpolation requires increasing completed ticks"))?;
+    if previous.epoch() != current.epoch() || previous.config() != current.config() {
+        return Err(anyhow!(
+            "capture interpolation refuses changed epoch or configuration"
+        ));
+    }
+    let previous_digest = previous.world_digest_v1()?.overall;
+    let current_digest = current.world_digest_v1()?.overall;
+    let previous_snapshot = WorldSnapshot::from_world(previous)
+        .ok_or_else(|| anyhow!("previous capture snapshot unavailable"))?;
+    let mut snapshot = WorldSnapshot::from_world(current)
+        .ok_or_else(|| anyhow!("current capture snapshot unavailable"))?;
+    let previous_poses: std::collections::HashMap<_, _> = previous_snapshot
+        .agents
+        .iter()
+        .map(|agent| (agent.uid, crate::MotionPose::from(agent)))
+        .collect();
+    if !snapshot.reduced_motion {
+        for agent in &mut snapshot.agents {
+            let Some(previous) = previous_poses.get(&agent.uid) else {
+                continue;
+            };
+            let pose = crate::interpolate_motion_pose(
+                *previous,
+                crate::MotionPose::from(&*agent),
+                snapshot.world_size,
+                snapshot.agent_radius,
+                ticks,
+                alpha,
+            );
+            agent.position = pose.position;
+            agent.heading = pose.heading;
+            agent.spike_length = pose.spike_length;
+        }
+    }
+    Ok((
+        snapshot,
+        CaptureInterpolation {
+            schema: "scriptbots.pose-interpolation.v1".to_owned(),
+            previous_tick: previous.tick().0,
+            current_tick: current.tick().0,
+            alpha,
+            previous_world_digest: previous_digest,
+            current_world_digest: current_digest,
+        },
+    ))
 }
 
 fn validate_capture_tick(snapshot_tick: u64, requested_tick: u64) -> Result<()> {
@@ -1905,6 +2042,101 @@ fn setup_capture_resources(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn interpolation_world(ticks: u32, x: f32, heading: f32, spike: f32) -> WorldState {
+        use scriptbots_core::{AgentData, Position, ScriptBotsConfig, Velocity};
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 256,
+            world_height: 256,
+            food_cell_size: 32,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            persistence_interval: 0,
+            rng_seed: Some(42),
+            ..default()
+        })
+        .unwrap();
+        let id = world.try_inject_agent(AgentData::default()).unwrap();
+        for _ in 0..ticks {
+            world.step().unwrap();
+        }
+        assert!(
+            world
+                .try_update_agent(id, |data, _| {
+                    data.position = Position { x, y: 128.0 };
+                    data.velocity = Velocity { vx: 20.0, vy: 0.0 };
+                    data.heading = heading;
+                    data.spike_length = spike;
+                })
+                .unwrap()
+        );
+        world
+    }
+
+    #[test]
+    fn explicit_capture_fraction_has_exact_endpoints_and_never_changes_either_source() {
+        let previous = interpolation_world(0, 250.0, 350.0_f32.to_radians(), 0.0);
+        let current = interpolation_world(1, 6.0, 10.0_f32.to_radians(), 4.0);
+        let previous_digest = previous.world_digest_v1().unwrap().overall;
+        let current_digest = current.world_digest_v1().unwrap().overall;
+        let previous_snapshot = WorldSnapshot::from_world(&previous).unwrap();
+        let current_snapshot = WorldSnapshot::from_world(&current).unwrap();
+        let mut midpoint = None;
+        for alpha in [0.0, 0.25, 0.5, 1.0, 0.5] {
+            let (snapshot, provenance) =
+                prepare_interpolated_capture(&previous, &current, 42, alpha).unwrap();
+            assert_eq!(snapshot.tick, current.tick().0);
+            assert_eq!(snapshot.agents.len(), current_snapshot.agents.len());
+            let agent = &snapshot.agents[0];
+            assert_eq!(agent.uid, current_snapshot.agents[0].uid);
+            assert_eq!(
+                agent.position,
+                Vec2::new((250.0 + 12.0 * alpha).rem_euclid(256.0), 128.0)
+            );
+            assert_eq!(agent.spike_length, 4.0 * alpha);
+            assert_eq!(agent.health, current_snapshot.agents[0].health);
+            if alpha <= 0.0 {
+                assert_eq!(agent.position, previous_snapshot.agents[0].position);
+                assert_eq!(agent.heading, previous_snapshot.agents[0].heading);
+            } else if alpha >= 1.0 {
+                assert!(snapshot.agents == current_snapshot.agents);
+            } else if (alpha - 0.5).abs() < f32::EPSILON {
+                assert!(
+                    Quat::from_rotation_y(agent.heading).angle_between(Quat::IDENTITY) < 0.001
+                );
+                if let Some(ref first_midpoint) = midpoint {
+                    assert!(&snapshot.agents == first_midpoint);
+                } else {
+                    midpoint = Some(snapshot.agents.clone());
+                }
+            }
+            assert_eq!(provenance.previous_tick, 0);
+            assert_eq!(provenance.current_tick, 1);
+            assert_eq!(provenance.alpha, alpha);
+            assert_eq!(provenance.previous_world_digest, previous_digest);
+            assert_eq!(provenance.current_world_digest, current_digest);
+            // The digest includes RNG and all scientific domains; projection
+            // must not step either source, including endpoint captures.
+            assert_eq!(previous.world_digest_v1().unwrap().overall, previous_digest);
+            assert_eq!(current.world_digest_v1().unwrap().overall, current_digest);
+        }
+    }
+
+    #[test]
+    fn explicit_capture_fraction_rejects_unbounded_or_mislabeled_sources() {
+        let previous = interpolation_world(0, 250.0, 0.0, 0.0);
+        let current = interpolation_world(1, 6.0, 0.0, 4.0);
+        for alpha in [f32::NAN, f32::INFINITY, -0.01, 1.01] {
+            assert!(prepare_interpolated_capture(&previous, &current, 42, alpha).is_err());
+        }
+        assert!(prepare_interpolated_capture(&previous, &current, 43, 0.5).is_err());
+        assert!(prepare_interpolated_capture(&current, &previous, 42, 0.5).is_err());
+        assert!(prepare_interpolated_capture(&current, &current, 42, 0.5).is_err());
+        let mut config = current.config().clone();
+        config.world_width = 512;
+        let other_config = WorldState::new(config).unwrap();
+        assert!(prepare_interpolated_capture(&other_config, &current, 42, 0.5).is_err());
+    }
 
     fn corruption_app(corrupt: bool) -> App {
         let mut app = App::new();
@@ -3154,6 +3386,7 @@ mod tests {
         let provenance = CaptureProvenance {
             schema: PROVENANCE_SCHEMA.to_string(),
             world_digest: Some("blake3:deadbeef".to_string()),
+            interpolation: None,
             scene: "unit".to_string(),
             seed: 42,
             tick: 12,
@@ -3484,6 +3717,7 @@ mod tests {
         let mut provenance = CaptureProvenance {
             schema: PROVENANCE_SCHEMA.to_string(),
             world_digest: None,
+            interpolation: None,
             scene: "unit".to_string(),
             seed: 7,
             tick: 3,
@@ -3638,6 +3872,7 @@ mod tests {
         let provenance = CaptureProvenance {
             schema: PROVENANCE_SCHEMA.to_string(),
             world_digest: None,
+            interpolation: None,
             scene: "unit".to_string(),
             seed: 1,
             tick: 1,

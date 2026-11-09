@@ -57,6 +57,7 @@
             width: 100%;
             height: auto;
             display: block;
+            cursor: crosshair;
         }
 
         #stats-panel {
@@ -131,11 +132,47 @@
             background: #0f172a;
         }
 
-        #renderer-status {
+        #renderer-status, #environment-status {
             font-size: 0.75rem;
             color: #94a3b8;
             overflow-wrap: anywhere;
         }
+
+        #agent-inspector {
+            border: 1px solid #334155;
+            border-radius: 0.5rem;
+            padding: 0.75rem;
+            display: grid;
+            gap: 0.65rem;
+        }
+
+        #inspector-status {
+            margin: 0;
+            font-size: 0.75rem;
+            color: #cbd5e1;
+            overflow-wrap: anywhere;
+        }
+
+        #inspector-uid {
+            box-sizing: border-box;
+            width: 100%;
+            background: #0f172a;
+            color: #f8fafc;
+            border: 1px solid #475569;
+            border-radius: 0.25rem;
+            padding: 0.4rem;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .inspector-actions { display: flex; gap: 0.4rem; flex-wrap: wrap; }
+        #inspector-summary { grid-template-columns: 1fr 1fr; }
+        #inspector-summary dd { font-size: 0.75rem; overflow-wrap: anywhere; }
+        #inspector-summary dt { font-size: 0.75rem; }
+        #inspector-signals { max-height: 24rem; overflow: auto; }
+        #inspector-signals table { width: 100%; font-size: 0.75rem; border-collapse: collapse; }
+        #inspector-signals th { text-align: left; font-weight: 400; }
+        #inspector-signals td { text-align: right; font-variant-numeric: tabular-nums; }
+        #inspector-signals h3 { font-size: 0.8rem; }
 
         .controls button {
             padding: 0.6rem 0.8rem;
@@ -260,7 +297,7 @@
     <div id="mismatch-banner" role="alert" aria-live="polite"></div>
     <main>
         <section id="sim-container">
-            <canvas id="sim-canvas" width="1280" height="720" aria-label="Simulation canvas"></canvas>
+            <canvas id="sim-canvas" width="1280" height="720" tabindex="0" aria-label="Simulation canvas. Click a creature to inspect it; Escape clears selection."></canvas>
             <div id="remote-overlay" role="status" hidden>Waiting for a remote canvas frame…</div>
         </section>
         <aside id="stats-panel">
@@ -291,6 +328,33 @@
                     <option value="webgpu">WebGPU</option>
                 </select>
                 <div id="renderer-status" role="status" aria-live="polite">Starting renderer…</div>
+                <label for="environment-layer">World layers</label>
+                <select id="environment-layer">
+                    <option value="combined" selected>Terrain + food + water</option>
+                    <option value="terrain">Terrain</option>
+                    <option value="food">Food availability</option>
+                    <option value="water">Water depth</option>
+                    <option value="agents">Agents only</option>
+                </select>
+                <div id="environment-status" role="status" aria-live="polite">Waiting for environment layers…</div>
+                <section id="agent-inspector" aria-labelledby="inspector-heading" data-state="empty">
+                    <h2 id="inspector-heading">Creature inspector</h2>
+                    <p id="inspector-status" role="status">Click a creature in the world, or enter its stable UID.</p>
+                    <form id="inspector-form">
+                        <label for="inspector-uid">Creature UID</label>
+                        <input id="inspector-uid" type="text" inputmode="numeric" pattern="[0-9]+" maxlength="20" autocomplete="off" required />
+                        <button type="submit">Inspect</button>
+                    </form>
+                    <div class="inspector-actions">
+                        <button id="inspector-refresh" type="button" disabled>Refresh detail</button>
+                        <button id="inspector-clear" type="button" disabled>Clear selection</button>
+                    </div>
+                    <dl id="inspector-summary"></dl>
+                    <details>
+                        <summary>Senses and outputs</summary>
+                        <div id="inspector-signals"></div>
+                    </details>
+                </section>
                 <button id="capture-btn" type="button" disabled>Save Frame as PNG</button>
                 <div id="capture-status" role="status" aria-live="polite"></div>
                 <label>

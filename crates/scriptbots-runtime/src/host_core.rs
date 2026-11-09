@@ -4312,7 +4312,16 @@ impl HostCore {
         uid: AgentUid,
         max_contributors: usize,
     ) -> Result<Option<crate::channel::AgentInspectorData>, HostAccessError> {
-        self.inspect_agent_with_attribution(uid, Some(max_contributors), 0)
+        self.inspect_agent_with_attribution(uid, Some(max_contributors), 0, true)
+    }
+
+    /// Read bounded selected-creature detail without recomputing sensor attribution.
+    /// This is an observation of the current owner boundary and never advances time.
+    pub fn inspect_agent_basic(
+        &self,
+        uid: AgentUid,
+    ) -> Result<Option<crate::channel::AgentInspectorData>, HostAccessError> {
+        self.inspect_agent_with_attribution(uid, None, 0, false)
     }
 
     pub(crate) fn inspect_agent_with_attribution(
@@ -4320,6 +4329,7 @@ impl HostCore {
         uid: AgentUid,
         max_contributors: Option<usize>,
         genome_offset: usize,
+        include_genome: bool,
     ) -> Result<Option<crate::channel::AgentInspectorData>, HostAccessError> {
         if max_contributors.is_some_and(|limit| limit > crate::channel::MAX_INSPECTOR_CONTRIBUTORS)
         {
@@ -4346,8 +4356,16 @@ impl HostCore {
         let Some(runtime) = self.world.agent_runtime(id) else {
             return Ok(None);
         };
+        let index = self.world.agents().index_of(id).ok_or_else(|| {
+            HostAccessError::ProtocolViolation {
+                message: "inspected agent missing its dense index".to_owned(),
+            }
+        })?;
+        let body = self.world.agents().columns().snapshot(index);
         let latest = self.latest_snapshot();
-        let genome_browser = if let Some(envelope) = self.world.agent_brain_genome(id) {
+        let genome_browser = if include_genome
+            && let Some(envelope) = self.world.agent_brain_genome(id)
+        {
             let parents: Vec<_> = envelope
                 .provenance()
                 .parents
@@ -4362,11 +4380,6 @@ impl HostCore {
                         .flatten()
                 })
             });
-            let index = self.world.agents().index_of(id).ok_or_else(|| {
-                HostAccessError::ProtocolViolation {
-                    message: "inspected agent missing its dense index".to_owned(),
-                }
-            })?;
             self.world
                 .brain_registry()
                 .family_by_id(envelope.family_id())
@@ -4400,7 +4413,11 @@ impl HostCore {
                 inspected_host: self.revisions,
                 inspected_tick: self.world.tick(),
             },
+            epoch: self.world.epoch(),
             uid,
+            health: body.health,
+            age: body.age,
+            generation: body.generation.0,
             life: crate::channel::AgentLifeData::from(runtime),
             physiology: crate::channel::AgentPhysiologyData::from(runtime),
             sensors: runtime.sensors,

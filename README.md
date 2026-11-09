@@ -487,7 +487,8 @@ cargo check --target wasm32-unknown-unknown -p scriptbots-web
   - `candle` enables real tensor forward/batch inference, without production heritable-family registration.
   - `tract`, `tch`, and no-backend builds retain the sensor-copy `ml.placeholder` fallback.
   - `brain-ft` exposes `FtBrainConfig`, `FtBrainFamily`, and `FT_BRAIN_KIND`.
-  - The pinned Frankentorch `vector_to_parameters` path is not F32-safe, so FtBrain keeps a canonical flat F32 genome and materializes its layer slices without widening through F64. Resolution of that upstream gap and all compile/benchmark proof remain part of `bd-2z0.3.12.3`.
+  - FtBrain cohorts retain distinct weights for every agent and evaluate one packed F32 batched matrix contraction per layer. Core retains successful cohort evaluators across ticks while the exact factory, architecture, ordered stable identities, genomes/provenance and scalar checkpoints still match. This preserves packed weights and scratch between ticks. Membership changes or failures evict cached evaluators; checkpoints and scientific digests omit this execution cache. Scalar preimages and complete successor reconstruction still enforce atomic rejection, so this is not an end-to-end throughput claim. Adapter semantic version 3 identifies the packed executor; canonical genome and evaluator-state codecs are unchanged. Targeted DSR checks cover eight evolving scalar/cohort stages with one cohort construction, mutation/rebind/factory invalidation, warmed failure rollback and checkpoint continuation, plus the scalar-only feature lane.
+  - The pinned Frankentorch `vector_to_parameters` path is not F32-safe, so FtBrain keeps a canonical flat F32 genome and materializes its layer slices without widening through F64. Resolution of that upstream gap and full benchmark qualification remain part of `bd-2z0.3.12.3`.
 
 Note: NeuroFlow and the native brain implementations are functional. Candle has real library inference; Tract/tch inference and alternate spatial-index backends remain unimplemented. The ML disposition keeps placeholders out of production populations and selects FtBrain as the app-level ML family. FtBrain has real code-first inference, but is not accepted as complete until its pinned DSR evidence is green.
 
@@ -607,6 +608,20 @@ both the live renderer and offscreen scene capture. Each chunk selects its most
 common biome and shares that biome's cached texture; quality changes filter the
 same 64×64 source grain. Vertex colors still supply terrain hue and accessibility
 palettes. This detail path does not blend biome albedo textures per pixel.
+
+Bevy creature motion interpolates position, heading and spike extension between
+two producer-observed scientific snapshots, keyed by stable agent identity.
+Toroidal crossings take the short path; render timing selects a bounded fraction
+over the measured publication interval without advancing science or extrapolating.
+This introduces up to one observed interval of pose presentation delay.
+Pausing, reduced motion, a changed owner/configuration, rewinds, births and
+ambiguous teleports use the committed pose immediately.
+Picking and camera follow use the displayed creature position. The offscreen
+`OffscreenCapture::render_interpolated` API accepts an explicit fraction and records
+both endpoint ticks and science digests; an interpolated image has no single
+`world_digest` attribution. It does not certify independently supplied worlds as
+one replay. Terrain, population and other state cues use the later cut. Ordinary
+endpoint captures keep their existing contract.
 
 ### Environment variables (quick reference)
 - `RUST_LOG` — logging filter (e.g., `info`, `trace`, `scriptbots_core=debug`).
@@ -735,7 +750,8 @@ Deterministic, staged tick pipeline (six seeded, domain-separated RNG streams; e
 ### Legacy parity (what matches the C++ original and what does not)
 - **Transcribed from the C++:** the exact two-rotation locomotion (the default model), the 25-input sensor layout (four eyes, smell, sound, hearing, blood, clocks, temperature), carcass sharing (spiked kills only, maturity multiplier, `numaround^1.25` split) and the temperature-discomfort formula.
 - **Deliberately different:** combat runs every tick with reach `spike radius + spike length`, multiplicative damage bonuses and partial spike retraction, where the C++ checks every second tick for `d < 2r` within π/8 and snaps the spike to zero; health and energy are separate budgets; reproduction may take a partner (with probability `partner_chance`, the oldest other agent) and yields one child, where the C++ is asexual with `BABIES=2`; the population floor defaults to `population_minimum = 0` instead of topping up to `NUMBOTS=70`; food also regrows continuously in every cell (`food_growth_rate = 0.05`), where the C++ only refills one random cell to `FOODMAX` every 15 ticks.
-- **Launch ecology vs core defaults:** a launch without `--scenario` (`scriptbots-app-default-v2` / `-layered-v2`) makes reproduction food-driven, as in the C++, lowers food regrowth to `0.0005`, sets a floor of 20 agents, and places its 20 founders at seeded uniform positions across the whole world (`seeded-uniform-spread-20-registered-brain-v1`) instead of the 4x4 corner grid that scenario documents keep. Measured with spread founders (seeds 11, 42, 137): 185–290 agents at tick 30,000, with 45–63 births per 1,000 ticks (the grid founders gave 180–288 and 42–73). A 60,000-tick run reached 449–575 agents and was still growing slowly, so no plateau has been observed yet. The core `ScriptBotsConfig::default()`, which every scenario document builds on, still advances the reproduction counter every tick and gives each child full energy at no cost to the parent; with the same founders it passes 3,000 agents between ticks ~5,900 and ~7,900. `scenarios/meadow.scenario.toml` passes its 360-tick envelope but passes 3,000 agents by tick ~1,200 on all three declared seeds. Tracked in `bd-vgsx`.
+- **Launch ecology vs core defaults:** a launch without `--scenario` (`scriptbots-app-default-v2` / `-layered-v2`) uses predominantly food-driven reproduction, retaining a small timer contribution of `0.0001` per tick for both diets, lowers food regrowth to `0.0005`, sets a floor of 20 agents, and places its 20 founders at seeded uniform positions across the whole world (`seeded-uniform-spread-20-registered-brain-v1`) instead of the 4x4 corner grid that scenario documents keep. Measured with spread founders (seeds 11, 42, 137): 185–290 agents at tick 30,000, with 45–63 births per 1,000 ticks (the grid founders gave 180–288 and 42–73). A 60,000-tick run reached 449–575 agents and was still growing slowly, so no plateau has been observed yet. The core `ScriptBotsConfig::default()`, which every scenario document builds on, still advances the reproduction counter every tick and gives each child full energy at no cost to the parent; with the same founders it passes 3,000 agents between ticks ~5,900 and ~7,900. `scenarios/meadow.scenario.toml` passes its 360-tick envelope but passes 3,000 agents by tick ~1,200 on all three declared seeds. Tracked in `bd-vgsx`.
+- **Explicit food-funded experiment:** select `--scenario scenarios/food_funded_meadow_v1.scenario.toml` to make both reproduction rates exactly zero. Grazing and spiked-carcass rewards must earn the seven progress units required for a birth; elapsed ticks contribute nothing. This closed scenario has no population-floor or scheduled injections, no random food respawn, regrowth `0.0005`, and a parent debit equal to the child's `0.25` starting energy. Its declared 10,000-tick envelope across seeds 11/42/137 is an acceptance study awaiting execution, permits extinction, and makes no equilibrium claim. Five production core tests cover earned births, food-free waiting, carcass eligibility, newborn reset, separate injection accounting and unchanged timed arithmetic. Custom configurations must set both diet rates to zero or both positive; mixed zero/positive pairs are rejected. Existing defaults and the original meadow remain unchanged.
 - There is no C++ oracle harness yet, so parity beyond the transcribed pieces is not measured.
 
 ### Design principles & determinism
@@ -1479,6 +1495,35 @@ per consumer. Same-revision polls produce nothing. If the source becomes
 unavailable or changes session after connection, the stream emits a typed
 `error` record and closes; clients must handle that refusal explicitly.
 
+#### Browser creature selection and inspection
+
+Click a creature in either Canvas 2D or WebGPU, or enter its stable decimal UID
+in **Creature Inspector**. Both renderers highlight the selected creature.
+The panel reports health, age, generation, energy, lifetime net food balance,
+reproduction progress, lineage, sensory traits, and the brain's recorded inputs
+and outputs. Selection and inspection are presentation operations and do not
+advance the simulation.
+
+Local viewing reads the WASM owner's completed boundary through
+`SimHandle.inspectAgent(uid)`. Remote viewing uses
+`GET /api/agents/inspect?uid=UID&session_id=SESSION&epoch=EPOCH` under the existing
+Host and Origin policy. The result identifies its owner, epoch, inspected tick,
+publication and scientific revisions with exact decimal strings. The panel
+distinguishes an owner observation from the displayed frame and discards replies
+from a previous selection, reset, owner or epoch. Missing creatures and source
+changes are explicit states.
+
+Automatic refresh is limited to four reads per second, with one current request;
+remote reads have a two-second client timeout and a 16 KiB response limit.
+The native owner query has a 250 ms deadline. The projection contains fixed
+signal arrays and a bounded brain label; it does not load genomes or histories,
+so basic inspection also works for brains without a genome-locus browser schema.
+
+The native owner path passed focused DSR tests before a workspace outage. The
+committed feature was then recovered from the reviewed edits; those recovered
+bytes have not been recompiled. Browser test results were not recoverable,
+and actual DOM/WebGPU journeys and the HTTP integration test remain unexecuted.
+
 #### Remote browser viewing and stream subscriptions
 
 The web demo's **Remote Server** controls connect its existing Canvas 2D or WebGPU
@@ -1504,22 +1549,25 @@ Send a subscription as JSON text:
 ```
 
 The server acknowledges with `type: "subscribed"`, the correlation `request_id`,
-`protocol_version: 1`, `stream_protocol_version: 1`, decimal-string `session_id`,
+`protocol_version: 1`, `stream_protocol_version: 2`, decimal-string `session_id`,
 selected `channels`, and `max_fps`. Ignore any initial binary summaries until
 that acknowledgment. Every subsequent binary message begins with ASCII `SBWS`,
-a little-endian `u16` version (`1`), and exactly one Postcard `RemoteFrame` from
+a little-endian `u16` version (`2`), and exactly one Postcard `RemoteFrame` from
 `scriptbots_runtime::remote`. Its identity contains the actual host session,
 publication, scientific, control and configuration revisions, and completed tick.
 Every frame also carries observed playback state and `coalesced_publications`.
 The WASM `decode_remote_frame_binary` export validates this envelope and exposes
 all identity/cursor integers as decimal strings under
-`schema: "scriptbots.remote-frame.v1"`. The dynamic canvas payload preserves the
-existing world-v2 schema used by both renderers.
+`schema: "scriptbots.remote-frame.v2"`. The dynamic canvas payload preserves the
+existing world-v2 schema used by both renderers. Stream v2 also carries a bounded
+environment overview from that same publication. JSON controls, subscriptions and
+consumption acknowledgments remain protocol version 1. Rebuild the server, WASM
+decoder and browser together; binary stream v1 is rejected explicitly.
 
 | Channel | Payload and delivery behavior |
 | --- | --- |
 | `telemetry` | Canonical `TickSummaryDto` from one host publication; latest value only. |
-| `canvas` | Complete dynamic-world snapshot from that same publication; latest value only, including paused control changes. |
+| `canvas` | Complete dynamic-world snapshot plus coherent terrain, food and water-depth overview; latest value only, including paused control changes. |
 | `events` | Up to 64 canonical narrative records, oldest first, with session-bound sequence numbers and an exact missing-prefix gap when retention overtakes a reader. Backlogged pages drain even while science is paused. |
 
 Subscriptions contain one through three unique channels. Omitted channels do no
@@ -1528,7 +1576,12 @@ frequency, not simulation speed. Binary frames are capped at 8 MiB, canvas frame
 at 65,536 agents, and narrative pages at 64 records with bounded text. An
 unrepresentable source is refused instead of silently truncated. The shared
 decoder rejects unknown versions, trailing data, invalid lengths, non-finite
-presentation values, mismatched ticks and noncontiguous event pages.
+presentation values, mismatched ticks and noncontiguous event pages. Environment
+overviews contain at most 128 × 128 cells and must cover the exact source world.
+Small grids retain every cell; larger grids select the source cell at each
+overview cell's center. This sampling is labelled and does not replace metrics
+with inferred averages. Terrain, food and hydrology revisions remain exact decimal
+strings at the JavaScript boundary. Other stream channels carry no environment.
 
 Each channel has one consumption credit. After consuming a frame, acknowledge its
 exact identity before another frame in that channel can be sent:
@@ -2118,6 +2171,14 @@ Runtime constraints:
 We maintain a sibling browser-targeted crate, `scriptbots-web`, that reuses core crates without invasive changes. See `PLAN_TO_CREATE_SIBLING_APP_CRATE_TARGETING_WASM.md` and `docs/wasm/` (ADRs, audits, capability matrix). Initial MVP runs single-threaded by disabling `scriptbots-core`’s `parallel` feature on wasm; WebGPU vs Canvas2D rendering is under evaluation.
 
 > Quick peek: `crates/scriptbots-web/web/` ships a Canvas demo harness that consumes the wasm snapshots, surfaces live metrics, and can be served locally via `python -m http.server`. Binary snapshots (`snapshot_format: "binary"`) and custom seeding strategies are already wired in for experimentation.
+
+The **World layers** selector offers combined terrain/food/water, terrain, food
+availability, water depth and agents-only views in both Canvas and WebGPU.
+Environment and agents come from the same immutable owner publication in local
+and remote mode. Layer switching does not tick or edit the world. The status line
+identifies exact cells versus a bounded center-sampled overview and reports disabled
+hydrology or unavailable layers. Empty or extinct populations still show their
+environment, and missing observations clear the previous background.
 
 The browser supports explicit saved continuations for MLP and Unbound worlds.
 Choose the brain for a new world, Reset, then use **Save in This Browser** to

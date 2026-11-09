@@ -2,6 +2,177 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Browser creature inspector (2026-11-09):** [Source implemented and reviewed —
+Codex; recovered-byte compilation and browser/HTTP acceptance open]
+
+Continue the browser interaction slice of `bd-2z0.12.3` with click and keyboard
+selection, a shared Canvas/WebGPU highlight, and a bounded scientific inspector.
+Local WASM and remote REST use the same typed read-only owner projection.
+Stable creature IDs, session, epoch and source revisions remain exact decimal
+strings; the panel identifies observed versus displayed boundaries and rejects
+late replies after selection, reset, source, session or epoch changes. The owner
+stamps even an absent-creature reply with its epoch, so a request from an old
+epoch reports a source conflict instead of a misleading missing-creature result.
+
+The panel exposes health, age, generation, energy, net lifetime food balance,
+reproduction progress, lineage, sensory traits, and named recorded input/output
+channels. The basic owner query skips genome decoding and sensor attribution,
+so inspection does not require a brain's optional genome-locus schema. It does
+not submit selection commands, step science, retain history or serialize genomes.
+Automatic refresh is limited to 4 Hz and one current request; native queries
+carry a 250 ms deadline and browser requests a two-second timeout with a streamed
+16 KiB response cap. Existing Host and Origin checks protect the REST route.
+
+Before the workspace became unavailable, DSR compiled the current core library
+and complete runtime test crate using the pinned compiler and retained locked
+Cargo dependencies. Inspector, owner-query and remote/subscription filters
+passed 23 unique tests, and the four runtime files passed formatting. The first
+compile attempt exposed a missing proc-macro search path in the external
+verification helper; correcting that helper allowed the same source to pass.
+
+The 17 feature files were subsequently recovered from reviewed edits against
+the exact published base. Subsequent source review fixed two integration gaps:
+absent-creature replies now retain the owner epoch, and the WASM inspector uses
+JSON-compatible serialization so absent parents are null just as they are in
+REST responses. Those fixes and their regression cases are also unexecuted.
+The recovered bytes have not been compiled or formatted again. Browser Node/syntax/format and web Cargo checks were launched,
+but their outcomes were lost with the executor; they are not claimed as passes.
+Authored HTTP origin/source checks, Node state-machine cases and actual DOM
+picking/highlight journeys remain qualification work. No WASM, GPU, full
+workspace Cargo/Clippy or performance acceptance is asserted by this increment.
+
+**Persistent cohort execution and food-funded ecology (2026-11-09):**
+[Implemented increments — Codex; targeted native tests passed, broader
+performance, application and long-horizon qualification open]
+
+Continue `bd-2z0.3.12.3` by retaining successful batch evaluators across science
+ticks, with exact membership/genome/state validation and transactional failure
+invalidation. Continue the selectable ecology work behind `bd-lmk6` by admitting
+an explicit food-funded reproduction configuration and a separate meadow
+scenario. Existing timed defaults and baseline artifacts remain unchanged.
+These are functionality increments; the broader performance and long-horizon
+acceptance requirements remain open.
+
+Successful batch evaluators now survive across brain stages only when their
+actual adapter allocation and semantic identity, architecture, ordered stable
+UID/arena identities, genome material/provenance and exact scalar preimages
+match. Every successor still checkpoints and reconstructs before publication.
+Faults discard retained scratch; departed cohorts and changed layouts do not
+accumulate as history. The map is owned directly by `WorldState`, accessed through
+its exclusive borrow, and absent from checkpoints and scientific digests. Cold
+checkpoint restoration reconstructs it on demand. Peak rebuild memory may contain
+both previous and next active cohorts; no exact heap-byte bound is claimed.
+
+DSR compiled the complete core test crate in both the default and scalar-only
+feature lanes, with economy fault tests enabled and retained locked Cargo
+dependencies. The default lane passed six cache-specific regressions, the
+eight-stage scalar/cohort equivalence test, 11 brain-stage tests and 19
+reproduction tests (filters overlap). The scalar-only lane passed its brain-stage
+test and all 19 reproduction tests; source formatting passed. An initial new
+test incorrectly assumed `WorldState: Sync`, which the existing Send-only sense
+provider already prevents. The cache now uses an ordinary owned map and the test
+asserts the actual `Send` contract. A separate scalar compile was killed under
+host memory pressure; the subsequent identical feature lane compiled and passed.
+No throughput result or full workspace Cargo/Clippy qualification is asserted.
+
+The food-funded slice is now implemented: both diet rates may be zero together;
+mixed zero/positive pairs remain invalid and positive-rate timer reachability is
+still enforced. `scenarios/food_funded_meadow_v1.scenario.toml` is selectable
+through the existing scenario CLI, with seven food-earned progress units, closed
+population accounting, low regrowth and parent-paid child energy. Its three-seed,
+10,000-tick study is included in the real CLI cohort/replay matrix but has not
+been executed. No long-run stability or balance conclusion is asserted.
+
+DSR compiled the complete core test crate using the pinned compiler and retained
+locked Cargo dependencies, then passed all five new food-funded tests, all 19
+reproduction-filtered tests (including those five), the existing bounded-config
+negative test, and formatting for core and the scenario test file. The first run
+identified a fixture that omitted the parent's real brain-initialization ordinal;
+the corrected expectation passes without changing production behavior. Full
+workspace Cargo/Clippy and the application scenario test remain unqualified.
+
+**Novelty/curiosity birth admission (2026-11-09):** [Implemented and targeted
+tests passed — Codex; full workspace qualification open]
+
+The production reproduction gate now compares the deterministic admission draw
+with the effective probability after selection modulation, including when the
+configured attempt chance is one. Previously that setting bypassed novelty and
+curiosity entirely. Fitness keeps its existing certain-admission/no-draw path.
+Two regression tests exercise actual novelty recomputation and the keyed
+admission stream, including missing scores and zero/intermediate/unit scores.
+All 14 reproduction-filtered core tests pass, with the economy fault feature
+enabled, under DSR using the pinned compiler and dependencies retained from the
+previous locked Cargo build. Source formatting also passes. This focused run
+does not establish full Cargo, Clippy or workspace qualification, and opt-in
+novelty/curiosity trajectories can intentionally change at affected settings.
+
+**Bevy snapshot-pair presentation (2026-11-09):** [Source implemented and
+reviewed — Codex; native build, formatting, test and GPU qualification open]
+
+The presentation slice of `bd-2z0.14.1.9.1` now retains two compact producer-observed
+pose cuts rather than integrating an easing filter over rendered frames. Stable
+UIDs, one shared frame fraction and shortest toroidal displacement align creature
+roots, heading and spike extension; terrain grounding samples the displayed pose.
+Picking and camera follow use the same displayed position.
+
+Owner/session, epoch, configuration, scientific revision and tick continuity gate
+the pair. Pauses, reduced motion, rewinds, births, changed arena handles and
+ambiguous teleports snap to the current committed endpoint. Control-only
+publications preserve the measured interval, and a stalled consumer receives the
+producer's last pair without accumulating a queue or extrapolating.
+
+`OffscreenCapture::render_interpolated` accepts two immutable worlds and a bounded
+explicit fraction. Its provenance records both actual endpoint digests and leaves
+the synthetic frame's single `world_digest` absent. Terrain, population and other
+discrete cues use the current cut; independently supplied worlds are not certified
+as one replay. Ordinary endpoint capture validation and provenance are preserved.
+
+After the execution environment failed, both files were reconstructed against
+the pinned upstream source and independently reviewed in full. These bytes do
+not match the unavailable pre-loss files; the earlier formatter pass does not
+qualify this reconstruction. Regression tests cover timing, coalesced delivery,
+identity discontinuities, pause/resume, births/reordering, toroidal motion,
+terrain/spike clearance, displayed follow/picking, capture endpoints and source
+immutability, but they remain unexecuted. The concurrent embedded-font and
+wrapping change is preserved. Full native/GPU acceptance, wheel-phase/event
+treatment, hydrology interpolation and performance evidence remain open.
+
+
+**Ft cohorts and browser world layers (2026-11-09):** [Source implemented —
+Codex; full native, rendered-output and performance qualification remains open]
+
+This pass prioritizes missing executable functionality from the current plan and
+authoritative Beads: true FtBrain cohort evaluation (`bd-2z0.3.12.3`) and browser
+environment rendering (`bd-2z0.12.3`).
+
+- FtBrain now packs distinct per-agent weights and invokes one F32 batched matrix
+  contraction per layer. Scalar evaluation remains the bit-level oracle; output
+  publication is all-or-nothing. Canonical genome and evaluator-state codecs stay
+  unchanged; adapter semantic version 3 identifies the new executor. At that
+  increment core reconstructed cohorts at each tick; retention is implemented
+  above. Neither increment establishes a throughput result.
+- Local WASM and remote Canvas/WebGPU views now show terrain, food and observed
+  water depth from the agents' immutable publication, including empty worlds.
+  Overviews retain all small-grid cells or at most 128 × 128 labelled center
+  samples covering the full source world. Layer/owner caches, frozen JS objects
+  and owner-generation invalidation prevent stale or caller-poisoned reuse.
+  Binary `SBWS` frames advance to v2; JSON controls/subscriptions/acks remain v1.
+- Executed DSR checks: the final Ft source passed all 15 tests with Rayon thread
+  counts 1 and 4 after compiling against the dependencies from its successful
+  locked Cargo build; final browser consumer/continuation tests passed 25/25;
+  runtime remote/subscription tests passed 17/17. The exact production browser
+  Rust/JS and consumer-test blobs were recovered after executor loss by matching
+  their recorded Git hashes. UI wording, documentation and parts of the browser
+  DOM harness were reconstructed and source-reviewed; the DOM harness was not run.
+- Full Cargo/Clippy continuation and native web/Bevy qualification were blocked
+  when the shared filesystem filled, then the execution environment became
+  unavailable. The targeted Ft rerun used DSR with memory-backed compiler output
+  and the previously built locked dependencies; it does not stand in for full
+  workspace qualification. Actual Canvas/WebGPU pixel assertions are authored
+  but unexecuted. Upstream F32 parameter round-trip, full performance evidence
+  and the original Beads' broader acceptance criteria remain open.
+
+
 **Checkpoint discovery and experiment admission (2026-11-05):** [Source
 implemented — Codex; native qualification remains open]
 
