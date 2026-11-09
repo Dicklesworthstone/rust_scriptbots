@@ -1981,7 +1981,14 @@ fn compact_command_feedback(message: &str) -> String {
                 .then(|| format!("{label}: {outcome}"))
         })
         .unwrap_or_else(|| line.to_owned());
-    compact.replace(" • ", " | ")
+    native_feedback_for_hud(&compact)
+}
+
+// Bevy's embedded default font is an ASCII subset: the bullet and ellipsis
+// used by the command-status formatter render as missing-glyph boxes there.
+// Preserve the underlying status text and normalize only its display form.
+fn native_feedback_for_hud(message: &str) -> String {
+    message.replace(" • ", " | ").replace('…', "...")
 }
 
 #[derive(Clone, Copy)]
@@ -2173,6 +2180,19 @@ mod native_command_feedback_tests {
         HostSessionId, JournalFailure, ManualInstant, PlaybackSnapshot, ScientificRevision,
         channel::{ChannelHostDriver, ChannelHostOptions},
     };
+
+    #[test]
+    fn hud_feedback_uses_supported_separators_and_preserves_details() {
+        let raw = "Pause [00000000000000000000000000000001]: Rejected • limit reached… • Journal • pending";
+        assert_eq!(
+            native_feedback_for_hud(raw),
+            "Pause [00000000000000000000000000000001]: Rejected | limit reached... | Journal | pending"
+        );
+        assert_eq!(
+            compact_command_feedback(raw),
+            "Pause: Rejected | limit reached... | Journal | pending"
+        );
+    }
     use std::sync::atomic::AtomicU64;
     use std::time::Instant;
 
@@ -2542,8 +2562,8 @@ mod native_command_feedback_tests {
             let text = app.world().get::<Text>(label).unwrap().as_str();
             let latest = text.lines().next().unwrap();
             assert!(latest.starts_with(&format!("{action} [{id}]:")), "{text}");
-            if latest.contains(&format!("Applied • tick {tick} •"))
-                && latest.contains("Journal • committed in memory")
+            if latest.contains(&format!("Applied | tick {tick} |"))
+                && latest.contains("Journal | committed in memory")
             {
                 break;
             }
@@ -6159,7 +6179,7 @@ fn update_hud(
             if diagnostics_visible
                 && let Ok(mut text) = texts.get_mut(hud_elements.command_feedback)
             {
-                set_hud_text_if_changed(&mut text, message.clone());
+                set_hud_text_if_changed(&mut text, native_feedback_for_hud(&message));
             }
             if let Ok(mut text) = texts.get_mut(hud_elements.command_summary) {
                 let summary = compact_command_feedback(&message);
