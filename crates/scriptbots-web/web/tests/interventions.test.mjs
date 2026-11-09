@@ -363,6 +363,163 @@ test("closing aborts in-flight work but retains the exact uncertain command for 
   assert.equal(h.identities(), 1);
 });
 
+test("returning to a saved owner preserves its queued experiment and history cursor without replaying it", async () => {
+  const h = harness();
+  const pageRead = h.controller.historyPageAfter("2");
+  const pageRequest = h.histories[1].request;
+  const savedPage = history(pageRequest, { records: [] });
+  h.histories[1].resolve(savedPage);
+  await pageRead;
+  const staged = h.controller.stage(action());
+  const original = h.sends[0].request;
+  const originalIdentity = h.controller.retained.identity;
+  const queued = receipt(original, { journal: "durable" });
+  h.sends[0].resolve(queued);
+  await staged;
+  h.controller.setEnabled(false);
+
+  // Other playback commands may publish while science remains paused at tick 10.
+  const returned = frame({ identity: { publicationRevision: "30", controlRevision: "12", scientificRevision: "17" } });
+  h.controller.reattachOwner(returned, 3);
+  assert.equal(h.controller.enabled, false, "reattachment cannot start work before the view is enabled");
+  assert.equal(h.controller.retained.request, original);
+  assert.equal(h.controller.retained.identity, originalIdentity);
+  assert.equal(h.controller.retained.context, `3/${SESSION}`);
+  assert.equal(h.controller.receipt, queued);
+  assert.equal(h.controller.historyPage, savedPage);
+  assert.equal(h.controller.historyAfter, "2");
+  assert.equal(h.histories.length, 2, "reattachment alone performs no reads");
+  assert.equal(h.sends.length, 1, "restoring the view never replays its submission");
+  h.controller.setEnabled(true);
+  assert.equal(h.histories[2].request.afterSeq, "2");
+  assert.equal(h.histories[2].request.identity.controlRevision, "12");
+  assert.equal(original.expectedControlRevision, "7", "the original command guard cannot follow the current frame");
+  assert.equal(h.controller.canStage, false, "the first ecological effect is still queued at this same science tick");
+  await assert.rejects(h.controller.stage(action()));
+  h.controller.observe(frame({ identity: { publicationRevision: "31", controlRevision: "12", scientificRevision: "18", tick: "11" } }), 3);
+  assert.equal(h.controller.canStage, true, "the next observed science tick releases the experiment slot");
+  assert.equal(h.identities(), 1);
+});
+
+test("reattaching an uncertain owner aborts old I/O and only an explicit retry resends its frozen request", async () => {
+  const h = harness(), staged = h.controller.stage(action());
+  const old = h.sends[0], originalIdentity = h.controller.retained.identity;
+  h.controller.reattachOwner(frame({ identity: { publicationRevision: "23", controlRevision: "8", scientificRevision: "13" } }), 5);
+  assert.equal(old.signal.aborted, true);
+  assert.equal(h.histories[0].signal.aborted, true);
+  assert.equal(h.controller.retained.request, old.request);
+  assert.equal(h.controller.retained.identity, originalIdentity);
+  assert.match(h.controller.commandError, /original request is retained/);
+  assert.equal(h.controller.enabled, false);
+  h.controller.setEnabled(true);
+  assert.equal(h.sends.length, 1, "a reconnect must never automatically submit an uncertain command");
+  assert.equal(h.controller.canStage, false);
+  old.resolve(receipt(old.request));
+  await staged;
+  assert.equal(h.controller.receipt, null, "a detached response cannot replace the retained uncertain outcome");
+
+  const retried = h.controller.retry();
+  assert.equal(h.sends[1].request, old.request);
+  assert.equal(h.sends[1].request.expectedControlRevision, "7");
+  h.sends[1].resolve(receipt(old.request));
+  await retried;
+  assert.equal(h.controller.receipt.commandId, COMMAND);
+  assert.equal(h.identities(), 1);
+});
+
+test("reattaching a different owner session clears old receipts and ignores its late submission result", async () => {
+  const h = harness(), staged = h.controller.stage(action());
+  const old = h.sends[0];
+  const replacement = frame({ identity: { sessionId: "18446744073709551611" } });
+  h.controller.reattachOwner(replacement, 2);
+  assert.equal(old.signal.aborted, true);
+  assert.equal(h.controller.retained, null);
+  assert.equal(h.controller.receipt, null);
+  assert.equal(h.controller.historyPage, null);
+  assert.equal(h.controller.historyAfter, "0");
+  assert.equal(h.controller.enabled, false);
+  old.resolve(receipt(old.request));
+  await staged;
+  assert.equal(h.controller.receipt, null);
+  h.controller.setEnabled(true);
+  const next = h.controller.stage(action());
+  assert.equal(h.sends[1].request.sessionId, replacement.identity.sessionId);
+  assert.notEqual(h.sends[1].request.requestId, old.request.requestId);
+  h.sends[1].resolve(receipt(h.sends[1].request, { source: replacement }));
+  await next;
+  assert.equal(h.controller.receipt.source.sessionId, replacement.identity.sessionId);
+});
+
+test("an explicit owner replacement cannot restore a request merely because its checkpoint reused the session", async () => {
+  const h = harness(), staged = h.controller.stage(action());
+  const old = h.sends[0];
+  h.sends[0].resolve(receipt(old.request, { journal: "durable" }));
+  await staged;
+  h.controller.setEnabled(false);
+  h.controller.reset();
+  h.controller.reattachOwner(h.current, 4);
+  h.controller.setEnabled(true);
+  assert.equal(h.controller.retained, null);
+  assert.equal(h.controller.receipt, null);
+  assert.equal(h.controller.canStage, true);
+  const next = h.controller.stage(action());
+  assert.notEqual(h.sends[1].request.requestId, old.request.requestId);
+  h.sends[1].resolve(receipt(h.sends[1].request));
+  await next;
+});
+
+test("same-session source rewinds block staging and retry while preserving the uncertain original request", async () => {
+  const h = harness();
+  const boundary = frame({ identity: { publicationRevision: "40", scientificRevision: "30", controlRevision: "10",
+    configRevision: "4", tick: "100" }, snapshot: { epoch: "2" } });
+  h.controller.observe(boundary, 1);
+  const staged = h.controller.stage(action());
+  const original = h.sends[0].request;
+  h.sends[0].reject(new Error("response lost after possible admission"));
+  await staged;
+  for (const field of ["epoch", "publicationRevision", "scientificRevision", "controlRevision", "configRevision", "tick"]) {
+    const rewound = structuredClone(boundary);
+    const counters = field === "epoch" ? rewound.snapshot : rewound.identity;
+    counters[field] = (BigInt(counters[field]) - 1n).toString();
+    assert.equal(h.controller.reattachOwner(rewound, 3), false, `${field} regression must refuse reattachment`);
+    assert.equal(h.controller.retained.request, original);
+    assert.equal(h.controller.frame, boundary, "keep the earlier evidence needed to detect a rewind");
+    assert.match(h.controller.attachmentError, new RegExp(field));
+    h.controller.setEnabled(true);
+    assert.equal(h.controller.enabled, false, "opening the toolbox cannot bypass source refusal");
+    assert.equal(h.controller.canStage, false);
+    await h.controller.retry();
+    assert.equal(h.sends.length, 1, "an unsafe source cannot receive even an explicit retry");
+  }
+  assert.equal(h.controller.reattachOwner(boundary, 3), true);
+  assert.equal(h.controller.attachmentError, null);
+  assert.equal(h.sends.length, 1, "returning to a coherent boundary never resubmits automatically");
+  h.controller.setEnabled(true);
+  const retried = h.controller.retry();
+  assert.equal(h.sends[1].request, original);
+  h.sends[1].resolve(receipt(original, { source: boundary }));
+  await retried;
+  assert.equal(h.identities(), 1);
+});
+
+test("reattachment also guards the newer source already observed by an owner receipt", async () => {
+  const h = harness(), staged = h.controller.stage(action());
+  const original = h.sends[0].request;
+  const accepted = receipt(original, { journal: "durable" });
+  h.sends[0].resolve(accepted);
+  await staged;
+  const newerThanCanvas = frame({ identity: { publicationRevision: "21" } });
+  assert.equal(h.controller.reattachOwner(newerThanCanvas, 3), false,
+    "a fresh connection frame may still be older than its previous HTTP observation");
+  assert.equal(h.controller.receipt, accepted);
+  assert.equal(h.controller.retained.request, original);
+  const coherent = frame({ identity: { publicationRevision: "22", controlRevision: "8", scientificRevision: "13" } });
+  assert.equal(h.controller.reattachOwner(coherent, 3), true);
+  h.controller.setEnabled(true);
+  assert.equal(h.controller.canStage, false, "coherence does not turn a queued action into an ecological effect");
+  assert.equal(h.sends.length, 1);
+});
+
 test("history requests are single-flight, publication-driven and stop when disabled", async () => {
   const h = harness();
   assert.equal(h.histories.length, 1);

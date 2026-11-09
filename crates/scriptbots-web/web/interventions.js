@@ -151,18 +151,19 @@ export class InterventionController {
   constructor({ send, status, history, onChange = () => {}, now = () => performance.now(), id = interventionRequestId }) {
     Object.assign(this, { send, status, history, onChange, now, id, enabled: false,
       frame: null, context: null, retained: null, receipt: null, commandPending: null,
-      historyPending: null, historyPage: null, historyAfter: "0", commandError: null, historyError: null,
+      historyPending: null, historyPage: null, historyAfter: "0", commandError: null, historyError: null, attachmentError: null,
       lastHistoryAt: -Infinity, lastStatusAt: -Infinity, lastHistoryPublication: null, lastStatusPublication: null });
   }
   emit() { this.onChange(this); }
   reset() {
     this.commandPending?.abort.abort(); this.historyPending?.abort.abort();
     Object.assign(this, { frame: null, context: null, retained: null, receipt: null, commandPending: null,
-      historyPending: null, historyPage: null, historyAfter: "0", commandError: null, historyError: null,
+      historyPending: null, historyPage: null, historyAfter: "0", commandError: null, historyError: null, attachmentError: null,
       lastHistoryAt: -Infinity, lastStatusAt: -Infinity, lastHistoryPublication: null, lastStatusPublication: null });
     this.emit();
   }
   setEnabled(enabled) {
+    enabled = Boolean(enabled) && !this.attachmentError;
     if (this.enabled === enabled) return;
     this.enabled = enabled;
     if (!enabled) {
@@ -173,6 +174,29 @@ export class InterventionController {
       }
     } else { void this.refreshHistory(true); }
     this.emit();
+  }
+  /** Reopen a saved handle/endpoint view; the caller must first match that owner. */
+  reattachOwner(frame, generation) {
+    this.setEnabled(false);
+    if (this.frame?.identity.sessionId === frame.identity.sessionId) {
+      const current = { ...frame.identity, epoch: frame.snapshot.epoch };
+      const observed = [{ ...this.frame.identity, epoch: this.frame.snapshot.epoch },
+        this.receipt?.source, this.historyPage?.source].filter(Boolean);
+      const regressed = SOURCE_FIELDS.filter((field) => observed.some((source) => BigInt(current[field]) < BigInt(source[field])));
+      if (regressed.length) {
+        const error = `Owner source moved behind previously observed ${regressed.join(", ")}. Intervention actions are disabled until a coherent boundary returns or the owner is explicitly replaced. Any original request remains retained; nothing was resubmitted.`;
+        if (this.attachmentError !== error) { this.attachmentError = error; this.emit(); }
+        return false;
+      }
+      // Only presentation generation changes. The command's original source,
+      // revision guard and retry identity must survive a round trip to another view.
+      this.context = `${generation}/${frame.identity.sessionId}`;
+      if (this.retained) this.retained = { ...this.retained, context: this.context };
+    }
+    this.attachmentError = null;
+    this.observe(frame, generation);
+    this.emit();
+    return true;
   }
   observe(frame, generation) {
     const changed = this.context !== `${generation}/${frame.identity.sessionId}`
@@ -270,7 +294,7 @@ const renderedHistory = new WeakMap();
 export function renderInterventions(panel, controller) {
   if (!panel) return;
   const query = (id) => panel.querySelector(`#intervention-${id}`);
-  const { frame, retained, receipt, commandPending, commandError, historyPage, historyError } = controller;
+  const { frame, retained, receipt, commandPending, commandError, historyPage, historyError, attachmentError } = controller;
   query("stage").disabled = !controller.canStage;
   query("retry").disabled = !controller.enabled || !retained || !!commandPending;
   query("status-refresh").disabled = !controller.enabled || !receipt || !!commandPending;
@@ -280,9 +304,10 @@ export function renderInterventions(panel, controller) {
   query("pause").disabled = !controller.enabled || !frame || frame.playback?.paused === true;
   query("step").disabled = !controller.enabled || !frame || frame.playback?.paused !== true || !!commandPending;
   query("resume").disabled = !controller.enabled || !frame || frame.playback?.paused !== true || !!commandPending;
-  query("owner").textContent = frame ? `Displayed owner: ${frame.playback?.paused ? "paused" : "running"} · tick ${frame.identity.tick} · control revision ${frame.identity.controlRevision}. Pause to stage; Step or Resume applies queued effects.` : "Waiting for an observed world.";
+  query("owner").textContent = attachmentError ? "Displayed owner has regressed behind an earlier observation. Intervention actions remain disabled."
+    : frame ? `Displayed owner: ${frame.playback?.paused ? "paused" : "running"} · tick ${frame.identity.tick} · control revision ${frame.identity.controlRevision}. Pause to stage; Step or Resume applies queued effects.` : "Waiting for an observed world.";
   query("request").textContent = retained ? `${retained.request.intervention.kind.replaceAll("_", " ")} · request ${retained.request.requestId}${receipt ? ` · command ${receipt.commandId}` : ""}` : "No intervention request in this owner session.";
-  query("receipt").textContent = `${commandPending ? "Waiting for owner response. " : ""}${receipt ? interventionReceiptText(receipt) : ""}${commandError ? ` ${commandError}` : ""}`;
+  query("receipt").textContent = `${commandPending ? "Waiting for owner response. " : ""}${receipt ? interventionReceiptText(receipt) : ""}${commandError ? ` ${commandError}` : ""}${attachmentError ? ` ${attachmentError}` : ""}`;
   query("history-source").textContent = historyError || (historyPage
     ? `Global effects observed at tick ${historyPage.source.tick}; world ${historyPage.closed ? "closed" : "open"}. Showing ${historyPage.records.length} records after #${historyPage.afterSeq}; latest observed #${historyPage.latestSeq}. These records are not correlated to the command above.`
     : "Open the toolbox to read global ecological effects.");

@@ -98,6 +98,12 @@ export class RemoteFrameTracker {
     this.sessionId = null;
     this.afterEvent = 0n;
     this.observed = new Map();
+    this.freshSnapshots = new Set();
+  }
+
+  /** Revalidate each new connection without discarding its earlier source floors. */
+  beginConnection(channels = this.channels) {
+    this.freshSnapshots = new Set(validateChannels(channels).filter((channel) => channel !== "events"));
   }
 
   acknowledge(sessionId, channels = this.channels) {
@@ -118,7 +124,7 @@ export class RemoteFrameTracker {
     // sibling telemetry. An unseen channel has no cursor: revision zero itself
     // may still need delivering from a paused, freshly started host.
     const resume = { session_id: this.sessionId, after_event: String(this.afterEvent) };
-    if (snapshots.length && snapshots.every((channel) => this.observed.has(channel))) {
+    if (snapshots.length && snapshots.every((channel) => this.observed.has(channel) && !this.freshSnapshots.has(channel))) {
       const revisions = snapshots.map((channel) => BigInt(this.observed.get(channel).identity.publicationRevision));
       resume.after_revision = String(revisions.reduce((minimum, value) => value < minimum ? value : minimum));
     }
@@ -127,6 +133,7 @@ export class RemoteFrameTracker {
 
   /** Deliver synchronously, then commit cursors. Refusal leaves all cursors unchanged. */
   accept(frame, consume) {
+    const freshSnapshots = this.freshSnapshots;
     if (frame?.schema !== "scriptbots.remote-frame.v2" || !this.channels.includes(frame.kind)
         || this.sessionId === null || frame.identity?.sessionId !== this.sessionId) {
       throw new Error("Remote frame has an unnegotiated schema, channel or session");
@@ -183,7 +190,7 @@ export class RemoteFrameTracker {
           || String(frame.payload.tick) !== frame.identity.tick) {
         throw new Error("Remote payload tick differs from its exact publication identity");
       }
-      if (previous?.identity.publicationRevision === frame.identity.publicationRevision) return false;
+      if (previous?.identity.publicationRevision === frame.identity.publicationRevision && !freshSnapshots.has(frame.kind)) return false;
     }
     const accepted = consume(frame);
     if (accepted && typeof accepted.then === "function") {
@@ -192,6 +199,7 @@ export class RemoteFrameTracker {
     if (accepted === false) throw new Error("Remote frame consumer refused the publication");
     this.afterEvent = nextEvent;
     this.observed.set(frame.kind, metadata(frame));
+    freshSnapshots.delete(frame.kind);
     return true;
   }
 }
@@ -346,6 +354,7 @@ export class RemoteStreamClient {
 
   connect() {
     if (this.socket) throw new Error("A remote connection is already active");
+    this.tracker.beginConnection(this.channels);
     const generation = ++this.generation;
     this.report("connecting", "Connecting to the remote host…");
     let socket;

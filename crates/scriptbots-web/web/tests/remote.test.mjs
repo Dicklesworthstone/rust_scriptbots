@@ -1,6 +1,7 @@
 // Consumer-state tests. The Rust codec tests exercise actual HostCore bytes;
 // these tests exercise the browser's cursor commits and request correlation.
 import assert from "node:assert/strict";
+import { webcrypto } from "node:crypto";
 import test from "node:test";
 import { RemoteFrameTracker, RemoteStreamClient, consumeRemoteFrame } from "../remote.js";
 import { EnvironmentRaster, environmentDescription } from "../renderers/environment.js";
@@ -357,4 +358,93 @@ test("rate observations keep the connection usable and invalid mask changes are 
   assert.equal(value.maxFps, 60);
   assert.throws(() => value.setSubscriptions({ channels: ["events", "events"] }), /distinct/);
   assert.deepEqual(value.channels, ["canvas"]);
+});
+
+test("a paused owner reconnect refreshes unchanged snapshots once while preserving cursors and refusing rewinds", () => {
+  const originalSocket = globalThis.WebSocket;
+  const originalCrypto = Object.getOwnPropertyDescriptor(globalThis, "crypto");
+  if (!globalThis.crypto) Object.defineProperty(globalThis, "crypto", { value: webcrypto, configurable: true });
+  const sockets = [], delivered = [];
+  let decoded;
+  class ControlledSocket {
+    constructor(url) {
+      this.url = url; this.readyState = 0; this.bufferedAmount = 0;
+      this.listeners = new Map(); this.sent = []; sockets.push(this);
+    }
+    addEventListener(kind, listener) { this.listeners.set(kind, listener); }
+    send(text) { this.sent.push(JSON.parse(text)); }
+    close() { this.readyState = 3; }
+    open() { this.readyState = 1; this.listeners.get("open")(); }
+    message(data) { this.listeners.get("message")({ data }); }
+  }
+  globalThis.WebSocket = ControlledSocket;
+  const value = new RemoteStreamClient({ url: "wss://lab.example/api/ws/stream", channels: ["canvas", "telemetry", "events"],
+    decodeFrame: () => decoded, onFrame: (source) => delivered.push(source) });
+  const subscribe = () => {
+    const socket = sockets.at(-1);
+    socket.open();
+    const request = socket.sent.find((message) => message.command === "subscribe");
+    socket.message(JSON.stringify({ protocol_version: 1, stream_protocol_version: 2, type: "subscribed",
+      request_id: request.request_id, session_id: SESSION, channels: request.channels, max_fps: request.max_fps }));
+    return { socket, request };
+  };
+  const receive = (socket, source) => { decoded = source; socket.message(new ArrayBuffer(1)); };
+  try {
+    value.connect();
+    const first = subscribe();
+    assert.equal(first.request.resume, undefined);
+    receive(first.socket, frame("canvas", "10"));
+    receive(first.socket, frame("telemetry", "10"));
+    receive(first.socket, eventPage("0", "1", "1", "1", 1, "10"));
+    assert.deepEqual(value.resume, { session_id: SESSION, after_event: "1", after_revision: "10" });
+    value.sendControl("pause", { requestId: "retained-pause" });
+    const retained = value.requests.get("retained-pause").text;
+
+    value.reconnect();
+    const second = subscribe();
+    assert.deepEqual(second.request.resume, { session_id: SESSION, after_event: "1" },
+      "omit only the snapshot cursor so an unchanged paused host can answer");
+    assert.equal(delivered.length, 3, "subscription acknowledgement is not a source observation");
+    receive(second.socket, frame("canvas", "10"));
+    assert.equal(delivered.length, 4, "one fresh equal-revision canvas must reach the consumer");
+    receive(second.socket, frame("canvas", "10"));
+    assert.equal(delivered.length, 4, "same-connection duplicate canvas delivery stays suppressed");
+    receive(second.socket, frame("telemetry", "10"));
+    receive(second.socket, frame("telemetry", "10"));
+    assert.equal(delivered.length, 5, "each subscribed snapshot channel has exactly one refresh");
+    assert.deepEqual(value.resume, { session_id: SESSION, after_event: "1", after_revision: "10" });
+    assert.equal(value.requests.get("retained-pause").text, retained);
+    assert.ok(second.socket.sent.every((message) => ["subscribe", "stream_ack"].includes(message.command)),
+      "reconnect never replays a retained command");
+
+    value.reconnect();
+    const third = subscribe();
+    receive(third.socket, frame("canvas", "9"));
+    assert.equal(value.state, "error", "refresh permission cannot admit an older publication");
+    assert.equal(delivered.length, 5);
+    assert.equal(value.tracker.observed.get("canvas").identity.publicationRevision, "10");
+    value.reconnect();
+    const fourth = subscribe();
+    const changed = frame("canvas", "10"); changed.identity.controlRevision = "5";
+    receive(fourth.socket, changed);
+    assert.equal(value.state, "error", "the same publication cannot acquire a different identity on reconnect");
+    assert.equal(delivered.length, 5);
+  } finally {
+    value.disconnect();
+    globalThis.WebSocket = originalSocket;
+    if (originalCrypto) Object.defineProperty(globalThis, "crypto", originalCrypto);
+    else delete globalThis.crypto;
+  }
+});
+
+test("a synchronous reconnect during consumption retains the new connection's fresh-snapshot allowance", () => {
+  const value = tracker(["canvas"]), source = frame("canvas", "10");
+  value.accept(source, () => {});
+  value.beginConnection();
+  assert.equal(value.accept(source, () => { value.beginConnection(); }), true);
+  assert.equal(value.resume().after_revision, undefined,
+    "consuming the previous connection's frame cannot spend the replacement connection's refresh");
+  assert.equal(value.accept(source, () => {}), true);
+  assert.equal(value.accept(source, () => {}), false);
+  assert.equal(value.resume().after_revision, "10");
 });

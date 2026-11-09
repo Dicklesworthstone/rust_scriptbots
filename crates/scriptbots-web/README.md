@@ -65,6 +65,16 @@ The crate exposes the following wasm-bindgen surface:
   decimal-string identities, its dynamic snapshot, and a bounded terrain/food/water
   overview. The environment is cached by owner and layer revisions and frozen in
   JavaScript; callers cannot mutate the shared cells. This does not tick the world.
+- `SimHandle::inspectGenome(uid: string, locusOffset: number, deltaOffset: number)` —
+  reads a bounded page of canonical loci and retained primary-parent differences.
+  Start both offsets at zero and follow the returned independent page cursors.
+- `SimHandle::intervene(request)` — stages a source-bound intervention at an observed
+  paused boundary. Keep the exact request for an explicit idempotent retry after an
+  uncertain response; an applied receipt means queued for the next scientific tick.
+- `SimHandle::interventionStatus(commandId: string, sessionId: string)` — reads the
+  retained application and journal outcome. A null result means unknown.
+- `SimHandle::interventionHistory(sessionId: string, epoch: string, afterSeq: string, limit: number)` —
+  reads 1–64 global ecological effect records, including explicit retention gaps.
 - `SimHandle::reset(seed?: number)` — rebuilds the world. An explicit seed
   overrides the nested config for that reset; omitting it falls back to the
   original `config.rng_seed` (or entropy when the nested seed is also absent).
@@ -138,3 +148,45 @@ world intact. This saved continuation is separate from the owner's journal
 receipt state. It does not write a SQLite image or ordered batch journal, or
 promote volatile receipts to `Durable`; those original `bd-ywtv` requirements
 remain open. Multiple tabs share the slot: the last completed manual save wins.
+
+## Genome inspection and interventions
+
+Select a creature and open **Inherited genome & parent differences** to inspect its
+actual canonical genome. Loci and changed parent loci have separate page controls;
+the summary covers the full compared genome. Inspection reads on selection, page
+navigation and explicit refresh, without advancing the world or decoding a genome
+on every frame. Pages contain at most 64 loci and 32 differences, with a 64 KiB
+response ceiling and a pre-decode ceiling of 65,536 loci per genome. The parent must
+still be living and retain material matching the child's recorded provenance.
+Unavailable parent material is reported explicitly. Crossover comparisons describe
+differences from the primary parent, without attributing all differences to mutation.
+
+Open **Scientific intervention toolbox**, pause the world, and choose drought,
+embargo, bloom, meteor, or closed/open-world policy. Ecological actions can cover
+the whole world or a toroidal disc; the disc can be centered on the selected
+creature. **Stage intervention at paused boundary** records a command. **Step once**
+or **Resume** then advances science so the queued action can take effect. The
+toolbox displays command application and journal durability separately from the
+global observed-effects history. History rows have no per-command attribution.
+
+If delivery is uncertain, **Retry original request with same ID** preserves the
+original action and source guard. It does not construct a new experiment. Another
+intervention remains disabled while the previous result is unknown or a queued
+action has not reached a later tick. Session, epoch and control-revision guards
+refuse stale commands, including concurrent Resume or Step races.
+
+Switching to a remote server preserves the retained local world's request and
+receipt for **Return to Local**. Reconnecting to the same remote endpoint also
+retains its request until a fresh, painted owner frame confirms the source. A
+rewound same-session source disables intervention actions while retaining the
+original request. Resetting or replacing the local world explicitly starts a new
+toolbox context. Only one local and one remote view are retained.
+
+The same surfaces work against the connected native owner. Its HTTP endpoints are
+`GET /api/agents/genome`, `POST /api/control/browser-intervention`,
+`GET /api/control/browser-intervention/{command_id}` and
+`GET /api/interventions/browser`. Genome queries carry `uid`, `session_id`, `epoch`,
+`locus_offset` and `delta_offset`; history queries carry `session_id`, `epoch`,
+`after_seq` and `limit`. Preserve decimal strings for 64-bit source identities and
+counters, and the canonical 32-character hexadecimal command ID. Request and
+response sizes, owner work, page size and browser read time are bounded.

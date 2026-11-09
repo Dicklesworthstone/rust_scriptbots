@@ -3,19 +3,34 @@
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
 **Browser laboratory controls and replicated branch studies (2026-11-09):**
-[Currently In Progress — Codex]
+[Source implemented — Codex; full application and packaged-browser qualification open]
 
-Continue the actual browser functionality in `bd-2z0.12.3`: bounded canonical
-genome-locus and parent-difference pages, and source-bound local/remote scientific
-interventions with retry-stable command identities. Command application queues an
-intervention; observed ecological history remains a separate outcome. Reads and
-pages must retain exact owner identities and refuse oversized source material.
+The browser functionality in `bd-2z0.12.3` now includes bounded canonical
+genome-locus and living-primary-parent difference pages, and source-bound
+local/remote scientific interventions with retry-stable command identities.
+Command application queues an intervention; the next scientific tick can apply
+its ecological effect. Application, journal durability and global observed-effect
+history remain separate outcomes. Reads preserve exact owner identities and
+refuse oversized source material before decoding. Paused-boundary admission
+rejects stale or future control revisions, including queued Resume races.
 
-Extend Phase 4.5 with independently seeded checkpoint pairs and aggregate terminal
-endpoints. Replication must count independent seeds, preserve every underlying run,
-and enforce the existing study work ceiling across the complete seed cohort.
-Implementation, focused execution and full frontend/native qualification will be
-reported separately; existing bead ownership and acceptance remain unchanged.
+Phase 4.5 now exposes `branch-study --seeds` and independently initialized matched
+checkpoint pairs. Aggregate population, food-total and total-energy inference
+uses one terminal observation per seed and branch. The runner preserves every
+underlying report and verified bundle, rejects duplicate seeds, enforces the
+existing transition ceiling across the complete cohort, and publishes no aggregate
+success for incomplete studies. README documents commands and statistical limits.
+
+Frozen DSR evidence includes 284 passing runtime tests (six ignored), a separate
+six-test intervention owner regression suite, focused real MLP genome and local
+intervention/reset tests, native browser-crate checking, and the actual
+`wasm32-unknown-unknown` target check. JavaScript controller/transport, formatting
+and UBS critical-issue gates pass. Actual packaged-browser/DOM execution remains
+unqualified. Application all-target and isolated library/binary checks, including
+a resource-only MIR-memory retry, were killed in `asupersync` 0.5.0 under the host's
+8 GiB limit before application validation. The new application HTTP and replicated
+study executable tests therefore remain unexecuted. Existing bead ownership and
+acceptance remain unchanged.
 
 **Shared native creature appearance (2026-11-09):** [Source implemented and
 independently reviewed — Codex; native/GPU execution and performance acceptance open]

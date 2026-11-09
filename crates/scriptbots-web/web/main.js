@@ -175,35 +175,55 @@ const interventionPanel = document.getElementById("intervention-toolbox");
 const interventionField = (id) => document.getElementById(`intervention-${id}`);
 let interventionRegionContext = null;
 let interventionResumeSpeed = 1;
-const interventions = new InterventionController({
-  send: (request, signal) => {
-    if (remoteMode) return remoteClient.intervene(request, { signal });
-    if (!simHandle?.intervene) throw new Error("This WASM package does not expose interventions; rebuild the browser package");
-    return simHandle.intervene(request);
-  },
-  status: (commandId, sessionId, signal) => {
-    if (remoteMode) return remoteClient.interventionStatus(commandId, { sessionId, signal });
-    if (!simHandle?.interventionStatus) throw new Error("This WASM package does not expose intervention receipts");
-    return simHandle.interventionStatus(commandId, sessionId);
-  },
-  history: (request, signal) => {
-    if (remoteMode) return remoteClient.interventionHistory({ ...request, signal });
-    if (!simHandle?.interventionHistory) throw new Error("This WASM package does not expose intervention history");
-    return simHandle.interventionHistory(request.sessionId, request.epoch, request.afterSeq, request.limit);
-  },
-  onChange: (controller) => {
-    if (controller.frame && interventionRegionContext !== controller.context) {
-      interventionRegionContext = controller.context;
-      const world = controller.frame.snapshot.world;
-      interventionField("x").value = String(world.width / 2);
-      interventionField("y").value = String(world.height / 2);
-      interventionField("radius").value = String(Math.min(100, world.width / 4, world.height / 4));
-    }
-    renderInterventions(interventionPanel, controller);
-  },
-});
+let interventions;
+function createInterventionController(remote) {
+  return new InterventionController({
+    send: (request, signal) => {
+      if (remote) return remoteClient.intervene(request, { signal });
+      if (!simHandle?.intervene) throw new Error("This WASM package does not expose interventions; rebuild the browser package");
+      return simHandle.intervene(request);
+    },
+    status: (commandId, sessionId, signal) => {
+      if (remote) return remoteClient.interventionStatus(commandId, { sessionId, signal });
+      if (!simHandle?.interventionStatus) throw new Error("This WASM package does not expose intervention receipts");
+      return simHandle.interventionStatus(commandId, sessionId);
+    },
+    history: (request, signal) => {
+      if (remote) return remoteClient.interventionHistory({ ...request, signal });
+      if (!simHandle?.interventionHistory) throw new Error("This WASM package does not expose intervention history");
+      return simHandle.interventionHistory(request.sessionId, request.epoch, request.afterSeq, request.limit);
+    },
+    onChange: (controller) => {
+      if (controller !== interventions) return;
+      if (controller.frame && interventionRegionContext !== controller.context) {
+        interventionRegionContext = controller.context;
+        const world = controller.frame.snapshot.world;
+        interventionField("x").value = String(world.width / 2);
+        interventionField("y").value = String(world.height / 2);
+        interventionField("radius").value = String(Math.min(100, world.width / 4, world.height / 4));
+      }
+      renderInterventions(interventionPanel, controller);
+    },
+  });
+}
+// Only the retained local owner and the current remote endpoint have saved views.
+const localInterventions = createInterventionController(false);
+const remoteInterventions = createInterventionController(true);
+interventions = localInterventions;
+let localInterventionOwner = null;
+let remoteInterventionEndpoint = null;
+let interventionNeedsAttach = false;
 const updateInterventionVisibility = () => interventions.setEnabled(Boolean(interventionPanel?.open)
-  && !document.hidden && (!remoteMode || remoteConnected));
+  && !document.hidden && !interventionNeedsAttach && (!remoteMode || (remoteConnected && remoteFrame !== null)));
+function observeInterventions(frame) {
+  if (interventionNeedsAttach) {
+    // A verified source must also have painted before it can stage an experiment.
+    if (!interventions.reattachOwner(frame, simulationGeneration)) return;
+    interventionNeedsAttach = false;
+    updateInterventionVisibility();
+  }
+  interventions.observe(frame, simulationGeneration);
+}
 interventionPanel?.addEventListener("toggle", updateInterventionVisibility);
 document.addEventListener("visibilitychange", updateInterventionVisibility);
 function updateInterventionFields() {
@@ -413,10 +433,18 @@ function receiveRemoteFrame(frame) {
 
 function receiveRemoteState(state) {
   if (!remoteMode) return;
+  const hadFrame = remoteFrame !== null;
   remoteConnected = state.state === "connected";
+  if (!remoteConnected) {
+    // The canvas pixels may remain visible, but neither a stale RAF nor the next
+    // subscription acknowledgement can admit experiments before a fresh paint.
+    remoteFrame = null;
+    interventionNeedsAttach = true;
+    lastPaintedFrame = null;
+  }
   remoteStatus.dataset.state = state.state;
   remoteStatus.textContent = state.message || state.state;
-  if (["disconnected", "error", "session_changed"].includes(state.state) && remoteFrame) {
+  if (["disconnected", "error", "session_changed"].includes(state.state) && hadFrame) {
     remoteStatus.textContent += " Showing the last received frame.";
   }
   if (state.state === "session_changed") {
@@ -446,7 +474,18 @@ function receiveRemoteReceipt(reply) {
 }
 
 function connectRemote() {
+  let installedClient = false;
   try {
+    // Refuse invalid connection options before disturbing either retained owner.
+    const nextClient = new RemoteStreamClient({
+      url: remoteUrl.value.trim(),
+      decodeFrame: wasm.decode_remote_frame_binary,
+      channels: ["canvas", "telemetry", "events"],
+      maxFps: 60,
+      onFrame: receiveRemoteFrame,
+      onState: receiveRemoteState,
+      onReceipt: receiveRemoteReceipt,
+    });
     // Freeze local science before changing the active source. The saved local
     // owner is resumed only by the user's explicit Return to Local action.
     if (!remoteMode && simHandle) {
@@ -456,8 +495,10 @@ function connectRemote() {
     if (simulationTimer !== null) clearTimeout(simulationTimer);
     simulationTimer = null;
     queuedReset = false;
+    interventions.setEnabled(false);
     remoteClient?.disconnect();
-    remoteClient = null;
+    remoteClient = nextClient;
+    installedClient = true;
     remoteMode = true;
     remoteConnected = false;
     remoteFrame = null;
@@ -468,27 +509,24 @@ function connectRemote() {
     inspector.reset();
     brainInspector.reset();
     genomeInspector.reset();
-    interventions.reset();
+    interventions = remoteInterventions;
+    if (remoteInterventionEndpoint !== nextClient.url) remoteInterventions.reset();
+    remoteInterventionEndpoint = nextClient.url;
+    interventionNeedsAttach = true;
+    remoteInterventions.emit();
     lastPaintedFrame = null;
     if (captureRequest) finishCapture(captureRequest, new Error("Presentation source changed"));
     remoteEvents.replaceChildren();
     remoteReceipt.textContent = "";
     remotePlayback.textContent = "Waiting for observed server state…";
-    remoteClient = new RemoteStreamClient({
-      url: remoteUrl.value.trim(),
-      decodeFrame: wasm.decode_remote_frame_binary,
-      channels: ["canvas", "telemetry", "events"],
-      maxFps: 60,
-      onFrame: receiveRemoteFrame,
-      onState: receiveRemoteState,
-      onReceipt: receiveRemoteReceipt,
-    });
     updateMismatchBanner(null);
     resetPerformanceWindows();
     updateRemoteControls();
     remoteClient.connect();
   } catch (error) {
-    receiveRemoteState({ state: "error", message: `Connection failed: ${error.message}` });
+    const message = `Connection failed: ${error.message}`;
+    if (installedClient) receiveRemoteState({ state: "error", message });
+    else { remoteStatus.dataset.state = "error"; remoteStatus.textContent = message; }
   }
 }
 
@@ -498,6 +536,7 @@ remoteReconnect.addEventListener("click", () => {
   catch (error) { receiveRemoteState({ state: "error", message: error.message }); }
 });
 remoteLocal.addEventListener("click", () => {
+  interventions.setEnabled(false);
   remoteClient?.disconnect();
   remoteMode = false;
   remoteConnected = false;
@@ -507,7 +546,12 @@ remoteLocal.addEventListener("click", () => {
   inspector.reset();
   brainInspector.reset();
   genomeInspector.reset();
-  interventions.reset();
+  interventions = localInterventions;
+  interventionNeedsAttach = true;
+  if (localInterventionOwner !== simHandle) {
+    localInterventions.reset();
+    localInterventionOwner = simHandle;
+  }
   lastPaintedFrame = null;
   if (captureRequest) finishCapture(captureRequest, new Error("Presentation source changed"));
   remoteStatus.textContent = "Running locally in this browser.";
@@ -515,8 +559,9 @@ remoteLocal.addEventListener("click", () => {
   remotePlayback.textContent = "";
   remoteReceipt.textContent = "";
   resetPerformanceWindows();
-  updateRemoteControls();
   applyPlaybackSpeed();
+  localInterventions.emit();
+  updateRemoteControls();
   scheduleSimulation();
 });
 
@@ -651,7 +696,7 @@ function drawSnapshot(frame) {
     inspector.observe(frame, simulationGeneration);
     brainInspector.observe(frame, simulationGeneration);
     genomeInspector.observe(frame, simulationGeneration);
-    interventions.observe(frame, simulationGeneration);
+    observeInterventions(frame);
     return true;
   }
   try {
@@ -674,7 +719,7 @@ function drawSnapshot(frame) {
       inspector.observe(frame, simulationGeneration);
       brainInspector.observe(frame, simulationGeneration);
       genomeInspector.observe(frame, simulationGeneration);
-      interventions.observe(frame, simulationGeneration);
+      observeInterventions(frame);
       return true;
     }
   } catch (error) {
@@ -921,7 +966,11 @@ function replaceSimulation(next, { continuation = false, permalink = null, expec
   inspector.reset();
   brainInspector.reset();
   genomeInspector.reset();
-  interventions.reset();
+  // Checkpoint restoration may retain the canonical session ID, but it replaces
+  // the actual local owner and must never inherit the prior owner's requests.
+  localInterventions.reset();
+  localInterventionOwner = next;
+  if (interventions === localInterventions) interventionNeedsAttach = true;
   simulationStartedAt = performance.now();
   lastPaintedFrame = null;
   if (continuation) {
