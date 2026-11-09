@@ -10095,6 +10095,19 @@ enum InspectorSection {
     Brain,
 }
 
+impl InspectorSection {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Life => "LIFE",
+            Self::Senses => "SENSES",
+            Self::Actions => "ACTIONS",
+            Self::Body => "BODY",
+            Self::Genome => "GENOME",
+            Self::Brain => "BRAIN",
+        }
+    }
+}
+
 #[derive(Component, Clone, Copy)]
 enum InspectorPageButton {
     Previous,
@@ -10185,6 +10198,25 @@ impl OwnerInspectorSample {
 
     fn page_count(&self, frame: &WorldSnapshot) -> usize {
         self.section_start(InspectorSection::Brain) + 1 + frame.brain.value_page_count()
+    }
+
+    /// Return the section-local position for a valid page in the global sequence.
+    fn section_position(
+        &self,
+        frame: &WorldSnapshot,
+        page: usize,
+    ) -> (InspectorSection, usize, usize) {
+        let section = self.section_at(page);
+        let start = self.section_start(section);
+        let end = match section {
+            InspectorSection::Life => self.section_start(InspectorSection::Senses),
+            InspectorSection::Senses => self.section_start(InspectorSection::Actions),
+            InspectorSection::Actions => self.section_start(InspectorSection::Body),
+            InspectorSection::Body => self.section_start(InspectorSection::Genome),
+            InspectorSection::Genome => self.section_start(InspectorSection::Brain),
+            InspectorSection::Brain => self.page_count(frame),
+        };
+        (section, page - start + 1, end - start)
     }
 
     fn genome_delta_page_count(&self) -> usize {
@@ -10420,10 +10452,12 @@ impl OwnerInspector {
         };
         let index = page % sample.page_count(frame);
         let age = current.source.inspected_tick.0 - sample.target.source.inspected_tick.0;
+        let (section, section_page, section_count) = sample.section_position(frame, index);
         let mut status = format!(
-            "PAGE {}/{} | SAMPLE TICK {} | {} ticks old | I / SHIFT+I",
-            index + 1,
-            sample.page_count(frame),
+            "{} {}/{} | SAMPLE TICK {} | {} ticks old | I / SHIFT+I",
+            section.label(),
+            section_page,
+            section_count,
             sample.target.source.inspected_tick.0,
             age
         );
@@ -12484,6 +12518,48 @@ mod owner_inspector_tests {
         assert!(
             inspector.job.is_none(),
             "paused exact source must reuse its completed sample"
+        );
+        let sample = inspector.sample.as_ref().unwrap();
+        let frame = app
+            .world()
+            .resource::<SnapshotState>()
+            .latest
+            .as_ref()
+            .unwrap();
+        let sections = [
+            InspectorSection::Life,
+            InspectorSection::Senses,
+            InspectorSection::Actions,
+            InspectorSection::Body,
+            InspectorSection::Genome,
+            InspectorSection::Brain,
+        ];
+        for (i, section) in sections.into_iter().enumerate() {
+            let start = sample.section_start(section);
+            let end = sections.get(i + 1).map_or_else(
+                || sample.page_count(frame),
+                |next| sample.section_start(*next),
+            );
+            assert!(end > start, "each inspector section has at least one page");
+            assert_eq!(
+                sample.section_position(frame, start),
+                (section, 1, end - start)
+            );
+            assert_eq!(
+                sample.section_position(frame, end - 1),
+                (section, end - start, end - start)
+            );
+            let (status, _, _) = inspector.card_page(frame, start);
+            assert!(
+                status.starts_with(&format!("{} 1/{} |", section.label(), end - start)),
+                "{status}"
+            );
+        }
+        assert!(
+            inspector
+                .card_page(frame, sample.page_count(frame))
+                .0
+                .starts_with("LIFE 1/1 |")
         );
         let pages = &inspector.sample.as_ref().unwrap().pages;
         let joined = pages.join("\n");
