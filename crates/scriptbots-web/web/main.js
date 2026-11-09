@@ -4,7 +4,8 @@ import { WebGpuRenderer } from "./renderers/webgpu.js";
 import { environmentDescription } from "./renderers/environment.js";
 import { RemoteStreamClient } from "./remote.js";
 import { BrowserContinuationStore } from "./continuation-store.js";
-import { InspectionController, pickAgent, renderInspector, renderInspectorSource } from "./inspector.js";
+import { InspectionController, pickAgent, renderInspector, renderInspectorSource,
+  validateBrainInspection, renderBrainInspector, renderBrainSource } from "./inspector.js";
 
 const {
   init_sim,
@@ -131,9 +132,26 @@ const inspector = new InspectionController({
   onChange: (state, frame) => renderInspector(inspectorPanel, state, frame),
   onFrame: (state, frame) => renderInspectorSource(inspectorPanel, state, frame),
 });
+const brainPanel = document.getElementById("brain-inspector");
+const brainInspector = new InspectionController({
+  enabled: false,
+  validate: validateBrainInspection,
+  read: (uid, request, signal) => {
+    if (remoteMode) return remoteClient.inspectBrain(uid, { sessionId: request.sessionId, epoch: request.epoch, signal });
+    if (!simHandle?.inspectBrain) throw new Error("This WASM package does not expose brain activity; rebuild the browser package");
+    return simHandle.inspectBrain(uid);
+  },
+  onChange: (state, frame) => renderBrainInspector(brainPanel, state, frame),
+  onFrame: (state, frame) => renderBrainSource(brainPanel, state, frame),
+});
+const updateBrainVisibility = () => brainInspector.setEnabled(Boolean(brainPanel?.open) && !document.hidden);
+brainPanel?.addEventListener("toggle", updateBrainVisibility);
+document.addEventListener("visibilitychange", updateBrainVisibility);
+document.getElementById("brain-refresh")?.addEventListener("click", () => { void brainInspector.refresh(true); });
 
 function selectCreature(uid) {
   inspector.select(uid);
+  brainInspector.select(uid);
   // Selection is presentation-only, so paused frames also need repainting.
   lastPaintedFrame = null;
 }
@@ -314,6 +332,7 @@ function connectRemote() {
     lastRemoteStatusRequestId = null;
     simulationGeneration += 1;
     inspector.reset();
+    brainInspector.reset();
     lastPaintedFrame = null;
     if (captureRequest) finishCapture(captureRequest, new Error("Presentation source changed"));
     remoteEvents.replaceChildren();
@@ -350,6 +369,7 @@ remoteLocal.addEventListener("click", () => {
   remoteFrame = null;
   simulationGeneration += 1;
   inspector.reset();
+  brainInspector.reset();
   lastPaintedFrame = null;
   if (captureRequest) finishCapture(captureRequest, new Error("Presentation source changed"));
   remoteStatus.textContent = "Running locally in this browser.";
@@ -491,6 +511,7 @@ function drawSnapshot(frame) {
       && lastPaintedFrame.width === canvas.width && lastPaintedFrame.height === canvas.height
       && (!captureRequest || captureRequest.encoding)) {
     inspector.observe(frame, simulationGeneration);
+    brainInspector.observe(frame, simulationGeneration);
     return true;
   }
   try {
@@ -511,6 +532,7 @@ function drawSnapshot(frame) {
       }
       captureAdmittedFrame(frame.identity);
       inspector.observe(frame, simulationGeneration);
+      brainInspector.observe(frame, simulationGeneration);
       return true;
     }
   } catch (error) {
@@ -755,6 +777,7 @@ function replaceSimulation(next, { continuation = false, permalink = null, expec
   simHandle = next;
   simulationGeneration += 1;
   inspector.reset();
+  brainInspector.reset();
   simulationStartedAt = performance.now();
   lastPaintedFrame = null;
   if (continuation) {

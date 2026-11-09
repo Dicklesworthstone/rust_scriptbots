@@ -1043,6 +1043,29 @@ unconfirmed. Paused and single-step snapshots settle agent positions, headings,
 spikes, and idle-body deformation immediately at their recorded poses; camera
 navigation remains available while paused.
 
+### Bevy shared creature appearance
+
+Live Bevy rendering and offscreen capture now use the same shared PBR appearance
+plugin. Four material classes cover the existing creature alpha, lighting and
+sidedness combinations. Stable per-part slots hold linear color and emission in
+a resident storage buffer, while `MeshTag` selects each instance's row. Identical
+mesh/material handles let Bevy batch eligible creatures using its normal paths.
+
+Changed colors upload coalesced dirty ranges. Storage grows only when retained
+capacity is exceeded, and an actual GPU-buffer replacement receives a full
+upload. Per-row revisions preserve changes across skipped publications; slot
+generations reject stale ownership after population turnover or capture reset.
+The actual device binding limit and an independent application ceiling bound
+storage. Existing geometry, per-part entities, terrain contact, interpolation,
+picking, accessibility palettes, lighting and alpha/shadow behavior are retained.
+
+This is an implemented, independently reviewed source increment. Changed Rust
+formatting passed DSR. Native Cargo checks progressed after genuine system
+prerequisites were supplied, then the 8 GiB host memory limit killed the unchanged
+`bevy_render` dependency before project compilation. Six new CPU regressions and
+GPU capture acceptance remain unexecuted. Entity elimination, measured draw-call
+reduction and throughput qualification remain open under `bd-2z0.7.3`.
+
 ### Keyboard shortcuts (GUI)
 
 Simulation controls and retained-history playback are separate. The unmodified `S` shortcut returns the invoking view to live and queues one scientific step; when that isolated step succeeds, it advances exactly once and leaves the simulation paused. `space`, `G`, and `1`/`2`/`3` apply in Lab. Canvas presentation shortcuts (`N`, `Ctrl+P`, `D`, `F`, `Ctrl+Shift+O`, `Shift+S`, `O`, `Shift+F`, `0`, and `,`) apply in World. Simulation and canonical selection commands work from either window.
@@ -1520,10 +1543,32 @@ The native owner query has a 250 ms deadline. The projection contains fixed
 signal arrays and a bounded brain label; it does not load genomes or histories,
 so basic inspection also works for brains without a genome-locus browser schema.
 
-The native owner path passed focused DSR tests before a workspace outage. The
-committed feature was then recovered from the reviewed edits; those recovered
-bytes have not been recompiled. Browser test results were not recoverable,
-and actual DOM/WebGPU journeys and the HTTP integration test remain unexecuted.
+Expand **Brain activity and output explanations** to inspect the selected
+creature's named layers, signed activation heatmap, exact node values, actual
+connection weights and canonical output channels. Connection pages retain the
+original weights, and view navigation does not request another observation.
+Local WASM uses `SimHandle.inspectBrain(uid)`; remote viewing uses
+`GET /api/agents/brain?uid=UID&session_id=SESSION&epoch=EPOCH`. Both expose the same
+bounded owner projection and explicitly identify retained evaluator state versus
+verified feed-forward reconstruction.
+
+Brain reads stop while the panel or page is hidden. The panel permits one current
+request, refreshes at most four times per second when publications advance, and
+rejects late selection/source replies. Remote brain responses have a separate
+512 KiB streamed ceiling. Heatmaps contain at most 64 by 64 cells. Core graph
+clipping, unavailable activity, numerical overflow and exhausted explanation
+work are visible outcomes; none is presented as a complete input explanation.
+Path attribution additionally caps edge examinations, pending paths and retained
+contribution rows, so dense cyclic graphs cannot expand without a fixed bound.
+
+DSR passed all 36 Node tests, JavaScript syntax checks and changed Rust formatting.
+It type-checked the current core library and complete runtime test source using
+the pinned compiler and retained locked Cargo dependencies. All 16 tests in the
+actual final attribution module passed against verified unchanged shared types;
+this isolated module lane does not qualify current-core integration. Full web
+and app Cargo checks were attempted but killed by the host memory limit in core
+and asupersync respectively. WASM, actual DOM/WebGPU journeys, HTTP integration
+and the authored native owner execution regressions remain unqualified.
 
 #### Remote browser viewing and stream subscriptions
 

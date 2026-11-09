@@ -2,6 +2,80 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Shared native creature appearance (2026-11-09):** [Source implemented and
+independently reviewed — Codex; native/GPU execution and performance acceptance open]
+
+Continue the material and rendering portion of `bd-2z0.7.3`: live Bevy and
+`OffscreenCapture` install one appearance plugin, with four shared PBR classes
+and stable `MeshTag` rows for independently colored parts. Suspension joints
+reuse their body's row. Eligible identical mesh/material pairs can use Bevy's
+automatic batching; the existing root and part entities still own transforms,
+visibility, picking, terrain contact and interpolation.
+
+A resident storage buffer receives coalesced dirty-range writes. Ordinary color
+changes do not modify the storage-buffer asset, avoiding Bevy 0.17's repeated GPU
+allocation path. Growth rebinds the shared materials; actual buffer recreation
+forces a complete upload. Revisions retain changes across skipped extraction or
+late render-asset preparation. Population turnover releases old slots before
+allocating replacements, and generation checks prevent stale ownership. Capture
+reset reuses retained storage and invalidates former slots. Capacity admission
+uses both the actual device binding limit and an independent application ceiling.
+
+Forward/deferred PBR and a dedicated prepass preserve the admitted material
+classes' linear colors, emissive exposure semantics, vertex tint, lighting,
+fog, normals/motion output and Blend/Add shadow cutoff. Independent review checked
+these paths against pinned Bevy 0.17.3, plus resource scheduling, API signatures,
+all changed helper calls and system arity. Concurrent HUD/receipt and motion-test
+fixes through `aacdb4ebe1d85e3aa7a0055cfe78d2e98d7bb6a1` are preserved.
+
+DSR formatting passed. The actual Cargo all-targets check first lacked pkg-config;
+a verified distro-package extraction supplied genuine pkgconf, Wayland, ALSA,
+xkbcommon and udev prerequisites, whose version checks passed. The subsequent
+check was killed by the 8 GiB host memory limit inside unchanged `bevy_render`,
+before the project's native code compiled. Six new CPU tests cover slot lifetime,
+resident uploads, growth, five-palette reference parity, turnover/capacity refusal
+and capture reset; they remain unexecuted, as does GPU capture qualification.
+This increment does not close entity elimination, culling/LOD, draw-call,
+throughput or the full instancing acceptance work.
+
+**Browser brain activity and bounded explanations (2026-11-09):** [Implemented;
+focused executable checks and runtime type checks passed — Codex; full native,
+WASM and rendered-output acceptance open]
+
+Continue `bd-2z0.12.3` with an opt-in selected-brain panel shared by local WASM and
+remote REST. The panel displays named activation layers, signed heatmaps, exact
+selected values, actual retained weights and the shared core's output estimates.
+Observed owner/session/epoch/revisions stay distinct from the displayed frame.
+Reconstructed Ft activity is explicitly labelled; missing, unbound, unsupported,
+unrecorded and mismatched observations retain typed unavailable outcomes.
+
+The owner query reads one requested brain without advancing science or installing
+a persistent probe. Closing the panel or hiding the page stops reads. There is
+one current request, a four-Hz publication-driven refresh ceiling, a 250 ms native
+owner deadline and a separate 512 KiB streamed brain-response ceiling. View
+navigation is local, including 32-connection pages; accepted heatmaps allocate at
+most 512 by 512 pixels, including narrow and wide 4,096-value layers.
+
+Core attribution now refuses an affected output when finite arithmetic overflows.
+It also checks fixed ceilings before examining more than 262,144 path edges,
+retaining more than 1,024 pending states or collecting more than 4,096 unmerged
+contributions per output. Refusal discards partial estimates while retaining the
+network and other outputs; accepted calculations preserve their previous f32
+order. Dense cyclic graphs therefore have an explicit work bound independent
+of payload clipping and the request deadline.
+
+Executed DSR evidence: 36 Node tests and four JavaScript syntax checks passed;
+all changed Rust sources passed formatting. The exact core library and complete
+runtime test source passed a pinned type check using retained locked Cargo
+dependencies. The real final attribution module passed all 16 of its tests in an
+isolated harness after its shared activation types, constants and channel source
+were compared with the retained Cargo-built core. Fifteen are data/channel tests;
+one also exercises the retained core's unbound owner. This is module coverage,
+not current-core integration. Actual web and app Cargo checks were killed by the
+8 GiB host memory limit in core and asupersync; authored owner, HTTP, WASM and
+DOM/pixel acceptance remain open. Genome paging and intervention controls are
+separate remaining functionality; this increment does not close the full bead.
+
 **Ft genome loci and activity inspection (2026-11-09):** [Implemented and
  type-checked — Codex; executable qualification open]
 

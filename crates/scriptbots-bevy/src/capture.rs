@@ -1160,6 +1160,14 @@ impl<'a> OffscreenCapture<'a> {
         self.set_camera_active(true);
         // Frame 1: sync_world applies the snapshot; pipelines compile.
         self.app.update();
+        if let Some(error) = self
+            .app
+            .world()
+            .resource::<crate::AppearanceTable>()
+            .error()
+        {
+            return Err(anyhow!("capture creature appearance failed: {error}"));
+        }
         // Frame 2: draw after scene synchronization. Pipeline compilation is
         // synchronous in this offscreen app; a fixed frame count alone cannot
         // establish that asynchronous compiler tasks finished.
@@ -1515,6 +1523,7 @@ fn build_capture_app(config: &OffscreenCaptureConfig) -> Result<App> {
         ),
     )
     .add_plugins(crate::TerrainMaterialPlugin)
+    .add_plugins(crate::AppearancePlugin)
     .add_systems(
         Startup,
         (setup_capture_rig, setup_capture_resources).chain(),
@@ -1895,6 +1904,9 @@ fn reset_capture_scene(world: &mut World) {
     }
     *world.resource_mut::<SnapshotState>() = SnapshotState::default();
     *world.resource_mut::<AgentRegistry>() = AgentRegistry::default();
+    if let Some(mut appearance) = world.get_resource_mut::<crate::AppearanceTable>() {
+        appearance.reset();
+    }
 }
 
 fn configure_capture_rig(world: &mut World, target: &Handle<Image>, shadows: bool) {
@@ -2196,6 +2208,58 @@ mod tests {
             panic!("selection ring positions missing")
         };
         assert_eq!(points.len(), 390);
+    }
+
+    #[test]
+    fn capture_shared_appearance_reset_reuses_storage_and_invalidates_old_slots() {
+        let mut app = corruption_app(false);
+        app.init_resource::<crate::AppearanceTable>()
+            .init_resource::<Assets<crate::AppearanceMaterial>>()
+            .init_resource::<Assets<bevy::render::storage::ShaderStorageBuffer>>();
+        let mut previous_slot: Option<crate::appearance::AppearanceSlot> = None;
+        let mut material = None;
+        for _ in 0..3 {
+            reset_capture_scene(app.world_mut());
+            app.world_mut()
+                .run_system_once(setup_capture_resources)
+                .unwrap();
+            let mut snapshot = crate::terrain_tests::sample_world_snapshot();
+            snapshot
+                .agents
+                .push(crate::terrain_tests::sample_agent_visual());
+            app.world_mut().resource_mut::<SnapshotState>().latest = Some(snapshot);
+            app.update();
+            let table = app.world().resource::<crate::AppearanceTable>();
+            assert!(table.error().is_none());
+            let record =
+                &app.world().resource::<AgentRegistry>().records[&scriptbots_core::AgentUid(1)];
+            let appearance = record.body.appearance.as_ref().unwrap();
+            if let Some(previous) = previous_slot {
+                assert_ne!(
+                    appearance.slot, previous,
+                    "a new capture must invalidate old slot ownership"
+                );
+                assert_eq!(appearance.slot.index, previous.index);
+            }
+            if let Some(ref previous) = material {
+                assert_eq!(&appearance.material, previous);
+            }
+            previous_slot = Some(appearance.slot);
+            material = Some(appearance.material.clone());
+            assert_eq!(
+                app.world()
+                    .resource::<Assets<crate::AppearanceMaterial>>()
+                    .len(),
+                4
+            );
+            assert_eq!(
+                app.world()
+                    .resource::<Assets<bevy::render::storage::ShaderStorageBuffer>>()
+                    .len(),
+                1
+            );
+            assert_eq!(app.world().resource::<Assets<StandardMaterial>>().len(), 0);
+        }
     }
 
     #[test]

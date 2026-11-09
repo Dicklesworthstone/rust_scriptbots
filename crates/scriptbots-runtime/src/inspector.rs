@@ -5,10 +5,23 @@
 //! distinct when the scientific owner is ahead of the presentation stream.
 
 use scriptbots_core::channels::{OutputChannel, SENSOR_LAYOUT};
-use scriptbots_core::{AgentUid, INPUT_SIZE, MutationRates, OUTPUT_SIZE, TraitModifiers};
+use scriptbots_core::{
+    AgentUid, BrainActivations, BrainActivitySource, BrainInspectionBuildStats,
+    BrainInspectionLimits, BrainInspectionUnavailable, INPUT_SIZE, MutationRates, OUTPUT_SIZE,
+    SelectedBrainTelemetryOutcome, TraitModifiers,
+};
 use serde::Serialize;
 
-use crate::{HostRevisions, channel::AgentInspectorData};
+use crate::{
+    BrainProjection, BrainProjectionSource, HostAccessError, HostRevisions,
+    channel::AgentInspectorData,
+};
+
+/// Per-output contribution rows retained by the browser brain panel.
+pub const BRAIN_ACTIVITY_CONTRIBUTORS: usize = 3;
+
+/// Transport ceiling for the bounded brain JSON observation, including its provenance.
+pub const MAX_BRAIN_ACTIVITY_JSON_BYTES: usize = 512 * 1024;
 
 /// Parse one canonical, exact stable creature identity without numeric coercion.
 #[must_use]
@@ -55,6 +68,126 @@ pub struct InspectionSource {
     pub inspected: InspectionRevisions,
     /// Completed scientific tick actually inspected.
     pub tick: String,
+}
+
+impl InspectionSource {
+    fn new(source: BrainProjectionSource, epoch: u64) -> Self {
+        Self {
+            session_id: source.session_id.get().to_string(),
+            epoch: epoch.to_string(),
+            publication_revision: source.published_snapshot.get().to_string(),
+            published: source.published_host.into(),
+            inspected: source.inspected_host.into(),
+            tick: source.inspected_tick.0.to_string(),
+        }
+    }
+}
+
+/// An explicitly requested activity observation for one stable creature identity.
+///
+/// The core bounds the producer work and retained activation graph before this projection.
+/// Output explanations consume that same bounded graph and preserve their method/refusal.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrainActivityInspection {
+    /// Version of the browser/HTTP activity contract.
+    pub schema: &'static str,
+    /// Exact owner boundary, including missing and unsupported results.
+    pub source: InspectionSource,
+    /// Stable creature identity, never a reusable arena handle.
+    pub uid: String,
+    /// Actual independent producer and payload limits used for this observation.
+    pub limits: BrainInspectionLimits,
+    /// One typed result; an unavailable brain is never presented as an empty network.
+    #[serde(flatten)]
+    pub outcome: BrainActivityOutcome,
+}
+
+/// Available activity or an explicit scientific reason it cannot be observed.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(
+    tag = "status",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum BrainActivityOutcome {
+    /// The current bounded evaluator observation and explanations derived from it.
+    Ready {
+        /// Whether values are retained evaluator state or a read-only feed-forward reconstruction.
+        activity_source: BrainActivitySource,
+        /// Named layers, row-major values, actual weighted connections and output slots.
+        activations: BrainActivations,
+        /// Source and retained work, including explicit clipping evidence.
+        build: BrainInspectionBuildStats,
+        /// All canonical output channels and at most three named input contributions each.
+        outputs: Vec<scriptbots_core::attribution::OutputExplanation>,
+    },
+    /// The subject is absent, unbound or does not support this observation.
+    Unavailable {
+        /// Typed reason supplied by core, not inferred from an empty payload.
+        reason: BrainInspectionUnavailable,
+    },
+}
+
+impl BrainActivityInspection {
+    pub(crate) fn from_projection(
+        epoch: u64,
+        uid: AgentUid,
+        projection: BrainProjection,
+    ) -> Result<Self, HostAccessError> {
+        let invalid = || HostAccessError::ProtocolViolation {
+            message: "brain activity projection did not contain its one requested subject"
+                .to_owned(),
+        };
+        if projection.request.targets != [uid] || projection.inspection.telemetry.len() != 1 {
+            return Err(invalid());
+        }
+        let outcome = match projection
+            .inspection
+            .telemetry
+            .into_iter()
+            .next()
+            .ok_or_else(invalid)?
+        {
+            SelectedBrainTelemetryOutcome::Ready { telemetry } if telemetry.agent_uid == uid => {
+                let outputs = scriptbots_core::attribution::explain_outputs(
+                    &telemetry.outputs,
+                    true,
+                    Some(&telemetry.inspection.activations),
+                    BRAIN_ACTIVITY_CONTRIBUTORS,
+                );
+                BrainActivityOutcome::Ready {
+                    activity_source: telemetry.inspection.activity_source,
+                    activations: telemetry.inspection.activations,
+                    build: telemetry.inspection.build,
+                    outputs,
+                }
+            }
+            SelectedBrainTelemetryOutcome::Unavailable { agent_uid, reason }
+                if agent_uid == uid =>
+            {
+                BrainActivityOutcome::Unavailable { reason }
+            }
+            _ => return Err(invalid()),
+        };
+        let detail = Self {
+            schema: "scriptbots.brain-activity.v1",
+            source: InspectionSource::new(projection.source, epoch),
+            uid: uid.to_string(),
+            limits: projection.request.limits,
+            outcome,
+        };
+        let encoded =
+            serde_json::to_vec(&detail).map_err(|error| HostAccessError::ProtocolViolation {
+                message: format!("brain activity could not be encoded: {error}"),
+            })?;
+        if encoded.len() > MAX_BRAIN_ACTIVITY_JSON_BYTES {
+            return Err(HostAccessError::ProtocolViolation {
+                message: "brain activity exceeds its JSON transport bound".to_owned(),
+            });
+        }
+        Ok(detail)
+    }
 }
 
 /// One value labelled by the core's canonical channel table.
@@ -123,14 +256,7 @@ impl From<AgentInspectorData> for AgentInspection {
     fn from(value: AgentInspectorData) -> Self {
         Self {
             schema: "scriptbots.agent-inspection.v1",
-            source: InspectionSource {
-                session_id: value.source.session_id.get().to_string(),
-                epoch: value.epoch.to_string(),
-                publication_revision: value.source.published_snapshot.get().to_string(),
-                published: value.source.published_host.into(),
-                inspected: value.source.inspected_host.into(),
-                tick: value.source.inspected_tick.0.to_string(),
-            },
+            source: InspectionSource::new(value.source, value.epoch),
             uid: value.uid.to_string(),
             health: value.health,
             age: value.age,
@@ -177,7 +303,16 @@ mod tests {
             parse_agent_uid("9007199254740993"),
             Some(AgentUid(9_007_199_254_740_993))
         );
-        for value in ["", "01", "+1", "-1", "1.0", "1e3", " 1", "18446744073709551616"] {
+        for value in [
+            "",
+            "01",
+            "+1",
+            "-1",
+            "1.0",
+            "1e3",
+            " 1",
+            "18446744073709551616",
+        ] {
             assert_eq!(parse_agent_uid(value), None, "{value}");
         }
     }
@@ -235,7 +370,12 @@ mod tests {
             }
         );
         assert!(serde_json::to_vec(&view).unwrap().len() < 16 * 1024);
-        assert!(owner.inspect_agent_basic(AgentUid(u64::MAX)).unwrap().is_none());
+        assert!(
+            owner
+                .inspect_agent_basic(AgentUid(u64::MAX))
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(owner.scientific_digest_v1().unwrap(), digest);
         assert_eq!(owner.latest_snapshot().revision, publication.revision);
     }

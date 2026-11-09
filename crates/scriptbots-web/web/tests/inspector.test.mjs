@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { InspectionController, agentUid, exactIdentity, inspectionStatus, pickAgent, validateInspection } from "../inspector.js";
+import { InspectionController, agentUid, exactIdentity, inspectionStatus, pickAgent, validateInspection,
+  validateBrainInspection, brainActivityColor, brainHeatmapShape } from "../inspector.js";
 import { CanvasRenderer } from "../renderers/canvas.js";
 import { WebGpuRenderer } from "../renderers/webgpu.js";
 import { RemoteStreamClient } from "../remote.js";
@@ -34,16 +35,146 @@ function detail(request) {
     outputs: Array.from({ length: 9 }, (_, index) => ({ name: `output${index}`, value: index / 9 })) };
 }
 
-function deferredController() {
+function deferredController(options = {}) {
   const reads = [];
   const changes = [];
   const painted = [];
   let time = 0;
-  const controller = new InspectionController({ now: () => time,
+  const controller = new InspectionController({ ...options, now: () => time,
     read: (uid, request, signal) => new Promise((resolve, reject) => reads.push({ uid, request, signal, resolve, reject })),
     onChange: (state) => changes.push(state), onFrame: (state, paintedFrame) => painted.push(inspectionStatus(state.detail, paintedFrame)) });
   return { controller, reads, changes, painted, advance: (ms) => { time += ms; } };
 }
+
+function brainDetail(request) {
+  const values = Array.from({ length: 34 }, (_, index) => (index - 17) / 17);
+  const connections = Array.from({ length: 9 }, (_, index) => ({ from: 4, to: index + 25, weight: -0.25 }));
+  return { schema: "scriptbots.brain-activity.v1", source: detail(request).source, uid: request.uid,
+    limits: { max_layers: 64, max_name_bytes: 1024, max_values: 4096, max_edges: 1024,
+      max_payload_bytes: 65536, max_source_scalars: 65536 }, status: "ready", activitySource: "evaluator_state",
+    activations: { layers: [{ name: "state", width: 34, height: 1, values }], connections,
+      output_slots: Array.from({ length: 9 }, (_, index) => index + 25), truncated: false },
+    build: { source_scalars: 34, source_layers: 1, source_name_bytes: 5, source_values: 34, source_edges: 9,
+      retained_layers: 1, retained_name_bytes: 5, retained_values: 34, retained_edges: 9, retained_payload_bytes: 1024, truncated: false },
+    outputs: Array.from({ length: 9 }, (_, index) => ({ output_index: index, output_name: `output${index}`,
+      raw_value: 0.5, effective: { clamped: { raw: 0.5, applied: 0.5 } }, method: "one_hop_weight_activation",
+      non_finite_skipped: 0, inputs: [{ input_index: 4, sensor_name: "food", contribution: -0.125, weight: -0.25, activation: 0.5 }] })) };
+}
+
+test("brain reads are explicitly opt-in, stop on close, and reject late closed-panel responses", async () => {
+  const { controller, reads, advance } = deferredController({ enabled: false, validate: validateBrainInspection });
+  controller.observe(frame(), 1);
+  controller.select(HUGE_UID);
+  await controller.refresh(true);
+  assert.equal(reads.length, 0, "selecting a creature cannot install a hidden brain probe");
+  controller.setEnabled(true);
+  assert.equal(reads.length, 1);
+  controller.setEnabled(false);
+  assert.equal(reads[0].signal.aborted, true);
+  reads[0].resolve(brainDetail(reads[0].request));
+  await flush();
+  assert.equal(controller.state.status, "inactive");
+  controller.observe(frame(2), 1);
+  advance(1000);
+  assert.equal(reads.length, 1);
+  controller.setEnabled(true);
+  assert.equal(reads.length, 2);
+  reads[1].resolve(brainDetail(reads[1].request));
+  await flush();
+  assert.equal(controller.state.detail.status, "ready");
+  controller.observe(frame(2), 1);
+  assert.equal(reads.length, 2, "an open paused panel has no polling queue");
+  controller.observe(frame(3), 1);
+  advance(250);
+  controller.observe(frame(3), 1);
+  const pending = reads.at(-1);
+  controller.observe(frame(3, [agent()], "1"), 1);
+  assert.equal(pending.signal.aborted, true);
+  pending.resolve(brainDetail(pending.request));
+  await flush();
+  assert.equal(controller.state.status, "empty");
+});
+
+test("brain graph validation preserves weights and refuses malformed bounds, topology, methods and provenance", () => {
+  const presented = frame(9);
+  const request = { uid: HUGE_UID, sessionId: presented.identity.sessionId, epoch: "0", identity: presented.identity };
+  const value = brainDetail(request);
+  assert.equal(validateBrainInspection(value, request), value);
+  assert.equal(value.activations.connections[0].weight, -0.25);
+  for (const mutate of [
+    (d) => { d.uid = "9007199254740993"; },
+    (d) => { d.source.epoch = "1"; },
+    (d) => { d.source.tick = "8"; },
+    (d) => { d.limits.max_values = 4097; },
+    (d) => { d.activations.layers[0].width = 4097; },
+    (d) => { d.activations.layers[0].values[0] = Infinity; },
+    (d) => { d.activations.connections[0].from = 34; },
+    (d) => { d.activations.connections[0].weight = NaN; },
+    (d) => { d.activations.output_slots[0] = 34; },
+    (d) => { d.build.retained_values = 1; },
+    (d) => { d.build.source_scalars = 65537; },
+    (d) => { d.activitySource = "guessed"; },
+    (d) => { d.outputs[0].inputs.push(...d.outputs[0].inputs, ...d.outputs[0].inputs, ...d.outputs[0].inputs); },
+    (d) => { d.outputs[0].method = { path_product: { depth: 5 } }; },
+    (d) => { d.outputs[0].effective = { thresholded: { raw: 0.5, threshold: NaN, active: true } }; },
+    (d) => { d.outputs[0].inputs[0].sensor_name = "<script>"; },
+  ]) {
+    const malformed = structuredClone(value);
+    mutate(malformed);
+    assert.throws(() => validateBrainInspection(malformed, request));
+  }
+  const clipped = structuredClone(value);
+  clipped.activations.truncated = clipped.build.truncated = true;
+  clipped.activations.output_slots = [];
+  assert.throws(() => validateBrainInspection(clipped, request), /clipped topology/);
+  for (const output of clipped.outputs) { output.method = { unavailable: "truncated_topology" }; output.inputs = []; }
+  assert.equal(validateBrainInspection(clipped, request), clipped);
+  clipped.activitySource = "reconstructed_feed_forward";
+  assert.equal(validateBrainInspection(clipped, request).activitySource, "reconstructed_feed_forward");
+  const overflow = structuredClone(value);
+  overflow.outputs[0].method = { unavailable: "numerical_overflow" };
+  overflow.outputs[0].inputs = [];
+  overflow.outputs[0].non_finite_skipped = 1;
+  assert.equal(validateBrainInspection(overflow, request), overflow, "one refused explanation does not discard valid brain activity");
+  overflow.outputs[0].method = { unavailable: "work_limit_exceeded" };
+  overflow.outputs[0].non_finite_skipped = 0;
+  assert.equal(validateBrainInspection(overflow, request), overflow, "bounded path refusal preserves the rest of the observation");
+  for (const reason of ["missing_agent", "unbound_brain", "unsupported", "no_recorded_evaluation", "recorded_response_mismatch"]) {
+    const unavailable = { schema: value.schema, source: value.source, uid: value.uid, limits: value.limits, status: "unavailable", reason };
+    assert.equal(validateBrainInspection(unavailable, request), unavailable);
+  }
+  assert.notDeepEqual(brainActivityColor(-1), brainActivityColor(1));
+  assert.deepEqual(brainActivityColor(0), [25, 34, 52]);
+  for (const [width, height] of [[1, 4096], [4096, 1], [64, 64]]) {
+    const shape = brainHeatmapShape({ width, height, values: Array(4096).fill(0) });
+    assert.deepEqual(shape, { columns: 64, rows: 64 });
+  }
+  assert.deepEqual(brainHeatmapShape({ width: 4096, height: 1, values: [0.25] }), { columns: 1, rows: 1 });
+});
+
+test("remote brain activity uses the negotiated host, exact identities and a separate streamed byte limit", async () => {
+  const original = globalThis.fetch;
+  const client = new RemoteStreamClient({ url: "wss://host.test/lab/api/ws/stream", decodeFrame: () => {} });
+  client.state = "connected";
+  client.tracker.acknowledge("9007199254740993");
+  const options = { sessionId: "9007199254740993", epoch: "18446744073709551615" };
+  try {
+    globalThis.fetch = async (url, request) => {
+      assert.equal(url.pathname, "/lab/api/agents/brain");
+      assert.equal(url.searchParams.get("uid"), HUGE_UID);
+      assert.equal(url.searchParams.get("epoch"), options.epoch);
+      assert.equal(request.credentials, "omit");
+      return new Response(JSON.stringify({ status: "unavailable", reason: "no_recorded_evaluation" }));
+    };
+    assert.equal((await client.inspectBrain(HUGE_UID, options)).reason, "no_recorded_evaluation");
+    globalThis.fetch = async () => new Response("x".repeat(512 * 1024 + 1));
+    await assert.rejects(client.inspectBrain(HUGE_UID, options), /512 KiB/);
+    globalThis.fetch = async () => new Response("{}", { headers: { "content-length": String(512 * 1024 + 1) } });
+    await assert.rejects(client.inspectBrain(HUGE_UID, options), /512 KiB/);
+    globalThis.fetch = async () => new Response(JSON.stringify({ message: "source epoch changed" }), { status: 409 });
+    await assert.rejects(client.inspectBrain(HUGE_UID, options), /source epoch changed/);
+  } finally { globalThis.fetch = original; }
+});
 
 test("picking uses stable exact UIDs and CSS-scaled renderer positions", () => {
   assert.equal(exactIdentity(HUGE_UID), HUGE_UID);

@@ -1045,6 +1045,21 @@ impl SimHandle {
             .map_err(js_error)
     }
 
+    /// Read bounded brain layers, actual weights and shared output explanations on demand.
+    /// Missing, unbound and unsupported brains remain typed outcomes with exact provenance.
+    #[wasm_bindgen(js_name = inspectBrain)]
+    pub fn inspect_brain_js(&self, uid: &str) -> Result<JsValue, JsValue> {
+        let uid = scriptbots_runtime::inspector::parse_agent_uid(uid)
+            .ok_or_else(|| js_error("creature UID must be a canonical u64 decimal string"))?;
+        self.inner
+            .borrow()
+            .core
+            .inspect_brain_activity(uid)
+            .map_err(js_error)?
+            .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+            .map_err(js_error)
+    }
+
     /// Rebuild the simulation with an optional nonnegative numeric seed.
     #[wasm_bindgen(js_name = reset)]
     pub fn reset_js(&self, seed: Option<f64>) -> Result<(), JsValue> {
@@ -2576,7 +2591,9 @@ mod tests {
     #[wasm_bindgen_test]
     fn browser_inspector_exposes_null_parents_and_absent_subject_without_science() {
         let simulation = browser_clock_simulation();
-        let uid = simulation.core.latest_snapshot().world.agents[0].uid.to_string();
+        let uid = simulation.core.latest_snapshot().world.agents[0]
+            .uid
+            .to_string();
         let before = simulation.core.scientific_digest_v1().unwrap();
         let handle = SimHandle {
             inner: Rc::new(RefCell::new(simulation)),
@@ -2589,8 +2606,84 @@ mod tests {
         assert_eq!(parents.length(), 2);
         assert!(parents.get(0).is_null());
         assert!(parents.get(1).is_null());
-        assert!(handle.inspect_agent_js(&u64::MAX.to_string()).unwrap().is_null());
-        assert_eq!(handle.inner.borrow().core.scientific_digest_v1().unwrap(), before);
+        assert!(
+            handle
+                .inspect_agent_js(&u64::MAX.to_string())
+                .unwrap()
+                .is_null()
+        );
+        let brain = handle
+            .inspect_brain_js(&observed_uid.as_string().unwrap())
+            .unwrap();
+        assert_eq!(
+            js_sys::Reflect::get(&brain, &JsValue::from_str("schema"))
+                .unwrap()
+                .as_string()
+                .as_deref(),
+            Some("scriptbots.brain-activity.v1")
+        );
+        assert_eq!(
+            js_sys::Reflect::get(&brain, &JsValue::from_str("status"))
+                .unwrap()
+                .as_string()
+                .as_deref(),
+            Some("ready")
+        );
+        let missing_brain = handle.inspect_brain_js(&u64::MAX.to_string()).unwrap();
+        assert_eq!(
+            js_sys::Reflect::get(&missing_brain, &JsValue::from_str("reason"))
+                .unwrap()
+                .as_string()
+                .as_deref(),
+            Some("missing_agent")
+        );
+        assert_eq!(
+            handle.inner.borrow().core.scientific_digest_v1().unwrap(),
+            before
+        );
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_brain_activity_matches_real_mlp_and_preserves_continuation() {
+        let mut observed = browser_clock_simulation();
+        let mut twin = browser_clock_simulation();
+        for _ in 0..4 {
+            observed.tick(1).unwrap();
+            twin.tick(1).unwrap();
+            let uid = observed.core.latest_snapshot().world.agents[0].uid;
+            let digest = observed.core.scientific_digest_v1().unwrap();
+            let detail = observed.core.inspect_brain_activity(uid).unwrap();
+            let scriptbots_runtime::inspector::BrainActivityOutcome::Ready {
+                activations,
+                build,
+                outputs,
+                ..
+            } = detail.outcome
+            else {
+                panic!("real MLP activity must be available");
+            };
+            assert!(!activations.layers.is_empty());
+            assert!(!activations.connections.is_empty());
+            assert_eq!(outputs.len(), scriptbots_core::OUTPUT_SIZE);
+            assert_eq!(
+                build.retained_values,
+                activations
+                    .layers
+                    .iter()
+                    .map(|layer| layer.values.len())
+                    .sum::<usize>()
+            );
+            assert_eq!(build.retained_edges, activations.connections.len());
+            assert_eq!(observed.core.scientific_digest_v1().unwrap(), digest);
+            assert_eq!(digest, twin.core.scientific_digest_v1().unwrap());
+        }
+        observed.tick(1).unwrap();
+        twin.tick(1).unwrap();
+        assert_eq!(
+            observed.core.scientific_digest_v1().unwrap(),
+            twin.core.scientific_digest_v1().unwrap()
+        );
     }
 
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
@@ -2610,8 +2703,8 @@ mod tests {
                 let publication = observed.core.latest_snapshot();
                 let frame = BrowserFrame::new(&publication);
                 assert_eq!(frame.identity.tick, observed.snapshot().tick.to_string());
-                let mut expected = serde_json::to_value(observed.snapshot())
-                    .expect("existing projection JSON");
+                let mut expected =
+                    serde_json::to_value(observed.snapshot()).expect("existing projection JSON");
                 expected["epoch"] = publication.world.epoch.to_string().into();
                 for agent in expected["agents"].as_array_mut().unwrap() {
                     for field in ["id", "uid", "brainKey"] {
@@ -2625,7 +2718,11 @@ mod tests {
                     expected
                 );
                 let selected = publication.world.agents[0].uid;
-                let detail = observed.core.inspect_agent_basic(selected).unwrap().unwrap();
+                let detail = observed
+                    .core
+                    .inspect_agent_basic(selected)
+                    .unwrap()
+                    .unwrap();
                 assert!(detail.source.matches_snapshot(&publication));
                 assert_eq!(detail.uid, selected);
             }

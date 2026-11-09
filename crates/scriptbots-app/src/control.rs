@@ -4617,6 +4617,30 @@ impl ControlHandle {
         Ok(detail.map(scriptbots_runtime::inspector::AgentInspection::from))
     }
 
+    /// Read bounded brain activity from one owner boundary without installing a probe.
+    pub fn inspect_brain_activity(
+        &self,
+        uid: scriptbots_core::AgentUid,
+        session_id: u64,
+        epoch: u64,
+    ) -> Result<scriptbots_runtime::inspector::BrainActivityInspection, ControlError> {
+        if self.host.session_id().get() != session_id {
+            return Err(ControlError::Conflict(
+                "brain inspector host session changed".to_owned(),
+            ));
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        let detail = self.host.inspect_brain_activity_before(uid, deadline)?;
+        if detail.source.session_id != session_id.to_string()
+            || detail.source.epoch != epoch.to_string()
+        {
+            return Err(ControlError::Conflict(
+                "brain inspector source epoch or session changed".to_owned(),
+            ));
+        }
+        Ok(detail)
+    }
+
     /// Submit a selection update and return its admission receipt.
     ///
     /// This used to return `Result<(), _>`, which made selection the only

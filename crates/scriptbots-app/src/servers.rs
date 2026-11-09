@@ -34,7 +34,6 @@ use tracing::{debug, error, info, warn};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
-use crate::{ScenarioIdentityV0, ScenarioInterventionV1};
 use crate::command::CommandSubmit;
 use crate::control::{
     AgentScoreEntry, ApiSchemaDto, ApiVersionDto, AppliedInterventionDto, ArtifactMetadataDto,
@@ -49,6 +48,7 @@ use crate::control::{
     SpeedRequest, parse_intervention_command, parse_map_artifact,
 };
 use crate::narrative_search::{NarrativeAroundQuery, NarrativeSearchHitDto, NarrativeSearchQuery};
+use crate::{ScenarioIdentityV0, ScenarioInterventionV1};
 use scriptbots_core::{
     AgentDebugInfo, AgentDebugQuery, AgentDebugSort, ConfigAuditEntry, Position, SelectionUpdate,
     Tick, TickSummaryDto,
@@ -1523,6 +1523,7 @@ pub struct SpeedRequestBody {
         get_scoreboard,
         get_agents_debug,
         get_agent_inspection,
+        get_brain_activity,
         get_config_audit,
         get_scenario,
         list_presets,
@@ -2131,7 +2132,8 @@ fn tick_history_messages(
             data: json!({
                 "gap": true, "resumed_from": last, "current": current_tick,
                 "reason": "world_reset_or_future_cursor",
-            }).to_string(),
+            })
+            .to_string(),
         });
         messages.push(summary_message(&current));
         return messages;
@@ -2268,11 +2270,13 @@ async fn stream_ticks_sse(
         })
         .flat_map(futures_util::stream::iter);
 
-    Ok(Sse::new(stream).keep_alive(
-        axum::response::sse::KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("keep-alive"),
-    ).into_response())
+    Ok(Sse::new(stream)
+        .keep_alive(
+            axum::response::sse::KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keep-alive"),
+        )
+        .into_response())
 }
 
 /// Upgrade HTTP connection to a WebSocket binary/text real-time stream.
@@ -3187,6 +3191,21 @@ struct AgentInspectionParams {
     epoch: String,
 }
 
+impl AgentInspectionParams {
+    fn identities(&self) -> Result<(scriptbots_core::AgentUid, u64, u64), AppError> {
+        let parse = |value: &str| {
+            scriptbots_runtime::inspector::parse_agent_uid(value).ok_or_else(|| {
+                AppError::bad_request("inspector identities must be canonical u64 decimal strings")
+            })
+        };
+        Ok((
+            parse(&self.uid)?,
+            parse(&self.session_id)?.get(),
+            parse(&self.epoch)?.get(),
+        ))
+    }
+}
+
 #[utoipa::path(
     get,
     path = "/api/agents/inspect",
@@ -3208,18 +3227,37 @@ async fn get_agent_inspection(
     State(state): State<ApiState>,
     axum::extract::Query(params): axum::extract::Query<AgentInspectionParams>,
 ) -> Result<Json<scriptbots_runtime::inspector::AgentInspection>, AppError> {
-    let parse = |value: &str| {
-        scriptbots_runtime::inspector::parse_agent_uid(value).ok_or_else(|| {
-            AppError::bad_request("inspector identities must be canonical u64 decimal strings")
-        })
-    };
-    let uid = parse(&params.uid)?;
-    let session_id = parse(&params.session_id)?.get();
-    let epoch = parse(&params.epoch)?.get();
+    let (uid, session_id, epoch) = params.identities()?;
     let detail = run_control(move || state.handle.inspect_agent(uid, session_id, epoch)).await?;
     detail
         .map(Json)
         .ok_or_else(|| AppError::not_found("creature is no longer present in this host"))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/agents/brain",
+    tag = "control",
+    params(
+        ("uid" = String, Query, description = "Exact canonical decimal stable creature UID"),
+        ("session_id" = String, Query, description = "Exact host session from the displayed frame"),
+        ("epoch" = String, Query, description = "Exact evolution epoch from the displayed frame")
+    ),
+    responses(
+        (status = 200, body = Object, description = "Bounded scriptbots.brain-activity.v1 observation, including typed missing/unbound/unsupported outcomes; no persistent probe is installed"),
+        (status = 400, body = ErrorResponse),
+        (status = 409, body = ErrorResponse, description = "Host session or epoch changed"),
+        (status = 503, body = ErrorResponse, description = "Owner read deadline or availability failure")
+    )
+)]
+async fn get_brain_activity(
+    State(state): State<ApiState>,
+    axum::extract::Query(params): axum::extract::Query<AgentInspectionParams>,
+) -> Result<Json<scriptbots_runtime::inspector::BrainActivityInspection>, AppError> {
+    let (uid, session_id, epoch) = params.identities()?;
+    run_control(move || state.handle.inspect_brain_activity(uid, session_id, epoch))
+        .await
+        .map(Json)
 }
 
 #[utoipa::path(
@@ -4080,6 +4118,7 @@ fn prepare_rest_server(
         .route("/api/scoreboard", get(get_scoreboard))
         .route("/api/agents/debug", get(get_agents_debug))
         .route("/api/agents/inspect", get(get_agent_inspection))
+        .route("/api/agents/brain", get(get_brain_activity))
         .route("/api/selection", post(post_selection).get(get_selection))
         .route("/api/interventions", get(get_interventions))
         // Scenario identity and presets
@@ -5914,12 +5953,12 @@ mod tests {
         .unwrap();
         let address = reservation.rest_address().unwrap();
         let (runtime, _) = reservation.launch(host.port.clone(), false).unwrap();
-        let request = |query: &str, origin: &str| {
+        let request = |endpoint: &str, query: &str, origin: &str| {
             let mut stream = TcpStream::connect(address).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
-            write!(stream, "GET /api/agents/inspect?{query} HTTP/1.1\r\nHost: {address}\r\nOrigin: {origin}\r\nConnection: close\r\n\r\n").unwrap();
+            write!(stream, "GET /api/agents/{endpoint}?{query} HTTP/1.1\r\nHost: {address}\r\nOrigin: {origin}\r\nConnection: close\r\n\r\n").unwrap();
             let mut response = String::new();
             stream.read_to_string(&mut response).unwrap();
             response
@@ -5929,7 +5968,7 @@ mod tests {
             source.session_id.get(),
             source.world.epoch
         );
-        let response = request(&query, "https://lab.example");
+        let response = request("inspect", &query, "https://lab.example");
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         assert!(
             response
@@ -5979,7 +6018,7 @@ mod tests {
                 "400",
             ),
         ] {
-            let refusal = request(&query, "https://lab.example");
+            let refusal = request("inspect", &query, "https://lab.example");
             assert!(
                 refusal.starts_with(&format!("HTTP/1.1 {code}")),
                 "{refusal}"
@@ -5990,10 +6029,58 @@ mod tests {
                     .contains("access-control-allow-origin: https://lab.example")
             );
         }
-        let forbidden = request(&query, "https://unlisted.example");
+        let forbidden = request("inspect", &query, "https://unlisted.example");
         assert!(forbidden.starts_with("HTTP/1.1 403"), "{forbidden}");
+        let activity = request("brain", &query, "https://lab.example");
+        assert!(activity.starts_with("HTTP/1.1 200"), "{activity}");
+        let activity: Value =
+            serde_json::from_str(activity.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(activity["schema"], "scriptbots.brain-activity.v1");
+        assert_eq!(activity["status"], "unavailable");
+        assert_eq!(activity["reason"], "unbound_brain");
+        assert_eq!(activity["source"], detail["source"]);
+        for (query, code) in [
+            (
+                format!(
+                    "uid={}&session_id={}&epoch=1",
+                    u64::MAX,
+                    source.session_id.get()
+                ),
+                "409",
+            ),
+            (
+                format!("uid=01&session_id={}&epoch=0", source.session_id.get()),
+                "400",
+            ),
+            (
+                format!(
+                    "uid={}&session_id={}&epoch=0",
+                    u64::MAX,
+                    source.session_id.get()
+                ),
+                "200",
+            ),
+        ] {
+            let reply = request("brain", &query, "https://lab.example");
+            assert!(reply.starts_with(&format!("HTTP/1.1 {code}")), "{reply}");
+            assert!(
+                reply
+                    .to_ascii_lowercase()
+                    .contains("access-control-allow-origin: https://lab.example")
+            );
+            if code == "200" {
+                let absent: Value =
+                    serde_json::from_str(reply.split_once("\r\n\r\n").unwrap().1).unwrap();
+                assert_eq!(absent["reason"], "missing_agent");
+                assert_eq!(absent["uid"], u64::MAX.to_string());
+            }
+        }
+        assert!(request("brain", &query, "https://unlisted.example").starts_with("HTTP/1.1 403"));
         assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
-        assert_eq!(host.handle().read_snapshot().unwrap().revision, source.revision);
+        assert_eq!(
+            host.handle().read_snapshot().unwrap().revision,
+            source.revision
+        );
         runtime.shutdown().unwrap();
     }
 
@@ -7466,13 +7553,10 @@ mod tests {
         let request = serde_json::from_value::<ExperimentCreateRequest>(input.clone())
             .expect("typed timed treatment");
         let expected = request.variants[0].interventions.clone();
-        let (status_code, Json(created)) = post_v1_experiments(
-            State(state.clone()),
-            HeaderMap::new(),
-            Json(request),
-        )
-        .await
-        .expect("REST admits actual timed experiment");
+        let (status_code, Json(created)) =
+            post_v1_experiments(State(state.clone()), HeaderMap::new(), Json(request))
+                .await
+                .expect("REST admits actual timed experiment");
         assert_eq!(status_code, StatusCode::CREATED);
 
         let mcp = mcp_http_test_state(handle.clone(), ServerBuilder::new("timed-experiment", "0"));
@@ -7495,7 +7579,8 @@ mod tests {
             .iter()
             .find(|tool| tool["name"] == "experiment_create")
             .expect("experiment tool")["inputSchema"];
-        let patch_schema = &schema["properties"]["variants"]["items"]["properties"]["interventions"];
+        let patch_schema =
+            &schema["properties"]["variants"]["items"]["properties"]["interventions"];
         assert_eq!(
             patch_schema["maxItems"],
             crate::experiment_runner::MAX_EXPERIMENT_INTERVENTIONS
@@ -7504,8 +7589,8 @@ mod tests {
         assert_eq!(patch_schema["items"]["additionalProperties"], false);
         let openapi = serde_json::to_value(ApiDoc::openapi()).expect("OpenAPI");
         assert_eq!(
-            openapi["components"]["schemas"]["ExperimentVariantDto"]["properties"]
-                ["interventions"]["items"]["$ref"],
+            openapi["components"]["schemas"]["ExperimentVariantDto"]["properties"]["interventions"]
+                ["items"]["$ref"],
             "#/components/schemas/ScenarioInterventionV1"
         );
 
@@ -7517,14 +7602,18 @@ mod tests {
         .await;
         assert!(retry.get("error").is_none(), "{retry}");
         let retried: ExperimentBatchStatusDto = serde_json::from_str(
-            retry["result"]["content"][0]["text"].as_str().expect("batch status"),
+            retry["result"]["content"][0]["text"]
+                .as_str()
+                .expect("batch status"),
         )
         .expect("typed MCP retry response");
         assert_eq!(retried.experiment_id, created.experiment_id);
         assert_eq!(retried.plan_digest, created.plan_digest);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let completed = loop {
-            let status = handle.get_experiment(&created.experiment_id).expect("batch status");
+            let status = handle
+                .get_experiment(&created.experiment_id)
+                .expect("batch status");
             if status.status == "completed" {
                 break status;
             }
@@ -7585,7 +7674,12 @@ mod tests {
         .await
         .expect_err("a patch at the completed horizon must fail before admission");
         assert_eq!(refused.status, StatusCode::BAD_REQUEST);
-        assert!(!handle.artifacts_dir().join("experiments/invalid-schedule").exists());
+        assert!(
+            !handle
+                .artifacts_dir()
+                .join("experiments/invalid-schedule")
+                .exists()
+        );
     }
 
     async fn experiment_comparison_mcp(handle: ControlHandle) -> McpHttpState {

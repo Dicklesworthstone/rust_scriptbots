@@ -9,6 +9,7 @@ const MAX_CONTROL_BYTES = 16 * 1024;
 const MAX_SEND_BUFFER_BYTES = 64 * 1024;
 const MAX_REQUESTS = 32;
 const MAX_INSPECTION_BYTES = 16 * 1024;
+const MAX_BRAIN_ACTIVITY_BYTES = 512 * 1024;
 const CHANNELS = ["canvas", "telemetry", "events"];
 const IDENTITY_FIELDS = ["sessionId", "publicationRevision", "scientificRevision",
   "controlRevision", "configRevision", "tick"];
@@ -224,6 +225,15 @@ export class RemoteStreamClient {
 
   /** Read bounded scientific detail from the same host as the negotiated stream. */
   async inspectAgent(uid, { sessionId, epoch, signal } = {}) {
+    return this.readInspection("inspect", MAX_INSPECTION_BYTES, uid, { sessionId, epoch, signal });
+  }
+
+  /** Explicit activity reads share the owner endpoint and never subscribe a background probe. */
+  async inspectBrain(uid, { sessionId, epoch, signal } = {}) {
+    return this.readInspection("brain", MAX_BRAIN_ACTIVITY_BYTES, uid, { sessionId, epoch, signal });
+  }
+
+  async readInspection(endpoint, byteLimit, uid, { sessionId, epoch, signal }) {
     decimal(uid);
     decimal(sessionId, 128);
     decimal(epoch);
@@ -235,7 +245,7 @@ export class RemoteStreamClient {
       throw new Error("The inspector requires the host's /api/ws/stream endpoint");
     }
     url.protocol = url.protocol === "wss:" ? "https:" : "http:";
-    url.pathname = `${url.pathname.slice(0, -"/api/ws/stream".length)}/api/agents/inspect`;
+    url.pathname = `${url.pathname.slice(0, -"/api/ws/stream".length)}/api/agents/${endpoint}`;
     url.search = new URLSearchParams({ uid, session_id: sessionId, epoch }).toString();
     url.hash = "";
     const abort = new AbortController();
@@ -246,9 +256,9 @@ export class RemoteStreamClient {
     try {
       const response = await fetch(url, { method: "GET", cache: "no-store", credentials: "omit", signal: abort.signal });
       const advertised = response.headers.get("content-length");
-      if (advertised !== null && (!/^\d+$/.test(advertised) || Number(advertised) > MAX_INSPECTION_BYTES)) {
+      if (advertised !== null && (!/^\d+$/.test(advertised) || Number(advertised) > byteLimit)) {
         await response.body?.cancel();
-        throw new Error("Remote creature inspection exceeds its 16 KiB bound");
+        throw new Error(`Remote inspection exceeds its ${byteLimit / 1024} KiB bound`);
       }
       if (!response.body) throw new Error("Remote creature inspection returned no body");
       const reader = response.body.getReader();
@@ -259,9 +269,9 @@ export class RemoteStreamClient {
           const { done, value } = await reader.read();
           if (done) break;
           length += value.byteLength;
-          if (length > MAX_INSPECTION_BYTES) {
+          if (length > byteLimit) {
             await reader.cancel();
-            throw new Error("Remote creature inspection exceeds its 16 KiB bound");
+            throw new Error(`Remote inspection exceeds its ${byteLimit / 1024} KiB bound`);
           }
           chunks.push(value);
         }
@@ -272,7 +282,7 @@ export class RemoteStreamClient {
       let offset = 0;
       for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
       const detail = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
-      if (response.status === 404 && detail.message === "creature is no longer present in this host") return null;
+      if (endpoint === "inspect" && response.status === 404 && detail.message === "creature is no longer present in this host") return null;
       if (!response.ok) throw new Error(detail.error || detail.message || `Remote inspection failed (${response.status})`);
       return detail;
     } finally {
