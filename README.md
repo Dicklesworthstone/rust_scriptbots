@@ -609,6 +609,20 @@ common biome and shares that biome's cached texture; quality changes filter the
 same 64×64 source grain. Vertex colors still supply terrain hue and accessibility
 palettes. This detail path does not blend biome albedo textures per pixel.
 
+Bevy creature motion interpolates position, heading and spike extension between
+two producer-observed scientific snapshots, keyed by stable agent identity.
+Toroidal crossings take the short path; render timing selects a bounded fraction
+over the measured publication interval without advancing science or extrapolating.
+This introduces up to one observed interval of pose presentation delay.
+Pausing, reduced motion, a changed owner/configuration, rewinds, births and
+ambiguous teleports use the committed pose immediately.
+Picking and camera follow use the displayed creature position. The offscreen
+`OffscreenCapture::render_interpolated` API accepts an explicit fraction and records
+both endpoint ticks and science digests; an interpolated image has no single
+`world_digest` attribution. It does not certify independently supplied worlds as
+one replay. Terrain, population and other state cues use the later cut. Ordinary
+endpoint captures keep their existing contract.
+
 ### Environment variables (quick reference)
 - `RUST_LOG` — logging filter (e.g., `info`, `trace`, `scriptbots_core=debug`).
   Use `info,scriptbots_core::parallelism=debug` to observe the Rayon pool width inside each actual science step.

@@ -2,6 +2,38 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Bevy snapshot-pair presentation (2026-11-09):** [Source implemented and
+reviewed — Codex; native build, formatting, test and GPU qualification open]
+
+The presentation slice of `bd-2z0.14.1.9.1` now retains two compact producer-observed
+pose cuts rather than integrating an easing filter over rendered frames. Stable
+UIDs, one shared frame fraction and shortest toroidal displacement align creature
+roots, heading and spike extension; terrain grounding samples the displayed pose.
+Picking and camera follow use the same displayed position.
+
+Owner/session, epoch, configuration, scientific revision and tick continuity gate
+the pair. Pauses, reduced motion, rewinds, births, changed arena handles and
+ambiguous teleports snap to the current committed endpoint. Control-only
+publications preserve the measured interval, and a stalled consumer receives the
+producer's last pair without accumulating a queue or extrapolating.
+
+`OffscreenCapture::render_interpolated` accepts two immutable worlds and a bounded
+explicit fraction. Its provenance records both actual endpoint digests and leaves
+the synthetic frame's single `world_digest` absent. Terrain, population and other
+discrete cues use the current cut; independently supplied worlds are not certified
+as one replay. Ordinary endpoint capture validation and provenance are preserved.
+
+After the execution environment failed, both files were reconstructed against
+the pinned upstream source and independently reviewed in full. These bytes do
+not match the unavailable pre-loss files; the earlier formatter pass does not
+qualify this reconstruction. Regression tests cover timing, coalesced delivery,
+identity discontinuities, pause/resume, births/reordering, toroidal motion,
+terrain/spike clearance, displayed follow/picking, capture endpoints and source
+immutability, but they remain unexecuted. The concurrent embedded-font and
+wrapping change is preserved. Full native/GPU acceptance, wheel-phase/event
+treatment, hydrology interpolation and performance evidence remain open.
+
+
 **Ft cohorts and browser world layers (2026-11-09):** [Source implemented —
 Codex; full native, rendered-output and performance qualification remains open]
 
