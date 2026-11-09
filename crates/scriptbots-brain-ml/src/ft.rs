@@ -9,12 +9,14 @@
 use ft_api::FrankenTorchSession;
 use ft_core::{DType, Device, ExecutionMode, TensorMeta};
 use scriptbots_core::{
-    BrainAdapterIdentityV1, BrainBatchArchitectureKey, BrainBatchEvaluator, BrainEnvelopeKind,
-    BrainEvaluator, BrainEvaluatorStateEnvelope, BrainFamilyCodec, BrainFamilyId,
-    BrainGenomeEnvelope, BrainGenomeMaterial, BrainHeredityCapabilityV1, BrainHeredityExclusionV1,
-    BrainInspection, BrainInspectionError, BrainInspectionSnapshot, BrainProtocolError, INPUT_SIZE,
-    MAX_BRAIN_GENOME_PAYLOAD_BYTES, MutationRates, OUTPUT_SIZE, OffspringStatePolicy,
-    OutputChannel, RandomStream,
+    ActivationEdge, ActivationLayer, BrainActivations, BrainActivitySource, BrainAdapterIdentityV1,
+    BrainBatchArchitectureKey, BrainBatchEvaluator, BrainEnvelopeKind, BrainEvaluator,
+    BrainEvaluatorStateEnvelope, BrainFamilyCodec, BrainFamilyId, BrainGenomeEnvelope,
+    BrainGenomeMaterial, BrainHeredityCapabilityV1, BrainInspection, BrainInspectionContext,
+    BrainInspectionError, BrainInspectionLimits, BrainInspectionSnapshot,
+    BrainInspectionUnavailable, BrainLocusSchemaIdentityV1, BrainMutationTrialGroupV1,
+    BrainProtocolError, INPUT_SIZE, MAX_BRAIN_GENOME_PAYLOAD_BYTES, MutationRates, OUTPUT_SIZE,
+    OffspringStatePolicy, OutputChannel, RandomStream, Tick, bound_brain_inspection,
 };
 
 /// Stable registry label for the Frankentorch brain family.
@@ -34,6 +36,12 @@ const MAX_LAYER_WIDTH: usize = 256;
 const GENOME_FIXED_HEADER_BYTES: usize = 16;
 const STATE_PAYLOAD_BYTES: usize = STATE_MAGIC.len() + 32;
 const ADAPTER_SEMANTIC_VERSION: u32 = 3;
+const LOCUS_SCHEMA_SEMANTIC_VERSION: u32 = 1;
+const LOCUS_SCHEMA_SEMANTIC_PREFIX: &[u8] = b"dense-f32-loci;inputs=25;outputs=9;\
+    nodes=inputs-then-hidden-then-output;order=layer,node,bias,connection-weight-target;\
+    connection-slot=incoming-column;target=previous-layer-source;\
+    scalar-bits=canonical-weight-out-in-then-bias;structural-targets=immutable;\
+    mutation-trials=one-next-u32-high24-less-than-primary-per-parameter";
 const ADAPTER_SEMANTIC_PREFIX: &[u8] = b"dense-f32;\
     scalar-kernel=ft-kernel-cpu::linear_tensor_f32;\
     cohort-kernel=ft-kernel-cpu::bmm_tensor_contiguous_f32_into;\
@@ -586,6 +594,164 @@ impl FtNetwork {
         }
         Ok(outputs)
     }
+
+    // Reuse the exact scalar kernels and activation order; this is observational work only.
+    #[allow(clippy::too_many_lines)]
+    fn inspect_recorded(
+        &self,
+        context: BrainInspectionContext<'_>,
+        limits: BrainInspectionLimits,
+    ) -> Result<BrainInspectionSnapshot, BrainInspectionError> {
+        if context.source_tick == Tick::zero()
+            || context
+                .sensors
+                .iter()
+                .chain(context.outputs)
+                .all(|value| *value == 0.0)
+        {
+            // A newly inserted agent has this pair. Even if an extreme sigmoid could also
+            // produce it, no stored history distinguishes that response from initialization.
+            return Err(BrainInspectionError::ActivityUnavailable {
+                reason: BrainInspectionUnavailable::NoRecordedEvaluation,
+            });
+        }
+        let node_count = INPUT_SIZE
+            + self
+                .layers
+                .iter()
+                .map(|layer| layer.output_width)
+                .sum::<usize>();
+        let source_edges = self
+            .layers
+            .iter()
+            .map(|layer| layer.weights.len())
+            .sum::<usize>();
+        let source_scalars = node_count
+            + self
+                .layers
+                .iter()
+                .map(|layer| layer.weights.len() + layer.bias.len())
+                .sum::<usize>();
+        if source_scalars > limits.max_source_scalars() {
+            return Err(BrainInspectionError::SourceScalarLimitExceeded {
+                family: FT_BRAIN_KIND.to_owned(),
+                required: source_scalars,
+                limit: limits.max_source_scalars(),
+            });
+        }
+        if context
+            .sensors
+            .iter()
+            .chain(context.outputs)
+            .any(|value| !value.is_finite())
+        {
+            return Err(BrainInspectionError::ActivityUnavailable {
+                reason: BrainInspectionUnavailable::RecordedResponseMismatch,
+            });
+        }
+
+        let mut flat_values = Vec::with_capacity(node_count);
+        flat_values.extend_from_slice(context.sensors);
+        let mut layers = Vec::with_capacity(self.layers.len() + 2);
+        layers.push(ActivationLayer {
+            name: "Reconstructed input".to_owned(),
+            width: INPUT_SIZE,
+            height: 1,
+            values: context.sensors.to_vec(),
+        });
+        let mut activations = context.sensors.to_vec();
+        for (index, layer) in self.layers.iter().enumerate() {
+            activations = ft_kernel_cpu::linear_tensor_f32(
+                &activations,
+                &layer.weights,
+                Some(&layer.bias),
+                1,
+                layer.input_width,
+                layer.output_width,
+            );
+            let output_layer = index + 1 == self.layers.len();
+            for value in &mut activations {
+                *value = if output_layer {
+                    sigmoid(*value)
+                } else {
+                    value.tanh()
+                };
+            }
+            if activations.iter().any(|value| !value.is_finite()) {
+                return Err(BrainInspectionError::ActivityUnavailable {
+                    reason: BrainInspectionUnavailable::RecordedResponseMismatch,
+                });
+            }
+            flat_values.extend_from_slice(&activations);
+            layers.push(ActivationLayer {
+                name: if output_layer {
+                    "Reconstructed output".to_owned()
+                } else {
+                    format!("Reconstructed hidden {}", index + 1)
+                },
+                width: layer.output_width,
+                height: 1,
+                values: activations.clone(),
+            });
+        }
+        if activations.len() != OUTPUT_SIZE
+            || activations
+                .iter()
+                .zip(context.outputs)
+                .any(|(reconstructed, recorded)| reconstructed.to_bits() != recorded.to_bits())
+        {
+            return Err(BrainInspectionError::ActivityUnavailable {
+                reason: BrainInspectionUnavailable::RecordedResponseMismatch,
+            });
+        }
+
+        // Core attribution indexes the final layer's flat state. Keep the named layer views
+        // as well, but never reinterpret hidden-local indices as global connection endpoints.
+        layers.push(ActivationLayer {
+            name: "Reconstructed flat state".to_owned(),
+            width: node_count,
+            height: 1,
+            values: flat_values,
+        });
+        let source_layers = layers.len();
+        let source_name_bytes = layers.iter().map(|layer| layer.name.len()).sum();
+        let source_values = node_count * 2;
+        let edge_limit = source_edges.min(limits.max_edges());
+        let mut connections = Vec::with_capacity(edge_limit);
+        let mut source_start = 0;
+        let mut node_start = INPUT_SIZE;
+        for layer in &self.layers {
+            for (weight_index, &weight) in layer.weights.iter().enumerate() {
+                if connections.len() == edge_limit {
+                    break;
+                }
+                connections.push(ActivationEdge {
+                    from: source_start + weight_index % layer.input_width,
+                    to: node_start + weight_index / layer.input_width,
+                    weight,
+                });
+            }
+            source_start = node_start;
+            node_start += layer.output_width;
+        }
+        let mut snapshot = bound_brain_inspection(
+            FT_BRAIN_KIND,
+            BrainActivations {
+                layers,
+                connections,
+                output_slots: (node_count - OUTPUT_SIZE..node_count).collect(),
+                truncated: edge_limit < source_edges,
+            },
+            source_scalars,
+            limits,
+        )?;
+        snapshot.activity_source = BrainActivitySource::ReconstructedFeedForward;
+        snapshot.build.source_layers = source_layers;
+        snapshot.build.source_name_bytes = source_name_bytes;
+        snapshot.build.source_values = source_values;
+        snapshot.build.source_edges = source_edges;
+        Ok(snapshot)
+    }
 }
 
 struct FtEvaluator {
@@ -610,7 +776,18 @@ impl BrainEvaluator for FtEvaluator {
         &self,
         _request: BrainInspection,
     ) -> Result<Option<BrainInspectionSnapshot>, BrainInspectionError> {
-        Ok(None)
+        Err(BrainInspectionError::ActivityUnavailable {
+            reason: BrainInspectionUnavailable::NoRecordedEvaluation,
+        })
+    }
+
+    fn inspect_with_context(
+        &self,
+        request: BrainInspection,
+        context: BrainInspectionContext<'_>,
+    ) -> Result<Option<BrainInspectionSnapshot>, BrainInspectionError> {
+        let BrainInspection::Activations(limits) = request;
+        self.network.inspect_recorded(context, limits).map(Some)
     }
 
     fn checkpoint_state(&self) -> Result<BrainEvaluatorStateEnvelope, BrainProtocolError> {
@@ -817,7 +994,27 @@ impl BrainFamilyCodec for FtBrainFamily {
     }
 
     fn heredity_capability(&self) -> BrainHeredityCapabilityV1 {
-        BrainHeredityCapabilityV1::excluded(BrainHeredityExclusionV1::NoCanonicalLocusSchema)
+        let mut descriptor = LOCUS_SCHEMA_SEMANTIC_PREFIX.to_vec();
+        descriptor
+            .push(u8::try_from(self.config.hidden_layers.len()).expect("validated layer count"));
+        for &width in &self.config.hidden_layers {
+            descriptor.extend_from_slice(
+                &u16::try_from(width)
+                    .expect("validated layer width")
+                    .to_le_bytes(),
+            );
+        }
+        let trials =
+            u32::try_from(validate_config(&self.config).expect("validated FtBrain architecture"))
+                .expect("bounded parameter count fits u32");
+        BrainHeredityCapabilityV1::locus_capable(
+            BrainLocusSchemaIdentityV1::from_semantic_descriptor(
+                &self.family_id,
+                LOCUS_SCHEMA_SEMANTIC_VERSION,
+                &descriptor,
+            ),
+            vec![BrainMutationTrialGroupV1::new(trials, 1, 1)],
+        )
     }
 
     fn random_genome_material(
@@ -829,6 +1026,56 @@ impl BrainFamilyCodec for FtBrainFamily {
 
     fn validate_genome(&self, genome: &BrainGenomeEnvelope) -> Result<(), BrainProtocolError> {
         self.decode_genome(genome).map(|_| ())
+    }
+
+    fn genome_loci(
+        &self,
+        genome: &BrainGenomeEnvelope,
+    ) -> Result<
+        Vec<(
+            scriptbots_core::genome_diff::Locus,
+            scriptbots_core::genome_diff::LocusValue,
+        )>,
+        BrainProtocolError,
+    > {
+        use scriptbots_core::genome_diff::{Locus, LocusValue};
+        let decoded = self.decode_genome(genome)?;
+        let mut loci = Vec::with_capacity(decoded.parameters.len() * 2);
+        let mut parameter_start = 0;
+        let mut source_start = 0;
+        let mut node_start = INPUT_SIZE;
+        for (input_width, output_width) in layer_shapes(&decoded.config) {
+            let weights_end = parameter_start + input_width * output_width;
+            for row in 0..output_width {
+                let node = u32::try_from(node_start + row).expect("bounded FtBrain node index");
+                loci.push((
+                    Locus::NodeBias(node),
+                    LocusValue::Scalar(decoded.parameters[weights_end + row]),
+                ));
+                for column in 0..input_width {
+                    let conn = u8::try_from(column).expect("at most 256 incoming connections");
+                    loci.push((
+                        Locus::NodeWeight { node, conn },
+                        LocusValue::Scalar(
+                            decoded.parameters[parameter_start + row * input_width + column],
+                        ),
+                    ));
+                    // As in the recurrent families, NodeTarget names the incoming source.
+                    // These structural loci never consume mutation trials or RNG draws.
+                    loci.push((
+                        Locus::NodeTarget { node, conn },
+                        LocusValue::Target(
+                            u32::try_from(source_start + column)
+                                .expect("bounded FtBrain source index"),
+                        ),
+                    ));
+                }
+            }
+            parameter_start = weights_end + output_width;
+            source_start = node_start;
+            node_start += output_width;
+        }
+        Ok(loci)
     }
 
     fn validate_evaluator_state(
@@ -1162,6 +1409,449 @@ mod tests {
             BrainProvenance::default(),
         )
         .expect("genome envelope")
+    }
+
+    #[test]
+    fn ft_loci_are_architecture_bound_and_match_every_mutated_parameter() {
+        use scriptbots_core::genome_diff::{Locus, LocusValue};
+        use std::collections::BTreeMap;
+        let family = FtBrainFamily::new(FtBrainConfig::new(vec![2]).unwrap()).unwrap();
+        let count = validate_config(&family.config).unwrap();
+        let mut parameters = vec![0.25; count];
+        parameters[1] = -0.0;
+        parameters[50] = -0.5;
+        parameters[78] = 0.75;
+        let genome = genome_with_parameters(&family, &parameters);
+        let loci = family.genome_loci(&genome).unwrap();
+        let by_locus: BTreeMap<_, _> = loci.iter().copied().collect();
+        assert_eq!(
+            by_locus.len(),
+            loci.len(),
+            "canonical addresses cannot alias"
+        );
+        assert_eq!(loci.len(), 2 * (50 + 18) + 11);
+        assert_eq!(loci[0], (Locus::NodeBias(25), LocusValue::Scalar(-0.5)));
+        let LocusValue::Scalar(signed_zero) = by_locus[&Locus::NodeWeight { node: 25, conn: 1 }]
+        else {
+            panic!("a dense weight must remain a scalar locus");
+        };
+        assert_eq!(signed_zero.to_bits(), (-0.0_f32).to_bits());
+        assert_eq!(
+            by_locus[&Locus::NodeTarget { node: 25, conn: 24 }],
+            LocusValue::Target(24)
+        );
+        assert_eq!(
+            by_locus[&Locus::NodeTarget { node: 35, conn: 1 }],
+            LocusValue::Target(26)
+        );
+        assert_eq!(by_locus[&Locus::NodeBias(35)], LocusValue::Scalar(0.75));
+        assert_eq!(family.genome_loci(&genome).unwrap(), loci);
+
+        let BrainHeredityCapabilityV1::LocusCapable {
+            locus_schema,
+            mutation_trials,
+        } = family.heredity_capability()
+        else {
+            panic!("Ft must participate in typed heredity discovery");
+        };
+        assert_eq!(locus_schema.family_id(), family.family_id());
+        assert_eq!(
+            mutation_trials,
+            vec![BrainMutationTrialGroupV1::new(79, 1, 1)]
+        );
+        let other = FtBrainFamily::new(FtBrainConfig::new(vec![3]).unwrap()).unwrap();
+        let BrainHeredityCapabilityV1::LocusCapable {
+            locus_schema: other_schema,
+            ..
+        } = other.heredity_capability()
+        else {
+            panic!("other architecture is locus-capable");
+        };
+        assert_ne!(
+            locus_schema, other_schema,
+            "different layouts cannot reuse a locus schema"
+        );
+        assert!(
+            other.genome_loci(&genome).is_err(),
+            "loci must use the validated architecture"
+        );
+
+        let mut rng = ScriptedStream::selected_positive_gaussian(count);
+        let child = family
+            .mutate_genome(
+                &genome,
+                MutationRates {
+                    primary: 1.0,
+                    secondary: 0.125,
+                },
+                BrainProvenance {
+                    parents: [Some(AgentUid(1)), None],
+                    parent_genome_hashes: [Some(genome.material_hash()), None],
+                    created_at: Tick(1),
+                    derivation: BrainGenomeDerivation::MutationOnly,
+                },
+                &mut rng,
+            )
+            .unwrap();
+        let child_loci = family.genome_loci(&child).unwrap();
+        let mut changed_scalars = 0;
+        for ((address, old), (next_address, new)) in loci.iter().zip(&child_loci) {
+            assert_eq!(address, next_address);
+            match (old, new) {
+                (LocusValue::Scalar(old), LocusValue::Scalar(new)) => {
+                    assert_ne!(old.to_bits(), new.to_bits());
+                    changed_scalars += 1;
+                }
+                (LocusValue::Target(old), LocusValue::Target(new)) => assert_eq!(old, new),
+                _ => panic!("dense loci must preserve their scalar or target type"),
+            }
+        }
+        assert_eq!(changed_scalars, count);
+        assert_eq!(rng.consumed(), count * 3);
+        assert_eq!(rng.remaining(), 0);
+
+        let wide = FtBrainFamily::new(FtBrainConfig::new(vec![256]).unwrap()).unwrap();
+        let wide_genome =
+            genome_with_parameters(&wide, &vec![0.0; validate_config(&wide.config).unwrap()]);
+        let wide_loci: BTreeMap<_, _> = wide
+            .genome_loci(&wide_genome)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(
+            wide_loci[&Locus::NodeTarget {
+                node: 281,
+                conn: 255
+            }],
+            LocusValue::Target(280)
+        );
+    }
+
+    #[test]
+    fn ft_inspection_reconstructs_global_activity_and_preserves_continuation() {
+        let family = FtBrainFamily::new(FtBrainConfig::new(vec![2]).unwrap()).unwrap();
+        let mut parameters = vec![0.0; 79];
+        parameters[0] = 1.0;
+        parameters[24] = -0.5;
+        parameters[26] = 0.5;
+        parameters[50] = 0.25;
+        parameters[51] = -0.25;
+        parameters[52] = 2.0;
+        parameters[53] = -1.0;
+        parameters[70] = 0.125;
+        let genome = genome_with_parameters(&family, &parameters);
+        let state = family.state_for(&genome).unwrap();
+        let mut evaluator = family.evaluator(&genome, &state).unwrap();
+        let mut sensors = [0.0; INPUT_SIZE];
+        sensors[0] = 0.25;
+        sensors[1] = 0.5;
+        sensors[24] = 0.5;
+        let outputs = evaluator.evaluate(&sensors).unwrap();
+        let before = evaluator.checkpoint_state().unwrap();
+        let inspection = evaluator
+            .inspect_with_context(
+                BrainInspection::Activations(BrainInspectionLimits::hard()),
+                BrainInspectionContext {
+                    source_tick: Tick(1),
+                    sensors: &sensors,
+                    outputs: &outputs,
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            inspection.activity_source,
+            BrainActivitySource::ReconstructedFeedForward
+        );
+        assert!(!inspection.build.truncated);
+        assert_eq!(inspection.build.source_scalars, 79 + 36);
+        assert_eq!(inspection.build.source_values, 72);
+        assert_eq!(inspection.build.source_edges, 68);
+        assert_eq!(inspection.activations.layers.len(), 4);
+        assert!(
+            inspection
+                .activations
+                .layers
+                .iter()
+                .all(|layer| layer.name.starts_with("Reconstructed "))
+        );
+        assert_eq!(inspection.activations.layers[0].values, sensors);
+        assert_eq!(
+            inspection.activations.layers[1].values[0].to_bits(),
+            0.25_f32.tanh().to_bits()
+        );
+        assert_eq!(
+            inspection.activations.layers[1].values[1].to_bits(),
+            0.0_f32.to_bits()
+        );
+        let flat = &inspection.activations.layers.last().unwrap().values;
+        assert_eq!(&flat[..INPUT_SIZE], &sensors);
+        assert_eq!(
+            inspection.activations.output_slots,
+            (27..36).collect::<Vec<_>>()
+        );
+        for channel in OutputChannel::ALL {
+            assert_eq!(
+                flat[27 + channel.index()].to_bits(),
+                outputs[channel.index()].to_bits()
+            );
+        }
+        assert_eq!(
+            inspection.activations.connections[0],
+            ActivationEdge {
+                from: 0,
+                to: 25,
+                weight: 1.0
+            }
+        );
+        assert_eq!(
+            inspection.activations.connections[50],
+            ActivationEdge {
+                from: 25,
+                to: 27,
+                weight: 2.0
+            }
+        );
+        let explanation =
+            scriptbots_core::attribution::attribute_output(&inspection.activations, 0, 3).unwrap();
+        assert!(matches!(
+            explanation.method,
+            scriptbots_core::attribution::AttributionMethod::PathProduct { .. }
+        ));
+        assert_eq!(explanation.raw_value.to_bits(), outputs[0].to_bits());
+        assert_eq!(evaluator.checkpoint_state().unwrap(), before);
+        let mut control = family.evaluator(&genome, &before).unwrap();
+        let next_sensors = [0.75; INPUT_SIZE];
+        assert_output_bits(
+            &[evaluator.evaluate(&next_sensors).unwrap()],
+            &[control.evaluate(&next_sensors).unwrap()],
+        );
+        assert_eq!(
+            evaluator.checkpoint_state().unwrap(),
+            control.checkpoint_state().unwrap()
+        );
+
+        // Core rehydrates scalar evaluators after committing a batch; they must not need a
+        // private last-input cache to inspect the owner's recorded batch response.
+        let mut cohort = family
+            .batch_evaluator(&[&genome], &[&state])
+            .unwrap()
+            .unwrap();
+        let mut cohort_outputs = [[0.0; OUTPUT_SIZE]];
+        cohort
+            .evaluate_batch(&[sensors], &mut cohort_outputs)
+            .unwrap();
+        let restored = family
+            .evaluator(&genome, &cohort.checkpoint_states().unwrap()[0])
+            .unwrap();
+        let reconstructed = restored
+            .inspect_with_context(
+                BrainInspection::Activations(BrainInspectionLimits::hard()),
+                BrainInspectionContext {
+                    source_tick: Tick(1),
+                    sensors: &sensors,
+                    outputs: &cohort_outputs[0],
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(reconstructed, inspection);
+    }
+
+    #[test]
+    fn ft_inspection_refuses_unrecorded_mismatched_and_over_budget_activity() {
+        let family = FtBrainFamily::new(FtBrainConfig::new(vec![1]).unwrap()).unwrap();
+        let (genome, state) = founder(&family, 9_100);
+        let mut evaluator = family.evaluator(&genome, &state).unwrap();
+        let sensors = [0.25; INPUT_SIZE];
+        let outputs = evaluator.evaluate(&sensors).unwrap();
+        let request = BrainInspection::Activations(BrainInspectionLimits::hard());
+        assert!(matches!(
+            evaluator.inspect(request),
+            Err(BrainInspectionError::ActivityUnavailable {
+                reason: BrainInspectionUnavailable::NoRecordedEvaluation,
+            })
+        ));
+        for (source_tick, recorded_sensors, recorded_outputs) in [
+            (Tick::zero(), sensors, outputs),
+            (Tick(10), [0.0; INPUT_SIZE], [0.0; OUTPUT_SIZE]),
+        ] {
+            assert!(matches!(
+                evaluator.inspect_with_context(
+                    request,
+                    BrainInspectionContext {
+                        source_tick,
+                        sensors: &recorded_sensors,
+                        outputs: &recorded_outputs,
+                    }
+                ),
+                Err(BrainInspectionError::ActivityUnavailable {
+                    reason: BrainInspectionUnavailable::NoRecordedEvaluation
+                })
+            ));
+        }
+        let mut altered = outputs;
+        altered[8] = f32::from_bits(altered[8].to_bits() ^ 1);
+        assert!(matches!(
+            evaluator.inspect_with_context(
+                request,
+                BrainInspectionContext {
+                    source_tick: Tick(1),
+                    sensors: &sensors,
+                    outputs: &altered,
+                }
+            ),
+            Err(BrainInspectionError::ActivityUnavailable {
+                reason: BrainInspectionUnavailable::RecordedResponseMismatch
+            })
+        ));
+        assert_eq!(evaluator.checkpoint_state().unwrap(), state);
+
+        let large = FtBrainFamily::new(FtBrainConfig::new(vec![256, 256]).unwrap()).unwrap();
+        let large_genome =
+            genome_with_parameters(&large, &vec![0.0; validate_config(&large.config).unwrap()]);
+        let large_evaluator = large
+            .evaluator(&large_genome, &large.state_for(&large_genome).unwrap())
+            .unwrap();
+        assert!(
+            matches!(large_evaluator.inspect_with_context(request, BrainInspectionContext {
+            source_tick: Tick(1), sensors: &sensors, outputs: &[0.5; OUTPUT_SIZE],
+        }), Err(BrainInspectionError::SourceScalarLimitExceeded { required, limit, .. }) if required > limit)
+        );
+        let tight = BrainInspectionLimits::tightened(2, 32, 4, 1, 256, 1_024);
+        let clipped = evaluator
+            .inspect_with_context(
+                BrainInspection::Activations(tight),
+                BrainInspectionContext {
+                    source_tick: Tick(1),
+                    sensors: &sensors,
+                    outputs: &outputs,
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert!(clipped.build.truncated);
+        assert!(clipped.build.retained_payload_bytes <= tight.max_payload_bytes());
+        assert!(clipped.activations.layers.is_empty());
+        assert!(clipped.activations.connections.is_empty());
+    }
+
+    #[test]
+    fn ft_world_inspection_keeps_clipped_weights_and_is_checkpoint_neutral() {
+        use scriptbots_core::{
+            AgentData, BrainInspectionClientId, BrainInspectionRequest, BrainInspectionRevision,
+            BrainRegistry, Position, ScriptBotsConfig, SelectedBrainTelemetryOutcome, WorldState,
+        };
+        let family = FtBrainFamily::default();
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 20,
+            closed: true,
+            persistence_interval: 0,
+            rng_seed: Some(9_200),
+            ..ScriptBotsConfig::default()
+        })
+        .unwrap();
+        let key = world
+            .register_brain_family(FT_BRAIN_KIND, Box::new(family.clone()))
+            .unwrap();
+        let agent = world
+            .try_spawn_agent(AgentData {
+                position: Position::new(60.0, 60.0),
+                ..AgentData::default()
+            })
+            .unwrap();
+        world.bind_agent_brain(agent, key).unwrap();
+        let uid = world.agent_uid(agent).unwrap();
+        let mut request = BrainInspectionRequest::single(
+            BrainInspectionClientId::new(3),
+            BrainInspectionRevision::new(1),
+            uid,
+        );
+        assert!(matches!(
+            world.inspect_brains(&request).unwrap().telemetry.as_slice(),
+            [SelectedBrainTelemetryOutcome::Unavailable {
+                reason: BrainInspectionUnavailable::NoRecordedEvaluation,
+                ..
+            }]
+        ));
+        assert_eq!(
+            world
+                .brain_registry()
+                .heredity_capabilities()
+                .unwrap()
+                .descriptors[0]
+                .capability,
+            family.heredity_capability()
+        );
+        world.step().unwrap();
+        let checkpoint = world.checkpoint_v1().unwrap();
+        let before_bytes = checkpoint.encode().unwrap();
+        let before_digest = world.world_digest_v1().unwrap();
+        let response = world.inspect_brains(&request).unwrap();
+        let ready = response.ready_for(uid).unwrap();
+        assert_eq!(
+            ready.inspection.activity_source,
+            BrainActivitySource::ReconstructedFeedForward
+        );
+        assert_eq!(
+            ready.inspection.activations.connections.len(),
+            request.limits.max_edges()
+        );
+        assert!(ready.inspection.build.source_edges > ready.inspection.build.retained_edges);
+        assert!(ready.inspection.activations.truncated);
+        assert_eq!(world.world_digest_v1().unwrap(), before_digest);
+        assert_eq!(
+            world.checkpoint_v1().unwrap().encode().unwrap(),
+            before_bytes
+        );
+        let mut registry = BrainRegistry::default();
+        registry
+            .register_family(FT_BRAIN_KIND, Box::new(family.clone()))
+            .unwrap();
+        let mut control = WorldState::restore_checkpoint_v1(&checkpoint, registry).unwrap();
+        world.step().unwrap();
+        control.step().unwrap();
+        assert_eq!(
+            world.world_digest_v1().unwrap(),
+            control.world_digest_v1().unwrap()
+        );
+
+        let fresh = world
+            .try_inject_agent(AgentData {
+                position: Position::new(140.0, 140.0),
+                ..AgentData::default()
+            })
+            .unwrap();
+        world.bind_agent_brain(fresh, key).unwrap();
+        let fresh_uid = world.agent_uid(fresh).unwrap();
+        request.targets.push(fresh_uid);
+        let mixed = world.inspect_brains(&request).unwrap();
+        assert!(mixed.ready_for(uid).is_some());
+        assert!(matches!(
+            mixed.telemetry[1],
+            SelectedBrainTelemetryOutcome::Unavailable {
+                reason: BrainInspectionUnavailable::NoRecordedEvaluation,
+                ..
+            }
+        ));
+        let different_genome = genome_with_parameters(
+            &family,
+            &vec![0.0; validate_config(&family.config).unwrap()],
+        );
+        world
+            .bind_agent_brain_genome(agent, &different_genome)
+            .unwrap();
+        let mismatched = world.inspect_brains(&request).unwrap();
+        assert!(matches!(
+            mismatched.telemetry[0],
+            SelectedBrainTelemetryOutcome::Unavailable {
+                reason: BrainInspectionUnavailable::RecordedResponseMismatch,
+                ..
+            }
+        ));
+        assert!(world.agent_runtime(agent).unwrap().energy.is_finite());
     }
 
     #[test]

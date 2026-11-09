@@ -791,9 +791,26 @@ pub struct BrainInspectionBuildStats {
     pub truncated: bool,
 }
 
+/// How the displayed activity was obtained, independently of its topology and bounds.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BrainActivitySource {
+    /// Values retained in the evaluator's current state.
+    #[default]
+    EvaluatorState,
+    /// A read-only feed-forward reconstruction from the owner's recorded signal arrays.
+    ///
+    /// The final response matches the recorded outputs bit-for-bit. Intermediate activations
+    /// were recomputed; this does not claim they were retained from a historical evaluation.
+    ReconstructedFeedForward,
+}
+
 /// A family-produced activation payload after all request-time bounds are applied.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BrainInspectionSnapshot {
+    /// Whether activity is retained evaluator state or a labelled reconstruction.
+    #[serde(default)]
+    pub activity_source: BrainActivitySource,
     /// Bounded activation payload.
     pub activations: BrainActivations,
     /// Structural cost evidence for the build.
@@ -803,6 +820,12 @@ pub struct BrainInspectionSnapshot {
 /// Typed refusal at the read-only brain-inspection boundary.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Error)]
 pub enum BrainInspectionError {
+    /// This target has no trustworthy activity sample; other targets remain inspectable.
+    #[error("brain activity is unavailable: {reason:?}")]
+    ActivityUnavailable {
+        /// Why no activity sample can be supplied.
+        reason: BrainInspectionUnavailable,
+    },
     /// Request exceeded the hard target-count bound.
     #[error("brain inspection requested {requested} targets, exceeding hard limit {limit}")]
     TargetLimitExceeded {
@@ -950,7 +973,10 @@ pub fn bound_brain_inspection(
         .filter_map(|layer| layer.width.checked_mul(layer.height))
         .max()
         .unwrap_or_default();
-    if !truncated {
+    // An already clipped edge list remains useful to inspectors. Reapplying the owner-side
+    // bounds must not erase it merely because the producer honestly marked it truncated.
+    // If a layer was dropped here, its index space is incomplete and edges are discarded.
+    if layers.len() == source_layers {
         connections = Vec::with_capacity(source_edges.min(limits.max_edges));
         for edge in activations.connections {
             if connections.len() == limits.max_edges
@@ -1005,6 +1031,7 @@ pub fn bound_brain_inspection(
     }
     let retained_payload_bytes = activation_payload_bytes(&activations);
     Ok(BrainInspectionSnapshot {
+        activity_source: BrainActivitySource::EvaluatorState,
         build: BrainInspectionBuildStats {
             source_scalars,
             source_layers,
@@ -2507,6 +2534,20 @@ impl BrainBinding {
         }
     }
 
+    /// Inspect with the owner's recorded signals, without changing evaluator state.
+    pub fn inspect_with_context(
+        &self,
+        request: BrainInspection,
+        context: BrainInspectionContext<'_>,
+    ) -> Result<Option<BrainInspectionSnapshot>, BrainInspectionError> {
+        match self {
+            Self::Protocol { evaluator, .. } => evaluator.as_ref().map_or(Ok(None), |evaluator| {
+                evaluator.inspect_with_context(request, context)
+            }),
+            Self::Unbound | Self::Legacy { .. } => self.inspect(request),
+        }
+    }
+
     fn take_execution(&mut self) -> BrainExecution {
         match self {
             Self::Unbound => BrainExecution::None,
@@ -3397,6 +3438,10 @@ pub enum BrainInspectionUnavailable {
     UnboundBrain,
     /// The bound brain family cannot inspect.
     Unsupported,
+    /// No recorded signal pair can be distinguished from the unevaluated initial state.
+    NoRecordedEvaluation,
+    /// Reconstructing from recorded inputs did not reproduce the recorded response exactly.
+    RecordedResponseMismatch,
 }
 
 /// Current selected-agent detail captured without mutating the evaluator or world.
@@ -10566,6 +10611,20 @@ pub enum BrainInspection {
     Activations(BrainInspectionLimits),
 }
 
+/// Borrowed owner-side signals available to a read-only inspection.
+///
+/// These arrays are scientific state already recorded by the owner. The context adds no
+/// evaluator history or checkpoint fields and cannot advance a simulation or random stream.
+#[derive(Debug, Clone, Copy)]
+pub struct BrainInspectionContext<'a> {
+    /// Completed owner tick at which the arrays are being inspected.
+    pub source_tick: Tick,
+    /// Latest sensor vector recorded by the owner.
+    pub sensors: &'a [f32; INPUT_SIZE],
+    /// Latest unmodified evaluator response recorded by the owner.
+    pub outputs: &'a [f32; OUTPUT_SIZE],
+}
+
 /// Object-safe scalar evaluator reconstructed from exact genome and state envelopes.
 pub trait BrainEvaluator: Send + Sync {
     /// Owning protocol family.
@@ -10587,6 +10646,16 @@ pub trait BrainEvaluator: Send + Sync {
         &self,
         request: BrainInspection,
     ) -> Result<Option<BrainInspectionSnapshot>, BrainInspectionError>;
+
+    /// Inspect using recorded owner signals when the family has no retained activation state.
+    /// Existing families keep their ordinary state-based inspection by default.
+    fn inspect_with_context(
+        &self,
+        request: BrainInspection,
+        _context: BrainInspectionContext<'_>,
+    ) -> Result<Option<BrainInspectionSnapshot>, BrainInspectionError> {
+        self.inspect(request)
+    }
 
     /// Capture every future-affecting dynamic value in a bounded state envelope.
     fn checkpoint_state(&self) -> Result<BrainEvaluatorStateEnvelope, BrainProtocolError>;
@@ -31794,10 +31863,23 @@ impl WorldState {
 
             runner_inspections = runner_inspections.saturating_add(1);
             let family = runtime.brain.kind().unwrap_or("unknown");
-            let Some(produced) = runtime
-                .brain
-                .inspect(BrainInspection::Activations(request.limits))?
-            else {
+            let produced = match runtime.brain.inspect_with_context(
+                BrainInspection::Activations(request.limits),
+                BrainInspectionContext {
+                    source_tick: self.tick,
+                    sensors: &runtime.sensors,
+                    outputs: &runtime.outputs,
+                },
+            ) {
+                Ok(produced) => produced,
+                Err(BrainInspectionError::ActivityUnavailable { reason }) => {
+                    telemetry
+                        .push(SelectedBrainTelemetryOutcome::Unavailable { agent_uid, reason });
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let Some(produced) = produced else {
                 telemetry.push(SelectedBrainTelemetryOutcome::Unavailable {
                     agent_uid,
                     reason: BrainInspectionUnavailable::Unsupported,
@@ -31805,12 +31887,14 @@ impl WorldState {
                 continue;
             };
             let producer_build = produced.build;
+            let activity_source = produced.activity_source;
             let mut snapshot = bound_brain_inspection(
                 family,
                 produced.activations,
                 producer_build.source_scalars,
                 request.limits,
             )?;
+            snapshot.activity_source = activity_source;
             snapshot.build.source_layers = snapshot
                 .build
                 .source_layers
@@ -42110,6 +42194,63 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn activation_edge_clipping_survives_repeated_bounds_without_claiming_complete_topology() {
+        let limits = BrainInspectionLimits::tightened(2, 32, 8, 2, 1024, 32);
+        let first = bound_brain_inspection(
+            "clipped-weights",
+            BrainActivations {
+                layers: vec![ActivationLayer {
+                    name: "flat".to_owned(),
+                    width: 4,
+                    height: 1,
+                    values: vec![0.1, 0.2, 0.3, 0.4],
+                }],
+                connections: (0..3)
+                    .map(|from| ActivationEdge {
+                        from,
+                        to: 3,
+                        weight: 0.5,
+                    })
+                    .collect(),
+                output_slots: vec![3],
+                truncated: false,
+            },
+            7,
+            limits,
+        )
+        .expect("first bounds pass");
+        assert_eq!(first.activations.connections.len(), 2);
+        assert!(first.activations.truncated);
+        let second = bound_brain_inspection(
+            "clipped-weights",
+            first.activations.clone(),
+            first.build.source_scalars,
+            limits,
+        )
+        .expect("owner bounds pass");
+        assert_eq!(first.activations, second.activations);
+        assert!(matches!(
+            crate::attribution::attribute_output(&second.activations, 0, 3)
+                .unwrap()
+                .method,
+            crate::attribution::AttributionMethod::Unavailable(
+                crate::attribution::AttributionUnavailable::TruncatedTopology
+            )
+        ));
+
+        let dropped_layer = bound_brain_inspection(
+            "clipped-weights",
+            second.activations,
+            7,
+            BrainInspectionLimits::tightened(1, 32, 3, 2, 1024, 32),
+        )
+        .expect("tighter layer bound");
+        assert!(dropped_layer.activations.layers.is_empty());
+        assert!(dropped_layer.activations.connections.is_empty());
+        assert!(dropped_layer.activations.truncated);
     }
 
     #[test]

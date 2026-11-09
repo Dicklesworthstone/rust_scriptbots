@@ -2,6 +2,36 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Ft genome loci and activity inspection (2026-11-09):** [Implemented and
+ type-checked — Codex; executable qualification open]
+
+FtBrain now exposes architecture-scoped canonical bias, weight and incoming-source
+loci through the shared heredity and genome-browser protocol. Discovery reports
+one mutation trial per existing flat parameter; structural source loci consume
+no mutation trials or random draws. The heredity discovery digest changes, while
+the adapter descriptor, genome/state codecs and checkpoint registry identity
+remain unchanged.
+
+A context-aware inspection hook reconstructs feed-forward activity from the
+owner's recorded sensors using the exact scalar kernels and verifies the recorded
+outputs bit-for-bit. The result explicitly labels reconstructed activity, names
+its layers and supplies global connection indices. Initial/indistinguishable
+zero observations and mismatched responses produce typed per-target refusals.
+Source work is checked before graph allocation or evaluation. Reapplying owner
+bounds preserves valid sampled weights while keeping clipping explicit and
+refusing attribution over incomplete topology. Inspection adds no evaluator
+history, checkpoint state or scientific mutation.
+
+DSR type-checked the exact core and brain libraries and the complete Ft test
+source with the pinned compiler and retained locked Cargo dependencies. Four new
+Ft regressions and one core regression cover loci/mutation mapping, reconstruction,
+batch rehydration, clipping, unavailable targets and checkpoint/continuation
+neutrality. Their executable results remain open: the 8 GiB host memory limit
+killed the unchanged Frankentorch dependency during Cargo code generation and
+then the core code-generation attempt using retained dependencies. Formatting
+is checked separately. This increment does not establish full Cargo/Clippy,
+GPU or performance acceptance for `bd-2z0.3.12.3`.
+
 **Browser creature inspector (2026-11-09):** [Source implemented and reviewed —
 Codex; recovered-byte compilation and browser/HTTP acceptance open]
 
