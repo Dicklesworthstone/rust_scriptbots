@@ -487,7 +487,8 @@ cargo check --target wasm32-unknown-unknown -p scriptbots-web
   - `candle` enables real tensor forward/batch inference, without production heritable-family registration.
   - `tract`, `tch`, and no-backend builds retain the sensor-copy `ml.placeholder` fallback.
   - `brain-ft` exposes `FtBrainConfig`, `FtBrainFamily`, and `FT_BRAIN_KIND`.
-  - The pinned Frankentorch `vector_to_parameters` path is not F32-safe, so FtBrain keeps a canonical flat F32 genome and materializes its layer slices without widening through F64. Resolution of that upstream gap and all compile/benchmark proof remain part of `bd-2z0.3.12.3`.
+  - FtBrain cohorts retain distinct weights for every agent and evaluate one packed F32 batched matrix contraction per layer. The scalar evaluator remains the reference path; malformed lanes reject the whole output batch. Execution buffers are shared within a cohort, while the core still reconstructs cohorts at tick boundaries. This is not an end-to-end throughput claim. Adapter semantic version 3 records the new executor identity; canonical genome and evaluator-state codecs are unchanged.
+  - The pinned Frankentorch `vector_to_parameters` path is not F32-safe, so FtBrain keeps a canonical flat F32 genome and materializes its layer slices without widening through F64. Resolution of that upstream gap and full benchmark qualification remain part of `bd-2z0.3.12.3`.
 
 Note: NeuroFlow and the native brain implementations are functional. Candle has real library inference; Tract/tch inference and alternate spatial-index backends remain unimplemented. The ML disposition keeps placeholders out of production populations and selects FtBrain as the app-level ML family. FtBrain has real code-first inference, but is not accepted as complete until its pinned DSR evidence is green.
 
@@ -1504,22 +1505,25 @@ Send a subscription as JSON text:
 ```
 
 The server acknowledges with `type: "subscribed"`, the correlation `request_id`,
-`protocol_version: 1`, `stream_protocol_version: 1`, decimal-string `session_id`,
+`protocol_version: 1`, `stream_protocol_version: 2`, decimal-string `session_id`,
 selected `channels`, and `max_fps`. Ignore any initial binary summaries until
 that acknowledgment. Every subsequent binary message begins with ASCII `SBWS`,
-a little-endian `u16` version (`1`), and exactly one Postcard `RemoteFrame` from
+a little-endian `u16` version (`2`), and exactly one Postcard `RemoteFrame` from
 `scriptbots_runtime::remote`. Its identity contains the actual host session,
 publication, scientific, control and configuration revisions, and completed tick.
 Every frame also carries observed playback state and `coalesced_publications`.
 The WASM `decode_remote_frame_binary` export validates this envelope and exposes
 all identity/cursor integers as decimal strings under
-`schema: "scriptbots.remote-frame.v1"`. The dynamic canvas payload preserves the
-existing world-v2 schema used by both renderers.
+`schema: "scriptbots.remote-frame.v2"`. The dynamic canvas payload preserves the
+existing world-v2 schema used by both renderers. Stream v2 also carries a bounded
+environment overview from that same publication. JSON controls, subscriptions and
+consumption acknowledgments remain protocol version 1. Rebuild the server, WASM
+decoder and browser together; binary stream v1 is rejected explicitly.
 
 | Channel | Payload and delivery behavior |
 | --- | --- |
 | `telemetry` | Canonical `TickSummaryDto` from one host publication; latest value only. |
-| `canvas` | Complete dynamic-world snapshot from that same publication; latest value only, including paused control changes. |
+| `canvas` | Complete dynamic-world snapshot plus coherent terrain, food and water-depth overview; latest value only, including paused control changes. |
 | `events` | Up to 64 canonical narrative records, oldest first, with session-bound sequence numbers and an exact missing-prefix gap when retention overtakes a reader. Backlogged pages drain even while science is paused. |
 
 Subscriptions contain one through three unique channels. Omitted channels do no
@@ -1528,7 +1532,12 @@ frequency, not simulation speed. Binary frames are capped at 8 MiB, canvas frame
 at 65,536 agents, and narrative pages at 64 records with bounded text. An
 unrepresentable source is refused instead of silently truncated. The shared
 decoder rejects unknown versions, trailing data, invalid lengths, non-finite
-presentation values, mismatched ticks and noncontiguous event pages.
+presentation values, mismatched ticks and noncontiguous event pages. Environment
+overviews contain at most 128 × 128 cells and must cover the exact source world.
+Small grids retain every cell; larger grids select the source cell at each
+overview cell's center. This sampling is labelled and does not replace metrics
+with inferred averages. Terrain, food and hydrology revisions remain exact decimal
+strings at the JavaScript boundary. Other stream channels carry no environment.
 
 Each channel has one consumption credit. After consuming a frame, acknowledge its
 exact identity before another frame in that channel can be sent:
@@ -2118,6 +2127,14 @@ Runtime constraints:
 We maintain a sibling browser-targeted crate, `scriptbots-web`, that reuses core crates without invasive changes. See `PLAN_TO_CREATE_SIBLING_APP_CRATE_TARGETING_WASM.md` and `docs/wasm/` (ADRs, audits, capability matrix). Initial MVP runs single-threaded by disabling `scriptbots-core`’s `parallel` feature on wasm; WebGPU vs Canvas2D rendering is under evaluation.
 
 > Quick peek: `crates/scriptbots-web/web/` ships a Canvas demo harness that consumes the wasm snapshots, surfaces live metrics, and can be served locally via `python -m http.server`. Binary snapshots (`snapshot_format: "binary"`) and custom seeding strategies are already wired in for experimentation.
+
+The **World layers** selector offers combined terrain/food/water, terrain, food
+availability, water depth and agents-only views in both Canvas and WebGPU.
+Environment and agents come from the same immutable owner publication in local
+and remote mode. Layer switching does not tick or edit the world. The status line
+identifies exact cells versus a bounded center-sampled overview and reports disabled
+hydrology or unavailable layers. Empty or extinct populations still show their
+environment, and missing observations clear the previous background.
 
 The browser supports explicit saved continuations for MLP and Unbound worlds.
 Choose the brain for a new world, Reset, then use **Save in This Browser** to

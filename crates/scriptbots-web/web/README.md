@@ -84,6 +84,14 @@ history/credit handling; nonempty narrative delivery requires observed records.
   with boost rings. The canvas keeps its intrinsic aspect ratio when displayed
   beside the controls. The demo consumes one latest JSON snapshot per paint;
   binary bindings are separate from these controls.
+- **World layers**: choose the combined view, terrain, food, water, or agents
+  only. Canvas and WebGPU use the same overview captured with the agents'
+  committed publication, both locally and when connected to a server. Source
+  grids up to 128 cells per side retain every cell; larger grids use at most
+  128 × 128 center-cell samples covering the whole world. These samples are not
+  scientific averages. Food uses the configured food maximum and water uses
+  observed depth. The layer status identifies sampling and disabled hydrology.
+  Changing the view never submits a simulation command or advances a tick.
 - **Reset Simulation**: reseeds with a fresh RNG seed and reuses the slider settings. A rolling 5-second performance log is appended to the console pane (`FPS`, `TPS`, population).
 - **Saved continuations**: choose MLP or Unbound for a new world, then Reset.
   **Save Continuation File** downloads a portable full-owner checkpoint; **Load

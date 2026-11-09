@@ -61,6 +61,10 @@ The crate exposes the following wasm-bindgen surface:
   Explicit `tick(steps)` still completes exactly the
   requested manual steps without advancing the elapsed clock or changing speed.
 - `SimHandle::snapshot() -> JsValue` — builds a snapshot without ticking (uses the same format toggle).
+- `SimHandle::frame() -> JsValue` — reads one immutable host publication with exact
+  decimal-string identities, its dynamic snapshot, and a bounded terrain/food/water
+  overview. The environment is cached by owner and layer revisions and frozen in
+  JavaScript; callers cannot mutate the shared cells. This does not tick the world.
 - `SimHandle::reset(seed?: number)` — rebuilds the world. An explicit seed
   overrides the nested config for that reset; omitting it falls back to the
   original `config.rng_seed` (or entropy when the nested seed is also absent).
@@ -86,6 +90,22 @@ Snapshots are deterministic and use camelCase field names at the JavaScript boun
 - Per-agent state (`position`, `velocity`, `heading`, `energy`, `health`, `color`, `spikeLength`, `boost` flag)
 
 The wasm crate depends on `scriptbots-core` with `default-features = false`, disabling Rayon on wasm targets. Native builds can re-enable parallelism via the `parallel` feature if needed.
+
+The demo's **World layers** selector works in Canvas 2D and WebGPU, locally and
+while connected to a native server. It offers combined terrain/food/water, terrain,
+food availability, water depth and agents-only views. Environment observations
+cover the exact world with at most 128 × 128 cells. Small grids preserve every
+source cell; larger grids use a labelled center-sampled overview, not statistical
+averages. Empty populations retain the world background. Missing environment
+observations clear it, and owner/epoch/revision changes invalidate cached pixels.
+
+Remote binary frames use `SBWS` version 2 and decode to
+`scriptbots.remote-frame.v2`; the unchanged dynamic-world payload keeps its v2
+codec. Only canvas frames carry the new environment field. JSON commands,
+subscriptions and frame acknowledgments remain protocol version 1. Build the
+viewer, WASM decoder and native server from matching sources; an old binary
+stream is explicitly refused. The standalone `snapshot()` and `tick()` codecs
+remain unchanged.
 
 The Canvas demo drives elapsed time from one independent timer. RAF only reads
 the latest immutable snapshot. Its speed slider and visibility changes use host

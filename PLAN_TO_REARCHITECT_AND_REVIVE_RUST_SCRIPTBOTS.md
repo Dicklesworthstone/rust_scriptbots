@@ -2,6 +2,40 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Ft cohorts and browser world layers (2026-11-09):** [Source implemented —
+Codex; full native, rendered-output and performance qualification remains open]
+
+This pass prioritizes missing executable functionality from the current plan and
+authoritative Beads: true FtBrain cohort evaluation (`bd-2z0.3.12.3`) and browser
+environment rendering (`bd-2z0.12.3`).
+
+- FtBrain now packs distinct per-agent weights and invokes one F32 batched matrix
+  contraction per layer. Scalar evaluation remains the bit-level oracle; output
+  publication is all-or-nothing. Canonical genome and evaluator-state codecs stay
+  unchanged; adapter semantic version 3 identifies the new executor. Core still
+  reconstructs cohorts at tick boundaries, so this is not a throughput claim.
+- Local WASM and remote Canvas/WebGPU views now show terrain, food and observed
+  water depth from the agents' immutable publication, including empty worlds.
+  Overviews retain all small-grid cells or at most 128 × 128 labelled center
+  samples covering the full source world. Layer/owner caches, frozen JS objects
+  and owner-generation invalidation prevent stale or caller-poisoned reuse.
+  Binary `SBWS` frames advance to v2; JSON controls/subscriptions/acks remain v1.
+- Executed DSR checks: the final Ft source passed all 15 tests with Rayon thread
+  counts 1 and 4 after compiling against the dependencies from its successful
+  locked Cargo build; final browser consumer/continuation tests passed 25/25;
+  runtime remote/subscription tests passed 17/17. The exact production browser
+  Rust/JS and consumer-test blobs were recovered after executor loss by matching
+  their recorded Git hashes. UI wording, documentation and parts of the browser
+  DOM harness were reconstructed and source-reviewed; the DOM harness was not run.
+- Full Cargo/Clippy continuation and native web/Bevy qualification were blocked
+  when the shared filesystem filled, then the execution environment became
+  unavailable. The targeted Ft rerun used DSR with memory-backed compiler output
+  and the previously built locked dependencies; it does not stand in for full
+  workspace qualification. Actual Canvas/WebGPU pixel assertions are authored
+  but unexecuted. Upstream F32 parameter round-trip, full performance evidence
+  and the original Beads' broader acceptance criteria remain open.
+
+
 **Checkpoint discovery and experiment admission (2026-11-05):** [Source
 implemented — Codex; native qualification remains open]
 

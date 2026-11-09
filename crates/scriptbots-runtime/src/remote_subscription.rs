@@ -7,17 +7,19 @@
 use crate::RenderSnapshot;
 use crate::remote::{
     REMOTE_MAX_AGENTS, REMOTE_MAX_EVENT_LABEL_BYTES, REMOTE_MAX_EVENT_TEXT_BYTES,
-    REMOTE_MAX_EVENTS, REMOTE_PROTOCOL_VERSION, RemoteEventGap, RemoteEventPage, RemoteEventRecord,
+    REMOTE_MAX_EVENTS, RemoteEnvironmentCache, RemoteEventGap, RemoteEventPage, RemoteEventRecord,
     RemoteFrame, RemoteFrameIdentity, RemoteFramePayload, RemoteProtocolError,
     RemoteSequencedEvent,
 };
 use scriptbots_core::{Tick, TickSummary, TickSummaryDto};
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::{cell::RefCell, time::Duration};
 use thiserror::Error;
 
 /// Maximum inbound subscription or control message, independently of frame size.
 pub const REMOTE_MAX_REQUEST_BYTES: usize = 16 * 1024;
+/// JSON subscription and consumption-credit schema; independent of the binary frame codec.
+pub const REMOTE_SUBSCRIPTION_PROTOCOL_VERSION: u16 = 1;
 
 /// Independently negotiated presentation channels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,7 +27,7 @@ pub const REMOTE_MAX_REQUEST_BYTES: usize = 16 * 1024;
 pub enum RemoteChannel {
     /// Canonical tick aggregates.
     Telemetry,
-    /// Dynamic-world snapshots for the existing browser renderers.
+    /// Dynamic-world snapshots and coherent bounded environment overviews.
     Canvas,
     /// Canonical narrative records with session-bound ordinals.
     Events,
@@ -116,7 +118,9 @@ impl RemoteFrameAck {
     }
 
     fn validated_identity(&self) -> Result<(u128, u64, Option<u64>), RemoteSubscriptionError> {
-        if self.protocol_version != REMOTE_PROTOCOL_VERSION || self.command != "stream_ack" {
+        if self.protocol_version != REMOTE_SUBSCRIPTION_PROTOCOL_VERSION
+            || self.command != "stream_ack"
+        {
             return Err(RemoteSubscriptionError::Request(
                 "expected protocol_version 1 and command stream_ack".into(),
             ));
@@ -164,7 +168,9 @@ impl RemoteSubscriptionRequest {
     }
 
     fn validate(&self) -> Result<(), RemoteSubscriptionError> {
-        if self.protocol_version != REMOTE_PROTOCOL_VERSION || self.command != "subscribe" {
+        if self.protocol_version != REMOTE_SUBSCRIPTION_PROTOCOL_VERSION
+            || self.command != "subscribe"
+        {
             return Err(RemoteSubscriptionError::Request(
                 "expected protocol_version 1 and command subscribe".into(),
             ));
@@ -428,7 +434,7 @@ fn delivery_clock_regression() -> RemoteSubscriptionError {
     RemoteSubscriptionError::Request("remote delivery clock moved backwards".into())
 }
 
-/// Per-connection cursors; no snapshots or outbound messages are retained here.
+/// Per-connection cursors and one bounded environment cache; no outbound queue is retained.
 #[derive(Debug, Clone)]
 pub struct RemoteSubscription {
     session_id: u128,
@@ -438,6 +444,7 @@ pub struct RemoteSubscription {
     canvas_revision: Option<u64>,
     after_event: u64,
     initial_events: bool,
+    environment: RefCell<RemoteEnvironmentCache>,
 }
 
 impl RemoteSubscription {
@@ -487,6 +494,7 @@ impl RemoteSubscription {
             canvas_revision: after_revision,
             after_event,
             initial_events: true,
+            environment: RefCell::new(RemoteEnvironmentCache::default()),
         })
     }
 
@@ -601,6 +609,11 @@ impl RemoteSubscription {
             playback: snapshot.playback,
             coalesced_publications: previous_revision
                 .map_or(0, |previous| identity.publication_revision - previous - 1),
+            environment: if channel == RemoteChannel::Canvas {
+                Some(self.environment.borrow_mut().snapshot(snapshot)?)
+            } else {
+                None
+            },
             payload,
         };
         frame.validate()?;
@@ -787,7 +800,7 @@ mod tests {
             ),
         };
         RemoteFrameAck {
-            protocol_version: REMOTE_PROTOCOL_VERSION,
+            protocol_version: REMOTE_SUBSCRIPTION_PROTOCOL_VERSION,
             command: "stream_ack".into(),
             session_id: frame.identity.session_id.to_string(),
             channel,

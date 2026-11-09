@@ -1,6 +1,7 @@
 import initWasm, * as wasm from "./pkg/scriptbots_web.js";
 import { CanvasRenderer } from "./renderers/canvas.js";
 import { WebGpuRenderer } from "./renderers/webgpu.js";
+import { environmentDescription } from "./renderers/environment.js";
 import { RemoteStreamClient } from "./remote.js";
 import { BrowserContinuationStore } from "./continuation-store.js";
 
@@ -19,6 +20,8 @@ const {
 let canvas = document.getElementById("sim-canvas");
 const rendererSelect = document.getElementById("renderer");
 const rendererStatus = document.getElementById("renderer-status");
+const environmentLayer = document.getElementById("environment-layer");
+const environmentStatus = document.getElementById("environment-status");
 const captureButton = document.getElementById("capture-btn");
 const captureStatus = document.getElementById("capture-status");
 let captureRequest = null;
@@ -195,7 +198,8 @@ function receiveRemoteFrame(frame) {
   if (!remoteMode) return;
   remotePlayback.textContent = `Observed server: ${frame.playback.paused ? "paused" : "running"}, ${frame.playback.speedMultiplier}× — tick ${frame.identity.tick}`;
   if (frame.kind === "canvas") {
-    const browserFrame = { schema: "scriptbots.browser-frame.v1", identity: frame.identity, snapshot: frame.payload };
+    const browserFrame = { schema: "scriptbots.browser-frame.v1", identity: frame.identity,
+      snapshot: frame.payload, environment: frame.environment };
     validateFrameIdentity(browserFrame);
     remoteFrame = browserFrame;
     if (frame.coalescedPublications !== "0") {
@@ -412,6 +416,11 @@ rendererSelect.addEventListener("change", () => {
   void selectRenderer(rendererSelect.value).catch(reportRendererFailure);
 });
 
+environmentLayer?.addEventListener("change", () => {
+  // Presentation-only: redraw the same committed frame, including while paused.
+  lastPaintedFrame = null;
+});
+
 function validateFrameIdentity(frame) {
   const identity = frame?.identity;
   if (frame?.schema !== "scriptbots.browser-frame.v1"
@@ -440,11 +449,19 @@ function drawSnapshot(frame) {
     return true;
   }
   try {
-    if (renderer.render(frame.snapshot)) {
+    if (renderer.render(frame.snapshot, { environment: frame.environment, identity: frame.identity,
+      layer: environmentLayer?.value ?? "combined", generation: simulationGeneration })) {
       lastPaintedFrame = { simulationGeneration, publicationRevision: frame.identity.publicationRevision,
         sessionId: frame.identity.sessionId, width: canvas.width, height: canvas.height };
       for (const [key, value] of Object.entries(frame.identity)) {
         rendererStatus.dataset[key === "tick" ? "snapshotTick" : key] = value;
+      }
+      if (environmentStatus) {
+        environmentStatus.textContent = environmentDescription(frame.environment);
+        environmentStatus.dataset.state = frame.environment ? "observed" : "unavailable";
+        environmentStatus.dataset.sessionId = frame.identity.sessionId;
+        environmentStatus.dataset.publicationRevision = frame.identity.publicationRevision;
+        environmentStatus.dataset.layer = environmentLayer?.value ?? "combined";
       }
       captureAdmittedFrame(frame.identity);
       return true;

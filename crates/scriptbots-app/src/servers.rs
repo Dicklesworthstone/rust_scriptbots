@@ -1935,7 +1935,8 @@ impl StreamResumeQuery {
             return Ok(None);
         };
         let request = RemoteSubscriptionRequest {
-            protocol_version: REMOTE_PROTOCOL_VERSION,
+            protocol_version:
+                scriptbots_runtime::remote_subscription::REMOTE_SUBSCRIPTION_PROTOCOL_VERSION,
             request_id: None,
             command: "subscribe".to_owned(),
             channels: vec![RemoteChannel::Telemetry],
@@ -10008,7 +10009,7 @@ mod tests {
             assert_eq!(ack["type"], "subscribed");
             assert_eq!(ack["request_id"], id);
             assert_eq!(ack["channels"], channels);
-            assert_eq!(ack["stream_protocol_version"], 1);
+            assert_eq!(ack["stream_protocol_version"], REMOTE_PROTOCOL_VERSION);
             assert_eq!(ack["session_id"], initial.session_id.get().to_string());
         }
         send_websocket_text(
@@ -10024,6 +10025,12 @@ mod tests {
             panic!("canvas channel")
         };
         assert_eq!(world, initial.world);
+        assert_eq!(
+            image.environment.as_deref(),
+            Some(
+                &scriptbots_runtime::remote::RemoteEnvironmentSnapshot::capture(&initial).unwrap()
+            )
+        );
         let events = read_remote_binary(&mut canvas);
         let RemoteFramePayload::Events(page) = events.payload else {
             panic!("events channel")

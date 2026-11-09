@@ -177,7 +177,7 @@ function createServer(packageInfo) {
     } else if (url.pathname === "/main.js") {
       res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8" });
       res.end(fs.readFileSync(path.join(webDir, "main.js")));
-    } else if (["/remote.js", "/continuation-store.js", "/renderers/canvas.js", "/renderers/webgpu.js"].includes(url.pathname)) {
+    } else if (["/remote.js", "/continuation-store.js", "/renderers/canvas.js", "/renderers/webgpu.js", "/renderers/environment.js"].includes(url.pathname)) {
       res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8" });
       res.end(fs.readFileSync(path.join(webDir, url.pathname.slice(1))));
     } else if (url.pathname.startsWith("/pkg/")
@@ -628,8 +628,8 @@ async function runRendererTests(browser, baseUrl) {
         ],
       };
       let capturedPixels = null;
-      const read = async (input, points) => {
-        if (input) renderer.render(input);
+      const read = async (input, points, presentation) => {
+        if (input) renderer.render(input, presentation);
         const pendingPng = capturedPixels === null && input
           ? new Promise((resolve) => canvas.toBlob(resolve, "image/png")) : null;
         if (renderer.device) await renderer.device.queue.onSubmittedWorkDone();
@@ -675,6 +675,49 @@ async function runRendererTests(browser, baseUrl) {
         const resized = await read(snapshot, [[128, 64], [256, 128]]);
         if (resized[0][1] <= resized[0][0] + 70 || resized[1][0] <= resized[1][1] + 70) {
           throw new Error(`${backend} did not rescale after resize: ${resized}`);
+        }
+        const environment = {
+          width: 2, height: 2, sourceWidth: 2, sourceHeight: 2, cellSize: 40,
+          terrainRevision: "1", foodRevision: "1", hydrologyRevision: "1", foodMax: 0.5,
+          hydrologyEnabled: true,
+          cells: [
+            { terrain: "Grass", elevation: 0, food: 0, waterDepth: 0 },
+            { terrain: "Sand", elevation: 1, food: 0.5, waterDepth: 0 },
+            { terrain: "DeepWater", elevation: 0, food: 0.25, waterDepth: 0.15 },
+            { terrain: "Rock", elevation: 0.5, food: 0, waterDepth: 1 },
+          ],
+        };
+        const emptyWorld = { ...snapshot, world: { width: 80, height: 80 }, agents: [] };
+        const observation = { environment, identity: { sessionId: "100" }, layer: "food" };
+        const centers = [[128, 64], [384, 64], [128, 192], [384, 192]];
+        const foodCells = await read(emptyWorld, centers, observation);
+        const close = (actual, expected) => actual.every((value, index) => Math.abs(value - expected[index]) <= 1);
+        if (!close(foodCells[0], [18, 27, 37, 255]) || !close(foodCells[1], [120, 180, 48, 255])) {
+          throw new Error(`${backend} lost food cells in an empty world: ${JSON.stringify(foodCells)}`);
+        }
+        const sameRaster = renderer.environment.current;
+        await read(emptyWorld, centers, observation);
+        if (renderer.environment.current !== sameRaster) throw new Error(`${backend} rebuilt unchanged environment`);
+        const waterCells = await read(emptyWorld, centers, { ...observation, layer: "water" });
+        if (!close(waterCells[2], [29, 80, 116, 255])) {
+          throw new Error(`${backend} lost actual water depth: ${JSON.stringify(waterCells)}`);
+        }
+        const depleted = { ...environment, foodRevision: "2",
+          cells: environment.cells.map((cell) => ({ ...cell, food: 0 })) };
+        const changedCells = await read(emptyWorld, centers, { ...observation, environment: depleted });
+        if (!close(changedCells[1], [18, 27, 37, 255])) throw new Error(`${backend} retained stale food`);
+        const sessionCells = await read(emptyWorld, centers, { ...observation, identity: { sessionId: "101" } });
+        if (!close(sessionCells[1], [120, 180, 48, 255])) throw new Error(`${backend} reused another session's grid`);
+        const replacementCells = await read(emptyWorld, centers, {
+          ...observation, identity: { sessionId: "101" }, generation: 1,
+          environment: { ...environment, cells: depleted.cells },
+        });
+        if (!close(replacementCells[1], [18, 27, 37, 255])) {
+          throw new Error(`${backend} reused a replaced same-seed owner's grid`);
+        }
+        const absentCells = await read(emptyWorld, centers);
+        if (absentCells.some((cell) => cell[0] > 15 || cell[1] > 22 || cell[2] > 38)) {
+          throw new Error(`${backend} displayed stale environment when layers were absent`);
         }
         let capacityError = null;
         if (renderer.device) {
@@ -740,7 +783,8 @@ async function runRendererTests(browser, baseUrl) {
             queue.writeBuffer = writeBuffer;
           }
         }
-        results[backend] = { pixels, capturedPixels, empty, resized, growthAgents: 513, capacityError, admission };
+        results[backend] = { pixels, capturedPixels, empty, resized, growthAgents: 513, capacityError, admission,
+          environment: { foodCells, waterCells, changedCells, sessionCells, replacementCells, absentCells } };
       } finally {
         renderer.destroy();
       }
@@ -760,9 +804,9 @@ async function runRendererTests(browser, baseUrl) {
     const { CanvasRenderer } = await import("/renderers/canvas.js");
     const render = CanvasRenderer.prototype.render;
     window.__canvasRenderCalls = 0;
-    CanvasRenderer.prototype.render = function (snapshot) {
+    CanvasRenderer.prototype.render = function (snapshot, presentation) {
       if (this.canvas.id === "sim-canvas") window.__canvasRenderCalls += 1;
-      return render.call(this, snapshot);
+      return render.call(this, snapshot, presentation);
     };
     const frame = wasm.SimHandle.prototype.frame;
     wasm.SimHandle.prototype.frame = function () {
@@ -839,6 +883,40 @@ async function runRendererTests(browser, baseUrl) {
   });
   if (pausedPaints.unchangedCalls !== 0 || pausedPaints.resizeCalls !== 1 || pausedPaints.restoreCalls !== 1
       || !pausedPaints.unchangedState) throw new Error(`Paused publication was repainted or resize ignored: ${JSON.stringify(pausedPaints)}`);
+  const observedEnvironment = await page.evaluate(() => {
+    const first = window.__rendererSim.frame();
+    const second = window.__rendererSim.frame();
+    const environment = first.environment;
+    if (!environment || environment !== second.environment
+        || environment.width !== Math.min(environment.sourceWidth, 128)
+        || environment.height !== Math.min(environment.sourceHeight, 128)
+        || environment.cells.length !== environment.width * environment.height
+        || environment.sourceWidth * environment.cellSize !== first.snapshot.world.width
+        || environment.sourceHeight * environment.cellSize !== first.snapshot.world.height) {
+      throw new Error("Local frames lost their coherent bounded environment or reused-object cache");
+    }
+    if (!Object.isFrozen(environment) || !Object.isFrozen(environment.cells)
+        || !Object.isFrozen(environment.cells[0])) {
+      throw new Error("Shared environment objects must be immutable");
+    }
+    const originalFood = environment.cells[0].food;
+    try { environment.cells[0].food = originalFood + 1; } catch {}
+    if (window.__rendererSim.frame().environment.cells[0].food !== originalFood) {
+      throw new Error("A caller poisoned the environment reused by a later frame");
+    }
+    return {
+      sourceWidth: environment.sourceWidth, sourceHeight: environment.sourceHeight,
+      width: environment.width, height: environment.height, cells: environment.cells.length,
+      shared: true, immutable: true,
+    };
+  });
+  await page.selectOption("#environment-layer", "food");
+  await page.waitForFunction(() => document.getElementById("environment-status").dataset.layer === "food");
+  if (await page.evaluate(() => JSON.stringify(window.__rendererSim.snapshot())) !== snapshotBefore) {
+    throw new Error("Changing the displayed environment layer changed the scientific snapshot");
+  }
+  await page.selectOption("#environment-layer", "combined");
+  await page.waitForFunction(() => document.getElementById("environment-status").dataset.layer === "combined");
   await page.locator("#sim-canvas").screenshot({ path: path.join(proof, "main-canvas.png") });
   exports.canvas = await saveFrame(page, "canvas");
   if (await page.evaluate(() => JSON.stringify(window.__rendererSim.snapshot())) !== snapshotBefore) throw new Error("Canvas switch changed exported snapshot");
@@ -1135,7 +1213,7 @@ async function runRendererTests(browser, baseUrl) {
   }
   if (errors.length !== 0) throw new Error(`Renderer page errors: ${JSON.stringify(errors)}`);
   const result = { schema: "scriptbots.browser-renderers.v2", status: "pass", browser: browser.version(), adapter,
-    geometry, aspect, pausedTick, pausedPaints, exportedSnapshotSha256: createHash("sha256").update(snapshotBefore).digest("hex"),
+    geometry, aspect, pausedTick, pausedPaints, observedEnvironment, exportedSnapshotSha256: createHash("sha256").update(snapshotBefore).digest("hex"),
     backpressure: { beforeHold, duringHold, afterHold,
       presentationControl: "one producer callback retained and invoked explicitly; real independent timer" },
     injectedCompletionRejection: { paintedPixels: rejectedCompletionPixels,

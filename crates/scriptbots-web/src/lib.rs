@@ -11,6 +11,7 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, ensure};
 use js_sys::Uint8Array;
@@ -42,8 +43,8 @@ use serde_wasm_bindgen::{from_value, to_value};
 use wasm_bindgen::prelude::*;
 
 use scriptbots_runtime::remote::{
-    RemoteEventPage, RemoteEventRecord, RemoteFrame, RemoteFrameIdentity, RemoteFramePayload,
-    decode_remote_frame,
+    RemoteEnvironmentCache, RemoteEnvironmentCell, RemoteEnvironmentSnapshot, RemoteEventPage,
+    RemoteEventRecord, RemoteFrame, RemoteFrameIdentity, RemoteFramePayload, decode_remote_frame,
 };
 use scriptbots_runtime::{
     ApplicationState, CommandStatus, DriveReceipt, HostCommand, HostCore, HostCoreOptions,
@@ -118,6 +119,8 @@ struct Simulation {
     spec: SimSpec,
     mlp_key: Option<u64>,
     now_nanos: u64,
+    environment_cache: RemoteEnvironmentCache,
+    environment_js: Option<(Arc<RemoteEnvironmentSnapshot>, JsValue)>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -161,6 +164,42 @@ struct BrowserFrame<'a> {
     schema: &'static str,
     identity: BrowserFrameIdentity,
     snapshot: &'a SimulationSnapshot,
+    environment: Option<BrowserEnvironment<'a>>,
+}
+
+/// The same bounded overview in local and remote frames. Revisions stay exact in JavaScript.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserEnvironment<'a> {
+    width: u32,
+    height: u32,
+    source_width: u32,
+    source_height: u32,
+    cell_size: u32,
+    terrain_revision: String,
+    food_revision: String,
+    hydrology_revision: String,
+    food_max: f32,
+    hydrology_enabled: bool,
+    cells: &'a [RemoteEnvironmentCell],
+}
+
+impl<'a> From<&'a RemoteEnvironmentSnapshot> for BrowserEnvironment<'a> {
+    fn from(value: &'a RemoteEnvironmentSnapshot) -> Self {
+        Self {
+            width: value.width,
+            height: value.height,
+            source_width: value.source_width,
+            source_height: value.source_height,
+            cell_size: value.cell_size,
+            terrain_revision: value.terrain_revision.to_string(),
+            food_revision: value.food_revision.to_string(),
+            hydrology_revision: value.hydrology_revision.to_string(),
+            food_max: value.food_max,
+            hydrology_enabled: value.hydrology_enabled,
+            cells: &value.cells,
+        }
+    }
 }
 
 /// Decimal strings preserve every host identity bit across the JavaScript boundary.
@@ -181,6 +220,7 @@ impl<'a> BrowserFrame<'a> {
             schema: "scriptbots.browser-frame.v1",
             identity: RemoteFrameIdentity::from(publication).into(),
             snapshot: &publication.world,
+            environment: None,
         }
     }
 }
@@ -206,6 +246,7 @@ struct BrowserRemoteFrame<'a> {
     identity: BrowserFrameIdentity,
     playback: BrowserRemotePlayback,
     coalesced_publications: String,
+    environment: Option<BrowserEnvironment<'a>>,
     payload: BrowserRemotePayload<'a>,
 }
 
@@ -320,7 +361,7 @@ impl<'a> From<&'a RemoteFrame> for BrowserRemoteFrame<'a> {
             }
         };
         Self {
-            schema: "scriptbots.remote-frame.v1",
+            schema: "scriptbots.remote-frame.v2",
             kind,
             identity: frame.identity.into(),
             playback: BrowserRemotePlayback {
@@ -328,6 +369,7 @@ impl<'a> From<&'a RemoteFrame> for BrowserRemoteFrame<'a> {
                 speed_multiplier: frame.playback.speed_multiplier,
             },
             coalesced_publications: frame.coalesced_publications.to_string(),
+            environment: frame.environment.as_deref().map(BrowserEnvironment::from),
             payload,
         }
     }
@@ -359,6 +401,9 @@ mod remote_frame_tests {
             identity: RemoteFrameIdentity::from(publication.as_ref()),
             playback: publication.playback,
             coalesced_publications: 0,
+            environment: Some(Arc::new(
+                RemoteEnvironmentSnapshot::capture(&publication).unwrap(),
+            )),
             payload: RemoteFramePayload::Canvas(publication.world.clone()),
         };
         let bytes = encode_remote_frame(&frame).unwrap();
@@ -368,7 +413,14 @@ mod remote_frame_tests {
         assert_eq!(browser["payload"], local["snapshot"]);
         assert_eq!(browser["identity"], local["identity"]);
         assert_eq!(browser["kind"], "canvas");
-        assert_eq!(browser["schema"], "scriptbots.remote-frame.v1");
+        assert_eq!(browser["schema"], "scriptbots.remote-frame.v2");
+        assert_eq!(
+            browser["environment"],
+            serde_json::to_value(BrowserEnvironment::from(
+                frame.environment.as_deref().unwrap()
+            ))
+            .unwrap()
+        );
         assert_eq!(browser["playback"]["paused"], publication.playback.paused);
         assert_eq!(
             browser["playback"]["speedMultiplier"],
@@ -381,6 +433,7 @@ mod remote_frame_tests {
         frame.identity.publication_revision = u64::MAX;
         frame.identity.scientific_revision = u64::MAX - 1;
         frame.coalesced_publications = u64::MAX - 2;
+        Arc::make_mut(frame.environment.as_mut().unwrap()).terrain_revision = u64::MAX;
         let decoded = decode_remote_frame(&encode_remote_frame(&frame).unwrap()).unwrap();
         let browser = serde_json::to_value(BrowserRemoteFrame::from(&decoded)).unwrap();
         assert_eq!(browser["identity"]["sessionId"], u128::MAX.to_string());
@@ -393,6 +446,10 @@ mod remote_frame_tests {
             (u64::MAX - 1).to_string()
         );
         assert_eq!(browser["coalescedPublications"], (u64::MAX - 2).to_string());
+        assert_eq!(
+            browser["environment"]["terrainRevision"],
+            u64::MAX.to_string()
+        );
     }
 
     #[test]
@@ -425,6 +482,7 @@ mod remote_frame_tests {
                 speed_multiplier: 2.0,
             },
             coalesced_publications: 0,
+            environment: None,
             payload: RemoteFramePayload::Events(RemoteEventPage {
                 after_event: u64::MAX - 1,
                 earliest_retained: u64::MAX,
@@ -587,6 +645,8 @@ impl Simulation {
             spec,
             mlp_key,
             now_nanos: 0,
+            environment_cache: RemoteEnvironmentCache::default(),
+            environment_js: None,
         })
     }
 
@@ -620,6 +680,8 @@ impl Simulation {
             spec,
             mlp_key,
             now_nanos: 0,
+            environment_cache: RemoteEnvironmentCache::default(),
+            environment_js: None,
         })
     }
 
@@ -651,6 +713,8 @@ impl Simulation {
         self.core = core;
         self.spec = spec;
         self.now_nanos = 0;
+        self.environment_cache = RemoteEnvironmentCache::default();
+        self.environment_js = None;
         Ok(())
     }
 
@@ -871,9 +935,33 @@ impl SimHandle {
     /// This does not advance science and is independent of the snapshot codec option.
     #[wasm_bindgen(js_name = frame)]
     pub fn frame_js(&self) -> Result<JsValue, JsValue> {
-        let simulation = self.inner.borrow();
+        let mut simulation = self.inner.borrow_mut();
         let publication = simulation.core.latest_snapshot();
-        to_value(&BrowserFrame::new(&publication)).map_err(js_error)
+        let environment = simulation
+            .environment_cache
+            .snapshot(&publication)
+            .map_err(js_error)?;
+        let environment_js = if let Some((cached, value)) = &simulation.environment_js
+            && Arc::ptr_eq(cached, &environment)
+        {
+            value.clone()
+        } else {
+            let value =
+                to_value(&BrowserEnvironment::from(environment.as_ref())).map_err(js_error)?;
+            // Shared JS layers are immutable; a caller cannot poison later frames by
+            // editing the reusable overview. The dynamic snapshot remains a fresh value.
+            let cells = js_sys::Reflect::get(&value, &JsValue::from_str("cells"))?;
+            for cell in js_sys::Array::from(&cells).iter() {
+                js_sys::Object::freeze(&js_sys::Object::from(cell));
+            }
+            js_sys::Object::freeze(&js_sys::Object::from(cells));
+            js_sys::Object::freeze(&js_sys::Object::from(value.clone()));
+            simulation.environment_js = Some((environment, value.clone()));
+            value
+        };
+        let frame = to_value(&BrowserFrame::new(&publication)).map_err(js_error)?;
+        js_sys::Reflect::set(&frame, &JsValue::from_str("environment"), &environment_js)?;
+        Ok(frame)
     }
 
     /// Rebuild the simulation with an optional nonnegative numeric seed.
@@ -2319,6 +2407,41 @@ mod tests {
                 .expect("repeated nested-seed digest"),
             nested_seed_digest,
             "reset without an explicit seed must reproduce the nested seeded world"
+        );
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn reset_rebuilds_environment_when_owner_revisions_and_seed_repeat() {
+        let mut simulation = Simulation::new(
+            InitOptions {
+                population: 0,
+                seed: Some(11),
+                config: Some(ScriptBotsConfig {
+                    world_width: 80,
+                    world_height: 80,
+                    food_cell_size: 40,
+                    initial_food: 0.25,
+                    ..ScriptBotsConfig::default()
+                }),
+                ..InitOptions::default()
+            }
+            .into_spec(),
+        )
+        .unwrap();
+        let initial = simulation.core.latest_snapshot();
+        let first = simulation.environment_cache.snapshot(&initial).unwrap();
+        assert_eq!(first.cells[0].food.to_bits(), 0.25_f32.to_bits());
+        simulation.spec.base_config.initial_food = 0.0;
+        simulation.reset(Some(11)).unwrap();
+        let replacement = simulation.core.latest_snapshot();
+        assert_eq!(replacement.session_id, initial.session_id);
+        assert_eq!(replacement.layers.revisions, initial.layers.revisions);
+        let next = simulation.environment_cache.snapshot(&replacement).unwrap();
+        assert_eq!(next.cells[0].food.to_bits(), 0.0_f32.to_bits());
+        assert_eq!(
+            *next,
+            RemoteEnvironmentSnapshot::capture(&replacement).unwrap()
         );
     }
 

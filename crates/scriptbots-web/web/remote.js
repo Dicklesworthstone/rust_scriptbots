@@ -3,6 +3,7 @@
 // consumer cursors, with no queue of historical canvas frames.
 
 const VERSION = 1;
+const STREAM_VERSION = 2;
 const MAX_FRAME_BYTES = 8 * 1024 * 1024;
 const MAX_CONTROL_BYTES = 16 * 1024;
 const MAX_SEND_BUFFER_BYTES = 64 * 1024;
@@ -83,7 +84,7 @@ export class RemoteFrameTracker {
 
   /** Deliver synchronously, then commit cursors. Refusal leaves all cursors unchanged. */
   accept(frame, consume) {
-    if (frame?.schema !== "scriptbots.remote-frame.v1" || !this.channels.includes(frame.kind)
+    if (frame?.schema !== "scriptbots.remote-frame.v2" || !this.channels.includes(frame.kind)
         || this.sessionId === null || frame.identity?.sessionId !== this.sessionId) {
       throw new Error("Remote frame has an unnegotiated schema, channel or session");
     }
@@ -357,7 +358,7 @@ export class RemoteStreamClient {
     if (reply.protocol_version !== VERSION) throw new Error("Unsupported remote control protocol version");
     if (reply.type === "subscribed") {
       const pending = this.subscription;
-      if (!pending || reply.request_id !== pending.request_id || reply.stream_protocol_version !== VERSION
+      if (!pending || reply.request_id !== pending.request_id || reply.stream_protocol_version !== STREAM_VERSION
           || reply.max_fps !== pending.max_fps
           || JSON.stringify(validateChannels(reply.channels).sort()) !== JSON.stringify([...pending.channels].sort())) {
         throw new Error("Remote subscription acknowledgement does not match the request");

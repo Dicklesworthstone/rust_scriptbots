@@ -131,7 +131,7 @@
             background: #0f172a;
         }
 
-        #renderer-status {
+        #renderer-status, #environment-status {
             font-size: 0.75rem;
             color: #94a3b8;
             overflow-wrap: anywhere;
@@ -291,6 +291,15 @@
                     <option value="webgpu">WebGPU</option>
                 </select>
                 <div id="renderer-status" role="status" aria-live="polite">Starting renderer…</div>
+                <label for="environment-layer">World layers</label>
+                <select id="environment-layer">
+                    <option value="combined" selected>Terrain + food + water</option>
+                    <option value="terrain">Terrain</option>
+                    <option value="food">Food availability</option>
+                    <option value="water">Water depth</option>
+                    <option value="agents">Agents only</option>
+                </select>
+                <div id="environment-status" role="status" aria-live="polite">Waiting for environment layers…</div>
                 <button id="capture-btn" type="button" disabled>Save Frame as PNG</button>
                 <div id="capture-status" role="status" aria-live="polite"></div>
                 <label>
