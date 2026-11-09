@@ -168,6 +168,16 @@
         #inspector-summary { grid-template-columns: 1fr 1fr; }
         #inspector-summary dd { font-size: 0.75rem; overflow-wrap: anywhere; }
         #inspector-summary dt { font-size: 0.75rem; }
+
+        #brain-inspector { border-top: 1px solid #334155; padding-top: 0.5rem; }
+        #brain-inspector p { font-size: 0.75rem; overflow-wrap: anywhere; }
+        #brain-content[hidden] { display: none; }
+        #brain-content { display: grid; gap: 0.5rem; min-width: 0; }
+        #brain-content select, #brain-node { width: 100%; box-sizing: border-box; }
+        #brain-heatmap { display: block; max-width: 100%; image-rendering: pixelated; cursor: crosshair; }
+        #brain-content table { font-size: 0.7rem; width: 100%; font-variant-numeric: tabular-nums; }
+        #brain-content th, #brain-content td { text-align: right; overflow-wrap: anywhere; }
+        #brain-content th:first-child, #brain-content td:first-child { text-align: left; }
         #inspector-signals { max-height: 24rem; overflow: auto; }
         #inspector-signals table { width: 100%; font-size: 0.75rem; border-collapse: collapse; }
         #inspector-signals th { text-align: left; font-weight: 400; }
@@ -353,6 +363,41 @@
                     <details>
                         <summary>Senses and outputs</summary>
                         <div id="inspector-signals"></div>
+                    </details>
+                    <details id="brain-inspector" data-state="inactive">
+                        <summary>Brain activity and output explanations</summary>
+                        <p id="brain-status" role="status">Open this panel to request bounded activity from the selected creature.</p>
+                        <p id="brain-source"></p>
+                        <button id="brain-refresh" type="button" disabled>Refresh brain observation</button>
+                        <div id="brain-content" hidden>
+                            <p id="brain-budget"></p>
+                            <label for="brain-layer">Activation layer</label>
+                            <select id="brain-layer"></select>
+                            <canvas id="brain-heatmap" width="8" height="8" role="img" aria-label="Brain activity"></canvas>
+                            <p>Blue: positive · orange: negative · dark: zero. Color saturates for large magnitudes; select a cell for its exact value.</p>
+                            <label for="brain-node">Node in this layer</label>
+                            <input id="brain-node" type="number" min="0" step="1" value="0" />
+                            <p id="brain-node-value"></p>
+                            <h3>Actual weighted connections</h3>
+                            <p id="brain-edge-page"></p>
+                            <div class="inspector-actions">
+                                <button id="brain-edge-prev" type="button">Previous connections</button>
+                                <button id="brain-edge-next" type="button">Next connections</button>
+                            </div>
+                            <table aria-label="Retained brain connection weights">
+                                <thead><tr><th scope="col">From</th><th scope="col">To</th><th scope="col">Weight</th></tr></thead>
+                                <tbody id="brain-edges"></tbody>
+                            </table>
+                            <h3>Output explanation</h3>
+                            <label for="brain-output">Chosen actuator</label>
+                            <select id="brain-output"></select>
+                            <p id="brain-output-value"></p>
+                            <table aria-label="Top input contributions from shared core">
+                                <thead><tr><th scope="col">Input</th><th scope="col">Contribution</th><th scope="col">Weight</th><th scope="col">Activation</th></tr></thead>
+                                <tbody id="brain-contributions"></tbody>
+                            </table>
+                            <p id="brain-attribution-note"></p>
+                        </div>
                     </details>
                 </section>
                 <button id="capture-btn" type="button" disabled>Save Frame as PNG</button>

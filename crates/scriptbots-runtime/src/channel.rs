@@ -145,6 +145,11 @@ pub enum ChannelHostOptionsError {
 
 /// One pre-admission message offered to the owner thread.
 enum IngressMessage {
+    BrainActivity {
+        uid: AgentUid,
+        expires_at: Instant,
+        reply: Sender<Result<crate::inspector::BrainActivityInspection, HostAccessError>>,
+    },
     BrainProjection {
         request: BrainProjectionRequest,
         expires_at: Instant,
@@ -562,6 +567,22 @@ impl ChannelHostPort {
         let expires_at = self.inspection_deadline()?;
         self.read_owner(|reply| IngressMessage::BrainProjection {
             request: request.clone(),
+            expires_at,
+            reply,
+        })
+    }
+
+    /// Read one browser brain observation with an epoch-stamped missing/unavailable result.
+    pub fn inspect_brain_activity_before(
+        &self,
+        uid: AgentUid,
+        deadline: Instant,
+    ) -> Result<crate::inspector::BrainActivityInspection, HostAccessError> {
+        let bounded =
+            self.bounded_before_with_error(deadline, HostAccessError::OwnerReadTimeout)?;
+        let expires_at = bounded.inspection_deadline()?;
+        bounded.read_owner(|reply| IngressMessage::BrainActivity {
+            uid,
             expires_at,
             reply,
         })
@@ -1447,6 +1468,9 @@ impl ChannelHostDriver {
         let error =
             || ChannelHostPort::protocol_violation("owner handoff refused later queued ingress");
         match message {
+            IngressMessage::BrainActivity { reply, .. } => {
+                let _ = reply.send(Err(error()));
+            }
             IngressMessage::BrainProjection { reply, .. } => {
                 let _ = reply.send(Err(error()));
             }
@@ -1525,6 +1549,17 @@ impl ChannelHostDriver {
             return;
         }
         match message {
+            IngressMessage::BrainActivity {
+                uid,
+                expires_at,
+                reply,
+            } => {
+                if Instant::now() >= expires_at {
+                    let _ = reply.send(Err(HostAccessError::OwnerReadTimeout));
+                    return;
+                }
+                let _ = reply.send(self.host.core().inspect_brain_activity(uid));
+            }
             IngressMessage::BrainProjection {
                 request,
                 expires_at,
@@ -3733,6 +3768,7 @@ mod tests {
             }
             IngressMessage::CommandStatus { .. }
             | IngressMessage::Wake
+            | IngressMessage::BrainActivity { .. }
             | IngressMessage::BrainProjection { .. }
             | IngressMessage::AgentInspection { .. }
             | IngressMessage::DebugAgents { .. }
@@ -3897,6 +3933,10 @@ mod tests {
             port.inspect_agent_for_hud_before(AgentUid(1), expired),
             Err(HostAccessError::OwnerReadTimeout)
         ));
+        assert!(matches!(
+            port.inspect_brain_activity_before(AgentUid(1), expired),
+            Err(HostAccessError::OwnerReadTimeout)
+        ));
         let request = BrainProjectionRequest::focused(
             crate::ProjectionClientId::new(613),
             crate::ProjectionRequestRevision::new(1),
@@ -3993,6 +4033,42 @@ mod tests {
             reply,
         });
         assert!(receive.recv().expect("live brain reply").is_ok());
+    }
+
+    #[test]
+    fn browser_brain_activity_expiry_and_absent_epoch_come_from_owner_ingress() {
+        let (mut driver, _) = ChannelHostDriver::new(test_host(true), fast_options()).unwrap();
+        let source = driver.host.core().latest_snapshot();
+        let digest = driver.host.core().scientific_digest_v1().unwrap();
+        let (reply, receive) = std::sync::mpsc::channel();
+        driver.process_ingress(IngressMessage::BrainActivity {
+            uid: AgentUid(u64::MAX),
+            expires_at: Instant::now(),
+            reply,
+        });
+        assert!(matches!(
+            receive.recv().unwrap(),
+            Err(HostAccessError::OwnerReadTimeout)
+        ));
+        let (reply, receive) = std::sync::mpsc::channel();
+        driver.process_ingress(IngressMessage::BrainActivity {
+            uid: AgentUid(u64::MAX),
+            expires_at: Instant::now() + Duration::from_secs(1),
+            reply,
+        });
+        let detail = receive.recv().unwrap().unwrap();
+        assert_eq!(detail.source.epoch, source.world.epoch.to_string());
+        assert_eq!(
+            detail.source.session_id,
+            source.session_id.get().to_string()
+        );
+        assert!(matches!(
+            detail.outcome,
+            crate::inspector::BrainActivityOutcome::Unavailable {
+                reason: scriptbots_core::BrainInspectionUnavailable::MissingAgent,
+            }
+        ));
+        assert_eq!(driver.host.core().scientific_digest_v1().unwrap(), digest);
     }
 
     #[test]
@@ -4112,6 +4188,7 @@ mod tests {
             }
             IngressMessage::Command { .. }
             | IngressMessage::Wake
+            | IngressMessage::BrainActivity { .. }
             | IngressMessage::BrainProjection { .. }
             | IngressMessage::AgentInspection { .. }
             | IngressMessage::DebugAgents { .. }

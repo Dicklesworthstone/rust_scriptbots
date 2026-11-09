@@ -3893,6 +3893,31 @@ impl HostCore {
         })
     }
 
+    /// Observe one brain on demand at one immutable owner boundary.
+    ///
+    /// This does not install a capture probe or inspect other creatures. The owner epoch
+    /// is retained even for an absent subject, so remote clients can reject stale worlds.
+    pub fn inspect_brain_activity(
+        &self,
+        uid: AgentUid,
+    ) -> Result<crate::inspector::BrainActivityInspection, HostAccessError> {
+        let request = BrainProjectionRequest::focused(
+            crate::ProjectionClientId::new(0),
+            crate::ProjectionRequestRevision::new(0),
+            uid,
+        );
+        let projection =
+            self.inspect_brains(&request)
+                .map_err(|error| HostAccessError::ProtocolViolation {
+                    message: format!("brain activity inspection failed: {error}"),
+                })?;
+        crate::inspector::BrainActivityInspection::from_projection(
+            self.world.epoch(),
+            uid,
+            projection,
+        )
+    }
+
     /// Current queryable health.
     #[must_use]
     pub const fn health(&self) -> &HostHealth {
@@ -4356,55 +4381,56 @@ impl HostCore {
         let Some(runtime) = self.world.agent_runtime(id) else {
             return Ok(None);
         };
-        let index = self.world.agents().index_of(id).ok_or_else(|| {
-            HostAccessError::ProtocolViolation {
-                message: "inspected agent missing its dense index".to_owned(),
-            }
-        })?;
+        let index =
+            self.world
+                .agents()
+                .index_of(id)
+                .ok_or_else(|| HostAccessError::ProtocolViolation {
+                    message: "inspected agent missing its dense index".to_owned(),
+                })?;
         let body = self.world.agents().columns().snapshot(index);
         let latest = self.latest_snapshot();
-        let genome_browser = if include_genome
-            && let Some(envelope) = self.world.agent_brain_genome(id)
-        {
-            let parents: Vec<_> = envelope
-                .provenance()
-                .parents
-                .iter()
-                .flatten()
-                .copied()
-                .collect();
-            let parent = parents.first().and_then(|parent_uid| {
-                self.world.agents().iter_handles().find_map(|handle| {
-                    (self.world.agent_uid(handle) == Some(*parent_uid))
-                        .then(|| self.world.agent_brain_genome(handle))
-                        .flatten()
-                })
-            });
-            self.world
-                .brain_registry()
-                .family_by_id(envelope.family_id())
-                .map(|codec| {
-                    scriptbots_core::genome_browser::GenomeBrowserViewModel::build(
-                        codec,
-                        uid,
-                        self.world.agents().columns().generations()[index].0,
-                        self.world.tick(),
-                        envelope,
-                        parent,
-                        parents,
-                        None,
-                        None,
-                        genome_offset,
-                        page_size,
-                    )
-                })
-                .transpose()
-                .map_err(|error| HostAccessError::ProtocolViolation {
-                    message: format!("genome inspection failed: {error}"),
-                })?
-        } else {
-            None
-        };
+        let genome_browser =
+            if include_genome && let Some(envelope) = self.world.agent_brain_genome(id) {
+                let parents: Vec<_> = envelope
+                    .provenance()
+                    .parents
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .collect();
+                let parent = parents.first().and_then(|parent_uid| {
+                    self.world.agents().iter_handles().find_map(|handle| {
+                        (self.world.agent_uid(handle) == Some(*parent_uid))
+                            .then(|| self.world.agent_brain_genome(handle))
+                            .flatten()
+                    })
+                });
+                self.world
+                    .brain_registry()
+                    .family_by_id(envelope.family_id())
+                    .map(|codec| {
+                        scriptbots_core::genome_browser::GenomeBrowserViewModel::build(
+                            codec,
+                            uid,
+                            self.world.agents().columns().generations()[index].0,
+                            self.world.tick(),
+                            envelope,
+                            parent,
+                            parents,
+                            None,
+                            None,
+                            genome_offset,
+                            page_size,
+                        )
+                    })
+                    .transpose()
+                    .map_err(|error| HostAccessError::ProtocolViolation {
+                        message: format!("genome inspection failed: {error}"),
+                    })?
+            } else {
+                None
+            };
         Ok(Some(crate::channel::AgentInspectorData {
             source: BrainProjectionSource {
                 session_id: self.session_id,
@@ -9963,6 +9989,76 @@ mod tests {
         }
         HostCore::new(HostSessionId::new(0x0042_5241_494e), world, options(true))
             .expect("brain projection host")
+    }
+
+    #[test]
+    fn browser_brain_activity_keeps_real_layers_source_and_unavailable_outcomes() {
+        let core = projection_brain_host();
+        let publication = core.latest_snapshot();
+        let uid = publication.world.agents[0].uid;
+        let digest = core.scientific_digest_v1().unwrap();
+        let detail = core.inspect_brain_activity(uid).unwrap();
+        assert_eq!(detail.uid, uid.to_string());
+        assert_eq!(detail.source.epoch, publication.world.epoch.to_string());
+        assert_eq!(detail.source.tick, publication.world.tick.to_string());
+        let crate::inspector::BrainActivityOutcome::Ready {
+            activations,
+            build,
+            outputs,
+            ..
+        } = &detail.outcome
+        else {
+            panic!("real owner brain must be observable");
+        };
+        assert_eq!(activations.layers[0].values, [0.25, 0.75]);
+        assert_eq!(build.retained_values, 2);
+        assert_eq!(outputs.len(), OUTPUT_SIZE);
+        assert!(outputs.iter().all(|output| matches!(
+            output.method,
+            scriptbots_core::attribution::AttributionMethod::Unavailable(
+                scriptbots_core::attribution::AttributionUnavailable::NoConnections
+            )
+        )));
+        let encoded = serde_json::to_value(&detail).unwrap();
+        assert_eq!(encoded["status"], "ready");
+        assert_eq!(encoded["activitySource"], "evaluator_state");
+
+        let clipped = core
+            .inspect_brains(&BrainProjectionRequest {
+                client_id: ProjectionClientId::new(1),
+                revision: ProjectionRequestRevision::new(1),
+                targets: vec![uid],
+                limits: BrainInspectionLimits::tightened(1, 64, 1, 0, 256, 2),
+            })
+            .unwrap();
+        let clipped = crate::inspector::BrainActivityInspection::from_projection(
+            publication.world.epoch,
+            uid,
+            clipped,
+        )
+        .unwrap();
+        let crate::inspector::BrainActivityOutcome::Ready {
+            activations, build, ..
+        } = clipped.outcome
+        else {
+            panic!("clipped activity remains explicit");
+        };
+        assert!(activations.truncated && build.truncated);
+        assert_eq!(
+            build.retained_values, 0,
+            "a layer exceeding its budget is not partially invented"
+        );
+        let absent = core.inspect_brain_activity(AgentUid(u64::MAX)).unwrap();
+        assert_eq!(absent.uid, u64::MAX.to_string());
+        assert_eq!(absent.source, detail.source);
+        assert!(matches!(
+            absent.outcome,
+            crate::inspector::BrainActivityOutcome::Unavailable {
+                reason: scriptbots_core::BrainInspectionUnavailable::MissingAgent,
+            }
+        ));
+        assert_eq!(core.scientific_digest_v1().unwrap(), digest);
+        assert_eq!(core.latest_snapshot().revision, publication.revision);
     }
 
     #[test]

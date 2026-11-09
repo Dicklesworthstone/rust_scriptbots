@@ -1520,10 +1520,32 @@ The native owner query has a 250 ms deadline. The projection contains fixed
 signal arrays and a bounded brain label; it does not load genomes or histories,
 so basic inspection also works for brains without a genome-locus browser schema.
 
-The native owner path passed focused DSR tests before a workspace outage. The
-committed feature was then recovered from the reviewed edits; those recovered
-bytes have not been recompiled. Browser test results were not recoverable,
-and actual DOM/WebGPU journeys and the HTTP integration test remain unexecuted.
+Expand **Brain activity and output explanations** to inspect the selected
+creature's named layers, signed activation heatmap, exact node values, actual
+connection weights and canonical output channels. Connection pages retain the
+original weights, and view navigation does not request another observation.
+Local WASM uses `SimHandle.inspectBrain(uid)`; remote viewing uses
+`GET /api/agents/brain?uid=UID&session_id=SESSION&epoch=EPOCH`. Both expose the same
+bounded owner projection and explicitly identify retained evaluator state versus
+verified feed-forward reconstruction.
+
+Brain reads stop while the panel or page is hidden. The panel permits one current
+request, refreshes at most four times per second when publications advance, and
+rejects late selection/source replies. Remote brain responses have a separate
+512 KiB streamed ceiling. Heatmaps contain at most 64 by 64 cells. Core graph
+clipping, unavailable activity, numerical overflow and exhausted explanation
+work are visible outcomes; none is presented as a complete input explanation.
+Path attribution additionally caps edge examinations, pending paths and retained
+contribution rows, so dense cyclic graphs cannot expand without a fixed bound.
+
+DSR passed all 36 Node tests, JavaScript syntax checks and changed Rust formatting.
+It type-checked the current core library and complete runtime test source using
+the pinned compiler and retained locked Cargo dependencies. All 16 tests in the
+actual final attribution module passed against verified unchanged shared types;
+this isolated module lane does not qualify current-core integration. Full web
+and app Cargo checks were attempted but killed by the host memory limit in core
+and asupersync respectively. WASM, actual DOM/WebGPU journeys, HTTP integration
+and the authored native owner execution regressions remain unqualified.
 
 #### Remote browser viewing and stream subscriptions
 

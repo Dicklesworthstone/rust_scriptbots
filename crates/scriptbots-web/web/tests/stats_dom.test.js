@@ -569,6 +569,26 @@ async function runRendererTests(browser, baseUrl) {
   });
   await page.goto(baseUrl);
   await page.waitForFunction(() => document.getElementById("renderer-status").dataset.renderer === "canvas");
+  await page.evaluate(async () => {
+    const wasm = await import("/pkg/scriptbots_web.js");
+    const frame = wasm.SimHandle.prototype.frame;
+    wasm.SimHandle.prototype.frame = function () {
+      window.__rendererSim = this;
+      return frame.call(this);
+    };
+    const inspect = wasm.SimHandle.prototype.inspectBrain;
+    window.__brainReadCount = 0;
+    wasm.SimHandle.prototype.inspectBrain = function (uid) {
+      window.__brainReadCount += 1;
+      const detail = inspect.call(this, uid);
+      window.__brainLastObservation = detail;
+      return detail;
+    };
+  });
+  await page.selectOption("#brain-preset", "mlp");
+  await page.click("#reset-btn");
+  await page.waitForFunction(() => window.__rendererSim?.brainPreset() === "mlp"
+    && window.__rendererSim.frame().snapshot.tick > 0);
   if (await page.inputValue("#renderer") !== "canvas") throw new Error("Unmeasured WebGPU became the default renderer");
   await page.selectOption("#renderer", "webgpu");
   await page.waitForFunction(() => Number(document.getElementById("renderer-status").dataset.snapshotTick) > 0);
@@ -602,6 +622,37 @@ async function runRendererTests(browser, baseUrl) {
   if (await page.evaluate(() => JSON.stringify(window.__rendererSim.snapshot())) !== selectedCreature.before) {
     throw new Error("Creature picking or inspection changed the paused scientific snapshot");
   }
+  if (await page.evaluate(() => window.__brainReadCount) !== 0) throw new Error("Closed brain panel performed an unsolicited evaluator read");
+  await page.click("#brain-inspector > summary");
+  await page.waitForFunction(() => document.getElementById("brain-inspector").dataset.state === "ready");
+  const activityObservation = await page.evaluate(async () => {
+    const { brainActivityColor } = await import("/inspector.js");
+    const detail = window.__brainLastObservation;
+    const layer = detail.activations.layers[0];
+    if (!layer?.values.length || !detail.activations.connections.length) throw new Error("Real MLP inspection omitted activity or retained weights");
+    if (detail.uid !== document.getElementById("agent-inspector").dataset.uid) throw new Error("Brain panel changed selected stable UID");
+    const canvas = document.getElementById("brain-heatmap");
+    const pixel = [...canvas.getContext("2d").getImageData(4, 4, 1, 1).data].slice(0, 3);
+    const expected = brainActivityColor(layer.values[0]);
+    if (pixel.some((value, index) => value !== expected[index])) throw new Error(`Brain heatmap differs from actual owner value: ${JSON.stringify({ pixel, expected })}`);
+    const first = detail.activations.connections[0];
+    const cells = [...document.querySelector("#brain-edges tr").children].map((cell) => cell.textContent);
+    if (JSON.stringify(cells) !== JSON.stringify([String(first.from), String(first.to), String(first.weight)])) throw new Error("Brain table did not expose the owner's exact retained connection");
+    return { uid: detail.uid, source: detail.source, values: detail.build.retained_values,
+      edges: detail.build.retained_edges, clipped: detail.build.truncated, pixel, expected, reads: window.__brainReadCount };
+  });
+  await page.fill("#brain-node", "1");
+  await page.selectOption("#brain-output", "6");
+  if (activityObservation.edges > 32) {
+    await page.click("#brain-edge-next");
+    if (!(await page.textContent("#brain-edge-page")).includes("33–")) throw new Error("Brain connection paging did not advance");
+    await page.click("#brain-edge-prev");
+  }
+  if (await page.evaluate(() => window.__brainReadCount) !== activityObservation.reads) throw new Error("Pure brain view navigation issued new owner reads");
+  if (await page.evaluate(() => JSON.stringify(window.__rendererSim.snapshot())) !== selectedCreature.before) throw new Error("Brain inspection or view navigation advanced paused science");
+  await page.click("#brain-inspector > summary");
+  await page.waitForFunction(() => document.getElementById("brain-inspector").dataset.state === "inactive");
+  console.log(JSON.stringify({ schema: "scriptbots.browser-brain-observation.v1", ...activityObservation }));
   await page.click("#inspector-clear");
   await page.waitForFunction(() => document.getElementById("agent-inspector").dataset.state === "empty");
 

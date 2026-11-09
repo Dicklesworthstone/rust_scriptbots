@@ -25,6 +25,13 @@ use thiserror::Error;
 /// cost stays bounded per probed agent per frame.
 pub const PATH_PRODUCT_DEPTH_CAP: usize = 4;
 
+/// Fixed work ceiling, including nonmatching edges examined during path expansion.
+pub const PATH_PRODUCT_EDGE_EXAMINATION_BUDGET: usize = 262_144;
+/// Maximum pending path states, independently of the depth and work ceilings.
+pub const PATH_PRODUCT_FRONTIER_BUDGET: usize = crate::ACTIVATION_EDGE_BUDGET;
+/// Maximum retained unmerged path contributions before attribution is refused.
+pub const PATH_PRODUCT_CONTRIBUTION_BUDGET: usize = crate::ACTIVATION_VALUE_BUDGET;
+
 /// How the contributions in an [`OutputExplanation`] were computed — or the
 /// honest reason they were not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,6 +70,10 @@ pub enum AttributionUnavailable {
     DynamicSelfModifyingProgram,
     /// Placeholder brain with no model loaded.
     PlaceholderNoModel,
+    /// Finite inputs overflowed while computing a contribution or merging paths.
+    NumericalOverflow,
+    /// Path expansion exceeded its independent fixed work or temporary-storage ceiling.
+    WorkLimitExceeded,
 }
 
 impl AttributionUnavailable {
@@ -85,6 +96,12 @@ impl AttributionUnavailable {
                 "dynamic self-modifying program; static edge attribution unavailable"
             }
             Self::PlaceholderNoModel => "placeholder brain with no model loaded",
+            Self::NumericalOverflow => {
+                "finite weight/activation arithmetic overflowed; attribution refused"
+            }
+            Self::WorkLimitExceeded => {
+                "path attribution exceeded its fixed work/storage bound; no partial estimate is reported"
+            }
         }
     }
 }
@@ -147,7 +164,7 @@ pub struct OutputExplanation {
     /// `input_index` asc) — an explicit total order, so the panel cannot
     /// flicker between frames on ties.
     pub inputs: Vec<InputAttribution>,
-    /// Non-finite weights or activations excluded from the attribution.
+    /// Non-finite inputs skipped, or arithmetic overflow that refused the entire attribution.
     pub non_finite_skipped: u32,
 }
 
@@ -265,7 +282,7 @@ pub fn explain_outputs(
 fn collect_one_hop_attributions(
     act: &BrainActivations,
     target_node: usize,
-) -> (Vec<InputAttribution>, bool, u32) {
+) -> Result<(Vec<InputAttribution>, bool, u32), u32> {
     let mut non_finite_skipped = 0_u32;
     let final_layer = act.layers.last().expect("non-empty layers checked above");
     let mut one_hop: Vec<InputAttribution> = Vec::new();
@@ -291,10 +308,14 @@ fn collect_one_hop_attributions(
             non_finite_skipped += 1;
             continue;
         }
+        let contribution = edge.weight * activation;
+        if !contribution.is_finite() {
+            return Err(non_finite_skipped.saturating_add(1));
+        }
         one_hop.push(InputAttribution {
             input_index: edge.from,
             sensor_name: SENSOR_LAYOUT[edge.from].name,
-            contribution: edge.weight * activation,
+            contribution,
             weight: edge.weight,
             activation,
         });
@@ -306,14 +327,19 @@ fn collect_one_hop_attributions(
             .iter_mut()
             .find(|e| e.input_index == attr.input_index)
         {
-            existing.contribution += attr.contribution;
-            existing.weight += attr.weight;
+            let contribution = existing.contribution + attr.contribution;
+            let weight = existing.weight + attr.weight;
+            if !contribution.is_finite() || !weight.is_finite() {
+                return Err(non_finite_skipped.saturating_add(1));
+            }
+            existing.contribution = contribution;
+            existing.weight = weight;
         } else {
             merged_one_hop.push(attr);
         }
     }
 
-    (merged_one_hop, has_internal_edges, non_finite_skipped)
+    Ok((merged_one_hop, has_internal_edges, non_finite_skipped))
 }
 
 ///
@@ -356,12 +382,40 @@ pub fn attribute_output(
     let target_node = act.output_slots.get(output).copied().unwrap_or(output);
 
     let (one_hop, has_internal_edges, mut non_finite_skipped) =
-        collect_one_hop_attributions(act, target_node);
+        match collect_one_hop_attributions(act, target_node) {
+            Ok(collected) => collected,
+            Err(skipped) => {
+                let mut refused = unavailable(act, AttributionUnavailable::NumericalOverflow);
+                refused.non_finite_skipped = skipped;
+                return Ok(refused);
+            }
+        };
 
     let (method, mut inputs) = if !one_hop.is_empty() && !has_internal_edges {
         (AttributionMethod::OneHopWeightActivation, one_hop)
     } else if has_internal_edges {
-        let (path_inputs, path_skipped) = path_product(act, target_node, PATH_PRODUCT_DEPTH_CAP);
+        let (path_inputs, path_skipped) =
+            match path_product(act, target_node, PATH_PRODUCT_DEPTH_CAP) {
+                Ok(collected) => collected,
+                Err(PathProductFailure::NumericalOverflow(skipped)) => {
+                    let mut refused = unavailable(act, AttributionUnavailable::NumericalOverflow);
+                    refused.non_finite_skipped = non_finite_skipped.saturating_add(skipped);
+                    return Ok(refused);
+                }
+                Err(PathProductFailure::WorkLimitExceeded {
+                    edge_examinations,
+                    pending,
+                    contributions,
+                    skipped,
+                }) => {
+                    debug_assert!(edge_examinations <= PATH_PRODUCT_EDGE_EXAMINATION_BUDGET);
+                    debug_assert!(pending <= PATH_PRODUCT_FRONTIER_BUDGET);
+                    debug_assert!(contributions <= PATH_PRODUCT_CONTRIBUTION_BUDGET);
+                    let mut refused = unavailable(act, AttributionUnavailable::WorkLimitExceeded);
+                    refused.non_finite_skipped = non_finite_skipped.saturating_add(skipped);
+                    return Ok(refused);
+                }
+            };
         non_finite_skipped += path_skipped;
         if path_inputs.is_empty() {
             if one_hop.is_empty() {
@@ -423,22 +477,44 @@ fn raw_output_value(act: &BrainActivations, output: usize) -> f32 {
 
 /// Depth-bounded backwards expansion from the output node to sensor sources,
 /// accumulating the product of edge weights along each path. Cycles are cut
-/// by the depth bound; the cap is [`PATH_PRODUCT_DEPTH_CAP`].
+/// by the depth bound; independent work and temporary-storage caps refuse the
+/// entire explanation before a dense cyclic graph can hold the science owner.
+#[derive(Debug, PartialEq, Eq)]
+enum PathProductFailure {
+    NumericalOverflow(u32),
+    WorkLimitExceeded {
+        edge_examinations: usize,
+        pending: usize,
+        contributions: usize,
+        skipped: u32,
+    },
+}
+
 fn path_product(
     act: &BrainActivations,
     output: usize,
     depth_cap: usize,
-) -> (Vec<InputAttribution>, u32) {
+) -> Result<(Vec<InputAttribution>, u32), PathProductFailure> {
     let final_layer = act.layers.last().expect("non-empty layers checked above");
     let mut skipped = 0_u32;
     // Frontier of (node, accumulated weight product, depth).
     let mut frontier: Vec<(usize, f32, usize)> = vec![(output, 1.0, 0)];
     let mut out: Vec<InputAttribution> = Vec::new();
+    let mut edge_examinations = 0;
     while let Some((node, product, depth)) = frontier.pop() {
         if depth >= depth_cap {
             continue;
         }
         for edge in &act.connections {
+            if edge_examinations == PATH_PRODUCT_EDGE_EXAMINATION_BUDGET {
+                return Err(PathProductFailure::WorkLimitExceeded {
+                    edge_examinations,
+                    pending: frontier.len(),
+                    contributions: out.len(),
+                    skipped,
+                });
+            }
+            edge_examinations += 1;
             if edge.to != node {
                 continue;
             }
@@ -447,6 +523,11 @@ fn path_product(
                 continue;
             }
             let next_product = product * edge.weight;
+            if !next_product.is_finite() {
+                return Err(PathProductFailure::NumericalOverflow(
+                    skipped.saturating_add(1),
+                ));
+            }
             if edge.from < INPUT_SIZE {
                 let Some(activation) = final_layer.values.get(edge.from).copied() else {
                     skipped += 1;
@@ -456,14 +537,36 @@ fn path_product(
                     skipped += 1;
                     continue;
                 }
+                let contribution = next_product * activation;
+                if !contribution.is_finite() {
+                    return Err(PathProductFailure::NumericalOverflow(
+                        skipped.saturating_add(1),
+                    ));
+                }
+                if out.len() == PATH_PRODUCT_CONTRIBUTION_BUDGET {
+                    return Err(PathProductFailure::WorkLimitExceeded {
+                        edge_examinations,
+                        pending: frontier.len(),
+                        contributions: out.len(),
+                        skipped,
+                    });
+                }
                 out.push(InputAttribution {
                     input_index: edge.from,
                     sensor_name: SENSOR_LAYOUT[edge.from].name,
-                    contribution: next_product * activation,
+                    contribution,
                     weight: next_product,
                     activation,
                 });
             } else {
+                if frontier.len() == PATH_PRODUCT_FRONTIER_BUDGET {
+                    return Err(PathProductFailure::WorkLimitExceeded {
+                        edge_examinations,
+                        pending: frontier.len(),
+                        contributions: out.len(),
+                        skipped,
+                    });
+                }
                 frontier.push((edge.from, next_product, depth + 1));
             }
         }
@@ -476,12 +579,18 @@ fn path_product(
             .iter_mut()
             .find(|entry| entry.input_index == attribution.input_index)
         {
-            existing.contribution += attribution.contribution;
+            let contribution = existing.contribution + attribution.contribution;
+            if !contribution.is_finite() {
+                return Err(PathProductFailure::NumericalOverflow(
+                    skipped.saturating_add(1),
+                ));
+            }
+            existing.contribution = contribution;
         } else {
             merged.push(attribution);
         }
     }
-    (merged, skipped)
+    Ok((merged, skipped))
 }
 
 #[cfg(test)]
@@ -509,6 +618,139 @@ mod tests {
 
     fn edge(from: usize, to: usize, weight: f32) -> ActivationEdge {
         ActivationEdge { from, to, weight }
+    }
+
+    #[test]
+    fn dense_cyclic_attribution_stops_at_observed_work_and_storage_bounds() {
+        let values = vec![0.5; INPUT_SIZE + 16];
+        let mut dense = Vec::new();
+        for target in INPUT_SIZE..INPUT_SIZE + 16 {
+            dense.push(edge(target, 0, 1.0));
+            dense.push(edge(4, target, 1.0));
+            for source in INPUT_SIZE..INPUT_SIZE + 16 {
+                dense.push(edge(source, target, 1.0));
+            }
+        }
+        let mut pending = vec![edge(INPUT_SIZE, 0, 1.0)];
+        pending
+            .extend((1..crate::ACTIVATION_EDGE_BUDGET).map(|_| edge(INPUT_SIZE, INPUT_SIZE, 1.0)));
+        let mut retained = vec![edge(INPUT_SIZE, 0, 1.0); 256];
+        retained.extend((0..256).map(|_| edge(4, INPUT_SIZE, 1.0)));
+        for (name, edges) in [
+            ("edge work", dense),
+            ("pending paths", pending),
+            ("retained rows", retained),
+        ] {
+            assert!(
+                edges.len() <= crate::ACTIVATION_EDGE_BUDGET,
+                "{name}: the adversary fits the actual graph contract"
+            );
+            let activity = fixture(vec![fixture_layer(&values)], edges);
+            let before = activity.clone();
+            let Err(PathProductFailure::WorkLimitExceeded {
+                edge_examinations,
+                pending,
+                contributions,
+                ..
+            }) = path_product(&activity, 0, PATH_PRODUCT_DEPTH_CAP)
+            else {
+                panic!("{name}: bounded refusal required");
+            };
+            assert!(edge_examinations <= PATH_PRODUCT_EDGE_EXAMINATION_BUDGET);
+            assert!(pending <= PATH_PRODUCT_FRONTIER_BUDGET);
+            assert!(contributions <= PATH_PRODUCT_CONTRIBUTION_BUDGET);
+            match name {
+                "edge work" => assert_eq!(edge_examinations, PATH_PRODUCT_EDGE_EXAMINATION_BUDGET),
+                "pending paths" => assert_eq!(pending, PATH_PRODUCT_FRONTIER_BUDGET),
+                "retained rows" => assert_eq!(contributions, PATH_PRODUCT_CONTRIBUTION_BUDGET),
+                _ => unreachable!(),
+            }
+            let explanation = attribute_output(&activity, 0, 3).unwrap();
+            assert_eq!(
+                explanation.method,
+                AttributionMethod::Unavailable(AttributionUnavailable::WorkLimitExceeded),
+                "{name}"
+            );
+            assert!(explanation.inputs.is_empty());
+            assert_eq!(activity, before);
+        }
+    }
+
+    #[test]
+    fn finite_arithmetic_overflow_refuses_one_output_without_losing_activity_or_other_outputs() {
+        let large = f32::MAX;
+        let cases = [
+            ("direct product", 2.0, vec![edge(4, 0, large)]),
+            (
+                "direct sum",
+                1.0,
+                vec![edge(4, 0, large * 0.6), edge(4, 0, large * 0.6)],
+            ),
+            (
+                "merged weight",
+                0.0,
+                vec![edge(4, 0, large), edge(4, 0, large)],
+            ),
+            (
+                "path product",
+                0.25,
+                vec![edge(4, 25, 2.0), edge(25, 0, large)],
+            ),
+            (
+                "path contribution",
+                2.0,
+                vec![edge(4, 25, 1.0), edge(25, 0, large)],
+            ),
+            (
+                "merged paths",
+                1.0,
+                vec![
+                    edge(4, 25, large * 0.6),
+                    edge(4, 26, large * 0.6),
+                    edge(25, 0, 1.0),
+                    edge(26, 0, 1.0),
+                ],
+            ),
+        ];
+        for (name, input, mut edges) in cases {
+            let mut values = vec![0.0; INPUT_SIZE + 16];
+            values[4] = input;
+            values[5] = 0.25;
+            edges.push(edge(5, 1, 2.0));
+            let activity = fixture(vec![fixture_layer(&values)], edges);
+            let before = activity.clone();
+            let outputs = explain_outputs(&[0.25; crate::OUTPUT_SIZE], true, Some(&activity), 3);
+            assert_eq!(
+                outputs[0].method,
+                AttributionMethod::Unavailable(AttributionUnavailable::NumericalOverflow),
+                "{name}"
+            );
+            assert!(
+                outputs[0].inputs.is_empty(),
+                "{name}: no partial explanation may survive overflow"
+            );
+            assert!(outputs[0].non_finite_skipped > 0, "{name}");
+            assert_eq!(outputs[0].raw_value, 0.25);
+            assert_eq!(
+                outputs[1].method,
+                AttributionMethod::OneHopWeightActivation,
+                "{name}"
+            );
+            assert_eq!(outputs[1].inputs[0].contribution, 0.5, "{name}");
+            assert_eq!(
+                activity, before,
+                "{name}: activity remains available and unchanged"
+            );
+            let encoded = serde_json::to_value(&outputs).unwrap();
+            assert_eq!(encoded[0]["method"]["unavailable"], "numerical_overflow");
+            assert_eq!(encoded[0]["inputs"], serde_json::json!([]));
+            assert!(
+                outputs
+                    .iter()
+                    .flat_map(|output| &output.inputs)
+                    .all(|input| input.contribution.is_finite() && input.weight.is_finite())
+            );
+        }
     }
 
     #[test]
