@@ -2,6 +2,32 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Persistent cohort execution and food-funded ecology (2026-11-09):**
+[Currently In Progress — Codex; implementation and validation pending]
+
+Continue `bd-2z0.3.12.3` by retaining successful batch evaluators across science
+ticks, with exact membership/genome/state validation and transactional failure
+invalidation. Continue the selectable ecology work behind `bd-lmk6` by admitting
+an explicit food-funded reproduction configuration and a separate meadow
+scenario. Existing timed defaults and baseline artifacts remain unchanged.
+These are functionality increments; the broader performance and long-horizon
+acceptance requirements remain open.
+
+**Novelty/curiosity birth admission (2026-11-09):** [Implemented and targeted
+tests passed — Codex; full workspace qualification open]
+
+The production reproduction gate now compares the deterministic admission draw
+with the effective probability after selection modulation, including when the
+configured attempt chance is one. Previously that setting bypassed novelty and
+curiosity entirely. Fitness keeps its existing certain-admission/no-draw path.
+Two regression tests exercise actual novelty recomputation and the keyed
+admission stream, including missing scores and zero/intermediate/unit scores.
+All 14 reproduction-filtered core tests pass, with the economy fault feature
+enabled, under DSR using the pinned compiler and dependencies retained from the
+previous locked Cargo build. Source formatting also passes. This focused run
+does not establish full Cargo, Clippy or workspace qualification, and opt-in
+novelty/curiosity trajectories can intentionally change at affected settings.
+
 **Bevy snapshot-pair presentation (2026-11-09):** [Source implemented and
 reviewed — Codex; native build, formatting, test and GPU qualification open]
 

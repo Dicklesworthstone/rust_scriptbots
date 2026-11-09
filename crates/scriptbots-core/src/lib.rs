@@ -28684,7 +28684,9 @@ impl WorldState {
                     .unwrap_or(0.0),
             };
             let p = (reproduction_chance * modulator).clamp(0.0, 1.0);
-            if reproduction_chance < 1.0 {
+            // A certain attempt still passes through novelty/curiosity selection.
+            // Fitness at probability one keeps its established no-draw path.
+            if p < 1.0 {
                 let draw: f32 = admission_rng.random_range(0.0..1.0);
                 if draw >= p {
                     continue;
@@ -49792,6 +49794,118 @@ mod tests {
         let ticks_b = reproduction_tick_sequence(base, 24);
         assert_eq!(ticks_a, ticks_b);
         assert_ne!(ticks_a, [] as [u64; 0]);
+    }
+
+    #[test]
+    fn reproduction_selection_modulates_certain_attempts_from_real_novelty_scores() {
+        for mode in [
+            EvolutionSelectionMode::Novelty,
+            EvolutionSelectionMode::Curiosity { w: 1.0 },
+            EvolutionSelectionMode::Fitness,
+        ] {
+            let mut config = protocol_reproduction_config(0.0);
+            config.selection_mode = mode;
+            config.novelty_k = 2;
+            config.archive_space = BehaviorSpaceV0::new(
+                0,
+                vec![
+                    Axis::new("diet", PhenotypeFeature::DietTendency, (0.0, 1.0), 4)
+                        .expect("diet behavior axis"),
+                ],
+            );
+            let mut world = WorldState::new(config).expect("selection world");
+            let mut parents = Vec::new();
+            for (seed, diet) in [(0, 0.0), (1, 0.0), (2, 1.0)] {
+                let parent = world.spawn_agent(sample_agent(seed));
+                let runtime = world.agent_runtime_mut(parent).expect("parent runtime");
+                runtime.energy = 1.0;
+                runtime.reproduction_counter = 1.0;
+                runtime.herbivore_tendency = diet;
+                parents.push(parent);
+            }
+
+            world.stage_reproduction().expect("selected reproduction");
+            let admitted: Vec<_> = world
+                .pending_spawns
+                .iter()
+                .map(|order| order.parent_id)
+                .collect();
+            if mode == EvolutionSelectionMode::Fitness {
+                assert_eq!(admitted, parents, "fitness keeps certain admission");
+                assert!(world.novelty_state.is_none());
+            } else {
+                let state = world.novelty_state.as_ref().expect("computed scores");
+                let scores: Vec<_> = parents
+                    .iter()
+                    .map(|id| state.normalized_scores[&world.agent_uid(*id).unwrap()])
+                    .collect();
+                assert_eq!(scores, vec![0.0, 0.0, 1.0]);
+                assert_eq!(
+                    admitted,
+                    vec![parents[2]],
+                    "only the novel parent reproduces"
+                );
+            }
+            for parent in &parents {
+                let born = u64::from(admitted.contains(parent));
+                assert_eq!(
+                    world.agent_rng_counters(*parent).expect("parent counters"),
+                    AgentRngCountersV1::from_ordinals(1, born, 0),
+                    "selection claims one attempt but only admitted births claim a birth ordinal"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reproduction_selection_uses_the_effective_probability_and_preserves_fitness() {
+        for mode in [
+            EvolutionSelectionMode::Novelty,
+            EvolutionSelectionMode::Curiosity { w: 0.5 },
+            EvolutionSelectionMode::Fitness,
+        ] {
+            for base_chance in [0.65_f32, 1.0] {
+                for score in [None, Some(0.0), Some(0.4), Some(1.0)] {
+                    let mut config = protocol_reproduction_config(0.0);
+                    config.selection_mode = mode;
+                    config.reproduction_attempt_chance = base_chance;
+                    let root_seed = config.rng_seed.expect("pinned seed");
+                    let mut world = WorldState::new(config).expect("selection threshold world");
+                    let parent = world.spawn_agent(sample_agent(0));
+                    let uid = world.agent_uid(parent).expect("parent uid");
+                    let runtime = world.agent_runtime_mut(parent).expect("parent runtime");
+                    runtime.energy = 1.0;
+                    runtime.reproduction_counter = 1.0;
+                    let scores: Vec<_> = score.into_iter().map(|value| (uid, value)).collect();
+                    world.novelty_state =
+                        Some(NoveltyState::new(Tick::zero(), &scores, &scores, 0));
+                    let effective = if mode == EvolutionSelectionMode::Fitness {
+                        base_chance
+                    } else {
+                        base_chance * score.unwrap_or(0.0)
+                    };
+                    let mut oracle = agent_substream(
+                        root_seed,
+                        uid,
+                        AgentRngOperationV1::ReproductionAdmission,
+                        0,
+                    );
+                    let expected = oracle.random_range(0.0..1.0) < effective;
+                    world
+                        .stage_reproduction()
+                        .expect("effective probability gate");
+                    assert_eq!(
+                        world.pending_spawns.len(),
+                        usize::from(expected),
+                        "mode={mode:?}, base={base_chance}, score={score:?}"
+                    );
+                    assert_eq!(
+                        world.agent_rng_counters(parent).expect("parent counters"),
+                        AgentRngCountersV1::from_ordinals(1, u64::from(expected), 0)
+                    );
+                }
+            }
+        }
     }
 
     #[test]
