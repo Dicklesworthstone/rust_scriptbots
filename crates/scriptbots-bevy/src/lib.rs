@@ -3,11 +3,13 @@
 // Capture queries require deeper auto-trait evaluation through Bevy/wgpu attachment types.
 #![recursion_limit = "256"]
 
+mod appearance;
 pub mod capture;
 pub mod creature_meshes;
 pub mod particles;
 
 use anyhow::{Context, Result, anyhow};
+use appearance::{AppearanceMaterial, AppearancePart, AppearancePlugin, AppearanceTable};
 use bevy::app::AppExit;
 use bevy::asset::{RenderAssetUsages, embedded_asset};
 use bevy::camera::RenderTarget;
@@ -23,10 +25,12 @@ use bevy::light::{
     EnvironmentMapLight, LightProbe,
 };
 use bevy::math::primitives::{Capsule3d, Cone, Rectangle, Sphere, Torus};
+use bevy::mesh::MeshTag;
 use bevy::pbr::prelude::*;
 use bevy::pbr::{ExtendedMaterial, MaterialExtension, ScreenSpaceAmbientOcclusion};
 use bevy::prelude::*;
 use bevy::render::render_resource::{AsBindGroup, PrimitiveTopology};
+use bevy::render::storage::ShaderStorageBuffer;
 use bevy::render::view::{ColorGrading, Hdr};
 use bevy::shader::ShaderRef;
 use bevy::ui::{BorderColor, BorderRadius, FocusPolicy, RelativeCursorPosition};
@@ -871,6 +875,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
     .insert_resource(effective_render_settings)
     .add_plugins(renderer_plugins(logging))
     .add_plugins(TerrainMaterialPlugin)
+    .add_plugins(AppearancePlugin)
     .add_plugins(AutoExposurePlugin)
     .add_systems(Startup, (initialize_ssao_support, setup_scene).chain())
     .add_systems(
@@ -1162,7 +1167,11 @@ impl MotionCut {
     }
 
     fn can_follow(&self, previous: &Self) -> bool {
-        let Some(ticks) = self.tick.checked_sub(previous.tick).filter(|ticks| *ticks > 0) else {
+        let Some(ticks) = self
+            .tick
+            .checked_sub(previous.tick)
+            .filter(|ticks| *ticks > 0)
+        else {
             return false;
         };
         let (Some((before, before_epoch)), Some((after, after_epoch))) =
@@ -1229,7 +1238,10 @@ impl SnapshotMotion {
         let Some(previous) = &self.previous else {
             return 1.0;
         };
-        let span = self.current.observed_at.duration_since(previous.observed_at);
+        let span = self
+            .current
+            .observed_at
+            .duration_since(previous.observed_at);
         let elapsed = now.saturating_duration_since(self.current.observed_at);
         (elapsed.as_secs_f64() / span.as_secs_f64()).clamp(0.0, 1.0) as f32
     }
@@ -1244,7 +1256,10 @@ impl SnapshotMotion {
         let Some(previous) = previous else {
             return Some(current);
         };
-        let ticks = self.current.tick.saturating_sub(self.previous.as_ref()?.tick);
+        let ticks = self
+            .current
+            .tick
+            .saturating_sub(self.previous.as_ref()?.tick);
         Some(interpolate_motion_pose(
             previous,
             current,
@@ -1297,9 +1312,7 @@ fn interpolate_motion_pose(
     // and collisions whose endpoint velocities differ from their mean.
     let travel = previous.velocity.length().max(current.velocity.length()) * ticks as f32;
     let allowance = (travel + radius.max(0.0) * 2.0).min(world_size.min_element() * 0.5);
-    if !travel.is_finite()
-        || travel >= world_size.min_element() * 0.5
-        || delta.length() > allowance
+    if !travel.is_finite() || travel >= world_size.min_element() * 0.5 || delta.length() > allowance
     {
         return current;
     }
@@ -1403,6 +1416,43 @@ impl ReflectionProbeAssets {
 struct PartRef {
     entity: Entity,
     material: Option<Handle<StandardMaterial>>,
+    appearance: Option<AppearancePart>,
+}
+
+/// Both shipped renderers install AppearancePlugin. Minimal CPU scene tests
+/// retain the StandardMaterial reference path, allowing exact visual parity
+/// checks without constructing a GPU device.
+enum AgentMaterialAccess<'a> {
+    Shared {
+        table: &'a mut AppearanceTable,
+        materials: &'a mut Assets<AppearanceMaterial>,
+        buffers: &'a mut Assets<ShaderStorageBuffer>,
+    },
+    Reference(&'a mut Assets<StandardMaterial>),
+}
+
+impl AgentMaterialAccess<'_> {
+    fn reserve_population(&mut self, population: usize) -> Result<()> {
+        if let Self::Shared {
+            table,
+            materials,
+            buffers,
+        } = self
+        {
+            let rows = population
+                .checked_mul(14 + 2 * NUM_EYES)
+                .ok_or_else(|| anyhow!("creature appearance population overflow"))?;
+            table.reserve(rows, materials, buffers)?;
+        }
+        Ok(())
+    }
+
+    fn fail(&mut self, error: impl std::fmt::Display) {
+        match self {
+            Self::Shared { table, .. } => table.fail(error),
+            Self::Reference(_) => error!(%error, "reference creature material failed"),
+        }
+    }
 }
 
 struct EyePart {
@@ -1595,10 +1645,7 @@ fn displayed_follow_target(
     match mode {
         FollowMode::Off => None,
         FollowMode::Selected => selected.or(first),
-        FollowMode::Oldest => oldest
-            .map(|(_, position)| position)
-            .or(selected)
-            .or(first),
+        FollowMode::Oldest => oldest.map(|(_, position)| position).or(selected).or(first),
     }
 }
 
@@ -1991,36 +2038,90 @@ fn make_material(
 fn spawn_part(
     commands: &mut Commands,
     mesh_handle: &Handle<Mesh>,
-    materials: &mut Assets<StandardMaterial>,
+    materials: &mut AgentMaterialAccess<'_>,
     base_color: Color,
     emissive: Color,
     alpha_mode: AlphaMode,
     unlit: bool,
     double_sided: bool,
     transform: Transform,
-) -> PartRef {
-    let material = make_material(
-        materials,
-        base_color,
-        emissive,
-        alpha_mode,
-        unlit,
-        double_sided,
-    );
+) -> Result<PartRef> {
+    let (material, appearance) = match materials {
+        AgentMaterialAccess::Shared {
+            table, materials, ..
+        } => (
+            None,
+            Some(table.allocate(
+                materials,
+                base_color,
+                emissive,
+                alpha_mode,
+                unlit,
+                double_sided,
+            )?),
+        ),
+        AgentMaterialAccess::Reference(materials) => (
+            Some(make_material(
+                materials,
+                base_color,
+                emissive,
+                alpha_mode,
+                unlit,
+                double_sided,
+            )),
+            None,
+        ),
+    };
     let entity = commands
         .spawn((
             Mesh3d(mesh_handle.clone()),
-            MeshMaterial3d(material.clone()),
             transform,
             GlobalTransform::default(),
             Visibility::default(),
             InheritedVisibility::default(),
         ))
         .id();
-    PartRef {
+    let part = PartRef {
         entity,
-        material: Some(material),
+        material,
+        appearance,
+    };
+    insert_part_material(commands, entity, &part);
+    Ok(part)
+}
+
+fn insert_part_material(commands: &mut Commands, entity: Entity, part: &PartRef) {
+    if let Some(appearance) = &part.appearance {
+        commands.entity(entity).insert((
+            MeshMaterial3d(appearance.material.clone()),
+            MeshTag(appearance.slot.index),
+        ));
+    } else if let Some(material) = &part.material {
+        commands
+            .entity(entity)
+            .insert(MeshMaterial3d(material.clone()));
     }
+}
+
+fn update_agent_part_colors(
+    materials: &mut AgentMaterialAccess<'_>,
+    part: &PartRef,
+    base: Color,
+    emissive: Color,
+) -> Result<()> {
+    match materials {
+        AgentMaterialAccess::Shared { table, .. } => {
+            let appearance = part
+                .appearance
+                .as_ref()
+                .ok_or_else(|| anyhow!("creature part has no shared appearance slot"))?;
+            table.update(appearance.slot, base, emissive)?;
+        }
+        AgentMaterialAccess::Reference(materials) => {
+            update_part_colors(materials, part, base, emissive);
+        }
+    }
+    Ok(())
 }
 
 fn update_part_transform(commands: &mut Commands, part: &PartRef, transform: Transform) {
@@ -2109,31 +2210,48 @@ fn mix_vec3(a: Vec3, b: Vec3, t: f32) -> Vec3 {
     a + (b - a) * t
 }
 
-fn cleanup_agent_materials(materials: &mut Assets<StandardMaterial>, record: &AgentRecord) {
-    fn remove(materials: &mut Assets<StandardMaterial>, part: &PartRef) {
-        if let Some(handle) = part.material.as_ref() {
-            materials.remove(handle);
+fn cleanup_agent_materials(
+    materials: &mut AgentMaterialAccess<'_>,
+    record: &AgentRecord,
+) -> Result<()> {
+    for part in agent_parts(record) {
+        match materials {
+            AgentMaterialAccess::Shared { table, .. } => {
+                let appearance = part
+                    .appearance
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("retired creature part has no appearance slot"))?;
+                table.release(appearance.slot)?;
+            }
+            AgentMaterialAccess::Reference(materials) => {
+                if let Some(handle) = part.material.as_ref() {
+                    materials.remove(handle);
+                }
+            }
         }
     }
+    Ok(())
+}
 
-    remove(materials, &record.body);
-    remove(materials, &record.stripe);
-    remove(materials, &record.wheel_left);
-    remove(materials, &record.wheel_right);
-    remove(materials, &record.mouth);
-    remove(materials, &record.nose);
-    remove(materials, &record.spike);
-    remove(materials, &record.boost);
-    remove(materials, &record.ear_left);
-    remove(materials, &record.ear_right);
-    remove(materials, &record.selection);
-    remove(materials, &record.indicator);
-    remove(materials, &record.sound_inner);
-    remove(materials, &record.sound_outer);
-    for eye in &record.eyes {
-        remove(materials, &eye.sclera);
-        remove(materials, &eye.pupil);
-    }
+fn agent_parts(record: &AgentRecord) -> impl Iterator<Item = &PartRef> {
+    [
+        &record.body,
+        &record.stripe,
+        &record.wheel_left,
+        &record.wheel_right,
+        &record.mouth,
+        &record.nose,
+        &record.spike,
+        &record.boost,
+        &record.ear_left,
+        &record.ear_right,
+        &record.selection,
+        &record.indicator,
+        &record.sound_inner,
+        &record.sound_outer,
+    ]
+    .into_iter()
+    .chain(record.eyes.iter().flat_map(|eye| [&eye.sclera, &eye.pupil]))
 }
 
 fn despawn_agent_entities(record: AgentRecord, commands: &mut Commands) {
@@ -6116,6 +6234,9 @@ pub(crate) fn sync_world(
     probe_assets: Res<ReflectionProbeAssets>,
     accessibility: Res<AccessibilityState>,
     mut last_terrain: Local<Option<TerrainSyncInput>>,
+    mut appearance: Option<ResMut<AppearanceTable>>,
+    mut appearance_materials: Option<ResMut<Assets<AppearanceMaterial>>>,
+    mut appearance_buffers: Option<ResMut<Assets<ShaderStorageBuffer>>>,
 ) {
     let Some(snapshot) = state.latest.as_ref() else {
         return;
@@ -6236,14 +6357,36 @@ pub(crate) fn sync_world(
             palette,
         });
     }
-    sync_agents(
+    let mut agent_materials = if let Some(table) = appearance.as_deref_mut() {
+        if table.error().is_some() {
+            return;
+        }
+        let (Some(materials), Some(buffers)) = (
+            appearance_materials.as_deref_mut(),
+            appearance_buffers.as_deref_mut(),
+        ) else {
+            table.fail("shared creature appearance assets are unavailable");
+            return;
+        };
+        AgentMaterialAccess::Shared {
+            table,
+            materials,
+            buffers,
+        }
+    } else {
+        AgentMaterialAccess::Reference(materials.as_mut())
+    };
+    if let Err(error) = sync_agents(
         snapshot,
         &mut commands,
         &mut registry,
         agent_meshes.as_ref(),
-        materials.as_mut(),
+        &mut agent_materials,
         palette,
-    );
+    ) {
+        agent_materials.fail(error);
+        return;
+    }
 
     state.last_applied_revision = snapshot_revision;
     state.last_applied_tick = snapshot_tick;
@@ -16590,8 +16733,7 @@ mod terrain_tests {
         motion_test_source(current);
         let at = Instant::now();
         let before = SnapshotMotion::advance(None, &previous, at);
-        let pair =
-            SnapshotMotion::advance(Some(&before), current, at + Duration::from_millis(100));
+        let pair = SnapshotMotion::advance(Some(&before), current, at + Duration::from_millis(100));
         assert!(pair.previous.is_some(), "fixture must admit a genuine pair");
         current.motion = Some(pair);
         current.motion_alpha = alpha;
@@ -17597,8 +17739,16 @@ mod terrain_tests {
         assert!(publisher.publish_at(snapshot.clone(), resumed_at));
         app.update();
         assert_eq!(
-            app.world().entity(root).get::<Transform>().unwrap().translation,
-            app.world().entity(root).get::<AgentPoseTarget>().unwrap().translation,
+            app.world()
+                .entity(root)
+                .get::<Transform>()
+                .unwrap()
+                .translation,
+            app.world()
+                .entity(root)
+                .get::<AgentPoseTarget>()
+                .unwrap()
+                .translation,
             "the first post-pause cut must snap to its committed pose"
         );
 
@@ -19975,9 +20125,9 @@ fn spawn_agent_entity(
     snapshot: &WorldSnapshot,
     commands: &mut Commands,
     meshes: &AgentMeshes,
-    materials: &mut Assets<StandardMaterial>,
+    materials: &mut AgentMaterialAccess<'_>,
     palette: ColorPaletteMode,
-) -> AgentRecord {
+) -> Result<AgentRecord> {
     let (translation, rotation) = agent_surface_pose(snapshot, agent);
     let root_transform = Transform::from_translation(translation).with_rotation(rotation);
     let target = AgentPoseTarget {
@@ -20013,7 +20163,7 @@ fn spawn_agent_entity(
         false,
         false,
         Transform::IDENTITY,
-    );
+    )?;
     commands.entity(root).add_child(body.entity);
 
     let stripe = spawn_part(
@@ -20026,7 +20176,7 @@ fn spawn_agent_entity(
         false,
         true,
         Transform::IDENTITY,
-    );
+    )?;
     commands.entity(root).add_child(stripe.entity);
 
     let wheel_left = spawn_part(
@@ -20039,7 +20189,7 @@ fn spawn_agent_entity(
         false,
         false,
         Transform::IDENTITY,
-    );
+    )?;
     commands.entity(root).add_child(wheel_left.entity);
     commands
         .entity(wheel_left.entity)
@@ -20055,28 +20205,25 @@ fn spawn_agent_entity(
         false,
         false,
         Transform::IDENTITY,
-    );
+    )?;
     commands.entity(root).add_child(wheel_right.entity);
     commands
         .entity(wheel_right.entity)
         .insert(WheelGroundContact { root, side: -1.0 });
 
-    // A body-colored ellipsoid bridges the shell and the wheel hub. Reusing
-    // the body material keeps the joint synchronized with live palette/state.
-    if let Some(material) = &body.material {
-        for wheel in [&wheel_left, &wheel_right] {
-            let joint = commands
-                .spawn((
-                    Mesh3d(meshes.joint.clone()),
-                    MeshMaterial3d(material.clone()),
-                    Transform::default(),
-                    WheelSuspensionJoint {
-                        wheel: wheel.entity,
-                    },
-                ))
-                .id();
-            commands.entity(root).add_child(joint);
-        }
+    // Both joints share the body's appearance row as well as its class.
+    for wheel in [&wheel_left, &wheel_right] {
+        let joint = commands
+            .spawn((
+                Mesh3d(meshes.joint.clone()),
+                Transform::default(),
+                WheelSuspensionJoint {
+                    wheel: wheel.entity,
+                },
+            ))
+            .id();
+        insert_part_material(commands, joint, &body);
+        commands.entity(root).add_child(joint);
     }
 
     let mouth = spawn_part(
@@ -20089,7 +20236,7 @@ fn spawn_agent_entity(
         true,
         true,
         Transform::IDENTITY,
-    );
+    )?;
     commands.entity(root).add_child(mouth.entity);
 
     let nose = spawn_part(
@@ -20102,7 +20249,7 @@ fn spawn_agent_entity(
         false,
         false,
         Transform::IDENTITY,
-    );
+    )?;
     commands.entity(root).add_child(nose.entity);
 
     let spike = spawn_part(
@@ -20115,7 +20262,7 @@ fn spawn_agent_entity(
         false,
         false,
         Transform::IDENTITY,
-    );
+    )?;
     commands.entity(root).add_child(spike.entity);
 
     let boost_style = visual::visual_style().events.boost;
@@ -20134,7 +20281,7 @@ fn spawn_agent_entity(
         true,
         true,
         Transform::IDENTITY,
-    );
+    )?;
     commands.entity(root).add_child(boost.entity);
 
     let ear_srgb = visual::visual_style().agents.ear_srgb;
@@ -20148,7 +20295,7 @@ fn spawn_agent_entity(
         false,
         false,
         Transform::IDENTITY,
-    );
+    )?;
     commands.entity(root).add_child(ear_left.entity);
 
     let ear_right = spawn_part(
@@ -20161,7 +20308,7 @@ fn spawn_agent_entity(
         false,
         false,
         Transform::IDENTITY,
-    );
+    )?;
     commands.entity(root).add_child(ear_right.entity);
 
     let selection = spawn_part(
@@ -20174,7 +20321,7 @@ fn spawn_agent_entity(
         true,
         true,
         Transform::IDENTITY,
-    );
+    )?;
     commands.entity(root).add_child(selection.entity);
     commands.entity(selection.entity).insert((
         bevy::light::NotShadowCaster,
@@ -20191,7 +20338,7 @@ fn spawn_agent_entity(
         true,
         true,
         Transform::IDENTITY,
-    );
+    )?;
     commands.entity(root).add_child(indicator.entity);
 
     let sound_inner = spawn_part(
@@ -20204,7 +20351,7 @@ fn spawn_agent_entity(
         true,
         true,
         Transform::IDENTITY,
-    );
+    )?;
     commands.entity(root).add_child(sound_inner.entity);
 
     let sound_outer = spawn_part(
@@ -20217,7 +20364,7 @@ fn spawn_agent_entity(
         true,
         true,
         Transform::IDENTITY,
-    );
+    )?;
     commands.entity(root).add_child(sound_outer.entity);
 
     let mut eyes = Vec::with_capacity(NUM_EYES);
@@ -20238,7 +20385,7 @@ fn spawn_agent_entity(
             false,
             false,
             Transform::IDENTITY,
-        );
+        )?;
         let pupil = spawn_part(
             commands,
             &meshes.sphere,
@@ -20253,7 +20400,7 @@ fn spawn_agent_entity(
             false,
             false,
             Transform::IDENTITY,
-        );
+        )?;
         commands.entity(root).add_child(sclera.entity);
         commands.entity(root).add_child(pupil.entity);
         eyes.push(EyePart { sclera, pupil });
@@ -20280,8 +20427,8 @@ fn spawn_agent_entity(
 
     apply_agent_visuals(
         &record, agent, snapshot, commands, materials, meshes, palette,
-    );
-    record
+    )?;
+    Ok(record)
 }
 
 fn update_agent_entity(
@@ -20289,13 +20436,13 @@ fn update_agent_entity(
     agent: &AgentVisual,
     snapshot: &WorldSnapshot,
     commands: &mut Commands,
-    materials: &mut Assets<StandardMaterial>,
+    materials: &mut AgentMaterialAccess<'_>,
     meshes: &AgentMeshes,
     palette: ColorPaletteMode,
-) {
+) -> Result<()> {
     apply_agent_visuals(
         record, agent, snapshot, commands, materials, meshes, palette,
-    );
+    )
 }
 
 fn apply_agent_visuals(
@@ -20303,10 +20450,10 @@ fn apply_agent_visuals(
     agent: &AgentVisual,
     snapshot: &WorldSnapshot,
     commands: &mut Commands,
-    materials: &mut Assets<StandardMaterial>,
+    materials: &mut AgentMaterialAccess<'_>,
     meshes: &AgentMeshes,
     palette: ColorPaletteMode,
-) {
+) -> Result<()> {
     use std::f32::consts::FRAC_PI_2;
 
     let visuals = canonical_agent_visual_params(agent);
@@ -20346,7 +20493,7 @@ fn apply_agent_visuals(
         phase: (agent.uid.0.wrapping_mul(2_654_435_761) % 1024) as f32
             * (std::f32::consts::TAU / 1024.0),
     });
-    update_part_colors(materials, &record.body, body_color, body_emissive);
+    update_agent_part_colors(materials, &record.body, body_color, body_emissive)?;
 
     let stripe_rgb = Vec3::from_array(visuals.stripe_color);
     let stripe_color = srgb_from_vec_with_palette(stripe_rgb, 0.9, palette);
@@ -20369,7 +20516,7 @@ fn apply_agent_visuals(
             phase: (agent.uid.0.wrapping_mul(2_654_435_761) % 1024) as f32
                 * (std::f32::consts::TAU / 1024.0),
         });
-    update_part_colors(materials, &record.stripe, stripe_color, stripe_emissive);
+    update_agent_part_colors(materials, &record.stripe, stripe_color, stripe_emissive)?;
 
     let wheel_offset = body_radius * 1.12;
     // Torus lies in local XZ before the quarter-turn. Equal X/Z scales keep
@@ -20400,8 +20547,8 @@ fn apply_agent_visuals(
     let right_color = srgb_from_vec_with_palette(right_rgb, 1.0, palette);
     let left_emissive = palette_hdr_emissive_from_srgb(visuals.wheel_emissives[0], 1.0, palette);
     let right_emissive = palette_hdr_emissive_from_srgb(visuals.wheel_emissives[1], 1.0, palette);
-    update_part_colors(materials, &record.wheel_left, left_color, left_emissive);
-    update_part_colors(materials, &record.wheel_right, right_color, right_emissive);
+    update_agent_part_colors(materials, &record.wheel_left, left_color, left_emissive)?;
+    update_agent_part_colors(materials, &record.wheel_right, right_color, right_emissive)?;
 
     let vocal_energy = clamp01(agent.sound_output.abs() * agent.sound_multiplier.max(0.1));
     let mouth_activity = visuals.mouth_activity;
@@ -20428,7 +20575,7 @@ fn apply_agent_visuals(
         ),
         palette,
     );
-    update_part_colors(materials, &record.mouth, mouth_color, mouth_emissive);
+    update_agent_part_colors(materials, &record.mouth, mouth_color, mouth_emissive)?;
 
     let nose_transform = Transform {
         translation: Vec3::new(body_length * 0.63, scale_factor * 0.24, 0.0),
@@ -20442,7 +20589,7 @@ fn apply_agent_visuals(
         Vec3::new(nose_rgb.x * 0.25, nose_rgb.y * 0.2, nose_rgb.z * 0.15),
         palette,
     );
-    update_part_colors(materials, &record.nose, nose_color, nose_emissive);
+    update_agent_part_colors(materials, &record.nose, nose_color, nose_emissive)?;
 
     let spike_ready = visuals.spike_readiness;
     // Core combat treats spike_length as a world-space extension beyond the
@@ -20462,15 +20609,13 @@ fn apply_agent_visuals(
         ),
     };
     update_part_transform(commands, &record.spike, spike_transform);
-    commands
-        .entity(record.spike.entity)
-        .insert((
-            SpikePoseTarget {
-                transform: spike_transform,
-                tick: snapshot.tick,
-            },
-            AgentMotionKey(agent.uid),
-        ));
+    commands.entity(record.spike.entity).insert((
+        SpikePoseTarget {
+            transform: spike_transform,
+            tick: snapshot.tick,
+        },
+        AgentMotionKey(agent.uid),
+    ));
     let spike_rgb = Vec3::from_array(visuals.spike_color);
     let spike_color = srgb_from_vec_with_palette(spike_rgb, 1.0, palette);
     let spike_emissive = palette_hdr_emissive_from_srgb(
@@ -20480,7 +20625,7 @@ fn apply_agent_visuals(
         visuals.spike_emissive_gain * spike_ready * 0.12,
         palette,
     );
-    update_part_colors(materials, &record.spike, spike_color, spike_emissive);
+    update_agent_part_colors(materials, &record.spike, spike_color, spike_emissive)?;
 
     let boost_strength = clamp01(agent.boost);
     let boost_length = (scale_factor * (0.6 + boost_strength * 0.9)).max(0.05);
@@ -20513,7 +20658,7 @@ fn apply_agent_visuals(
         ),
         palette,
     );
-    update_part_colors(materials, &record.boost, boost_color, boost_emissive);
+    update_agent_part_colors(materials, &record.boost, boost_color, boost_emissive)?;
     set_part_visibility(commands, &record.boost, boost_strength > 0.02);
 
     let hearing = clamp01(agent.trait_modifiers.hearing);
@@ -20543,8 +20688,8 @@ fn apply_agent_visuals(
         Vec3::new(ear_rgb.x * 0.18, ear_rgb.y * 0.2, ear_rgb.z * 0.15),
         palette,
     );
-    update_part_colors(materials, &record.ear_left, ear_color, ear_emissive);
-    update_part_colors(materials, &record.ear_right, ear_color, ear_emissive);
+    update_agent_part_colors(materials, &record.ear_left, ear_color, ear_emissive)?;
+    update_agent_part_colors(materials, &record.ear_right, ear_color, ear_emissive)?;
 
     // The visible ring is positioned after pose smoothing by
     // `conform_selection_ring`, which uses the displayed terrain contact.
@@ -20577,7 +20722,7 @@ fn apply_agent_visuals(
         ),
         palette,
     );
-    update_part_colors(materials, &record.selection, ring_color, ring_emissive);
+    update_agent_part_colors(materials, &record.selection, ring_color, ring_emissive)?;
     set_part_visibility(commands, &record.selection, ring_alpha > 0.02);
 
     let indicator_intensity = clamp01(agent.indicator.intensity);
@@ -20607,12 +20752,12 @@ fn apply_agent_visuals(
         ),
     };
     update_part_transform(commands, &record.indicator, indicator_transform);
-    update_part_colors(
+    update_agent_part_colors(
         materials,
         &record.indicator,
         indicator_color,
         indicator_emissive,
-    );
+    )?;
     set_part_visibility(commands, &record.indicator, indicator_alpha > 0.05);
 
     let ambient_sound = clamp01(agent.sound_level);
@@ -20649,7 +20794,7 @@ fn apply_agent_visuals(
             ),
             palette,
         );
-        update_part_colors(materials, &record.sound_inner, inner_color, inner_emissive);
+        update_agent_part_colors(materials, &record.sound_inner, inner_color, inner_emissive)?;
     }
 
     let outer_visible = arc_strength > 0.04;
@@ -20677,7 +20822,7 @@ fn apply_agent_visuals(
             ),
             palette,
         );
-        update_part_colors(materials, &record.sound_outer, outer_color, outer_emissive);
+        update_agent_part_colors(materials, &record.sound_outer, outer_color, outer_emissive)?;
     }
 
     let eye_base = scale_factor * (0.12 + clamp01(agent.trait_modifiers.eye) * 0.07);
@@ -20725,7 +20870,7 @@ fn apply_agent_visuals(
             Vec3::new(sclera_rgb.x * 0.18, sclera_rgb.y * 0.2, sclera_rgb.z * 0.24),
             palette,
         );
-        update_part_colors(materials, &eye.sclera, sclera_color, sclera_emissive);
+        update_agent_part_colors(materials, &eye.sclera, sclera_color, sclera_emissive)?;
 
         let pupil_base = Vec3::from_array(visual::visual_style().agents.eye_pupil_srgb);
         let pupil_rgb = pupil_base * (1.0 + clamp01(agent.sound_multiplier - 1.0) * 0.25);
@@ -20738,8 +20883,9 @@ fn apply_agent_visuals(
             ),
             palette,
         );
-        update_part_colors(materials, &eye.pupil, pupil_color, pupil_emissive);
+        update_agent_part_colors(materials, &eye.pupil, pupil_color, pupil_emissive)?;
     }
+    Ok(())
 }
 
 fn sync_agents(
@@ -20747,22 +20893,11 @@ fn sync_agents(
     commands: &mut Commands,
     registry: &mut AgentRegistry,
     meshes: &AgentMeshes,
-    materials: &mut Assets<StandardMaterial>,
+    materials: &mut AgentMaterialAccess<'_>,
     palette: ColorPaletteMode,
-) {
-    let mut seen: HashSet<AgentUid> = HashSet::with_capacity(snapshot.agents.len());
-    for agent in &snapshot.agents {
-        seen.insert(agent.uid);
-        if let Some(record) = registry.records.get_mut(&agent.uid) {
-            update_agent_entity(
-                record, agent, snapshot, commands, materials, meshes, palette,
-            );
-        } else {
-            let record = spawn_agent_entity(agent, snapshot, commands, meshes, materials, palette);
-            registry.records.insert(agent.uid, record);
-        }
-    }
-
+) -> Result<()> {
+    materials.reserve_population(snapshot.agents.len())?;
+    let seen: HashSet<AgentUid> = snapshot.agents.iter().map(|agent| agent.uid).collect();
     let stale: Vec<AgentUid> = registry
         .records
         .keys()
@@ -20772,10 +20907,24 @@ fn sync_agents(
 
     for id in stale {
         if let Some(record) = registry.records.remove(&id) {
-            cleanup_agent_materials(materials, &record);
+            cleanup_agent_materials(materials, &record)?;
             despawn_agent_entities(record, commands);
         }
     }
+
+    // Retire before allocating replacements so a population turnover can reuse
+    // its slots without temporarily doubling the resident appearance storage.
+    for agent in &snapshot.agents {
+        if let Some(record) = registry.records.get_mut(&agent.uid) {
+            update_agent_entity(
+                record, agent, snapshot, commands, materials, meshes, palette,
+            )?;
+        } else {
+            let record = spawn_agent_entity(agent, snapshot, commands, meshes, materials, palette)?;
+            registry.records.insert(agent.uid, record);
+        }
+    }
+    Ok(())
 }
 
 fn agent_ground_footprint(snapshot: &WorldSnapshot, agent: &AgentVisual) -> AgentGroundFootprint {
@@ -21414,8 +21563,7 @@ mod tests {
         // that all four intervening scientific revisions were ticks.
         snapshot.tick = 8;
         motion_test_source(&mut snapshot);
-        let pair =
-            SnapshotMotion::advance(Some(&first), &snapshot, at + Duration::from_millis(80));
+        let pair = SnapshotMotion::advance(Some(&first), &snapshot, at + Duration::from_millis(80));
         assert_eq!(pair.previous.as_ref().unwrap().tick, 4);
         assert_eq!(pair.alpha_at(at + Duration::from_millis(80)), 0.0);
         assert_eq!(pair.alpha_at(at + Duration::from_millis(100)), 0.25);
@@ -21447,8 +21595,7 @@ mod tests {
         let mut current = before.clone();
         current.tick = 2;
         motion_test_source(&mut current);
-        let pair =
-            SnapshotMotion::advance(Some(&first), &current, at + Duration::from_millis(10));
+        let pair = SnapshotMotion::advance(Some(&first), &current, at + Duration::from_millis(10));
         assert!(pair.previous.is_some());
         for discontinuity in 0..10 {
             let mut cut = current.clone();
@@ -21487,8 +21634,7 @@ mod tests {
             assert_eq!(snapped.alpha_at(at), 1.0);
         }
         current.paused = true;
-        let paused =
-            SnapshotMotion::advance(Some(&pair), &current, at + Duration::from_millis(20));
+        let paused = SnapshotMotion::advance(Some(&pair), &current, at + Duration::from_millis(20));
         assert!(paused.previous.is_none());
         current.paused = false;
         let resumed =
@@ -23430,11 +23576,7 @@ mod tests {
         );
         let display = app.world().get::<AgentDisplayPose>(entity).unwrap();
         assert_eq!(
-            displayed_agent_position(
-                Vec2::new(10.0, 500.0),
-                Some(display),
-                Vec2::splat(1000.0)
-            ),
+            displayed_agent_position(Vec2::new(10.0, 500.0), Some(display), Vec2::splat(1000.0)),
             Vec2::new(995.0, 500.0)
         );
         let snapshot = app
@@ -24399,6 +24541,7 @@ mod tests {
                 PartRef {
                     entity: Entity::PLACEHOLDER,
                     material: Some(material),
+                    appearance: None,
                 }
             })
             .collect();
@@ -24476,6 +24619,7 @@ mod tests {
                     &PartRef {
                         entity: Entity::PLACEHOLDER,
                         material,
+                        appearance: None,
                     },
                     base,
                     glow,

@@ -1043,6 +1043,29 @@ unconfirmed. Paused and single-step snapshots settle agent positions, headings,
 spikes, and idle-body deformation immediately at their recorded poses; camera
 navigation remains available while paused.
 
+### Bevy shared creature appearance
+
+Live Bevy rendering and offscreen capture now use the same shared PBR appearance
+plugin. Four material classes cover the existing creature alpha, lighting and
+sidedness combinations. Stable per-part slots hold linear color and emission in
+a resident storage buffer, while `MeshTag` selects each instance's row. Identical
+mesh/material handles let Bevy batch eligible creatures using its normal paths.
+
+Changed colors upload coalesced dirty ranges. Storage grows only when retained
+capacity is exceeded, and an actual GPU-buffer replacement receives a full
+upload. Per-row revisions preserve changes across skipped publications; slot
+generations reject stale ownership after population turnover or capture reset.
+The actual device binding limit and an independent application ceiling bound
+storage. Existing geometry, per-part entities, terrain contact, interpolation,
+picking, accessibility palettes, lighting and alpha/shadow behavior are retained.
+
+This is an implemented, independently reviewed source increment. Changed Rust
+formatting passed DSR. Native Cargo checks progressed after genuine system
+prerequisites were supplied, then the 8 GiB host memory limit killed the unchanged
+`bevy_render` dependency before project compilation. Six new CPU regressions and
+GPU capture acceptance remain unexecuted. Entity elimination, measured draw-call
+reduction and throughput qualification remain open under `bd-2z0.7.3`.
+
 ### Keyboard shortcuts (GUI)
 
 Simulation controls and retained-history playback are separate. The unmodified `S` shortcut returns the invoking view to live and queues one scientific step; when that isolated step succeeds, it advances exactly once and leaves the simulation paused. `space`, `G`, and `1`/`2`/`3` apply in Lab. Canvas presentation shortcuts (`N`, `Ctrl+P`, `D`, `F`, `Ctrl+Shift+O`, `Shift+S`, `O`, `Shift+F`, `0`, and `,`) apply in World. Simulation and canonical selection commands work from either window.

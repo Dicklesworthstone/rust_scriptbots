@@ -2,6 +2,42 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Shared native creature appearance (2026-11-09):** [Source implemented and
+independently reviewed — Codex; native/GPU execution and performance acceptance open]
+
+Continue the material and rendering portion of `bd-2z0.7.3`: live Bevy and
+`OffscreenCapture` install one appearance plugin, with four shared PBR classes
+and stable `MeshTag` rows for independently colored parts. Suspension joints
+reuse their body's row. Eligible identical mesh/material pairs can use Bevy's
+automatic batching; the existing root and part entities still own transforms,
+visibility, picking, terrain contact and interpolation.
+
+A resident storage buffer receives coalesced dirty-range writes. Ordinary color
+changes do not modify the storage-buffer asset, avoiding Bevy 0.17's repeated GPU
+allocation path. Growth rebinds the shared materials; actual buffer recreation
+forces a complete upload. Revisions retain changes across skipped extraction or
+late render-asset preparation. Population turnover releases old slots before
+allocating replacements, and generation checks prevent stale ownership. Capture
+reset reuses retained storage and invalidates former slots. Capacity admission
+uses both the actual device binding limit and an independent application ceiling.
+
+Forward/deferred PBR and a dedicated prepass preserve the admitted material
+classes' linear colors, emissive exposure semantics, vertex tint, lighting,
+fog, normals/motion output and Blend/Add shadow cutoff. Independent review checked
+these paths against pinned Bevy 0.17.3, plus resource scheduling, API signatures,
+all changed helper calls and system arity. Concurrent HUD/receipt and motion-test
+fixes through `aacdb4ebe1d85e3aa7a0055cfe78d2e98d7bb6a1` are preserved.
+
+DSR formatting passed. The actual Cargo all-targets check first lacked pkg-config;
+a verified distro-package extraction supplied genuine pkgconf, Wayland, ALSA,
+xkbcommon and udev prerequisites, whose version checks passed. The subsequent
+check was killed by the 8 GiB host memory limit inside unchanged `bevy_render`,
+before the project's native code compiled. Six new CPU tests cover slot lifetime,
+resident uploads, growth, five-palette reference parity, turnover/capacity refusal
+and capture reset; they remain unexecuted, as does GPU capture qualification.
+This increment does not close entity elimination, culling/LOD, draw-call,
+throughput or the full instancing acceptance work.
+
 **Browser brain activity and bounded explanations (2026-11-09):** [Implemented;
 focused executable checks and runtime type checks passed — Codex; full native,
 WASM and rendered-output acceptance open]
