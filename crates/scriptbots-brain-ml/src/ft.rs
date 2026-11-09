@@ -7,7 +7,7 @@
 //! F32 layer slices directly until that upstream API is F32-safe.
 
 use ft_api::FrankenTorchSession;
-use ft_core::ExecutionMode;
+use ft_core::{DType, Device, ExecutionMode, TensorMeta};
 use scriptbots_core::{
     BrainAdapterIdentityV1, BrainBatchArchitectureKey, BrainBatchEvaluator, BrainEnvelopeKind,
     BrainEvaluator, BrainEvaluatorStateEnvelope, BrainFamilyCodec, BrainFamilyId,
@@ -33,10 +33,12 @@ const MAX_HIDDEN_LAYERS: usize = 8;
 const MAX_LAYER_WIDTH: usize = 256;
 const GENOME_FIXED_HEADER_BYTES: usize = 16;
 const STATE_PAYLOAD_BYTES: usize = STATE_MAGIC.len() + 32;
-const ADAPTER_SEMANTIC_VERSION: u32 = 2;
-const ADAPTER_SEMANTIC_PREFIX: &[u8] = b"dense-f32;ft-kernel-cpu::linear_tensor_f32;\
+const ADAPTER_SEMANTIC_VERSION: u32 = 3;
+const ADAPTER_SEMANTIC_PREFIX: &[u8] = b"dense-f32;\
+    scalar-kernel=ft-kernel-cpu::linear_tensor_f32;\
+    cohort-kernel=ft-kernel-cpu::bmm_tensor_contiguous_f32_into;\
     layer-order=weight[out,in],bias[out];hidden=tanh;heads=typed-all-sigmoid;\
-    scalar=batch-loop-identical;state=genome-digest-only;layout=v1;\
+    equivalence=scalar-packed-cohort-bit-identical;state=genome-digest-only;layout=v1;\
     founder=xavier-uniform-next-u32-bias-zero;\
     mutation=per-gene-box-muller-draw-preserving-zero-sigma-identity;\
     crossover=per-gene-uniform-next-u32";
@@ -619,7 +621,81 @@ impl BrainEvaluator for FtEvaluator {
 struct FtBatchEvaluator {
     family: FtBrainFamily,
     genome_digests: Vec<[u8; 32]>,
-    networks: Vec<FtNetwork>,
+    layers: Vec<FtBatchLayer>,
+    activations: Vec<f32>,
+    candidates: Vec<f32>,
+}
+
+/// All lanes share an architecture, but each lane has its own heritable weights.
+/// A layer contracts `[lane, 1, input] @ [lane, input, output]`; sharing one
+/// `[input, output]` matrix across the cohort would silently erase that diversity.
+struct FtBatchLayer {
+    input_width: usize,
+    output_width: usize,
+    weights: Vec<f32>,
+    biases: Vec<f32>,
+    input_meta: TensorMeta,
+    weight_meta: TensorMeta,
+}
+
+impl FtBatchLayer {
+    fn new(
+        family: &FtBrainFamily,
+        lanes: usize,
+        input_width: usize,
+        output_width: usize,
+    ) -> Result<Self, BrainProtocolError> {
+        let weight_count = input_width
+            .checked_mul(output_width)
+            .and_then(|count| count.checked_mul(lanes))
+            .ok_or_else(|| config_error("FtBrain cohort weight footprint overflow"))?;
+        let bias_count = output_width
+            .checked_mul(lanes)
+            .ok_or_else(|| config_error("FtBrain cohort bias footprint overflow"))?;
+        Ok(Self {
+            input_width,
+            output_width,
+            weights: cohort_buffer(family, weight_count)?,
+            biases: cohort_buffer(family, bias_count)?,
+            input_meta: TensorMeta::from_shape(
+                vec![lanes, 1, input_width],
+                DType::F32,
+                Device::Cpu,
+            ),
+            weight_meta: TensorMeta::from_shape(
+                vec![lanes, input_width, output_width],
+                DType::F32,
+                Device::Cpu,
+            ),
+        })
+    }
+
+    fn pack_lane(&mut self, lane: usize, parameters: &[f32]) {
+        let weight_count = self.input_width * self.output_width;
+        let weights = &mut self.weights[lane * weight_count..(lane + 1) * weight_count];
+        // The canonical genome stays weight[out, in], bias[out]. Only this
+        // execution-owned copy is transposed, with no floating-point arithmetic.
+        for output in 0..self.output_width {
+            for input in 0..self.input_width {
+                weights[input * self.output_width + output] =
+                    parameters[output * self.input_width + input];
+            }
+        }
+        self.biases[lane * self.output_width..(lane + 1) * self.output_width]
+            .copy_from_slice(&parameters[weight_count..weight_count + self.output_width]);
+    }
+}
+
+fn cohort_buffer(family: &FtBrainFamily, count: usize) -> Result<Vec<f32>, BrainProtocolError> {
+    let mut values = Vec::new();
+    values.try_reserve_exact(count).map_err(|error| {
+        family.invalid(
+            BrainEnvelopeKind::EvaluatorState,
+            format!("cannot allocate FtBrain cohort buffer for {count} values: {error}"),
+        )
+    })?;
+    values.resize(count, 0.0);
+    Ok(values)
 }
 
 impl BrainBatchEvaluator for FtBatchEvaluator {
@@ -632,18 +708,85 @@ impl BrainBatchEvaluator for FtBatchEvaluator {
         sensors: &[[f32; INPUT_SIZE]],
         outputs: &mut [[f32; OUTPUT_SIZE]],
     ) -> Result<(), BrainProtocolError> {
-        if self.networks.len() != sensors.len() || sensors.len() != outputs.len() {
+        let lanes = self.genome_digests.len();
+        if lanes != sensors.len() || sensors.len() != outputs.len() {
             return Err(BrainProtocolError::BatchCardinalityMismatch {
-                evaluators: self.networks.len(),
+                evaluators: lanes,
                 inputs: sensors.len(),
                 outputs: outputs.len(),
             });
         }
-        let mut candidates = Vec::with_capacity(outputs.len());
-        for (network, input) in self.networks.iter().zip(sensors) {
-            candidates.push(network.evaluate(&self.family, input)?);
+        if lanes == 0 {
+            return Ok(());
         }
-        outputs.copy_from_slice(&candidates);
+        if let Some(lane) = sensors
+            .iter()
+            .position(|input| input.iter().any(|value| !value.is_finite()))
+        {
+            return Err(self.family.invalid(
+                BrainEnvelopeKind::EvaluatorState,
+                format!("FtBrain sensor input in cohort lane {lane} contains a non-finite value"),
+            ));
+        }
+        for (destination, input) in self.activations.chunks_exact_mut(INPUT_SIZE).zip(sensors) {
+            destination.copy_from_slice(input);
+        }
+
+        for (layer_index, layer) in self.layers.iter().enumerate() {
+            let output_count = lanes * layer.output_width;
+            let candidate = &mut self.candidates[..output_count];
+            ft_kernel_cpu::bmm_tensor_contiguous_f32_into(
+                &self.activations[..lanes * layer.input_width],
+                &layer.weights,
+                &layer.input_meta,
+                &layer.weight_meta,
+                candidate,
+            )
+            .map_err(|error| {
+                self.family.invalid(
+                    BrainEnvelopeKind::EvaluatorState,
+                    format!("FtBrain cohort layer {layer_index} evaluation failed: {error}"),
+                )
+            })?;
+
+            // Bias is added AFTER the kernel's reduction, exactly as in the
+            // scalar linear_tensor_f32 oracle. Fusing it into the contraction
+            // would change rounding and break scalar/cohort replay equivalence.
+            let output_layer = layer_index + 1 == self.layers.len();
+            for (value, bias) in candidate.iter_mut().zip(&layer.biases) {
+                *value += *bias;
+                *value = if output_layer {
+                    sigmoid(*value)
+                } else {
+                    value.tanh()
+                };
+            }
+            std::mem::swap(&mut self.activations, &mut self.candidates);
+        }
+
+        let final_activations = &self.activations[..lanes * OUTPUT_SIZE];
+        if let Some(index) = final_activations
+            .iter()
+            .position(|value| !value.is_finite())
+        {
+            return Err(self.family.invalid(
+                BrainEnvelopeKind::EvaluatorState,
+                format!(
+                    "FtBrain evaluation produced an invalid output in cohort lane {}",
+                    index / OUTPUT_SIZE
+                ),
+            ));
+        }
+        // No caller output is published until every lane has succeeded. Scratch
+        // is not evaluator state and is overwritten before the next attempt.
+        for (output, activation) in outputs
+            .iter_mut()
+            .zip(final_activations.chunks_exact(OUTPUT_SIZE))
+        {
+            for channel in OutputChannel::ALL {
+                output[channel.index()] = activation[channel.index()];
+            }
+        }
         Ok(())
     }
 
@@ -791,17 +934,40 @@ impl BrainFamilyCodec for FtBrainFamily {
                 outputs: states.len(),
             });
         }
-        let mut networks = Vec::with_capacity(genomes.len());
+        let lanes = genomes.len();
+        let scratch_width = self
+            .config
+            .hidden_layers
+            .iter()
+            .copied()
+            .chain([INPUT_SIZE, OUTPUT_SIZE])
+            .max()
+            .unwrap_or(INPUT_SIZE);
+        let scratch_count = lanes
+            .checked_mul(scratch_width)
+            .ok_or_else(|| config_error("FtBrain cohort activation footprint overflow"))?;
+        let mut layers = layer_shapes(&self.config)
+            .into_iter()
+            .map(|(input, output)| FtBatchLayer::new(self, lanes, input, output))
+            .collect::<Result<Vec<_>, _>>()?;
         let mut genome_digests = Vec::with_capacity(genomes.len());
-        for (&genome, &state) in genomes.iter().zip(states) {
+        for (lane, (&genome, &state)) in genomes.iter().zip(states).enumerate() {
             let decoded = self.validate_pair(genome, state)?;
-            networks.push(FtNetwork::materialize(&decoded));
+            let mut offset = 0;
+            for layer in &mut layers {
+                let parameter_count = (layer.input_width + 1) * layer.output_width;
+                layer.pack_lane(lane, &decoded.parameters[offset..offset + parameter_count]);
+                offset += parameter_count;
+            }
+            debug_assert_eq!(offset, decoded.parameters.len());
             genome_digests.push(*genome.material_hash().as_bytes());
         }
         Ok(Some(Box::new(FtBatchEvaluator {
             family: self.clone(),
             genome_digests,
-            networks,
+            layers,
+            activations: cohort_buffer(self, scratch_count)?,
+            candidates: cohort_buffer(self, scratch_count)?,
         })))
     }
 }
@@ -1148,6 +1314,291 @@ mod tests {
             batch.checkpoint_states().expect("batch checkpoints"),
             vec![left_state, right_state]
         );
+    }
+
+    fn cohort_inputs(lanes: usize, phase: usize) -> Vec<[f32; INPUT_SIZE]> {
+        (0..lanes)
+            .map(|lane| {
+                std::array::from_fn(|sensor| {
+                    let value = (lane * 11 + sensor * 7 + phase) % 37;
+                    f32::from(u8::try_from(value).expect("bounded fixture value")) / 18.0 - 1.0
+                })
+            })
+            .collect()
+    }
+
+    fn scalar_cohort_outputs(
+        family: &FtBrainFamily,
+        founders: &[(BrainGenomeEnvelope, BrainEvaluatorStateEnvelope)],
+        inputs: &[[f32; INPUT_SIZE]],
+    ) -> Vec<[f32; OUTPUT_SIZE]> {
+        founders
+            .iter()
+            .zip(inputs)
+            .map(|((genome, state), input)| {
+                family
+                    .evaluator(genome, state)
+                    .expect("scalar evaluator")
+                    .evaluate(input)
+                    .expect("scalar output")
+            })
+            .collect()
+    }
+
+    fn assert_output_bits(actual: &[[f32; OUTPUT_SIZE]], expected: &[[f32; OUTPUT_SIZE]]) {
+        assert_eq!(actual.len(), expected.len());
+        for (lane, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            for channel in OutputChannel::ALL {
+                assert_eq!(
+                    actual[channel.index()].to_bits(),
+                    expected[channel.index()].to_bits(),
+                    "first differing cohort lane {lane}, channel {channel:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn packed_cohort_matches_scalar_across_shapes_and_parallel_dispatch_boundary() {
+        // 7/8 straddles the pinned BMM kernel's serial/parallel lane dispatch.
+        // Asymmetric widths expose transpose/stride mistakes that square layers hide.
+        for hidden in [vec![1], vec![7, 13], vec![48, 32, 24], vec![31, 8, 17, 2]] {
+            let family =
+                FtBrainFamily::new(FtBrainConfig::new(hidden).expect("config")).expect("family");
+            for lanes in [0, 1, 7, 8, 17] {
+                let founders: Vec<_> = (0..lanes)
+                    .map(|lane| founder(&family, 1_001 + u64::try_from(lane).expect("lane")))
+                    .collect();
+                let genomes: Vec<_> = founders.iter().map(|(genome, _)| genome).collect();
+                let states: Vec<_> = founders.iter().map(|(_, state)| state).collect();
+                let mut cohort = family
+                    .batch_evaluator(&genomes, &states)
+                    .expect("construct packed cohort")
+                    .expect("cohort supported");
+                let initial_states = cohort.checkpoint_states().expect("initial states");
+                let mut actual = vec![[f32::NAN; OUTPUT_SIZE]; lanes];
+
+                // A second, different forward catches stale activation scratch.
+                for phase in [0, 19] {
+                    let inputs = cohort_inputs(lanes, phase);
+                    let expected = scalar_cohort_outputs(&family, &founders, &inputs);
+                    cohort
+                        .evaluate_batch(&inputs, &mut actual)
+                        .expect("packed evaluation");
+                    assert_output_bits(&actual, &expected);
+                }
+                assert_eq!(
+                    cohort.checkpoint_states().expect("final states"),
+                    initial_states,
+                    "execution scratch must never enter stateless evaluator checkpoints"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn packed_cohort_preserves_lane_identity_under_permutation_and_partition() {
+        let family = FtBrainFamily::default();
+        let founders: Vec<_> = (0..17).map(|lane| founder(&family, 2_000 + lane)).collect();
+        let inputs = cohort_inputs(founders.len(), 5);
+        let expected = scalar_cohort_outputs(&family, &founders, &inputs);
+        assert!(
+            expected.windows(2).any(|pair| pair[0] != pair[1]),
+            "a shared-weights implementation must not pass on identical fixture lanes"
+        );
+        let permutation: Vec<_> = (0..founders.len())
+            .map(|lane| (lane * 7) % founders.len())
+            .collect();
+        let permuted_inputs: Vec<_> = permutation.iter().map(|&lane| inputs[lane]).collect();
+        let permuted_expected: Vec<_> = permutation.iter().map(|&lane| expected[lane]).collect();
+
+        // Same biological lanes, different batching. These partitions include
+        // partial tails and cross the BMM backend's parallelism threshold.
+        for partition in [1, 3, 7, 8, 17] {
+            let mut actual = Vec::new();
+            for (lane_order, inputs) in permutation
+                .chunks(partition)
+                .zip(permuted_inputs.chunks(partition))
+            {
+                let genomes: Vec<_> = lane_order.iter().map(|&lane| &founders[lane].0).collect();
+                let states: Vec<_> = lane_order.iter().map(|&lane| &founders[lane].1).collect();
+                let mut cohort = family
+                    .batch_evaluator(&genomes, &states)
+                    .expect("construct partition")
+                    .expect("cohort supported");
+                let mut output = vec![[f32::NAN; OUTPUT_SIZE]; inputs.len()];
+                cohort
+                    .evaluate_batch(inputs, &mut output)
+                    .expect("evaluate partition");
+                assert_eq!(
+                    cohort.checkpoint_states().expect("partition states"),
+                    states.into_iter().cloned().collect::<Vec<_>>()
+                );
+                actual.extend(output);
+            }
+            assert_output_bits(&actual, &permuted_expected);
+        }
+    }
+
+    #[test]
+    fn packed_cohort_rejects_invalid_lanes_without_publishing_or_poisoning_retry() {
+        let family = FtBrainFamily::default();
+        let founders: Vec<_> = (0..9).map(|lane| founder(&family, 3_000 + lane)).collect();
+        let genomes: Vec<_> = founders.iter().map(|(genome, _)| genome).collect();
+        let states: Vec<_> = founders.iter().map(|(_, state)| state).collect();
+        let mut cohort = family
+            .batch_evaluator(&genomes, &states)
+            .expect("construct cohort")
+            .expect("cohort supported");
+        let inputs = cohort_inputs(founders.len(), 2);
+        let expected = scalar_cohort_outputs(&family, &founders, &inputs);
+        let initial_states = cohort.checkpoint_states().expect("initial states");
+        let sentinel = vec![[0.125; OUTPUT_SIZE]; founders.len()];
+
+        for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut malformed = inputs.clone();
+            malformed[8][INPUT_SIZE - 1] = invalid;
+            let mut outputs = sentinel.clone();
+            let error = cohort
+                .evaluate_batch(&malformed, &mut outputs)
+                .expect_err("a late malformed lane must reject the entire call");
+            assert!(error.to_string().contains("lane 8"));
+            assert_eq!(outputs, sentinel);
+            assert_eq!(
+                cohort.checkpoint_states().expect("error states"),
+                initial_states
+            );
+            cohort
+                .evaluate_batch(&inputs, &mut outputs)
+                .expect("clean retry after rejection");
+            assert_output_bits(&outputs, &expected);
+        }
+
+        let mut outputs = sentinel.clone();
+        assert!(matches!(
+            cohort.evaluate_batch(&inputs[..8], &mut outputs),
+            Err(BrainProtocolError::BatchCardinalityMismatch {
+                evaluators: 9,
+                inputs: 8,
+                outputs: 9,
+            })
+        ));
+        assert_eq!(outputs, sentinel);
+        let mut short_outputs = sentinel[..8].to_vec();
+        assert!(matches!(
+            cohort.evaluate_batch(&inputs, &mut short_outputs),
+            Err(BrainProtocolError::BatchCardinalityMismatch {
+                evaluators: 9,
+                inputs: 9,
+                outputs: 8,
+            })
+        ));
+        assert_eq!(short_outputs, sentinel[..8]);
+    }
+
+    #[test]
+    fn packed_cohort_rejects_mismatched_genome_state_and_architecture() {
+        let family = FtBrainFamily::default();
+        let (left, left_state) = founder(&family, 4_000);
+        let (right, right_state) = founder(&family, 4_001);
+        assert!(
+            family
+                .batch_evaluator(&[&left, &right], &[&left_state])
+                .is_err()
+        );
+        let error = family
+            .batch_evaluator(&[&left, &right], &[&left_state, &left_state])
+            .err()
+            .expect("lane state must remain bound to its own genome");
+        assert!(error.to_string().contains("different genome"));
+
+        let narrow = FtBrainFamily::new(FtBrainConfig::new(vec![5]).expect("config"))
+            .expect("narrow family");
+        let (other, other_state) = founder(&narrow, 4_002);
+        assert!(
+            family
+                .batch_evaluator(&[&left, &other], &[&left_state, &other_state])
+                .is_err()
+        );
+        assert!(
+            family
+                .batch_evaluator(&[&left, &right], &[&left_state, &right_state])
+                .expect("valid ordered cohort remains accepted")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn packed_cohort_preserves_scalar_extreme_finite_inputs_and_reuses_scratch() {
+        let family =
+            FtBrainFamily::new(FtBrainConfig::new(vec![1]).expect("config")).expect("family");
+        let (healthy, healthy_state) = founder(&family, 4_100);
+        let mut parameters = vec![0.0; validate_config(&family.config).expect("count")];
+        parameters[0] = f32::MAX;
+        parameters[1] = -f32::MAX;
+        for channel in OutputChannel::ALL {
+            let index = u8::try_from(channel.index()).expect("bounded output channel");
+            parameters[INPUT_SIZE + 1 + channel.index()] = (f32::from(index) - 4.0) * 0.125;
+        }
+        let explosive = genome_with_parameters(&family, &parameters);
+        let mut rng = SmallRngStream::seed_from_u64(4_101);
+        let explosive_state = family.initial_state(&explosive, &mut rng).expect("state");
+        let founders = [(healthy, healthy_state), (explosive, explosive_state)];
+        let genomes: Vec<_> = founders.iter().map(|(genome, _)| genome).collect();
+        let states: Vec<_> = founders.iter().map(|(_, state)| state).collect();
+        let mut cohort = family
+            .batch_evaluator(&genomes, &states)
+            .expect("finite weights are valid genomes")
+            .expect("cohort supported");
+        let initial_states = cohort.checkpoint_states().expect("initial states");
+        let sentinel = [[0.125; OUTPUT_SIZE]; 2];
+        let valid_inputs = [[0.0; INPUT_SIZE]; 2];
+        let expected_retry = scalar_cohort_outputs(&family, &founders, &valid_inputs);
+        // Fused multiply-add can retain an infinite accumulator through the
+        // opposing finite product, after which tanh saturates to a valid value.
+        // Unfused kernels can instead form inf + -inf and reject the NaN.
+        // Preserve the actual scalar backend's outcome, including its rejection
+        // boundary, rather than imposing a different overflow policy here.
+        for sensors in [
+            [2.0; INPUT_SIZE],
+            [-2.0; INPUT_SIZE],
+            [f32::MAX; INPUT_SIZE],
+            [-f32::MAX; INPUT_SIZE],
+            std::array::from_fn(|index| if index % 2 == 0 { f32::MAX } else { -f32::MAX }),
+        ] {
+            let inputs = [sensors; 2];
+            let expected: Vec<_> = founders
+                .iter()
+                .zip(&inputs)
+                .map(|((genome, state), input)| {
+                    family
+                        .evaluator(genome, state)
+                        .expect("scalar evaluator")
+                        .evaluate(input)
+                })
+                .collect();
+            let mut outputs = sentinel;
+            let result = cohort.evaluate_batch(&inputs, &mut outputs);
+            if let Some(lane) = expected.iter().position(Result::is_err) {
+                let error = result.expect_err("cohort must preserve scalar rejection");
+                assert!(error.to_string().contains(&format!("lane {lane}")));
+                assert_eq!(outputs, sentinel, "no partial cohort may be published");
+            } else {
+                result.expect("finite scalar outputs must remain accepted");
+                let expected: Vec<_> = expected.into_iter().map(Result::unwrap).collect();
+                assert_output_bits(&outputs, &expected);
+            }
+            assert_eq!(
+                cohort
+                    .checkpoint_states()
+                    .expect("states after extreme inputs"),
+                initial_states
+            );
+            cohort
+                .evaluate_batch(&valid_inputs, &mut outputs)
+                .expect("retry must overwrite previous scratch contents");
+            assert_output_bits(&outputs, &expected_retry);
+        }
     }
 
     #[test]
