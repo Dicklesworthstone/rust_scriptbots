@@ -1162,7 +1162,11 @@ impl MotionCut {
     }
 
     fn can_follow(&self, previous: &Self) -> bool {
-        let Some(ticks) = self.tick.checked_sub(previous.tick).filter(|ticks| *ticks > 0) else {
+        let Some(ticks) = self
+            .tick
+            .checked_sub(previous.tick)
+            .filter(|ticks| *ticks > 0)
+        else {
             return false;
         };
         let (Some((before, before_epoch)), Some((after, after_epoch))) =
@@ -1229,7 +1233,10 @@ impl SnapshotMotion {
         let Some(previous) = &self.previous else {
             return 1.0;
         };
-        let span = self.current.observed_at.duration_since(previous.observed_at);
+        let span = self
+            .current
+            .observed_at
+            .duration_since(previous.observed_at);
         let elapsed = now.saturating_duration_since(self.current.observed_at);
         (elapsed.as_secs_f64() / span.as_secs_f64()).clamp(0.0, 1.0) as f32
     }
@@ -1244,7 +1251,10 @@ impl SnapshotMotion {
         let Some(previous) = previous else {
             return Some(current);
         };
-        let ticks = self.current.tick.saturating_sub(self.previous.as_ref()?.tick);
+        let ticks = self
+            .current
+            .tick
+            .saturating_sub(self.previous.as_ref()?.tick);
         Some(interpolate_motion_pose(
             previous,
             current,
@@ -1297,9 +1307,7 @@ fn interpolate_motion_pose(
     // and collisions whose endpoint velocities differ from their mean.
     let travel = previous.velocity.length().max(current.velocity.length()) * ticks as f32;
     let allowance = (travel + radius.max(0.0) * 2.0).min(world_size.min_element() * 0.5);
-    if !travel.is_finite()
-        || travel >= world_size.min_element() * 0.5
-        || delta.length() > allowance
+    if !travel.is_finite() || travel >= world_size.min_element() * 0.5 || delta.length() > allowance
     {
         return current;
     }
@@ -1595,10 +1603,7 @@ fn displayed_follow_target(
     match mode {
         FollowMode::Off => None,
         FollowMode::Selected => selected.or(first),
-        FollowMode::Oldest => oldest
-            .map(|(_, position)| position)
-            .or(selected)
-            .or(first),
+        FollowMode::Oldest => oldest.map(|(_, position)| position).or(selected).or(first),
     }
 }
 
@@ -16590,8 +16595,7 @@ mod terrain_tests {
         motion_test_source(current);
         let at = Instant::now();
         let before = SnapshotMotion::advance(None, &previous, at);
-        let pair =
-            SnapshotMotion::advance(Some(&before), current, at + Duration::from_millis(100));
+        let pair = SnapshotMotion::advance(Some(&before), current, at + Duration::from_millis(100));
         assert!(pair.previous.is_some(), "fixture must admit a genuine pair");
         current.motion = Some(pair);
         current.motion_alpha = alpha;
@@ -17597,8 +17601,16 @@ mod terrain_tests {
         assert!(publisher.publish_at(snapshot.clone(), resumed_at));
         app.update();
         assert_eq!(
-            app.world().entity(root).get::<Transform>().unwrap().translation,
-            app.world().entity(root).get::<AgentPoseTarget>().unwrap().translation,
+            app.world()
+                .entity(root)
+                .get::<Transform>()
+                .unwrap()
+                .translation,
+            app.world()
+                .entity(root)
+                .get::<AgentPoseTarget>()
+                .unwrap()
+                .translation,
             "the first post-pause cut must snap to its committed pose"
         );
 
@@ -20462,15 +20474,13 @@ fn apply_agent_visuals(
         ),
     };
     update_part_transform(commands, &record.spike, spike_transform);
-    commands
-        .entity(record.spike.entity)
-        .insert((
-            SpikePoseTarget {
-                transform: spike_transform,
-                tick: snapshot.tick,
-            },
-            AgentMotionKey(agent.uid),
-        ));
+    commands.entity(record.spike.entity).insert((
+        SpikePoseTarget {
+            transform: spike_transform,
+            tick: snapshot.tick,
+        },
+        AgentMotionKey(agent.uid),
+    ));
     let spike_rgb = Vec3::from_array(visuals.spike_color);
     let spike_color = srgb_from_vec_with_palette(spike_rgb, 1.0, palette);
     let spike_emissive = palette_hdr_emissive_from_srgb(
@@ -21414,8 +21424,7 @@ mod tests {
         // that all four intervening scientific revisions were ticks.
         snapshot.tick = 8;
         motion_test_source(&mut snapshot);
-        let pair =
-            SnapshotMotion::advance(Some(&first), &snapshot, at + Duration::from_millis(80));
+        let pair = SnapshotMotion::advance(Some(&first), &snapshot, at + Duration::from_millis(80));
         assert_eq!(pair.previous.as_ref().unwrap().tick, 4);
         assert_eq!(pair.alpha_at(at + Duration::from_millis(80)), 0.0);
         assert_eq!(pair.alpha_at(at + Duration::from_millis(100)), 0.25);
@@ -21447,8 +21456,7 @@ mod tests {
         let mut current = before.clone();
         current.tick = 2;
         motion_test_source(&mut current);
-        let pair =
-            SnapshotMotion::advance(Some(&first), &current, at + Duration::from_millis(10));
+        let pair = SnapshotMotion::advance(Some(&first), &current, at + Duration::from_millis(10));
         assert!(pair.previous.is_some());
         for discontinuity in 0..10 {
             let mut cut = current.clone();
@@ -21487,8 +21495,7 @@ mod tests {
             assert_eq!(snapped.alpha_at(at), 1.0);
         }
         current.paused = true;
-        let paused =
-            SnapshotMotion::advance(Some(&pair), &current, at + Duration::from_millis(20));
+        let paused = SnapshotMotion::advance(Some(&pair), &current, at + Duration::from_millis(20));
         assert!(paused.previous.is_none());
         current.paused = false;
         let resumed =
@@ -23430,11 +23437,7 @@ mod tests {
         );
         let display = app.world().get::<AgentDisplayPose>(entity).unwrap();
         assert_eq!(
-            displayed_agent_position(
-                Vec2::new(10.0, 500.0),
-                Some(display),
-                Vec2::splat(1000.0)
-            ),
+            displayed_agent_position(Vec2::new(10.0, 500.0), Some(display), Vec2::splat(1000.0)),
             Vec2::new(995.0, 500.0)
         );
         let snapshot = app

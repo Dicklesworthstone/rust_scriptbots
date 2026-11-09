@@ -4324,13 +4324,10 @@ impl HostCore {
         self.inspect_agent_with_attribution(uid, None, 0, false)
     }
 
-    pub(crate) fn inspect_agent_with_attribution(
-        &self,
-        uid: AgentUid,
+    fn validate_inspector_request(
         max_contributors: Option<usize>,
         genome_offset: usize,
-        include_genome: bool,
-    ) -> Result<Option<crate::channel::AgentInspectorData>, HostAccessError> {
+    ) -> Result<(), HostAccessError> {
         if max_contributors.is_some_and(|limit| limit > crate::channel::MAX_INSPECTOR_CONTRIBUTORS)
         {
             return Err(HostAccessError::ProtocolViolation {
@@ -4345,6 +4342,18 @@ impl HostCore {
                 message: "invalid genome page offset".to_owned(),
             });
         }
+        Ok(())
+    }
+
+    pub(crate) fn inspect_agent_with_attribution(
+        &self,
+        uid: AgentUid,
+        max_contributors: Option<usize>,
+        genome_offset: usize,
+        include_genome: bool,
+    ) -> Result<Option<crate::channel::AgentInspectorData>, HostAccessError> {
+        Self::validate_inspector_request(max_contributors, genome_offset)?;
+        let page_size = crate::channel::INSPECTOR_GENOME_PAGE_SIZE;
         let Some(id) = self
             .world
             .agents()
@@ -6656,6 +6665,26 @@ mod tests {
         bound_brain_inspection,
     };
     use std::{hint::black_box, sync::Mutex, time::Instant};
+
+    #[test]
+    fn inspector_rejects_invalid_bounds_before_looking_up_an_agent() {
+        let owner = continuation_owner(71);
+        let missing = AgentUid(u64::MAX);
+        let page = crate::channel::INSPECTOR_GENOME_PAGE_SIZE;
+        let max = crate::channel::MAX_INSPECTOR_CONTRIBUTORS;
+        assert!(owner.inspect_agent_with_attribution(missing, None, 0, false).unwrap().is_none());
+        assert!(owner.inspect_agent_with_attribution(missing, Some(max), page, true).unwrap().is_none());
+        let error = |contributors, offset| {
+            match owner.inspect_agent_with_attribution(missing, contributors, offset, true) {
+                Err(HostAccessError::ProtocolViolation { message }) => message,
+                _ => panic!("invalid inspector request must be refused"),
+            }
+        };
+        assert_eq!(error(Some(max + 1), 1), "sensor explanation contributor limit exceeded");
+        assert_eq!(error(None, 1), "invalid genome page offset");
+        let overflowing_page = usize::MAX - usize::MAX % page;
+        assert_eq!(error(None, overflowing_page), "invalid genome page offset");
+    }
 
     fn world(persistence_interval: u32) -> WorldState {
         WorldState::new(ScriptBotsConfig {
