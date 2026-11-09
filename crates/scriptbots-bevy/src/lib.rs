@@ -4682,6 +4682,7 @@ fn setup_scene(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut images: ResMut<Assets<Image>>,
+    mut fonts: Option<ResMut<Assets<Font>>>,
     effective: Res<EffectiveRenderSettings>,
 ) {
     let camera_transform = Transform::from_xyz(0.0, 1800.0, 1400.0).looking_at(Vec3::ZERO, Vec3::Y);
@@ -4784,10 +4785,21 @@ fn setup_scene(
         InheritedVisibility::default(),
     ));
 
+    let interface_font = fonts.as_mut().map(|fonts| {
+        fonts.add(
+            Font::try_from_bytes(include_bytes!("ui-inter-regular.ttf").to_vec())
+                .expect("bundled Inter font must be valid"),
+        )
+    });
+    let ui_font = |size| TextFont {
+        font: interface_font.clone().unwrap_or_default(),
+        font_size: size,
+        ..default()
+    };
     let primary_text_color = Color::WHITE;
     let secondary_text_color = Color::srgb(0.80, 0.87, 0.84);
-    let primary_font = TextFont::from_font_size(16.0);
-    let secondary_font = TextFont::from_font_size(14.0);
+    let primary_font = ui_font(16.0);
+    let secondary_font = ui_font(14.0);
 
     let button_node = Node {
         padding: UiRect::axes(Val::Px(8.0), Val::Px(6.0)),
@@ -4833,7 +4845,7 @@ fn setup_scene(
             },
             BackgroundColor(Color::srgba(0.35, 0.10, 0.10, 0.82)),
             Text::new("SOFTWARE RENDERER - not GPU accelerated, not representative"),
-            TextFont::from_font_size(15.0),
+            ui_font(15.0),
             TextColor(Color::srgb(1.0, 0.85, 0.85)),
             SoftwareRendererWatermark,
         ));
@@ -4894,7 +4906,7 @@ fn setup_scene(
     commands.entity(hud_root).with_children(|parent| {
         parent.spawn((
             Text::new("SCRIPTBOTS  /  LIVE WORLD"),
-            TextFont::from_font_size(13.0),
+            ui_font(13.0),
             TextColor(Color::srgb(0.62, 0.82, 0.68)),
         ));
         tick = parent
@@ -4973,20 +4985,20 @@ fn setup_scene(
             .with_children(|card| {
                 card.spawn((
                     Text::new("CREATURE  /  FIELD PROFILE"),
-                    TextFont::from_font_size(11.0),
+                    ui_font(11.0),
                     TextColor(Color::srgb(0.57, 0.78, 0.66)),
                 ));
                 card_identity = card
                     .spawn((
                         Text::default(),
-                        TextFont::from_font_size(21.0),
+                        ui_font(21.0),
                         TextColor(Color::srgb(0.95, 0.98, 0.93)),
                     ))
                     .id();
                 card_context = card
                     .spawn((
                         Text::default(),
-                        TextFont::from_font_size(13.0),
+                        ui_font(13.0),
                         TextColor(Color::srgb(0.72, 0.83, 0.77)),
                     ))
                     .id();
@@ -5019,13 +5031,13 @@ fn setup_scene(
                         .with_children(|tile| {
                             tile.spawn((
                                 Text::new(label),
-                                TextFont::from_font_size(10.0),
+                                ui_font(10.0),
                                 TextColor(Color::srgb(0.65, 0.80, 0.71)),
                             ));
                             *slot = tile
                                 .spawn((
                                     Text::default(),
-                                    TextFont::from_font_size(17.0),
+                                    ui_font(17.0),
                                     TextColor(Color::srgb(0.95, 0.98, 0.93)),
                                 ))
                                 .id();
@@ -5063,7 +5075,7 @@ fn setup_scene(
                         .with_children(|button| {
                             button.spawn((
                                 Text::new(label),
-                                TextFont::from_font_size(12.0),
+                                ui_font(12.0),
                                 TextColor(secondary_text_color),
                             ));
                         });
@@ -5108,7 +5120,7 @@ fn setup_scene(
                         .with_children(|button| {
                             button.spawn((
                                 Text::new(label),
-                                TextFont::from_font_size(12.0),
+                                ui_font(12.0),
                                 TextColor(secondary_text_color),
                             ));
                         });
@@ -5116,7 +5128,7 @@ fn setup_scene(
                     card_page_status = row
                         .spawn((
                             Text::default(),
-                            TextFont::from_font_size(11.0),
+                            ui_font(11.0),
                             TextColor(Color::srgb(0.66, 0.81, 0.73)),
                             Node {
                                 flex_grow: 1.0,
@@ -5128,14 +5140,20 @@ fn setup_scene(
                 card_page_title = card
                     .spawn((
                         Text::default(),
-                        TextFont::from_font_size(15.0),
+                        ui_font(15.0),
                         TextColor(Color::srgb(0.91, 0.96, 0.89)),
                     ))
                     .id();
                 card_page_body = card
                     .spawn((
                         Text::default(),
-                        TextFont::from_font_size(13.0),
+                        ui_font(13.0),
+                        TextLayout::new_with_linebreak(bevy::text::LineBreak::WordOrCharacter),
+                        Node {
+                            width: Val::Percent(100.0),
+                            min_width: Val::Px(0.0),
+                            ..default()
+                        },
                         TextColor(Color::srgb(0.79, 0.87, 0.82)),
                     ))
                     .id();
@@ -8258,6 +8276,52 @@ mod adaptive_governor_tests {
             gpu: None,
             requested: RenderQuality::Auto,
         }
+    }
+
+    #[test]
+    fn scene_uses_the_embedded_interface_font_when_font_assets_exist() {
+        let mut app = App::new();
+        app.insert_resource(Assets::<Mesh>::default())
+            .insert_resource(Assets::<Image>::default())
+            .insert_resource(Assets::<Font>::default())
+            .insert_resource(auto_launch(RenderQuality::High))
+            .add_systems(Startup, setup_scene);
+        app.update();
+
+        let world = app.world_mut();
+        let mut texts = world.query::<(&Text, &TextFont)>();
+        let handle = texts
+            .iter(world)
+            .find(|(text, _)| text.as_str() == "SCRIPTBOTS  /  LIVE WORLD")
+            .expect("world heading")
+            .1
+            .font
+            .clone();
+        let font = world
+            .resource::<Assets<Font>>()
+            .get(&handle)
+            .expect("embedded font asset");
+        assert_eq!(font.data.as_slice(), include_bytes!("ui-inter-regular.ttf"));
+    }
+
+    #[test]
+    fn creature_detail_body_wraps_long_unbroken_values() {
+        let mut app = App::new();
+        app.insert_resource(Assets::<Mesh>::default())
+            .insert_resource(Assets::<Image>::default())
+            .insert_resource(auto_launch(RenderQuality::High))
+            .add_systems(Startup, setup_scene);
+        app.update();
+
+        let body = app.world().resource::<CreatureCardElements>().page_body;
+        let layout = app
+            .world()
+            .get::<TextLayout>(body)
+            .expect("body text layout");
+        assert_eq!(layout.linebreak, bevy::text::LineBreak::WordOrCharacter);
+        let node = app.world().get::<Node>(body).expect("body layout node");
+        assert_eq!(node.width, Val::Percent(100.0));
+        assert_eq!(node.min_width, Val::Px(0.0));
     }
 
     #[test]
