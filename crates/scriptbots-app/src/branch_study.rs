@@ -24,12 +24,13 @@
 //!    - **Descriptive Trajectory Comparisons**: Computes paired mean differences and their temporal
 //!      standard deviation across the recorded horizon. One seed provides one independent pair;
 //!      repeated ticks do not justify confidence intervals or significance tests. The separate
-//!      [`compute_paired_effect`] helper supports inference for independent paired replicates.
+//!      [`ReplicatedBranchStudyOrchestrator`] runs independently initialized matched seed pairs
+//!      and uses [`compute_paired_effect`] only on one terminal endpoint per seed and branch.
 //! 6. **Verifiable Artifact Bundles**: Every branch packages its metrics and evidence, then checks
 //!    bounded manifest/artifact integrity ([`scriptbots_storage::verify_run_bundle_bounded`]). This
 //!    does not establish that the bundle contains a restorable simulation owner checkpoint.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -52,11 +53,15 @@ use crate::brains::{BrainPreset, install_brains};
 use crate::lab::stats::bootstrap_ci;
 use crate::{resolve_scheduled_config_patch, seed_founding_population};
 
-/// Report revision with observed command boundaries and an explicit statistical analysis basis.
-pub const BRANCH_STUDY_REPORT_SCHEMA_VERSION: u16 = 2;
+/// Report revision with an observed terminal sample for independent replicate aggregation.
+pub const BRANCH_STUDY_REPORT_SCHEMA_VERSION: u16 = 3;
+/// Replicated study report contract: one terminal endpoint per independently initialized seed.
+pub const REPLICATED_BRANCH_STUDY_REPORT_SCHEMA_VERSION: u16 = 1;
 
 /// Maximum branches retained in one study, including its control.
 pub const MAX_STUDY_BRANCHES: usize = 32;
+/// Maximum independently initialized seed pairs in one replicated study.
+pub const MAX_STUDY_REPLICATES: usize = 32;
 /// Maximum recorded transitions per branch.
 pub const MAX_STUDY_HORIZON_TICKS: u64 = 10_000;
 /// Maximum baseline plus branch transitions admitted by one study.
@@ -357,6 +362,13 @@ impl BranchStudyPlan {
             })
     }
 
+    fn total_transitions(&self) -> Result<u64, BranchStudyError> {
+        self.horizon_ticks
+            .checked_mul(self.branches.len() as u64)
+            .and_then(|ticks| ticks.checked_add(self.checkpoint_tick))
+            .ok_or_else(|| BranchStudyError::InvalidPlan("study work count overflows".to_owned()))
+    }
+
     /// Create a standard 5-branch study plus control covering:
     /// Drought, ResourceShock, TemperatureShift, ClosedWorld, and Cooperation.
     #[must_use]
@@ -603,6 +615,8 @@ pub struct BranchOutcomeReport {
     pub effect_sizes: BTreeMap<String, BranchEffectSize>,
     /// Final world digest overall hash.
     pub final_digest: String,
+    /// Actual last recorded boundary, retained without substituting a trajectory average.
+    pub terminal_sample: BranchTickSample,
     /// Path to the metrics/evidence artifact bundle directory.
     pub bundle_path: Option<String>,
     /// Whether the bundle passed bounded manifest/artifact integrity verification.
@@ -632,6 +646,47 @@ pub struct BranchStudyReport {
     /// Reports for all branches (including Control).
     pub branch_reports: Vec<BranchOutcomeReport>,
     /// Human-readable Markdown summary.
+    pub summary_markdown: String,
+}
+
+/// Explicit independent-seed extension of an existing checkpoint-branch study.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicatedBranchStudyPlan {
+    /// Common configuration, branches, and timing. Its `base_seed` seeds statistical resampling;
+    /// each replicate replaces both founding seed fields with its own entry in `seeds`.
+    pub study: BranchStudyPlan,
+    /// Unique founding seeds, in the declared execution and reduction order.
+    pub seeds: Vec<u64>,
+}
+
+/// One independently initialized seed pair and its complete per-branch evidence.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BranchStudyReplicate {
+    /// Exact founding seed supplied to the per-seed executor.
+    pub seed: u64,
+    /// Per-seed report artifact relative to the replicated study directory.
+    pub report_path: String,
+    /// Exact per-seed result, including baseline digest, terminal endpoints and bundle receipts.
+    pub report: BranchStudyReport,
+}
+
+/// Terminal endpoint comparisons from independently initialized matched seed pairs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReplicatedBranchStudyReport {
+    /// Version of this replicated report contract.
+    pub schema_version: u16,
+    /// Exact retained inputs, including declared seed order and resampling seed.
+    pub plan: ReplicatedBranchStudyPlan,
+    /// The common terminal tick used for every paired endpoint.
+    pub endpoint_tick: u64,
+    /// Baseline plus branch transitions across all seeds, admitted before output reservation.
+    pub total_transitions: u64,
+    /// Complete reports in the declared seed order; incomplete studies publish no aggregate.
+    pub replicates: Vec<BranchStudyReplicate>,
+    /// Branch id -> metric -> paired terminal effect; the unperturbed control is omitted.
+    pub endpoint_effects: BTreeMap<String, BTreeMap<String, BranchEffectSize>>,
+    /// Human-readable endpoint results and their statistical limits.
     pub summary_markdown: String,
 }
 
@@ -712,6 +767,15 @@ pub enum BranchStudyError {
     /// Study was cancelled by caller.
     #[error("study execution was cancelled")]
     Cancelled,
+    /// A specific independent replicate failed; retained earlier results are not a complete study.
+    #[error("replicate seed {seed} failed: {source}")]
+    ReplicateFailed {
+        /// Founding seed of the failed replicate.
+        seed: u64,
+        /// Original typed failure.
+        #[source]
+        source: Box<BranchStudyError>,
+    },
 }
 
 fn study_output_error(path: &Path, error: std::io::Error) -> BranchStudyError {
@@ -788,6 +852,28 @@ fn write_new_study_artifact(path: &Path, bytes: &[u8]) -> Result<(), BranchStudy
     file.write_all(bytes)?;
     file.sync_all()?;
     Ok(())
+}
+
+fn reserve_study_output(output: &Path, plan_json: &[u8]) -> Result<(), BranchStudyError> {
+    match fs::symlink_metadata(output) {
+        Ok(metadata) => {
+            if !metadata.is_dir()
+                || metadata.file_type().is_symlink()
+                || fs::read_dir(output)?.next().transpose()?.is_some()
+            {
+                return Err(BranchStudyError::OutputAlreadyExists {
+                    path: output.to_path_buf(),
+                });
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(output)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    // Both single-seed and replicated studies use the same create_new writer claim.
+    // Concurrent invocations cannot each reserve a different kind of plan in one directory.
+    write_new_study_artifact(&output.join("study_plan.json"), plan_json)
 }
 
 /// Create a fresh [`BrainRegistry`] matching the given preset for checkpoint restoration.
@@ -1058,17 +1144,9 @@ impl BranchStudyOrchestrator {
             self.plan.horizon_ticks,
             MAX_STUDY_HORIZON_TICKS,
         )?;
-        let total_transitions = self
-            .plan
-            .horizon_ticks
-            .checked_mul(self.plan.branches.len() as u64)
-            .and_then(|ticks| ticks.checked_add(self.plan.checkpoint_tick))
-            .ok_or_else(|| {
-                BranchStudyError::InvalidPlan("study work count overflows".to_owned())
-            })?;
         enforce_study_limit(
             "total transitions",
-            total_transitions,
+            self.plan.total_transitions()?,
             MAX_STUDY_TOTAL_TRANSITIONS,
         )?;
         enforce_study_limit(
@@ -1295,30 +1373,8 @@ impl BranchStudyOrchestrator {
     }
 
     fn reserve_output_directory(&self) -> Result<(), BranchStudyError> {
-        match fs::symlink_metadata(&self.output_dir) {
-            Ok(metadata) => {
-                if !metadata.is_dir()
-                    || metadata.file_type().is_symlink()
-                    || fs::read_dir(&self.output_dir)?
-                        .next()
-                        .transpose()?
-                        .is_some()
-                {
-                    return Err(BranchStudyError::OutputAlreadyExists {
-                        path: self.output_dir.clone(),
-                    });
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                fs::create_dir_all(&self.output_dir)?;
-            }
-            Err(error) => return Err(error.into()),
-        }
-
-        // create_new is the writer claim, including when two invocations both
-        // observed an empty directory. A failed writer leaves its claim intact.
         let plan_json = serde_json::to_vec_pretty(&self.plan)?;
-        write_new_study_artifact(&self.output_dir.join("study_plan.json"), &plan_json)
+        reserve_study_output(&self.output_dir, &plan_json)
     }
 
     fn validate_control_observations(
@@ -1530,10 +1586,15 @@ impl BranchStudyOrchestrator {
             )));
         }
 
-        let final_pop = samples.last().map_or(0, |s| s.sample.population);
-        let final_digest = samples
+        let terminal_sample = samples
             .last()
-            .map_or_else(String::new, |s| s.digest.overall.clone());
+            .ok_or_else(|| {
+                BranchStudyError::InvalidComparison("branch has no terminal observation".to_owned())
+            })?
+            .sample
+            .clone();
+        let final_pop = terminal_sample.population;
+        let final_digest = terminal_sample.digest_overall.clone();
 
         // Assess population outcomes from the actual pre-command boundary, not from an earlier
         // checkpoint when the intervention was delayed. Control branches use the checkpoint.
@@ -1707,6 +1768,7 @@ impl BranchStudyOrchestrator {
             hysteresis,
             effect_sizes,
             final_digest,
+            terminal_sample,
             bundle_path: Some(bundle_path.to_string_lossy().into_owned()),
             bundle_verified,
         };
@@ -1834,6 +1896,12 @@ impl BranchStudyOrchestrator {
         }
 
         // 2. Branch evidence JSON
+        let terminal_sample = &samples
+            .last()
+            .ok_or_else(|| {
+                BranchStudyError::InvalidComparison("branch has no terminal observation".to_owned())
+            })?
+            .sample;
         let evidence_json = serde_json::to_vec_pretty(&serde_json::json!({
             "schema_version": BRANCH_STUDY_REPORT_SCHEMA_VERSION,
             "branch_id": branch.branch_id,
@@ -1849,6 +1917,7 @@ impl BranchStudyOrchestrator {
             "recovery": recovery,
             "hysteresis": hysteresis,
             "effect_sizes": effect_sizes,
+            "terminal_sample": terminal_sample,
         }))?;
 
         enforce_study_limit(
@@ -2025,6 +2094,330 @@ impl BranchStudyOrchestrator {
     }
 }
 
+/// Execute independently initialized checkpoint pairs without retaining multiple live worlds.
+pub struct ReplicatedBranchStudyOrchestrator {
+    /// Common study and explicit independent founding seeds.
+    pub plan: ReplicatedBranchStudyPlan,
+    /// New or empty destination for the aggregate and per-seed evidence.
+    pub output_dir: PathBuf,
+}
+
+impl ReplicatedBranchStudyOrchestrator {
+    /// Compose replication around the existing exact per-seed executor.
+    #[must_use]
+    pub fn new(plan: ReplicatedBranchStudyPlan, output_dir: PathBuf) -> Self {
+        Self { plan, output_dir }
+    }
+
+    /// Validate all common inputs, independent seeds and aggregate work before writing artifacts.
+    ///
+    /// # Errors
+    ///
+    /// Refuses empty/duplicate seed lists, unsupported study inputs, or total work exceeding the
+    /// same transition budget as a single study. Replication never multiplies the allowed budget.
+    pub fn validate(&self) -> Result<(), BranchStudyError> {
+        if self.plan.seeds.is_empty() {
+            return Err(BranchStudyError::InvalidPlan(
+                "replicated study requires at least one explicit seed".to_owned(),
+            ));
+        }
+        enforce_study_limit(
+            "replicate count",
+            self.plan.seeds.len() as u64,
+            MAX_STUDY_REPLICATES as u64,
+        )?;
+        let mut unique = BTreeSet::new();
+        for &seed in &self.plan.seeds {
+            if !unique.insert(seed) {
+                return Err(BranchStudyError::InvalidPlan(format!(
+                    "duplicate replicate seed {seed}; repeated seeds are not independent pairs"
+                )));
+            }
+        }
+        enforce_study_limit(
+            "replicated total transitions",
+            self.total_transitions()?,
+            MAX_STUDY_TOTAL_TRANSITIONS,
+        )?;
+        // Seed values themselves have no restricted range. All geometry, branches, schedules,
+        // brain registration and per-world limits are validated by the same production preflight.
+        BranchStudyOrchestrator::new(self.plan.study.clone(), self.output_dir.clone()).validate()
+    }
+
+    fn total_transitions(&self) -> Result<u64, BranchStudyError> {
+        self.plan
+            .study
+            .total_transitions()?
+            .checked_mul(self.plan.seeds.len() as u64)
+            .ok_or_else(|| {
+                BranchStudyError::InvalidPlan("replicated study work count overflows".to_owned())
+            })
+    }
+
+    fn replicate_plan(&self, seed: u64) -> BranchStudyPlan {
+        let mut plan = self.plan.study.clone();
+        plan.base_seed = seed;
+        plan.config.rng_seed = Some(seed);
+        plan
+    }
+
+    /// Run all declared pairs and publish endpoint inference only after complete success.
+    ///
+    /// # Errors
+    ///
+    /// Retains the exact plan and completed/partial seed outputs on refusal, failure or
+    /// cancellation. No aggregate success report is written for an incomplete seed set.
+    pub fn execute_study(
+        &self,
+        cancellation: Option<&AtomicBool>,
+    ) -> Result<ReplicatedBranchStudyReport, BranchStudyError> {
+        self.validate()?;
+        check_study_cancellation(cancellation)?;
+        reserve_study_output(&self.output_dir, &serde_json::to_vec_pretty(&self.plan)?)?;
+
+        let mut replicates = Vec::with_capacity(self.plan.seeds.len());
+        for &seed in &self.plan.seeds {
+            check_study_cancellation(cancellation)?;
+            let directory = format!("seed_{seed:016x}");
+            // Each call constructs its own founders, captures its own checkpoint, and verifies
+            // restoration separately for every branch. No checkpoint is shared across seeds.
+            let report = BranchStudyOrchestrator::new(
+                self.replicate_plan(seed),
+                self.output_dir.join(&directory),
+            )
+            .execute_study(cancellation)
+            .map_err(|source| BranchStudyError::ReplicateFailed {
+                seed,
+                source: Box::new(source),
+            })?;
+            replicates.push(BranchStudyReplicate {
+                seed,
+                report_path: format!("{directory}/study_report.json"),
+                report,
+            });
+        }
+        check_study_cancellation(cancellation)?;
+        let endpoint_effects = self.aggregate_endpoints(&replicates)?;
+        let mut report = ReplicatedBranchStudyReport {
+            schema_version: REPLICATED_BRANCH_STUDY_REPORT_SCHEMA_VERSION,
+            plan: self.plan.clone(),
+            endpoint_tick: self.plan.study.final_tick()?,
+            total_transitions: self.total_transitions()?,
+            replicates,
+            endpoint_effects,
+            summary_markdown: String::new(),
+        };
+        report.summary_markdown = replicated_summary(&report);
+        let report_json = serde_json::to_vec_pretty(&report)?;
+        enforce_study_limit(
+            "replicated report bytes",
+            report_json.len() as u64,
+            MAX_STUDY_ARTIFACT_BYTES,
+        )?;
+        check_study_cancellation(cancellation)?;
+        write_new_study_artifact(
+            &self.output_dir.join("replicated_summary.md"),
+            report.summary_markdown.as_bytes(),
+        )?;
+        check_study_cancellation(cancellation)?;
+        write_new_study_artifact(
+            &self.output_dir.join("replicated_report.json"),
+            &report_json,
+        )?;
+        Ok(report)
+    }
+
+    fn aggregate_endpoints(
+        &self,
+        replicates: &[BranchStudyReplicate],
+    ) -> Result<BTreeMap<String, BTreeMap<String, BranchEffectSize>>, BranchStudyError> {
+        let control_id = self
+            .plan
+            .study
+            .branches
+            .iter()
+            .find(|branch| branch.intervention.is_none())
+            .ok_or(BranchStudyError::MissingControlBranch)?
+            .branch_id
+            .as_str();
+        self.validate_replicate_results(replicates, control_id)?;
+        let mut effects = BTreeMap::new();
+        for branch in &self.plan.study.branches {
+            if branch.branch_id == control_id {
+                continue;
+            }
+            let mut control_values = [Vec::new(), Vec::new(), Vec::new()];
+            let mut branch_values = [Vec::new(), Vec::new(), Vec::new()];
+            for replicate in replicates {
+                let endpoints = &replicate.report.branch_reports;
+                let control = endpoints
+                    .iter()
+                    .find(|result| result.branch_id == control_id)
+                    .ok_or(BranchStudyError::MissingControlBranch)?;
+                let treatment = endpoints
+                    .iter()
+                    .find(|result| result.branch_id == branch.branch_id)
+                    .ok_or_else(|| {
+                        BranchStudyError::InvalidComparison(format!(
+                            "seed {} is missing branch {}",
+                            replicate.seed, branch.branch_id
+                        ))
+                    })?;
+                for (values, sample) in [
+                    (&mut control_values, &control.terminal_sample),
+                    (&mut branch_values, &treatment.terminal_sample),
+                ] {
+                    // Population has already passed the 10,000-agent product limit.
+                    let population = u32::try_from(sample.population).map_err(|_| {
+                        BranchStudyError::InvalidComparison(
+                            "endpoint population overflows".to_owned(),
+                        )
+                    })?;
+                    values[0].push(f64::from(population));
+                    values[1].push(sample.food_total);
+                    values[2].push(f64::from(sample.total_energy));
+                }
+            }
+            let mut metrics = BTreeMap::new();
+            for (index, metric) in ["population", "food_total", "total_energy"]
+                .iter()
+                .enumerate()
+            {
+                metrics.insert(
+                    (*metric).to_owned(),
+                    compute_paired_effect(
+                        &control_values[index],
+                        &branch_values[index],
+                        metric,
+                        self.plan.study.base_seed,
+                    )?,
+                );
+            }
+            effects.insert(branch.branch_id.clone(), metrics);
+        }
+        Ok(effects)
+    }
+
+    fn validate_replicate_results(
+        &self,
+        replicates: &[BranchStudyReplicate],
+        control_id: &str,
+    ) -> Result<(), BranchStudyError> {
+        if replicates.len() != self.plan.seeds.len() || replicates.is_empty() {
+            return Err(BranchStudyError::InvalidComparison(
+                "replicate set is incomplete; no partial inference is published".to_owned(),
+            ));
+        }
+        let endpoint_tick = self.plan.study.final_tick()?;
+        let expected_branches: BTreeSet<_> = self
+            .plan
+            .study
+            .branches
+            .iter()
+            .map(|branch| branch.branch_id.as_str())
+            .collect();
+        for (&seed, replicate) in self.plan.seeds.iter().zip(replicates) {
+            let report = &replicate.report;
+            if replicate.seed != seed
+                || report.base_seed != seed
+                || report.schema_version != BRANCH_STUDY_REPORT_SCHEMA_VERSION
+                || report.study_id != self.plan.study.study_id
+                || report.checkpoint_tick != self.plan.study.checkpoint_tick
+                || report.horizon_ticks != self.plan.study.horizon_ticks
+                || report.control_branch_id != control_id
+                || !report.pre_intervention_digest_verified_for_all_branches
+                || report.pre_intervention_digest.is_empty()
+                || report.branch_reports.len() != expected_branches.len()
+            {
+                return Err(BranchStudyError::InvalidComparison(format!(
+                    "replicate seed {seed} does not match its declared study inputs"
+                )));
+            }
+            let mut found = BTreeSet::new();
+            for branch in &report.branch_reports {
+                let sample = &branch.terminal_sample;
+                if !expected_branches.contains(branch.branch_id.as_str())
+                    || !found.insert(branch.branch_id.as_str())
+                    || !branch.bundle_verified
+                    || branch.bundle_path.is_none()
+                    || sample.tick != endpoint_tick
+                    || sample.digest_overall.is_empty()
+                    || sample.digest_overall != branch.final_digest
+                    || sample.population != branch.extinction.final_population
+                    || sample.population as u64 > MAX_STUDY_POPULATION
+                    || !sample.food_total.is_finite()
+                    || !sample.total_energy.is_finite()
+                {
+                    return Err(BranchStudyError::InvalidComparison(format!(
+                        "replicate seed {seed} branch {} lacks a verified terminal endpoint",
+                        branch.branch_id
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn check_study_cancellation(cancellation: Option<&AtomicBool>) -> Result<(), BranchStudyError> {
+    if cancellation.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+        Err(BranchStudyError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+fn replicated_summary(report: &ReplicatedBranchStudyReport) -> String {
+    let mut markdown = format!(
+        "# Replicated Checkpoint Study: {}\n\n{}\n\n\
+         **Analysis basis**: {} independently initialized matched seed pairs. Each pair contributes \
+         exactly one terminal observation at tick {} for population, food total and total energy. \
+         Repeated ticks are not independent replicates.\n\n\
+         Seeds, in execution order: `{:?}`. Statistical resampling seed: `{}`. \
+         Total admitted simulation transitions: `{}`.\n\n\
+         Intervals are 95% paired bootstrap intervals; p-values use the two-sided paired sign-flip \
+         test. Both use 1,000 seeded resamples and are unadjusted for multiple endpoint or branch \
+         comparisons. Seed choices define the sampled simulation ensemble; no population-wide \
+         biological claim or automatic winner decision is made. One seed remains descriptive \
+         and has no interval or p-value.\n\n\
+         | Branch | Terminal metric | Independent pairs | Mean treatment − control | 95% interval | p-value |\n\
+         |---|---|---:|---:|---|---:|\n",
+        report.plan.study.study_id,
+        report.plan.study.description,
+        report.replicates.len(),
+        report.endpoint_tick,
+        report.plan.seeds,
+        report.plan.study.base_seed,
+        report.total_transitions,
+    );
+    for (branch, metrics) in &report.endpoint_effects {
+        for (metric, effect) in metrics {
+            let interval = effect.ci_95.map_or_else(
+                || "unavailable".to_owned(),
+                |(lower, upper)| format!("[{lower:.6}, {upper:.6}]"),
+            );
+            let p_value = effect
+                .p_value
+                .map_or_else(|| "unavailable".to_owned(), |value| format!("{value:.6}"));
+            markdown.push_str(&format!(
+                "| {branch} | {metric} | {} | {:.6} | {interval} | {p_value} |\n",
+                effect.n_samples, effect.mean_diff,
+            ));
+        }
+    }
+    markdown.push_str("\n## Independent checkpoint evidence\n\n| Seed | Shared checkpoint digest | Per-seed report |\n|---:|---|---|\n");
+    for replicate in &report.replicates {
+        markdown.push_str(&format!(
+            "| {} | `{}` | [{}]({}) |\n",
+            replicate.seed,
+            replicate.report.pre_intervention_digest,
+            replicate.report_path,
+            replicate.report_path,
+        ));
+    }
+    markdown
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2041,6 +2434,228 @@ mod tests {
             world.step().expect("advance to checkpoint");
         }
         world
+    }
+
+    fn replicated_fixture() -> ReplicatedBranchStudyPlan {
+        let mut study = BranchStudyPlan::standard_five_branch("replicated-endpoints", 19, 2, 4);
+        study.brain_preset = BrainPreset::Mlp;
+        study.config.world_width = 480;
+        study.config.world_height = 480;
+        study.config.food_cell_size = 40;
+        study.config.initial_food = study.config.food_max;
+        study.config.population_minimum = 0;
+        study.config.population_spawn_interval = 0;
+        study.config.reproduction_attempt_chance = 0.0;
+        study
+            .branches
+            .retain(|branch| matches!(branch.branch_id.as_str(), "control" | "resource_shock"));
+        let shock = study
+            .branches
+            .iter_mut()
+            .find(|branch| branch.branch_id == "resource_shock")
+            .unwrap();
+        shock.intervention = Some(StudyIntervention::ResourceShock {
+            region: None,
+            bloom_amount: 0.0,
+            scorch: 0.5,
+        });
+        shock.scheduled_tick = Some(4);
+        ReplicatedBranchStudyPlan {
+            study,
+            seeds: vec![42, 137],
+        }
+    }
+
+    #[test]
+    fn replicated_study_refuses_duplicate_seeds_and_bounds_total_work_before_output() {
+        let directory = tempdir().unwrap();
+        let output = directory.path().join("not-reserved");
+        let plan = replicated_fixture();
+        for seeds in [vec![], vec![42, 42]] {
+            let invalid = ReplicatedBranchStudyPlan {
+                seeds,
+                ..plan.clone()
+            };
+            assert!(matches!(
+                ReplicatedBranchStudyOrchestrator::new(invalid, output.clone()).execute_study(None),
+                Err(BranchStudyError::InvalidPlan(_))
+            ));
+            assert!(!output.exists());
+        }
+        let too_many = ReplicatedBranchStudyPlan {
+            seeds: (0..=MAX_STUDY_REPLICATES as u64).collect(),
+            ..plan.clone()
+        };
+        assert!(matches!(
+            ReplicatedBranchStudyOrchestrator::new(too_many, output.clone()).execute_study(None),
+            Err(BranchStudyError::CapacityExceeded {
+                resource: "replicate count",
+                ..
+            })
+        ));
+        let mut at_limit = plan;
+        at_limit.study.checkpoint_tick = MAX_STUDY_TOTAL_TRANSITIONS / 2 - 8;
+        at_limit.study.branches[1].scheduled_tick = None;
+        ReplicatedBranchStudyOrchestrator::new(at_limit.clone(), output.clone())
+            .validate()
+            .expect("aggregate exact transition limit");
+        at_limit.study.checkpoint_tick += 1;
+        assert!(matches!(
+            ReplicatedBranchStudyOrchestrator::new(at_limit, output.clone()).execute_study(None),
+            Err(BranchStudyError::CapacityExceeded {
+                resource: "replicated total transitions",
+                ..
+            })
+        ));
+        assert!(
+            !output.exists(),
+            "no rejected plan reserves its destination"
+        );
+    }
+
+    #[test]
+    fn replicated_study_uses_real_independent_endpoints_and_rejects_incomplete_evidence() {
+        let directory = tempdir().unwrap();
+        let plan = replicated_fixture();
+        let orchestrator =
+            ReplicatedBranchStudyOrchestrator::new(plan.clone(), directory.path().join("study"));
+        let report = orchestrator.execute_study(None).unwrap();
+        assert_eq!(report.endpoint_tick, 6);
+        assert_eq!(report.total_transitions, 20);
+        assert_eq!(report.replicates.len(), 2);
+        assert_ne!(
+            report.replicates[0].report.pre_intervention_digest,
+            report.replicates[1].report.pre_intervention_digest,
+            "independent founders must not reuse one checkpoint"
+        );
+        let mut observed_food_difference = 0.0;
+        for (&seed, replicate) in plan.seeds.iter().zip(&report.replicates) {
+            assert_eq!(replicate.seed, seed);
+            assert_eq!(replicate.report.base_seed, seed);
+            let branches = &replicate.report.branch_reports;
+            let control = branches
+                .iter()
+                .find(|branch| branch.branch_id == "control")
+                .unwrap();
+            let shock = branches
+                .iter()
+                .find(|branch| branch.branch_id == "resource_shock")
+                .unwrap();
+            observed_food_difference +=
+                shock.terminal_sample.food_total - control.terminal_sample.food_total;
+            for branch in branches {
+                let evidence: serde_json::Value = serde_json::from_slice(
+                    &fs::read(
+                        Path::new(branch.bundle_path.as_deref().unwrap())
+                            .join("evidence/branch_evidence.json"),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    evidence["terminal_sample"],
+                    serde_json::to_value(&branch.terminal_sample).unwrap()
+                );
+                assert_eq!(branch.terminal_sample.tick, report.endpoint_tick);
+                assert_eq!(branch.terminal_sample.digest_overall, branch.final_digest);
+                for effect in branch.effect_sizes.values() {
+                    assert_eq!(effect.n_samples, 5);
+                    assert!(effect.ci_95.is_none() && effect.p_value.is_none());
+                }
+            }
+        }
+        let effects = &report.endpoint_effects["resource_shock"];
+        assert_eq!(effects.len(), 3);
+        assert_eq!(
+            effects["food_total"].mean_diff,
+            observed_food_difference / 2.0
+        );
+        assert!(
+            effects["food_total"].mean_diff < 0.0,
+            "observed shock must deplete food"
+        );
+        for effect in effects.values() {
+            assert_eq!(effect.n_samples, 2);
+            assert_eq!(
+                effect.analysis_basis,
+                BranchAnalysisBasis::IndependentPairedReplicates { pairs: 2 }
+            );
+            assert!(effect.ci_95.is_some() && effect.p_value.is_some());
+        }
+        assert!(
+            orchestrator
+                .aggregate_endpoints(&report.replicates[..1])
+                .is_err()
+        );
+        let mut altered = report.replicates.clone();
+        altered[1].report.base_seed = altered[0].report.base_seed;
+        assert!(orchestrator.aggregate_endpoints(&altered).is_err());
+        let mut altered = report.replicates.clone();
+        altered[0].report.branch_reports[1].terminal_sample.tick -= 1;
+        assert!(orchestrator.aggregate_endpoints(&altered).is_err());
+        let mut altered = report.replicates.clone();
+        altered[0].report.branch_reports[1]
+            .terminal_sample
+            .total_energy = f32::NAN;
+        assert!(orchestrator.aggregate_endpoints(&altered).is_err());
+        let mut altered = report.replicates.clone();
+        altered[0].report.branch_reports[1].bundle_verified = false;
+        assert!(orchestrator.aggregate_endpoints(&altered).is_err());
+
+        let retained = fs::read(orchestrator.output_dir.join("replicated_report.json")).unwrap();
+        assert!(matches!(
+            orchestrator.execute_study(None),
+            Err(BranchStudyError::OutputAlreadyExists { .. })
+        ));
+        assert_eq!(
+            fs::read(orchestrator.output_dir.join("replicated_report.json")).unwrap(),
+            retained
+        );
+        let singleton = ReplicatedBranchStudyOrchestrator::new(
+            ReplicatedBranchStudyPlan {
+                seeds: vec![42],
+                ..plan
+            },
+            directory.path().join("not-executed"),
+        );
+        let effects = singleton
+            .aggregate_endpoints(&report.replicates[..1])
+            .unwrap();
+        for effect in effects["resource_shock"].values() {
+            assert_eq!(effect.n_samples, 1);
+            assert!(effect.ci_95.is_none() && effect.p_value.is_none());
+        }
+    }
+
+    #[test]
+    fn replicated_study_cancellation_and_partial_destination_never_publish_aggregate_success() {
+        let directory = tempdir().unwrap();
+        let output = directory.path().join("cancelled");
+        let plan = replicated_fixture();
+        let orchestrator = ReplicatedBranchStudyOrchestrator::new(plan.clone(), output.clone());
+        assert!(matches!(
+            orchestrator.execute_study(Some(&AtomicBool::new(true))),
+            Err(BranchStudyError::Cancelled)
+        ));
+        assert!(!output.exists());
+
+        // A retained first seed from an interrupted/partial study is never silently resumed or
+        // promoted to complete inference. Its exact outputs survive the refusal.
+        let first = BranchStudyOrchestrator::new(
+            orchestrator.replicate_plan(42),
+            output.join("seed_000000000000002a"),
+        );
+        first.execute_study(None).unwrap();
+        let retained = fs::read(first.output_dir.join("study_report.json")).unwrap();
+        assert!(matches!(
+            orchestrator.execute_study(None),
+            Err(BranchStudyError::OutputAlreadyExists { .. })
+        ));
+        assert_eq!(
+            fs::read(first.output_dir.join("study_report.json")).unwrap(),
+            retained
+        );
+        assert!(!output.join("replicated_report.json").exists());
     }
 
     #[test]

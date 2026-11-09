@@ -3780,13 +3780,20 @@ pub struct BranchStudyArgs {
         conflicts_with = "example"
     )]
     pub out: Option<PathBuf>,
+    /// Run independent matched pairs for these unique seeds (comma-separated, at most 32).
+    /// The plan's base_seed then seeds statistical resampling, not an additional replicate.
+    #[arg(long, value_delimiter = ',', num_args = 1.., conflicts_with = "example")]
+    pub seeds: Option<Vec<u64>>,
     /// Print an editable five-intervention example plan as JSON without running a study.
-    #[arg(long, conflicts_with_all = ["plan", "out"])]
+    #[arg(long, conflicts_with_all = ["plan", "out", "seeds"])]
     pub example: bool,
 }
 
 fn run_branch_study_subcommand(args: &BranchStudyArgs) -> Result<()> {
-    use scriptbots_app::branch_study::{BranchStudyOrchestrator, BranchStudyPlan};
+    use scriptbots_app::branch_study::{
+        BranchStudyOrchestrator, BranchStudyPlan, ReplicatedBranchStudyOrchestrator,
+        ReplicatedBranchStudyPlan,
+    };
     use std::io::Read as _;
 
     if args.example {
@@ -3824,14 +3831,28 @@ fn run_branch_study_subcommand(args: &BranchStudyArgs) -> Result<()> {
     }
     let plan: BranchStudyPlan = serde_json::from_slice(&bytes)
         .with_context(|| format!("invalid study plan {}", plan_path.display()))?;
-    let report = BranchStudyOrchestrator::new(plan, output_dir.clone())
+    let report_name = if let Some(seeds) = &args.seeds {
+        let report = ReplicatedBranchStudyOrchestrator::new(
+            ReplicatedBranchStudyPlan {
+                study: plan,
+                seeds: seeds.clone(),
+            },
+            output_dir.clone(),
+        )
         .execute_study(None)
-        .context("checkpoint branch study failed; any existing artifacts were preserved")?;
-    print!("{}", report.summary_markdown);
-    println!(
-        "\nReport: {}",
-        output_dir.join("study_report.json").display()
-    );
+        .context(
+            "replicated checkpoint study failed; any completed or partial artifacts were preserved",
+        )?;
+        print!("{}", report.summary_markdown);
+        "replicated_report.json"
+    } else {
+        let report = BranchStudyOrchestrator::new(plan, output_dir.clone())
+            .execute_study(None)
+            .context("checkpoint branch study failed; any existing artifacts were preserved")?;
+        print!("{}", report.summary_markdown);
+        "study_report.json"
+    };
+    println!("\nReport: {}", output_dir.join(report_name).display());
     println!("Plan: {}", output_dir.join("study_plan.json").display());
     Ok(())
 }
@@ -7916,7 +7937,8 @@ mod tests {
             Some(AppSubcommand::BranchStudy(BranchStudyArgs {
                 example: true,
                 plan: None,
-                out: None
+                out: None,
+                seeds: None,
             }))
         ));
         let run = AppCli::try_parse_from([
@@ -7933,7 +7955,8 @@ mod tests {
             Some(AppSubcommand::BranchStudy(BranchStudyArgs {
                 example: false,
                 plan: Some(_),
-                out: Some(_)
+                out: Some(_),
+                seeds: None,
             }))
         ));
         for arguments in [
@@ -7954,8 +7977,49 @@ mod tests {
                 "--out",
                 "study-output",
             ],
+            vec![
+                "scriptbots-app",
+                "branch-study",
+                "--example",
+                "--seeds",
+                "42",
+            ],
         ] {
             assert!(AppCli::try_parse_from(arguments).is_err());
+        }
+    }
+
+    #[test]
+    fn branch_study_cli_parses_explicit_replicate_seeds_without_losing_u64_precision() {
+        let run = AppCli::try_parse_from([
+            "scriptbots-app",
+            "branch-study",
+            "--plan",
+            "plan.json",
+            "--out",
+            "study-output",
+            "--seeds",
+            "42,137,18446744073709551615",
+        ])
+        .expect("explicit independent seed list");
+        let Some(AppSubcommand::BranchStudy(args)) = run.subcommand else {
+            panic!("branch study command");
+        };
+        assert_eq!(args.seeds, Some(vec![42, 137, u64::MAX]));
+        for seeds in ["", "42,", "-1", "18446744073709551616"] {
+            assert!(
+                AppCli::try_parse_from([
+                    "scriptbots-app",
+                    "branch-study",
+                    "--plan",
+                    "plan.json",
+                    "--out",
+                    "study-output",
+                    "--seeds",
+                    seeds,
+                ])
+                .is_err()
+            );
         }
     }
 

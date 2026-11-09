@@ -20,7 +20,8 @@ use std::time::Duration;
 
 use scriptbots_app::branch_study::{
     BRANCH_STUDY_REPORT_SCHEMA_VERSION, BranchAnalysisBasis, BranchStudyOrchestrator,
-    BranchStudyPlan, BranchStudyReport, CooperationParams, StudyBranchSpec, StudyIntervention,
+    BranchStudyPlan, BranchStudyReport, CooperationParams, ReplicatedBranchStudyPlan,
+    ReplicatedBranchStudyReport, StudyBranchSpec, StudyIntervention,
 };
 use scriptbots_app::experiment_runner::MatchedSeedExperimentRunner;
 use scriptbots_storage::bundle::{RunBundleVerificationLimits, verify_run_bundle_bounded};
@@ -514,6 +515,18 @@ fn verify_cli_study(output: &Path, plan: &BranchStudyPlan) -> BranchStudyReport 
         assert_eq!(samples[0].digest, report.pre_intervention_digest);
         assert_eq!(samples.last().unwrap().digest, branch.final_digest);
         assert_eq!(
+            branch.terminal_sample.tick,
+            plan.checkpoint_tick + plan.horizon_ticks
+        );
+        assert_eq!(
+            branch.terminal_sample.population,
+            samples.last().unwrap().population
+        );
+        assert_eq!(
+            branch.terminal_sample.digest_overall,
+            samples.last().unwrap().digest
+        );
+        assert_eq!(
             samples.iter().map(|sample| sample.tick).collect::<Vec<_>>(),
             (plan.checkpoint_tick..=plan.checkpoint_tick + plan.horizon_ticks).collect::<Vec<_>>(),
         );
@@ -526,6 +539,10 @@ fn verify_cli_study(output: &Path, plan: &BranchStudyPlan) -> BranchStudyReport 
         assert_eq!(evidence["branch_id"], branch.branch_id);
         assert_eq!(evidence["base_seed"], plan.base_seed);
         assert_eq!(evidence["checkpoint_tick"], plan.checkpoint_tick);
+        assert_eq!(
+            evidence["terminal_sample"],
+            serde_json::to_value(&branch.terminal_sample).unwrap()
+        );
         assert_eq!(
             evidence["intervention"],
             serde_json::to_value(&spec.intervention).unwrap()
@@ -695,6 +712,199 @@ fn branch_study_cli_refuses_invalid_and_oversized_plans_before_creating_output()
         assert!(
             !output.exists(),
             "invalid plans must not reserve study output"
+        );
+    }
+}
+
+#[test]
+fn replicated_branch_study_cli_retains_independent_pairs_and_reproducible_endpoint_inference() {
+    let root = tempdir().expect("replicated CLI study");
+    let mut plan = tiny_cli_plan(BranchStudyPlan::standard_five_branch(
+        "replicated-cli",
+        19,
+        2,
+        4,
+    ));
+    plan.branches
+        .retain(|branch| matches!(branch.branch_id.as_str(), "control" | "resource_shock"));
+    let plan_path = root.path().join("plan.json");
+    fs::write(&plan_path, serde_json::to_vec_pretty(&plan).unwrap()).unwrap();
+
+    let mut reports = Vec::new();
+    for label in ["replicated-first", "replicated-second"] {
+        let output = root.path().join(label);
+        let capture = run_branch_cli(
+            root.path(),
+            label,
+            &[
+                OsStr::new("--plan"),
+                plan_path.as_os_str(),
+                OsStr::new("--out"),
+                output.as_os_str(),
+                OsStr::new("--seeds"),
+                OsStr::new("42,137"),
+            ],
+            true,
+        );
+        let report: ReplicatedBranchStudyReport =
+            serde_json::from_slice(&fs::read(output.join("replicated_report.json")).unwrap())
+                .unwrap();
+        let retained_plan: ReplicatedBranchStudyPlan =
+            serde_json::from_slice(&fs::read(output.join("study_plan.json")).unwrap()).unwrap();
+        assert_eq!(retained_plan, report.plan);
+        assert_eq!(report.plan.study, plan);
+        assert_eq!(report.plan.seeds, [42, 137]);
+        assert_eq!(
+            report.replicates.len(),
+            2,
+            "resampling seed is not an extra replicate"
+        );
+        assert_eq!(report.total_transitions, 20);
+        assert_eq!(report.endpoint_tick, 6);
+        assert!(!output.join("study_report.json").exists());
+        assert!(
+            diagnostic(&capture.stdout).contains("2 independently initialized matched seed pairs")
+        );
+        assert_eq!(
+            fs::read_to_string(output.join("replicated_summary.md")).unwrap(),
+            report.summary_markdown
+        );
+        assert_ne!(
+            report.replicates[0].report.pre_intervention_digest,
+            report.replicates[1].report.pre_intervention_digest
+        );
+        let mut measured_differences = [0.0; 3];
+        for replicate in &report.replicates {
+            let mut seed_plan = plan.clone();
+            seed_plan.base_seed = replicate.seed;
+            seed_plan.config.rng_seed = Some(replicate.seed);
+            let seed_output = output.join(format!("seed_{:016x}", replicate.seed));
+            let independent = verify_cli_study(&seed_output, &seed_plan);
+            assert_eq!(independent, replicate.report);
+            assert_eq!(
+                output.join(&replicate.report_path),
+                seed_output.join("study_report.json")
+            );
+            let control = independent
+                .branch_reports
+                .iter()
+                .find(|branch| branch.branch_id == "control")
+                .unwrap();
+            let shock = independent
+                .branch_reports
+                .iter()
+                .find(|branch| branch.branch_id == "resource_shock")
+                .unwrap();
+            measured_differences[0] +=
+                shock.terminal_sample.population as f64 - control.terminal_sample.population as f64;
+            measured_differences[1] +=
+                shock.terminal_sample.food_total - control.terminal_sample.food_total;
+            measured_differences[2] += f64::from(shock.terminal_sample.total_energy)
+                - f64::from(control.terminal_sample.total_energy);
+        }
+        for (index, metric) in ["population", "food_total", "total_energy"]
+            .iter()
+            .enumerate()
+        {
+            let effect = &report.endpoint_effects["resource_shock"][*metric];
+            assert_eq!(effect.n_samples, 2);
+            assert_eq!(
+                effect.analysis_basis,
+                BranchAnalysisBasis::IndependentPairedReplicates { pairs: 2 }
+            );
+            assert_eq!(effect.mean_diff, measured_differences[index] / 2.0);
+            assert!(effect.ci_95.is_some() && effect.p_value.is_some());
+        }
+        reports.push(report);
+    }
+    assert_eq!(
+        reports[0].endpoint_effects, reports[1].endpoint_effects,
+        "seeded resampling and observations repeat exactly"
+    );
+    for (left, right) in reports[0].replicates.iter().zip(&reports[1].replicates) {
+        assert_eq!(
+            left.report.pre_intervention_digest,
+            right.report.pre_intervention_digest
+        );
+        for (left, right) in left
+            .report
+            .branch_reports
+            .iter()
+            .zip(&right.report.branch_reports)
+        {
+            assert_eq!(left.terminal_sample, right.terminal_sample);
+        }
+    }
+
+    let occupied = root.path().join("replicated-first");
+    let before = retained_study_bytes(&occupied);
+    let refusal = run_branch_cli(
+        root.path(),
+        "replicated-occupied",
+        &[
+            OsStr::new("--plan"),
+            plan_path.as_os_str(),
+            OsStr::new("--out"),
+            occupied.as_os_str(),
+            OsStr::new("--seeds"),
+            OsStr::new("42,137"),
+        ],
+        false,
+    );
+    assert!(diagnostic(&refusal.stderr).contains("already occupied"));
+    assert_eq!(retained_study_bytes(&occupied), before);
+}
+
+#[test]
+fn replicated_branch_study_cli_refuses_duplicate_seeds_and_aggregate_work_before_output() {
+    let root = tempdir().unwrap();
+    let mut plan = tiny_cli_plan(BranchStudyPlan::standard_five_branch(
+        "replicated-refusal",
+        19,
+        2,
+        4,
+    ));
+    plan.branches
+        .retain(|branch| matches!(branch.branch_id.as_str(), "control" | "resource_shock"));
+    let valid_path = root.path().join("valid.json");
+    fs::write(&valid_path, serde_json::to_vec_pretty(&plan).unwrap()).unwrap();
+    let mut too_large = plan;
+    too_large.checkpoint_tick = scriptbots_app::branch_study::MAX_STUDY_TOTAL_TRANSITIONS / 2;
+    too_large.branches[1].scheduled_tick = None;
+    let work_path = root.path().join("aggregate-limit.json");
+    fs::write(&work_path, serde_json::to_vec_pretty(&too_large).unwrap()).unwrap();
+    for (label, path, seeds, message) in [
+        (
+            "duplicate",
+            &valid_path,
+            "42,42",
+            "duplicate replicate seed",
+        ),
+        (
+            "aggregate-work",
+            &work_path,
+            "42,137",
+            "replicated total transitions",
+        ),
+    ] {
+        let output = root.path().join(format!("{label}-output"));
+        let refusal = run_branch_cli(
+            root.path(),
+            label,
+            &[
+                OsStr::new("--plan"),
+                path.as_os_str(),
+                OsStr::new("--out"),
+                output.as_os_str(),
+                OsStr::new("--seeds"),
+                OsStr::new(seeds),
+            ],
+            false,
+        );
+        assert!(diagnostic(&refusal.stderr).contains(message));
+        assert!(
+            !output.exists(),
+            "refused replicated study must not claim an output"
         );
     }
 }

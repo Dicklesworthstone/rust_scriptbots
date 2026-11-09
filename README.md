@@ -812,14 +812,44 @@ checkpoint. The report records the observed application tick. Divergence compare
 control and treatment digests at the same tick and identifies a differing digest
 lane, without claiming to identify an internal transition stage.
 
-Branch reports use schema **2**. Each comparison declares
+Branch reports use schema **3**, including an exact `terminal_sample` in both the
+report and branch evidence JSON. Each trajectory comparison declares
 `analysis_basis.kind = "single_seed_trajectory"`: one seed supplies one independent
 pair, even when many ticks are recorded. The report includes trajectory mean
 differences and temporal spread, and omits confidence intervals, standardized
 inferential effects and p-values. Recovery and extinction use the observed
-population at the actual intervention boundary. The separate
-`compute_paired_effect` helper accepts independent matched replicates and now
-returns a `Result`, refusing unequal or non-finite observations.
+population at the actual intervention boundary.
+
+To compare terminal outcomes across independently initialized matched seed pairs,
+add an explicit seed list to the same plan:
+
+```bash
+scriptbots-app branch-study --plan study-plan.json \
+  --out runs/replicated-checkpoint-study --seeds 42,137,999
+```
+
+Each seed constructs its own founders and checkpoint, then restores its control
+and treatment branches from that checkpoint. The list accepts at most 32 unique
+`u64` seeds; duplicates are refused because rerunning the same seed does not add an
+independent pair. With `--seeds`, the plan's `base_seed` controls deterministic
+statistical resampling and is not added to the replicate list. Execution follows
+the declared seed order and runs one seed at a time. The existing 1,000,000
+transition budget covers **all seeds combined**.
+
+Replicated runs save `study_plan.json`, `replicated_report.json` (schema **1**),
+`replicated_summary.md`, and the complete per-seed studies under
+`seed_<16-digit-hex-seed>/`. The aggregate retains each seed's checkpoint digest,
+terminal observations and report location. For each treatment, exactly one final
+population, food-total and total-energy observation per seed enters the paired
+analysis; the statistical sample count is the seed count. Two or more seeds
+enable 95% paired bootstrap intervals and two-sided sign-flip p-values, each with
+1,000 seeded resamples. These are individual endpoint comparisons without a
+multiple-comparison correction or automatic winner decision. A one-seed list
+produces descriptive effects without inferential intervals or p-values.
+
+The aggregate success report is written only after every requested seed and its
+branch bundles complete. A failed or cancelled study retains its exact inputs
+and completed or partial seed outputs; reruns require a new output directory.
 
 Branch bundle verification checks retained artifact integrity. It does not claim
 to restore a complete application owner or reproduce the study from the bundle.
