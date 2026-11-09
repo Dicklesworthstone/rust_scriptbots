@@ -850,6 +850,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
     .init_resource::<InspectorPage>()
     .init_resource::<HudDiagnostics>()
     .init_resource::<HudDisplaySettings>()
+    .init_resource::<HudFollowMenu>()
     .insert_non_send_resource(BevyLifecycleFailureInbox {
         receiver: failure_rx,
         first_failure: Arc::clone(&first_worker_failure),
@@ -898,6 +899,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
                 handle_playback_buttons,
                 handle_hud_diagnostics,
                 handle_display_settings,
+                handle_follow_menu,
                 scroll_hud_panel,
             ),
             handle_tonemap_mode_buttons,
@@ -3490,8 +3492,68 @@ struct HudDisplaySettingsButton;
 #[derive(Component)]
 struct HudDisplaySettingsPanel;
 
+#[derive(Resource, Default)]
+struct HudFollowMenu(bool);
+
+#[derive(Component)]
+struct HudFollowMenuButton;
+
+#[derive(Component)]
+struct HudFollowMenuLabel;
+
+#[derive(Component)]
+struct HudFollowMenuPanel;
+
 #[derive(Component)]
 struct HudDiagnosticsPageControls;
+
+fn handle_follow_menu(
+    (mut menu, rig): (ResMut<HudFollowMenu>, Res<CameraRig>),
+    changed: Query<&Interaction, (Changed<Interaction>, With<HudFollowMenuButton>)>,
+    selections: Query<&Interaction, (Changed<Interaction>, With<FollowButton>)>,
+    clear: Query<&Interaction, (Changed<Interaction>, With<ClearSelectionButton>)>,
+    mut buttons: Query<(&Interaction, &mut BackgroundColor), With<HudFollowMenuButton>>,
+    mut panels: Query<&mut Node, With<HudFollowMenuPanel>>,
+    mut labels: Query<&mut Text, With<HudFollowMenuLabel>>,
+) {
+    if changed
+        .iter()
+        .filter(|value| **value == Interaction::Pressed)
+        .count()
+        % 2
+        == 1
+    {
+        menu.0 = !menu.0;
+    }
+    if selections
+        .iter()
+        .chain(clear.iter())
+        .any(|value| *value == Interaction::Pressed)
+    {
+        menu.0 = false;
+    }
+    for mut panel in &mut panels {
+        let desired = if menu.0 { Display::Flex } else { Display::None };
+        if panel.display != desired {
+            panel.display = desired;
+        }
+    }
+    for (interaction, mut color) in &mut buttons {
+        let desired = if menu.0 {
+            follow_active_color()
+        } else if *interaction == Interaction::Hovered {
+            follow_hover_color()
+        } else {
+            follow_idle_color()
+        };
+        if color.0 != desired {
+            color.0 = desired;
+        }
+    }
+    for mut text in &mut labels {
+        set_hud_text_if_changed(&mut text, format!("Follow: {}", rig.follow_mode.label()));
+    }
+}
 
 fn handle_display_settings(
     mut settings: ResMut<HudDisplaySettings>,
@@ -5334,6 +5396,15 @@ fn setup_scene(
         margin: UiRect::axes(Val::Px(0.0), Val::Px(4.0)),
         ..default()
     };
+    let toolbar_button = Node {
+        min_width: Val::Px(0.0),
+        padding: UiRect::axes(Val::Px(6.0), Val::Px(6.0)),
+        ..button_node.clone()
+    };
+    let toolbar_row = Node {
+        column_gap: Val::Px(6.0),
+        ..button_row_node.clone()
+    };
     let button_border_color = Color::srgba(0.34, 0.46, 0.40, 1.0);
 
     // Persistent SOFTWARE RENDERER watermark (bd-2z0.14.3.3 item 4).
@@ -5426,20 +5497,30 @@ fn setup_scene(
             ui_font(13.0),
             TextColor(Color::srgb(0.62, 0.82, 0.68)),
         ));
-        tick = parent
-            .spawn((
-                Text::new("Tick: --"),
-                primary_font.clone(),
-                TextColor(primary_text_color),
-            ))
-            .id();
-        agents = parent
-            .spawn((
-                Text::new("Agents: --"),
-                primary_font.clone(),
-                TextColor(primary_text_color),
-            ))
-            .id();
+        parent
+            .spawn(Node {
+                flex_direction: FlexDirection::Row,
+                flex_wrap: FlexWrap::Wrap,
+                column_gap: Val::Px(16.0),
+                row_gap: Val::Px(2.0),
+                ..default()
+            })
+            .with_children(|row| {
+                tick = row
+                    .spawn((
+                        Text::new("Tick: --"),
+                        primary_font.clone(),
+                        TextColor(primary_text_color),
+                    ))
+                    .id();
+                agents = row
+                    .spawn((
+                        Text::new("Agents: --"),
+                        primary_font.clone(),
+                        TextColor(primary_text_color),
+                    ))
+                    .id();
+            });
         selection = parent
             .spawn((
                 Text::new("Selection: --"),
@@ -5820,31 +5901,105 @@ fn setup_scene(
                 }
             });
 
-        parent
-            .spawn((button_row_node.clone(),))
-            .with_children(|row| {
-                for (view, label) in [
-                    (CameraView::Overhead, "Overhead"),
-                    (CameraView::Isometric, "Isometric"),
-                    (CameraView::Low, "Low view"),
+        parent.spawn((toolbar_row,)).with_children(|row| {
+            for (view, label) in [
+                (CameraView::Overhead, "Overhead"),
+                (CameraView::Isometric, "Isometric"),
+                (CameraView::Low, "Low"),
+            ] {
+                row.spawn((
+                    Button,
+                    toolbar_button.clone(),
+                    BackgroundColor(follow_idle_color()),
+                    BorderRadius::all(Val::Px(6.0)),
+                    BorderColor::all(button_border_color),
+                    CameraViewButton(view),
+                ))
+                .with_children(|btn| {
+                    btn.spawn((
+                        Text::new(label),
+                        secondary_font.clone(),
+                        TextColor(secondary_text_color),
+                    ));
+                });
+            }
+            #[derive(Clone, Copy)]
+            enum ToolbarAction {
+                Follow,
+                Settings,
+                Diagnostics,
+            }
+            for (label, kind) in [
+                ("Follow: Off", ToolbarAction::Follow),
+                ("Settings", ToolbarAction::Settings),
+                ("Diagnostics", ToolbarAction::Diagnostics),
+            ] {
+                let mut button = row.spawn((
+                    Button,
+                    toolbar_button.clone(),
+                    BackgroundColor(follow_idle_color()),
+                    BorderRadius::all(Val::Px(6.0)),
+                    BorderColor::all(button_border_color),
+                ));
+                match kind {
+                    ToolbarAction::Follow => {
+                        button.insert(HudFollowMenuButton);
+                    }
+                    ToolbarAction::Settings => {
+                        button.insert(HudDisplaySettingsButton);
+                    }
+                    ToolbarAction::Diagnostics => {
+                        button.insert(HudDiagnosticsButton);
+                    }
+                }
+                button.with_children(|btn| {
+                    let mut label = btn.spawn((
+                        Text::new(label),
+                        secondary_font.clone(),
+                        TextColor(secondary_text_color),
+                    ));
+                    if matches!(kind, ToolbarAction::Follow) {
+                        label.insert(HudFollowMenuLabel);
+                    }
+                });
+            }
+            // Diagnostics replaces the creature card, so its page actions
+            // remain next to the diagnostics toggle when that mode is open.
+            row.spawn((
+                Node {
+                    display: Display::None,
+                    flex_direction: FlexDirection::Row,
+                    flex_shrink: 0.0,
+                    column_gap: Val::Px(8.0),
+                    ..default()
+                },
+                HudDiagnostic,
+                HudDiagnosticsPageControls,
+            ))
+            .with_children(|group| {
+                for (direction, label) in [
+                    (InspectorPageButton::Previous, "Page <"),
+                    (InspectorPageButton::Next, "Page >"),
                 ] {
-                    row.spawn((
-                        Button,
-                        button_node.clone(),
-                        BackgroundColor(follow_idle_color()),
-                        BorderRadius::all(Val::Px(6.0)),
-                        BorderColor::all(button_border_color),
-                        CameraViewButton(view),
-                    ))
-                    .with_children(|btn| {
-                        btn.spawn((
-                            Text::new(label),
-                            secondary_font.clone(),
-                            TextColor(secondary_text_color),
-                        ));
-                    });
+                    group
+                        .spawn((
+                            Button,
+                            toolbar_button.clone(),
+                            BackgroundColor(follow_idle_color()),
+                            BorderRadius::all(Val::Px(6.0)),
+                            BorderColor::all(button_border_color),
+                            direction,
+                        ))
+                        .with_children(|btn| {
+                            btn.spawn((
+                                Text::new(label),
+                                secondary_font.clone(),
+                                TextColor(secondary_text_color),
+                            ));
+                        });
                 }
             });
+        });
 
         let follow_buttons = [
             (FollowMode::Off, "Follow off"),
@@ -5852,8 +6007,10 @@ fn setup_scene(
             (FollowMode::Oldest, "Follow oldest"),
         ];
 
+        let mut follow_row = button_row_node.clone();
+        follow_row.display = Display::None;
         parent
-            .spawn((button_row_node.clone(),))
+            .spawn((follow_row, HudFollowMenuPanel))
             .with_children(|row| {
                 for (mode, label) in follow_buttons {
                     row.spawn((
@@ -5887,76 +6044,6 @@ fn setup_scene(
                         secondary_font.clone(),
                         TextColor(secondary_text_color),
                     ));
-                });
-
-                row.spawn((
-                    Button,
-                    button_node.clone(),
-                    BackgroundColor(follow_idle_color()),
-                    BorderRadius::all(Val::Px(6.0)),
-                    BorderColor::all(button_border_color),
-                    HudDisplaySettingsButton,
-                ))
-                .with_children(|btn| {
-                    btn.spawn((
-                        Text::new("Display settings"),
-                        secondary_font.clone(),
-                        TextColor(secondary_text_color),
-                    ));
-                });
-                row.spawn((
-                    Button,
-                    button_node.clone(),
-                    BackgroundColor(follow_idle_color()),
-                    BorderRadius::all(Val::Px(6.0)),
-                    BorderColor::all(button_border_color),
-                    HudDiagnosticsButton,
-                ))
-                .with_children(|btn| {
-                    btn.spawn((
-                        Text::new("Diagnostics (H)"),
-                        secondary_font.clone(),
-                        TextColor(secondary_text_color),
-                    ));
-                });
-                // The card owns page navigation in normal mode. Diagnostics
-                // replaces that card, so expose the same actions there only.
-                row.spawn((
-                    Node {
-                        display: Display::None,
-                        flex_direction: FlexDirection::Row,
-                        flex_shrink: 0.0,
-                        column_gap: Val::Px(8.0),
-                        ..default()
-                    },
-                    HudDiagnostic,
-                    HudDiagnosticsPageControls,
-                ))
-                .with_children(|group| {
-                    for (direction, label) in [
-                        (InspectorPageButton::Previous, "Page <"),
-                        (InspectorPageButton::Next, "Page >"),
-                    ] {
-                        group
-                            .spawn((
-                                Button,
-                                Node {
-                                    min_width: Val::Px(60.0),
-                                    ..button_node.clone()
-                                },
-                                BackgroundColor(follow_idle_color()),
-                                BorderRadius::all(Val::Px(6.0)),
-                                BorderColor::all(button_border_color),
-                                direction,
-                            ))
-                            .with_children(|btn| {
-                                btn.spawn((
-                                    Text::new(label),
-                                    secondary_font.clone(),
-                                    TextColor(secondary_text_color),
-                                ));
-                            });
-                    }
                 });
             });
 
@@ -6502,7 +6589,7 @@ fn set_hud_text_if_changed(text: &mut Mut<Text>, value: String) {
 /// inspector; stale owner pages remain explicitly labeled with their age.
 fn update_creature_card(
     state: Res<SnapshotState>,
-    card: Option<Res<CreatureCardElements>>,
+    (card, hud): (Option<Res<CreatureCardElements>>, Option<Res<HudElements>>),
     diagnostics: Option<Res<HudDiagnostics>>,
     owner: Option<NonSend<OwnerInspector>>,
     page: Option<Res<InspectorPage>>,
@@ -6537,6 +6624,18 @@ fn update_creature_card(
         };
         if root.display != display {
             root.display = display;
+        }
+    }
+    if let Some(hud) = hud
+        && let Ok(mut node) = nodes.get_mut(hud.selection)
+    {
+        let display = if selected.is_some() && !diagnostics.as_ref().is_some_and(|d| d.0) {
+            Display::None
+        } else {
+            Display::Flex
+        };
+        if node.display != display {
+            node.display = display;
         }
     }
     let (Some(frame), Some(agent)) = (state.latest.as_ref(), selected) else {
@@ -9076,6 +9175,63 @@ mod adaptive_governor_tests {
             world.query::<&ExposureAdjustButton>().iter(world).count(),
             2
         );
+    }
+
+    #[test]
+    fn follow_tray_opens_and_closes_after_a_choice() {
+        let mut app = App::new();
+        app.insert_resource(Assets::<Mesh>::default())
+            .insert_resource(Assets::<Image>::default())
+            .insert_resource(auto_launch(RenderQuality::High))
+            .init_resource::<HudFollowMenu>()
+            .init_resource::<CameraRig>()
+            .add_systems(Startup, setup_scene)
+            .add_systems(Update, handle_follow_menu);
+        app.update();
+        let world = app.world_mut();
+        let tray = world
+            .query_filtered::<Entity, With<HudFollowMenuPanel>>()
+            .single(world)
+            .unwrap();
+        let toggle = world
+            .query_filtered::<Entity, With<HudFollowMenuButton>>()
+            .single(world)
+            .unwrap();
+        let choice = world
+            .query_filtered::<Entity, With<FollowButton>>()
+            .iter(world)
+            .next()
+            .unwrap();
+        let label = world
+            .query_filtered::<Entity, With<HudFollowMenuLabel>>()
+            .single(world)
+            .unwrap();
+        assert_eq!(world.get::<Node>(tray).unwrap().display, Display::None);
+        assert_eq!(world.get::<Text>(label).unwrap().0, "Follow: Off");
+        assert_eq!(world.query::<&CameraViewButton>().iter(world).count(), 3);
+        app.world_mut()
+            .entity_mut(toggle)
+            .insert(Interaction::Pressed);
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(tray).unwrap().display,
+            Display::Flex
+        );
+        app.world_mut()
+            .entity_mut(toggle)
+            .insert(Interaction::Hovered);
+        app.world_mut()
+            .entity_mut(choice)
+            .insert(Interaction::Pressed);
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(tray).unwrap().display,
+            Display::None
+        );
+        assert!(!app.world().resource::<HudFollowMenu>().0);
+        app.world_mut().resource_mut::<CameraRig>().follow_mode = FollowMode::Oldest;
+        app.update();
+        assert_eq!(app.world().get::<Text>(label).unwrap().0, "Follow: Oldest");
     }
 
     #[test]
@@ -13133,6 +13289,25 @@ mod owner_inspector_tests {
             page_title: label(),
             page_body: label(),
         };
+        let selection = app.world_mut().spawn(Node::default()).id();
+        app.insert_resource(HudElements {
+            tick: Entity::PLACEHOLDER,
+            agents: Entity::PLACEHOLDER,
+            selection,
+            follow: Entity::PLACEHOLDER,
+            camera: Entity::PLACEHOLDER,
+            playback: Entity::PLACEHOLDER,
+            command_feedback: Entity::PLACEHOLDER,
+            command_summary: Entity::PLACEHOLDER,
+            fps: Entity::PLACEHOLDER,
+            world: Entity::PLACEHOLDER,
+            tonemap: Entity::PLACEHOLDER,
+            palette: Entity::PLACEHOLDER,
+            events: Entity::PLACEHOLDER,
+            inspector: Entity::PLACEHOLDER,
+            history: Entity::PLACEHOLDER,
+            brain: Entity::PLACEHOLDER,
+        });
         app.insert_resource(card)
             .add_systems(Update, update_creature_card);
         app.update();
@@ -13144,6 +13319,10 @@ mod owner_inspector_tests {
             app.world().get::<Node>(root).unwrap().display,
             Display::Flex
         );
+        assert_eq!(
+            app.world().get::<Node>(selection).unwrap().display,
+            Display::None
+        );
         app.world_mut().resource_mut::<HudDiagnostics>().0 = true;
         app.update();
         assert_eq!(
@@ -13153,6 +13332,10 @@ mod owner_inspector_tests {
         assert_eq!(
             app.world().get::<Node>(root).unwrap().display,
             Display::None
+        );
+        assert_eq!(
+            app.world().get::<Node>(selection).unwrap().display,
+            Display::Flex
         );
         app.world_mut().resource_mut::<HudDiagnostics>().0 = false;
         for agent in &mut app
