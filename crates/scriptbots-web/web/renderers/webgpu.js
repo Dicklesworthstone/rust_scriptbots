@@ -1,4 +1,5 @@
 import { EnvironmentRaster } from "./environment.js";
+import { agentRadius, agentUid } from "../inspector.js";
 
 const ENVIRONMENT_WGSL = /* wgsl */ `
 @group(0) @binding(0) var grid: texture_2d<f32>;
@@ -33,7 +34,7 @@ struct ViewUniforms {
 struct Agent {
     position : vec2<f32>,
     radius : f32,
-    pad0 : f32,
+    selected : f32,
     color : vec4<f32>,
 }
 
@@ -49,6 +50,7 @@ struct VertexOutput {
     @location(1) offset : vec2<f32>,
     @location(2) @interpolate(flat) radius : f32,
     @location(3) @interpolate(flat) boost : f32,
+    @location(4) @interpolate(flat) selected : f32,
 }
 
 @vertex
@@ -65,7 +67,7 @@ fn vs(@builtin(vertex_index) vertexIndex : u32,
 
     let agent = agents[instanceIndex];
     let corner = positions[vertexIndex];
-    let extent = agent.radius + select(0.0, 2.6, agent.color.a > 0.5);
+    let extent = agent.radius + select(select(0.0, 2.6, agent.color.a > 0.5), 5.5, agent.selected > 0.5);
     let offset = corner * extent;
     let world = agent.position + offset;
     let clip_x = (world.x / view.canvas.x) * 2.0 - 1.0;
@@ -77,6 +79,7 @@ fn vs(@builtin(vertex_index) vertexIndex : u32,
     output.offset = offset;
     output.radius = agent.radius;
     output.boost = agent.color.a;
+    output.selected = agent.selected;
     return output;
 }
 
@@ -85,6 +88,9 @@ fn fs(input : VertexOutput) -> @location(0) vec4<f32> {
     let distance = length(input.offset);
     if (distance <= input.radius) {
         return vec4<f32>(input.color, 0.9);
+    }
+    if (input.selected > 0.5 && abs(distance - input.radius - 4.5) <= 1.0) {
+        return vec4<f32>(251.0 / 255.0, 191.0 / 255.0, 36.0 / 255.0, 1.0);
     }
     if (input.boost > 0.5 && abs(distance - input.radius - 2.0) <= 0.6) {
         return vec4<f32>(30.0 / 255.0, 144.0 / 255.0, 1.0, 0.65);
@@ -309,11 +315,12 @@ export class WebGpuRenderer {
     for (let i = 0; i < agents.length; i += 1) {
       const base = i * floatsPerAgent;
       const agent = agents[i];
-      const radius = Math.max(1.5, Math.sqrt(agent.health + 0.15) * 3.5);
+      const radius = agentRadius(agent);
       this.agentArray[base + 0] = agent.position[0] * scaleX;
       this.agentArray[base + 1] = agent.position[1] * scaleY;
       this.agentArray[base + 2] = radius;
-      this.agentArray[base + 3] = 0.0;
+      this.agentArray[base + 3] = typeof presentation.selectedUid === "string"
+        && agentUid(agent) === presentation.selectedUid ? 1.0 : 0.0;
       this.agentArray[base + 4] = agent.color[0];
       this.agentArray[base + 5] = agent.color[1];
       this.agentArray[base + 6] = agent.color[2];

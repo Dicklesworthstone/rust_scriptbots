@@ -1495,6 +1495,35 @@ per consumer. Same-revision polls produce nothing. If the source becomes
 unavailable or changes session after connection, the stream emits a typed
 `error` record and closes; clients must handle that refusal explicitly.
 
+#### Browser creature selection and inspection
+
+Click a creature in either Canvas 2D or WebGPU, or enter its stable decimal UID
+in **Creature Inspector**. Both renderers highlight the selected creature.
+The panel reports health, age, generation, energy, lifetime net food balance,
+reproduction progress, lineage, sensory traits, and the brain's recorded inputs
+and outputs. Selection and inspection are presentation operations and do not
+advance the simulation.
+
+Local viewing reads the WASM owner's completed boundary through
+`SimHandle.inspectAgent(uid)`. Remote viewing uses
+`GET /api/agents/inspect?uid=UID&session_id=SESSION&epoch=EPOCH` under the existing
+Host and Origin policy. The result identifies its owner, epoch, inspected tick,
+publication and scientific revisions with exact decimal strings. The panel
+distinguishes an owner observation from the displayed frame and discards replies
+from a previous selection, reset, owner or epoch. Missing creatures and source
+changes are explicit states.
+
+Automatic refresh is limited to four reads per second, with one current request;
+remote reads have a two-second client timeout and a 16 KiB response limit.
+The native owner query has a 250 ms deadline. The projection contains fixed
+signal arrays and a bounded brain label; it does not load genomes or histories,
+so basic inspection also works for brains without a genome-locus browser schema.
+
+The native owner path passed focused DSR tests before a workspace outage. The
+committed feature was then recovered from the reviewed edits; those recovered
+bytes have not been recompiled. Browser test results were not recoverable,
+and actual DOM/WebGPU journeys and the HTTP integration test remain unexecuted.
+
 #### Remote browser viewing and stream subscriptions
 
 The web demo's **Remote Server** controls connect its existing Canvas 2D or WebGPU

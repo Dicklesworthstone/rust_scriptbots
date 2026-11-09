@@ -79,6 +79,7 @@ pub mod allopatry;
 pub mod archipelago;
 pub mod channel;
 pub mod host_core;
+pub mod inspector;
 pub mod migrator;
 pub mod native;
 pub mod remote;

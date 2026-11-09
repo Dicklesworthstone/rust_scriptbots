@@ -190,6 +190,7 @@ const mockWasmModule = `
         const fromPermalink = kind === "permalink";
         return {
           tick: record.tick,
+          epoch: "0",
           world: { width: 1280, height: 720, closed: true },
           summary: {
             agentCount: fromPermalink ? 150 : 200,
@@ -688,7 +689,7 @@ function createServer() {
     } else if (url.pathname === "/main.js") {
       res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8" });
       res.end(fs.readFileSync(path.join(webDir, "main.js")));
-    } else if (["/remote.js", "/continuation-store.js", "/renderers/canvas.js", "/renderers/webgpu.js", "/renderers/environment.js"].includes(url.pathname)) {
+    } else if (["/remote.js", "/continuation-store.js", "/inspector.js", "/renderers/canvas.js", "/renderers/webgpu.js", "/renderers/environment.js"].includes(url.pathname)) {
       res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8" });
       res.end(fs.readFileSync(path.join(webDir, url.pathname.slice(1))));
     } else {

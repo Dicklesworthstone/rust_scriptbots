@@ -154,8 +154,9 @@ enum IngressMessage {
         uid: AgentUid,
         max_contributors: Option<usize>,
         genome_offset: usize,
+        include_genome: bool,
         expires_at: Instant,
-        reply: Sender<Result<Option<AgentInspectorData>, HostAccessError>>,
+        reply: Sender<Result<(u64, Option<AgentInspectorData>), HostAccessError>>,
     },
     DebugAgents {
         query: AgentDebugQuery,
@@ -295,8 +296,16 @@ impl From<&scriptbots_core::AgentRuntime> for AgentPhysiologyData {
 pub struct AgentInspectorData {
     /// Source revisions for rejecting a detail paired with an older rendered frame.
     pub source: BrainProjectionSource,
+    /// Evolution epoch captured at the inspected owner boundary.
+    pub epoch: u64,
     /// Stable subject identity, independent of slot reuse.
     pub uid: AgentUid,
+    /// Health at the same owner boundary as the physiology and signals.
+    pub health: f32,
+    /// Completed scientific ticks lived by the subject.
+    pub age: u32,
+    /// Heritable lineage generation.
+    pub generation: u32,
     /// Life-history values read at the same scientific boundary.
     pub life: AgentLifeData,
     /// Physiology and event markers read at the same scientific boundary.
@@ -612,7 +621,8 @@ impl ChannelHostPort {
                 "sensor explanation contributor limit exceeded before enqueue",
             ));
         }
-        self.inspect_agent_with_attribution(uid, Some(max_contributors), 0)
+        self.inspect_agent_with_attribution(uid, Some(max_contributors), 0, true)
+            .map(|(_, detail)| detail)
     }
 
     fn inspect_agent_with_attribution(
@@ -620,7 +630,8 @@ impl ChannelHostPort {
         uid: AgentUid,
         max_contributors: Option<usize>,
         genome_offset: usize,
-    ) -> Result<Option<AgentInspectorData>, HostAccessError> {
+        include_genome: bool,
+    ) -> Result<(u64, Option<AgentInspectorData>), HostAccessError> {
         if !genome_offset.is_multiple_of(INSPECTOR_GENOME_PAGE_SIZE)
             || genome_offset
                 .checked_add(INSPECTOR_GENOME_PAGE_SIZE)
@@ -633,6 +644,7 @@ impl ChannelHostPort {
             uid,
             max_contributors,
             genome_offset,
+            include_genome,
             expires_at,
             reply,
         })
@@ -666,7 +678,30 @@ impl ChannelHostPort {
         deadline: Instant,
     ) -> Result<Option<AgentInspectorData>, HostAccessError> {
         self.bounded_before_with_error(deadline, HostAccessError::OwnerReadTimeout)?
-            .inspect_agent_with_attribution(uid, None, genome_offset)
+            .inspect_agent_with_attribution(uid, None, genome_offset, true)
+            .map(|(_, detail)| detail)
+    }
+
+    /// Read fixed-size physiology and signals without genome decoding or sensor attribution.
+    pub fn inspect_agent_basic_before(
+        &self,
+        uid: AgentUid,
+        deadline: Instant,
+    ) -> Result<Option<AgentInspectorData>, HostAccessError> {
+        self.inspect_agent_basic_with_epoch_before(uid, deadline)
+            .map(|(_, detail)| detail)
+    }
+
+    /// Read the owner epoch together with fixed-size detail, including when the UID is absent.
+    /// Both values come from one synchronous owner boundary, so callers can reject a stale
+    /// epoch without mistaking that source change for the creature's disappearance.
+    pub fn inspect_agent_basic_with_epoch_before(
+        &self,
+        uid: AgentUid,
+        deadline: Instant,
+    ) -> Result<(u64, Option<AgentInspectorData>), HostAccessError> {
+        self.bounded_before_with_error(deadline, HostAccessError::OwnerReadTimeout)?
+            .inspect_agent_with_attribution(uid, None, 0, false)
     }
 
     /// Query the owner's debug rows, preserving the query's filters and limit.
@@ -1510,6 +1545,7 @@ impl ChannelHostDriver {
                 uid,
                 max_contributors,
                 genome_offset,
+                include_genome,
                 expires_at,
                 reply,
             } => {
@@ -1517,11 +1553,17 @@ impl ChannelHostDriver {
                     let _ = reply.send(Err(HostAccessError::OwnerReadTimeout));
                     return;
                 }
-                let _ = reply.send(self.host.core().inspect_agent_with_attribution(
-                    uid,
-                    max_contributors,
-                    genome_offset,
-                ));
+                let core = self.host.core();
+                let epoch = core.world().epoch();
+                let result = core
+                    .inspect_agent_with_attribution(
+                        uid,
+                        max_contributors,
+                        genome_offset,
+                        include_genome,
+                    )
+                    .map(|detail| (epoch, detail));
+                let _ = reply.send(result);
             }
             IngressMessage::DebugAgents { query, reply } => {
                 let _ = reply.send(Ok(self.host.core().world().agent_debug_view(query)));
@@ -1997,6 +2039,7 @@ mod tests {
             uid: AgentUid(1),
             max_contributors: None,
             genome_offset: 0,
+            include_genome: true,
             expires_at: Instant::now(),
             reply,
         });
@@ -2130,6 +2173,28 @@ mod tests {
         assert_eq!(hud.brain_descriptor, detail.brain_descriptor);
         assert_eq!(hud.eye_direction, detail.eye_direction);
         assert_eq!(hud.eye_fov, detail.eye_fov);
+        let basic = port
+            .inspect_agent_basic_before(uid, Instant::now() + Duration::from_secs(1))
+            .expect("bounded browser detail")
+            .expect("living browser subject");
+        assert!(basic.genome_browser.is_none());
+        assert!(basic.sensor_attribution.is_none());
+        assert_eq!(basic.source, detail.source);
+        assert_eq!(basic.epoch, snapshot.world.epoch);
+        assert_eq!(basic.physiology, detail.physiology);
+        assert_eq!(basic.sensors, detail.sensors);
+        assert_eq!(basic.outputs, detail.outputs);
+        assert_eq!(basic.health, snapshot.world.agents[0].health);
+        assert_eq!(basic.age, snapshot.world.agents[0].age);
+        assert_eq!(basic.generation, snapshot.world.agents[0].generation.0);
+        let (missing_epoch, missing) = port
+            .inspect_agent_basic_with_epoch_before(
+                AgentUid(u64::MAX),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .expect("missing subject retains its owner source");
+        assert_eq!(missing_epoch, snapshot.world.epoch);
+        assert!(missing.is_none());
         let physiology = detail.physiology;
         assert_eq!(physiology.energy, 0.73);
         assert_eq!(physiology.food_delta, -0.12);
@@ -3872,6 +3937,16 @@ mod tests {
             IngressMessage::AgentInspection { expires_at, .. }
                 if expires_at <= deadline && expires_at <= Instant::now()
         ));
+        let deadline = Instant::now() + Duration::from_millis(20);
+        assert!(matches!(
+            port.inspect_agent_basic_before(AgentUid(1), deadline),
+            Err(HostAccessError::OwnerReadTimeout)
+        ));
+        assert!(matches!(
+            driver.receiver.try_recv().expect("basic inspector ingress"),
+            IngressMessage::AgentInspection { include_genome: false, max_contributors: None, expires_at, .. }
+                if expires_at <= deadline && expires_at <= Instant::now()
+        ));
         let request = BrainProjectionRequest::focused(
             crate::ProjectionClientId::new(614),
             crate::ProjectionRequestRevision::new(1),
@@ -3961,6 +4036,7 @@ mod tests {
             uid: AgentUid(u64::MAX),
             max_contributors: Some(0),
             genome_offset: 0,
+            include_genome: true,
             expires_at: Instant::now(),
             reply,
         });
@@ -3974,10 +4050,11 @@ mod tests {
             uid: AgentUid(u64::MAX),
             max_contributors: Some(0),
             genome_offset: 0,
+            include_genome: true,
             expires_at: Instant::now() + Duration::from_secs(1),
             reply,
         });
-        assert!(matches!(receive.recv().expect("live reply"), Ok(None)));
+        assert!(matches!(receive.recv().expect("live reply"), Ok((0, None))));
     }
 
     #[test]

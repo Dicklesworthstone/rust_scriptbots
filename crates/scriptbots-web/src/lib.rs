@@ -38,6 +38,7 @@ use scriptbots_core::{
     AgentUid, DynamicAgentSnapshot as AgentSnapshot, DynamicSnapshotSummary as SnapshotSummary,
     DynamicSnapshotWorld as SnapshotWorld,
 };
+use serde::ser::SerializeStruct as _;
 use serde::{Deserialize, Serialize};
 use serde_wasm_bindgen::{from_value, to_value};
 use wasm_bindgen::prelude::*;
@@ -163,8 +164,54 @@ struct SimSpec {
 struct BrowserFrame<'a> {
     schema: &'static str,
     identity: BrowserFrameIdentity,
+    #[serde(serialize_with = "serialize_browser_snapshot")]
     snapshot: &'a SimulationSnapshot,
     environment: Option<BrowserEnvironment<'a>>,
+}
+
+/// Browser views retain exact creature/brain identities without changing the core codecs.
+fn serialize_browser_snapshot<S>(
+    snapshot: &SimulationSnapshot,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    struct Agents<'a>(&'a [scriptbots_core::DynamicAgentSnapshot]);
+    struct Agent<'a>(&'a scriptbots_core::DynamicAgentSnapshot);
+    impl Serialize for Agents<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.collect_seq(self.0.iter().map(Agent))
+        }
+    }
+    impl Serialize for Agent<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            let value = self.0;
+            let mut agent = serializer.serialize_struct("BrowserAgent", 14)?;
+            agent.serialize_field("id", &value.id.to_string())?;
+            agent.serialize_field("uid", &value.uid.to_string())?;
+            agent.serialize_field("position", &value.position)?;
+            agent.serialize_field("velocity", &value.velocity)?;
+            agent.serialize_field("heading", &value.heading)?;
+            agent.serialize_field("health", &value.health)?;
+            agent.serialize_field("energy", &value.energy)?;
+            agent.serialize_field("color", &value.color)?;
+            agent.serialize_field("spikeLength", &value.spike_length)?;
+            agent.serialize_field("boost", &value.boost)?;
+            agent.serialize_field("age", &value.age)?;
+            agent.serialize_field("generation", &value.generation)?;
+            agent.serialize_field("herbivoreTendency", &value.herbivore_tendency)?;
+            agent.serialize_field("brainKey", &value.brain_key.map(|key| key.to_string()))?;
+            agent.end()
+        }
+    }
+    let mut state = serializer.serialize_struct("BrowserSnapshot", 5)?;
+    state.serialize_field("tick", &snapshot.tick)?;
+    state.serialize_field("epoch", &snapshot.epoch.to_string())?;
+    state.serialize_field("world", &snapshot.world)?;
+    state.serialize_field("summary", &snapshot.summary)?;
+    state.serialize_field("agents", &Agents(&snapshot.agents))?;
+    state.end()
 }
 
 /// The same bounded overview in local and remote frames. Revisions stay exact in JavaScript.
@@ -262,7 +309,7 @@ struct BrowserRemotePlayback {
 #[serde(untagged)]
 enum BrowserRemotePayload<'a> {
     Telemetry(&'a scriptbots_core::TickSummaryDto),
-    Canvas(&'a SimulationSnapshot),
+    Canvas(#[serde(serialize_with = "serialize_browser_snapshot")] &'a SimulationSnapshot),
     Events(BrowserRemoteEventPage<'a>),
 }
 
@@ -433,6 +480,12 @@ mod remote_frame_tests {
         frame.identity.publication_revision = u64::MAX;
         frame.identity.scientific_revision = u64::MAX - 1;
         frame.coalesced_publications = u64::MAX - 2;
+        if let RemoteFramePayload::Canvas(snapshot) = &mut frame.payload {
+            snapshot.epoch = u64::MAX;
+            snapshot.agents[0].uid = AgentUid(u64::MAX);
+            snapshot.agents[0].id = u64::MAX - 1;
+            snapshot.agents[0].brain_key = Some(u64::MAX - 2);
+        }
         Arc::make_mut(frame.environment.as_mut().unwrap()).terrain_revision = u64::MAX;
         let decoded = decode_remote_frame(&encode_remote_frame(&frame).unwrap()).unwrap();
         let browser = serde_json::to_value(BrowserRemoteFrame::from(&decoded)).unwrap();
@@ -446,6 +499,16 @@ mod remote_frame_tests {
             (u64::MAX - 1).to_string()
         );
         assert_eq!(browser["coalescedPublications"], (u64::MAX - 2).to_string());
+        assert_eq!(browser["payload"]["epoch"], u64::MAX.to_string());
+        assert_eq!(browser["payload"]["agents"][0]["uid"], u64::MAX.to_string());
+        assert_eq!(
+            browser["payload"]["agents"][0]["id"],
+            (u64::MAX - 1).to_string()
+        );
+        assert_eq!(
+            browser["payload"]["agents"][0]["brainKey"],
+            (u64::MAX - 2).to_string()
+        );
         assert_eq!(
             browser["environment"]["terrainRevision"],
             u64::MAX.to_string()
@@ -962,6 +1025,24 @@ impl SimHandle {
         let frame = to_value(&BrowserFrame::new(&publication)).map_err(js_error)?;
         js_sys::Reflect::set(&frame, &JsValue::from_str("environment"), &environment_js)?;
         Ok(frame)
+    }
+
+    /// Inspect one stable creature UID without advancing science or changing selection state.
+    /// The result includes its actual owner/session/epoch/revisions; a missing UID yields null.
+    #[wasm_bindgen(js_name = inspectAgent)]
+    pub fn inspect_agent_js(&self, uid: &str) -> Result<JsValue, JsValue> {
+        let uid = scriptbots_runtime::inspector::parse_agent_uid(uid)
+            .ok_or_else(|| js_error("creature UID must be a canonical u64 decimal string"))?;
+        let detail = self
+            .inner
+            .borrow()
+            .core
+            .inspect_agent_basic(uid)
+            .map_err(js_error)?;
+        detail
+            .map(scriptbots_runtime::inspector::AgentInspection::from)
+            .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+            .map_err(js_error)
     }
 
     /// Rebuild the simulation with an optional nonnegative numeric seed.
@@ -2491,6 +2572,27 @@ mod tests {
         .expect("seeded nonempty browser host")
     }
 
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn browser_inspector_exposes_null_parents_and_absent_subject_without_science() {
+        let simulation = browser_clock_simulation();
+        let uid = simulation.core.latest_snapshot().world.agents[0].uid.to_string();
+        let before = simulation.core.scientific_digest_v1().unwrap();
+        let handle = SimHandle {
+            inner: Rc::new(RefCell::new(simulation)),
+        };
+        let inspected = handle.inspect_agent_js(&uid).unwrap();
+        let observed_uid = js_sys::Reflect::get(&inspected, &JsValue::from_str("uid")).unwrap();
+        assert_eq!(observed_uid.as_string(), Some(uid));
+        let lineage = js_sys::Reflect::get(&inspected, &JsValue::from_str("lineage")).unwrap();
+        let parents = js_sys::Array::from(&lineage);
+        assert_eq!(parents.length(), 2);
+        assert!(parents.get(0).is_null());
+        assert!(parents.get(1).is_null());
+        assert!(handle.inspect_agent_js(&u64::MAX.to_string()).unwrap().is_null());
+        assert_eq!(handle.inner.borrow().core.scientific_digest_v1().unwrap(), before);
+    }
+
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
     #[cfg_attr(not(target_arch = "wasm32"), test)]
     fn browser_clock_observers_do_not_authorize_science() {
@@ -2508,10 +2610,24 @@ mod tests {
                 let publication = observed.core.latest_snapshot();
                 let frame = BrowserFrame::new(&publication);
                 assert_eq!(frame.identity.tick, observed.snapshot().tick.to_string());
+                let mut expected = serde_json::to_value(observed.snapshot())
+                    .expect("existing projection JSON");
+                expected["epoch"] = publication.world.epoch.to_string().into();
+                for agent in expected["agents"].as_array_mut().unwrap() {
+                    for field in ["id", "uid", "brainKey"] {
+                        if let Some(value) = agent[field].as_u64() {
+                            agent[field] = value.to_string().into();
+                        }
+                    }
+                }
                 assert_eq!(
                     serde_json::to_value(&frame).expect("browser frame JSON")["snapshot"],
-                    serde_json::to_value(observed.snapshot()).expect("existing projection JSON")
+                    expected
                 );
+                let selected = publication.world.agents[0].uid;
+                let detail = observed.core.inspect_agent_basic(selected).unwrap().unwrap();
+                assert!(detail.source.matches_snapshot(&publication));
+                assert_eq!(detail.uid, selected);
             }
             assert_eq!(
                 observed.core.scientific_digest_v1().expect("after reads"),

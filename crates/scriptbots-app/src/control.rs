@@ -4585,6 +4585,38 @@ impl ControlHandle {
         Ok(self.host.debug_agents(query)?)
     }
 
+    /// Read one creature from the scientific owner, bound to the caller's session and epoch.
+    /// Inspection is read-only and has a bounded owner-response deadline.
+    pub fn inspect_agent(
+        &self,
+        uid: scriptbots_core::AgentUid,
+        session_id: u64,
+        epoch: u64,
+    ) -> Result<Option<scriptbots_runtime::inspector::AgentInspection>, ControlError> {
+        if self.host.session_id().get() != session_id {
+            return Err(ControlError::Conflict(
+                "inspector host session changed".to_owned(),
+            ));
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        let (observed_epoch, detail) = self
+            .host
+            .inspect_agent_basic_with_epoch_before(uid, deadline)?;
+        if observed_epoch != epoch {
+            return Err(ControlError::Conflict(
+                "inspector source epoch changed".to_owned(),
+            ));
+        }
+        if let Some(detail) = &detail
+            && (detail.source.session_id.get() != session_id || detail.epoch != epoch)
+        {
+            return Err(ControlError::Conflict(
+                "inspector source epoch or session changed".to_owned(),
+            ));
+        }
+        Ok(detail.map(scriptbots_runtime::inspector::AgentInspection::from))
+    }
+
     /// Submit a selection update and return its admission receipt.
     ///
     /// This used to return `Result<(), _>`, which made selection the only

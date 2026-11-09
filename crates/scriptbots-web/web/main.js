@@ -4,6 +4,7 @@ import { WebGpuRenderer } from "./renderers/webgpu.js";
 import { environmentDescription } from "./renderers/environment.js";
 import { RemoteStreamClient } from "./remote.js";
 import { BrowserContinuationStore } from "./continuation-store.js";
+import { InspectionController, pickAgent, renderInspector, renderInspectorSource } from "./inspector.js";
 
 const {
   init_sim,
@@ -119,6 +120,47 @@ let remoteConnected = false;
 let lastRemoteRequestId = null;
 let lastRemoteCommandId = null;
 let lastRemoteStatusRequestId = null;
+
+const inspectorPanel = document.getElementById("agent-inspector");
+const inspector = new InspectionController({
+  read: (uid, request, signal) => {
+    if (remoteMode) return remoteClient.inspectAgent(uid, { sessionId: request.sessionId, epoch: request.epoch, signal });
+    if (!simHandle?.inspectAgent) throw new Error("This WASM package does not expose creature inspection; rebuild the browser package");
+    return simHandle.inspectAgent(uid);
+  },
+  onChange: (state, frame) => renderInspector(inspectorPanel, state, frame),
+  onFrame: (state, frame) => renderInspectorSource(inspectorPanel, state, frame),
+});
+
+function selectCreature(uid) {
+  inspector.select(uid);
+  // Selection is presentation-only, so paused frames also need repainting.
+  lastPaintedFrame = null;
+}
+
+document.getElementById("sim-container")?.addEventListener("click", (event) => {
+  if (event.target !== canvas || event.button !== 0 || !inspector.frame) return;
+  const bounds = canvas.getBoundingClientRect();
+  const uid = pickAgent(inspector.frame.snapshot, event.clientX - bounds.left, event.clientY - bounds.top,
+    { width: bounds.width, height: bounds.height, canvasWidth: canvas.width, canvasHeight: canvas.height });
+  selectCreature(uid);
+  canvas.focus({ preventScroll: true });
+});
+document.getElementById("inspector-form")?.addEventListener("submit", (event) => {
+  event.preventDefault();
+  const input = document.getElementById("inspector-uid");
+  input.setCustomValidity("");
+  try { selectCreature(input.value.trim()); }
+  catch (error) { input.setCustomValidity(error.message); input.reportValidity(); }
+});
+document.getElementById("inspector-uid")?.addEventListener("input", (event) => event.target.setCustomValidity(""));
+document.getElementById("inspector-clear")?.addEventListener("click", () => selectCreature(null));
+document.getElementById("inspector-refresh")?.addEventListener("click", () => { void inspector.refresh(true); });
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && (event.target === canvas || inspectorPanel?.contains(event.target))) {
+    selectCreature(null);
+  }
+});
 
 stepsSlider.addEventListener("input", () => {
   if (remoteMode) return;
@@ -271,6 +313,7 @@ function connectRemote() {
     lastRemoteCommandId = null;
     lastRemoteStatusRequestId = null;
     simulationGeneration += 1;
+    inspector.reset();
     lastPaintedFrame = null;
     if (captureRequest) finishCapture(captureRequest, new Error("Presentation source changed"));
     remoteEvents.replaceChildren();
@@ -306,6 +349,7 @@ remoteLocal.addEventListener("click", () => {
   remoteClient = null;
   remoteFrame = null;
   simulationGeneration += 1;
+  inspector.reset();
   lastPaintedFrame = null;
   if (captureRequest) finishCapture(captureRequest, new Error("Presentation source changed"));
   remoteStatus.textContent = "Running locally in this browser.";
@@ -446,11 +490,13 @@ function drawSnapshot(frame) {
       && lastPaintedFrame.sessionId === frame.identity.sessionId
       && lastPaintedFrame.width === canvas.width && lastPaintedFrame.height === canvas.height
       && (!captureRequest || captureRequest.encoding)) {
+    inspector.observe(frame, simulationGeneration);
     return true;
   }
   try {
     if (renderer.render(frame.snapshot, { environment: frame.environment, identity: frame.identity,
-      layer: environmentLayer?.value ?? "combined", generation: simulationGeneration })) {
+      layer: environmentLayer?.value ?? "combined", generation: simulationGeneration,
+      selectedUid: inspector.selectionFor(frame, simulationGeneration) })) {
       lastPaintedFrame = { simulationGeneration, publicationRevision: frame.identity.publicationRevision,
         sessionId: frame.identity.sessionId, width: canvas.width, height: canvas.height };
       for (const [key, value] of Object.entries(frame.identity)) {
@@ -464,6 +510,7 @@ function drawSnapshot(frame) {
         environmentStatus.dataset.layer = environmentLayer?.value ?? "combined";
       }
       captureAdmittedFrame(frame.identity);
+      inspector.observe(frame, simulationGeneration);
       return true;
     }
   } catch (error) {
@@ -707,6 +754,7 @@ function replaceSimulation(next, { continuation = false, permalink = null, expec
   const previous = simHandle;
   simHandle = next;
   simulationGeneration += 1;
+  inspector.reset();
   simulationStartedAt = performance.now();
   lastPaintedFrame = null;
   if (continuation) {

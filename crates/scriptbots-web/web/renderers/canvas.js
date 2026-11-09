@@ -1,4 +1,5 @@
 import { EnvironmentRaster } from "./environment.js";
+import { agentRadius, agentUid } from "../inspector.js";
 
 export class CanvasRenderer {
   constructor(canvas) {
@@ -43,7 +44,7 @@ export class CanvasRenderer {
     for (const agent of snapshot.agents) {
       const px = agent.position[0] * scaleX;
       const py = agent.position[1] * scaleY;
-      const radius = Math.max(1.5, 3.5 * Math.sqrt(agent.health + 0.15));
+      const radius = agentRadius(agent);
 
       ctx.beginPath();
       ctx.fillStyle = `rgba(${Math.round(agent.color[0] * 255)}, ${Math.round(agent.color[1] * 255)}, ${Math.round(agent.color[2] * 255)}, 0.9)`;
@@ -55,6 +56,13 @@ export class CanvasRenderer {
         ctx.strokeStyle = "rgba(30, 144, 255, 0.65)";
         ctx.lineWidth = 1.2;
         ctx.arc(px, py, radius + 2.0, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+      if (typeof presentation.selectedUid === "string" && agentUid(agent) === presentation.selectedUid) {
+        ctx.beginPath();
+        ctx.strokeStyle = "rgb(251, 191, 36)";
+        ctx.lineWidth = 2;
+        ctx.arc(px, py, radius + 4.5, 0, Math.PI * 2);
         ctx.stroke();
       }
     }

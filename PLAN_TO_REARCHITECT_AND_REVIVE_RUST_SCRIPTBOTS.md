@@ -2,6 +2,45 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Browser creature inspector (2026-11-09):** [Source implemented and reviewed —
+Codex; recovered-byte compilation and browser/HTTP acceptance open]
+
+Continue the browser interaction slice of `bd-2z0.12.3` with click and keyboard
+selection, a shared Canvas/WebGPU highlight, and a bounded scientific inspector.
+Local WASM and remote REST use the same typed read-only owner projection.
+Stable creature IDs, session, epoch and source revisions remain exact decimal
+strings; the panel identifies observed versus displayed boundaries and rejects
+late replies after selection, reset, source, session or epoch changes. The owner
+stamps even an absent-creature reply with its epoch, so a request from an old
+epoch reports a source conflict instead of a misleading missing-creature result.
+
+The panel exposes health, age, generation, energy, net lifetime food balance,
+reproduction progress, lineage, sensory traits, and named recorded input/output
+channels. The basic owner query skips genome decoding and sensor attribution,
+so inspection does not require a brain's optional genome-locus schema. It does
+not submit selection commands, step science, retain history or serialize genomes.
+Automatic refresh is limited to 4 Hz and one current request; native queries
+carry a 250 ms deadline and browser requests a two-second timeout with a streamed
+16 KiB response cap. Existing Host and Origin checks protect the REST route.
+
+Before the workspace became unavailable, DSR compiled the current core library
+and complete runtime test crate using the pinned compiler and retained locked
+Cargo dependencies. Inspector, owner-query and remote/subscription filters
+passed 23 unique tests, and the four runtime files passed formatting. The first
+compile attempt exposed a missing proc-macro search path in the external
+verification helper; correcting that helper allowed the same source to pass.
+
+The 17 feature files were subsequently recovered from reviewed edits against
+the exact published base. Subsequent source review fixed two integration gaps:
+absent-creature replies now retain the owner epoch, and the WASM inspector uses
+JSON-compatible serialization so absent parents are null just as they are in
+REST responses. Those fixes and their regression cases are also unexecuted.
+The recovered bytes have not been compiled or formatted again. Browser Node/syntax/format and web Cargo checks were launched,
+but their outcomes were lost with the executor; they are not claimed as passes.
+Authored HTTP origin/source checks, Node state-machine cases and actual DOM
+picking/highlight journeys remain qualification work. No WASM, GPU, full
+workspace Cargo/Clippy or performance acceptance is asserted by this increment.
+
 **Persistent cohort execution and food-funded ecology (2026-11-09):**
 [Implemented increments — Codex; targeted native tests passed, broader
 performance, application and long-horizon qualification open]

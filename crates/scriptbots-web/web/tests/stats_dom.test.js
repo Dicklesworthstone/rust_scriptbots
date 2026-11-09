@@ -95,6 +95,7 @@ const camelCaseWasmModule = `
         const avgHealth = 0.900 - (tick * 0.001);
         return {
           tick: tick,
+          epoch: "0",
           world: { width: 1280, height: 720, closed: true },
           summary: {
             agentCount: pop,
@@ -149,6 +150,7 @@ const snakeCaseWasmModule = `
         tick += steps;
         return {
           tick: tick,
+          epoch: "0",
           world: { width: 1280, height: 720, closed: true },
           summary: {
             agent_count: 256,
@@ -177,7 +179,7 @@ function createServer(packageInfo) {
     } else if (url.pathname === "/main.js") {
       res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8" });
       res.end(fs.readFileSync(path.join(webDir, "main.js")));
-    } else if (["/remote.js", "/continuation-store.js", "/renderers/canvas.js", "/renderers/webgpu.js", "/renderers/environment.js"].includes(url.pathname)) {
+    } else if (["/remote.js", "/continuation-store.js", "/inspector.js", "/renderers/canvas.js", "/renderers/webgpu.js", "/renderers/environment.js"].includes(url.pathname)) {
       res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8" });
       res.end(fs.readFileSync(path.join(webDir, url.pathname.slice(1))));
     } else if (url.pathname.startsWith("/pkg/")
@@ -575,6 +577,34 @@ async function runRendererTests(browser, baseUrl) {
     speed.value = "0";
     speed.dispatchEvent(new Event("input", { bubbles: true }));
   });
+  const selectedCreature = await page.evaluate(async () => {
+    const { pickAgent } = await import("/inspector.js");
+    const owner = window.__rendererSim;
+    const frame = owner.frame();
+    const first = frame.snapshot.agents[0];
+    if (!first || typeof first.uid !== "string") throw new Error("Packaged owner must expose exact creature UIDs");
+    const canvas = document.getElementById("sim-canvas");
+    const bounds = canvas.getBoundingClientRect();
+    const x = first.position[0] / frame.snapshot.world.width * bounds.width;
+    const y = first.position[1] / frame.snapshot.world.height * bounds.height;
+    const uid = pickAgent(frame.snapshot, x, y, { width: bounds.width, height: bounds.height,
+      canvasWidth: canvas.width, canvasHeight: canvas.height });
+    return { uid, x: bounds.left + x, y: bounds.top + y, before: JSON.stringify(owner.snapshot()) };
+  });
+  await page.mouse.click(selectedCreature.x, selectedCreature.y);
+  await page.waitForFunction((uid) => document.getElementById("agent-inspector").dataset.state === "ready"
+    && document.getElementById("agent-inspector").dataset.uid === uid, selectedCreature.uid);
+  if (await page.locator("#inspector-signals tr").count() !== 34) throw new Error("Inspector omitted canonical sensor/actuator rows");
+  await page.fill("#inspector-uid", "18446744073709551615");
+  await page.click("#inspector-refresh");
+  await page.waitForFunction(() => document.getElementById("agent-inspector").dataset.state === "ready");
+  if (await page.inputValue("#inspector-uid") !== "18446744073709551615") throw new Error("Inspector refresh overwrote an edited UID");
+  if (await page.evaluate(() => JSON.stringify(window.__rendererSim.snapshot())) !== selectedCreature.before) {
+    throw new Error("Creature picking or inspection changed the paused scientific snapshot");
+  }
+  await page.click("#inspector-clear");
+  await page.waitForFunction(() => document.getElementById("agent-inspector").dataset.state === "empty");
+
   const screenshotControl = await page.evaluate(() => {
     const canvas = document.createElement("canvas");
     canvas.id = "screenshot-control";
@@ -623,8 +653,8 @@ async function runRendererTests(browser, baseUrl) {
       const snapshot = {
         tick: 0, world: { width: 2560, height: 1440 },
         agents: [
-          { position: [640, 360], health: 1, color: [0.2, 0.8, 0.2], boost: true },
-          { position: [1280, 720], health: 1, color: [0.9, 0.1, 0.1], boost: false },
+          { uid: "18446744073709551615", position: [640, 360], health: 1, color: [0.2, 0.8, 0.2], boost: true },
+          { uid: "9007199254740993", position: [1280, 720], health: 1, color: [0.9, 0.1, 0.1], boost: false },
         ],
       };
       let capturedPixels = null;
@@ -663,6 +693,14 @@ async function runRendererTests(browser, baseUrl) {
             || corner[0] > 15 || corner[1] > 22 || corner[2] > 38
             || ring[2] <= ring[0] + 70) {
           throw new Error(`${backend} failed world scaling, circular body or boost ring: ${JSON.stringify(pixels)}`);
+        }
+        const selected = await read(snapshot, [[328, 180], [648, 360]], { selectedUid: "18446744073709551615" });
+        const selectedOther = await read(snapshot, [[328, 180], [648, 360]], { selectedUid: "9007199254740993" });
+        const unselected = await read(snapshot, [[328, 180], [648, 360]], { selectedUid: null });
+        const gold = (pixel) => pixel[0] > 180 && pixel[1] > 120 && pixel[2] < 80;
+        if (!gold(selected[0]) || gold(selected[1]) || gold(selectedOther[0]) || !gold(selectedOther[1])
+            || unselected.some(gold)) {
+          throw new Error(`${backend} selected UID highlight was stale or rounded: ${JSON.stringify({ selected, selectedOther, unselected })}`);
         }
         const empty = await read({ ...snapshot, agents: [] }, [[320, 180]]);
         if (empty[0][0] > 15 || empty[0][1] > 22 || empty[0][2] > 38 || empty[0][3] !== 255) {
@@ -783,7 +821,7 @@ async function runRendererTests(browser, baseUrl) {
             queue.writeBuffer = writeBuffer;
           }
         }
-        results[backend] = { pixels, capturedPixels, empty, resized, growthAgents: 513, capacityError, admission,
+        results[backend] = { pixels, capturedPixels, empty, resized, selected, selectedOther, unselected, growthAgents: 513, capacityError, admission,
           environment: { foodCells, waterCells, changedCells, sessionCells, replacementCells, absentCells } };
       } finally {
         renderer.destroy();
