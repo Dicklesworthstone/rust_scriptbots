@@ -6698,15 +6698,31 @@ mod tests {
         let missing = AgentUid(u64::MAX);
         let page = crate::channel::INSPECTOR_GENOME_PAGE_SIZE;
         let max = crate::channel::MAX_INSPECTOR_CONTRIBUTORS;
-        assert!(owner.inspect_agent_with_attribution(missing, None, 0, false).unwrap().is_none());
-        assert!(owner.inspect_agent_with_attribution(missing, Some(max), page, true).unwrap().is_none());
-        let error = |contributors, offset| {
-            match owner.inspect_agent_with_attribution(missing, contributors, offset, true) {
-                Err(HostAccessError::ProtocolViolation { message }) => message,
-                _ => panic!("invalid inspector request must be refused"),
-            }
+        assert!(
+            owner
+                .inspect_agent_with_attribution(missing, None, 0, false)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            owner
+                .inspect_agent_with_attribution(missing, Some(max), page, true)
+                .unwrap()
+                .is_none()
+        );
+        let error = |contributors, offset| match owner.inspect_agent_with_attribution(
+            missing,
+            contributors,
+            offset,
+            true,
+        ) {
+            Err(HostAccessError::ProtocolViolation { message }) => message,
+            _ => panic!("invalid inspector request must be refused"),
         };
-        assert_eq!(error(Some(max + 1), 1), "sensor explanation contributor limit exceeded");
+        assert_eq!(
+            error(Some(max + 1), 1),
+            "sensor explanation contributor limit exceeded"
+        );
         assert_eq!(error(None, 1), "invalid genome page offset");
         let overflowing_page = usize::MAX - usize::MAX % page;
         assert_eq!(error(None, overflowing_page), "invalid genome page offset");

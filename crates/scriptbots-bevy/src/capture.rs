@@ -1156,7 +1156,10 @@ impl<'a> OffscreenCapture<'a> {
             .next_snapshot_revision
             .checked_add(1)
             .ok_or_else(|| anyhow!("offscreen capture snapshot revision overflow"))?;
-        self.app.world_mut().resource_mut::<SnapshotState>().latest = Some(snapshot);
+        self.app
+            .world_mut()
+            .resource_mut::<SnapshotState>()
+            .install_snapshot(snapshot);
         self.set_camera_active(true);
         // Frame 1: sync_world applies the snapshot; pipelines compile.
         self.app.update();

@@ -19,6 +19,10 @@ struct AppearanceRow {
 @group(#{MATERIAL_BIND_GROUP}) @binding(100)
 var<storage, read> appearance: array<AppearanceRow>;
 
+// Match Bevy 0.17's prepass cutoff. Its module-local constant is not exported
+// through naga_oil, so referring to it through the module fails shader composition.
+const PREMULTIPLIED_ALPHA_CUTOFF: f32 = 0.05;
+
 fn discard_appearance(in: prepass_io::VertexOutput) {
 #ifdef VISIBILITY_RANGE_DITHER
     pbr_functions::visibility_range_dither(in.position, in.visibility_range_dither);
@@ -27,7 +31,7 @@ fn discard_appearance(in: prepass_io::VertexOutput) {
     let alpha_mode = material.flags & pbr_types::STANDARD_MATERIAL_FLAGS_ALPHA_MODE_RESERVED_BITS;
     if (alpha_mode == pbr_types::STANDARD_MATERIAL_FLAGS_ALPHA_MODE_BLEND ||
         alpha_mode == pbr_types::STANDARD_MATERIAL_FLAGS_ALPHA_MODE_ADD) &&
-        appearance[get_tag(in.instance_index)].base.a < pbr_prepass_functions::PREMULTIPLIED_ALPHA_CUTOFF {
+        appearance[get_tag(in.instance_index)].base.a < PREMULTIPLIED_ALPHA_CUTOFF {
         discard;
     }
 #endif

@@ -1360,6 +1360,18 @@ pub(crate) struct SnapshotState {
     sim_rate: f32,
 }
 
+impl SnapshotState {
+    fn install_snapshot(&mut self, mut snapshot: WorldSnapshot) {
+        prepare_smooth_height_grid(
+            &mut snapshot.terrain_height,
+            self.latest
+                .as_ref()
+                .map(|previous| &previous.terrain_height),
+        );
+        self.latest = Some(snapshot);
+    }
+}
+
 #[derive(Default, Resource)]
 pub(crate) struct AgentRegistry {
     // Stable scientific identity is the presentation continuity key. AgentId
@@ -1526,16 +1538,22 @@ struct AgentMotionSettings {
     enabled: bool,
 }
 
+type SmoothAgentQuery<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static AgentPoseTarget,
+        &'static mut AgentDisplayPose,
+        &'static mut Transform,
+        Option<&'static AgentGroundFootprint>,
+        Option<&'static AgentMotionKey>,
+    ),
+>;
+
 fn smooth_agent_poses(
     state: Res<SnapshotState>,
     settings: Option<Res<AgentMotionSettings>>,
-    mut agents: Query<(
-        &AgentPoseTarget,
-        &mut AgentDisplayPose,
-        &mut Transform,
-        Option<&AgentGroundFootprint>,
-        Option<&AgentMotionKey>,
-    )>,
+    mut agents: SmoothAgentQuery<'_, '_>,
 ) {
     let paused = state
         .latest
@@ -1686,17 +1704,23 @@ struct SpikeDisplayPose {
     tick: u64,
 }
 
+type SmoothSpikeQuery<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static SpikePoseTarget,
+        Option<&'static mut SpikeDisplayPose>,
+        &'static mut Transform,
+        Option<&'static AgentMotionKey>,
+    ),
+>;
+
 fn smooth_spike_poses(
     mut commands: Commands,
     state: Option<Res<SnapshotState>>,
     settings: Option<Res<AgentMotionSettings>>,
-    mut spikes: Query<(
-        Entity,
-        &SpikePoseTarget,
-        Option<&mut SpikeDisplayPose>,
-        &mut Transform,
-        Option<&AgentMotionKey>,
-    )>,
+    mut spikes: SmoothSpikeQuery<'_, '_>,
 ) {
     let paused = state
         .as_ref()
@@ -3951,11 +3975,11 @@ struct TerrainColorMap {
     pixels: Vec<u8>,
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone)]
 struct TerrainHeightSnapshot {
     dims: UVec2,
     cell_size: u32,
-    elevation: Vec<f32>,
+    elevation: Arc<[f32]>,
     moisture: Vec<f32>,
     accent: Vec<f32>,
     water_depth: Vec<f32>,
@@ -3963,6 +3987,23 @@ struct TerrainHeightSnapshot {
     temperature: Vec<f32>,
     kinds: Vec<TerrainKind>,
     daylight: f32,
+    smooth_grid: Option<Arc<SmoothHeightGrid>>,
+}
+
+// The cache is derived renderer state, not part of snapshot identity.
+impl PartialEq for TerrainHeightSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        self.dims == other.dims
+            && self.cell_size == other.cell_size
+            && self.elevation == other.elevation
+            && self.moisture == other.moisture
+            && self.accent == other.accent
+            && self.water_depth == other.water_depth
+            && self.fertility == other.fertility
+            && self.temperature == other.temperature
+            && self.kinds == other.kinds
+            && self.daylight == other.daylight
+    }
 }
 
 impl TerrainHeightSnapshot {
@@ -3996,7 +4037,7 @@ impl TerrainHeightSnapshot {
         Some(Self {
             dims,
             cell_size: layer.cell_size(),
-            elevation,
+            elevation: elevation.into(),
             moisture,
             accent,
             water_depth: water_depth.map_or_else(|| vec![0.0; total], |depth| depth.to_vec()),
@@ -4004,6 +4045,7 @@ impl TerrainHeightSnapshot {
             temperature,
             kinds,
             daylight,
+            smooth_grid: None,
         })
     }
 
@@ -4787,6 +4829,7 @@ impl WorldSnapshot {
             kinds: terrain.tiles.iter().map(|tile| tile.kind).collect(),
             water_depth: water.map_or_else(|| vec![0.0; total], <[f32]>::to_vec),
             daylight: visual::daylight_factor(snapshot.world.tick, cycle_ticks, start_phase),
+            smooth_grid: None,
         };
         let mut agents = Vec::with_capacity(snapshot.world.agents.len());
         for (index, agent) in snapshot.world.agents.iter().enumerate() {
@@ -6202,7 +6245,7 @@ fn poll_snapshots(
 ) {
     if let Some(snapshot) = inbox.take_latest() {
         motion.enabled = !snapshot.reduced_motion;
-        state.latest = Some(snapshot);
+        state.install_snapshot(snapshot);
     }
     if let Some(snapshot) = state.latest.as_mut() {
         snapshot.motion_alpha = snapshot
@@ -6252,21 +6295,13 @@ fn terrain_chunk_colors(
     bounds: TerrainChunkBounds,
     palette: ColorPaletteMode,
 ) -> Vec<[f32; 4]> {
-    let mut colors = Vec::with_capacity(((bounds.size.x + 1) * (bounds.size.y + 1)) as usize);
-    for z in 0..=bounds.size.y {
-        for x in 0..=bounds.size.x {
-            let x = bounds.origin.x + x;
-            let z = bounds.origin.y + z;
-            let sample = terrain.sample_tile(x, z);
-            let slope = compute_tile_slope(terrain, x, z);
-            let splat = terrain_sample_splat(sample, slope);
-            colors.push(terrain_vertex_color_from_splat(
-                sample,
-                slope,
-                splat,
-                terrain.daylight,
-                palette,
-            ));
+    let nx = bounds.size.x * TERRAIN_SUBDIVISIONS + 1;
+    let nz = bounds.size.y * TERRAIN_SUBDIVISIONS + 1;
+    let mut colors = Vec::with_capacity((nx * nz) as usize);
+    let appearance = TerrainAppearanceGrid::new(terrain, bounds, palette);
+    for z in 0..nz {
+        for x in 0..nx {
+            colors.push(appearance.at(x, z).0);
         }
     }
     colors
@@ -8010,7 +8045,7 @@ mod adaptive_governor_tests {
         {
             let mut state = app.world_mut().resource_mut::<SnapshotState>();
             let snapshot = state.latest.as_mut().unwrap();
-            snapshot.terrain_height.elevation[0] += 0.2;
+            Arc::make_mut(&mut snapshot.terrain_height.elevation)[0] += 0.2;
             snapshot.revision += 1;
         }
         app.update();
@@ -8065,7 +8100,7 @@ mod adaptive_governor_tests {
         {
             let mut state = app.world_mut().resource_mut::<SnapshotState>();
             let snapshot = state.latest.as_mut().unwrap();
-            snapshot.terrain_height.elevation[0] += 0.25;
+            Arc::make_mut(&mut snapshot.terrain_height.elevation)[0] += 0.25;
             snapshot.revision += 1;
         }
         app.update();
@@ -8327,12 +8362,15 @@ mod adaptive_governor_tests {
         else {
             panic!("right chunk must have UVs");
         };
-        assert_eq!(left[1], right[0]);
-        assert_eq!(left[3], right[2]);
-        assert!(left[1][0] > 0.0);
+        let edge = TERRAIN_SUBDIVISIONS as usize;
+        let stride = edge + 1;
+        for row in 0..=edge {
+            assert_eq!(left[row * stride + edge], right[row * stride]);
+        }
+        assert!(left[edge][0] > 0.0);
         for width in [1, 3, 12, 97, 120] {
-            let start = terrain_detail_uv(0, width);
-            let end = terrain_detail_uv(width, width);
+            let start = terrain_detail_uv(0.0, width);
+            let end = terrain_detail_uv(width as f32, width);
             assert_eq!(start, 0.0);
             assert_eq!(end % 2.0, 0.0, "mirrored texture phase must wrap");
         }
@@ -8366,14 +8404,15 @@ mod adaptive_governor_tests {
         for x in 0..5 {
             let left = weights(x);
             let right = weights(x + 1);
-            assert_eq!(
-                left[1], right[0],
-                "shared top vertex must blend identically"
-            );
-            assert_eq!(
-                left[3], right[2],
-                "shared bottom vertex must blend identically"
-            );
+            let edge = TERRAIN_SUBDIVISIONS as usize;
+            let stride = edge + 1;
+            for row in 0..=edge {
+                assert_eq!(
+                    left[row * stride + edge],
+                    right[row * stride],
+                    "shared vertex {row} must blend identically"
+                );
+            }
             let sample = terrain.sample_tile(x, 0);
             let splat = terrain_sample_splat(sample, compute_tile_slope(terrain, x, 0));
             assert_eq!(left[0], [splat[0] + splat[1], splat[3] + splat[4]]);
@@ -16302,6 +16341,188 @@ struct TerrainChunkStats {
     signature: TerrainChunkSignature,
 }
 
+// Keep the rendered geometry, its height sampler and the support overlay on
+// the same triangulation. The simulation's underlying cells stay unchanged.
+const TERRAIN_SUBDIVISIONS: u32 = 4;
+
+struct SmoothHeightGrid {
+    source: Arc<[f32]>,
+    dims: UVec2,
+    cell_size: u32,
+    width: usize,
+    heights: Vec<f32>,
+}
+
+impl SmoothHeightGrid {
+    fn matches(&self, terrain: &TerrainHeightSnapshot) -> bool {
+        self.dims == terrain.dims
+            && self.cell_size == terrain.cell_size
+            && Arc::ptr_eq(&self.source, &terrain.elevation)
+    }
+
+    fn height(&self, x: u32, z: u32) -> f32 {
+        let max = (self.dims - UVec2::ONE) * TERRAIN_SUBDIVISIONS;
+        self.heights[z.min(max.y) as usize * self.width + x.min(max.x) as usize]
+    }
+}
+
+fn prepare_smooth_height_grid(
+    terrain: &mut TerrainHeightSnapshot,
+    previous: Option<&TerrainHeightSnapshot>,
+) {
+    if terrain.dims.x == 0 || terrain.dims.y == 0 {
+        terrain.smooth_grid = None;
+        return;
+    }
+    if let Some(previous) = previous
+        && previous.dims == terrain.dims
+        && previous.cell_size == terrain.cell_size
+        && previous.elevation == terrain.elevation
+        && let Some(grid) = previous
+            .smooth_grid
+            .as_ref()
+            .filter(|grid| grid.matches(previous))
+    {
+        terrain.elevation = Arc::clone(&previous.elevation);
+        terrain.smooth_grid = Some(Arc::clone(grid));
+        return;
+    }
+    let size = (terrain.dims - UVec2::ONE) * TERRAIN_SUBDIVISIONS + UVec2::ONE;
+    let mut heights = Vec::with_capacity((size.x * size.y) as usize);
+    for z in 0..size.y {
+        for x in 0..size.x {
+            heights.push(terrain_smooth_height(
+                terrain,
+                x as f32 / TERRAIN_SUBDIVISIONS as f32,
+                z as f32 / TERRAIN_SUBDIVISIONS as f32,
+                1.0,
+            ));
+        }
+    }
+    terrain.smooth_grid = Some(Arc::new(SmoothHeightGrid {
+        source: Arc::clone(&terrain.elevation),
+        dims: terrain.dims,
+        cell_size: terrain.cell_size,
+        width: size.x as usize,
+        heights,
+    }));
+}
+
+fn terrain_render_vertex_height(
+    terrain: &TerrainHeightSnapshot,
+    x: u32,
+    z: u32,
+    scale: f32,
+) -> f32 {
+    terrain
+        .smooth_grid
+        .as_ref()
+        .filter(|grid| grid.matches(terrain))
+        .map_or_else(
+            || {
+                terrain_smooth_height(
+                    terrain,
+                    x as f32 / TERRAIN_SUBDIVISIONS as f32,
+                    z as f32 / TERRAIN_SUBDIVISIONS as f32,
+                    scale,
+                )
+            },
+            |grid| grid.height(x, z) * scale,
+        )
+}
+
+fn bounded_cubic(p0: f32, p1: f32, p2: f32, p3: f32, t: f32) -> f32 {
+    let a = 2.0 * p1;
+    let b = p2 - p0;
+    let c = 2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3;
+    let d = -p0 + 3.0 * p1 - 3.0 * p2 + p3;
+    (0.5 * (a + t * (b + t * (c + t * d)))).clamp(p1.min(p2), p1.max(p2))
+}
+
+fn terrain_smooth_height(terrain: &TerrainHeightSnapshot, x: f32, z: f32, scale: f32) -> f32 {
+    if terrain.dims.x == 0 || terrain.dims.y == 0 {
+        return 0.0;
+    }
+    let x = x.clamp(0.0, (terrain.dims.x - 1) as f32);
+    let z = z.clamp(0.0, (terrain.dims.y - 1) as f32);
+    let base_x = x.floor() as i32;
+    let base_z = z.floor() as i32;
+    let tx = x - base_x as f32;
+    let tz = z - base_z as f32;
+    let height = |x: i32, z: i32| {
+        let x = x.clamp(0, terrain.dims.x as i32 - 1) as u32;
+        let z = z.clamp(0, terrain.dims.y as i32 - 1) as u32;
+        terrain.elevation[terrain.index(x, z)]
+    };
+    let row = |z| {
+        bounded_cubic(
+            height(base_x - 1, z),
+            height(base_x, z),
+            height(base_x + 1, z),
+            height(base_x + 2, z),
+            tx,
+        )
+    };
+    bounded_cubic(
+        row(base_z - 1),
+        row(base_z),
+        row(base_z + 1),
+        row(base_z + 2),
+        tz,
+    ) * scale
+}
+
+struct TerrainAppearanceGrid {
+    stride: usize,
+    samples: Vec<(Vec4, Vec2)>,
+}
+
+impl TerrainAppearanceGrid {
+    fn new(
+        terrain: &TerrainHeightSnapshot,
+        bounds: TerrainChunkBounds,
+        palette: ColorPaletteMode,
+    ) -> Self {
+        let stride = (bounds.size.x + 2) as usize;
+        let mut samples = Vec::with_capacity(stride * (bounds.size.y + 2) as usize);
+        for z in 0..=bounds.size.y + 1 {
+            for x in 0..=bounds.size.x + 1 {
+                let point = bounds.origin + UVec2::new(x, z);
+                let sample = terrain.sample_tile(point.x, point.y);
+                let slope = compute_tile_slope(terrain, point.x, point.y);
+                let splat = terrain_sample_splat(sample, slope);
+                let color = terrain_vertex_color_from_splat(
+                    sample,
+                    slope,
+                    splat,
+                    terrain.daylight,
+                    palette,
+                );
+                samples.push((
+                    Vec4::from_array(color),
+                    Vec2::new(splat[0] + splat[1], splat[3] + splat[4]),
+                ));
+            }
+        }
+        Self { stride, samples }
+    }
+
+    fn at(&self, x: u32, z: u32) -> ([f32; 4], [f32; 2]) {
+        let ix = (x / TERRAIN_SUBDIVISIONS) as usize;
+        let iz = (z / TERRAIN_SUBDIVISIONS) as usize;
+        let tx = (x % TERRAIN_SUBDIVISIONS) as f32 / TERRAIN_SUBDIVISIONS as f32;
+        let tz = (z % TERRAIN_SUBDIVISIONS) as f32 / TERRAIN_SUBDIVISIONS as f32;
+        let (c00, w00) = self.samples[iz * self.stride + ix];
+        let (c10, w10) = self.samples[iz * self.stride + ix + 1];
+        let (c01, w01) = self.samples[(iz + 1) * self.stride + ix];
+        let (c11, w11) = self.samples[(iz + 1) * self.stride + ix + 1];
+        (
+            c00.lerp(c10, tx).lerp(c01.lerp(c11, tx), tz).to_array(),
+            w00.lerp(w10, tx).lerp(w01.lerp(w11, tx), tz).to_array(),
+        )
+    }
+}
+
 /// Area-weight the incident rendered triangles using global cell coordinates.
 /// A shared chunk-edge vertex must see the same faces from either chunk.
 fn terrain_vertex_normal(
@@ -16312,14 +16533,12 @@ fn terrain_vertex_normal(
     if terrain.dims.x == 0 || terrain.dims.y == 0 {
         return Vec3::Y;
     }
-    let cell = (terrain.cell_size as f32).max(1.0);
-    let height = |x: u32, y: u32| {
-        let index = terrain.index(x.min(terrain.dims.x - 1), y.min(terrain.dims.y - 1));
-        terrain.elevation[index] * height_scale
-    };
+    let cell = (terrain.cell_size as f32).max(1.0) / TERRAIN_SUBDIVISIONS as f32;
+    let height = |x: u32, y: u32| terrain_render_vertex_height(terrain, x, y, height_scale);
+    let last = terrain.dims * TERRAIN_SUBDIVISIONS - UVec2::ONE;
     let mut sum = Vec3::ZERO;
-    for y in vertex.y.saturating_sub(1)..=vertex.y.min(terrain.dims.y - 1) {
-        for x in vertex.x.saturating_sub(1)..=vertex.x.min(terrain.dims.x - 1) {
+    for y in vertex.y.saturating_sub(1)..=vertex.y.min(last.y) {
+        for x in vertex.x.saturating_sub(1)..=vertex.x.min(last.x) {
             let h00 = height(x, y);
             let h10 = height(x + 1, y);
             let h01 = height(x, y + 1);
@@ -16338,10 +16557,10 @@ fn terrain_vertex_normal(
     sum.try_normalize().unwrap_or(Vec3::Y)
 }
 
-fn terrain_detail_uv(coordinate: u32, tiles: u32) -> f32 {
+fn terrain_detail_uv(coordinate: f32, tiles: u32) -> f32 {
     let span = tiles.max(1) as f32;
     let mirrored_periods = (span / 8.0).round().max(1.0);
-    coordinate as f32 / span * (mirrored_periods * 2.0)
+    coordinate / span * (mirrored_periods * 2.0)
 }
 
 fn build_chunk_mesh(
@@ -16354,8 +16573,8 @@ fn build_chunk_mesh(
     let cell_size = terrain.cell_size as f32;
     let half = snapshot.world_size * 0.5;
 
-    let verts_x = bounds.size.x + 1;
-    let verts_z = bounds.size.y + 1;
+    let verts_x = bounds.size.x * TERRAIN_SUBDIVISIONS + 1;
+    let verts_z = bounds.size.y * TERRAIN_SUBDIVISIONS + 1;
     let vertex_count = (verts_x * verts_z) as usize;
 
     let mut positions = Vec::with_capacity(vertex_count);
@@ -16367,48 +16586,49 @@ fn build_chunk_mesh(
     let mut sum_slope = 0.0f64;
     let mut max_height = f32::MIN;
     let mut biome_tiles = [0_usize; visual::SPLAT_LAYERS];
+    let mut coarse_vertices = 0_usize;
+    let appearance = TerrainAppearanceGrid::new(terrain, bounds, palette);
 
     for vz in 0..verts_z {
         for vx in 0..verts_x {
-            let global_x = bounds.origin.x + vx;
-            let global_z = bounds.origin.y + vz;
-            let height =
-                sample_height_linear(terrain, global_x as f32, global_z as f32, height_scale);
-            let world_x = global_x as f32 * cell_size - half.x;
-            let world_z = half.y - global_z as f32 * cell_size;
+            let grid = bounds.origin * TERRAIN_SUBDIVISIONS + UVec2::new(vx, vz);
+            let global = grid.as_vec2() / TERRAIN_SUBDIVISIONS as f32;
+            let height = terrain_render_vertex_height(terrain, grid.x, grid.y, height_scale);
+            let world_x = global.x * cell_size - half.x;
+            let world_z = half.y - global.y * cell_size;
             positions.push([world_x, height, world_z]);
-            normals.push(
-                terrain_vertex_normal(terrain, UVec2::new(global_x, global_z), height_scale)
-                    .to_array(),
-            );
+            normals.push(terrain_vertex_normal(terrain, grid, height_scale).to_array());
             max_height = max_height.max(height);
 
             // Align chunk edges and complete an even number of mirrored
             // repeats across the world so the texture phase wraps at its edge.
-            let uv_x = terrain_detail_uv(global_x, terrain.dims.x);
-            let uv_z = terrain_detail_uv(global_z, terrain.dims.y);
+            let uv_x = terrain_detail_uv(global.x, terrain.dims.x);
+            let uv_z = terrain_detail_uv(global.y, terrain.dims.y);
             uvs.push([uv_x, uv_z]);
 
-            let sample = terrain.sample_tile(global_x, global_z);
-            let slope = compute_tile_slope(terrain, global_x, global_z);
-            let splat = terrain_sample_splat(sample, slope);
-            blend_weights.push([splat[0] + splat[1], splat[3] + splat[4]]);
-            let color =
-                terrain_vertex_color_from_splat(sample, slope, splat, terrain.daylight, palette);
+            let (color, weights) = appearance.at(vx, vz);
+            blend_weights.push(weights);
             colors.push(color);
 
-            if vx < bounds.size.x && vz < bounds.size.y {
-                biome_tiles[visual::terrain_kind_index(sample.kind)] += 1;
+            if vx % TERRAIN_SUBDIVISIONS == 0 && vz % TERRAIN_SUBDIVISIONS == 0 {
+                let global_x = grid.x / TERRAIN_SUBDIVISIONS;
+                let global_z = grid.y / TERRAIN_SUBDIVISIONS;
+                let sample = terrain.sample_tile(global_x, global_z);
+                let slope = compute_tile_slope(terrain, global_x, global_z);
+                if vx < verts_x - 1 && vz < verts_z - 1 {
+                    biome_tiles[visual::terrain_kind_index(sample.kind)] += 1;
+                }
+                sum_moisture += sample.moisture as f64;
+                sum_slope += slope as f64;
+                coarse_vertices += 1;
             }
-            sum_moisture += sample.moisture as f64;
-            sum_slope += slope as f64;
         }
     }
 
-    let mut indices = Vec::with_capacity((bounds.size.x * bounds.size.y * 6) as usize);
+    let mut indices = Vec::with_capacity(((verts_x - 1) * (verts_z - 1) * 6) as usize);
     let stride = verts_x;
-    for z in 0..bounds.size.y {
-        for x in 0..bounds.size.x {
+    for z in 0..verts_z - 1 {
+        for x in 0..verts_x - 1 {
             let i0 = z * stride + x;
             let i1 = i0 + 1;
             let i2 = i0 + stride;
@@ -16419,7 +16639,7 @@ fn build_chunk_mesh(
         }
     }
 
-    let vertex_total = vertex_count as f64;
+    let vertex_total = coarse_vertices as f64;
     let mean_moisture = (sum_moisture / vertex_total) as f32;
     let mean_slope = (sum_slope / vertex_total) as f32;
     let height_factor = (max_height / height_scale).clamp(0.0, 1.0);
@@ -16477,6 +16697,7 @@ fn build_chunk_mesh(
     BuiltChunk { mesh, stats }
 }
 
+#[cfg(test)]
 fn sample_height_linear(terrain: &TerrainHeightSnapshot, x: f32, z: f32, height_scale: f32) -> f32 {
     if terrain.dims.x == 0 || terrain.dims.y == 0 {
         return 0.0;
@@ -16504,31 +16725,78 @@ fn sample_height_linear(terrain: &TerrainHeightSnapshot, x: f32, z: f32, height_
 }
 
 fn sample_height_world(terrain: &TerrainHeightSnapshot, position: Vec2, height_scale: f32) -> f32 {
+    if let Some(grid) = terrain
+        .smooth_grid
+        .as_ref()
+        .filter(|grid| grid.matches(terrain))
+    {
+        // sample_rendered_triangles bounds both coordinates to this grid.
+        return sample_rendered_triangles(terrain, position, |x, z| {
+            grid.heights[z as usize * grid.width + x as usize] * height_scale
+        });
+    }
+    sample_rendered_triangles(terrain, position, |x, z| {
+        terrain_render_vertex_height(terrain, x, z, height_scale)
+    })
+}
+
+fn sample_height_world_cached(
+    terrain: &TerrainHeightSnapshot,
+    position: Vec2,
+    height_scale: f32,
+    cache: &mut HashMap<UVec2, f32>,
+) -> f32 {
+    if terrain
+        .smooth_grid
+        .as_ref()
+        .is_some_and(|grid| grid.matches(terrain))
+    {
+        return sample_height_world(terrain, position, height_scale);
+    }
+    sample_rendered_triangles(terrain, position, |x, z| {
+        *cache.entry(UVec2::new(x, z)).or_insert_with(|| {
+            terrain_smooth_height(
+                terrain,
+                x as f32 / TERRAIN_SUBDIVISIONS as f32,
+                z as f32 / TERRAIN_SUBDIVISIONS as f32,
+                height_scale,
+            )
+        })
+    })
+}
+
+fn sample_rendered_triangles(
+    terrain: &TerrainHeightSnapshot,
+    position: Vec2,
+    mut height: impl FnMut(u32, u32) -> f32,
+) -> f32 {
     if terrain.dims.x == 0 || terrain.dims.y == 0 {
         return 0.0;
     }
     let cell = terrain.cell_size.max(1) as f32;
-    let grid_x = (position.x / cell).clamp(0.0, (terrain.dims.x - 1) as f32);
-    let grid_z = (position.y / cell).clamp(0.0, (terrain.dims.y - 1) as f32);
+    let subdivisions = TERRAIN_SUBDIVISIONS as f32;
+    let grid_x =
+        (position.x / cell * subdivisions).clamp(0.0, (terrain.dims.x - 1) as f32 * subdivisions);
+    let grid_z =
+        (position.y / cell * subdivisions).clamp(0.0, (terrain.dims.y - 1) as f32 * subdivisions);
     let x0 = grid_x.floor() as u32;
     let z0 = grid_z.floor() as u32;
-    let x1 = (x0 + 1).min(terrain.dims.x - 1);
-    let z1 = (z0 + 1).min(terrain.dims.y - 1);
+    let x1 = (x0 + 1).min((terrain.dims.x - 1) * TERRAIN_SUBDIVISIONS);
+    let z1 = (z0 + 1).min((terrain.dims.y - 1) * TERRAIN_SUBDIVISIONS);
     let tx = grid_x - x0 as f32;
     let tz = grid_z - z0 as f32;
-    let h00 = terrain.elevation[terrain.index(x0, z0)];
-    let h10 = terrain.elevation[terrain.index(x1, z0)];
-    let h01 = terrain.elevation[terrain.index(x0, z1)];
-    let h11 = terrain.elevation[terrain.index(x1, z1)];
+    let h00 = height(x0, z0);
+    let h10 = height(x1, z0);
+    let h01 = height(x0, z1);
+    let h11 = height(x1, z1);
     // Match the two actual triangles [00,10,01] and [10,11,01].
     // Bilinear interpolation describes a curved patch, which can be well
     // above or below the rendered planar surface on a saddle-shaped cell.
-    let height = if tx + tz <= 1.0 {
+    if tx + tz <= 1.0 {
         h00 + (h10 - h00) * tx + (h01 - h00) * tz
     } else {
         h11 + (h01 - h11) * (1.0 - tx) + (h10 - h11) * (1.0 - tz)
-    };
-    height * height_scale
+    }
 }
 
 fn terrain_tile_surface_srgb(
@@ -17045,7 +17313,8 @@ mod terrain_tests {
         terrain.cell_size = 100;
         terrain.elevation = vec![
             0.2, 0.5, 0.1, 0.6, 0.3, 0.7, 0.25, 0.45, 0.6, 0.15, 0.65, 0.2, 0.4, 0.55, 0.1, 0.5,
-        ];
+        ]
+        .into();
         terrain.moisture = vec![0.5; 16];
         terrain.accent = vec![0.1; 16];
         terrain.water_depth = vec![0.0; 16];
@@ -17191,7 +17460,8 @@ mod terrain_tests {
         snapshot.terrain_height.cell_size = 100;
         snapshot.terrain_height.elevation = vec![
             0.1, 0.2, 0.1, 0.2, 0.3, 0.6, 0.2, 0.4, 0.1, 0.4, 0.8, 0.3, 0.2, 0.1, 0.4, 0.2,
-        ];
+        ]
+        .into();
         let mut agent = sample_agent_visual();
         let coordinates = [
             0.0, 1.0, 25.0, 75.0, 95.0, 100.0, 105.0, 150.0, 195.0, 200.0, 205.0, 255.0, 299.0,
@@ -17559,7 +17829,8 @@ mod terrain_tests {
         snapshot.terrain_height.cell_size = 100;
         snapshot.terrain_height.elevation = vec![
             0.1, 0.2, 0.1, 0.2, 0.3, 0.6, 0.2, 0.4, 0.1, 0.4, 0.8, 0.3, 0.2, 0.1, 0.4, 0.2,
-        ];
+        ]
+        .into();
         let mut agent = sample_agent_visual();
         let coordinates = [
             0.0, 1.0, 25.0, 75.0, 95.0, 100.0, 105.0, 150.0, 195.0, 200.0, 205.0, 255.0, 299.0,
@@ -18112,7 +18383,7 @@ mod terrain_tests {
                 snapshot.terrain_height.dims = UVec2::splat(3);
                 snapshot.terrain_height.cell_size = 500;
                 snapshot.terrain_height.elevation =
-                    vec![0.0, 0.1, 0.2, 0.0, 0.1, 0.2, 0.0, 0.1, 0.2];
+                    vec![0.0, 0.1, 0.2, 0.0, 0.1, 0.2, 0.0, 0.1, 0.2].into();
             }
             let focus_height = snapshot.as_ref().map_or(0.0, |snapshot| {
                 sample_height_world(&snapshot.terrain_height, focus, TERRAIN_HEIGHT_SCALE)
@@ -18641,7 +18912,9 @@ mod terrain_tests {
             else {
                 panic!("terrain mesh colors must be Float32x4");
             };
-            let actual = colors[5];
+            let subdiv = TERRAIN_SUBDIVISIONS as usize;
+            let stride = 3 * subdiv + 1;
+            let actual = colors[subdiv * stride + subdiv];
             for (channel, (actual, expected)) in actual[..3]
                 .iter()
                 .copied()
@@ -19238,7 +19511,9 @@ mod terrain_tests {
             Some(VertexAttributeValues::Float32x3(values)) => values.clone(),
             other => panic!("unexpected position attribute: {:?}", other),
         };
-        assert_eq!(positions.len(), 9, "expected 3x3 vertex grid");
+        let stride = (bounds.size.x * TERRAIN_SUBDIVISIONS + 1) as usize;
+        let rows = (bounds.size.y * TERRAIN_SUBDIVISIONS + 1) as usize;
+        assert_eq!(positions.len(), stride * rows);
 
         let world_half = snapshot.world_size * 0.5;
         // Top-left vertex (0,0)
@@ -19254,7 +19529,7 @@ mod terrain_tests {
         assert!((p0.y - 0.0).abs() < 1e-3, "height mismatch for vertex 0");
 
         // Center vertex (global 1,1) should match bilinear height sample
-        let center = Vec3::from_array(positions[4]);
+        let center = Vec3::from_array(positions[TERRAIN_SUBDIVISIONS as usize * (stride + 1)]);
         let expected_center = sample_height_linear(&snapshot.terrain_height, 1.0, 1.0, 100.0);
         assert!(
             (center.y - expected_center).abs() < 1e-3,
@@ -19264,7 +19539,7 @@ mod terrain_tests {
         );
 
         // Bottom-right vertex corresponds to the far corner height sample
-        let last = Vec3::from_array(positions[8]);
+        let last = Vec3::from_array(*positions.last().unwrap());
         let expected_last = sample_height_linear(
             &snapshot.terrain_height,
             snapshot.terrain_height.dims.x as f32,
@@ -19284,8 +19559,8 @@ mod terrain_tests {
         };
         assert_eq!(
             indices.len(),
-            24,
-            "expected 2x2 quads => 24 indices (two tris per cell)"
+            (stride - 1) * (rows - 1) * 6,
+            "each subdivided quad has two triangles"
         );
 
         assert!(built.stats.mean_moisture > 0.0);
@@ -19295,7 +19570,7 @@ mod terrain_tests {
     #[test]
     fn flat_terrain_normals_point_toward_the_sky() {
         let mut snapshot = sample_world_snapshot();
-        snapshot.terrain_height.elevation.fill(0.25);
+        Arc::make_mut(&mut snapshot.terrain_height.elevation).fill(0.25);
         let built = build_chunk_mesh(
             &snapshot,
             TerrainChunkBounds {
@@ -19336,7 +19611,8 @@ mod terrain_tests {
             let Some(Indices::U32(indices)) = built.mesh.indices() else {
                 panic!("terrain triangle indices missing");
             };
-            let expected_triangles = (bounds.size.x * bounds.size.y * 2) as usize;
+            let expected_triangles =
+                (bounds.size.x * bounds.size.y * TERRAIN_SUBDIVISIONS.pow(2) * 2) as usize;
             assert!(expected_triangles > 0);
             assert_eq!(indices.len(), expected_triangles * 3);
             for triangle in indices.as_chunks::<3>().0 {
@@ -19372,7 +19648,8 @@ mod terrain_tests {
         snapshot.terrain_height.cell_size = 100;
         snapshot.terrain_height.elevation = vec![
             0.1, 0.2, 0.1, 0.2, 0.3, 0.6, 0.2, 0.4, 0.1, 0.4, 0.8, 0.3, 0.2, 0.1, 0.4, 0.2,
-        ];
+        ]
+        .into();
         snapshot.terrain_height.moisture = vec![0.3; 16];
         snapshot.terrain_height.accent = vec![0.1; 16];
         snapshot.terrain_height.water_depth = vec![0.0; 16];
@@ -19399,9 +19676,14 @@ mod terrain_tests {
         let left_normals = normals(&left);
         let right_normals = normals(&right);
         let below_normals = normals(&below);
-        for index in 0..=2 {
-            assert_eq!(left_normals[index * 3 + 2], right_normals[index * 3]);
-            assert_eq!(left_normals[6 + index], below_normals[index]);
+        let edge = (2 * TERRAIN_SUBDIVISIONS) as usize;
+        let stride = edge + 1;
+        for index in 0..=edge {
+            assert_eq!(
+                left_normals[index * stride + edge],
+                right_normals[index * stride]
+            );
+            assert_eq!(left_normals[edge * stride + index], below_normals[index]);
         }
         let positions = match full.attribute(Mesh::ATTRIBUTE_POSITION).unwrap() {
             VertexAttributeValues::Float32x3(values) => values,
@@ -19429,7 +19711,7 @@ mod terrain_tests {
     #[test]
     fn agent_translation_respects_terrain_height() {
         let mut snapshot = sample_world_snapshot();
-        snapshot.terrain_height.elevation.fill(0.5);
+        Arc::make_mut(&mut snapshot.terrain_height.elevation).fill(0.5);
         snapshot.agents.push(sample_agent_visual());
 
         let translation = agent_translation(&snapshot, &snapshot.agents[0]);
@@ -19447,16 +19729,176 @@ mod terrain_tests {
     }
 
     #[test]
-    fn world_height_matches_both_rendered_triangles_of_a_saddle_cell() {
+    fn smooth_height_cache_reuses_equal_geometry_and_rejects_mutation() {
+        let mut first = sample_world_snapshot().terrain_height;
+        first.elevation = vec![0.0, 0.2, 0.4, 1.0].into();
+        first.dims = UVec2::new(2, 2);
+        first.cell_size = 100;
+        prepare_smooth_height_grid(&mut first, None);
+        let grid = first.smooth_grid.as_ref().unwrap();
+        assert!(grid.matches(&first));
+        let points = [
+            Vec2::new(17.0, 22.0),
+            Vec2::new(43.0, 71.0),
+            Vec2::new(100.0, 100.0),
+            Vec2::new(-5.0, 120.0),
+            Vec2::new(220.0, -9.0),
+        ];
+        let expected = points.map(|p| sample_height_world(&first, p, 100.0));
+        let mut uncached_first = first.clone();
+        uncached_first.smooth_grid = None;
+        assert_eq!(
+            points.map(|p| sample_height_world(&uncached_first, p, 100.0)),
+            expected
+        );
+
+        // A separately published but equal terrain must reuse the same grid.
+        let mut same = first.clone();
+        same.elevation = first.elevation.to_vec().into();
+        same.smooth_grid = None;
+        prepare_smooth_height_grid(&mut same, Some(&first));
+        assert!(Arc::ptr_eq(same.smooth_grid.as_ref().unwrap(), grid));
+        assert_eq!(
+            points.map(|p| sample_height_world(&same, p, 100.0)),
+            expected
+        );
+
+        // Copy-on-write must invalidate by identity even before preparation.
+        let mut changed = same.clone();
+        Arc::make_mut(&mut changed.elevation)[3] = 0.1;
+        assert!(!changed.smooth_grid.as_ref().unwrap().matches(&changed));
+        assert!((sample_height_world(&changed, points[2], 100.0) - expected[2]).abs() > 1.0);
+        let uncached = points.map(|p| sample_height_world(&changed, p, 100.0));
+        prepare_smooth_height_grid(&mut changed, Some(&same));
+        assert!(!Arc::ptr_eq(changed.smooth_grid.as_ref().unwrap(), grid));
+        assert_eq!(
+            points.map(|p| sample_height_world(&changed, p, 100.0)),
+            uncached
+        );
+
+        // Equal elevations with a different cell size must not reuse the grid.
+        let mut resized = same.clone();
+        resized.cell_size = 50;
+        prepare_smooth_height_grid(&mut resized, Some(&same));
+        assert!(!Arc::ptr_eq(resized.smooth_grid.as_ref().unwrap(), grid));
+        assert!(resized.smooth_grid.as_ref().unwrap().matches(&resized));
+    }
+
+    #[test]
+    fn snapshot_install_shares_and_invalidates_the_rendered_height_grid() {
+        let mut snapshot = sample_world_snapshot();
+        let mut state = SnapshotState::default();
+        state.install_snapshot(snapshot.clone());
+        let first = Arc::clone(
+            state
+                .latest
+                .as_ref()
+                .unwrap()
+                .terrain_height
+                .smooth_grid
+                .as_ref()
+                .unwrap(),
+        );
+        snapshot.revision += 1;
+        snapshot.terrain_height.daylight = 0.5;
+        state.install_snapshot(snapshot.clone());
+        let same = state
+            .latest
+            .as_ref()
+            .unwrap()
+            .terrain_height
+            .smooth_grid
+            .as_ref()
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&first, same),
+            "lighting-only changes must reuse geometry"
+        );
+        Arc::make_mut(&mut snapshot.terrain_height.elevation)[0] += 0.25;
+        snapshot.revision += 1;
+        state.install_snapshot(snapshot);
+        let changed = &state.latest.as_ref().unwrap().terrain_height;
+        assert!(!Arc::ptr_eq(&first, changed.smooth_grid.as_ref().unwrap()));
+        assert!(changed.smooth_grid.as_ref().unwrap().matches(changed));
+    }
+
+    #[test]
+    fn subdivided_height_sampler_matches_rendered_triangle_interiors() {
+        let mut snapshot = sample_world_snapshot();
+        snapshot.terrain_height.dims = UVec2::new(2, 2);
+        snapshot.terrain_height.cell_size = 100;
+        snapshot.terrain_height.elevation = vec![0.0, 0.2, 0.4, 1.0].into();
+        snapshot.world_size = Vec2::splat(200.0);
+        let built = build_chunk_mesh(
+            &snapshot,
+            TerrainChunkBounds {
+                origin: UVec2::ZERO,
+                size: UVec2::new(2, 2),
+            },
+            100.0,
+            ColorPaletteMode::Natural,
+        );
+        let Some(VertexAttributeValues::Float32x3(positions)) =
+            built.mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+        else {
+            panic!("missing terrain positions");
+        };
+        let Some(Indices::U32(indices)) = built.mesh.indices() else {
+            panic!("missing terrain indices");
+        };
+        assert_eq!(positions.len(), 81);
+        assert_eq!(indices.len(), 8 * 8 * 6);
+        for &[a, b, c] in indices.as_chunks::<3>().0 {
+            let [a, b, c] = [a, b, c].map(|i| Vec3::from_array(positions[i as usize]));
+            for point in [(a + b + c) / 3.0, a * 0.2 + b * 0.7 + c * 0.1] {
+                let world = Vec2::new(point.x + 100.0, 100.0 - point.z);
+                let sampled = sample_height_world(&snapshot.terrain_height, world, 100.0);
+                assert!(
+                    (sampled - point.y).abs() < 0.001,
+                    "{world:?}: {sampled} != {}",
+                    point.y
+                );
+            }
+        }
+        let mut cache = HashMap::new();
+        for p in [
+            Vec2::new(11.0, 12.0),
+            Vec2::new(40.0, 77.0),
+            Vec2::new(199.0, 160.0),
+        ] {
+            assert_eq!(
+                sample_height_world_cached(&snapshot.terrain_height, p, 100.0, &mut cache),
+                sample_height_world(&snapshot.terrain_height, p, 100.0)
+            );
+        }
+        assert!(
+            (sample_height_world(&snapshot.terrain_height, Vec2::splat(50.0), 100.0) - 30.0).abs()
+                > 0.1,
+            "the new sampler must distinguish the old coarse saddle triangle"
+        );
+    }
+
+    #[test]
+    fn world_height_matches_both_rendered_subtriangles_of_a_saddle_cell() {
         let mut snapshot = sample_world_snapshot();
         let terrain = &mut snapshot.terrain_height;
         terrain.dims = UVec2::new(2, 2);
         terrain.cell_size = 100;
-        terrain.elevation = vec![0.0, 0.2, 0.4, 1.0];
+        terrain.elevation = vec![0.0, 0.2, 0.4, 1.0].into();
         let sample = |x, y| sample_height_world(terrain, Vec2::new(x, y), 100.0);
-        assert!((sample(25.0, 25.0) - 15.0).abs() < 0.001);
-        assert!((sample(75.0, 75.0) - 65.0).abs() < 0.001);
-        assert!((sample(50.0, 50.0) - 30.0).abs() < 0.001);
+        let node = |x, z| terrain_smooth_height(terrain, x, z, 100.0);
+        let h00 = node(0.25, 0.25);
+        let h10 = node(0.50, 0.25);
+        let h01 = node(0.25, 0.50);
+        let h11 = node(0.50, 0.50);
+        let lower = h00 * 0.5 + h10 * 0.25 + h01 * 0.25;
+        let upper = h11 * 0.5 + h10 * 0.25 + h01 * 0.25;
+        assert!((sample(31.25, 31.25) - lower).abs() < 0.001);
+        assert!((sample(43.75, 43.75) - upper).abs() < 0.001);
+        assert!(
+            (sample(50.0, 50.0) - 30.0).abs() > 0.1,
+            "old coarse saddle must differ"
+        );
         assert!((sample(200.0, 200.0) - 100.0).abs() < 0.001);
     }
 
@@ -19509,7 +19951,8 @@ mod terrain_tests {
         snapshot.terrain_height.cell_size = 100;
         snapshot.terrain_height.elevation = vec![
             0.1, 0.2, 0.1, 0.2, 0.3, 0.6, 0.2, 0.4, 0.1, 0.4, 0.8, 0.3, 0.2, 0.1, 0.4, 0.2,
-        ];
+        ]
+        .into();
         let mut agent = sample_agent_visual();
         agent.spike_length = 0.0;
         let footprint = agent_ground_footprint(&snapshot, &agent);
@@ -19764,7 +20207,7 @@ mod terrain_tests {
     fn wheel_suspension_closes_ground_gap_without_accumulating_or_penetrating() {
         let mut snapshot = sample_world_snapshot();
         snapshot.agent_radius = 10.0;
-        snapshot.terrain_height.elevation.fill(0.0);
+        Arc::make_mut(&mut snapshot.terrain_height.elevation).fill(0.0);
         let agent = sample_agent_visual();
         let footprint = agent_ground_footprint(&snapshot, &agent);
         let world = snapshot.world_size;
@@ -19838,7 +20281,8 @@ mod terrain_tests {
         snapshot.terrain_height.cell_size = 100;
         snapshot.terrain_height.elevation = vec![
             0.1, 0.2, 0.1, 0.2, 0.3, 0.6, 0.2, 0.4, 0.1, 0.4, 0.8, 0.3, 0.2, 0.1, 0.4, 0.2,
-        ];
+        ]
+        .into();
         let mut agent = sample_agent_visual();
         agent.spike_length = 0.0;
         let footprint = agent_ground_footprint(&snapshot, &agent);
@@ -19963,7 +20407,8 @@ mod terrain_tests {
         snapshot.terrain_height.cell_size = 100;
         snapshot.terrain_height.elevation = vec![
             0.1, 0.2, 0.1, 0.2, 0.3, 0.6, 0.2, 0.4, 0.1, 0.4, 0.8, 0.3, 0.2, 0.1, 0.4, 0.2,
-        ];
+        ]
+        .into();
         let body = Mesh::from(AGENT_BODY_CAPSULE);
         let wheel = Mesh::from(Torus::new(0.3, 0.6));
         let vertices = |mesh: &Mesh| match mesh.attribute(Mesh::ATTRIBUTE_POSITION).unwrap() {
@@ -20076,7 +20521,8 @@ mod terrain_tests {
         snapshot.terrain_height.cell_size = 100;
         snapshot.terrain_height.elevation = vec![
             0.1, 0.2, 0.1, 0.2, 0.3, 0.6, 0.2, 0.4, 0.1, 0.4, 0.8, 0.3, 0.2, 0.1, 0.4, 0.2,
-        ];
+        ]
+        .into();
         let mut agent = sample_agent_visual();
         agent.position = Vec2::new(195.0, 100.0);
         agent.heading = 0.8;
@@ -21132,7 +21578,7 @@ fn include_ground_mesh(
     terrain: &TerrainHeightSnapshot,
     mut include: impl FnMut(Vec3),
 ) {
-    let cell = terrain.cell_size.max(1) as f32;
+    let cell = terrain.cell_size.max(1) as f32 / TERRAIN_SUBDIVISIONS as f32;
     let offsets: Vec<Vec3> = mesh
         .vertices
         .iter()
@@ -21148,13 +21594,11 @@ fn include_ground_mesh(
     // A triangle is convex. If all projected mesh vertices lie in one
     // terrain triangle, every mesh face does too, and vertex support is exact
     // for this planar patch. Keep the full overlay path across any boundary.
-    if let Some(first) = grid
-        .first()
-        .and_then(|&point| terrain_triangle_at(point, terrain.dims))
-        && grid
-            .iter()
-            .all(|&point| terrain_triangle_at(point, terrain.dims) == Some(first))
-    {
+    if let Some(first) = grid.first().and_then(|&point| {
+        terrain_triangle_at(point, terrain.dims * TERRAIN_SUBDIVISIONS + UVec2::ONE)
+    }) && grid.iter().all(|&point| {
+        terrain_triangle_at(point, terrain.dims * TERRAIN_SUBDIVISIONS + UVec2::ONE) == Some(first)
+    }) {
         return;
     }
     // Terrain triangle edges lie on integer x, y, and x+y grid lines.
@@ -21225,6 +21669,7 @@ fn selection_ring_grounded_transform(
         snapshot.world_size.y * 0.5 - root.translation.z,
     );
     let mut support = f32::NEG_INFINITY;
+    let mut heights = HashMap::new();
     include_ground_mesh(
         &ground_mesh_samples().selection_ring,
         ring,
@@ -21234,8 +21679,12 @@ fn selection_ring_grounded_transform(
         |offset| {
             let point = position + Vec2::new(offset.x, -offset.z);
             support = support.max(
-                sample_height_world(&snapshot.terrain_height, point, TERRAIN_HEIGHT_SCALE)
-                    - offset.y,
+                sample_height_world_cached(
+                    &snapshot.terrain_height,
+                    point,
+                    TERRAIN_HEIGHT_SCALE,
+                    &mut heights,
+                ) - offset.y,
             );
         },
     );
@@ -21280,6 +21729,7 @@ fn conform_agent_wheels(
     let Some(snapshot) = &state.latest else {
         return;
     };
+    let mut heights = HashMap::new();
     for (contact, mut wheel) in &mut wheels {
         let Ok((root, footprint)) = roots.get(contact.root) else {
             continue;
@@ -21300,8 +21750,12 @@ fn conform_agent_wheels(
             |offset| {
                 let point = position + Vec2::new(offset.x, -offset.z);
                 support = support.max(
-                    sample_height_world(&snapshot.terrain_height, point, TERRAIN_HEIGHT_SCALE)
-                        - offset.y,
+                    sample_height_world_cached(
+                        &snapshot.terrain_height,
+                        point,
+                        TERRAIN_HEIGHT_SCALE,
+                        &mut heights,
+                    ) - offset.y,
                 );
             },
         );
@@ -21356,9 +21810,12 @@ fn terrain_footprint_height(
 ) -> f32 {
     let radius = footprint.radius;
     let mut required = f32::NEG_INFINITY;
+    let mut heights = HashMap::new();
     let mut include = |offset: Vec3| {
         let sample = position + Vec2::new(offset.x, -offset.z);
-        let height = sample_height_world(terrain, sample, TERRAIN_HEIGHT_SCALE) - offset.y;
+        let height =
+            sample_height_world_cached(terrain, sample, TERRAIN_HEIGHT_SCALE, &mut heights)
+                - offset.y;
         required = required.max(height);
     };
     // Sample the lower capsule surface, including the rounded ends. Its
@@ -23571,7 +24028,8 @@ mod tests {
         snapshot.agent_radius = 10.0;
         snapshot.terrain_height.dims = UVec2::new(3, 3);
         snapshot.terrain_height.cell_size = 100;
-        snapshot.terrain_height.elevation = vec![0.0, 0.8, 0.0, 0.0, 0.8, 0.0, 0.0, 0.8, 0.0];
+        snapshot.terrain_height.elevation =
+            vec![0.0, 0.8, 0.0, 0.0, 0.8, 0.0, 0.0, 0.8, 0.0].into();
         let mut agent = sample_agent_visual();
         agent.position = Vec2::splat(150.0);
         agent.velocity = Vec2::X * 100.0;
@@ -24074,7 +24532,7 @@ mod tests {
     fn close_shallow_camera_clears_elevated_terrain_and_targets_its_surface() {
         let world = WorldState::new(ScriptBotsConfig::default()).expect("world init");
         let mut snapshot = WorldSnapshot::from_world(&world).expect("snapshot");
-        snapshot.terrain_height.elevation.fill(0.9);
+        Arc::make_mut(&mut snapshot.terrain_height.elevation).fill(0.9);
         let focus = snapshot.world_size * 0.5;
         let focus_y =
             0.9 * TERRAIN_HEIGHT_SCALE + snapshot.agent_radius * AGENT_GROUND_OFFSET_FACTOR;

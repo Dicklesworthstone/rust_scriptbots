@@ -1616,31 +1616,14 @@ impl ChannelHostDriver {
                 let _ = reply.send(result);
             }
             IngressMessage::WorldDigests { reply } => {
-                let world = self.host.core().world();
-                let result = world
-                    .characterization_digest_v0()
-                    .and_then(|physical| {
-                        world
-                            .world_digest_v1()
-                            .map(|scientific| (physical, scientific))
-                    })
-                    .map_err(|error| ChannelHostPort::protocol_violation(error.to_string()));
-                let _ = reply.send(result);
+                self.process_world_digests(&reply);
             }
             IngressMessage::CaptureCheckpoint { reply } => self.capture_or_park(reply),
             IngressMessage::CaptureHostCheckpoint { request } => {
                 self.accept_host_capture(request);
             }
             IngressMessage::Command { envelope, reply } => {
-                let result = self.host.submit(envelope);
-                if let Ok(status) = &result
-                    && let Ok(mut board) = self.statuses.write()
-                {
-                    board.insert(status.clone(), self.status_board_capacity);
-                }
-                // A client that timed out is unreachable; the admission
-                // remains authoritative and mirrored either way.
-                let _ = reply.send(result);
+                self.process_command(envelope, &reply);
             }
             IngressMessage::CommandStatus { command_id, reply } => {
                 let result = self.port.command_status(command_id);
@@ -1654,6 +1637,37 @@ impl ChannelHostDriver {
             #[cfg(test)]
             IngressMessage::Wake => {}
         }
+    }
+
+    fn process_world_digests(
+        &self,
+        reply: &Sender<Result<(CharacterizationDigestV0, WorldDigestV1), HostAccessError>>,
+    ) {
+        let world = self.host.core().world();
+        let result = world
+            .characterization_digest_v0()
+            .and_then(|physical| {
+                world
+                    .world_digest_v1()
+                    .map(|scientific| (physical, scientific))
+            })
+            .map_err(|error| ChannelHostPort::protocol_violation(error.to_string()));
+        let _ = reply.send(result);
+    }
+
+    fn process_command(
+        &mut self,
+        envelope: CommandEnvelope,
+        reply: &Sender<Result<CommandStatus, HostAccessError>>,
+    ) {
+        let result = self.host.submit(envelope);
+        if let Ok(status) = &result
+            && let Ok(mut board) = self.statuses.write()
+        {
+            board.insert(status.clone(), self.status_board_capacity);
+        }
+        // A client that timed out is unreachable; the admission remains authoritative.
+        let _ = reply.send(result);
     }
 
     fn drain_ingress(&mut self) {
