@@ -924,7 +924,10 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
             handle_exposure_adjust_buttons,
             handle_palette_shortcuts,
             handle_selection_input,
-            handle_follow_button_interactions,
+            (
+                handle_follow_button_interactions,
+                handle_camera_view_buttons,
+            ),
             handle_clear_selection_button,
             update_playback_button_colors,
             update_follow_button_colors,
@@ -3153,6 +3156,8 @@ fn submit_playback_command(
 const DIAGNOSTIC_REPORT_INTERVAL: u32 = 300;
 const CAMERA_MIN_DISTANCE: f32 = 300.0;
 const CAMERA_MAX_DISTANCE: f32 = 6000.0;
+// Stop just short of vertical so the camera's up vector remains well-defined.
+const CAMERA_OVERHEAD_PITCH: f32 = -1.55;
 const CAMERA_SMOOTHING_LERP: f32 = 8.0;
 const CAMERA_PAN_SPEED: f32 = 600.0;
 const CAMERA_PAN_RESPONSE: f32 = 18.0;
@@ -3796,6 +3801,26 @@ struct QualityTierLabel;
 struct FollowButton {
     mode: FollowMode,
 }
+
+#[derive(Clone, Copy)]
+enum CameraView {
+    Overhead,
+    Isometric,
+    Low,
+}
+
+impl CameraView {
+    fn pitch(self) -> f32 {
+        match self {
+            Self::Overhead => CAMERA_OVERHEAD_PITCH,
+            Self::Isometric => -0.615_48,
+            Self::Low => -0.25,
+        }
+    }
+}
+
+#[derive(Component)]
+struct CameraViewButton(CameraView);
 
 #[derive(Component)]
 struct PlaybackButton {
@@ -5741,6 +5766,32 @@ fn setup_scene(
                         BorderRadius::all(Val::Px(6.0)),
                         BorderColor::all(button_border_color),
                         PlaybackButton { action },
+                    ))
+                    .with_children(|btn| {
+                        btn.spawn((
+                            Text::new(label),
+                            secondary_font.clone(),
+                            TextColor(secondary_text_color),
+                        ));
+                    });
+                }
+            });
+
+        parent
+            .spawn((button_row_node.clone(),))
+            .with_children(|row| {
+                for (view, label) in [
+                    (CameraView::Overhead, "Overhead"),
+                    (CameraView::Isometric, "Isometric"),
+                    (CameraView::Low, "Low view"),
+                ] {
+                    row.spawn((
+                        Button,
+                        button_node.clone(),
+                        BackgroundColor(follow_idle_color()),
+                        BorderRadius::all(Val::Px(6.0)),
+                        BorderColor::all(button_border_color),
+                        CameraViewButton(view),
                     ))
                     .with_children(|btn| {
                         btn.spawn((
@@ -14583,6 +14634,27 @@ fn handle_follow_button_interactions(
     }
 }
 
+fn handle_camera_view_buttons(
+    mut rig: ResMut<CameraRig>,
+    mut buttons: Query<(&CameraViewButton, Ref<Interaction>, &mut BackgroundColor)>,
+) {
+    for (button, interaction, mut color) in &mut buttons {
+        if interaction.is_changed() && *interaction == Interaction::Pressed {
+            rig.pitch = button.0.pitch();
+        }
+        let target = if (rig.pitch - button.0.pitch()).abs() < 0.001 {
+            follow_active_color()
+        } else if matches!(*interaction, Interaction::Hovered | Interaction::Pressed) {
+            follow_hover_color()
+        } else {
+            follow_idle_color()
+        };
+        if color.0 != target {
+            *color = target.into();
+        }
+    }
+}
+
 fn handle_clear_selection_button(
     submitter: Option<Res<CommandSubmitter>>,
     mut rig: ResMut<CameraRig>,
@@ -15324,7 +15396,7 @@ fn control_camera(
     if buttons.pressed(MouseButton::Right) && !pointer_over_hud {
         for ev in mouse_motion.read() {
             rig.yaw -= ev.delta.x * 0.005;
-            rig.pitch = (rig.pitch - ev.delta.y * 0.005).clamp(-1.45, -0.05);
+            rig.pitch = (rig.pitch - ev.delta.y * 0.005).clamp(CAMERA_OVERHEAD_PITCH, -0.05);
         }
     } else {
         mouse_motion.clear();
@@ -15572,7 +15644,7 @@ fn control_camera(
     rig.focus_smoothed = rig.focus_smoothed.lerp(target_focus, smoothing);
     rig.distance_smoothed += (rig.distance - rig.distance_smoothed) * smoothing;
 
-    rig.pitch = rig.pitch.clamp(-1.45, -0.05);
+    rig.pitch = rig.pitch.clamp(CAMERA_OVERHEAD_PITCH, -0.05);
     let yaw = rig.yaw;
     let pitch = rig.pitch;
     let distance = rig
@@ -22507,6 +22579,48 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    #[test]
+    fn camera_view_buttons_preserve_follow_and_zoom() {
+        let mut app = App::new();
+        app.insert_resource(CameraRig {
+            yaw: 0.7,
+            distance: 900.0,
+            follow_mode: FollowMode::Selected,
+            ..default()
+        });
+        app.add_systems(Update, handle_camera_view_buttons);
+        let buttons = [CameraView::Overhead, CameraView::Isometric, CameraView::Low].map(|view| {
+            app.world_mut()
+                .spawn((
+                    CameraViewButton(view),
+                    Interaction::None,
+                    BackgroundColor::default(),
+                ))
+                .id()
+        });
+        app.update();
+        for (button, pitch) in buttons
+            .into_iter()
+            .zip([CAMERA_OVERHEAD_PITCH, -0.615_48, -0.25])
+        {
+            app.world_mut()
+                .entity_mut(button)
+                .insert(Interaction::Pressed);
+            app.update();
+            let rig = app.world().resource::<CameraRig>();
+            assert_eq!(rig.pitch, pitch);
+            assert_eq!(rig.yaw, 0.7);
+            assert_eq!(rig.distance, 900.0);
+            assert_eq!(rig.follow_mode, FollowMode::Selected);
+            assert_eq!(
+                app.world().get::<BackgroundColor>(button).unwrap().0,
+                follow_active_color()
+            );
+            app.world_mut().entity_mut(button).insert(Interaction::None);
+            app.update();
+        }
     }
 
     #[test]
