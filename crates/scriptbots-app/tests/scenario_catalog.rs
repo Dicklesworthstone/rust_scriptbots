@@ -8,10 +8,13 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use scriptbots_app::precedence::{ConfigLayerKind, ConfigLayerStatement, resolve_config_layers};
 use scriptbots_app::{ScenarioDocumentV1, ScenarioEnvelopeV1};
+use scriptbots_core::ScriptBotsConfig;
 
-const CATALOG: [&str; 6] = [
+const CATALOG: [&str; 7] = [
     "meadow",
+    "food_funded_meadow_v1",
     "drought_recovery",
     "predator_prey",
     "islands_closed",
@@ -180,6 +183,49 @@ fn assert_envelope(id: &str, seed: u64, envelope: &ScenarioEnvelopeV1, run: &Coh
             run.summary.total_spike_hits
         );
     }
+}
+
+#[test]
+fn food_funded_meadow_uses_the_production_config_resolver_without_population_subsidies() {
+    let bytes = std::fs::read(catalog_dir().join("food_funded_meadow_v1.scenario.toml"))
+        .expect("food-funded meadow document");
+    let document = ScenarioDocumentV1::parse_toml(&bytes).expect("versioned scenario");
+    let defaults = serde_json::to_value(ScriptBotsConfig::default()).expect("core defaults");
+    let resolved = resolve_config_layers(
+        &defaults,
+        &[ConfigLayerStatement {
+            kind: ConfigLayerKind::File,
+            label: document.id.clone(),
+            fields: document.config.clone(),
+        }],
+    );
+    let config: ScriptBotsConfig = serde_json::from_value(resolved.merged)
+        .expect("scenario fields accepted by production schema");
+    config.validate().expect("food-funded scenario config");
+    assert_eq!(config.reproduction_rate_herbivore.to_bits(), 0);
+    assert_eq!(config.reproduction_rate_carnivore.to_bits(), 0);
+    assert!(config.reproduction_food_bonus > 0.0);
+    assert!(config.carcass_reproduction_reward > 0.0);
+    assert_eq!(config.reproduction_cooldown, 7);
+    assert!(config.closed);
+    assert_eq!(config.population_minimum, 0);
+    assert_eq!(config.population_spawn_interval, 0);
+    assert_eq!(config.food_respawn_interval, 0);
+    assert_eq!(
+        config.reproduction_energy_cost.to_bits(),
+        config.reproduction_child_energy.to_bits()
+    );
+    assert!(config.food_growth_rate > 0.0);
+    assert!(config.food_growth_rate < ScriptBotsConfig::default().food_growth_rate);
+    assert_eq!(document.seeds, [11, 42, 137]);
+    assert_eq!(
+        document.envelope.expect("measurable study envelope").ticks,
+        10_000
+    );
+    assert!(
+        CATALOG.contains(&document.id.as_str()),
+        "the real CLI cohort runner must consume this document"
+    );
 }
 
 #[test]

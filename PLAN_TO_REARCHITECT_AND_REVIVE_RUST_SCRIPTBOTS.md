@@ -13,6 +13,22 @@ scenario. Existing timed defaults and baseline artifacts remain unchanged.
 These are functionality increments; the broader performance and long-horizon
 acceptance requirements remain open.
 
+The food-funded slice is now implemented: both diet rates may be zero together;
+mixed zero/positive pairs remain invalid and positive-rate timer reachability is
+still enforced. `scenarios/food_funded_meadow_v1.scenario.toml` is selectable
+through the existing scenario CLI, with seven food-earned progress units, closed
+population accounting, low regrowth and parent-paid child energy. Its three-seed,
+10,000-tick study is included in the real CLI cohort/replay matrix but has not
+been executed. No long-run stability or balance conclusion is asserted.
+
+DSR compiled the complete core test crate using the pinned compiler and retained
+locked Cargo dependencies, then passed all five new food-funded tests, all 19
+reproduction-filtered tests (including those five), the existing bounded-config
+negative test, and formatting for core and the scenario test file. The first run
+identified a fixture that omitted the parent's real brain-initialization ordinal;
+the corrected expectation passes without changing production behavior. Full
+workspace Cargo/Clippy and the application scenario test remain unqualified.
+
 **Novelty/curiosity birth admission (2026-11-09):** [Implemented and targeted
 tests passed — Codex; full workspace qualification open]
 

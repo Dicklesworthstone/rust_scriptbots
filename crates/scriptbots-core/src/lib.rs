@@ -13120,15 +13120,21 @@ pub struct ScriptBotsConfig {
     pub reproduction_energy_threshold: f32,
     /// Energy deducted from a parent upon reproduction.
     pub reproduction_energy_cost: f32,
-    /// Cooldown in ticks between reproductions.
+    /// Reproduction progress required before another birth (at least one unit).
+    /// Food intake and carcass rewards earn progress; positive reproduction rates
+    /// also add progress each tick. This is a tick cooldown only at unit rates
+    /// when food contributes no progress.
     pub reproduction_cooldown: u32,
     /// Interval (in ticks) controlling when reproduction attempts are evaluated. `0` allows attempts every tick.
     pub reproduction_attempt_interval: u32,
     /// Probability that a ready agent reproduces when the attempt cadence fires.
     pub reproduction_attempt_chance: f32,
-    /// Herbivore reproduction rate multiplier applied per tick.
+    /// Per-tick reproduction progress for a pure herbivore.
+    /// Set both diet rates to zero for food-funded reproduction, or both positive
+    /// for the existing diet-interpolated timer plus food bonuses.
     pub reproduction_rate_herbivore: f32,
-    /// Carnivore reproduction rate multiplier applied per tick.
+    /// Per-tick reproduction progress for a pure carnivore; see
+    /// [`Self::reproduction_rate_herbivore`] for the paired-rate policy.
     pub reproduction_rate_carnivore: f32,
     /// Bonus applied to the reproduction counter per unit ground intake.
     pub reproduction_food_bonus: f32,
@@ -14023,20 +14029,30 @@ impl ScriptBotsConfig {
             "reproduction_attempt_chance must be within [0, 1]"
         );
         reject_unless!(
-            self.reproduction_rate_herbivore > 0.0,
-            "reproduction_rate_herbivore must be positive"
+            self.reproduction_rate_herbivore >= 0.0,
+            "reproduction_rate_herbivore must be non-negative"
         );
         reject_unless!(
-            self.reproduction_rate_carnivore > 0.0,
-            "reproduction_rate_carnivore must be positive"
+            self.reproduction_rate_carnivore >= 0.0,
+            "reproduction_rate_carnivore must be non-negative"
         );
+        // Both zero is an explicit food-funded regime. A mixed zero/positive pair
+        // would interpolate arbitrarily small timer rates for some diets, outside
+        // the established reachability guarantee for positive-rate worlds.
+        let food_funded_reproduction =
+            self.reproduction_rate_herbivore == 0.0 && self.reproduction_rate_carnivore == 0.0;
         let minimum_reproduction_rate = self
             .reproduction_rate_herbivore
             .min(self.reproduction_rate_carnivore);
+        reject_unless!(
+            food_funded_reproduction || minimum_reproduction_rate > 0.0,
+            "reproduction_rate_herbivore and reproduction_rate_carnivore must both be zero or both be positive"
+        );
         let maximum_reachable_cooldown =
             f64::from(minimum_reproduction_rate) * f64::from(MAX_EXACT_F32_INTEGER);
         reject_unless!(
-            f64::from(self.reproduction_cooldown.max(1)) <= maximum_reachable_cooldown,
+            food_funded_reproduction
+                || f64::from(self.reproduction_cooldown.max(1)) <= maximum_reachable_cooldown,
             "reproduction_cooldown must be reachable at the minimum configured reproduction rate"
         );
         reject_unless!(
@@ -36111,10 +36127,10 @@ mod tests {
             ("reproduction_attempt_chance", -0.1, |config, value| {
                 config.reproduction_attempt_chance = value;
             }),
-            ("reproduction_rate_herbivore", 0.0, |config, value| {
+            ("reproduction_rate_herbivore", -1.0, |config, value| {
                 config.reproduction_rate_herbivore = value;
             }),
-            ("reproduction_rate_carnivore", 0.0, |config, value| {
+            ("reproduction_rate_carnivore", -1.0, |config, value| {
                 config.reproduction_rate_carnivore = value;
             }),
             ("reproduction_food_bonus", -1.0, |config, value| {
@@ -49610,6 +49626,309 @@ mod tests {
         let history: Vec<_> = world.history().cloned().collect();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].tick, Tick(1));
+    }
+
+    #[test]
+    fn food_funded_reproduction_requires_an_explicit_zero_rate_pair() {
+        let food_funded = ScriptBotsConfig {
+            reproduction_rate_herbivore: 0.0,
+            reproduction_rate_carnivore: 0.0,
+            reproduction_cooldown: 7,
+            ..ScriptBotsConfig::default()
+        };
+        food_funded.validate().expect("food-funded regime");
+        let encoded = serde_json::to_vec(&food_funded).expect("serialize food-funded config");
+        let decoded: ScriptBotsConfig =
+            serde_json::from_slice(&encoded).expect("restore food-funded config");
+        decoded.validate().expect("restored food-funded regime");
+        assert_eq!(decoded.reproduction_rate_herbivore.to_bits(), 0);
+        assert_eq!(decoded.reproduction_rate_carnivore.to_bits(), 0);
+
+        for (herbivore, carnivore) in [(0.0, 1.0), (1.0, 0.0)] {
+            let config = ScriptBotsConfig {
+                reproduction_rate_herbivore: herbivore,
+                reproduction_rate_carnivore: carnivore,
+                ..food_funded.clone()
+            };
+            let error = config.validate().expect_err("mixed timer policy refused");
+            assert_eq!(
+                invalid_config_message(&error),
+                "reproduction_rate_herbivore and reproduction_rate_carnivore must both be zero or both be positive"
+            );
+        }
+
+        let unreachable_timer = ScriptBotsConfig {
+            reproduction_rate_herbivore: f32::MIN_POSITIVE,
+            reproduction_rate_carnivore: f32::MIN_POSITIVE,
+            ..food_funded
+        };
+        assert_eq!(
+            invalid_config_message(
+                &unreachable_timer
+                    .validate()
+                    .expect_err("timed reachability retained")
+            ),
+            "reproduction_cooldown must be reachable at the minimum configured reproduction rate"
+        );
+        ScriptBotsConfig::default()
+            .validate()
+            .expect("unchanged timed defaults");
+    }
+
+    fn food_funded_reproduction_config() -> ScriptBotsConfig {
+        ScriptBotsConfig {
+            food_growth_rate: 0.0,
+            food_decay_rate: 0.0,
+            food_diffusion_rate: 0.0,
+            food_intake_rate: 0.25,
+            food_waste_rate: 0.25,
+            food_capacity_base: 1.0,
+            food_capacity_fertility: 0.0,
+            food_transfer_rate: 0.0,
+            reproduction_rate_herbivore: 0.0,
+            reproduction_rate_carnivore: 0.0,
+            reproduction_food_bonus: 2.0,
+            reproduction_fertility_bonus: 0.0,
+            reproduction_energy_cost: 0.25,
+            reproduction_child_energy: 0.25,
+            reproduction_mutation_scale: 0.0,
+            closed: true,
+            history_capacity: 16,
+            ..protocol_reproduction_config(0.0)
+        }
+    }
+
+    fn food_funded_reproduction_world(
+        config: ScriptBotsConfig,
+        herbivore: f32,
+    ) -> (WorldState, AgentId) {
+        let mut world = WorldState::new(config).expect("reproduction world");
+        let key = world
+            .brain_registry_mut()
+            .expect("idle heritable brain registry")
+            .register("food-funded-idle", |_rng| {
+                Ok(Box::new(HeritableBrain::new(0.0)))
+            });
+        let parent = world.spawn_agent(AgentData {
+            position: Position::new(25.0, 25.0),
+            ..AgentData::default()
+        });
+        assert!(
+            world
+                .bind_agent_brain(parent, key)
+                .expect("bind idle parent")
+        );
+        let runtime = world.agent_runtime_mut(parent).expect("parent runtime");
+        runtime.herbivore_tendency = herbivore;
+        runtime.energy = 1.0;
+        runtime.reproduction_counter = 0.0;
+        (world, parent)
+    }
+
+    #[test]
+    fn food_funded_reproduction_needs_real_grazing_and_resets_the_newborn() {
+        let config = food_funded_reproduction_config();
+        let (mut dry, dry_parent) = food_funded_reproduction_world(config.clone(), 1.0);
+        let (mut fed, fed_parent) = food_funded_reproduction_world(config, 1.0);
+        fed.food.fill(0.5).expect("two ground meals per cell");
+
+        for tick in 1..=2 {
+            let completion = fed.step_outcome().expect("grazing tick");
+            assert!(completion.fault.is_none(), "{:?}", completion.fault);
+            assert_eq!(completion.outcome.summary.births, usize::from(tick == 2));
+            if tick == 1 {
+                assert_eq!(
+                    fed.agent_runtime(fed_parent)
+                        .expect("fed parent")
+                        .reproduction_counter
+                        .to_bits(),
+                    0.5_f32.to_bits(),
+                    "one actual 0.25 meal earns half the required progress"
+                );
+            } else {
+                let births: Vec<_> = completion
+                    .outcome
+                    .births
+                    .iter()
+                    .filter(|record| record.origin == BirthOrigin::Born)
+                    .collect();
+                assert_eq!(births.len(), 1);
+                assert_eq!(births[0].parent_a, fed.agent_uid(fed_parent));
+            }
+        }
+        assert_eq!(
+            fed.food.get(1, 1),
+            Some(0.0),
+            "the parent's cell was consumed"
+        );
+        let child = fed
+            .agents()
+            .iter_handles()
+            .find(|id| *id != fed_parent)
+            .expect("food-earned child");
+        assert_eq!(
+            fed.agent_runtime(child)
+                .expect("newborn")
+                .reproduction_counter
+                .to_bits(),
+            0
+        );
+        assert_eq!(
+            fed.agent_runtime(fed_parent)
+                .expect("parent reset")
+                .reproduction_counter
+                .to_bits(),
+            0
+        );
+
+        fed.food.fill(0.0).expect("remove remaining food");
+        for _ in 0..128 {
+            for world in [&mut dry, &mut fed] {
+                let completion = world.step_outcome().expect("food-free tick");
+                assert!(completion.fault.is_none(), "{:?}", completion.fault);
+                assert_eq!(completion.outcome.summary.births, 0);
+                assert!(
+                    completion
+                        .outcome
+                        .births
+                        .iter()
+                        .all(|birth| birth.origin != BirthOrigin::Injected)
+                );
+            }
+        }
+        assert_eq!(dry.agent_count(), 1);
+        assert_eq!(fed.agent_count(), 2);
+        assert_eq!(
+            dry.agent_runtime(dry_parent)
+                .expect("dry parent")
+                .reproduction_counter
+                .to_bits(),
+            0
+        );
+        assert_eq!(
+            fed.agent_runtime(child)
+                .expect("unfed child")
+                .reproduction_counter
+                .to_bits(),
+            0
+        );
+    }
+
+    #[test]
+    fn food_funded_reproduction_uses_an_actual_spiked_carcass() {
+        for spiked in [false, true] {
+            let config = ScriptBotsConfig {
+                carcass_reproduction_reward: 1.0,
+                carcass_maturity_age: 1,
+                ..food_funded_reproduction_config()
+            };
+            let (mut world, parent) = food_funded_reproduction_world(config, 0.0);
+            let corpse = world.spawn_agent(AgentData {
+                position: Position::new(26.0, 25.0),
+                health: 0.0,
+                age: 2,
+                ..AgentData::default()
+            });
+            world
+                .agent_runtime_mut(corpse)
+                .expect("corpse runtime")
+                .spiked = spiked;
+            let completion = world.step_outcome().expect("carcass-feeding tick");
+            assert!(completion.fault.is_none(), "{:?}", completion.fault);
+            assert_eq!(completion.outcome.summary.deaths, 1);
+            assert_eq!(completion.outcome.summary.births, usize::from(spiked));
+            assert!(!world.agents().contains(corpse));
+            assert_eq!(world.agent_count(), 1 + usize::from(spiked));
+            assert_eq!(
+                world
+                    .agent_runtime(parent)
+                    .expect("surviving carnivore")
+                    .reproduction_counter
+                    .to_bits(),
+                0
+            );
+            if spiked {
+                let child = world
+                    .agents()
+                    .iter_handles()
+                    .find(|id| *id != parent)
+                    .expect("carcass-earned child");
+                assert_eq!(
+                    world
+                        .agent_runtime(child)
+                        .expect("newborn")
+                        .reproduction_counter
+                        .to_bits(),
+                    0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn food_funded_reproduction_keeps_population_injection_separate() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            closed: false,
+            population_minimum: 2,
+            ..food_funded_reproduction_config()
+        })
+        .expect("open food-funded world");
+        let completion = world.step_outcome().expect("population-floor tick");
+        assert!(completion.fault.is_none(), "{:?}", completion.fault);
+        assert_eq!(world.agent_count(), 2);
+        assert_eq!(completion.outcome.summary.births, 0);
+        assert_eq!(completion.outcome.births.len(), 2);
+        assert!(
+            completion
+                .outcome
+                .births
+                .iter()
+                .all(|birth| birth.origin == BirthOrigin::Injected)
+        );
+    }
+
+    #[test]
+    fn food_funded_reproduction_admission_preserves_positive_rate_arithmetic() {
+        let config = ScriptBotsConfig {
+            reproduction_rate_carnivore: 0.5,
+            reproduction_rate_herbivore: 1.5,
+            reproduction_cooldown: 3,
+            ..food_funded_reproduction_config()
+        };
+        let (mut world, parent) = food_funded_reproduction_world(config, 0.25);
+        // This existing timed regime earns exactly 3/4 per tick with no food.
+        // It produces three births, paying 1/4 energy each, at ticks 4, 8, and 12.
+        let counter_bits = [0x3f40_0000, 0x3fc0_0000, 0x4010_0000, 0];
+        let mut birth_ticks = Vec::new();
+        for tick in 1_u64..=12 {
+            let completion = world.step_outcome().expect("unchanged timed tick");
+            assert!(completion.fault.is_none(), "{:?}", completion.fault);
+            if completion.outcome.summary.births != 0 {
+                birth_ticks.push(tick);
+            }
+            assert_eq!(
+                world
+                    .agent_runtime(parent)
+                    .expect("timed parent")
+                    .reproduction_counter
+                    .to_bits(),
+                counter_bits[((tick - 1) % 4) as usize]
+            );
+        }
+        assert_eq!(birth_ticks, vec![4, 8, 12]);
+        assert_eq!(world.agent_count(), 4);
+        assert_eq!(
+            world
+                .agent_runtime(parent)
+                .expect("timed parent")
+                .energy
+                .to_bits(),
+            0.25_f32.to_bits()
+        );
+        assert_eq!(
+            world.agent_rng_counters(parent),
+            Some(AgentRngCountersV1::from_ordinals(3, 3, 1))
+        );
     }
 
     #[test]
