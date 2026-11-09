@@ -845,6 +845,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
     .insert_non_send_resource(owner_inspector)
     .init_resource::<InspectorPage>()
     .init_resource::<HudDiagnostics>()
+    .init_resource::<HudDisplaySettings>()
     .insert_non_send_resource(BevyLifecycleFailureInbox {
         receiver: failure_rx,
         first_failure: Arc::clone(&first_worker_failure),
@@ -891,6 +892,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
                 handle_playback_shortcuts,
                 handle_playback_buttons,
                 handle_hud_diagnostics,
+                handle_display_settings,
                 scroll_hud_panel,
             ),
             handle_tonemap_mode_buttons,
@@ -3009,6 +3011,57 @@ struct HudInspectorContent;
 
 #[derive(Component)]
 struct HudDiagnosticsButton;
+
+#[derive(Resource, Default)]
+struct HudDisplaySettings(bool);
+
+#[derive(Component)]
+struct HudDisplaySettingsButton;
+
+#[derive(Component)]
+struct HudDisplaySettingsPanel;
+
+#[derive(Component)]
+struct HudDiagnosticsPageControls;
+
+fn handle_display_settings(
+    mut settings: ResMut<HudDisplaySettings>,
+    mut buttons: Query<(&Interaction, &mut BackgroundColor), With<HudDisplaySettingsButton>>,
+    changed: Query<&Interaction, (Changed<Interaction>, With<HudDisplaySettingsButton>)>,
+    mut panels: Query<&mut Node, With<HudDisplaySettingsPanel>>,
+) {
+    if changed
+        .iter()
+        .filter(|interaction| **interaction == Interaction::Pressed)
+        .count()
+        % 2
+        == 1
+    {
+        settings.0 = !settings.0;
+    }
+    for mut panel in &mut panels {
+        let desired = if settings.0 {
+            Display::Flex
+        } else {
+            Display::None
+        };
+        if panel.display != desired {
+            panel.display = desired;
+        }
+    }
+    for (interaction, mut color) in &mut buttons {
+        let desired = if settings.0 {
+            follow_active_color()
+        } else if *interaction == Interaction::Hovered {
+            follow_hover_color()
+        } else {
+            follow_idle_color()
+        };
+        if color.0 != desired {
+            color.0 = desired;
+        }
+    }
+}
 
 fn hud_diagnostic_node() -> Node {
     Node {
@@ -5167,7 +5220,9 @@ fn setup_scene(
                 width: Val::Px(560.0),
                 max_width: Val::Percent(45.0),
                 padding: UiRect::all(Val::Px(10.0)),
-                flex_direction: FlexDirection::Column,
+                // Expand optional rows upward so the playback and display
+                // controls do not move out from under the pointer.
+                flex_direction: FlexDirection::ColumnReverse,
                 row_gap: Val::Px(4.0),
                 ..default()
             },
@@ -5253,13 +5308,49 @@ fn setup_scene(
                     ));
                 });
 
-                // Keep both directions together if the surrounding row wraps.
-                row.spawn(Node {
-                    flex_direction: FlexDirection::Row,
-                    flex_shrink: 0.0,
-                    column_gap: Val::Px(8.0),
-                    ..default()
-                })
+                row.spawn((
+                    Button,
+                    button_node.clone(),
+                    BackgroundColor(follow_idle_color()),
+                    BorderRadius::all(Val::Px(6.0)),
+                    BorderColor::all(button_border_color),
+                    HudDisplaySettingsButton,
+                ))
+                .with_children(|btn| {
+                    btn.spawn((
+                        Text::new("Display settings"),
+                        secondary_font.clone(),
+                        TextColor(secondary_text_color),
+                    ));
+                });
+                row.spawn((
+                    Button,
+                    button_node.clone(),
+                    BackgroundColor(follow_idle_color()),
+                    BorderRadius::all(Val::Px(6.0)),
+                    BorderColor::all(button_border_color),
+                    HudDiagnosticsButton,
+                ))
+                .with_children(|btn| {
+                    btn.spawn((
+                        Text::new("Diagnostics (H)"),
+                        secondary_font.clone(),
+                        TextColor(secondary_text_color),
+                    ));
+                });
+                // The card owns page navigation in normal mode. Diagnostics
+                // replaces that card, so expose the same actions there only.
+                row.spawn((
+                    Node {
+                        display: Display::None,
+                        flex_direction: FlexDirection::Row,
+                        flex_shrink: 0.0,
+                        column_gap: Val::Px(8.0),
+                        ..default()
+                    },
+                    HudDiagnostic,
+                    HudDiagnosticsPageControls,
+                ))
                 .with_children(|group| {
                     for (direction, label) in [
                         (InspectorPageButton::Previous, "Page <"),
@@ -5286,23 +5377,10 @@ fn setup_scene(
                             });
                     }
                 });
-                row.spawn((
-                    Button,
-                    button_node.clone(),
-                    BackgroundColor(follow_idle_color()),
-                    BorderRadius::all(Val::Px(6.0)),
-                    BorderColor::all(button_border_color),
-                    HudDiagnosticsButton,
-                ))
-                .with_children(|btn| {
-                    btn.spawn((
-                        Text::new("Diagnostics (H)"),
-                        secondary_font.clone(),
-                        TextColor(secondary_text_color),
-                    ));
-                });
             });
 
+        let mut display_row = button_row_node.clone();
+        display_row.display = Display::None;
         let tonemap_modes = [
             TonemappingMode::Aces,
             TonemappingMode::Agx,
@@ -5310,7 +5388,7 @@ fn setup_scene(
         ];
 
         parent
-            .spawn((button_row_node.clone(),))
+            .spawn((display_row.clone(), HudDisplaySettingsPanel))
             .with_children(|row| {
                 for mode in tonemap_modes {
                     row.spawn((
@@ -5332,7 +5410,7 @@ fn setup_scene(
             });
 
         parent
-            .spawn((button_row_node.clone(),))
+            .spawn((display_row, HudDisplaySettingsPanel))
             .with_children(|row| {
                 row.spawn((
                     Button,
@@ -5911,12 +5989,16 @@ fn update_hud(
     accessibility: Res<AccessibilityState>,
     owner_inspector: Option<NonSend<OwnerInspector>>,
     inspector_page: Option<Res<InspectorPage>>,
+    diagnostics: Option<Res<HudDiagnostics>>,
     mut texts: Query<&mut Text>,
 ) {
     let Some(_) = state.latest.as_ref() else {
         return;
     };
 
+    // Standalone callers without the optional UI mode retain the original
+    // behavior. In the application these panels are hidden by default.
+    let diagnostics_visible = diagnostics.as_ref().is_none_or(|mode| mode.0);
     let (
         tick,
         agent_count,
@@ -5948,18 +6030,26 @@ fn update_hud(
         }
         // Formatted here so the snapshot borrow ends with the rest of the
         // extraction rather than being held across the text writes below.
-        let event_feed = format_event_feed(&snapshot.events);
-        let history_panel = format_history_panel(&snapshot.history);
-        let brain_panel = format_brain_overlay(&snapshot.brain);
-        let mut inspector_text = format_inspector(
-            primary_agent
-                .map(|agent| InspectorDetail::from_agent(agent, selected_count.saturating_sub(1))),
-        );
-        if let Some(owner) = owner_inspector.as_ref() {
-            inspector_text.push('\n');
-            inspector_text
-                .push_str(&owner.panel(snapshot, inspector_page.as_ref().map_or(0, |page| page.0)));
-        }
+        let (event_feed, history_panel, brain_panel, inspector_text) = if diagnostics_visible {
+            let mut inspector_text =
+                format_inspector(primary_agent.map(|agent| {
+                    InspectorDetail::from_agent(agent, selected_count.saturating_sub(1))
+                }));
+            if let Some(owner) = owner_inspector.as_ref() {
+                inspector_text.push('\n');
+                inspector_text.push_str(
+                    &owner.panel(snapshot, inspector_page.as_ref().map_or(0, |page| page.0)),
+                );
+            }
+            (
+                format_event_feed(&snapshot.events),
+                format_history_panel(&snapshot.history),
+                format_brain_overlay(&snapshot.brain),
+                inspector_text,
+            )
+        } else {
+            (String::new(), String::new(), String::new(), String::new())
+        };
         (
             tick,
             agent_count,
@@ -6028,7 +6118,7 @@ fn update_hud(
         if let Ok(mut text) = texts.get_mut(hud_elements.selection) {
             set_hud_text_if_changed(&mut text, selection_text);
         }
-        if let Ok(mut text) = texts.get_mut(hud_elements.follow) {
+        if diagnostics_visible && let Ok(mut text) = texts.get_mut(hud_elements.follow) {
             set_hud_text_if_changed(
                 &mut text,
                 format!(
@@ -6037,7 +6127,7 @@ fn update_hud(
                 ),
             );
         }
-        if let Ok(mut text) = texts.get_mut(hud_elements.camera) {
+        if diagnostics_visible && let Ok(mut text) = texts.get_mut(hud_elements.camera) {
             let yaw_deg = rig.yaw.to_degrees();
             let pitch_deg = rig.pitch.to_degrees();
             set_hud_text_if_changed(
@@ -6066,7 +6156,9 @@ fn update_hud(
             |feedback| feedback.text(),
         );
         if let Some(message) = feedback_message {
-            if let Ok(mut text) = texts.get_mut(hud_elements.command_feedback) {
+            if diagnostics_visible
+                && let Ok(mut text) = texts.get_mut(hud_elements.command_feedback)
+            {
                 set_hud_text_if_changed(&mut text, message.clone());
             }
             if let Ok(mut text) = texts.get_mut(hud_elements.command_summary) {
@@ -6078,6 +6170,9 @@ fn update_hud(
                 };
                 set_hud_text_if_changed(&mut text, summary);
             }
+        }
+        if !diagnostics_visible {
+            return;
         }
         if let Ok(mut text) = texts.get_mut(hud_elements.fps) {
             let delta_seconds = time.delta_secs();
@@ -8285,6 +8380,7 @@ mod adaptive_governor_tests {
         assert_eq!(node.position_type, PositionType::Absolute);
         assert_eq!(node.bottom, Val::Px(12.0));
         assert_eq!(node.right, Val::Px(12.0));
+        assert_eq!(node.flex_direction, FlexDirection::ColumnReverse);
         assert_eq!(*interaction, Interaction::None);
         assert_eq!(world.query::<&PlaybackButton>().iter(world).count(), 5);
         assert_eq!(world.query::<&FollowButton>().iter(world).count(), 3);
@@ -8303,6 +8399,97 @@ mod adaptive_governor_tests {
         assert_eq!(world.query::<&QualityTierButton>().iter(world).count(), 1);
         assert_eq!(
             world.query::<&ExposureAdjustButton>().iter(world).count(),
+            2
+        );
+    }
+
+    #[test]
+    fn display_settings_are_collapsed_and_toggle_without_losing_controls() {
+        let mut app = App::new();
+        app.insert_resource(Assets::<Mesh>::default())
+            .insert_resource(Assets::<Image>::default())
+            .insert_resource(auto_launch(RenderQuality::High))
+            .init_resource::<HudDisplaySettings>()
+            .init_resource::<HudDiagnostics>()
+            .add_systems(Startup, setup_scene)
+            .add_systems(Update, (handle_display_settings, handle_hud_diagnostics));
+        app.update();
+        let world = app.world_mut();
+        let panels: Vec<_> = world
+            .query_filtered::<Entity, With<HudDisplaySettingsPanel>>()
+            .iter(world)
+            .collect();
+        assert_eq!(panels.len(), 2);
+        let button = world
+            .query_filtered::<Entity, With<HudDisplaySettingsButton>>()
+            .single(world)
+            .unwrap();
+        for panel in &panels {
+            assert_eq!(world.get::<Node>(*panel).unwrap().display, Display::None);
+        }
+        let quality = world
+            .query_filtered::<Entity, With<QualityTierButton>>()
+            .single(world)
+            .unwrap();
+        let row = world.get::<ChildOf>(quality).unwrap().parent();
+        assert!(panels.contains(&row));
+        let page_controls = world
+            .query_filtered::<Entity, With<HudDiagnosticsPageControls>>()
+            .single(world)
+            .unwrap();
+        let diagnostic_button = world
+            .query_filtered::<Entity, With<HudDiagnosticsButton>>()
+            .single(world)
+            .unwrap();
+        assert_eq!(
+            world.get::<Node>(page_controls).unwrap().display,
+            Display::None
+        );
+        app.world_mut()
+            .entity_mut(button)
+            .insert(Interaction::Pressed);
+        app.update();
+        for panel in &panels {
+            assert_eq!(
+                app.world().get::<Node>(*panel).unwrap().display,
+                Display::Flex
+            );
+        }
+        app.world_mut()
+            .entity_mut(button)
+            .insert(Interaction::Hovered);
+        app.update();
+        for panel in &panels {
+            assert_eq!(
+                app.world().get::<Node>(*panel).unwrap().display,
+                Display::Flex
+            );
+        }
+        app.world_mut()
+            .entity_mut(button)
+            .insert(Interaction::Pressed);
+        app.update();
+        for panel in &panels {
+            assert_eq!(
+                app.world().get::<Node>(*panel).unwrap().display,
+                Display::None
+            );
+        }
+        app.world_mut()
+            .entity_mut(diagnostic_button)
+            .insert(Interaction::Pressed);
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(page_controls).unwrap().display,
+            Display::Flex
+        );
+        let world = app.world_mut();
+        let mut pages = world.query::<(&InspectorPageButton, &ChildOf)>();
+        assert_eq!(
+            pages
+                .iter(world)
+                .filter(|(_, parent)| parent.parent() == page_controls)
+                .count(),
             2
         );
     }
@@ -22138,6 +22325,32 @@ mod tests {
         assert!(
             palette_text.contains("press C to cycle"),
             "palette text missing cycle hint: {palette_text}"
+        );
+
+        // Hidden diagnostic text must not be rebuilt, while the visible
+        // summary keeps tracking the world. Reopening must catch up at once.
+        app.insert_resource(HudDiagnostics(false));
+        app.world_mut().resource_mut::<CameraRig>().distance += 250.0;
+        app.world_mut()
+            .resource_mut::<SnapshotState>()
+            .latest
+            .as_mut()
+            .unwrap()
+            .tick += 1;
+        app.update();
+        assert_eq!(
+            app.world().get::<Text>(hud_ids.4).unwrap().as_str(),
+            camera_text
+        );
+        assert_eq!(
+            app.world().get::<Text>(hud_ids.0).unwrap().as_str(),
+            format!("Tick: {}", snapshot.tick + 1)
+        );
+        app.world_mut().resource_mut::<HudDiagnostics>().0 = true;
+        app.update();
+        assert_ne!(
+            app.world().get::<Text>(hud_ids.4).unwrap().as_str(),
+            camera_text
         );
 
         Ok(())
