@@ -2719,7 +2719,7 @@ struct BrainEntry {
     adapter_identity: Option<BrainAdapterIdentityV1>,
     heredity_capability: Option<BrainHeredityCapabilityV1>,
     spawner: Option<BrainSpawner>,
-    protocol_adapter: Option<Box<dyn BrainFamilyAdapter>>,
+    protocol_adapter: Option<Arc<dyn BrainFamilyAdapter>>,
 }
 
 /// Registry owning brain runners keyed by opaque handles.
@@ -2983,7 +2983,7 @@ impl BrainRegistry {
                 adapter_identity: Some(adapter_identity),
                 heredity_capability: Some(heredity_capability),
                 spawner: None,
-                protocol_adapter: Some(adapter),
+                protocol_adapter: Some(Arc::from(adapter)),
             },
         );
         Ok(key)
@@ -10598,9 +10598,12 @@ pub trait BrainEvaluator: Send + Sync {
 /// arrays or device-native state instead of allocating one `Box<dyn BrainEvaluator>` per agent.
 /// Lane order is caller order. A successful call must be bit-identical to scalar evaluation with
 /// the same per-lane reduction order and independent of cohort partitioning or thread count. Core
-/// evaluates through a disposable batch object and commits outputs/state only after every lane
-/// checkpoints and reconstructs successfully, so a rejected or partially mutated batch is never
-/// allowed to replace the parked scalar preimages.
+/// commits outputs/state only after every lane checkpoints and reconstructs successfully, so a
+/// rejected or partially mutated batch is never allowed to replace the parked scalar preimages.
+/// A successful batch may be retained for the next stage only while its factory, ordered lane
+/// identities, genomes and exact checkpoint states still match those scalar preimages. Every
+/// future-affecting lane value must therefore be represented by `checkpoint_states`; retained
+/// scratch and packed immutable weights must not change the scientific transition.
 pub trait BrainBatchEvaluator: Send {
     /// Owning protocol family.
     fn family_id(&self) -> &BrainFamilyId;
@@ -10614,6 +10617,38 @@ pub trait BrainBatchEvaluator: Send {
 
     /// Capture one future-affecting state envelope per evaluator lane.
     fn checkpoint_states(&self) -> Result<Vec<BrainEvaluatorStateEnvelope>, BrainProtocolError>;
+}
+
+#[cfg(feature = "batch-brains")]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct BrainCohortKey {
+    registry_key: u64,
+    family_id: BrainFamilyId,
+    architecture: BrainBatchArchitectureKey,
+}
+
+#[cfg(feature = "batch-brains")]
+#[derive(PartialEq, Eq)]
+struct BrainCohortLane {
+    agent_id: AgentId,
+    uid: AgentUid,
+    material_hash: BrainGenomeHash,
+    // Material hashes deliberately exclude provenance, but an adapter receives the entire
+    // envelope and may use that metadata when constructing its evaluator.
+    provenance: BrainProvenance,
+}
+
+/// Execution-only reuse of the immediately preceding stage's successful cohorts. This is not
+/// scientific state and is deliberately absent from checkpoints, world digests and registry
+/// descriptors. Keeping the actual adapter alive makes pointer identity safe against allocator
+/// reuse, including replacement by an identically attested factory at the same registry key.
+#[cfg(feature = "batch-brains")]
+struct RetainedBrainCohort {
+    adapter: Arc<dyn BrainFamilyAdapter>,
+    adapter_identity: BrainAdapterIdentityV1,
+    lanes: Vec<BrainCohortLane>,
+    states: Vec<BrainEvaluatorStateEnvelope>,
+    evaluator: Box<dyn BrainBatchEvaluator>,
 }
 
 /// Object-safe family-owned protocol hooks implemented by each concrete brain family.
@@ -21711,6 +21746,12 @@ pub struct WorldState {
     runtime: AgentMap<AgentRuntime>,
     index: UniformGridIndex,
     brain_registry: BrainRegistry,
+    // Only cohorts used in the immediately preceding stage survive. Membership changes and
+    // failures evict them; no history of prior populations or architectures accumulates. Like
+    // the existing Send-only SenseProvider, batch evaluators preserve WorldState's Send
+    // contract. The stage accesses this map only through its exclusive world borrow.
+    #[cfg(feature = "batch-brains")]
+    brain_cohorts: BTreeMap<BrainCohortKey, RetainedBrainCohort>,
     cadence: TickCadence,
     food_scratch: Vec<f32>,
     // Reusable per-tick working buffers to avoid allocations
@@ -22716,6 +22757,8 @@ impl WorldState {
             runtime: AgentMap::new(),
             index,
             brain_registry: BrainRegistry::new(),
+            #[cfg(feature = "batch-brains")]
+            brain_cohorts: BTreeMap::new(),
             cadence,
             food_profiles,
             food_scratch: vec![0.0; (food_w as usize) * (food_h as usize)],
@@ -24089,14 +24132,6 @@ impl WorldState {
         &mut self,
         execution_faults: &mut BTreeMap<AgentId, BrainExecutionFault>,
     ) -> Result<(), BrainSpawnError> {
-        #[cfg(feature = "batch-brains")]
-        #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
-        struct BrainCohortKey {
-            registry_key: u64,
-            family_id: BrainFamilyId,
-            architecture: BrainBatchArchitectureKey,
-        }
-
         struct BrainJob {
             agent_id: AgentId,
             kind: String,
@@ -24140,9 +24175,12 @@ impl WorldState {
 
         #[cfg(feature = "batch-brains")]
         {
+            let mut retained_cohorts = std::mem::take(&mut self.brain_cohorts);
+            let mut next_cohorts = BTreeMap::new();
             let mut candidates = Vec::<(BrainCohortKey, usize)>::new();
             let mut opted_in_families = BTreeSet::new();
             let mut rejected_cohorts = 0_usize;
+            let mut reused_cohorts = 0_usize;
 
             // Classification is canonical and fail-closed. Missing execution variants never
             // reach this loop because only a parked live protocol evaluator can become a batch
@@ -24216,7 +24254,7 @@ impl WorldState {
                 let end = cursor + cohort_len;
                 let cohort = &candidates[cursor..end];
 
-                // A single lane gains nothing from transient cohort construction and retains the
+                // A single lane gains nothing from cohort construction and retains the
                 // exact scalar steady-state path.
                 if cohort.len() < 2 {
                     cursor = end;
@@ -24224,7 +24262,13 @@ impl WorldState {
                 }
                 eligible_sizes.push(cohort.len());
 
-                let Some(adapter) = self.brain_registry.family(cohort_key.registry_key) else {
+                let Some(adapter) = self
+                    .brain_registry
+                    .entries
+                    .get(&cohort_key.registry_key)
+                    .and_then(|entry| entry.protocol_adapter.as_ref())
+                    .cloned()
+                else {
                     cursor = end;
                     continue;
                 };
@@ -24262,18 +24306,49 @@ impl WorldState {
                     continue;
                 }
 
-                let state_refs = states.iter().collect::<Vec<_>>();
-                let mut batch = match adapter.batch_evaluator(&genomes, &state_refs) {
-                    Ok(Some(batch)) => batch,
-                    Ok(None) => {
-                        cursor = end;
-                        continue;
-                    }
-                    Err(error) => {
-                        rejected_cohorts += 1;
-                        reject_cohort(&mut jobs, cohort, error);
-                        cursor = end;
-                        continue;
+                let adapter_identity = adapter.adapter_identity();
+                let lanes = cohort
+                    .iter()
+                    .zip(&genomes)
+                    .map(|((_, job_index), genome)| {
+                        let agent_id = jobs[*job_index].agent_id;
+                        self.identities
+                            .get(agent_id)
+                            .map(|identity| BrainCohortLane {
+                                agent_id,
+                                uid: identity.uid,
+                                material_hash: genome.material_hash(),
+                                provenance: genome.provenance().clone(),
+                            })
+                    })
+                    .collect::<Option<Vec<_>>>();
+                // The parked live scalar evaluators remain authoritative. Reuse is permitted
+                // only after every current preimage has passed the same validation as a fresh
+                // cohort; a rebind, mutation, state edit, arena reuse or factory replacement
+                // therefore cannot execute stale packed parameters or lane state.
+                let retained = retained_cohorts.remove(cohort_key).filter(|retained| {
+                    Arc::ptr_eq(&retained.adapter, &adapter)
+                        && retained.adapter_identity == adapter_identity
+                        && lanes.as_ref() == Some(&retained.lanes)
+                        && retained.states == states
+                });
+                let mut batch = if let Some(retained) = retained {
+                    reused_cohorts += 1;
+                    retained.evaluator
+                } else {
+                    let state_refs = states.iter().collect::<Vec<_>>();
+                    match adapter.batch_evaluator(&genomes, &state_refs) {
+                        Ok(Some(batch)) => batch,
+                        Ok(None) => {
+                            cursor = end;
+                            continue;
+                        }
+                        Err(error) => {
+                            rejected_cohorts += 1;
+                            reject_cohort(&mut jobs, cohort, error);
+                            cursor = end;
+                            continue;
+                        }
                     }
                 };
 
@@ -24293,17 +24368,18 @@ impl WorldState {
                             outputs: outputs.len(),
                         });
                     }
-                    genomes
+                    let replacements = genomes
                         .iter()
                         .zip(&next_states)
                         .map(|(genome, state)| {
-                            Self::reconstruct_protocol_evaluator(adapter, genome, state)
+                            Self::reconstruct_protocol_evaluator(adapter.as_ref(), genome, state)
                         })
-                        .collect::<Result<Vec<_>, _>>()
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok((replacements, next_states))
                 })();
 
                 match replacements {
-                    Ok(replacements) => {
+                    Ok((replacements, next_states)) => {
                         for (((_, job_index), output), evaluator) in
                             cohort.iter().zip(outputs).zip(replacements)
                         {
@@ -24313,6 +24389,18 @@ impl WorldState {
                             job.batch_handled = true;
                         }
                         batch_sizes.push(cohort.len());
+                        if let Some(lanes) = lanes {
+                            next_cohorts.insert(
+                                cohort_key.clone(),
+                                RetainedBrainCohort {
+                                    adapter,
+                                    adapter_identity,
+                                    lanes,
+                                    states: next_states,
+                                    evaluator: batch,
+                                },
+                            );
+                        }
                     }
                     Err(error) => {
                         rejected_cohorts += 1;
@@ -24321,6 +24409,10 @@ impl WorldState {
                 }
                 cursor = end;
             }
+
+            // Unmatched old cohorts, singleton fallbacks and declined layouts are all dropped.
+            // Retention is bounded by this stage's active cohorts, not by simulation lifetime.
+            self.brain_cohorts = next_cohorts;
 
             let scalar_protocol_agents = jobs
                 .iter()
@@ -24339,6 +24431,7 @@ impl WorldState {
                 batch_agents = batch_sizes.iter().sum::<usize>(),
                 scalar_protocol_agents,
                 rejected_cohorts,
+                reused_cohorts,
                 eligible_sizes = ?eligible_sizes,
                 batch_sizes = ?batch_sizes,
                 "classified and evaluated protocol brain cohorts"
@@ -24350,6 +24443,7 @@ impl WorldState {
                 batch_sizes,
                 scalar_protocol_agents,
                 rejected_cohorts,
+                reused_cohorts,
             );
         }
 
@@ -24486,6 +24580,13 @@ impl WorldState {
                 explain_calls = self.probe_stats.explain_calls,
                 "probe activation stats"
             );
+        }
+
+        #[cfg(feature = "batch-brains")]
+        if first_error.is_some() || !execution_faults.is_empty() {
+            // No partially evaluated or otherwise fault-adjacent scratch crosses a containment
+            // boundary. Scalar preimages and the existing fault/zero-output policy are intact.
+            self.brain_cohorts.clear();
         }
 
         first_error.map_or(Ok(()), Err)
@@ -43223,9 +43324,11 @@ mod tests {
         batch_opt_in: bool,
         batch_returns_none: bool,
         batch_fail_at_lane: Option<usize>,
+        batch_failure_accumulator: Option<i16>,
         batch_truncates_checkpoint: bool,
         reconstruction_failure: Option<(i8, i16)>,
         batch_probe: Option<Arc<Mutex<Vec<Vec<i8>>>>>,
+        batch_layout: Option<Arc<AtomicUsize>>,
         locus_mode: FixtureLocusMode,
         heredity_capability: BrainHeredityCapabilityV1,
     }
@@ -43242,9 +43345,11 @@ mod tests {
                 batch_opt_in: true,
                 batch_returns_none: false,
                 batch_fail_at_lane: None,
+                batch_failure_accumulator: None,
                 batch_truncates_checkpoint: false,
                 reconstruction_failure: None,
                 batch_probe: None,
+                batch_layout: None,
                 locus_mode: FixtureLocusMode::Unavailable,
                 heredity_capability: BrainHeredityCapabilityV1::excluded(
                     BrainHeredityExclusionV1::NoCanonicalLocusSchema,
@@ -43482,6 +43587,7 @@ mod tests {
         id: BrainFamilyId,
         evaluators: Vec<FixtureBrainEvaluator>,
         fail_at_lane: Option<usize>,
+        failure_accumulator: Option<i16>,
         truncates_checkpoint: bool,
     }
 
@@ -43509,7 +43615,11 @@ mod tests {
                 .zip(outputs.iter_mut())
                 .enumerate()
             {
-                if self.fail_at_lane == Some(lane) {
+                if self.fail_at_lane == Some(lane)
+                    && self
+                        .failure_accumulator
+                        .is_none_or(|accumulator| evaluator.accumulator == accumulator)
+                {
                     return Err(BrainProtocolError::InvalidPayload {
                         kind: BrainEnvelopeKind::EvaluatorState,
                         family_id: self.id.clone(),
@@ -43556,6 +43666,10 @@ mod tests {
             if let Some(lane) = self.batch_fail_at_lane {
                 semantic_material.push(1);
                 semantic_material.extend_from_slice(lane.to_string().as_bytes());
+            }
+            if let Some(accumulator) = self.batch_failure_accumulator {
+                semantic_material.push(4);
+                semantic_material.extend_from_slice(&accumulator.to_le_bytes());
             }
             if self.batch_truncates_checkpoint {
                 semantic_material.push(2);
@@ -43749,7 +43863,12 @@ mod tests {
             if !self.batch_opt_in {
                 return Ok(None);
             }
-            BrainBatchArchitectureKey::new(b"fixture-dense-scalar-v1".to_vec()).map(Some)
+            let mut architecture = b"fixture-dense-scalar-v1".to_vec();
+            if let Some(layout) = &self.batch_layout {
+                architecture
+                    .extend_from_slice(&layout.load(AtomicUsizeOrdering::Relaxed).to_le_bytes());
+            }
+            BrainBatchArchitectureKey::new(architecture).map(Some)
         }
 
         fn batch_evaluator(
@@ -43791,6 +43910,7 @@ mod tests {
                 id: self.id.clone(),
                 evaluators,
                 fail_at_lane: self.batch_fail_at_lane,
+                failure_accumulator: self.batch_failure_accumulator,
                 truncates_checkpoint: self.batch_truncates_checkpoint,
             })))
         }
@@ -46395,12 +46515,49 @@ mod tests {
             agents: batch_agents,
             probe: batch_probe,
         } = build_world(true);
-        scalar
-            .stage_brains(&mut BTreeMap::new())
-            .expect("matched scalar stage");
-        batch
-            .stage_brains(&mut BTreeMap::new())
-            .expect("matched batch stage");
+        for stage in 0..8 {
+            for (lane, (scalar_agent, batch_agent)) in
+                scalar_agents.into_iter().zip(batch_agents).enumerate()
+            {
+                let sensor = (stage + lane) as f32 * 0.25;
+                scalar.agent_runtime_mut(scalar_agent).unwrap().sensors[0] = sensor;
+                batch.agent_runtime_mut(batch_agent).unwrap().sensors[0] = sensor;
+            }
+            scalar
+                .stage_brains(&mut BTreeMap::new())
+                .expect("matched scalar stage");
+            batch
+                .stage_brains(&mut BTreeMap::new())
+                .expect("matched retained batch stage");
+            for (scalar_agent, batch_agent) in scalar_agents.into_iter().zip(batch_agents) {
+                assert_eq!(
+                    output_bits(
+                        scalar
+                            .agent_runtime(scalar_agent)
+                            .expect("matched scalar result")
+                            .outputs,
+                    ),
+                    output_bits(
+                        batch
+                            .agent_runtime(batch_agent)
+                            .expect("matched batch result")
+                            .outputs,
+                    )
+                );
+                assert_eq!(
+                    scalar
+                        .agent_brain_evaluator_state(scalar_agent)
+                        .expect("matched scalar checkpoint"),
+                    batch
+                        .agent_brain_evaluator_state(batch_agent)
+                        .expect("matched batch checkpoint")
+                );
+            }
+            assert_eq!(
+                scalar.world_digest_v1().expect("matched scalar digest"),
+                batch.world_digest_v1().expect("matched batch digest")
+            );
+        }
         assert!(
             scalar_probe
                 .lock()
@@ -46409,36 +46566,275 @@ mod tests {
         );
         assert_eq!(
             *batch_probe.lock().expect("matched batch probe"),
-            vec![vec![2, 3, -1, 2]]
+            vec![vec![2, 3, -1, 2]],
+            "eight evolving stages must construct the packed cohort only once"
         );
-        for (scalar_agent, batch_agent) in scalar_agents.into_iter().zip(batch_agents) {
+    }
+
+    #[cfg(feature = "batch-brains")]
+    fn retained_cohort_fixture(family: FixtureBrainFamily) -> (WorldState, u64, [AgentId; 2]) {
+        let family_id = family.id.to_string();
+        let mut world = WorldState::new(ScriptBotsConfig {
+            population_minimum: 0,
+            rng_seed: Some(0xCA_C4_E0),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("retained cohort world");
+        let key = world
+            .register_brain_family(family_id.clone(), Box::new(family))
+            .expect("retained cohort family");
+        let agents = [
+            fixture_protocol_lane(1, 2, 0, 0, 4.0),
+            fixture_protocol_lane(2, 3, 0, 0, 2.0),
+        ]
+        .map(|lane| spawn_fixture_protocol_agent(&mut world, key, &family_id, lane));
+        (world, key, agents)
+    }
+
+    #[cfg(feature = "batch-brains")]
+    #[test]
+    fn stage_brains_retained_cohort_invalidates_material_provenance_and_scalar_state() {
+        let probe = Arc::new(Mutex::new(Vec::new()));
+        let family = FixtureBrainFamily::with_batch_probe("retained-edits", Arc::clone(&probe));
+        let (mut world, key, agents) = retained_cohort_fixture(family);
+        world.stage_brains(&mut BTreeMap::new()).unwrap();
+        assert_eq!(probe.lock().unwrap().len(), 1);
+
+        // Each edit changes just one relevant continuation input: material, provenance with
+        // identical material/state, then scalar checkpoint state with an identical genome.
+        let family = FixtureBrainFamily::new("retained-edits");
+        for (gain, created_at, accumulator, constructions) in
+            [(5, 0, 1, 2), (5, 1, 2, 3), (5, 1, -7, 4)]
+        {
+            let genome = family.genome(
+                gain,
+                0,
+                BrainProvenance {
+                    created_at: Tick(created_at),
+                    ..BrainProvenance::default()
+                },
+            );
+            let state = family.state(accumulator);
+            let evaluator = family.evaluator(&genome, &state).unwrap();
+            world.agent_runtime_mut(agents[0]).unwrap().brain =
+                BrainBinding::protocol(key, "retained-edits".to_owned(), genome, evaluator);
+            world.stage_brains(&mut BTreeMap::new()).unwrap();
+            assert_eq!(probe.lock().unwrap().len(), constructions);
             assert_eq!(
-                output_bits(
-                    scalar
-                        .agent_runtime(scalar_agent)
-                        .expect("matched scalar result")
-                        .outputs,
-                ),
-                output_bits(
-                    batch
-                        .agent_runtime(batch_agent)
-                        .expect("matched batch result")
-                        .outputs,
-                )
+                world.agent_runtime(agents[0]).unwrap().outputs[0].to_bits(),
+                (f32::from(gain) * 4.0 + f32::from(accumulator)).to_bits()
             );
             assert_eq!(
-                scalar
-                    .agent_brain_evaluator_state(scalar_agent)
-                    .expect("matched scalar checkpoint"),
-                batch
-                    .agent_brain_evaluator_state(batch_agent)
-                    .expect("matched batch checkpoint")
+                world.agent_brain_evaluator_state(agents[0]).unwrap(),
+                Some(family.state(accumulator + 1))
             );
         }
+    }
+
+    #[cfg(feature = "batch-brains")]
+    #[test]
+    fn stage_brains_retained_cohort_tracks_membership_and_evicts_inactive_groups() {
+        let probe = Arc::new(Mutex::new(Vec::new()));
+        let family = FixtureBrainFamily::with_batch_probe("retained-members", Arc::clone(&probe));
+        let (mut world, key, [first, second]) = retained_cohort_fixture(family);
+        world.stage_brains(&mut BTreeMap::new()).unwrap();
+        let retired_uid = world.agent_uid(second).unwrap();
+        world.remove_agent(second).unwrap();
+        world.stage_brains(&mut BTreeMap::new()).unwrap();
+        assert!(world.brain_cohorts.is_empty());
         assert_eq!(
-            scalar.world_digest_v1().expect("matched scalar digest"),
-            batch.world_digest_v1().expect("matched batch digest")
+            probe.lock().unwrap().len(),
+            1,
+            "singletons use scalar execution"
         );
+
+        let replacement = spawn_fixture_protocol_agent(
+            &mut world,
+            key,
+            "retained-members",
+            fixture_protocol_lane(2, 3, 0, 1, 2.0),
+        );
+        assert_ne!(
+            replacement, second,
+            "recycled arena slots carry new generations"
+        );
+        assert_ne!(world.agent_uid(replacement).unwrap(), retired_uid);
+        world.stage_brains(&mut BTreeMap::new()).unwrap();
+        world.stage_brains(&mut BTreeMap::new()).unwrap();
+        assert_eq!(probe.lock().unwrap().len(), 2);
+
+        // Replace a member between stages without changing the population or lane material.
+        // Its matching checkpoint must not hide a new stable identity or arena generation.
+        let accumulator = FixtureBrainFamily::new("retained-members")
+            .decode_state(
+                &world
+                    .agent_brain_evaluator_state(replacement)
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+        world.remove_agent(replacement).unwrap();
+        let replacement = spawn_fixture_protocol_agent(
+            &mut world,
+            key,
+            "retained-members",
+            fixture_protocol_lane(2, 3, 0, accumulator, 2.0),
+        );
+        world.stage_brains(&mut BTreeMap::new()).unwrap();
+        assert_eq!(probe.lock().unwrap().len(), 3);
+        world.remove_agent(first).unwrap();
+        world.remove_agent(replacement).unwrap();
+        world.stage_brains(&mut BTreeMap::new()).unwrap();
+        assert!(world.brain_cohorts.is_empty());
+    }
+
+    #[cfg(feature = "batch-brains")]
+    #[test]
+    fn stage_brains_retained_cohort_rebuilds_for_layout_and_same_descriptor_factory() {
+        let probe = Arc::new(Mutex::new(Vec::new()));
+        let layout = Arc::new(AtomicUsize::new(0));
+        let mut family =
+            FixtureBrainFamily::with_batch_probe("retained-factory", Arc::clone(&probe));
+        family.batch_layout = Some(Arc::clone(&layout));
+        let (mut world, key, _) = retained_cohort_fixture(family);
+        world.stage_brains(&mut BTreeMap::new()).unwrap();
+        for revision in [1, 0] {
+            layout.store(revision, AtomicUsizeOrdering::Relaxed);
+            world.stage_brains(&mut BTreeMap::new()).unwrap();
+        }
+        assert_eq!(
+            probe.lock().unwrap().len(),
+            3,
+            "old layouts are not retained as history"
+        );
+
+        let identity = world
+            .brain_registry()
+            .family(key)
+            .unwrap()
+            .adapter_identity();
+        let mut family =
+            FixtureBrainFamily::with_batch_probe("retained-factory", Arc::clone(&probe));
+        family.batch_layout = Some(layout);
+        assert_eq!(family.adapter_identity(), identity);
+        let mut replacement = BrainRegistry::new();
+        assert_eq!(
+            replacement
+                .register_family("retained-factory", Box::new(family))
+                .unwrap(),
+            key
+        );
+        *world.brain_registry_mut().unwrap() = replacement;
+        world.stage_brains(&mut BTreeMap::new()).unwrap();
+        world.stage_brains(&mut BTreeMap::new()).unwrap();
+        assert_eq!(
+            probe.lock().unwrap().len(),
+            4,
+            "a new factory object at the same key must rebuild once despite identical attestations"
+        );
+    }
+
+    #[cfg(feature = "batch-brains")]
+    #[test]
+    fn stage_brains_retained_cohort_failure_discards_mutated_scratch() {
+        let probe = Arc::new(Mutex::new(Vec::new()));
+        let mut family =
+            FixtureBrainFamily::failing_batch_after("retained-failure", 1, Arc::clone(&probe));
+        family.batch_failure_accumulator = Some(2);
+        let (mut world, _, agents) = retained_cohort_fixture(family);
+        world.stage_brains(&mut BTreeMap::new()).unwrap();
+        world.stage_brains(&mut BTreeMap::new()).unwrap();
+        assert_eq!(probe.lock().unwrap().len(), 1);
+        let before = agents.map(|agent| world.agent_brain_evaluator_state(agent).unwrap());
+
+        for constructions in [1, 2] {
+            let error = world.stage_brains(&mut BTreeMap::new()).unwrap_err();
+            assert!(error.to_string().contains("fixture batch failed at lane 1"));
+            assert_eq!(probe.lock().unwrap().len(), constructions);
+            assert!(world.brain_cohorts.is_empty());
+            for (lane, agent) in agents.into_iter().enumerate() {
+                assert_eq!(
+                    world.agent_runtime(agent).unwrap().outputs,
+                    [0.0; OUTPUT_SIZE]
+                );
+                assert_eq!(
+                    world.agent_brain_evaluator_state(agent).unwrap(),
+                    before[lane]
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "batch-brains")]
+    #[test]
+    fn stage_brains_retained_cohort_never_rescues_a_missing_scalar_evaluator() {
+        let probe = Arc::new(Mutex::new(Vec::new()));
+        let family = FixtureBrainFamily::with_batch_probe("retained-missing", Arc::clone(&probe));
+        let (mut world, _, agents) = retained_cohort_fixture(family);
+        world.stage_brains(&mut BTreeMap::new()).unwrap();
+        let BrainBinding::Protocol { evaluator, .. } =
+            &mut world.agent_runtime_mut(agents[0]).unwrap().brain
+        else {
+            panic!("fixture protocol binding");
+        };
+        *evaluator = None;
+        let error = world.stage_brains(&mut BTreeMap::new()).unwrap_err();
+        assert!(error.to_string().contains("no live evaluator"));
+        assert_eq!(
+            world.agent_runtime(agents[0]).unwrap().outputs,
+            [0.0; OUTPUT_SIZE]
+        );
+        assert_eq!(probe.lock().unwrap().len(), 1);
+        assert!(world.brain_cohorts.is_empty());
+    }
+
+    #[cfg(feature = "batch-brains")]
+    #[test]
+    fn retained_cohorts_do_not_change_checkpoint_bytes_or_world_send_contract() {
+        fn require_send<T: Send>() {}
+        require_send::<WorldState>();
+
+        let probe = Arc::new(Mutex::new(Vec::new()));
+        let family =
+            FixtureBrainFamily::with_batch_probe("retained-checkpoint", Arc::clone(&probe));
+        let (mut world, _, agents) = retained_cohort_fixture(family);
+        for agent in agents {
+            let genome = world.agent_brain_genome(agent).unwrap().clone();
+            world.bind_agent_brain_genome(agent, &genome).unwrap();
+        }
+        world.stage_brains(&mut BTreeMap::new()).unwrap();
+        assert_eq!(world.brain_cohorts.len(), 1);
+        let checkpoint = world.checkpoint_v1().unwrap();
+        let bytes = checkpoint.encode().unwrap();
+        let digest = world.world_digest_v1().unwrap();
+        let retained = std::mem::take(&mut world.brain_cohorts);
+        assert_eq!(world.checkpoint_v1().unwrap().encode().unwrap(), bytes);
+        assert_eq!(world.world_digest_v1().unwrap(), digest);
+        world.brain_cohorts = retained;
+
+        let restored_probe = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = BrainRegistry::new();
+        registry
+            .register_family(
+                "retained-checkpoint",
+                Box::new(FixtureBrainFamily::with_batch_probe(
+                    "retained-checkpoint",
+                    Arc::clone(&restored_probe),
+                )),
+            )
+            .unwrap();
+        let mut restored = WorldState::restore_checkpoint_v1(&checkpoint, registry).unwrap();
+        assert!(restored.brain_cohorts.is_empty());
+        for _ in 0..3 {
+            world.stage_brains(&mut BTreeMap::new()).unwrap();
+            restored.stage_brains(&mut BTreeMap::new()).unwrap();
+            assert_eq!(
+                world.world_digest_v1().unwrap(),
+                restored.world_digest_v1().unwrap()
+            );
+        }
+        assert_eq!(probe.lock().unwrap().len(), 1);
+        assert_eq!(restored_probe.lock().unwrap().len(), 1);
     }
 
     #[cfg(feature = "batch-brains")]
@@ -46520,7 +46916,7 @@ mod tests {
                 Box::new(FixtureBrainFamily::failing_reconstruction_after_batch(
                     "batch-reconstruction",
                     3,
-                    2,
+                    3,
                     Arc::clone(&probe),
                 )),
             )
@@ -46539,6 +46935,10 @@ mod tests {
                 fixture_protocol_lane(2, 3, -2, 1, 2.0),
             ),
         ];
+        world
+            .stage_brains(&mut BTreeMap::new())
+            .expect("warm cohort before reconstruction failure");
+        assert_eq!(world.brain_cohorts.len(), 1);
         let before = agents.map(|agent| {
             world
                 .agent_brain_evaluator_state(agent)
@@ -46552,12 +46952,13 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("fixture rejected reconstruction for gain 3 at accumulator 2")
+                .contains("fixture rejected reconstruction for gain 3 at accumulator 3")
         );
         assert_eq!(
             *probe.lock().expect("reconstruction probe"),
             vec![vec![2, 3]]
         );
+        assert!(world.brain_cohorts.is_empty());
         for (lane, agent) in agents.into_iter().enumerate() {
             let runtime = world
                 .agent_runtime(agent)

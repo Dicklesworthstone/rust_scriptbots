@@ -3,7 +3,8 @@
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
 **Persistent cohort execution and food-funded ecology (2026-11-09):**
-[Currently In Progress — Codex; implementation and validation pending]
+[Implemented increments — Codex; targeted native tests passed, broader
+performance, application and long-horizon qualification open]
 
 Continue `bd-2z0.3.12.3` by retaining successful batch evaluators across science
 ticks, with exact membership/genome/state validation and transactional failure
@@ -12,6 +13,28 @@ an explicit food-funded reproduction configuration and a separate meadow
 scenario. Existing timed defaults and baseline artifacts remain unchanged.
 These are functionality increments; the broader performance and long-horizon
 acceptance requirements remain open.
+
+Successful batch evaluators now survive across brain stages only when their
+actual adapter allocation and semantic identity, architecture, ordered stable
+UID/arena identities, genome material/provenance and exact scalar preimages
+match. Every successor still checkpoints and reconstructs before publication.
+Faults discard retained scratch; departed cohorts and changed layouts do not
+accumulate as history. The map is owned directly by `WorldState`, accessed through
+its exclusive borrow, and absent from checkpoints and scientific digests. Cold
+checkpoint restoration reconstructs it on demand. Peak rebuild memory may contain
+both previous and next active cohorts; no exact heap-byte bound is claimed.
+
+DSR compiled the complete core test crate in both the default and scalar-only
+feature lanes, with economy fault tests enabled and retained locked Cargo
+dependencies. The default lane passed six cache-specific regressions, the
+eight-stage scalar/cohort equivalence test, 11 brain-stage tests and 19
+reproduction tests (filters overlap). The scalar-only lane passed its brain-stage
+test and all 19 reproduction tests; source formatting passed. An initial new
+test incorrectly assumed `WorldState: Sync`, which the existing Send-only sense
+provider already prevents. The cache now uses an ordinary owned map and the test
+asserts the actual `Send` contract. A separate scalar compile was killed under
+host memory pressure; the subsequent identical feature lane compiled and passed.
+No throughput result or full workspace Cargo/Clippy qualification is asserted.
 
 The food-funded slice is now implemented: both diet rates may be zero together;
 mixed zero/positive pairs remain invalid and positive-rate timer reachability is
@@ -86,8 +109,9 @@ environment rendering (`bd-2z0.12.3`).
 - FtBrain now packs distinct per-agent weights and invokes one F32 batched matrix
   contraction per layer. Scalar evaluation remains the bit-level oracle; output
   publication is all-or-nothing. Canonical genome and evaluator-state codecs stay
-  unchanged; adapter semantic version 3 identifies the new executor. Core still
-  reconstructs cohorts at tick boundaries, so this is not a throughput claim.
+  unchanged; adapter semantic version 3 identifies the new executor. At that
+  increment core reconstructed cohorts at each tick; retention is implemented
+  above. Neither increment establishes a throughput result.
 - Local WASM and remote Canvas/WebGPU views now show terrain, food and observed
   water depth from the agents' immutable publication, including empty worlds.
   Overviews retain all small-grid cells or at most 128 × 128 labelled center
