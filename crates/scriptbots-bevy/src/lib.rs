@@ -1977,8 +1977,29 @@ fn compact_command_feedback(message: &str) -> String {
         .split_once(" [")
         .and_then(|(label, rest)| {
             let (id, outcome) = rest.split_once("]: ")?;
-            (id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
-                .then(|| format!("{label}: {outcome}"))
+            if id.len() != 32 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return None;
+            }
+            // Only simplify a fully recognized applied receipt. Unknown,
+            // rejected and failed states keep their complete explanation.
+            let brief = outcome
+                .strip_prefix("Applied • tick ")
+                .and_then(|rest| rest.split_once(" • science revision "))
+                .and_then(|(tick, rest)| {
+                    let (revision, journal) = rest.split_once(" • Journal • ")?;
+                    (!tick.is_empty()
+                        && tick.bytes().all(|b| b.is_ascii_digit())
+                        && !revision.is_empty()
+                        && revision.bytes().all(|b| b.is_ascii_digit()))
+                    .then_some(journal)
+                })
+                .and_then(|journal| match journal {
+                    "committed in memory" => Some("Applied • in memory"),
+                    "durable" => Some("Applied • durable"),
+                    "pending" => Some("Applied • journal pending"),
+                    _ => None,
+                });
+            Some(format!("{label}: {}", brief.unwrap_or(outcome)))
         })
         .unwrap_or_else(|| line.to_owned());
     native_feedback_for_hud(&compact)
@@ -3000,6 +3021,7 @@ struct HudElements {
 /// diagnostic text so the card can use a clear visual hierarchy.
 #[derive(Resource)]
 struct CreatureCardElements {
+    panel: Entity,
     root: Entity,
     identity: Entity,
     context: Entity,
@@ -3267,6 +3289,27 @@ mod hud_diagnostics_tests {
             compact_command_feedback("Commands: feedback unavailable"),
             "Commands: feedback unavailable"
         );
+        for (journal, expected) in [
+            ("committed in memory", "in memory"),
+            ("durable", "durable"),
+            ("pending", "journal pending"),
+        ] {
+            let raw = format!(
+                "Selection [00000000000000010000000000000002]: Applied • tick 516 • science revision 516 • Journal • {journal}"
+            );
+            assert_eq!(
+                compact_command_feedback(&raw),
+                format!("Selection: Applied | {expected}")
+            );
+            assert!(native_feedback_for_hud(&raw).contains("tick 516 | science revision 516"));
+        }
+        let failed = "Selection [00000000000000010000000000000002]: Applied • tick 516 • science revision 516 • Journal failed • disk_full • free space";
+        assert_eq!(
+            compact_command_feedback(failed),
+            "Selection: Applied | tick 516 | science revision 516 | Journal failed | disk_full | free space"
+        );
+        let unrecognized = "Selection [00000000000000010000000000000002]: Applied • tick unknown • science revision 516 • Journal • durable";
+        assert!(compact_command_feedback(unrecognized).contains("tick unknown"));
     }
 
     #[test]
@@ -4857,7 +4900,7 @@ fn setup_scene(
                 position_type: PositionType::Absolute,
                 top: Val::Px(12.0),
                 left: Val::Px(12.0),
-                width: Val::Px(560.0),
+                width: Val::Px(320.0),
                 max_width: Val::Percent(45.0),
                 max_height: Val::Percent(92.0),
                 padding: UiRect::all(Val::Px(10.0)),
@@ -5536,6 +5579,7 @@ fn setup_scene(
         brain,
     });
     commands.insert_resource(CreatureCardElements {
+        panel: hud_root,
         root: card_root,
         identity: card_identity,
         context: card_context,
@@ -5949,6 +5993,19 @@ fn update_creature_card(
             .iter()
             .find(|agent| agent.selection == SelectionState::Selected)
     });
+    let width = if diagnostics.as_ref().is_some_and(|mode| mode.0) {
+        560.0
+    } else if selected.is_some() {
+        440.0
+    } else {
+        320.0
+    };
+    if let Ok(mut node) = nodes.get_mut(card.panel) {
+        let desired = Val::Px(width);
+        if node.width != desired {
+            node.width = desired;
+        }
+    }
     if let Ok(mut root) = nodes.get_mut(card.root) {
         let display = if selected.is_some() && !diagnostics.as_ref().is_some_and(|d| d.0) {
             Display::Flex
@@ -6003,7 +6060,14 @@ fn update_creature_card(
         (card.context, context),
         (card.health, format!("{:.2}", agent.health)),
         (card.energy, format!("{:.2}", agent.energy)),
-        (card.age, format!("{} steps", agent.age)),
+        (
+            card.age,
+            format!(
+                "{} step{}",
+                agent.age,
+                if agent.age == 1 { "" } else { "s" }
+            ),
+        ),
         (card.generation, format!("{}", agent.generation)),
         (card.page_status, status),
         (card.page_title, title),
@@ -12517,6 +12581,75 @@ mod owner_inspector_tests {
     }
 
     #[test]
+    fn creature_panel_width_tracks_selection_and_diagnostics() {
+        let owner = TestOwner::new();
+        let frame = owner.frame();
+        let mut app = App::new();
+        app.insert_resource(SnapshotState {
+            latest: Some(frame),
+            ..default()
+        });
+        app.insert_resource(HudDiagnostics::default());
+        let panel = app.world_mut().spawn((Node::default(), HudScenePanel)).id();
+        let root = app.world_mut().spawn(Node::default()).id();
+        let mut label = || app.world_mut().spawn(Text::default()).id();
+        let card = CreatureCardElements {
+            panel,
+            root,
+            identity: label(),
+            context: label(),
+            health: label(),
+            energy: label(),
+            age: label(),
+            generation: label(),
+            page_status: label(),
+            page_title: label(),
+            page_body: label(),
+        };
+        app.insert_resource(card)
+            .add_systems(Update, update_creature_card);
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(panel).unwrap().width,
+            Val::Px(440.0)
+        );
+        assert_eq!(
+            app.world().get::<Node>(root).unwrap().display,
+            Display::Flex
+        );
+        app.world_mut().resource_mut::<HudDiagnostics>().0 = true;
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(panel).unwrap().width,
+            Val::Px(560.0)
+        );
+        assert_eq!(
+            app.world().get::<Node>(root).unwrap().display,
+            Display::None
+        );
+        app.world_mut().resource_mut::<HudDiagnostics>().0 = false;
+        for agent in &mut app
+            .world_mut()
+            .resource_mut::<SnapshotState>()
+            .latest
+            .as_mut()
+            .unwrap()
+            .agents
+        {
+            agent.selection = SelectionState::None;
+        }
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(panel).unwrap().width,
+            Val::Px(320.0)
+        );
+        assert_eq!(
+            app.world().get::<Node>(root).unwrap().display,
+            Display::None
+        );
+    }
+
+    #[test]
     fn creature_card_tracks_selection_real_detail_pages_and_failure() {
         let mut owner = TestOwner::new();
         owner.serve();
@@ -12539,6 +12672,7 @@ mod owner_inspector_tests {
         let root = app.world_mut().spawn(Node::default()).id();
         let mut label = || app.world_mut().spawn(Text::default()).id();
         let card = CreatureCardElements {
+            panel: root,
             root,
             identity: label(),
             context: label(),
@@ -12700,6 +12834,7 @@ mod owner_inspector_tests {
         let root = app.world_mut().spawn(Node::default()).id();
         let mut label = || app.world_mut().spawn(Text::default()).id();
         let card = CreatureCardElements {
+            panel: root,
             root,
             identity: label(),
             context: label(),
