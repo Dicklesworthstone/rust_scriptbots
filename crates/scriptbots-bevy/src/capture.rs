@@ -2101,9 +2101,7 @@ mod tests {
             } else if alpha >= 1.0 {
                 assert!(snapshot.agents == current_snapshot.agents);
             } else if (alpha - 0.5).abs() < f32::EPSILON {
-                assert!(
-                    Quat::from_rotation_y(agent.heading).angle_between(Quat::IDENTITY) < 0.001
-                );
+                assert!(Quat::from_rotation_y(agent.heading).angle_between(Quat::IDENTITY) < 0.001);
                 if let Some(ref first_midpoint) = midpoint {
                     assert!(&snapshot.agents == first_midpoint);
                 } else {
@@ -2280,7 +2278,6 @@ mod tests {
                 crate::AgentGroundFootprint {
                     radius: 10.0,
                     spike_extension: 0.0,
-                    spike: None,
                 },
                 crate::AgentDisplayPose {
                     translation: pose.translation,
