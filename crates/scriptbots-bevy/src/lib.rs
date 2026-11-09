@@ -17481,18 +17481,33 @@ mod terrain_tests {
         let mut snapshot = sample_world_snapshot();
         snapshot.world_size = Vec2::splat(1000.0);
         snapshot.agents.push(sample_agent_visual());
-        assert!(publisher.publish(snapshot.clone()));
+        motion_test_source(&mut snapshot);
+        let first_observation = Instant::now() - Duration::from_secs(10);
+        assert!(publisher.publish_at(snapshot.clone(), first_observation));
         app.update();
         let record = &app.world().resource::<AgentRegistry>().records[&AgentUid(1)];
         let (root, spike, body) = (record.root, record.spike.entity, record.body.entity);
 
         snapshot.revision += 1;
         snapshot.tick += 1;
-        snapshot.agents[0].position.x += 100.0;
+        snapshot.agents[0].position.x += 10.0;
         snapshot.agents[0].heading += 0.5;
         snapshot.agents[0].spike_length += 10.0;
-        assert!(publisher.publish(snapshot.clone()));
+        motion_test_source(&mut snapshot);
+        assert!(publisher.publish_at(snapshot.clone(), Instant::now()));
         app.update();
+        assert!(
+            app.world()
+                .resource::<SnapshotState>()
+                .latest
+                .as_ref()
+                .unwrap()
+                .motion
+                .as_ref()
+                .unwrap()
+                .previous
+                .is_some()
+        );
         let root_target = app.world().entity(root).get::<AgentPoseTarget>().unwrap();
         assert_ne!(
             app.world()
@@ -17516,6 +17531,7 @@ mod terrain_tests {
             snapshot.tick += step;
             snapshot.agents[0].position.y += 30.0 * step as f32;
             snapshot.agents[0].spike_length += 3.0 * step as f32;
+            motion_test_source(&mut snapshot);
             assert!(publisher.publish(snapshot.clone()));
             app.update();
             assert!(
@@ -17571,12 +17587,29 @@ mod terrain_tests {
         snapshot.revision += 1;
         snapshot.tick += 1;
         snapshot.paused = false;
-        snapshot.agents[0].position.x += 80.0;
+        snapshot.agents[0].position.x += 10.0;
         snapshot.agents[0].spike_length += 5.0;
+        motion_test_source(&mut snapshot);
         app.world_mut()
             .resource_mut::<Time>()
             .advance_by(Duration::from_secs_f32(1.0 / 60.0));
-        assert!(publisher.publish(snapshot));
+        let resumed_at = Instant::now();
+        assert!(publisher.publish_at(snapshot.clone(), resumed_at));
+        app.update();
+        assert_eq!(
+            app.world().entity(root).get::<Transform>().unwrap().translation,
+            app.world().entity(root).get::<AgentPoseTarget>().unwrap().translation,
+            "the first post-pause cut must snap to its committed pose"
+        );
+
+        // A second consecutive running cut may interpolate again. Use a
+        // controlled observation interval so CPU scheduling cannot consume it.
+        snapshot.revision += 1;
+        snapshot.tick += 1;
+        snapshot.agents[0].position.x += 10.0;
+        snapshot.agents[0].spike_length += 5.0;
+        motion_test_source(&mut snapshot);
+        assert!(publisher.publish_at(snapshot, resumed_at + Duration::from_secs(10)));
         app.update();
         let root_target = app.world().entity(root).get::<AgentPoseTarget>().unwrap();
         assert_ne!(
