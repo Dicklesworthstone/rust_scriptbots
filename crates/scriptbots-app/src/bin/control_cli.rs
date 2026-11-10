@@ -24,9 +24,10 @@ use ratatui::{
 };
 use reqwest::{Client, StatusCode};
 use scriptbots_app::control::{
-    ApiSchemaDto, ArtifactMetadataDto, CheckpointCreateRequest, CheckpointMetadataDto,
-    ExperimentBatchStatusDto, ExperimentComparisonDto, ExperimentCreateRequest,
-    MAX_ARTIFACT_DOWNLOAD_BYTES, MapApplyAgentPolicy, PaginatedArtifactsResponse,
+    ApiSchemaDto, ArtifactMetadataDto, CheckpointBranchRequest, CheckpointBranchStatusDto,
+    CheckpointCreateRequest, CheckpointMetadataDto, ExperimentBatchStatusDto,
+    ExperimentComparisonDto, ExperimentCreateRequest, MAX_ARTIFACT_DOWNLOAD_BYTES,
+    MAX_CHECKPOINT_BRANCH_REQUEST_BYTES, MapApplyAgentPolicy, PaginatedArtifactsResponse,
     PaginatedCheckpointsResponse, PaginatedExperimentsResponse, compute_blake3, compute_sha256,
 };
 use scriptbots_app::experiment_runner::EXPERIMENT_ENDPOINT_METRICS;
@@ -289,6 +290,26 @@ enum CheckpointSubcommand {
         #[arg(long, short)]
         out: PathBuf,
     },
+    /// Run or inspect an independent future from a saved cut; the live owner is unchanged.
+    Branch {
+        #[command(subcommand)]
+        sub: CheckpointBranchSubcommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum CheckpointBranchSubcommand {
+    /// Admit a bounded branch study; poll status to observe completion and its report.
+    Create {
+        /// CheckpointBranchRequest JSON file or '-' for stdin (at most 16 KiB).
+        /// Must include checkpoint_id, branch_name, ticks and idempotency_key.
+        #[arg(long, short)]
+        file: PathBuf,
+    },
+    /// Read observed branch progress and its source checkpoint identity as JSON.
+    Status { id: String },
+    /// Request a cooperative stop; 'cancelling' does not mean it has stopped yet.
+    Cancel { id: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -840,6 +861,96 @@ async fn checkpoint_request(
                 bail!("checkpoint response identity differs from the requested checkpoint");
             }
             download_artifact(client, base_url, &id, &out, Some(&checkpoint)).await
+        }
+        CheckpointSubcommand::Branch { sub } => {
+            checkpoint_branch_request(client, base_url, sub, key).await
+        }
+    }
+}
+
+fn read_checkpoint_branch_request(
+    file: &Path,
+    key: Option<&str>,
+) -> Result<CheckpointBranchRequest> {
+    let mut bytes = Vec::new();
+    let limit = u64::try_from(MAX_CHECKPOINT_BRANCH_REQUEST_BYTES)
+        .expect("checkpoint branch input bound fits u64");
+    if file == Path::new("-") {
+        io::stdin()
+            .lock()
+            .take(limit + 1)
+            .read_to_end(&mut bytes)
+            .context("failed to read checkpoint branch JSON from stdin")?;
+    } else {
+        let metadata = fs::metadata(file).with_context(|| {
+            format!(
+                "failed to inspect checkpoint branch request {}",
+                file.display()
+            )
+        })?;
+        if !metadata.is_file() || metadata.len() > limit {
+            bail!("checkpoint branch request must be a regular file of at most {limit} bytes");
+        }
+        fs::File::open(file)
+            .with_context(|| {
+                format!(
+                    "failed to open checkpoint branch request {}",
+                    file.display()
+                )
+            })?
+            .take(limit + 1)
+            .read_to_end(&mut bytes)
+            .context("failed to read checkpoint branch request")?;
+    }
+    if bytes.len() > MAX_CHECKPOINT_BRANCH_REQUEST_BYTES {
+        bail!("checkpoint branch request exceeds the {limit}-byte input limit");
+    }
+    if bytes.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{') {
+        bail!("checkpoint branch request must be a JSON object");
+    }
+    let request: CheckpointBranchRequest =
+        serde_json::from_slice(&bytes).context("invalid CheckpointBranchRequest JSON")?;
+    if key.is_some_and(|key| key != request.idempotency_key) {
+        bail!("--idempotency-key conflicts with the key in the checkpoint branch request");
+    }
+    request
+        .validate_shape()
+        .context("invalid checkpoint branch request")?;
+    if serde_json::to_vec(&request)?.len() > MAX_CHECKPOINT_BRANCH_REQUEST_BYTES {
+        bail!("serialized checkpoint branch request exceeds the {limit}-byte input limit");
+    }
+    Ok(request)
+}
+
+async fn checkpoint_branch_request(
+    client: &Client,
+    base_url: &str,
+    command: CheckpointBranchSubcommand,
+    key: Option<&str>,
+) -> Result<Value> {
+    match command {
+        CheckpointBranchSubcommand::Create { file } => {
+            let body = read_checkpoint_branch_request(&file, key)?;
+            let mut request = client
+                .post(data_api_url(base_url, &["checkpoints", "branches"])?)
+                .json(&body);
+            if let Some(key) = key {
+                request = request.header("Idempotency-Key", key);
+            }
+            data_json::<CheckpointBranchStatusDto>(request).await
+        }
+        CheckpointBranchSubcommand::Status { id } => {
+            data_json::<CheckpointBranchStatusDto>(
+                client.get(data_api_url(base_url, &["checkpoints", "branches", &id])?),
+            )
+            .await
+        }
+        CheckpointBranchSubcommand::Cancel { id } => {
+            data_json::<CheckpointBranchStatusDto>(client.post(data_api_url(
+                base_url,
+                &["checkpoints", "branches", &id, "cancel"],
+            )?))
+            .await
         }
     }
 }
@@ -2571,6 +2682,79 @@ mod tests {
     use clap::CommandFactory;
 
     #[test]
+    fn checkpoint_branch_cli_exposes_create_status_and_cancel() {
+        let parsed = Cli::try_parse_from([
+            "control",
+            "checkpoint",
+            "branch",
+            "create",
+            "--file",
+            "branch.json",
+        ])
+        .expect("checkpoint branch creation command");
+        assert!(matches!(parsed.command, Command::Checkpoint {
+            sub: CheckpointSubcommand::Branch {
+                sub: CheckpointBranchSubcommand::Create { file }
+            }
+        } if file == Path::new("branch.json")));
+        for action in ["status", "cancel"] {
+            assert!(
+                Cli::try_parse_from(["control", "checkpoint", "branch", action, "branch-1"])
+                    .is_ok()
+            );
+        }
+        assert!(Cli::try_parse_from(["control", "checkpoint", "branch", "create"]).is_err());
+    }
+
+    #[test]
+    fn checkpoint_branch_input_is_bounded_strict_and_preserves_retry_identity() -> Result<()> {
+        use scriptbots_app::control::MAX_CHECKPOINT_BRANCH_TICKS;
+        let directory = tempdir()?;
+        let path = directory.path().join("branch.json");
+        let original = serde_json::json!({
+            "checkpoint_id": "checkpoint-1", "branch_name": "food-treatment", "ticks": 2,
+            "intervention": {"type": "ConfigPatch", "params": {"food_growth_rate": 0.0}},
+            "idempotency_key": "branch-retry"
+        });
+        let mut bytes = serde_json::to_vec(&original)?;
+        bytes.resize(MAX_CHECKPOINT_BRANCH_REQUEST_BYTES, b' ');
+        fs::write(&path, &bytes)?;
+        assert_eq!(
+            serde_json::to_value(read_checkpoint_branch_request(&path, Some("branch-retry"))?)?,
+            original
+        );
+        assert!(read_checkpoint_branch_request(&path, Some("changed-key")).is_err());
+        bytes.push(b' ');
+        fs::write(&path, &bytes)?;
+        assert!(read_checkpoint_branch_request(&path, None).is_err());
+        for (field, invalid) in [
+            ("branch_name", serde_json::json!("../escape")),
+            ("ticks", serde_json::json!(0)),
+            ("ticks", serde_json::json!(MAX_CHECKPOINT_BRANCH_TICKS + 1)),
+            ("idempotency_key", serde_json::json!("  ")),
+            ("interventon", serde_json::json!({})),
+        ] {
+            let mut request = original.clone();
+            request[field] = invalid;
+            fs::write(&path, serde_json::to_vec(&request)?)?;
+            assert!(
+                read_checkpoint_branch_request(&path, None).is_err(),
+                "{request}"
+            );
+        }
+        for bytes in [
+            br#"["checkpoint-1","branch",2,null,"retry"]"#.as_slice(),
+            br#"{"checkpoint_id":"checkpoint-1","branch_name":"branch","ticks":2}"#,
+            br#"{"checkpoint_id":"checkpoint-1","branch_name":"branch","ticks":2,"idempotency_key":"one","idempotency_key":"two"}"#,
+        ] {
+            fs::write(&path, bytes)?;
+            assert!(read_checkpoint_branch_request(&path, Some("retry")).is_err());
+        }
+        assert!(read_checkpoint_branch_request(directory.path(), None).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn experiment_cli_exposes_lifecycle_and_canonical_metric_choices() {
         for action in ["status", "cancel", "resume"] {
             assert!(Cli::try_parse_from(["control", "experiment", action, "study-1"]).is_ok());
@@ -3272,6 +3456,148 @@ mod tests {
             assert!(save_verified_download(&link, b"replacement").is_err());
             assert!(!target.exists());
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one actual saved cut drives the CLI lifecycle and verified report download"
+    )]
+    async fn checkpoint_branch_cli_runs_an_isolated_future_and_downloads_its_report() -> Result<()>
+    {
+        use scriptbots_app::branch_study::{BranchStudyReport, BranchStudySource};
+        let root = tempdir()?;
+        let mut server = LiveDataServer::start(&root.path().join("artifacts"))?;
+        let before = server
+            .host
+            .as_ref()
+            .unwrap()
+            .port()
+            .scientific_digest_v1()?;
+        let client = Client::new();
+        let saved = checkpoint_request(
+            &client,
+            &server.base_url,
+            CheckpointSubcommand::Create {
+                description: Some("branch source".into()),
+            },
+            Some("cli-branch-source"),
+        )
+        .await?;
+        let checkpoint: CheckpointMetadataDto = serde_json::from_value(saved)?;
+        let path = root.path().join("branch.json");
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "checkpoint_id": checkpoint.checkpoint_id,
+                "branch_name": "food-treatment", "ticks": 2,
+                "intervention": {"type": "ConfigPatch", "params": {"food_growth_rate": 0.0}},
+                "idempotency_key": "cli-branch-retry"
+            }))?,
+        )?;
+        let created: CheckpointBranchStatusDto = serde_json::from_value(
+            checkpoint_request(
+                &client,
+                &server.base_url,
+                CheckpointSubcommand::Branch {
+                    sub: CheckpointBranchSubcommand::Create { file: path.clone() },
+                },
+                Some("cli-branch-retry"),
+            )
+            .await?,
+        )?;
+        assert_eq!(created.checkpoint_id, checkpoint.checkpoint_id);
+        assert_eq!(created.source_tick, checkpoint.tick);
+        assert_eq!(created.target_tick, checkpoint.tick + 2);
+        assert_eq!(created.world_digest_v1, before.overall);
+        assert!(matches!(created.status.as_str(), "running" | "completed"));
+        if created.status == "running" {
+            assert!(created.artifact_id.is_none());
+        }
+        let retry = checkpoint_request(
+            &client,
+            &server.base_url,
+            CheckpointSubcommand::Branch {
+                sub: CheckpointBranchSubcommand::Create { file: path },
+            },
+            Some("cli-branch-retry"),
+        )
+        .await?;
+        assert_eq!(retry["branch_id"], created.branch_id);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let completed = loop {
+            let observed: CheckpointBranchStatusDto = serde_json::from_value(
+                checkpoint_request(
+                    &client,
+                    &server.base_url,
+                    CheckpointSubcommand::Branch {
+                        sub: CheckpointBranchSubcommand::Status {
+                            id: created.branch_id.clone(),
+                        },
+                    },
+                    None,
+                )
+                .await?,
+            )?;
+            if observed.status == "completed" {
+                break observed;
+            }
+            assert_eq!(observed.status, "running", "{observed:?}");
+            assert!(Instant::now() < deadline, "{observed:?}");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        };
+        let output = root.path().join("download/report.json");
+        let artifact_id = completed
+            .artifact_id
+            .clone()
+            .expect("completed report artifact");
+        let receipt = artifact_request(
+            &client,
+            &server.base_url,
+            ArtifactSubcommand::Download {
+                id: artifact_id.clone(),
+                out: output.clone(),
+            },
+        )
+        .await?;
+        assert_eq!(receipt["artifact_id"], artifact_id);
+        let report: BranchStudyReport = serde_json::from_slice(&fs::read(output)?)?;
+        assert!(matches!(
+            report.source,
+            BranchStudySource::SavedCheckpoint { .. }
+        ));
+        assert_eq!(report.pre_intervention_digest, before.overall);
+        assert!(report.pre_intervention_digest_verified_for_all_branches);
+        assert_eq!(report.checkpoint_tick, checkpoint.tick);
+        assert_eq!(report.horizon_ticks, 2);
+        assert_eq!(report.branch_reports.len(), 2);
+        for branch in &report.branch_reports {
+            assert_eq!(branch.terminal_sample.tick, completed.target_tick);
+            assert!(branch.bundle_verified);
+        }
+        let cancelled = checkpoint_request(
+            &client,
+            &server.base_url,
+            CheckpointSubcommand::Branch {
+                sub: CheckpointBranchSubcommand::Cancel {
+                    id: created.branch_id,
+                },
+            },
+            None,
+        )
+        .await?;
+        assert_eq!(cancelled["status"], "completed");
+        assert_eq!(
+            server
+                .host
+                .as_ref()
+                .unwrap()
+                .port()
+                .scientific_digest_v1()?,
+            before
+        );
+        server.stop()?;
         Ok(())
     }
 

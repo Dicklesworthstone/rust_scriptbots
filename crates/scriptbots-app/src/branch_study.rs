@@ -87,6 +87,15 @@ const MAX_STUDY_DESCRIPTION_BYTES: usize = 4096;
 const MAX_STUDY_ARTIFACT_BYTES: u64 = 50 * 1024 * 1024;
 const SOURCE_CHECKPOINT_ARTIFACT: &str = "source_checkpoint.bin";
 
+/// The producer and managed download catalog verify the same bundle contract.
+pub(crate) const STUDY_BUNDLE_VERIFICATION_LIMITS: RunBundleVerificationLimits =
+    RunBundleVerificationLimits {
+        max_manifest_bytes: 10 * 1024 * 1024,
+        max_artifacts: 100,
+        max_artifact_bytes: MAX_STUDY_ARTIFACT_BYTES,
+        max_total_artifact_bytes: 100 * 1024 * 1024,
+    };
+
 /// Specific intervention perturbations for branch studies.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "params", deny_unknown_fields)]
@@ -868,7 +877,7 @@ fn enforce_study_limit(
     Ok(())
 }
 
-fn validate_study_config(config: &ScriptBotsConfig) -> Result<(), BranchStudyError> {
+pub(crate) fn validate_study_config(config: &ScriptBotsConfig) -> Result<(), BranchStudyError> {
     // These auxiliary states are retained by host checkpoints, not raw science cuts.
     // Apply this restriction to both sources and resolved future ConfigPatch treatments.
     if config.selection_mode != EvolutionSelectionMode::Fitness {
@@ -1226,9 +1235,13 @@ impl BranchStudyOrchestrator {
     /// invalid configurations/interventions, or exceeded resource limits.
     pub fn validate(&self) -> Result<(), BranchStudyError> {
         if self.plan.source_checkpoint.is_some() {
-            self.validate_with_config(&self.plan.config, self.plan.total_transitions()?)
+            self.validate_with_config(&self.plan.config, self.plan.total_transitions()?, true)
         } else {
-            self.validate_with_config(&self.plan.effective_config(), self.plan.total_transitions()?)
+            self.validate_with_config(
+                &self.plan.effective_config(),
+                self.plan.total_transitions()?,
+                false,
+            )
         }
     }
 
@@ -1236,15 +1249,16 @@ impl BranchStudyOrchestrator {
         &self,
         config: &ScriptBotsConfig,
         total_transitions: u64,
+        saved_source: bool,
     ) -> Result<(), BranchStudyError> {
         if self.plan.study_id.trim().is_empty() {
             return Err(BranchStudyError::InvalidPlan(
                 "study_id cannot be empty".to_string(),
             ));
         }
-        if self.plan.checkpoint_tick == 0 {
+        if self.plan.checkpoint_tick == 0 && !saved_source {
             return Err(BranchStudyError::InvalidPlan(
-                "checkpoint_tick must be >= 1".to_string(),
+                "seeded warmup checkpoint_tick must be >= 1".to_string(),
             ));
         }
         if self.plan.horizon_ticks == 0 {
@@ -1416,11 +1430,7 @@ impl BranchStudyOrchestrator {
         }
 
         let checkpoint = world.checkpoint_v1()?;
-        self.execute_checkpoint_branches(
-            &checkpoint,
-            BranchStudySource::SeededWarmup,
-            cancellation,
-        )
+        self.execute_checkpoint_branches(&checkpoint, BranchStudySource::SeededWarmup, cancellation)
     }
 
     /// Run new isolated scientific futures from an already decoded saved world.
@@ -1459,7 +1469,34 @@ impl BranchStudyOrchestrator {
         checkpoint: &WorldCheckpointV1,
         cancellation: Option<&AtomicBool>,
     ) -> Result<BranchStudyReport, BranchStudyError> {
-        self.validate_with_config(checkpoint.config(), self.plan.branch_transitions()?)?;
+        if cancellation.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+            return Err(BranchStudyError::Cancelled);
+        }
+        let source_bytes = self.validate_from_checkpoint(checkpoint)?;
+        let source = BranchStudySource::SavedCheckpoint {
+            artifact_path: SOURCE_CHECKPOINT_ARTIFACT.to_owned(),
+            byte_size: source_bytes.len() as u64,
+            checksum_blake3: blake3::hash(&source_bytes).to_hex().to_string(),
+        };
+        if cancellation.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+            return Err(BranchStudyError::Cancelled);
+        }
+        self.reserve_output_directory()?;
+        write_new_study_artifact(
+            &self.output_dir.join(SOURCE_CHECKPOINT_ARTIFACT),
+            &source_bytes,
+        )?;
+        drop(source_bytes);
+        self.execute_checkpoint_branches(checkpoint, source, cancellation)
+    }
+
+    /// Validate a decoded source before managed execution is admitted or output reserved.
+    /// Returns the validated canonical source bytes, retaining no reconstructed world.
+    pub(crate) fn validate_from_checkpoint(
+        &self,
+        checkpoint: &WorldCheckpointV1,
+    ) -> Result<Vec<u8>, BranchStudyError> {
+        self.validate_with_config(checkpoint.config(), self.plan.branch_transitions()?, true)?;
         // Compare canonical typed encodings, preserving distinctions such as signed zero
         // that PartialEq would treat as equal. No seed or persistence field is normalized.
         if serde_json::to_vec(&self.plan.config)? != serde_json::to_vec(checkpoint.config())? {
@@ -1479,30 +1516,12 @@ impl BranchStudyOrchestrator {
             checkpoint.agent_count() as u64,
             MAX_STUDY_POPULATION,
         )?;
-        if cancellation.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
-            return Err(BranchStudyError::Cancelled);
-        }
-
         // Encoding validates the complete strict envelope. Canonical decode/encode retains
         // every source byte. Restore checks family codecs, supported state and the complete
         // science digest before output is claimed; the preflight owner never takes a step.
         let source_bytes = checkpoint.encode()?;
         drop(self.restore_study_checkpoint(checkpoint)?);
-        let source = BranchStudySource::SavedCheckpoint {
-            artifact_path: SOURCE_CHECKPOINT_ARTIFACT.to_owned(),
-            byte_size: source_bytes.len() as u64,
-            checksum_blake3: blake3::hash(&source_bytes).to_hex().to_string(),
-        };
-        if cancellation.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
-            return Err(BranchStudyError::Cancelled);
-        }
-        self.reserve_output_directory()?;
-        write_new_study_artifact(
-            &self.output_dir.join(SOURCE_CHECKPOINT_ARTIFACT),
-            &source_bytes,
-        )?;
-        drop(source_bytes);
-        self.execute_checkpoint_branches(checkpoint, source, cancellation)
+        Ok(source_bytes)
     }
 
     fn restore_study_checkpoint(
@@ -2218,14 +2237,7 @@ impl BranchStudyOrchestrator {
         .map_err(|e| BranchStudyError::Bundle(e.to_string()))?;
 
         // 4. Verify bundle bounded
-        let limits = RunBundleVerificationLimits {
-            max_manifest_bytes: 10 * 1024 * 1024,
-            max_artifacts: 100,
-            max_artifact_bytes: MAX_STUDY_ARTIFACT_BYTES,
-            max_total_artifact_bytes: 100 * 1024 * 1024,
-        };
-
-        verify_run_bundle_bounded(&bundle_dir, limits)
+        verify_run_bundle_bounded(&bundle_dir, STUDY_BUNDLE_VERIFICATION_LIMITS)
             .map_err(|e| BranchStudyError::Bundle(e.to_string()))?;
 
         Ok((bundle_dir, true))
@@ -2785,7 +2797,9 @@ mod tests {
         assert!(matches!(
             BranchStudyOrchestrator::new(wrong_registry, output.clone())
                 .execute_from_checkpoint(&checkpoint, None),
-            Err(BranchStudyError::Checkpoint(WorldCheckpointError::RegistryMismatch { .. }))
+            Err(BranchStudyError::Checkpoint(
+                WorldCheckpointError::RegistryMismatch { .. }
+            ))
         ));
         assert!(!output.exists());
         let output = directory.path().join("cancelled");
@@ -2796,7 +2810,10 @@ mod tests {
         ));
         assert!(!output.exists());
         assert_eq!(checkpoint.encode().unwrap(), original_bytes);
-        assert_eq!(source_world.world_digest_v1().unwrap(), *checkpoint.source_digest());
+        assert_eq!(
+            source_world.world_digest_v1().unwrap(),
+            *checkpoint.source_digest()
+        );
     }
 
     #[test]
@@ -2807,28 +2824,41 @@ mod tests {
         let original = checkpoint.encode().unwrap();
         let source_path = directory.path().join("evolved-source.bin");
         fs::write(&source_path, &original).unwrap();
-        let supplied = BranchStudyOrchestrator::new(plan.clone(), directory.path().join("supplied"))
-            .execute_from_checkpoint(&checkpoint, None)
-            .unwrap();
+        let supplied =
+            BranchStudyOrchestrator::new(plan.clone(), directory.path().join("supplied"))
+                .execute_from_checkpoint(&checkpoint, None)
+                .unwrap();
         plan.source_checkpoint = Some(source_path.clone());
         let output = directory.path().join("declared");
         let declared = BranchStudyOrchestrator::new(plan.clone(), output.clone())
             .execute_study(None)
             .unwrap();
-        assert_eq!(declared.pre_intervention_digest, supplied.pre_intervention_digest);
+        assert_eq!(
+            declared.pre_intervention_digest,
+            supplied.pre_intervention_digest
+        );
         assert_eq!(declared.source, supplied.source);
         for (declared_branch, supplied_branch) in
             declared.branch_reports.iter().zip(&supplied.branch_reports)
         {
             assert_eq!(declared_branch.final_digest, supplied_branch.final_digest);
-            assert_eq!(declared_branch.terminal_sample, supplied_branch.terminal_sample);
-            assert_eq!(declared_branch.first_divergence, supplied_branch.first_divergence);
+            assert_eq!(
+                declared_branch.terminal_sample,
+                supplied_branch.terminal_sample
+            );
+            assert_eq!(
+                declared_branch.first_divergence,
+                supplied_branch.first_divergence
+            );
         }
         let retained_plan: BranchStudyPlan =
             serde_json::from_slice(&fs::read(output.join("study_plan.json")).unwrap()).unwrap();
         assert_eq!(retained_plan, plan);
         assert_eq!(fs::read(&source_path).unwrap(), original);
-        assert_eq!(fs::read(output.join(SOURCE_CHECKPOINT_ARTIFACT)).unwrap(), original);
+        assert_eq!(
+            fs::read(output.join(SOURCE_CHECKPOINT_ARTIFACT)).unwrap(),
+            original
+        );
         let source: BranchStudySource =
             serde_json::from_slice(&fs::read(output.join("study_source.json")).unwrap()).unwrap();
         assert_eq!(
@@ -2844,14 +2874,19 @@ mod tests {
             BranchStudyOrchestrator::new(plan, output.clone()).execute_study(None),
             Err(BranchStudyError::OutputAlreadyExists { .. })
         ));
-        assert_eq!(fs::read(output.join(SOURCE_CHECKPOINT_ARTIFACT)).unwrap(), original);
+        assert_eq!(
+            fs::read(output.join(SOURCE_CHECKPOINT_ARTIFACT)).unwrap(),
+            original
+        );
     }
 
     #[test]
     fn declared_sources_refuse_replication_and_ambiguous_api_before_file_reads() {
         let directory = tempdir().unwrap();
         let mut replicated = replicated_fixture();
-        let checkpoint = world_at_checkpoint(&replicated.study).checkpoint_v1().unwrap();
+        let checkpoint = world_at_checkpoint(&replicated.study)
+            .checkpoint_v1()
+            .unwrap();
         replicated.study.source_checkpoint = Some(directory.path().join("missing-source.bin"));
         let output = directory.path().join("replicated");
         assert!(matches!(
@@ -2886,10 +2921,17 @@ mod tests {
         let mut runner = BranchStudyOrchestrator::new(plan, PathBuf::from("unused"));
         assert!(matches!(
             runner.validate(),
-            Err(BranchStudyError::CapacityExceeded { resource: "total transitions", .. })
+            Err(BranchStudyError::CapacityExceeded {
+                resource: "total transitions",
+                ..
+            })
         ));
         runner
-            .validate_with_config(&runner.plan.config, runner.plan.branch_transitions().unwrap())
+            .validate_with_config(
+                &runner.plan.config,
+                runner.plan.branch_transitions().unwrap(),
+                true,
+            )
             .expect("a supplied cut performs only its bounded future transitions");
         runner.plan.source_checkpoint = Some(PathBuf::from("old-source.bin"));
         runner
@@ -2999,8 +3041,8 @@ mod tests {
         let directory = tempdir().unwrap();
         let mut plan = replicated_fixture().study;
         plan.config.archive_enabled = true;
-        plan.branches[1].intervention = Some(StudyIntervention::Core(
-            Intervention::SpawnFromArchive {
+        plan.branches[1].intervention =
+            Some(StudyIntervention::Core(Intervention::SpawnFromArchive {
                 selector: scriptbots_core::CellSelector::TopKByQuality(1),
                 placement: scriptbots_core::Placement::Seeded {
                     region: Region::All,
@@ -3008,8 +3050,7 @@ mod tests {
                 },
                 headroom: None,
                 herbivore_tendency: None,
-            },
-        ));
+            }));
         let checkpoint = world_at_checkpoint(&plan).checkpoint_v1().unwrap();
         for imported in [false, true] {
             let output = directory.path().join(format!("archive-{imported}"));
@@ -3059,13 +3100,14 @@ mod tests {
         world.apply_map_artifact(&artifact).unwrap();
         let checkpoint = world.checkpoint_v1().unwrap();
         let original = checkpoint.encode().unwrap();
-        let registry = crate::brains::create_brain_registry_for_config(
-            plan.brain_preset,
-            checkpoint.config(),
-        )
-        .unwrap();
+        let registry =
+            crate::brains::create_brain_registry_for_config(plan.brain_preset, checkpoint.config())
+                .unwrap();
         let raw_restored = WorldState::restore_checkpoint_v1(&checkpoint, registry).unwrap();
-        assert_eq!(raw_restored.world_digest_v1().unwrap(), *checkpoint.source_digest());
+        assert_eq!(
+            raw_restored.world_digest_v1().unwrap(),
+            *checkpoint.source_digest()
+        );
         assert!(raw_restored.map_metadata().is_some());
         assert!(matches!(
             BranchStudyOrchestrator::new(plan, output.clone())
@@ -3074,7 +3116,10 @@ mod tests {
         ));
         assert!(!output.exists());
         assert_eq!(checkpoint.encode().unwrap(), original);
-        assert_eq!(world.world_digest_v1().unwrap(), *checkpoint.source_digest());
+        assert_eq!(
+            world.world_digest_v1().unwrap(),
+            *checkpoint.source_digest()
+        );
     }
 
     #[test]
@@ -3095,11 +3140,21 @@ mod tests {
             seeded.branch_reports.iter().zip(&imported.branch_reports)
         {
             assert_eq!(seeded_branch.final_digest, imported_branch.final_digest);
-            assert_eq!(seeded_branch.terminal_sample, imported_branch.terminal_sample);
-            assert_eq!(seeded_branch.first_divergence, imported_branch.first_divergence);
+            assert_eq!(
+                seeded_branch.terminal_sample,
+                imported_branch.terminal_sample
+            );
+            assert_eq!(
+                seeded_branch.first_divergence,
+                imported_branch.first_divergence
+            );
         }
         assert_eq!(
-            imported.branch_reports[1].first_divergence.as_ref().unwrap().stage,
+            imported.branch_reports[1]
+                .first_divergence
+                .as_ref()
+                .unwrap()
+                .stage,
             "config"
         );
     }
@@ -3122,13 +3177,22 @@ mod tests {
             .execute_from_checkpoint(&checkpoint, None)
             .expect("configured NeuroFlow checkpoint study");
         assert_eq!(seeded.source, BranchStudySource::SeededWarmup);
-        assert_eq!(seeded.pre_intervention_digest, imported.pre_intervention_digest);
+        assert_eq!(
+            seeded.pre_intervention_digest,
+            imported.pre_intervention_digest
+        );
         for (seeded_branch, imported_branch) in
             seeded.branch_reports.iter().zip(&imported.branch_reports)
         {
             assert_eq!(seeded_branch.final_digest, imported_branch.final_digest);
-            assert_eq!(seeded_branch.terminal_sample, imported_branch.terminal_sample);
-            assert_eq!(seeded_branch.first_divergence, imported_branch.first_divergence);
+            assert_eq!(
+                seeded_branch.terminal_sample,
+                imported_branch.terminal_sample
+            );
+            assert_eq!(
+                seeded_branch.first_divergence,
+                imported_branch.first_divergence
+            );
         }
     }
 
@@ -3143,7 +3207,11 @@ mod tests {
         let mut world = WorldState::new(plan.config.clone()).unwrap();
         let installed = install_brains(&mut world, plan.brain_preset).unwrap();
         assert_eq!(installed.population().len(), 1);
-        assert!(world.brain_registry().is_protocol_family(installed.population()[0]));
+        assert!(
+            world
+                .brain_registry()
+                .is_protocol_family(installed.population()[0])
+        );
         // No genomes are available to guess the old constructor settings. The retained
         // registry identity remains authoritative for an empty source world.
         for _ in 0..plan.checkpoint_tick {
@@ -3160,15 +3228,23 @@ mod tests {
         let original = checkpoint.encode().unwrap();
         assert_eq!(checkpoint.config(), &plan.config);
         assert_eq!(checkpoint.tick().0, plan.checkpoint_tick);
-        assert_eq!(world.agent_substream_protocol_v1().root_seed(), plan.base_seed);
+        assert_eq!(
+            world.agent_substream_protocol_v1().root_seed(),
+            plan.base_seed
+        );
         assert!(matches!(
             BranchStudyOrchestrator::new(plan, output.clone())
                 .execute_from_checkpoint(&checkpoint, None),
-            Err(BranchStudyError::Checkpoint(WorldCheckpointError::RegistryMismatch { .. }))
+            Err(BranchStudyError::Checkpoint(
+                WorldCheckpointError::RegistryMismatch { .. }
+            ))
         ));
         assert!(!output.exists());
         assert_eq!(checkpoint.encode().unwrap(), original);
-        assert_eq!(world.world_digest_v1().unwrap(), *checkpoint.source_digest());
+        assert_eq!(
+            world.world_digest_v1().unwrap(),
+            *checkpoint.source_digest()
+        );
     }
 
     #[test]
