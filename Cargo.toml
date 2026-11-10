@@ -1,4 +1,5 @@
 [workspace]
+exclude = ["vendor/crossterm"]
 resolver = "2"
 members = [
     "crates/scriptbots-core",
@@ -87,6 +88,7 @@ serde-wasm-bindgen = "0.6.5"
 wasm-bindgen = { version = "0.2.104", features = ["serde-serialize"] }
 
 [patch.crates-io]
+crossterm = { path = "vendor/crossterm" }
 # GPUI's inactive screen-capture option still puts xcb 1.7.0 in Cargo.lock.
 # Keep broad lockfile audits clean with this exact upstream compatibility commit,
 # which replaces xcb's vulnerable build-time quick-xml 0.30 parser with 0.41.
