@@ -1073,6 +1073,41 @@ unconfirmed. Paused and single-step snapshots settle agent positions, headings,
 spikes, and idle-body deformation immediately at their recorded poses; camera
 navigation remains available while paused.
 
+### Native Lab experiments and saved checkpoints
+
+In Bevy, use **Lab (F6)** to open the experiment pane or **F7** to open saved
+checkpoints. Tab or Up/Down selects an enabled action, Enter activates it, and
+PageUp/PageDown or the mouse wheel scrolls the panel. Escape closes the panel.
+
+The experiment pane reads the same application services as GPUI. It lists retained
+batches, shows every variant through bounded pages, and reports completed,
+running and failed runs. Select baseline and challenger arms to compare verified
+population endpoints from matched seeds. Comparisons retain their plan digest,
+source generation, endpoint and available statistical results. Stop and resume
+buttons use the existing experiment runner; its returned status remains the
+authority. Create new batches through the experiment CLI or API.
+
+The saved-checkpoint pane lists retained scientific cuts and reconstructs the
+selected cut for inspection. **SAVED CHECKPOINT** and a return-live banner identify
+historical presentation while the independent live owner continues running.
+Live organism picking and simulation commands are disabled during review. Click
+the banner, choose **Return live**, or press Escape with the panel closed to
+restore the newest live publication. Review does not replace or rewind the owner.
+
+Both native frontends share one bounded workflow model. Discarding a pending
+result keeps its worker slot occupied until the operation finishes; changing
+session, panel or selection invalidates its result. File reads and experiment
+verification run outside the render loop. Bevy retains at most one saved
+presentation and one newest live publication, and reuses a bounded pool of UI
+rows.
+
+This source increment covers experiment inspection/comparison and checkpoint
+review under `bd-2z0.7.6.1`. Replay seeking, first-divergence display and artifact
+export remain separate unfinished parts of that bead. Compilation, strict Clippy,
+the authored regressions and native GPU interaction checks were not completed in
+this session because the execution environment disconnected; no acceptance
+closure is claimed.
+
 ### Bevy shared creature appearance
 
 Live Bevy rendering and offscreen capture now use the same shared PBR appearance

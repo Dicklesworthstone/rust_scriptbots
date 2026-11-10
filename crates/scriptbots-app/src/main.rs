@@ -5170,10 +5170,15 @@ impl Renderer for BevyRenderer {
         prepare_linux_gui_backend();
         let control_health: scriptbots_bevy::ControlHealthFn =
             Arc::new(ctx.control_runtime.health_probe());
+        let lab_control = ctx
+            .control_runtime
+            .control_handle()
+            .ok_or_else(|| anyhow!("native Lab requires the owner control adapter"))?;
         let bevy_ctx = BevyRendererContext {
             host: ctx.host,
             command_submit: Arc::clone(&ctx.command_submit),
             control_health: Some(control_health),
+            lab_submit: Some(scriptbots_app::renderer::lab_workflow_submit(lab_control)),
             logging: scriptbots_bevy::LoggingOwnership::Host,
         };
         scriptbots_bevy::run_renderer(bevy_ctx)

@@ -6268,6 +6268,20 @@ idempotent cancel/shutdown landed and were pushed at exact revision
 
 #### 3.9 Bevy terrain, camera, HUD, and capture
 
+**[Source implemented; executable qualification open — bd-2z0.7.6.1, Codex, 2026-11-10]**
+Share the native experiment/checkpoint protocol, bounded asynchronous consumer and
+stale-result guards between GPUI and Bevy. Bevy adds experiment catalog/detail,
+paired population comparisons, stop/resume and saved-checkpoint review with a
+separate latest-live presentation. Its modal captures input, historical pixels
+cannot issue live organism commands, and returning live restores the newest
+owner publication. Existing GPUI behavior and the application services remain
+the consumers and authorities of the same protocol.
+
+Retain the original bead and its remaining replay seek, first-divergence, export
+and full native/GPU acceptance. The execution environment disconnected before
+compiler/test execution; source review and authored regressions are not passing
+DSR, Clippy, native-window, performance or GPU qualification.
+
 **[Currently In Progress — bd-2z0.14.1.20, TurquoiseLake, 2026-09-08]**
 Connect same-tick look-development camera bookmarks and configured exposure to
 the existing GPU capture path. Art review and hardware evidence remain open.

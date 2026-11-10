@@ -6,6 +6,7 @@
 mod appearance;
 pub mod capture;
 pub mod creature_meshes;
+mod lab_workflows;
 pub mod particles;
 
 use anyhow::{Context, Result, anyhow};
@@ -105,6 +106,8 @@ pub struct BevyRendererContext {
     pub host: ChannelHostPort,
     pub command_submit: CommandSubmitFn,
     pub control_health: Option<ControlHealthFn>,
+    /// Application-owned services used by the experiment and checkpoint panes.
+    pub lab_submit: Option<scriptbots_runtime::lab_workflows::LabWorkflowSubmit>,
     pub logging: LoggingOwnership,
 }
 
@@ -748,6 +751,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
         mut host,
         command_submit,
         control_health,
+        lab_submit,
         logging,
     } = ctx;
 
@@ -847,6 +851,8 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
     ))
     .insert_non_send_resource(snapshot_inbox)
     .insert_non_send_resource(owner_inspector)
+    .insert_non_send_resource(lab_workflows::consumer(lab_submit))
+    .init_resource::<lab_workflows::LabPresentation>()
     .init_resource::<InspectorPage>()
     .init_resource::<HudDiagnostics>()
     .init_resource::<HudDisplaySettings>()
@@ -882,7 +888,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
     .add_systems(
         Update,
         (
-            poll_snapshots,
+            (poll_snapshots, lab_workflows::update).chain(),
             (
                 sync_world,
                 sync_far_terrain_color,
@@ -896,8 +902,8 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
             )
                 .chain(),
             (
-                handle_playback_shortcuts,
-                handle_playback_buttons,
+                handle_playback_shortcuts.run_if(lab_workflows::world_controls_allowed),
+                handle_playback_buttons.run_if(lab_workflows::world_controls_allowed),
                 handle_hud_diagnostics,
                 handle_display_settings,
                 handle_follow_menu,
@@ -931,7 +937,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
                 handle_follow_button_interactions,
                 handle_camera_view_buttons,
             ),
-            handle_clear_selection_button,
+            handle_clear_selection_button.run_if(lab_workflows::world_controls_allowed),
             update_playback_button_colors,
             update_follow_button_colors,
             update_tonemap_button_colors,
@@ -946,7 +952,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
             (
                 poll_owner_inspector,
                 toggle_creature_details,
-                handle_inspector_page,
+                handle_inspector_page.run_if(lab_workflows::camera_controls_allowed),
                 update_genome_slice_button_visibility,
                 update_hud,
                 update_creature_card,
@@ -960,9 +966,15 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
         (
             poll_control_health,
             poll_bevy_lifecycle_failures,
-            close_on_esc,
+            close_on_esc
+                .run_if(lab_workflows::world_controls_allowed)
+                .after(lab_workflows::update),
         )
             .chain(),
+    )
+    .add_systems(
+        Update,
+        lab_workflows::refresh_panel.after(lab_workflows::update),
     );
 
     if diagnostics_enabled {
@@ -5740,6 +5752,7 @@ fn setup_scene(
     commands.entity(hud_root).with_children(|parent| {
         parent.spawn((
             Text::new("SCRIPTBOTS  /  LIVE WORLD"),
+            lab_workflows::LabWorldHeading,
             ui_font(13.0),
             TextColor(Color::srgb(0.62, 0.82, 0.68)),
         ));
@@ -6513,6 +6526,21 @@ fn setup_scene(
             });
 
         parent.spawn((toolbar_row,)).with_children(|row| {
+            row.spawn((
+                Button,
+                toolbar_button.clone(),
+                BackgroundColor(follow_idle_color()),
+                BorderRadius::all(Val::Px(6.0)),
+                BorderColor::all(button_border_color),
+                lab_workflows::OpenLabButton,
+            ))
+            .with_children(|button| {
+                button.spawn((
+                    Text::new("Lab (F6)"),
+                    secondary_font.clone(),
+                    TextColor(secondary_text_color),
+                ));
+            });
             for (view, label) in [
                 (CameraView::Overhead, "Overhead"),
                 (CameraView::Isometric, "Isometric"),
@@ -6791,6 +6819,7 @@ fn setup_scene(
         page_title: card_page_title,
         page_body: card_page_body,
     });
+    lab_workflows::setup_panel(&mut commands, interface_font.unwrap_or_default());
 }
 
 fn run_snapshot_publisher(
@@ -6942,10 +6971,15 @@ fn poll_snapshots(
     inbox: NonSendMut<SnapshotInbox>,
     mut state: ResMut<SnapshotState>,
     mut motion: ResMut<AgentMotionSettings>,
+    lab: Option<ResMut<lab_workflows::LabPresentation>>,
 ) {
     if let Some(snapshot) = inbox.take_latest() {
-        motion.enabled = !snapshot.reduced_motion;
-        state.install_snapshot(snapshot);
+        if let Some(mut lab) = lab {
+            lab.receive_live(snapshot, &mut state, &mut motion);
+        } else {
+            motion.enabled = !snapshot.reduced_motion;
+            state.install_snapshot(snapshot);
+        }
     }
     if let Some(snapshot) = state.latest.as_mut() {
         snapshot.motion_alpha = snapshot
@@ -7620,6 +7654,7 @@ fn update_hud(
     owner_inspector: Option<NonSend<OwnerInspector>>,
     inspector_page: Option<Res<InspectorPage>>,
     diagnostics: Option<Res<HudDiagnostics>>,
+    lab: Option<Res<lab_workflows::LabPresentation>>,
     mut texts: Query<&mut Text>,
 ) {
     let Some(_) = state.latest.as_ref() else {
@@ -7770,7 +7805,9 @@ fn update_hud(
         }
         if let Ok(mut text) = texts.get_mut(hud_elements.playback) {
             let speed = control_snapshot.speed_multiplier.clamp(0.0, 999.9);
-            let mut message = if speed > 0.0 {
+            let mut message = if lab.as_ref().is_some_and(|lab| lab.reviewing()) {
+                format!("Saved view at tick {tick} | live owner {playback_status}")
+            } else if speed > 0.0 {
                 format!("Playback: {} | x{speed:>4.1}", playback_status)
             } else {
                 format!("Playback: {} | x0.0", playback_status)
@@ -15985,6 +16022,7 @@ fn handle_selection_input(
         Query<&AgentDisplayPose>,
     ),
     submitter: Option<Res<CommandSubmitter>>,
+    lab: Option<Res<lab_workflows::LabPresentation>>,
     ui_interactions: Query<&Interaction, With<Node>>,
     mut rig: ResMut<CameraRig>,
 ) {
@@ -15993,6 +16031,11 @@ fn handle_selection_input(
         .and_then(|(camera, _)| camera_target_window(&camera.target, primary_window.single().ok()));
     let selection_clicked =
         window_received_selection_click(mouse_buttons.read().copied(), target_window);
+    // Drain captured clicks even while the Lab is open; closing the modal
+    // must not replay an old button press as a world selection.
+    if !lab_workflows::world_controls_allowed(lab) {
+        return;
+    }
     let Some(submitter) = submitter else {
         return;
     };
@@ -16336,8 +16379,10 @@ fn handle_playback_shortcuts(
 
 fn update_playback_button_colors(
     controls: Res<SimulationControl>,
+    lab: Option<Res<lab_workflows::LabPresentation>>,
     mut query: Query<(&PlaybackButton, &Interaction, &mut BackgroundColor)>,
 ) {
+    let enabled = lab_workflows::world_controls_allowed(lab);
     let snapshot = controls.snapshot();
     for (button, interaction, mut color) in query.iter_mut() {
         let highlight = match button.action {
@@ -16346,7 +16391,9 @@ fn update_playback_button_colors(
             _ => false,
         };
 
-        let target = if highlight {
+        let target = if !enabled {
+            Color::srgba(0.10, 0.13, 0.12, 0.65)
+        } else if highlight {
             follow_active_color()
         } else if matches!(interaction, Interaction::Hovered | Interaction::Pressed) {
             follow_hover_color()
@@ -17034,6 +17081,7 @@ fn control_camera(
     mut observed_selection: Local<bool>,
     motion: Option<Res<AgentMotionSettings>>,
     feedback: Option<Res<NativeCommandFeedback>>,
+    lab: Option<Res<lab_workflows::LabPresentation>>,
     buttons: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
     mut mouse_motion: MessageReader<MouseMotion>,
@@ -17043,6 +17091,11 @@ fn control_camera(
     panels: Query<(&ComputedNode, &Visibility), With<HudScenePanel>>,
     mut camera_query: Query<(&mut Transform, Option<&Projection>), With<PrimaryCamera>>,
 ) {
+    if !lab_workflows::camera_controls_allowed(lab) {
+        mouse_motion.clear();
+        mouse_wheel.clear();
+        return;
+    }
     let Ok((mut transform, projection)) = camera_query.single_mut() else {
         mouse_motion.clear();
         mouse_wheel.clear();
