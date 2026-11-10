@@ -9,6 +9,7 @@
 //! - Self-contained run bundle creation and bounded canonical verification.
 //! - Retention of configs, commands, digests, reports, timings, and logs on disk.
 //! - Real CLI execution, repeatable artifacts, and refusal without overwriting evidence.
+//! - Saved-checkpoint plans continue real evolved worlds and retain their exact source bytes.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -20,8 +21,8 @@ use std::time::Duration;
 
 use scriptbots_app::branch_study::{
     BRANCH_STUDY_REPORT_SCHEMA_VERSION, BranchAnalysisBasis, BranchStudyOrchestrator,
-    BranchStudyPlan, BranchStudyReport, CooperationParams, ReplicatedBranchStudyPlan,
-    ReplicatedBranchStudyReport, StudyBranchSpec, StudyIntervention,
+    BranchStudyPlan, BranchStudyReport, BranchStudySource, CooperationParams,
+    ReplicatedBranchStudyPlan, ReplicatedBranchStudyReport, StudyBranchSpec, StudyIntervention,
 };
 use scriptbots_app::experiment_runner::MatchedSeedExperimentRunner;
 use scriptbots_storage::bundle::{RunBundleVerificationLimits, verify_run_bundle_bounded};
@@ -59,6 +60,7 @@ fn test_seeded_checkpoint_branch_intervention_study_e2e() {
                 .to_string(),
         base_seed,
         checkpoint_tick,
+        source_checkpoint: None,
         horizon_ticks,
         brain_preset: scriptbots_app::BrainPreset::Mlp,
         config: scriptbots_core::ScriptBotsConfig {
@@ -474,6 +476,14 @@ fn verify_cli_study(output: &Path, plan: &BranchStudyPlan) -> BranchStudyReport 
         fs::read_to_string(output.join("study_summary.md")).expect("retained CLI summary"),
         report.summary_markdown,
     );
+    let retained_source: BranchStudySource = serde_json::from_slice(
+        &fs::read(output.join("study_source.json")).expect("retained study source"),
+    )
+    .expect("typed source provenance");
+    assert_eq!(retained_source, report.source);
+    if plan.source_checkpoint.is_none() {
+        assert_eq!(report.source, BranchStudySource::SeededWarmup);
+    }
 
     let control = report
         .branch_reports
@@ -536,6 +546,7 @@ fn verify_cli_study(output: &Path, plan: &BranchStudyPlan) -> BranchStudyReport 
         )
         .expect("typed branch evidence JSON");
         assert_eq!(evidence["schema_version"], report.schema_version);
+        assert_eq!(evidence["source"], serde_json::to_value(&report.source).unwrap());
         assert_eq!(evidence["branch_id"], branch.branch_id);
         assert_eq!(evidence["base_seed"], plan.base_seed);
         assert_eq!(evidence["checkpoint_tick"], plan.checkpoint_tick);
@@ -907,4 +918,287 @@ fn replicated_branch_study_cli_refuses_duplicate_seeds_and_aggregate_work_before
             "refused replicated study must not claim an output"
         );
     }
+}
+
+fn evolved_import_fixture(
+    preset: scriptbots_app::BrainPreset,
+) -> (BranchStudyPlan, scriptbots_core::WorldState) {
+    let mut plan = tiny_cli_plan(BranchStudyPlan::standard_five_branch(
+        "saved-cut",
+        42,
+        2,
+        4,
+    ));
+    plan.brain_preset = preset;
+    plan.branches
+        .retain(|branch| matches!(branch.branch_id.as_str(), "control" | "resource_shock"));
+    if preset == scriptbots_app::BrainPreset::Neuro {
+        plan.config.neuroflow.enabled = false;
+        plan.config.neuroflow.hidden_layers = vec![7, 3];
+        plan.config.neuroflow.activation = scriptbots_core::NeuroflowActivationKind::Sigmoid;
+    }
+    let mut world = scriptbots_core::WorldState::new(plan.config.clone()).unwrap();
+    let installed = scriptbots_app::install_brains(&mut world, preset).unwrap();
+    scriptbots_app::seed_founders(
+        &mut world,
+        installed.population(),
+        scriptbots_app::FounderRecipe::CornerGrid,
+    )
+    .unwrap();
+    world
+        .enqueue_intervention(scriptbots_core::Intervention::Drought {
+            region: scriptbots_core::Region::All,
+            ticks: 7,
+            growth_scale: 0.25,
+        })
+        .unwrap();
+    for _ in 0..plan.checkpoint_tick {
+        world.step().unwrap();
+    }
+    assert!(!world.active_effects().is_empty());
+    assert!(world.agent_count() > 0);
+    // Current configuration is not a recipe for repeating the world's original seed.
+    // Import must retain this edit while verifying the actual restored RNG root.
+    let mut edited = world.config().clone();
+    edited.rng_seed = None;
+    world.apply_config_update(edited.clone()).unwrap();
+    assert_eq!(
+        world.agent_substream_protocol_v1().root_seed(),
+        plan.base_seed
+    );
+    plan.config = edited;
+    (plan, world)
+}
+
+fn direct_import_trajectory(
+    mut world: scriptbots_core::WorldState,
+    horizon: u64,
+    meteor_at: Option<u64>,
+) -> Vec<(u64, String)> {
+    let mut observed = vec![(world.tick().0, world.world_digest_v1().unwrap().overall)];
+    for _ in 0..horizon {
+        if meteor_at == Some(world.tick().0) {
+            world
+                .enqueue_intervention(scriptbots_core::Intervention::Meteor {
+                    region: scriptbots_core::Region::All,
+                    lethality: 0.0,
+                    scorch: 0.5,
+                })
+                .unwrap();
+        }
+        world.step().unwrap();
+        observed.push((world.tick().0, world.world_digest_v1().unwrap().overall));
+    }
+    observed
+}
+
+#[test]
+fn saved_checkpoint_plan_cli_matches_original_control_and_direct_core_treatment() {
+    let root = tempdir().unwrap();
+    for preset in [
+        scriptbots_app::BrainPreset::Mlp,
+        scriptbots_app::BrainPreset::Dwraon,
+        #[cfg(feature = "neuro")]
+        scriptbots_app::BrainPreset::Neuro,
+    ] {
+        let label = preset.as_str();
+        let (mut plan, original) = evolved_import_fixture(preset);
+        let checkpoint = original.checkpoint_v1().unwrap();
+        let source_bytes = checkpoint.encode().unwrap();
+        let source_name = format!("source-{label}.bin");
+        let source_path = root.path().join(&source_name);
+        fs::write(&source_path, &source_bytes).unwrap();
+        // The existing CLI runs in root; relative inputs have explicit invocation-cwd semantics.
+        plan.source_checkpoint = Some(PathBuf::from(source_name));
+        let plan_path = root.path().join(format!("import-{label}.json"));
+        let plan_bytes = serde_json::to_vec_pretty(&plan).unwrap();
+        fs::write(&plan_path, &plan_bytes).unwrap();
+
+        let registry =
+            scriptbots_app::create_brain_registry_for_config(preset, &plan.config).unwrap();
+        let treatment =
+            scriptbots_core::WorldState::restore_checkpoint_v1(&checkpoint, registry).unwrap();
+        let due = plan.checkpoint_tick + 2;
+        let expected_control = direct_import_trajectory(original, plan.horizon_ticks, None);
+        let expected_treatment =
+            direct_import_trajectory(treatment, plan.horizon_ticks, Some(due));
+        assert_eq!(expected_control[0], expected_treatment[0]);
+        assert_ne!(
+            expected_control.last().unwrap().1,
+            expected_treatment.last().unwrap().1,
+            "the direct treatment oracle must have a real scientific effect"
+        );
+
+        let output = root.path().join(format!("import-{label}"));
+        run_branch_cli(
+            root.path(),
+            &format!("import-{label}"),
+            &[
+                OsStr::new("--plan"),
+                plan_path.as_os_str(),
+                OsStr::new("--out"),
+                output.as_os_str(),
+            ],
+            true,
+        );
+        let report = verify_cli_study(&output, &plan);
+        assert_eq!(report.pre_intervention_digest, checkpoint.source_digest().overall);
+        assert_eq!(
+            report.source,
+            BranchStudySource::SavedCheckpoint {
+                artifact_path: "source_checkpoint.bin".to_owned(),
+                byte_size: u64::try_from(source_bytes.len()).unwrap(),
+                checksum_blake3: blake3::hash(&source_bytes).to_hex().to_string(),
+            }
+        );
+        assert_eq!(
+            fs::read(output.join("source_checkpoint.bin")).unwrap(),
+            source_bytes
+        );
+        for (branch_id, expected) in [
+            ("control", &expected_control),
+            ("resource_shock", &expected_treatment),
+        ] {
+            let branch = report
+                .branch_reports
+                .iter()
+                .find(|branch| branch.branch_id == branch_id)
+                .unwrap();
+            let observed: Vec<_> = read_samples(branch.bundle_path.as_deref().unwrap())
+                .into_iter()
+                .map(|sample| (sample.tick, sample.digest))
+                .collect();
+            assert_eq!(&observed, expected, "every saved-cut transition for {label}/{branch_id}");
+        }
+
+        let retained = retained_study_bytes(&output);
+        let refusal = run_branch_cli(
+            root.path(),
+            &format!("import-occupied-{label}"),
+            &[
+                OsStr::new("--plan"),
+                plan_path.as_os_str(),
+                OsStr::new("--out"),
+                output.as_os_str(),
+            ],
+            false,
+        );
+        assert!(diagnostic(&refusal.stderr).contains("already occupied"));
+        assert_eq!(retained_study_bytes(&output), retained);
+        assert_eq!(fs::read(&source_path).unwrap(), source_bytes);
+        assert_eq!(fs::read(&plan_path).unwrap(), plan_bytes);
+    }
+}
+
+#[test]
+fn saved_checkpoint_plan_cli_refuses_mismatches_and_unsafe_inputs_without_output() {
+    let root = tempdir().unwrap();
+    let (mut plan, world) = evolved_import_fixture(scriptbots_app::BrainPreset::Mlp);
+    let bytes = world.checkpoint_v1().unwrap().encode().unwrap();
+    let source = root.path().join("valid-source.bin");
+    fs::write(&source, &bytes).unwrap();
+    plan.source_checkpoint = Some(source.clone());
+
+    let mut wrong_tick = plan.clone();
+    wrong_tick.checkpoint_tick += 1;
+    let mut wrong_seed = plan.clone();
+    wrong_seed.base_seed += 1;
+    let mut wrong_config = plan.clone();
+    wrong_config.config.closed = !wrong_config.config.closed;
+    let mut wrong_family = plan.clone();
+    wrong_family.brain_preset = scriptbots_app::BrainPreset::Dwraon;
+    for (label, rejected) in [
+        ("source-tick", wrong_tick),
+        ("source-root", wrong_seed),
+        ("source-config", wrong_config),
+        ("source-registry", wrong_family),
+    ] {
+        let path = root.path().join(format!("{label}.json"));
+        fs::write(&path, serde_json::to_vec(&rejected).unwrap()).unwrap();
+        let output = root.path().join(format!("{label}-output"));
+        run_branch_cli(
+            root.path(),
+            label,
+            &[
+                OsStr::new("--plan"),
+                path.as_os_str(),
+                OsStr::new("--out"),
+                output.as_os_str(),
+            ],
+            false,
+        );
+        assert!(!output.exists(), "identity refusal must precede output reservation");
+    }
+
+    let malformed = root.path().join("malformed-source.bin");
+    fs::write(&malformed, b"not a world checkpoint").unwrap();
+    let corrupted = root.path().join("corrupted-source.bin");
+    let mut changed = bytes.clone();
+    let midpoint = changed.len() / 2;
+    changed[midpoint] ^= 1;
+    fs::write(&corrupted, &changed).unwrap();
+    let trailing = root.path().join("trailing-source.bin");
+    let mut extra = bytes.clone();
+    extra.push(0);
+    fs::write(&trailing, &extra).unwrap();
+    let oversized = root.path().join("oversized-source.bin");
+    fs::File::create(&oversized)
+        .unwrap()
+        .set_len(u64::try_from(scriptbots_core::MAX_WORLD_CHECKPOINT_BYTES).unwrap() + 1)
+        .unwrap();
+    let directory = root.path().join("source-directory");
+    fs::create_dir(&directory).unwrap();
+    let mut cases = vec![
+        ("malformed-source", malformed),
+        ("corrupted-source", corrupted),
+        ("trailing-source", trailing),
+        ("oversized-source", oversized),
+        ("directory-source", directory),
+        ("missing-source", root.path().join("missing-source.bin")),
+    ];
+    #[cfg(unix)]
+    {
+        let link = root.path().join("symlink-source.bin");
+        std::os::unix::fs::symlink(&source, &link).unwrap();
+        cases.push(("symlink-source", link));
+    }
+    for (label, input) in cases {
+        let mut rejected = plan.clone();
+        rejected.source_checkpoint = Some(input);
+        let path = root.path().join(format!("{label}.json"));
+        fs::write(&path, serde_json::to_vec(&rejected).unwrap()).unwrap();
+        let output = root.path().join(format!("{label}-output"));
+        run_branch_cli(
+            root.path(),
+            label,
+            &[
+                OsStr::new("--plan"),
+                path.as_os_str(),
+                OsStr::new("--out"),
+                output.as_os_str(),
+            ],
+            false,
+        );
+        assert!(!output.exists(), "invalid source must not claim output");
+    }
+
+    let declared = root.path().join("declared-source.json");
+    fs::write(&declared, serde_json::to_vec(&plan).unwrap()).unwrap();
+    let output = root.path().join("false-replicates");
+    let refusal = run_branch_cli(
+        root.path(),
+        "false-replicates",
+        &[
+            OsStr::new("--plan"),
+            declared.as_os_str(),
+            OsStr::new("--out"),
+            output.as_os_str(),
+            OsStr::new("--seeds"),
+            OsStr::new("42,137"),
+        ],
+        false,
+    );
+    assert!(diagnostic(&refusal.stderr).contains("checkpoint"));
+    assert!(!output.exists(), "one saved world cannot become independent founding replicates");
+    assert_eq!(fs::read(&source).unwrap(), bytes);
 }
