@@ -159,7 +159,7 @@ pub struct LabComparison {
     pub mean_difference: f64,
     /// Optional confidence interval.
     pub ci_95: Option<(f64, f64)>,
-    /// Optional paired Cohen's d_z.
+    /// Optional paired Cohen's `d_z`.
     pub standardized_effect: Option<f64>,
     /// Optional raw inferential p value.
     pub p_value: Option<f64>,
@@ -383,7 +383,7 @@ pub fn checkpoint_request_identity_is_valid(request_id: &str) -> bool {
 
 fn next_checkpoint_request(session: HostSessionId) -> Option<String> {
     let sequence = NEXT_CHECKPOINT_REQUEST
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
             value.checked_add(1)
         })
         .ok()?;
@@ -409,18 +409,16 @@ fn checkpoint_receipt_is_bounded(checkpoint: &LabCheckpoint) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
-fn page_is_bounded<T>(items: &[T], offset: usize, total: usize, next: &Option<String>) -> bool {
+fn page_is_bounded<T>(items: &[T], offset: usize, total: usize, next: Option<&str>) -> bool {
     items.len() <= LAB_PAGE_SIZE
         && offset <= total
         && items.len() <= total.saturating_sub(offset)
-        && next
-            .as_ref()
-            .map_or(offset + items.len() == total, |cursor| {
-                cursor.len() <= 20
-                    && cursor.parse::<usize>().is_ok_and(|next| {
-                        next == offset + items.len() && next > offset && next < total
-                    })
-            })
+        && next.map_or(offset + items.len() == total, |cursor| {
+            cursor.len() <= 20
+                && cursor
+                    .parse::<usize>()
+                    .is_ok_and(|next| next == offset + items.len() && next > offset && next < total)
+        })
 }
 
 fn summary_is_bounded(summary: &LabExperimentSummary) -> bool {
@@ -469,6 +467,11 @@ fn batch_is_bounded(batch: &LabExperiment) -> bool {
             .collect::<std::collections::BTreeSet<_>>()
             .len()
             == batch.variants.len()
+}
+
+fn comparison_matches_batch(comparison: &LabComparison, batch: &LabExperiment) -> bool {
+    let same_generation = comparison.status_generation == batch.generation;
+    comparison.plan_digest == batch.plan_digest && same_generation
 }
 
 impl LabWorkflows {
@@ -784,18 +787,19 @@ impl LabWorkflows {
                 return None;
             }
         };
-        let accepted = match (&job.request, response) {
+        self.accept_response(&job.request, response)
+    }
+
+    fn accept_response(
+        &mut self,
+        request: &LabWorkflowRequest,
+        response: LabWorkflowResponse,
+    ) -> Option<(String, Arc<RenderSnapshot>)> {
+        let accepted = match (request, response) {
             (
                 LabWorkflowRequest::ListExperiments { cursor },
                 LabWorkflowResponse::Experiments(page),
-            ) if cursor == &self.experiment_cursor
-                && page.offset == cursor.as_ref().and_then(|v| v.parse().ok()).unwrap_or(0)
-                && page_is_bounded(&page.items, page.offset, page.total, &page.next_cursor)
-                && page.items.iter().all(summary_is_bounded) =>
-            {
-                self.experiments = Some(page);
-                true
-            }
+            ) => self.accept_experiment_page(cursor.as_deref(), page),
             (
                 LabWorkflowRequest::GetExperiment { experiment_id }
                 | LabWorkflowRequest::CancelExperiment { experiment_id }
@@ -815,14 +819,14 @@ impl LabWorkflows {
                     challenger_variant,
                 },
                 LabWorkflowResponse::Comparison(comparison),
-            ) if self.comparison_request().as_ref() == Some(&job.request)
+            ) if self.comparison_request().as_ref() == Some(request)
                 && comparison.experiment_id == *experiment_id
                 && comparison.baseline_variant == *baseline_variant
                 && comparison.challenger_variant == *challenger_variant
-                && self.batch.as_ref().is_some_and(|batch| {
-                    batch.plan_digest == comparison.plan_digest
-                        && batch.generation == comparison.status_generation
-                })
+                && self
+                    .batch
+                    .as_ref()
+                    .is_some_and(|batch| comparison_matches_batch(&comparison, batch))
                 && comparison_is_bounded(&comparison) =>
             {
                 self.comparison = Some(comparison);
@@ -831,24 +835,7 @@ impl LabWorkflows {
             (
                 LabWorkflowRequest::ListCheckpoints { cursor },
                 LabWorkflowResponse::Checkpoints(page),
-            ) if cursor == &self.checkpoint_cursor
-                && page.offset == cursor.as_ref().and_then(|v| v.parse().ok()).unwrap_or(0)
-                && page_is_bounded(&page.items, page.offset, page.total, &page.next_cursor)
-                && page.items.iter().all(|row| {
-                    identity_is_bounded(&row.checkpoint_id) && row.world_digest.len() <= 128
-                }) =>
-            {
-                if self.selected_checkpoint.as_ref().is_some_and(|id| {
-                    !page.items.iter().any(|row| &row.checkpoint_id == id)
-                        && self
-                            .saved_checkpoint_metadata()
-                            .is_none_or(|row| &row.checkpoint_id != id)
-                }) {
-                    self.selected_checkpoint = None;
-                }
-                self.checkpoints = Some(page);
-                true
-            }
+            ) => self.accept_checkpoint_page(cursor.as_deref(), page),
             (
                 LabWorkflowRequest::ReviewCheckpoint { checkpoint_id },
                 LabWorkflowResponse::CheckpointFrame {
@@ -873,7 +860,7 @@ impl LabWorkflows {
         };
         if !accepted
             && matches!(
-                &job.request,
+                request,
                 LabWorkflowRequest::GetExperiment { .. }
                     | LabWorkflowRequest::CancelExperiment { .. }
                     | LabWorkflowRequest::ResumeExperiment { .. }
@@ -890,17 +877,62 @@ impl LabWorkflows {
         None
     }
 
+    fn accept_experiment_page(&mut self, cursor: Option<&str>, page: LabExperimentPage) -> bool {
+        if cursor != self.experiment_cursor.as_deref()
+            || page.offset != cursor.and_then(|value| value.parse().ok()).unwrap_or(0)
+            || !page_is_bounded(
+                &page.items,
+                page.offset,
+                page.total,
+                page.next_cursor.as_deref(),
+            )
+            || !page.items.iter().all(summary_is_bounded)
+        {
+            return false;
+        }
+        self.experiments = Some(page);
+        true
+    }
+
+    fn accept_checkpoint_page(&mut self, cursor: Option<&str>, page: LabCheckpointPage) -> bool {
+        if cursor != self.checkpoint_cursor.as_deref()
+            || page.offset != cursor.and_then(|value| value.parse().ok()).unwrap_or(0)
+            || !page_is_bounded(
+                &page.items,
+                page.offset,
+                page.total,
+                page.next_cursor.as_deref(),
+            )
+            || !page
+                .items
+                .iter()
+                .all(|row| identity_is_bounded(&row.checkpoint_id) && row.world_digest.len() <= 128)
+        {
+            return false;
+        }
+        if self.selected_checkpoint.as_ref().is_some_and(|id| {
+            !page.items.iter().any(|row| &row.checkpoint_id == id)
+                && self
+                    .saved_checkpoint_metadata()
+                    .is_none_or(|row| &row.checkpoint_id != id)
+        }) {
+            self.selected_checkpoint = None;
+        }
+        self.checkpoints = Some(page);
+        true
+    }
+
     fn refresh_request(&self) -> Option<LabWorkflowRequest> {
         match self.panel {
             LabPanel::Inactive => None,
-            LabPanel::Experiments => Some(match &self.selected_experiment {
-                Some(id) => LabWorkflowRequest::GetExperiment {
-                    experiment_id: id.clone(),
-                },
-                None => LabWorkflowRequest::ListExperiments {
+            LabPanel::Experiments => Some(self.selected_experiment.as_ref().map_or_else(
+                || LabWorkflowRequest::ListExperiments {
                     cursor: self.experiment_cursor.clone(),
                 },
-            }),
+                |id| LabWorkflowRequest::GetExperiment {
+                    experiment_id: id.clone(),
+                },
+            )),
             LabPanel::Checkpoints => Some(LabWorkflowRequest::ListCheckpoints {
                 cursor: self.checkpoint_cursor.clone(),
             }),
@@ -937,10 +969,11 @@ impl LabWorkflows {
 
     fn accept_batch(&mut self, mut batch: LabExperiment) {
         batch.error_reason = batch.error_reason.as_deref().map(bounded_message);
-        if self.comparison.as_ref().is_some_and(|comparison| {
-            comparison.plan_digest != batch.plan_digest
-                || comparison.status_generation != batch.generation
-        }) {
+        if self
+            .comparison
+            .as_ref()
+            .is_some_and(|comparison| !comparison_matches_batch(comparison, &batch))
+        {
             self.comparison = None;
         }
         if self
@@ -1447,11 +1480,11 @@ mod tests {
             "an oversized page is rejected, not silently truncated"
         );
         assert!(
-            !page_is_bounded(&[1], 0, 2, &None),
+            !page_is_bounded(&[1], 0, 2, None),
             "remaining rows require a cursor"
         );
         assert!(
-            !page_is_bounded(&[1], 0, 2, &Some("0".into())),
+            !page_is_bounded(&[1], 0, 2, Some("0")),
             "pagination must move forward"
         );
     }
