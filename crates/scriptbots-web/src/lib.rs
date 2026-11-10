@@ -8,6 +8,10 @@
 #![cfg(any(target_arch = "wasm32", test))]
 //! Browser simulation controls, snapshots, and shareable world configuration.
 
+mod launch;
+
+pub use launch::LaunchInfo;
+
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -110,10 +114,11 @@ fn ensure_panic_hook_installed() {
 
 /// A row in the parent diff comparison view.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct DiffRow {
     /// Dot-separated configuration knob path.
     pub knob: String,
-    /// Value configured in the base scenario.
+    /// Value configured in the original browser launch or gallery base scenario.
     pub parent_value: f64,
     /// Value configured in this permalink world.
     pub this_value: f64,
@@ -202,6 +207,7 @@ struct SimSpec {
     seed_strategy: SeedStrategy,
     default_brain: Option<BrainPreset>,
     permalink: Option<Permalink>,
+    launch: Option<launch::BrowserLaunch>,
     preserve_population_config: bool,
 }
 
@@ -681,6 +687,7 @@ impl SimSpec {
             seed_strategy,
             default_brain,
             permalink: None,
+            launch: None,
             preserve_population_config: false,
         }
     }
@@ -695,6 +702,7 @@ impl SimSpec {
             seed_strategy: SeedStrategy::None,
             default_brain: None,
             permalink: Some(permalink),
+            launch: None,
             preserve_population_config: true,
         }
     }
@@ -702,9 +710,8 @@ impl SimSpec {
     fn with_seed(&self, seed: Option<u64>) -> Self {
         let mut next = self.clone();
         next.seed = seed;
-        if let (Some(link), Some(s)) = (&mut next.permalink, seed) {
-            link.seed = s;
-        }
+        next.permalink = None;
+        next.launch = None;
         next
     }
 
@@ -819,9 +826,18 @@ impl Simulation {
         })
     }
 
-    fn new(spec: SimSpec) -> Result<Self> {
-        let mut world = WorldState::new(spec.config())
-            .context("failed to initialize ScriptBots world state")?;
+    fn new(mut spec: SimSpec) -> Result<Self> {
+        let mut config = spec.config();
+        // Resolve entropy before constructing the world so both its scientific
+        // configuration and launch recipe record the same actual root seed.
+        // Keep the caller's original options in base_config for reset(None).
+        config.rng_seed = Some(config.rng_seed.unwrap_or_else(rand::random));
+        launch::validate_config(&config, spec.initial_population).map_err(anyhow::Error::msg)?;
+        if spec.default_brain.is_some() {
+            spec.seed_strategy = SeedStrategy::None;
+        }
+        let mut world =
+            WorldState::new(config).context("failed to initialize ScriptBots world state")?;
         let mut brain_key = None;
         seed_agents(
             &mut world,
@@ -830,6 +846,10 @@ impl Simulation {
             spec.default_brain,
             &mut brain_key,
         )?;
+        spec.launch = Some(
+            launch::BrowserLaunch::from_fresh(&spec, world.config().clone())
+                .map_err(anyhow::Error::msg)?,
+        );
         let session_id = fresh_browser_session()?;
         let options = HostCoreOptions {
             initial_playback: PlaybackSnapshot {
@@ -854,35 +874,9 @@ impl Simulation {
     }
 
     fn reset(&mut self, seed: Option<u64>) -> Result<()> {
-        let spec = self.spec.with_seed(seed);
-        let mut world = WorldState::new(spec.config())
+        let next = Self::new(self.spec.with_seed(seed))
             .context("failed to rebuild ScriptBots world state during reset")?;
-        let mut brain_key = None;
-        seed_agents(
-            &mut world,
-            spec.initial_population,
-            spec.seed_strategy,
-            spec.default_brain,
-            &mut brain_key,
-        )?;
-        let session_id = fresh_browser_session()?;
-        let options = HostCoreOptions {
-            initial_playback: PlaybackSnapshot {
-                paused: false,
-                speed_multiplier: 1.0,
-            },
-            ..Default::default()
-        };
-        let mut core = HostCore::new(session_id, world, options)
-            .map_err(|e| anyhow::anyhow!("failed to rebuild HostCore for web: {e}"))?;
-        core.drive(ManualInstant::from_nanos(0))
-            .context("failed to establish the reset ScriptBots web time boundary")?;
-        self.controls = NullFrontend::new(core.local_port(), 1);
-        self.core = core;
-        self.spec = spec;
-        self.now_nanos = 0;
-        self.environment_cache = RemoteEnvironmentCache::default();
-        self.environment_js = None;
+        *self = next;
         Ok(())
     }
 
@@ -1346,30 +1340,26 @@ impl SimHandle {
             }
             other => return Err(js_error(format!("unknown brain preset: {other}"))),
         }
+        spec.permalink = None;
+        spec.launch = None;
         // Construct before replacing the owner so adapter/configuration failures
         // cannot change the active world's reset recipe or evaluator family.
         *simulation = Simulation::new(spec).map_err(js_error)?;
         Ok(())
     }
 
-    /// Encode the current configured world as a shareable permalink.
+    /// Encode the retained initial recipe, never the current tick or interventions.
     #[wasm_bindgen(js_name = permalinkOf)]
     pub fn permalink_of(&self) -> Result<String, JsValue> {
-        let sim = self.inner.borrow();
-        if let Some(ref link) = sim.spec.permalink {
-            return Ok(link.to_url_string());
-        }
-        let seed = sim.spec.effective_seed().unwrap_or(0);
-        let config_val = serde_json::to_value(sim.spec.config()).map_err(js_error)?;
-        let digest = config_digest_with_diff(&config_val, &[]);
-        let link = Permalink {
-            scenario_id: "default".to_string(),
-            seed,
-            knob_diff: Vec::new(),
-            config_digest: digest,
-            build: canonical_build_link(),
-        };
-        Ok(link.to_url_string())
+        self.permalink_string().map_err(js_error)
+    }
+
+    /// Explain the retained recipe or why an imported continuation cannot share one.
+    #[wasm_bindgen(js_name = launchInfo)]
+    pub fn launch_info_js(&self) -> Result<JsValue, JsValue> {
+        self.launch_info()
+            .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+            .map_err(js_error)
     }
 
     /// Return a child permalink with validated configuration knob assignments.
@@ -1381,46 +1371,62 @@ impl SimHandle {
 }
 
 impl SimHandle {
+    /// Return a bounded initial-conditions link without JavaScript conversion.
+    pub fn permalink_string(&self) -> Result<String, String> {
+        let simulation = self.inner.borrow();
+        if let Some(link) = &simulation.spec.permalink {
+            return Ok(link.to_url_string());
+        }
+        simulation
+            .spec
+            .launch
+            .as_ref()
+            .ok_or_else(|| CONTINUATION_LAUNCH_REASON.to_owned())?
+            .encode()
+    }
+
+    /// Describe exactly which initial conditions this handle can restart.
+    #[must_use]
+    pub fn launch_info(&self) -> LaunchInfo {
+        let simulation = self.inner.borrow();
+        if let Some(link) = &simulation.spec.permalink {
+            return gallery_launch_info(link);
+        }
+        simulation
+            .spec
+            .launch
+            .as_ref()
+            .map_or_else(continuation_launch_info, launch::BrowserLaunch::info)
+    }
+
     /// Advance the simulation and return the strongly-typed snapshot directly.
     pub fn tick_snapshot(&self, steps: u32) -> Result<SimulationSnapshot> {
         let mut simulation = self.inner.borrow_mut();
         simulation.tick(steps)
     }
 
-    /// Fork this world with an explicit slice of knob assignments without converting to `JsValue`.
+    /// Make a link restarting initial conditions with validated knob assignments.
+    /// Current agents, elapsed ticks and live interventions are not part of this recipe.
     pub fn fork_patch(&self, patch: &[(String, f64)]) -> Result<String, String> {
         let sim = self.inner.borrow();
-        let parent_link = if let Some(ref link) = sim.spec.permalink {
-            link.clone()
-        } else {
-            let seed = sim.spec.effective_seed().unwrap_or(0);
-            let config_val = serde_json::to_value(sim.spec.config()).map_err(|e| e.to_string())?;
-            let digest = config_digest_with_diff(&config_val, &[]);
-            Permalink {
-                scenario_id: "default".to_string(),
-                seed,
-                knob_diff: Vec::new(),
-                config_digest: digest,
-                build: canonical_build_link(),
-            }
+        let Some(parent_link) = sim.spec.permalink.clone() else {
+            return sim
+                .spec
+                .launch
+                .as_ref()
+                .ok_or_else(|| CONTINUATION_LAUNCH_REASON.to_owned())?
+                .fork(patch)?
+                .encode();
         };
 
+        let effective = reconstruct_config_from_permalink(&parent_link)?;
+        launch::validate_patch(
+            &serde_json::to_value(effective).map_err(|error| error.to_string())?,
+            patch,
+        )?;
         let mut merged: BTreeMap<String, f64> = parent_link.knob_diff.into_iter().collect();
 
         for (path, value) in patch {
-            if !value.is_finite() {
-                return Err(format!("knob value for '{path}' must be finite"));
-            }
-            let Some(range) = scriptbots_core::knob_range(path) else {
-                return Err(format!("unknown knob id '{path}' not in registry"));
-            };
-            if *value < range.min || *value > range.max {
-                return Err(format!(
-                    "knob '{path}' = {value} is outside [{min}, {max}]",
-                    min = range.min,
-                    max = range.max
-                ));
-            }
             merged.insert(path.clone(), *value);
         }
 
@@ -1437,6 +1443,7 @@ impl SimHandle {
             build: canonical_build_link(),
         };
         child_link.validate_knobs().map_err(|e| e.to_string())?;
+        validate_gallery_config(&reconstruct_config_from_permalink(&child_link)?)?;
 
         Ok(child_link.to_url_string())
     }
@@ -1643,7 +1650,7 @@ pub fn decode_remote_frame_binary(bytes: &[u8]) -> Result<JsValue, JsValue> {
     to_value(&BrowserRemoteFrame::from(&frame)).map_err(js_error)
 }
 
-/// Initialize a simulation from a shareable permalink string (`sbw1...`).
+/// Initialize from a complete browser launch (`sbb1.`) or core gallery reference (`sbw1.`).
 ///
 /// Guarantees:
 /// - Evaluates using the exact shared config composition path as native runs.
@@ -1654,6 +1661,24 @@ pub fn decode_remote_frame_binary(bytes: &[u8]) -> Result<JsValue, JsValue> {
 #[wasm_bindgen]
 pub fn init_from_permalink(link: &str) -> Result<SimHandle, JsValue> {
     ensure_panic_hook_installed();
+    if link.starts_with(launch::PREFIX) {
+        let recipe = launch::BrowserLaunch::decode(link).map_err(js_error)?;
+        let state = recipe
+            .build
+            .comparison(&launch::BrowserBuildInputs::current());
+        info(&format!(
+            "loaded browser initial-conditions recipe: recorded_build={state}"
+        ));
+        if state != "recorded_match" {
+            warn(
+                "browser launch build inputs differ or are unavailable; replay equivalence is not established",
+            );
+        }
+        let simulation = Simulation::new(recipe.into_spec()).map_err(js_error)?;
+        return Ok(SimHandle {
+            inner: Rc::new(RefCell::new(simulation)),
+        });
+    }
     let hex_prefix = hex_first_16(link.as_bytes());
     let permalink = match Permalink::from_url_string(link) {
         Ok(p) => p,
@@ -1676,13 +1701,7 @@ pub fn init_from_permalink(link: &str) -> Result<SimHandle, JsValue> {
         }
     };
 
-    if config.population_minimum > 50_000 {
-        let err = "population_minimum must be 50,000 agents or fewer for browser builds";
-        warn(&format!("rejected permalink: {err}"));
-        return Err(js_error(err));
-    }
-    if config.world_width > 4096 || config.world_height > 4096 {
-        let err = "world dimensions must not exceed 4096 for browser builds";
+    if let Err(err) = validate_gallery_config(&config) {
         warn(&format!("rejected permalink: {err}"));
         return Err(js_error(err));
     }
@@ -1747,14 +1766,17 @@ pub fn permalink_of(handle: &SimHandle) -> Result<String, JsValue> {
     handle.permalink_of()
 }
 
-/// Standalone binding to fork a running world with an inline knob patch.
+/// Standalone binding to restart initial conditions with an inline knob patch.
 #[wasm_bindgen]
 pub fn fork(handle: &SimHandle, knob_patch: JsValue) -> Result<String, JsValue> {
     handle.fork(knob_patch)
 }
 
-/// Strongly-typed rows of a permalink's diff against its base scenario.
+/// Strongly-typed rows against the original browser recipe or gallery base scenario.
 pub fn permalink_diff_rows(link: &str) -> Result<Vec<DiffRow>, String> {
+    if link.starts_with(launch::PREFIX) {
+        return launch::BrowserLaunch::decode(link).map(|launch| launch.changes);
+    }
     let permalink = Permalink::from_url_string(link).map_err(|e| e.to_string())?;
     let base_config = base_config_for_scenario(&permalink.scenario_id);
     let base_json = serde_json::to_value(&base_config).map_err(|e| e.to_string())?;
@@ -1773,32 +1795,97 @@ pub fn permalink_diff_rows(link: &str) -> Result<Vec<DiffRow>, String> {
 }
 
 /// Return an array of [`DiffRow`] objects `[{ knob, parent_value, this_value }]`
-/// comparing this permalink's knobs against its base scenario.
+/// comparing this link against its original browser recipe or gallery base scenario.
 #[wasm_bindgen]
 pub fn permalink_diff(link: &str) -> Result<JsValue, JsValue> {
     let rows = permalink_diff_rows(link).map_err(js_error)?;
     to_value(&rows).map_err(js_error)
 }
 
+const CONTINUATION_LAUNCH_REASON: &str = "The imported owner checkpoint does not record its original browser founders. Save the owner checkpoint to continue this world, or reset explicitly to create a new initial recipe.";
+
+fn continuation_launch_info() -> LaunchInfo {
+    LaunchInfo {
+        kind: "checkpoint_continuation".to_owned(),
+        semantics: "saved_owner_continuation".to_owned(),
+        shareable: false,
+        seed: None,
+        initial_population: None,
+        brain_preset: None,
+        recipe_version: None,
+        reason: Some(CONTINUATION_LAUNCH_REASON.to_owned()),
+    }
+}
+
+fn gallery_launch_info(link: &Permalink) -> LaunchInfo {
+    LaunchInfo {
+        kind: "gallery_reference".to_owned(),
+        semantics: "gallery_configuration_restart".to_owned(),
+        shareable: true,
+        seed: Some(link.seed.to_string()),
+        initial_population: None,
+        brain_preset: None,
+        recipe_version: None,
+        reason: Some("This core gallery reference uses the gallery's population policy; it does not encode browser founders or their brain family.".to_owned()),
+    }
+}
+
+fn validate_gallery_config(config: &ScriptBotsConfig) -> Result<(), String> {
+    launch::validate_config(config, 0)?;
+    if config.world_width > 4096 || config.world_height > 4096 {
+        return Err(
+            "world dimensions must not exceed 4096 for legacy browser gallery references"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+/// Inspect a link's replay scope without creating or mutating a world.
+pub fn permalink_info_details(link: &str) -> Result<LaunchInfo, String> {
+    if link.starts_with(launch::PREFIX) {
+        return launch::BrowserLaunch::decode(link).map(|launch| launch.info());
+    }
+    let permalink = Permalink::from_url_string(link).map_err(|error| error.to_string())?;
+    let config = reconstruct_config_from_permalink(&permalink)?;
+    validate_gallery_config(&config)?;
+    Ok(gallery_launch_info(&permalink))
+}
+
+/// Return initial-condition metadata with exact decimal seeds and explicit scope.
+#[wasm_bindgen]
+pub fn permalink_info(link: &str) -> Result<JsValue, JsValue> {
+    permalink_info_details(link)
+        .map_err(js_error)?
+        .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+        .map_err(js_error)
+}
+
 /// Information about the running build identity.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BuildIdentityResult {
-    /// Hexadecimal digest of the running toolchain identity.
+    /// Fingerprint of the toolchain file, or `unavailable`.
     pub toolchain_digest: String,
-    /// Hexadecimal digest of the running dependency lockfile.
+    /// Fingerprint of the dependency lockfile, or `unavailable`.
     pub lockfile_digest: String,
-    /// Hexadecimal digest of the running simulation core.
+    /// Fingerprint of the recorded source inventory, or `unavailable`.
     pub core_digest: String,
+    /// Scope of the recorded inputs, distinct from a binary attestation.
+    pub identity_scope: String,
+    /// Qualifications on what a matching input record establishes.
+    pub evidence: String,
 }
 
 /// Return the local running build identity as a JS object.
 #[wasm_bindgen]
 pub fn build_identity() -> Result<JsValue, JsValue> {
-    let build = canonical_build_link();
+    let build = launch::BrowserBuildInputs::current();
     let res = BuildIdentityResult {
-        toolchain_digest: format!("{:#018x}", build.toolchain_digest),
-        lockfile_digest: format!("{:#018x}", build.lockfile_digest),
-        core_digest: format!("{:#018x}", build.core_digest),
+        toolchain_digest: display_fingerprint(build.toolchain_fingerprint),
+        lockfile_digest: display_fingerprint(build.lockfile_fingerprint),
+        core_digest: display_fingerprint(build.source_fingerprint),
+        identity_scope: "recorded_browser_build_inputs".to_owned(),
+        evidence: BROWSER_BUILD_EVIDENCE.to_owned(),
     };
     to_value(&res).map_err(js_error)
 }
@@ -1806,24 +1893,43 @@ pub fn build_identity() -> Result<JsValue, JsValue> {
 /// Structured build match assessment result.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BuildMatchResult {
-    /// Exact, compatible, or mismatched build assessment.
+    /// Browser `recorded_match`/`mismatch`/`unavailable`, or legacy gallery assessment.
     pub status: String,
-    /// Simulation core digest encoded in the permalink.
+    /// Whether this compares captured browser inputs or legacy gallery identifiers.
+    pub identity_scope: String,
+    /// Qualifications on what the recorded comparison establishes.
+    pub evidence: String,
+    /// Source fingerprint or legacy core identifier encoded in the link.
     pub link_core_digest: String,
-    /// Simulation core digest of this module.
+    /// Source fingerprint or legacy core identifier of this module.
     pub local_core_digest: String,
-    /// Toolchain digest encoded in the permalink.
+    /// Toolchain-file fingerprint or legacy identifier encoded in the link.
     pub link_toolchain_digest: String,
-    /// Toolchain digest of this module.
+    /// Toolchain-file fingerprint or legacy identifier of this module.
     pub local_toolchain_digest: String,
-    /// Dependency lockfile digest encoded in the permalink.
+    /// Lockfile fingerprint or legacy identifier encoded in the link.
     pub link_lockfile_digest: String,
-    /// Dependency lockfile digest of this module.
+    /// Lockfile fingerprint or legacy identifier of this module.
     pub local_lockfile_digest: String,
 }
 
 /// Evaluate the build match between a permalink and the local WASM build identity without JS conversions.
 pub fn check_build_match_identity(link: &str) -> Result<BuildMatchResult, String> {
+    if link.starts_with(launch::PREFIX) {
+        let recorded = launch::BrowserLaunch::decode(link)?.build;
+        let local = launch::BrowserBuildInputs::current();
+        return Ok(BuildMatchResult {
+            status: recorded.comparison(&local).to_owned(),
+            identity_scope: "recorded_browser_build_inputs".to_owned(),
+            evidence: BROWSER_BUILD_EVIDENCE.to_owned(),
+            link_core_digest: display_fingerprint(recorded.source_fingerprint),
+            local_core_digest: display_fingerprint(local.source_fingerprint),
+            link_toolchain_digest: display_fingerprint(recorded.toolchain_fingerprint),
+            local_toolchain_digest: display_fingerprint(local.toolchain_fingerprint),
+            link_lockfile_digest: display_fingerprint(recorded.lockfile_fingerprint),
+            local_lockfile_digest: display_fingerprint(local.lockfile_fingerprint),
+        });
+    }
     let permalink = Permalink::from_url_string(link).map_err(|e| e.to_string())?;
     let local = canonical_build_link();
     let match_state = permalink.build_match(&local);
@@ -1835,6 +1941,8 @@ pub fn check_build_match_identity(link: &str) -> Result<BuildMatchResult, String
 
     Ok(BuildMatchResult {
         status: state_str.to_string(),
+        identity_scope: "legacy_gallery_reference".to_owned(),
+        evidence: "Legacy gallery identifiers are fixed reference values, not measured compiler, source or lockfile identity.".to_owned(),
         link_core_digest: format!("{:#018x}", permalink.build.core_digest),
         local_core_digest: format!("{:#018x}", local.core_digest),
         link_toolchain_digest: format!("{:#018x}", permalink.build.toolchain_digest),
@@ -1842,6 +1950,12 @@ pub fn check_build_match_identity(link: &str) -> Result<BuildMatchResult, String
         link_lockfile_digest: format!("{:#018x}", permalink.build.lockfile_digest),
         local_lockfile_digest: format!("{:#018x}", local.lockfile_digest),
     })
+}
+
+const BROWSER_BUILD_EVIDENCE: &str = "Compares the recorded source inventory, compiler, target, flags, profile, core lane and toolchain/lockfile FNV-1a fingerprints. These are noncryptographic input fingerprints, not authorization or proof of bit-exact cross-build replay.";
+
+fn display_fingerprint(value: Option<String>) -> String {
+    value.unwrap_or_else(|| "unavailable".to_owned())
 }
 
 /// Evaluate the build match between a permalink and the local WASM build identity.
@@ -2962,7 +3076,7 @@ mod tests {
 
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
     #[cfg_attr(not(target_arch = "wasm32"), test)]
-    fn omitted_seeds_keep_entropy_config() {
+    fn omitted_seeds_record_the_actual_entropy_seed() {
         let simulation = Simulation::new(
             InitOptions {
                 population: 0,
@@ -2972,7 +3086,29 @@ mod tests {
         )
         .expect("entropy-seeded web simulation");
 
-        assert_eq!(simulation.core.world().config().rng_seed, None);
+        let seed = simulation
+            .core
+            .world()
+            .config()
+            .rng_seed
+            .expect("resolved seed");
+        assert_eq!(
+            simulation
+                .core
+                .world()
+                .agent_substream_protocol_v1()
+                .root_seed(),
+            seed
+        );
+        assert_eq!(
+            simulation.spec.launch.as_ref().unwrap().info().seed,
+            Some(seed.to_string())
+        );
+        assert_eq!(
+            simulation.spec.effective_seed(),
+            None,
+            "reset options retain entropy semantics"
+        );
     }
 
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]

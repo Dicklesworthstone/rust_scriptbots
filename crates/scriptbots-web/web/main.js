@@ -9,6 +9,7 @@ import { InspectionController, pickAgent, renderInspector, renderInspectorSource
 import { GenomeInspectionController, renderGenomeInspector, renderGenomeSource } from "./genome.js";
 import { InterventionController, renderInterventions, validateInterventionAction } from "./interventions.js";
 import { NarrativeController, renderNarrative, renderNarrativeSource } from "./narrative.js";
+import { validateLaunchInfo, launchInfoText, renderBuildComparison } from "./recipes.js";
 
 const {
   init_sim,
@@ -84,6 +85,8 @@ const forkPatchInput = document.getElementById("fork-patch-input");
 const forkBtn = document.getElementById("fork-btn");
 const forkOutput = document.getElementById("fork-output");
 const forkChildLink = document.getElementById("fork-child-link");
+const launchInfoElement = document.getElementById("launch-info");
+const forkRecipeInfo = document.getElementById("fork-recipe-info");
 const loadForkedBtn = document.getElementById("load-forked-btn");
 const copyForkBtn = document.getElementById("copy-fork-btn");
 const diffContainer = document.getElementById("diff-container");
@@ -93,6 +96,20 @@ const diffTbody = document.getElementById("diff-tbody");
 
 let currentPermalink = null;
 let latestForkedLink = null;
+let activeLaunchInfo = null;
+
+function updateRecipeControls() {
+  const unavailable = remoteMode || !simHandle || !wasmInitialized || activeLaunchInfo?.shareable === false;
+  for (const control of [copyPermalinkBtn, forkPatchInput, forkBtn]) if (control) control.disabled = unavailable;
+  for (const control of [loadForkedBtn, copyForkBtn]) if (control) control.disabled = remoteMode || !latestForkedLink;
+  if (launchInfoElement) {
+    launchInfoElement.dataset.kind = remoteMode ? "remote" : activeLaunchInfo?.kind ?? "unknown";
+    launchInfoElement.dataset.shareable = remoteMode ? "false" : String(activeLaunchInfo?.shareable ?? "unknown");
+    launchInfoElement.textContent = remoteMode
+      ? "Viewing a remote world. Local recipe details return with your local simulation."
+      : launchInfoText(activeLaunchInfo);
+  }
+}
 
 const metrics = {
   lastFrameTs: performance.now(),
@@ -420,6 +437,7 @@ function updateCheckpointControls() {
     : !supportsContinuation
       ? "This Wander world is a movement demo without inherited genomes or saved continuations. Choose MLP, DWRAON or Assembly, then Reset Simulation to start an evolving world."
       : "This local world supports saved continuations. Loading a continuation preserves its brain family and resumes paused.";
+  updateRecipeControls();
 }
 
 function receiveRemoteFrame(frame) {
@@ -952,6 +970,7 @@ function replaceSimulation(next, { continuation = false, permalink = null, expec
   const nextSpeed = continuation ? 0 : speedMultiplier;
   let frame;
   let brainPreset;
+  let launchInfo;
   try {
     // All fallible owner reads happen before the active world, clock, or UI is
     // changed. Refusing a candidate must leave the previous owner usable.
@@ -962,10 +981,17 @@ function replaceSimulation(next, { continuation = false, permalink = null, expec
       throw new Error("Saved continuation tick does not match its checkpoint bytes");
     }
     brainPreset = next.brainPreset?.() ?? null;
+    launchInfo = typeof next.launchInfo === "function" ? validateLaunchInfo(next.launchInfo()) : continuation ? {
+      kind: "checkpoint_continuation", semantics: "saved_owner_continuation", shareable: false,
+      seed: null, initial_population: null, brain_preset: null, recipe_version: null,
+      reason: "This package did not record the original launch recipe for the saved owner.",
+    } : null;
     if (continuation && !["mlp", "dwraon", "assembly", "none"].includes(brainPreset)) {
       throw new Error("Saved continuation has an unsupported brain family");
     }
-    if (!continuation && permalink_of) {
+    if (launchInfo?.shareable === false) {
+      permalink = null;
+    } else if (!continuation && permalink_of) {
       permalink = permalink_of(next);
     } else if (!continuation && next.permalinkOf) {
       permalink = next.permalinkOf();
@@ -978,6 +1004,10 @@ function replaceSimulation(next, { continuation = false, permalink = null, expec
   const previous = simHandle;
   simHandle = next;
   activeBrainPreset = brainPreset;
+  activeLaunchInfo = launchInfo;
+  latestForkedLink = null;
+  if (forkOutput) forkOutput.style.display = "none";
+  if (forkRecipeInfo) forkRecipeInfo.textContent = "";
   simulationGeneration += 1;
   narrative.reset("local");
   inspector.reset();
@@ -1001,7 +1031,7 @@ function replaceSimulation(next, { continuation = false, permalink = null, expec
   updateCheckpointControls();
   if (previous) releaseSimulation(previous);
   scheduleSimulation();
-  return { frame, permalink };
+  return { frame, permalink, launchInfo };
 }
 
 function scheduleSimulation() {
@@ -1036,45 +1066,8 @@ function pumpSimulation() {
   scheduleSimulation();
 }
 
-function bannerLine(parent, text, className = "") {
-  const line = document.createElement("div");
-  line.className = className;
-  line.textContent = text;
-  parent.append(line);
-  return line;
-}
-
 function updateMismatchBanner(matchResult) {
-  if (!mismatchBannerEl) return;
-
-  if (!matchResult || matchResult.status === "exact") {
-    mismatchBannerEl.className = "";
-    mismatchBannerEl.style.display = "none";
-    mismatchBannerEl.replaceChildren();
-    return;
-  }
-
-  if (matchResult.status !== "compatible" && matchResult.status !== "mismatch") return;
-  const compatible = matchResult.status === "compatible";
-  mismatchBannerEl.replaceChildren();
-  mismatchBannerEl.className = compatible ? "banner-compatible" : "banner-mismatch";
-  mismatchBannerEl.style.display = "block";
-  const title = bannerLine(mismatchBannerEl, "", "banner-title");
-  const icon = document.createElement("span");
-  icon.textContent = compatible ? "ⓘ" : "⚠";
-  const titleText = document.createElement("span");
-  titleText.textContent = compatible ? "Compatible Build Note" : "Build Mismatch Warning";
-  title.append(icon, titleText);
-  bannerLine(mismatchBannerEl, compatible
-    ? "This world was recorded on a compatible build. Toolchain or lockfile differ, but core simulation digest matches."
-    : `This world was recorded on a different build (core digest ${matchResult.link_core_digest}). You are on build (core digest ${matchResult.local_core_digest}). Trajectories may diverge after tick 0.`);
-  const details = bannerLine(mismatchBannerEl, "", "banner-details");
-  bannerLine(details, `Link Build: toolchain=${matchResult.link_toolchain_digest}, lockfile=${matchResult.link_lockfile_digest}, core=${matchResult.link_core_digest}`);
-  bannerLine(details, `Running Build: toolchain=${matchResult.local_toolchain_digest}, lockfile=${matchResult.local_lockfile_digest}, core=${matchResult.local_core_digest}`);
-  if (!compatible) {
-    const note = bannerLine(details, "Cross-target floating point equivalence between native and WebAssembly is an open research area (bd-2wj).");
-    note.style.cssText = "margin-top: 0.35rem; font-style: italic; opacity: 0.85;";
-  }
+  renderBuildComparison(mismatchBannerEl, matchResult);
 }
 
 function updateDiffTable(linkStr) {
@@ -1083,7 +1076,7 @@ function updateDiffTable(linkStr) {
   if (!linkStr || !permalink_diff) {
     diffTable.style.display = "none";
     diffEmpty.style.display = "block";
-    diffEmpty.textContent = "No knob differences from base scenario.";
+    diffEmpty.textContent = "No recorded configuration changes.";
     return;
   }
 
@@ -1092,7 +1085,7 @@ function updateDiffTable(linkStr) {
     if (!rows || rows.length === 0) {
       diffTable.style.display = "none";
       diffEmpty.style.display = "block";
-      diffEmpty.textContent = "No knob differences from base scenario (0 diffs).";
+      diffEmpty.textContent = "No configuration changes from the original recipe or gallery base (0 diffs).";
       diffTbody.innerHTML = "";
       return;
     }
@@ -1164,7 +1157,9 @@ async function loadWorldFromPermalink(linkStr) {
     updateDiffTable(linkStr);
 
     if (permalinkStatus) {
-      permalinkStatus.textContent = "Initial-condition recipe loaded; world restarted at tick zero";
+      permalinkStatus.textContent = installed.launchInfo?.kind === "gallery_reference"
+        ? "Gallery configuration loaded at tick zero; no browser founder recipe is encoded"
+        : "Initial-condition recipe loaded; world restarted at tick zero";
       permalinkStatus.style.color = "#34d399";
     }
     appendLog(`Restarted from shared initial-condition recipe (${linkStr.slice(0, 20)}…)`);
@@ -1185,7 +1180,7 @@ async function loadWorldFromPermalink(linkStr) {
 }
 
 async function handleFork() {
-  if (remoteMode || !simHandle) {
+  if (remoteMode || !simHandle || activeLaunchInfo?.shareable === false) {
     appendLog("Cannot fork: simulation not running");
     return;
   }
@@ -1215,6 +1210,7 @@ async function handleFork() {
       throw new Error("fork is not exported by wasm module");
     }
 
+    const childInfo = typeof wasm.permalink_info === "function" ? validateLaunchInfo(wasm.permalink_info(childLink)) : null;
     latestForkedLink = childLink;
     if (forkChildLink) {
       forkChildLink.textContent = childLink;
@@ -1222,6 +1218,8 @@ async function handleFork() {
     if (forkOutput) {
       forkOutput.style.display = "block";
     }
+    if (forkRecipeInfo) forkRecipeInfo.textContent = launchInfoText(childInfo);
+    updateRecipeControls();
     if (permalinkStatus) {
       permalinkStatus.textContent = "Variant recipe created; loading starts a new world at tick zero";
       permalinkStatus.style.color = "#34d399";
@@ -1248,7 +1246,7 @@ if (loadPermalinkBtn) {
 
 if (copyPermalinkBtn) {
   copyPermalinkBtn.addEventListener("click", () => {
-    if (remoteMode) return;
+    if (remoteMode || activeLaunchInfo?.shareable === false) return;
     if (!currentPermalink && simHandle) {
       try {
         if (permalink_of) {
@@ -1256,7 +1254,13 @@ if (copyPermalinkBtn) {
         } else if (simHandle.permalinkOf) {
           currentPermalink = simHandle.permalinkOf();
         }
-      } catch (_) {}
+      } catch (error) {
+        if (permalinkStatus) {
+          permalinkStatus.textContent = `Recipe export unavailable: ${error.message || error}`;
+          permalinkStatus.style.color = "#f87171";
+        }
+        return;
+      }
     }
     if (currentPermalink) {
       navigator.clipboard
@@ -1318,9 +1322,7 @@ async function resetSimulation(populationOverride) {
 
   const installed = replaceSimulation(init_sim(options));
   currentPermalink = installed.permalink;
-  if (currentPermalink && permalinkInput) {
-    permalinkInput.value = currentPermalink;
-  }
+  if (permalinkInput) permalinkInput.value = currentPermalink ?? "";
 
   updateMismatchBanner(null);
   updateDiffTable(currentPermalink);

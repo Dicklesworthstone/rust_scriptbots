@@ -6448,14 +6448,27 @@ parity fixtures and pinned tooling; no Vite integration or fresh browser pass is
 
 #### 5.3 browser live renderer
 
-**[Currently In Progress — Codex, 2026-11-10]** Complete the browser's
-reproducible initial-world sharing and local narrative consumers under
-`bd-2z0.12.3`. Capture the actual launch configuration, resolved seed, founder
-population and selected brain family in bounded links; preserve these inputs
-when creating an initial-condition variant. Expose the canonical owner's
-narrative pages locally through the existing remote event projection, including
-exact cursors and retention gaps, without advancing science. Saved continuations
-remain distinct from initial-world links. The original native/browser, package,
+**[Implementation contributed — Codex, 2026-11-10; qualification open]**
+Browser sharing and local narrative consumers now have functional implementations
+under `bd-2z0.12.3`. Bounded `sbb1` launch recipes retain the effective config,
+actual resolved seed, founder population and brain family, including entropy
+starts. Initial-condition variants preserve those inputs and validate the
+complete resulting configuration; existing `sbw1` gallery references remain
+supported. Imported continuations explicitly refuse invented founder recipes.
+The UI identifies each recipe's restart semantics and reports captured build
+inputs without claiming cross-build replay equivalence. Local narrative pages
+reuse the canonical remote event projection; the shared timeline has exact
+cursors, bounded paging/display, explicit retention gaps and owner isolation.
+
+Focused DSR checks on 2026-11-10 passed 93 Node tests, JavaScript syntax checks,
+targeted web Rust formatting, and the production WASM library typecheck
+(`cargo check -p scriptbots-web --lib --target wasm32-unknown-unknown --locked`).
+UBS completed both language scanners with
+test-pattern and heuristic findings reviewed; it did not return a clean exit.
+Native test execution was blocked by a killed compiler before the new tests ran,
+and Chromium refused its startup socket before DOM execution. The added Rust
+roundtrip/scientific-neutrality tests and expanded browser fixtures are not
+represented as executed passes. The original native/browser, package,
 durability and performance acceptance remains open.
 
 - only after native runtime and snapshot contracts are stable;

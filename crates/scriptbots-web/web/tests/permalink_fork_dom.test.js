@@ -20,7 +20,7 @@ const mockWasmModule = `
   export function default_init_options() { return { world_width: 1280, world_height: 720 }; }
   
   const currentWorldLink = "sbw1.root_world_link";
-  const owners = window.__ownerTest = { records: [], nextFailure: null, failDriveId: null, frameFailure: null };
+  const owners = window.__ownerTest = { records: [], nextFailure: null, failDriveId: null, frameFailure: null, forkCalls: 0 };
   const timers = window.__ownerTimers = { pending: new Set(), maximum: 0 };
   const frames = window.__ownerFrames = { pending: new Set(), maximum: 0, callbacks: 0 };
   const schedule = window.setTimeout.bind(window);
@@ -57,6 +57,19 @@ const mockWasmModule = `
   }
 
   export function check_build_match(link) {
+    if (link.startsWith("sbb1.")) {
+      const status = link.includes("unavailable") ? "unavailable" : link.includes("mismatch") ? "mismatch" : "recorded_match";
+      return {
+        status, identity_scope: "recorded_browser_build_inputs",
+        evidence: "<em>Recorded recipe fixture; source input fingerprints only.</em>",
+        link_toolchain_digest: status === "unavailable" ? "unavailable" : "0x1111111111111111",
+        link_lockfile_digest: "0x2222222222222222",
+        link_core_digest: status === "mismatch" ? "0xcccccccccccccccc" : "0x3333333333333333",
+        local_toolchain_digest: "0x1111111111111111",
+        local_lockfile_digest: "0x2222222222222222",
+        local_core_digest: "0x3333333333333333"
+      };
+    }
     if (link.includes("mismatch")) {
       return {
         status: "mismatch",
@@ -81,6 +94,8 @@ const mockWasmModule = `
     }
     return {
       status: "exact",
+      identity_scope: "legacy_gallery_reference",
+      evidence: "Gallery fixture identifiers are not measured compiler or source identity.",
       link_toolchain_digest: "0x1111111111111111",
       link_lockfile_digest: "0x2222222222222222",
       link_core_digest: "0x3333333333333333",
@@ -105,19 +120,31 @@ const mockWasmModule = `
   }
 
   export function fork(handle, patch) {
-    return "sbw1.child_fork_link_with_diff";
+    owners.forkCalls += 1;
+    return handle.launchInfo().kind === "browser_launch" ? "sbb1.child_recipe_with_diff" : "sbw1.child_fork_link_with_diff";
+  }
+
+  export function permalink_info(link) {
+    return link.startsWith("sbb1.") ? {
+      kind: "browser_launch", semantics: "initial_conditions_restart", shareable: true,
+      seed: "18446744073709551615", initial_population: 151, brain_preset: "dwraon", recipe_version: 1, reason: null
+    } : {
+      kind: "gallery_reference", semantics: "gallery_configuration_restart", shareable: true,
+      seed: "1", initial_population: null, brain_preset: null, recipe_version: null,
+      reason: "No browser founder recipe is encoded in this gallery reference."
+    };
   }
 
   export function init_from_permalink(link) {
     if (link.startsWith("invalid") || link.includes("corrupt")) {
       throw new Error("permalink magic mismatch (first bytes: " + link.slice(0, 8) + ")");
     }
-    return createHandle("permalink", link, 0, "none");
+    return createHandle("permalink", link, 0, link.startsWith("sbb1.") ? "dwraon" : "none");
   }
 
   export function init_sim(opts) {
     const preset = opts.default_brain || (opts.seed_strategy === "wander" ? "wander" : "none");
-    return createHandle("reset", currentWorldLink, 0, preset);
+    return createHandle("reset", currentWorldLink, 0, preset, opts.seed, opts.population);
   }
 
   export function checkpoint_byte_limit() { return 1024; }
@@ -128,12 +155,12 @@ const mockWasmModule = `
   }
   export function decode_remote_frame_binary() { throw new Error("No remote frame in this lifecycle fixture"); }
 
-  function createHandle(kind, link, initialTick = 0, preset = "mlp") {
+  function createHandle(kind, link, initialTick = 0, preset = "mlp", seed = 1, population = 200) {
     const failure = owners.nextFailure;
     owners.nextFailure = null;
     if (failure === "create") throw new Error("intentional create failure");
-    const record = { id: owners.records.length + 1, kind, preset, tick: initialTick,
-      freeCalls: 0, driveCalls: 0, frameCalls: 0, narrativeReads: 0, elapsed: 0, speed: 1 };
+    const record = { id: owners.records.length + 1, kind, preset, seed: String(seed), population, tick: initialTick,
+      freeCalls: 0, driveCalls: 0, frameCalls: 0, narrativeReads: 0, permalinkCalls: 0, elapsed: 0, speed: 1 };
     owners.records.push(record);
     let credit = 0;
     function check(stage) {
@@ -145,8 +172,22 @@ const mockWasmModule = `
         record.freeCalls += 1;
         if (record.freeCalls !== 1) throw new Error("owner freed twice: " + record.id);
       },
-      permalinkOf() { check("permalink"); return link; },
+      permalinkOf() { check("permalink"); record.permalinkCalls += 1; return link; },
       brainPreset() { check("preset"); return preset; },
+      launchInfo: failure === "launch_missing" ? undefined : function () {
+        check("launch");
+        if (failure === "launch_schema") return { kind: "browser_launch", semantics: "saved_owner_continuation", shareable: true };
+        if (failure === "launch_seed") return { ...permalink_info("sbb1.fixture"), seed: "18446744073709551616" };
+        if (kind === "checkpoint") return {
+          kind: "checkpoint_continuation", semantics: "saved_owner_continuation", shareable: false,
+          seed: null, initial_population: null, brain_preset: null, recipe_version: null,
+          reason: "Use a saved-owner continuation; the original launch recipe is unavailable."
+        };
+        if (kind === "permalink") return permalink_info(link);
+        return { kind: "browser_launch", semantics: "initial_conditions_restart", shareable: failure !== "launch_unshareable",
+          seed: String(seed), initial_population: population, brain_preset: preset, recipe_version: 1,
+          reason: failure === "launch_unshareable" ? "This owner recipe exceeds the link size limit." : null };
+      },
       narrativePage(afterEvent, expectedSessionId) {
         check("narrative");
         record.narrativeReads += 1;
@@ -404,7 +445,7 @@ async function runOwnerLifecycleCases(page, context) {
   // each failed candidate must be freed without moving the paused old world.
   await setSpeed(0);
   for (const operation of ["reset", "permalink", "checkpoint"]) {
-    for (const failure of ["create", "speed", "frame", "snapshot", "identity",
+    for (const failure of ["create", "speed", "frame", "snapshot", "identity", "launch", "launch_schema", "launch_seed",
       operation === "checkpoint" ? "preset" : "permalink"]) {
       const before = await state();
       const previous = activeOwner(before);
@@ -424,6 +465,27 @@ async function runOwnerLifecycleCases(page, context) {
         rejectedOwner: candidates[0]?.id ?? null, retainedTick: retained.tick });
     }
   }
+
+  // A large but valid owner remains usable when the bounded URL codec cannot
+  // admit its original recipe. Neither copy nor variant may invent a link.
+  await page.evaluate(() => { window.__ownerTest.nextFailure = "launch_unshareable"; });
+  await replace("reset");
+  const unshareable = activeOwner(await state());
+  const unshareableUi = await page.evaluate(() => ({
+    text: document.getElementById("launch-info").textContent,
+    controls: ["copy-permalink-btn", "fork-btn"].map((id) => document.getElementById(id).disabled),
+    link: document.getElementById("permalink-input").value,
+  }));
+  if (unshareable.permalinkCalls !== 0 || !unshareableUi.controls.every(Boolean)
+      || unshareableUi.link !== "" || !unshareableUi.text.includes("exceeds the link size limit")
+      || !unshareableUi.text.includes(`Initial seed ${unshareable.seed}`)) {
+    throw new Error(`A valid unshareable recipe lost its owner or offered an invented link: ${JSON.stringify(unshareableUi)}`);
+  }
+  await replace("reset");
+  if (await page.locator("#copy-permalink-btn").isDisabled() || await page.locator("#fork-btn").isDisabled()) {
+    throw new Error("A fresh bounded recipe did not restore sharing after an unshareable owner");
+  }
+  observations.unshareableRecipe = { owner: unshareable.id, ui: unshareableUi };
 
   // A stopped pump must stay stopped until a replacement succeeds. Check drive
   // calls as well as ticks: duplicate timers can drive the same elapsed boundary
@@ -737,6 +799,27 @@ async function runOwnerLifecycleCases(page, context) {
   observations.narrative = { evidence: "production DOM and JavaScript with explicit WASM double",
     before: narrativeBefore, refreshed: narrativeRefreshed, replacement: narrativeReplaced,
     narrativeText, replacementText };
+  const continuationRecipe = await page.evaluate(() => {
+    const before = window.__ownerTest.forkCalls;
+    for (const id of ["copy-permalink-btn", "fork-btn"]) document.getElementById(id).dispatchEvent(new Event("click"));
+    return { disabled: ["copy-permalink-btn", "fork-btn", "fork-patch-input"].every((id) => document.getElementById(id).disabled),
+      kind: document.getElementById("launch-info").dataset.kind, text: document.getElementById("launch-info").textContent,
+      forkCalls: window.__ownerTest.forkCalls - before,
+      exports: window.__ownerTest.records.find((owner) => owner.freeCalls === 0).permalinkCalls };
+  });
+  if (!continuationRecipe.disabled || continuationRecipe.kind !== "checkpoint_continuation"
+      || !continuationRecipe.text.includes("original launch recipe is unavailable")
+      || continuationRecipe.forkCalls !== 0 || continuationRecipe.exports !== 0) {
+    throw new Error(`Continuation offered an unrecorded initial-condition recipe: ${JSON.stringify(continuationRecipe)}`);
+  }
+  observations.continuationRecipe = continuationRecipe;
+  await page.evaluate(() => { window.__ownerTest.nextFailure = "launch_missing"; });
+  await replace("checkpoint");
+  if (!(await page.locator("#copy-permalink-btn").isDisabled()) || !(await page.locator("#fork-btn").isDisabled())
+      || await page.getAttribute("#launch-info", "data-kind") !== "checkpoint_continuation"
+      || activeOwner(await state()).permalinkCalls !== 0) {
+    throw new Error("An older package without launchInfo offered a recipe for a saved continuation");
+  }
   const finalState = await state();
   observations.releasedOwners = finalState.records.filter((owner) => owner.freeCalls === 1).length;
   observations.maximumPendingTimers = finalState.maximumTimers;
@@ -753,7 +836,7 @@ function createServer() {
     } else if (url.pathname === "/main.js") {
       res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8" });
       res.end(fs.readFileSync(path.join(webDir, "main.js")));
-    } else if (["/remote.js", "/continuation-store.js", "/inspector.js", "/genome.js", "/interventions.js", "/narrative.js", "/renderers/canvas.js", "/renderers/webgpu.js", "/renderers/environment.js"].includes(url.pathname)) {
+    } else if (["/remote.js", "/continuation-store.js", "/inspector.js", "/genome.js", "/interventions.js", "/narrative.js", "/recipes.js", "/renderers/canvas.js", "/renderers/webgpu.js", "/renderers/environment.js"].includes(url.pathname)) {
       res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8" });
       res.end(fs.readFileSync(path.join(webDir, url.pathname.slice(1))));
     } else {
@@ -835,6 +918,33 @@ async function runTests() {
             || await page.evaluate(() => !!window.__bannerExecuted)) {
           throw new Error(`${kind} banner interpreted build details as HTML`);
         }
+      }
+
+      for (const [status, heading] of [["recorded_match", "Recorded Build Inputs Match"],
+        ["unavailable", "Build Identity Unavailable"], ["mismatch", "Build Mismatch Warning"]]) {
+        await page.fill("#permalink-input", `sbb1.${status}_recipe`);
+        await page.click("#load-permalink-btn");
+        const banner = await page.textContent("#mismatch-banner");
+        const info = await page.textContent("#launch-info");
+        if (!banner.includes(heading) || !banner.includes("<em>Recorded recipe fixture; source input fingerprints only.</em>")
+            || await page.locator("#mismatch-banner em").count() !== 0
+            || !info.includes("18446744073709551615") || !info.includes("151 founders") || !info.includes("dwraon brains")
+            || !info.includes("tick zero") || await page.locator("#copy-permalink-btn").isDisabled()) {
+          throw new Error(`Browser recipe metadata or scoped build status was misrepresented: ${JSON.stringify({ status, banner, info })}`);
+        }
+        if (status === "unavailable" && (!banner.includes("equality is unknown") || banner.includes("Build Mismatch Warning"))) {
+          throw new Error("Unavailable recorded identity was treated as failed reproduction");
+        }
+        const tickBefore = BigInt(await page.textContent("#metric-tick"));
+        await context.clock.runFor(64);
+        if (BigInt(await page.textContent("#metric-tick")) <= tickBefore) throw new Error(`${status} prevented a recipe from running`);
+      }
+
+      await page.fill("#permalink-input", "sbw1.gallery_reference");
+      await page.click("#load-permalink-btn");
+      if (!(await page.textContent("#mismatch-banner")).includes("Gallery Build Reference")
+          || !(await page.textContent("#launch-info")).includes("does not encode a browser founder population")) {
+        throw new Error("Legacy gallery metadata was promoted to a measured browser recipe");
       }
 
       await context.close();
@@ -920,6 +1030,26 @@ async function runTests() {
         throw new Error(
           `Running world was mutated! Expected sbw1.root_world_link, got: ${currentInput}`,
         );
+      }
+
+      await page.fill("#permalink-input", "sbb1.root_recipe");
+      await page.click("#load-permalink-btn");
+      const parentOwner = await page.evaluate(() => window.__ownerTest.records.find((owner) => owner.freeCalls === 0).id);
+      await page.fill("#fork-patch-input", '{"food_growth_rate": 0.05}');
+      await page.click("#fork-btn");
+      const childRecipe = await page.textContent("#fork-recipe-info");
+      if ((await page.textContent("#fork-child-link")) !== "sbb1.child_recipe_with_diff"
+          || !childRecipe.includes("18446744073709551615") || !childRecipe.includes("151 founders")
+          || !childRecipe.includes("dwraon brains") || !childRecipe.includes("tick zero")
+          || await page.inputValue("#permalink-input") !== "sbb1.root_recipe"
+          || await page.evaluate(() => window.__ownerTest.records.find((owner) => owner.freeCalls === 0).id) !== parentOwner) {
+        throw new Error("Variant recipe changed its running parent or lost founder recipe metadata");
+      }
+      await page.click("#load-forked-btn");
+      if (await page.inputValue("#permalink-input") !== "sbb1.child_recipe_with_diff"
+          || await page.evaluate(() => window.__ownerTest.records.find((owner) => owner.freeCalls === 0).id) === parentOwner
+          || await page.$eval("#fork-output", (element) => window.getComputedStyle(element).display) !== "none") {
+        throw new Error("Starting a variant did not replace its owner or clear the old child preview");
       }
 
       await context.close();

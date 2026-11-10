@@ -119,6 +119,17 @@ history/credit handling; nonempty narrative delivery requires observed records.
   over its stable UID. Selection, highlights and inspection never advance science
   or alter the simulation's selection state.
 - **Reset Simulation**: reseeds with a fresh RNG seed and reuses the slider settings. A rolling 5-second performance log is appended to the console pane (`FPS`, `TPS`, population).
+- **Initial-world recipes**: the launch panel displays the actual decimal seed,
+  founder count and brain family. Copying a recipe records these inputs and the
+  full effective configuration, including randomly initialized worlds. Opening
+  it restarts those founders at tick zero. Creating a variant changes the chosen
+  registered knobs while retaining the remaining launch inputs; it does not
+  branch the currently evolved state. Loaded continuations explicitly disable
+  recipe sharing and variants because their original founders are unknown.
+  Share those worlds with a continuation file instead. Browser recipes use
+  `sbb1`; existing `sbw1` gallery links remain supported. Build banners compare
+  recorded build inputs and identify missing metadata without claiming a proven
+  cross-build replay match.
 - **Scientific timeline**: both local worlds and remote sessions display the
   canonical detector's event text, event tick and exact sequence. The source line
   distinguishes the last history observation from a newer world publication.

@@ -41,8 +41,8 @@ The crate exposes the following wasm-bindgen surface:
 - `init_sim(options: JsValue) -> SimHandle` — constructs a simulation using the supplied options. Recognised fields include:
   - `population` (usize): initial spawn count (defaults to 64).
   - `seed` (u64): explicit RNG seed. It overrides `config.rng_seed`; when omitted,
-    the nested config seed is preserved. If both are omitted, core seeds the world
-    from entropy.
+    the nested config seed is preserved. If both are omitted, the browser resolves
+    and records an entropy seed before creating the world.
   - `world_width` / `world_height`: override the world dimensions (pixels).
   - `config`: optional full `ScriptBotsConfig` override (rarely needed; defaults are usually sufficient).
   - `snapshot_format`: `"json"` (default) or `"binary"` (Postcard-encoded `Uint8Array`).
@@ -109,7 +109,42 @@ The crate exposes the following wasm-bindgen surface:
 - `checkpoint_byte_limit() -> number` — the canonical owner codec's file bound,
   also checked before the demo reads a selected file.
 - `SimHandle::brainPreset() -> string` — the new-world brain preset for this handle.
+- `SimHandle::launchInfo() -> JsValue` — describes the retained initial-world
+  recipe, its exact decimal-string seed, founder count and brain preset. A loaded
+  continuation has no original launch recipe and reports `shareable: false`.
+- `SimHandle::permalinkOf() -> string` — encodes the complete initial-world
+  recipe as a bounded `sbb1` link. This restarts the recorded founders at tick
+  zero; current tick, live interventions and evolved state require a checkpoint.
+- `init_from_permalink(link: string) -> SimHandle` — validates and constructs
+  either a browser `sbb1` launch or an existing `sbw1` gallery reference.
+- `permalink_info(link: string) -> JsValue` — reads launch metadata before
+  replacing an owner. `permalink_diff(link)` exposes recorded knob changes;
+  `fork(handle, changes)` creates another initial-condition recipe while retaining
+  the other configuration, founder count and selected brain family.
 - `decode_snapshot_binary(bytes: &[u8]) -> JsValue` — helper exposed for JS callers to convert binary snapshots back into structured data.
+
+### Initial-world sharing
+
+Browser links retain the effective configuration, resolved root seed, founder
+population, brain family or explicit Wander/Unbound strategy, and the versioned
+founder recipe. This fixes the former default-gallery substitution, which could
+not reconstruct an ordinary browser world's configuration. Reset and brain
+replacement record the newly constructed owner's recipe; failed replacements
+leave the existing owner intact. A world remains usable when its recipe exceeds
+the sharing bounds, but metadata explains why sharing is unavailable.
+
+`sbb1` has a canonical JSON payload, a corruption checksum and explicit admission
+bounds. Its checksum and build-input fingerprints are noncryptographic; they
+are not signatures. `check_build_match(link)` reports `recorded_match`,
+`mismatch` or `unavailable` for browser recipes by comparing captured source,
+lockfile, toolchain, compiler and target/profile inputs. Matching recorded inputs
+does not establish cross-target or cross-build scientific equivalence. Existing
+`sbw1` links retain their gallery identity scope and loading behavior. A malformed,
+oversized or inconsistent recipe is refused before a new world is installed.
+
+Loaded continuations preserve their saved state but cannot recreate a missing
+original founder recipe. Their share and initial-condition-fork operations
+therefore refuse explicitly; use the continuation file to share that saved world.
 
 Snapshots are deterministic and use camelCase field names at the JavaScript boundary. They include:
 

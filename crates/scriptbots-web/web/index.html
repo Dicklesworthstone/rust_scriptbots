@@ -138,6 +138,8 @@
             overflow-wrap: anywhere;
         }
 
+        #launch-info, #fork-recipe-info { font-size: 0.75rem; overflow-wrap: anywhere; }
+
         #agent-inspector {
             border: 1px solid #334155;
             border-radius: 0.5rem;
@@ -356,6 +358,7 @@
                     <dt>Avg Health</dt>
                     <dd id="metric-health">–</dd>
                 </dl>
+                <p id="launch-info" role="status">Waiting for initial-condition metadata.</p>
                 <label for="renderer">Renderer</label>
                 <select id="renderer">
                     <option value="auto">Automatic (prefer WebGPU)</option>
@@ -588,7 +591,7 @@
                 <p>A recipe link starts a new world at tick zero. Use a saved continuation to preserve an evolved population and its history.</p>
                 <label>
                     Initial-condition recipe link
-                    <input id="permalink-input" type="text" placeholder="Paste sbw1... permalink" spellcheck="false" />
+                    <input id="permalink-input" type="text" placeholder="Paste sbb1... recipe or sbw1... gallery link" spellcheck="false" />
                 </label>
                 <div style="display: flex; gap: 0.5rem;">
                     <button id="load-permalink-btn" type="button" style="flex: 1;">Restart from Link</button>
@@ -604,6 +607,7 @@
                 <div id="fork-output" style="display: none; font-size: 0.75rem; background: rgba(16,185,129,0.1); border: 1px solid rgba(16,185,129,0.3); padding: 0.5rem; border-radius: 0.25rem; word-break: break-all;">
                     <div style="font-weight: 600; margin-bottom: 0.25rem; color: #6ee7b7;">Variant Recipe:</div>
                     <div id="fork-child-link" style="font-family: monospace; font-size: 0.7rem;"></div>
+                    <p id="fork-recipe-info"></p>
                     <div style="margin-top: 0.4rem; display: flex; gap: 0.4rem;">
                         <button id="load-forked-btn" type="button" style="padding: 0.3rem 0.5rem; font-size: 0.7rem; background: #059669;">Start Variant</button>
                         <button id="copy-fork-btn" type="button" style="padding: 0.3rem 0.5rem; font-size: 0.7rem; background: #334155;">Copy Link</button>
@@ -611,14 +615,14 @@
                 </div>
             </div>
             <div id="diff-container" class="controls">
-                <div class="chip">Parent Scenario Diff</div>
-                <div id="diff-empty" style="font-size: 0.8rem; opacity: 0.7;">No knob differences from base scenario.</div>
+                <div class="chip">Recipe Configuration Changes</div>
+                <div id="diff-empty" style="font-size: 0.8rem; opacity: 0.7;">No recorded configuration changes.</div>
                 <table id="diff-table" style="width: 100%; border-collapse: collapse; font-size: 0.75rem; display: none;">
                     <thead>
                         <tr style="border-bottom: 1px solid #1f2a44; text-align: left; opacity: 0.7;">
                             <th style="padding: 0.25rem 0.4rem;">Knob</th>
-                            <th style="padding: 0.25rem 0.4rem;">Base</th>
-                            <th style="padding: 0.25rem 0.4rem;">This World</th>
+                            <th style="padding: 0.25rem 0.4rem;">Original</th>
+                            <th style="padding: 0.25rem 0.4rem;">Recipe</th>
                         </tr>
                     </thead>
                     <tbody id="diff-tbody"></tbody>
