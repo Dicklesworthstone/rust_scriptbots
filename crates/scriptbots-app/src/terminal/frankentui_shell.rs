@@ -333,6 +333,10 @@ impl CommandReceiptEntry {
 
 /// Actions and messages processed by the FrankenTUI Model.
 #[derive(Debug, Clone)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "ShellMessage is a short-lived enum moved by value through the FrankenTUI update               queue; clippy measures it at >=400 bytes, where the largest variant is a screen-data               payload SetExperimentsData(ScreenDataState<ExperimentsViewData>) (>=400 bytes) and               the second-largest is CommandReceipt(CommandReceiptEntry) (>=152 bytes). The               Set*Data(ScreenDataState<_>) screen-data variants are the common update path, so               boxing them would route that hot path through a heap allocation on every screen               refresh and ripple Box/deref across 100+ construct and match sites for no measurable               gain -- the value is stack-moved briefly and never held in bulk, so the transient               size is acceptable"
+)]
 pub enum ShellMessage {
     /// Raw terminal input event.
     Event(Event),
