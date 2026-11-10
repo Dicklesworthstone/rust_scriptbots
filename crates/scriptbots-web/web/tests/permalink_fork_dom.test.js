@@ -112,11 +112,12 @@ const mockWasmModule = `
     if (link.startsWith("invalid") || link.includes("corrupt")) {
       throw new Error("permalink magic mismatch (first bytes: " + link.slice(0, 8) + ")");
     }
-    return createHandle("permalink", link);
+    return createHandle("permalink", link, 0, "none");
   }
 
   export function init_sim(opts) {
-    return createHandle("reset", currentWorldLink);
+    const preset = opts.default_brain || (opts.seed_strategy === "wander" ? "wander" : "none");
+    return createHandle("reset", currentWorldLink, 0, preset);
   }
 
   export function checkpoint_byte_limit() { return 1024; }
@@ -127,11 +128,11 @@ const mockWasmModule = `
   }
   export function decode_remote_frame_binary() { throw new Error("No remote frame in this lifecycle fixture"); }
 
-  function createHandle(kind, link, initialTick = 0) {
+  function createHandle(kind, link, initialTick = 0, preset = "mlp") {
     const failure = owners.nextFailure;
     owners.nextFailure = null;
     if (failure === "create") throw new Error("intentional create failure");
-    const record = { id: owners.records.length + 1, kind, tick: initialTick,
+    const record = { id: owners.records.length + 1, kind, preset, tick: initialTick,
       freeCalls: 0, driveCalls: 0, frameCalls: 0, elapsed: 0, speed: 1 };
     owners.records.push(record);
     let credit = 0;
@@ -145,7 +146,7 @@ const mockWasmModule = `
         if (record.freeCalls !== 1) throw new Error("owner freed twice: " + record.id);
       },
       permalinkOf() { check("permalink"); return link; },
-      brainPreset() { check("preset"); return kind === "checkpoint" ? "mlp" : "wander"; },
+      brainPreset() { check("preset"); return preset; },
       checkpoint() {
         check("checkpoint");
         const bytes = new Uint8Array(9);
@@ -267,6 +268,20 @@ async function runOwnerLifecycleCases(page, context) {
     }
     await context.clock.runFor(32);
   };
+
+  observations.brainFamilies = [];
+  const defaultFamily = activeOwner(await state()).preset;
+  if (defaultFamily !== "mlp") throw new Error("Browser did not pass its default real MLP family to the owner");
+  for (const preset of ["dwraon", "assembly", "wander", "none", "mlp"]) {
+    await page.selectOption("#brain-preset", preset);
+    await replace("reset");
+    const current = activeOwner(await state());
+    const disabled = await page.evaluate(() => ["checkpoint-save", "checkpoint-browser-save"].map((id) => document.getElementById(id).disabled));
+    if (current.preset !== preset || disabled.some((value) => value !== (preset === "wander"))) {
+      throw new Error(`Family selection or continuation capability is incorrect: ${JSON.stringify({ preset, current, disabled })}`);
+    }
+    observations.brainFamilies.push({ preset, owner: current.id, saveDisabled: disabled });
+  }
 
   // Keep reading the active owner after presentation faults, without flooding
   // the UI/log or creating a second scientific timer or RAF chain.
@@ -689,7 +704,7 @@ function createServer() {
     } else if (url.pathname === "/main.js") {
       res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8" });
       res.end(fs.readFileSync(path.join(webDir, "main.js")));
-    } else if (["/remote.js", "/continuation-store.js", "/inspector.js", "/renderers/canvas.js", "/renderers/webgpu.js", "/renderers/environment.js"].includes(url.pathname)) {
+    } else if (["/remote.js", "/continuation-store.js", "/inspector.js", "/genome.js", "/interventions.js", "/renderers/canvas.js", "/renderers/webgpu.js", "/renderers/environment.js"].includes(url.pathname)) {
       res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8" });
       res.end(fs.readFileSync(path.join(webDir, url.pathname.slice(1))));
     } else {
