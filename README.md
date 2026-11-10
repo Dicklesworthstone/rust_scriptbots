@@ -1259,12 +1259,16 @@ bounded pages, preserves the recorded cadence and history, and returns the newes
 events in canonical order. Its event counts cover the complete run, including
 events evicted from the live event ring. The default output limit is 1,024 and the
 maximum is 4,096; `limit=0` still validates and reconstructs the entire input stream.
-The JSON includes input provenance, coverage, output truncation and eviction counts.
-Missing or corrupt inputs are refused, so older databases without canonical detector
-inputs cannot use this report. Changes to detector interval, history capacity or
-event capacity during a run are also refused; unrelated authenticated configuration
-revisions are supported. The report does not use saved narrative outputs to supply
-its reconstructed events.
+The version-2 JSON includes input provenance, coverage, output truncation, eviction
+counts, the number of effective policy changes and the final detector policy.
+Journal-authenticated changes to detector interval, history capacity and event
+capacity are applied at their completed tick boundaries. Shrinking a buffer keeps
+its newest entries; growing it preserves the available history. Disabling and
+re-enabling narration preserves event cooldowns and pending persistence records.
+Missing, corrupt or unauthenticated inputs are refused, so older databases without
+canonical detector inputs cannot use this report. Reconstruction uses the current
+detector implementation and does not assert historical equality across source
+revisions. Saved narrative outputs never supply its reconstructed events.
 
 ### Streaming demographic and metric summaries
 

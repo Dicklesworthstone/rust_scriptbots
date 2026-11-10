@@ -2,6 +2,32 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Live narrative policy transitions (2026-11-09):**
+[Source implemented and independently reviewed — Codex; executable qualification open]
+
+Continue `bd-16g.2.9` with shared tick-boundary retention for the live detector
+and persisted-input replay. Authenticated cadence/history/event-capacity changes
+preserve detector cooldowns and pending persistence, remove the complete excess
+display/history prefix, and take effect at the next completed tick. Coalesced
+commands between ticks cannot erase unrecorded history. Reconstruction report
+schema v2 includes policy-change counts and the final effective policy; it uses
+the current kernel and does not assert historical equality across source revisions.
+
+Three new core regressions cover atomic refusals, disable/re-enable cadence,
+live/replay parity and scientific-digest neutrality. Analytics coverage includes
+the actual owner/storage-journal path across page boundaries. These tests are
+authored but unexecuted: genuine DSR refused native host admission because every
+available writable filesystem has less than its required 20 GiB free. Pinned
+rustfmt was used to format edited source; no DSR format, compiler, Clippy or test
+gate is claimed. Original whole-run, recovery and scenario-budget acceptance
+remains required.
+
+**Experiment checkpoint progress (2026-11-09):** [Currently In Progress — Codex]
+
+Continue `bd-2z0.5.11` and `bd-2z0.12.2` with separately observed, successfully
+published checkpoint progress while retaining terminal status and completion
+evidence. Original recovery, resource and native acceptance remains required.
+
 **Browser laboratory controls and replicated branch studies (2026-11-09):**
 [Source implemented — Codex; full application and packaged-browser qualification open]
 

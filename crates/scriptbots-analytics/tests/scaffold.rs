@@ -11,8 +11,8 @@
 use std::process::Command;
 
 use scriptbots_analytics::{
-    AnalyticsError, NARRATIVE_TIMELINE_SCHEMA_VERSION, REPORT_SCHEMA_VERSION, ReaderCtx, Registry,
-    ReportParams,
+    AnalyticsError, NARRATIVE_RECONSTRUCT_SCHEMA_VERSION, NARRATIVE_TIMELINE_SCHEMA_VERSION,
+    REPORT_SCHEMA_VERSION, ReaderCtx, Registry, ReportParams,
 };
 use scriptbots_core::narrative::{EventKind, EventRecord, NarrativeInputRecordV1, SubjectRef};
 use scriptbots_core::{
@@ -565,7 +565,7 @@ fn narrative_reconstruct_matches_online_events_across_pages_and_output_limits() 
     let full = registry
         .run("narrative-reconstruct", &cx, &ReportParams::default())
         .expect("independent reconstruction");
-    assert_eq!(full.schema_version, REPORT_SCHEMA_VERSION);
+    assert_eq!(full.schema_version, NARRATIVE_RECONSTRUCT_SCHEMA_VERSION);
     assert_eq!(full.latest_tick, Some(320));
     assert_eq!(full.row_count, expected.len());
     assert_eq!(
@@ -575,6 +575,11 @@ fn narrative_reconstruct_matches_online_events_across_pages_and_output_limits() 
     assert_eq!(full.machine["inputs_replayed"], 320);
     assert_eq!(full.machine["input_pages"], 2);
     assert_eq!(full.machine["input_binding"]["input_count"], 320);
+    assert_eq!(full.machine["policy_changes"], 0);
+    assert_eq!(
+        full.machine["final_policy"],
+        full.machine["input_binding"]["policy"]
+    );
     assert_eq!(
         full.machine["input_binding"]["policy"]["history_capacity"],
         128
@@ -630,6 +635,260 @@ fn narrative_reconstruct_matches_online_events_across_pages_and_output_limits() 
     assert_eq!(
         independent.machine, full.machine,
         "output rows cannot supply reconstruction"
+    );
+}
+
+/// Exercise the actual owner, durable command authority and journal adapter.
+/// Retry an admission with its original identity; never turn a retry into a
+/// second step. A completed application alone is not a durable observation.
+fn narrative_host_command(
+    core: &mut scriptbots_runtime::HostCore,
+    command: scriptbots_runtime::HostCommand,
+    sequence: &mut u64,
+    now: &mut u64,
+) {
+    use scriptbots_runtime::{
+        ApplicationState, CommandAuthorityLookupFailure, CommandEnvelope, CommandId,
+        HostAccessError, HostPort, JournalState, ManualHostDriver, ManualInstant,
+    };
+    let envelope =
+        CommandEnvelope::new(CommandId::from_client_sequence(0x16_29, *sequence), command);
+    *sequence += 1;
+    let mut port = core.local_port();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut admitted = false;
+    loop {
+        let observation = if admitted {
+            port.command_status(envelope.command_id)
+        } else {
+            port.submit(envelope.clone()).map(Some)
+        };
+        match observation {
+            Ok(Some(status)) => {
+                admitted = true;
+                assert!(
+                    matches!(
+                        status.application(),
+                        ApplicationState::Admitted | ApplicationState::Applied(_)
+                    ),
+                    "owner refused the actual command: {status:?}"
+                );
+                assert!(
+                    !matches!(status.journal(), JournalState::Failed(_)),
+                    "{status:?}"
+                );
+                if status.journal() == &JournalState::Durable {
+                    assert!(matches!(status.application(), ApplicationState::Applied(_)));
+                    return;
+                }
+            }
+            Err(HostAccessError::CommandAuthorityLookup {
+                failure:
+                    CommandAuthorityLookupFailure::Pending
+                    | CommandAuthorityLookupFailure::Busy
+                    | CommandAuthorityLookupFailure::Capacity { .. },
+                ..
+            }) => {}
+            other => panic!("unexpected command observation: {other:?}"),
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "durable command timed out"
+        );
+        core.drive(ManualInstant::from_nanos(*now))
+            .expect("drive actual owner");
+        *now += 1;
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "complete owner-journal fixture covers policy transitions, persisted evidence, paging and bounded output"
+)]
+fn narrative_reconstruct_applies_journal_authenticated_policy_changes_across_pages() {
+    use scriptbots_runtime::{
+        HostCommand, HostCore, HostCoreOptions, HostSessionId, PlaybackSnapshot,
+        ScheduledConfigPatch,
+    };
+    use scriptbots_storage::StorageJournalOptions;
+
+    fn resolve(
+        config: &ScriptBotsConfig,
+        patch: &serde_json::Value,
+    ) -> Result<ScriptBotsConfig, String> {
+        let mut value = serde_json::to_value(config).map_err(|error| error.to_string())?;
+        let object = value.as_object_mut().ok_or("config object required")?;
+        for (key, field) in patch.as_object().ok_or("patch object required")? {
+            object.insert(key.clone(), field.clone());
+        }
+        serde_json::from_value(value).map_err(|error| error.to_string())
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir
+        .path()
+        .join("changing-policy.sqlite")
+        .display()
+        .to_string();
+    let mut pipeline = StoragePipeline::create_unattributed_file(&path).expect("file run");
+    let mut world = WorldState::new(ScriptBotsConfig {
+        world_width: 200,
+        world_height: 200,
+        food_cell_size: 20,
+        closed: true,
+        population_spawn_interval: 0,
+        metabolism_drain: 0.0,
+        movement_drain: 0.0,
+        temperature_discomfort_rate: 0.0,
+        aging_health_decay_rate: 0.0,
+        spike_damage: 0.0,
+        spike_energy_cost: 0.0,
+        reproduction_energy_threshold: f32::MAX,
+        persistence_interval: 37,
+        narrative_interval: 16,
+        history_capacity: 128,
+        narrative_capacity: 8,
+        rng_seed: Some(0x16_020_902),
+        ..ScriptBotsConfig::default()
+    })
+    .expect("world");
+    for index in 0..12_u16 {
+        world
+            .try_spawn_agent(AgentData {
+                position: Position::new(f32::from(index).mul_add(10.0, 20.0), 20.0),
+                health: 2.0,
+                ..AgentData::default()
+            })
+            .expect("founder");
+    }
+    let session = HostSessionId::new(0x16_29_02);
+    let journal = pipeline
+        .journal_port(session, StorageJournalOptions::default())
+        .expect("journal");
+    let mut core = HostCore::with_journal(
+        session,
+        world,
+        HostCoreOptions {
+            initial_playback: PlaybackSnapshot {
+                paused: true,
+                speed_multiplier: 1.0,
+            },
+            ..HostCoreOptions::default()
+        },
+        Box::new(journal),
+    )
+    .expect("owner");
+    core.install_schedule(
+        vec![
+            ScheduledConfigPatch::new(1, Tick(64), json!({"narrative_interval": 8})).unwrap(),
+            // A real ecological change with an unchanged narrative policy must not
+            // be counted as a detector-policy transition.
+            ScheduledConfigPatch::new(
+                2,
+                Tick(96),
+                json!({
+                    "aging_health_decay_start": 0,
+                    "aging_health_decay_rate": 10.0,
+                    "aging_health_decay_max": 10.0
+                }),
+            )
+            .unwrap(),
+            ScheduledConfigPatch::new(
+                3,
+                Tick(128),
+                json!({
+                    "history_capacity": 64, "narrative_capacity": 1
+                }),
+            )
+            .unwrap(),
+            ScheduledConfigPatch::new(
+                4,
+                Tick(192),
+                json!({
+                    "narrative_interval": 0, "history_capacity": 32, "narrative_capacity": 0
+                }),
+            )
+            .unwrap(),
+            ScheduledConfigPatch::new(
+                5,
+                Tick(256),
+                json!({
+                    "narrative_interval": 16, "history_capacity": 128, "narrative_capacity": 4
+                }),
+            )
+            .unwrap(),
+        ],
+        resolve,
+    )
+    .expect("authenticated owner schedule");
+    let mut sequence = 1;
+    let mut now = 0;
+    for tick in 1..=320 {
+        narrative_host_command(&mut core, HostCommand::Step, &mut sequence, &mut now);
+        assert_eq!(core.world_tick(), Tick(tick));
+        assert!(core.world().history().count() <= core.world().config().history_capacity);
+        assert!(core.world().narrative_events().len() <= core.world().config().narrative_capacity);
+    }
+    let dropped = core.world().narrative_dropped_events();
+    assert!(
+        dropped > 0,
+        "capacity changes must actually discard display events"
+    );
+    narrative_host_command(&mut core, HostCommand::Shutdown, &mut sequence, &mut now);
+    drop(core);
+    pipeline.shutdown().expect("durable shutdown");
+
+    let cx = ReaderCtx::open(&path).expect("finished reader");
+    let expected: Vec<_> = cx
+        .reader
+        .recent_run_events(4096)
+        .unwrap()
+        .into_iter()
+        .map(|event| event.into_parts().1)
+        .collect();
+    assert!(
+        expected
+            .iter()
+            .any(|event| event.kind == EventKind::Extinction)
+    );
+    assert!(
+        expected.len() > 1,
+        "comparison must include events discarded by the display ring"
+    );
+    let registry = Registry::builtin();
+    let full = registry
+        .run("narrative-reconstruct", &cx, &ReportParams::default())
+        .expect("reconstruct authenticated live policy changes");
+    assert_eq!(full.schema_version, NARRATIVE_RECONSTRUCT_SCHEMA_VERSION);
+    assert_eq!(full.machine["inputs_replayed"], 320);
+    assert_eq!(full.machine["input_pages"], 2);
+    assert_eq!(full.machine["policy_changes"], 4);
+    assert_eq!(
+        full.machine["final_policy"],
+        json!({
+            "narrative_interval": 16, "history_capacity": 128, "event_capacity": 4
+        })
+    );
+    assert_eq!(full.machine["detector_events_evicted"], dropped);
+    assert_eq!(
+        full.machine["events"],
+        serde_json::to_value(&expected).unwrap()
+    );
+    let limited = registry
+        .run(
+            "narrative-reconstruct",
+            &cx,
+            &ReportParams::from_pairs(["limit=0".to_owned()]).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(limited.row_count, 0);
+    assert_eq!(limited.machine["policy_changes"], 4);
+    assert_eq!(limited.machine["events_reconstructed"], expected.len());
+    assert_eq!(
+        limited.machine["event_counts"],
+        full.machine["event_counts"]
     );
 }
 
