@@ -1438,8 +1438,10 @@ impl BranchStudyOrchestrator {
     /// The plan must name the exact saved configuration, completed tick, root RNG seed and
     /// executable brain registry, and must not also declare a source path. No population is
     /// seeded and no warmup is performed. The canonical source envelope and its checksum
-    /// are retained once at the study root. The source host's session, schedules, storage
-    /// ownership and retained analytics are not continued.
+    /// are retained once at the study root. The published plan names that retained source
+    /// by its absolute path so `execute_study` reproduces this cut without warmup. Moving
+    /// the output requires updating that path to the relocated source. The source host's
+    /// session, schedules, storage ownership and retained analytics are not continued.
     ///
     /// Sources and future configurations require Fitness selection and disabled communication
     /// scrambling because raw checkpoints omit those auxiliary histories. Imported maps are
@@ -1481,7 +1483,22 @@ impl BranchStudyOrchestrator {
         if cancellation.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
             return Err(BranchStudyError::Cancelled);
         }
-        self.reserve_output_directory()?;
+        let mut retained_plan = self.plan.clone();
+        if retained_plan.source_checkpoint.is_none() {
+            // Absence means seeded warmup to the offline CLI. A decoded saved cut
+            // therefore publishes a plan bound to the canonical copy written below.
+            // Relative source paths use the invocation's cwd, not the plan's parent.
+            let output = if self.output_dir.is_absolute() {
+                self.output_dir.clone()
+            } else {
+                std::env::current_dir()?.join(&self.output_dir)
+            };
+            retained_plan.source_checkpoint = Some(output.join(SOURCE_CHECKPOINT_ARTIFACT));
+        }
+        reserve_study_output(
+            &self.output_dir,
+            &serde_json::to_vec_pretty(&retained_plan)?,
+        )?;
         write_new_study_artifact(
             &self.output_dir.join(SOURCE_CHECKPOINT_ARTIFACT),
             &source_bytes,
@@ -2270,7 +2287,7 @@ impl BranchStudyOrchestrator {
                     "- **Starting State**: Saved scientific checkpoint [{artifact_path}]({artifact_path}), {byte_size} bytes, BLAKE3 `{checksum_blake3}`\n"
                 ));
                 md.push_str("- **Ownership**: New isolated scientific futures; the source host's session, scheduled commands and storage ownership are not continued\n");
-                md.push_str("- **Source Retention**: One canonical checkpoint at the study root. To reproduce from this retained copy, select its path as source_checkpoint in a new study plan. Individual branch bundles contain metrics and evidence.\n");
+                md.push_str("- **Source Retention**: One canonical checkpoint at the study root. Plans created from a decoded checkpoint name this retained copy; plans with a declared source preserve that path. After moving the study, set source_checkpoint to the relocated retained copy. Individual branch bundles contain metrics and evidence.\n");
             }
         }
         md.push_str(&format!(

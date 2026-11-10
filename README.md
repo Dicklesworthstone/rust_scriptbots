@@ -2256,6 +2256,11 @@ The report compares one source trajectory and does not count its ticks as indepe
 replicates. The saved cut restores science state; the original owner's pending commands,
 session and storage ownership remain with the live run.
 
+The published `study_plan.json` names the retained `source_checkpoint.bin`, allowing
+offline study execution to reproduce the same saved cut. If you download or move
+these files, update the plan's `source_checkpoint` to the source file's new path
+before running it into a fresh output directory.
+
 Interactive dashboard:
 ```bash
 # Live TUI dashboard of knobs and their current values; press 'q' to quit, 'r' to refresh

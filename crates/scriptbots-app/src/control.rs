@@ -10742,6 +10742,63 @@ pub(crate) mod tests {
                     .iter()
                     .any(|item| item.filename == "bundle_manifest.json")
             );
+            // The same published plan consumed by the offline CLI must restore
+            // this saved cut, including tick zero, instead of seeding a new world.
+            let plan_artifact = artifacts
+                .items
+                .iter()
+                .find(|item| item.filename == "study_plan.json")
+                .expect("published reproducible plan");
+            let (_, plan_bytes) = handle
+                .read_artifact_bytes(&plan_artifact.artifact_id)
+                .unwrap();
+            let retained_plan: crate::branch_study::BranchStudyPlan =
+                serde_json::from_slice(&plan_bytes).unwrap();
+            let retained_source = retained_plan
+                .source_checkpoint
+                .as_ref()
+                .expect("saved-cut plan cannot imply seeded warmup");
+            assert!(retained_source.is_absolute());
+            assert_eq!(
+                retained_source,
+                &directory
+                    .join("branches")
+                    .join(&admitted.branch_id)
+                    .join("source_checkpoint.bin")
+            );
+            assert_eq!(fs::read(retained_source).unwrap(), original_bytes);
+            let rerun_output = directory.join("offline-reproduced");
+            let rerunner = crate::branch_study::BranchStudyOrchestrator::new(
+                retained_plan,
+                rerun_output.clone(),
+            );
+            rerunner.validate().expect("published plan is executable");
+            let reproduced = std::thread::Builder::new()
+                .stack_size(32 * 1024 * 1024)
+                .spawn(move || rerunner.execute_study(None))
+                .unwrap()
+                .join()
+                .unwrap()
+                .unwrap();
+            assert_eq!(reproduced.source, report.source);
+            assert_eq!(
+                reproduced.pre_intervention_digest,
+                report.pre_intervention_digest
+            );
+            assert_eq!(reproduced.branch_reports.len(), report.branch_reports.len());
+            assert_eq!(
+                reproduced.branch_reports[0].final_digest,
+                outcome.final_digest
+            );
+            assert_eq!(
+                reproduced.branch_reports[0].terminal_sample,
+                outcome.terminal_sample
+            );
+            assert!(reproduced.branch_reports[0].bundle_verified);
+            assert_eq!(
+                fs::read(rerun_output.join("source_checkpoint.bin")).unwrap(),
+                original_bytes
+            );
             for artifact in artifacts.items {
                 handle.read_artifact_bytes(&artifact.artifact_id).unwrap();
             }

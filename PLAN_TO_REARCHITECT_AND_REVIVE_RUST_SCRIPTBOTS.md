@@ -14,6 +14,12 @@ shared execution capacity, owned cancellable workers and joined shutdown prevent
 duplicate or detached work. Completed reports, exact source bytes and verified
 bundles become downloadable together after integrity checks.
 
+The canonical plan exported for a decoded saved source now names its retained
+checkpoint instead of implying seeded warmup. Reproduction regressions download
+the published plan and run the offline orchestrator from both tick-zero MLP and
+nonzero DWRAON sources, checking exact source bytes and final scientific outcomes.
+Relocating the files requires updating the source path in the plan.
+
 Replay now configures the horizon and treatment with N, starts with Enter, and
 shows observed status plus the completed report identity. Admission waits for a
 successfully presented pending receipt. Navigation retains the running study;
