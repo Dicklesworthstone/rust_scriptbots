@@ -797,6 +797,8 @@ pub mod execution {
     };
     use crate::precedence::{ConfigLayerKind, ConfigLayerStatement, resolve_config_layers};
     use scriptbots_brain::BrainKind;
+    #[cfg(feature = "neuro")]
+    use scriptbots_brain_neuro::{NeuroflowBrainConfig, NeuroflowFamilyAdapter};
     use scriptbots_core::{AgentData, ScriptBotsConfig, WorldState};
     use std::{
         collections::{BTreeMap, HashMap},
@@ -881,7 +883,7 @@ pub mod execution {
             let key = match registered.get(canonical.as_str()) {
                 Some(key) => *key,
                 None => {
-                    let adapter = adapter_for(name)?;
+                    let adapter = adapter_for(name, world.config())?;
                     let key = world
                         .register_brain_family(canonical.clone(), adapter)
                         .map_err(|error| TournamentError::UnbalancedOrders {
@@ -898,10 +900,13 @@ pub mod execution {
         Ok(keys)
     }
 
-    /// Resolve an entered arm name to a built-in family adapter.
+    /// Resolve an entered arm name to its configured built-in family adapter.
     fn adapter_for(
         name: &str,
+        config: &ScriptBotsConfig,
     ) -> Result<Box<dyn scriptbots_core::BrainFamilyAdapter>, TournamentError> {
+        #[cfg(not(feature = "neuro"))]
+        let _ = config;
         if name == "mlp" || name.starts_with("mlp.") || name.starts_with("mlp-") {
             return Ok(Box::new(scriptbots_brain::mlp::MlpBrainFamily::new()));
         }
@@ -929,21 +934,49 @@ pub mod execution {
                     .to_owned(),
             });
         }
-        if matches!(name, "neuro" | "neuroflow" | "ml.neuroflow") {
+        if is_neuroflow_family(name) {
+            #[cfg(feature = "neuro")]
+            return Ok(Box::new(neuroflow_adapter(config)?));
+            #[cfg(not(feature = "neuro"))]
             return Err(TournamentError::UnavailableBrainFamily {
                 family: name.to_owned(),
-                reason: "NeuroFlow has a legacy runner but no canonical genome/evaluator family adapter; it cannot enter a heritable tournament".to_owned(),
+                reason: "NeuroFlow tournaments require a build with the neuro feature"
+                    .to_owned(),
             });
         }
         Err(TournamentError::UnbalancedOrders {
             reason: format!(
-                "no built-in adapter for entered family {name:?}; enter an mlp, dwraon, assembly, or feature-enabled ft family"
+                "no built-in adapter for entered family {name:?}; enter an mlp, dwraon, assembly, or feature-enabled ft or neuro family"
             ),
         })
     }
 
+    #[cfg(feature = "neuro")]
+    fn neuroflow_adapter(
+        config: &ScriptBotsConfig,
+    ) -> Result<NeuroflowFamilyAdapter, TournamentError> {
+        NeuroflowFamilyAdapter::new(NeuroflowBrainConfig::from_settings(&config.neuroflow))
+            .map_err(|error| TournamentError::UnbalancedOrders {
+                reason: format!("NeuroFlow adapter construction: {error}"),
+            })
+    }
+
     pub(super) fn is_frankentorch_family(name: &str) -> bool {
         matches!(name, "ft" | "frankentorch") || name.starts_with("ft.") || name.starts_with("ft-")
+    }
+
+    pub(super) fn is_neuroflow_family(name: &str) -> bool {
+        matches!(name, "neuro" | "neuroflow" | "ml.neuroflow")
+            || [
+                "neuro.",
+                "neuro-",
+                "neuroflow.",
+                "neuroflow-",
+                "ml.neuroflow.",
+                "ml.neuroflow-",
+            ]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
     }
 
     fn canonical_kind_of(name: &str) -> String {
@@ -962,6 +995,8 @@ pub mod execution {
                 .to_owned()
         } else if is_frankentorch_family(name) {
             "ft".to_owned()
+        } else if is_neuroflow_family(name) {
+            "ml.neuroflow".to_owned()
         } else {
             name.to_owned()
         }
@@ -1073,7 +1108,7 @@ pub mod execution {
         }
         // Refuse unavailable families before constructing a world or executing another arm.
         for family in &plan.spawn_order {
-            adapter_for(family.as_str())?;
+            adapter_for(family.as_str(), base_config)?;
         }
         let mut config = base_config.clone();
         config.rng_seed = Some(plan.world_seed);
@@ -1131,7 +1166,7 @@ pub mod execution {
                     reason: format!("family {} has no cohort entry", family.as_str()),
                 }
             })?;
-            let adapter = adapter_for(family.as_str())?;
+            let adapter = adapter_for(family.as_str(), world.config())?;
             let family_hash = blake3::hash(family.as_str().as_bytes());
             let mut family_seed_bytes = [0_u8; 8];
             family_seed_bytes.copy_from_slice(&family_hash.as_bytes()[..8]);
@@ -1187,6 +1222,17 @@ pub mod execution {
                     // Ft has no recorded activation at tick zero. Read validated genome
                     // structure instead of advancing science to manufacture a sample.
                     let scalars = scriptbots_brain_ml::FtBrainFamily::default()
+                        .genome_source_scalars(&genome)
+                        .map_err(|error| TournamentError::Publication {
+                            reason: format!("initial genome topology for {family_name}: {error}"),
+                        })?;
+                    initial_brain_source_scalars.insert(family.clone(), scalars);
+                }
+                #[cfg(feature = "neuro")]
+                if member_index == 0 && is_neuroflow_family(family_name) {
+                    // Use the exact configured genome's validated shape. Structural
+                    // counting needs neither an evaluator snapshot nor an extra tick.
+                    let scalars = neuroflow_adapter(world.config())?
                         .genome_source_scalars(&genome)
                         .map_err(|error| TournamentError::Publication {
                             reason: format!("initial genome topology for {family_name}: {error}"),
@@ -1353,6 +1399,12 @@ pub mod execution {
                     family.as_str()
                 ));
             }
+            if is_neuroflow_family(family.as_str()) {
+                outcome.warnings.push(format!(
+                    "family {}: initial source-scalar count comes from validated NeuroFlow genome topology (weights, four working arrays per neuron and three network scalars), not recorded tick-zero activity",
+                    family.as_str()
+                ));
+            }
             if let Some(tick) = extinct_at.get(family)
                 && *tick <= ticks / 10
             {
@@ -1459,7 +1511,7 @@ pub mod execution {
         let plans = super::plan(spec)?;
         let effective_config = resolve_spec_config(spec, base_config)?;
         for family in &spec.families {
-            adapter_for(family.as_str())?;
+            adapter_for(family.as_str(), &effective_config)?;
         }
         let worker_count = jobs.max(1).min(plans.len()).min(MAX_PARALLEL_MATCH_WORKERS);
         let reports = if worker_count == 1 {
@@ -3866,6 +3918,9 @@ pub mod leaderboard {
             .iter()
             .map(|row| row.initial_brain_source_scalars)
             .collect();
+        let has_neuroflow = rows
+            .iter()
+            .any(|row| super::execution::is_neuroflow_family(&row.family));
         if rows
             .iter()
             .any(|row| super::execution::is_frankentorch_family(&row.family))
@@ -3873,10 +3928,19 @@ pub mod leaderboard {
             out.push_str(&format!(
                 "| Observed Initial Topology | {topology:?} source scalars per founder representative; Ft counts validated genome neurons, weights and biases, without claiming tick-zero activity |\n"
             ));
+        } else if has_neuroflow {
+            out.push_str(&format!(
+                "| Observed Initial Topology | {topology:?} source scalars per founder representative |\n"
+            ));
         } else {
             out.push_str(&format!(
                 "| Observed Initial Topology | {topology:?} source activation scalars per inspected family representative |\n"
             ));
+        }
+        if has_neuroflow {
+            out.push_str(
+                "| NeuroFlow Topology | NeuroFlow counts validated genome weights, four working arrays per neuron and three network scalars, without claiming tick-zero activity |\n",
+            );
         }
         let observed_matches: BTreeSet<_> = rows.iter().map(|row| row.match_id).collect();
         out.push_str(&format!(
