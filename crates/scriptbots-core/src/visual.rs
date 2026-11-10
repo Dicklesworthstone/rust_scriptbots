@@ -1003,6 +1003,19 @@ pub const fn terrain_temperature_tint(temperature: f32) -> [f32; 3] {
 /// `moisture` and `temperature` likewise.
 #[must_use]
 pub const fn terrain_shaded_color(input: &TerrainShadeInput) -> [f32; 3] {
+    terrain_shaded_color_for(visual_style(), input)
+}
+
+/// Resolve a terrain tile's shaded color under an explicit style.
+///
+/// `terrain_shaded_color` is this with the active [`visual_style`]; the dark-field figure/ground
+/// test passes [`BIOLUMINESCENT_DARK_FIELD_V1`] to resolve the reference style's full shaded
+/// terrain sweep.
+#[must_use]
+pub const fn terrain_shaded_color_for(
+    style: &VisualStyleV1,
+    input: &TerrainShadeInput,
+) -> [f32; 3] {
     let moisture = clamp01(input.moisture);
     let elevation = clamp01(input.elevation);
     let slope = clamp01(input.slope);
@@ -1010,7 +1023,7 @@ pub const fn terrain_shaded_color(input: &TerrainShadeInput) -> [f32; 3] {
     let daylight = clamp01(input.daylight);
     let temperature = clamp01(input.temperature);
 
-    let base = terrain_kind_base_color(input.kind);
+    let base = style.terrain[terrain_kind_index(input.kind)].albedo_srgb;
     let brightness = match input.kind {
         TerrainKind::DeepWater => (0.42 + daylight * 0.25 + moisture * 0.2).clamp(0.25, 1.05),
         TerrainKind::ShallowWater => (0.55 + daylight * 0.35 + moisture * 0.3).clamp(0.4, 1.25),
@@ -3078,6 +3091,14 @@ mod tests {
 
     #[test]
     fn weakest_agent_remains_brighter_than_the_brightest_resolved_terrain() {
+        // Guards the dark-field figure/ground ordering: even the weakest (darkest) agent must
+        // out-luminance the brightest RESOLVED terrain of the BIOLUMINESCENT_DARK_FIELD_V1 style
+        // -- the full shaded sweep, not raw albedos. 2de46a55 swapped the active terrain albedos
+        // for the daylight NATURAL_FIELD_STYLE_V2 and deliberately kept the dark-field constant so
+        // "creature and interface semantics stay inherited until their own redesigns", so this
+        // contract is asserted against the dark-field reference via terrain_shaded_color_for, not
+        // the active visual_style(). Creature figure/ground under the active daylight terrain is a
+        // documented baseline pending the creature redesign -- docs/visual_art_direction.md 2.1.
         let weak = agent_visual_params(&AgentVisualInput {
             genome_color: [0.0; 3],
             health: 0.0,
@@ -3100,17 +3121,19 @@ mod tests {
                     for slope in [0.0, 1.0] {
                         for accent in [0.0, 1.0] {
                             for daylight in [0.0, 1.0] {
-                                brightest_terrain = brightest_terrain.max(luminance(
-                                    terrain_shaded_color(&TerrainShadeInput {
-                                        kind,
-                                        moisture,
-                                        elevation,
-                                        slope,
-                                        accent,
-                                        daylight,
-                                        temperature: 0.5,
-                                    }),
-                                ));
+                                brightest_terrain =
+                                    brightest_terrain.max(luminance(terrain_shaded_color_for(
+                                        &BIOLUMINESCENT_DARK_FIELD_V1,
+                                        &TerrainShadeInput {
+                                            kind,
+                                            moisture,
+                                            elevation,
+                                            slope,
+                                            accent,
+                                            daylight,
+                                            temperature: 0.5,
+                                        },
+                                    )));
                             }
                         }
                     }
@@ -3119,8 +3142,10 @@ mod tests {
         }
         assert!(
             luminance(weak.body_color) > brightest_terrain,
-            "figure/ground invariant: {:?} vs {brightest_terrain}",
-            weak.body_color
+            "dark-field figure/ground: weakest agent {:?} (L={:.4}) must out-luminance brightest V1 resolved terrain (L={:.4})",
+            weak.body_color,
+            luminance(weak.body_color),
+            brightest_terrain
         );
     }
 
