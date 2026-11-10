@@ -381,12 +381,19 @@ pub fn checkpoint_request_identity_is_valid(request_id: &str) -> bool {
     identity_is_bounded(request_id)
 }
 
+fn reserve_checkpoint_sequence(counter: &AtomicU64) -> Option<u64> {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        let next = current.checked_add(1)?;
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(reserved) => return Some(reserved),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 fn next_checkpoint_request(session: HostSessionId) -> Option<String> {
-    let sequence = NEXT_CHECKPOINT_REQUEST
-        .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-            value.checked_add(1)
-        })
-        .ok()?;
+    let sequence = reserve_checkpoint_sequence(&NEXT_CHECKPOINT_REQUEST)?;
     // This client namespace uses independent thread entropy, never the world's
     // scientific RNG. The checked process-wide sequence prevents reuse across
     // frontend instances and source resets even if they share a namespace.
@@ -1872,5 +1879,41 @@ mod tests {
         for invalid in [String::new(), "a".repeat(257), "line\nbreak".into()] {
             assert!(!checkpoint_request_identity_is_valid(&invalid));
         }
+    }
+
+    #[test]
+    fn checkpoint_sequence_reservations_are_unique_and_refuse_concurrent_exhaustion() {
+        let initial = u64::MAX - 3;
+        let counter = AtomicU64::new(initial);
+        let contenders = 8;
+        let start = std::sync::Barrier::new(contenders);
+        let mut reserved = std::thread::scope(|scope| {
+            let workers = (0..contenders)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        reserve_checkpoint_sequence(&counter)
+                    })
+                })
+                .collect::<Vec<_>>();
+            workers
+                .into_iter()
+                .filter_map(|worker| worker.join().expect("reservation worker"))
+                .collect::<Vec<_>>()
+        });
+        reserved.sort_unstable();
+        assert_eq!(
+            reserved,
+            (initial..u64::MAX).collect::<Vec<_>>(),
+            "each remaining identity must be reserved exactly once under contention"
+        );
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+        assert!(reserve_checkpoint_sequence(&counter).is_none());
+        assert!(reserve_checkpoint_sequence(&counter).is_none());
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            u64::MAX,
+            "exhaustion must never wrap or reopen the identity domain"
+        );
     }
 }
