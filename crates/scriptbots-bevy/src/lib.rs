@@ -944,6 +944,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
             sync_camera_tonemapping,
             (
                 poll_owner_inspector,
+                toggle_creature_details,
                 handle_inspector_page,
                 update_genome_slice_button_visibility,
                 update_hud,
@@ -3458,9 +3459,92 @@ struct CreatureCardElements {
     energy: Entity,
     age: Entity,
     generation: Entity,
+    signal_status: Entity,
+    brain_status: Entity,
     page_status: Entity,
     page_title: Entity,
     page_body: Entity,
+}
+
+/// One live bar in the selected creature's always-visible signal overview.
+#[derive(Component)]
+struct CreatureSignalBar {
+    source: CreatureSignalSource,
+    index: usize,
+}
+
+#[derive(Clone, Copy)]
+enum CreatureSignalSource {
+    Sensor,
+    Output,
+}
+
+#[derive(Component, Clone, Copy)]
+enum CreatureVitalBar {
+    Health,
+    Energy,
+}
+
+#[derive(Component)]
+struct CreatureDetailsButton;
+
+#[derive(Component)]
+struct CreatureDetailsSection;
+
+#[derive(Component)]
+struct CreatureBrainLayer(usize);
+
+#[derive(Component)]
+struct CreatureBrainLabel(usize);
+
+#[derive(Component)]
+struct CreatureBrainCell {
+    layer: usize,
+    index: usize,
+}
+
+fn toggle_creature_details(
+    buttons: Query<&Interaction, (Changed<Interaction>, With<CreatureDetailsButton>)>,
+    mut sections: Query<&mut Node, With<CreatureDetailsSection>>,
+) {
+    for interaction in &buttons {
+        if *interaction == Interaction::Pressed {
+            for mut section in &mut sections {
+                section.display = if section.display == Display::None {
+                    Display::Flex
+                } else {
+                    Display::None
+                };
+            }
+        }
+    }
+}
+
+fn creature_sensor_labels() -> Vec<(String, usize)> {
+    let mut plain = scriptbots_core::SENSOR_LAYOUT
+        .iter()
+        .filter(|channel| channel.eye.is_none());
+    let mut labels = Vec::with_capacity(scriptbots_core::INPUT_SIZE);
+    for eye in 0..NUM_EYES {
+        for channel in scriptbots_core::SENSOR_LAYOUT
+            .iter()
+            .filter(|channel| channel.eye == Some(eye))
+        {
+            let name = match channel.kind {
+                scriptbots_core::SensorKind::EyeDensity => "density",
+                scriptbots_core::SensorKind::EyeRed => "red",
+                scriptbots_core::SensorKind::EyeGreen => "green",
+                scriptbots_core::SensorKind::EyeBlue => "blue",
+                _ => channel.name,
+            };
+            labels.push((format!("E{} {name}", eye + 1), channel.index));
+        }
+        if let Some(channel) = plain.next() {
+            labels.push((channel.name.to_owned(), channel.index));
+        }
+    }
+    labels.extend(plain.map(|channel| (channel.name.to_owned(), channel.index)));
+    labels
 }
 
 #[derive(Component)]
@@ -4309,6 +4393,23 @@ const HUD_EVENT_FEED_CAPACITY: usize = 6;
 const BRAIN_OVERLAY_MAX_LAYERS: usize = 4;
 const BRAIN_OVERLAY_MAX_VALUES: usize = 12;
 const BRAIN_VALUES_PER_PAGE: usize = 8;
+/// A compact overview of every returned value, using peak magnitude per bin
+/// when a layer has more values than cells.
+const BRAIN_DASHBOARD_BINS: usize = 48;
+
+fn brain_dashboard_bin(values: &[f32], index: usize) -> Option<f32> {
+    let bins = values.len().min(BRAIN_DASHBOARD_BINS);
+    if index >= bins {
+        return None;
+    }
+    let start = index * values.len() / bins;
+    let end = (index + 1) * values.len() / bins;
+    values[start..end]
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .max_by(|a, b| a.abs().total_cmp(&b.abs()))
+}
 
 /// Stable client identity for this frontend's inspection requests, so core can
 /// distinguish Bevy's requests from GPUI's and the TUI's.
@@ -5487,6 +5588,8 @@ fn setup_scene(
     let mut card_energy = Entity::PLACEHOLDER;
     let mut card_age = Entity::PLACEHOLDER;
     let mut card_generation = Entity::PLACEHOLDER;
+    let mut card_signal_status = Entity::PLACEHOLDER;
+    let mut card_brain_status = Entity::PLACEHOLDER;
     let mut card_page_status = Entity::PLACEHOLDER;
     let mut card_page_title = Entity::PLACEHOLDER;
     let mut card_page_body = Entity::PLACEHOLDER;
@@ -5608,11 +5711,19 @@ fn setup_scene(
                     ..default()
                 })
                 .with_children(|row| {
-                    for (label, slot) in [
-                        ("HEALTH", &mut card_health),
-                        ("ENERGY", &mut card_energy),
-                        ("AGE", &mut card_age),
-                        ("GEN", &mut card_generation),
+                    for (label, slot, vital) in [
+                        (
+                            "HEALTH / 2",
+                            &mut card_health,
+                            Some(CreatureVitalBar::Health),
+                        ),
+                        (
+                            "ENERGY / 2",
+                            &mut card_energy,
+                            Some(CreatureVitalBar::Energy),
+                        ),
+                        ("AGE", &mut card_age, None),
+                        ("GEN", &mut card_generation, None),
                     ] {
                         row.spawn((
                             Node {
@@ -5639,122 +5750,326 @@ fn setup_scene(
                                     TextColor(Color::srgb(0.95, 0.98, 0.93)),
                                 ))
                                 .id();
+                            if let Some(vital) = vital {
+                                tile.spawn((
+                                    Node {
+                                        width: Val::Percent(100.0),
+                                        height: Val::Px(4.0),
+                                        ..default()
+                                    },
+                                    BackgroundColor(Color::srgb(0.15, 0.25, 0.21)),
+                                    BorderRadius::all(Val::Px(2.0)),
+                                ))
+                                .with_children(|track| {
+                                    track.spawn((
+                                        Node {
+                                            width: Val::Percent(0.0),
+                                            height: Val::Percent(100.0),
+                                            ..default()
+                                        },
+                                        BackgroundColor(match vital {
+                                            CreatureVitalBar::Health => {
+                                                Color::srgb(0.40, 0.82, 0.57)
+                                            }
+                                            CreatureVitalBar::Energy => {
+                                                Color::srgb(0.97, 0.73, 0.34)
+                                            }
+                                        }),
+                                        BorderRadius::all(Val::Px(2.0)),
+                                        vital,
+                                    ));
+                                });
+                            }
                         });
                     }
                 });
-                card.spawn(Node {
-                    flex_direction: FlexDirection::Row,
-                    flex_wrap: FlexWrap::Wrap,
-                    column_gap: Val::Px(4.0),
-                    row_gap: Val::Px(4.0),
-                    ..default()
-                })
-                .with_children(|row| {
-                    for (section, label) in [
-                        (InspectorSection::Life, "Life"),
-                        (InspectorSection::Senses, "Senses"),
-                        (InspectorSection::Actions, "Actions"),
-                        (InspectorSection::Body, "Body"),
-                        (InspectorSection::Genome, "Genome"),
-                        (InspectorSection::Brain, "Brain"),
-                    ] {
+                card_signal_status = card
+                    .spawn((
+                        Text::new("SIGNALS  /  waiting for owner sample"),
+                        ui_font(10.0),
+                        TextColor(Color::srgb(0.66, 0.81, 0.73)),
+                    ))
+                    .id();
+                for (title, source, labels) in [
+                    (
+                        "SENSORS  ·  E1–E4: DENSITY AND COLOR",
+                        CreatureSignalSource::Sensor,
+                        creature_sensor_labels(),
+                    ),
+                    (
+                        "BRAIN OUTPUTS  ·  BARS CLAMPED TO 0–1",
+                        CreatureSignalSource::Output,
+                        OutputChannel::ALL
+                            .iter()
+                            .map(|channel| {
+                                let label = match channel {
+                                    OutputChannel::WheelLeft => "left",
+                                    OutputChannel::WheelRight => "right",
+                                    OutputChannel::ColorRed => "red",
+                                    OutputChannel::ColorGreen => "green",
+                                    OutputChannel::ColorBlue => "blue",
+                                    OutputChannel::SpikeTarget => "spike",
+                                    OutputChannel::Boost => "boost",
+                                    OutputChannel::SoundLevel => "sound",
+                                    OutputChannel::GiveIntent => "share",
+                                };
+                                (label.to_owned(), channel.index())
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+                ] {
+                    card.spawn((
+                        Text::new(title),
+                        ui_font(10.0),
+                        TextColor(Color::srgb(0.65, 0.80, 0.71)),
+                    ));
+                    card.spawn(Node {
+                        flex_direction: FlexDirection::Row,
+                        flex_wrap: FlexWrap::Wrap,
+                        column_gap: Val::Percent(1.0),
+                        row_gap: Val::Px(3.0),
+                        ..default()
+                    })
+                    .with_children(|grid| {
+                        for (label, index) in labels {
+                            grid.spawn(Node {
+                                width: Val::Percent(19.0),
+                                flex_direction: FlexDirection::Column,
+                                row_gap: Val::Px(2.0),
+                                ..default()
+                            })
+                            .with_children(|cell| {
+                                cell.spawn((
+                                    Text::new(label),
+                                    ui_font(10.0),
+                                    TextColor(Color::srgb(0.80, 0.89, 0.83)),
+                                ));
+                                cell.spawn((
+                                    Node {
+                                        width: Val::Percent(100.0),
+                                        height: Val::Px(4.0),
+                                        ..default()
+                                    },
+                                    BackgroundColor(Color::srgb(0.15, 0.25, 0.21)),
+                                    BorderRadius::all(Val::Px(2.0)),
+                                ))
+                                .with_children(|track| {
+                                    track.spawn((
+                                        Node {
+                                            width: Val::Percent(0.0),
+                                            height: Val::Percent(100.0),
+                                            ..default()
+                                        },
+                                        BackgroundColor(match source {
+                                            CreatureSignalSource::Sensor => {
+                                                Color::srgb(0.38, 0.78, 0.71)
+                                            }
+                                            CreatureSignalSource::Output => {
+                                                Color::srgb(0.93, 0.68, 0.35)
+                                            }
+                                        }),
+                                        BorderRadius::all(Val::Px(2.0)),
+                                        CreatureSignalBar { source, index },
+                                    ));
+                                });
+                            });
+                        }
+                    });
+                }
+                card_brain_status = card
+                    .spawn((
+                        Text::new("BRAIN ACTIVITY  /  waiting"),
+                        ui_font(10.0),
+                        TextColor(Color::srgb(0.66, 0.81, 0.73)),
+                    ))
+                    .id();
+                for layer in 0..BRAIN_OVERLAY_MAX_LAYERS {
+                    card.spawn((
+                        Node {
+                            display: Display::None,
+                            flex_direction: FlexDirection::Column,
+                            row_gap: Val::Px(3.0),
+                            ..default()
+                        },
+                        CreatureBrainLayer(layer),
+                    ))
+                    .with_children(|row| {
                         row.spawn((
-                            Button,
-                            Node {
-                                min_width: Val::Px(0.0),
-                                padding: UiRect::axes(Val::Px(8.0), Val::Px(3.0)),
-                                ..button_node.clone()
-                            },
-                            BackgroundColor(follow_idle_color()),
-                            BorderRadius::all(Val::Px(5.0)),
-                            BorderColor::all(button_border_color),
-                            InspectorPageButton::Section(section),
-                        ))
-                        .with_children(|button| {
-                            button.spawn((
-                                Text::new(label),
-                                ui_font(12.0),
-                                TextColor(secondary_text_color),
-                            ));
-                        });
-                    }
-                });
-                card.spawn(Node {
-                    flex_direction: FlexDirection::Row,
-                    flex_wrap: FlexWrap::Wrap,
-                    align_items: AlignItems::Center,
-                    column_gap: Val::Px(6.0),
-                    row_gap: Val::Px(4.0),
-                    ..default()
-                })
-                .with_children(|row| {
-                    for (direction, label) in [
-                        (InspectorPageButton::Previous, "Previous"),
-                        (InspectorPageButton::Next, "Next"),
-                        (InspectorPageButton::PreviousGenomeSlice, "Earlier nodes"),
-                        (InspectorPageButton::NextGenomeSlice, "Later nodes"),
-                    ] {
-                        row.spawn((
-                            Button,
-                            Node {
-                                min_width: Val::Px(0.0),
-                                padding: UiRect::axes(Val::Px(8.0), Val::Px(3.0)),
-                                display: if matches!(
-                                    direction,
-                                    InspectorPageButton::PreviousGenomeSlice
-                                        | InspectorPageButton::NextGenomeSlice
-                                ) {
-                                    Display::None
-                                } else {
-                                    Display::Flex
-                                },
-                                ..button_node.clone()
-                            },
-                            BackgroundColor(follow_idle_color()),
-                            BorderRadius::all(Val::Px(5.0)),
-                            BorderColor::all(button_border_color),
-                            direction,
-                        ))
-                        .with_children(|button| {
-                            button.spawn((
-                                Text::new(label),
-                                ui_font(12.0),
-                                TextColor(secondary_text_color),
-                            ));
-                        });
-                    }
-                    card_page_status = row
-                        .spawn((
                             Text::default(),
-                            ui_font(11.0),
-                            TextColor(Color::srgb(0.66, 0.81, 0.73)),
+                            ui_font(10.0),
+                            TextColor(Color::srgb(0.80, 0.89, 0.83)),
                             Node {
-                                flex_grow: 1.0,
+                                width: Val::Percent(100.0),
                                 ..default()
                             },
+                            CreatureBrainLabel(layer),
+                        ));
+                        row.spawn(Node {
+                            flex_direction: FlexDirection::Row,
+                            flex_wrap: FlexWrap::Wrap,
+                            column_gap: Val::Percent(0.25),
+                            row_gap: Val::Px(2.0),
+                            ..default()
+                        })
+                        .with_children(|grid| {
+                            for index in 0..BRAIN_DASHBOARD_BINS {
+                                grid.spawn((
+                                    Node {
+                                        width: Val::Percent(3.9),
+                                        height: Val::Px(7.0),
+                                        ..default()
+                                    },
+                                    BackgroundColor(Color::srgb(0.15, 0.25, 0.21)),
+                                    BorderRadius::all(Val::Px(2.0)),
+                                    CreatureBrainCell { layer, index },
+                                ));
+                            }
+                        });
+                    });
+                }
+                card.spawn((
+                    Button,
+                    Node {
+                        align_self: AlignSelf::Start,
+                        padding: UiRect::axes(Val::Px(9.0), Val::Px(4.0)),
+                        ..button_node.clone()
+                    },
+                    BackgroundColor(follow_idle_color()),
+                    BorderRadius::all(Val::Px(5.0)),
+                    BorderColor::all(button_border_color),
+                    CreatureDetailsButton,
+                ))
+                .with_children(|button| {
+                    button.spawn((
+                        Text::new("Detailed readings"),
+                        ui_font(12.0),
+                        TextColor(secondary_text_color),
+                    ));
+                });
+                card.spawn((
+                    Node {
+                        display: Display::None,
+                        flex_direction: FlexDirection::Column,
+                        row_gap: Val::Px(7.0),
+                        ..default()
+                    },
+                    CreatureDetailsSection,
+                ))
+                .with_children(|card| {
+                    card.spawn(Node {
+                        flex_direction: FlexDirection::Row,
+                        flex_wrap: FlexWrap::Wrap,
+                        column_gap: Val::Px(4.0),
+                        row_gap: Val::Px(4.0),
+                        ..default()
+                    })
+                    .with_children(|row| {
+                        for (section, label) in [
+                            (InspectorSection::Life, "Life"),
+                            (InspectorSection::Senses, "Senses"),
+                            (InspectorSection::Actions, "Actions"),
+                            (InspectorSection::Body, "Body"),
+                            (InspectorSection::Genome, "Genome"),
+                            (InspectorSection::Brain, "Brain"),
+                        ] {
+                            row.spawn((
+                                Button,
+                                Node {
+                                    min_width: Val::Px(0.0),
+                                    padding: UiRect::axes(Val::Px(8.0), Val::Px(3.0)),
+                                    ..button_node.clone()
+                                },
+                                BackgroundColor(follow_idle_color()),
+                                BorderRadius::all(Val::Px(5.0)),
+                                BorderColor::all(button_border_color),
+                                InspectorPageButton::Section(section),
+                            ))
+                            .with_children(|button| {
+                                button.spawn((
+                                    Text::new(label),
+                                    ui_font(12.0),
+                                    TextColor(secondary_text_color),
+                                ));
+                            });
+                        }
+                    });
+                    card.spawn(Node {
+                        flex_direction: FlexDirection::Row,
+                        flex_wrap: FlexWrap::Wrap,
+                        align_items: AlignItems::Center,
+                        column_gap: Val::Px(6.0),
+                        row_gap: Val::Px(4.0),
+                        ..default()
+                    })
+                    .with_children(|row| {
+                        for (direction, label) in [
+                            (InspectorPageButton::Previous, "Previous"),
+                            (InspectorPageButton::Next, "Next"),
+                            (InspectorPageButton::PreviousGenomeSlice, "Earlier nodes"),
+                            (InspectorPageButton::NextGenomeSlice, "Later nodes"),
+                        ] {
+                            row.spawn((
+                                Button,
+                                Node {
+                                    min_width: Val::Px(0.0),
+                                    padding: UiRect::axes(Val::Px(8.0), Val::Px(3.0)),
+                                    display: if matches!(
+                                        direction,
+                                        InspectorPageButton::PreviousGenomeSlice
+                                            | InspectorPageButton::NextGenomeSlice
+                                    ) {
+                                        Display::None
+                                    } else {
+                                        Display::Flex
+                                    },
+                                    ..button_node.clone()
+                                },
+                                BackgroundColor(follow_idle_color()),
+                                BorderRadius::all(Val::Px(5.0)),
+                                BorderColor::all(button_border_color),
+                                direction,
+                            ))
+                            .with_children(|button| {
+                                button.spawn((
+                                    Text::new(label),
+                                    ui_font(12.0),
+                                    TextColor(secondary_text_color),
+                                ));
+                            });
+                        }
+                        card_page_status = row
+                            .spawn((
+                                Text::default(),
+                                ui_font(11.0),
+                                TextColor(Color::srgb(0.66, 0.81, 0.73)),
+                                Node {
+                                    flex_grow: 1.0,
+                                    ..default()
+                                },
+                            ))
+                            .id();
+                    });
+                    card_page_title = card
+                        .spawn((
+                            Text::default(),
+                            ui_font(15.0),
+                            TextColor(Color::srgb(0.91, 0.96, 0.89)),
+                        ))
+                        .id();
+                    card_page_body = card
+                        .spawn((
+                            Text::default(),
+                            ui_font(13.0),
+                            TextLayout::new_with_linebreak(bevy::text::LineBreak::WordOrCharacter),
+                            Node {
+                                width: Val::Percent(100.0),
+                                min_width: Val::Px(0.0),
+                                ..default()
+                            },
+                            TextColor(Color::srgb(0.79, 0.87, 0.82)),
                         ))
                         .id();
                 });
-                card_page_title = card
-                    .spawn((
-                        Text::default(),
-                        ui_font(15.0),
-                        TextColor(Color::srgb(0.91, 0.96, 0.89)),
-                    ))
-                    .id();
-                card_page_body = card
-                    .spawn((
-                        Text::default(),
-                        ui_font(13.0),
-                        TextLayout::new_with_linebreak(bevy::text::LineBreak::WordOrCharacter),
-                        Node {
-                            width: Val::Percent(100.0),
-                            min_width: Val::Px(0.0),
-                            ..default()
-                        },
-                        TextColor(Color::srgb(0.79, 0.87, 0.82)),
-                    ))
-                    .id();
             })
             .id();
         command_feedback = parent
@@ -6174,6 +6489,8 @@ fn setup_scene(
         energy: card_energy,
         age: card_age,
         generation: card_generation,
+        signal_status: card_signal_status,
+        brain_status: card_brain_status,
         page_status: card_page_status,
         page_title: card_page_title,
         page_body: card_page_body,
@@ -6585,17 +6902,45 @@ fn set_hud_text_if_changed(text: &mut Mut<Text>, value: String) {
     }
 }
 
+fn dashboard_sample_age(age: u64) -> String {
+    format!("{age} TICK{} OLD", if age == 1 { "" } else { "S" })
+}
+
+#[derive(bevy::ecs::system::SystemParam)]
+struct CreatureCardData<'w, 's> {
+    diagnostics: Option<Res<'w, HudDiagnostics>>,
+    owner: Option<NonSend<'w, OwnerInspector>>,
+    page: Option<Res<'w, InspectorPage>>,
+    nodes: Query<'w, 's, &'static mut Node>,
+    texts: Query<'w, 's, &'static mut Text>,
+    backgrounds: Query<'w, 's, &'static mut BackgroundColor>,
+    bars: Query<'w, 's, (Entity, &'static CreatureSignalBar)>,
+    vitals: Query<'w, 's, (Entity, &'static CreatureVitalBar)>,
+    brain_layers: Query<'w, 's, (Entity, &'static CreatureBrainLayer)>,
+    brain_labels: Query<'w, 's, (Entity, &'static CreatureBrainLabel)>,
+    brain_cells: Query<'w, 's, (Entity, &'static CreatureBrainCell)>,
+}
+
 /// Present selected snapshot data independently of the asynchronous owner
 /// inspector; stale owner pages remain explicitly labeled with their age.
 fn update_creature_card(
     state: Res<SnapshotState>,
     (card, hud): (Option<Res<CreatureCardElements>>, Option<Res<HudElements>>),
-    diagnostics: Option<Res<HudDiagnostics>>,
-    owner: Option<NonSend<OwnerInspector>>,
-    page: Option<Res<InspectorPage>>,
-    mut nodes: Query<&mut Node>,
-    mut texts: Query<&mut Text>,
+    data: CreatureCardData,
 ) {
+    let CreatureCardData {
+        diagnostics,
+        owner,
+        page,
+        mut nodes,
+        mut texts,
+        mut backgrounds,
+        bars,
+        vitals,
+        brain_layers,
+        brain_labels,
+        brain_cells,
+    } = data;
     let Some(card) = card else { return };
     let selected = state.latest.as_ref().and_then(|frame| {
         frame
@@ -6641,6 +6986,167 @@ fn update_creature_card(
     let (Some(frame), Some(agent)) = (state.latest.as_ref(), selected) else {
         return;
     };
+    for (entity, vital) in &vitals {
+        let value = match vital {
+            CreatureVitalBar::Health => agent.health,
+            CreatureVitalBar::Energy => agent.energy,
+        };
+        let fraction = if value.is_finite() {
+            (value / 2.0).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        if let Ok(mut node) = nodes.get_mut(entity) {
+            let width = Val::Percent(fraction * 100.0);
+            if node.width != width {
+                node.width = width;
+            }
+        }
+    }
+    let current = InspectorTarget::from_frame(frame);
+    let sample = owner.as_ref().and_then(|inspector| {
+        inspector
+            .sample
+            .as_ref()
+            .filter(|sample| current.is_some_and(|target| sample.target.visible_at(target)))
+    });
+    let mut signal_status = match (current, sample) {
+        (Some(current), Some(sample)) => format!(
+            "SIGNALS  /  TICK {}  ·  {}",
+            sample.target.source.inspected_tick.0,
+            dashboard_sample_age(
+                current.source.inspected_tick.0 - sample.target.source.inspected_tick.0
+            ),
+        ),
+        _ if owner.is_none() => "SIGNALS  /  OWNER DETAIL UNAVAILABLE".to_owned(),
+        _ => "SIGNALS  /  WAITING FOR OWNER SAMPLE".to_owned(),
+    };
+    if let Some(error) = owner
+        .as_ref()
+        .and_then(|inspector| inspector.last_failure.as_ref())
+    {
+        signal_status.push_str(&format!("  ·  REFRESH FAILED: {error}"));
+    }
+    for (entity, bar) in &bars {
+        let value = sample.and_then(|sample| match bar.source {
+            CreatureSignalSource::Sensor => sample.sensors.get(bar.index),
+            CreatureSignalSource::Output => sample.outputs.get(bar.index),
+        });
+        let fraction = value
+            .copied()
+            .filter(|value| value.is_finite())
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
+        if let Ok(mut node) = nodes.get_mut(entity) {
+            let width = Val::Percent(fraction * 100.0);
+            if node.width != width {
+                node.width = width;
+            }
+        }
+    }
+    let brain = &frame.brain;
+    let ready = brain.status == BrainOverlayStatus::Ready;
+    let brain_status = if ready {
+        let clipped = brain.truncated
+            || brain.layers.len() > BRAIN_OVERLAY_MAX_LAYERS
+            || brain
+                .layers
+                .iter()
+                .any(|layer| layer.total > layer.shown.len());
+        let summarized = brain
+            .layers
+            .iter()
+            .take(BRAIN_OVERLAY_MAX_LAYERS)
+            .any(|layer| layer.shown.len() > BRAIN_DASHBOARD_BINS);
+        format!(
+            "BRAIN  /  TICK {}  ·  {}  ·  BLUE − / AMBER +{}{}",
+            brain.source_tick,
+            dashboard_sample_age(frame.tick.saturating_sub(brain.source_tick)),
+            if summarized { "  ·  GROUP PEAKS" } else { "" },
+            if clipped { "  ·  PREVIEW" } else { "" },
+        )
+    } else {
+        match brain.status {
+            BrainOverlayStatus::NotRequested | BrainOverlayStatus::Pending => {
+                "BRAIN  /  WAITING FOR ACTIVITY".to_owned()
+            }
+            BrainOverlayStatus::TimedOut => "BRAIN  /  OWNER TIMEOUT".to_owned(),
+            BrainOverlayStatus::Unavailable | BrainOverlayStatus::NoStableIdentity => {
+                "BRAIN  /  ACTIVITY UNAVAILABLE".to_owned()
+            }
+            BrainOverlayStatus::Ready => unreachable!(),
+        }
+    };
+    for (entity, layer) in &brain_layers {
+        if let Ok(mut node) = nodes.get_mut(entity) {
+            let display = if ready && brain.layers.get(layer.0).is_some() {
+                Display::Flex
+            } else {
+                Display::None
+            };
+            if node.display != display {
+                node.display = display;
+            }
+        }
+    }
+    for (entity, label) in &brain_labels {
+        if let (Some(layer), Ok(mut text)) = (
+            brain.layers.get(label.0).filter(|_| ready),
+            texts.get_mut(entity),
+        ) {
+            let count = if layer.total > layer.shown.len() {
+                format!("{}/{} values", layer.shown.len(), layer.total)
+            } else {
+                format!("{} values", layer.shown.len())
+            };
+            let groups = if layer.shown.len() > BRAIN_DASHBOARD_BINS {
+                format!(" / {BRAIN_DASHBOARD_BINS} groups")
+            } else {
+                String::new()
+            };
+            set_hud_text_if_changed(&mut text, format!("{}  ·  {count}{groups}", layer.name));
+        }
+    }
+    for (entity, cell) in &brain_cells {
+        let layer = brain.layers.get(cell.layer).filter(|_| ready);
+        let value = layer.and_then(|layer| brain_dashboard_bin(&layer.shown, cell.index));
+        if let Ok(mut node) = nodes.get_mut(entity) {
+            let display = if layer
+                .is_some_and(|layer| cell.index < layer.shown.len().min(BRAIN_DASHBOARD_BINS))
+            {
+                Display::Flex
+            } else {
+                Display::None
+            };
+            if node.display != display {
+                node.display = display;
+            }
+        }
+        let color = match value {
+            Some(value) if value < 0.0 => {
+                let strength = value.abs().min(1.0);
+                Color::srgb(
+                    0.15 + 0.15 * strength,
+                    0.25 + 0.33 * strength,
+                    0.21 + 0.66 * strength,
+                )
+            }
+            Some(value) if value > 0.0 => {
+                let strength = value.min(1.0);
+                Color::srgb(
+                    0.15 + 0.78 * strength,
+                    0.25 + 0.43 * strength,
+                    0.21 + 0.14 * strength,
+                )
+            }
+            _ => Color::srgb(0.15, 0.25, 0.21),
+        };
+        if let Ok(mut background) = backgrounds.get_mut(entity)
+            && background.0 != color
+        {
+            background.0 = color;
+        }
+    }
     let selected_count = frame
         .agents
         .iter()
@@ -6691,6 +7197,8 @@ fn update_creature_card(
             ),
         ),
         (card.generation, format!("{}", agent.generation)),
+        (card.signal_status, signal_status),
+        (card.brain_status, brain_status),
         (card.page_status, status),
         (card.page_title, title),
         (card.page_body, body),
@@ -7060,6 +7568,73 @@ mod renderer_plugins_tests {
 #[cfg(test)]
 mod hud_inspector_tests {
     use super::*;
+
+    #[test]
+    fn signal_labels_cover_each_canonical_sensor_once_and_group_eyes() {
+        let labels = creature_sensor_labels();
+        assert_eq!(labels.len(), scriptbots_core::INPUT_SIZE);
+        let mut indices = labels.iter().map(|(_, index)| *index).collect::<Vec<_>>();
+        indices.sort_unstable();
+        assert_eq!(
+            indices,
+            (0..scriptbots_core::INPUT_SIZE).collect::<Vec<_>>()
+        );
+        for eye in 0..NUM_EYES {
+            let group = &labels[eye * 5..eye * 5 + 4];
+            assert!(
+                group
+                    .iter()
+                    .all(|(_, index)| scriptbots_core::SENSOR_LAYOUT[*index].eye == Some(eye))
+            );
+        }
+    }
+
+    #[test]
+    fn dashboard_sample_age_uses_the_correct_unit() {
+        assert_eq!(dashboard_sample_age(0), "0 TICKS OLD");
+        assert_eq!(dashboard_sample_age(1), "1 TICK OLD");
+        assert_eq!(dashboard_sample_age(2), "2 TICKS OLD");
+    }
+
+    #[test]
+    fn creature_details_toggle_without_hiding_the_overview() {
+        let mut app = App::new();
+        let section = app
+            .world_mut()
+            .spawn((
+                Node {
+                    display: Display::None,
+                    ..default()
+                },
+                CreatureDetailsSection,
+            ))
+            .id();
+        let button = app
+            .world_mut()
+            .spawn((Interaction::None, CreatureDetailsButton))
+            .id();
+        let overview = app.world_mut().spawn(Node::default()).id();
+        app.add_systems(Update, toggle_creature_details);
+        app.update();
+        *app.world_mut().get_mut::<Interaction>(button).unwrap() = Interaction::Pressed;
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(section).unwrap().display,
+            Display::Flex
+        );
+        assert_eq!(
+            app.world().get::<Node>(overview).unwrap().display,
+            Display::Flex
+        );
+        *app.world_mut().get_mut::<Interaction>(button).unwrap() = Interaction::None;
+        app.update();
+        *app.world_mut().get_mut::<Interaction>(button).unwrap() = Interaction::Pressed;
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(section).unwrap().display,
+            Display::None
+        );
+    }
 
     #[test]
     fn unchanged_hud_text_does_not_trigger_change_detection() {
@@ -9029,8 +9604,11 @@ mod adaptive_governor_tests {
         let status = card.page_status;
         let world = app.world_mut();
         let row = world.get::<ChildOf>(status).expect("status row").parent();
+        let details = world.get::<ChildOf>(row).expect("details section").parent();
+        assert!(world.get::<CreatureDetailsSection>(details).is_some());
+        assert_eq!(world.get::<Node>(details).unwrap().display, Display::None);
         assert_eq!(
-            world.get::<ChildOf>(row).expect("card parent").parent(),
+            world.get::<ChildOf>(details).expect("card parent").parent(),
             root
         );
         let mut query = world.query::<(Entity, &InspectorPageButton, &ChildOf)>();
@@ -9076,7 +9654,8 @@ mod adaptive_governor_tests {
             .iter(world)
             .filter_map(|(button, parent)| match button {
                 InspectorPageButton::Section(section)
-                    if world.get::<ChildOf>(parent.parent()).map(ChildOf::parent) == Some(root) =>
+                    if world.get::<ChildOf>(parent.parent()).map(ChildOf::parent)
+                        == Some(details) =>
                 {
                     Some(*section)
                 }
@@ -11174,6 +11753,8 @@ impl InspectorTarget {
 
 struct OwnerInspectorSample {
     target: InspectorTarget,
+    sensors: [f32; scriptbots_core::INPUT_SIZE],
+    outputs: [f32; scriptbots_core::OUTPUT_SIZE],
     pages: Vec<String>,
     sections: InspectorSectionStarts,
     genome_paging: Option<scriptbots_core::genome_browser::BrowserPagingMeta>,
@@ -11543,6 +12124,8 @@ fn capture_owner_inspector_at(
         .map_or_else(Vec::new, |genome| genome.deltas);
     Ok(Some(OwnerInspectorSample {
         target: captured,
+        sensors: detail.sensors,
+        outputs: detail.outputs,
         pages,
         sections,
         genome_paging,
@@ -12541,6 +13124,8 @@ mod owner_inspector_tests {
         assert!(node.contains("Slot 2 | target 8 | weight -0.7500 | kind unavailable"));
         let mut sample = OwnerInspectorSample {
             target,
+            sensors: detail.sensors,
+            outputs: detail.outputs,
             pages,
             sections,
             genome_paging: detail.genome_browser.as_ref().map(|genome| genome.paging),
@@ -12586,6 +13171,8 @@ mod owner_inspector_tests {
         };
         let make_sample = |label: &str| OwnerInspectorSample {
             target,
+            sensors: [0.0; scriptbots_core::INPUT_SIZE],
+            outputs: [0.0; scriptbots_core::OUTPUT_SIZE],
             pages: vec!["Life".into(), label.into()],
             sections: InspectorSectionStarts {
                 senses: 1,
@@ -13285,6 +13872,8 @@ mod owner_inspector_tests {
             energy: label(),
             age: label(),
             generation: label(),
+            signal_status: label(),
+            brain_status: label(),
             page_status: label(),
             page_title: label(),
             page_body: label(),
@@ -13390,18 +13979,72 @@ mod owner_inspector_tests {
             energy: label(),
             age: label(),
             generation: label(),
+            signal_status: label(),
+            brain_status: label(),
             page_status: label(),
             page_title: label(),
             page_body: label(),
         };
         let identity = card.identity;
         let energy = card.energy;
+        let signal_status = card.signal_status;
+        let brain_status = card.brain_status;
         let status = card.page_status;
         let title = card.page_title;
         let body = card.page_body;
+        let food_bar = app
+            .world_mut()
+            .spawn((
+                Node::default(),
+                CreatureSignalBar {
+                    source: CreatureSignalSource::Sensor,
+                    index: 4,
+                },
+            ))
+            .id();
+        let boost_bar = app
+            .world_mut()
+            .spawn((
+                Node::default(),
+                CreatureSignalBar {
+                    source: CreatureSignalSource::Output,
+                    index: OutputChannel::Boost.index(),
+                },
+            ))
+            .id();
+        let energy_bar = app
+            .world_mut()
+            .spawn((Node::default(), CreatureVitalBar::Energy))
+            .id();
+        let brain_row = app
+            .world_mut()
+            .spawn((Node::default(), CreatureBrainLayer(0)))
+            .id();
+        let brain_label = app
+            .world_mut()
+            .spawn((Text::default(), CreatureBrainLabel(0)))
+            .id();
+        let positive = app
+            .world_mut()
+            .spawn((
+                BackgroundColor(Color::BLACK),
+                CreatureBrainCell { layer: 0, index: 0 },
+            ))
+            .id();
+        let negative = app
+            .world_mut()
+            .spawn((
+                BackgroundColor(Color::BLACK),
+                CreatureBrainCell { layer: 0, index: 1 },
+            ))
+            .id();
         app.insert_resource(card)
             .add_systems(Update, update_creature_card);
         app.update();
+        assert_eq!(
+            app.world().get::<Node>(brain_row).unwrap().display,
+            Display::None
+        );
         assert_eq!(
             app.world().get::<Node>(root).unwrap().display,
             Display::Flex
@@ -13414,6 +14057,22 @@ mod owner_inspector_tests {
                 .contains(&target.uid.0.to_string())
         );
         assert_eq!(app.world().get::<Text>(energy).unwrap().0, "0.73");
+        for (entity, expected) in [(food_bar, 5.0), (boost_bar, 35.0), (energy_bar, 36.5)] {
+            let Val::Percent(actual) = app.world().get::<Node>(entity).unwrap().width else {
+                panic!("dashboard bars must use percentage widths");
+            };
+            assert!(
+                (actual - expected).abs() < 0.001,
+                "expected {expected}, got {actual}"
+            );
+        }
+        assert!(
+            app.world()
+                .get::<Text>(signal_status)
+                .unwrap()
+                .0
+                .contains("0 TICKS OLD")
+        );
         assert!(
             app.world()
                 .get::<Text>(title)
@@ -13472,13 +14131,42 @@ mod owner_inspector_tests {
             status: BrainOverlayStatus::Ready,
             source_tick: 37,
             layers: vec![BrainOverlayLayer {
-                name: "hidden".into(),
+                name: "hidden layer with a long descriptive name".into(),
                 shown: vec![0.2, -0.4],
                 total: 3,
             }],
             truncated: true,
         };
         app.update();
+        assert_eq!(
+            app.world().get::<Node>(brain_row).unwrap().display,
+            Display::Flex
+        );
+        assert_eq!(
+            app.world().get::<Text>(brain_label).unwrap().0,
+            "hidden layer with a long descriptive name  ·  2/3 values"
+        );
+        assert!(
+            app.world()
+                .get::<Text>(brain_status)
+                .unwrap()
+                .0
+                .contains("PREVIEW")
+        );
+        let positive_color = app
+            .world()
+            .get::<BackgroundColor>(positive)
+            .unwrap()
+            .0
+            .to_srgba();
+        let negative_color = app
+            .world()
+            .get::<BackgroundColor>(negative)
+            .unwrap()
+            .0
+            .to_srgba();
+        assert!(positive_color.red > positive_color.blue);
+        assert!(negative_color.blue > negative_color.red);
         assert!(
             app.world()
                 .get::<Text>(title)
@@ -13498,7 +14186,48 @@ mod owner_inspector_tests {
                 .get::<Text>(body)
                 .unwrap()
                 .0
-                .contains("hidden [2/3]")
+                .contains("hidden layer with a long descriptive name [2/3]")
+        );
+        app.world_mut()
+            .resource_mut::<SnapshotState>()
+            .latest
+            .as_mut()
+            .unwrap()
+            .brain = BrainOverlay {
+            status: BrainOverlayStatus::Ready,
+            source_tick: 37,
+            layers: vec![BrainOverlayLayer {
+                name: "Assembly working cells".into(),
+                shown: vec![0.1; 200],
+                total: 200,
+            }],
+            truncated: false,
+        };
+        app.update();
+        assert_eq!(
+            app.world().get::<Text>(brain_label).unwrap().0,
+            "Assembly working cells  ·  200 values / 48 groups"
+        );
+        let map_status = &app.world().get::<Text>(brain_status).unwrap().0;
+        assert!(map_status.contains("GROUP PEAKS"));
+        assert!(!map_status.contains("PREVIEW"));
+        app.world_mut()
+            .resource_mut::<SnapshotState>()
+            .latest
+            .as_mut()
+            .unwrap()
+            .brain = BrainOverlay::default();
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(brain_row).unwrap().display,
+            Display::None
+        );
+        assert!(
+            app.world()
+                .get::<Text>(brain_status)
+                .unwrap()
+                .0
+                .contains("WAITING")
         );
         app.world_mut().resource_mut::<HudDiagnostics>().0 = true;
         app.update();
@@ -13522,6 +14251,26 @@ mod owner_inspector_tests {
             app.world().get::<Node>(root).unwrap().display,
             Display::None
         );
+    }
+
+    #[test]
+    fn dashboard_bins_cover_the_entire_layer_and_preserve_peak_sign() {
+        let mut values = vec![0.0; 200];
+        for index in 0..values.len() {
+            values[index] = if index % 2 == 0 { 0.8 } else { -0.9 };
+            assert!(
+                (0..BRAIN_DASHBOARD_BINS)
+                    .filter_map(|bin| brain_dashboard_bin(&values, bin))
+                    .any(|value| value == values[index]),
+                "activity at index {index} was not represented"
+            );
+            values[index] = 0.0;
+        }
+        assert_eq!(brain_dashboard_bin(&[0.2, -0.7], 0), Some(0.2));
+        assert_eq!(brain_dashboard_bin(&[0.2, -0.7], 1), Some(-0.7));
+        assert_eq!(brain_dashboard_bin(&[f32::NAN], 0), None);
+        assert_eq!(brain_dashboard_bin(&[], 0), None);
+        assert_eq!(brain_dashboard_bin(&values, BRAIN_DASHBOARD_BINS), None);
     }
 
     #[test]
@@ -13552,6 +14301,8 @@ mod owner_inspector_tests {
             energy: label(),
             age: label(),
             generation: label(),
+            signal_status: label(),
+            brain_status: label(),
             page_status: label(),
             page_title: label(),
             page_body: label(),

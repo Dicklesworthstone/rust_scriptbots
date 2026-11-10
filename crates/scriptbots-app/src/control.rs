@@ -5249,7 +5249,7 @@ impl ControlHandle {
         let status = self.host.submit_before(envelope, deadline)?;
         Ok(BrowserInterventionReceipt::from_status(
             &status,
-            &self.read_snapshot()?,
+            self.read_snapshot()?.as_ref(),
         ))
     }
 
@@ -5264,7 +5264,7 @@ impl ControlHandle {
             validate_browser_intervention_session,
         };
         let command_id = browser_intervention_command_id(command_id)?;
-        validate_browser_intervention_session(&self.read_snapshot()?, session_id)?;
+        validate_browser_intervention_session(self.read_snapshot()?.as_ref(), session_id)?;
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
         let status = self.host.command_status_before(command_id, deadline)?;
         let snapshot = self.read_snapshot()?;
@@ -5281,7 +5281,7 @@ impl ControlHandle {
     ) -> Result<scriptbots_runtime::remote::BrowserInterventionHistory, ControlError> {
         Ok(
             scriptbots_runtime::remote::BrowserInterventionHistory::capture(
-                &self.read_snapshot()?,
+                self.read_snapshot()?.as_ref(),
                 session_id,
                 epoch,
                 after_seq,
