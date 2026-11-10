@@ -25,6 +25,10 @@ fn synthetic_summary(tick: u64) -> TickSummary {
     let phase = u16::try_from(tick % 5).expect("bounded phase");
     let population = if tick < 100 { 10_u16 } else { 40_u16 } + phase;
     let energy_phase = i16::try_from(tick % 7).expect("bounded energy phase");
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "fixture arithmetic; keep the exact f32 so certified energy values stay bit-stable"
+    )]
     let average_energy = 50.0 + f32::from(energy_phase - 3) * 0.5;
     let spike_hits = if tick < 100 { 2 } else { 12 } + u32::from(phase);
     TickSummary {
@@ -59,9 +63,9 @@ fn event(tick: u64, kind: EventKind, metric: &str) -> EventRecord {
 
 /// A synthetic statistics fixture, not a claim of simulated lifecycle counts.
 ///
-/// Summaries and canonical inputs agree exactly. Batches use the production
-/// default persistence cadence; generic dashboard metrics deliberately carry
-/// no evidence of the planted shift.
+/// Summaries and canonical inputs agree exactly. Batches use an explicit sparse
+/// persistence cadence (the config default, `0`, disables persistence); generic
+/// dashboard metrics deliberately carry no evidence of the planted shift.
 fn create_fixture(
     dir: &tempfile::TempDir,
     events: &[EventRecord],
@@ -69,7 +73,10 @@ fn create_fixture(
 ) -> String {
     let path = dir.path().join("series.sqlite").display().to_string();
     let mut storage = Storage::create_unattributed_file(&path).expect("create fixture");
-    let config = ScriptBotsConfig::default();
+    let config = ScriptBotsConfig {
+        persistence_interval: 3,
+        ..ScriptBotsConfig::default()
+    };
     let interval = u64::from(config.persistence_interval);
     assert!(interval > 1, "the fixture must exercise sparse persistence");
     let mut replay_events = Vec::new();
@@ -340,6 +347,7 @@ fn real_world_default_persistence_certifies_an_event_between_batch_boundaries() 
         world_height: 200,
         food_cell_size: 20,
         closed: true,
+        persistence_interval: 3,
         population_spawn_interval: 0,
         metabolism_drain: 0.0,
         movement_drain: 0.0,

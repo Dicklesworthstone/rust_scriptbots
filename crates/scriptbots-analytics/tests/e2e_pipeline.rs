@@ -223,6 +223,10 @@ fn populate_seeded_fixture(dir: &Path) -> (String, String) {
         // Plant a real change in this fixture's agent states, so persisted summary
         // energy and canonical detector inputs describe the same population.
         let phase = f32::from(u16::try_from(tick % 5).expect("energy phase fits u16"));
+        #[expect(
+            clippy::suboptimal_flops,
+            reason = "fixture arithmetic; keep the exact f32 so planted energy stays bit-stable"
+        )]
         let agent_energy = if tick < 100 { 40.0 } else { 10.0 } + (phase - 2.0) * 0.2;
         for agent in &mut agents {
             agent.runtime.energy = agent_energy;
