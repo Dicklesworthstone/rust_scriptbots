@@ -8,8 +8,8 @@ use super::*;
 use scriptbots_runtime::{
     HostSessionId,
     lab_workflows::{
-        LAB_PAGE_SIZE, LabAction, LabPanel, LabWorkflowSubmit, LabWorkflows,
-        VARIANTS_PER_PAGE, comparison_lines,
+        LAB_PAGE_SIZE, LabAction, LabCheckpointSaveState, LabPanel, LabWorkflowSubmit,
+        LabWorkflows, VARIANTS_PER_PAGE, comparison_lines,
     },
 };
 
@@ -93,7 +93,8 @@ struct ReviewFrame {
 #[derive(Resource, Default)]
 pub(super) struct LabPresentation {
     panel: LabPanel,
-    source: Option<(HostSessionId, u64)>,
+    // Scientific epoch advances during an ordinary run; it is not an owner identity.
+    source: Option<HostSessionId>,
     source_changed: bool,
     live: Option<WorldSnapshot>,
     review: Option<ReviewFrame>,
@@ -109,9 +110,7 @@ impl LabPresentation {
         state: &mut SnapshotState,
         motion: &mut AgentMotionSettings,
     ) {
-        let source = snapshot
-            .owner_source
-            .map(|(source, epoch)| (source.session_id, epoch));
+        let source = snapshot.owner_source.map(|(source, _)| source.session_id);
         if self.source != source {
             self.source_changed = true;
             self.source = source;
@@ -181,6 +180,10 @@ impl LabPresentation {
 
     pub(super) fn reviewing(&self) -> bool {
         self.review.is_some()
+    }
+
+    fn checkpoint_source_is_live(&self) -> bool {
+        self.source.is_some() && self.review.is_none()
     }
 
     fn world_controls_allowed(&self) -> bool {
@@ -305,10 +308,7 @@ pub(super) fn setup_panel(commands: &mut Commands, font: Handle<Font>) {
                 BorderRadius::all(Val::Px(4.0)),
                 Interaction::default(),
                 FocusPolicy::Block,
-                LabRow {
-                    index,
-                    ..default()
-                },
+                LabRow { index, ..default() },
             ))
             .id();
         commands.entity(row).add_child(text);
@@ -340,7 +340,7 @@ pub(super) fn update(
         model.reset_observations();
         presentation.source_changed = false;
     }
-    if let Some((session, _)) = presentation.source {
+    if let Some(session) = presentation.source {
         model.synchronize(session, presentation.panel);
     }
     let mut action = rows.iter().find_map(|(row, interaction)| {
@@ -350,7 +350,9 @@ pub(super) fn update(
             None
         }
     });
-    if open.iter().any(|interaction| *interaction == Interaction::Pressed)
+    if open
+        .iter()
+        .any(|interaction| *interaction == Interaction::Pressed)
         || keys.just_pressed(KeyCode::F6)
     {
         action = Some(if presentation.panel == LabPanel::Inactive {
@@ -364,7 +366,9 @@ pub(super) fn update(
         action = Some(PanelAction::Panel(LabPanel::Checkpoints));
         presentation.keyboard_captured = true;
     }
-    if banners.iter().any(|interaction| *interaction == Interaction::Pressed)
+    if banners
+        .iter()
+        .any(|interaction| *interaction == Interaction::Pressed)
         || (keys.just_pressed(KeyCode::Escape)
             && presentation.review.is_some()
             && presentation.panel == LabPanel::Inactive)
@@ -376,7 +380,9 @@ pub(super) fn update(
         action = Some(PanelAction::Close);
         presentation.keyboard_captured = true;
     }
-    if presentation.panel != LabPanel::Inactive && let Some(ui) = ui {
+    if presentation.panel != LabPanel::Inactive
+        && let Some(ui) = ui
+    {
         let choices = ui
             .shown
             .iter()
@@ -387,8 +393,8 @@ pub(super) fn update(
         let previous = keys.just_pressed(KeyCode::ArrowUp)
             || (keys.just_pressed(KeyCode::Tab)
                 && (keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight)));
-        let next = keys.just_pressed(KeyCode::ArrowDown)
-            || (keys.just_pressed(KeyCode::Tab) && !previous);
+        let next =
+            keys.just_pressed(KeyCode::ArrowDown) || (keys.just_pressed(KeyCode::Tab) && !previous);
         if (previous || next) && !choices.is_empty() {
             let current = presentation
                 .focus
@@ -421,23 +427,33 @@ pub(super) fn update(
                 presentation.change_panel(LabPanel::Inactive);
             }
             PanelAction::Workflow(action) => {
-                if action == LabAction::ReturnLive {
-                    presentation.keyboard_captured = true;
-                    presentation.return_live(&mut state, &mut motion);
-                    rig.queue_fit(FitCommand::World);
+                // A row may have been painted before review/source changed.
+                // Never let that stale input capture the hidden live owner.
+                if action == LabAction::CreateCheckpoint
+                    && !presentation.checkpoint_source_is_live()
+                {
+                    model.set_notice(
+                        "Show the identified live world before saving or retrying a checkpoint.",
+                    );
+                } else {
+                    if action == LabAction::ReturnLive {
+                        presentation.keyboard_captured = true;
+                        presentation.return_live(&mut state, &mut motion);
+                        rig.queue_fit(FitCommand::World);
+                    }
+                    model.dispatch(action);
                 }
-                model.dispatch(action);
             }
         }
     }
-    if let Some((session, _)) = presentation.source {
+    if let Some(session) = presentation.source {
         model.synchronize(session, presentation.panel);
     }
     if let Some((id, snapshot)) = model.poll() {
         if presentation.show_checkpoint(id, &snapshot, &mut state, &mut motion) {
             presentation.change_panel(LabPanel::Inactive);
             presentation.keyboard_captured = true;
-            if let Some((session, _)) = presentation.source {
+            if let Some(session) = presentation.source {
                 model.synchronize(session, LabPanel::Inactive);
             }
             model.set_notice("Viewing a saved checkpoint. The live owner continues independently.");
@@ -459,8 +475,16 @@ fn panel_rows(model: &LabWorkflows, presentation: &LabPresentation) -> Vec<Panel
         PanelRow::text(
             "F6: Lab | F7: checkpoints | Tab / arrows / Enter: select | PageUp / PageDown: scroll | Escape: close",
         ),
-        PanelRow::button("Experiments", PanelAction::Panel(LabPanel::Experiments), true),
-        PanelRow::button("Saved checkpoints", PanelAction::Panel(LabPanel::Checkpoints), true),
+        PanelRow::button(
+            "Experiments",
+            PanelAction::Panel(LabPanel::Experiments),
+            true,
+        ),
+        PanelRow::button(
+            "Saved checkpoints",
+            PanelAction::Panel(LabPanel::Checkpoints),
+            true,
+        ),
         PanelRow::button("Close panel", PanelAction::Close, true),
     ];
     if let Some(review) = &presentation.review {
@@ -468,38 +492,56 @@ fn panel_rows(model: &LabWorkflows, presentation: &LabPresentation) -> Vec<Panel
             "DISPLAYING SAVED CHECKPOINT {} AT TICK {}. Return to live to enable world controls.",
             review.checkpoint_id, review.tick,
         )));
-        rows.push(PanelRow::workflow("Return to live world", LabAction::ReturnLive, true));
+        rows.push(PanelRow::workflow(
+            "Return to live world",
+            LabAction::ReturnLive,
+            true,
+        ));
     }
     if model.submit.is_none() {
-        rows.push(PanelRow::text("Lab services are unavailable in this launch."));
+        rows.push(PanelRow::text(
+            "Lab services are unavailable in this launch.",
+        ));
         return rows;
     }
     if presentation.source.is_none() {
-        rows.push(PanelRow::text("Waiting for an identified host publication."));
+        rows.push(PanelRow::text(
+            "Waiting for an identified host publication.",
+        ));
         return rows;
     }
     let idle = !model.is_busy();
     rows.push(PanelRow::workflow(
-        if idle { "Refresh" } else { "Request running..." },
+        if idle {
+            "Refresh"
+        } else {
+            "Request running..."
+        },
         LabAction::Refresh,
         idle,
     ));
     if !idle {
-        rows.push(PanelRow::workflow("Discard pending result", LabAction::CancelRequest, true));
+        rows.push(PanelRow::workflow(
+            "Discard pending result",
+            LabAction::CancelRequest,
+            true,
+        ));
     }
     if let Some(notice) = &model.notice {
         rows.push(PanelRow::text(notice.clone()));
     }
     match presentation.panel {
         LabPanel::Experiments => experiment_rows(model, idle, &mut rows),
-        LabPanel::Checkpoints => checkpoint_rows(model, idle, &mut rows),
+        LabPanel::Checkpoints => checkpoint_rows(model, presentation, idle, &mut rows),
         LabPanel::Inactive => {}
     }
     // Fail visibly if future extensions outgrow the widget pool; never silently
     // omit the end of a scientific comparison or its provenance.
     if rows.len() > MAX_PANEL_ROWS {
         rows.clear();
-        rows.push(PanelRow::text("Lab view exceeds its display capacity. Close the panel and use the control CLI."));
+        rows.push(PanelRow::text(
+            "Lab view exceeds its display capacity. Close the panel and use the control CLI.",
+        ));
         rows.push(PanelRow::button("Close panel", PanelAction::Close, true));
     }
     rows
@@ -507,16 +549,27 @@ fn panel_rows(model: &LabWorkflows, presentation: &LabPresentation) -> Vec<Panel
 
 fn experiment_rows(model: &LabWorkflows, idle: bool, rows: &mut Vec<PanelRow>) {
     if model.selected_experiment.is_some() {
-        rows.push(PanelRow::workflow("All experiments", LabAction::AllExperiments, true));
+        rows.push(PanelRow::workflow(
+            "All experiments",
+            LabAction::AllExperiments,
+            true,
+        ));
         let Some(batch) = &model.batch else {
-            rows.push(PanelRow::text("Experiment details have not been observed. Refresh to retry."));
+            rows.push(PanelRow::text(
+                "Experiment details have not been observed. Refresh to retry.",
+            ));
             return;
         };
         let summary = &batch.summary;
         rows.push(PanelRow::text(format!(
             "{} | {}\n{} / {} completed; {} failed\nPlan {} | observation generation {}",
-            summary.experiment_id, summary.status, summary.completed_runs, summary.total_runs,
-            summary.failed_runs, batch.plan_digest, batch.generation,
+            summary.experiment_id,
+            summary.status,
+            summary.completed_runs,
+            summary.total_runs,
+            summary.failed_runs,
+            batch.plan_digest,
+            batch.generation,
         )));
         if let Some(error) = &batch.error_reason {
             rows.push(PanelRow::text(format!("Run failure: {error}")));
@@ -529,14 +582,25 @@ fn experiment_rows(model: &LabWorkflows, idle: bool, rows: &mut Vec<PanelRow>) {
         rows.push(PanelRow::workflow(
             "Resume unfinished runs",
             LabAction::ResumeExperiment,
-            idle && !matches!(summary.status.as_str(), "running" | "pending" | "cancelling")
-                && summary.completed_runs + summary.failed_runs < summary.total_runs,
+            idle && !matches!(
+                summary.status.as_str(),
+                "running" | "pending" | "cancelling"
+            ) && summary.completed_runs + summary.failed_runs < summary.total_runs,
         ));
-        for variant in batch.variants.iter().skip(model.variant_offset).take(VARIANTS_PER_PAGE) {
+        for variant in batch
+            .variants
+            .iter()
+            .skip(model.variant_offset)
+            .take(VARIANTS_PER_PAGE)
+        {
             rows.push(PanelRow::text(format!(
                 "{} | {} | {} / {} completed, {} running, {} failed",
-                variant.variant_id, variant.brain_family, variant.completed_runs,
-                variant.total_runs, variant.running_runs, variant.failed_runs,
+                variant.variant_id,
+                variant.brain_family,
+                variant.completed_runs,
+                variant.total_runs,
+                variant.running_runs,
+                variant.failed_runs,
             )));
             rows.push(PanelRow::workflow(
                 if model.baseline.as_ref() == Some(&variant.variant_id) {
@@ -589,8 +653,11 @@ fn experiment_rows(model: &LabWorkflows, idle: bool, rows: &mut Vec<PanelRow>) {
             rows.push(PanelRow::workflow(
                 format!(
                     "{} | {} | {} / {} completed | {} failed",
-                    item.experiment_id, item.status, item.completed_runs,
-                    item.total_runs, item.failed_runs,
+                    item.experiment_id,
+                    item.status,
+                    item.completed_runs,
+                    item.total_runs,
+                    item.failed_runs,
                 ),
                 LabAction::SelectExperiment(item.experiment_id.clone()),
                 true,
@@ -615,9 +682,79 @@ fn previous_cursor(offset: usize) -> Option<String> {
     (offset > LAB_PAGE_SIZE).then(|| (offset - LAB_PAGE_SIZE).to_string())
 }
 
-fn checkpoint_rows(model: &LabWorkflows, idle: bool, rows: &mut Vec<PanelRow>) {
+fn checkpoint_rows(
+    model: &LabWorkflows,
+    presentation: &LabPresentation,
+    idle: bool,
+    rows: &mut Vec<PanelRow>,
+) {
+    let saving = model.latest_checkpoint_save.as_ref().is_some_and(|save| {
+        presentation.source == Some(save.session_id)
+            && matches!(&save.state, LabCheckpointSaveState::Pending)
+            && model.is_busy()
+    });
+    let label = if saving {
+        "Saving checkpoint..."
+    } else if model.will_retry_checkpoint_save() {
+        "Retry previous checkpoint save"
+    } else {
+        "Save live checkpoint"
+    };
+    rows.push(PanelRow::workflow(
+        label,
+        LabAction::CreateCheckpoint,
+        presentation.checkpoint_source_is_live() && model.can_create_checkpoint(),
+    ));
+    rows.push(PanelRow::text(
+        "A new save records the live world. Its durable receipt identifies the exact saved tick.",
+    ));
+    if !presentation.checkpoint_source_is_live() {
+        rows.push(PanelRow::text(
+            "Return to live before saving or retrying a checkpoint.",
+        ));
+    }
+    if let Some(save) = &model.latest_checkpoint_save {
+        let current_source = presentation.source == Some(save.session_id);
+        if !current_source {
+            rows.push(PanelRow::text(
+                "Previous source save: this receipt or unconfirmed request belongs to an earlier world source.",
+            ));
+        }
+        match &save.state {
+            LabCheckpointSaveState::Pending => rows.push(PanelRow::text(
+                "Saving checkpoint - awaiting a durable receipt.",
+            )),
+            LabCheckpointSaveState::Retryable { reason } => {
+                rows.push(PanelRow::text(format!("Save not confirmed: {reason}")));
+                rows.push(PanelRow::text(if current_source {
+                    "Retry previous checkpoint save uses the same request identity."
+                } else {
+                    "Saving this live source starts a new request after the previous worker finishes."
+                }));
+            }
+            LabCheckpointSaveState::Saved(checkpoint) => {
+                rows.push(PanelRow::text(format!(
+                    "Saved checkpoint {} | tick {} | {} agents | {} bytes",
+                    checkpoint.checkpoint_id,
+                    checkpoint.tick,
+                    checkpoint.agent_count,
+                    checkpoint.byte_size,
+                )));
+                rows.push(PanelRow::text(format!(
+                    "Saved world digest: {}",
+                    checkpoint.world_digest,
+                )));
+            }
+        }
+        rows.push(PanelRow::text(format!("Save request: {}", save.request_id)));
+    }
     rows.push(PanelRow::text(
         "Review reconstructs the selected saved world. The live owner continues separately.",
+    ));
+    rows.push(PanelRow::workflow(
+        "Review selected checkpoint in world",
+        LabAction::ReviewCheckpoint,
+        idle && model.selected_checkpoint_metadata().is_some(),
     ));
     let Some(page) = &model.checkpoints else {
         rows.push(PanelRow::text("No checkpoint page has been observed yet."));
@@ -636,21 +773,21 @@ fn checkpoint_rows(model: &LabWorkflows, idle: bool, rows: &mut Vec<PanelRow>) {
             format!(
                 "{}{} | tick {} | {} agents | {} bytes",
                 if selected { "Selected: " } else { "" },
-                checkpoint.checkpoint_id, checkpoint.tick,
-                checkpoint.agent_count, checkpoint.byte_size,
+                checkpoint.checkpoint_id,
+                checkpoint.tick,
+                checkpoint.agent_count,
+                checkpoint.byte_size,
             ),
             LabAction::SelectCheckpoint(checkpoint.checkpoint_id.clone()),
             true,
         ));
     }
     if let Some(checkpoint) = model.selected_checkpoint_metadata() {
-        rows.push(PanelRow::text(format!("Saved world digest: {}", checkpoint.world_digest)));
+        rows.push(PanelRow::text(format!(
+            "Saved world digest: {}",
+            checkpoint.world_digest
+        )));
     }
-    rows.push(PanelRow::workflow(
-        "Review selected checkpoint in world",
-        LabAction::ReviewCheckpoint,
-        idle && model.selected_checkpoint_metadata().is_some(),
-    ));
     rows.push(PanelRow::workflow(
         "Previous checkpoints",
         LabAction::CheckpointsPage(previous_cursor(page.offset)),
@@ -663,13 +800,10 @@ fn checkpoint_rows(model: &LabWorkflows, idle: bool, rows: &mut Vec<PanelRow>) {
     ));
 }
 
-fn retained_focus(
-    previous: &[PanelRow],
-    next: &[PanelRow],
-    focus: Option<usize>,
-) -> Option<usize> {
+fn retained_focus(previous: &[PanelRow], next: &[PanelRow], focus: Option<usize>) -> Option<usize> {
     let action = previous.get(focus?)?.action.as_ref()?;
-    next.iter().position(|row| row.enabled && row.action.as_ref() == Some(action))
+    next.iter()
+        .position(|row| row.enabled && row.action.as_ref() == Some(action))
 }
 
 /// Update the fixed widget pool. Stable observations do not mark text changed.
@@ -679,7 +813,12 @@ pub(super) fn refresh_panel(
     ui: Option<ResMut<LabUi>>,
     mut nodes: Query<&mut Node>,
     roots: Query<Entity, With<LabPanelRoot>>,
-    mut rows: Query<(&mut LabRow, &Interaction, &mut BackgroundColor, &mut BorderColor)>,
+    mut rows: Query<(
+        &mut LabRow,
+        &Interaction,
+        &mut BackgroundColor,
+        &mut BorderColor,
+    )>,
     mut texts: Query<&mut Text>,
     banners: Query<Entity, With<LabReviewBanner>>,
     headings: Query<Entity, With<LabWorldHeading>>,
@@ -688,7 +827,9 @@ pub(super) fn refresh_panel(
     mut bodies: Query<(&ComputedNode, &mut ScrollPosition), With<LabPanelBody>>,
     sizes: Query<&ComputedNode, With<LabRow>>,
 ) {
-    let Some(mut ui) = ui else { return; };
+    let Some(mut ui) = ui else {
+        return;
+    };
     let open = presentation.panel != LabPanel::Inactive;
     for entity in &roots {
         if let Ok(mut node) = nodes.get_mut(entity) {
@@ -712,7 +853,11 @@ pub(super) fn refresh_panel(
     }
     for entity in &banners {
         if let Ok(mut node) = nodes.get_mut(entity) {
-            let display = if presentation.review.is_some() { Display::Flex } else { Display::None };
+            let display = if presentation.review.is_some() {
+                Display::Flex
+            } else {
+                Display::None
+            };
             if node.display != display {
                 node.display = display;
             }
@@ -727,7 +872,11 @@ pub(super) fn refresh_panel(
             );
         }
     }
-    let desired = if open { panel_rows(&model, &presentation) } else { Vec::new() };
+    let desired = if open {
+        panel_rows(&model, &presentation)
+    } else {
+        Vec::new()
+    };
     if ui.shown != desired {
         for (index, (entity, label)) in ui.rows.iter().copied().enumerate() {
             let value = desired.get(index);
@@ -735,7 +884,11 @@ pub(super) fn refresh_panel(
                 continue;
             }
             if let Ok(mut node) = nodes.get_mut(entity) {
-                node.display = if value.is_some() { Display::Flex } else { Display::None };
+                node.display = if value.is_some() {
+                    Display::Flex
+                } else {
+                    Display::None
+                };
             }
             if let Ok((mut row, _, _, _)) = rows.get_mut(entity) {
                 row.action = value.and_then(|value| value.action.clone());
@@ -771,7 +924,11 @@ pub(super) fn refresh_panel(
         if background.0 != color {
             background.0 = color;
         }
-        let color = BorderColor::all(if focused { Color::srgb(0.75, 0.91, 0.65) } else { Color::NONE });
+        let color = BorderColor::all(if focused {
+            Color::srgb(0.75, 0.91, 0.65)
+        } else {
+            Color::NONE
+        });
         if *border != color {
             *border = color;
         }
@@ -829,7 +986,8 @@ mod tests {
     use super::*;
     use crate::terrain_tests::{motion_test_source, sample_world_snapshot};
     use scriptbots_runtime::lab_workflows::{
-        LAB_MAX_VARIANTS, LabExperiment, LabExperimentSummary, LabVariantProgress,
+        LAB_MAX_VARIANTS, LabCheckpoint, LabCheckpointPage, LabCheckpointSave, LabExperiment,
+        LabExperimentSummary, LabVariantProgress, LabWorkflowRequest,
     };
     use scriptbots_runtime::{HostCore, HostCoreOptions};
 
@@ -873,7 +1031,12 @@ mod tests {
         presentation.receive_live(live_frame(12), &mut state, &mut motion);
         state.last_applied_revision = 1;
         state.last_applied_palette = Some(ColorPaletteMode::Natural);
-        assert!(presentation.show_checkpoint("saved-1".into(), &saved_snapshot(), &mut state, &mut motion));
+        assert!(presentation.show_checkpoint(
+            "saved-1".into(),
+            &saved_snapshot(),
+            &mut state,
+            &mut motion
+        ));
         let saved = state.latest.as_ref().unwrap();
         assert_eq!(saved.tick, 0);
         assert!(saved.owner_source.is_none());
@@ -899,15 +1062,20 @@ mod tests {
     }
 
     #[test]
-    fn new_owner_epoch_leaves_saved_review_and_clears_old_retention() {
+    fn new_owner_session_leaves_saved_review_and_clears_old_retention() {
         let mut presentation = LabPresentation::default();
         let mut state = SnapshotState::default();
         let mut motion = AgentMotionSettings { enabled: true };
         presentation.receive_live(live_frame(12), &mut state, &mut motion);
-        assert!(presentation.show_checkpoint("saved-1".into(), &saved_snapshot(), &mut state, &mut motion));
+        assert!(presentation.show_checkpoint(
+            "saved-1".into(),
+            &saved_snapshot(),
+            &mut state,
+            &mut motion
+        ));
         presentation.source_changed = false;
         let mut reset = live_frame(1);
-        reset.owner_source.as_mut().unwrap().1 = 9;
+        reset.owner_source.as_mut().unwrap().0.session_id = HostSessionId::new(72);
         presentation.receive_live(reset, &mut state, &mut motion);
         assert_eq!(state.latest.as_ref().unwrap().tick, 1);
         assert!(presentation.source_changed);
@@ -944,26 +1112,30 @@ mod tests {
             },
             plan_digest: "verified-plan".into(),
             generation: 3,
-            variants: (0..LAB_MAX_VARIANTS).map(|index| LabVariantProgress {
-                variant_id: format!("variant-{index}"),
-                brain_family: "mlp".into(),
-                total_runs: 1,
-                completed_runs: 1,
-                failed_runs: 0,
-                running_runs: 0,
-            }).collect(),
+            variants: (0..LAB_MAX_VARIANTS)
+                .map(|index| LabVariantProgress {
+                    variant_id: format!("variant-{index}"),
+                    brain_family: "mlp".into(),
+                    total_runs: 1,
+                    completed_runs: 1,
+                    failed_runs: 0,
+                    running_runs: 0,
+                })
+                .collect(),
             error_reason: None,
         });
         let presentation = LabPresentation {
             panel: LabPanel::Experiments,
-            source: Some((HostSessionId::new(1), 0)),
+            source: Some(HostSessionId::new(1)),
             ..default()
         };
         let last_variant = format!("variant-{} |", LAB_MAX_VARIANTS - 1);
         let first = panel_rows(&model, &presentation);
         assert!(first.iter().any(|row| row.text.starts_with("variant-0 |")));
         assert!(!first.iter().any(|row| row.text.starts_with(&last_variant)));
-        model.dispatch(LabAction::VariantsPage(LAB_MAX_VARIANTS - VARIANTS_PER_PAGE));
+        model.dispatch(LabAction::VariantsPage(
+            LAB_MAX_VARIANTS - VARIANTS_PER_PAGE,
+        ));
         let last = panel_rows(&model, &presentation);
         assert!(last.iter().any(|row| row.text.starts_with(&last_variant)));
         assert!(!last.iter().any(|row| row.text.starts_with("variant-0 |")));
@@ -984,16 +1156,313 @@ mod tests {
             previous[2].clone(),
         ];
         assert_eq!(retained_focus(&previous, &shifted, Some(1)), Some(2));
-        let replaced = vec![
-            previous[0].clone(),
-            previous[2].clone(),
-        ];
+        let replaced = vec![previous[0].clone(), previous[2].clone()];
         assert_eq!(retained_focus(&previous, &replaced, Some(1)), None);
         let disabled = vec![
             previous[0].clone(),
             PanelRow::workflow("refresh", LabAction::Refresh, false),
         ];
         assert_eq!(retained_focus(&previous, &disabled, Some(1)), None);
+    }
+
+    fn empty_checkpoint_page() -> LabCheckpointPage {
+        LabCheckpointPage {
+            items: Vec::new(),
+            total: 0,
+            offset: 0,
+            next_cursor: None,
+            retained_bytes: 0,
+            max_bytes: 1_000,
+        }
+    }
+
+    #[test]
+    fn stale_save_button_cannot_capture_a_reviewed_or_unidentified_world() {
+        let mut presentation = LabPresentation {
+            panel: LabPanel::Checkpoints,
+            ..default()
+        };
+        let mut state = SnapshotState::default();
+        let mut motion = AgentMotionSettings { enabled: true };
+        presentation.receive_live(live_frame(12), &mut state, &mut motion);
+        let session = presentation.source.unwrap();
+        assert!(presentation.show_checkpoint(
+            "saved-1".into(),
+            &saved_snapshot(),
+            &mut state,
+            &mut motion
+        ));
+        presentation.source_changed = false;
+
+        let (submitted, requests) = std::sync::mpsc::channel();
+        let mut model = consumer(Some(Arc::new(move |request| {
+            let LabWorkflowRequest::CreateCheckpoint {
+                request_id,
+                session_id,
+            } = request
+            else {
+                panic!("this fixture already has its checkpoint catalog");
+            };
+            submitted.send((request_id, session_id)).unwrap();
+            Err("test receipt is unconfirmed".into())
+        })));
+        model.synchronize(session, LabPanel::Checkpoints);
+        model.checkpoints = Some(empty_checkpoint_page());
+        let save_row = panel_rows(&model, &presentation)
+            .into_iter()
+            .find(|row| row.action == Some(PanelAction::Workflow(LabAction::CreateCheckpoint)))
+            .expect("visible save control");
+        assert!(
+            !save_row.enabled,
+            "historical display must disable creation"
+        );
+
+        let mut app = App::new();
+        app.insert_non_send_resource(model)
+            .insert_resource(presentation)
+            .insert_resource(state)
+            .insert_resource(motion)
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<CameraRig>()
+            .add_systems(Update, update);
+        // Deliberately preserve an enabled row from the earlier live paint.
+        let button = app
+            .world_mut()
+            .spawn((
+                LabRow {
+                    index: 0,
+                    action: save_row.action,
+                    enabled: true,
+                },
+                Interaction::Pressed,
+            ))
+            .id();
+        app.update();
+        assert!(
+            app.world()
+                .non_send_resource::<LabWorkflows>()
+                .latest_checkpoint_save
+                .is_none()
+        );
+        assert!(requests.try_recv().is_err());
+
+        let mut presentation = app
+            .world_mut()
+            .remove_resource::<LabPresentation>()
+            .unwrap();
+        let mut state = app.world_mut().remove_resource::<SnapshotState>().unwrap();
+        let mut motion = app
+            .world_mut()
+            .remove_resource::<AgentMotionSettings>()
+            .unwrap();
+        presentation.return_live(&mut state, &mut motion);
+        // The model still remembers the previous owner. A missing current
+        // presentation identity must nevertheless refuse a stale enabled row.
+        presentation.source = None;
+        app.insert_resource(presentation)
+            .insert_resource(state)
+            .insert_resource(motion);
+        app.world_mut()
+            .entity_mut(button)
+            .insert(Interaction::Pressed);
+        app.update();
+        assert!(
+            app.world()
+                .non_send_resource::<LabWorkflows>()
+                .latest_checkpoint_save
+                .is_none()
+        );
+        assert!(requests.try_recv().is_err());
+
+        app.world_mut().resource_mut::<LabPresentation>().source = Some(session);
+        app.world_mut()
+            .entity_mut(button)
+            .insert(Interaction::Pressed);
+        app.update();
+        let (_, requested_session) = requests
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("live save submitted");
+        assert_eq!(requested_session, session);
+        assert!(
+            app.world()
+                .non_send_resource::<LabWorkflows>()
+                .latest_checkpoint_save
+                .is_some()
+        );
+        assert_eq!(
+            app.world()
+                .resource::<SnapshotState>()
+                .latest
+                .as_ref()
+                .unwrap()
+                .tick,
+            12
+        );
+    }
+
+    #[test]
+    fn scientific_epoch_progress_preserves_review_and_unconfirmed_save_identity() {
+        let mut presentation = LabPresentation {
+            panel: LabPanel::Checkpoints,
+            ..default()
+        };
+        let mut state = SnapshotState::default();
+        let mut motion = AgentMotionSettings { enabled: true };
+        presentation.receive_live(live_frame(9_999), &mut state, &mut motion);
+        let session = presentation.source.unwrap();
+        presentation.source_changed = false;
+        assert!(presentation.show_checkpoint(
+            "saved-1".into(),
+            &saved_snapshot(),
+            &mut state,
+            &mut motion
+        ));
+        let mut next_epoch = live_frame(10_000);
+        next_epoch.owner_source.as_mut().unwrap().1 = 1;
+        presentation.receive_live(next_epoch, &mut state, &mut motion);
+        assert!(
+            presentation.reviewing(),
+            "normal epoch progress must not leave saved review"
+        );
+        assert!(!presentation.source_changed);
+        assert_eq!(state.latest.as_ref().unwrap().tick, 0);
+        assert_eq!(presentation.live.as_ref().unwrap().tick, 10_000);
+
+        let (submitted, requests) = std::sync::mpsc::channel();
+        let mut model = consumer(Some(Arc::new(move |request| {
+            let LabWorkflowRequest::CreateCheckpoint {
+                request_id,
+                session_id,
+            } = request
+            else {
+                panic!("retry should be the only request");
+            };
+            submitted.send((request_id, session_id)).unwrap();
+            Err("test receipt is unconfirmed".into())
+        })));
+        model.synchronize(session, LabPanel::Checkpoints);
+        model.checkpoints = Some(empty_checkpoint_page());
+        model.latest_checkpoint_save = Some(LabCheckpointSave {
+            request_id: "save-before-epoch".into(),
+            session_id: session,
+            state: LabCheckpointSaveState::Retryable {
+                reason: "receipt timed out".into(),
+            },
+        });
+        presentation.return_live(&mut state, &mut motion);
+        let mut app = App::new();
+        app.insert_non_send_resource(model)
+            .insert_resource(presentation)
+            .insert_resource(state)
+            .insert_resource(motion)
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<CameraRig>()
+            .add_systems(Update, update);
+        app.world_mut().spawn((
+            LabRow {
+                index: 0,
+                action: Some(PanelAction::Workflow(LabAction::CreateCheckpoint)),
+                enabled: true,
+            },
+            Interaction::Pressed,
+        ));
+        app.update();
+        let (request_id, requested_session) = requests
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("same-source retry");
+        assert_eq!(request_id, "save-before-epoch");
+        assert_eq!(requested_session, session);
+        assert_eq!(
+            app.world()
+                .resource::<SnapshotState>()
+                .latest
+                .as_ref()
+                .unwrap()
+                .tick,
+            10_000
+        );
+    }
+
+    #[test]
+    fn checkpoint_save_rows_distinguish_retry_receipt_and_new_source() {
+        let session = HostSessionId::new(71);
+        let mut model = consumer(Some(Arc::new(|_| Err("unused".into()))));
+        model.synchronize(session, LabPanel::Checkpoints);
+        model.checkpoints = Some(empty_checkpoint_page());
+        model.latest_checkpoint_save = Some(LabCheckpointSave {
+            request_id: "request-1".into(),
+            session_id: session,
+            state: LabCheckpointSaveState::Retryable {
+                reason: "receipt timed out".into(),
+            },
+        });
+        let mut presentation = LabPresentation {
+            panel: LabPanel::Checkpoints,
+            source: Some(session),
+            ..default()
+        };
+        let rows = panel_rows(&model, &presentation);
+        assert!(
+            rows.iter()
+                .any(|row| row.enabled && row.text == "Retry previous checkpoint save")
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.text.contains("Save not confirmed"))
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.text.contains("same request identity"))
+        );
+
+        let next_session = HostSessionId::new(72);
+        presentation.source = Some(next_session);
+        model.synchronize(next_session, LabPanel::Checkpoints);
+        let rows = panel_rows(&model, &presentation);
+        assert!(
+            rows.iter()
+                .any(|row| row.enabled && row.text == "Save live checkpoint")
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.text.starts_with("Previous source save:"))
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.text == "Retry previous checkpoint save")
+        );
+
+        model.latest_checkpoint_save.as_mut().unwrap().state =
+            LabCheckpointSaveState::Saved(LabCheckpoint {
+                checkpoint_id: "saved-cut".into(),
+                tick: 37,
+                agent_count: 9,
+                byte_size: 640,
+                world_digest: "a".repeat(64),
+            });
+        let rows = panel_rows(&model, &presentation);
+        assert!(
+            rows.iter().any(
+                |row| row.text == "Saved checkpoint saved-cut | tick 37 | 9 agents | 640 bytes"
+            )
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.text == format!("Saved world digest: {}", "a".repeat(64)))
+        );
+        assert!(rows.len() <= MAX_PANEL_ROWS);
+
+        presentation.source = Some(session);
+        model.synchronize(session, LabPanel::Checkpoints);
+        model.selected_checkpoint = Some("saved-cut".into());
+        model.checkpoints = None;
+        let rows = panel_rows(&model, &presentation);
+        assert!(
+            rows.iter().any(|row| row.enabled
+                && row.action == Some(PanelAction::Workflow(LabAction::ReviewCheckpoint))),
+            "a verified saved cut must remain reviewable without a catalog page"
+        );
     }
 
     #[test]
@@ -1003,7 +1472,7 @@ mod tests {
             panel: LabPanel::Experiments,
             ..default()
         };
-        presentation.source = Some((HostSessionId::new(1), 0));
+        presentation.source = Some(HostSessionId::new(1));
         let mut keys = ButtonInput::<KeyCode>::default();
         keys.press(KeyCode::Escape);
         app.insert_resource(keys)
@@ -1039,6 +1508,9 @@ mod tests {
         assert_eq!(ui.rows.len(), MAX_PANEL_ROWS);
         assert!(ui.shown.iter().any(|row| row.text.contains("unavailable")));
         app.update();
-        assert_eq!(app.world_mut().query::<&LabRow>().iter(app.world()).count(), MAX_PANEL_ROWS);
+        assert_eq!(
+            app.world_mut().query::<&LabRow>().iter(app.world()).count(),
+            MAX_PANEL_ROWS
+        );
     }
 }

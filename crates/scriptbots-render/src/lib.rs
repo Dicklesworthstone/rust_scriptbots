@@ -52,9 +52,9 @@ use scriptbots_core::{
     MapGenerationError, PaintedConstraint, SamplePatternSpec, TileSpec, TilesetSpec,
     ToroidalSeamReport, check_toroidal_seams, compute_sample_hash, default_tileset_spec,
 };
+use scriptbots_runtime::lab_workflows::{LabWorkflowSubmit, LabWorkflows};
 use scriptbots_runtime::{FoodLayerSnapshot, RenderSnapshot, TerrainLayerSnapshot};
 use scriptbots_runtime::{HostPort, ScientificRevision, channel::ChannelHostPort};
-use scriptbots_runtime::lab_workflows::{LabWorkflowSubmit, LabWorkflows};
 use scriptbots_storage::{AnalyticsSnapshotProvider, MetricReading};
 use std::{
     cmp::Ordering,

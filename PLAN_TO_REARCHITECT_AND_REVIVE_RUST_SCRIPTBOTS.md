@@ -6272,15 +6272,18 @@ idempotent cancel/shutdown landed and were pushed at exact revision
 Share the native experiment/checkpoint protocol, bounded asynchronous consumer and
 stale-result guards between GPUI and Bevy. Bevy adds experiment catalog/detail,
 paired population comparisons, stop/resume and saved-checkpoint review with a
-separate latest-live presentation. Its modal captures input, historical pixels
-cannot issue live organism commands, and returning live restores the newest
-owner publication. Existing GPUI behavior and the application services remain
-the consumers and authorities of the same protocol.
+separate latest-live presentation. Both native frontends can save the live world
+through the existing owner service, preserve idempotency across uncertain
+retries and directly review the verified saved cut outside the current catalog
+page. Its modal captures input, historical pixels cannot issue live organism
+commands, and returning live restores the newest owner publication. Ordinary
+simulation epoch progression preserves review; an actual host-session change
+invalidates stale observations. Existing application services remain the
+authorities of the shared protocol.
 
 Retain the original bead and its remaining replay seek, first-divergence, export
-and full native/GPU acceptance. The execution environment disconnected before
-compiler/test execution; source review and authored regressions are not passing
-DSR, Clippy, native-window, performance or GPU qualification.
+and full native/GPU acceptance. Source review and authored regressions alone do
+not establish DSR, Clippy, native-window, performance or GPU qualification.
 
 **[Currently In Progress — bd-2z0.14.1.20, TurquoiseLake, 2026-09-08]**
 Connect same-tick look-development camera bookmarks and configured exposure to

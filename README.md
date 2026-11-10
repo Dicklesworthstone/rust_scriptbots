@@ -1087,8 +1087,14 @@ source generation, endpoint and available statistical results. Stop and resume
 buttons use the existing experiment runner; its returned status remains the
 authority. Create new batches through the experiment CLI or API.
 
-The saved-checkpoint pane lists retained scientific cuts and reconstructs the
-selected cut for inspection. **SAVED CHECKPOINT** and a return-live banner identify
+The saved-checkpoint pane can **save the current live world**, list retained
+scientific cuts and reconstruct a selected cut for inspection. A completed save
+reports its exact checkpoint ID, tick and world digest and selects that saved cut
+for review, even when it is outside the current catalog page. Saving uses the
+existing owner service without advancing the simulation. If the result is
+uncertain, **Retry previous checkpoint save** retains the original request identity; a retry
+does not silently request a second cut. Return to live before starting a save
+from a historical view. **SAVED CHECKPOINT** and a return-live banner identify
 historical presentation while the independent live owner continues running.
 Live organism picking and simulation commands are disabled during review. Click
 the banner, choose **Return live**, or press Escape with the panel closed to
@@ -1101,12 +1107,11 @@ verification run outside the render loop. Bevy retains at most one saved
 presentation and one newest live publication, and reuses a bounded pool of UI
 rows.
 
-This source increment covers experiment inspection/comparison and checkpoint
-review under `bd-2z0.7.6.1`. Replay seeking, first-divergence display and artifact
-export remain separate unfinished parts of that bead. Compilation, strict Clippy,
-the authored regressions and native GPU interaction checks were not completed in
-this session because the execution environment disconnected; no acceptance
-closure is claimed.
+This increment covers experiment inspection/comparison and checkpoint saving and
+review under `bd-2z0.7.6.1`. Replay seeking, first-divergence display, artifact
+export and full native/GPU acceptance remain unfinished parts of that bead.
+Normal simulation epoch progression preserves a saved view; a change of host
+session invalidates stale observations and results.
 
 ### Bevy shared creature appearance
 
