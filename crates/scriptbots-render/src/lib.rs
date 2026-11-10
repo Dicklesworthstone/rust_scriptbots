@@ -54,6 +54,7 @@ use scriptbots_core::{
 };
 use scriptbots_runtime::{FoodLayerSnapshot, RenderSnapshot, TerrainLayerSnapshot};
 use scriptbots_runtime::{HostPort, ScientificRevision, channel::ChannelHostPort};
+use scriptbots_runtime::lab_workflows::{LabWorkflowSubmit, LabWorkflows};
 use scriptbots_storage::{AnalyticsSnapshotProvider, MetricReading};
 use std::{
     cmp::Ordering,
@@ -2670,7 +2671,7 @@ struct GuiSession {
     selection_submission: Arc<Mutex<()>>,
     timeline_submit: Option<TimelineReviewSubmit>,
     timeline_cancelled: Arc<AtomicBool>,
-    lab_submit: Option<lab_workflows::LabWorkflowSubmit>,
+    lab_submit: Option<LabWorkflowSubmit>,
 }
 
 impl GuiSession {
@@ -2858,7 +2859,7 @@ pub fn run_demo(
     command_submit: Arc<dyn Fn(ControlCommand) -> Option<String> + Send + Sync + 'static>,
     map_apply_submit: MapApplySubmit,
     timeline_submit: TimelineReviewSubmit,
-    lab_submit: lab_workflows::LabWorkflowSubmit,
+    lab_submit: LabWorkflowSubmit,
     health_probe: GuiHealthProbe,
 ) -> Result<(), GuiRunError> {
     if let Ok(Some(snapshot)) = host.clone().snapshot_after(None)
@@ -4658,7 +4659,7 @@ pub struct SimulationView {
     timeline_submit: Option<TimelineReviewSubmit>,
     timeline_job: Option<TimelineReviewJob>,
     timeline_cancelled: Arc<AtomicBool>,
-    lab_workflows: lab_workflows::LabWorkflows,
+    lab_workflows: LabWorkflows,
     perf: PerfStats,
     last_perf: PerfSnapshot,
     /// When set, `render` must NOT overwrite `last_perf` (bd-c7pg).
@@ -4805,7 +4806,7 @@ impl SimulationView {
             timeline_submit: None,
             timeline_job: None,
             timeline_cancelled: Arc::new(AtomicBool::new(false)),
-            lab_workflows: lab_workflows::LabWorkflows::default(),
+            lab_workflows: LabWorkflows::default(),
             perf: PerfStats::new(240),
             last_perf: PerfSnapshot::default(),
             forced_perf: None,

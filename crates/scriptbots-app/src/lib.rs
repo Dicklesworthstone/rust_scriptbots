@@ -4108,14 +4108,14 @@ pub mod renderer {
         })
     }
 
-    /// Project existing application services into the optional GPUI Lab. All I/O,
-    /// verification and statistics execute on the renderer's single Lab worker.
-    #[cfg(any(feature = "gui", test))]
+    /// Project application services into either native Lab frontend. All I/O,
+    /// verification and statistics execute on the shared bounded Lab worker.
+    #[cfg(any(feature = "gui", feature = "bevy_render", test))]
     #[must_use]
     pub fn lab_workflow_submit(
         control: crate::control::ControlHandle,
-    ) -> scriptbots_render::lab_workflows::LabWorkflowSubmit {
-        use scriptbots_render::lab_workflows::{
+    ) -> scriptbots_runtime::lab_workflows::LabWorkflowSubmit {
+        use scriptbots_runtime::lab_workflows::{
             LAB_PAGE_SIZE, LabCheckpoint, LabCheckpointPage, LabComparison,
             LabExperimentPage, LabWorkflowRequest, LabWorkflowResponse,
         };
@@ -4125,7 +4125,7 @@ pub mod renderer {
                     .list_experiments(Some(LAB_PAGE_SIZE), cursor.as_deref())
                     .map(|page| LabWorkflowResponse::Experiments(LabExperimentPage {
                         items: page.items.into_iter().map(|row| {
-                            scriptbots_render::lab_workflows::LabExperimentSummary {
+                            scriptbots_runtime::lab_workflows::LabExperimentSummary {
                                 experiment_id: row.experiment_id,
                                 status: row.status,
                                 total_runs: row.total_runs,
@@ -4194,11 +4194,11 @@ pub mod renderer {
         })
     }
 
-    #[cfg(any(feature = "gui", test))]
+    #[cfg(any(feature = "gui", feature = "bevy_render", test))]
     fn project_lab_experiment(
         batch: crate::control::ExperimentBatchStatusDto,
-    ) -> Result<scriptbots_render::lab_workflows::LabExperiment, crate::control::ControlError> {
-        use scriptbots_render::lab_workflows::{
+    ) -> Result<scriptbots_runtime::lab_workflows::LabExperiment, crate::control::ControlError> {
+        use scriptbots_runtime::lab_workflows::{
             LAB_MAX_VARIANTS, LabExperiment, LabExperimentSummary, LabVariantProgress,
         };
         if batch.runs.len() > 4096 {
@@ -4267,9 +4267,26 @@ pub mod renderer {
             TimelineReviewRequest, TimelineReviewResponse, render_png_offscreen,
         };
 
+        fn finish_native_lab_request(
+            model: &mut scriptbots_runtime::lab_workflows::LabWorkflows,
+        ) -> Option<(String, Arc<scriptbots_runtime::RenderSnapshot>)> {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while model.is_busy() {
+                if let Some(frame) = model.poll() {
+                    return Some(frame);
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "native Lab worker timed out"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            None
+        }
+
         #[test]
-        fn gui_lab_provider_uses_verified_experiment_bundles_and_saved_checkpoint_cuts() {
-            use scriptbots_render::lab_workflows::{LabWorkflowRequest as Request, LabWorkflowResponse as Response};
+        fn native_lab_provider_uses_verified_experiment_bundles_and_saved_checkpoint_cuts() {
+            use scriptbots_runtime::lab_workflows::{LabWorkflowRequest as Request, LabWorkflowResponse as Response};
             let root = tempfile::tempdir().unwrap();
             let world = scriptbots_core::WorldState::new(ScriptBotsConfig {
                 rng_seed: Some(42), world_width: 120, world_height: 120, food_cell_size: 20,
@@ -4335,6 +4352,26 @@ pub mod renderer {
                 }
                 _ => panic!("wrong checkpoint review response"),
             }
+            // Both native frontends use the same consumer. Exercise the real
+            // application worker boundary as well as the individual projections.
+            use scriptbots_runtime::lab_workflows::{LabAction, LabPanel, LabWorkflows};
+            let mut model = LabWorkflows::default();
+            model.submit = Some(Arc::clone(&provider));
+            model.synchronize(
+                host.port.snapshot_hub().latest().session_id,
+                LabPanel::Checkpoints,
+            );
+            model.dispatch(LabAction::Refresh);
+            assert!(finish_native_lab_request(&mut model).is_none());
+            assert_eq!(model.checkpoints.as_ref().unwrap().items.len(), 1);
+            model.dispatch(LabAction::SelectCheckpoint(checkpoint.checkpoint_id.clone()));
+            model.dispatch(LabAction::ReviewCheckpoint);
+            let (reviewed_id, reviewed_frame) =
+                finish_native_lab_request(&mut model).expect("saved frame");
+            assert_eq!(reviewed_id, checkpoint.checkpoint_id);
+            assert_eq!(reviewed_frame.world.tick, 0);
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+
             let artifact = handle.get_artifact(&checkpoint.checkpoint_id).unwrap();
             let path = root.path().join(artifact.relative_path);
             std::fs::copy(&path, path.with_extension("preserved-original")).unwrap();
