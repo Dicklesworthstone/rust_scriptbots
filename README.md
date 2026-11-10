@@ -1911,6 +1911,37 @@ reports `cancelled`; its unfinished run records retain `running`, with actual
 progress in validated owner/journal cuts for resume. A batch that finishes before
 the request takes effect still reports `completed`.
 
+Read per-run checkpoint progress through `GET /api/v1/experiments/{id}`, MCP
+`experiment_status`, or `control_cli experiment status ID`. Each run includes
+`target_ticks`, the validated plan's requested horizon, and a separate typed
+`checkpoint_progress`:
+
+- `state: "observed"` supplies the saved `tick`, a `checkpoint_digest` containing
+  the BLAKE3 of the complete encoded checkpoint, and its observation `source`.
+  `source: "published"` means the runner successfully wrote, synced and published
+  that cut. `source: "recovered"` means the runner read an existing committed cut,
+  validated its plan/run/build/family identities, and restored its world, owner
+  and journal without advancing science.
+- `state: "unavailable"` identifies not-started work, a pending publication or
+  recovery, or a missing committed checkpoint. It does not imply tick zero.
+- `state: "refused"` distinguishes invalid or unreadable checkpoints and
+  conflicting observations. Explicit resume retries repaired cuts through the
+  existing validation path.
+
+`total_ticks` remains terminal status evidence and stays zero for pending and
+running records, including cancelled unfinished runs. For example, a running
+record can have `total_ticks: 0`, `target_ticks: 1000`, and an observed checkpoint
+at tick 317. The terminal Experiments screen displays this as **Saved/Target**;
+an unavailable observation stays unavailable instead of becoming a zero estimate.
+
+Active status polls read a bounded latest-value cache. A stopped detail request
+recovers at most one cold checkpoint, with at most one recovery in flight per
+runner; repeat detail requests to observe additional retained cuts. Summary
+listings perform no checkpoint recovery. These bounds do not impose a filesystem
+deadline. An observation describes the exact previously seen cut, not continuous
+integrity verification of its current file; downloads and resume retain their
+own validation. Progress reads neither advance science nor rewrite saved status.
+
 Experiment create and resume share one execution budget across REST, MCP and
 cloned control handles. Each worker reserves the smaller of its concurrency and
 unfinished-run count, and keeps those slots through preparation and artifact

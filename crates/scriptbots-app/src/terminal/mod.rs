@@ -1684,8 +1684,12 @@ fn experiment_arms_for_view(
             variant_id: run.variant_id,
             brain_family: run.brain_family,
             seed: run.seed,
-            current_tick: (run.state == "completed").then_some(run.total_ticks),
-            target_ticks: run.total_ticks,
+            current_tick: if run.state == "completed" {
+                Some(run.total_ticks)
+            } else {
+                run.checkpoint_progress.observed_tick()
+            },
+            target_ticks: run.target_ticks,
             mean_fitness: None,
             uncertainty_ci_95: None,
             digest: run.final_digest.unwrap_or_else(|| "unavailable".into()),
@@ -18980,7 +18984,98 @@ for case in ('panic', 'subscription', 'renderer'):
     }
 
     #[test]
+    fn experiment_projection_uses_sealed_progress_without_inventing_terminal_ticks() {
+        use std::collections::BTreeMap;
+
+        use crate::experiment_runner::{
+            CheckpointProgressRefusal, CheckpointProgressSource, CheckpointProgressUnavailable,
+            ExperimentCheckpointProgress,
+        };
+        let mut runs = Vec::new();
+        for (id, state, total_ticks, checkpoint_progress) in [
+            (
+                "active",
+                "running",
+                0,
+                ExperimentCheckpointProgress::Observed {
+                    tick: 17,
+                    checkpoint_digest: "observed-cut".into(),
+                    source: CheckpointProgressSource::Published,
+                },
+            ),
+            (
+                "stopped",
+                "running",
+                0,
+                ExperimentCheckpointProgress::Observed {
+                    tick: 9,
+                    checkpoint_digest: "recovered-cut".into(),
+                    source: CheckpointProgressSource::Recovered,
+                },
+            ),
+            (
+                "pending",
+                "pending",
+                0,
+                ExperimentCheckpointProgress::Unavailable {
+                    reason: CheckpointProgressUnavailable::NotStarted,
+                },
+            ),
+            (
+                "corrupt",
+                "running",
+                0,
+                ExperimentCheckpointProgress::Refused {
+                    reason: CheckpointProgressRefusal::InvalidCheckpoint,
+                },
+            ),
+            (
+                "done",
+                "completed",
+                100,
+                ExperimentCheckpointProgress::Unavailable {
+                    reason: CheckpointProgressUnavailable::RecoveryPending,
+                },
+            ),
+        ] {
+            runs.push(crate::control::ExperimentRunRecordDto {
+                run_id: id.into(),
+                variant_id: id.into(),
+                brain_family: "mlp.baseline".into(),
+                seed: 7,
+                state: state.into(),
+                total_ticks,
+                target_ticks: 100,
+                checkpoint_progress,
+                final_digest: None,
+                bundle_path: None,
+                error_reason: None,
+            });
+        }
+        let arms = experiment_arms_for_view(runs);
+        let actual = arms
+            .iter()
+            .map(|arm| (arm.variant_id.as_str(), arm.current_tick))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            actual,
+            BTreeMap::from([
+                ("active", Some(17)),
+                ("stopped", Some(9)),
+                ("pending", None),
+                ("corrupt", None),
+                ("done", Some(100)),
+            ])
+        );
+        assert!(arms.iter().all(|arm| arm.target_ticks == 100));
+    }
+
+    #[test]
     fn experiment_projection_keeps_distinct_variants_when_seed_rows_exceed_the_view_bound() {
+        use crate::experiment_runner::{
+            CheckpointProgressUnavailable, ExperimentCheckpointProgress,
+        };
+
         for (variants, seeds) in [(2, 128), (64, 2)] {
             let runs = (0..variants)
                 .flat_map(|variant| {
@@ -18993,6 +19088,10 @@ for case in ('panic', 'subscription', 'renderer'):
                             seed,
                             state: "completed".into(),
                             total_ticks: 2,
+                            target_ticks: 2,
+                            checkpoint_progress: ExperimentCheckpointProgress::Unavailable {
+                                reason: CheckpointProgressUnavailable::NotStarted,
+                            },
                             final_digest: Some(format!("fixture-digest-{variant}-{seed}")),
                             bundle_path: None,
                             error_reason: None,

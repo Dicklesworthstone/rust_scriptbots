@@ -620,7 +620,13 @@ pub struct ExperimentRunRecordDto {
     pub brain_family: String,
     pub seed: u64,
     pub state: String,
+    /// Terminal recorded transitions; remains zero for pending and running runs.
     pub total_ticks: u64,
+    /// Requested horizon from the validated experiment plan.
+    pub target_ticks: u64,
+    /// Last observed sealed cut, independently of terminal completion/status generation.
+    #[schema(inline)]
+    pub checkpoint_progress: crate::experiment_runner::ExperimentCheckpointProgress,
     pub final_digest: Option<String>,
     pub bundle_path: Option<String>,
     pub error_reason: Option<String>,
@@ -1241,7 +1247,8 @@ impl ExperimentDefinitionV1 {
 
 /// A REST/MCP-created matched-seed batch executing on a background runner thread.
 ///
-/// The runner's atomically written status file is the only source of run
+/// The runner's atomically written status file is the source of terminal run
+/// evidence. Separate source-bound observations expose its sealed checkpoint
 /// progress; this job adds process-local execution state and the last status
 /// generation whose completed artifacts were verified and published.
 struct ExperimentJob {
@@ -1353,7 +1360,10 @@ impl ExperimentJob {
         }
     }
 
-    fn status_dto(&self) -> Result<ExperimentBatchStatusDto, ControlError> {
+    fn status_dto(
+        &self,
+        recover_checkpoint: bool,
+    ) -> Result<ExperimentBatchStatusDto, ControlError> {
         use crate::experiment_runner::RunState;
         use std::sync::atomic::Ordering;
         let running = self.running.load(Ordering::Acquire);
@@ -1392,10 +1402,18 @@ impl ExperimentJob {
         } else {
             "stopped"
         };
+        let mut checkpoint_progress = self
+            .runner
+            .checkpoint_progress_snapshot(&self.state_file, &status, running || !recover_checkpoint)
+            .map_err(|error| experiment_catalog_error(&self.state_file, error))?;
         let runs = status
             .runs
             .into_iter()
             .map(|run| ExperimentRunRecordDto {
+                target_ticks: self.runner.max_ticks,
+                checkpoint_progress: checkpoint_progress
+                    .remove(&run.run_id)
+                    .expect("progress covers every validated run"),
                 run_id: run.run_id,
                 variant_id: run.variant_id,
                 brain_family: run.brain_family,
@@ -3000,7 +3018,7 @@ impl ControlHandle {
         let job = lock.get(experiment_id).ok_or_else(|| {
             ControlError::NotFound(format!("experiment '{experiment_id}' not found"))
         })?;
-        job.status_dto()
+        job.status_dto(true)
     }
 
     /// Compare one declared endpoint across two complete, distinct variant cohorts.
@@ -3204,7 +3222,7 @@ impl ControlHandle {
             ControlError::NotFound(format!("experiment '{experiment_id}' not found"))
         })?;
         job.cancel.store(true, std::sync::atomic::Ordering::Release);
-        job.status_dto()
+        job.status_dto(true)
     }
 
     /// Resume a stopped experiment with pending or checkpointed unfinished runs.
@@ -3221,7 +3239,7 @@ impl ControlHandle {
         let job = lock.get_mut(experiment_id).ok_or_else(|| {
             ControlError::NotFound(format!("experiment '{experiment_id}' not found"))
         })?;
-        let current = job.status_dto()?;
+        let current = job.status_dto(false)?;
         match current.status.as_str() {
             "running" | "pending" => {
                 return Err(ControlError::Conflict(format!(
@@ -3266,7 +3284,7 @@ impl ControlHandle {
             *error = None;
         }
         job.start(std::sync::Arc::clone(&self.data_services), reservation);
-        job.status_dto()
+        job.status_dto(true)
     }
 
     /// List experiments with bounded pagination.
@@ -3296,7 +3314,9 @@ impl ControlHandle {
             .skip(offset)
             .take(limit)
             .map(|job| {
-                job.status_dto().map(|e| ExperimentSummaryDto {
+                // The listing omits per-run progress. Do not decode one large
+                // cold checkpoint for every listed experiment only to discard it.
+                job.status_dto(false).map(|e| ExperimentSummaryDto {
                     experiment_id: e.experiment_id,
                     status: e.status,
                     total_runs: e.total_runs,
@@ -6438,6 +6458,31 @@ pub(crate) mod tests {
                     .iter()
                     .all(|run| run.state == "running" && run.total_ticks == 0)
             );
+            for run in &stopped.runs {
+                assert_eq!(run.target_ticks, 10_000);
+                let crate::experiment_runner::ExperimentCheckpointProgress::Observed {
+                    tick,
+                    checkpoint_digest,
+                    source,
+                } = &run.checkpoint_progress
+                else {
+                    panic!("cancelled owner lost its published progress: {run:?}");
+                };
+                assert!(*tick > 0 && *tick < run.target_ticks);
+                assert_eq!(
+                    *source,
+                    crate::experiment_runner::CheckpointProgressSource::Published
+                );
+                let checkpoint = directory.join(format!("{}.checkpoint", run.run_id));
+                assert_eq!(
+                    *checkpoint_digest,
+                    compute_blake3(&fs::read(checkpoint).unwrap())
+                );
+                let encoded = serde_json::to_value(run).unwrap();
+                assert_eq!(encoded["total_ticks"], 0);
+                assert_eq!(encoded["checkpoint_progress"]["state"], "observed");
+                assert_eq!(encoded["checkpoint_progress"]["tick"], *tick);
+            }
             let capacity = retained
                 .list_experiments(None, None)
                 .unwrap()
@@ -6956,7 +7001,7 @@ pub(crate) mod tests {
             let jobs = services.experiments.lock().unwrap();
             assert_eq!(jobs.len(), 1);
             let job = jobs.get("saved").unwrap();
-            let status = job.status_dto().unwrap();
+            let status = job.status_dto(true).unwrap();
             assert_eq!(status.status, "stopped");
             assert_eq!(status.created_at_utc, "123456");
             assert_eq!(status.total_runs, 1);
@@ -7035,7 +7080,10 @@ pub(crate) mod tests {
             services.recover_experiment("z-healthy").unwrap();
             let jobs = services.experiments.lock().unwrap();
             assert!(!jobs.contains_key("a-corrupt"));
-            assert_eq!(jobs["z-healthy"].status_dto().unwrap().status, "stopped");
+            assert_eq!(
+                jobs["z-healthy"].status_dto(true).unwrap().status,
+                "stopped"
+            );
             assert_eq!(fs::read(&path).unwrap(), bytes);
             assert!(healthy.is_file());
             eprintln!(

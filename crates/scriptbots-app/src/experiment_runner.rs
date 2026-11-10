@@ -28,6 +28,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tracing::{error, info};
@@ -219,6 +220,81 @@ pub struct RunRecord {
     pub final_digest: Option<String>,
     pub bundle_path: Option<String>,
     pub error_reason: Option<String>,
+}
+
+/// How the last complete checkpoint was actually observed. Neither observation
+/// continuously re-verifies the current file or certifies the completed run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointProgressSource {
+    /// The runner successfully wrote, synced and published this exact cut.
+    Published,
+    /// An existing committed cut was read, validated and restored to an owner.
+    Recovered,
+}
+
+/// An absent progress observation is distinct from an observed tick zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointProgressUnavailable {
+    NotStarted,
+    AwaitingPublication,
+    RecoveryPending,
+    NoCommittedCheckpoint,
+}
+
+/// Typed refusal of a checkpoint progress observation, without inventing ticks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointProgressRefusal {
+    InvalidCheckpoint,
+    UnreadableCheckpoint,
+    ConflictingObservation,
+}
+
+/// Last successfully observed checkpoint for the enclosing source-bound plan/run.
+///
+/// This is observational progress, separate from terminal `RunRecord::total_ticks`.
+/// Its digest identifies the complete encoded checkpoint bytes. Cached observations
+/// describe that exact historical cut; downloads and resume still perform their own
+/// complete validation. A stopped reader recovers at most one cut per status read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ExperimentCheckpointProgress {
+    Observed {
+        tick: u64,
+        checkpoint_digest: String,
+        #[schema(inline)]
+        source: CheckpointProgressSource,
+    },
+    Unavailable {
+        #[schema(inline)]
+        reason: CheckpointProgressUnavailable,
+    },
+    Refused {
+        #[schema(inline)]
+        reason: CheckpointProgressRefusal,
+    },
+}
+
+impl ExperimentCheckpointProgress {
+    #[must_use]
+    pub const fn observed_tick(&self) -> Option<u64> {
+        match self {
+            Self::Observed { tick, .. } => Some(*tick),
+            Self::Unavailable { .. } | Self::Refused { .. } => None,
+        }
+    }
+}
+
+#[derive(Default)]
+struct CheckpointProgressCache {
+    plan_digest: String,
+    output_dir: PathBuf,
+    /// Exactly the admitted run IDs, bounded by `MAX_BATCH_RUNS`; no history.
+    runs: BTreeMap<String, Option<ExperimentCheckpointProgress>>,
+    /// Across concurrent status readers, at most one bounded recovery is active.
+    recovering_run: Option<String>,
 }
 
 /// Complete experiment batch status report supporting atomic checkpointing and resume.
@@ -1177,6 +1253,7 @@ pub struct MatchedSeedExperimentRunner {
     pub max_ticks: u64,
     pub max_concurrency: usize,
     pub output_dir: PathBuf,
+    checkpoint_progress: Mutex<CheckpointProgressCache>,
 }
 
 impl MatchedSeedExperimentRunner {
@@ -1195,7 +1272,254 @@ impl MatchedSeedExperimentRunner {
             max_ticks,
             max_concurrency,
             output_dir: output_dir.into(),
+            checkpoint_progress: Mutex::new(CheckpointProgressCache::default()),
         }
+    }
+
+    fn progress_cache(&self, plan: &ValidatedPlan) -> MutexGuard<'_, CheckpointProgressCache> {
+        let mut cache = self
+            .checkpoint_progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache.plan_digest != plan.digest || cache.output_dir != self.output_dir {
+            *cache = CheckpointProgressCache {
+                plan_digest: plan.digest.clone(),
+                output_dir: self.output_dir.clone(),
+                runs: plan
+                    .runs
+                    .iter()
+                    .map(|run| (run.run_id.clone(), None))
+                    .collect(),
+                recovering_run: None,
+            };
+        }
+        cache
+    }
+
+    fn prepare_progress_for_execution(&self, plan: &ValidatedPlan) {
+        let mut cache = self.progress_cache(plan);
+        // An explicit resume retries unavailable/refused observations. Preserve
+        // earlier observed cuts until the owner publishes a verified successor.
+        for progress in cache.runs.values_mut() {
+            if !matches!(
+                progress,
+                Some(ExperimentCheckpointProgress::Observed { .. })
+            ) {
+                *progress = None;
+            }
+        }
+    }
+
+    fn observe_checkpoint_progress(
+        &self,
+        plan_digest: &str,
+        run_id: &str,
+        tick: u64,
+        checkpoint_digest: String,
+        source: CheckpointProgressSource,
+    ) {
+        let mut cache = self
+            .checkpoint_progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache.plan_digest != plan_digest || cache.output_dir != self.output_dir {
+            return;
+        }
+        let Some(progress) = cache.runs.get_mut(run_id) else {
+            return;
+        };
+        if matches!(
+            progress,
+            Some(ExperimentCheckpointProgress::Refused {
+                reason: CheckpointProgressRefusal::ConflictingObservation,
+            })
+        ) {
+            // A contradictory same-tick observation cannot erase the previous
+            // high-water mark and then admit an older cut. Explicit resume must
+            // revalidate the committed owner before observations can restart.
+            return;
+        }
+        if let Some(ExperimentCheckpointProgress::Observed {
+            tick: previous,
+            checkpoint_digest: previous_digest,
+            ..
+        }) = progress
+        {
+            if tick < *previous {
+                return;
+            }
+            if tick == *previous {
+                if checkpoint_digest != *previous_digest {
+                    *progress = Some(ExperimentCheckpointProgress::Refused {
+                        reason: CheckpointProgressRefusal::ConflictingObservation,
+                    });
+                }
+                return;
+            }
+        }
+        *progress = Some(ExperimentCheckpointProgress::Observed {
+            tick,
+            checkpoint_digest,
+            source,
+        });
+    }
+
+    /// Observe bounded checkpoint progress without changing status or science.
+    /// Active polls only read the latest-value cache. Cold stopped jobs recover
+    /// one committed cut per call, with one recovery in flight across readers;
+    /// valid observations and typed refusals are cached until explicit resume.
+    pub(crate) fn checkpoint_progress_snapshot(
+        &self,
+        state_file: &Path,
+        status: &ExperimentBatchStatus,
+        running: bool,
+    ) -> Result<BTreeMap<String, ExperimentCheckpointProgress>, ExperimentRunnerError> {
+        let plan = self.validated_plan()?;
+        self.validate_status(state_file, status, &plan)?;
+        let recover = {
+            let mut cache = self.progress_cache(&plan);
+            let candidate = if !running && cache.recovering_run.is_none() {
+                // Suspended runs precede terminal ones so large completed
+                // cohorts cannot hide the remaining live work after restart.
+                [RunState::Running, RunState::Failed, RunState::Completed]
+                    .into_iter()
+                    .find_map(|state| {
+                        status
+                            .runs
+                            .iter()
+                            .find(|run| run.state == state && cache.runs[&run.run_id].is_none())
+                    })
+                    .cloned()
+            } else {
+                None
+            };
+            if let Some(run) = &candidate {
+                cache.recovering_run = Some(run.run_id.clone());
+                cache.runs.insert(
+                    run.run_id.clone(),
+                    Some(ExperimentCheckpointProgress::Unavailable {
+                        reason: CheckpointProgressUnavailable::RecoveryPending,
+                    }),
+                );
+            }
+            candidate
+        };
+        if let Some(run) = recover {
+            let path = self.run_checkpoint_path(&run.run_id);
+            let recovered = self.recover_checkpoint_progress(&path, &run, &plan);
+            let mut cache = self.progress_cache(&plan);
+            if cache.recovering_run.as_deref() == Some(run.run_id.as_str()) {
+                cache.recovering_run = None;
+                let entry = cache.runs.get_mut(&run.run_id).expect("admitted run");
+                // A runner may have started and published a newer observation
+                // while this read was in flight. Never replace that publication.
+                if matches!(
+                    entry,
+                    Some(ExperimentCheckpointProgress::Unavailable { .. }) | None
+                ) {
+                    *entry = Some(recovered);
+                }
+            }
+        }
+        let cache = self.progress_cache(&plan);
+        Ok(status
+            .runs
+            .iter()
+            .map(|run| {
+                let observation = if run.state == RunState::Pending {
+                    ExperimentCheckpointProgress::Unavailable {
+                        reason: CheckpointProgressUnavailable::NotStarted,
+                    }
+                } else {
+                    cache.runs[&run.run_id].clone().unwrap_or(
+                        ExperimentCheckpointProgress::Unavailable {
+                            reason: if running {
+                                CheckpointProgressUnavailable::AwaitingPublication
+                            } else {
+                                CheckpointProgressUnavailable::RecoveryPending
+                            },
+                        },
+                    )
+                };
+                (run.run_id.clone(), observation)
+            })
+            .collect())
+    }
+
+    fn recover_checkpoint_progress(
+        &self,
+        path: &Path,
+        run: &RunRecord,
+        plan: &ValidatedPlan,
+    ) -> ExperimentCheckpointProgress {
+        let read = || -> Result<Option<ExperimentCheckpointProgress>, ExperimentRunnerError> {
+            let Some(checkpoint) = read_optional_run_checkpoint(path)? else {
+                return Ok(None);
+            };
+            let (variant, family) = &plan.variants[&run.variant_id];
+            self.validate_run_checkpoint(
+                path,
+                &checkpoint,
+                variant,
+                run.seed,
+                &run.run_id,
+                &plan.digest,
+            )?;
+            // Framing and metadata are insufficient: verify the actual executable
+            // world/owner/journal cut without advancing a tick or promoting a tmp.
+            let owner = restore_run_owner(&checkpoint, *family, &run.run_id, path)?;
+            let tick = owner.world_tick().0;
+            if run.state == RunState::Completed && tick != run.total_ticks {
+                return Err(invalid_checkpoint(
+                    path,
+                    "completed status and cut ticks differ",
+                ));
+            }
+            Ok(Some(ExperimentCheckpointProgress::Observed {
+                tick,
+                checkpoint_digest: blake3::hash(&checkpoint.encode(path)?).to_hex().to_string(),
+                source: CheckpointProgressSource::Recovered,
+            }))
+        };
+        match read() {
+            Ok(Some(observation)) => observation,
+            Ok(None) => ExperimentCheckpointProgress::Unavailable {
+                reason: CheckpointProgressUnavailable::NoCommittedCheckpoint,
+            },
+            Err(error) => {
+                tracing::warn!(
+                    experiment_id = %self.experiment_id,
+                    run_id = %run.run_id,
+                    %error,
+                    "experiment checkpoint progress refused"
+                );
+                ExperimentCheckpointProgress::Refused {
+                    reason: if matches!(error, ExperimentRunnerError::Io { .. }) {
+                        CheckpointProgressRefusal::UnreadableCheckpoint
+                    } else {
+                        CheckpointProgressRefusal::InvalidCheckpoint
+                    },
+                }
+            }
+        }
+    }
+
+    fn publish_run_checkpoint(
+        &self,
+        path: &Path,
+        checkpoint: &RunCheckpointV1,
+        bytes: &[u8],
+    ) -> Result<String, ExperimentRunnerError> {
+        write_run_checkpoint(path, bytes)?;
+        let digest = blake3::hash(bytes).to_hex().to_string();
+        self.observe_checkpoint_progress(
+            &checkpoint.metadata.plan_digest,
+            &checkpoint.metadata.run_id,
+            checkpoint.owner.host_checkpoint().tick().0,
+            digest.clone(),
+            CheckpointProgressSource::Published,
+        );
+        Ok(digest)
     }
 
     /// Run a canonical CLI worker with a wall-clock bound and reap every exit path.
@@ -1606,6 +1930,7 @@ impl MatchedSeedExperimentRunner {
                 ),
             });
         }
+        self.prepare_progress_for_execution(&plan);
         self.prepare_run_checkpoint(
             planned_variant,
             *planned_family,
@@ -1661,6 +1986,7 @@ impl MatchedSeedExperimentRunner {
         let plan = self.validated_plan()?;
         let _lease = ExperimentStatusWriterLease::acquire(state_file)?;
         let mut status = self.load_or_create_status_locked(state_file, &plan)?;
+        self.prepare_progress_for_execution(&plan);
 
         let mut recovered = false;
         let mut recovery_error = None;
@@ -2542,7 +2868,8 @@ impl MatchedSeedExperimentRunner {
         }
         let checkpoint = self.initial_run_checkpoint(variant, family, seed, run_id, plan_digest)?;
         self.validate_run_checkpoint(&path, &checkpoint, variant, seed, run_id, plan_digest)?;
-        write_run_checkpoint(&path, &checkpoint.encode(&path)?)
+        self.publish_run_checkpoint(&path, &checkpoint, &checkpoint.encode(&path)?)
+            .map(|_| ())
     }
 
     fn initial_run_checkpoint(
@@ -2682,6 +3009,13 @@ impl MatchedSeedExperimentRunner {
             .to_hex()
             .to_string();
         let mut core = restore_run_owner(&checkpoint, family, run_id, &path)?;
+        self.observe_checkpoint_progress(
+            plan_digest,
+            run_id,
+            core.world_tick().0,
+            parent_digest.clone(),
+            CheckpointProgressSource::Recovered,
+        );
         let (_, client_namespace) = host_identifiers(run_id);
         let mut frontend = NullFrontend::new(core.local_port(), client_namespace);
         let mut next_nanos = 0_u64;
@@ -2728,8 +3062,7 @@ impl MatchedSeedExperimentRunner {
             )?;
             checkpoint.metadata.parent_digest = Some(parent_digest);
             let bytes = checkpoint.encode(&path)?;
-            write_run_checkpoint(&path, &bytes)?;
-            parent_digest = blake3::hash(&bytes).to_hex().to_string();
+            parent_digest = self.publish_run_checkpoint(&path, &checkpoint, &bytes)?;
         }
 
         let completed_ticks = core.world_tick().0;
@@ -4016,6 +4349,299 @@ pub(crate) fn insert_dotted_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn progress_runner(directory: &Path, seeds: Vec<u64>) -> MatchedSeedExperimentRunner {
+        MatchedSeedExperimentRunner::new(
+            "checkpoint-progress",
+            MatchedSeedCohort {
+                cohort_id: "cohort".into(),
+                seeds,
+            },
+            vec![ScenarioVariant {
+                variant_id: "mlp".into(),
+                brain_family: "mlp".into(),
+                config_overrides: BTreeMap::from([
+                    ("world_width".into(), serde_json::json!(40)),
+                    ("world_height".into(), serde_json::json!(40)),
+                    ("food_cell_size".into(), serde_json::json!(10)),
+                ]),
+                interventions: Vec::new(),
+            }],
+            3,
+            2,
+            directory.join("bundles"),
+        )
+    }
+
+    #[test]
+    fn checkpoint_progress_follows_successful_publication_not_attempted_science() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let runner = progress_runner(&directory, vec![7]);
+        let state_file = directory.join("status.json");
+        let mut status = runner.load_or_create_status(&state_file).unwrap();
+        let plan = runner.validated_plan().unwrap();
+        let record = &plan.runs[0];
+        let (variant, family) = &plan.variants[&record.variant_id];
+        let pending = runner
+            .checkpoint_progress_snapshot(&state_file, &status, true)
+            .unwrap();
+        assert_eq!(
+            pending[&record.run_id],
+            ExperimentCheckpointProgress::Unavailable {
+                reason: CheckpointProgressUnavailable::NotStarted,
+            }
+        );
+        runner.prepare_progress_for_execution(&plan);
+        runner
+            .prepare_run_checkpoint(variant, *family, record.seed, &record.run_id, &plan.digest)
+            .unwrap();
+        status.runs[0].state = RunState::Running;
+        runner.save_status(&state_file, &mut status).unwrap();
+        let status_bytes = fs::read(&state_file).unwrap();
+        let path = runner.run_checkpoint_path(&record.run_id);
+        let initial_bytes = fs::read(&path).unwrap();
+        let initial = runner
+            .checkpoint_progress_snapshot(&state_file, &status, true)
+            .unwrap();
+        assert_eq!(
+            initial[&record.run_id],
+            ExperimentCheckpointProgress::Observed {
+                tick: 0,
+                checkpoint_digest: blake3::hash(&initial_bytes).to_hex().to_string(),
+                source: CheckpointProgressSource::Published,
+            }
+        );
+
+        let mut checkpoint = RunCheckpointV1::decode(&initial_bytes, &path).unwrap();
+        let mut owner = restore_run_owner(&checkpoint, *family, &record.run_id, &path).unwrap();
+        let (_, namespace) = host_identifiers(&record.run_id);
+        let mut frontend = NullFrontend::new(owner.local_port(), namespace);
+        let command = frontend
+            .submit_envelope(CommandEnvelope::new(
+                CommandId::from_client_sequence(namespace, 1),
+                HostCommand::Step,
+            ))
+            .unwrap();
+        let mut now = 0;
+        drive_command_to_volatile_commit(
+            &record.run_id,
+            "progress test step",
+            &mut frontend,
+            &mut owner,
+            command.command_id(),
+            1,
+            0,
+            &mut now,
+        )
+        .unwrap();
+        seal_run_checkpoint(&record.run_id, &mut frontend, &mut owner, &mut now).unwrap();
+        checkpoint.owner = owner.capture_volatile_host_checkpoint_v1().unwrap();
+        checkpoint.metadata.parent_digest = Some(blake3::hash(&initial_bytes).to_hex().to_string());
+        let advanced_bytes = checkpoint.encode(&path).unwrap();
+        let temporary = status_temporary_path(&path).unwrap();
+        fs::write(&temporary, b"injected incomplete checkpoint write").unwrap();
+        assert!(
+            runner
+                .publish_run_checkpoint(&path, &checkpoint, &advanced_bytes)
+                .is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), initial_bytes);
+        assert_eq!(
+            runner
+                .checkpoint_progress_snapshot(&state_file, &status, true)
+                .unwrap(),
+            initial,
+            "an advanced owner and failed write cannot publish progress"
+        );
+        fs::rename(&temporary, path.with_extension("preserved-write-fault")).unwrap();
+        runner
+            .publish_run_checkpoint(&path, &checkpoint, &advanced_bytes)
+            .unwrap();
+        let observed = runner
+            .checkpoint_progress_snapshot(&state_file, &status, true)
+            .unwrap();
+        assert_eq!(
+            observed[&record.run_id],
+            ExperimentCheckpointProgress::Observed {
+                tick: 1,
+                checkpoint_digest: blake3::hash(&advanced_bytes).to_hex().to_string(),
+                source: CheckpointProgressSource::Published,
+            }
+        );
+        runner.observe_checkpoint_progress(
+            &plan.digest,
+            &record.run_id,
+            0,
+            blake3::hash(&initial_bytes).to_hex().to_string(),
+            CheckpointProgressSource::Recovered,
+        );
+        assert_eq!(
+            runner
+                .checkpoint_progress_snapshot(&state_file, &status, true)
+                .unwrap(),
+            observed
+        );
+        assert_eq!(fs::read(&state_file).unwrap(), status_bytes);
+        assert_eq!(status.runs[0].total_ticks, 0);
+        assert_eq!(status.runs[0].state, RunState::Running);
+        runner.observe_checkpoint_progress(
+            &plan.digest,
+            &record.run_id,
+            1,
+            blake3::hash(&initial_bytes).to_hex().to_string(),
+            CheckpointProgressSource::Recovered,
+        );
+        runner.observe_checkpoint_progress(
+            &plan.digest,
+            &record.run_id,
+            0,
+            blake3::hash(&initial_bytes).to_hex().to_string(),
+            CheckpointProgressSource::Recovered,
+        );
+        assert_eq!(
+            runner
+                .checkpoint_progress_snapshot(&state_file, &status, true)
+                .unwrap()[&record.run_id],
+            ExperimentCheckpointProgress::Refused {
+                reason: CheckpointProgressRefusal::ConflictingObservation,
+            },
+            "conflicting evidence cannot reset the monotonicity guard"
+        );
+    }
+
+    #[test]
+    fn checkpoint_progress_cold_recovery_is_bounded_read_only_and_rejects_foreign_cuts() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let runner = progress_runner(&directory, vec![7, 9]);
+        let state_file = directory.join("status.json");
+        let mut status = runner.load_or_create_status(&state_file).unwrap();
+        let plan = runner.validated_plan().unwrap();
+        for record in &mut status.runs {
+            let (variant, family) = &plan.variants[&record.variant_id];
+            runner
+                .prepare_run_checkpoint(variant, *family, record.seed, &record.run_id, &plan.digest)
+                .unwrap();
+            record.state = RunState::Running;
+        }
+        runner.save_status(&state_file, &mut status).unwrap();
+        let status_bytes = fs::read(&state_file).unwrap();
+        let paths = status
+            .runs
+            .iter()
+            .map(|run| runner.run_checkpoint_path(&run.run_id))
+            .collect::<Vec<_>>();
+        let cuts = paths
+            .iter()
+            .map(|path| fs::read(path).unwrap())
+            .collect::<Vec<_>>();
+        let names = fs::read_dir(&runner.output_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<BTreeSet<_>>();
+        let cold = progress_runner(&directory, vec![7, 9]);
+        let active = cold
+            .checkpoint_progress_snapshot(&state_file, &status, true)
+            .unwrap();
+        assert!(
+            active.values().all(|progress| matches!(
+                progress,
+                ExperimentCheckpointProgress::Unavailable {
+                    reason: CheckpointProgressUnavailable::AwaitingPublication,
+                }
+            )),
+            "active polling must not decode existing files"
+        );
+        let first = cold
+            .checkpoint_progress_snapshot(&state_file, &status, false)
+            .unwrap();
+        assert_eq!(
+            first
+                .values()
+                .filter(|progress| progress.observed_tick().is_some())
+                .count(),
+            1
+        );
+        let second = cold
+            .checkpoint_progress_snapshot(&state_file, &status, false)
+            .unwrap();
+        for (index, record) in status.runs.iter().enumerate() {
+            assert_eq!(
+                second[&record.run_id],
+                ExperimentCheckpointProgress::Observed {
+                    tick: 0,
+                    checkpoint_digest: blake3::hash(&cuts[index]).to_hex().to_string(),
+                    source: CheckpointProgressSource::Recovered,
+                }
+            );
+        }
+        assert_eq!(fs::read(&state_file).unwrap(), status_bytes);
+        assert_eq!(
+            names,
+            fs::read_dir(&runner.output_dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect()
+        );
+        for (path, bytes) in paths.iter().zip(&cuts) {
+            assert_eq!(fs::read(path).unwrap(), *bytes);
+        }
+
+        // Cached progress is explicitly an observation of a past cut, not a
+        // substitute for current readback or resume validation.
+        fs::copy(&paths[0], paths[0].with_extension("preserved-original")).unwrap();
+        fs::write(&paths[0], b"corrupt checkpoint").unwrap();
+        assert_eq!(
+            cold.checkpoint_progress_snapshot(&state_file, &status, false)
+                .unwrap(),
+            second
+        );
+        let refused = progress_runner(&directory, vec![7, 9]);
+        let corrupt = refused
+            .checkpoint_progress_snapshot(&state_file, &status, false)
+            .unwrap();
+        assert_eq!(
+            corrupt[&status.runs[0].run_id],
+            ExperimentCheckpointProgress::Refused {
+                reason: CheckpointProgressRefusal::InvalidCheckpoint,
+            }
+        );
+        fs::copy(&paths[1], paths[1].with_extension("preserved-original")).unwrap();
+        fs::write(&paths[1], &cuts[0]).unwrap();
+        let foreign = refused
+            .checkpoint_progress_snapshot(&state_file, &status, false)
+            .unwrap();
+        assert!(
+            foreign.values().all(|progress| matches!(
+                progress,
+                ExperimentCheckpointProgress::Refused {
+                    reason: CheckpointProgressRefusal::InvalidCheckpoint,
+                }
+            )),
+            "a byte-valid cut for another seed must refuse"
+        );
+        for (path, bytes) in paths.iter().zip(&cuts) {
+            fs::write(path, bytes).unwrap();
+        }
+        assert_eq!(
+            refused
+                .checkpoint_progress_snapshot(&state_file, &status, false)
+                .unwrap(),
+            foreign
+        );
+        let completed = refused.execute_batch(&state_file).unwrap();
+        assert_eq!(
+            completed.completed_runs, 2,
+            "explicit resume retries repaired cuts"
+        );
+        let resumed = refused
+            .checkpoint_progress_snapshot(&state_file, &completed, false)
+            .unwrap();
+        assert!(
+            resumed
+                .values()
+                .all(|progress| progress.observed_tick() == Some(3))
+        );
+    }
 
     #[test]
     fn endpoint_summary_reports_observed_state_and_preserves_unavailable_empty_statistics() {
@@ -7004,6 +7630,28 @@ mod tests {
                                 .is_some_and(|cut| cut.owner.host_checkpoint().tick().0 > 0)
                         });
                         if all_started {
+                            let status = runner.status_snapshot(&state_file).unwrap();
+                            let progress = runner
+                                .checkpoint_progress_snapshot(&state_file, &status, true)
+                                .unwrap();
+                            if !active_ids
+                                .iter()
+                                .all(|id| progress[id].observed_tick().is_some_and(|tick| tick > 0))
+                            {
+                                assert!(
+                                    Instant::now() < deadline,
+                                    "published progress never appeared"
+                                );
+                                std::thread::yield_now();
+                                continue;
+                            }
+                            assert!(
+                                status
+                                    .runs
+                                    .iter()
+                                    .filter(|run| run.state == RunState::Running)
+                                    .all(|run| run.total_ticks == 0)
+                            );
                             cancel.store(true, Ordering::Release);
                             break;
                         }
@@ -7023,6 +7671,9 @@ mod tests {
                     .count();
                 assert_eq!(active_count, concurrency);
                 observed_cells.insert((stopped.runs[1].brain_family.clone(), active_count));
+                let progress = runner
+                    .checkpoint_progress_snapshot(&state_file, &stopped, false)
+                    .unwrap();
                 let mut saved_cuts = Vec::new();
                 for (index, record) in stopped.runs.iter().enumerate().skip(1) {
                     if index <= concurrency {
@@ -7036,6 +7687,14 @@ mod tests {
                         let cut = RunCheckpointV1::decode(&bytes, &path).unwrap();
                         let tick = cut.owner.host_checkpoint().tick().0;
                         assert!(tick > 0 && tick < runner.max_ticks, "stopped tick {tick}");
+                        assert_eq!(
+                            progress[&record.run_id],
+                            ExperimentCheckpointProgress::Observed {
+                                tick,
+                                checkpoint_digest: blake3::hash(&bytes).to_hex().to_string(),
+                                source: CheckpointProgressSource::Published,
+                            }
+                        );
                         let restored = restore_run_owner(
                             &cut,
                             ResolvedBrainFamily::resolve(&runner.variants[0]).unwrap(),
@@ -7080,6 +7739,13 @@ mod tests {
                 assert!(resumed.is_finished());
                 assert_eq!(resumed.failed_runs, 0);
                 assert_eq!(resumed.completed_runs, resumed.total_runs);
+                assert!(
+                    runner
+                        .checkpoint_progress_snapshot(&state_file, &resumed, false)
+                        .unwrap()
+                        .values()
+                        .all(|progress| progress.observed_tick() == Some(runner.max_ticks))
+                );
                 assert_eq!(
                     fs::read(completed_bundle.join("bundle_manifest.json")).unwrap(),
                     original_manifest

@@ -22,11 +22,33 @@ rustfmt was used to format edited source; no DSR format, compiler, Clippy or tes
 gate is claimed. Original whole-run, recovery and scenario-budget acceptance
 remains required.
 
-**Experiment checkpoint progress (2026-11-09):** [Currently In Progress — Codex]
+**Experiment checkpoint progress (2026-11-09):**
+[Source implemented and independently reviewed — Codex; executable qualification open]
 
-Continue `bd-2z0.5.11` and `bd-2z0.12.2` with separately observed, successfully
-published checkpoint progress while retaining terminal status and completion
-evidence. Original recovery, resource and native acceptance remains required.
+Continue `bd-2z0.5.11` and `bd-2z0.12.2` with plan-derived `target_ticks` and typed
+`checkpoint_progress` across REST, MCP, the control CLI and the terminal's
+Saved/Target display. Terminal `total_ticks` and completion evidence retain their
+existing meaning. Published observations follow successful checkpoint write,
+sync, rename and directory sync; recovered observations validate the complete
+committed world/owner/journal cut. Both identify the exact encoded bytes by
+BLAKE3. Unavailable and refused states never invent progress.
+
+The latest-value cache is bounded by admitted run IDs and bound to the source-aware
+plan and output root. Active polls read the cache. Stopped detail requests recover
+at most one cold cut, with one recovery in flight per runner; summary listings
+recover none. Observations describe historical cuts, not continuous file-integrity
+verification or a filesystem deadline. Explicit resume retries cached refusals
+through the existing checkpoint guards; status reads do not advance science or
+rewrite saved status.
+
+Authored regressions cover real-owner publication and write failure, bounded
+read-only recovery, corrupt and foreign cuts, conflicting/older observations,
+cancel/resume checksums, control DTOs and terminal projection. Independent source
+review resolved a missing test import and a conflict-then-older cache edge.
+Executable qualification remains unavailable: genuine DSR refuses native host
+admission because available writable filesystems have less than its required
+20 GiB free. No passing compiler, Clippy or test result is claimed. Original full
+recovery, resource, fault, process and native acceptance remains open.
 
 **Browser laboratory controls and replicated branch studies (2026-11-09):**
 [Source implemented — Codex; full application and packaged-browser qualification open]

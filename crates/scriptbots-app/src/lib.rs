@@ -4349,6 +4349,9 @@ pub mod renderer {
             let runs = (0..64).flat_map(|variant| (0..64).map(move |seed| crate::control::ExperimentRunRecordDto {
                 run_id: format!("arm-{variant}-{seed}"), variant_id: format!("arm-{variant:02}"), brain_family: "mlp".into(), seed,
                 state: if seed == 0 { "completed" } else { "pending" }.into(), total_ticks: if seed == 0 { 2 } else { 0 },
+                target_ticks: 2, checkpoint_progress: crate::experiment_runner::ExperimentCheckpointProgress::Unavailable {
+                    reason: crate::experiment_runner::CheckpointProgressUnavailable::NotStarted,
+                },
                 final_digest: None, bundle_path: None, error_reason: None,
             })).collect();
             let batch = project_lab_experiment(crate::control::ExperimentBatchStatusDto {
