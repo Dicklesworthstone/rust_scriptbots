@@ -5,7 +5,13 @@ edition = "2024"
 
 [dependencies]
 anyhow = { workspace = true }
-bevy = { version = "0.17", features = ["jpeg"] }
+# bevy 0.17.3's default features, verbatim, with zstd_rust swapped for zstd_c. The
+# pure-Rust ruzstd backend has a decompression-bomb advisory (RUSTSEC-2026-0344,
+# patched >= 0.9.1) that bevy_image 0.17's `ruzstd = "0.8"` pin cannot reach; the C
+# zstd backend is unaffected. smaa_luts still needs zstd, so the backend is swapped,
+# not dropped. bevy is opt-in only (scriptbots-app `bevy_render`), not in the shipped build.
+# jpeg is not a bevy default; it is enabled so the authored groundcover images can load.
+bevy = { version = "0.17", default-features = false, features = ["std", "async_executor", "android-game-activity", "android_shared_stdcxx", "animation", "bevy_asset", "bevy_audio", "bevy_color", "bevy_core_pipeline", "bevy_post_process", "bevy_anti_alias", "bevy_gilrs", "bevy_gizmos", "bevy_gltf", "bevy_input_focus", "bevy_log", "bevy_mesh_picking_backend", "bevy_pbr", "bevy_picking", "bevy_render", "bevy_scene", "bevy_image", "bevy_mesh", "bevy_camera", "bevy_light", "bevy_shader", "bevy_sprite", "bevy_sprite_picking_backend", "bevy_sprite_render", "bevy_state", "bevy_text", "bevy_ui", "bevy_ui_picking_backend", "bevy_ui_render", "bevy_window", "bevy_winit", "custom_cursor", "default_font", "hdr", "ktx2", "multi_threaded", "png", "reflect_auto_register", "smaa_luts", "sysinfo_plugin", "tonemapping_luts", "vorbis", "webgl2", "x11", "wayland", "debug", "zstd_c", "jpeg"] }
 bevy_mesh = { version = "0.17" }
 bevy_post_process = { version = "0.17" }
 blake3 = { workspace = true }
