@@ -54,6 +54,10 @@ use scriptbots_runtime::remote::{
     RemoteEventRecord, RemoteFrame, RemoteFrameIdentity, RemoteFramePayload,
     browser_intervention_command_id, decode_remote_frame, validate_browser_intervention_session,
 };
+use scriptbots_runtime::remote_subscription::{
+    REMOTE_SUBSCRIPTION_PROTOCOL_VERSION, RemoteChannel, RemoteResumeRequest, RemoteSubscription,
+    RemoteSubscriptionRequest,
+};
 use scriptbots_runtime::{
     ApplicationState, CommandStatus, DriveReceipt, HostCommand, HostCore, HostCoreOptions,
     HostSessionId, LocalHostPort, ManualHostDriver, ManualInstant, NullFrontend, PlaybackSnapshot,
@@ -399,6 +403,41 @@ struct BrowserRemoteEventRecord<'a> {
     score: f64,
     subject: Option<&'a str>,
     human_text: &'a str,
+}
+
+/// Reuse the remote event contract over one immutable local publication. A fresh
+/// reader returns an empty page too, so a client can record which publication it
+/// inspected without installing a subscription or changing the owner.
+fn browser_narrative_page(
+    snapshot: &RenderSnapshot,
+    after_event: &str,
+    expected_session_id: &str,
+) -> Result<RemoteFrame> {
+    // Bound the strings before copying them into the shared request type. The
+    // subscription validator then enforces canonical decimal form and range.
+    ensure!(
+        after_event.len() <= 20,
+        "event cursor exceeds the u64 decimal bound"
+    );
+    ensure!(
+        expected_session_id.len() <= 39,
+        "session identity exceeds the u128 decimal bound"
+    );
+    let request = RemoteSubscriptionRequest {
+        protocol_version: REMOTE_SUBSCRIPTION_PROTOCOL_VERSION,
+        request_id: None,
+        command: "subscribe".to_owned(),
+        channels: vec![RemoteChannel::Events],
+        max_fps: 4,
+        resume: Some(RemoteResumeRequest {
+            session_id: expected_session_id.to_owned(),
+            after_revision: None,
+            after_event: Some(after_event.to_owned()),
+        }),
+    };
+    RemoteSubscription::new(&request, snapshot)?
+        .next_frame(RemoteChannel::Events, snapshot)?
+        .context("initial narrative read did not produce an event page")
 }
 
 impl<'a> From<&'a RemoteEventRecord> for BrowserRemoteEventRecord<'a> {
@@ -1067,6 +1106,23 @@ impl SimHandle {
             "none"
         }
         .to_owned()
+    }
+
+    /// Read at most 64 canonical narrative records after an exact session-bound
+    /// cursor. The returned frame reports retained-history gaps and the observed
+    /// publication; this read never advances science or acknowledges a command.
+    #[wasm_bindgen(js_name = narrativePage)]
+    pub fn narrative_page_js(
+        &self,
+        after_event: &str,
+        expected_session_id: &str,
+    ) -> Result<JsValue, JsValue> {
+        let snapshot = self.inner.borrow().core.latest_snapshot();
+        let frame = browser_narrative_page(&snapshot, after_event, expected_session_id)
+            .map_err(js_error)?;
+        BrowserRemoteFrame::from(&frame)
+            .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+            .map_err(js_error)
     }
 
     /// Advance exactly the requested number of scientific steps and encode the snapshot.
@@ -4705,6 +4761,211 @@ mod tests {
             lush, arid,
             "web terrain evaluation must distinguish lush vs arid"
         );
+    }
+}
+
+#[cfg(test)]
+mod narrative_tests {
+    use super::*;
+    use scriptbots_core::narrative::{EVENT_RECORD_SCHEMA_VERSION, EventKind, EventRecord};
+    use scriptbots_core::{Intervention, Region, Tick};
+    use scriptbots_runtime::remote::REMOTE_MAX_EVENTS;
+    #[cfg(target_arch = "wasm32")]
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    fn narrative_simulation() -> Simulation {
+        Simulation::new(SimSpec::new(
+            ScriptBotsConfig {
+                world_width: 160,
+                world_height: 160,
+                food_cell_size: 40,
+                closed: true,
+                metabolism_drain: 0.0,
+                movement_drain: 0.0,
+                temperature_discomfort_rate: 0.0,
+                aging_health_decay_rate: 0.0,
+                spike_damage: 0.0,
+                spike_energy_cost: 0.0,
+                reproduction_energy_threshold: f32::MAX,
+                narrative_interval: 8,
+                narrative_capacity: 8,
+                history_capacity: 128,
+                persistence_interval: 0,
+                ..ScriptBotsConfig::default()
+            },
+            12,
+            Some(291),
+            SnapshotFormat::Json,
+            SeedStrategy::None,
+            Some(BrainPreset::Mlp),
+        ))
+        .expect("small real browser owner")
+    }
+
+    fn events(frame: &RemoteFrame) -> &RemoteEventPage {
+        let RemoteFramePayload::Events(page) = &frame.payload else {
+            panic!("narrative reads must return events")
+        };
+        page
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn local_narrative_reads_real_extinction_without_changing_owner_or_continuation() {
+        let mut simulation = narrative_simulation();
+        simulation.tick(96).unwrap();
+        assert_eq!(simulation.snapshot().agents.len(), 12);
+        simulation
+            .apply_command(HostCommand::Intervention(Box::new(
+                scriptbots_core::interventions::InterventionCommand::new(
+                    Intervention::Meteor {
+                        region: Region::All,
+                        lethality: 10.0,
+                        scorch: 0.0,
+                    },
+                    scriptbots_core::interventions::InterventionSurface::Script,
+                    "narrative test",
+                ),
+            )))
+            .unwrap();
+        simulation.tick(8).unwrap();
+        assert!(simulation.snapshot().agents.is_empty());
+        simulation.set_speed(0.0).unwrap();
+        let before_bytes = simulation.checkpoint().unwrap();
+        let before_digest = simulation.core.scientific_digest_v1().unwrap();
+        let snapshot = simulation.core.latest_snapshot();
+        let session = snapshot.session_id.get().to_string();
+        let frame = browser_narrative_page(&snapshot, "0", &session).unwrap();
+        assert_eq!(frame.identity, RemoteFrameIdentity::from(snapshot.as_ref()));
+        let page = events(&frame);
+        let extinction = page
+            .events
+            .iter()
+            .find(|event| event.record.kind == EventKind::Extinction)
+            .expect("real owner must narrate the intervention's extinction");
+        assert_eq!(extinction.record.tick, 97);
+        assert_eq!(extinction.record.human_text, "population reached zero");
+        assert_eq!(extinction.record.before, 12.0);
+        assert_eq!(extinction.record.after, 0.0);
+        assert_eq!(page.events.len(), snapshot.narrative_events.len());
+        let repeated = browser_narrative_page(&snapshot, "0", &session).unwrap();
+        assert_eq!(frame, repeated);
+        let cursor = page.latest_event.to_string();
+        let empty = browser_narrative_page(&snapshot, &cursor, &session).unwrap();
+        assert!(events(&empty).events.is_empty());
+        assert_eq!(events(&empty).after_event, page.latest_event);
+        assert_eq!(
+            simulation.core.scientific_digest_v1().unwrap(),
+            before_digest
+        );
+        assert_eq!(
+            simulation.core.latest_snapshot().revisions,
+            snapshot.revisions
+        );
+        assert_eq!(
+            simulation.core.latest_snapshot().playback,
+            snapshot.playback
+        );
+        assert_eq!(simulation.checkpoint().unwrap(), before_bytes);
+        let restored = Simulation::from_checkpoint(&before_bytes).unwrap();
+        let resumed = browser_narrative_page(&restored.core.latest_snapshot(), "0", &session)
+            .expect("continuation retains canonical narrative history and session");
+        assert_eq!(events(&resumed), page);
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn local_narrative_pages_bound_rows_and_preserve_large_ordinals_and_gaps() {
+        let simulation = narrative_simulation();
+        let mut snapshot = simulation.core.latest_snapshot().as_ref().clone();
+        let dropped = (1_u64 << 53) + 11;
+        snapshot.narrative_dropped_events = dropped;
+        snapshot.narrative_events = Arc::new(vec![
+            EventRecord {
+                schema_version: EVENT_RECORD_SCHEMA_VERSION,
+                tick: Tick(0),
+                kind: EventKind::PopulationBoom,
+                severity: 0.5,
+                magnitude: 5.0,
+                window: (0, 0),
+                metric: "population".to_owned(),
+                before: 1.0,
+                after: 6.0,
+                score: 0.75,
+                subject: None,
+                human_text: "population increased".to_owned(),
+            };
+            REMOTE_MAX_EVENTS + 1
+        ]);
+        let session = snapshot.session_id.get().to_string();
+        let first = browser_narrative_page(&snapshot, "0", &session).unwrap();
+        let page = events(&first);
+        assert_eq!(page.events.len(), REMOTE_MAX_EVENTS);
+        let gap = page.gap.unwrap();
+        assert_eq!((gap.first_missing, gap.last_missing), (1, dropped));
+        assert_eq!(page.events[0].sequence, dropped + 1);
+        let cursor = page.events.last().unwrap().sequence;
+        let second = browser_narrative_page(&snapshot, &cursor.to_string(), &session).unwrap();
+        assert!(events(&second).gap.is_none());
+        assert_eq!(events(&second).events.len(), 1);
+        assert_eq!(events(&second).events[0].sequence, cursor + 1);
+        assert_eq!(events(&second).latest_event, cursor + 1);
+        let json = serde_json::to_value(BrowserRemoteFrame::from(&first)).unwrap();
+        assert_eq!(json["payload"]["gap"]["lastMissing"], dropped.to_string());
+        assert_eq!(
+            json["payload"]["events"][0]["sequence"],
+            (dropped + 1).to_string()
+        );
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn local_narrative_refuses_foreign_future_noncanonical_and_exhausted_cursors() {
+        let mut simulation = narrative_simulation();
+        let snapshot = simulation.core.latest_snapshot();
+        let session = snapshot.session_id.get().to_string();
+        for cursor in ["1", "01", "-1", "", "18446744073709551616"] {
+            assert!(browser_narrative_page(&snapshot, cursor, &session).is_err());
+        }
+        for identity in ["", "01", "-1", "340282366920938463463374607431768211456"] {
+            assert!(browser_narrative_page(&snapshot, "0", identity).is_err());
+        }
+        simulation.reset(Some(291)).unwrap();
+        assert!(browser_narrative_page(&simulation.core.latest_snapshot(), "0", &session).is_err());
+        let mut exhausted = snapshot.as_ref().clone();
+        exhausted.narrative_dropped_events = u64::MAX;
+        assert!(browser_narrative_page(&exhausted, "0", &session).is_err());
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn local_narrative_binding_returns_the_canonical_browser_event_shape() {
+        let simulation = narrative_simulation();
+        let session = simulation
+            .core
+            .latest_snapshot()
+            .session_id
+            .get()
+            .to_string();
+        let handle = SimHandle {
+            inner: Rc::new(RefCell::new(simulation)),
+        };
+        let page = handle.narrative_page_js("0", &session).unwrap();
+        let get = |object: &JsValue, key: &str| {
+            js_sys::Reflect::get(object, &JsValue::from_str(key)).unwrap()
+        };
+        assert_eq!(get(&page, "kind").as_string().as_deref(), Some("events"));
+        assert_eq!(
+            get(&get(&page, "identity"), "sessionId").as_string(),
+            Some(session)
+        );
+        let payload = get(&page, "payload");
+        assert_eq!(
+            get(&payload, "afterEvent").as_string().as_deref(),
+            Some("0")
+        );
+        assert!(get(&payload, "gap").is_null());
+        assert_eq!(js_sys::Array::from(&get(&payload, "events")).length(), 0);
     }
 }
 

@@ -6431,6 +6431,16 @@ parity fixtures and pinned tooling; no Vite integration or fresh browser pass is
 
 #### 5.3 browser live renderer
 
+**[Currently In Progress — Codex, 2026-11-10]** Complete the browser's
+reproducible initial-world sharing and local narrative consumers under
+`bd-2z0.12.3`. Capture the actual launch configuration, resolved seed, founder
+population and selected brain family in bounded links; preserve these inputs
+when creating an initial-condition variant. Expose the canonical owner's
+narrative pages locally through the existing remote event projection, including
+exact cursors and retention gaps, without advancing science. Saved continuations
+remain distinct from initial-world links. The original native/browser, package,
+durability and performance acceptance remains open.
+
 - only after native runtime and snapshot contracts are stable;
 - real Canvas/WebGPU tests;
 - capability/fallback matrix;

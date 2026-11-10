@@ -69,6 +69,15 @@ The crate exposes the following wasm-bindgen surface:
   decimal-string identities, its dynamic snapshot, and a bounded terrain/food/water
   overview. The environment is cached by owner and layer revisions and frozen in
   JavaScript; callers cannot mutate the shared cells. This does not tick the world.
+- `SimHandle::narrativePage(afterEvent: string, expectedSessionId: string)` — reads
+  up to 64 canonical narrative records from one immutable owner publication.
+  Start at cursor `"0"` with the session from `frame().identity.sessionId` and
+  continue after the last returned event sequence. The result uses the existing
+  `scriptbots.remote-frame.v2` events envelope, including an explicit unavailable
+  prefix if retention overtook the cursor. Cursors and source identities are exact
+  decimal strings; malformed, foreign-session and future cursors are refused.
+  An empty page still identifies the observed publication. This read neither
+  advances science nor confirms durable journal storage.
 - `SimHandle::inspectGenome(uid: string, locusOffset: number, deltaOffset: number)` —
   reads a bounded page of canonical loci and retained primary-parent differences.
   Start both offsets at zero and follow the returned independent page cursors.

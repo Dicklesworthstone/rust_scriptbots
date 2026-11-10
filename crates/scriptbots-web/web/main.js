@@ -8,6 +8,7 @@ import { InspectionController, pickAgent, renderInspector, renderInspectorSource
   validateBrainInspection, renderBrainInspector, renderBrainSource } from "./inspector.js";
 import { GenomeInspectionController, renderGenomeInspector, renderGenomeSource } from "./genome.js";
 import { InterventionController, renderInterventions, validateInterventionAction } from "./interventions.js";
+import { NarrativeController, renderNarrative, renderNarrativeSource } from "./narrative.js";
 
 const {
   init_sim,
@@ -67,7 +68,6 @@ const remoteLocal = document.getElementById("remote-local");
 const remoteStatus = document.getElementById("remote-status");
 const remotePlayback = document.getElementById("remote-playback");
 const remoteReceipt = document.getElementById("remote-receipt");
-const remoteEvents = document.getElementById("remote-events");
 const remoteOverlay = document.getElementById("remote-overlay");
 const remotePause = document.getElementById("remote-pause");
 const remoteResume = document.getElementById("remote-resume");
@@ -125,6 +125,20 @@ let remoteConnected = false;
 let lastRemoteRequestId = null;
 let lastRemoteCommandId = null;
 let lastRemoteStatusRequestId = null;
+
+const narrativePanel = document.getElementById("narrative-timeline");
+const narrative = new NarrativeController({
+  read: (afterEvent, sessionId) => {
+    if (!simHandle?.narrativePage) throw new Error("This WASM package does not expose scientific narrative history; rebuild the browser package");
+    return simHandle.narrativePage(afterEvent, sessionId);
+  },
+  onChange: (controller) => renderNarrative(narrativePanel, controller),
+  onFrame: (controller) => renderNarrativeSource(narrativePanel, controller),
+});
+const updateNarrativeVisibility = () => narrative.setEnabled(!document.hidden);
+updateNarrativeVisibility();
+document.addEventListener("visibilitychange", updateNarrativeVisibility);
+document.getElementById("narrative-refresh")?.addEventListener("click", () => { void narrative.refresh(true); });
 
 const inspectorPanel = document.getElementById("agent-inspector");
 const inspector = new InspectionController({
@@ -408,14 +422,6 @@ function updateCheckpointControls() {
       : "This local world supports saved continuations. Loading a continuation preserves its brain family and resumes paused.";
 }
 
-function remoteEventLine(text) {
-  const item = document.createElement("li");
-  item.textContent = text;
-  remoteEvents.append(item);
-  while (remoteEvents.children.length > 48) remoteEvents.firstElementChild.remove();
-  remoteEvents.scrollTop = remoteEvents.scrollHeight;
-}
-
 function receiveRemoteFrame(frame) {
   if (!remoteMode) return;
   remotePlayback.textContent = `Observed server: ${frame.playback.paused ? "paused" : "running"}, ${frame.playback.speedMultiplier}× — tick ${frame.identity.tick}`;
@@ -429,13 +435,7 @@ function receiveRemoteFrame(frame) {
     }
     updateRemoteControls();
   } else if (frame.kind === "events") {
-    const page = frame.payload;
-    if (page.gap) {
-      remoteEventLine(`History gap: narrative events ${page.gap.firstMissing}–${page.gap.lastMissing} are no longer retained by this server.`);
-    }
-    for (const event of page.events) {
-      remoteEventLine(`#${event.sequence} · tick ${event.record.tick}: ${event.record.humanText}`);
-    }
+    narrative.accept(frame);
   }
 }
 
@@ -443,6 +443,8 @@ function receiveRemoteState(state) {
   if (!remoteMode) return;
   const hadFrame = remoteFrame !== null;
   remoteConnected = state.state === "connected";
+  narrative.setConnection(remoteConnected ? null
+    : `Server history is not live: ${String(state.message || state.state).slice(0, 512)}. Retained events describe the earlier observation.`);
   if (!remoteConnected) {
     // The canvas pixels may remain visible, but neither a stale RAF nor the next
     // subscription acknowledgement can admit experiments before a fresh paint.
@@ -514,6 +516,7 @@ function connectRemote() {
     lastRemoteCommandId = null;
     lastRemoteStatusRequestId = null;
     simulationGeneration += 1;
+    narrative.reset("remote");
     inspector.reset();
     brainInspector.reset();
     genomeInspector.reset();
@@ -524,7 +527,6 @@ function connectRemote() {
     remoteInterventions.emit();
     lastPaintedFrame = null;
     if (captureRequest) finishCapture(captureRequest, new Error("Presentation source changed"));
-    remoteEvents.replaceChildren();
     remoteReceipt.textContent = "";
     remotePlayback.textContent = "Waiting for observed server state…";
     updateMismatchBanner(null);
@@ -551,6 +553,7 @@ remoteLocal.addEventListener("click", () => {
   remoteClient = null;
   remoteFrame = null;
   simulationGeneration += 1;
+  narrative.reset("local");
   inspector.reset();
   brainInspector.reset();
   genomeInspector.reset();
@@ -817,6 +820,7 @@ function captureAdmittedFrame(frameIdentity) {
 }
 
 window.addEventListener("pagehide", () => {
+  narrative.setEnabled(false);
   remoteClient?.disconnect();
   if (captureRequest) finishCapture(captureRequest, new Error("Page left during capture"));
   if (captureUrl) URL.revokeObjectURL(captureUrl);
@@ -875,6 +879,7 @@ function presentSimulation(now) {
     if (!hasPresentationFrame()) return;
 
     const frame = remoteMode ? remoteFrame : simHandle.frame();
+    narrative.observe(frame, simulationGeneration);
     const presented = drawSnapshot(frame);
     updateStats(frame.snapshot, now);
     if (presented && presentationFailure) {
@@ -974,6 +979,7 @@ function replaceSimulation(next, { continuation = false, permalink = null, expec
   simHandle = next;
   activeBrainPreset = brainPreset;
   simulationGeneration += 1;
+  narrative.reset("local");
   inspector.reset();
   brainInspector.reset();
   genomeInspector.reset();
@@ -1158,10 +1164,10 @@ async function loadWorldFromPermalink(linkStr) {
     updateDiffTable(linkStr);
 
     if (permalinkStatus) {
-      permalinkStatus.textContent = "World loaded from permalink";
+      permalinkStatus.textContent = "Initial-condition recipe loaded; world restarted at tick zero";
       permalinkStatus.style.color = "#34d399";
     }
-    appendLog(`Loaded permalink world (${linkStr.slice(0, 20)}…)`);
+    appendLog(`Restarted from shared initial-condition recipe (${linkStr.slice(0, 20)}…)`);
 
     try {
       const url = new URL(window.location.href);
@@ -1217,10 +1223,10 @@ async function handleFork() {
       forkOutput.style.display = "block";
     }
     if (permalinkStatus) {
-      permalinkStatus.textContent = "Fork created successfully";
+      permalinkStatus.textContent = "Variant recipe created; loading starts a new world at tick zero";
       permalinkStatus.style.color = "#34d399";
     }
-    appendLog(`Created fork child link (${childLink.slice(0, 20)}…)`);
+    appendLog(`Created initial-condition variant link (${childLink.slice(0, 20)}…)`);
   } catch (err) {
     console.error("Fork failed:", err);
     if (permalinkStatus) {
@@ -1257,7 +1263,7 @@ if (copyPermalinkBtn) {
         .writeText(currentPermalink)
         .then(() => {
           if (permalinkStatus) {
-            permalinkStatus.textContent = "Permalink copied to clipboard";
+            permalinkStatus.textContent = "Initial-condition recipe copied; this link restarts at tick zero";
             permalinkStatus.style.color = "#34d399";
           }
         })
@@ -1287,7 +1293,7 @@ if (copyForkBtn) {
     if (latestForkedLink) {
       navigator.clipboard.writeText(latestForkedLink).then(() => {
         if (permalinkStatus) {
-          permalinkStatus.textContent = "Fork link copied to clipboard";
+          permalinkStatus.textContent = "Variant recipe link copied; this link restarts at tick zero";
           permalinkStatus.style.color = "#34d399";
         }
       });

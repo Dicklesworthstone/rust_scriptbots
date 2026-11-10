@@ -133,7 +133,7 @@ const mockWasmModule = `
     owners.nextFailure = null;
     if (failure === "create") throw new Error("intentional create failure");
     const record = { id: owners.records.length + 1, kind, preset, tick: initialTick,
-      freeCalls: 0, driveCalls: 0, frameCalls: 0, elapsed: 0, speed: 1 };
+      freeCalls: 0, driveCalls: 0, frameCalls: 0, narrativeReads: 0, elapsed: 0, speed: 1 };
     owners.records.push(record);
     let credit = 0;
     function check(stage) {
@@ -147,6 +147,21 @@ const mockWasmModule = `
       },
       permalinkOf() { check("permalink"); return link; },
       brainPreset() { check("preset"); return preset; },
+      narrativePage(afterEvent, expectedSessionId) {
+        check("narrative");
+        record.narrativeReads += 1;
+        if (expectedSessionId !== String(2000 + record.id) || !["0", "1"].includes(afterEvent)) {
+          throw new Error("narrative fixture refused a foreign session or cursor");
+        }
+        return { schema: "scriptbots.remote-frame.v2", kind: "events", identity: {
+          sessionId: expectedSessionId, publicationRevision: String(record.tick + 400),
+          scientificRevision: String(record.tick + 100), controlRevision: "20", configRevision: "10", tick: String(record.tick)
+        }, playback: { paused: record.speed === 0, speedMultiplier: record.speed }, coalescedPublications: "0", environment: null,
+          payload: { afterEvent, earliestRetained: "1", latestEvent: "1", gap: null,
+            events: afterEvent === "1" ? [] : [{ sequence: "1", record: { schemaVersion: 1, tick: "0",
+              kind: "extinction", humanText: "<em>owner " + record.id + " narrative fixture</em>", metric: "population",
+              severity: 1, magnitude: -1, window: ["0", "0"], before: 1, after: 0, score: 1, subject: null } }] } };
+      },
       checkpoint() {
         check("checkpoint");
         const bytes = new Uint8Array(9);
@@ -688,6 +703,40 @@ async function runOwnerLifecycleCases(page, context) {
     staleStoredReads.push({ change, retainedOwner: activeOwner(after).id });
   }
   observations.browserStorage = { storedRefusals, quotaMessage, staleStoredReads };
+
+  // Production DOM/controller integration with the explicit WASM double above.
+  // This proves presentation and owner lifetime, not real detector generation.
+  await setSpeed(0);
+  await context.clock.runFor(300);
+  const narrativeBefore = activeOwner(await state());
+  const narrativeText = await page.locator("#remote-events li").allTextContents();
+  if (narrativeText.length !== 1 || narrativeText[0] !== `#1 · tick 0: <em>owner ${narrativeBefore.id} narrative fixture</em>`
+      || await page.locator("#remote-events em").count() !== 0
+      || await page.getAttribute("#narrative-timeline", "data-session-id") !== String(2000 + narrativeBefore.id)) {
+    throw new Error("Local timeline did not consume exact canonical fixture prose as text for the active owner");
+  }
+  await context.clock.runFor(1_000);
+  const narrativeQuiet = activeOwner(await state());
+  if (narrativeQuiet.tick !== narrativeBefore.tick || narrativeQuiet.narrativeReads !== narrativeBefore.narrativeReads) {
+    throw new Error("Paused timeline presentation advanced ticks or reread an unchanged publication");
+  }
+  await page.evaluate(() => document.getElementById("narrative-refresh").click());
+  await context.clock.runFor(1);
+  const narrativeRefreshed = activeOwner(await state());
+  if (narrativeRefreshed.tick !== narrativeBefore.tick || narrativeRefreshed.narrativeReads !== narrativeBefore.narrativeReads + 1
+      || await page.locator("#remote-events li").count() !== 1) {
+    throw new Error("Explicit local history refresh changed science, duplicated events, or failed to read");
+  }
+  await replace("checkpoint");
+  const narrativeReplaced = activeOwner(await state());
+  const replacementText = await page.locator("#remote-events li").allTextContents();
+  if (replacementText.length !== 1 || replacementText[0] !== `#1 · tick 0: <em>owner ${narrativeReplaced.id} narrative fixture</em>`
+      || await page.getAttribute("#narrative-timeline", "data-session-id") !== String(2000 + narrativeReplaced.id)) {
+    throw new Error("Timeline retained old-owner prose when a replacement reused event ordinal one");
+  }
+  observations.narrative = { evidence: "production DOM and JavaScript with explicit WASM double",
+    before: narrativeBefore, refreshed: narrativeRefreshed, replacement: narrativeReplaced,
+    narrativeText, replacementText };
   const finalState = await state();
   observations.releasedOwners = finalState.records.filter((owner) => owner.freeCalls === 1).length;
   observations.maximumPendingTimers = finalState.maximumTimers;
@@ -704,7 +753,7 @@ function createServer() {
     } else if (url.pathname === "/main.js") {
       res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8" });
       res.end(fs.readFileSync(path.join(webDir, "main.js")));
-    } else if (["/remote.js", "/continuation-store.js", "/inspector.js", "/genome.js", "/interventions.js", "/renderers/canvas.js", "/renderers/webgpu.js", "/renderers/environment.js"].includes(url.pathname)) {
+    } else if (["/remote.js", "/continuation-store.js", "/inspector.js", "/genome.js", "/interventions.js", "/narrative.js", "/renderers/canvas.js", "/renderers/webgpu.js", "/renderers/environment.js"].includes(url.pathname)) {
       res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8" });
       res.end(fs.readFileSync(path.join(webDir, url.pathname.slice(1))));
     } else {

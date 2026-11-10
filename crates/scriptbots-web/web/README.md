@@ -119,6 +119,17 @@ history/credit handling; nonempty narrative delivery requires observed records.
   over its stable UID. Selection, highlights and inspection never advance science
   or alter the simulation's selection state.
 - **Reset Simulation**: reseeds with a fresh RNG seed and reuses the slider settings. A rolling 5-second performance log is appended to the console pane (`FPS`, `TPS`, population).
+- **Scientific timeline**: both local worlds and remote sessions display the
+  canonical detector's event text, event tick and exact sequence. The source line
+  distinguishes the last history observation from a newer world publication.
+  Local reads occur at most four times per second, one bounded page at a time;
+  a paused unchanged publication is read once unless retained pages remain.
+  Hidden pages stop local reads. The view retains 48 rows and reports both
+  display omissions and exact gaps in the owner's retained history. Reset,
+  continuation replacement and local/remote switches cannot mix owners' events.
+  **Refresh history** explicitly retries an unavailable read. These observations
+  come from retained memory or a saved continuation, and do not establish a
+  durable event journal. Reading the timeline never ticks the simulation.
 - **Saved continuations**: MLP, DWRAON, Assembly and Unbound worlds can be saved.
   Both save controls are visibly disabled for the legacy Wander demo.
   **Save Continuation File** downloads a portable full-owner checkpoint; **Load
