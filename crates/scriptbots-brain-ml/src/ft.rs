@@ -138,6 +138,22 @@ impl FtBrainFamily {
         })
     }
 
+    /// Count the neurons and parameters in a validated founding genome.
+    ///
+    /// This is the structural source-scalar count used by activity inspection, not an
+    /// activation sample. It is available before the first evaluation and neither
+    /// constructs an evaluator nor changes its state or the random stream.
+    pub fn genome_source_scalars(
+        &self,
+        genome: &BrainGenomeEnvelope,
+    ) -> Result<usize, BrainProtocolError> {
+        let decoded = self.decode_genome(genome)?;
+        Ok(INPUT_SIZE
+            + decoded.config.hidden_layers.iter().sum::<usize>()
+            + OUTPUT_SIZE
+            + decoded.parameters.len())
+    }
+
     fn invalid(&self, kind: BrainEnvelopeKind, detail: impl Into<String>) -> BrainProtocolError {
         BrainProtocolError::InvalidPayload {
             kind,
@@ -1553,6 +1569,49 @@ mod tests {
             }],
             LocusValue::Target(280)
         );
+    }
+
+    #[test]
+    fn founding_genome_topology_matches_real_activity_without_evaluation() {
+        for hidden_layers in [vec![1], vec![2, 3], vec![48, 32, 24]] {
+            let family = FtBrainFamily::new(FtBrainConfig::new(hidden_layers).unwrap()).unwrap();
+            let (genome, state) = founder(&family, 9_101);
+            let topology = family.genome_source_scalars(&genome).unwrap();
+            let mut evaluator = family.evaluator(&genome, &state).unwrap();
+            let request = BrainInspection::Activations(BrainInspectionLimits::hard());
+            assert!(matches!(
+                evaluator.inspect(request),
+                Err(BrainInspectionError::ActivityUnavailable {
+                    reason: BrainInspectionUnavailable::NoRecordedEvaluation,
+                })
+            ));
+            assert_eq!(evaluator.checkpoint_state().unwrap(), state);
+
+            let sensors = [0.25; INPUT_SIZE];
+            let outputs = evaluator.evaluate(&sensors).unwrap();
+            let activity = evaluator
+                .inspect_with_context(
+                    request,
+                    BrainInspectionContext {
+                        source_tick: Tick(1),
+                        sensors: &sensors,
+                        outputs: &outputs,
+                    },
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(topology, activity.build.source_scalars);
+
+            let truncated = BrainGenomeEnvelope::new(
+                genome.family_id().clone(),
+                genome.schema_version(),
+                genome.codec_version(),
+                genome.payload()[..genome.payload().len() - 1].to_vec(),
+                genome.provenance().clone(),
+            )
+            .unwrap();
+            assert!(family.genome_source_scalars(&truncated).is_err());
+        }
     }
 
     #[test]

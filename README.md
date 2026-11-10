@@ -2432,6 +2432,35 @@ Unprovisioned controllers leave execution pending; workflow wiring does not prov
 that CI ran. The original wire-level control probe remains a separate CI job.
 This matrix covers bounded tournament smoke, not the full publication protocol.
 
+### Comparing FtBrain with MLP
+
+The tournament runner accepts the versioned FtBrain family when the application
+is built with `brain-ft`. The bundled opt-in profile exercises real founding
+genomes, both spawn orders, equal founder cohorts, result rows and leaderboard
+generation:
+
+```bash
+cargo run -p scriptbots-app --features brain-ft -- tournament \
+  --spec tournament/ft_comparison.toml --smoke --out runs/ft-comparison
+```
+
+The smoke profile uses two seeds, two orders, eight founders and 32 ticks per
+match; omit `--smoke` for four seeds, 16 founders and 240 ticks. Both require an
+identical rerun. These are bounded architecture comparisons, not evidence of
+long-horizon evolution or a superior family. Ft uses its default dense hidden
+layers `[48, 32, 24]`; the existing MLP architecture differs. The report retains
+the actual initial genome digests and source-scalar counts. Ft's initial count
+comes from validated genome structure, without claiming recorded activity before
+the first scientific tick.
+
+`ft` and `frankentorch` select the same family in CLI/spec inputs. Explicit labels
+such as `ft-control` remain distinct experimental arms. A build without `brain-ft`
+refuses the family before starting matches. NeuroFlow remains unavailable to this
+heritable tournament because its legacy runner lacks the canonical
+genome/evaluator adapter. The canonical `tournament/spec.toml` retains its existing
+200-source-scalar requirement; the new mixed-architecture profile explicitly
+omits that requirement instead of weakening it globally.
+
 ## Roadmap (condensed)
 1. Core data structures and config (done); expand parity (metabolism, locomotion, food math, carcass sharing).
 2. World mechanics and determinism under parallelism; spatial index tuning.

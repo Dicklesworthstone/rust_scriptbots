@@ -149,6 +149,8 @@ pub enum TournamentError {
     EmptyCohort,
     #[error("family {family} is entered more than once")]
     DuplicateFamilies { family: String },
+    #[error("tournament family {family:?} is unavailable: {reason}")]
+    UnavailableBrainFamily { family: String, reason: String },
     #[error(
         "cohort size {cohort_size} is not divisible by {families} families; unequal cohorts change the reproduction operator each family experiences"
     )]
@@ -917,11 +919,31 @@ pub mod execution {
                 })?;
             return Ok(Box::new(adapter));
         }
+        if is_frankentorch_family(name) {
+            #[cfg(feature = "brain-ft")]
+            return Ok(Box::new(scriptbots_brain_ml::FtBrainFamily::default()));
+            #[cfg(not(feature = "brain-ft"))]
+            return Err(TournamentError::UnavailableBrainFamily {
+                family: name.to_owned(),
+                reason: "FrankenTorch tournaments require a build with the brain-ft feature"
+                    .to_owned(),
+            });
+        }
+        if matches!(name, "neuro" | "neuroflow" | "ml.neuroflow") {
+            return Err(TournamentError::UnavailableBrainFamily {
+                family: name.to_owned(),
+                reason: "NeuroFlow has a legacy runner but no canonical genome/evaluator family adapter; it cannot enter a heritable tournament".to_owned(),
+            });
+        }
         Err(TournamentError::UnbalancedOrders {
             reason: format!(
-                "no built-in adapter for entered family {name:?}; enter an mlp, dwraon, or assembly family"
+                "no built-in adapter for entered family {name:?}; enter an mlp, dwraon, assembly, or feature-enabled ft family"
             ),
         })
+    }
+
+    pub(super) fn is_frankentorch_family(name: &str) -> bool {
+        matches!(name, "ft" | "frankentorch") || name.starts_with("ft.") || name.starts_with("ft-")
     }
 
     fn canonical_kind_of(name: &str) -> String {
@@ -938,6 +960,8 @@ pub mod execution {
             scriptbots_brain::assembly::AssemblyBrain::KIND
                 .as_str()
                 .to_owned()
+        } else if is_frankentorch_family(name) {
+            "ft".to_owned()
         } else {
             name.to_owned()
         }
@@ -1047,6 +1071,10 @@ pub mod execution {
                 ),
             });
         }
+        // Refuse unavailable families before constructing a world or executing another arm.
+        for family in &plan.spawn_order {
+            adapter_for(family.as_str())?;
+        }
         let mut config = base_config.clone();
         config.rng_seed = Some(plan.world_seed);
         config.closed = closed;
@@ -1093,6 +1121,7 @@ pub mod execution {
         let mut arm_by_uid: HashMap<scriptbots_core::AgentUid, BrainKind> = HashMap::new();
         let mut first_uid_by_family = BTreeMap::new();
         let mut initial_genome_digests = BTreeMap::new();
+        let mut initial_brain_source_scalars = BTreeMap::new();
         let mut initial_mutation_rates =
             BTreeMap::<BrainKind, Vec<scriptbots_core::MutationRates>>::new();
         for family in &plan.spawn_order {
@@ -1153,6 +1182,17 @@ pub mod execution {
                         ),
                     });
                 }
+                #[cfg(feature = "brain-ft")]
+                if member_index == 0 && is_frankentorch_family(family_name) {
+                    // Ft has no recorded activation at tick zero. Read validated genome
+                    // structure instead of advancing science to manufacture a sample.
+                    let scalars = scriptbots_brain_ml::FtBrainFamily::default()
+                        .genome_source_scalars(&genome)
+                        .map_err(|error| TournamentError::Publication {
+                            reason: format!("initial genome topology for {family_name}: {error}"),
+                        })?;
+                    initial_brain_source_scalars.insert(family.clone(), scalars);
+                }
                 let genome_bytes =
                     serde_json::to_vec(&genome).map_err(|error| TournamentError::Publication {
                         reason: format!("founder genome serialization for {family_name}: {error}"),
@@ -1174,8 +1214,10 @@ pub mod execution {
             }
         }
 
-        let mut initial_brain_source_scalars = BTreeMap::new();
         for (family, uid) in first_uid_by_family {
+            if initial_brain_source_scalars.contains_key(&family) {
+                continue;
+            }
             let family_name = family.as_str();
             let request = scriptbots_core::BrainInspectionRequest::single(
                 scriptbots_core::BrainInspectionClientId::new(0),
@@ -1305,6 +1347,12 @@ pub mod execution {
             );
         }
         for family in &plan.spawn_order {
+            if is_frankentorch_family(family.as_str()) {
+                outcome.warnings.push(format!(
+                    "family {}: initial source-scalar count comes from validated genome topology (neurons, weights and biases), not recorded tick-zero activity",
+                    family.as_str()
+                ));
+            }
             if let Some(tick) = extinct_at.get(family)
                 && *tick <= ticks / 10
             {
@@ -1410,6 +1458,9 @@ pub mod execution {
     ) -> Result<Vec<MatchRunReport>, TournamentError> {
         let plans = super::plan(spec)?;
         let effective_config = resolve_spec_config(spec, base_config)?;
+        for family in &spec.families {
+            adapter_for(family.as_str())?;
+        }
         let worker_count = jobs.max(1).min(plans.len()).min(MAX_PARALLEL_MATCH_WORKERS);
         let reports = if worker_count == 1 {
             plans
@@ -3322,7 +3373,8 @@ pub mod leaderboard {
             "mlp" | "mlp.baseline" => BrainKind::new("mlp"),
             "dwraon" | "dwraon.baseline" => BrainKind::new("dwraon"),
             "assembly" | "assembly.experimental" => BrainKind::new("assembly"),
-            "neuro" | "ml.neuroflow" => BrainKind::new("neuro"),
+            "ft" | "frankentorch" => BrainKind::new("ft"),
+            "neuro" | "neuroflow" | "ml.neuroflow" => BrainKind::new("neuro"),
             other => BrainKind::from(other.to_owned()),
         }
     }
@@ -3427,9 +3479,12 @@ pub mod leaderboard {
 
             for (family_name, outcome) in &report.outcome.per_family {
                 let run_id = format!("run-{match_id:016x}-{family_name}");
+                // Match reports retain entered arm labels, including named same-family
+                // controls and canonical aliases supplied through the public Rust API.
+                let entered_family = BrainKind::from(family_name.clone());
                 let agents_final = report
                     .agents_final
-                    .get(&to_brain_kind(family_name))
+                    .get(&entered_family)
                     .copied()
                     .unwrap_or(0);
 
@@ -3453,13 +3508,9 @@ pub mod leaderboard {
                     source_tree_clean: build.source_tree_clean,
                     source_provenance_complete: build.derived_provenance_complete(),
                     initial_brain_source_scalars: report.initial_brain_source_scalars
-                        [&to_brain_kind(family_name)],
-                    initial_genome_digest: report.initial_genome_digests
-                        [&to_brain_kind(family_name)]
-                        .clone(),
-                    initial_mutation_rates: report.initial_mutation_rates
-                        [&to_brain_kind(family_name)]
-                        .clone(),
+                        [&entered_family],
+                    initial_genome_digest: report.initial_genome_digests[&entered_family].clone(),
+                    initial_mutation_rates: report.initial_mutation_rates[&entered_family].clone(),
                     survival_share: outcome.survival_share,
                     biomass_share: outcome.biomass_share,
                     mean_lineage_depth: outcome.mean_lineage_depth,
@@ -3516,6 +3567,7 @@ pub mod leaderboard {
                 .iter()
                 .map(|family| family.as_str().to_owned())
                 .collect();
+            let entered_family = BrainKind::from(row.family.clone());
             if !seen.insert(key)
                 || row.run_id != format!("run-{:016x}-{}", row.match_id, row.family)
                 || row.seed != plan.seed
@@ -3541,7 +3593,7 @@ pub mod leaderboard {
                     .bytes()
                     .all(|byte| byte.is_ascii_hexdigit())
                 || Some(row.initial_mutation_rates.len())
-                    != plan.cohort.get(&to_brain_kind(&row.family)).copied()
+                    != plan.cohort.get(&entered_family).copied()
                 || row.initial_mutation_rates.iter().any(|rates| {
                     !rates.primary.is_finite()
                         || rates.primary < 0.0
@@ -3706,7 +3758,7 @@ pub mod leaderboard {
                 seed: acc.seed,
                 ticks_run: acc.ticks_run,
                 spawn_order_index: acc.spawn_order_index,
-                spawn_order: acc.spawn_order.iter().map(|s| to_brain_kind(s)).collect(),
+                spawn_order: acc.spawn_order.into_iter().map(BrainKind::from).collect(),
                 per_family: acc.per_family,
                 warnings: acc.warnings,
             })
@@ -3814,9 +3866,18 @@ pub mod leaderboard {
             .iter()
             .map(|row| row.initial_brain_source_scalars)
             .collect();
-        out.push_str(&format!(
-            "| Observed Initial Topology | {topology:?} source activation scalars per inspected family representative |\n"
-        ));
+        if rows
+            .iter()
+            .any(|row| super::execution::is_frankentorch_family(&row.family))
+        {
+            out.push_str(&format!(
+                "| Observed Initial Topology | {topology:?} source scalars per founder representative; Ft counts validated genome neurons, weights and biases, without claiming tick-zero activity |\n"
+            ));
+        } else {
+            out.push_str(&format!(
+                "| Observed Initial Topology | {topology:?} source activation scalars per inspected family representative |\n"
+            ));
+        }
         let observed_matches: BTreeSet<_> = rows.iter().map(|row| row.match_id).collect();
         out.push_str(&format!(
             "| Observed Matrix | {} matches, {} family rows |\n",
@@ -4586,7 +4647,7 @@ pub mod leaderboard {
         #[arg(long = "spec", default_value = "tournament/spec.toml")]
         pub spec: PathBuf,
 
-        /// Brain families to enter, or "all" (e.g. "mlp,dwraon,assembly").
+        /// Brain families to enter (e.g. "mlp,ft" with brain-ft), or "all" to keep the spec's families.
         #[arg(long = "families")]
         pub families: Option<String>,
 

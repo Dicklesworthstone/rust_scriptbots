@@ -1,0 +1,36 @@
+# Opt-in FrankenTorch / MLP architecture comparison (bd-2z0.3.12.6).
+# Requires scriptbots-app built with --features brain-ft.
+#
+# This bounded workload demonstrates real matched-world entry and artifact generation.
+# Four seeds and 240 ticks are not a long-horizon evolution or superiority study.
+# Both spawn orders run with equal founder cohorts and an identical world configuration.
+# Architectures differ: Ft uses its default dense [48, 32, 24] hidden layers, whereas
+# MLP uses its existing recurrent architecture. The report retains observed source-scalar
+# counts and genome digests; equal population does NOT mean equal parameter capacity.
+# Consequently the canonical tournament's 200-source-scalar [parameters] gate is absent
+# from this explicit comparison, rather than disabled in the runner or the canonical spec.
+
+[tournament]
+title = "FrankenTorch vs MLP bounded architecture comparison"
+version = "1.0.0"
+families = ["mlp", "ft"]
+seeds = [17, 29, 47, 71]
+ticks = 240
+cohort_size = 16
+order_policy = "both_assignments"
+closed = true
+sense_backend = "cpu_simd"
+sense_determinism = "exact"
+reproducible = true
+
+[reproducibility]
+require_identical_rerun = true
+max_retries = 1
+
+[smoke]
+families = ["mlp", "ft"]
+seeds = [17, 29]
+ticks = 32
+cohort_size = 8
+order_policy = "both_assignments"
+closed = true

@@ -198,6 +198,276 @@ fn outcomes_record_every_family_with_warnings_channel() {
 }
 
 #[test]
+fn named_family_rows_preserve_the_exact_entered_arm_evidence() {
+    use scriptbots_app::{
+        BuildProvenanceV0,
+        tournament::{
+            leaderboard::{rows_to_match_outcomes, validate_result_matrix},
+            reports_to_result_rows,
+        },
+    };
+
+    let spec = two_family_spec(4);
+    let reports = run_tournament(&spec, &small_world()).expect("real matches");
+    let build = BuildProvenanceV0::current();
+    let rows = reports_to_result_rows(
+        &reports,
+        "cpu_simd",
+        "exact",
+        true,
+        "named-arm-test",
+        &build,
+    );
+    assert_eq!(rows.len(), 4);
+    validate_result_matrix(&rows, &spec, "named-arm-test", &build).expect("exact arm matrix");
+    for reconstructed in rows_to_match_outcomes(&rows) {
+        let original = reports
+            .iter()
+            .find(|report| report.outcome.match_id == reconstructed.match_id)
+            .expect("original match");
+        assert_eq!(reconstructed, original.outcome);
+    }
+    for row in rows {
+        let report = reports
+            .iter()
+            .find(|report| report.outcome.match_id.0 == row.match_id)
+            .expect("matching run");
+        let entered = BrainKind::from(row.family);
+        assert_eq!(
+            row.initial_genome_digest,
+            report.initial_genome_digests[&entered]
+        );
+        assert_eq!(
+            row.initial_brain_source_scalars,
+            report.initial_brain_source_scalars[&entered]
+        );
+        assert_eq!(
+            row.initial_mutation_rates,
+            report.initial_mutation_rates[&entered]
+        );
+        assert_eq!(
+            row.agents_final,
+            report.agents_final.get(&entered).copied().unwrap_or(0)
+        );
+    }
+}
+
+#[test]
+fn neuroflow_tournament_reports_missing_protocol_adapter() {
+    for name in ["neuro", "neuroflow", "ml.neuroflow"] {
+        let mut spec = two_family_spec(1);
+        spec.families[1] = BrainKind::from(name.to_owned());
+        let error = run_tournament(&spec, &small_world()).expect_err("legacy-only family");
+        assert!(matches!(
+            error,
+            TournamentError::UnavailableBrainFamily { ref family, ref reason }
+                if family == name && reason.contains("no canonical genome/evaluator")
+        ));
+    }
+}
+
+#[cfg(not(feature = "brain-ft"))]
+#[test]
+fn ft_tournament_requires_the_feature_without_substitution() {
+    for name in ["ft", "frankentorch", "ft-control", "ft.baseline"] {
+        let mut spec = two_family_spec(1);
+        spec.families[1] = BrainKind::from(name.to_owned());
+        let error = run_tournament_with_jobs(&spec, &small_world(), 2)
+            .expect_err("Ft without its compiled feature");
+        assert!(matches!(
+            error,
+            TournamentError::UnavailableBrainFamily { ref family, ref reason }
+                if family == name && reason.contains("brain-ft")
+        ));
+    }
+}
+
+#[test]
+fn ft_spec_aliases_have_one_identity_and_keep_explicit_control_arms() {
+    use scriptbots_app::tournament::{TournamentSpecFile, to_brain_kind};
+
+    assert_eq!(to_brain_kind("frankentorch"), to_brain_kind("ft"));
+    assert_ne!(to_brain_kind("ft-control"), to_brain_kind("ft"));
+    let mut spec = TournamentSpecFile::from_toml_str(include_str!("../../../tournament/spec.toml"))
+        .expect("existing spec");
+    spec.apply_cli_overrides(Some("ft,frankentorch"), Some("1"), Some(1), Some(8))
+        .expect("CLI overrides");
+    assert!(matches!(
+        plan(&spec.to_spec().unwrap()),
+        Err(TournamentError::DuplicateFamilies { family }) if family == "ft"
+    ));
+}
+
+#[test]
+fn ft_comparison_preset_admits_bounded_mixed_architectures_explicitly() {
+    use scriptbots_app::tournament::TournamentSpecFile;
+
+    let spec_file =
+        TournamentSpecFile::from_toml_str(include_str!("../../../tournament/ft_comparison.toml"))
+            .expect("shipped Ft comparison preset");
+    assert!(spec_file.parameters.is_none());
+    assert!(
+        spec_file
+            .tournament
+            .title
+            .contains("architecture comparison")
+    );
+    assert!(
+        spec_file
+            .reproducibility
+            .as_ref()
+            .expect("explicit repeatability policy")
+            .require_identical_rerun
+    );
+    for spec in [
+        spec_file.to_spec().unwrap(),
+        spec_file.to_smoke_spec().unwrap(),
+    ] {
+        assert_eq!(
+            spec.families,
+            vec![BrainKind::new("mlp"), BrainKind::new("ft")]
+        );
+        assert!(spec.closed);
+        assert_eq!(spec.order_policy, OrderPolicy::BothAssignments);
+        let plans = plan(&spec).expect("balanced bounded comparison");
+        assert_eq!(plans.len(), spec.seeds.len() * 2);
+        let repeated_tick_budget = plans.len() as u64 * spec.ticks * 2;
+        assert!(repeated_tick_budget <= 4_096);
+        assert!(plans.iter().all(|entry| {
+            entry.cohort[&BrainKind::new("ft")] == entry.cohort[&BrainKind::new("mlp")]
+        }));
+    }
+}
+
+#[cfg(feature = "brain-ft")]
+#[test]
+fn ft_tournament_runs_real_genomes_with_repeatable_parallel_outcomes() {
+    let mut spec = two_family_spec(16);
+    spec.families[1] = BrainKind::new("frankentorch");
+    spec.cohort_size = 8;
+    spec.seeds = vec![17, 29];
+    let serial = run_tournament(&spec, &small_world()).expect("Ft matches");
+    let parallel = run_tournament_with_jobs(&spec, &small_world(), 2).expect("parallel Ft matches");
+    assert_eq!(serial.len(), 4);
+    for (first, repeated) in serial.iter().zip(parallel) {
+        assert_eq!(first.outcome, repeated.outcome);
+        assert_eq!(first.config_digest, repeated.config_digest);
+        assert_eq!(
+            first.initial_genome_digests,
+            repeated.initial_genome_digests
+        );
+        assert_eq!(
+            first.initial_mutation_rates,
+            repeated.initial_mutation_rates
+        );
+        let ft = BrainKind::new("frankentorch");
+        assert_eq!(first.outcome.ticks_run, spec.ticks);
+        assert!(first.outcome.family(ft.clone()).is_some());
+        assert!(first.initial_brain_source_scalars[&ft] > 0);
+        assert_ne!(
+            first.initial_genome_digests[&ft],
+            first.initial_genome_digests[&MLP_A]
+        );
+        assert!(first.outcome.warnings.iter().any(|warning| {
+            warning.contains("validated genome topology")
+                && warning.contains("not recorded tick-zero activity")
+        }));
+    }
+
+    let rows = scriptbots_app::tournament::reports_to_result_rows(
+        &serial,
+        "cpu_simd",
+        "exact",
+        true,
+        "ft-alias-test",
+        &scriptbots_app::BuildProvenanceV0::current(),
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.family == "frankentorch")
+            .count(),
+        4
+    );
+    assert!(rows.iter().all(|row| row.initial_genome_digest.len() == 64));
+}
+
+#[cfg(feature = "brain-ft")]
+#[test]
+fn ft_leaderboard_carries_topology_provenance_and_keeps_profile_constraints() {
+    use scriptbots_app::{
+        BuildProvenanceV0,
+        tournament::{TournamentResultRow, TournamentSpecFile, execute_leaderboard_tournament},
+    };
+
+    let mut spec = TournamentSpecFile::from_toml_str(include_str!("../../../tournament/spec.toml"))
+        .expect("existing spec");
+    spec.apply_cli_overrides(Some("mlp,frankentorch"), Some("17,29"), Some(4), Some(8))
+        .expect("explicit Ft CLI entry");
+    let build = BuildProvenanceV0::current();
+    let constrained = execute_leaderboard_tournament(
+        &spec,
+        None,
+        true,
+        &small_world(),
+        &build,
+        None,
+        None,
+        true,
+        1,
+    )
+    .expect_err("the pinned 200-cell profile is not a dense Ft architecture");
+    assert!(matches!(
+        constrained,
+        TournamentError::Publication { reason }
+            if reason.contains("observed initial family topology differs")
+    ));
+
+    // The shipped opt-in experiment compares architectures without claiming equal cell counts.
+    spec =
+        TournamentSpecFile::from_toml_str(include_str!("../../../tournament/ft_comparison.toml"))
+            .expect("shipped Ft comparison preset");
+    spec.apply_cli_overrides(Some("mlp,frankentorch"), Some("17,29"), Some(4), Some(8))
+        .expect("bounded explicit comparison");
+    let outcome = execute_leaderboard_tournament(
+        &spec,
+        None,
+        true,
+        &small_world(),
+        &build,
+        None,
+        None,
+        true,
+        2,
+    )
+    .expect("complete real Ft leaderboard and repeated-execution check");
+    assert_eq!(outcome.total_matches, 4);
+    assert_eq!(outcome.eligible_rows, 8);
+    assert_eq!(outcome.excluded_rows, 0);
+    let rows = TournamentResultRow::deserialize_jsonl(&outcome.results_jsonl).expect("result rows");
+    let ft_rows: Vec<_> = rows.iter().filter(|row| row.family == "ft").collect();
+    assert_eq!(ft_rows.len(), 4);
+    assert!(ft_rows.iter().all(|row| {
+        row.ticks_run == 4
+            && row.initial_genome_digest.len() == 64
+            && row
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("validated genome topology"))
+    }));
+    assert!(
+        outcome
+            .leaderboard_md
+            .contains("Ft counts validated genome")
+    );
+    assert!(
+        outcome
+            .leaderboard_md
+            .contains("without claiming tick-zero activity")
+    );
+    assert!(outcome.leaderboard_md.contains("ft-survival_share"));
+}
+
+#[test]
 fn test_tournament_integration_elo_progression() {
     let mut harness = TournamentHarness::new();
     harness.register_family("mlp");
