@@ -30,9 +30,8 @@
 //! completed barrier. Transient journal-capacity backpressure leaves the exact
 //! partial barrier private and is retried once by the next explicit barrier
 //! call. A terminal mid-barrier island fault latches the whole archipelago
-//! with a typed error naming the island; in either case exposed views and
-//! digests remain at the prior barrier rather than leaking a silently uneven
-//! epoch.
+//! with a typed error naming the island; in either case snapshots remain at
+//! the prior barrier and live science reads refuse the incomplete epoch.
 //!
 //! # Step topology (the parallelism dial)
 //!
@@ -1374,17 +1373,10 @@ impl Archipelago {
     /// epoch; the fault error already names the failed island and tick), and
     /// [`ArchipelagoError::Digest`] when the digest cannot be computed.
     pub fn island_digest(&self, island: IslandId) -> Result<WorldDigestV1, ArchipelagoError> {
-        if let Some(detail) = &self.latched {
-            return Err(ArchipelagoError::Latched {
-                detail: detail.clone(),
-            });
-        }
+        self.ensure_barrier_readable()?;
         let index = self
             .island_index(island)
             .ok_or(ArchipelagoError::UnknownIsland { island })?;
-        if let Some(blocked) = self.islands.iter().find_map(Self::journal_full_error) {
-            return Err(blocked);
-        }
         self.islands[index]
             .core
             .scientific_digest_v1()
@@ -1400,21 +1392,18 @@ impl Archipelago {
     /// about digests.
     ///
     /// Takes `&self`, so it cannot be called while [`Self::step_to_barrier`] holds
-    /// `&mut self`. The partially-stepped world stays unobservable by construction, which
-    /// is the invariant this module's header commits to.
+    /// `&mut self`. If a barrier returns with retained journal backpressure, reads
+    /// remain blocked until every island completes that same barrier. The closure
+    /// is never invoked while the archipelago is blocked or latched.
     ///
-    /// Errors identically to [`Self::island_digest`] on a latched archipelago or an
-    /// unknown island: a caller must not be able to read science out of a failed run.
+    /// Errors identically to [`Self::island_digest`] on a blocked or latched
+    /// archipelago or an unknown island.
     pub fn with_island_world<R>(
         &self,
         island: IslandId,
         read: impl FnOnce(&WorldState) -> R,
     ) -> Result<R, ArchipelagoError> {
-        if let Some(detail) = &self.latched {
-            return Err(ArchipelagoError::Latched {
-                detail: detail.clone(),
-            });
-        }
+        self.ensure_barrier_readable()?;
         let index = self
             .island_index(island)
             .ok_or(ArchipelagoError::UnknownIsland { island })?;
@@ -1439,21 +1428,36 @@ impl Archipelago {
     /// genuinely wants a cross-island gene pool has to discard the island axis
     /// deliberately, which is a decision someone can review.
     ///
-    /// The set is barrier-consistent: it reads committed island worlds through
-    /// `&self`, so it cannot interleave with [`Self::step_to_barrier`].
+    /// The set is barrier-consistent: it cannot interleave with
+    /// [`Self::step_to_barrier`] and refuses an incomplete retained barrier.
     ///
     /// # Errors
     ///
-    /// Returns [`ArchipelagoError::Latched`] once an island fault has latched the
-    /// archipelago — a census taken then would describe a partially-stepped
-    /// epoch — or [`ArchipelagoError::Digest`] if an island's per-agent identity
-    /// state cannot be read.
+    /// Returns [`ArchipelagoError::JournalBlocked`] while transient journal
+    /// backpressure retains an incomplete barrier, [`ArchipelagoError::Latched`]
+    /// once an island fault has latched the archipelago, or
+    /// [`ArchipelagoError::Digest`] if an island's per-agent identity state cannot
+    /// be read.
     pub fn organism_census(&self) -> Result<BTreeSet<OrganismId>, ArchipelagoError> {
+        self.ensure_barrier_readable()?;
+        self.current_organism_census()
+    }
+
+    fn ensure_barrier_readable(&self) -> Result<(), ArchipelagoError> {
         if let Some(detail) = &self.latched {
             return Err(ArchipelagoError::Latched {
                 detail: detail.clone(),
             });
         }
+        if let Some(blocked) = self.islands.iter().find_map(Self::journal_full_error) {
+            return Err(blocked);
+        }
+        Ok(())
+    }
+
+    /// Inspect current owners for internal migration conservation and recovery.
+    /// This does not certify a committed barrier; public reads use the guard above.
+    fn current_organism_census(&self) -> Result<BTreeSet<OrganismId>, ArchipelagoError> {
         let mut census = BTreeSet::new();
         for island in &self.islands {
             let id = island.meta.id;
@@ -1692,7 +1696,7 @@ impl Archipelago {
         // production, not only in tests, because the failure it catches is
         // silent and a run that has corrupted its population must stop rather
         // than keep producing plausible science.
-        let census_after = self.organism_census()?;
+        let census_after = self.current_organism_census()?;
         verify_migration(&census_before, &census_after, &moves).map_err(|violation| {
             ArchipelagoError::MigrationCorrupted {
                 tick: barrier_tick.0,
@@ -2617,7 +2621,16 @@ mod tests {
             panic!("application before journal refusal must remain visible: {error:?}");
         };
         assert_eq!(observed.island, IslandId(1));
-        let after = archipelago.organism_census().expect("after census");
+        assert!(matches!(
+            archipelago.organism_census(),
+            Err(ArchipelagoError::JournalBlocked {
+                island: IslandId(1),
+                ..
+            })
+        ));
+        let after = archipelago
+            .current_organism_census()
+            .expect("internal interrupted-arrival census");
         assert_eq!(after.len(), before.len());
         assert!(!after.contains(&origin));
         assert!(after.contains(&observed));
@@ -3145,17 +3158,42 @@ mod tests {
                     ..
                 })
             ));
+            let mut read_called = false;
+            let read = archipelago.with_island_world(id, |_| {
+                read_called = true;
+            });
+            assert!(matches!(
+                read,
+                Err(ArchipelagoError::JournalBlocked {
+                    island: IslandId(1),
+                    ..
+                })
+            ));
+            assert!(!read_called, "a blocked science closure must not execute");
         }
+        assert!(matches!(
+            archipelago.organism_census(),
+            Err(ArchipelagoError::JournalBlocked {
+                island: IslandId(1),
+                ..
+            })
+        ));
     }
 
     #[test]
     fn transient_journal_full_retries_same_barrier_without_duplicate_science() {
         let state = Rc::new(RefCell::new(FullOnceJournalState::default()));
         let journal_state = Rc::clone(&state);
-        let islands = vec![spec(0, test_config(None)), spec(1, test_config(None))];
+        let config = ScriptBotsConfig {
+            population_spawn_interval: 1,
+            ..populated_config(None)
+        };
+        let islands = vec![spec(0, config.clone()), spec(1, config)];
+        let mut uninterrupted = populated_archipelago(archipelago_config(islands.clone(), 5))
+            .expect("uninterrupted reference archipelago");
         let mut archipelago = Archipelago::with_factories(
             archipelago_config(islands, 5),
-            |meta| WorldState::new(meta.effective_config.clone()),
+            populated_world_factory,
             move |meta| {
                 (meta.id == IslandId(1)).then(|| {
                     Box::new(FullOnceJournal {
@@ -3165,6 +3203,15 @@ mod tests {
             },
         )
         .expect("archipelago with transient journal backpressure");
+        let previous_snapshots: Vec<_> = [IslandId(0), IslandId(1)]
+            .into_iter()
+            .map(|id| {
+                (
+                    id,
+                    archipelago.island_snapshot(id).expect("initial snapshot"),
+                )
+            })
+            .collect();
 
         let first_error = archipelago
             .step_to_barrier()
@@ -3177,6 +3224,12 @@ mod tests {
             }
         ));
         assert_partial_barrier_stays_private(&archipelago);
+        for (id, previous) in &previous_snapshots {
+            assert!(Arc::ptr_eq(
+                previous,
+                &archipelago.island_snapshot(*id).expect("retained snapshot"),
+            ));
+        }
 
         let first_batch = {
             let state = state.borrow();
@@ -3197,8 +3250,17 @@ mod tests {
         let report = archipelago
             .step_to_barrier()
             .expect("the next explicit barrier retries retained backpressure");
+        uninterrupted
+            .step_to_barrier()
+            .expect("uninterrupted reference barrier");
         assert_eq!(report.epoch, 1);
         assert_eq!(report.barrier_tick, Tick(5));
+        assert!(
+            report
+                .islands
+                .iter()
+                .all(|island| island.ticks_stepped == 5)
+        );
         assert_eq!(archipelago.barrier_tick(), Tick(5));
         assert_eq!(archipelago.epoch(), 1);
         assert!(archipelago.latched().is_none());
@@ -3210,21 +3272,40 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Tick(5), Tick(5)]
         );
-        assert_eq!(
-            archipelago.islands[1].next_command_sequence, 6,
-            "retrying the retained batch must not duplicate the applied tick"
-        );
-        for id in [IslandId(0), IslandId(1)] {
+        for island in &archipelago.islands {
+            assert_eq!(
+                island.next_command_sequence, 6,
+                "retrying the retained barrier must not duplicate any island's steps"
+            );
+        }
+        for (id, previous) in &previous_snapshots {
+            let current = archipelago
+                .island_snapshot(*id)
+                .expect("committed snapshot");
+            assert_eq!(current.world.tick, 5);
+            assert!(!Arc::ptr_eq(previous, &current));
+            assert_eq!(previous.world.tick, 0, "held prior snapshots are immutable");
             assert_eq!(
                 archipelago
-                    .island_snapshot(id)
-                    .expect("committed snapshot")
-                    .world
-                    .tick,
-                5
+                    .with_island_world(*id, WorldState::tick)
+                    .expect("committed world"),
+                Tick(5),
             );
-            archipelago.island_digest(id).expect("committed digest");
+            assert_eq!(
+                archipelago.island_digest(*id).expect("committed digest"),
+                uninterrupted.island_digest(*id).expect("reference digest"),
+                "retry must match uninterrupted agent, brain, and RNG state"
+            );
         }
+        let census = archipelago.organism_census().expect("committed census");
+        assert!(
+            !census.is_empty(),
+            "the retry proof must exercise living agents"
+        );
+        assert_eq!(
+            census,
+            uninterrupted.organism_census().expect("reference census")
+        );
 
         let state = state.borrow();
         assert_eq!(
@@ -3234,6 +3315,21 @@ mod tests {
         );
         assert!(Arc::ptr_eq(&first_batch, &state.attempts[1]));
         assert_eq!(state.attempts[1].id(), first_batch_id);
+        assert_eq!(
+            state
+                .attempts
+                .iter()
+                .map(|batch| {
+                    batch
+                        .scientific()
+                        .expect("scientific boundary")
+                        .summary()
+                        .tick
+                })
+                .collect::<Vec<_>>(),
+            vec![Tick(1), Tick(1), Tick(2), Tick(3), Tick(4), Tick(5)],
+            "the retained tick is retried exactly once; later ticks are not duplicated"
+        );
         assert!(
             state.attempts[2..]
                 .windows(2)
@@ -3294,9 +3390,19 @@ mod tests {
                 "island {id}'s exposed view must remain at the prior barrier \
                  after a mid-barrier fault"
             );
+            assert!(matches!(
+                archipelago.island_digest(IslandId(id)),
+                Err(ArchipelagoError::Latched { .. })
+            ));
+            let mut read_called = false;
+            let read = archipelago.with_island_world(IslandId(id), |_| {
+                read_called = true;
+            });
+            assert!(matches!(read, Err(ArchipelagoError::Latched { .. })));
+            assert!(!read_called, "a failed science closure must not execute");
         }
         assert!(matches!(
-            archipelago.island_digest(IslandId(0)),
+            archipelago.organism_census(),
             Err(ArchipelagoError::Latched { .. })
         ));
     }

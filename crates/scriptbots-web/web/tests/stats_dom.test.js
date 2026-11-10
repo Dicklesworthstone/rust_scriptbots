@@ -234,10 +234,18 @@ async function runCheckpointJourney(browser, baseUrl, moduleFile) {
     await page.waitForFunction(() => document.getElementById("version").textContent !== "initializing…");
     await observeOwnerAndPause();
     const snapshot = () => page.evaluate(() => JSON.stringify(window.__continuationOwner.snapshot()));
-    const legacy = await snapshot();
-    await page.click("#checkpoint-save");
-    await page.waitForFunction(() => document.getElementById("checkpoint-status").textContent.startsWith("Save failed:"));
-    if (downloads !== 0 || await snapshot() !== legacy) throw new Error("Legacy refusal changed science or produced a file");
+    const defaultOwner = await page.evaluate(() => {
+      const owner = window.__continuationOwner;
+      const before = JSON.stringify(owner.snapshot());
+      const bytes = owner.checkpoint();
+      return { preset: owner.brainPreset(), selected: document.getElementById("brain-preset").value,
+        bytes: bytes.length, unchanged: before === JSON.stringify(owner.snapshot()),
+        canSave: !document.getElementById("checkpoint-save").disabled };
+    });
+    if (defaultOwner.preset !== "mlp" || defaultOwner.selected !== "mlp"
+        || !defaultOwner.bytes || !defaultOwner.unchanged || !defaultOwner.canSave) {
+      throw new Error(`Default browser world is not an evolvable, saveable MLP owner: ${JSON.stringify(defaultOwner)}`);
+    }
 
     await page.selectOption("#brain-preset", "mlp");
     await page.evaluate(() => {
@@ -322,9 +330,14 @@ async function runCheckpointJourney(browser, baseUrl, moduleFile) {
     await page.waitForFunction(() => window.__continuationOwner !== window.__browserBeforeWanderReset
       && window.__continuationOwner?.brainPreset() === "wander");
     const legacyAfterReload = await snapshot();
-    await page.click("#checkpoint-browser-save");
-    await page.waitForFunction(() => document.getElementById("checkpoint-browser-status").textContent.startsWith("Browser save failed:"));
-    if (await snapshot() !== legacyAfterReload) throw new Error("Unsupported browser save changed the Wander world");
+    const legacyRefusal = await page.evaluate(() => {
+      let refused = false;
+      try { window.__continuationOwner.checkpoint(); } catch (_) { refused = true; }
+      return { refused, disabled: ["checkpoint-save", "checkpoint-browser-save"].every((id) => document.getElementById(id).disabled),
+        explanation: document.getElementById("checkpoint-capability").textContent };
+    });
+    if (!legacyRefusal.refused || !legacyRefusal.disabled || !legacyRefusal.explanation.includes("Wander")
+        || await snapshot() !== legacyAfterReload) throw new Error("Legacy Wander continuation refusal is hidden or changes science");
     await page.click("#checkpoint-browser-restore");
     await page.waitForFunction(() => document.getElementById("checkpoint-browser-status").textContent.startsWith("Restored browser continuation at tick"));
     if (await snapshot() !== saved.snapshot || await page.inputValue("#steps-per-frame") !== "0") {
@@ -399,6 +412,39 @@ async function runCheckpointJourney(browser, baseUrl, moduleFile) {
     if (await snapshot() !== beforeOversize || await page.evaluate(() => window.__continuationReads) !== 0) {
       throw new Error("Oversized file was read or changed the running world");
     }
+    const familyContinuations = [];
+    for (const preset of ["dwraon", "assembly"]) {
+      await page.selectOption("#brain-preset", preset);
+      await page.evaluate(() => { window.__ownerBeforeFamilyReset = window.__continuationOwner; });
+      await page.click("#reset-btn");
+      await page.waitForFunction((family) => window.__continuationOwner !== window.__ownerBeforeFamilyReset
+        && window.__continuationOwner.brainPreset() === family, preset);
+      const before = await page.evaluate(() => {
+        const owner = window.__continuationOwner;
+        owner.tick(3);
+        return { snapshot: JSON.stringify(owner.snapshot()), identity: owner.frame().identity };
+      });
+      const [familyDownload] = await Promise.all([page.waitForEvent("download"), page.click("#checkpoint-save")]);
+      const familyPath = path.join(proof, `${preset}.sbcheckpoint`);
+      await familyDownload.saveAs(familyPath);
+      const expected = await page.evaluate(() => {
+        window.__continuationOwner.tick(1);
+        return JSON.stringify(window.__continuationOwner.snapshot());
+      });
+      await page.setInputFiles("#checkpoint-load", familyPath);
+      await page.waitForFunction((family) => document.getElementById("checkpoint-status").textContent.startsWith("Loaded continuation")
+        && document.getElementById("brain-preset").value === family, preset);
+      if (await snapshot() !== before.snapshot || await page.inputValue("#steps-per-frame") !== "0") {
+        throw new Error(`${preset} continuation did not restore the exact paused source`);
+      }
+      const actual = await page.evaluate(() => {
+        window.__continuationOwner.tick(1);
+        return JSON.stringify(window.__continuationOwner.snapshot());
+      });
+      if (actual !== expected) throw new Error(`${preset} continuation lost recurrent/program evaluator state`);
+      familyContinuations.push({ preset, artifact: familyPath, bytes: fs.statSync(familyPath).size,
+        identity: before.identity, nextTick: JSON.parse(actual).tick });
+    }
     await page.evaluate(() => {
       const read = File.prototype.arrayBuffer;
       window.__ownerBeforeDelayedLoad = window.__continuationOwner;
@@ -419,7 +465,8 @@ async function runCheckpointJourney(browser, baseUrl, moduleFile) {
     const result = { passed: true, artifact, bytes: bytes.length, sourceIdentity: saved.identity,
       continuedIdentity: continued.identity, savedTick: JSON.parse(saved.snapshot).tick,
       nextTick: JSON.parse(continued.snapshot).tick, rejected, oversizedBytes: limit + 1,
-      oversizedReads: 0, staleReadPreservedReset: true, browserStorage, downloads, errors, consoleLogs: logs };
+      oversizedReads: 0, staleReadPreservedReset: true, defaultOwner, legacyRefusal, familyContinuations,
+      browserStorage, downloads, errors, consoleLogs: logs };
     fs.writeFileSync(path.join(proof, "result.json"), JSON.stringify(result, null, 2), { flag: "wx" });
     return result;
   } finally {

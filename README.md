@@ -1259,12 +1259,16 @@ bounded pages, preserves the recorded cadence and history, and returns the newes
 events in canonical order. Its event counts cover the complete run, including
 events evicted from the live event ring. The default output limit is 1,024 and the
 maximum is 4,096; `limit=0` still validates and reconstructs the entire input stream.
-The JSON includes input provenance, coverage, output truncation and eviction counts.
-Missing or corrupt inputs are refused, so older databases without canonical detector
-inputs cannot use this report. Changes to detector interval, history capacity or
-event capacity during a run are also refused; unrelated authenticated configuration
-revisions are supported. The report does not use saved narrative outputs to supply
-its reconstructed events.
+The version-2 JSON includes input provenance, coverage, output truncation, eviction
+counts, the number of effective policy changes and the final detector policy.
+Journal-authenticated changes to detector interval, history capacity and event
+capacity are applied at their completed tick boundaries. Shrinking a buffer keeps
+its newest entries; growing it preserves the available history. Disabling and
+re-enabling narration preserves event cooldowns and pending persistence records.
+Missing, corrupt or unauthenticated inputs are refused, so older databases without
+canonical detector inputs cannot use this report. Reconstruction uses the current
+detector implementation and does not assert historical equality across source
+revisions. Saved narrative outputs never supply its reconstructed events.
 
 ### Streaming demographic and metric summaries
 
@@ -1907,6 +1911,37 @@ reports `cancelled`; its unfinished run records retain `running`, with actual
 progress in validated owner/journal cuts for resume. A batch that finishes before
 the request takes effect still reports `completed`.
 
+Read per-run checkpoint progress through `GET /api/v1/experiments/{id}`, MCP
+`experiment_status`, or `control_cli experiment status ID`. Each run includes
+`target_ticks`, the validated plan's requested horizon, and a separate typed
+`checkpoint_progress`:
+
+- `state: "observed"` supplies the saved `tick`, a `checkpoint_digest` containing
+  the BLAKE3 of the complete encoded checkpoint, and its observation `source`.
+  `source: "published"` means the runner successfully wrote, synced and published
+  that cut. `source: "recovered"` means the runner read an existing committed cut,
+  validated its plan/run/build/family identities, and restored its world, owner
+  and journal without advancing science.
+- `state: "unavailable"` identifies not-started work, a pending publication or
+  recovery, or a missing committed checkpoint. It does not imply tick zero.
+- `state: "refused"` distinguishes invalid or unreadable checkpoints and
+  conflicting observations. Explicit resume retries repaired cuts through the
+  existing validation path.
+
+`total_ticks` remains terminal status evidence and stays zero for pending and
+running records, including cancelled unfinished runs. For example, a running
+record can have `total_ticks: 0`, `target_ticks: 1000`, and an observed checkpoint
+at tick 317. The terminal Experiments screen displays this as **Saved/Target**;
+an unavailable observation stays unavailable instead of becoming a zero estimate.
+
+Active status polls read a bounded latest-value cache. A stopped detail request
+recovers at most one cold checkpoint, with at most one recovery in flight per
+runner; repeat detail requests to observe additional retained cuts. Summary
+listings perform no checkpoint recovery. These bounds do not impose a filesystem
+deadline. An observation describes the exact previously seen cut, not continuous
+integrity verification of its current file; downloads and resume retain their
+own validation. Progress reads neither advance science nor rewrite saved status.
+
 Experiment create and resume share one execution budget across REST, MCP and
 cloned control handles. Each worker reserves the smaller of its concurrency and
 unfinished-run count, and keeps those slots through preparation and artifact
@@ -2427,6 +2462,35 @@ lane evidence, and uploads its raw logs and observations even after a failed run
 Unprovisioned controllers leave execution pending; workflow wiring does not prove
 that CI ran. The original wire-level control probe remains a separate CI job.
 This matrix covers bounded tournament smoke, not the full publication protocol.
+
+### Comparing FtBrain with MLP
+
+The tournament runner accepts the versioned FtBrain family when the application
+is built with `brain-ft`. The bundled opt-in profile exercises real founding
+genomes, both spawn orders, equal founder cohorts, result rows and leaderboard
+generation:
+
+```bash
+cargo run -p scriptbots-app --features brain-ft -- tournament \
+  --spec tournament/ft_comparison.toml --smoke --out runs/ft-comparison
+```
+
+The smoke profile uses two seeds, two orders, eight founders and 32 ticks per
+match; omit `--smoke` for four seeds, 16 founders and 240 ticks. Both require an
+identical rerun. These are bounded architecture comparisons, not evidence of
+long-horizon evolution or a superior family. Ft uses its default dense hidden
+layers `[48, 32, 24]`; the existing MLP architecture differs. The report retains
+the actual initial genome digests and source-scalar counts. Ft's initial count
+comes from validated genome structure, without claiming recorded activity before
+the first scientific tick.
+
+`ft` and `frankentorch` select the same family in CLI/spec inputs. Explicit labels
+such as `ft-control` remain distinct experimental arms. A build without `brain-ft`
+refuses the family before starting matches. NeuroFlow remains unavailable to this
+heritable tournament because its legacy runner lacks the canonical
+genome/evaluator adapter. The canonical `tournament/spec.toml` retains its existing
+200-source-scalar requirement; the new mixed-architecture profile explicitly
+omits that requirement instead of weakening it globally.
 
 ## Roadmap (condensed)
 1. Core data structures and config (done); expand parity (metabolism, locomotion, food math, carcass sharing).

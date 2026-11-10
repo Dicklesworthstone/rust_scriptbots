@@ -9,6 +9,9 @@ scriptbots.db
 toolchains/
 crates/scriptbots-web/web/pkg/
 vendor/
+!/vendor/
+/vendor/*
+!/vendor/crossterm/
 *.backup
 scriptbots.db.wal
 scriptbots*.db

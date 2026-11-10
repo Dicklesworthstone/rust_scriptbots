@@ -15839,9 +15839,10 @@ pub mod narrative {
     ///
     /// This is deliberately a runtime policy, not a persisted wire type:
     /// storage must bind a run to fixed-width, versioned configuration
-    /// metadata before constructing it. One replay covers one stable policy
-    /// revision; a mid-run policy transition must be segmented or refused by
-    /// the persisted feeder rather than silently applied.
+    /// metadata before constructing it. Policy transitions take effect at the
+    /// next completed scientific tick; they retain detector cooldowns and the
+    /// newest history that fits the new bounds. A persisted feeder must verify
+    /// the configuration revision before supplying a changed policy.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct NarrativeReplayPolicyV1 {
         /// Completed ticks between detector passes; zero disables detection.
@@ -15937,17 +15938,45 @@ pub mod narrative {
         /// Refuses unsupported schemas, non-finite values, repeated or
         /// decreasing ticks, and gaps in the supposedly complete input stream.
         pub fn push(&mut self, input: NarrativeInputV1) -> Result<(), NarrativeInputError> {
+            self.push_with_policy(input, self.policy)
+        }
+
+        /// Feed one complete input under its authenticated effective policy.
+        ///
+        /// Changes apply at this completed tick, as in the live world. Shrinking
+        /// retention evicts the oldest display events and inputs; growing it
+        /// never reconstructs previously evicted history. Detection cadence is
+        /// evaluated against the absolute tick, including after re-enabling it.
+        /// Cooldowns and events awaiting persistence survive every policy change.
+        /// The caller owns authentication of the recorded configuration revision.
+        ///
+        /// # Errors
+        ///
+        /// Invalid policies, inputs, and continuity leave the entire replay,
+        /// including its previous policy and retained evidence, unchanged.
+        pub fn push_with_policy(
+            &mut self,
+            input: NarrativeInputV1,
+            policy: NarrativeReplayPolicyV1,
+        ) -> Result<(), NarrativeInputError> {
+            let policy = NarrativeReplayPolicyV1::new(
+                policy.interval,
+                policy.history_capacity,
+                policy.event_capacity,
+            )?;
             input.validate()?;
             if let Some(previous) = self.last_tick {
                 validate_tick_pair(previous, input.tick.0)?;
             }
 
-            if self.history.len() >= self.policy.history_capacity {
-                self.history.pop_front();
-                self.dropped_inputs = self.dropped_inputs.saturating_add(1);
-            }
+            self.policy = policy;
+            self.dropped_inputs = self.dropped_inputs.saturating_add(retain_latest(
+                &mut self.history,
+                self.policy.history_capacity - 1,
+            ));
             self.history.push_back(input);
             self.last_tick = Some(input.tick.0);
+            self.narrative.retain_capacity(self.policy.event_capacity);
 
             if self.policy.interval != 0
                 && input.tick.0.is_multiple_of(u64::from(self.policy.interval))
@@ -16068,6 +16097,15 @@ pub mod narrative {
     }
 
     impl RunNarrative {
+        /// Apply a display-ring bound without dropping undrained evidence or
+        /// resetting deduplication. Called once per completed tick even when
+        /// event detection is disabled or not due.
+        pub(super) fn retain_capacity(&mut self, capacity: usize) {
+            self.dropped = self
+                .dropped
+                .saturating_add(retain_latest(&mut self.events, capacity));
+        }
+
         pub(crate) fn validate_checkpoint(&self, tick: Tick, capacity: usize) -> bool {
             let policy = self.policy;
             self.events.len() <= capacity
@@ -16186,6 +16224,7 @@ pub mod narrative {
         {
             let inputs: Vec<NarrativeInputV1> = history.into_iter().collect();
             validate_input_sequence(&inputs)?;
+            self.retain_capacity(capacity);
             if inputs.len() < 8 || capacity == 0 {
                 return Ok(());
             }
@@ -16380,6 +16419,16 @@ pub mod narrative {
             self.pending_persistence.push(record.clone());
             self.events.push_back(record);
         }
+    }
+
+    /// Preserve the newest observations without allocating or inventing history.
+    /// Both the live and persisted feeders apply this at the tick boundary.
+    pub(super) fn retain_latest<T>(values: &mut VecDeque<T>, capacity: usize) -> u64 {
+        let removed = values.len().saturating_sub(capacity);
+        for _ in 0..removed {
+            values.pop_front();
+        }
+        u64::try_from(removed).unwrap_or(u64::MAX)
     }
 
     fn validate_input_sequence(inputs: &[NarrativeInputV1]) -> Result<(), NarrativeInputError> {
@@ -26023,9 +26072,10 @@ impl WorldState {
             spike_hits: self.combat_spike_hits,
         };
         self.record_narrative_input(&summary);
-        if self.history.len() >= self.config.history_capacity {
-            self.history.pop_front();
-        }
+        narrative::retain_latest(
+            &mut self.history,
+            self.config.history_capacity.saturating_sub(1),
+        );
         self.history.push_back(summary.clone());
         self.last_spike_hits = self.combat_spike_hits;
         self.last_max_age = max_age;
@@ -26652,6 +26702,8 @@ impl WorldState {
     /// observes or mutates simulation state, so enabling it cannot perturb a
     /// run (proved by `narrative_layer_does_not_perturb_the_simulation`).
     fn stage_narrative(&mut self, next_tick: Tick) {
+        self.narrative
+            .retain_capacity(self.config.narrative_capacity);
         let interval = self.config.narrative_interval;
         if interval == 0 || !next_tick.0.is_multiple_of(u64::from(interval)) {
             return;
@@ -31763,6 +31815,9 @@ impl WorldState {
             }
         }
 
+        // Narrative retention follows the final effective policy at the next
+        // completed tick. Trimming here would make a shrink/grow command pair
+        // between ticks lose history that persisted per-tick inputs cannot see.
         self.config = new_config;
         if self.config.communication_mi_interval > 0 {
             self.realized_hearing_capture_enabled = true;
@@ -37657,6 +37712,146 @@ mod tests {
     }
 
     #[test]
+    fn narrative_policy_changes_bound_history_and_refuse_invalid_inputs_atomically() {
+        use narrative::{NarrativeInputV1, NarrativeReplay, NarrativeReplayPolicyV1};
+
+        let input = |tick| NarrativeInputV1::new(Tick(tick), 10, 1.0, 0).unwrap();
+        let original = NarrativeReplayPolicyV1::new(0, 8, 8).unwrap();
+        let mut replay = NarrativeReplay::from_inputs(original, (1..=8).map(input)).unwrap();
+        let small = NarrativeReplayPolicyV1::new(0, 3, 0).unwrap();
+        replay.push_with_policy(input(9), small).unwrap();
+        assert_eq!(
+            replay
+                .history()
+                .iter()
+                .map(|row| row.tick.0)
+                .collect::<Vec<_>>(),
+            vec![7, 8, 9],
+            "one tick must enforce a smaller bound, not evict only one old row"
+        );
+        assert_eq!(replay.dropped_inputs(), 6);
+
+        let grown = NarrativeReplayPolicyV1::new(0, 6, 8).unwrap();
+        replay.push_with_policy(input(10), grown).unwrap();
+        replay.push(input(11)).unwrap();
+        assert_eq!(
+            replay
+                .history()
+                .iter()
+                .map(|row| row.tick.0)
+                .collect::<Vec<_>>(),
+            vec![7, 8, 9, 10, 11],
+            "increasing retention must not fabricate the evicted prefix"
+        );
+        assert_eq!(replay.dropped_inputs(), 6);
+
+        let invalid_policy = NarrativeReplayPolicyV1 {
+            history_capacity: 0,
+            ..small
+        };
+        for (candidate, policy) in [
+            (input(12), invalid_policy),
+            (input(11), small),
+            (input(13), small),
+            (
+                NarrativeInputV1 {
+                    average_energy: f32::NAN,
+                    ..input(12)
+                },
+                small,
+            ),
+        ] {
+            let previous = replay.clone();
+            assert!(replay.push_with_policy(candidate, policy).is_err());
+            assert_eq!(replay.policy(), previous.policy());
+            assert_eq!(replay.history(), previous.history());
+            assert_eq!(replay.events(), previous.events());
+            assert_eq!(replay.dropped_inputs(), previous.dropped_inputs());
+            assert_eq!(replay.dropped_events(), previous.dropped_events());
+            assert_eq!(replay.emission_watermarks(), previous.emission_watermarks());
+            assert_eq!(replay.pending_persistence(), previous.pending_persistence());
+        }
+        replay
+            .push(input(12))
+            .expect("failed transitions leave the next tick retryable");
+        assert_eq!(replay.history().len(), 6);
+    }
+
+    #[test]
+    fn narrative_policy_disable_and_reenable_preserve_evidence_cooldowns_and_cadence() {
+        use narrative::{EventKind, NarrativeInputV1, NarrativeReplay, NarrativeReplayPolicyV1};
+
+        let original = NarrativeReplayPolicyV1::new(1, 128, 8).unwrap();
+        let input = |tick, count| NarrativeInputV1::new(Tick(tick), count, 1.0, 0).unwrap();
+        let mut replay = NarrativeReplay::new(original).unwrap();
+        for tick in 1..=128 {
+            replay
+                .push(input(tick, if tick <= 64 { 1000 } else { 200 }))
+                .unwrap();
+        }
+        assert!(
+            replay
+                .events()
+                .iter()
+                .any(|event| event.kind == EventKind::PopulationCrash)
+        );
+        let pending = replay.pending_persistence().to_vec();
+        let watermarks = replay.emission_watermarks().to_vec();
+        let retained = replay.events().len();
+        let dropped = replay.dropped_events();
+
+        let disabled = NarrativeReplayPolicyV1::new(0, 128, 0).unwrap();
+        replay.push_with_policy(input(129, 1000), disabled).unwrap();
+        assert!(
+            replay.events().is_empty(),
+            "zero capacity clears the display ring even when detection is disabled"
+        );
+        assert_eq!(
+            replay.dropped_events(),
+            dropped + u64::try_from(retained).unwrap()
+        );
+        assert_eq!(replay.pending_persistence(), pending);
+        assert_eq!(replay.emission_watermarks(), watermarks);
+
+        let reenabled = NarrativeReplayPolicyV1::new(16, 128, 8).unwrap();
+        for tick in 130..144 {
+            replay
+                .push_with_policy(input(tick, 1000), reenabled)
+                .unwrap();
+            assert!(
+                replay.events().is_empty(),
+                "detection must wait for the absolute cadence at tick 144"
+            );
+            assert_eq!(replay.pending_persistence(), pending);
+        }
+        replay.push(input(144, 1000)).unwrap();
+        assert!(
+            replay
+                .events()
+                .iter()
+                .any(|event| event.kind == EventKind::PopulationBoom)
+        );
+        assert!(
+            replay
+                .events()
+                .iter()
+                .all(|event| event.kind != EventKind::PopulationCrash),
+            "re-enabling a retained history must not re-emit the earlier crash"
+        );
+        assert!(replay.pending_persistence().starts_with(&pending));
+        let before = replay.clone();
+        let invalid = NarrativeInputV1 {
+            average_energy: f32::INFINITY,
+            ..input(145, 200)
+        };
+        assert!(replay.push_with_policy(invalid, disabled).is_err());
+        assert_eq!(replay.events(), before.events());
+        assert_eq!(replay.pending_persistence(), before.pending_persistence());
+        assert_eq!(replay.emission_watermarks(), before.emission_watermarks());
+        assert_eq!(replay.policy(), before.policy());
+    }
+
+    #[test]
     fn narrative_detects_a_crash_and_names_it_in_deterministic_prose() {
         let mut values = vec![1000usize; 120];
         values.extend(std::iter::repeat_n(300usize, 120));
@@ -38107,6 +38302,158 @@ mod tests {
             replay.dropped_events(),
             "live and replay output rings must truncate identically"
         );
+    }
+
+    #[test]
+    fn production_narrative_policy_changes_match_replay_without_changing_science() {
+        let config = ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 20,
+            closed: true,
+            population_spawn_interval: 0,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            temperature_discomfort_rate: 0.0,
+            aging_health_decay_rate: 0.0,
+            spike_damage: 0.0,
+            spike_energy_cost: 0.0,
+            reproduction_energy_threshold: f32::MAX,
+            history_capacity: 128,
+            narrative_interval: 8,
+            narrative_capacity: 8,
+            rng_seed: Some(0x16_020_902),
+            ..ScriptBotsConfig::default()
+        };
+        let original_policy = narrative::NarrativeReplayPolicyV1::from_config(&config).unwrap();
+        let mut world = WorldState::new(config.clone()).unwrap();
+        let mut control = WorldState::new(config).unwrap();
+        let mut replay = narrative::NarrativeReplay::new(original_policy).unwrap();
+        for seed in 0..12 {
+            let mut agent = sample_agent(seed);
+            agent.health = 2.0;
+            world.spawn_agent(agent.clone());
+            control.spawn_agent(agent);
+        }
+        for tick in 1..=160 {
+            if tick == 97 {
+                for target in [&mut world, &mut control] {
+                    target
+                        .enqueue_intervention(Intervention::Meteor {
+                            region: Region::All,
+                            lethality: 10.0,
+                            scorch: 0.0,
+                        })
+                        .unwrap();
+                }
+            }
+            if tick == 105 {
+                let history = world.history.clone();
+                let events = world.narrative_events().clone();
+                let previous = world.config().clone();
+                let mut small = previous.clone();
+                small.history_capacity = 3;
+                small.narrative_capacity = 0;
+                small.narrative_interval = 0;
+                world.apply_config_update(small).unwrap();
+                assert_eq!(world.history, history);
+                assert_eq!(world.narrative_events(), &events);
+                world.apply_config_update(previous).unwrap();
+                assert_eq!(
+                    world.history, history,
+                    "coalesced policy changes must not erase history between recorded ticks"
+                );
+
+                let previous_revision = world.config_revision();
+                let previous_config = world.config().clone();
+                let mut invalid = previous_config.clone();
+                invalid.history_capacity = 0;
+                assert!(world.apply_config_update(invalid).is_err());
+                assert_eq!(world.config_revision(), previous_revision);
+                assert_eq!(world.config(), &previous_config);
+                assert_eq!(world.history, history);
+                assert_eq!(world.narrative_events(), &events);
+            }
+            if let Some((history_capacity, narrative_capacity, narrative_interval)) = match tick {
+                113 => Some((3, 0, 0)),
+                114 => Some((32, 8, 8)),
+                137 => Some((8, 1, 0)),
+                145 => Some((32, 8, 8)),
+                _ => None,
+            } {
+                let mut next = world.config().clone();
+                next.history_capacity = history_capacity;
+                next.narrative_capacity = narrative_capacity;
+                next.narrative_interval = narrative_interval;
+                world.apply_config_update(next).unwrap();
+            }
+            if tick == 129 {
+                for seed in 100..112 {
+                    let mut agent = sample_agent(seed);
+                    agent.health = 2.0;
+                    world.try_inject_agent(agent.clone()).unwrap();
+                    control.try_inject_agent(agent).unwrap();
+                }
+            }
+            let completion = world.step_outcome().expect("live policy transition");
+            control
+                .step_outcome()
+                .expect("unchanged-policy scientific control");
+            replay
+                .push_with_policy(
+                    narrative::NarrativeInputV1::try_from(&completion.outcome.summary).unwrap(),
+                    narrative::NarrativeReplayPolicyV1::from_config(world.config()).unwrap(),
+                )
+                .unwrap();
+            assert_eq!(world.narrative_events(), replay.events(), "tick {tick}");
+            assert_eq!(
+                world.narrative_dropped_events(),
+                replay.dropped_events(),
+                "tick {tick}"
+            );
+            assert_eq!(
+                world.narrative.emission_watermarks(),
+                replay.emission_watermarks(),
+                "tick {tick}"
+            );
+            let live_inputs = world
+                .history
+                .iter()
+                .map(narrative::NarrativeInputV1::try_from)
+                .collect::<Result<VecDeque<_>, _>>()
+                .unwrap();
+            assert_eq!(&live_inputs, replay.history(), "tick {tick}");
+            assert!(world.history.len() <= world.config().history_capacity);
+            assert!(world.narrative_events().len() <= world.config().narrative_capacity);
+            assert_eq!(
+                world.world_digest_v1().unwrap(),
+                control.world_digest_v1().unwrap(),
+                "narrative policy must leave the scientific transition unchanged at tick {tick}"
+            );
+            // The disabled storage lane drains pending events at every live tick.
+            replay.drain_pending_persistence();
+
+            match tick {
+                104 => assert!(
+                    world
+                        .narrative_events()
+                        .iter()
+                        .any(|event| event.kind == narrative::EventKind::Extinction)
+                ),
+                113 => {
+                    assert_eq!(world.history.len(), 3);
+                    assert!(world.narrative_events().is_empty());
+                }
+                114 => assert_eq!(world.history.len(), 4),
+                136 => assert!(
+                    world
+                        .narrative_events()
+                        .iter()
+                        .any(|event| event.kind == narrative::EventKind::PopulationBoom)
+                ),
+                _ => {}
+            }
+        }
     }
 
     #[test]

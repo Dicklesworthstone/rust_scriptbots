@@ -468,10 +468,13 @@
                 <button id="reset-btn" type="button">Reset Simulation</button>
                 <label for="brain-preset">Brain for new worlds</label>
                 <select id="brain-preset">
-                    <option value="wander" selected>Wander</option>
-                    <option value="mlp">MLP (supports saved continuations)</option>
+                    <option value="mlp" selected>MLP — evolving neural network</option>
+                    <option value="dwraon">DWRAON — evolving recurrent network</option>
+                    <option value="assembly">Assembly — evolving program (experimental)</option>
+                    <option value="wander">Wander — legacy movement demo (cannot save)</option>
                     <option value="none">Unbound (supports saved continuations)</option>
                 </select>
+                <p id="checkpoint-capability" role="status">MLP, DWRAON and Assembly worlds support inherited genomes and saved continuations.</p>
                 <button id="checkpoint-save" type="button" disabled>Save Continuation File</button>
                 <label for="checkpoint-load">Load Continuation File (pauses the loaded world)</label>
                 <input id="checkpoint-load" type="file" accept=".sbcheckpoint,application/octet-stream" disabled />

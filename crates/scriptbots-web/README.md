@@ -46,8 +46,12 @@ The crate exposes the following wasm-bindgen surface:
   - `world_width` / `world_height`: override the world dimensions (pixels).
   - `config`: optional full `ScriptBotsConfig` override (rarely needed; defaults are usually sufficient).
   - `snapshot_format`: `"json"` (default) or `"binary"` (Postcard-encoded `Uint8Array`).
-  - `seed_strategy`: `"wander"` (default) to attach lightweight wander brains or `"none"` to start with passive agents for custom registry wiring.
-  - `default_brain`: `"mlp"` to pre-bind agents to the baseline MLP implementation during seeding.
+  - `default_brain`: `"mlp"`, `"dwraon"`, or `"assembly"` to bind agents to a
+    versioned, heritable brain family during seeding. Omitting both brain choices
+    starts with MLP. Assembly is an experimental evolving program family.
+  - `seed_strategy`: explicitly choose `"wander"` for the legacy movement demo or
+    `"none"` for unbound agents when `default_brain` is absent. A selected
+    `default_brain` takes precedence. Wander cannot export continuations.
 - `SimHandle::tick(steps: u32) -> JsValue` — advances the simulation and returns either JSON or a `Uint8Array` depending on `snapshot_format`.
 - `SimHandle::drive(elapsedMilliseconds: number) -> JsValue` — drives the existing
   `HostCore` at monotonic elapsed time since initialization/reset. Returns its
@@ -78,16 +82,21 @@ The crate exposes the following wasm-bindgen surface:
 - `SimHandle::reset(seed?: number)` — rebuilds the world. An explicit seed
   overrides the nested config for that reset; omitting it falls back to the
   original `config.rng_seed` (or entropy when the nested seed is also absent).
-- `SimHandle::registerBrain(kind: string)` — installs a brain preset for all agents (`"wander"`, `"mlp"`, or `"none"`).
+- `SimHandle::registerBrain(kind: string)` — rebuilds the world with `"mlp"`,
+  `"dwraon"`, `"assembly"`, `"wander"`, or `"none"`. Unknown or invalid presets
+  leave the active owner intact.
 - `SimHandle::checkpoint() -> Uint8Array` — settles the current volatile journal
   boundary and exports the existing full owner checkpoint: science, evaluators,
   command history and cadence credit. It does not advance elapsed time. Legacy
-  wander evaluators are refused; MLP and unbound worlds are supported.
+  wander evaluators are refused; MLP, DWRAON, Assembly and unbound worlds are
+  supported, including empty populations.
 - `restore_checkpoint(bytes: Uint8Array) -> SimHandle` — validates and restores a
   new owner, with a new command namespace and rebased elapsed clock. Failed
   imports preserve existing handles. Future science matches the saved state;
   offline wall time adds no ticks. Reset starts a new world using the loaded
-  configuration, checkpoint population and supported brain preset.
+  configuration, checkpoint population and saved brain family. Restoration uses
+  that family's exact registry and evaluator identity; unknown or mismatched
+  families are refused instead of being substituted.
 - `checkpoint_byte_limit() -> number` — the canonical owner codec's file bound,
   also checked before the demo reads a selected file.
 - `SimHandle::brainPreset() -> string` — the new-world brain preset for this handle.
@@ -125,11 +134,14 @@ pages have no hard real-time guarantee. The receipt exposes skipped opportunitie
 Full packaged-browser/DSR acceptance remains with `bd-2z0.12.3` and `bd-azi3`;
 native unit tests alone do not establish browser scheduling or durability.
 
-The demo's **Brain for new worlds** selector takes effect on Reset. Wander remains
-the default. Select MLP or Unbound to use **Save Continuation File**; **Load
-Continuation File** validates a saved owner before replacing the current world,
-then pauses it. Local continuation controls are disabled while displaying a remote
-server. A delayed file read cannot replace a newer reset or remote session.
+The demo starts with **MLP**, with canonical inherited genomes and evaluator
+state. **Brain for new worlds** also offers DWRAON, experimental Assembly,
+Unbound and the legacy Wander movement demo; the choice takes effect on Reset.
+All except Wander support saved continuations. Wander visibly disables both
+save controls. **Load Continuation File** validates a saved owner before replacing
+the current world, restores its saved family and pauses it. Local continuation
+controls are disabled while displaying a remote server. A delayed file read
+cannot replace a newer reset or remote session.
 
 **Save in This Browser** stores one complete owner continuation in IndexedDB for
 this site's origin and browser profile. The UI acknowledges the save only after

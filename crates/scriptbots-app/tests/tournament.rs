@@ -198,6 +198,540 @@ fn outcomes_record_every_family_with_warnings_channel() {
 }
 
 #[test]
+fn named_family_rows_preserve_the_exact_entered_arm_evidence() {
+    use scriptbots_app::{
+        BuildProvenanceV0,
+        tournament::{
+            leaderboard::{rows_to_match_outcomes, validate_result_matrix},
+            reports_to_result_rows,
+        },
+    };
+
+    let spec = two_family_spec(4);
+    let reports = run_tournament(&spec, &small_world()).expect("real matches");
+    let build = BuildProvenanceV0::current();
+    let rows = reports_to_result_rows(
+        &reports,
+        "cpu_simd",
+        "exact",
+        true,
+        "named-arm-test",
+        &build,
+    );
+    assert_eq!(rows.len(), 4);
+    validate_result_matrix(&rows, &spec, "named-arm-test", &build).expect("exact arm matrix");
+    for reconstructed in rows_to_match_outcomes(&rows) {
+        let original = reports
+            .iter()
+            .find(|report| report.outcome.match_id == reconstructed.match_id)
+            .expect("original match");
+        assert_eq!(reconstructed, original.outcome);
+    }
+    for row in rows {
+        let report = reports
+            .iter()
+            .find(|report| report.outcome.match_id.0 == row.match_id)
+            .expect("matching run");
+        let entered = BrainKind::from(row.family);
+        assert_eq!(
+            row.initial_genome_digest,
+            report.initial_genome_digests[&entered]
+        );
+        assert_eq!(
+            row.initial_brain_source_scalars,
+            report.initial_brain_source_scalars[&entered]
+        );
+        assert_eq!(
+            row.initial_mutation_rates,
+            report.initial_mutation_rates[&entered]
+        );
+        assert_eq!(
+            row.agents_final,
+            report.agents_final.get(&entered).copied().unwrap_or(0)
+        );
+    }
+}
+
+#[cfg(not(feature = "neuro"))]
+#[test]
+fn neuroflow_tournament_requires_the_feature_without_substitution() {
+    for name in [
+        "neuro",
+        "neuroflow",
+        "ml.neuroflow",
+        "neuro-control",
+        "neuro.baseline",
+        "neuroflow-control",
+        "neuroflow.baseline",
+        "ml.neuroflow-control",
+        "ml.neuroflow.baseline",
+    ] {
+        let mut spec = two_family_spec(1);
+        spec.families[1] = BrainKind::from(name.to_owned());
+        let error = run_tournament_with_jobs(&spec, &small_world(), 2)
+            .expect_err("NeuroFlow without its compiled feature");
+        assert!(matches!(
+            error,
+            TournamentError::UnavailableBrainFamily { ref family, ref reason }
+                if family == name && reason.contains("neuro feature")
+        ));
+    }
+}
+
+#[test]
+fn neuroflow_spec_aliases_share_identity_and_named_arms_remain_distinct() {
+    use scriptbots_app::tournament::{TournamentSpecFile, to_brain_kind};
+
+    for alias in ["neuro", "neuroflow", "ml.neuroflow"] {
+        assert_eq!(to_brain_kind(alias), BrainKind::new("neuro"));
+    }
+    for named in ["neuro-control", "neuroflow.treatment", "ml.neuroflow-control"] {
+        assert_eq!(to_brain_kind(named).as_str(), named);
+        assert_ne!(to_brain_kind(named), to_brain_kind("neuro"));
+    }
+
+    let mut spec = TournamentSpecFile::from_toml_str(include_str!("../../../tournament/spec.toml"))
+        .expect("existing spec");
+    for aliases in ["neuro,neuroflow", "neuro,ml.neuroflow"] {
+        spec.apply_cli_overrides(Some(aliases), Some("1"), Some(1), Some(8))
+            .expect("explicit alias entries");
+        assert!(matches!(
+            plan(&spec.to_spec().unwrap()),
+            Err(TournamentError::DuplicateFamilies { family }) if family == "neuro"
+        ));
+    }
+    spec.apply_cli_overrides(
+        Some("neuro-control,neuroflow.treatment"),
+        Some("1"),
+        Some(1),
+        Some(8),
+    )
+    .expect("two distinct named arms");
+    let named = spec.to_spec().unwrap();
+    assert_eq!(
+        named.families,
+        vec![BrainKind::new("neuro-control"), BrainKind::new("neuroflow.treatment")]
+    );
+    let assignments = plan(&named).expect("named same-family controls remain legal");
+    assert_eq!(assignments.len(), 2);
+    assert!(assignments.iter().all(|entry| {
+        entry.cohort[&BrainKind::new("neuro-control")] == 4
+            && entry.cohort[&BrainKind::new("neuroflow.treatment")] == 4
+    }));
+}
+
+#[cfg(feature = "neuro")]
+fn configured_neuro_world() -> ScriptBotsConfig {
+    let mut config = small_world();
+    // This switch controls the Mixed preset, not an explicitly entered tournament family.
+    config.neuroflow.enabled = false;
+    config.neuroflow.hidden_layers = vec![7, 3];
+    config.neuroflow.activation = scriptbots_core::NeuroflowActivationKind::Sigmoid;
+    config
+}
+
+#[cfg(feature = "neuro")]
+const CONFIGURED_NEURO_SOURCE_SCALARS: usize = (scriptbots_core::INPUT_SIZE + 1) * 7
+    + (7 + 1) * 3
+    + (3 + 1) * scriptbots_core::OUTPUT_SIZE
+    + 4 * (7 + 3 + scriptbots_core::OUTPUT_SIZE)
+    + 3;
+
+#[cfg(feature = "neuro")]
+#[test]
+fn configured_neuroflow_matches_preserve_exact_parallel_genomes_and_arm_evidence() {
+    let neuro = BrainKind::new("neuroflow.treatment");
+    let mut spec = two_family_spec(8);
+    spec.families[1] = neuro.clone();
+    spec.cohort_size = 8;
+    spec.seeds = vec![17, 29];
+    let config = configured_neuro_world();
+    let serial = run_tournament(&spec, &config).expect("configured NeuroFlow matches");
+    let parallel =
+        run_tournament_with_jobs(&spec, &config, 2).expect("parallel configured NeuroFlow matches");
+    assert_eq!(serial.len(), 4);
+    assert_eq!(parallel.len(), serial.len());
+    for (first, repeated) in serial.iter().zip(&parallel) {
+        assert_eq!(first.outcome, repeated.outcome);
+        assert_eq!(first.config_digest, repeated.config_digest);
+        assert_eq!(first.agents_final, repeated.agents_final);
+        assert_eq!(first.initial_genome_digests, repeated.initial_genome_digests);
+        assert_eq!(first.initial_mutation_rates, repeated.initial_mutation_rates);
+        assert_eq!(
+            first.initial_brain_source_scalars,
+            repeated.initial_brain_source_scalars
+        );
+        assert_eq!(first.outcome.ticks_run, spec.ticks);
+        assert!(first.outcome.family(neuro.clone()).is_some());
+        assert_eq!(
+            first.initial_brain_source_scalars[&neuro],
+            CONFIGURED_NEURO_SOURCE_SCALARS
+        );
+        assert_eq!(first.initial_genome_digests[&neuro].len(), 64);
+        assert_ne!(
+            first.initial_genome_digests[&neuro],
+            first.initial_genome_digests[&MLP_A]
+        );
+        assert_eq!(first.initial_mutation_rates[&neuro].len(), 4);
+        assert!(first.outcome.warnings.iter().any(|warning| {
+            warning.contains("validated NeuroFlow genome topology")
+                && warning.contains("not recorded tick-zero activity")
+        }));
+    }
+
+    let rows = scriptbots_app::tournament::reports_to_result_rows(
+        &serial,
+        "cpu_simd",
+        "exact",
+        true,
+        "configured-neuro-named-arm",
+        &scriptbots_app::BuildProvenanceV0::current(),
+    );
+    let neuro_rows: Vec<_> = rows
+        .iter()
+        .filter(|row| row.family == neuro.as_str())
+        .collect();
+    assert_eq!(neuro_rows.len(), 4);
+    assert!(neuro_rows.iter().all(|row| {
+        row.initial_brain_source_scalars == CONFIGURED_NEURO_SOURCE_SCALARS
+            && row.initial_genome_digest.len() == 64
+            && row.initial_mutation_rates.len() == 4
+    }));
+}
+
+#[cfg(feature = "neuro")]
+#[test]
+fn neuroflow_constructor_changes_bind_genomes_and_preserve_the_other_family_seed() {
+    let neuro = BrainKind::new("ml.neuroflow");
+    let mut spec = two_family_spec(4);
+    spec.families[1] = neuro.clone();
+    spec.cohort_size = 8;
+    let match_plan = &plan(&spec).unwrap()[0];
+    let config = configured_neuro_world();
+    let baseline = run_match(match_plan, spec.ticks, spec.closed, &config).unwrap();
+    let mut architecture = config.clone();
+    architecture.neuroflow.hidden_layers = vec![11, 5];
+    let mut activation = config.clone();
+    activation.neuroflow.activation = scriptbots_core::NeuroflowActivationKind::Relu;
+    let larger_source_scalars = (scriptbots_core::INPUT_SIZE + 1) * 11
+        + (11 + 1) * 5
+        + (5 + 1) * scriptbots_core::OUTPUT_SIZE
+        + 4 * (11 + 5 + scriptbots_core::OUTPUT_SIZE)
+        + 3;
+    for (changed, expected_scalars) in [
+        (architecture, larger_source_scalars),
+        (activation, CONFIGURED_NEURO_SOURCE_SCALARS),
+    ] {
+        let report = run_match(match_plan, spec.ticks, spec.closed, &changed)
+            .expect("changed configured NeuroFlow constructor");
+        assert_ne!(report.config_digest, baseline.config_digest);
+        assert_ne!(
+            report.initial_genome_digests[&neuro],
+            baseline.initial_genome_digests[&neuro]
+        );
+        assert_eq!(
+            report.initial_genome_digests[&MLP_A],
+            baseline.initial_genome_digests[&MLP_A],
+            "changing NeuroFlow settings must not displace the other family's brain seed"
+        );
+        assert_eq!(report.initial_mutation_rates, baseline.initial_mutation_rates);
+        assert_eq!(report.initial_brain_source_scalars[&neuro], expected_scalars);
+    }
+}
+
+#[cfg(feature = "neuro")]
+#[test]
+fn neuroflow_tournament_refuses_genome_and_state_budgets_before_matches() {
+    let mut spec = two_family_spec(1);
+    spec.families[1] = BrainKind::new("neuro");
+    spec.cohort_size = 8;
+    for (layers, field) in [
+        (vec![256, 256, 256], "genome_payload_bytes"),
+        (vec![1000, 1].repeat(9), "evaluator_state_payload_bytes"),
+    ] {
+        let mut config = configured_neuro_world();
+        config.neuroflow.hidden_layers = layers;
+        config.validate().expect("architecture remains within core config bounds");
+        let error = run_tournament_with_jobs(&spec, &config, 2)
+            .expect_err("configured versioned payload exceeds its declared budget");
+        assert!(matches!(
+            error,
+            TournamentError::UnbalancedOrders { ref reason }
+                if reason.contains("NeuroFlow adapter construction") && reason.contains(field)
+        ));
+    }
+}
+
+#[cfg(feature = "neuro")]
+#[test]
+fn neuroflow_leaderboard_retains_configured_topology_and_equal_parameter_refusals() {
+    use scriptbots_app::{
+        BuildProvenanceV0,
+        tournament::{TournamentResultRow, TournamentSpecFile, execute_leaderboard_tournament},
+    };
+
+    let mut spec = TournamentSpecFile::from_toml_str(include_str!("../../../tournament/spec.toml"))
+        .expect("existing constrained spec");
+    spec.apply_cli_overrides(Some("mlp,neuroflow"), Some("17,29"), Some(4), Some(8))
+        .expect("explicit NeuroFlow CLI entry");
+    let config = configured_neuro_world();
+    let build = BuildProvenanceV0::current();
+    let constrained = execute_leaderboard_tournament(
+        &spec,
+        None,
+        true,
+        &config,
+        &build,
+        None,
+        None,
+        true,
+        1,
+    )
+    .expect_err("the 200-cell profile cannot certify the configured NeuroFlow architecture");
+    assert!(matches!(
+        constrained,
+        TournamentError::Publication { reason }
+            if reason.contains("observed initial family topology differs")
+    ));
+
+    // Explicitly compare different architectures without retaining an equal-cell-count claim.
+    spec.parameters = None;
+    spec.tournament.title = "Configured NeuroFlow architecture comparison".to_owned();
+    let outcome = execute_leaderboard_tournament(
+        &spec,
+        None,
+        true,
+        &config,
+        &build,
+        None,
+        None,
+        true,
+        2,
+    )
+    .expect("configured NeuroFlow leaderboard with an independent identical rerun");
+    assert_eq!(outcome.total_matches, 4);
+    assert_eq!(outcome.eligible_rows, 8);
+    assert_eq!(outcome.excluded_rows, 0);
+    let rows = TournamentResultRow::deserialize_jsonl(&outcome.results_jsonl).unwrap();
+    let neuro_rows: Vec<_> = rows.iter().filter(|row| row.family == "neuro").collect();
+    assert_eq!(neuro_rows.len(), 4);
+    assert!(neuro_rows.iter().all(|row| {
+        row.ticks_run == 4
+            && row.initial_genome_digest.len() == 64
+            && row.initial_brain_source_scalars == CONFIGURED_NEURO_SOURCE_SCALARS
+            && row.initial_mutation_rates.len() == 4
+            && row.warnings.iter().any(|warning| {
+                warning.contains("validated NeuroFlow genome topology")
+                    && warning.contains("not recorded tick-zero activity")
+            })
+    }));
+    assert!(outcome.leaderboard_md.contains("NeuroFlow counts validated genome"));
+    assert!(outcome.leaderboard_md.contains("without claiming tick-zero activity"));
+    assert!(outcome.leaderboard_md.contains("neuro-survival_share"));
+}
+
+#[cfg(not(feature = "brain-ft"))]
+#[test]
+fn ft_tournament_requires_the_feature_without_substitution() {
+    for name in ["ft", "frankentorch", "ft-control", "ft.baseline"] {
+        let mut spec = two_family_spec(1);
+        spec.families[1] = BrainKind::from(name.to_owned());
+        let error = run_tournament_with_jobs(&spec, &small_world(), 2)
+            .expect_err("Ft without its compiled feature");
+        assert!(matches!(
+            error,
+            TournamentError::UnavailableBrainFamily { ref family, ref reason }
+                if family == name && reason.contains("brain-ft")
+        ));
+    }
+}
+
+#[test]
+fn ft_spec_aliases_have_one_identity_and_keep_explicit_control_arms() {
+    use scriptbots_app::tournament::{TournamentSpecFile, to_brain_kind};
+
+    assert_eq!(to_brain_kind("frankentorch"), to_brain_kind("ft"));
+    assert_ne!(to_brain_kind("ft-control"), to_brain_kind("ft"));
+    let mut spec = TournamentSpecFile::from_toml_str(include_str!("../../../tournament/spec.toml"))
+        .expect("existing spec");
+    spec.apply_cli_overrides(Some("ft,frankentorch"), Some("1"), Some(1), Some(8))
+        .expect("CLI overrides");
+    assert!(matches!(
+        plan(&spec.to_spec().unwrap()),
+        Err(TournamentError::DuplicateFamilies { family }) if family == "ft"
+    ));
+}
+
+#[test]
+fn ft_comparison_preset_admits_bounded_mixed_architectures_explicitly() {
+    use scriptbots_app::tournament::TournamentSpecFile;
+
+    let spec_file =
+        TournamentSpecFile::from_toml_str(include_str!("../../../tournament/ft_comparison.toml"))
+            .expect("shipped Ft comparison preset");
+    assert!(spec_file.parameters.is_none());
+    assert!(
+        spec_file
+            .tournament
+            .title
+            .contains("architecture comparison")
+    );
+    assert!(
+        spec_file
+            .reproducibility
+            .as_ref()
+            .expect("explicit repeatability policy")
+            .require_identical_rerun
+    );
+    for spec in [
+        spec_file.to_spec().unwrap(),
+        spec_file.to_smoke_spec().unwrap(),
+    ] {
+        assert_eq!(
+            spec.families,
+            vec![BrainKind::new("mlp"), BrainKind::new("ft")]
+        );
+        assert!(spec.closed);
+        assert_eq!(spec.order_policy, OrderPolicy::BothAssignments);
+        let plans = plan(&spec).expect("balanced bounded comparison");
+        assert_eq!(plans.len(), spec.seeds.len() * 2);
+        let repeated_tick_budget = plans.len() as u64 * spec.ticks * 2;
+        assert!(repeated_tick_budget <= 4_096);
+        assert!(plans.iter().all(|entry| {
+            entry.cohort[&BrainKind::new("ft")] == entry.cohort[&BrainKind::new("mlp")]
+        }));
+    }
+}
+
+#[cfg(feature = "brain-ft")]
+#[test]
+fn ft_tournament_runs_real_genomes_with_repeatable_parallel_outcomes() {
+    let mut spec = two_family_spec(16);
+    spec.families[1] = BrainKind::new("frankentorch");
+    spec.cohort_size = 8;
+    spec.seeds = vec![17, 29];
+    let serial = run_tournament(&spec, &small_world()).expect("Ft matches");
+    let parallel = run_tournament_with_jobs(&spec, &small_world(), 2).expect("parallel Ft matches");
+    assert_eq!(serial.len(), 4);
+    for (first, repeated) in serial.iter().zip(parallel) {
+        assert_eq!(first.outcome, repeated.outcome);
+        assert_eq!(first.config_digest, repeated.config_digest);
+        assert_eq!(
+            first.initial_genome_digests,
+            repeated.initial_genome_digests
+        );
+        assert_eq!(
+            first.initial_mutation_rates,
+            repeated.initial_mutation_rates
+        );
+        let ft = BrainKind::new("frankentorch");
+        assert_eq!(first.outcome.ticks_run, spec.ticks);
+        assert!(first.outcome.family(ft.clone()).is_some());
+        assert!(first.initial_brain_source_scalars[&ft] > 0);
+        assert_ne!(
+            first.initial_genome_digests[&ft],
+            first.initial_genome_digests[&MLP_A]
+        );
+        assert!(first.outcome.warnings.iter().any(|warning| {
+            warning.contains("validated genome topology")
+                && warning.contains("not recorded tick-zero activity")
+        }));
+    }
+
+    let rows = scriptbots_app::tournament::reports_to_result_rows(
+        &serial,
+        "cpu_simd",
+        "exact",
+        true,
+        "ft-alias-test",
+        &scriptbots_app::BuildProvenanceV0::current(),
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.family == "frankentorch")
+            .count(),
+        4
+    );
+    assert!(rows.iter().all(|row| row.initial_genome_digest.len() == 64));
+}
+
+#[cfg(feature = "brain-ft")]
+#[test]
+fn ft_leaderboard_carries_topology_provenance_and_keeps_profile_constraints() {
+    use scriptbots_app::{
+        BuildProvenanceV0,
+        tournament::{TournamentResultRow, TournamentSpecFile, execute_leaderboard_tournament},
+    };
+
+    let mut spec = TournamentSpecFile::from_toml_str(include_str!("../../../tournament/spec.toml"))
+        .expect("existing spec");
+    spec.apply_cli_overrides(Some("mlp,frankentorch"), Some("17,29"), Some(4), Some(8))
+        .expect("explicit Ft CLI entry");
+    let build = BuildProvenanceV0::current();
+    let constrained = execute_leaderboard_tournament(
+        &spec,
+        None,
+        true,
+        &small_world(),
+        &build,
+        None,
+        None,
+        true,
+        1,
+    )
+    .expect_err("the pinned 200-cell profile is not a dense Ft architecture");
+    assert!(matches!(
+        constrained,
+        TournamentError::Publication { reason }
+            if reason.contains("observed initial family topology differs")
+    ));
+
+    // The shipped opt-in experiment compares architectures without claiming equal cell counts.
+    spec =
+        TournamentSpecFile::from_toml_str(include_str!("../../../tournament/ft_comparison.toml"))
+            .expect("shipped Ft comparison preset");
+    spec.apply_cli_overrides(Some("mlp,frankentorch"), Some("17,29"), Some(4), Some(8))
+        .expect("bounded explicit comparison");
+    let outcome = execute_leaderboard_tournament(
+        &spec,
+        None,
+        true,
+        &small_world(),
+        &build,
+        None,
+        None,
+        true,
+        2,
+    )
+    .expect("complete real Ft leaderboard and repeated-execution check");
+    assert_eq!(outcome.total_matches, 4);
+    assert_eq!(outcome.eligible_rows, 8);
+    assert_eq!(outcome.excluded_rows, 0);
+    let rows = TournamentResultRow::deserialize_jsonl(&outcome.results_jsonl).expect("result rows");
+    let ft_rows: Vec<_> = rows.iter().filter(|row| row.family == "ft").collect();
+    assert_eq!(ft_rows.len(), 4);
+    assert!(ft_rows.iter().all(|row| {
+        row.ticks_run == 4
+            && row.initial_genome_digest.len() == 64
+            && row
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("validated genome topology"))
+    }));
+    assert!(
+        outcome
+            .leaderboard_md
+            .contains("Ft counts validated genome")
+    );
+    assert!(
+        outcome
+            .leaderboard_md
+            .contains("without claiming tick-zero activity")
+    );
+    assert!(outcome.leaderboard_md.contains("ft-survival_share"));
+}
+
+#[test]
 fn test_tournament_integration_elo_progression() {
     let mut harness = TournamentHarness::new();
     harness.register_family("mlp");

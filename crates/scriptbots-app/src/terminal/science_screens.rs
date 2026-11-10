@@ -196,6 +196,7 @@ pub struct ExperimentArmView {
     pub variant_id: String,
     pub brain_family: String,
     pub seed: u64,
+    /// Last observed sealed checkpoint, or terminal completed tick; never an estimate.
     pub current_tick: Option<u64>,
     pub target_ticks: u64,
     pub mean_fitness: Option<f32>,
@@ -798,7 +799,7 @@ pub fn render_experiments_screen(
                 frame,
                 4,
                 y_start + 5,
-                "  Arm Variant    Family     Seed    Ticks/Target  Fitness  95% Conf Interval",
+                "  Arm Variant    Family     Seed    Saved/Target  Fitness  95% Conf Interval",
             );
             print_text(
                 frame,
@@ -1519,6 +1520,7 @@ mod tests {
             ShellRoute::Experiments,
             ShellMessage::SetExperimentsData(ScreenDataState::Data(data.clone())),
         );
+        assert!(frame.contains("Saved/Target"));
         assert!(row(&frame, "measured-arm").contains("0/100"));
         assert!(row(&frame, "measured-arm").contains("[0.00, 0.00]"));
         assert!(!row(&frame, "measured-arm").contains("unavailable"));

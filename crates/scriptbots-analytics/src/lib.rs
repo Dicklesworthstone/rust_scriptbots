@@ -30,9 +30,10 @@ use scriptbots_core::narrative::{EventRecord, NarrativeInputRecordV1, NarrativeR
 use scriptbots_core::{AgentUid, Tick};
 use scriptbots_runtime::RunId;
 use scriptbots_storage::{
-    FinishedRunView, NarrativeInputBindingV1, NarrativeInputStreamError, PersistedAgentObservation,
-    PersistedInteraction, PersistedInteractionCapture, PersistedMetric, PersistedRunEvent,
-    PersistenceBatchId, RunEventIdentity, RunManifestRecord, StorageError, StorageReader,
+    FinishedRunView, NarrativeInputBindingV1, NarrativeInputPolicyV1, NarrativeInputStreamError,
+    PersistedAgentObservation, PersistedInteraction, PersistedInteractionCapture, PersistedMetric,
+    PersistedRunEvent, PersistenceBatchId, RunEventIdentity, RunManifestRecord, StorageError,
+    StorageReader,
 };
 use serde::{Deserialize, Serialize};
 
@@ -115,6 +116,13 @@ pub const REPORT_SCHEMA_VERSION: u32 = 1;
 /// run, and explicitly scopes kind counts to the returned page. The original
 /// replay-record shape remains available as the `replay-timeline` report at v1.
 pub const NARRATIVE_TIMELINE_SCHEMA_VERSION: u32 = 2;
+
+/// Narrative reconstruction with authenticated tick-boundary policy transitions.
+///
+/// V2 adds the effective policy-change count and final policy. Reconstruction
+/// uses the current detector implementation; this is not a claim of historical
+/// equivalence across different source revisions.
+pub const NARRATIVE_RECONSTRUCT_SCHEMA_VERSION: u32 = 2;
 
 /// Maximum metric rows sampled by `metric-summary` in one bounded SQL page.
 ///
@@ -598,14 +606,6 @@ pub enum AnalyticsError {
     /// The canonical narrative detector refused a recorded input or policy.
     #[error("narrative reconstruction error: {0}")]
     NarrativeInput(#[from] scriptbots_core::narrative::NarrativeInputError),
-    /// The current replay kernel cannot reproduce a mid-run detector policy change.
-    #[error(
-        "narrative detector policy changed at tick {tick}; reconstruction requires constant narrative_interval, history_capacity, and narrative_capacity"
-    )]
-    NarrativePolicyChanged {
-        /// First input whose detector policy differs from the initial recorded policy.
-        tick: u64,
-    },
 }
 
 /// Read-only context handed to every report.
@@ -2291,7 +2291,7 @@ fn read_comparison_source(
     let config: serde_json::Value = serde_json::from_str(&manifest.normalized_config_json)?;
     let seed = (manifest.manifest_schema_version != 0
         && config.get("rng_seed").and_then(serde_json::Value::as_u64) == Some(manifest.root_seed))
-        .then_some(manifest.root_seed);
+    .then_some(manifest.root_seed);
     if require_cohort_evidence && seed.is_none() {
         return Err(comparison_error(format!(
             "run {} in {db} lacks attributable seed evidence; cohort runs require a validated manifest and matching normalized_config.rng_seed",
@@ -2299,7 +2299,10 @@ fn read_comparison_source(
         )));
     }
     let terminal_tick = reader.max_tick()?.ok_or_else(|| {
-        comparison_error(format!("run {} in {db} has no durable tick", manifest.run_id))
+        comparison_error(format!(
+            "run {} in {db} has no durable tick",
+            manifest.run_id
+        ))
     })?;
     if endpoint_tick > terminal_tick {
         return Err(comparison_error(format!(
@@ -2336,12 +2339,8 @@ fn read_comparison_source(
         )));
     }
 
-    let condition_digest = comparison_condition_digest(
-        &manifest,
-        &manifest_value,
-        config,
-        require_cohort_evidence,
-    )?;
+    let condition_digest =
+        comparison_condition_digest(&manifest, &manifest_value, config, require_cohort_evidence)?;
     let manifest_digest = manifest.manifest_digest()?;
     reader.verify_database_path(db)?;
     Ok((
@@ -2419,7 +2418,8 @@ impl ComparisonInputReader<'_> {
             observation
         };
         let (seed, source) = observation;
-        let seed = seed.ok_or_else(|| comparison_error("cohort source has no verified root seed"))?;
+        let seed =
+            seed.ok_or_else(|| comparison_error("cohort source has no verified root seed"))?;
         let is_context = same_database && source.run_id == self.context.reader.run_id();
         Ok((seed, source, is_context))
     }
@@ -2583,9 +2583,10 @@ fn comparison_machine(
     let metrics = compare_endpoint_metrics(&pairs, names, params, infer)?;
     let seed_pairing = if matched {
         "matched"
-    } else if pairs.iter().any(|pair| {
-        pair.control.root_seed_hex.is_none() || pair.treatment.root_seed_hex.is_none()
-    }) {
+    } else if pairs
+        .iter()
+        .any(|pair| pair.control.root_seed_hex.is_none() || pair.treatment.root_seed_hex.is_none())
+    {
         "unknown"
     } else {
         "mismatched"
@@ -2632,7 +2633,10 @@ fn comparison_machine(
         n_resamples: if infer { params.n_resamples } else { 0 },
         n_permutations: if infer { params.n_permutations } else { 0 },
         metrics_compared: metrics.len(),
-        significant: metrics.iter().filter(|metric| metric.significant_fdr).count(),
+        significant: metrics
+            .iter()
+            .filter(|metric| metric.significant_fdr)
+            .count(),
         control_only_metrics,
         treatment_only_metrics,
         pairs,
@@ -2656,7 +2660,8 @@ fn compare_cohort_file(
         metrics: &cohort.metrics,
     };
     let mut identities = BTreeSet::new();
-    let (control, includes_context) = input_reader.arm("control", &cohort.control, &mut identities)?;
+    let (control, includes_context) =
+        input_reader.arm("control", &cohort.control, &mut identities)?;
     if !includes_context {
         return Err(comparison_error(
             "the selected database/run must be a declared control in cohort_file",
@@ -3379,6 +3384,8 @@ struct NarrativeReconstruct;
 #[derive(Debug, Serialize)]
 struct NarrativeReconstructionMachine {
     input_binding: NarrativeInputBindingV1,
+    policy_changes: u64,
+    final_policy: NarrativeInputPolicyV1,
     inputs_replayed: u64,
     input_pages: u64,
     events_reconstructed: u64,
@@ -3411,7 +3418,7 @@ impl Report for NarrativeReconstruct {
         let _ = writeln!(md, "Run: `{}`\n", binding.run_id);
         let _ = writeln!(
             md,
-            "Replayed all {} detector inputs from tick {} through {} in {} bounded pages. The recorded policy uses an interval of {} ticks, {} history entries, and an event ring of {}.\n",
+            "Replayed all {} detector inputs from tick {} through {} in {} bounded pages. The initial recorded policy uses an interval of {} ticks, {} history entries, and an event ring of {}.\n",
             machine.inputs_replayed,
             binding.first_tick,
             binding.terminal_tick,
@@ -3422,7 +3429,15 @@ impl Report for NarrativeReconstruct {
         );
         let _ = writeln!(
             md,
-            "Reconstructed {} events independently of persisted narrative output rows. Event counts cover the complete run.\n",
+            "Applied {} authenticated policy changes at their completed tick boundaries, preserving detector cooldowns. The final policy uses an interval of {} ticks, {} history entries, and an event ring of {}.\n",
+            machine.policy_changes,
+            machine.final_policy.narrative_interval,
+            machine.final_policy.history_capacity,
+            machine.final_policy.event_capacity,
+        );
+        let _ = writeln!(
+            md,
+            "Reconstructed {} events with the current detector implementation, independently of persisted narrative output rows. Event counts cover the complete run; historical equivalence across different source revisions is not asserted.\n",
             machine.events_reconstructed,
         );
         if machine.events_reconstructed == 0 {
@@ -3456,13 +3471,14 @@ impl Report for NarrativeReconstruct {
                 "\n_Showing the newest {count} events in canonical tick/kind/metric order; the output limit does not limit detector input coverage._"
             );
         }
-        let output = base_output(
+        let mut output = base_output(
             self.name(),
             cx,
             machine.events.len(),
             serde_json::to_value(&machine)?,
             md,
         )?;
+        output.schema_version = NARRATIVE_RECONSTRUCT_SCHEMA_VERSION;
         log_report_stage("render", &render_started, output.row_count);
         Ok(output)
     }
@@ -3485,6 +3501,8 @@ fn reconstruct_narrative(
             },
         ))?;
     let mut replay = NarrativeReplay::new(first.replay_policy()?)?;
+    let mut final_policy = NarrativeInputPolicyV1::from(*first);
+    let mut policy_changes = 0_u64;
     let mut inputs_replayed = 0_u64;
     let mut input_pages = 0_u64;
     let mut events_reconstructed = 0_u64;
@@ -3493,7 +3511,12 @@ fn reconstruct_narrative(
     loop {
         input_pages = input_pages.saturating_add(1);
         for record in page.inputs {
+            let policy = NarrativeInputPolicyV1::from(record);
             replay_narrative_record(&mut replay, record)?;
+            if policy != final_policy {
+                policy_changes = policy_changes.saturating_add(1);
+                final_policy = policy;
+            }
             inputs_replayed = inputs_replayed.saturating_add(1);
             // Drain each tick so complete-run counting neither depends on the
             // production event-ring capacity nor accumulates an unbounded tail.
@@ -3513,6 +3536,8 @@ fn reconstruct_narrative(
     }
     Ok(NarrativeReconstructionMachine {
         input_binding: binding,
+        policy_changes,
+        final_policy,
         inputs_replayed,
         input_pages,
         events_reconstructed,
@@ -3533,14 +3558,11 @@ fn replay_narrative_record(
     replay: &mut NarrativeReplay,
     record: NarrativeInputRecordV1,
 ) -> Result<(), AnalyticsError> {
-    if record.replay_policy()? != replay.policy() {
-        // Resetting the detector here would silently lose its history and
-        // cooldown state. Unrelated authenticated config revisions are safe.
-        return Err(AnalyticsError::NarrativePolicyChanged {
-            tick: record.input.tick.0,
-        });
-    }
-    replay.push(record.input)?;
+    // StorageReader authenticates revision/policy transitions against the owner
+    // journal before returning a page. Reuse the live tick-boundary retention
+    // semantics without resetting history, event identities or cooldown state.
+    record.validate()?;
+    replay.push_with_policy(record.input, record.replay_policy()?)?;
     Ok(())
 }
 
@@ -3550,7 +3572,7 @@ mod narrative_reconstruction_tests {
     use scriptbots_core::narrative::NarrativeInputV1;
 
     #[test]
-    fn replay_refuses_policy_changes_without_losing_state() {
+    fn replay_applies_policy_changes_and_rejects_invalid_records_atomically() {
         let original = NarrativeInputRecordV1 {
             record_schema_version: 1,
             input: NarrativeInputV1::new(Tick(1), 12, 1.0, 0).expect("valid input"),
@@ -3569,28 +3591,56 @@ mod narrative_reconstruction_tests {
         };
         for changed in [
             NarrativeInputRecordV1 {
-                narrative_interval: 8,
+                record_schema_version: original.record_schema_version + 1,
                 ..next
             },
             NarrativeInputRecordV1 {
-                history_capacity: 64,
+                history_capacity: 0,
                 ..next
             },
             NarrativeInputRecordV1 {
-                event_capacity: 16,
+                input: original.input,
+                narrative_interval: 0,
+                history_capacity: 1,
+                event_capacity: 0,
                 ..next
             },
         ] {
             assert!(matches!(
                 replay_narrative_record(&mut replay, changed),
-                Err(AnalyticsError::NarrativePolicyChanged { tick: 2 })
+                Err(AnalyticsError::NarrativeInput(_))
             ));
+            assert_eq!(replay.policy(), original.replay_policy().unwrap());
             assert_eq!(replay.history().len(), 1);
             assert_eq!(replay.history().front(), Some(&original.input));
         }
         replay_narrative_record(&mut replay, next)
             .expect("an unrelated authenticated config revision preserves detector policy");
         assert_eq!(replay.history().len(), 2);
+        let smaller = NarrativeInputRecordV1 {
+            input: NarrativeInputV1::new(Tick(3), 12, 1.0, 0).unwrap(),
+            config_revision: 2,
+            narrative_interval: 0,
+            history_capacity: 1,
+            event_capacity: 0,
+            ..next
+        };
+        replay_narrative_record(&mut replay, smaller).expect("authenticated retention change");
+        assert_eq!(replay.policy(), smaller.replay_policy().unwrap());
+        assert_eq!(replay.history().len(), 1);
+        assert_eq!(replay.history().front(), Some(&smaller.input));
+        assert_eq!(replay.dropped_inputs(), 2);
+        let resumed = NarrativeInputRecordV1 {
+            input: NarrativeInputV1::new(Tick(4), 12, 1.0, 0).unwrap(),
+            config_revision: 3,
+            ..next
+        };
+        replay_narrative_record(&mut replay, resumed).expect("re-enable detector without reset");
+        assert_eq!(replay.policy(), original.replay_policy().unwrap());
+        assert_eq!(replay.history().len(), 2);
+        assert_eq!(replay.history().front(), Some(&smaller.input));
+        assert_eq!(replay.history().back(), Some(&resumed.input));
+        assert_eq!(replay.dropped_inputs(), 2);
     }
 }
 

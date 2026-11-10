@@ -22,6 +22,9 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+mod protocol;
+pub use protocol::NeuroflowFamilyAdapter;
+
 /// Number of inputs inherited from the simulation sensors.
 const INPUT_SIZE: usize = scriptbots_core::INPUT_SIZE;
 /// Number of outputs consumed by the actuation stage.

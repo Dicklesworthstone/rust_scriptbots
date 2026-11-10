@@ -73,7 +73,14 @@ history/credit handling; nonempty narrative delivery requires observed records.
   replaying the hidden interval. A late timer retains the host's bounded catch-up
   policy and logs actual skipped tick opportunities. This main-thread adapter
   cannot guarantee deadlines when the browser suspends or blocks JavaScript.
-- **Population**: select the spawn count used the next time you reset. The wander brain offers immediate motion for visual feedback.
+- **Population**: select the spawn count used the next time you reset.
+- **Brain for new worlds**: the default MLP starts creatures with canonical
+  inherited genomes and evaluator state. DWRAON offers a recurrent network;
+  Assembly is an experimental evolving program. These three families use the
+  same versioned adapters as native worlds, including inherited offspring and
+  saved continuations. Unbound creates passive agents. The legacy Wander
+  movement demo has no supported continuation export. Selections take effect
+  when you reset.
 - **Renderer**: Automatic prefers WebGPU and falls back to Canvas 2D. You can
   also select either backend explicitly. Canvas presents immediately while
   WebGPU initializes, so a delayed device cannot block simulation startup.
@@ -112,9 +119,12 @@ history/credit handling; nonempty narrative delivery requires observed records.
   over its stable UID. Selection, highlights and inspection never advance science
   or alter the simulation's selection state.
 - **Reset Simulation**: reseeds with a fresh RNG seed and reuses the slider settings. A rolling 5-second performance log is appended to the console pane (`FPS`, `TPS`, population).
-- **Saved continuations**: choose MLP or Unbound for a new world, then Reset.
+- **Saved continuations**: MLP, DWRAON, Assembly and Unbound worlds can be saved.
+  Both save controls are visibly disabled for the legacy Wander demo.
   **Save Continuation File** downloads a portable full-owner checkpoint; **Load
-  Continuation File** validates and restores it paused. **Save in This Browser**
+  Continuation File** validates and restores it paused with its original family,
+  inherited genomes and evaluator state. Unsupported or mismatched family
+  identities are refused. **Save in This Browser**
   replaces one IndexedDB slot for this site and browser profile. The save is
   acknowledged only when the transaction completes. A reload displays the saved
   tick and time; **Restore Saved World** is always explicit and starts paused,
@@ -123,7 +133,9 @@ history/credit handling; nonempty narrative delivery requires observed records.
   copy. Quota/abort errors keep the previous save, and invalid or stale restores
   preserve the active world. Both local restore paths work after an invalid
   startup permalink; all local continuation controls are disabled in remote mode.
-- Runtime brain presets can be toggled programmatically via `registerBrain("wander" | "mlp" | "none")` on the `SimHandle`.
+- Runtime brain presets can be rebuilt programmatically via
+  `registerBrain("mlp" | "dwraon" | "assembly" | "wander" | "none")` on the
+  `SimHandle`. Invalid choices preserve the current world.
 
 Snapshots returned to JS follow the selected `snapshot_format` (defaults to JSON). To switch to binary snapshots (Postcard-encoded `Uint8Array`), pass `snapshot_format: "binary"` to `init_sim`.
 
@@ -212,13 +224,17 @@ opaque empty-frame negatives and a one-pixel positive control. A separate
 canvas-copy count is diagnostic; it does not qualify GPU image export.
 The ordinary stats mode retains its separate four-case contract.
 
-The ordinary real-package checkpoint journey also saves a nonempty MLP owner in
-actual IndexedDB, aborts a replacement after request success, reloads the page,
-and explicitly restores the original snapshot and uninterrupted next tick. It
-checks stored-byte corruption and recovery from an ownerless startup. The
-permalink lifecycle harness separately checks stored tick mismatches, bounds,
-quota refusal, and delayed restore races with reset/remote mode using its explicit
-WASM double. `tests/continuation_store.test.mjs` can run under Node through DSR;
+The ordinary real-package checkpoint journey checks the default MLP owner's
+continuation capability, saves a nonempty MLP owner in actual IndexedDB, aborts a
+replacement after request success, reloads the page, and explicitly restores the
+original snapshot and uninterrupted next tick. It exercises downloaded DWRAON
+and Assembly continuations, preserving each selected family and its exact next
+tick, and verifies that the explicit Wander demo refuses save without changing
+science. It also checks stored-byte corruption and recovery from an ownerless
+startup. The permalink lifecycle harness separately checks each preset selection,
+stored tick mismatches, bounds, quota refusal, and delayed restore races with
+reset/remote mode using its explicit WASM double.
+`tests/continuation_store.test.mjs` can run under Node through DSR;
 its controlled IndexedDB events test adapter ordering, error handling and bounds,
 not real browser persistence or the Rust codec.
 

@@ -48,6 +48,8 @@ const brainPresetSelect = document.getElementById("brain-preset");
 const checkpointSaveButton = document.getElementById("checkpoint-save");
 const checkpointLoadInput = document.getElementById("checkpoint-load");
 const checkpointStatus = document.getElementById("checkpoint-status");
+const checkpointCapability = document.getElementById("checkpoint-capability");
+let activeBrainPreset = null;
 let checkpointLoadPending = false;
 const browserSaveButton = document.getElementById("checkpoint-browser-save");
 const browserRestoreButton = document.getElementById("checkpoint-browser-restore");
@@ -392,12 +394,18 @@ function updateRemoteControls() {
 }
 
 function updateCheckpointControls() {
+  const supportsContinuation = activeBrainPreset !== "wander";
   if (brainPresetSelect) brainPresetSelect.disabled = remoteMode;
-  if (checkpointSaveButton) checkpointSaveButton.disabled = remoteMode || !simHandle || checkpointLoadPending;
+  if (checkpointSaveButton) checkpointSaveButton.disabled = remoteMode || !simHandle || checkpointLoadPending || !supportsContinuation;
   if (checkpointLoadInput) checkpointLoadInput.disabled = remoteMode || !wasmInitialized || checkpointLoadPending || browserStorePending;
   const storageBusy = remoteMode || !browserContinuationStore || checkpointLoadPending || browserStorePending;
-  if (browserSaveButton) browserSaveButton.disabled = storageBusy || !simHandle;
+  if (browserSaveButton) browserSaveButton.disabled = storageBusy || !simHandle || !supportsContinuation;
   if (browserRestoreButton) browserRestoreButton.disabled = storageBusy;
+  if (checkpointCapability) checkpointCapability.textContent = remoteMode
+    ? "These continuation controls apply to your local browser world. Return to Local Simulation to use them."
+    : !supportsContinuation
+      ? "This Wander world is a movement demo without inherited genomes or saved continuations. Choose MLP, DWRAON or Assembly, then Reset Simulation to start an evolving world."
+      : "This local world supports saved continuations. Loading a continuation preserves its brain family and resumes paused.";
 }
 
 function remoteEventLine(text) {
@@ -948,11 +956,13 @@ function replaceSimulation(next, { continuation = false, permalink = null, expec
     if (expectedTick !== null && frame.identity.tick !== expectedTick) {
       throw new Error("Saved continuation tick does not match its checkpoint bytes");
     }
-    if (continuation) {
-      brainPreset = next.brainPreset();
-    } else if (permalink_of) {
+    brainPreset = next.brainPreset?.() ?? null;
+    if (continuation && !["mlp", "dwraon", "assembly", "none"].includes(brainPreset)) {
+      throw new Error("Saved continuation has an unsupported brain family");
+    }
+    if (!continuation && permalink_of) {
       permalink = permalink_of(next);
-    } else if (next.permalinkOf) {
+    } else if (!continuation && next.permalinkOf) {
       permalink = next.permalinkOf();
     }
   } catch (error) {
@@ -962,6 +972,7 @@ function replaceSimulation(next, { continuation = false, permalink = null, expec
 
   const previous = simHandle;
   simHandle = next;
+  activeBrainPreset = brainPreset;
   simulationGeneration += 1;
   inspector.reset();
   brainInspector.reset();
@@ -1288,12 +1299,15 @@ async function resetSimulation(populationOverride) {
   if (remoteMode) return;
   const defaults = default_init_options ? default_init_options() : {};
   const seed = Math.floor(Math.random() * 1_000_000);
+  const preset = brainPresetSelect?.value || "mlp";
+  const evolutionary = ["mlp", "dwraon", "assembly"].includes(preset);
+  if (!evolutionary && !["wander", "none"].includes(preset)) throw new Error("Choose a supported brain family");
   const options = {
     ...defaults,
     seed,
     population: populationOverride,
-    default_brain: brainPresetSelect?.value === "mlp" ? "mlp" : null,
-    seed_strategy: brainPresetSelect?.value === "none" || brainPresetSelect?.value === "mlp" ? "none" : "wander",
+    default_brain: evolutionary ? preset : null,
+    seed_strategy: preset === "wander" ? "wander" : "none",
   };
 
   const installed = replaceSimulation(init_sim(options));

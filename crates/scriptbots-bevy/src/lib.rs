@@ -4300,7 +4300,28 @@ struct TerrainChunkRegistry {
     chunks: HashMap<TerrainChunkKey, TerrainChunkRecord>,
     chunk_size: u32,
     height_scale: f32,
+    food: FoodLayerPresentation,
 }
+
+// Food is a separate consumable layer. Fertile terrain is not evidence that
+// food remains in a cell, and drawing food must never recolor that substrate.
+const FOOD_CHUNK_SIDE: u32 = 16;
+const FOOD_MOTE_SEGMENTS: u32 = 8;
+
+#[derive(Default)]
+struct FoodLayerPresentation {
+    chunks: HashMap<TerrainChunkKey, FoodChunkRecord>,
+    material: Option<Handle<StandardMaterial>>,
+}
+
+struct FoodChunkRecord {
+    entity: Entity,
+    mesh: Handle<Mesh>,
+    signature: [u8; 32],
+}
+
+#[derive(Component)]
+struct FoodChunk;
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
 struct TerrainChunkKey {
@@ -5064,8 +5085,12 @@ impl WorldSnapshot {
         }
         let terrain = &snapshot.layers.terrain;
         let food = &snapshot.layers.food;
-        let food_total = (food.width as usize).checked_mul(food.height as usize)?;
-        if food.width == 0 || food.height == 0 || food.cells.len() != food_total {
+        if !valid_food_layer(
+            food,
+            config.food_cell_size,
+            config.food_max,
+            Vec2::new(width, height),
+        ) {
             return None;
         }
         let total = terrain.width as usize * terrain.height as usize;
@@ -7118,6 +7143,16 @@ pub(crate) fn sync_world(
             palette,
         });
     }
+    let food_height_scale = terrain_registry.height_scale;
+    sync_food_layer(
+        snapshot,
+        palette,
+        food_height_scale,
+        &mut terrain_registry.food,
+        &mut commands,
+        meshes.as_mut(),
+        materials.as_mut(),
+    );
     let mut agent_materials = if let Some(table) = appearance.as_deref_mut() {
         if table.error().is_some() {
             return;
@@ -17412,6 +17447,351 @@ fn control_camera(
     transform.look_at(center, Vec3::Y);
 }
 
+fn valid_food_layer(
+    food: &FoodLayerSnapshot,
+    cell_size: u32,
+    maximum: f32,
+    world_size: Vec2,
+) -> bool {
+    let Some(count) = (food.width as usize).checked_mul(food.height as usize) else {
+        return false;
+    };
+    let (Some(width), Some(height)) = (
+        food.width.checked_mul(cell_size),
+        food.height.checked_mul(cell_size),
+    ) else {
+        return false;
+    };
+    food.width > 0
+        && food.height > 0
+        && cell_size > 0
+        && count == food.cells.len()
+        && maximum.is_finite()
+        && maximum > 0.0
+        && world_size.is_finite()
+        && world_size == Vec2::new(width as f32, height as f32)
+        && food
+            .cells
+            .iter()
+            .all(|value| value.is_finite() && *value >= 0.0)
+}
+
+fn food_surface_signature(snapshot: &WorldSnapshot, height_scale: f32) -> Option<[u8; 32]> {
+    let terrain = &snapshot.terrain_height;
+    let count = (terrain.dims.x as usize).checked_mul(terrain.dims.y as usize)?;
+    if terrain.dims.x == 0
+        || terrain.dims.y == 0
+        || terrain.dims.x.checked_mul(TERRAIN_SUBDIVISIONS).is_none()
+        || terrain.dims.y.checked_mul(TERRAIN_SUBDIVISIONS).is_none()
+        || terrain.cell_size == 0
+        || !height_scale.is_finite()
+        || height_scale < 0.0
+        || count != terrain.elevation.len()
+        || terrain
+            .elevation
+            .iter()
+            .any(|height| !height.is_finite() || !(0.0..=1.0).contains(height))
+    {
+        return None;
+    }
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"scriptbots.bevy-food-surface.v1");
+    for value in [terrain.dims.x, terrain.dims.y, terrain.cell_size] {
+        hash.update(&value.to_le_bytes());
+    }
+    for value in [snapshot.world_size.x, snapshot.world_size.y, height_scale] {
+        hash.update(&value.to_bits().to_le_bytes());
+    }
+    for height in terrain.elevation.iter() {
+        hash.update(&height.to_bits().to_le_bytes());
+    }
+    Some(*hash.finalize().as_bytes())
+}
+
+fn food_chunk_signature(
+    snapshot: &WorldSnapshot,
+    bounds: TerrainChunkBounds,
+    surface: &[u8; 32],
+    palette: ColorPaletteMode,
+) -> [u8; 32] {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"scriptbots.bevy-food-chunk.v1");
+    hash.update(surface);
+    for value in [
+        snapshot.food.width,
+        snapshot.food.height,
+        snapshot.food_cell_size,
+        bounds.origin.x,
+        bounds.origin.y,
+        bounds.size.x,
+        bounds.size.y,
+    ] {
+        hash.update(&value.to_le_bytes());
+    }
+    hash.update(&snapshot.food_max.to_bits().to_le_bytes());
+    hash.update(&[match palette {
+        ColorPaletteMode::Natural => 0,
+        ColorPaletteMode::Deuteranopia => 1,
+        ColorPaletteMode::Protanopia => 2,
+        ColorPaletteMode::Tritanopia => 3,
+        ColorPaletteMode::HighContrast => 4,
+    }]);
+    for y in bounds.origin.y..bounds.origin.y + bounds.size.y {
+        let start = y as usize * snapshot.food.width as usize + bounds.origin.x as usize;
+        for value in &snapshot.food.cells[start..start + bounds.size.x as usize] {
+            hash.update(&value.to_bits().to_le_bytes());
+        }
+    }
+    *hash.finalize().as_bytes()
+}
+
+fn food_footprint_height(
+    terrain: &TerrainHeightSnapshot,
+    center: Vec2,
+    radius: f32,
+    height_scale: f32,
+) -> f32 {
+    // The rendered terrain is piecewise planar: the maximum of every
+    // triangle touching the footprint is bounded by its three vertices.
+    // A horizontal fan above those vertices cannot cut through an interior
+    // ridge, as a fan that only samples its own vertices can. Clamp the
+    // support scan to the source grid, including its constant edge extension.
+    let last = (terrain.dims - UVec2::ONE) * TERRAIN_SUBDIVISIONS;
+    let cell = terrain.cell_size as f32;
+    let subdivisions = TERRAIN_SUBDIVISIONS as f32;
+    let first = ((center - Vec2::splat(radius)) / cell * subdivisions)
+        .floor()
+        .max(Vec2::ZERO)
+        .as_uvec2()
+        .min(last);
+    let end = ((center + Vec2::splat(radius)) / cell * subdivisions)
+        .ceil()
+        .max(Vec2::ZERO)
+        .as_uvec2()
+        .min(last);
+    let mut support = 0.0_f32;
+    for y in first.y..=end.y {
+        for x in first.x..=end.x {
+            support = support.max(terrain_render_vertex_height(terrain, x, y, height_scale));
+        }
+    }
+    support
+}
+
+fn build_food_chunk_mesh(
+    snapshot: &WorldSnapshot,
+    bounds: TerrainChunkBounds,
+    palette: ColorPaletteMode,
+    height_scale: f32,
+) -> Mesh {
+    // Each positive source cell contributes one bounded fan. No per-cell
+    // entity, material, animation clock or simulated growth is introduced.
+    let capacity = (bounds.size.x * bounds.size.y * (FOOD_MOTE_SEGMENTS + 1)) as usize;
+    let mut positions = Vec::with_capacity(capacity);
+    let mut colors = Vec::with_capacity(capacity);
+    let mut indices =
+        Vec::with_capacity((bounds.size.x * bounds.size.y * FOOD_MOTE_SEGMENTS * 3) as usize);
+    let cell = snapshot.food_cell_size as f32;
+    let half = snapshot.world_size * 0.5;
+    let lift = (cell.min(snapshot.terrain_height.cell_size as f32) * 0.015).max(0.02);
+    for y in bounds.origin.y..bounds.origin.y + bounds.size.y {
+        for x in bounds.origin.x..bounds.origin.x + bounds.size.x {
+            let amount =
+                snapshot.food.cells[y as usize * snapshot.food.width as usize + x as usize];
+            if amount <= 0.0 {
+                continue;
+            }
+            let density = (amount / snapshot.food_max).clamp(0.0, 1.0);
+            let style = visual::food_visual_params(density);
+            let core = srgb_to_linear_rgb(
+                apply_palette_rgb(Vec3::from_array(style.core_srgb), palette).to_array(),
+            );
+            let halo = srgb_to_linear_rgb(
+                apply_palette_rgb(Vec3::from_array(style.halo_srgb), palette).to_array(),
+            );
+            // Keep the footprint inside its own source cell, even at maximum
+            // density. Radius and opacity carry quantity without changing hue.
+            let radius = cell * 0.2 * style.relative_radius.min(2.0);
+            let center = Vec2::new((x as f32 + 0.5) * cell, (y as f32 + 0.5) * cell);
+            let height =
+                food_footprint_height(&snapshot.terrain_height, center, radius, height_scale)
+                    + lift;
+            let first = positions.len() as u32;
+            for vertex in 0..=FOOD_MOTE_SEGMENTS {
+                let (point, rgb, alpha) = if vertex == 0 {
+                    (center, core, style.alpha * density.sqrt())
+                } else {
+                    let angle =
+                        (vertex - 1) as f32 * std::f32::consts::TAU / FOOD_MOTE_SEGMENTS as f32;
+                    let (sin, cos) = angle.sin_cos();
+                    (center + Vec2::new(cos, sin) * radius, halo, 0.0)
+                };
+                positions.push([point.x - half.x, height, half.y - point.y]);
+                colors.push([
+                    rgb[0] * style.emissive_gain,
+                    rgb[1] * style.emissive_gain,
+                    rgb[2] * style.emissive_gain,
+                    alpha,
+                ]);
+            }
+            for side in 0..FOOD_MOTE_SEGMENTS {
+                indices.extend_from_slice(&[
+                    first,
+                    first + side + 1,
+                    first + (side + 1) % FOOD_MOTE_SEGMENTS + 1,
+                ]);
+            }
+        }
+    }
+    let mut mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+    );
+    mesh.insert_attribute(
+        Mesh::ATTRIBUTE_NORMAL,
+        vec![[0.0, 1.0, 0.0]; positions.len()],
+    );
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
+    mesh.insert_indices(Indices::U32(indices));
+    mesh
+}
+
+fn sync_food_layer(
+    snapshot: &WorldSnapshot,
+    palette: ColorPaletteMode,
+    height_scale: f32,
+    state: &mut FoodLayerPresentation,
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+) {
+    let surface = food_surface_signature(snapshot, height_scale);
+    let valid = valid_food_layer(
+        &snapshot.food,
+        snapshot.food_cell_size,
+        snapshot.food_max,
+        snapshot.world_size,
+    );
+    let mut seen = HashSet::new();
+    let material_changed = state
+        .material
+        .as_ref()
+        .is_none_or(|handle| materials.get(handle).is_none());
+    if let Some(surface) = surface.filter(|_| valid) {
+        for y in 0..snapshot.food.height.div_ceil(FOOD_CHUNK_SIDE) {
+            for x in 0..snapshot.food.width.div_ceil(FOOD_CHUNK_SIDE) {
+                let key = TerrainChunkKey { x, y };
+                let origin = UVec2::new(x, y) * FOOD_CHUNK_SIDE;
+                let bounds = TerrainChunkBounds {
+                    origin,
+                    size: (UVec2::new(snapshot.food.width, snapshot.food.height) - origin)
+                        .min(UVec2::splat(FOOD_CHUNK_SIDE)),
+                };
+                let nonempty = (origin.y..origin.y + bounds.size.y).any(|row| {
+                    let start = row as usize * snapshot.food.width as usize + origin.x as usize;
+                    snapshot.food.cells[start..start + bounds.size.x as usize]
+                        .iter()
+                        .any(|value| *value > 0.0)
+                });
+                if !nonempty {
+                    continue;
+                }
+                seen.insert(key);
+                let signature = food_chunk_signature(snapshot, bounds, &surface, palette);
+                let material_missing = state
+                    .material
+                    .as_ref()
+                    .is_none_or(|handle| materials.get(handle).is_none());
+                if material_missing {
+                    state.material = Some(materials.add(StandardMaterial {
+                        base_color: Color::WHITE,
+                        alpha_mode: AlphaMode::Blend,
+                        unlit: true,
+                        double_sided: true,
+                        cull_mode: None,
+                        ..default()
+                    }));
+                }
+                let material = state
+                    .material
+                    .as_ref()
+                    .expect("food material created above");
+                if let Some(record) = state.chunks.get_mut(&key) {
+                    // ubs:ignore[rust.security.constant-time-compare] — public food input digest for mesh reuse, not authentication.
+                    if record.signature != signature || meshes.get(&record.mesh).is_none() {
+                        let mesh = build_food_chunk_mesh(snapshot, bounds, palette, height_scale);
+                        let aabb = bevy::camera::primitives::MeshAabb::compute_aabb(&mesh);
+                        if let Some(current) = meshes.get_mut(&record.mesh) {
+                            *current = mesh;
+                        } else {
+                            record.mesh = meshes.add(mesh);
+                            commands
+                                .entity(record.entity)
+                                .insert(Mesh3d(record.mesh.clone()));
+                        }
+                        if let Some(aabb) = aabb {
+                            commands.entity(record.entity).insert(aabb);
+                        }
+                        record.signature = signature;
+                    }
+                    if material_changed {
+                        commands
+                            .entity(record.entity)
+                            .insert(MeshMaterial3d(material.clone()));
+                    }
+                } else {
+                    let built = build_food_chunk_mesh(snapshot, bounds, palette, height_scale);
+                    let aabb = bevy::camera::primitives::MeshAabb::compute_aabb(&built);
+                    let mesh = meshes.add(built);
+                    let entity = commands
+                        .spawn((
+                            Mesh3d(mesh.clone()),
+                            MeshMaterial3d(material.clone()),
+                            Transform::default(),
+                            GlobalTransform::default(),
+                            Visibility::default(),
+                            InheritedVisibility::default(),
+                            bevy::light::NotShadowCaster,
+                            FoodChunk,
+                        ))
+                        .id();
+                    if let Some(aabb) = aabb {
+                        commands.entity(entity).insert(aabb);
+                    }
+                    state.chunks.insert(
+                        key,
+                        FoodChunkRecord {
+                            entity,
+                            mesh,
+                            signature,
+                        },
+                    );
+                }
+            }
+        }
+    } else {
+        warn!(
+            tick = snapshot.tick,
+            "invalid food presentation layer; removing stale food geometry"
+        );
+    }
+    state.chunks.retain(|key, record| {
+        if seen.contains(key) {
+            true
+        } else {
+            commands.entity(record.entity).despawn();
+            meshes.remove(&record.mesh);
+            false
+        }
+    });
+    if state.chunks.is_empty()
+        && let Some(material) = state.material.take()
+    {
+        materials.remove(&material);
+    }
+}
+
 fn sync_terrain(
     snapshot: &WorldSnapshot,
     commands: &mut Commands,
@@ -17457,9 +17837,9 @@ fn sync_terrain(
 
             match registry.chunks.get_mut(&key) {
                 Some(record) => {
-                    // ubs:ignore[rust.security.constant-time-compare] — public terrain geometry/material digest for mesh cache invalidation, not authentication.
                     if record.palette != palette
                         || record.daylight_colors_dirty
+                        // ubs:ignore[rust.security.constant-time-compare] — public terrain geometry/material digest for mesh cache invalidation, not authentication.
                         || record.signature != built.stats.signature
                         || meshes.get(&record.mesh).is_none()
                     {
@@ -18931,6 +19311,578 @@ mod terrain_tests {
             .init_resource::<AccessibilityState>()
             .insert_resource(AgentMotionSettings { enabled: true });
         app
+    }
+
+    fn food_test_world() -> WorldState {
+        WorldState::new(scriptbots_core::ScriptBotsConfig {
+            world_width: (FOOD_CHUNK_SIDE + 1) * 16,
+            world_height: 16,
+            food_cell_size: 16,
+            food_max: 1.0,
+            initial_food: 1.0,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            persistence_interval: 0,
+            rng_seed: Some(41),
+            ..default()
+        })
+        .unwrap()
+    }
+
+    fn food_test_app() -> App {
+        let mut app = presentation_test_app();
+        app.insert_resource(TerrainChunkRegistry {
+            chunk_size: FOOD_CHUNK_SIDE,
+            height_scale: TERRAIN_HEIGHT_SCALE,
+            ..default()
+        });
+        app.add_systems(Update, sync_world);
+        app
+    }
+
+    fn publish_food_test_world(app: &mut App, world: &WorldState) {
+        let mut state = app.world_mut().resource_mut::<SnapshotState>();
+        let mut snapshot = WorldSnapshot::from_world(world).unwrap();
+        snapshot.paused = true;
+        snapshot.revision = state
+            .latest
+            .as_ref()
+            .map_or(1, |previous| previous.revision + 1);
+        state.install_snapshot(snapshot);
+    }
+
+    fn food_positions(mesh: &Mesh) -> &[[f32; 3]] {
+        match mesh.attribute(Mesh::ATTRIBUTE_POSITION).unwrap() {
+            VertexAttributeValues::Float32x3(points) => points,
+            _ => panic!("food mesh must expose its actual vertex positions"),
+        }
+    }
+
+    fn food_colors(mesh: &Mesh) -> &[[f32; 4]] {
+        match mesh.attribute(Mesh::ATTRIBUTE_COLOR).unwrap() {
+            VertexAttributeValues::Float32x4(colors) => colors,
+            _ => panic!("food mesh must expose its actual vertex colors"),
+        }
+    }
+
+    #[test]
+    fn food_mesh_uses_consumable_density_and_its_own_cell_grid() {
+        let mut snapshot = sample_world_snapshot();
+        snapshot.food_cell_size = 25;
+        snapshot.food = Arc::new(FoodLayerSnapshot {
+            width: 4,
+            height: 4,
+            cells: vec![0.0; 16],
+        });
+        // The terrain still has 2x2 cells of size 50. A hard-coded terrain
+        // indexing policy would either miss these motes or place them wrong.
+        Arc::make_mut(&mut snapshot.food).cells[0] = 0.25;
+        Arc::make_mut(&mut snapshot.food).cells[15] = 1.0;
+        let bounds = TerrainChunkBounds {
+            origin: UVec2::ZERO,
+            size: UVec2::splat(4),
+        };
+        let mesh = build_food_chunk_mesh(
+            &snapshot,
+            bounds,
+            ColorPaletteMode::Natural,
+            TERRAIN_HEIGHT_SCALE,
+        );
+        let points = food_positions(&mesh);
+        let colors = food_colors(&mesh);
+        let vertices = (FOOD_MOTE_SEGMENTS + 1) as usize;
+        assert_eq!(points.len(), vertices * 2);
+        assert_eq!([points[0][0], points[0][2]], [-37.5, 37.5]);
+        assert_eq!([points[vertices][0], points[vertices][2]], [37.5, -37.5]);
+        let sparse_radius = (points[1][0] - points[0][0]).abs();
+        let dense_radius = (points[vertices + 1][0] - points[vertices][0]).abs();
+        assert!(sparse_radius > 0.0 && dense_radius > sparse_radius);
+        assert!(colors[vertices][3] > colors[0][3] && colors[0][3] > 0.0);
+        assert!(
+            colors[vertices][1] > colors[0][1],
+            "density must reach HDR color data"
+        );
+        for (index, point) in points.iter().enumerate() {
+            let source = Vec2::new(point[0] + 50.0, 50.0 - point[2]);
+            let cell = if index < vertices {
+                0.0..25.0
+            } else {
+                75.0..100.0
+            };
+            assert!(cell.contains(&source.x) && cell.contains(&source.y));
+            assert!(
+                point[1]
+                    > sample_height_world(&snapshot.terrain_height, source, TERRAIN_HEIGHT_SCALE)
+            );
+            assert!(point.iter().all(|value| value.is_finite()));
+            assert!(colors[index].iter().all(|value| value.is_finite()));
+        }
+        let Indices::U32(indices) = mesh.indices().unwrap() else {
+            panic!("food indices")
+        };
+        assert_eq!(indices.len(), FOOD_MOTE_SEGMENTS as usize * 6);
+        for triangle in indices.chunks_exact(3) {
+            let a = Vec3::from_array(points[triangle[0] as usize]);
+            let b = Vec3::from_array(points[triangle[1] as usize]);
+            let c = Vec3::from_array(points[triangle[2] as usize]);
+            assert!(
+                (b - a).cross(c - a).y > 0.0,
+                "food triangles face the camera above ground"
+            );
+        }
+        Arc::make_mut(&mut snapshot.food).cells.fill(0.0);
+        assert!(
+            food_positions(&build_food_chunk_mesh(
+                &snapshot,
+                bounds,
+                ColorPaletteMode::Natural,
+                TERRAIN_HEIGHT_SCALE,
+            ))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn food_mesh_clears_an_interior_ridge_between_its_vertices() {
+        let mut snapshot = sample_world_snapshot();
+        let mut tiles = vec![
+            TerrainTile {
+                kind: TerrainKind::Grass,
+                elevation: 0.0,
+                moisture: 0.3,
+                accent: 0.0,
+                fertility_bias: 0.0,
+                temperature_bias: 0.0,
+                palette_index: 0,
+            };
+            20 * 20
+        ];
+        // A narrow peak at (60, 55) lies strictly inside the first food
+        // triangle. All nine food vertices themselves sit above flat ground.
+        tiles[11 * 20 + 12].elevation = 1.0;
+        let terrain = TerrainLayer::from_tiles(20, 20, 5, tiles).unwrap();
+        snapshot.terrain_height =
+            TerrainHeightSnapshot::new(&terrain, None, visual::DAYLIGHT_STATIC).unwrap();
+        snapshot.food_cell_size = 100;
+        snapshot.food = Arc::new(FoodLayerSnapshot {
+            width: 1,
+            height: 1,
+            cells: vec![1.0],
+        });
+        let bounds = TerrainChunkBounds {
+            origin: UVec2::ZERO,
+            size: UVec2::ONE,
+        };
+        let height_scale = 37.0;
+        let ground = build_chunk_mesh(
+            &snapshot,
+            TerrainChunkBounds {
+                origin: UVec2::ZERO,
+                size: UVec2::splat(20),
+            },
+            height_scale,
+            ColorPaletteMode::Natural,
+        );
+        let stride = 20 * TERRAIN_SUBDIVISIONS as usize + 1;
+        let peak = Vec3::from_array(
+            food_positions(&ground.mesh)
+                [11 * TERRAIN_SUBDIVISIONS as usize * stride + 12 * TERRAIN_SUBDIVISIONS as usize],
+        );
+        assert_eq!(peak, Vec3::new(10.0, height_scale, -5.0));
+        let world = |point: Vec3| Vec2::new(point.x + 50.0, 50.0 - point.z);
+        for cached in [false, true] {
+            if cached {
+                prepare_smooth_height_grid(&mut snapshot.terrain_height, None);
+            }
+            let mesh =
+                build_food_chunk_mesh(&snapshot, bounds, ColorPaletteMode::Natural, height_scale);
+            let points = food_positions(&mesh);
+            let Indices::U32(indices) = mesh.indices().unwrap() else {
+                panic!("food indices")
+            };
+            let a = Vec3::from_array(points[indices[0] as usize]);
+            let b = Vec3::from_array(points[indices[1] as usize]);
+            let c = Vec3::from_array(points[indices[2] as usize]);
+            let u = world(b) - world(a);
+            let v = world(c) - world(a);
+            let offset = world(peak) - world(a);
+            let s = offset.perp_dot(v) / u.perp_dot(v);
+            let t = u.perp_dot(offset) / u.perp_dot(v);
+            assert!(s > 0.0 && t > 0.0 && s + t < 1.0);
+            let old_height = [a, b, c]
+                .into_iter()
+                .zip([1.0 - s - t, s, t])
+                .map(|(point, weight)| {
+                    sample_height_world(&snapshot.terrain_height, world(point), height_scale)
+                        * weight
+                })
+                .sum::<f32>();
+            assert!(
+                old_height + 1.0 < peak.y,
+                "vertex-only grounding buries this fan"
+            );
+            let visible = a * (1.0 - s - t) + b * s + c * t;
+            assert!(
+                visible.y > peak.y,
+                "the actual food mesh must clear the rendered peak"
+            );
+            assert!(food_colors(&mesh)[0][3] * (1.0 - s - t) > 0.0);
+            for triangle in indices.chunks_exact(3) {
+                let a = Vec3::from_array(points[triangle[0] as usize]);
+                let b = Vec3::from_array(points[triangle[1] as usize]);
+                let c = Vec3::from_array(points[triangle[2] as usize]);
+                for i in 1..12 {
+                    for j in 1..12 - i {
+                        let s = i as f32 / 12.0;
+                        let t = j as f32 / 12.0;
+                        let point = a * (1.0 - s - t) + b * s + c * t;
+                        assert!(
+                            point.y
+                                > sample_height_world(
+                                    &snapshot.terrain_height,
+                                    world(point),
+                                    height_scale,
+                                ),
+                            "food triangle interior must stay above its rendered terrain"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn food_sync_updates_paused_dirty_chunks_then_removes_and_regrows_them() {
+        let mut world = food_test_world();
+        let mut app = food_test_app();
+        publish_food_test_world(&mut app, &world);
+        let science = world.world_digest_v1().unwrap();
+        app.update();
+        let left = TerrainChunkKey { x: 0, y: 0 };
+        let right = TerrainChunkKey { x: 1, y: 0 };
+        let before: HashMap<_, _> = app
+            .world()
+            .resource::<TerrainChunkRegistry>()
+            .food
+            .chunks
+            .iter()
+            .map(|(key, record)| (*key, (record.entity, record.mesh.clone(), record.signature)))
+            .collect();
+        assert_eq!(
+            before.len(),
+            2,
+            "capacity boundary produces two bounded batches"
+        );
+        let shared = app
+            .world()
+            .resource::<TerrainChunkRegistry>()
+            .food
+            .material
+            .clone()
+            .unwrap();
+        for record in before.values() {
+            let entity = app.world().entity(record.0);
+            assert!(entity.contains::<FoodChunk>());
+            assert!(entity.contains::<bevy::light::NotShadowCaster>());
+            assert_eq!(entity.get::<Mesh3d>().unwrap().0, record.1);
+            assert_eq!(
+                entity.get::<MeshMaterial3d<StandardMaterial>>().unwrap().0,
+                shared
+            );
+        }
+        let untouched = app
+            .world()
+            .entity(before[&right].0)
+            .get_ref::<bevy::camera::primitives::Aabb>()
+            .unwrap()
+            .last_changed();
+        assert_eq!(world.world_digest_v1().unwrap(), science);
+        world.try_update_food(|cells| cells[0] = 0.0).unwrap();
+        publish_food_test_world(&mut app, &world);
+        let consumed = world.world_digest_v1().unwrap();
+        app.update();
+        let layer = &app.world().resource::<TerrainChunkRegistry>().food;
+        assert_ne!(layer.chunks[&left].signature, before[&left].2);
+        assert_eq!(layer.chunks[&right].signature, before[&right].2);
+        assert_eq!(
+            layer.chunks[&left].mesh, before[&left].1,
+            "changed chunks reuse GPU handles"
+        );
+        assert_eq!(
+            app.world()
+                .entity(before[&right].0)
+                .get_ref::<bevy::camera::primitives::Aabb>()
+                .unwrap()
+                .last_changed(),
+            untouched
+        );
+        let mesh = app
+            .world()
+            .resource::<Assets<Mesh>>()
+            .get(&before[&left].1)
+            .unwrap();
+        assert_eq!(
+            food_positions(mesh).len(),
+            (FOOD_CHUNK_SIDE as usize - 1) * (FOOD_MOTE_SEGMENTS + 1) as usize
+        );
+        assert_eq!(
+            app.world()
+                .resource::<SnapshotState>()
+                .latest
+                .as_ref()
+                .unwrap()
+                .tick,
+            0
+        );
+        assert_eq!(world.world_digest_v1().unwrap(), consumed);
+        world.try_update_food(|cells| cells.fill(0.0)).unwrap();
+        publish_food_test_world(&mut app, &world);
+        app.update();
+        let layer = &app.world().resource::<TerrainChunkRegistry>().food;
+        assert!(layer.chunks.is_empty() && layer.material.is_none());
+        assert!(
+            app.world()
+                .resource::<Assets<StandardMaterial>>()
+                .get(&shared)
+                .is_none()
+        );
+        for (_, mesh, _) in before.values() {
+            assert!(app.world().resource::<Assets<Mesh>>().get(mesh).is_none());
+        }
+        world
+            .try_update_food(|cells| *cells.last_mut().unwrap() = 0.5)
+            .unwrap();
+        publish_food_test_world(&mut app, &world);
+        app.update();
+        let layer = &app.world().resource::<TerrainChunkRegistry>().food;
+        assert_eq!(layer.chunks.len(), 1);
+        let mesh = app
+            .world()
+            .resource::<Assets<Mesh>>()
+            .get(&layer.chunks[&right].mesh)
+            .unwrap();
+        assert_eq!(
+            food_positions(mesh).len(),
+            (FOOD_MOTE_SEGMENTS + 1) as usize
+        );
+        assert!(food_colors(mesh)[0][3] > 0.0);
+    }
+
+    #[test]
+    fn food_sync_preserves_substrate_and_reacts_to_palette_capacity_and_surface() {
+        let world = food_test_world();
+        let mut app = food_test_app();
+        publish_food_test_world(&mut app, &world);
+        app.update();
+        let key = TerrainChunkKey { x: 0, y: 0 };
+        let handle = app.world().resource::<TerrainChunkRegistry>().food.chunks[&key]
+            .mesh
+            .clone();
+        let before = app
+            .world()
+            .resource::<Assets<Mesh>>()
+            .get(&handle)
+            .unwrap()
+            .clone();
+        let terrain_handle = app.world().resource::<TerrainChunkRegistry>().chunks[&key]
+            .mesh
+            .clone();
+        let substrate = app
+            .world()
+            .resource::<Assets<Mesh>>()
+            .get(&terrain_handle)
+            .unwrap()
+            .clone();
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            let snapshot = state.latest.as_mut().unwrap();
+            snapshot.food_max = 2.0;
+            snapshot.revision += 1;
+        }
+        app.update();
+        let lower = app
+            .world()
+            .resource::<Assets<Mesh>>()
+            .get(&handle)
+            .unwrap()
+            .clone();
+        assert_ne!(food_positions(&lower), food_positions(&before));
+        assert!(food_colors(&lower)[0][3] < food_colors(&before)[0][3]);
+        let unchanged_terrain = app
+            .world()
+            .resource::<Assets<Mesh>>()
+            .get(&terrain_handle)
+            .unwrap();
+        assert_eq!(
+            unchanged_terrain.attribute(Mesh::ATTRIBUTE_COLOR),
+            substrate.attribute(Mesh::ATTRIBUTE_COLOR)
+        );
+        assert_eq!(
+            unchanged_terrain.attribute(Mesh::ATTRIBUTE_POSITION),
+            substrate.attribute(Mesh::ATTRIBUTE_POSITION)
+        );
+        app.world_mut().resource_mut::<AccessibilityState>().palette =
+            ColorPaletteMode::HighContrast;
+        app.update();
+        let accessible = app
+            .world()
+            .resource::<Assets<Mesh>>()
+            .get(&handle)
+            .unwrap()
+            .clone();
+        assert_ne!(food_colors(&accessible), food_colors(&lower));
+        assert_eq!(food_positions(&accessible), food_positions(&lower));
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            let snapshot = state.latest.as_mut().unwrap();
+            snapshot.terrain_height.elevation =
+                vec![0.8; snapshot.terrain_height.elevation.len()].into();
+            snapshot.terrain_height.smooth_grid = None;
+            snapshot.revision += 1;
+        }
+        app.update();
+        let lifted = app.world().resource::<Assets<Mesh>>().get(&handle).unwrap();
+        assert_ne!(food_positions(lifted), food_positions(&accessible));
+        assert_eq!(food_colors(lifted), food_colors(&accessible));
+        for point in food_positions(lifted) {
+            assert!(point[1] > 0.8 * TERRAIN_HEIGHT_SCALE);
+        }
+        let previous_positions = food_positions(lifted).to_vec();
+        app.world_mut()
+            .resource_mut::<TerrainChunkRegistry>()
+            .height_scale = 20.0;
+        app.world_mut()
+            .resource_mut::<SnapshotState>()
+            .latest
+            .as_mut()
+            .unwrap()
+            .revision += 1;
+        app.update();
+        let rescaled = app.world().resource::<Assets<Mesh>>().get(&handle).unwrap();
+        assert_ne!(food_positions(rescaled), previous_positions);
+        assert_eq!(food_colors(rescaled), food_colors(&accessible));
+        for point in food_positions(rescaled) {
+            assert!(point[1] > 16.0 && point[1] < 17.0);
+        }
+        assert_eq!(world.tick().0, 0);
+    }
+
+    #[test]
+    fn food_sync_recovers_removed_assets_and_replaces_the_old_world_grid() {
+        let world = food_test_world();
+        let mut app = food_test_app();
+        publish_food_test_world(&mut app, &world);
+        app.update();
+        let left = TerrainChunkKey { x: 0, y: 0 };
+        let old_mesh = app.world().resource::<TerrainChunkRegistry>().food.chunks[&left]
+            .mesh
+            .clone();
+        let old_material = app
+            .world()
+            .resource::<TerrainChunkRegistry>()
+            .food
+            .material
+            .clone()
+            .unwrap();
+        app.world_mut()
+            .resource_mut::<Assets<Mesh>>()
+            .remove(&old_mesh);
+        app.world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .remove(&old_material);
+        publish_food_test_world(&mut app, &world);
+        app.update();
+        let layer = &app.world().resource::<TerrainChunkRegistry>().food;
+        assert_ne!(layer.chunks[&left].mesh, old_mesh);
+        let replacement = layer.material.as_ref().unwrap();
+        assert_ne!(replacement, &old_material);
+        for record in layer.chunks.values() {
+            assert_eq!(
+                &app.world()
+                    .entity(record.entity)
+                    .get::<MeshMaterial3d<StandardMaterial>>()
+                    .unwrap()
+                    .0,
+                replacement,
+                "every surviving batch must rebind a replaced shared material"
+            );
+        }
+        let replacement_world = WorldState::new(scriptbots_core::ScriptBotsConfig {
+            world_width: 64,
+            world_height: 32,
+            food_cell_size: 8,
+            initial_food: 0.25,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            persistence_interval: 0,
+            rng_seed: Some(73),
+            ..default()
+        })
+        .unwrap();
+        publish_food_test_world(&mut app, &replacement_world);
+        app.update();
+        let layer = &app.world().resource::<TerrainChunkRegistry>().food;
+        assert_eq!(
+            layer.chunks.len(),
+            1,
+            "old extent must not retain orphan food batches"
+        );
+        let mesh = app
+            .world()
+            .resource::<Assets<Mesh>>()
+            .get(&layer.chunks[&left].mesh)
+            .unwrap();
+        let points = food_positions(mesh);
+        assert_eq!(points.len(), 8 * 4 * (FOOD_MOTE_SEGMENTS + 1) as usize);
+        assert_eq!([points[0][0], points[0][2]], [-28.0, 12.0]);
+        let last = points.len() - (FOOD_MOTE_SEGMENTS + 1) as usize;
+        assert_eq!([points[last][0], points[last][2]], [28.0, -12.0]);
+    }
+
+    #[test]
+    fn food_projection_refuses_invalid_size_geometry_and_nonfinite_samples() {
+        let valid = FoodLayerSnapshot {
+            width: 2,
+            height: 2,
+            cells: vec![0.5; 4],
+        };
+        assert!(valid_food_layer(&valid, 25, 1.0, Vec2::splat(50.0)));
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.01] {
+            let mut invalid = valid.clone();
+            invalid.cells[3] = value;
+            assert!(!valid_food_layer(&invalid, 25, 1.0, Vec2::splat(50.0)));
+        }
+        for maximum in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert!(!valid_food_layer(&valid, 25, maximum, Vec2::splat(50.0)));
+        }
+        for cell_size in [0, 24, u32::MAX] {
+            assert!(!valid_food_layer(&valid, cell_size, 1.0, Vec2::splat(50.0)));
+        }
+        let mut invalid = valid.clone();
+        invalid.cells.pop();
+        assert!(!valid_food_layer(&invalid, 25, 1.0, Vec2::splat(50.0)));
+        invalid.width = u32::MAX;
+        invalid.height = u32::MAX;
+        assert!(!valid_food_layer(&invalid, 25, 1.0, Vec2::splat(50.0)));
+        assert!(!valid_food_layer(
+            &valid,
+            25,
+            1.0,
+            Vec2::new(f32::NAN, 50.0)
+        ));
+        let snapshot = sample_world_snapshot();
+        assert!(food_surface_signature(&snapshot, TERRAIN_HEIGHT_SCALE).is_some());
+        for scale in [-1.0, f32::NAN, f32::INFINITY] {
+            assert!(food_surface_signature(&snapshot, scale).is_none());
+        }
+        for height in [-0.01, 1.01, f32::NAN, f32::INFINITY] {
+            let mut invalid = snapshot.clone();
+            Arc::make_mut(&mut invalid.terrain_height.elevation)[0] = height;
+            assert!(food_surface_signature(&invalid, TERRAIN_HEIGHT_SCALE).is_none());
+        }
+        let mut invalid = snapshot.clone();
+        invalid.terrain_height.dims = UVec2::new(u32::MAX, 1);
+        assert!(food_surface_signature(&invalid, TERRAIN_HEIGHT_SCALE).is_none());
     }
 
     fn eye_geometry_test_app() -> App {

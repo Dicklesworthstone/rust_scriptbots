@@ -2,6 +2,91 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Evolutionary browser defaults, Ft tournament entry, and visible food (2026-11-09):**
+[Source implemented and independently reviewed — Codex; full native, browser and GPU qualification open]
+
+Continue `bd-2z0.12.3`, `bd-2z0.3.12.6` and `bd-2z0.7.4` with three functional
+increments. New browser worlds use versioned, heritable MLP genomes; DWRAON and
+experimental Assembly are selectable, and owner continuations restore the exact
+family/evaluator identity, including empty worlds. Explicit Wander and unbound
+choices retain their meaning; Wander's unsupported save controls are visibly
+disabled. Replacement owners are constructed before the current owner is changed.
+
+The tournament runner admits the real Ft adapter under `brain-ft`, refuses
+unavailable families before execution, and retains entered competitor identities
+through rows, cohort validation and ratings. Its founder topology count reads a
+validated genome without inventing tick-zero activity. The opt-in
+`tournament/ft_comparison.toml` compares Ft and MLP with equal founder cohorts,
+balanced orders and identical reruns. It explicitly permits different model
+capacities; the canonical 200-source-scalar gate remains unchanged.
+
+Bevy consumes published food through the shared live/offscreen `sync_world` path.
+Separate bounded meshes follow actual density, depletion and regrowth, including
+paused revisions. Unchanged chunks retain their mesh assets; food uses its own
+cell grid and palette without recoloring terrain. A full-footprint terrain support
+bound keeps each mote above interior ridges. Regression source covers inherited
+offspring, exact continuations, tournament identity/refusals, food cache lifetime,
+asset recovery, independent grids and interior terrain clearance.
+
+Frozen DSR checks passed for browser native and `wasm32-unknown-unknown`
+all-targets checking, Ft adapter all-targets checking, 75 Node component tests,
+JavaScript syntax, edited Rust formatting and zero-critical UBS scans. These are
+focused feature-snapshot results, not full final-main qualification. Native browser
+test code generation was killed in unchanged core code; later application and
+Bevy checks stopped in dependencies when the shared disk filled. Chromium was
+refused by the environment before DOM execution. Executable tournament, native
+food/GPU, full workspace, Clippy, performance and long-horizon scientific
+acceptance remain open. Concurrent main changes and existing bead ownership are
+preserved; the parent acceptance beads are not closed by these increments.
+
+**Live narrative policy transitions (2026-11-09):**
+[Source implemented and independently reviewed — Codex; executable qualification open]
+
+Continue `bd-16g.2.9` with shared tick-boundary retention for the live detector
+and persisted-input replay. Authenticated cadence/history/event-capacity changes
+preserve detector cooldowns and pending persistence, remove the complete excess
+display/history prefix, and take effect at the next completed tick. Coalesced
+commands between ticks cannot erase unrecorded history. Reconstruction report
+schema v2 includes policy-change counts and the final effective policy; it uses
+the current kernel and does not assert historical equality across source revisions.
+
+Three new core regressions cover atomic refusals, disable/re-enable cadence,
+live/replay parity and scientific-digest neutrality. Analytics coverage includes
+the actual owner/storage-journal path across page boundaries. These tests are
+authored but unexecuted: genuine DSR refused native host admission because every
+available writable filesystem has less than its required 20 GiB free. Pinned
+rustfmt was used to format edited source; no DSR format, compiler, Clippy or test
+gate is claimed. Original whole-run, recovery and scenario-budget acceptance
+remains required.
+
+**Experiment checkpoint progress (2026-11-09):**
+[Source implemented and independently reviewed — Codex; executable qualification open]
+
+Continue `bd-2z0.5.11` and `bd-2z0.12.2` with plan-derived `target_ticks` and typed
+`checkpoint_progress` across REST, MCP, the control CLI and the terminal's
+Saved/Target display. Terminal `total_ticks` and completion evidence retain their
+existing meaning. Published observations follow successful checkpoint write,
+sync, rename and directory sync; recovered observations validate the complete
+committed world/owner/journal cut. Both identify the exact encoded bytes by
+BLAKE3. Unavailable and refused states never invent progress.
+
+The latest-value cache is bounded by admitted run IDs and bound to the source-aware
+plan and output root. Active polls read the cache. Stopped detail requests recover
+at most one cold cut, with one recovery in flight per runner; summary listings
+recover none. Observations describe historical cuts, not continuous file-integrity
+verification or a filesystem deadline. Explicit resume retries cached refusals
+through the existing checkpoint guards; status reads do not advance science or
+rewrite saved status.
+
+Authored regressions cover real-owner publication and write failure, bounded
+read-only recovery, corrupt and foreign cuts, conflicting/older observations,
+cancel/resume checksums, control DTOs and terminal projection. Independent source
+review resolved a missing test import and a conflict-then-older cache edge.
+Executable qualification remains unavailable: genuine DSR refuses native host
+admission because available writable filesystems have less than its required
+20 GiB free. No passing compiler, Clippy or test result is claimed. Original full
+recovery, resource, fault, process and native acceptance remains open.
+
 **Browser laboratory controls and replicated branch studies (2026-11-09):**
 [Source implemented — Codex; full application and packaged-browser qualification open]
 
