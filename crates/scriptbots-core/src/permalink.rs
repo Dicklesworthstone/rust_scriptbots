@@ -609,6 +609,279 @@ pub fn config_digest_with_diff(
     hash
 }
 
+/// AP-invariant config->Value for the permalink config digest (bd R1 / fastmcp FND-01).
+///
+/// `serde_json`'s `arbitrary_precision` feature (hard-enabled transitively by fastmcp) changes how
+/// an `f32` lands in a `serde_json::Value`: without it the value is the f64-widened number, with it
+/// the f32-shortest decimal, so `canonical_config_bytes`'s `as_f64().to_bits()` would read two
+/// different bit patterns and the committed (AP-off) digests would stop verifying. This adapter
+/// wraps any `Serializer` and widens every `f32` to `f64` (`v as f64`) at the point the type is
+/// known -- never by re-parsing a `Value` -- recursing through every compound serializer so nested
+/// `f32` fields widen too. The result matches the committed digests in both feature states.
+mod canonical_value {
+    use serde::ser::{
+        Serialize, SerializeMap, SerializeSeq, SerializeStruct, SerializeStructVariant,
+        SerializeTuple, SerializeTupleStruct, SerializeTupleVariant, Serializer,
+    };
+
+    struct Widen<'a, T: ?Sized>(&'a T);
+    impl<T: ?Sized + Serialize> Serialize for Widen<'_, T> {
+        fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            self.0.serialize(WidenSer(s))
+        }
+    }
+
+    struct WidenSer<S>(S);
+
+    impl<S: Serializer> Serializer for WidenSer<S> {
+        type Ok = S::Ok;
+        type Error = S::Error;
+        type SerializeSeq = WidenSeq<S::SerializeSeq>;
+        type SerializeTuple = WidenTuple<S::SerializeTuple>;
+        type SerializeTupleStruct = WidenTupleStruct<S::SerializeTupleStruct>;
+        type SerializeTupleVariant = WidenTupleVariant<S::SerializeTupleVariant>;
+        type SerializeMap = WidenMap<S::SerializeMap>;
+        type SerializeStruct = WidenStruct<S::SerializeStruct>;
+        type SerializeStructVariant = WidenStructVariant<S::SerializeStructVariant>;
+
+        fn serialize_f32(self, v: f32) -> Result<S::Ok, S::Error> {
+            self.0.serialize_f64(f64::from(v))
+        }
+        fn serialize_f64(self, v: f64) -> Result<S::Ok, S::Error> {
+            self.0.serialize_f64(v)
+        }
+        fn serialize_bool(self, v: bool) -> Result<S::Ok, S::Error> {
+            self.0.serialize_bool(v)
+        }
+        fn serialize_i8(self, v: i8) -> Result<S::Ok, S::Error> {
+            self.0.serialize_i8(v)
+        }
+        fn serialize_i16(self, v: i16) -> Result<S::Ok, S::Error> {
+            self.0.serialize_i16(v)
+        }
+        fn serialize_i32(self, v: i32) -> Result<S::Ok, S::Error> {
+            self.0.serialize_i32(v)
+        }
+        fn serialize_i64(self, v: i64) -> Result<S::Ok, S::Error> {
+            self.0.serialize_i64(v)
+        }
+        fn serialize_i128(self, v: i128) -> Result<S::Ok, S::Error> {
+            self.0.serialize_i128(v)
+        }
+        fn serialize_u8(self, v: u8) -> Result<S::Ok, S::Error> {
+            self.0.serialize_u8(v)
+        }
+        fn serialize_u16(self, v: u16) -> Result<S::Ok, S::Error> {
+            self.0.serialize_u16(v)
+        }
+        fn serialize_u32(self, v: u32) -> Result<S::Ok, S::Error> {
+            self.0.serialize_u32(v)
+        }
+        fn serialize_u64(self, v: u64) -> Result<S::Ok, S::Error> {
+            self.0.serialize_u64(v)
+        }
+        fn serialize_u128(self, v: u128) -> Result<S::Ok, S::Error> {
+            self.0.serialize_u128(v)
+        }
+        fn serialize_char(self, v: char) -> Result<S::Ok, S::Error> {
+            self.0.serialize_char(v)
+        }
+        fn serialize_str(self, v: &str) -> Result<S::Ok, S::Error> {
+            self.0.serialize_str(v)
+        }
+        fn serialize_bytes(self, v: &[u8]) -> Result<S::Ok, S::Error> {
+            self.0.serialize_bytes(v)
+        }
+        fn serialize_none(self) -> Result<S::Ok, S::Error> {
+            self.0.serialize_none()
+        }
+        fn serialize_some<T: ?Sized + Serialize>(self, v: &T) -> Result<S::Ok, S::Error> {
+            self.0.serialize_some(&Widen(v))
+        }
+        fn serialize_unit(self) -> Result<S::Ok, S::Error> {
+            self.0.serialize_unit()
+        }
+        fn serialize_unit_struct(self, name: &'static str) -> Result<S::Ok, S::Error> {
+            self.0.serialize_unit_struct(name)
+        }
+        fn serialize_unit_variant(
+            self,
+            name: &'static str,
+            idx: u32,
+            variant: &'static str,
+        ) -> Result<S::Ok, S::Error> {
+            self.0.serialize_unit_variant(name, idx, variant)
+        }
+        fn serialize_newtype_struct<T: ?Sized + Serialize>(
+            self,
+            name: &'static str,
+            v: &T,
+        ) -> Result<S::Ok, S::Error> {
+            self.0.serialize_newtype_struct(name, &Widen(v))
+        }
+        fn serialize_newtype_variant<T: ?Sized + Serialize>(
+            self,
+            name: &'static str,
+            idx: u32,
+            variant: &'static str,
+            v: &T,
+        ) -> Result<S::Ok, S::Error> {
+            self.0
+                .serialize_newtype_variant(name, idx, variant, &Widen(v))
+        }
+        fn serialize_seq(self, len: Option<usize>) -> Result<Self::SerializeSeq, S::Error> {
+            Ok(WidenSeq(self.0.serialize_seq(len)?))
+        }
+        fn serialize_tuple(self, len: usize) -> Result<Self::SerializeTuple, S::Error> {
+            Ok(WidenTuple(self.0.serialize_tuple(len)?))
+        }
+        fn serialize_tuple_struct(
+            self,
+            name: &'static str,
+            len: usize,
+        ) -> Result<Self::SerializeTupleStruct, S::Error> {
+            Ok(WidenTupleStruct(self.0.serialize_tuple_struct(name, len)?))
+        }
+        fn serialize_tuple_variant(
+            self,
+            name: &'static str,
+            idx: u32,
+            variant: &'static str,
+            len: usize,
+        ) -> Result<Self::SerializeTupleVariant, S::Error> {
+            Ok(WidenTupleVariant(
+                self.0.serialize_tuple_variant(name, idx, variant, len)?,
+            ))
+        }
+        fn serialize_map(self, len: Option<usize>) -> Result<Self::SerializeMap, S::Error> {
+            Ok(WidenMap(self.0.serialize_map(len)?))
+        }
+        fn serialize_struct(
+            self,
+            name: &'static str,
+            len: usize,
+        ) -> Result<Self::SerializeStruct, S::Error> {
+            Ok(WidenStruct(self.0.serialize_struct(name, len)?))
+        }
+        fn serialize_struct_variant(
+            self,
+            name: &'static str,
+            idx: u32,
+            variant: &'static str,
+            len: usize,
+        ) -> Result<Self::SerializeStructVariant, S::Error> {
+            Ok(WidenStructVariant(
+                self.0.serialize_struct_variant(name, idx, variant, len)?,
+            ))
+        }
+    }
+
+    struct WidenSeq<S>(S);
+    impl<S: SerializeSeq> SerializeSeq for WidenSeq<S> {
+        type Ok = S::Ok;
+        type Error = S::Error;
+        fn serialize_element<T: ?Sized + Serialize>(&mut self, v: &T) -> Result<(), S::Error> {
+            self.0.serialize_element(&Widen(v))
+        }
+        fn end(self) -> Result<S::Ok, S::Error> {
+            self.0.end()
+        }
+    }
+    struct WidenTuple<S>(S);
+    impl<S: SerializeTuple> SerializeTuple for WidenTuple<S> {
+        type Ok = S::Ok;
+        type Error = S::Error;
+        fn serialize_element<T: ?Sized + Serialize>(&mut self, v: &T) -> Result<(), S::Error> {
+            self.0.serialize_element(&Widen(v))
+        }
+        fn end(self) -> Result<S::Ok, S::Error> {
+            self.0.end()
+        }
+    }
+    struct WidenTupleStruct<S>(S);
+    impl<S: SerializeTupleStruct> SerializeTupleStruct for WidenTupleStruct<S> {
+        type Ok = S::Ok;
+        type Error = S::Error;
+        fn serialize_field<T: ?Sized + Serialize>(&mut self, v: &T) -> Result<(), S::Error> {
+            self.0.serialize_field(&Widen(v))
+        }
+        fn end(self) -> Result<S::Ok, S::Error> {
+            self.0.end()
+        }
+    }
+    struct WidenTupleVariant<S>(S);
+    impl<S: SerializeTupleVariant> SerializeTupleVariant for WidenTupleVariant<S> {
+        type Ok = S::Ok;
+        type Error = S::Error;
+        fn serialize_field<T: ?Sized + Serialize>(&mut self, v: &T) -> Result<(), S::Error> {
+            self.0.serialize_field(&Widen(v))
+        }
+        fn end(self) -> Result<S::Ok, S::Error> {
+            self.0.end()
+        }
+    }
+    struct WidenMap<S>(S);
+    impl<S: SerializeMap> SerializeMap for WidenMap<S> {
+        type Ok = S::Ok;
+        type Error = S::Error;
+        fn serialize_key<T: ?Sized + Serialize>(&mut self, k: &T) -> Result<(), S::Error> {
+            self.0.serialize_key(&Widen(k))
+        }
+        fn serialize_value<T: ?Sized + Serialize>(&mut self, v: &T) -> Result<(), S::Error> {
+            self.0.serialize_value(&Widen(v))
+        }
+        fn end(self) -> Result<S::Ok, S::Error> {
+            self.0.end()
+        }
+    }
+    struct WidenStruct<S>(S);
+    impl<S: SerializeStruct> SerializeStruct for WidenStruct<S> {
+        type Ok = S::Ok;
+        type Error = S::Error;
+        fn serialize_field<T: ?Sized + Serialize>(
+            &mut self,
+            key: &'static str,
+            v: &T,
+        ) -> Result<(), S::Error> {
+            self.0.serialize_field(key, &Widen(v))
+        }
+        fn skip_field(&mut self, key: &'static str) -> Result<(), S::Error> {
+            self.0.skip_field(key)
+        }
+        fn end(self) -> Result<S::Ok, S::Error> {
+            self.0.end()
+        }
+    }
+    struct WidenStructVariant<S>(S);
+    impl<S: SerializeStructVariant> SerializeStructVariant for WidenStructVariant<S> {
+        type Ok = S::Ok;
+        type Error = S::Error;
+        fn serialize_field<T: ?Sized + Serialize>(
+            &mut self,
+            key: &'static str,
+            v: &T,
+        ) -> Result<(), S::Error> {
+            self.0.serialize_field(key, &Widen(v))
+        }
+        fn skip_field(&mut self, key: &'static str) -> Result<(), S::Error> {
+            self.0.skip_field(key)
+        }
+        fn end(self) -> Result<S::Ok, S::Error> {
+            self.0.end()
+        }
+    }
+
+    /// Convert a config value into a `serde_json::Value` with every `f32` widened to `f64`, so the
+    /// permalink digest is invariant to `serde_json`'s `arbitrary_precision` feature.
+    pub fn to_canonical_value<T: Serialize>(
+        value: &T,
+    ) -> Result<serde_json::Value, serde_json::Error> {
+        value.serialize(WidenSer(serde_json::value::Serializer))
+    }
+}
+
+pub(crate) use canonical_value::to_canonical_value;
+
 /// Serialize a config value with deterministic key order so digest inputs are
 /// stable regardless of map construction order.
 fn canonical_config_bytes(value: &serde_json::Value) -> Vec<u8> {

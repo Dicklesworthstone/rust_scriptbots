@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::fmt::Write as _;
 
 use crate::narrative::EventRecord;
-use crate::permalink::{BuildLink, Permalink, config_digest_with_diff};
+use crate::permalink::{BuildLink, Permalink, config_digest_with_diff, to_canonical_value};
 use crate::{ScriptBotsConfig, WorldState};
 
 /// A semantic event expected to occur during a gallery run.
@@ -480,7 +480,7 @@ pub fn create_gallery_permalink(
 ) -> Result<String, String> {
     let base_config = base_config_for_scenario(scenario_id);
     let scenario_config =
-        serde_json::to_value(&base_config).map_err(|e| format!("serialize base config: {e}"))?;
+        to_canonical_value(&base_config).map_err(|e| format!("serialize base config: {e}"))?;
     let config_digest = config_digest_with_diff(&scenario_config, &knob_diff);
 
     let permalink = Permalink {
@@ -508,7 +508,7 @@ pub fn reconstruct_config_from_permalink(link: &Permalink) -> Result<ScriptBotsC
 
     let mut config = base_config_for_scenario(&link.scenario_id);
     let scenario_json =
-        serde_json::to_value(&config).map_err(|e| format!("serialize base config: {e}"))?;
+        to_canonical_value(&config).map_err(|e| format!("serialize base config: {e}"))?;
     link.verify_config_digest(&scenario_json)
         .map_err(|e| format!("config digest verification failed: {e}"))?;
 

@@ -5064,8 +5064,11 @@ pub const KNOB_RANGES: &[KnobRange] = &[
     KnobRange::live("food_intake_rate", 0.0, 1.0),
     KnobRange::live("food_waste_rate", 0.0, 1.0),
     KnobRange::live("food_transfer_rate", 0.0, 1.0),
+    KnobRange::live("food_respawn_interval", 0.0, 1_000_000.0),
     // Metabolism and locomotion.
     KnobRange::live("metabolism_drain", 0.0, 1.0),
+    KnobRange::live("metabolism_ramp_rate", 0.0, 1.0),
+    KnobRange::live("metabolism_boost_penalty", 0.0, 1.0),
     KnobRange::live("movement_drain", 0.0, 1.0),
     KnobRange::live("bot_speed", 0.0, 100.0),
     KnobRange::live("boost_multiplier", 1.0, 50.0),
@@ -5090,6 +5093,7 @@ pub const KNOB_RANGES: &[KnobRange] = &[
     // reappear unnoticed.
     KnobRange::live("reproduction_energy_threshold", 0.0, 2.0),
     KnobRange::live("reproduction_energy_cost", 0.0, 2.0),
+    KnobRange::live("reproduction_attempt_chance", 0.0, 1.0),
     // Population.
     KnobRange::live("population_minimum", 0.0, 100_000.0),
     KnobRange::live("population_spawn_interval", 0.0, 1_000_000.0),
@@ -5179,7 +5183,7 @@ pub fn knob_range(path: &str) -> Option<&'static KnobRange> {
 /// wrong agents near the seam — an agent at x=5 and one at x=995 in a 1000-wide
 /// world are 10 apart, not 990 — and the bug is invisible until someone drops a
 /// meteor near an edge and watches the wrong things die.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 #[serde(tag = "shape", rename_all = "snake_case")]
 pub enum Region {
     /// The entire world.
@@ -5205,6 +5209,46 @@ pub enum Region {
         /// Height along the wrapped y axis.
         h: f32,
     },
+}
+
+impl<'de> Deserialize<'de> for Region {
+    // AP-invariant deserialize (bd R1 / fastmcp FND-01 hazard): a plain struct's derived Deserialize
+    // calls `deserialize_f32` directly and never Content-buffers, so serde_json's `arbitrary_precision`
+    // feature (which turns buffered numbers into maps) cannot break it. The wire stays byte-identical
+    // to the `#[serde(tag = "shape")]` Serialize above.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        struct Flat {
+            shape: String,
+            x: Option<f32>,
+            y: Option<f32>,
+            radius: Option<f32>,
+            w: Option<f32>,
+            h: Option<f32>,
+        }
+        let flat = Flat::deserialize(deserializer)?;
+        match flat.shape.as_str() {
+            "all" => Ok(Self::All),
+            "disc" => Ok(Self::Disc {
+                x: flat.x.ok_or_else(|| serde::de::Error::missing_field("x"))?,
+                y: flat.y.ok_or_else(|| serde::de::Error::missing_field("y"))?,
+                radius: flat
+                    .radius
+                    .ok_or_else(|| serde::de::Error::missing_field("radius"))?,
+            }),
+            "rect" => Ok(Self::Rect {
+                x: flat.x.ok_or_else(|| serde::de::Error::missing_field("x"))?,
+                y: flat.y.ok_or_else(|| serde::de::Error::missing_field("y"))?,
+                w: flat.w.ok_or_else(|| serde::de::Error::missing_field("w"))?,
+                h: flat.h.ok_or_else(|| serde::de::Error::missing_field("h"))?,
+            }),
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                &["all", "disc", "rect"],
+            )),
+        }
+    }
 }
 
 impl Eq for Region {}
@@ -5368,7 +5412,7 @@ pub enum CohortSource {
 }
 
 /// How cohort positions are sampled without consuming world RNG.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(tag = "placement", rename_all = "snake_case")]
 pub enum Placement {
     /// Uniform sampling inside the region, driven by the carried seed. The seed IS the
@@ -5379,6 +5423,37 @@ pub enum Placement {
         /// Seed driving the sampling; carried so replay reproduces the cohort exactly.
         seed: u64,
     },
+}
+
+impl<'de> Deserialize<'de> for Placement {
+    // AP-invariant deserialize (bd R1 / fastmcp FND-01 hazard): the derived internally-tagged
+    // Deserialize Content-buffers the whole map, so under serde_json's `arbitrary_precision` the
+    // nested `Region`'s f32 fields arrive as maps ("invalid type: map, expected f32") even though
+    // `Region` now has a direct Deserialize. A plain `Flat` struct's derived Deserialize reads each
+    // field straight from the deserializer (no buffer), so `region` reaches `Region::deserialize`
+    // directly and stays AP-safe. The wire is byte-identical to the `#[serde(tag = "placement")]`
+    // Serialize above.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        struct Flat {
+            placement: String,
+            region: Option<Region>,
+            seed: Option<u64>,
+        }
+        let flat = Flat::deserialize(deserializer)?;
+        match flat.placement.as_str() {
+            "seeded" => Ok(Self::Seeded {
+                region: flat
+                    .region
+                    .ok_or_else(|| serde::de::Error::missing_field("region"))?,
+                seed: flat
+                    .seed
+                    .ok_or_else(|| serde::de::Error::missing_field("seed"))?,
+            }),
+            other => Err(serde::de::Error::unknown_variant(other, &["seeded"])),
+        }
+    }
 }
 
 impl Placement {
@@ -5467,7 +5542,7 @@ const fn neutral_cohort_diet() -> f32 {
 }
 
 /// An operator intervention applied at a simulation tick boundary.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Intervention {
     /// Suppress food regrowth in a region for a while.
@@ -5548,6 +5623,132 @@ pub enum Intervention {
         #[serde(default)]
         herbivore_tendency: Option<f32>,
     },
+}
+
+impl<'de> Deserialize<'de> for Intervention {
+    // AP-invariant deserialize (bd R1 / fastmcp FND-01 hazard): the derived internally-tagged
+    // Deserialize Content-buffers the whole map, so under serde_json's `arbitrary_precision` every
+    // f32 (and every nested Region/Placement f32) arrives as a map ("invalid type: map, expected
+    // f32"). A plain `Flat` struct's derived Deserialize reads each field straight from the
+    // deserializer (no buffer): the direct f32 fields use `deserialize_f32`, and `region`/`placement`
+    // reach their own direct Deserialize. Wire byte-identical to the `#[serde(tag = "kind")]`
+    // Serialize above; the Option fields below reproduce the original `#[serde(default...)]`.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the AP-invariant Flat deserialize matches all 8 Intervention variants in one place; splitting it would scatter the single-source wire contract across helper fns"
+    )]
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        struct Flat {
+            kind: String,
+            region: Option<Region>,
+            ticks: Option<u32>,
+            growth_scale: Option<f32>,
+            amount: Option<f32>,
+            lethality: Option<f32>,
+            scorch: Option<f32>,
+            terrain: Option<TerrainKind>,
+            fertility_bias: Option<f32>,
+            count: Option<u16>,
+            genome: Option<CohortSource>,
+            placement: Option<Placement>,
+            herbivore_tendency: Option<f32>,
+            closed: Option<bool>,
+            selector: Option<CellSelector>,
+            headroom: Option<u32>,
+        }
+        let f = Flat::deserialize(deserializer)?;
+        match f.kind.as_str() {
+            "drought" => Ok(Self::Drought {
+                region: f
+                    .region
+                    .ok_or_else(|| serde::de::Error::missing_field("region"))?,
+                ticks: f
+                    .ticks
+                    .ok_or_else(|| serde::de::Error::missing_field("ticks"))?,
+                growth_scale: f
+                    .growth_scale
+                    .ok_or_else(|| serde::de::Error::missing_field("growth_scale"))?,
+            }),
+            "embargo" => Ok(Self::Embargo {
+                region: f
+                    .region
+                    .ok_or_else(|| serde::de::Error::missing_field("region"))?,
+                ticks: f
+                    .ticks
+                    .ok_or_else(|| serde::de::Error::missing_field("ticks"))?,
+            }),
+            "bloom" => Ok(Self::Bloom {
+                region: f
+                    .region
+                    .ok_or_else(|| serde::de::Error::missing_field("region"))?,
+                amount: f
+                    .amount
+                    .ok_or_else(|| serde::de::Error::missing_field("amount"))?,
+            }),
+            "meteor" => Ok(Self::Meteor {
+                region: f
+                    .region
+                    .ok_or_else(|| serde::de::Error::missing_field("region"))?,
+                lethality: f
+                    .lethality
+                    .ok_or_else(|| serde::de::Error::missing_field("lethality"))?,
+                scorch: f
+                    .scorch
+                    .ok_or_else(|| serde::de::Error::missing_field("scorch"))?,
+            }),
+            "paint_terrain" => Ok(Self::PaintTerrain {
+                region: f
+                    .region
+                    .ok_or_else(|| serde::de::Error::missing_field("region"))?,
+                terrain: f
+                    .terrain
+                    .ok_or_else(|| serde::de::Error::missing_field("terrain"))?,
+                fertility_bias: f.fertility_bias,
+            }),
+            "inject_cohort" => Ok(Self::InjectCohort {
+                count: f
+                    .count
+                    .ok_or_else(|| serde::de::Error::missing_field("count"))?,
+                genome: f
+                    .genome
+                    .ok_or_else(|| serde::de::Error::missing_field("genome"))?,
+                placement: f
+                    .placement
+                    .ok_or_else(|| serde::de::Error::missing_field("placement"))?,
+                herbivore_tendency: f.herbivore_tendency.unwrap_or_else(neutral_cohort_diet),
+            }),
+            "set_closed_world" => Ok(Self::SetClosedWorld {
+                closed: f
+                    .closed
+                    .ok_or_else(|| serde::de::Error::missing_field("closed"))?,
+            }),
+            "spawn_from_archive" => Ok(Self::SpawnFromArchive {
+                selector: f
+                    .selector
+                    .ok_or_else(|| serde::de::Error::missing_field("selector"))?,
+                placement: f
+                    .placement
+                    .ok_or_else(|| serde::de::Error::missing_field("placement"))?,
+                headroom: f.headroom,
+                herbivore_tendency: f.herbivore_tendency,
+            }),
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                &[
+                    "drought",
+                    "embargo",
+                    "bloom",
+                    "meteor",
+                    "paint_terrain",
+                    "inject_cohort",
+                    "set_closed_world",
+                    "spawn_from_archive",
+                ],
+            )),
+        }
+    }
 }
 
 impl Intervention {
