@@ -1,6 +1,7 @@
 #import bevy_pbr::{
     pbr_fragment::pbr_input_from_standard_material,
     pbr_functions::alpha_discard,
+    mesh_view_bindings::view,
 }
 #ifdef PREPASS_PIPELINE
 #import bevy_pbr::{
@@ -21,6 +22,9 @@
 @group(#{MATERIAL_BIND_GROUP}) @binding(104) var rock_texture: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(105) var rock_sampler: sampler;
 @group(#{MATERIAL_BIND_GROUP}) @binding(106) var<uniform> dry_light_strength: f32;
+@group(#{MATERIAL_BIND_GROUP}) @binding(107) var far_color_texture: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(108) var far_color_sampler: sampler;
+@group(#{MATERIAL_BIND_GROUP}) @binding(109) var<uniform> far_color_mapping: vec4<f32>;
 
 @fragment
 fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> FragmentOutput {
@@ -52,7 +56,17 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     // Rock and sand share this texture group. Lift their natural-palette light
     // response while retaining hue and avoiding channel clipping; the uniform
     // disables the lift for every accessibility palette.
-    let base = pbr_input.material.base_color.rgb;
+    // Preserve canonical vertex colors up close. At a distance, reduce the
+    // cell-scale biome pattern; alpha protects nearby water boundaries.
+    let cell = max(far_color_mapping.z, 1.0);
+    let grid = vec2<f32>(in.world_position.x + far_color_mapping.x,
+                         far_color_mapping.y - in.world_position.z) / cell;
+    let size = vec2<f32>(textureDimensions(far_color_texture));
+    let uv = (grid + vec2<f32>(0.5)) / size;
+    let far_color = textureSample(far_color_texture, far_color_sampler, uv);
+    let distance_cells = distance(view.world_position.xyz, in.world_position.xyz) / cell;
+    let fade = smoothstep(8.0, 16.0, distance_cells) * far_color.a * far_color_mapping.w;
+    let base = mix(pbr_input.material.base_color.rgb, far_color.rgb, fade);
     let peak = max(max(base.r, base.g), base.b);
     let max_gain = max(1.0, 1.0 / max(peak, 0.00001));
     let gain = min(1.0 + dry_light_strength * rock_weight / total, max_gain);

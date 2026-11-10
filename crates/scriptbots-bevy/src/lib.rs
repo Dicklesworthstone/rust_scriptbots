@@ -885,6 +885,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
             poll_snapshots,
             (
                 sync_world,
+                sync_far_terrain_color,
                 apply_daynight_lighting,
                 smooth_agent_poses,
                 conform_selection_ring,
@@ -3473,10 +3474,69 @@ struct CreatureSignalBar {
     index: usize,
 }
 
+/// Color perceived by one eye in the current owner-inspection sample.
+#[derive(Component)]
+struct CreatureEyeSwatch(usize);
+
+/// Marker for an eye's bearing relative to the creature's forward direction.
+#[derive(Component)]
+struct CreatureEyeBearing(usize);
+
 #[derive(Clone, Copy)]
 enum CreatureSignalSource {
     Sensor,
     Output,
+}
+
+fn creature_eye_rgb(sensors: &[f32], eye: usize) -> Option<[f32; 3]> {
+    use scriptbots_core::SensorKind;
+    let channel = |kind| {
+        let index = scriptbots_core::SENSOR_LAYOUT
+            .iter()
+            .find(|channel| channel.eye == Some(eye) && channel.kind == kind)?
+            .index;
+        sensors
+            .get(index)
+            .copied()
+            .filter(|value| value.is_finite())
+            .map(|value| value.clamp(0.0, 1.0))
+    };
+    Some([
+        channel(SensorKind::EyeRed)?,
+        channel(SensorKind::EyeGreen)?,
+        channel(SensorKind::EyeBlue)?,
+    ])
+}
+
+fn creature_signal_color(source: CreatureSignalSource, index: usize) -> Color {
+    use scriptbots_core::SensorKind;
+    let rgb = match source {
+        CreatureSignalSource::Sensor => {
+            scriptbots_core::SENSOR_LAYOUT
+                .get(index)
+                .and_then(|c| match c.kind {
+                    SensorKind::EyeRed => Some(Color::srgb(0.95, 0.38, 0.35)),
+                    SensorKind::EyeGreen => Some(Color::srgb(0.42, 0.82, 0.50)),
+                    SensorKind::EyeBlue => Some(Color::srgb(0.39, 0.67, 0.96)),
+                    _ => None,
+                })
+        }
+        CreatureSignalSource::Output => {
+            if index == OutputChannel::ColorRed.index() {
+                Some(Color::srgb(0.95, 0.38, 0.35))
+            } else if index == OutputChannel::ColorGreen.index() {
+                Some(Color::srgb(0.42, 0.82, 0.50))
+            } else if index == OutputChannel::ColorBlue.index() {
+                Some(Color::srgb(0.39, 0.67, 0.96))
+            } else {
+                None
+            }
+        }
+    };
+    rgb.unwrap_or_else(|| match source {
+        CreatureSignalSource::Sensor => Color::srgb(0.38, 0.78, 0.71),
+        CreatureSignalSource::Output => Color::srgb(0.93, 0.68, 0.35),
+    })
 }
 
 #[derive(Component, Clone, Copy)]
@@ -3484,6 +3544,15 @@ enum CreatureVitalBar {
     Health,
     Energy,
 }
+
+#[derive(Component, Clone, Copy)]
+enum CreaturePreference {
+    Diet,
+    Temperature,
+}
+
+#[derive(Component)]
+struct CreaturePreferenceLabel(CreaturePreference);
 
 #[derive(Component)]
 struct CreatureDetailsButton;
@@ -4267,6 +4336,11 @@ struct TerrainBlend {
     rock: Option<Handle<Image>>,
     #[uniform(106)]
     dry_light_strength: f32,
+    #[texture(107)]
+    #[sampler(108)]
+    far_color: Option<Handle<Image>>,
+    #[uniform(109)]
+    far_color_mapping: Vec4,
 }
 
 const fn dry_ground_light_strength(palette: ColorPaletteMode) -> f32 {
@@ -5720,7 +5794,7 @@ fn setup_scene(
                     padding: UiRect::all(Val::Px(12.0)),
                     border: UiRect::all(Val::Px(1.0)),
                     flex_direction: FlexDirection::Column,
-                    row_gap: Val::Px(7.0),
+                    row_gap: Val::Px(5.0),
                     ..default()
                 },
                 BackgroundColor(Color::srgba(0.08, 0.16, 0.14, 0.96)),
@@ -5827,6 +5901,138 @@ fn setup_scene(
                         });
                     }
                 });
+                card.spawn(Node {
+                    flex_direction: FlexDirection::Row,
+                    column_gap: Val::Px(10.0),
+                    ..default()
+                })
+                .with_children(|row| {
+                    for preference in [CreaturePreference::Diet, CreaturePreference::Temperature] {
+                        row.spawn(Node {
+                            flex_grow: 1.0,
+                            flex_basis: Val::Px(0.0),
+                            flex_direction: FlexDirection::Column,
+                            row_gap: Val::Px(3.0),
+                            ..default()
+                        })
+                        .with_children(|scale| {
+                            scale.spawn((
+                                Text::default(),
+                                ui_font(10.0),
+                                TextColor(Color::srgb(0.80, 0.89, 0.83)),
+                                CreaturePreferenceLabel(preference),
+                            ));
+                            scale
+                                .spawn((
+                                    Node {
+                                        width: Val::Percent(100.0),
+                                        height: Val::Px(5.0),
+                                        ..default()
+                                    },
+                                    BackgroundColor(Color::srgb(0.22, 0.34, 0.29)),
+                                    BorderRadius::all(Val::Px(3.0)),
+                                ))
+                                .with_children(|track| {
+                                    track.spawn((
+                                        Node {
+                                            position_type: PositionType::Absolute,
+                                            display: Display::None,
+                                            width: Val::Px(5.0),
+                                            height: Val::Px(9.0),
+                                            top: Val::Px(-2.0),
+                                            margin: UiRect::left(Val::Px(-2.5)),
+                                            ..default()
+                                        },
+                                        BackgroundColor(Color::srgb(0.83, 0.90, 0.76)),
+                                        BorderRadius::all(Val::Px(2.0)),
+                                        preference,
+                                    ));
+                                });
+                        });
+                    }
+                });
+                card.spawn(Node {
+                    flex_direction: FlexDirection::Row,
+                    align_items: AlignItems::Center,
+                    column_gap: Val::Px(6.0),
+                    ..default()
+                })
+                .with_children(|row| {
+                    row.spawn((
+                        Text::new("EYES\n↑ FORWARD"),
+                        ui_font(9.0),
+                        TextColor(Color::srgb(0.65, 0.80, 0.71)),
+                    ));
+                    for eye in 0..NUM_EYES {
+                        row.spawn((
+                            Node {
+                                flex_grow: 1.0,
+                                flex_basis: Val::Px(0.0),
+                                min_width: Val::Px(0.0),
+                                flex_direction: FlexDirection::Row,
+                                align_items: AlignItems::Center,
+                                justify_content: JustifyContent::Center,
+                                column_gap: Val::Px(5.0),
+                                padding: UiRect::axes(Val::Px(3.0), Val::Px(3.0)),
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgba(0.13, 0.23, 0.19, 0.95)),
+                            BorderRadius::all(Val::Px(5.0)),
+                        ))
+                        .with_children(|cell| {
+                            cell.spawn((
+                                Text::new(format!("E{}", eye + 1)),
+                                ui_font(10.0),
+                                TextColor(Color::srgb(0.80, 0.89, 0.83)),
+                            ));
+                            cell.spawn((
+                                Node {
+                                    width: Val::Px(24.0),
+                                    height: Val::Px(24.0),
+                                    flex_shrink: 0.0,
+                                    border: UiRect::all(Val::Px(1.0)),
+                                    ..default()
+                                },
+                                BackgroundColor(Color::srgb(0.08, 0.16, 0.14)),
+                                BorderColor::all(Color::srgb(0.35, 0.50, 0.42)),
+                                BorderRadius::all(Val::Px(12.0)),
+                            ))
+                            .with_children(|compass| {
+                                // A fixed notch marks forward; the brighter dot
+                                // shows the eye's relative bearing around it.
+                                compass.spawn((
+                                    Node {
+                                        position_type: PositionType::Absolute,
+                                        left: Val::Percent(50.0),
+                                        top: Val::Px(0.0),
+                                        width: Val::Px(2.0),
+                                        height: Val::Px(4.0),
+                                        margin: UiRect::left(Val::Px(-1.0)),
+                                        ..default()
+                                    },
+                                    BackgroundColor(Color::srgb(0.56, 0.68, 0.60)),
+                                ));
+                                compass.spawn((
+                                    Node {
+                                        position_type: PositionType::Absolute,
+                                        display: Display::None,
+                                        width: Val::Px(6.0),
+                                        height: Val::Px(6.0),
+                                        margin: UiRect {
+                                            left: Val::Px(-3.0),
+                                            top: Val::Px(-3.0),
+                                            ..default()
+                                        },
+                                        ..default()
+                                    },
+                                    BackgroundColor(Color::srgb(0.46, 0.87, 0.75)),
+                                    BorderRadius::all(Val::Px(3.0)),
+                                    CreatureEyeBearing(eye),
+                                ));
+                            });
+                        });
+                    }
+                });
                 card_signal_status = card
                     .spawn((
                         Text::new("SIGNALS  /  waiting for owner sample"),
@@ -5836,7 +6042,7 @@ fn setup_scene(
                     .id();
                 for (title, source, labels) in [
                     (
-                        "SENSORS  ·  E1–E4: DENSITY AND COLOR",
+                        "SENSORS  ·  E1–E4: SWATCH = EYE RGB",
                         CreatureSignalSource::Sensor,
                         creature_sensor_labels(),
                     ),
@@ -5883,11 +6089,39 @@ fn setup_scene(
                                 ..default()
                             })
                             .with_children(|cell| {
-                                cell.spawn((
-                                    Text::new(label),
-                                    ui_font(10.0),
-                                    TextColor(Color::srgb(0.80, 0.89, 0.83)),
-                                ));
+                                cell.spawn(Node {
+                                    flex_direction: FlexDirection::Row,
+                                    align_items: AlignItems::Center,
+                                    column_gap: Val::Px(3.0),
+                                    ..default()
+                                })
+                                .with_children(|header| {
+                                    if matches!(source, CreatureSignalSource::Sensor)
+                                        && let Some(channel) =
+                                            scriptbots_core::SENSOR_LAYOUT.get(index)
+                                        && channel.kind == scriptbots_core::SensorKind::EyeDensity
+                                        && let Some(eye) = channel.eye
+                                    {
+                                        header.spawn((
+                                            Node {
+                                                width: Val::Px(12.0),
+                                                height: Val::Px(12.0),
+                                                flex_shrink: 0.0,
+                                                border: UiRect::all(Val::Px(1.0)),
+                                                ..default()
+                                            },
+                                            BackgroundColor(Color::srgb(0.17, 0.22, 0.20)),
+                                            BorderColor::all(Color::srgb(0.54, 0.65, 0.59)),
+                                            BorderRadius::all(Val::Px(6.0)),
+                                            CreatureEyeSwatch(eye),
+                                        ));
+                                    }
+                                    header.spawn((
+                                        Text::new(label),
+                                        ui_font(10.0),
+                                        TextColor(Color::srgb(0.80, 0.89, 0.83)),
+                                    ));
+                                });
                                 cell.spawn((
                                     Node {
                                         width: Val::Percent(100.0),
@@ -5904,14 +6138,7 @@ fn setup_scene(
                                             height: Val::Percent(100.0),
                                             ..default()
                                         },
-                                        BackgroundColor(match source {
-                                            CreatureSignalSource::Sensor => {
-                                                Color::srgb(0.38, 0.78, 0.71)
-                                            }
-                                            CreatureSignalSource::Output => {
-                                                Color::srgb(0.93, 0.68, 0.35)
-                                            }
-                                        }),
+                                        BackgroundColor(creature_signal_color(source, index)),
                                         BorderRadius::all(Val::Px(2.0)),
                                         CreatureSignalBar { source, index },
                                     ));
@@ -6959,7 +7186,11 @@ struct CreatureCardData<'w, 's> {
     texts: Query<'w, 's, &'static mut Text>,
     backgrounds: Query<'w, 's, &'static mut BackgroundColor>,
     bars: Query<'w, 's, (Entity, &'static CreatureSignalBar)>,
+    eyes: Query<'w, 's, (Entity, &'static CreatureEyeSwatch)>,
+    eye_bearings: Query<'w, 's, (Entity, &'static CreatureEyeBearing)>,
     vitals: Query<'w, 's, (Entity, &'static CreatureVitalBar)>,
+    preferences: Query<'w, 's, (Entity, &'static CreaturePreference)>,
+    preference_labels: Query<'w, 's, (Entity, &'static CreaturePreferenceLabel)>,
     brain_layers: Query<'w, 's, (Entity, &'static CreatureBrainLayer)>,
     brain_labels: Query<'w, 's, (Entity, &'static CreatureBrainLabel)>,
     brain_cells: Query<'w, 's, (Entity, &'static CreatureBrainCell)>,
@@ -6980,7 +7211,11 @@ fn update_creature_card(
         mut texts,
         mut backgrounds,
         bars,
+        eyes,
+        eye_bearings,
         vitals,
+        preferences,
+        preference_labels,
         brain_layers,
         brain_labels,
         brain_cells,
@@ -7030,6 +7265,33 @@ fn update_creature_card(
     let (Some(frame), Some(agent)) = (state.latest.as_ref(), selected) else {
         return;
     };
+    for (entity, bearing) in &eye_bearings {
+        if let Ok(mut node) = nodes.get_mut(entity) {
+            let angle = agent
+                .eye_dirs
+                .get(bearing.0)
+                .copied()
+                .filter(|v| v.is_finite());
+            let display = if angle.is_some() {
+                Display::Flex
+            } else {
+                Display::None
+            };
+            if node.display != display {
+                node.display = display;
+            }
+            if let Some(angle) = angle {
+                let left = Val::Percent(50.0 + 32.0 * angle.sin());
+                let top = Val::Percent(50.0 - 32.0 * angle.cos());
+                if node.left != left {
+                    node.left = left;
+                }
+                if node.top != top {
+                    node.top = top;
+                }
+            }
+        }
+    }
     for (entity, vital) in &vitals {
         let value = match vital {
             CreatureVitalBar::Health => agent.health,
@@ -7045,6 +7307,43 @@ fn update_creature_card(
             if node.width != width {
                 node.width = width;
             }
+        }
+    }
+    let preference_value = |preference: CreaturePreference| {
+        let value = match preference {
+            CreaturePreference::Diet => agent.herbivore_tendency,
+            CreaturePreference::Temperature => agent.temperature_preference,
+        };
+        (value.is_finite() && (0.0..=1.0).contains(&value)).then_some(value)
+    };
+    for (entity, preference) in &preferences {
+        if let Ok(mut node) = nodes.get_mut(entity) {
+            let value = preference_value(*preference);
+            let display = if value.is_some() {
+                Display::Flex
+            } else {
+                Display::None
+            };
+            if node.display != display {
+                node.display = display;
+            }
+            if let Some(value) = value {
+                let left = Val::Percent(value * 100.0);
+                if node.left != left {
+                    node.left = left;
+                }
+            }
+        }
+    }
+    for (entity, label) in &preference_labels {
+        if let Ok(mut text) = texts.get_mut(entity) {
+            let value = preference_value(label.0)
+                .map_or_else(|| "--".to_owned(), |value| format!("{value:.2}"));
+            let label = match label.0 {
+                CreaturePreference::Diet => format!("DIET {value}  ·  MEAT → PLANTS"),
+                CreaturePreference::Temperature => format!("TEMP PREF {value}  ·  COOL → WARM"),
+            };
+            set_hud_text_if_changed(&mut text, label);
         }
     }
     let current = InspectorTarget::from_frame(frame);
@@ -7070,6 +7369,19 @@ fn update_creature_card(
         .and_then(|inspector| inspector.last_failure.as_ref())
     {
         signal_status.push_str(&format!("  ·  REFRESH FAILED: {error}"));
+    }
+    for (entity, eye) in &eyes {
+        let color = sample
+            .and_then(|sample| creature_eye_rgb(&sample.sensors, eye.0))
+            .map_or_else(
+                || Color::srgb(0.17, 0.22, 0.20),
+                |[r, g, b]| Color::srgb(r, g, b),
+            );
+        if let Ok(mut background) = backgrounds.get_mut(entity)
+            && background.0 != color
+        {
+            background.0 = color;
+        }
     }
     for (entity, bar) in &bars {
         let value = sample.and_then(|sample| match bar.source {
@@ -7619,6 +7931,35 @@ mod renderer_plugins_tests {
 #[cfg(test)]
 mod hud_inspector_tests {
     use super::*;
+
+    #[test]
+    fn eye_swatches_follow_the_canonical_sensor_layout() {
+        let mut sensors = [0.0; scriptbots_core::INPUT_SIZE];
+        for channel in scriptbots_core::SENSOR_LAYOUT {
+            if channel.eye == Some(3) {
+                sensors[channel.index] = match channel.kind {
+                    scriptbots_core::SensorKind::EyeRed => 0.2,
+                    scriptbots_core::SensorKind::EyeGreen => 0.6,
+                    scriptbots_core::SensorKind::EyeBlue => 0.9,
+                    _ => 0.4,
+                };
+            }
+        }
+        assert_eq!(creature_eye_rgb(&sensors, 3), Some([0.2, 0.6, 0.9]));
+        assert_eq!(creature_eye_rgb(&sensors, NUM_EYES), None);
+        assert_eq!(creature_eye_rgb(&sensors[..3], 3), None);
+        let red = scriptbots_core::SENSOR_LAYOUT
+            .iter()
+            .find(|channel| {
+                channel.eye == Some(3) && channel.kind == scriptbots_core::SensorKind::EyeRed
+            })
+            .unwrap()
+            .index;
+        sensors[red] = f32::NAN;
+        assert_eq!(creature_eye_rgb(&sensors, 3), None);
+        sensors[red] = 2.0;
+        assert_eq!(creature_eye_rgb(&sensors, 3), Some([1.0, 0.6, 0.9]));
+    }
 
     #[test]
     fn signal_labels_cover_each_canonical_sensor_once_and_group_eyes() {
@@ -8610,6 +8951,99 @@ mod adaptive_governor_tests {
         app.insert_resource(auto_launch(RenderQuality::High));
         app.add_systems(Update, (sync_world, apply_tier_to_terrain_detail).chain());
         app
+    }
+
+    #[test]
+    fn far_terrain_color_reuses_image_and_tracks_daylight_and_palette() {
+        let mut app = terrain_detail_app();
+        app.add_systems(Update, sync_far_terrain_color.after(sync_world));
+        app.update();
+        let material_handle = app
+            .world()
+            .resource::<TerrainChunkRegistry>()
+            .chunks
+            .values()
+            .next()
+            .unwrap()
+            .material
+            .clone();
+        let material = app
+            .world()
+            .resource::<Assets<TerrainMaterial>>()
+            .get(&material_handle)
+            .unwrap();
+        let image_handle = material.extension.far_color.clone().unwrap();
+        assert_eq!(material.extension.far_color_mapping.w, 1.0);
+        let images = app.world().resource::<Assets<Image>>();
+        let image_count = images.len();
+        let initial = images.get(&image_handle).unwrap().data.clone();
+
+        app.update();
+        assert_eq!(app.world().resource::<Assets<Image>>().len(), image_count);
+        assert_eq!(
+            app.world()
+                .resource::<Assets<Image>>()
+                .get(&image_handle)
+                .unwrap()
+                .data,
+            initial
+        );
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            let snapshot = state.latest.as_mut().unwrap();
+            snapshot.revision += 1;
+            snapshot.terrain_height.daylight = visual::DAYLIGHT_NIGHT_FLOOR;
+        }
+        app.update();
+        let material = app
+            .world()
+            .resource::<Assets<TerrainMaterial>>()
+            .get(&material_handle)
+            .unwrap();
+        assert_eq!(material.extension.far_color.as_ref(), Some(&image_handle));
+        let images = app.world().resource::<Assets<Image>>();
+        assert_eq!(images.len(), image_count);
+        assert_ne!(images.get(&image_handle).unwrap().data, initial);
+
+        app.world_mut().resource_mut::<AccessibilityState>().cycle();
+        app.update();
+        let material = app
+            .world()
+            .resource::<Assets<TerrainMaterial>>()
+            .get(&material_handle)
+            .unwrap();
+        assert_eq!(material.extension.far_color_mapping.w, 0.0);
+
+        app.world_mut()
+            .resource_mut::<Assets<Image>>()
+            .remove(image_handle.id());
+        app.update();
+        let material = app
+            .world()
+            .resource::<Assets<TerrainMaterial>>()
+            .get(&material_handle)
+            .unwrap();
+        assert!(material.extension.far_color.is_none());
+        assert_eq!(material.extension.far_color_mapping.w, 0.0);
+
+        for _ in 0..4 {
+            app.world_mut().resource_mut::<AccessibilityState>().cycle();
+        }
+        app.update();
+        let material = app
+            .world()
+            .resource::<Assets<TerrainMaterial>>()
+            .get(&material_handle)
+            .unwrap();
+        let restored = material.extension.far_color.as_ref().unwrap();
+        assert_ne!(restored, &image_handle);
+        assert_eq!(material.extension.far_color_mapping.w, 1.0);
+        assert!(
+            app.world()
+                .resource::<Assets<Image>>()
+                .get(restored)
+                .is_some()
+        );
     }
 
     #[test]
@@ -9661,6 +10095,44 @@ mod adaptive_governor_tests {
             .get(&handle)
             .expect("embedded font asset");
         assert_eq!(font.data.as_slice(), include_bytes!("ui-inter-regular.ttf"));
+    }
+
+    #[test]
+    fn scene_creates_one_eye_swatch_per_canonical_eye() {
+        let mut app = App::new();
+        app.insert_resource(Assets::<Mesh>::default())
+            .insert_resource(Assets::<Image>::default())
+            .insert_resource(auto_launch(RenderQuality::High))
+            .add_systems(Startup, setup_scene);
+        app.update();
+
+        let world = app.world_mut();
+        let mut eyes: Vec<_> = world
+            .query::<&CreatureEyeSwatch>()
+            .iter(world)
+            .map(|eye| eye.0)
+            .collect();
+        eyes.sort_unstable();
+        assert_eq!(eyes, (0..NUM_EYES).collect::<Vec<_>>());
+        let mut bearings: Vec<_> = world
+            .query::<&CreatureEyeBearing>()
+            .iter(world)
+            .map(|eye| eye.0)
+            .collect();
+        bearings.sort_unstable();
+        assert_eq!(bearings, (0..NUM_EYES).collect::<Vec<_>>());
+        let preferences: Vec<_> = world.query::<&CreaturePreference>().iter(world).collect();
+        assert_eq!(preferences.len(), 2);
+        assert!(
+            preferences
+                .iter()
+                .any(|p| matches!(p, CreaturePreference::Diet))
+        );
+        assert!(
+            preferences
+                .iter()
+                .any(|p| matches!(p, CreaturePreference::Temperature))
+        );
     }
 
     #[test]
@@ -14106,9 +14578,32 @@ mod owner_inspector_tests {
                 },
             ))
             .id();
+        let eye_swatch = app
+            .world_mut()
+            .spawn((BackgroundColor(Color::WHITE), CreatureEyeSwatch(0)))
+            .id();
+        let eye_bearing = app
+            .world_mut()
+            .spawn((Node::default(), CreatureEyeBearing(0)))
+            .id();
         let energy_bar = app
             .world_mut()
             .spawn((Node::default(), CreatureVitalBar::Energy))
+            .id();
+        let diet_marker = app
+            .world_mut()
+            .spawn((Node::default(), CreaturePreference::Diet))
+            .id();
+        let temperature_marker = app
+            .world_mut()
+            .spawn((Node::default(), CreaturePreference::Temperature))
+            .id();
+        let temperature_label = app
+            .world_mut()
+            .spawn((
+                Text::default(),
+                CreaturePreferenceLabel(CreaturePreference::Temperature),
+            ))
             .id();
         let brain_row = app
             .world_mut()
@@ -14134,7 +14629,49 @@ mod owner_inspector_tests {
             .id();
         app.insert_resource(card)
             .add_systems(Update, update_creature_card);
+        app.world_mut()
+            .resource_mut::<SnapshotState>()
+            .latest
+            .as_mut()
+            .unwrap()
+            .agents[0]
+            .eye_dirs[0] = 0.0;
         app.update();
+        {
+            let node = app.world().get::<Node>(eye_bearing).unwrap();
+            assert_eq!(node.display, Display::Flex);
+            assert_eq!(node.left, Val::Percent(50.0));
+            assert_eq!(node.top, Val::Percent(18.0));
+        }
+        app.world_mut()
+            .resource_mut::<SnapshotState>()
+            .latest
+            .as_mut()
+            .unwrap()
+            .agents[0]
+            .eye_dirs[0] = std::f32::consts::FRAC_PI_2;
+        app.update();
+        {
+            let node = app.world().get::<Node>(eye_bearing).unwrap();
+            assert_eq!(node.display, Display::Flex);
+            assert_eq!(node.left, Val::Percent(82.0));
+            let Val::Percent(top) = node.top else {
+                panic!("eye bearing must use a percentage position");
+            };
+            assert!((top - 50.0).abs() < 0.001);
+        }
+        app.world_mut()
+            .resource_mut::<SnapshotState>()
+            .latest
+            .as_mut()
+            .unwrap()
+            .agents[0]
+            .eye_dirs[0] = f32::NAN;
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(eye_bearing).unwrap().display,
+            Display::None
+        );
         assert_eq!(
             app.world().get::<Node>(brain_row).unwrap().display,
             Display::None
@@ -14151,6 +14688,55 @@ mod owner_inspector_tests {
                 .contains(&target.uid.0.to_string())
         );
         assert_eq!(app.world().get::<Text>(energy).unwrap().0, "0.73");
+        for (entity, expected) in [(diet_marker, 83.0), (temperature_marker, 61.0)] {
+            let node = app.world().get::<Node>(entity).unwrap();
+            let Val::Percent(actual) = node.left else {
+                panic!("preference markers must use percentage positions");
+            };
+            assert!((actual - expected).abs() < 0.001);
+            assert_eq!(node.display, Display::Flex);
+        }
+        assert_eq!(
+            app.world().get::<Text>(temperature_label).unwrap().0,
+            "TEMP PREF 0.61  ·  COOL → WARM"
+        );
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            state.latest.as_mut().unwrap().agents[0].temperature_preference = f32::NAN;
+        }
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(temperature_marker).unwrap().display,
+            Display::None
+        );
+        assert_eq!(
+            app.world().get::<Text>(temperature_label).unwrap().0,
+            "TEMP PREF --  ·  COOL → WARM"
+        );
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            state.latest.as_mut().unwrap().agents[0].temperature_preference = 0.61;
+        }
+        app.update();
+        assert_eq!(
+            app.world().get::<BackgroundColor>(eye_swatch).unwrap().0,
+            Color::srgb(0.02, 0.03, 0.04)
+        );
+        {
+            let mut owner = app.world_mut().non_send_resource_mut::<OwnerInspector>();
+            owner.sample.as_mut().unwrap().sensors[1] = f32::NAN;
+        }
+        app.update();
+        assert_eq!(
+            app.world().get::<BackgroundColor>(eye_swatch).unwrap().0,
+            Color::srgb(0.17, 0.22, 0.20),
+            "invalid sensor data must not look like a real eye color"
+        );
+        {
+            let mut owner = app.world_mut().non_send_resource_mut::<OwnerInspector>();
+            owner.sample.as_mut().unwrap().sensors[1] = 0.02;
+        }
+        app.update();
         for (entity, expected) in [(food_bar, 5.0), (boost_bar, 35.0), (energy_bar, 36.5)] {
             let Val::Percent(actual) = app.world().get::<Node>(entity).unwrap().width else {
                 panic!("dashboard bars must use percentage widths");
@@ -17004,6 +17590,154 @@ fn create_chunk_material(stats: &TerrainChunkStats) -> StandardMaterial {
     }
 }
 
+// The distant color image is an optional visual filter. Keep its allocation
+// bounded; larger grids retain the canonical terrain rendering instead.
+const FAR_TERRAIN_MAX_DIMENSION: u32 = 2048;
+const FAR_TERRAIN_MAX_TEXELS: usize = 1_048_576;
+
+struct FarTerrainColorCache {
+    terrain: TerrainHeightSnapshot,
+    image: Handle<Image>,
+}
+
+fn far_terrain_color_supported(dims: UVec2) -> bool {
+    dims.x > 0
+        && dims.y > 0
+        && dims.x <= FAR_TERRAIN_MAX_DIMENSION
+        && dims.y <= FAR_TERRAIN_MAX_DIMENSION
+        && (dims.x as usize)
+            .checked_mul(dims.y as usize)
+            .is_some_and(|count| count <= FAR_TERRAIN_MAX_TEXELS)
+}
+
+fn far_terrain_color_image(terrain: &TerrainHeightSnapshot) -> Option<Image> {
+    use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+    let UVec2 {
+        x: width,
+        y: height,
+    } = terrain.dims;
+    if !far_terrain_color_supported(terrain.dims) {
+        return None;
+    }
+    let count = (width as usize) * (height as usize);
+    let mut canonical = Vec::with_capacity(count);
+    for z in 0..height {
+        for x in 0..width {
+            let sample = terrain.sample_tile(x, z);
+            let slope = compute_tile_slope(terrain, x, z);
+            let color = terrain_vertex_color_from_splat(
+                sample,
+                slope,
+                terrain_sample_splat(sample, slope),
+                terrain.daylight,
+                ColorPaletteMode::Natural,
+            );
+            let water = matches!(
+                sample.kind,
+                TerrainKind::DeepWater | TerrainKind::ShallowWater
+            ) || sample.water_depth > 0.0;
+            canonical.push((Vec4::from_array(color), water));
+        }
+    }
+    let mut pixels = Vec::with_capacity(count * 4);
+    for z in 0..height {
+        for x in 0..width {
+            let center_water = canonical[z as usize * width as usize + x as usize].1;
+            let mut color = Vec4::ZERO;
+            let mut same_surface = true;
+            for (dz, wz) in [(-1, 1.0), (0, 2.0), (1, 1.0)] {
+                for (dx, wx) in [(-1, 1.0), (0, 2.0), (1, 1.0)] {
+                    let sx = x.saturating_add_signed(dx).min(width - 1);
+                    let sz = z.saturating_add_signed(dz).min(height - 1);
+                    let (sample, water) = canonical[sz as usize * width as usize + sx as usize];
+                    color += sample * (wx * wz / 16.0);
+                    same_surface &= water == center_water;
+                }
+            }
+            for value in [color.x, color.y, color.z] {
+                pixels.push((value.clamp(0.0, 1.0) * 255.0).round() as u8);
+            }
+            // Preserve the unfiltered color around even a single water cell.
+            pixels.push(if same_surface { 255 } else { 0 });
+        }
+    }
+    let mut image = Image::new(
+        Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        pixels,
+        TextureFormat::Rgba8Unorm,
+        RenderAssetUsages::default(),
+    );
+    image.sampler = bevy::image::ImageSampler::linear();
+    Some(image)
+}
+
+fn sync_far_terrain_color(
+    state: Res<SnapshotState>,
+    registry: Res<TerrainChunkRegistry>,
+    accessibility: Res<AccessibilityState>,
+    mut images: ResMut<Assets<Image>>,
+    mut materials: ResMut<Assets<TerrainMaterial>>,
+    mut cached: Local<Option<FarTerrainColorCache>>,
+) {
+    let Some(snapshot) = state.latest.as_ref() else {
+        return;
+    };
+    let terrain = &snapshot.terrain_height;
+    let enabled = accessibility.palette() == ColorPaletteMode::Natural
+        && far_terrain_color_supported(terrain.dims);
+    if enabled
+        && cached
+            .as_ref()
+            .is_none_or(|cached| cached.terrain != *terrain || images.get(&cached.image).is_none())
+        && let Some(image) = far_terrain_color_image(terrain)
+    {
+        if let Some(cached) = cached.as_mut() {
+            if let Some(existing) = images.get(&cached.image) {
+                // Avoid an unnecessary GPU upload when different daylight or
+                // terrain inputs quantize to identical filtered pixels.
+                if existing.data != image.data
+                    || existing.texture_descriptor.size != image.texture_descriptor.size
+                {
+                    *images.get_mut(&cached.image).expect("image checked above") = image;
+                }
+            } else {
+                cached.image = images.add(image);
+            }
+            cached.terrain = terrain.clone();
+        } else {
+            *cached = Some(FarTerrainColorCache {
+                terrain: terrain.clone(),
+                image: images.add(image),
+            });
+        }
+    }
+    let image = cached
+        .as_ref()
+        .filter(|cached| images.get(&cached.image).is_some())
+        .map(|cached| cached.image.clone());
+    let mapping = Vec4::new(
+        snapshot.world_size.x * 0.5,
+        snapshot.world_size.y * 0.5,
+        terrain.cell_size.max(1) as f32,
+        if enabled && image.is_some() { 1.0 } else { 0.0 },
+    );
+    for chunk in registry.chunks.values() {
+        if let Some(material) = materials.get(&chunk.material)
+            && (material.extension.far_color != image
+                || material.extension.far_color_mapping != mapping)
+            && let Some(material) = materials.get_mut(&chunk.material)
+        {
+            material.extension.far_color.clone_from(&image);
+            material.extension.far_color_mapping = mapping;
+        }
+    }
+}
+
 const TERRAIN_DETAIL_RESOLUTION: u32 = visual::CANONICAL_BIOME_ATLAS_TILE_SIZE;
 
 #[derive(Default)]
@@ -19761,6 +20495,43 @@ mod terrain_tests {
             history: HudHistory::default(),
             brain: BrainOverlay::default(),
         }
+    }
+
+    #[test]
+    fn far_terrain_color_filters_land_but_preserves_water_boundaries() {
+        let mut snapshot = backend_agreement_snapshot();
+        snapshot.terrain_height.water_depth.fill(0.0);
+        let terrain = &snapshot.terrain_height;
+        let image = far_terrain_color_image(terrain).unwrap();
+        let data = image.data.as_ref().unwrap();
+        assert_eq!(image.texture_descriptor.size.width, 3);
+        assert_eq!(image.texture_descriptor.size.height, 3);
+        assert!(data.chunks_exact(4).all(|pixel| pixel[3] == 255));
+        let center = terrain_vertex_color(terrain, 1, 1, ColorPaletteMode::Natural);
+        let unfiltered = center[..3]
+            .iter()
+            .map(|value| (value.clamp(0.0, 1.0) * 255.0).round() as u8)
+            .collect::<Vec<_>>();
+        assert_ne!(&data[16..19], unfiltered.as_slice());
+
+        snapshot.terrain_height.water_depth[4] = 1.5;
+        let flooded = far_terrain_color_image(&snapshot.terrain_height).unwrap();
+        assert!(
+            flooded
+                .data
+                .unwrap()
+                .chunks_exact(4)
+                .all(|pixel| pixel[3] == 0)
+        );
+    }
+
+    #[test]
+    fn far_terrain_color_rejects_unbounded_images() {
+        assert!(!far_terrain_color_supported(UVec2::ZERO));
+        assert!(far_terrain_color_supported(UVec2::new(2048, 512)));
+        assert!(!far_terrain_color_supported(UVec2::new(2048, 513)));
+        assert!(!far_terrain_color_supported(UVec2::new(2049, 1)));
+        assert!(!far_terrain_color_supported(UVec2::splat(u32::MAX)));
     }
 
     #[test]
