@@ -457,6 +457,10 @@ fn assert_float_identical(actual: f64, expected: f64) {
 
 /// The former JSONL + whole-table strategy is a deliberately independent,
 /// small-fixture oracle for paging, group order, and floating-point operations.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the independent whole-table summary oracle asserts paging, group order, rolling               metrics, lineage, and markdown rendering in one place so it stays a single coherent               cross-check of the production summary"
+)]
 fn assert_summary_matches_materialized(
     reader: &StorageReader,
     epoch_size: u64,
@@ -610,12 +614,20 @@ fn read_columnar_pages(path: &Path, format: AnalyticsExportFormat) -> Vec<Record
                     "Parquet writer must not retain a whole-table row group"
                 );
             }
+            // arrow-rs strips schema-level metadata from DECODED Parquet batches, but the file's
+            // own schema (from the footer's ARROW:schema) still carries it. Rebuild each page against
+            // the reader's file schema so the test reads the file's preserved provenance -- never an
+            // injected/expected schema.
+            let file_schema = builder.schema().clone();
             builder
                 .with_batch_size(EXPORT_PAGE_ROWS)
                 .build()
                 .unwrap()
-                .collect::<Result<_, _>>()
-                .unwrap()
+                .map(|page| {
+                    RecordBatch::try_new(file_schema.clone(), page.unwrap().columns().to_vec())
+                        .unwrap()
+                })
+                .collect::<Vec<_>>()
         }
         AnalyticsExportFormat::Arrow => {
             ArrowFileReader::try_new(fs::File::open(path).unwrap(), None)
@@ -996,10 +1008,10 @@ fn empty_summary_has_defaults_and_no_fabricated_observations() {
         .expect("finish empty source");
     let reader = StorageReader::open_finished(&db_path).expect("finished source lease");
     let summary = assert_summary_matches_materialized(&reader, 0, 0);
-    assert!(summary.diet_summaries.is_empty());
-    assert!(summary.brain_summaries.is_empty());
-    assert!(summary.rolling_metrics.is_empty());
-    assert!(summary.founder_lineages.is_empty());
+    assert_eq!(summary.diet_summaries, []);
+    assert_eq!(summary.brain_summaries, []);
+    assert_eq!(summary.rolling_metrics, []);
+    assert_eq!(summary.founder_lineages, []);
     assert!(summary.markdown_table.contains("(no agents recorded)"));
     assert!(summary.markdown_table.contains("| - | 0 | 0 | 0 |"));
 }

@@ -405,11 +405,16 @@ pub fn read_parquet_batch(path: &Path) -> Result<RecordBatch, DataFrameError> {
     if batches.is_empty() {
         return Ok(RecordBatch::new_empty(schema));
     }
-    if batches.len() == 1 {
-        return Ok(batches.remove(0));
-    }
-    let schema = batches[0].schema();
-    Ok(arrow::compute::concat_batches(&schema, &batches)?)
+    // The Parquet reader does not surface schema-level metadata (e.g. embedded provenance)
+    // onto decoded batches; rebuild against the reader schema, which carries it. Arrow IPC
+    // preserves it, Parquet does not -- verified against arrow/parquet 58.4.0.
+    let combined = if batches.len() == 1 {
+        batches.remove(0)
+    } else {
+        let page_schema = batches[0].schema();
+        arrow::compute::concat_batches(&page_schema, &batches)?
+    };
+    Ok(RecordBatch::try_new(schema, combined.columns().to_vec())?)
 }
 
 /// Read all batches from an Arrow IPC file and concatenate them.
@@ -818,6 +823,14 @@ pub fn export_database_table(
                     ParquetRecordBatchReaderBuilder::try_new(File::open(&target_path)?)?;
                 let schema = builder.schema().clone();
                 let batches = builder.with_batch_size(EXPORT_PAGE_ROWS).build()?;
+                // Parquet drops schema-level metadata from decoded batches; rebuild each
+                // against the reader schema so per-page verification sees the provenance.
+                let rewrap = schema.clone();
+                let batches = batches.map(move |page| {
+                    page.and_then(|batch| {
+                        RecordBatch::try_new(rewrap.clone(), batch.columns().to_vec())
+                    })
+                });
                 verify_columnar_pages(reader, table, &prov, &schema, batches)?;
             }
         }
@@ -1621,7 +1634,7 @@ mod tests {
             .finish()
             .unwrap();
 
-        let mut foreign = prov.clone();
+        let mut foreign = prov;
         foreign.run_id.push_str("-different-source");
         let foreign_schema = spec_to_arrow_schema(METRIC_ARROW_SCHEMA, Some(&foreign));
         assert!(BatchReadback::new(empty(), schema.clone(), &foreign_schema).is_err());
