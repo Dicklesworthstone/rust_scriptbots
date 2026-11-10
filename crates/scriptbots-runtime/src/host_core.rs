@@ -5214,13 +5214,7 @@ impl HostCore {
         // every publication rather than a copy of the ring.
         let intervention_seq = latest_intervention_seq(&self.world);
         let applied_interventions = self.snapshot_applied_interventions(intervention_seq);
-        let (command_queue_depth, last_applied_command) = {
-            let shared = self.shared.borrow();
-            (
-                shared.queue.len(),
-                shared.last_applied.map(|(_, command_id)| command_id),
-            )
-        };
+        let (command_queue_depth, last_applied_command) = self.snapshot_command_queue_state();
         let narrative_events = self.snapshot_narrative(&mut build);
         let scheduled_patches = self.snapshot_scheduled(&mut build);
         let snapshot = Arc::new(RenderSnapshot {
@@ -5262,6 +5256,14 @@ impl HostCore {
         self.last_published_scientific = self.revisions.scientific;
         self.shared.borrow_mut().visible_boundary = self.applied_boundary();
         Ok(())
+    }
+
+    fn snapshot_command_queue_state(&self) -> (usize, Option<CommandId>) {
+        let shared = self.shared.borrow();
+        (
+            shared.queue.len(),
+            shared.last_applied.map(|(_, command_id)| command_id),
+        )
     }
 
     fn snapshot_scheduled(&self, build: &mut SnapshotBuildStats) -> Arc<Vec<ScheduledPatchStatus>> {
@@ -6934,12 +6936,7 @@ mod tests {
             assert!(!paired.host_checkpoint().has_schedule());
             assert_eq!(paired.host_checkpoint().remaining_schedule(), None);
             assert_eq!(paired.host_checkpoint().completed_schedule_sequence(), None);
-            assert!(
-                paired
-                    .host_checkpoint()
-                    .scheduled_patch_history()
-                    .is_empty()
-            );
+            assert_eq!(paired.host_checkpoint().scheduled_patch_history(), []);
             assert_eq!(
                 paired.journal.scientific_entries.len(),
                 usize::try_from(completed.min(3)).unwrap()
@@ -7148,7 +7145,7 @@ mod tests {
             pending.remaining_schedule().unwrap(),
             [scheduled(1, 0, serde_json::json!({"food_max": 0.61}))]
         );
-        assert!(pending.scheduled_patch_history().is_empty());
+        assert_eq!(pending.scheduled_patch_history(), []);
         settle_continuation_command(
             &mut scheduled_owner,
             CommandEnvelope::new(CommandId::new(5), HostCommand::Step),
@@ -7173,7 +7170,7 @@ mod tests {
         );
         let completed = scheduled_owner.capture_host_checkpoint_v1().unwrap();
         assert_eq!(completed.completed_schedule_sequence(), Some(1));
-        assert!(completed.remaining_schedule().unwrap().is_empty());
+        assert_eq!(completed.remaining_schedule().unwrap(), []);
         assert_eq!(completed.scheduled_patch_history().len(), 1);
         assert_eq!(
             completed.scheduled_patch_history()[0].evidence.scheduled,
@@ -7200,9 +7197,9 @@ mod tests {
         );
         let empty_cut = empty.capture_host_checkpoint_v1().unwrap();
         assert!(empty_cut.has_schedule());
-        assert!(empty_cut.remaining_schedule().unwrap().is_empty());
+        assert_eq!(empty_cut.remaining_schedule().unwrap(), []);
         assert_eq!(empty_cut.completed_schedule_sequence(), Some(0));
-        assert!(empty_cut.scheduled_patch_history().is_empty());
+        assert_eq!(empty_cut.scheduled_patch_history(), []);
     }
 
     #[test]
@@ -7580,6 +7577,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // interdependent 116-line checkpoint-continuation test; repo precedent: crates/scriptbots-core/tests/map_elites.rs:1108
     fn full_host_checkpoint_continues_nonempty_owner_schedule_counters_and_exact_retries() {
         let declared = [
             scheduled(1, 1, serde_json::json!({"food_max": 0.61})),
@@ -7824,7 +7822,7 @@ mod tests {
             let after = restored.capture_host_checkpoint_v1().unwrap();
             let uninterrupted = oracle.capture_host_checkpoint_v1().unwrap();
             assert_eq!(after.completed_schedule_sequence(), Some(4));
-            assert!(after.remaining_schedule().unwrap().is_empty());
+            assert_eq!(after.remaining_schedule().unwrap(), []);
             assert_eq!(after.scheduled_patch_history_capacity(), capacity);
             assert_eq!(after.step_traces(), uninterrupted.step_traces());
             assert_eq!(after.encode().unwrap(), uninterrupted.encode().unwrap());
