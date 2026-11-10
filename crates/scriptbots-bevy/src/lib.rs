@@ -52,8 +52,8 @@ use scriptbots_core::{
 #[cfg(test)]
 use scriptbots_core::{BrainInspectionClientId, BrainInspectionRequest, BrainInspectionRevision};
 use scriptbots_runtime::{
-    ApplicationState, CommandId, CommandStatus, HostAccessError, HostClient, HostPort,
-    JournalState, RejectionReason, RenderSnapshot, channel::ChannelHostPort,
+    ApplicationState, CommandId, CommandStatus, FoodLayerSnapshot, HostAccessError, HostClient,
+    HostPort, JournalState, RejectionReason, RenderSnapshot, channel::ChannelHostPort,
 };
 use serde::Deserialize;
 use slotmap::Key;
@@ -4364,6 +4364,10 @@ pub(crate) struct WorldSnapshot {
     agent_radius: f32,
     terrain_color: TerrainColorMap,
     terrain_height: TerrainHeightSnapshot,
+    /// The published consumable food field, shared with the host snapshot.
+    food: Arc<FoodLayerSnapshot>,
+    food_max: f32,
+    food_cell_size: u32,
     day_night_active: bool,
     night_ambient: f32,
     agents: Vec<AgentVisual>,
@@ -4409,6 +4413,28 @@ fn brain_dashboard_bin(values: &[f32], index: usize) -> Option<f32> {
         .copied()
         .filter(|value| value.is_finite())
         .max_by(|a, b| a.abs().total_cmp(&b.abs()))
+}
+
+/// Compress magnitude continuously, preserving distinctions above one without
+/// changing the scale when a new peak enters or leaves the sample.
+fn brain_dashboard_strength(value: f32) -> f32 {
+    if !value.is_finite() {
+        return 0.0;
+    }
+    let magnitude = value.abs();
+    magnitude / (1.0 + magnitude)
+}
+
+fn brain_dashboard_range(values: &[f32]) -> Option<(f32, f32)> {
+    values
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .fold(None, |range: Option<(f32, f32)>, value| {
+            Some(range.map_or((value, value), |(min, max)| {
+                (min.min(value), max.max(value))
+            }))
+        })
 }
 
 /// Stable client identity for this frontend's inspection requests, so core can
@@ -4963,6 +4989,11 @@ impl WorldSnapshot {
             return None;
         }
         let terrain = &snapshot.layers.terrain;
+        let food = &snapshot.layers.food;
+        let food_total = (food.width as usize).checked_mul(food.height as usize)?;
+        if food.width == 0 || food.height == 0 || food.cells.len() != food_total {
+            return None;
+        }
         let total = terrain.width as usize * terrain.height as usize;
         let water = snapshot
             .layers
@@ -5072,6 +5103,9 @@ impl WorldSnapshot {
                 pixels,
             },
             terrain_height,
+            food: Arc::clone(food),
+            food_max: config.food_max,
+            food_cell_size: config.food_cell_size,
             day_night_active: config.render.day_night_active(),
             night_ambient: night_ambient_floor(&config.render),
             agents,
@@ -5089,6 +5123,9 @@ impl WorldSnapshot {
             && self.agent_radius == other.agent_radius
             && self.terrain_color == other.terrain_color
             && self.terrain_height == other.terrain_height
+            && self.food == other.food
+            && self.food_max == other.food_max
+            && self.food_cell_size == other.food_cell_size
             && self.day_night_active == other.day_night_active
             && self.night_ambient == other.night_ambient
             && self.agents == other.agents
@@ -5263,6 +5300,13 @@ impl WorldSnapshot {
                 pixels: terrain_pixels,
             },
             terrain_height,
+            food: Arc::new(FoodLayerSnapshot {
+                width: world.food().width(),
+                height: world.food().height(),
+                cells: world.food().cells().to_vec(),
+            }),
+            food_max: config.food_max,
+            food_cell_size: config.food_cell_size,
             day_night_active: config.render.day_night_active(),
             night_ambient: night_ambient_floor(&config.render),
             agents,
@@ -7059,7 +7103,7 @@ fn update_creature_card(
             .take(BRAIN_OVERLAY_MAX_LAYERS)
             .any(|layer| layer.shown.len() > BRAIN_DASHBOARD_BINS);
         format!(
-            "BRAIN  /  TICK {}  ·  {}  ·  BLUE − / AMBER +{}{}",
+            "BRAIN  /  TICK {}  ·  {}  ·  BLUE − / AMBER +  ·  ±1 HALF COLOR{}{}",
             brain.source_tick,
             dashboard_sample_age(frame.tick.saturating_sub(brain.source_tick)),
             if summarized { "  ·  GROUP PEAKS" } else { "" },
@@ -7104,7 +7148,14 @@ fn update_creature_card(
             } else {
                 String::new()
             };
-            set_hud_text_if_changed(&mut text, format!("{}  ·  {count}{groups}", layer.name));
+            let range = brain_dashboard_range(&layer.shown).map_or_else(
+                || "no finite values".to_owned(),
+                |(min, max)| format!("shown {min:+.2} to {max:+.2}"),
+            );
+            set_hud_text_if_changed(
+                &mut text,
+                format!("{}  ·  {count}{groups}  ·  {range}", layer.name),
+            );
         }
     }
     for (entity, cell) in &brain_cells {
@@ -7124,7 +7175,7 @@ fn update_creature_card(
         }
         let color = match value {
             Some(value) if value < 0.0 => {
-                let strength = value.abs().min(1.0);
+                let strength = brain_dashboard_strength(value);
                 Color::srgb(
                     0.15 + 0.15 * strength,
                     0.25 + 0.33 * strength,
@@ -7132,7 +7183,7 @@ fn update_creature_card(
                 )
             }
             Some(value) if value > 0.0 => {
-                let strength = value.min(1.0);
+                let strength = brain_dashboard_strength(value);
                 Color::srgb(
                     0.15 + 0.78 * strength,
                     0.25 + 0.43 * strength,
@@ -8793,6 +8844,49 @@ mod adaptive_governor_tests {
             panic!("terrain positions must be Float32x3");
         };
         assert_ne!(positions[0][1], first_height);
+    }
+
+    #[test]
+    fn terrain_visibility_bounds_follow_rebuilt_geometry() {
+        use bevy::camera::primitives::{Aabb, MeshAabb};
+
+        let mut app = terrain_detail_app();
+        app.update();
+        let key = TerrainChunkKey { x: 0, y: 0 };
+        let record = &app.world().resource::<TerrainChunkRegistry>().chunks[&key];
+        let entity = record.entity;
+        let mesh = record.mesh.clone();
+        let original = *app.world().get::<Aabb>(entity).unwrap();
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            let snapshot = state.latest.as_mut().unwrap();
+            for height in Arc::make_mut(&mut snapshot.terrain_height.elevation) {
+                *height += 10.0;
+            }
+            snapshot.revision += 1;
+        }
+        app.update();
+
+        let updated = *app.world().get::<Aabb>(entity).unwrap();
+        let actual = app
+            .world()
+            .resource::<Assets<Mesh>>()
+            .get(&mesh)
+            .unwrap()
+            .compute_aabb()
+            .unwrap();
+        assert!(
+            updated.center.y - updated.half_extents.y > original.center.y + original.half_extents.y,
+            "fixture must move the mesh completely outside its original vertical bounds"
+        );
+        assert_eq!(updated, actual);
+        assert_eq!(
+            app.world().resource::<TerrainChunkRegistry>().chunks[&key]
+                .mesh
+                .id(),
+            mesh.id(),
+            "updating bounds must not replace the mesh handle"
+        );
     }
 
     #[test]
@@ -14144,7 +14238,7 @@ mod owner_inspector_tests {
         );
         assert_eq!(
             app.world().get::<Text>(brain_label).unwrap().0,
-            "hidden layer with a long descriptive name  ·  2/3 values"
+            "hidden layer with a long descriptive name  ·  2/3 values  ·  shown -0.40 to +0.20"
         );
         assert!(
             app.world()
@@ -14188,6 +14282,36 @@ mod owner_inspector_tests {
                 .0
                 .contains("hidden layer with a long descriptive name [2/3]")
         );
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            let layer = &mut state.latest.as_mut().unwrap().brain.layers[0];
+            layer.shown = vec![2.0, 10.0];
+            layer.total = 2;
+        }
+        app.update();
+        let smaller = app
+            .world()
+            .get::<BackgroundColor>(positive)
+            .unwrap()
+            .0
+            .to_srgba();
+        let larger = app
+            .world()
+            .get::<BackgroundColor>(negative)
+            .unwrap()
+            .0
+            .to_srgba();
+        assert!(
+            larger.red > smaller.red,
+            "large values need distinct colors"
+        );
+        assert!(
+            app.world()
+                .get::<Text>(brain_label)
+                .unwrap()
+                .0
+                .contains("shown +2.00 to +10.00")
+        );
         app.world_mut()
             .resource_mut::<SnapshotState>()
             .latest
@@ -14206,7 +14330,7 @@ mod owner_inspector_tests {
         app.update();
         assert_eq!(
             app.world().get::<Text>(brain_label).unwrap().0,
-            "Assembly working cells  ·  200 values / 48 groups"
+            "Assembly working cells  ·  200 values / 48 groups  ·  shown +0.10 to +0.10"
         );
         let map_status = &app.world().get::<Text>(brain_status).unwrap().0;
         assert!(map_status.contains("GROUP PEAKS"));
@@ -14271,6 +14395,22 @@ mod owner_inspector_tests {
         assert_eq!(brain_dashboard_bin(&[f32::NAN], 0), None);
         assert_eq!(brain_dashboard_bin(&[], 0), None);
         assert_eq!(brain_dashboard_bin(&values, BRAIN_DASHBOARD_BINS), None);
+    }
+
+    #[test]
+    fn brain_dashboard_preserves_large_magnitudes_and_reports_observed_range() {
+        assert_eq!(brain_dashboard_strength(0.0), 0.0);
+        assert_eq!(brain_dashboard_strength(1.0), 0.5);
+        assert_eq!(brain_dashboard_strength(-1.0), 0.5);
+        assert!(brain_dashboard_strength(2.0) > brain_dashboard_strength(1.0));
+        assert!(brain_dashboard_strength(10.0) > brain_dashboard_strength(2.0));
+        assert!(brain_dashboard_strength(f32::MAX).is_finite());
+        assert_eq!(brain_dashboard_strength(f32::NAN), 0.0);
+        assert_eq!(brain_dashboard_range(&[f32::NAN, f32::INFINITY]), None);
+        assert_eq!(
+            brain_dashboard_range(&[2.0, -4.0, f32::NAN]),
+            Some((-4.0, 2.0))
+        );
     }
 
     #[test]
@@ -16737,6 +16877,11 @@ fn sync_terrain(
                         || record.signature != built.stats.signature
                         || meshes.get(&record.mesh).is_none()
                     {
+                        // Bevy computes an AABB only when one is absent. A
+                        // replaced mesh can extend beyond its original bounds,
+                        // so keep the visibility test in sync with the geometry.
+                        let mesh_bounds =
+                            bevy::camera::primitives::MeshAabb::compute_aabb(&built.mesh);
                         if let Some(existing) = meshes.get_mut(&record.mesh) {
                             *existing = built.mesh;
                         } else {
@@ -16745,6 +16890,13 @@ fn sync_terrain(
                             commands
                                 .entity(record.entity)
                                 .insert(Mesh3d(mesh_handle.clone()));
+                        }
+                        if let Some(bounds) = mesh_bounds {
+                            commands.entity(record.entity).insert(bounds);
+                        } else {
+                            commands
+                                .entity(record.entity)
+                                .remove::<bevy::camera::primitives::Aabb>();
                         }
                         update_chunk_material(materials, &record.material, &built.stats);
                         record.signature = built.stats.signature;
@@ -16764,6 +16916,7 @@ fn sync_terrain(
                     record.last_tick = snapshot.tick;
                 }
                 None => {
+                    let mesh_bounds = bevy::camera::primitives::MeshAabb::compute_aabb(&built.mesh);
                     let mesh_handle = meshes.add(built.mesh);
                     let material_handle = materials.add(TerrainMaterial {
                         base: create_chunk_material(&built.stats),
@@ -16782,6 +16935,9 @@ fn sync_terrain(
                             InheritedVisibility::default(),
                         ))
                         .id();
+                    if let Some(bounds) = mesh_bounds {
+                        commands.entity(entity).insert(bounds);
+                    }
                     let probe = spawn_reflection_probe(
                         commands,
                         probe_assets,
@@ -17967,6 +18123,13 @@ mod terrain_tests {
             agent_radius: 12.0,
             terrain_color: color,
             terrain_height: height,
+            food: Arc::new(FoodLayerSnapshot {
+                width: dims.x,
+                height: dims.y,
+                cells: vec![0.0; (dims.x * dims.y) as usize],
+            }),
+            food_max: 1.0,
+            food_cell_size: layer.cell_size(),
             day_night_active: true,
             night_ambient: 0.35,
             agents: Vec::new(),
@@ -19584,6 +19747,13 @@ mod terrain_tests {
                 pixels: vec![0; 3 * 3 * 4],
             },
             terrain_height: height,
+            food: Arc::new(FoodLayerSnapshot {
+                width: 3,
+                height: 3,
+                cells: vec![0.0; 9],
+            }),
+            food_max: 1.0,
+            food_cell_size: layer.cell_size(),
             day_night_active: true,
             night_ambient: 0.35,
             agents: Vec::new(),
@@ -23240,6 +23410,17 @@ mod tests {
         .expect("drawing host");
         let before = host.scientific_digest_v1().expect("initial digest").overall;
         let published = host.latest_snapshot();
+        let projected = WorldSnapshot::from_snapshot(&published).expect("food projection");
+        assert!(Arc::ptr_eq(&projected.food, &published.layers.food));
+        assert_eq!(projected.food.as_ref(), expected.food.as_ref());
+        assert_eq!(projected.food_max, published.config.food_max);
+        let mut changed_food = (*published).clone();
+        Arc::make_mut(&mut changed_food.layers.food).cells[0] += 0.1;
+        let changed_food = WorldSnapshot::from_snapshot(&changed_food).expect("changed food");
+        assert!(!changed_food.same_render_content(&projected));
+        let mut malformed_food = (*published).clone();
+        Arc::make_mut(&mut malformed_food.layers.food).cells.pop();
+        assert!(WorldSnapshot::from_snapshot(&malformed_food).is_none());
         let mut lighting_changed = (*published).clone();
         let lighting_config = Arc::make_mut(&mut lighting_changed.config)
             .render
