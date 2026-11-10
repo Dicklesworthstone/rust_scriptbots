@@ -411,6 +411,11 @@ enum LiveTerminalMessage {
         request_id: String,
         result: std::result::Result<crate::control::CheckpointMetadataDto, String>,
     },
+    CheckpointBranch {
+        request_id: String,
+        admission: bool,
+        result: std::result::Result<crate::control::CheckpointBranchStatusDto, String>,
+    },
     CheckpointCanvas {
         request: u64,
         target: CanvasReviewTarget,
@@ -450,11 +455,62 @@ struct LiveTerminalModel<'a> {
     experiment_comparison_cancelled: bool,
     pending_checkpoints: RefCell<VecDeque<String>>,
     presented_checkpoint: RefCell<Option<String>>,
+    presented_branch: RefCell<Option<String>>,
+    branch_namespace: u128,
+    branch_study: Option<TerminalBranchStudy>,
     active_request: RefCell<Option<PendingTerminalRequest>>,
     presented_shutdown_receipt: RefCell<Option<frankentui_shell::CommandReceiptEntry>>,
     prefer_checkpoint: Cell<bool>,
     last_service_poll: Option<Instant>,
     lineage: LiveLineages,
+}
+
+/// One terminal-owned request; navigation never detaches its lifecycle observer.
+struct TerminalBranchStudy {
+    request_id: String,
+    request: crate::control::CheckpointBranchRequest,
+    branch_id: Option<String>,
+    /// Written before the admission task checks cancellation, so closing while
+    /// its result is queued still reaches the admitted worker.
+    admitted_id: Arc<std::sync::Mutex<Option<String>>>,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    started: bool,
+    finished: bool,
+    operation_in_flight: bool,
+    last_poll: Option<Instant>,
+}
+
+impl TerminalBranchStudy {
+    fn matches(&self, status: &crate::control::CheckpointBranchStatusDto) -> bool {
+        status.checkpoint_id == self.request.checkpoint_id
+            && status.branch_name == self.request.branch_name
+            && self
+                .branch_id
+                .as_ref()
+                .is_none_or(|id| *id == status.branch_id)
+            && status.target_tick.checked_sub(status.source_tick) == Some(self.request.ticks)
+            && matches!(
+                status.status.as_str(),
+                "running" | "cancelling" | "completed" | "cancelled" | "failed"
+            )
+            && (status.status != "completed" || status.artifact_id.is_some())
+    }
+}
+
+fn checkpoint_branch_message(status: &crate::control::CheckpointBranchStatusDto) -> String {
+    let detail = status.artifact_id.as_ref().map_or_else(
+        || {
+            status.error_reason.as_deref().map_or_else(
+                || "independent future; live owner unchanged".to_owned(),
+                |reason| reason.chars().take(240).collect(),
+            )
+        },
+        |artifact| format!("report artifact {artifact}"),
+    );
+    format!(
+        "Branch {} {} (saved {} -> target {}): {detail}",
+        status.branch_name, status.status, status.source_tick, status.target_tick
+    )
 }
 
 /// Observe the pinned runtime's successful presentation branch. An exhausted
@@ -480,13 +536,14 @@ struct TerminalPresentation {
 enum PendingTerminalRequest {
     Command(CommandId),
     Checkpoint(String),
+    CheckpointBranch(String),
 }
 
 impl PendingTerminalRequest {
     fn receipt_id(&self) -> String {
         match self {
             Self::Command(id) => id.to_string(),
-            Self::Checkpoint(id) => id.clone(),
+            Self::Checkpoint(id) | Self::CheckpointBranch(id) => id.clone(),
         }
     }
 }
@@ -536,6 +593,9 @@ impl<'a> LiveTerminalModel<'a> {
             experiment_comparison_cancelled: false,
             pending_checkpoints: RefCell::new(VecDeque::new()),
             presented_checkpoint: RefCell::new(None),
+            presented_branch: RefCell::new(None),
+            branch_namespace: rand::random(),
+            branch_study: None,
             active_request: RefCell::new(None),
             presented_shutdown_receipt: RefCell::new(None),
             prefer_checkpoint: Cell::new(false),
@@ -545,6 +605,7 @@ impl<'a> LiveTerminalModel<'a> {
     }
 
     fn fail(&self, error: anyhow::Error) -> Cmd<LiveTerminalMessage> {
+        self.cancel_branch_on_exit();
         self.pointer_frame_presented.set(false);
         let mut app = self.app.borrow_mut();
         app.hit_regions = HitRegionMap::default();
@@ -619,6 +680,9 @@ impl<'a> LiveTerminalModel<'a> {
                     *self.presented_checkpoint.borrow_mut() = Some(id.clone());
                     self.prefer_checkpoint.set(false);
                 }
+                Some(PendingTerminalRequest::CheckpointBranch(id)) => {
+                    *self.presented_branch.borrow_mut() = Some(id.clone());
+                }
                 None => {}
             }
             self.pointer_frame_presented.set(true);
@@ -659,6 +723,30 @@ impl<'a> LiveTerminalModel<'a> {
                         && receipt.journal_state.is_some()
                 })
         }))
+    }
+
+    fn cancel_branch_on_exit(&self) {
+        if let Some(study) = &self.branch_study
+            && !study.finished
+        {
+            study
+                .cancelled
+                .store(true, std::sync::atomic::Ordering::Release);
+            // Admission publishes its identity before reading this flag. If the
+            // result is still queued, this shared slot closes the handoff race.
+            let admitted_id = study.branch_id.clone().or_else(|| {
+                study
+                    .admitted_id
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone()
+            });
+            if let Some(id) = admitted_id
+                && let Some(handle) = self.app.borrow().control.control_handle()
+            {
+                let _ = handle.cancel_checkpoint_branch(&id);
+            }
+        }
     }
 }
 
@@ -791,6 +879,43 @@ impl Model for LiveTerminalModel<'_> {
                     app.record_checkpoint_result(request_id, result);
                     Ok(false)
                 }
+                LiveTerminalMessage::CheckpointBranch { request_id, admission, result } => {
+                    if let Some(study) = &mut self.branch_study
+                        && study.request_id == request_id
+                        && study.operation_in_flight
+                    {
+                        study.operation_in_flight = false;
+                        let result = result.and_then(|status| {
+                            if study.matches(&status) {
+                                Ok(status)
+                            } else {
+                                Err("Branch observation does not match its original request".into())
+                            }
+                        });
+                        if admission {
+                            app.record_branch_admission_result(&request_id, &result);
+                        }
+                        match result {
+                            Ok(status) => {
+                                study.branch_id = Some(status.branch_id.clone());
+                                study.finished = matches!(status.status.as_str(), "completed" | "cancelled" | "failed");
+                                let message = checkpoint_branch_message(&status);
+                                if study.finished {
+                                    app.push_toast(message.clone());
+                                }
+                                app.frankentui.checkpoint_branch = Some(status);
+                                app.frankentui.status_message = Some(message);
+                            }
+                            Err(error) => {
+                                // Read errors do not mean the worker stopped. Keep its
+                                // identity and retry bounded status reads or cancellation.
+                                study.finished = admission;
+                                app.frankentui.status_message = Some(format!("Branch status unavailable: {error}"));
+                            }
+                        }
+                    }
+                    Ok(false)
+                }
                 LiveTerminalMessage::CheckpointCanvas {
                     request,
                     target,
@@ -910,12 +1035,17 @@ impl Model for LiveTerminalModel<'_> {
             .front()
             .cloned()
             .map(PendingTerminalRequest::Checkpoint);
+        let pending_branch = self
+            .branch_study
+            .as_ref()
+            .filter(|study| !study.started && !study.finished)
+            .map(|study| PendingTerminalRequest::CheckpointBranch(study.request_id.clone()));
         let pending_request = if self.active_request.borrow().is_some() {
             None
         } else if self.prefer_checkpoint.get() {
-            pending_checkpoint.or(pending_command)
+            pending_checkpoint.or(pending_command).or(pending_branch)
         } else {
-            pending_command.or(pending_checkpoint)
+            pending_command.or(pending_checkpoint).or(pending_branch)
         };
         let request_receipt = self
             .active_request
@@ -946,6 +1076,9 @@ impl Model for LiveTerminalModel<'_> {
                     }
                     PendingTerminalRequest::Checkpoint(id) => {
                         format!("[PENDING] id={id} CreateCheckpoint")
+                    }
+                    PendingTerminalRequest::CheckpointBranch(id) => {
+                        format!("[PENDING] id={id} StartCheckpointBranch")
                     }
                 })
             });
@@ -1030,6 +1163,7 @@ impl Model for LiveTerminalModel<'_> {
     }
 
     fn on_shutdown(&mut self) -> Cmd<Self::Message> {
+        self.cancel_branch_on_exit();
         if self.failure.borrow().is_none() {
             self.acknowledge_presentation();
         }
@@ -1362,40 +1496,107 @@ impl LiveTerminalModel<'_> {
                     }
                 }
                 ShellEffect::BranchCheckpoint {
+                    request_id,
                     checkpoint_id,
                     branch_name,
+                    ticks,
+                    intervention,
                 } => {
-                    app.frankentui.update(ShellMessage::SetStatus(format!(
-                        "Branch {branch_name} from {checkpoint_id} unavailable: full host/session restore is not implemented"
-                    )));
+                    if self
+                        .branch_study
+                        .as_ref()
+                        .is_some_and(|study| !study.finished)
+                    {
+                        app.record_branch_admission_result(
+                            &request_id,
+                            &Err("Another terminal branch study is active".into()),
+                        );
+                    } else {
+                        let idempotency_key =
+                            format!("terminal-{:032x}-{request_id}", self.branch_namespace);
+                        self.branch_study = Some(TerminalBranchStudy {
+                            request_id,
+                            request: crate::control::CheckpointBranchRequest {
+                                checkpoint_id,
+                                branch_name,
+                                ticks,
+                                intervention,
+                                idempotency_key,
+                            },
+                            branch_id: None,
+                            admitted_id: Arc::new(std::sync::Mutex::new(None)),
+                            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                            started: false,
+                            finished: false,
+                            operation_in_flight: false,
+                            last_poll: None,
+                        });
+                    }
+                }
+                ShellEffect::CancelCheckpointBranch => {
+                    if let Some(study) = &mut self.branch_study
+                        && !study.finished
+                    {
+                        study
+                            .cancelled
+                            .store(true, std::sync::atomic::Ordering::Release);
+                        if study.started {
+                            study.last_poll = None;
+                            app.frankentui.status_message = Some(
+                                "Branch cancellation requested; awaiting the worker outcome".into(),
+                            );
+                        } else {
+                            study.finished = true;
+                            app.record_branch_admission_result(
+                                &study.request_id,
+                                &Err("Cancelled before service admission".into()),
+                            );
+                        }
+                    }
                 }
                 ShellEffect::CompareExperiments {
                     experiment_id,
                     baseline,
                     challenger,
                 } => {
-                    let target = ExperimentComparisonTarget { experiment_id, baseline, challenger };
+                    let target = ExperimentComparisonTarget {
+                        experiment_id,
+                        baseline,
+                        challenger,
+                    };
                     if self.experiment_comparison_in_flight.is_some() {
-                        app.frankentui.status_message = Some(
-                            "A comparison is still running; wait for its result".into(),
-                        );
+                        app.frankentui.status_message =
+                            Some("A comparison is still running; wait for its result".into());
                     } else if !target.matches(&app) || target.baseline == target.challenger {
                         app.frankentui.status_message = Some(
                             "Comparison cancelled: two distinct variants from the current batch are required".into(),
                         );
-                    } else if let Some(request) = self.experiment_comparison_generation.checked_add(1) {
+                    } else if let Some(request) =
+                        self.experiment_comparison_generation.checked_add(1)
+                    {
                         if let Some(handle) = app.control.control_handle() {
                             self.experiment_comparison_generation = request;
                             self.experiment_comparison_cancelled = false;
                             self.experiment_comparison_in_flight = Some((request, target.clone()));
-                            if let science_screens::ScreenDataState::Data(data) = &mut app.frankentui.science.experiments {
+                            if let science_screens::ScreenDataState::Data(data) =
+                                &mut app.frankentui.science.experiments
+                            {
                                 data.comparison_summary = None;
                             }
                             commands.push(Cmd::task(move || {
-                                let result = handle.compare_experiment_variants(
-                                    &target.experiment_id, &target.baseline, &target.challenger, "alive_agents",
-                                ).map_err(|error| error.to_string());
-                                LiveTerminalMessage::ExperimentComparison { request, target, result }
+                                let result = handle
+                                    .compare_experiment_variants(
+                                        &target.experiment_id,
+                                        &target.baseline,
+                                        &target.challenger,
+                                        "alive_agents",
+                                    )
+                                    .map_err(|error| error.to_string());
+                                LiveTerminalMessage::ExperimentComparison {
+                                    request,
+                                    target,
+                                    result,
+                                }
                             }));
                         } else {
                             app.frankentui.status_message = Some(
@@ -1403,7 +1604,8 @@ impl LiveTerminalModel<'_> {
                             );
                         }
                     } else {
-                        app.frankentui.status_message = Some("Comparison request identities exhausted".into());
+                        app.frankentui.status_message =
+                            Some("Comparison request identities exhausted".into());
                     }
                 }
                 ShellEffect::ExportScreenData { format } => {
@@ -1443,6 +1645,78 @@ impl LiveTerminalModel<'_> {
                     request_id,
                     Err("Not submitted: control data services are disabled".into()),
                 );
+            }
+        }
+        let presented_branch = self.presented_branch.borrow_mut().take();
+        if let Some(study) = &mut self.branch_study
+            && !study.finished
+            && !study.operation_in_flight
+        {
+            if !study.started && presented_branch.as_deref() == Some(study.request_id.as_str()) {
+                if let Some(handle) = app.control.control_handle() {
+                    study.started = true;
+                    study.operation_in_flight = true;
+                    let request_id = study.request_id.clone();
+                    let request = study.request.clone();
+                    let cancelled = Arc::clone(&study.cancelled);
+                    let admitted_id = Arc::clone(&study.admitted_id);
+                    commands.push(Cmd::task(move || {
+                        let result = handle
+                            .create_checkpoint_branch(request)
+                            .map(|status| {
+                                *admitted_id
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                    Some(status.branch_id.clone());
+                                if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                                    // Preserve a known admission even if its cancellation read
+                                    // fails. The retained identity permits another cancel attempt.
+                                    handle
+                                        .cancel_checkpoint_branch(&status.branch_id)
+                                        .unwrap_or(status)
+                                } else {
+                                    status
+                                }
+                            })
+                            .map_err(|error| error.to_string());
+                        LiveTerminalMessage::CheckpointBranch {
+                            request_id,
+                            admission: true,
+                            result,
+                        }
+                    }));
+                } else {
+                    study.finished = true;
+                    app.record_branch_admission_result(
+                        &study.request_id,
+                        &Err("Control data services are disabled".into()),
+                    );
+                }
+            } else if study.started
+                && let Some(branch_id) = &study.branch_id
+                && study
+                    .last_poll
+                    .is_none_or(|last| last.elapsed() >= Duration::from_millis(500))
+                && let Some(handle) = app.control.control_handle()
+            {
+                study.operation_in_flight = true;
+                study.last_poll = Some(Instant::now());
+                let request_id = study.request_id.clone();
+                let branch_id = branch_id.clone();
+                let cancel = study.cancelled.load(std::sync::atomic::Ordering::Acquire);
+                commands.push(Cmd::task(move || {
+                    let result = if cancel {
+                        handle.cancel_checkpoint_branch(&branch_id)
+                    } else {
+                        handle.get_checkpoint_branch(&branch_id)
+                    }
+                    .map_err(|error| error.to_string());
+                    LiveTerminalMessage::CheckpointBranch {
+                        request_id,
+                        admission: false,
+                        result,
+                    }
+                }));
             }
         }
         let route = app.frankentui.route;
@@ -3507,6 +3781,28 @@ impl<'a> TerminalApp<'a> {
         use ftui::core::event::{Event as E, KeyCode as K, KeyEventKind as Kind, Modifiers};
         match event {
             E::Key(key) if key.kind == Kind::Press => {
+                if self.frankentui.branch_draft.is_some()
+                    && !self.palette_open
+                    && !self.help_visible
+                {
+                    self.frankentui.update(ShellMessage::Event(E::Key(key)));
+                    return Ok(false);
+                }
+                if !self.palette_open
+                    && !self.help_visible
+                    && self.frankentui.route == ShellRoute::Replay
+                    && (key.modifiers == Modifiers::NONE || key.modifiers == Modifiers::SHIFT)
+                {
+                    let message = match key.code {
+                        K::Char('n' | 'N') => Some(ShellMessage::ConfigureCheckpointBranch),
+                        K::Char('x' | 'X') => Some(ShellMessage::CancelActiveQuery),
+                        _ => None,
+                    };
+                    if let Some(message) = message {
+                        self.frankentui.update(message);
+                        return Ok(false);
+                    }
+                }
                 if !self.palette_open && !self.help_visible && key.modifiers == Modifiers::NONE {
                     if let K::Char(number @ '1'..='9') = key.code {
                         let route = ShellRoute::all_screens()[number as usize - '1' as usize];
@@ -3530,7 +3826,9 @@ impl<'a> TerminalApp<'a> {
                             K::Enter if self.frankentui.route == ShellRoute::Experiments => {
                                 Some(ShellMessage::PinComparisonBaseline)
                             }
-                            K::Char('c' | 'C') if self.frankentui.route == ShellRoute::Experiments => {
+                            K::Char('c' | 'C')
+                                if self.frankentui.route == ShellRoute::Experiments =>
+                            {
                                 Some(ShellMessage::CompareSelectedExperiments)
                             }
                             K::Char('x') => Some(ShellMessage::CancelActiveQuery),
@@ -3550,6 +3848,9 @@ impl<'a> TerminalApp<'a> {
                 }
             }
             E::Mouse(mouse) => {
+                if self.frankentui.branch_draft.is_some() {
+                    return Ok(false);
+                }
                 self.handle_mouse(terminal_mouse(mouse))?;
                 Ok(false)
             }
@@ -3594,6 +3895,43 @@ impl<'a> TerminalApp<'a> {
             .update(ShellMessage::CommandReceipt(CommandReceiptEntry {
                 command_id: request_id,
                 action: "CreateCheckpoint".into(),
+                status,
+                journal_state: None,
+                control_revision: self.retained_render.revisions.control.get(),
+                scientific_revision: self.retained_render.revisions.scientific.get(),
+                timestamp_tick: self.snapshot.tick,
+            }));
+        self.frankentui.update(ShellMessage::SetStatus(message));
+    }
+
+    fn record_branch_admission_result(
+        &mut self,
+        request_id: &str,
+        result: &std::result::Result<crate::control::CheckpointBranchStatusDto, String>,
+    ) {
+        use frankentui_shell::{CommandReceiptEntry, ReceiptStatusKind, ShellMessage};
+        self.frankentui.branch_request_pending = false;
+        let (status, message) = match result {
+            Ok(job) => (
+                ReceiptStatusKind::Applied,
+                format!(
+                    "Branch study {} admitted; execution status: {}",
+                    job.branch_id, job.status
+                ),
+            ),
+            Err(error) => (
+                ReceiptStatusKind::Failed(error.clone()),
+                format!("Branch study was not started: {error}"),
+            ),
+        };
+        if self.frankentui.presentation_receipt.as_deref() == Some(request_id) {
+            self.checkpoint_presentation_result = Some((request_id.to_owned(), message.clone()));
+        }
+        self.frankentui
+            .update(ShellMessage::CommandReceipt(CommandReceiptEntry {
+                command_id: request_id.to_owned(),
+                // This is completion of service admission, not completion of the study.
+                action: "StartCheckpointBranch".into(),
                 status,
                 journal_state: None,
                 control_revision: self.retained_render.revisions.control.get(),
@@ -3743,10 +4081,15 @@ impl<'a> TerminalApp<'a> {
                 if let Some(previous) = self.frankentui.science.experiments.data()
                     && previous.experiment_id == data.experiment_id
                 {
-                    data.selected_arm_index = previous.selected_arm_index
+                    data.selected_arm_index = previous
+                        .selected_arm_index
                         .min(data.active_arms.len().saturating_sub(1));
-                    data.comparison_baseline = previous.comparison_baseline.clone()
-                        .filter(|baseline| data.active_arms.iter().any(|arm| &arm.variant_id == baseline));
+                    data.comparison_baseline =
+                        previous.comparison_baseline.clone().filter(|baseline| {
+                            data.active_arms
+                                .iter()
+                                .any(|arm| &arm.variant_id == baseline)
+                        });
                     // Selected cohorts can be complete while another variant is
                     // running or failed. Preserve verified evidence for an unchanged
                     // batch observation, and clear it when status or run data changes.
@@ -17747,6 +18090,364 @@ for case in ('panic', 'subscription', 'renderer'):
         model.acknowledge_presentation();
     }
 
+    fn checkpoint_branch_terminal_fixture() -> (
+        TerminalTestHost,
+        ControlRuntime,
+        crate::control::ControlHandle,
+        crate::control::CheckpointMetadataDto,
+        PathBuf,
+    ) {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 120,
+            world_height: 120,
+            food_cell_size: 20,
+            persistence_interval: 0,
+            rng_seed: Some(42),
+            closed: true,
+            topography_enabled: false,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            reproduction_energy_threshold: f32::MAX,
+            ..ScriptBotsConfig::default()
+        })
+        .unwrap();
+        let installed = crate::install_brains(&mut world, crate::BrainPreset::Mlp).unwrap();
+        for _ in 0..2 {
+            let id = world.spawn_agent(scriptbots_core::AgentData::default());
+            assert!(
+                world
+                    .bind_agent_brain(id, installed.population()[0])
+                    .unwrap()
+            );
+        }
+        let host = TerminalTestHost::take(Arc::new(std::sync::Mutex::new(world)));
+        let (runtime, _) = ControlRuntime::launch(
+            host.port(),
+            crate::servers::ControlServerConfig {
+                rest_enabled: false,
+                mcp_transport: crate::servers::McpTransportConfig::Disabled,
+                ..crate::servers::ControlServerConfig::default()
+            },
+        )
+        .unwrap();
+        let artifacts = std::env::temp_dir().join(format!(
+            "scriptbots-terminal-branch-{}-{:032x}",
+            std::process::id(),
+            rand::random::<u128>()
+        ));
+        let handle = runtime
+            .control_handle()
+            .unwrap()
+            .with_artifacts_dir(artifacts.clone())
+            .unwrap();
+        let checkpoint = handle
+            .create_checkpoint(crate::control::CheckpointCreateRequest {
+                description: Some("actual terminal branch source".into()),
+                ..crate::control::CheckpointCreateRequest::default()
+            })
+            .unwrap();
+        (host, runtime, handle, checkpoint, artifacts)
+    }
+
+    fn checkpoint_branch_terminal_key(
+        code: ftui::core::event::KeyCode,
+        modifiers: ftui::core::event::Modifiers,
+    ) -> LiveTerminalMessage {
+        let mut key = ftui::core::event::KeyEvent::new(code);
+        key.modifiers = modifiers;
+        LiveTerminalMessage::Event(ftui::core::event::Event::Key(key))
+    }
+
+    fn checkpoint_branch_terminal_task(
+        command: Cmd<LiveTerminalMessage>,
+    ) -> Box<dyn FnOnce() -> LiveTerminalMessage + Send> {
+        match command {
+            Cmd::Task(_, work) => work,
+            Cmd::Batch(mut commands) => {
+                assert_eq!(commands.len(), 1, "one actual branch service operation");
+                checkpoint_branch_terminal_task(commands.pop().unwrap())
+            }
+            _ => panic!("expected the actual branch admission or status task"),
+        }
+    }
+
+    #[test]
+    fn live_checkpoint_branch_requires_presented_intent_and_reports_actual_isolated_future() {
+        use frankentui_shell::{ReceiptStatusKind, ShellRoute};
+        use ftui::core::event::{KeyCode as K, Modifiers as M};
+        let (host, runtime, handle, checkpoint, artifacts) = checkpoint_branch_terminal_fixture();
+        let before = host.port().scientific_digest_v1().unwrap();
+        let retained = host.port().snapshot_hub().latest();
+        let renderer = TerminalRenderer::default();
+        let mut app = TerminalApp::new(&renderer, host.context(&runtime));
+        app.navigate_route(ShellRoute::Replay);
+        for message in science_service_messages(&handle, ShellRoute::Replay, 1) {
+            app.frankentui.update(message);
+        }
+        let mut model = LiveTerminalModel::new(app).unwrap();
+        // The real catalog is loaded above; isolate branch work from periodic reads.
+        model.cancelled_service_route = Some(ShellRoute::Replay);
+        let mut simulator = ftui::runtime::ProgramSimulator::new(model);
+
+        // A request cancelled before presentation never consumes service capacity.
+        for (code, modifiers) in [
+            (K::Char('N'), M::SHIFT),
+            (K::Enter, M::NONE),
+            (K::Char('X'), M::SHIFT),
+        ] {
+            let _ = simulator
+                .model_mut()
+                .update(checkpoint_branch_terminal_key(code, modifiers));
+        }
+        let cancelled = simulator.model().branch_study.as_ref().unwrap();
+        assert!(cancelled.finished && !cancelled.started);
+        assert!(matches!(
+            simulator
+                .model()
+                .app
+                .borrow()
+                .frankentui
+                .latest_receipt()
+                .unwrap()
+                .status,
+            ReceiptStatusKind::Failed(_)
+        ));
+        assert!(!artifacts.join("branches").exists());
+
+        // Production Shift+N opens the draft. Select a real one-tick drought pair.
+        for (code, modifiers) in [
+            (K::Char('N'), M::SHIFT),
+            (K::Right, M::NONE),
+            (K::Down, M::NONE),
+            (K::Down, M::NONE),
+            (K::Enter, M::NONE),
+        ] {
+            let _ = simulator
+                .model_mut()
+                .update(checkpoint_branch_terminal_key(code, modifiers));
+        }
+        let study = simulator.model().branch_study.as_ref().unwrap();
+        let request_id = study.request_id.clone();
+        assert_eq!(study.request.checkpoint_id, checkpoint.checkpoint_id);
+        assert_eq!(study.request.ticks, 1);
+        assert!(matches!(
+            &study.request.intervention,
+            Some(crate::branch_study::StudyIntervention::Drought {
+                duration_ticks: 1,
+                ..
+            })
+        ));
+        assert!(!study.started);
+
+        // Neither an unreadable receipt nor a skipped write can authorize admission.
+        for (width, height, present_us) in [(1, 1, 1), (120, 36, 0)] {
+            simulator.capture_frame(width, height);
+            simulator_presentation_callback(simulator.model(), present_us);
+            let _ = simulator.model_mut().update(LiveTerminalMessage::Refresh);
+            assert!(!simulator.model().branch_study.as_ref().unwrap().started);
+            assert!(!artifacts.join("branches").exists());
+        }
+        let pending = frankentui_shell::buffer_to_string(simulator.capture_frame(120, 36));
+        assert!(pending.contains(&format!("[PENDING] id={request_id}")));
+        assert!(pending.contains("StartCheckpointBranch"));
+        simulator_presentation_callback(simulator.model(), 1);
+        let work = checkpoint_branch_terminal_task(
+            simulator.model_mut().update(LiveTerminalMessage::Refresh),
+        );
+        assert!(simulator.model().branch_study.as_ref().unwrap().started);
+        assert!(
+            simulator
+                .model()
+                .branch_study
+                .as_ref()
+                .unwrap()
+                .branch_id
+                .is_none()
+        );
+        let _ = simulator
+            .model_mut()
+            .update(checkpoint_branch_terminal_key(K::Char('1'), M::NONE));
+        assert_eq!(
+            simulator.model().app.borrow().frankentui.route,
+            ShellRoute::Dashboard
+        );
+        assert_eq!(
+            simulator.model().branch_study.as_ref().unwrap().request_id,
+            request_id
+        );
+
+        // Execute the real service closure, not a fabricated success response.
+        let message = std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(work)
+            .unwrap()
+            .join()
+            .unwrap();
+        let LiveTerminalMessage::CheckpointBranch {
+            result: Ok(admitted),
+            admission: true,
+            ..
+        } = &message
+        else {
+            panic!("actual saved-cut branch admission failed");
+        };
+        let branch_id = admitted.branch_id.clone();
+        assert_eq!(admitted.world_digest_v1, checkpoint.world_digest_v1);
+        let mut next = Some(simulator.model_mut().update(message));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !simulator.model().branch_study.as_ref().unwrap().finished {
+            assert!(
+                Instant::now() < deadline,
+                "actual branch worker did not finish"
+            );
+            let command = next.take().unwrap_or_else(|| {
+                simulator
+                    .model_mut()
+                    .branch_study
+                    .as_mut()
+                    .unwrap()
+                    .last_poll = None;
+                simulator.model_mut().service_commands()
+            });
+            let observed = checkpoint_branch_terminal_task(command)();
+            let queued = simulator.model_mut().update(observed);
+            if simulator
+                .model()
+                .branch_study
+                .as_ref()
+                .unwrap()
+                .operation_in_flight
+            {
+                next = Some(queued);
+            }
+            std::thread::park_timeout(Duration::from_millis(1));
+        }
+        let completed = simulator
+            .model()
+            .app
+            .borrow()
+            .frankentui
+            .checkpoint_branch
+            .clone()
+            .unwrap();
+        assert_eq!(completed.status, "completed", "{completed:?}");
+        assert_eq!(completed.branch_id, branch_id);
+        assert_eq!(completed.target_tick, checkpoint.tick + 1);
+        assert_eq!(
+            simulator
+                .model()
+                .app
+                .borrow()
+                .frankentui
+                .receipt_for(&request_id)
+                .unwrap()
+                .status,
+            ReceiptStatusKind::Applied
+        );
+        let (_, bytes) = handle
+            .read_artifact_bytes(completed.artifact_id.as_deref().unwrap())
+            .unwrap();
+        let report: crate::branch_study::BranchStudyReport =
+            serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(report.pre_intervention_digest, checkpoint.world_digest_v1);
+        assert!(report.pre_intervention_digest_verified_for_all_branches);
+        assert_eq!(report.branch_reports.len(), 2);
+        assert!(
+            report
+                .branch_reports
+                .iter()
+                .all(|branch| branch.bundle_verified
+                    && branch.terminal_sample.tick == completed.target_tick)
+        );
+        assert!(
+            report
+                .branch_reports
+                .iter()
+                .any(|branch| branch.branch_id == "treatment" && branch.first_divergence.is_some())
+        );
+
+        let _ = simulator
+            .model_mut()
+            .update(checkpoint_branch_terminal_key(K::Char('7'), M::NONE));
+        let frame = frankentui_shell::buffer_to_string(simulator.capture_frame(160, 36));
+        assert!(frame.contains("completed"));
+        assert!(frame.contains("Completed report artifact:"));
+        assert!(frame.contains(completed.artifact_id.as_deref().unwrap()));
+        assert_eq!(host.port().scientific_digest_v1().unwrap(), before);
+        assert!(Arc::ptr_eq(&host.port().snapshot_hub().latest(), &retained));
+        handle.data_services().shutdown_experiments().unwrap();
+    }
+
+    #[test]
+    fn live_checkpoint_branch_shutdown_cancels_both_sides_of_admission_result_handoff() {
+        use frankentui_shell::{ShellMessage, ShellRoute};
+        for close_before_admission in [true, false] {
+            let (host, runtime, handle, checkpoint, _) = checkpoint_branch_terminal_fixture();
+            let before = host.port().scientific_digest_v1().unwrap();
+            let renderer = TerminalRenderer::default();
+            let mut app = TerminalApp::new(&renderer, host.context(&runtime));
+            app.navigate_route(ShellRoute::Replay);
+            app.frankentui.update(ShellMessage::BranchCheckpoint {
+                checkpoint_id: checkpoint.checkpoint_id,
+                branch_name: "close-during-handoff".into(),
+                ticks: crate::control::MAX_CHECKPOINT_BRANCH_TICKS,
+                intervention: None,
+            });
+            let mut model = LiveTerminalModel::new(app).unwrap();
+            model.cancelled_service_route = Some(ShellRoute::Replay);
+            let _ = model.service_commands();
+            let mut simulator = ftui::runtime::ProgramSimulator::new(model);
+            simulator.capture_frame(120, 36);
+            simulator_presentation_callback(simulator.model(), 1);
+            let work = checkpoint_branch_terminal_task(
+                simulator.model_mut().update(LiveTerminalMessage::Refresh),
+            );
+            if close_before_admission {
+                let _ = simulator.model_mut().on_shutdown();
+            }
+            let message = std::thread::Builder::new()
+                .stack_size(32 * 1024 * 1024)
+                .spawn(work)
+                .unwrap()
+                .join()
+                .unwrap();
+            let LiveTerminalMessage::CheckpointBranch {
+                result: Ok(admitted),
+                ..
+            } = message
+            else {
+                panic!("actual admission task failed before shutdown observation");
+            };
+            let study = simulator.model().branch_study.as_ref().unwrap();
+            assert!(
+                study.branch_id.is_none(),
+                "admission result is deliberately still undelivered"
+            );
+            assert_eq!(
+                study.admitted_id.lock().unwrap().as_deref(),
+                Some(admitted.branch_id.as_str())
+            );
+            if !close_before_admission {
+                let _ = simulator.model_mut().on_shutdown();
+            }
+            let observed = handle.get_checkpoint_branch(&admitted.branch_id).unwrap();
+            assert!(
+                matches!(
+                    observed.status.as_str(),
+                    "cancelling" | "cancelled" | "completed"
+                ),
+                "closing must reach the worker even while its result is queued: {observed:?}"
+            );
+            handle.data_services().shutdown_experiments().unwrap();
+            let stopped = handle.get_checkpoint_branch(&admitted.branch_id).unwrap();
+            assert!(
+                matches!(stopped.status.as_str(), "cancelled" | "completed"),
+                "{stopped:?}"
+            );
+            assert_eq!(host.port().scientific_digest_v1().unwrap(), before);
+        }
+    }
+
     #[test]
     fn live_requests_present_each_pending_and_final_before_the_next_request() {
         use frankentui_shell::{ReceiptStatusKind, ShellRoute};
@@ -19132,7 +19833,9 @@ for case in ('panic', 'subscription', 'renderer'):
 
     #[test]
     fn live_science_provider_records_match_real_checkpoint_and_completed_experiment() {
-        use crate::control::{CheckpointCreateRequest, ExperimentCreateRequest, ExperimentVariantDto};
+        use crate::control::{
+            CheckpointCreateRequest, ExperimentCreateRequest, ExperimentVariantDto,
+        };
         use frankentui_shell::{ShellMessage, ShellRoute};
         use science_screens::ScreenDataState;
 
@@ -19185,7 +19888,9 @@ for case in ('panic', 'subscription', 'renderer'):
             },
         )
         .unwrap();
-        let handle = comparison_runtime.control_handle().unwrap()
+        let handle = comparison_runtime
+            .control_handle()
+            .unwrap()
             .with_artifacts_dir(artifacts.clone())
             .expect("reserve unique real data-service artifacts");
         let owner_before = host

@@ -2204,6 +2204,58 @@ the request. Validation failures create no destination file; write or sync error
 report and preserve any partial output. A downloaded checkpoint contains the core
 science state; complete application-owner continuation remains a separate workflow.
 
+#### Run a future from a saved checkpoint
+
+Start an independent scientific future from a checkpoint while the live simulation
+continues under its existing owner. Save this request as `branch.json`, replacing
+`CHECKPOINT_ID` with an identifier returned by `checkpoint create` or `checkpoint list`:
+
+```json
+{
+  "checkpoint_id": "CHECKPOINT_ID",
+  "branch_name": "food-treatment",
+  "ticks": 240,
+  "intervention": {"type": "ConfigPatch", "params": {"food_growth_rate": 0.0}},
+  "idempotency_key": "food-treatment-1"
+}
+```
+
+```bash
+cargo run -p scriptbots-app --bin control_cli -- checkpoint branch create --file branch.json
+cargo run -p scriptbots-app --bin control_cli -- checkpoint branch status BRANCH_ID
+cargo run -p scriptbots-app --bin control_cli -- checkpoint branch cancel BRANCH_ID
+# After status reports completed, download its artifact_id:
+cargo run -p scriptbots-app --bin control_cli -- artifact download ARTIFACT_ID \
+  --out runs/branch-report.json
+```
+
+Omit `intervention` for one unchanged future; supplying it runs matched control
+and treatment branches from the same saved state. `ticks` is an additional horizon
+of 1–10,000 transitions. Requests are limited to 16 KiB, branch names to 64 ASCII
+letters/digits/underscores/hyphens, and the required retry key to 1,024 bytes.
+Repeat the exact request and key after an uncertain response. An optional global
+`--idempotency-key` must match the JSON key.
+
+REST uses the same JSON with `POST /api/v1/checkpoints/branches` (HTTP 202),
+`GET /api/v1/checkpoints/branches/{branch_id}` and
+`POST /api/v1/checkpoints/branches/{branch_id}/cancel`. MCP exposes
+`checkpoint_branch_create`, `checkpoint_branch_status` and `checkpoint_branch_cancel`.
+Admission does not establish completion: poll until `completed`, `cancelled` or
+`failed`. Cancellation can first report `cancelling`; completion may win the race.
+`world_digest_v1` identifies the source cut, and only completion publishes the report
+`artifact_id`. Jobs belong to the current control-service process; retained files
+are preserved, but branch execution/status is not resumed after a service restart.
+
+In the simulation terminal, open **Replay** (`7`), select a saved checkpoint, and
+press **N**. Choose the horizon with **Up/Down** or **+/-** and the treatment with
+**Left/Right**, then press **Enter** to start. **Esc/X** discards the draft; **X**
+in Replay requests cancellation of an active study. The status panel identifies
+the source and target ticks, observed execution state, and completed report artifact.
+
+The report compares one source trajectory and does not count its ticks as independent
+replicates. The saved cut restores science state; the original owner's pending commands,
+session and storage ownership remain with the live run.
+
 Interactive dashboard:
 ```bash
 # Live TUI dashboard of knobs and their current values; press 'q' to quit, 'r' to refresh

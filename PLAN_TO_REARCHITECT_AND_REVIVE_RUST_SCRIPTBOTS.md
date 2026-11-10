@@ -2,6 +2,38 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Managed checkpoint branch studies (2026-11-10):**
+[Source implemented and independently reviewed — Codex; runtime qualification open]
+
+`fb1d90f13a5c` connects verified saved scientific checkpoints to the existing
+branch-study runner through one bounded application service, REST/MCP and the
+control CLI. An unchanged future or a matched control/treatment pair runs without
+advancing or replacing the live owner. Saved tick-zero sources are supported;
+seeded warmup still requires a positive checkpoint tick. Exact retry identities,
+shared execution capacity, owned cancellable workers and joined shutdown prevent
+duplicate or detached work. Completed reports, exact source bytes and verified
+bundles become downloadable together after integrity checks.
+
+Replay now configures the horizon and treatment with N, starts with Enter, and
+shows observed status plus the completed report identity. Admission waits for a
+successfully presented pending receipt. Navigation retains the running study;
+X requests cancellation, and closing the terminal cancels even when admission's
+result is still queued. A shared admitted-identity handoff covers that shutdown
+race. Draft cancellation and worker cancellation remain distinct outcomes.
+
+Added real-source MLP/DWRAON oracle and divergence regressions, invalid/corrupt
+source and capacity cases, shutdown/drop cases, cross-transport and CLI report
+journeys, and terminal presentation/admission/shutdown journeys. Pinned formatting
+and independent source review passed; new runtime tests and full native terminal
+qualification have not yet been established in this environment.
+
+Managed job status and retry identities currently last for the service process;
+retained files survive restart, and existing output is never overwritten. A
+scientific fork does not continue the source host's session, journal, schedules,
+or omitted auxiliary histories. One source trajectory is descriptive evidence,
+not independent replication. Existing raw-checkpoint refusals and full-owner
+acceptance requirements remain.
+
 **Evolutionary browser defaults, Ft tournament entry, and visible food (2026-11-09):**
 [Source implemented and independently reviewed — Codex; full native, browser and GPU qualification open]
 
