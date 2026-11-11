@@ -57,8 +57,8 @@ rand = { workspace = true }
 tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "signal"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-utoipa = { version = "5.4.0", features = ["macros", "axum_extras"] }
-utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
+utoipa = { version = "6", features = ["macros", "axum_extras"] }
+utoipa-swagger-ui = { version = "10.0.2", features = ["axum", "vendored"] }
 crossterm = "0.27"
 owo-colors = "4.3.0"
 csv = { workspace = true }

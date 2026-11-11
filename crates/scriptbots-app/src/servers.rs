@@ -1556,8 +1556,71 @@ pub struct SpeedRequestBody {
     pub speed: f32,
 }
 
+/// Fills empty OpenAPI response descriptions so the emitted 3.1 document keeps the
+/// required `Response.description`. utoipa 6 omits an empty description
+/// (`utoipa::openapi::response`: `skip_serializing_if = "String::is_empty"`); this
+/// fills each empty one with the HTTP reason phrase and never overwrites a
+/// non-empty description.
+struct FillEmptyResponseDescriptions;
+
+impl FillEmptyResponseDescriptions {
+    fn reason(code: &str) -> String {
+        if code == "default" {
+            return "Default response".to_string();
+        }
+        code.parse::<u16>()
+            .ok()
+            .and_then(|c| axum::http::StatusCode::from_u16(c).ok())
+            .and_then(|status| status.canonical_reason())
+            .unwrap_or("Response")
+            .to_string()
+    }
+
+    fn fill(
+        responses: &mut std::collections::BTreeMap<
+            String,
+            utoipa::openapi::RefOr<utoipa::openapi::Response>,
+        >,
+    ) {
+        for (code, response) in responses.iter_mut() {
+            if let utoipa::openapi::RefOr::T(response) = response
+                && response.description.is_empty()
+            {
+                response.description = Self::reason(code);
+            }
+        }
+    }
+}
+
+impl utoipa::Modify for FillEmptyResponseDescriptions {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        for item in openapi.paths.paths.values_mut() {
+            let operations = [
+                item.get.as_mut(),
+                item.put.as_mut(),
+                item.post.as_mut(),
+                item.delete.as_mut(),
+                item.options.as_mut(),
+                item.head.as_mut(),
+                item.patch.as_mut(),
+                item.trace.as_mut(),
+            ];
+            for operation in operations.into_iter().flatten() {
+                Self::fill(&mut operation.responses.responses);
+            }
+            for operation in item.additional_operations.values_mut() {
+                Self::fill(&mut operation.responses.responses);
+            }
+        }
+        if let Some(components) = openapi.components.as_mut() {
+            Self::fill(&mut components.responses);
+        }
+    }
+}
+
 #[derive(OpenApi)]
 #[openapi(
+    modifiers(&FillEmptyResponseDescriptions),
     paths(
         get_knobs,
         get_config,
@@ -10773,6 +10836,63 @@ mod tests {
             }
         }
         found
+    }
+
+    #[test]
+    fn every_response_has_a_nonempty_description() {
+        let openapi = serde_json::to_value(ApiDoc::openapi()).expect("serialize OpenAPI");
+        fn resolve(openapi: &serde_json::Value, response: &serde_json::Value) -> serde_json::Value {
+            if let Some(reference) = response.get("$ref").and_then(|value| value.as_str())
+                && let Some(name) = reference.strip_prefix("#/components/responses/")
+            {
+                return openapi["components"]["responses"][name].clone();
+            }
+            response.clone()
+        }
+        fn has_description(resolved: &serde_json::Value) -> bool {
+            resolved
+                .get("description")
+                .and_then(|value| value.as_str())
+                .is_some_and(|text| !text.is_empty())
+        }
+        let methods = [
+            "get", "put", "post", "delete", "options", "head", "patch", "trace",
+        ];
+        let mut misses: Vec<String> = Vec::new();
+        if let Some(paths) = openapi["paths"].as_object() {
+            for (path, item) in paths {
+                let Some(item) = item.as_object() else {
+                    continue;
+                };
+                for (method, operation) in item {
+                    if !methods.contains(&method.as_str()) {
+                        continue;
+                    }
+                    if let Some(responses) = operation
+                        .get("responses")
+                        .and_then(|value| value.as_object())
+                    {
+                        for (code, response) in responses {
+                            if !has_description(&resolve(&openapi, response)) {
+                                misses.push(format!("{method} {path} {code}"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(component_responses) = openapi["components"]["responses"].as_object() {
+            for (name, response) in component_responses {
+                if !has_description(&resolve(&openapi, response)) {
+                    misses.push(format!("components/responses/{name}"));
+                }
+            }
+        }
+        assert!(
+            misses.is_empty(),
+            "{} response(s) missing a non-empty description: {misses:?}",
+            misses.len()
+        );
     }
 
     /// The Swagger UI and `/api-docs/openapi.json` are the advertised control-API
