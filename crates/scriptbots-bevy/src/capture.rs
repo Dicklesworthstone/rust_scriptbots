@@ -1171,6 +1171,14 @@ impl<'a> OffscreenCapture<'a> {
         {
             return Err(anyhow!("capture creature appearance failed: {error}"));
         }
+        if let Some(error) = self
+            .app
+            .world()
+            .resource::<crate::particle_render::ParticleScene>()
+            .error()
+        {
+            return Err(anyhow!("capture visual-event particles failed: {error}"));
+        }
         // Frame 2: draw after scene synchronization. Pipeline compilation is
         // synchronous in this offscreen app; a fixed frame count alone cannot
         // establish that asynchronous compiler tasks finished.
@@ -1527,6 +1535,7 @@ fn build_capture_app(config: &OffscreenCaptureConfig) -> Result<App> {
     )
     .add_plugins(crate::TerrainMaterialPlugin)
     .add_plugins(crate::AppearancePlugin)
+    .add_plugins(crate::particle_render::ParticleRenderPlugin)
     .add_systems(
         Startup,
         (setup_capture_rig, setup_capture_resources).chain(),
@@ -1909,6 +1918,9 @@ fn reset_capture_scene(world: &mut World) {
     *world.resource_mut::<AgentRegistry>() = AgentRegistry::default();
     if let Some(mut appearance) = world.get_resource_mut::<crate::AppearanceTable>() {
         appearance.reset();
+    }
+    if let Some(mut particles) = world.get_resource_mut::<crate::particle_render::ParticleScene>() {
+        particles.reset();
     }
 }
 

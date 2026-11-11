@@ -3369,6 +3369,7 @@ impl HostCore {
             narrative_events,
             narrative_dropped_events: world.narrative_dropped_events(),
             visual_events: Arc::new(world.visual_events().to_vec()),
+            visual_seed: world.agent_substream_protocol_v1().root_seed(),
             visual_dropped_events: world.visual_dropped_events_this_tick(),
             hybrid_count: world
                 .agents()
@@ -5226,6 +5227,7 @@ impl HostCore {
             narrative_events,
             narrative_dropped_events: self.world.narrative_dropped_events(),
             visual_events: Arc::new(self.world.visual_events().to_vec()),
+            visual_seed: self.world.agent_substream_protocol_v1().root_seed(),
             visual_dropped_events: self.world.visual_dropped_events_this_tick(),
             hybrid_count: self.hybrid_count(),
             session_id: self.session_id,

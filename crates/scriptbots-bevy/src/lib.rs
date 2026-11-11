@@ -7,6 +7,7 @@ mod appearance;
 pub mod capture;
 pub mod creature_meshes;
 mod lab_workflows;
+mod particle_render;
 pub mod particles;
 
 use anyhow::{Context, Result, anyhow};
@@ -883,6 +884,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
     .add_plugins(renderer_plugins(logging))
     .add_plugins(TerrainMaterialPlugin)
     .add_plugins(AppearancePlugin)
+    .add_plugins(particle_render::ParticleRenderPlugin)
     .add_plugins(AutoExposurePlugin)
     .add_systems(Startup, (initialize_ssao_support, setup_scene).chain())
     .add_systems(
@@ -4491,6 +4493,8 @@ pub(crate) struct WorldSnapshot {
     /// Bounded by [`HUD_EVENT_FEED_CAPACITY`] at construction, so a long run
     /// or a births/deaths storm cannot grow the snapshot without limit.
     events: Vec<HudEvent>,
+    /// Exact positioned event boundary; HUD summaries are not event evidence.
+    visual: particle_render::VisualFrame,
 }
 
 /// How many recent events the HUD feed retains and renders.
@@ -5221,6 +5225,7 @@ impl WorldSnapshot {
             night_ambient: night_ambient_floor(&config.render),
             agents,
             events: HudEvent::recent_from_history(snapshot.summary_history.iter()),
+            visual: particle_render::VisualFrame::from_snapshot(snapshot),
             history: HudHistory::from_history(snapshot.summary_history.iter()),
             brain: BrainOverlay::default(),
         })
@@ -5241,6 +5246,7 @@ impl WorldSnapshot {
             && self.night_ambient == other.night_ambient
             && self.agents == other.agents
             && self.events == other.events
+            && self.visual == other.visual
             && self.history == other.history
             && self.brain == other.brain
     }
@@ -5422,6 +5428,7 @@ impl WorldSnapshot {
             night_ambient: night_ambient_floor(&config.render),
             agents,
             events: HudEvent::recent_from_history(world.history()),
+            visual: particle_render::VisualFrame::from_world(world),
             history: HudHistory::from_history(world.history()),
             // Left empty here on purpose: issuing an inspection request needs a
             // client-owned monotonic revision, which the snapshot worker holds.
@@ -19301,6 +19308,7 @@ mod terrain_tests {
             night_ambient: 0.35,
             agents: Vec::new(),
             events: Vec::new(),
+            visual: particle_render::VisualFrame::default(),
             history: HudHistory::default(),
             brain: BrainOverlay::default(),
         }
@@ -21497,6 +21505,7 @@ mod terrain_tests {
             night_ambient: 0.35,
             agents: Vec::new(),
             events: Vec::new(),
+            visual: particle_render::VisualFrame::default(),
             history: HudHistory::default(),
             brain: BrainOverlay::default(),
         }

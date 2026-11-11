@@ -362,19 +362,31 @@ impl ParticlePool {
     /// Returns the number of expirations. Slot-order determinism: the same
     /// pool state and tick always produce the same post-step state.
     pub fn expire(&mut self, tick: u64) -> usize {
-        let mut expired = Vec::new();
-        for (index, slot) in self.slots.iter().enumerate() {
-            if let Some(particle) = slot
-                && tick >= particle.born_tick + u64::from(particle.duration_ticks)
+        let mut count = 0;
+        for index in 0..self.slots.len() {
+            if let Some(particle) = &self.slots[index]
+                && tick.saturating_sub(particle.born_tick) >= u64::from(particle.duration_ticks)
+                && tick >= particle.born_tick
             {
-                expired.push(u32::try_from(index).unwrap_or(u32::MAX));
+                self.kill_slot(u32::try_from(index).unwrap_or(u32::MAX));
+                count += 1;
             }
         }
-        let count = expired.len();
-        for slot in expired {
-            self.kill_slot(slot);
-        }
         count
+    }
+
+    /// Retire all particles without discarding pool allocations.
+    pub fn clear(&mut self) {
+        for slot in 0..self.slots.len() {
+            self.kill_slot(u32::try_from(slot).unwrap_or(u32::MAX));
+        }
+        // A new source gets the same deterministic slot order as a new pool.
+        // Generations still advance, so handles from the old source stay stale.
+        self.free.clear();
+        let slots = u32::try_from(self.slots.len()).unwrap_or(u32::MAX);
+        self.free.extend((0..slots).rev());
+        self.born_counter = 0;
+        self.born_seq.fill(0);
     }
 
     /// Update anchor positions for following particles (boost trails).
@@ -710,9 +722,24 @@ impl CueScheduler {
         position: [f32; 3],
     ) -> SpawnBatch {
         let count = self.count_for_cue(cue);
+        let mut particles = Vec::with_capacity(count as usize);
+        self.schedule_into(tick, ordinal, cue, position, |particle| particles.push(particle));
+        SpawnBatch { particles }
+    }
+
+    /// Emit a deterministic batch without allocating a temporary vector.
+    /// `ordinal` is the original accepted world-event ordinal, not a local rank.
+    pub fn schedule_into(
+        &self,
+        tick: u64,
+        ordinal: u32,
+        cue: &VisualCue,
+        position: [f32; 3],
+        mut emit: impl FnMut(Particle),
+    ) {
+        let count = self.count_for_cue(cue);
         let sprite = Self::sprite_for(cue.kind);
         let priority = Self::priority_for(cue.kind);
-        let mut particles = Vec::with_capacity(count as usize);
         for index in 0..count {
             let angle = self.jitter(tick, ordinal, index, 1) * 2.0 * core::f32::consts::PI;
             let speed = self.jitter(tick, ordinal, index, 2).mul_add(0.6, 0.15)
@@ -735,7 +762,7 @@ impl CueScheduler {
                 .duration_ticks
                 .saturating_add(self.jitter_u32(tick, ordinal, index, 4, 8))
                 .max(2);
-            particles.push(Particle {
+            emit(Particle {
                 position,
                 velocity: [angle.cos() * speed, upward * speed, angle.sin() * speed],
                 gravity,
@@ -754,7 +781,6 @@ impl CueScheduler {
                 follow: None,
             });
         }
-        SpawnBatch { particles }
     }
 }
 
@@ -1272,6 +1298,39 @@ mod tests {
             priority,
             follow: None,
         }
+    }
+
+    #[test]
+    fn clearing_a_source_preserves_capacity_and_invalidates_old_handles() {
+        let mut pool = ParticlePool::with_capacity(3);
+        let old = pool.spawn(particle(ParticlePriority::Critical)).unwrap();
+        pool.spawn(particle(ParticlePriority::Ambient)).unwrap();
+        pool.clear();
+        assert_eq!(pool.capacity(), 3);
+        assert_eq!(pool.live_count(), 0);
+        assert!(pool.get(old).is_none());
+        let current = pool.spawn(particle(ParticlePriority::Critical)).unwrap();
+        assert_eq!(current.slot, old.slot);
+        assert_ne!(current, old);
+        assert!(pool.get(old).is_none());
+        assert!(pool.get(current).is_some());
+    }
+
+    #[test]
+    fn expiry_near_u64_limit_uses_elapsed_ticks_without_overflow() {
+        let mut pool = ParticlePool::with_capacity(1);
+        let mut value = particle(ParticlePriority::Critical);
+        value.born_tick = u64::MAX - 5;
+        value.duration_ticks = 10;
+        pool.spawn(value).unwrap();
+        assert_eq!(pool.expire(u64::MAX - 6), 0);
+        assert_eq!(pool.expire(u64::MAX), 0);
+        assert_eq!(pool.live_count(), 1);
+        pool.clear();
+        value.duration_ticks = 5;
+        pool.spawn(value).unwrap();
+        assert_eq!(pool.expire(u64::MAX), 1);
+        assert_eq!(pool.live_count(), 0);
     }
 
     /// THE DEFECT, as a regression guard: eviction must take the oldest

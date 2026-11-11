@@ -2,6 +2,38 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Native ecological particles (2026-11-11):**
+[Source wired and independently reviewed — Codex; native and GPU qualification open]
+
+Continue `bd-2z0.14.1.7` by consuming authoritative located birth, death, combat,
+eating, reproduction, spike and boost events through one live/offscreen Bevy
+plugin. The actual resolved world entropy root, recorded event tick and original
+accepted ordinal determine each recipe without consuming scientific randomness.
+One bounded pool, resident storage buffer, indexed billboard mesh and material
+replace the former absence of a production particle consumer.
+
+Quality-tier and adapter bounds constrain admission; critical effects take
+priority. Duplicate publications do not respawn events, ordinary 10,000-tick
+epoch changes preserve active effects, and prior-tick intervention stamps retain
+their actual age. Relative integer ages preserve precision at large ticks;
+pause and reduced-motion settings stop fractional motion. Explicit counters
+record skipped snapshot boundaries and producer or budget drops. A latest-value
+snapshot stream still cannot recover events it never observed.
+
+The shared shader uses pinned Bevy material/view bindings, aligned storage rows,
+additive premultiplied output and depth testing. Reversed-axis torus wrapping
+keeps edge events beside their agents. Eleven new regression tests cover event
+provenance, scientific neutrality, lifecycle, bounds, resident assets, shader
+layout and pool overflow/handle edges; none have executed. Independent source
+review checked Bevy 0.17.3 interfaces. The local executor repeatedly disconnected
+before the bounded DSR formatting attempt could start. Rust formatting,
+compilation, native/GPU execution and performance acceptance remain open.
+
+Serialized `RenderSnapshot` now requires the actual `visual_seed`; older host
+checkpoint JSON embedding a seedless render snapshot fails decoding. No fallback
+seed is invented. Scientific world-checkpoint and browser dynamic-frame schemas
+are unchanged. The parent bead retains its original qualification requirements.
+
 **Browser saved-world studies (2026-11-11):**
 [Source implemented and reviewed — Codex; executable and packaged-browser qualification open]
 

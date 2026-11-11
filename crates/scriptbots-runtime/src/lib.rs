@@ -668,6 +668,9 @@ pub struct RenderSnapshot {
     /// Located visual events from this completed world boundary for rendering and visual effects.
     #[serde(with = "serde_arc", default)]
     pub visual_events: Arc<Vec<scriptbots_core::LocatedWorldVisualEvent>>,
+    /// Actual resolved world root for deterministic presentation recipes.
+    /// This remains available when the original config requested entropy.
+    pub visual_seed: u64,
     /// Number of visual events dropped this boundary due to buffer limits.
     #[serde(default)]
     pub visual_dropped_events: u64,
@@ -5960,6 +5963,7 @@ mod tests {
             narrative_events: Arc::new(Vec::new()),
             narrative_dropped_events: 0,
             visual_events: Arc::new(Vec::new()),
+            visual_seed: 0,
             visual_dropped_events: 0,
             hybrid_count: 0,
             config: Arc::new(ScriptBotsConfig::default()),
@@ -7909,6 +7913,7 @@ mod tests {
                 narrative_events: Arc::new(Vec::new()),
                 narrative_dropped_events: 0,
                 visual_events: Arc::new(Vec::new()),
+                visual_seed: 0,
                 visual_dropped_events: 0,
                 hybrid_count: 0,
                 config: Arc::new(ScriptBotsConfig::default()),
