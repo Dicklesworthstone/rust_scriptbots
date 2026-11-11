@@ -155,9 +155,47 @@ history/credit handling; nonempty narrative delivery requires observed records.
   copy. Quota/abort errors keep the previous save, and invalid or stale restores
   preserve the active world. Both local restore paths work after an invalid
   startup permalink; all local continuation controls are disabled in remote mode.
+- **Saved-world experiments (remote)**: connect to a server and open the
+  **Saved-world experiments** panel. Save a server checkpoint or select an
+  existing one, then run an unchanged future or a paired treatment/control
+  study. Drought, food shock, temperature stress and population injection
+  policy are available as explicit treatments. The source is the selected
+  saved scientific state, rather than a new tick-zero recipe. The live owner
+  is not replaced or advanced by the study. The panel shows observed job
+  status, supports cooperative cancellation, and exposes the completed report
+  and the actual retained source, plan and verified bundle files.
 - Runtime brain presets can be rebuilt programmatically via
   `registerBrain("mlp" | "dwraon" | "assembly" | "wander" | "none")` on the
   `SimHandle`. Invalid choices preserve the current world.
+
+### Remote checkpoint studies
+
+The browser uses the server's existing bounded checkpoint and managed-study
+services. Each save and launch retains an immutable request with a unique retry
+key. If delivery is uncertain, use **Retry same save** or **Retry same study
+request**; editing the form does not change that retained request. The explicit
+`X-ScriptBots-Session` header binds Lab operations to the owner negotiated by
+the stream. A replaced server session refuses old requests before acting.
+Returning to the local browser world or disconnecting stops reads and discards
+late responses, while the same endpoint/session can retain an uncertain retry.
+Closing the panel does not cancel a running server study; use **Cancel study**
+and observe its final status.
+
+Checkpoint and artifact lists are paginated. Only files published for the
+selected completed study are offered in its file list; a partial directory
+does not establish completion. Downloads are bounded and verified against the
+retained metadata. The browser offers each file for saving and does not claim
+the operating system has persisted it. To reproduce a downloaded plan offline,
+preserve its relative files and update the saved source path when relocating
+them, as described by the native `branch-study` command.
+
+A saved scientific fork retains its genomes, evaluator state and scientific
+source, but does not continue the original host session, journal, schedules or
+omitted auxiliary histories. One saved trajectory and its matched control are
+descriptive evidence, not independent replication. The server retains study receipts across restarts
+and marks interrupted studies stopped. This browser panel keeps its current
+in-memory view; it does not list historical jobs or automatically rerun
+interrupted work. Existing resource limits and backend refusals remain visible.
 
 Snapshots returned to JS follow the selected `snapshot_format` (defaults to JSON). To switch to binary snapshots (Postcard-encoded `Uint8Array`), pass `snapshot_format: "binary"` to `init_sim`.
 

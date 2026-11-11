@@ -200,6 +200,18 @@
         #intervention-history { max-height: 19rem; overflow: auto; padding-left: 1.25rem; font-size: 0.75rem; }
         #intervention-history li { margin: 0.5rem 0; overflow-wrap: anywhere; }
         #intervention-form-error, #intervention-history-gap { color: #fbbf24; }
+        #checkpoint-lab { border: 1px solid #334155; border-radius: 0.5rem; padding: 0.75rem; }
+        #checkpoint-lab summary { cursor: pointer; font-weight: 700; }
+        #checkpoint-lab p { font-size: 0.75rem; overflow-wrap: anywhere; }
+        #checkpoint-lab [hidden] { display: none; }
+        #checkpoint-lab h3 { font-size: 0.85rem; margin: 0.9rem 0 0.4rem; }
+        #checkpoint-lab select { width: 100%; min-width: 0; box-sizing: border-box; }
+        #lab-branch-form, #lab-branch-form fieldset { display: grid; gap: 0.5rem; }
+        #lab-branch-form fieldset { border: 1px solid #334155; border-radius: 0.35rem; margin: 0; }
+        #lab-branch-form label { display: grid; gap: 0.25rem; }
+        #lab-branch-form input { box-sizing: border-box; width: 100%; background: #0f172a; color: #e2e8f0; border: 1px solid #475569; border-radius: 0.25rem; padding: 0.4rem; }
+        #lab-notice, #lab-form-error { color: #fbbf24; }
+        #lab-checkpoint-detail, #lab-branch-detail, #lab-artifact-detail { white-space: pre-line; }
         #inspector-signals { max-height: 24rem; overflow: auto; }
         #inspector-signals table { width: 100%; font-size: 0.75rem; border-collapse: collapse; }
         #inspector-signals th { text-align: left; font-weight: 400; }
@@ -510,6 +522,102 @@
                 <button id="remote-retry" type="button" disabled>Retry Last Command with Same ID</button>
                 <div id="remote-receipt" role="status" aria-live="polite"></div>
             </div>
+            <details id="checkpoint-lab" class="controls">
+                <summary>Saved-world experiments</summary>
+                <p id="lab-source" role="status">Connect to a remote server to save and study an evolved world.</p>
+                <p id="lab-notice" role="status" aria-live="polite"></p>
+                <h3>1. Choose a saved scientific state</h3>
+                <p>Save a completed state from the connected server, or select an earlier checkpoint. The saved tick identifies the actual source of your study.</p>
+                <div class="inspector-actions">
+                    <button id="lab-checkpoint-save" type="button" disabled>Save server checkpoint</button>
+                    <button id="lab-checkpoint-retry" type="button" disabled>Retry same save</button>
+                    <button id="lab-checkpoint-refresh" type="button" disabled>Refresh checkpoints</button>
+                </div>
+                <label for="lab-checkpoint-select">Study source</label>
+                <select id="lab-checkpoint-select" disabled><option value="">No checkpoints loaded</option></select>
+                <div class="inspector-actions">
+                    <button id="lab-checkpoint-first" type="button" disabled>First page</button>
+                    <button id="lab-checkpoint-next" type="button" disabled>Next page</button>
+                </div>
+                <p id="lab-checkpoint-detail">No source selected.</p>
+                <button id="lab-checkpoint-download" type="button" disabled>Download selected checkpoint</button>
+                <h3>2. Run a future from that state</h3>
+                <p>An unchanged future runs one trajectory. A treatment runs alongside an unchanged control from the same saved state. Both run independently of the live world.</p>
+                <form id="lab-branch-form">
+                    <label for="lab-branch-name">Study name
+                        <input id="lab-branch-name" type="text" value="future" pattern="[A-Za-z0-9_\-]{1,64}" maxlength="64" required />
+                    </label>
+                    <label for="lab-branch-ticks">Future scientific ticks
+                        <input id="lab-branch-ticks" type="number" min="1" max="10000" step="1" value="120" required />
+                    </label>
+                    <label for="lab-branch-kind">Treatment
+                        <select id="lab-branch-kind">
+                            <option value="unchanged">Unchanged future</option>
+                            <option value="drought">Drought versus unchanged control</option>
+                            <option value="resource_shock">Food shock versus unchanged control</option>
+                            <option value="temperature">Temperature stress versus unchanged control</option>
+                            <option value="closed_world">Population injection policy versus control</option>
+                        </select>
+                    </label>
+                    <fieldset data-lab-kinds="drought" hidden disabled>
+                        <legend>Whole-world drought</legend>
+                        <label for="lab-drought-ticks">Drought duration (ticks)
+                            <input id="lab-drought-ticks" type="number" min="1" max="4294967295" step="1" value="120" required />
+                        </label>
+                        <label for="lab-growth-scale">Food growth multiplier (0–1)
+                            <input id="lab-growth-scale" type="number" min="0" max="1" step="any" value="0.1" required />
+                        </label>
+                    </fieldset>
+                    <fieldset data-lab-kinds="resource_shock" hidden disabled>
+                        <legend>Whole-world food shock</legend>
+                        <label for="lab-bloom">Food added per cell
+                            <input id="lab-bloom" type="number" min="0" step="any" value="0" required />
+                        </label>
+                        <label for="lab-scorch">Fraction of food removed (0–1)
+                            <input id="lab-scorch" type="number" min="0" max="1" step="any" value="0.5" required />
+                        </label>
+                    </fieldset>
+                    <fieldset data-lab-kinds="temperature" hidden disabled>
+                        <legend>Temperature stress</legend>
+                        <label for="lab-discomfort">Discomfort health drain rate
+                            <input id="lab-discomfort" type="number" min="0" step="any" value="0.01" required />
+                        </label>
+                        <label for="lab-comfort-band">Comfort band around preferred temperature
+                            <input id="lab-comfort-band" type="number" min="0" step="any" value="0.1" required />
+                        </label>
+                    </fieldset>
+                    <fieldset data-lab-kinds="closed_world" hidden disabled>
+                        <legend>Population injection policy</legend>
+                        <label for="lab-closed">Policy for treatment
+                            <select id="lab-closed">
+                                <option value="true">Closed — no automatic population injection</option>
+                                <option value="false">Open — permit configured population injection</option>
+                            </select>
+                        </label>
+                    </fieldset>
+                    <button id="lab-branch-launch" type="submit" disabled>Run study from selected checkpoint</button>
+                    <p id="lab-form-error" role="status"></p>
+                </form>
+                <p id="lab-branch-detail" role="status" aria-live="polite">No study launched in this view.</p>
+                <div class="inspector-actions">
+                    <button id="lab-branch-retry" type="button" disabled>Retry same study request</button>
+                    <button id="lab-branch-refresh" type="button" disabled>Refresh study status</button>
+                    <button id="lab-branch-cancel" type="button" disabled>Cancel study</button>
+                </div>
+                <h3>3. Inspect and reproduce the result</h3>
+                <p>The completed report compares observed outcomes and records its exact source. One saved trajectory is descriptive evidence; independent replication requires multiple starting seeds.</p>
+                <button id="lab-report-download" type="button" disabled>Download completed study report</button>
+                <div class="inspector-actions">
+                    <button id="lab-artifact-refresh" type="button" disabled>List study files</button>
+                    <button id="lab-artifact-first" type="button" disabled>First files page</button>
+                    <button id="lab-artifact-next" type="button" disabled>Next files page</button>
+                </div>
+                <label for="lab-artifact-select">Source, plan and verified result files</label>
+                <select id="lab-artifact-select" disabled><option value="">No completed study files loaded</option></select>
+                <p id="lab-artifact-detail"></p>
+                <button id="lab-artifact-download" type="button" disabled>Download selected study file</button>
+                <p id="lab-download-status" role="status" aria-live="polite"></p>
+            </details>
             <section id="narrative-timeline" class="controls" aria-label="Scientific narrative timeline">
                 <h2>Scientific timeline</h2>
                 <p id="narrative-status" role="status">Waiting for scientific history.</p>

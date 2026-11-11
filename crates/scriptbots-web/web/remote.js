@@ -1,6 +1,7 @@
 // Remote presentation never owns or drives a local SimHandle. Binary decoding is
 // supplied by the shared Rust/WASM protocol; this module owns connection and
 // consumer cursors, with no queue of historical canvas frames.
+import { MAX_LAB_ARTIFACT_BYTES, validateLabArtifact, validateLabIntervention } from "./checkpoint-lab.js";
 
 const VERSION = 1;
 const STREAM_VERSION = 2;
@@ -15,16 +16,31 @@ const IDENTITY_FIELDS = ["sessionId", "publicationRevision", "scientificRevision
   "controlRevision", "configRevision", "tick"];
 const encoder = new TextEncoder();
 
+/** Preserve actual HTTP refusal separately from transport failures and lost receipts. */
+export class RemoteOwnerHttpError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.name = "RemoteOwnerHttpError";
+    this.status = status;
+    // 503 includes both capacity refusal and unknown owner outcomes. Checkpoint
+    // 507 can follow a retained file write, so both require the original retry key.
+    this.admission = [400, 404, 409, 413, 415, 422].includes(status) ? "not_admitted" : "unknown";
+  }
+}
+
 /** One deadline and one actual-byte ceiling cover every JSON owner response. */
-async function boundedOwnerJson(url, byteLimit, { signal, method = "GET", body, missingMessage } = {}) {
+async function boundedOwnerJson(url, byteLimit, { signal, method = "GET", body, missingMessage,
+  sessionId, timeoutMs = 2000 } = {}) {
   const abort = new AbortController();
   const cancel = () => abort.abort();
   if (signal?.aborted) cancel();
   signal?.addEventListener("abort", cancel, { once: true });
-  const timeout = setTimeout(cancel, 2000);
+  const timeout = setTimeout(cancel, timeoutMs);
   try {
+    const headers = { ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+      ...(sessionId === undefined ? {} : { "X-ScriptBots-Session": sessionId }) };
     const response = await fetch(url, { method, body, cache: "no-store", credentials: "omit",
-      ...(body === undefined ? {} : { headers: { "Content-Type": "application/json" } }), signal: abort.signal });
+      ...(Object.keys(headers).length ? { headers } : {}), signal: abort.signal });
     const advertised = response.headers.get("content-length");
     if (advertised !== null && (!/^\d+$/.test(advertised) || Number(advertised) > byteLimit)) {
       await response.body?.cancel();
@@ -46,10 +62,78 @@ async function boundedOwnerJson(url, byteLimit, { signal, method = "GET", body, 
     const bytes = new Uint8Array(length);
     let offset = 0;
     for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
-    const detail = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+    let detail;
+    try { detail = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)); }
+    catch (error) {
+      if (!response.ok) throw new RemoteOwnerHttpError(response.status, `Remote owner request failed (${response.status})`);
+      throw error;
+    }
     if (response.status === 404 && missingMessage && detail.message === missingMessage) return null;
-    if (!response.ok) throw new Error(detail.error || detail.message || `Remote owner request failed (${response.status})`);
+    if (!response.ok) throw new RemoteOwnerHttpError(response.status, detail.error || detail.message || `Remote owner request failed (${response.status})`);
     return detail;
+  } finally {
+    clearTimeout(timeout);
+    signal?.removeEventListener("abort", cancel);
+  }
+}
+
+function labIdentifier(value) {
+  if (typeof value !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(value)) throw new Error("Invalid bounded Lab artifact identity");
+  return value;
+}
+
+function labPageQuery(cursor, limit) {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new Error("Invalid bounded Lab page size");
+  if (cursor !== null && (decimal(cursor) > BigInt(Number.MAX_SAFE_INTEGER))) throw new Error("Lab page cursor exceeds exact browser integers");
+  return { limit: String(limit), ...(cursor === null ? {} : { cursor }) };
+}
+
+/** Bytes are bounded before allocation, then checked against the catalog's exact SHA-256. */
+async function downloadLabBytes(url, metadata, sessionId, signal) {
+  if (!globalThis.crypto?.subtle) throw new Error("SHA-256 verification requires a secure browser context");
+  const abort = new AbortController();
+  const cancel = () => abort.abort();
+  if (signal?.aborted) cancel();
+  signal?.addEventListener("abort", cancel, { once: true });
+  const timeout = setTimeout(cancel, 15000);
+  try {
+    const response = await fetch(url, { cache: "no-store", credentials: "omit",
+      headers: { "X-ScriptBots-Session": sessionId }, signal: abort.signal });
+    const limit = response.ok ? metadata.byte_size : 16 * 1024;
+    const advertised = response.headers.get("content-length");
+    if (advertised !== null && (!/^(0|[1-9][0-9]*)$/.test(advertised)
+        || Number(advertised) > limit || (response.ok && Number(advertised) !== metadata.byte_size))) {
+      await response.body?.cancel();
+      throw new Error("Artifact response size differs from its catalog metadata");
+    }
+    if (!response.body) throw new Error("The host returned no artifact bytes");
+    const reader = response.body.getReader(), chunks = [];
+    let length = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        length += value.byteLength;
+        if (length > limit || length > MAX_LAB_ARTIFACT_BYTES) {
+          await reader.cancel();
+          throw new Error("Artifact response exceeds its exact byte bound");
+        }
+        chunks.push(value);
+      }
+    } finally { reader.releaseLock(); }
+    const bytes = new Uint8Array(length);
+    let offset = 0;
+    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+    if (!response.ok) {
+      let detail;
+      try { detail = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)); } catch (_) { /* Report bounded HTTP status when no JSON error exists. */ }
+      throw new Error(detail?.message || detail?.error || `Artifact download failed (${response.status})`);
+    }
+    if (length !== metadata.byte_size) throw new Error("Artifact response is truncated");
+    const checksum = Array.from(new Uint8Array(await globalThis.crypto.subtle.digest("SHA-256", bytes)),
+      (byte) => byte.toString(16).padStart(2, "0")).join("");
+    if (checksum !== metadata.checksum_sha256) throw new Error("Downloaded artifact SHA-256 differs from its verified catalog entry");
+    return new Blob([bytes], { type: metadata.content_type });
   } finally {
     clearTimeout(timeout);
     signal?.removeEventListener("abort", cancel);
@@ -312,6 +396,82 @@ export class RemoteStreamClient {
     const url = this.apiUrl("/api/interventions/browser", sessionId,
       { session_id: sessionId, epoch, after_seq: afterSeq, limit: String(limit) });
     return boundedOwnerJson(url, 65536, { signal });
+  }
+
+  /** Every Lab read/write is bound to the negotiated owner, including at the HTTP server. */
+  async labJson(path, sessionId, byteLimit, { signal, body, method = "GET", query = {} } = {}) {
+    const url = this.apiUrl(path, sessionId, query);
+    const generation = this.generation;
+    const value = await boundedOwnerJson(url, byteLimit, { signal, body, method, sessionId, timeoutMs: 15000 });
+    this.requireLabSource(sessionId, generation);
+    return value;
+  }
+
+  requireLabSource(sessionId, generation) {
+    if (this.state !== "connected" || this.tracker.sessionId !== sessionId || this.generation !== generation) {
+      throw new Error("The remote connection changed while the Lab request was pending; its outcome is unconfirmed");
+    }
+  }
+
+  async listCheckpoints({ sessionId, cursor = null, limit = 12, signal } = {}) {
+    return this.labJson("/api/v1/checkpoints", sessionId, 128 * 1024,
+      { signal, query: labPageQuery(cursor, limit) });
+  }
+
+  async saveCheckpoint({ sessionId, description, idempotency_key }, { signal } = {}) {
+    if (typeof idempotency_key !== "string" || !idempotency_key.trim() || encoder.encode(idempotency_key).length > 1024
+        || (description != null && (typeof description !== "string" || encoder.encode(description).length > 4096))) {
+      throw new Error("Invalid bounded checkpoint save or retry identity");
+    }
+    const body = JSON.stringify({ description, idempotency_key });
+    return this.labJson("/api/v1/checkpoints", sessionId, 16 * 1024, { signal, method: "POST", body });
+  }
+
+  async launchCheckpointBranch(request, { signal } = {}) {
+    const { sessionId, ...payload } = request;
+    labIdentifier(payload.checkpoint_id);
+    if (typeof payload.branch_name !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(payload.branch_name)
+        || !Number.isSafeInteger(payload.ticks) || payload.ticks < 1 || payload.ticks > 10000
+        || typeof payload.idempotency_key !== "string" || !payload.idempotency_key.trim()
+        || encoder.encode(payload.idempotency_key).length > 1024) throw new Error("Invalid bounded checkpoint study request");
+    validateLabIntervention(payload.intervention ?? null);
+    const body = JSON.stringify(payload);
+    if (encoder.encode(body).length > 16 * 1024) throw new Error("Checkpoint study request exceeds 16 KiB");
+    return this.labJson("/api/v1/checkpoints/branches", sessionId, 16 * 1024, { signal, method: "POST", body });
+  }
+
+  async checkpointBranchStatus(branchId, { sessionId, signal } = {}) {
+    return this.labJson(`/api/v1/checkpoints/branches/${labIdentifier(branchId)}`, sessionId, 16 * 1024, { signal });
+  }
+
+  async cancelCheckpointBranch(branchId, { sessionId, signal } = {}) {
+    return this.labJson(`/api/v1/checkpoints/branches/${labIdentifier(branchId)}/cancel`, sessionId, 16 * 1024,
+      { signal, method: "POST" });
+  }
+
+  async checkpointBranchArtifacts(branchId, { sessionId, cursor = null, limit = 12, signal } = {}) {
+    return this.labJson(`/api/v1/checkpoints/branches/${labIdentifier(branchId)}/artifacts`, sessionId, 128 * 1024,
+      { signal, query: labPageQuery(cursor, limit) });
+  }
+
+  /** Download only an actual catalog entry, preserving its filename and verifying byte integrity. */
+  async downloadArtifact(artifactId, { sessionId, signal, expected = null } = {}) {
+    labIdentifier(artifactId);
+    const generation = this.generation;
+    const metadata = await this.labJson(`/api/v1/artifacts/${artifactId}`, sessionId, 16 * 1024, { signal });
+    validateLabArtifact(metadata);
+    if (metadata.byte_size > MAX_LAB_ARTIFACT_BYTES) {
+      throw new Error("Artifact exceeds the 64 MiB browser download limit; the saved source remains available for server studies");
+    }
+    if (metadata.artifact_id !== artifactId || (expected && (
+      (expected.artifact_id ?? expected.checkpoint_id) !== artifactId
+      || ["byte_size", "checksum_blake3", "checksum_sha256"].some((key) => metadata[key] !== expected[key])))) {
+      throw new Error("Artifact catalog entry differs from the selected saved source");
+    }
+    const url = this.apiUrl(`/api/v1/artifacts/${artifactId}/download`, sessionId);
+    const blob = await downloadLabBytes(url, metadata, sessionId, signal);
+    this.requireLabSource(sessionId, generation);
+    return { blob, filename: metadata.filename, metadata: Object.freeze(metadata) };
   }
 
   apiUrl(path, sessionId, query = {}) {

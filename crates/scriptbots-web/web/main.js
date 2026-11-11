@@ -10,6 +10,7 @@ import { GenomeInspectionController, renderGenomeInspector, renderGenomeSource }
 import { InterventionController, renderInterventions, validateInterventionAction } from "./interventions.js";
 import { NarrativeController, renderNarrative, renderNarrativeSource } from "./narrative.js";
 import { validateLaunchInfo, launchInfoText, renderBuildComparison } from "./recipes.js";
+import { CheckpointLabController, renderCheckpointLab } from "./checkpoint-lab.js";
 
 const {
   init_sim,
@@ -142,6 +143,132 @@ let remoteConnected = false;
 let lastRemoteRequestId = null;
 let lastRemoteCommandId = null;
 let lastRemoteStatusRequestId = null;
+
+const checkpointLabPanel = document.getElementById("checkpoint-lab");
+const labForm = document.getElementById("lab-branch-form");
+const labFormError = document.getElementById("lab-form-error");
+const labDownloadStatus = document.getElementById("lab-download-status");
+let labDownloadUrl = null;
+let labPollTimer = null;
+const checkpointLab = new CheckpointLabController({
+  list: (request, signal) => remoteClient.listCheckpoints({ ...request, signal }),
+  save: (request, signal) => remoteClient.saveCheckpoint(request, { signal }),
+  launch: (request, signal) => remoteClient.launchCheckpointBranch(request, { signal }),
+  status: (request, signal) => remoteClient.checkpointBranchStatus(request.branchId, { sessionId: request.sessionId, signal }),
+  cancel: (request, signal) => remoteClient.cancelCheckpointBranch(request.branchId, { sessionId: request.sessionId, signal }),
+  artifacts: (request, signal) => remoteClient.checkpointBranchArtifacts(request.branchId, { ...request, signal }),
+  download: (request, signal) => remoteClient.downloadArtifact(request.artifactId, {
+    sessionId: request.sessionId, expected: request.expected, signal,
+  }),
+  onChange: (controller) => renderCheckpointLab(checkpointLabPanel, controller),
+});
+
+function updateCheckpointLabVisibility() {
+  const observed = remoteFrame && lastPaintedFrame?.sessionId === remoteFrame.identity.sessionId
+    && lastPaintedFrame.simulationGeneration === simulationGeneration;
+  checkpointLab.setEnabled(remoteMode && remoteConnected && !!observed && !!checkpointLabPanel?.open && !document.hidden);
+}
+
+function observeCheckpointLab(frame) {
+  if (remoteMode && remoteConnected && remoteClient) {
+    checkpointLab.observe(frame, remoteClient.url);
+    updateCheckpointLabVisibility();
+  }
+}
+
+function updateLabTreatmentFields() {
+  const kind = document.getElementById("lab-branch-kind")?.value;
+  for (const fields of labForm?.querySelectorAll("[data-lab-kinds]") ?? []) {
+    const active = fields.dataset.labKinds.split(" ").includes(kind);
+    fields.hidden = !active;
+    fields.disabled = !active;
+  }
+  if (labFormError) labFormError.textContent = "";
+}
+
+function readLabTreatment() {
+  const number = (id) => Number(document.getElementById(id).value);
+  switch (document.getElementById("lab-branch-kind").value) {
+    case "unchanged": return null;
+    case "drought": return { type: "Drought", params: {
+      region: null, duration_ticks: number("lab-drought-ticks"), growth_scale: number("lab-growth-scale"),
+    } };
+    case "resource_shock": return { type: "ResourceShock", params: {
+      region: null, bloom_amount: number("lab-bloom"), scorch: number("lab-scorch"),
+    } };
+    case "temperature": return { type: "TemperatureShift", params: {
+      discomfort_rate: number("lab-discomfort"), comfort_band: number("lab-comfort-band"),
+    } };
+    case "closed_world": return { type: "ClosedWorld", params: {
+      closed: document.getElementById("lab-closed").value === "true",
+    } };
+    default: throw new Error("Choose a supported study treatment");
+  }
+}
+
+async function offerLabDownload(operation) {
+  try {
+    const result = await operation();
+    if (!result) return;
+    if (!(result.blob instanceof Blob)) throw new Error("The server did not return a downloadable file");
+    if (labDownloadUrl) URL.revokeObjectURL(labDownloadUrl);
+    labDownloadUrl = URL.createObjectURL(result.blob);
+    const anchor = document.createElement("a");
+    anchor.href = labDownloadUrl;
+    anchor.download = result.filename;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    if (labDownloadStatus) labDownloadStatus.textContent = `${result.filename} is ready to save (${result.blob.size.toLocaleString()} bytes). Your browser manages the final file save.`;
+  } catch (error) {
+    if (labDownloadStatus) labDownloadStatus.textContent = `Download unavailable: ${String(error.message || error).slice(0, 512)}`;
+  }
+}
+
+checkpointLabPanel?.addEventListener("toggle", updateCheckpointLabVisibility);
+document.addEventListener("visibilitychange", updateCheckpointLabVisibility);
+document.getElementById("lab-branch-kind")?.addEventListener("change", updateLabTreatmentFields);
+labForm?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!labForm.reportValidity()) return;
+  try {
+    labFormError.textContent = "";
+    await checkpointLab.launch({ branchName: document.getElementById("lab-branch-name").value,
+      ticks: Number(document.getElementById("lab-branch-ticks").value), intervention: readLabTreatment() });
+  } catch (error) {
+    labFormError.textContent = String(error.message || error).slice(0, 512);
+  }
+});
+for (const [id, action] of [
+  ["lab-checkpoint-save", () => checkpointLab.save()],
+  ["lab-checkpoint-retry", () => checkpointLab.retrySave()],
+  ["lab-checkpoint-refresh", () => checkpointLab.refresh(true)],
+  ["lab-checkpoint-first", () => checkpointLab.firstPage()],
+  ["lab-checkpoint-next", () => checkpointLab.nextPage()],
+  ["lab-branch-retry", () => checkpointLab.retryLaunch()],
+  ["lab-branch-refresh", () => checkpointLab.refreshBranch(true)],
+  ["lab-branch-cancel", () => checkpointLab.cancelBranch()],
+  ["lab-artifact-refresh", () => checkpointLab.refreshArtifacts(true)],
+  ["lab-artifact-first", () => checkpointLab.firstArtifactPage()],
+  ["lab-artifact-next", () => checkpointLab.nextArtifactPage()],
+]) {
+  document.getElementById(id)?.addEventListener("click", async () => {
+    try { await action(); }
+    catch (error) { if (labFormError) labFormError.textContent = String(error.message || error).slice(0, 512); }
+  });
+}
+document.getElementById("lab-checkpoint-select")?.addEventListener("change", (event) => checkpointLab.select(event.target.value));
+document.getElementById("lab-artifact-select")?.addEventListener("change", (event) => checkpointLab.selectArtifact(event.target.value));
+document.getElementById("lab-checkpoint-download")?.addEventListener("click", () => { void offerLabDownload(() => checkpointLab.downloadCheckpoint()); });
+document.getElementById("lab-report-download")?.addEventListener("click", () => { void offerLabDownload(() => checkpointLab.downloadReport()); });
+document.getElementById("lab-artifact-download")?.addEventListener("click", () => { void offerLabDownload(() => checkpointLab.downloadSelectedArtifact()); });
+function startLabPolling() {
+  if (labPollTimer === null) labPollTimer = setInterval(() => { void checkpointLab.poll(); }, 1000);
+}
+window.addEventListener("pageshow", () => { updateCheckpointLabVisibility(); startLabPolling(); });
+updateLabTreatmentFields();
+renderCheckpointLab(checkpointLabPanel, checkpointLab);
+startLabPolling();
 
 const narrativePanel = document.getElementById("narrative-timeline");
 const narrative = new NarrativeController({
@@ -410,6 +537,7 @@ function hasPresentationFrame() {
 
 function updateRemoteControls() {
   updateInterventionVisibility();
+  updateCheckpointLabVisibility();
   for (const input of [stepsSlider, populationSlider, resetButton, permalinkInput,
     loadPermalinkBtn, copyPermalinkBtn, forkPatchInput, forkBtn, loadForkedBtn, copyForkBtn]) {
     if (input) input.disabled = remoteMode;
@@ -525,6 +653,7 @@ function connectRemote() {
     queuedReset = false;
     interventions.setEnabled(false);
     remoteClient?.disconnect();
+    if (remoteClient?.url !== nextClient.url) checkpointLab.reset("Connected endpoint changed; choose a checkpoint from the new server.");
     remoteClient = nextClient;
     installedClient = true;
     remoteMode = true;
@@ -565,6 +694,7 @@ remoteReconnect.addEventListener("click", () => {
 });
 remoteLocal.addEventListener("click", () => {
   interventions.setEnabled(false);
+  checkpointLab.setEnabled(false);
   remoteClient?.disconnect();
   remoteMode = false;
   remoteConnected = false;
@@ -726,6 +856,7 @@ function drawSnapshot(frame) {
     brainInspector.observe(frame, simulationGeneration);
     genomeInspector.observe(frame, simulationGeneration);
     observeInterventions(frame);
+    observeCheckpointLab(frame);
     return true;
   }
   try {
@@ -749,6 +880,7 @@ function drawSnapshot(frame) {
       brainInspector.observe(frame, simulationGeneration);
       genomeInspector.observe(frame, simulationGeneration);
       observeInterventions(frame);
+      observeCheckpointLab(frame);
       return true;
     }
   } catch (error) {
@@ -839,6 +971,11 @@ function captureAdmittedFrame(frameIdentity) {
 
 window.addEventListener("pagehide", () => {
   narrative.setEnabled(false);
+  checkpointLab.setEnabled(false);
+  if (labPollTimer !== null) clearInterval(labPollTimer);
+  labPollTimer = null;
+  if (labDownloadUrl) URL.revokeObjectURL(labDownloadUrl);
+  labDownloadUrl = null;
   remoteClient?.disconnect();
   if (captureRequest) finishCapture(captureRequest, new Error("Page left during capture"));
   if (captureUrl) URL.revokeObjectURL(captureUrl);

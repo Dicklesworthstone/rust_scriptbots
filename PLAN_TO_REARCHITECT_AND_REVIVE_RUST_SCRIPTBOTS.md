@@ -2,6 +2,40 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Browser saved-world studies (2026-11-11):**
+[Source implemented and reviewed — Codex; executable and packaged-browser qualification open]
+
+Continue `bd-2z0.12.3` by connecting the browser to the existing checkpoint and
+managed-study services. The Saved-world experiments panel saves and pages real
+server checkpoints, launches an unchanged future or matched treatment/control
+study, observes job status, requests cancellation, and downloads the completed
+report, exact source, exported plan and retained bundle files. The live owner is
+not advanced or replaced by these studies. The shared backend now pages only
+artifacts actually published for the requested completed study.
+
+Each browser operation is bound to the observed server session. Immutable retry
+requests survive uncertain delivery; source changes invalidate late responses.
+The panel stops reads when hidden or disconnected and waits for a successfully
+painted remote frame before admitting work. Download paths, actual byte counts,
+metadata and SHA-256 are checked within explicit client bounds. Offered downloads
+do not establish an operating-system save, and one matched trajectory is not
+independent replication.
+
+Added backend session-guard and real-study artifact-isolation regressions, plus
+browser controller/transport coverage for retries, source changes, lifecycle,
+pagination and download integrity. A frozen feature snapshot passed all 117 Node
+tests, including 24 new checkpoint-study tests, and all three edited JavaScript
+syntax checks through DSR. A subsequent regression for the concurrent backend's
+new `stopped` recovery outcome is authored but unexecuted; the browser treats it
+as terminal and never automatically reruns it. UBS identified one public dropdown-cache comparison
+as a secret comparison; source review confirmed the false positive and a naming
+clarification followed. The final rerun was interrupted by renewed executor
+failure. Chromium was refused at startup before DOM execution. Rust regressions
+have not executed: baseline checking and Clippy stopped during dependency
+resolution when the shared disk filled. Compilation, final formatting,
+packaged-browser execution and full acceptance remain open. Existing parent bead
+status and ownership are preserved.
+
 **Managed checkpoint branch studies (2026-11-10):**
 [Source implemented and independently reviewed — Codex; runtime qualification open]
 
