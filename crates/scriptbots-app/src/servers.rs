@@ -46,7 +46,8 @@ use crate::control::{
     MAX_CHECKPOINT_BRANCH_ID_BYTES, MAX_CHECKPOINT_BRANCH_KEY_BYTES,
     MAX_CHECKPOINT_BRANCH_NAME_BYTES, MAX_CHECKPOINT_BRANCH_REQUEST_BYTES,
     MAX_CHECKPOINT_BRANCH_TICKS, MAX_STEP_BATCH, MapApplyAgentPolicy, MapApplyRequestBody,
-    MapGenerateRequestBody, PaginatedArtifactsResponse, PaginatedCheckpointsResponse,
+    MapGenerateRequestBody, PaginatedArtifactsResponse, PaginatedCheckpointBranchesResponse,
+    PaginatedCheckpointsResponse,
     PaginatedExperimentsResponse, Scoreboard, SelectionModeDto, SelectionSnapshotDto,
     SelectionStateDto, SimulationStatusDto, SpeedRequest, parse_intervention_command,
     parse_map_artifact,
@@ -1616,6 +1617,7 @@ pub struct SpeedRequestBody {
         get_v1_checkpoints,
         get_v1_checkpoint_by_id,
         post_v1_checkpoint_branches,
+        get_v1_checkpoint_branches,
         get_v1_checkpoint_branch,
         get_v1_checkpoint_branch_artifacts,
         post_v1_checkpoint_branch_cancel,
@@ -1676,6 +1678,7 @@ pub struct SpeedRequestBody {
             CheckpointRetentionDto,
             CheckpointBranchRequest,
             CheckpointBranchStatusDto,
+            PaginatedCheckpointBranchesResponse,
             ArtifactMetadataDto,
             PaginatedExperimentsResponse,
             PaginatedCheckpointsResponse,
@@ -4242,6 +4245,30 @@ async fn get_v1_checkpoint_by_id(
 }
 
 #[utoipa::path(
+    get,
+    path = "/api/v1/checkpoints/branches",
+    tag = "checkpoints",
+    params(PaginationQueryParams),
+    responses(
+        (status = 200, description = "Bounded admitted-study history, including recovered terminal receipts; this does not resume a study or reverify its artifacts", body = PaginatedCheckpointBranchesResponse),
+        (status = 400, description = "Invalid pagination cursor"),
+        (status = 409, description = "Retained study identities conflict")
+    )
+)]
+async fn get_v1_checkpoint_branches(
+    State(state): State<ApiState>,
+    axum::extract::Query(params): axum::extract::Query<PaginationQueryParams>,
+) -> Result<Json<PaginatedCheckpointBranchesResponse>, AppError> {
+    let page = run_control(move || {
+        state
+            .handle
+            .list_checkpoint_branches(params.limit, params.cursor.as_deref())
+    })
+    .await?;
+    Ok(Json(page))
+}
+
+#[utoipa::path(
     post,
     path = "/api/v1/checkpoints/branches",
     tag = "checkpoints",
@@ -4451,6 +4478,7 @@ fn prepare_rest_server(
         .route(
             "/api/v1/checkpoints/branches",
             post(post_v1_checkpoint_branches)
+                .get(get_v1_checkpoint_branches)
                 .layer(DefaultBodyLimit::max(MAX_CHECKPOINT_BRANCH_REQUEST_BYTES)),
         )
         .route(
@@ -5209,6 +5237,22 @@ fn register_control_tools(builder: ServerBuilder, handle: ControlHandle) -> Serv
 
     builder = register_tool(
         builder,
+        "checkpoint_branch_list",
+        "Discover admitted checkpoint studies, including recovered completed and stopped receipts, with bounded pagination. Reading history never resumes science or reconstructs a treatment request; download artifacts separately to verify retained bytes.",
+        json!({
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                "cursor": {"type": "string"}
+            },
+            "additionalProperties": false
+        }),
+        ControlToolKind::CheckpointBranchList,
+        handle.clone(),
+    );
+
+    builder = register_tool(
+        builder,
         "checkpoint_branch_create",
         "Run a bounded independent future from a saved checkpoint, preserving the live owner. With an intervention, compare matched control and treatment futures. Reuse the exact idempotency key and payload after an uncertain response. Admission is not completion; poll checkpoint_branch_status and download artifact_id only after completion.",
         json!({
@@ -5539,6 +5583,13 @@ struct ControlTool {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct McpCheckpointBranchPageRequest {
+    limit: Option<usize>,
+    cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct McpCheckpointBranchIdRequest {
     branch_id: String,
 }
@@ -5575,6 +5626,7 @@ enum ControlToolKind {
     CheckpointList,
     CheckpointStatus,
     CheckpointBranchCreate,
+    CheckpointBranchList,
     CheckpointBranchStatus,
     CheckpointBranchCancel,
     ArtifactList,
@@ -5601,6 +5653,7 @@ impl ToolHandler for ControlTool {
             ControlToolKind::Step
                 | ControlToolKind::ExperimentCompare
                 | ControlToolKind::CheckpointBranchCreate
+                | ControlToolKind::CheckpointBranchList
                 | ControlToolKind::CheckpointBranchStatus
                 | ControlToolKind::CheckpointBranchCancel
         ) && !arguments.is_object()
@@ -6036,6 +6089,20 @@ impl ToolHandler for ControlTool {
                 let handle = self.handle.clone();
                 let res = run_control_mcp_sync(move || handle.get_checkpoint(&checkpoint_id))?;
                 make_tool_result(res)
+            }
+            ControlToolKind::CheckpointBranchList => {
+                let request: McpCheckpointBranchPageRequest =
+                    serde_json::from_value(Value::Object(arguments)).map_err(|error| {
+                        McpError::new(
+                            McpErrorCode::InvalidParams,
+                            format!("invalid checkpoint_branch_list parameters: {error}"),
+                        )
+                    })?;
+                let handle = self.handle.clone();
+                let page = run_control_mcp_sync(move || {
+                    handle.list_checkpoint_branches(request.limit, request.cursor.as_deref())
+                })?;
+                make_tool_result(page)
             }
             ControlToolKind::CheckpointBranchCreate => {
                 let request: CheckpointBranchRequest =
@@ -6956,6 +7023,7 @@ mod tests {
             (reqwest::Method::GET, "/api/v1/checkpoints"),
             (reqwest::Method::GET, "/api/v1/checkpoints/missing"),
             (reqwest::Method::POST, "/api/v1/checkpoints/branches"),
+            (reqwest::Method::GET, "/api/v1/checkpoints/branches"),
             (reqwest::Method::GET, "/api/v1/checkpoints/branches/missing"),
             (
                 reqwest::Method::POST,
@@ -8501,6 +8569,7 @@ mod tests {
             .expect("registered tools");
         for name in [
             "checkpoint_branch_create",
+            "checkpoint_branch_list",
             "checkpoint_branch_status",
             "checkpoint_branch_cancel",
         ] {
@@ -8532,7 +8601,13 @@ mod tests {
                 ["application/json"]["schema"]["$ref"],
             "#/components/schemas/CheckpointBranchStatusDto"
         );
+        assert_eq!(
+            openapi["paths"]["/api/v1/checkpoints/branches"]["get"]["responses"]["200"]["content"]
+                ["application/json"]["schema"]["$ref"],
+            "#/components/schemas/PaginatedCheckpointBranchesResponse"
+        );
         for (path, method) in [
+            ("/api/v1/checkpoints/branches", "get"),
             ("/api/v1/checkpoints/branches/{branch_id}", "get"),
             ("/api/v1/checkpoints/branches/{branch_id}/cancel", "post"),
             ("/api/v1/checkpoints/branches/{branch_id}/artifacts", "get"),
@@ -8650,6 +8725,145 @@ mod tests {
                     "{refused}"
                 );
             }
+        }
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+
+        let second = handle
+            .create_checkpoint_branch(CheckpointBranchRequest {
+                checkpoint_id: saved.checkpoint_id.clone(),
+                branch_name: "transport-second".to_owned(),
+                ticks: 1,
+                intervention: None,
+                idempotency_key: "transport-second-retry".to_owned(),
+            })
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let second = loop {
+            let status = handle.get_checkpoint_branch(&second.branch_id).unwrap();
+            if status.status == "completed" {
+                break status;
+            }
+            assert_eq!(status.status, "running", "{status:?}");
+            assert!(std::time::Instant::now() < deadline, "{status:?}");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        };
+        handle.data_services().shutdown_experiments().unwrap();
+        drop(state);
+        drop(mcp);
+        drop(handle);
+
+        // A new service has neither the original request objects nor a live job
+        // map. Both transports must discover the same durable receipts.
+        let cold = host
+            .handle()
+            .with_artifacts_dir(temp.path().join("artifacts"))
+            .unwrap();
+        let state = ApiState {
+            handle: cold.clone(),
+            scenario: None,
+            presented_frame: empty_presented_frame(),
+        };
+        let mut expected = [completed, second];
+        expected.sort_by(|left, right| left.branch_id.cmp(&right.branch_id));
+        let Json(first_page) = get_v1_checkpoint_branches(
+            State(state.clone()),
+            axum::extract::Query(PaginationQueryParams {
+                limit: Some(1),
+                cursor: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first_page.total, 2);
+        assert_eq!(first_page.limit, 1);
+        assert_eq!(first_page.offset, 0);
+        assert_eq!(first_page.items, vec![expected[0].clone()]);
+        assert!(first_page.has_more);
+        assert_eq!(first_page.next_cursor.as_deref(), Some("1"));
+        let Json(second_page) = get_v1_checkpoint_branches(
+            State(state.clone()),
+            axum::extract::Query(PaginationQueryParams {
+                limit: Some(1),
+                cursor: first_page.next_cursor,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second_page.total, 2);
+        assert_eq!(second_page.offset, 1);
+        assert_eq!(second_page.items, vec![expected[1].clone()]);
+        assert!(!second_page.has_more);
+        assert!(second_page.next_cursor.is_none());
+        let Json(past_end) = get_v1_checkpoint_branches(
+            State(state.clone()),
+            axum::extract::Query(PaginationQueryParams {
+                limit: Some(1),
+                cursor: Some("2".to_owned()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(past_end.total, 2);
+        assert!(past_end.items.is_empty());
+        assert!(!past_end.has_more);
+        assert!(past_end.next_cursor.is_none());
+        let refused = get_v1_checkpoint_branches(
+            State(state),
+            axum::extract::Query(PaginationQueryParams {
+                limit: Some(1),
+                cursor: Some("not-an-offset".to_owned()),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+
+        let mcp = mcp_http_test_state(cold, ServerBuilder::new("checkpoint-history", "0"));
+        let initialized = map_policy_mcp_request(
+            &mcp,
+            json!({
+                "jsonrpc": "2.0", "id": 10, "method": "initialize",
+                "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                    "clientInfo": {"name": "checkpoint-history", "version": "0"}}
+            }),
+        )
+        .await;
+        assert!(initialized.get("error").is_none(), "{initialized}");
+        let history = map_policy_mcp_request(
+            &mcp,
+            json!({
+                "jsonrpc": "2.0", "id": 11, "method": "tools/call",
+                "params": {"name": "checkpoint_branch_list",
+                    "arguments": {"limit": 1, "cursor": "1"}}
+            }),
+        )
+        .await;
+        let history: Value = serde_json::from_str(
+            history["result"]["content"][0]["text"]
+                .as_str()
+                .expect("MCP recovered history"),
+        )
+        .unwrap();
+        assert_eq!(history, serde_json::to_value(second_page).unwrap());
+        for arguments in [
+            json!([]),
+            json!({"limit": "one"}),
+            json!({"cursor": 1}),
+            json!({"limit": 1, "unknown": true}),
+        ] {
+            let refused = map_policy_mcp_request(
+                &mcp,
+                json!({
+                    "jsonrpc": "2.0", "id": 12, "method": "tools/call",
+                    "params": {"name": "checkpoint_branch_list", "arguments": arguments}
+                }),
+            )
+            .await;
+            assert_eq!(
+                refused["error"]["code"],
+                i32::from(McpErrorCode::InvalidParams),
+                "{refused}"
+            );
         }
         assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
     }
@@ -10425,6 +10639,10 @@ mod tests {
             "checkpoint_create",
             "checkpoint_list",
             "checkpoint_status",
+            "checkpoint_branch_create",
+            "checkpoint_branch_list",
+            "checkpoint_branch_status",
+            "checkpoint_branch_cancel",
             "artifact_list",
             "artifact_get",
         ]

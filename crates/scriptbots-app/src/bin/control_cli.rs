@@ -28,7 +28,7 @@ use scriptbots_app::control::{
     CheckpointCreateRequest, CheckpointMetadataDto, ExperimentBatchStatusDto,
     ExperimentComparisonDto, ExperimentCreateRequest, MAX_ARTIFACT_DOWNLOAD_BYTES,
     MAX_CHECKPOINT_BRANCH_REQUEST_BYTES, MapApplyAgentPolicy, PaginatedArtifactsResponse,
-    PaginatedCheckpointsResponse, PaginatedExperimentsResponse, compute_blake3, compute_sha256,
+    PaginatedCheckpointBranchesResponse, PaginatedCheckpointsResponse, PaginatedExperimentsResponse, compute_blake3, compute_sha256,
 };
 use scriptbots_app::experiment_runner::EXPERIMENT_ENDPOINT_METRICS;
 use scriptbots_app::{
@@ -299,6 +299,11 @@ enum CheckpointSubcommand {
 
 #[derive(Subcommand, Debug)]
 enum CheckpointBranchSubcommand {
+    /// Page admitted studies, including recovered terminal history; never reruns a study.
+    List {
+        #[command(flatten)]
+        page: CatalogPageArgs,
+    },
     /// Admit a bounded branch study; poll status to observe completion and its report.
     Create {
         /// CheckpointBranchRequest JSON file or '-' for stdin (at most 16 KiB).
@@ -626,14 +631,14 @@ fn data_api_url(base: &str, segments: &[&str]) -> Result<reqwest::Url> {
 fn catalog_request(
     client: &Client,
     base_url: &str,
-    collection: &str,
+    collection: &[&str],
     page: &CatalogPageArgs,
 ) -> Result<reqwest::RequestBuilder> {
     if !(1..=100).contains(&page.limit) {
         bail!("catalog --limit must be in 1..=100");
     }
     let mut request = client
-        .get(data_api_url(base_url, &[collection])?)
+        .get(data_api_url(base_url, collection)?)
         .query(&[("limit", page.limit)]);
     if let Some(cursor) = &page.cursor {
         if cursor.is_empty() || cursor.len() > 1024 {
@@ -759,7 +764,7 @@ async fn experiment_request(
             data_json::<PaginatedExperimentsResponse>(catalog_request(
                 client,
                 base_url,
-                "experiments",
+                &["experiments"],
                 &page,
             )?)
             .await
@@ -842,7 +847,7 @@ async fn checkpoint_request(
             data_json::<PaginatedCheckpointsResponse>(catalog_request(
                 client,
                 base_url,
-                "checkpoints",
+                &["checkpoints"],
                 &page,
             )?)
             .await
@@ -929,6 +934,15 @@ async fn checkpoint_branch_request(
     key: Option<&str>,
 ) -> Result<Value> {
     match command {
+        CheckpointBranchSubcommand::List { page } => {
+            data_json::<PaginatedCheckpointBranchesResponse>(catalog_request(
+                client,
+                base_url,
+                &["checkpoints", "branches"],
+                &page,
+            )?)
+            .await
+        }
         CheckpointBranchSubcommand::Create { file } => {
             let body = read_checkpoint_branch_request(&file, key)?;
             let mut request = client
@@ -965,7 +979,7 @@ async fn artifact_request(
             data_json::<PaginatedArtifactsResponse>(catalog_request(
                 client,
                 base_url,
-                "artifacts",
+                &["artifacts"],
                 &page,
             )?)
             .await
@@ -2682,7 +2696,7 @@ mod tests {
     use clap::CommandFactory;
 
     #[test]
-    fn checkpoint_branch_cli_exposes_create_status_and_cancel() {
+    fn checkpoint_branch_cli_exposes_bounded_history_create_status_and_cancel() {
         let parsed = Cli::try_parse_from([
             "control",
             "checkpoint",
@@ -2704,6 +2718,20 @@ mod tests {
             );
         }
         assert!(Cli::try_parse_from(["control", "checkpoint", "branch", "create"]).is_err());
+        let parsed = Cli::try_parse_from([
+            "control", "checkpoint", "branch", "list", "--limit", "12", "--cursor", "24",
+        ])
+        .expect("checkpoint branch history command");
+        assert!(matches!(parsed.command, Command::Checkpoint {
+            sub: CheckpointSubcommand::Branch {
+                sub: CheckpointBranchSubcommand::List { page }
+            }
+        } if page.limit == 12 && page.cursor.as_deref() == Some("24")));
+        for limit in ["0", "101"] {
+            assert!(Cli::try_parse_from([
+                "control", "checkpoint", "branch", "list", "--limit", limit,
+            ]).is_err());
+        }
     }
 
     #[test]
@@ -2851,7 +2879,7 @@ mod tests {
         let request = catalog_request(
             &client,
             "http://localhost:4000",
-            "experiments",
+            &["experiments"],
             &CatalogPageArgs {
                 limit: 7,
                 cursor: Some("offset&limit=100".into()),
@@ -2868,6 +2896,18 @@ mod tests {
                 ("cursor".into(), "offset&limit=100".into())
             ]
         );
+        let history = catalog_request(
+            &client,
+            "http://localhost:4000/control/",
+            &["checkpoints", "branches"],
+            &CatalogPageArgs { limit: 12, cursor: Some("24".into()) },
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        assert_eq!(history.method(), reqwest::Method::GET);
+        assert_eq!(history.url().path(), "/control/api/v1/checkpoints/branches");
+        assert_eq!(history.url().query(), Some("limit=12&cursor=24"));
     }
 
     fn experiment_request_fixture() -> Value {
@@ -3581,7 +3621,7 @@ mod tests {
             &server.base_url,
             CheckpointSubcommand::Branch {
                 sub: CheckpointBranchSubcommand::Cancel {
-                    id: created.branch_id,
+                    id: created.branch_id.clone(),
                 },
             },
             None,
@@ -3598,6 +3638,61 @@ mod tests {
             before
         );
         server.stop()?;
+        let mut restarted = LiveDataServer::start(&root.path().join("artifacts"))?;
+        let before_history = restarted
+            .host
+            .as_ref()
+            .unwrap()
+            .port()
+            .scientific_digest_v1()?;
+        let recovered: PaginatedCheckpointBranchesResponse = serde_json::from_value(
+            checkpoint_request(
+                &client,
+                &restarted.base_url,
+                CheckpointSubcommand::Branch {
+                    sub: CheckpointBranchSubcommand::List {
+                        page: CatalogPageArgs { limit: 1, cursor: None },
+                    },
+                },
+                None,
+            )
+            .await?,
+        )?;
+        assert_eq!(recovered.total, 1);
+        assert_eq!(recovered.limit, 1);
+        assert_eq!(recovered.items, vec![completed.clone()]);
+        assert!(!recovered.has_more);
+        assert!(recovered.next_cursor.is_none());
+        let empty = checkpoint_request(
+            &client,
+            &restarted.base_url,
+            CheckpointSubcommand::Branch {
+                sub: CheckpointBranchSubcommand::List {
+                    page: CatalogPageArgs { limit: 1, cursor: Some("1".into()) },
+                },
+            },
+            None,
+        )
+        .await?;
+        assert_eq!(empty["total"], 1);
+        assert_eq!(empty["offset"], 1);
+        assert_eq!(empty["items"], serde_json::json!([]));
+        assert_eq!(empty["has_more"], false);
+        let observed = checkpoint_request(
+            &client,
+            &restarted.base_url,
+            CheckpointSubcommand::Branch {
+                sub: CheckpointBranchSubcommand::Status { id: created.branch_id },
+            },
+            None,
+        )
+        .await?;
+        assert_eq!(observed, serde_json::to_value(&completed)?);
+        assert_eq!(
+            restarted.host.as_ref().unwrap().port().scientific_digest_v1()?,
+            before_history
+        );
+        restarted.stop()?;
         Ok(())
     }
 
