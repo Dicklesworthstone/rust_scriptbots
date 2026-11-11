@@ -3029,6 +3029,11 @@ impl ControlHandle {
         }
     }
 
+    /// Immutable owner identity, available without requesting or advancing a snapshot.
+    pub(crate) fn session_id(&self) -> scriptbots_runtime::HostSessionId {
+        self.host.session_id()
+    }
+
     /// Return a reference to the canonical data services.
     pub fn data_services(&self) -> &std::sync::Arc<DataServices> {
         &self.data_services
@@ -4507,6 +4512,73 @@ impl ControlHandle {
                 ControlError::NotFound(format!("checkpoint branch '{branch_id}' not found"))
             })?
             .status_dto()
+    }
+
+    /// Page the actual artifacts published for one completed checkpoint study.
+    ///
+    /// Publication verifies every branch bundle before exposing its report. An
+    /// unfinished job's files are never inferred from the filesystem. Downloads
+    /// still revalidate the retained file's size, path and checksums independently.
+    pub fn list_checkpoint_branch_artifacts(
+        &self,
+        branch_id: &str,
+        limit: Option<usize>,
+        cursor: Option<&str>,
+    ) -> Result<PaginatedArtifactsResponse, ControlError> {
+        let limit = limit.unwrap_or(20).clamp(1, 100);
+        let offset = cursor.map_or(Ok(0), |value| {
+            value
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| ControlError::BadRequest(format!("invalid cursor: '{value}'")))
+        })?;
+        let status = self.get_checkpoint_branch(branch_id)?;
+        let report_id = status
+            .artifact_id
+            .as_deref()
+            .filter(|_| status.status == "completed")
+            .ok_or_else(|| {
+                ControlError::Conflict(
+                    "checkpoint branch artifacts are available only after verified completion"
+                        .to_owned(),
+                )
+            })?;
+        let prefix = format!("branches/{branch_id}/");
+        let artifacts = self
+            .data_services
+            .artifacts
+            .lock()
+            .map_err(|_| ControlError::Lock)?;
+        let report = artifacts.get(report_id).ok_or_else(|| {
+            ControlError::Conflict("completed checkpoint branch report is unavailable".to_owned())
+        })?;
+        if report.metadata.relative_path != format!("{prefix}study_report.json") {
+            return Err(ControlError::Conflict(
+                "completed checkpoint branch report has a different source identity".to_owned(),
+            ));
+        }
+        let belongs_to_branch = |artifact: &&RetainedArtifact| {
+            artifact.directory == report.directory
+                && artifact.metadata.relative_path.starts_with(&prefix)
+        };
+        let total = artifacts.values().filter(belongs_to_branch).count();
+        let items: Vec<_> = artifacts
+            .values()
+            .filter(belongs_to_branch)
+            .skip(offset)
+            .take(limit)
+            .map(|artifact| artifact.metadata.clone())
+            .collect();
+        let next_offset = offset.saturating_add(items.len());
+        let has_more = next_offset < total;
+        Ok(PaginatedArtifactsResponse {
+            items,
+            total,
+            limit,
+            offset,
+            next_cursor: has_more.then(|| next_offset.to_string()),
+            has_more,
+        })
     }
 
     /// Request cooperative cancellation; completion wins if it was already observed.
@@ -10866,6 +10938,93 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn managed_checkpoint_branch_artifacts_page_verified_files_without_crossing_studies() {
+        let (handle, host, checkpoint, directory) =
+            checkpoint_branch_fixture(Some(crate::BrainPreset::Mlp), 0);
+        let before = host.port.scientific_digest_v1().unwrap();
+        let first = handle
+            .create_checkpoint_branch(checkpoint_branch_request(&checkpoint.checkpoint_id, "first"))
+            .unwrap();
+        let first = wait_for_checkpoint_branch(&handle, &first.branch_id);
+        assert_eq!(first.status, "completed");
+        let second = handle
+            .create_checkpoint_branch(checkpoint_branch_request(&checkpoint.checkpoint_id, "second"))
+            .unwrap();
+        let second = wait_for_checkpoint_branch(&handle, &second.branch_id);
+        assert_eq!(second.status, "completed");
+
+        let prefix = format!("branches/{}/", first.branch_id);
+        let mut cursor = None;
+        let mut ids = std::collections::BTreeSet::new();
+        let mut paths = std::collections::BTreeSet::new();
+        let mut total = None;
+        loop {
+            let page = handle
+                .list_checkpoint_branch_artifacts(&first.branch_id, Some(2), cursor.as_deref())
+                .unwrap();
+            assert_eq!(page.limit, 2);
+            assert_eq!(page.offset, ids.len());
+            assert_eq!(*total.get_or_insert(page.total), page.total);
+            assert!(!page.items.is_empty());
+            for item in page.items {
+                assert!(item.relative_path.starts_with(&prefix));
+                assert!(
+                    ids.insert(item.artifact_id.clone()),
+                    "pagination repeated a file"
+                );
+                paths.insert(item.relative_path.clone());
+                let (download, bytes) = handle.read_artifact_bytes(&item.artifact_id).unwrap();
+                assert_eq!(download.relative_path, item.relative_path);
+                assert_eq!(bytes.len() as u64, item.byte_size);
+                assert_eq!(compute_blake3(&bytes), item.checksum_blake3);
+                assert_eq!(compute_sha256(&bytes), item.checksum_sha256);
+                assert_eq!(fs::read(directory.join(&item.relative_path)).unwrap(), bytes);
+            }
+            if !page.has_more {
+                assert!(page.next_cursor.is_none());
+                break;
+            }
+            assert_eq!(page.next_cursor, Some(ids.len().to_string()));
+            cursor = page.next_cursor;
+        }
+        assert_eq!(ids.len(), total.unwrap());
+        assert!(ids.contains(first.artifact_id.as_ref().unwrap()));
+        assert!(!ids.contains(second.artifact_id.as_ref().unwrap()));
+        assert!(!ids.contains(&checkpoint.checkpoint_id));
+        for filename in [
+            "study_plan.json",
+            "study_source.json",
+            "study_summary.md",
+            "study_report.json",
+            "source_checkpoint.bin",
+            "bundle_control/bundle_manifest.json",
+        ] {
+            assert!(paths.contains(&format!("{prefix}{filename}")), "{filename}");
+        }
+        let beyond = handle
+            .list_checkpoint_branch_artifacts(&first.branch_id, Some(1000), Some("999999"))
+            .unwrap();
+        assert_eq!(beyond.limit, 100);
+        assert!(beyond.items.is_empty());
+        assert!(!beyond.has_more);
+        assert!(beyond.next_cursor.is_none());
+        assert!(matches!(
+            handle.list_checkpoint_branch_artifacts(&first.branch_id, None, Some("invalid")),
+            Err(ControlError::BadRequest(_))
+        ));
+        assert!(matches!(
+            handle.list_checkpoint_branch_artifacts("unknown", None, None),
+            Err(ControlError::NotFound(_))
+        ));
+        assert!(matches!(
+            handle.list_checkpoint_branch_artifacts("../escape", None, None),
+            Err(ControlError::BadRequest(_))
+        ));
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        handle.data_services.shutdown_experiments().unwrap();
+    }
+
+    #[test]
     fn managed_checkpoint_branch_refuses_invalid_inputs_corrupt_sources_and_capacity_before_admission()
      {
         let (handle, host, checkpoint, directory) =
@@ -11014,6 +11173,10 @@ pub(crate) mod tests {
                 ));
                 if terminal.status == "cancelled" {
                     assert!(terminal.artifact_id.is_none());
+                    assert!(matches!(
+                        handle.list_checkpoint_branch_artifacts(&admitted.branch_id, None, None),
+                        Err(ControlError::Conflict(_))
+                    ));
                 }
                 assert_eq!(
                     handle

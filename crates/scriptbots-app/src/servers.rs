@@ -82,6 +82,7 @@ const CONTROL_RUNTIME_THREAD_STACK_BYTES: usize = 32 * 1024 * 1024;
 const WS_CONTROL_PROTOCOL_VERSION: u16 = 1;
 const MAX_WS_CONTROL_MESSAGE_BYTES: usize = REMOTE_MAX_REQUEST_BYTES;
 const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const LAB_SESSION_HEADER: &str = "x-scriptbots-session";
 
 /// Return the control CLI's default REST base URL from the server's socket authority.
 #[must_use]
@@ -536,7 +537,7 @@ async fn enforce_control_http_policy(
                 headers.split(',').all(|name| {
                     matches!(
                         name.trim().to_ascii_lowercase().as_str(),
-                        "accept" | "content-type" | "mcp-protocol-version"
+                        "accept" | "content-type" | "mcp-protocol-version" | LAB_SESSION_HEADER
                     )
                 })
             }),
@@ -559,7 +560,9 @@ async fn enforce_control_http_policy(
         );
         response.headers_mut().insert(
             axum::http::header::ACCESS_CONTROL_ALLOW_HEADERS,
-            axum::http::HeaderValue::from_static("Accept, Content-Type, Mcp-Protocol-Version"),
+            axum::http::HeaderValue::from_static(
+                "Accept, Content-Type, Mcp-Protocol-Version, X-ScriptBots-Session",
+            ),
         );
         response
     } else {
@@ -575,6 +578,52 @@ async fn enforce_control_http_policy(
         );
     }
     response
+}
+
+/// Bind browser lab requests to the immutable owner negotiated by their stream.
+/// Missing headers retain the existing CLI contract; an explicit expectation is
+/// never silently ignored, and no owner request or artifact access precedes it.
+fn require_lab_session(
+    headers: &HeaderMap,
+    session: scriptbots_runtime::HostSessionId,
+) -> Result<(), AppError> {
+    let mut values = headers.get_all(LAB_SESSION_HEADER).iter();
+    let Some(value) = values.next() else {
+        return Ok(());
+    };
+    if values.next().is_some() {
+        return Err(AppError::bad_request(
+            "X-ScriptBots-Session accepts exactly one session identity",
+        ));
+    }
+    let expected = value
+        .to_str()
+        .ok()
+        .and_then(|text| {
+            text.parse::<u64>()
+                .ok()
+                .filter(|value| value.to_string() == text)
+        })
+        .ok_or_else(|| {
+            AppError::bad_request("X-ScriptBots-Session must be a canonical u64 decimal string")
+        })?;
+    if expected != session.get() {
+        return Err(AppError::conflict(
+            "lab host session changed; reconnect to the intended owner before retrying",
+        ));
+    }
+    Ok(())
+}
+
+async fn enforce_lab_session(
+    State(session): State<scriptbots_runtime::HostSessionId>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if let Err(error) = require_lab_session(request.headers(), session) {
+        return error.into_response();
+    }
+    next.run(request).await
 }
 
 fn read_control_environment(name: &str, errors: &mut Vec<String>) -> Option<String> {
@@ -1568,6 +1617,7 @@ pub struct SpeedRequestBody {
         get_v1_checkpoint_by_id,
         post_v1_checkpoint_branches,
         get_v1_checkpoint_branch,
+        get_v1_checkpoint_branch_artifacts,
         post_v1_checkpoint_branch_cancel,
         get_v1_artifacts,
         get_v1_artifact_by_id,
@@ -1632,7 +1682,7 @@ pub struct SpeedRequestBody {
             PaginatedArtifactsResponse
         )
     ),
-    info(title = "ScriptBots Control API", version = "0.0.0", description = "HTTP requests require the bound listener's IP/localhost authority or SCRIPTBOTS_CONTROL_ALLOWED_AUTHORITIES. Browser Origin must match a configured authority or SCRIPTBOTS_CONTROL_ALLOWED_ORIGINS. CLI clients may omit Origin. Forwarded headers are refused; this targeting policy does not authenticate callers."),
+    info(title = "ScriptBots Control API", version = "0.0.0", description = "HTTP requests require the bound listener's IP/localhost authority or SCRIPTBOTS_CONTROL_ALLOWED_AUTHORITIES. Browser Origin must match a configured authority or SCRIPTBOTS_CONTROL_ALLOWED_ORIGINS. CLI clients may omit Origin. Checkpoint and artifact routes accept an optional X-ScriptBots-Session header containing the exact canonical decimal host session negotiated by the remote stream; mismatches are refused before any action. Forwarded headers are refused; this targeting policy does not authenticate callers."),
     tags(
         (name = "control", description = "Runtime configuration controls"),
         (name = "map", description = "Procedural map generation and application controls"),
@@ -4264,6 +4314,38 @@ async fn get_v1_checkpoint_branch(
 }
 
 #[utoipa::path(
+    get,
+    path = "/api/v1/checkpoints/branches/{branch_id}/artifacts",
+    tag = "checkpoints",
+    params(
+        ("branch_id" = String, Path, description = "Completed managed checkpoint branch job"),
+        PaginationQueryParams,
+        ("X-ScriptBots-Session" = Option<String>, Header, description = "Exact canonical decimal host session negotiated by the remote stream")
+    ),
+    responses(
+        (status = 200, body = PaginatedArtifactsResponse, description = "Actual retained study files published after every branch bundle verifies"),
+        (status = 400, body = ErrorResponse),
+        (status = 404, body = ErrorResponse, description = "Branch job not found"),
+        (status = 409, body = ErrorResponse, description = "Branch is not complete or the requested host session changed")
+    )
+)]
+async fn get_v1_checkpoint_branch_artifacts(
+    State(state): State<ApiState>,
+    axum::extract::Path(branch_id): axum::extract::Path<String>,
+    axum::extract::Query(params): axum::extract::Query<PaginationQueryParams>,
+) -> Result<Json<PaginatedArtifactsResponse>, AppError> {
+    let artifacts = run_control(move || {
+        state.handle.list_checkpoint_branch_artifacts(
+            &branch_id,
+            params.limit,
+            params.cursor.as_deref(),
+        )
+    })
+    .await?;
+    Ok(Json(artifacts))
+}
+
+#[utoipa::path(
     post,
     path = "/api/v1/checkpoints/branches/{branch_id}/cancel",
     tag = "checkpoints",
@@ -4357,6 +4439,46 @@ fn prepare_rest_server(
     let mut openapi = ApiDoc::openapi();
     openapi.info.version = env!("CARGO_PKG_VERSION").to_string();
 
+    let checkpoint_router = Router::new()
+        .route(
+            "/api/v1/checkpoints",
+            post(post_v1_checkpoints).get(get_v1_checkpoints),
+        )
+        .route(
+            "/api/v1/checkpoints/{checkpoint_id}",
+            get(get_v1_checkpoint_by_id),
+        )
+        .route(
+            "/api/v1/checkpoints/branches",
+            post(post_v1_checkpoint_branches)
+                .layer(DefaultBodyLimit::max(MAX_CHECKPOINT_BRANCH_REQUEST_BYTES)),
+        )
+        .route(
+            "/api/v1/checkpoints/branches/{branch_id}",
+            get(get_v1_checkpoint_branch),
+        )
+        .route(
+            "/api/v1/checkpoints/branches/{branch_id}/artifacts",
+            get(get_v1_checkpoint_branch_artifacts),
+        )
+        .route(
+            "/api/v1/checkpoints/branches/{branch_id}/cancel",
+            post(post_v1_checkpoint_branch_cancel),
+        )
+        .route("/api/v1/artifacts", get(get_v1_artifacts))
+        .route(
+            "/api/v1/artifacts/{artifact_id}",
+            get(get_v1_artifact_by_id),
+        )
+        .route(
+            "/api/v1/artifacts/{artifact_id}/download",
+            get(get_v1_artifact_download),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            state.handle.session_id(),
+            enforce_lab_session,
+        ));
+
     let api_router = Router::new()
         .route("/api/knobs", get(get_knobs))
         .route("/api/config", get(get_config).patch(patch_config))
@@ -4446,38 +4568,7 @@ fn prepare_rest_server(
             "/api/v1/experiments/{experiment_id}/resume",
             post(post_v1_experiment_resume),
         )
-        // Checkpoints lifecycle
-        .route(
-            "/api/v1/checkpoints",
-            post(post_v1_checkpoints).get(get_v1_checkpoints),
-        )
-        .route(
-            "/api/v1/checkpoints/{checkpoint_id}",
-            get(get_v1_checkpoint_by_id),
-        )
-        .route(
-            "/api/v1/checkpoints/branches",
-            post(post_v1_checkpoint_branches)
-                .layer(DefaultBodyLimit::max(MAX_CHECKPOINT_BRANCH_REQUEST_BYTES)),
-        )
-        .route(
-            "/api/v1/checkpoints/branches/{branch_id}",
-            get(get_v1_checkpoint_branch),
-        )
-        .route(
-            "/api/v1/checkpoints/branches/{branch_id}/cancel",
-            post(post_v1_checkpoint_branch_cancel),
-        )
-        // Artifacts discovery and download
-        .route("/api/v1/artifacts", get(get_v1_artifacts))
-        .route(
-            "/api/v1/artifacts/{artifact_id}",
-            get(get_v1_artifact_by_id),
-        )
-        .route(
-            "/api/v1/artifacts/{artifact_id}/download",
-            get(get_v1_artifact_download),
-        )
+        .merge(checkpoint_router)
         .with_state(state);
 
     let swagger_router: Router<_> = SwaggerUi::new(config.swagger_path.clone())
@@ -6786,6 +6877,191 @@ mod tests {
     }
 
     #[test]
+    fn lab_session_header_requires_one_exact_canonical_owner_identity() {
+        let session = scriptbots_runtime::HostSessionId::new(u64::MAX);
+        let mut headers = HeaderMap::new();
+        require_lab_session(&headers, session).expect("CLI without an expected session");
+        headers.insert(LAB_SESSION_HEADER, u64::MAX.to_string().parse().unwrap());
+        require_lab_session(&headers, session).expect("exact full-width identity");
+        headers.insert(LAB_SESSION_HEADER, "0".parse().unwrap());
+        assert_eq!(
+            require_lab_session(&headers, session).unwrap_err().status,
+            StatusCode::CONFLICT
+        );
+        require_lab_session(&headers, scriptbots_runtime::HostSessionId::new(0))
+            .expect("zero has one canonical representation");
+        for value in [
+            "",
+            "01",
+            "+1",
+            "-1",
+            "1.0",
+            "1e3",
+            "1,1",
+            " 1",
+            "1 ",
+            "18446744073709551616",
+        ] {
+            headers.insert(LAB_SESSION_HEADER, value.parse().unwrap());
+            assert_eq!(
+                require_lab_session(&headers, session).unwrap_err().status,
+                StatusCode::BAD_REQUEST,
+                "{value:?}"
+            );
+        }
+        headers.insert(LAB_SESSION_HEADER, u64::MAX.to_string().parse().unwrap());
+        headers.append(LAB_SESSION_HEADER, u64::MAX.to_string().parse().unwrap());
+        assert_eq!(
+            require_lab_session(&headers, session).unwrap_err().status,
+            StatusCode::BAD_REQUEST,
+            "repeated headers cannot select an arbitrary owner"
+        );
+        headers.insert(
+            LAB_SESSION_HEADER,
+            axum::http::HeaderValue::from_bytes(&[0xff]).unwrap(),
+        );
+        assert_eq!(
+            require_lab_session(&headers, session).unwrap_err().status,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one real HTTP listener proves all guarded routes, browser preflight and no-admission state"
+    )]
+    async fn lab_http_session_guard_precedes_checkpoint_branch_and_artifact_actions() {
+        let owner = test_host();
+        let before = owner.port.scientific_digest_v1().unwrap();
+        let browser_origin = "https://checkpoint-lab.example";
+        let reservation = ControlServerReservation::prepare(ControlServerConfig {
+            rest_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            mcp_transport: McpTransportConfig::Disabled,
+            allowed_origins: vec![browser_origin.to_owned()],
+            ..ControlServerConfig::default()
+        })
+        .unwrap();
+        let address = reservation.rest_address().unwrap();
+        let (server, _) = reservation.launch(owner.port.clone(), false).unwrap();
+        let handle = server.control_handle().unwrap();
+        let session = handle.session_id().get().to_string();
+        let stale = handle.session_id().get().wrapping_add(1).to_string();
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        for (method, path) in [
+            (reqwest::Method::POST, "/api/v1/checkpoints"),
+            (reqwest::Method::GET, "/api/v1/checkpoints"),
+            (reqwest::Method::GET, "/api/v1/checkpoints/missing"),
+            (reqwest::Method::POST, "/api/v1/checkpoints/branches"),
+            (reqwest::Method::GET, "/api/v1/checkpoints/branches/missing"),
+            (
+                reqwest::Method::POST,
+                "/api/v1/checkpoints/branches/missing/cancel",
+            ),
+            (
+                reqwest::Method::GET,
+                "/api/v1/checkpoints/branches/missing/artifacts",
+            ),
+            (reqwest::Method::GET, "/api/v1/artifacts"),
+            (reqwest::Method::GET, "/api/v1/artifacts/missing"),
+            (reqwest::Method::GET, "/api/v1/artifacts/missing/download"),
+        ] {
+            let response = client
+                .request(method, format!("http://{address}{path}"))
+                .header(LAB_SESSION_HEADER, &stale)
+                .header("Origin", browser_origin)
+                .json(&json!({}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), 409, "{path}");
+            let error: Value = response.json().await.unwrap();
+            assert!(
+                error["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("host session changed")
+            );
+        }
+        assert_eq!(handle.list_checkpoints(None, None).unwrap().total, 0);
+        assert_eq!(handle.list_artifacts(None, None).unwrap().total, 0);
+        assert_eq!(owner.port.scientific_digest_v1().unwrap(), before);
+
+        let url = format!("http://{address}/api/v1/checkpoints");
+        let preflight = client
+            .request(reqwest::Method::OPTIONS, &url)
+            .header("Origin", browser_origin)
+            .header("Access-Control-Request-Method", "POST")
+            .header(
+                "Access-Control-Request-Headers",
+                "content-type, x-scriptbots-session",
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(preflight.status().as_u16(), 204);
+        assert_eq!(
+            preflight.headers()["Access-Control-Allow-Origin"],
+            browser_origin
+        );
+        assert!(
+            preflight.headers()["Access-Control-Allow-Headers"]
+                .to_str()
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains(LAB_SESSION_HEADER)
+        );
+        let rejected_preflight = client
+            .request(reqwest::Method::OPTIONS, &url)
+            .header("Origin", browser_origin)
+            .header("Access-Control-Request-Method", "POST")
+            .header(
+                "Access-Control-Request-Headers",
+                "x-scriptbots-session, x-unconfigured-lab-header",
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rejected_preflight.status().as_u16(), 403);
+        for expected_session in [None, Some(session.as_str())] {
+            let mut request = client.get(&url);
+            if let Some(value) = expected_session {
+                request = request.header(LAB_SESSION_HEADER, value);
+            }
+            assert_eq!(request.send().await.unwrap().status().as_u16(), 200);
+        }
+        let malformed = client
+            .post(&url)
+            .header(LAB_SESSION_HEADER, "01")
+            .json(&json!({"idempotency_key": "session-negative"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(malformed.status().as_u16(), 400);
+        assert_eq!(handle.list_checkpoints(None, None).unwrap().total, 0);
+        let accepted = client
+            .post(&url)
+            .header(LAB_SESSION_HEADER, &session)
+            .header("Origin", browser_origin)
+            .json(&json!({"idempotency_key": "session-positive"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(accepted.status().as_u16(), 201);
+        let saved: CheckpointMetadataDto = accepted.json().await.unwrap();
+        assert_eq!(handle.list_checkpoints(None, None).unwrap().total, 1);
+        assert_eq!(
+            handle.get_checkpoint(&saved.checkpoint_id).unwrap().tick,
+            saved.tick
+        );
+        assert_eq!(handle.status().unwrap().tick, 0);
+        server.shutdown().unwrap();
+    }
+
+    #[test]
     fn wildcard_and_malformed_targeting_configuration_refuse_before_reservation() {
         let config = ControlServerConfig {
             rest_address: "0.0.0.0:0".parse().expect("wildcard socket"),
@@ -8259,6 +8535,7 @@ mod tests {
         for (path, method) in [
             ("/api/v1/checkpoints/branches/{branch_id}", "get"),
             ("/api/v1/checkpoints/branches/{branch_id}/cancel", "post"),
+            ("/api/v1/checkpoints/branches/{branch_id}/artifacts", "get"),
         ] {
             assert!(openapi["paths"][path][method].is_object());
         }
@@ -8296,6 +8573,27 @@ mod tests {
             .get_artifact(completed.artifact_id.as_ref().unwrap())
             .unwrap();
         assert!(artifact.byte_size > 0);
+        let Json(inventory) = get_v1_checkpoint_branch_artifacts(
+            State(state.clone()),
+            axum::extract::Path(created.branch_id.clone()),
+            axum::extract::Query(PaginationQueryParams {
+                limit: Some(100),
+                cursor: None,
+            }),
+        )
+        .await
+        .expect("completed study exposes its actual artifact inventory");
+        assert!(!inventory.has_more);
+        assert!(
+            inventory
+                .items
+                .iter()
+                .any(|item| item.artifact_id == artifact.artifact_id)
+        );
+        assert!(inventory.items.iter().all(|item| {
+            item.relative_path
+                .starts_with(&format!("branches/{}/", created.branch_id))
+        }));
         for name in ["checkpoint_branch_status", "checkpoint_branch_cancel"] {
             let observed = map_policy_mcp_request(
                 &mcp,
