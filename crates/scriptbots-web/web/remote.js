@@ -418,6 +418,11 @@ export class RemoteStreamClient {
       { signal, query: labPageQuery(cursor, limit) });
   }
 
+  async listCheckpointBranches({ sessionId, cursor = null, limit = 12, signal } = {}) {
+    return this.labJson("/api/v1/checkpoints/branches", sessionId, 128 * 1024,
+      { signal, query: labPageQuery(cursor, limit) });
+  }
+
   async saveCheckpoint({ sessionId, description, idempotency_key }, { signal } = {}) {
     if (typeof idempotency_key !== "string" || !idempotency_key.trim() || encoder.encode(idempotency_key).length > 1024
         || (description != null && (typeof description !== "string" || encoder.encode(description).length > 4096))) {
@@ -455,13 +460,16 @@ export class RemoteStreamClient {
   }
 
   /** Download only an actual catalog entry, preserving its filename and verifying byte integrity. */
-  async downloadArtifact(artifactId, { sessionId, signal, expected = null } = {}) {
+  async downloadArtifact(artifactId, { sessionId, signal, expected = null, maxBytes = MAX_LAB_ARTIFACT_BYTES } = {}) {
     labIdentifier(artifactId);
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > MAX_LAB_ARTIFACT_BYTES) {
+      throw new Error("Invalid bounded artifact download size");
+    }
     const generation = this.generation;
     const metadata = await this.labJson(`/api/v1/artifacts/${artifactId}`, sessionId, 16 * 1024, { signal });
     validateLabArtifact(metadata);
-    if (metadata.byte_size > MAX_LAB_ARTIFACT_BYTES) {
-      throw new Error("Artifact exceeds the 64 MiB browser download limit; the saved source remains available for server studies");
+    if (metadata.byte_size > maxBytes) {
+      throw new Error(`Artifact exceeds the ${maxBytes} byte browser download limit; the saved source remains available for server studies`);
     }
     if (metadata.artifact_id !== artifactId || (expected && (
       (expected.artifact_id ?? expected.checkpoint_id) !== artifactId

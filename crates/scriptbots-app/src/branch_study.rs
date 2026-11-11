@@ -1119,6 +1119,13 @@ pub fn compute_paired_effect(
     Ok(effect)
 }
 
+/// Small populations still need at least four fifths of their baseline.
+/// Subtracting floor(baseline / 5) computes the ceiling without float rounding
+/// or an overflowing multiplication. A zero baseline needs one living agent.
+fn recovery_population_target(baseline: usize) -> usize {
+    (baseline - baseline / 5).max(1)
+}
+
 fn describe_paired_effect(
     control: &[f64],
     branch: &[f64],
@@ -1921,9 +1928,8 @@ impl BranchStudyOrchestrator {
         };
 
         // Recovery assessment.
-        #[allow(clippy::cast_precision_loss)]
-        let target_recovery_pop = (0.8 * pre_intervention_pop as f64).round() as usize;
-        let recovered = final_pop >= target_recovery_pop.max(1);
+        let target_recovery_pop = recovery_population_target(pre_intervention_pop);
+        let recovered = final_pop >= target_recovery_pop;
         #[allow(clippy::cast_precision_loss)]
         let recovery_ratio = final_pop as f64 / (pre_intervention_pop.max(1) as f64);
 
@@ -2737,6 +2743,38 @@ fn replicated_summary(report: &ReplicatedBranchStudyReport) -> String {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn population_recovery_requires_at_least_four_fifths_and_one_living_agent() {
+        for (baseline, expected) in [
+            (0, 1),
+            (1, 1),
+            (2, 2),
+            (3, 3),
+            (4, 4),
+            (5, 4),
+            (6, 5),
+            (10, 8),
+            (15, 12),
+            (100, 80),
+            (101, 81),
+        ] {
+            assert_eq!(recovery_population_target(baseline), expected);
+        }
+        let three_agent_target = recovery_population_target(3);
+        assert!(2 < three_agent_target, "two of three agents is below 80%");
+        assert!(3 >= three_agent_target, "three of three agents recovers");
+        assert!(
+            0 < recovery_population_target(0),
+            "an empty later tick is not recovery"
+        );
+
+        for baseline in [usize::MAX - 4, usize::MAX] {
+            let exact =
+                usize::try_from((u128::try_from(baseline).unwrap() * 4).div_ceil(5)).unwrap();
+            assert_eq!(recovery_population_target(baseline), exact);
+        }
+    }
 
     fn world_at_checkpoint(plan: &BranchStudyPlan) -> WorldState {
         let mut config = plan.config.clone();

@@ -2,6 +2,7 @@
 // A saved scientific cut is neither a browser continuation nor a new live owner.
 import { exactIdentity } from "./inspector.js";
 import { interventionRequestId, validateInterventionAction } from "./interventions.js";
+import { MAX_STUDY_REPORT_BYTES, parseSavedStudyReport } from "./study-report.js";
 
 export const CHECKPOINT_LAB_PAGE_SIZE = 12;
 export const MAX_LAB_ARTIFACT_BYTES = 64 * 1024 * 1024;
@@ -51,7 +52,7 @@ function sameCheckpoint(left, right) {
     .every((key) => left[key] === right[key]);
 }
 
-function validatePage(page, cursor, validateItem) {
+function validatePage(page, cursor, validateItem, identityKey) {
   const offset = cursor === null ? 0 : Number(cursor);
   if (!object(page) || !Array.isArray(page.items) || page.items.length > CHECKPOINT_LAB_PAGE_SIZE
       || page.limit !== CHECKPOINT_LAB_PAGE_SIZE || !integer(page.total) || !integer(page.offset)
@@ -65,7 +66,7 @@ function validatePage(page, cursor, validateItem) {
   const ids = new Set();
   for (const row of page.items) {
     validateItem(row);
-    const id = row.checkpoint_id ?? row.artifact_id;
+    const id = row[identityKey];
     if (ids.has(id)) throw new Error("The catalog repeats an artifact identity");
     ids.add(id);
   }
@@ -73,7 +74,7 @@ function validatePage(page, cursor, validateItem) {
 }
 
 export function validateLabCheckpointPage(page, cursor = null) {
-  validatePage(page, cursor, validateLabCheckpoint);
+  validatePage(page, cursor, validateLabCheckpoint, "checkpoint_id");
   const retention = page.retention;
   if (!object(retention) || !["max_count", "max_bytes", "file_count", "file_bytes"]
     .every((key) => integer(retention[key]))) throw new Error("Checkpoint retention usage is unavailable or inexact");
@@ -105,24 +106,43 @@ export function validateLabIntervention(value) {
   return value;
 }
 
-/** Reject changed source identities, impossible tick bounds and lifecycle regressions. */
-export function validateLabBranchStatus(value, request, checkpoint, previous = null) {
-  if (!object(value) || !identifier(value.branch_id) || value.checkpoint_id !== request.checkpoint_id
-      || value.branch_name !== request.branch_name || !["running", "cancelling", ...TERMINAL].includes(value.status)
-      || value.source_tick !== checkpoint.tick || !integer(value.target_tick)
-      || value.target_tick !== checkpoint.tick + request.ticks
-      || value.world_digest_v1 !== checkpoint.world_digest_v1
+/** A retained receipt describes observed science without reconstructing its request. */
+export function validateLabBranchObservation(value, previous = null) {
+  if (!object(value) || !identifier(value.branch_id) || !identifier(value.checkpoint_id)
+      || !text(value.branch_name, 64) || !/^[A-Za-z0-9_-]{1,64}$/.test(value.branch_name)
+      || !["running", "cancelling", ...TERMINAL].includes(value.status)
+      || !integer(value.source_tick) || !integer(value.target_tick)
+      || !integer(value.target_tick - value.source_tick, 1, MAX_BRANCH_TICKS)
+      || !digest(value.world_digest_v1)
       || (value.error_reason != null && !text(value.error_reason, 4096))
       || (value.status === "completed" ? !identifier(value.artifact_id) || value.error_reason != null : value.artifact_id != null)) {
-    throw new Error("The study observation does not match its saved source and requested future");
+    throw new Error("The host returned invalid or inexact retained study metadata");
   }
-  if (previous && (value.branch_id !== previous.branch_id
-      || (TERMINAL.has(previous.status) && value.status !== previous.status)
+  if (previous && ["branch_id", "checkpoint_id", "branch_name", "source_tick", "target_tick", "world_digest_v1"]
+    .some((key) => value[key] !== previous[key])) {
+    throw new Error("The study observation does not match its retained source identity");
+  }
+  if (previous && ((TERMINAL.has(previous.status) && value.status !== previous.status)
       || (previous.status === "cancelling" && value.status === "running")
       || (previous.artifact_id != null && value.artifact_id !== previous.artifact_id))) {
     throw new Error("The study lifecycle regressed or changed its identity");
   }
   return value;
+}
+
+/** Reject changed source identities and bounds for a request made by this browser. */
+export function validateLabBranchStatus(value, request, checkpoint, previous = null) {
+  validateLabBranchObservation(value, previous);
+  if (value.checkpoint_id !== request.checkpoint_id || value.branch_name !== request.branch_name
+      || value.source_tick !== checkpoint.tick || value.target_tick !== checkpoint.tick + request.ticks
+      || value.world_digest_v1 !== checkpoint.world_digest_v1) {
+    throw new Error("The study observation does not match its saved source and requested future");
+  }
+  return value;
+}
+
+export function validateLabBranchPage(page, cursor = null) {
+  return validatePage(page, cursor, validateLabBranchObservation, "branch_id");
 }
 
 /** Catalog data supplies the identity and filename; no download URL comes from a report. */
@@ -142,17 +162,29 @@ export function validateLabArtifact(value, branchId = null) {
 
 export function validateLabArtifactPage(page, branchId, cursor = null) {
   if (!identifier(branchId)) throw new Error("Invalid study identity");
-  return validatePage(page, cursor, (row) => validateLabArtifact(row, branchId));
+  return validatePage(page, cursor, (row) => validateLabArtifact(row, branchId), "artifact_id");
+}
+
+function validateDownload(result, artifactId, expected, branchId) {
+  validateLabArtifact(result?.metadata, branchId);
+  const metadata = result.metadata;
+  if (metadata.artifact_id !== artifactId || !(result.blob instanceof Blob)
+      || result.blob.size !== metadata.byte_size || result.filename !== metadata.filename
+      || (expected && ["byte_size", "checksum_blake3", "checksum_sha256"].some((key) => metadata[key] !== expected[key]))) {
+    throw new Error("Downloaded artifact does not match the selected verified metadata");
+  }
+  return result;
 }
 
 /** One bounded request slot, with explicit retries for potentially admitted mutations. */
 export class CheckpointLabController {
-  constructor({ list, save, launch, status, cancel, artifacts, download, onChange = () => {},
-    id = interventionRequestId, now = () => performance.now() }) {
-    this.services = { list, save, launch, status, cancel, artifacts, download };
+  constructor({ list, listStudies, save, launch, status, cancel, artifacts, download, onChange = () => {},
+    id = interventionRequestId, now = () => performance.now(), parseReport = parseSavedStudyReport }) {
+    this.services = { list, listStudies, save, launch, status, cancel, artifacts, download };
     this.onChange = onChange;
     this.id = id;
     this.now = now;
+    this.parseReport = parseReport;
     this.enabled = false;
     this.source = null;
     this.generation = 0;
@@ -169,11 +201,15 @@ export class CheckpointLabController {
     this.saveState = "idle";
     this.branch = null;
     this.branchState = "idle";
+    this.historyPage = null;
+    this.historyCursor = null;
+    this.reportModel = null;
     this.artifactsPage = null;
     this.artifactCursor = null;
     this.selectedArtifact = null;
     this.lastPageRead = -Infinity;
     this.lastBranchRead = -Infinity;
+    this.lastHistoryRead = -Infinity;
     this.lastArtifactRead = -Infinity;
     this.notice = null;
   }
@@ -181,6 +217,7 @@ export class CheckpointLabController {
   get busy() { return this.operation !== null; }
   get canOperate() { return this.enabled && this.source !== null && !this.busy; }
   get canSave() { return this.canOperate && this.saveState !== "unconfirmed"; }
+  get canSelectStudy() { return this.canOperate && this.branchState !== "unconfirmed"; }
   get canLaunch() { return this.canOperate && this.selected !== null
     && (!this.branch || this.branchState === "refused" || TERMINAL.has(this.branch.status?.status)); }
 
@@ -257,7 +294,10 @@ export class CheckpointLabController {
       if (this.now() - this.lastBranchRead >= POLL_MS) void this.refreshBranch();
     } else if (this.branch?.status?.status === "completed" && !this.artifactsPage) {
       if (this.now() - this.lastArtifactRead >= POLL_MS) void this.refreshArtifacts();
-    } else if (!this.page && this.now() - this.lastPageRead >= POLL_MS) void this.refresh();
+    } else if (!this.page && this.now() - this.lastPageRead >= POLL_MS) {
+      void this.refresh();
+    } else if (!this.historyPage && typeof this.services.listStudies === "function"
+        && this.now() - this.lastHistoryRead >= POLL_MS) void this.refreshHistory();
   }
 
   refresh(force = false) {
@@ -295,6 +335,75 @@ export class CheckpointLabController {
     if (!selected) return;
     this.selected = copy(selected);
     this.emit();
+  }
+
+  checkStudySource(value) {
+    for (const source of [this.selected, this.saveReceipt, this.branch?.checkpoint, ...(this.page?.items ?? [])]) {
+      if (source?.checkpoint_id === value.checkpoint_id
+          && (source.tick !== value.source_tick || source.world_digest_v1 !== value.world_digest_v1)) {
+        throw new Error("The retained study does not match the known saved checkpoint identity");
+      }
+    }
+  }
+
+  refreshHistory(force = false) {
+    if (!this.canOperate || typeof this.services.listStudies !== "function"
+        || (!force && this.now() - this.lastHistoryRead < POLL_MS)) return Promise.resolve(null);
+    this.lastHistoryRead = this.now();
+    const request = { sessionId: this.source.sessionId, cursor: this.historyCursor, limit: CHECKPOINT_LAB_PAGE_SIZE };
+    return this.run("Study history unavailable", (signal) => this.services.listStudies(request, signal), (page) => {
+      validateLabBranchPage(page, request.cursor);
+      for (const row of page.items) {
+        this.checkStudySource(row);
+        const previous = row.branch_id === this.branch?.status?.branch_id ? this.branch.status
+          : this.historyPage?.items.find((item) => item.branch_id === row.branch_id);
+        if (previous) validateLabBranchObservation(row, previous);
+      }
+      this.historyPage = copy(page);
+      const current = page.items.find((row) => row.branch_id === this.branch?.status?.branch_id);
+      if (current) this.acceptStatus(current, this.branch);
+    });
+  }
+
+  firstHistoryPage() {
+    if (!this.canOperate) return Promise.resolve(null);
+    this.historyCursor = null;
+    this.historyPage = null;
+    return this.refreshHistory(true);
+  }
+
+  nextHistoryPage() {
+    if (!this.canOperate || !this.historyPage?.next_cursor) return Promise.resolve(null);
+    this.historyCursor = this.historyPage.next_cursor;
+    this.historyPage = null;
+    return this.refreshHistory(true);
+  }
+
+  selectStudy(branchId) {
+    if (!this.canSelectStudy) {
+      if (this.canOperate && this.branchState === "unconfirmed") {
+        this.notice = "Study admission remains unconfirmed. Retry the unchanged request before selecting another study.";
+        this.emit();
+      }
+      return Promise.resolve(null);
+    }
+    const receipt = this.branch?.status?.branch_id === branchId ? this.branch.status
+      : this.historyPage?.items.find((row) => row.branch_id === branchId) ?? null;
+    if (!receipt) return Promise.resolve(null);
+    const observed = copy(receipt);
+    const request = { sessionId: this.source.sessionId, branchId: observed.branch_id };
+    return this.run("Retained study unavailable", (signal) => this.services.status(request, signal), (value) => {
+      validateLabBranchObservation(value, observed);
+      this.checkStudySource(value);
+      const branch = { request: null, checkpoint: null, status: observed, origin: "history" };
+      this.acceptStatus(value, branch);
+      this.branch = branch;
+      this.reportModel = null;
+      this.artifactsPage = null;
+      this.selectedArtifact = null;
+      this.artifactCursor = null;
+      this.lastArtifactRead = -Infinity;
+    });
   }
 
   save() {
@@ -344,6 +453,7 @@ export class CheckpointLabController {
       const request = copy({ sessionId: this.source.sessionId, checkpoint_id: this.selected.checkpoint_id,
         branch_name: branchName, ticks, intervention, idempotency_key: key });
       this.branch = { request, checkpoint: this.selected, status: null };
+      this.reportModel = null;
       this.artifactsPage = null;
       this.selectedArtifact = null;
       this.artifactCursor = null;
@@ -352,11 +462,12 @@ export class CheckpointLabController {
   }
 
   retryLaunch() {
-    if (!this.canOperate || this.branchState !== "unconfirmed" || this.branch?.request.sessionId !== this.source.sessionId) return Promise.resolve(null);
+    if (!this.canOperate || this.branchState !== "unconfirmed" || this.branch?.request?.sessionId !== this.source.sessionId) return Promise.resolve(null);
     return this.submitBranch();
   }
 
   submitBranch() {
+    if (!this.canOperate || !this.branch?.request || !this.branch.checkpoint) return Promise.resolve(null);
     const branch = this.branch;
     const priorUncertainty = this.branchState === "unconfirmed";
     this.branchState = "pending";
@@ -371,13 +482,15 @@ export class CheckpointLabController {
   }
 
   acceptStatus(value, branch) {
-    validateLabBranchStatus(value, branch.request, branch.checkpoint, branch.status);
+    if (branch.request && branch.checkpoint) validateLabBranchStatus(value, branch.request, branch.checkpoint, branch.status);
+    else if (branch.origin === "history" && branch.status) validateLabBranchObservation(value, branch.status);
+    else throw new Error("A study requires its submitted request or an observed retained identity");
     branch.status = copy(value);
     this.branchState = "observed";
     this.lastBranchRead = this.now();
     this.notice = value.status === "completed"
       ? "Study completed. Its report and retained branch artifacts are available after server integrity verification."
-      : value.status === "stopped" ? "The study stopped after a host interruption and will not rerun automatically. Start a new study explicitly to run this saved source again."
+      : value.status === "stopped" ? "The study stopped after a host interruption and will not rerun automatically. Choose a retained checkpoint and start a new study explicitly."
         : value.status === "cancelled" ? "The study stopped after cancellation; interrupted output remains on the host."
           : value.status === "failed" ? `Study failed: ${value.error_reason || "the host reported no additional detail"}`
           : value.status === "cancelling" ? "Cancellation requested; waiting for the worker to stop."
@@ -445,6 +558,24 @@ export class CheckpointLabController {
     return this.download(this.branch.status.artifact_id, null, this.branch.status.branch_id);
   }
 
+  previewReport() {
+    if (!this.canOperate || this.branch?.status?.status !== "completed") return Promise.resolve(null);
+    const status = this.branch.status, checkpoint = this.branch.checkpoint;
+    const request = { sessionId: this.source.sessionId, artifactId: status.artifact_id,
+      expected: null, maxBytes: MAX_STUDY_REPORT_BYTES };
+    return this.run("Study report unavailable", async (signal) => {
+      const result = validateDownload(await this.services.download(request, signal),
+        status.artifact_id, null, status.branch_id);
+      signal.throwIfAborted();
+      if (result.blob.size > MAX_STUDY_REPORT_BYTES) throw new Error("Study report exceeds the browser preview byte limit");
+      return this.parseReport(result.blob, { status, checkpoint, artifact: result.metadata });
+    }, (model) => {
+      this.reportModel = model;
+      this.notice = "Verified saved-study report loaded. These descriptive trajectories come from one saved source.";
+      return model;
+    });
+  }
+
   downloadSelectedArtifact() {
     if (!this.selectedArtifact || this.branch?.status?.status !== "completed") return Promise.resolve(null);
     return this.download(this.selectedArtifact.artifact_id, this.selectedArtifact, this.branch.status.branch_id);
@@ -454,13 +585,8 @@ export class CheckpointLabController {
     if (!this.canOperate) return Promise.resolve(null);
     const request = { sessionId: this.source.sessionId, artifactId, expected };
     return this.run("Artifact download refused", (signal) => this.services.download(request, signal), (result) => {
-      validateLabArtifact(result?.metadata, branchId);
+      validateDownload(result, artifactId, expected, branchId);
       const metadata = result.metadata;
-      if (metadata.artifact_id !== artifactId || !(result.blob instanceof Blob)
-          || result.blob.size !== metadata.byte_size || result.filename !== metadata.filename
-          || (expected && ["byte_size", "checksum_blake3", "checksum_sha256"].some((key) => metadata[key] !== expected[key]))) {
-        throw new Error("Downloaded artifact does not match the selected verified metadata");
-      }
       this.notice = `Prepared ${metadata.filename}; downloaded bytes match its recorded size and SHA-256.`;
       return result;
     });
@@ -516,11 +642,24 @@ export function renderCheckpointLab(panel, controller) {
   disable("lab-branch-launch", !controller.canLaunch);
   disable("lab-branch-retry", !ready || controller.branchState !== "unconfirmed");
   const branch = controller.branch, status = branch?.status;
+  const history = (controller.historyPage?.items ?? []).map((row) => row.branch_id === status?.branch_id ? status : row);
+  if (status && !history.some((row) => row.branch_id === status.branch_id)) history.unshift(status);
+  updateSelect(find("lab-history-select"), history, status?.branch_id, "branch_id",
+    (row) => `${row.branch_name} · ${row.status} · ${row.source_tick} → ${row.target_tick} · ${row.branch_id}`);
+  disable("lab-history-select", !controller.canSelectStudy);
+  disable("lab-history-refresh", !ready);
+  disable("lab-history-first", !ready || controller.historyCursor === null);
+  disable("lab-history-next", !ready || !controller.historyPage?.next_cursor);
+  write("lab-history-detail", controller.branchState === "unconfirmed"
+    ? "Retry the unchanged pending admission before selecting a different retained study. Reading history does not resolve that request's identity."
+    : controller.historyPage ? `${controller.historyPage.total} retained studies; page begins at ${controller.historyPage.offset + 1}. Selecting a study reads its current status without starting it again.`
+      : "Load retained studies from this host to reconnect to their status and downloads after a browser refresh or host restart.");
   disable("lab-branch-refresh", !ready || !status);
   disable("lab-branch-cancel", !ready || !status || TERMINAL.has(status.status));
   disable("lab-report-download", !ready || status?.status !== "completed");
+  disable("lab-report-preview", !ready || status?.status !== "completed");
   write("lab-branch-detail", branch
-    ? `${status ? `Study ${status.branch_id}: ${status.status}` : controller.branchState === "refused" ? "Study request refused; no job admitted by this request" : "Study admission is unconfirmed"}. Saved tick ${branch.checkpoint.tick} → target ${branch.checkpoint.tick + branch.request.ticks}. ${branch.request.intervention ? "Treatment and unchanged control start from the identical saved state." : "One unchanged scientific future."} These are bounds, not live progress. One source gives a descriptive trajectory comparison, not independent-seed statistical inference.`
+    ? `${status ? `Study ${status.branch_id}: ${status.status}` : controller.branchState === "refused" ? "Study request refused; no job admitted by this request" : "Study admission is unconfirmed"}. Saved tick ${status?.source_tick ?? branch.checkpoint.tick} → target ${status?.target_tick ?? branch.checkpoint.tick + branch.request.ticks}. Source ${status?.checkpoint_id ?? branch.request.checkpoint_id}; world digest ${status?.world_digest_v1 ?? branch.checkpoint.world_digest_v1}. ${branch.request ? branch.request.intervention ? "Treatment and unchanged control start from the identical saved state." : "One unchanged scientific future." : "Selected from retained history. The original treatment is unknown from this receipt; inspect the verified plan or report for its design."} These are bounds, not live progress. One source gives a descriptive trajectory comparison, not independent-seed statistical inference.`
     : "Choose a horizon and, optionally, a treatment beside an unchanged control. The remote live world is neither advanced nor replaced by this study.");
   updateSelect(find("lab-artifact-select"), controller.artifactsPage?.items ?? [], controller.selectedArtifact?.artifact_id,
     "artifact_id", (row) => `${row.relative_path.split("/").slice(2).join("/")} · ${row.byte_size} bytes`);

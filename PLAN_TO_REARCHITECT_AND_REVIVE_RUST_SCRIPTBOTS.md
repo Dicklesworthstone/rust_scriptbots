@@ -2,6 +2,49 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Retained study discovery and measured browser outcomes (2026-11-11):**
+[Implemented and source reviewed — Codex; DSR web checks passed, native/browser qualification open]
+
+Continue `bd-2z0.12.3` and the checkpoint-study surface by exposing the durable
+receipt catalog through REST, MCP and `checkpoint branch list`. The recovery
+service contributed in `2b1b8ed4` retains admitted definitions and final receipts,
+restores completed artifact discovery, and marks interrupted work stopped.
+`a9d0ecba` makes that catalog available through each control interface.
+
+The browser pages those receipts and explicitly reopens an existing study
+without submitting scientific work. It pins the observed branch, source tick,
+target tick and world digest; selection never invents the original treatment,
+retry key or saved population. Uncertain admissions keep their unchanged retry
+request. Historical running studies remain observable and cancellable; completed
+studies expose retained downloads. A source change invalidates stale results.
+
+The new report reader verifies the downloaded artifact and admits bounded
+schema-4 saved-source reports tied to the selected receipt. It preserves the
+full u64 seed without JavaScript rounding, shows actual terminal observations
+and treatment-minus-control endpoint differences, and separately labels the
+recorded whole-trajectory means and standard deviations. First divergence,
+extinction, population recovery ratio and exact source provenance remain
+descriptive observations from one saved seed. The view does not infer independent
+replication from repeated ticks. Report previews have a 1 MiB bound; ordinary
+downloads retain their separate 64 MiB bound.
+
+Correct the report generator's recovery threshold to the integer ceiling of
+four fifths of the baseline, with at least one living agent. Previously rounding
+could label two of three agents as 80% recovered, and a zero baseline could use
+a different threshold when locating the first recovery tick. One shared exact
+threshold now controls both decisions without changing ecological dynamics.
+
+New coverage exercises cold REST/MCP/CLI discovery, browser history and stale
+source handling, verified report decoding, exact numeric provenance and small
+population recovery boundaries. The frozen feature candidate passed all 160
+Node tests and four production JavaScript syntax checks through DSR, with the
+same source snapshot before and after execution. UBS also passed through DSR
+with zero critical findings; noncritical warnings remain. Pinned Rustfmt passed
+on the three Rust files changed in this continuation. The JavaScript fixtures describe
+the Rust schema contract and are not evidence of a real scientific run. Native
+compilation and Rust runtime tests remain unverified with the shared disk nearly
+full; parent acceptance and packaged-browser qualification remain open.
+
 **Native ecological particles (2026-11-11):**
 [Source wired and independently reviewed — Codex; native and GPU qualification open]
 
@@ -55,16 +98,15 @@ independent replication.
 
 Added backend session-guard and real-study artifact-isolation regressions, plus
 browser controller/transport coverage for retries, source changes, lifecycle,
-pagination and download integrity. A frozen feature snapshot passed all 117 Node
-tests, including 24 new checkpoint-study tests, and all three edited JavaScript
-syntax checks through DSR. A subsequent regression for the concurrent backend's
-new `stopped` recovery outcome is authored but unexecuted; the browser treats it
-as terminal and never automatically reruns it. UBS identified one public dropdown-cache comparison
-as a secret comparison; source review confirmed the false positive and a naming
-clarification followed. The final rerun was interrupted by renewed executor
-failure. Chromium was refused at startup before DOM execution. Rust regressions
-have not executed: baseline checking and Clippy stopped during dependency
-resolution when the shared disk filled. Compilation, final formatting,
+pagination and download integrity. The initial feature snapshot passed all 117
+Node tests, including 24 new checkpoint-study tests, and three JavaScript syntax
+checks through DSR. A later regression covers the concurrent backend's `stopped`
+outcome; the current 160-test DSR result is recorded above. The browser treats
+stopped work as terminal and never automatically reruns it. An earlier UBS
+finding on the public dropdown-cache comparison was source-reviewed as a false
+positive and clarified by naming. Chromium was refused at startup before DOM
+execution. Rust regressions have not executed: baseline checking and Clippy
+stopped during dependency resolution when the shared disk filled. Compilation,
 packaged-browser execution and full acceptance remain open. Existing parent bead
 status and ownership are preserved.
 
@@ -99,12 +141,14 @@ journeys, and terminal presentation/admission/shutdown journeys. Pinned formatti
 and independent source review passed; new runtime tests and full native terminal
 qualification have not yet been established in this environment.
 
-Managed job status and retry identities currently last for the service process;
-retained files survive restart, and existing output is never overwritten. A
-scientific fork does not continue the source host's session, journal, schedules,
-or omitted auxiliary histories. One source trajectory is descriptive evidence,
-not independent replication. Existing raw-checkpoint refusals and full-owner
-acceptance requirements remain.
+At the November 10 implementation boundary, managed status and retry identities
+lasted for the service process. The November 11 recovery service and discovery
+work above supersede that limitation with durable definitions and receipts;
+interrupted work is marked stopped and never automatically rerun. Existing
+output is never overwritten. A scientific fork does not continue the source
+host's session, journal, schedules or omitted auxiliary histories. One source
+trajectory is descriptive evidence, not independent replication. Existing
+raw-checkpoint refusals and full-owner acceptance requirements remain.
 
 **Evolutionary browser defaults, Ft tournament entry, and visible food (2026-11-09):**
 [Source implemented and independently reviewed — Codex; full native, browser and GPU qualification open]

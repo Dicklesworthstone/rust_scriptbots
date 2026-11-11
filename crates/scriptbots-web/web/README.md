@@ -189,13 +189,32 @@ the operating system has persisted it. To reproduce a downloaded plan offline,
 preserve its relative files and update the saved source path when relocating
 them, as described by the native `branch-study` command.
 
+Use **Reopen a retained study** to page through the host's saved study receipts
+after a browser refresh, reconnect or server restart. Selecting a study fetches
+its current status; running work can be observed or cancelled, and completed
+work exposes its retained artifacts. Selection does not submit a new study.
+An uncertain launch must first be resolved with its unchanged retry request.
+Interrupted studies are marked **stopped** and require an explicit new launch
+from a retained checkpoint if another future is wanted.
+
+For a completed study, **Read study results** opens its verified report in the
+panel. The table shows actual terminal population, ground food, total energy,
+average health, and final-tick births, deaths and spike hits. Paired studies
+show treatment-minus-control terminal differences separately from the report's
+whole-trajectory mean differences and standard deviations. The view includes
+first divergence, population minimum, final population as a percentage of its
+baseline, exact starting seed, saved source digest and downloaded report hash.
+The preview requires the selected study's schema-4 saved-source report and
+enforces a 1 MiB limit before downloading it; ordinary file downloads retain
+their separate 64 MiB bound.
+
 A saved scientific fork retains its genomes, evaluator state and scientific
 source, but does not continue the original host session, journal, schedules or
 omitted auxiliary histories. One saved trajectory and its matched control are
-descriptive evidence, not independent replication. The server retains study receipts across restarts
-and marks interrupted studies stopped. This browser panel keeps its current
-in-memory view; it does not list historical jobs or automatically rerun
-interrupted work. Existing resource limits and backend refusals remain visible.
+descriptive evidence, not independent replication. Historical receipts identify
+the saved source and horizon; their original treatment is read from retained
+artifacts rather than reconstructed as a new request. Existing resource limits
+and backend refusals remain visible.
 
 Snapshots returned to JS follow the selected `snapshot_format` (defaults to JSON). To switch to binary snapshots (Postcard-encoded `Uint8Array`), pass `snapshot_format: "binary"` to `init_sim`.
 

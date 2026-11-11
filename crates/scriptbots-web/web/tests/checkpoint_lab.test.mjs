@@ -3,10 +3,11 @@ import { createHash, webcrypto } from "node:crypto";
 import test from "node:test";
 import {
   CHECKPOINT_LAB_PAGE_SIZE, MAX_LAB_ARTIFACT_BYTES, CheckpointLabController,
-  renderCheckpointLab, validateLabArtifact, validateLabArtifactPage, validateLabBranchStatus,
+  renderCheckpointLab, validateLabArtifact, validateLabArtifactPage, validateLabBranchObservation, validateLabBranchPage, validateLabBranchStatus,
   validateLabCheckpoint, validateLabCheckpointPage, validateLabIntervention,
 } from "../checkpoint-lab.js";
 import { RemoteOwnerHttpError, RemoteStreamClient } from "../remote.js";
+import { MAX_STUDY_REPORT_BYTES } from "../study-report.js";
 
 const SESSION = "18446744073709551610";
 const DIGEST = "a".repeat(64);
@@ -32,6 +33,26 @@ function status(request, source = checkpoint(), changes = {}) {
     world_digest_v1: source.world_digest_v1, ...changes };
 }
 
+function study(changes = {}) {
+  return status({ checkpoint_id: checkpoint().checkpoint_id, branch_name: "retained", ticks: 120 },
+    checkpoint(), changes);
+}
+
+function historyPage(items = [study()], changes = {}) {
+  return { items, total: items.length, limit: CHECKPOINT_LAB_PAGE_SIZE, offset: 0, has_more: false, ...changes };
+}
+
+function labPanel() {
+  const nodes = new Map();
+  const document = { createElement: () => ({ value: "", textContent: "" }) };
+  const panel = { dataset: {}, querySelector: (id) => {
+    if (!nodes.has(id)) nodes.set(id, { dataset: {}, ownerDocument: document, textContent: "", disabled: false,
+      replaceChildren(...options) { this.options = options; } });
+    return nodes.get(id);
+  } };
+  return { panel, nodes };
+}
+
 function artifact(changes = {}) {
   return { artifact_id: "checkpoint-branch-report", filename: "study_report.json", content_type: "application/json",
     byte_size: 2, checksum_blake3: DIGEST, checksum_sha256: createHash("sha256").update("{}").digest("hex"),
@@ -42,14 +63,14 @@ function artifactPage(items = [artifact()], changes = {}) {
   return { items, total: items.length, limit: CHECKPOINT_LAB_PAGE_SIZE, offset: 0, has_more: false, ...changes };
 }
 
-async function harness() {
+async function harness({ listStudies, parseReport } = {}) {
   let time = 0, nextId = 0;
   const queues = Object.fromEntries(["save", "launch", "status", "cancel", "artifacts", "download"].map((kind) => [kind, []]));
   const services = Object.fromEntries(Object.keys(queues).map((kind) => [kind, (request, signal) => new Promise((resolve, reject) => {
     queues[kind].push({ request, signal, resolve, reject });
   })]));
   const reads = [];
-  const controller = new CheckpointLabController({ ...services,
+  const controller = new CheckpointLabController({ ...services, listStudies, parseReport,
     list: async (request) => { reads.push(request); return page(); },
     id: () => `browser-lab-${++nextId}`, now: () => time });
   controller.observe(frame(), SOURCE);
@@ -402,6 +423,240 @@ test("an existing catalog row cannot replace a selected cut with different scien
   assert.match(h.controller.notice, /changed its scientific identity/);
 });
 
+test("retained study pages identify each branch independently of its shared checkpoint", () => {
+  const first = study(), second = study({ branch_id: "branch-two" });
+  assert.equal(validateLabBranchPage(historyPage([first, second])).items.length, 2);
+  for (const changes of [
+    { branch_id: undefined }, { checkpoint_id: ["checkpoint"] }, { branch_name: "unsafe name" },
+    { source_tick: -1 }, { target_tick: 100 }, { target_tick: 10101 },
+    { target_tick: Number.MAX_SAFE_INTEGER + 1 }, { world_digest_v1: [DIGEST] },
+    { status: "pending" }, { status: "completed" }, { artifact_id: "premature" },
+  ]) assert.throws(() => validateLabBranchObservation(study(changes)));
+  assert.throws(() => validateLabBranchPage(historyPage([first, first])));
+  const rows = Array.from({ length: 12 }, (_, index) => study({ branch_id: `branch-${index}` }));
+  assert.equal(validateLabBranchPage(historyPage(rows, { total: 13, has_more: true, next_cursor: "12" })).next_cursor, "12");
+  assert.throws(() => validateLabBranchPage(historyPage(rows, { total: 13, has_more: true, next_cursor: "13" })));
+  assert.throws(() => validateLabBranchObservation({ ...first, checkpoint_id: "different" }, first));
+  assert.throws(() => validateLabBranchObservation({ ...first, target_tick: 225 }, first));
+  assert.throws(() => validateLabBranchObservation({ ...first, world_digest_v1: "d".repeat(64) }, first));
+});
+
+test("selecting completed history reads exact retained status and downloads without reconstructing or submitting a study", async () => {
+  const receipt = study({ status: "completed", artifact_id: artifact().artifact_id });
+  const parsed = Object.freeze({ studyId: "retained-study", sourceTick: 100 });
+  let parsedContext;
+  const h = await harness({ listStudies: async () => historyPage([receipt]),
+    parseReport: async (_blob, context) => { parsedContext = context; return parsed; } });
+  await h.controller.refreshHistory(true);
+  const selected = h.controller.selectStudy(receipt.branch_id);
+  assert.equal(h.controller.branch, null);
+  assert.equal(h.queues.status[0].request.branchId, receipt.branch_id);
+  h.queues.status[0].resolve(receipt);
+  await selected;
+  assert.equal(h.controller.branch.origin, "history");
+  assert.equal(h.controller.branch.request, null);
+  assert.equal(h.controller.branch.checkpoint, null);
+  assert.ok(Object.isFrozen(h.controller.branch.status));
+  assert.equal(h.queues.launch.length, 0);
+  assert.equal(h.queues.save.length, 0);
+  assert.equal(h.identities(), 0);
+  assert.equal(await h.controller.retryLaunch(), null);
+  assert.equal(await h.controller.submitBranch(), null);
+  const { panel, nodes } = labPanel();
+  renderCheckpointLab(panel, h.controller);
+  const detail = nodes.get("#lab-branch-detail").textContent;
+  assert.match(detail, /original treatment is unknown/);
+  assert.ok(detail.includes(receipt.checkpoint_id) && detail.includes(receipt.world_digest_v1));
+  assert.ok(!detail.includes("One unchanged scientific future."));
+  assert.equal(nodes.get("#lab-report-download").disabled, false);
+  assert.equal(nodes.get("#lab-report-preview").disabled, false);
+  const download = h.controller.downloadReport();
+  h.queues.download[0].resolve({ blob: new Blob(["{}"]), filename: "study_report.json", metadata: artifact() });
+  assert.equal((await download).blob.size, 2);
+  const preview = h.controller.previewReport();
+  h.queues.download[1].resolve({ blob: new Blob(["{}"]), filename: "study_report.json", metadata: artifact() });
+  assert.equal(await preview, parsed);
+  assert.equal(parsedContext.checkpoint, null);
+  assert.equal(parsedContext.status.branch_id, receipt.branch_id);
+  assert.equal(parsedContext.artifact.artifact_id, receipt.artifact_id);
+  assert.equal(h.queues.launch.length, 0);
+});
+
+test("history pagination preserves the observed selection and uses bounded exact cursors", async () => {
+  const rows = Array.from({ length: 12 }, (_, index) => study({ branch_id: `branch-${index}` }));
+  const reads = [];
+  const h = await harness({ listStudies: async (request) => {
+    reads.push(request);
+    return request.cursor === "12" ? historyPage([study({ branch_id: "branch-last" })], { total: 13, offset: 12 })
+      : historyPage(rows, { total: 13, has_more: true, next_cursor: "12" });
+  } });
+  await h.controller.refreshHistory(true);
+  const selecting = h.controller.selectStudy("branch-0");
+  h.queues.status[0].resolve(rows[0]);
+  await selecting;
+  const selected = h.controller.branch;
+  await h.controller.nextHistoryPage();
+  assert.equal(h.controller.historyCursor, "12");
+  assert.equal(h.controller.historyPage.items[0].branch_id, "branch-last");
+  assert.equal(h.controller.branch, selected);
+  assert.equal(await h.controller.nextHistoryPage(), null);
+  await h.controller.firstHistoryPage();
+  assert.equal(h.controller.historyCursor, null);
+  assert.deepEqual(reads.map((request) => request.cursor), [null, "12", null]);
+  assert.ok(reads.every((request) => request.limit === 12 && request.sessionId === SESSION));
+});
+
+test("history selection refuses changed scientific evidence and never regresses a newer terminal receipt", async () => {
+  const running = study();
+  const complete = { ...running, status: "completed", artifact_id: artifact().artifact_id };
+  const h = await harness({ listStudies: async () => historyPage([running]) });
+  await h.controller.refreshHistory(true);
+  const first = h.controller.selectStudy(running.branch_id);
+  h.queues.status[0].resolve(complete);
+  await first;
+  const observed = h.controller.branch;
+  const changed = h.controller.selectStudy(running.branch_id);
+  h.queues.status[1].resolve({ ...complete, world_digest_v1: "d".repeat(64) });
+  assert.equal(await changed, null);
+  assert.equal(h.controller.branch, observed);
+  assert.match(h.controller.notice, /does not match/);
+  const regressed = h.controller.selectStudy(running.branch_id);
+  h.queues.status[2].resolve(running);
+  assert.equal(await regressed, null);
+  assert.equal(h.controller.branch.status.status, "completed");
+  const oldPage = h.controller.historyPage;
+  h.controller.services.listStudies = async () => historyPage([{ ...running, source_tick: 101 }]);
+  assert.equal(await h.controller.refreshHistory(true), null);
+  assert.equal(h.controller.historyPage, oldPage);
+  assert.equal(h.queues.launch.length, 0);
+});
+
+test("history cannot discard uncertain admission and late selection after disconnect does not replace an observed study", async () => {
+  const receipt = study({ branch_id: "branch-history" });
+  const h = await harness({ listStudies: async () => historyPage([receipt]) });
+  await h.controller.refreshHistory(true);
+  const admission = h.controller.launch({ branchName: "new_request", ticks: 25 });
+  const original = h.queues.launch[0].request;
+  h.queues.launch[0].reject(new Error("reply lost"));
+  await admission;
+  assert.equal(h.controller.canSelectStudy, false);
+  assert.equal(await h.controller.selectStudy(receipt.branch_id), null);
+  assert.equal(h.queues.status.length, 0);
+  assert.equal(h.controller.branch.request, original);
+  const retry = h.controller.retryLaunch();
+  h.queues.launch[1].resolve(status(original));
+  await retry;
+  const current = h.controller.branch;
+  const selecting = h.controller.selectStudy(receipt.branch_id);
+  h.controller.setEnabled(false);
+  assert.equal(h.queues.status[0].signal.aborted, true);
+  h.queues.status[0].resolve(receipt);
+  assert.equal(await selecting, null);
+  assert.equal(h.controller.branch, current);
+  h.controller.setEnabled(true);
+  const reselecting = h.controller.selectStudy(receipt.branch_id);
+  h.queues.status[1].resolve(receipt);
+  await reselecting;
+  assert.equal(h.controller.branch.origin, "history");
+  assert.equal(h.controller.branch.status.branch_id, receipt.branch_id);
+  assert.equal(h.queues.launch.length, 2, "only the original immutable admission retry was submitted");
+  assert.equal(h.identities(), 1);
+});
+
+test("a new host session discovers interrupted retained studies afresh without rerunning their science", async () => {
+  let receipt = study();
+  const sessions = [];
+  const h = await harness({ listStudies: async (request) => { sessions.push(request.sessionId); return historyPage([receipt]); } });
+  await h.controller.refreshHistory(true);
+  const selecting = h.controller.selectStudy(receipt.branch_id);
+  h.queues.status[0].resolve(receipt);
+  await selecting;
+  h.controller.observe(frame("7"), SOURCE);
+  await flush();
+  assert.equal(h.controller.branch, null);
+  assert.equal(h.controller.historyPage, null);
+  assert.equal(h.controller.selected, null);
+  receipt = { ...receipt, status: "stopped", error_reason: "interrupted by restart" };
+  await h.controller.refreshHistory(true);
+  const recovered = h.controller.selectStudy(receipt.branch_id);
+  assert.equal(h.queues.status[1].request.sessionId, "7");
+  h.queues.status[1].resolve(receipt);
+  await recovered;
+  assert.deepEqual(sessions, [SESSION, "7"]);
+  assert.equal(h.controller.branch.status.status, "stopped");
+  assert.equal(h.controller.branch.request, null);
+  assert.equal(h.controller.branch.checkpoint, null);
+  assert.match(h.controller.notice, /not rerun automatically/);
+  h.advance();
+  h.controller.poll();
+  assert.equal(h.queues.launch.length, 0);
+  assert.equal(h.queues.cancel.length, 0);
+  assert.equal(h.identities(), 0);
+});
+
+test("report preview binds verified bytes to the exact source and clears when a new study is requested", async () => {
+  let context;
+  const model = Object.freeze({ studyId: "browser-study", sourceTick: 100 });
+  const h = await harness({ parseReport: async (_blob, value) => { context = value; return model; } });
+  const branch = await launch(h);
+  const finished = h.controller.refreshBranch(true);
+  h.queues.status[0].resolve(status(branch.request, checkpoint(), { status: "completed", artifact_id: artifact().artifact_id }));
+  await finished;
+  const preview = h.controller.previewReport();
+  assert.equal(h.queues.download[0].request.maxBytes, MAX_STUDY_REPORT_BYTES);
+  h.queues.download[0].resolve({ blob: new Blob(["{}"]), filename: "study_report.json", metadata: artifact() });
+  assert.equal(await preview, model);
+  assert.equal(h.controller.reportModel, model);
+  assert.equal(context.status, branch.status);
+  assert.equal(context.checkpoint, branch.checkpoint);
+  assert.equal(context.artifact.checksum_sha256, artifact().checksum_sha256);
+  const next = h.controller.launch({ branchName: "next", ticks: 10 });
+  assert.equal(h.controller.reportModel, null);
+  h.queues.launch[1].resolve(status(h.queues.launch[1].request, checkpoint(), { branch_id: "branch-next" }));
+  await next;
+});
+
+test("report decoding that finishes after disconnection cannot publish a stale preview", async () => {
+  let finishParsing;
+  const h = await harness({ parseReport: () => new Promise((resolve) => { finishParsing = resolve; }) });
+  const branch = await launch(h);
+  const finished = h.controller.refreshBranch(true);
+  h.queues.status[0].resolve(status(branch.request, checkpoint(), { status: "completed", artifact_id: artifact().artifact_id }));
+  await finished;
+  const preview = h.controller.previewReport();
+  h.queues.download[0].resolve({ blob: new Blob(["{}"]), filename: "study_report.json", metadata: artifact() });
+  await flush();
+  assert.equal(typeof finishParsing, "function");
+  h.controller.setEnabled(false);
+  finishParsing(Object.freeze({ studyId: "stale" }));
+  assert.equal(await preview, null);
+  assert.equal(h.controller.reportModel, null);
+});
+
+test("report preview rejects unrelated bytes, oversized reports and parser failures without displaying a model", async () => {
+  let parseCalls = 0;
+  const h = await harness({ parseReport: async () => { parseCalls += 1; throw new Error("report schema mismatch"); } });
+  const branch = await launch(h);
+  const finished = h.controller.refreshBranch(true);
+  h.queues.status[0].resolve(status(branch.request, checkpoint(), { status: "completed", artifact_id: artifact().artifact_id }));
+  await finished;
+  const unrelated = h.controller.previewReport();
+  h.queues.download[0].resolve({ blob: new Blob(["{}"]), filename: "study_report.json",
+    metadata: artifact({ relative_path: "branches/unrelated/study_report.json" }) });
+  assert.equal(await unrelated, null);
+  const large = h.controller.previewReport();
+  const blob = new Blob([new Uint8Array(MAX_STUDY_REPORT_BYTES + 1)]);
+  h.queues.download[1].resolve({ blob, filename: "study_report.json", metadata: artifact({ byte_size: blob.size }) });
+  assert.equal(await large, null);
+  assert.equal(parseCalls, 0);
+  const malformed = h.controller.previewReport();
+  h.queues.download[2].resolve({ blob: new Blob(["{}"]), filename: "study_report.json", metadata: artifact() });
+  assert.equal(await malformed, null);
+  assert.equal(parseCalls, 1);
+  assert.match(h.controller.notice, /report schema mismatch/);
+  assert.equal(h.controller.reportModel, null);
+});
+
 function client() {
   const value = new RemoteStreamClient({ url: `${SOURCE}?old=query#fragment`, decodeFrame() {} });
   value.state = "connected";
@@ -451,6 +706,46 @@ test("Lab transport preserves reverse-proxy prefixes and exact server-checked se
     await assert.rejects(value.checkpointBranchStatus("../escape", { sessionId: SESSION }));
     await assert.rejects(value.launchCheckpointBranch({ ...branch, ticks: 10001 }));
     assert.equal(requests.length, count);
+  } finally { globalThis.fetch = previous; }
+});
+
+test("study history transport uses GET pagination and the current exact host session", async () => {
+  const previous = globalThis.fetch, requests = [];
+  globalThis.fetch = async (url, options) => {
+    requests.push({ url: new URL(url), ...options });
+    return new Response(JSON.stringify(historyPage()));
+  };
+  try {
+    const value = client();
+    await value.listCheckpointBranches({ sessionId: SESSION, cursor: "12", limit: 12 });
+    assert.equal(requests[0].method, "GET");
+    assert.equal(requests[0].url.pathname, "/nested/api/v1/checkpoints/branches");
+    assert.equal(requests[0].url.search, "?limit=12&cursor=12");
+    assert.equal(requests[0].headers["X-ScriptBots-Session"], SESSION);
+    assert.equal(requests[0].body, undefined);
+    await assert.rejects(value.listCheckpointBranches({ sessionId: SESSION, cursor: "01" }));
+    await assert.rejects(value.listCheckpointBranches({ sessionId: "7" }));
+    assert.equal(requests.length, 1);
+  } finally { globalThis.fetch = previous; }
+});
+
+test("report preview byte limits refuse oversized metadata before requesting binary content", async () => {
+  const previous = globalThis.fetch, requests = [];
+  const metadata = artifact({ byte_size: MAX_STUDY_REPORT_BYTES + 1 });
+  globalThis.fetch = async (url) => {
+    requests.push(String(url));
+    return new Response(JSON.stringify(metadata));
+  };
+  try {
+    const value = client();
+    await assert.rejects(value.downloadArtifact(metadata.artifact_id,
+      { sessionId: SESSION, maxBytes: MAX_STUDY_REPORT_BYTES }), /browser download limit/);
+    assert.equal(requests.length, 1);
+    assert.ok(!requests[0].endsWith("/download"));
+    for (const maxBytes of [0, -1, 0.5, Infinity, MAX_LAB_ARTIFACT_BYTES + 1]) {
+      await assert.rejects(value.downloadArtifact(metadata.artifact_id, { sessionId: SESSION, maxBytes }));
+    }
+    assert.equal(requests.length, 1);
   } finally { globalThis.fetch = previous; }
 });
 

@@ -212,6 +212,11 @@
         #lab-branch-form input { box-sizing: border-box; width: 100%; background: #0f172a; color: #e2e8f0; border: 1px solid #475569; border-radius: 0.25rem; padding: 0.4rem; }
         #lab-notice, #lab-form-error { color: #fbbf24; }
         #lab-checkpoint-detail, #lab-branch-detail, #lab-artifact-detail { white-space: pre-line; }
+        #lab-study-report { margin-top: 0.75rem; padding: 0.65rem; border: 1px solid #334155; border-radius: 0.4rem; background: #101b2e; overflow-x: auto; }
+        #lab-study-report h4 { margin: 0.6rem 0 0.35rem; font-size: 0.8rem; }
+        #lab-study-report table { width: 100%; border-collapse: collapse; font-size: 0.72rem; }
+        #lab-study-report th, #lab-study-report td { text-align: left; vertical-align: top; padding: 0.35rem; border-bottom: 1px solid #334155; }
+        #lab-study-report ul { padding-left: 1.1rem; font-size: 0.75rem; }
         #inspector-signals { max-height: 24rem; overflow: auto; }
         #inspector-signals table { width: 100%; font-size: 0.75rem; border-collapse: collapse; }
         #inspector-signals th { text-align: left; font-weight: 400; }
@@ -526,6 +531,16 @@
                 <summary>Saved-world experiments</summary>
                 <p id="lab-source" role="status">Connect to a remote server to save and study an evolved world.</p>
                 <p id="lab-notice" role="status" aria-live="polite"></p>
+                <h3>Reopen a retained study</h3>
+                <p>Find studies retained by this host, including after a reconnect or restart. Opening a study reads its status and available results.</p>
+                <div class="inspector-actions">
+                    <button id="lab-history-refresh" type="button" disabled>Refresh studies</button>
+                    <button id="lab-history-first" type="button" disabled>First studies page</button>
+                    <button id="lab-history-next" type="button" disabled>Next studies page</button>
+                </div>
+                <label for="lab-history-select">Retained study</label>
+                <select id="lab-history-select" disabled><option value="">No retained studies loaded</option></select>
+                <p id="lab-history-detail" role="status">Connect to discover retained studies.</p>
                 <h3>1. Choose a saved scientific state</h3>
                 <p>Save a completed state from the connected server, or select an earlier checkpoint. The saved tick identifies the actual source of your study.</p>
                 <div class="inspector-actions">
@@ -606,7 +621,11 @@
                 </div>
                 <h3>3. Inspect and reproduce the result</h3>
                 <p>The completed report compares observed outcomes and records its exact source. One saved trajectory is descriptive evidence; independent replication requires multiple starting seeds.</p>
-                <button id="lab-report-download" type="button" disabled>Download completed study report</button>
+                <div class="inspector-actions">
+                    <button id="lab-report-preview" type="button" disabled>Read study results</button>
+                    <button id="lab-report-download" type="button" disabled>Download completed study report</button>
+                </div>
+                <section id="lab-study-report" aria-label="Verified study results" hidden></section>
                 <div class="inspector-actions">
                     <button id="lab-artifact-refresh" type="button" disabled>List study files</button>
                     <button id="lab-artifact-first" type="button" disabled>First files page</button>

@@ -28,7 +28,8 @@ use scriptbots_app::control::{
     CheckpointCreateRequest, CheckpointMetadataDto, ExperimentBatchStatusDto,
     ExperimentComparisonDto, ExperimentCreateRequest, MAX_ARTIFACT_DOWNLOAD_BYTES,
     MAX_CHECKPOINT_BRANCH_REQUEST_BYTES, MapApplyAgentPolicy, PaginatedArtifactsResponse,
-    PaginatedCheckpointBranchesResponse, PaginatedCheckpointsResponse, PaginatedExperimentsResponse, compute_blake3, compute_sha256,
+    PaginatedCheckpointBranchesResponse, PaginatedCheckpointsResponse,
+    PaginatedExperimentsResponse, compute_blake3, compute_sha256,
 };
 use scriptbots_app::experiment_runner::EXPERIMENT_ENDPOINT_METRICS;
 use scriptbots_app::{
@@ -2719,7 +2720,14 @@ mod tests {
         }
         assert!(Cli::try_parse_from(["control", "checkpoint", "branch", "create"]).is_err());
         let parsed = Cli::try_parse_from([
-            "control", "checkpoint", "branch", "list", "--limit", "12", "--cursor", "24",
+            "control",
+            "checkpoint",
+            "branch",
+            "list",
+            "--limit",
+            "12",
+            "--cursor",
+            "24",
         ])
         .expect("checkpoint branch history command");
         assert!(matches!(parsed.command, Command::Checkpoint {
@@ -2728,9 +2736,10 @@ mod tests {
             }
         } if page.limit == 12 && page.cursor.as_deref() == Some("24")));
         for limit in ["0", "101"] {
-            assert!(Cli::try_parse_from([
-                "control", "checkpoint", "branch", "list", "--limit", limit,
-            ]).is_err());
+            assert!(
+                Cli::try_parse_from(["control", "checkpoint", "branch", "list", "--limit", limit,])
+                    .is_err()
+            );
         }
     }
 
@@ -2900,7 +2909,10 @@ mod tests {
             &client,
             "http://localhost:4000/control/",
             &["checkpoints", "branches"],
-            &CatalogPageArgs { limit: 12, cursor: Some("24".into()) },
+            &CatalogPageArgs {
+                limit: 12,
+                cursor: Some("24".into()),
+            },
         )
         .unwrap()
         .build()
@@ -3651,7 +3663,10 @@ mod tests {
                 &restarted.base_url,
                 CheckpointSubcommand::Branch {
                     sub: CheckpointBranchSubcommand::List {
-                        page: CatalogPageArgs { limit: 1, cursor: None },
+                        page: CatalogPageArgs {
+                            limit: 1,
+                            cursor: None,
+                        },
                     },
                 },
                 None,
@@ -3668,7 +3683,10 @@ mod tests {
             &restarted.base_url,
             CheckpointSubcommand::Branch {
                 sub: CheckpointBranchSubcommand::List {
-                    page: CatalogPageArgs { limit: 1, cursor: Some("1".into()) },
+                    page: CatalogPageArgs {
+                        limit: 1,
+                        cursor: Some("1".into()),
+                    },
                 },
             },
             None,
@@ -3682,14 +3700,21 @@ mod tests {
             &client,
             &restarted.base_url,
             CheckpointSubcommand::Branch {
-                sub: CheckpointBranchSubcommand::Status { id: created.branch_id },
+                sub: CheckpointBranchSubcommand::Status {
+                    id: created.branch_id,
+                },
             },
             None,
         )
         .await?;
         assert_eq!(observed, serde_json::to_value(&completed)?);
         assert_eq!(
-            restarted.host.as_ref().unwrap().port().scientific_digest_v1()?,
+            restarted
+                .host
+                .as_ref()
+                .unwrap()
+                .port()
+                .scientific_digest_v1()?,
             before_history
         );
         restarted.stop()?;
