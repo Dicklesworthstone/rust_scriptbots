@@ -3492,9 +3492,20 @@ struct CreatureSignalBar {
 #[derive(Component)]
 struct CreatureEyeSwatch(usize);
 
+/// Compass outline becomes amber when an eye can see in every direction.
+#[derive(Component)]
+struct CreatureEyeCompass(usize);
+
 /// Marker for an eye's bearing relative to the creature's forward direction.
 #[derive(Component)]
 struct CreatureEyeBearing(usize);
+
+/// One boundary of an eye's sensing cone, relative to its bearing.
+#[derive(Component)]
+struct CreatureEyeLimit {
+    eye: usize,
+    side: f32,
+}
 
 #[derive(Clone, Copy)]
 enum CreatureSignalSource {
@@ -3559,6 +3570,16 @@ enum CreatureVitalBar {
     Energy,
 }
 
+/// A raw wheel request, shown on the actuator's clamped 0–1 scale.
+#[derive(Component, Clone, Copy)]
+enum CreatureDrive {
+    Left,
+    Right,
+}
+
+#[derive(Component)]
+struct CreatureDriveLabel(CreatureDrive);
+
 #[derive(Component, Clone, Copy)]
 enum CreaturePreference {
     Diet,
@@ -3604,30 +3625,11 @@ fn toggle_creature_details(
 }
 
 fn creature_sensor_labels() -> Vec<(String, usize)> {
-    let mut plain = scriptbots_core::SENSOR_LAYOUT
+    scriptbots_core::SENSOR_LAYOUT
         .iter()
-        .filter(|channel| channel.eye.is_none());
-    let mut labels = Vec::with_capacity(scriptbots_core::INPUT_SIZE);
-    for eye in 0..NUM_EYES {
-        for channel in scriptbots_core::SENSOR_LAYOUT
-            .iter()
-            .filter(|channel| channel.eye == Some(eye))
-        {
-            let name = match channel.kind {
-                scriptbots_core::SensorKind::EyeDensity => "density",
-                scriptbots_core::SensorKind::EyeRed => "red",
-                scriptbots_core::SensorKind::EyeGreen => "green",
-                scriptbots_core::SensorKind::EyeBlue => "blue",
-                _ => channel.name,
-            };
-            labels.push((format!("E{} {name}", eye + 1), channel.index));
-        }
-        if let Some(channel) = plain.next() {
-            labels.push((channel.name.to_owned(), channel.index));
-        }
-    }
-    labels.extend(plain.map(|channel| (channel.name.to_owned(), channel.index)));
-    labels
+        .filter(|channel| channel.eye.is_none())
+        .map(|channel| (channel.name.to_owned(), channel.index))
+        .collect()
 }
 
 #[derive(Component)]
@@ -5839,7 +5841,7 @@ fn setup_scene(
                     padding: UiRect::all(Val::Px(12.0)),
                     border: UiRect::all(Val::Px(1.0)),
                     flex_direction: FlexDirection::Column,
-                    row_gap: Val::Px(5.0),
+                    row_gap: Val::Px(3.0),
                     ..default()
                 },
                 BackgroundColor(Color::srgba(0.08, 0.16, 0.14, 0.96)),
@@ -5952,6 +5954,54 @@ fn setup_scene(
                     ..default()
                 })
                 .with_children(|row| {
+                    for drive in [CreatureDrive::Left, CreatureDrive::Right] {
+                        row.spawn(Node {
+                            flex_grow: 1.0,
+                            flex_basis: Val::Px(0.0),
+                            flex_direction: FlexDirection::Column,
+                            row_gap: Val::Px(3.0),
+                            ..default()
+                        })
+                        .with_children(|column| {
+                            column.spawn((
+                                Text::default(),
+                                ui_font(10.0),
+                                TextColor(Color::srgb(0.80, 0.89, 0.83)),
+                                CreatureDriveLabel(drive),
+                            ));
+                            column
+                                .spawn((
+                                    Node {
+                                        width: Val::Percent(100.0),
+                                        height: Val::Px(6.0),
+                                        ..default()
+                                    },
+                                    BackgroundColor(Color::srgb(0.15, 0.25, 0.21)),
+                                    BorderRadius::all(Val::Px(3.0)),
+                                ))
+                                .with_children(|track| {
+                                    track.spawn((
+                                        Node {
+                                            position_type: PositionType::Absolute,
+                                            left: Val::Percent(0.0),
+                                            width: Val::Percent(0.0),
+                                            height: Val::Percent(100.0),
+                                            ..default()
+                                        },
+                                        BackgroundColor(Color::srgb(0.40, 0.82, 0.57)),
+                                        BorderRadius::all(Val::Px(3.0)),
+                                        drive,
+                                    ));
+                                });
+                        });
+                    }
+                });
+                card.spawn(Node {
+                    flex_direction: FlexDirection::Row,
+                    column_gap: Val::Px(10.0),
+                    ..default()
+                })
+                .with_children(|row| {
                     for preference in [CreaturePreference::Diet, CreaturePreference::Temperature] {
                         row.spawn(Node {
                             flex_grow: 1.0,
@@ -6004,7 +6054,7 @@ fn setup_scene(
                 })
                 .with_children(|row| {
                     row.spawn((
-                        Text::new("EYES\n↑ FORWARD"),
+                        Text::new("EYES\n↑ FORWARD\nCOLOR / DENSITY"),
                         ui_font(9.0),
                         TextColor(Color::srgb(0.65, 0.80, 0.71)),
                     ));
@@ -6014,10 +6064,10 @@ fn setup_scene(
                                 flex_grow: 1.0,
                                 flex_basis: Val::Px(0.0),
                                 min_width: Val::Px(0.0),
-                                flex_direction: FlexDirection::Row,
+                                flex_direction: FlexDirection::Column,
                                 align_items: AlignItems::Center,
                                 justify_content: JustifyContent::Center,
-                                column_gap: Val::Px(5.0),
+                                row_gap: Val::Px(3.0),
                                 padding: UiRect::axes(Val::Px(3.0), Val::Px(3.0)),
                                 ..default()
                             },
@@ -6025,69 +6075,162 @@ fn setup_scene(
                             BorderRadius::all(Val::Px(5.0)),
                         ))
                         .with_children(|cell| {
-                            cell.spawn((
-                                Text::new(format!("E{}", eye + 1)),
-                                ui_font(10.0),
-                                TextColor(Color::srgb(0.80, 0.89, 0.83)),
-                            ));
-                            cell.spawn((
-                                Node {
-                                    width: Val::Px(24.0),
-                                    height: Val::Px(24.0),
-                                    flex_shrink: 0.0,
-                                    border: UiRect::all(Val::Px(1.0)),
-                                    ..default()
-                                },
-                                BackgroundColor(Color::srgb(0.08, 0.16, 0.14)),
-                                BorderColor::all(Color::srgb(0.35, 0.50, 0.42)),
-                                BorderRadius::all(Val::Px(12.0)),
-                            ))
-                            .with_children(|compass| {
-                                // A fixed notch marks forward; the brighter dot
-                                // shows the eye's relative bearing around it.
-                                compass.spawn((
+                            cell.spawn(Node {
+                                flex_direction: FlexDirection::Row,
+                                align_items: AlignItems::Center,
+                                justify_content: JustifyContent::Center,
+                                column_gap: Val::Px(5.0),
+                                ..default()
+                            })
+                            .with_children(|cell| {
+                                cell.spawn((
+                                    Text::new(format!("E{}", eye + 1)),
+                                    ui_font(10.0),
+                                    TextColor(Color::srgb(0.80, 0.89, 0.83)),
+                                ));
+                                cell.spawn((
                                     Node {
-                                        position_type: PositionType::Absolute,
-                                        left: Val::Percent(50.0),
-                                        top: Val::Px(0.0),
-                                        width: Val::Px(2.0),
-                                        height: Val::Px(4.0),
-                                        margin: UiRect::left(Val::Px(-1.0)),
+                                        width: Val::Px(24.0),
+                                        height: Val::Px(24.0),
+                                        flex_shrink: 0.0,
+                                        border: UiRect::all(Val::Px(1.0)),
                                         ..default()
                                     },
-                                    BackgroundColor(Color::srgb(0.56, 0.68, 0.60)),
-                                ));
-                                compass.spawn((
-                                    Node {
-                                        position_type: PositionType::Absolute,
-                                        display: Display::None,
-                                        width: Val::Px(6.0),
-                                        height: Val::Px(6.0),
-                                        margin: UiRect {
-                                            left: Val::Px(-3.0),
-                                            top: Val::Px(-3.0),
+                                    BackgroundColor(Color::srgb(0.08, 0.16, 0.14)),
+                                    BorderColor::all(Color::srgb(0.35, 0.50, 0.42)),
+                                    BorderRadius::all(Val::Px(12.0)),
+                                    CreatureEyeCompass(eye),
+                                ))
+                                .with_children(|compass| {
+                                    compass.spawn((
+                                        Node {
+                                            position_type: PositionType::Absolute,
+                                            left: Val::Percent(50.0),
+                                            top: Val::Percent(50.0),
+                                            width: Val::Px(10.0),
+                                            height: Val::Px(10.0),
+                                            margin: UiRect {
+                                                left: Val::Px(-5.0),
+                                                top: Val::Px(-5.0),
+                                                ..default()
+                                            },
                                             ..default()
                                         },
+                                        BackgroundColor(Color::srgb(0.17, 0.22, 0.20)),
+                                        BorderRadius::all(Val::Px(5.0)),
+                                        CreatureEyeSwatch(eye),
+                                    ));
+                                    // A fixed notch marks forward; the brighter dot
+                                    // shows the eye's relative bearing around it.
+                                    compass.spawn((
+                                        Node {
+                                            position_type: PositionType::Absolute,
+                                            left: Val::Percent(50.0),
+                                            top: Val::Px(0.0),
+                                            width: Val::Px(2.0),
+                                            height: Val::Px(4.0),
+                                            margin: UiRect::left(Val::Px(-1.0)),
+                                            ..default()
+                                        },
+                                        BackgroundColor(Color::srgb(0.56, 0.68, 0.60)),
+                                    ));
+                                    compass.spawn((
+                                        Node {
+                                            position_type: PositionType::Absolute,
+                                            display: Display::None,
+                                            width: Val::Px(6.0),
+                                            height: Val::Px(6.0),
+                                            margin: UiRect {
+                                                left: Val::Px(-3.0),
+                                                top: Val::Px(-3.0),
+                                                ..default()
+                                            },
+                                            ..default()
+                                        },
+                                        BackgroundColor(Color::srgb(0.46, 0.87, 0.75)),
+                                        BorderRadius::all(Val::Px(3.0)),
+                                        CreatureEyeBearing(eye),
+                                    ));
+                                    for side in [-1.0, 1.0] {
+                                        compass.spawn((
+                                            Node {
+                                                position_type: PositionType::Absolute,
+                                                display: Display::None,
+                                                width: Val::Px(4.0),
+                                                height: Val::Px(4.0),
+                                                margin: UiRect {
+                                                    left: Val::Px(-2.0),
+                                                    top: Val::Px(-2.0),
+                                                    ..default()
+                                                },
+                                                ..default()
+                                            },
+                                            BackgroundColor(Color::srgb(0.97, 0.73, 0.34)),
+                                            BorderRadius::all(Val::Px(2.0)),
+                                            CreatureEyeLimit { eye, side },
+                                        ));
+                                    }
+                                });
+                            });
+                            if let Some(channel) =
+                                scriptbots_core::SENSOR_LAYOUT.iter().find(|channel| {
+                                    channel.eye == Some(eye)
+                                        && channel.kind == scriptbots_core::SensorKind::EyeDensity
+                                })
+                            {
+                                cell.spawn((
+                                    Node {
+                                        width: Val::Percent(100.0),
+                                        height: Val::Px(4.0),
                                         ..default()
                                     },
-                                    BackgroundColor(Color::srgb(0.46, 0.87, 0.75)),
-                                    BorderRadius::all(Val::Px(3.0)),
-                                    CreatureEyeBearing(eye),
-                                ));
-                            });
+                                    BackgroundColor(Color::srgb(0.15, 0.25, 0.21)),
+                                    BorderRadius::all(Val::Px(2.0)),
+                                ))
+                                .with_children(|track| {
+                                    track.spawn((
+                                        Node {
+                                            width: Val::Percent(0.0),
+                                            height: Val::Percent(100.0),
+                                            ..default()
+                                        },
+                                        BackgroundColor(creature_signal_color(
+                                            CreatureSignalSource::Sensor,
+                                            channel.index,
+                                        )),
+                                        BorderRadius::all(Val::Px(2.0)),
+                                        CreatureSignalBar {
+                                            source: CreatureSignalSource::Sensor,
+                                            index: channel.index,
+                                        },
+                                    ));
+                                });
+                            }
                         });
                     }
                 });
-                card_signal_status = card
-                    .spawn((
-                        Text::new("SIGNALS  /  waiting for owner sample"),
-                        ui_font(10.0),
-                        TextColor(Color::srgb(0.66, 0.81, 0.73)),
-                    ))
-                    .id();
+                // Keep transient owner errors from reflowing the entire card.
+                // The complete failure remains available in Detailed readings.
+                card.spawn(Node {
+                    width: Val::Percent(100.0),
+                    height: Val::Px(14.0),
+                    flex_shrink: 0.0,
+                    overflow: Overflow::clip(),
+                    ..default()
+                })
+                .with_children(|row| {
+                    card_signal_status = row
+                        .spawn((
+                            Text::new("SIGNALS  /  WAITING FOR OWNER SAMPLE"),
+                            ui_font(10.0),
+                            TextLayout::new_with_linebreak(bevy::text::LineBreak::NoWrap),
+                            TextColor(Color::srgb(0.66, 0.81, 0.73)),
+                        ))
+                        .id();
+                });
                 for (title, source, labels) in [
                     (
-                        "SENSORS  ·  E1–E4: SWATCH = EYE RGB",
+                        "OTHER SENSORS  ·  BARS CLAMPED TO 0–1",
                         CreatureSignalSource::Sensor,
                         creature_sensor_labels(),
                     ),
@@ -6096,6 +6239,12 @@ fn setup_scene(
                         CreatureSignalSource::Output,
                         OutputChannel::ALL
                             .iter()
+                            .filter(|channel| {
+                                !matches!(
+                                    channel,
+                                    OutputChannel::WheelLeft | OutputChannel::WheelRight
+                                )
+                            })
                             .map(|channel| {
                                 let label = match channel {
                                     OutputChannel::WheelLeft => "left",
@@ -6141,26 +6290,6 @@ fn setup_scene(
                                     ..default()
                                 })
                                 .with_children(|header| {
-                                    if matches!(source, CreatureSignalSource::Sensor)
-                                        && let Some(channel) =
-                                            scriptbots_core::SENSOR_LAYOUT.get(index)
-                                        && channel.kind == scriptbots_core::SensorKind::EyeDensity
-                                        && let Some(eye) = channel.eye
-                                    {
-                                        header.spawn((
-                                            Node {
-                                                width: Val::Px(12.0),
-                                                height: Val::Px(12.0),
-                                                flex_shrink: 0.0,
-                                                border: UiRect::all(Val::Px(1.0)),
-                                                ..default()
-                                            },
-                                            BackgroundColor(Color::srgb(0.17, 0.22, 0.20)),
-                                            BorderColor::all(Color::srgb(0.54, 0.65, 0.59)),
-                                            BorderRadius::all(Val::Px(6.0)),
-                                            CreatureEyeSwatch(eye),
-                                        ));
-                                    }
                                     header.spawn((
                                         Text::new(label),
                                         ui_font(10.0),
@@ -6532,22 +6661,10 @@ fn setup_scene(
                 }
             });
 
-        parent.spawn((toolbar_row,)).with_children(|row| {
-            row.spawn((
-                Button,
-                toolbar_button.clone(),
-                BackgroundColor(follow_idle_color()),
-                BorderRadius::all(Val::Px(6.0)),
-                BorderColor::all(button_border_color),
-                lab_workflows::OpenLabButton,
-            ))
-            .with_children(|button| {
-                button.spawn((
-                    Text::new("Lab (F6)"),
-                    secondary_font.clone(),
-                    TextColor(secondary_text_color),
-                ));
-            });
+        // The camera controls and the follow mode form one group. Keeping
+        // tools on a separate row avoids a lone wrapped button at common
+        // window sizes while preserving the dock's bottom-up expansion.
+        parent.spawn((toolbar_row.clone(),)).with_children(|row| {
             for (view, label) in [
                 (CameraView::Overhead, "Overhead"),
                 (CameraView::Isometric, "Isometric"),
@@ -6569,17 +6686,41 @@ fn setup_scene(
                     ));
                 });
             }
-            #[derive(Clone, Copy)]
-            enum ToolbarAction {
-                Follow,
-                Settings,
-                Diagnostics,
-            }
-            for (label, kind) in [
-                ("Follow: Off", ToolbarAction::Follow),
-                ("Settings", ToolbarAction::Settings),
-                ("Diagnostics", ToolbarAction::Diagnostics),
-            ] {
+            row.spawn((
+                Button,
+                toolbar_button.clone(),
+                BackgroundColor(follow_idle_color()),
+                BorderRadius::all(Val::Px(6.0)),
+                BorderColor::all(button_border_color),
+                HudFollowMenuButton,
+            ))
+            .with_children(|button| {
+                button.spawn((
+                    Text::new("Follow: Off"),
+                    secondary_font.clone(),
+                    TextColor(secondary_text_color),
+                    HudFollowMenuLabel,
+                ));
+            });
+        });
+
+        parent.spawn((toolbar_row,)).with_children(|row| {
+            row.spawn((
+                Button,
+                toolbar_button.clone(),
+                BackgroundColor(follow_idle_color()),
+                BorderRadius::all(Val::Px(6.0)),
+                BorderColor::all(button_border_color),
+                lab_workflows::OpenLabButton,
+            ))
+            .with_children(|button| {
+                button.spawn((
+                    Text::new("Lab (F6)"),
+                    secondary_font.clone(),
+                    TextColor(secondary_text_color),
+                ));
+            });
+            for (label, diagnostic) in [("Settings", false), ("Diagnostics", true)] {
                 let mut button = row.spawn((
                     Button,
                     toolbar_button.clone(),
@@ -6587,26 +6728,17 @@ fn setup_scene(
                     BorderRadius::all(Val::Px(6.0)),
                     BorderColor::all(button_border_color),
                 ));
-                match kind {
-                    ToolbarAction::Follow => {
-                        button.insert(HudFollowMenuButton);
-                    }
-                    ToolbarAction::Settings => {
-                        button.insert(HudDisplaySettingsButton);
-                    }
-                    ToolbarAction::Diagnostics => {
-                        button.insert(HudDiagnosticsButton);
-                    }
+                if diagnostic {
+                    button.insert(HudDiagnosticsButton);
+                } else {
+                    button.insert(HudDisplaySettingsButton);
                 }
-                button.with_children(|btn| {
-                    let mut label = btn.spawn((
+                button.with_children(|button| {
+                    button.spawn((
                         Text::new(label),
                         secondary_font.clone(),
                         TextColor(secondary_text_color),
                     ));
-                    if matches!(kind, ToolbarAction::Follow) {
-                        label.insert(HudFollowMenuLabel);
-                    }
                 });
             }
             // Diagnostics replaces the creature card, so its page actions
@@ -7261,10 +7393,15 @@ struct CreatureCardData<'w, 's> {
     nodes: Query<'w, 's, &'static mut Node>,
     texts: Query<'w, 's, &'static mut Text>,
     backgrounds: Query<'w, 's, &'static mut BackgroundColor>,
+    borders: Query<'w, 's, &'static mut BorderColor>,
     bars: Query<'w, 's, (Entity, &'static CreatureSignalBar)>,
     eyes: Query<'w, 's, (Entity, &'static CreatureEyeSwatch)>,
+    eye_compasses: Query<'w, 's, (Entity, &'static CreatureEyeCompass)>,
     eye_bearings: Query<'w, 's, (Entity, &'static CreatureEyeBearing)>,
+    eye_limits: Query<'w, 's, (Entity, &'static CreatureEyeLimit)>,
     vitals: Query<'w, 's, (Entity, &'static CreatureVitalBar)>,
+    drives: Query<'w, 's, (Entity, &'static CreatureDrive)>,
+    drive_labels: Query<'w, 's, (Entity, &'static CreatureDriveLabel)>,
     preferences: Query<'w, 's, (Entity, &'static CreaturePreference)>,
     preference_labels: Query<'w, 's, (Entity, &'static CreaturePreferenceLabel)>,
     brain_layers: Query<'w, 's, (Entity, &'static CreatureBrainLayer)>,
@@ -7286,10 +7423,15 @@ fn update_creature_card(
         mut nodes,
         mut texts,
         mut backgrounds,
+        mut borders,
         bars,
         eyes,
+        eye_compasses,
         eye_bearings,
+        eye_limits,
         vitals,
+        drives,
+        drive_labels,
         preferences,
         preference_labels,
         brain_layers,
@@ -7341,6 +7483,26 @@ fn update_creature_card(
     let (Some(frame), Some(agent)) = (state.latest.as_ref(), selected) else {
         return;
     };
+    for (entity, compass) in &eye_compasses {
+        let full_view = agent
+            .eye_dirs
+            .get(compass.0)
+            .zip(agent.eye_fov.get(compass.0))
+            .is_some_and(|(&bearing, &fov)| {
+                bearing.is_finite() && fov.is_finite() && fov >= std::f32::consts::PI
+            });
+        let color = if full_view {
+            Color::srgb(0.97, 0.73, 0.34)
+        } else {
+            Color::srgb(0.35, 0.50, 0.42)
+        };
+        if let Ok(mut border) = borders.get_mut(entity) {
+            let desired = BorderColor::all(color);
+            if *border != desired {
+                *border = desired;
+            }
+        }
+    }
     for (entity, bearing) in &eye_bearings {
         if let Ok(mut node) = nodes.get_mut(entity) {
             let angle = agent
@@ -7348,6 +7510,36 @@ fn update_creature_card(
                 .get(bearing.0)
                 .copied()
                 .filter(|v| v.is_finite());
+            let display = if angle.is_some() {
+                Display::Flex
+            } else {
+                Display::None
+            };
+            if node.display != display {
+                node.display = display;
+            }
+            if let Some(angle) = angle {
+                let left = Val::Percent(50.0 + 32.0 * angle.sin());
+                let top = Val::Percent(50.0 - 32.0 * angle.cos());
+                if node.left != left {
+                    node.left = left;
+                }
+                if node.top != top {
+                    node.top = top;
+                }
+            }
+        }
+    }
+    for (entity, limit) in &eye_limits {
+        let angle = agent
+            .eye_dirs
+            .get(limit.eye)
+            .zip(agent.eye_fov.get(limit.eye))
+            .and_then(|(&bearing, &fov)| {
+                (bearing.is_finite() && fov.is_finite() && fov > 0.0 && fov < std::f32::consts::PI)
+                    .then(|| bearing + limit.side * fov)
+            });
+        if let Ok(mut node) = nodes.get_mut(entity) {
             let display = if angle.is_some() {
                 Display::Flex
             } else {
@@ -7383,6 +7575,46 @@ fn update_creature_card(
             if node.width != width {
                 node.width = width;
             }
+        }
+    }
+    let drive_value = |drive: CreatureDrive| match drive {
+        CreatureDrive::Left => agent.wheel_left,
+        CreatureDrive::Right => agent.wheel_right,
+    };
+    for (entity, drive) in &drives {
+        let value = drive_value(*drive);
+        let fraction = if value.is_finite() {
+            value.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        if let Ok(mut node) = nodes.get_mut(entity) {
+            let width = Val::Percent(fraction * 100.0);
+            if node.width != width {
+                node.width = width;
+            }
+        }
+    }
+    for (entity, label) in &drive_labels {
+        if let Ok(mut text) = texts.get_mut(entity) {
+            let value = drive_value(label.0);
+            let side = match label.0 {
+                CreatureDrive::Left => "LEFT WHEEL REQUEST",
+                CreatureDrive::Right => "RIGHT WHEEL REQUEST",
+            };
+            let reading = if value.is_finite() {
+                format!(
+                    "{value:+.2}{}",
+                    if !(0.0..=1.0).contains(&value) {
+                        " · BAR CLAMPED"
+                    } else {
+                        ""
+                    }
+                )
+            } else {
+                "UNAVAILABLE".to_owned()
+            };
+            set_hud_text_if_changed(&mut text, format!("{side}  {reading}"));
         }
     }
     let preference_value = |preference: CreaturePreference| {
@@ -7429,23 +7661,25 @@ fn update_creature_card(
             .as_ref()
             .filter(|sample| current.is_some_and(|target| sample.target.visible_at(target)))
     });
-    let mut signal_status = match (current, sample) {
+    let refresh_failed = owner
+        .as_ref()
+        .is_some_and(|inspector| inspector.last_failure.is_some());
+    let signal_prefix = if refresh_failed {
+        "SIGNALS  /  REFRESH FAILED"
+    } else {
+        "SIGNALS"
+    };
+    let signal_status = match (current, sample) {
         (Some(current), Some(sample)) => format!(
-            "SIGNALS  /  TICK {}  ·  {}",
+            "{signal_prefix}  ·  TICK {}  ·  {}",
             sample.target.source.inspected_tick.0,
             dashboard_sample_age(
                 current.source.inspected_tick.0 - sample.target.source.inspected_tick.0
             ),
         ),
         _ if owner.is_none() => "SIGNALS  /  OWNER DETAIL UNAVAILABLE".to_owned(),
-        _ => "SIGNALS  /  WAITING FOR OWNER SAMPLE".to_owned(),
+        _ => format!("{signal_prefix}  ·  WAITING FOR OWNER SAMPLE"),
     };
-    if let Some(error) = owner
-        .as_ref()
-        .and_then(|inspector| inspector.last_failure.as_ref())
-    {
-        signal_status.push_str(&format!("  ·  REFRESH FAILED: {error}"));
-    }
     for (entity, eye) in &eyes {
         let color = sample
             .and_then(|sample| creature_eye_rgb(&sample.sensors, eye.0))
@@ -7595,7 +7829,7 @@ fn update_creature_card(
     let context = format!(
         "{} | position {:.0}, {:.0}{}{}\n\
          Speed {:.2}/tick | heading {:.2} rad\n\
-         Drive L {:+.2} / R {:+.2} | spike {:.2} | boost {}",
+         Spike {:.2} | boost {}",
         detail.diet(),
         agent.position.x,
         agent.position.y,
@@ -7607,8 +7841,6 @@ fn update_creature_card(
         },
         agent.velocity.length(),
         agent.heading,
-        agent.wheel_left,
-        agent.wheel_right,
         agent.spike_length,
         if agent.boost > 0.5 { "on" } else { "off" },
     );
@@ -8041,23 +8273,16 @@ mod hud_inspector_tests {
     }
 
     #[test]
-    fn signal_labels_cover_each_canonical_sensor_once_and_group_eyes() {
+    fn signal_labels_cover_each_non_eye_sensor_once() {
         let labels = creature_sensor_labels();
-        assert_eq!(labels.len(), scriptbots_core::INPUT_SIZE);
         let mut indices = labels.iter().map(|(_, index)| *index).collect::<Vec<_>>();
         indices.sort_unstable();
-        assert_eq!(
-            indices,
-            (0..scriptbots_core::INPUT_SIZE).collect::<Vec<_>>()
-        );
-        for eye in 0..NUM_EYES {
-            let group = &labels[eye * 5..eye * 5 + 4];
-            assert!(
-                group
-                    .iter()
-                    .all(|(_, index)| scriptbots_core::SENSOR_LAYOUT[*index].eye == Some(eye))
-            );
-        }
+        let expected = scriptbots_core::SENSOR_LAYOUT
+            .iter()
+            .filter(|channel| channel.eye.is_none())
+            .map(|channel| channel.index)
+            .collect::<Vec<_>>();
+        assert_eq!(indices, expected);
     }
 
     #[test]
@@ -10186,6 +10411,18 @@ mod adaptive_governor_tests {
         app.update();
 
         let world = app.world_mut();
+        let signal_status = world.resource::<CreatureCardElements>().signal_status;
+        let status_row = world
+            .get::<ChildOf>(signal_status)
+            .expect("signal status has a clipping row")
+            .parent();
+        let status_row = world.get::<Node>(status_row).unwrap();
+        assert_eq!(status_row.height, Val::Px(14.0));
+        assert_eq!(status_row.overflow, Overflow::clip());
+        assert_eq!(
+            world.get::<TextLayout>(signal_status).unwrap().linebreak,
+            bevy::text::LineBreak::NoWrap
+        );
         let mut eyes: Vec<_> = world
             .query::<&CreatureEyeSwatch>()
             .iter(world)
@@ -10193,6 +10430,28 @@ mod adaptive_governor_tests {
             .collect();
         eyes.sort_unstable();
         assert_eq!(eyes, (0..NUM_EYES).collect::<Vec<_>>());
+        let mut sensor_bars: Vec<_> = world
+            .query::<&CreatureSignalBar>()
+            .iter(world)
+            .filter(|bar| matches!(bar.source, CreatureSignalSource::Sensor))
+            .map(|bar| bar.index)
+            .collect();
+        sensor_bars.sort_unstable();
+        let expected_sensor_bars: Vec<_> = scriptbots_core::SENSOR_LAYOUT
+            .iter()
+            .filter(|channel| {
+                channel.eye.is_none() || channel.kind == scriptbots_core::SensorKind::EyeDensity
+            })
+            .map(|channel| channel.index)
+            .collect();
+        assert_eq!(sensor_bars, expected_sensor_bars);
+        let mut compasses: Vec<_> = world
+            .query::<&CreatureEyeCompass>()
+            .iter(world)
+            .map(|eye| eye.0)
+            .collect();
+        compasses.sort_unstable();
+        assert_eq!(compasses, (0..NUM_EYES).collect::<Vec<_>>());
         let mut bearings: Vec<_> = world
             .query::<&CreatureEyeBearing>()
             .iter(world)
@@ -10200,6 +10459,18 @@ mod adaptive_governor_tests {
             .collect();
         bearings.sort_unstable();
         assert_eq!(bearings, (0..NUM_EYES).collect::<Vec<_>>());
+        let mut limits: Vec<_> = world
+            .query::<&CreatureEyeLimit>()
+            .iter(world)
+            .map(|limit| (limit.eye, limit.side as i32))
+            .collect();
+        limits.sort_unstable();
+        assert_eq!(
+            limits,
+            (0..NUM_EYES)
+                .flat_map(|eye| [(eye, -1), (eye, 1)])
+                .collect::<Vec<_>>()
+        );
         let preferences: Vec<_> = world.query::<&CreaturePreference>().iter(world).collect();
         assert_eq!(preferences.len(), 2);
         assert!(
@@ -10211,6 +10482,36 @@ mod adaptive_governor_tests {
             preferences
                 .iter()
                 .any(|p| matches!(p, CreaturePreference::Temperature))
+        );
+        let drives: Vec<_> = world.query::<&CreatureDrive>().iter(world).collect();
+        assert_eq!(drives.len(), 2);
+        assert!(
+            drives
+                .iter()
+                .any(|drive| matches!(drive, CreatureDrive::Left))
+        );
+        assert!(
+            drives
+                .iter()
+                .any(|drive| matches!(drive, CreatureDrive::Right))
+        );
+        let mut other_outputs: Vec<_> = world
+            .query::<&CreatureSignalBar>()
+            .iter(world)
+            .filter(|bar| matches!(bar.source, CreatureSignalSource::Output))
+            .map(|bar| bar.index)
+            .collect();
+        other_outputs.sort_unstable();
+        assert_eq!(
+            other_outputs,
+            OutputChannel::ALL
+                .iter()
+                .filter(|channel| !matches!(
+                    channel,
+                    OutputChannel::WheelLeft | OutputChannel::WheelRight
+                ))
+                .map(|channel| channel.index())
+                .collect::<Vec<_>>()
         );
     }
 
@@ -10430,6 +10731,32 @@ mod adaptive_governor_tests {
             .query_filtered::<Entity, With<HudFollowMenuLabel>>()
             .single(world)
             .unwrap();
+        let camera = world
+            .query_filtered::<Entity, With<CameraViewButton>>()
+            .iter(world)
+            .next()
+            .unwrap();
+        let lab = world
+            .query_filtered::<Entity, With<lab_workflows::OpenLabButton>>()
+            .single(world)
+            .unwrap();
+        let settings = world
+            .query_filtered::<Entity, With<HudDisplaySettingsButton>>()
+            .single(world)
+            .unwrap();
+        let diagnostics = world
+            .query_filtered::<Entity, With<HudDiagnosticsButton>>()
+            .single(world)
+            .unwrap();
+        let camera_row = world.get::<ChildOf>(camera).unwrap().parent();
+        let tools_row = world.get::<ChildOf>(lab).unwrap().parent();
+        assert_eq!(world.get::<ChildOf>(toggle).unwrap().parent(), camera_row);
+        assert_eq!(world.get::<ChildOf>(settings).unwrap().parent(), tools_row);
+        assert_eq!(
+            world.get::<ChildOf>(diagnostics).unwrap().parent(),
+            tools_row
+        );
+        assert_ne!(camera_row, tools_row);
         assert_eq!(world.get::<Node>(tray).unwrap().display, Display::None);
         assert_eq!(world.get::<Text>(label).unwrap().0, "Follow: Off");
         assert_eq!(world.query::<&CameraViewButton>().iter(world).count(), 3);
@@ -14661,9 +14988,21 @@ mod owner_inspector_tests {
             .world_mut()
             .spawn((BackgroundColor(Color::WHITE), CreatureEyeSwatch(0)))
             .id();
+        let eye_compass = app
+            .world_mut()
+            .spawn((BorderColor::all(Color::WHITE), CreatureEyeCompass(0)))
+            .id();
         let eye_bearing = app
             .world_mut()
             .spawn((Node::default(), CreatureEyeBearing(0)))
+            .id();
+        let eye_left = app
+            .world_mut()
+            .spawn((Node::default(), CreatureEyeLimit { eye: 0, side: -1.0 }))
+            .id();
+        let eye_right = app
+            .world_mut()
+            .spawn((Node::default(), CreatureEyeLimit { eye: 0, side: 1.0 }))
             .id();
         let energy_bar = app
             .world_mut()
@@ -14715,13 +15054,88 @@ mod owner_inspector_tests {
             .unwrap()
             .agents[0]
             .eye_dirs[0] = 0.0;
+        app.world_mut()
+            .resource_mut::<SnapshotState>()
+            .latest
+            .as_mut()
+            .unwrap()
+            .agents[0]
+            .eye_fov[0] = std::f32::consts::FRAC_PI_2;
         app.update();
+        assert_eq!(
+            *app.world().get::<BorderColor>(eye_compass).unwrap(),
+            BorderColor::all(Color::srgb(0.35, 0.50, 0.42))
+        );
         {
             let node = app.world().get::<Node>(eye_bearing).unwrap();
             assert_eq!(node.display, Display::Flex);
             assert_eq!(node.left, Val::Percent(50.0));
             assert_eq!(node.top, Val::Percent(18.0));
         }
+        for (entity, expected) in [(eye_left, 18.0), (eye_right, 82.0)] {
+            let node = app.world().get::<Node>(entity).unwrap();
+            assert_eq!(node.display, Display::Flex);
+            assert_eq!(node.left, Val::Percent(expected));
+            let Val::Percent(top) = node.top else {
+                panic!("expected percentage");
+            };
+            assert!((top - 50.0).abs() < 0.001);
+        }
+        app.world_mut()
+            .resource_mut::<SnapshotState>()
+            .latest
+            .as_mut()
+            .unwrap()
+            .agents[0]
+            .eye_fov[0] = 0.0;
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(eye_left).unwrap().display,
+            Display::None
+        );
+        app.world_mut()
+            .resource_mut::<SnapshotState>()
+            .latest
+            .as_mut()
+            .unwrap()
+            .agents[0]
+            .eye_fov[0] = std::f32::consts::TAU;
+        app.update();
+        for entity in [eye_left, eye_right] {
+            let node = app.world().get::<Node>(entity).unwrap();
+            assert_eq!(node.display, Display::None);
+        }
+        assert_eq!(
+            *app.world().get::<BorderColor>(eye_compass).unwrap(),
+            BorderColor::all(Color::srgb(0.97, 0.73, 0.34))
+        );
+        app.world_mut()
+            .resource_mut::<SnapshotState>()
+            .latest
+            .as_mut()
+            .unwrap()
+            .agents[0]
+            .eye_fov[0] = f32::NAN;
+        app.update();
+        assert_eq!(
+            *app.world().get::<BorderColor>(eye_compass).unwrap(),
+            BorderColor::all(Color::srgb(0.35, 0.50, 0.42))
+        );
+        assert_eq!(
+            app.world().get::<Node>(eye_left).unwrap().display,
+            Display::None
+        );
+        assert_eq!(
+            app.world().get::<Node>(eye_right).unwrap().display,
+            Display::None
+        );
+        app.world_mut()
+            .resource_mut::<SnapshotState>()
+            .latest
+            .as_mut()
+            .unwrap()
+            .agents[0]
+            .eye_fov[0] = std::f32::consts::FRAC_PI_2;
         app.world_mut()
             .resource_mut::<SnapshotState>()
             .latest
@@ -14749,6 +15163,14 @@ mod owner_inspector_tests {
         app.update();
         assert_eq!(
             app.world().get::<Node>(eye_bearing).unwrap().display,
+            Display::None
+        );
+        assert_eq!(
+            app.world().get::<Node>(eye_left).unwrap().display,
+            Display::None
+        );
+        assert_eq!(
+            app.world().get::<Node>(eye_right).unwrap().display,
             Display::None
         );
         assert_eq!(
@@ -14856,7 +15278,7 @@ mod owner_inspector_tests {
         app.world_mut().resource_mut::<InspectorPage>().0 = 1;
         app.world_mut()
             .non_send_resource_mut::<OwnerInspector>()
-            .last_failure = Some("test timeout".into());
+            .last_failure = Some("test timeout with a long diagnostic\nsecond line".into());
         app.update();
         assert!(
             app.world()
@@ -14870,7 +15292,23 @@ mod owner_inspector_tests {
                 .get::<Text>(status)
                 .unwrap()
                 .0
-                .contains("REFRESH FAILED: test timeout")
+                .contains("REFRESH FAILED: test timeout with a long diagnostic\nsecond line")
+        );
+        let compact_status = &app.world().get::<Text>(signal_status).unwrap().0;
+        assert!(compact_status.contains("REFRESH FAILED"));
+        assert!(compact_status.contains("TICKS OLD"));
+        assert!(!compact_status.contains('\n'));
+        assert!(!compact_status.contains("long diagnostic"));
+        app.world_mut()
+            .non_send_resource_mut::<OwnerInspector>()
+            .last_failure = None;
+        app.update();
+        assert!(
+            !app.world()
+                .get::<Text>(signal_status)
+                .unwrap()
+                .0
+                .contains("REFRESH FAILED")
         );
         let brain_page = app
             .world()
@@ -15114,12 +15552,36 @@ mod owner_inspector_tests {
         };
         let context = card.context;
         let status = card.page_status;
+        let left_bar = app
+            .world_mut()
+            .spawn((Node::default(), CreatureDrive::Left))
+            .id();
+        let right_bar = app
+            .world_mut()
+            .spawn((Node::default(), CreatureDrive::Right))
+            .id();
+        let left_label = app
+            .world_mut()
+            .spawn((Text::default(), CreatureDriveLabel(CreatureDrive::Left)))
+            .id();
         app.insert_resource(card)
             .add_systems(Update, update_creature_card);
         app.update();
         let text = &app.world().get::<Text>(context).unwrap().0;
         assert!(text.contains("Speed 5.00/tick | heading 1.25 rad"));
-        assert!(text.contains("Drive L -0.35 / R +0.65 | spike 7.50 | boost on"));
+        assert!(text.contains("Spike 7.50 | boost on"));
+        assert_eq!(
+            app.world().get::<Node>(left_bar).unwrap().width,
+            Val::Percent(0.0)
+        );
+        assert_eq!(
+            app.world().get::<Node>(right_bar).unwrap().width,
+            Val::Percent(65.0)
+        );
+        assert_eq!(
+            app.world().get::<Text>(left_label).unwrap().0,
+            "LEFT WHEEL REQUEST  -0.35 · BAR CLAMPED"
+        );
         assert_eq!(
             app.world().get::<Text>(status).unwrap().0,
             "DETAIL UNAVAILABLE"
@@ -15137,7 +15599,36 @@ mod owner_inspector_tests {
         app.update();
         let text = &app.world().get::<Text>(context).unwrap().0;
         assert!(text.contains("Speed 0.00/tick"));
-        assert!(text.contains("Drive L +0.20 / R -0.40 | spike 0.00 | boost off"));
+        assert!(text.contains("Spike 0.00 | boost off"));
+        assert_eq!(
+            app.world().get::<Node>(left_bar).unwrap().width,
+            Val::Percent(20.0)
+        );
+        assert_eq!(
+            app.world().get::<Node>(right_bar).unwrap().width,
+            Val::Percent(0.0)
+        );
+        assert_eq!(
+            app.world().get::<Text>(left_label).unwrap().0,
+            "LEFT WHEEL REQUEST  +0.20"
+        );
+
+        app.world_mut()
+            .resource_mut::<SnapshotState>()
+            .latest
+            .as_mut()
+            .unwrap()
+            .agents[0]
+            .wheel_left = f32::NAN;
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(left_bar).unwrap().width,
+            Val::Percent(0.0)
+        );
+        assert_eq!(
+            app.world().get::<Text>(left_label).unwrap().0,
+            "LEFT WHEEL REQUEST  UNAVAILABLE"
+        );
     }
 
     #[test]

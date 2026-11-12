@@ -18113,7 +18113,9 @@ for case in ('panic', 'subscription', 'renderer'):
         .unwrap();
         let installed = crate::install_brains(&mut world, crate::BrainPreset::Mlp).unwrap();
         for _ in 0..2 {
-            let id = world.spawn_agent(scriptbots_core::AgentData::default());
+            let id = world
+                .try_spawn_agent(scriptbots_core::AgentData::default())
+                .expect("seed terminal checkpoint branch founder");
             assert!(
                 world
                     .bind_agent_brain(id, installed.population()[0])

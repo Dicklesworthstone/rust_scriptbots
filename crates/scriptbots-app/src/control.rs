@@ -1441,6 +1441,13 @@ fn valid_branch_digest(value: &str) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
+fn valid_world_digest_v1(value: &str) -> bool {
+    value.len() == std::mem::size_of::<u64>() * 2
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
 fn checkpoint_branch_specs(
     request: &CheckpointBranchRequest,
     source_tick: u64,
@@ -1568,7 +1575,7 @@ impl CheckpointBranchDefinitionV1 {
             || directory.file_name().and_then(|name| name.to_str()) != Some(expected_id.as_str())
             || self.request_hash != compute_blake3(&self.request.bounded_payload()?)
             || self.source_tick.checked_add(self.request.ticks) != Some(self.target_tick)
-            || !valid_branch_digest(&self.world_digest_v1)
+            || !valid_world_digest_v1(&self.world_digest_v1)
             || !valid_branch_digest(&self.source_checksum_blake3)
             || self.source_byte_size == 0
             || self.source_byte_size > MAX_ARTIFACT_DOWNLOAD_BYTES as u64
@@ -2316,7 +2323,7 @@ fn validate_checkpoint_branch_report(
                     || branch.command_applied_tick != spec.scheduled_tick
                     || branch.terminal_sample.tick != definition.target_tick
                     || branch.final_digest != branch.terminal_sample.digest_overall
-                    || !valid_branch_digest(&branch.final_digest)
+                    || !valid_world_digest_v1(&branch.final_digest)
                     || !branch.bundle_verified
             })
     {
@@ -11669,7 +11676,9 @@ pub(crate) mod tests {
         if let Some(preset) = preset {
             let installed = crate::install_brains(&mut world, preset).unwrap();
             for _ in 0..2 {
-                let id = world.spawn_agent(scriptbots_core::AgentData::default());
+                let id = world
+                    .try_spawn_agent(scriptbots_core::AgentData::default())
+                    .expect("seed checkpoint branch founder");
                 assert!(
                     world
                         .bind_agent_brain(id, installed.population()[0])
@@ -11714,6 +11723,27 @@ pub(crate) mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+    }
+
+    #[test]
+    fn checkpoint_world_digest_and_artifact_checksums_have_distinct_formats() {
+        assert!(valid_world_digest_v1("0123456789abcdef"));
+        for invalid in [
+            "0123456789abcde",
+            "0123456789abcdef0",
+            "0123456789abcdeF",
+            "0123456789abcdeg",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        ] {
+            assert!(!valid_world_digest_v1(invalid), "{invalid}");
+        }
+        assert!(!valid_branch_digest("0123456789abcdef"));
+        assert!(valid_branch_digest(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        ));
+        assert!(!valid_branch_digest(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeF"
+        ));
     }
 
     #[test]
