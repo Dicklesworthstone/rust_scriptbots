@@ -10,6 +10,160 @@ Repository: <https://github.com/Dicklesworthstone/rust_scriptbots>
 
 ---
 
+## [v0.5.0] - 2026-11-12
+
+Source release (GitHub Release notes, same venue as v0.4.0; no prebuilt binaries).
+565 commits since v0.4.0.
+
+### Compatibility
+- **Run databases:** the journal archive stays at version 6 and the storage schema at version 19, both as in v0.4.0. Run databases from v0.2.0 and v0.3.0 are still refused, as in v0.4.0 ([#6](https://github.com/Dicklesworthstone/rust_scriptbots/issues/6)).
+- **`scriptbots-brain-ml` no longer has a `tch` feature,** and `MlBackendKind::Tch` is gone. The feature only selected a placeholder label: the adapter ran the same sensor-copy placeholder as a build with no ML backend, and no code used the tch crate. A build that enables `tch` must drop it.
+- **The MCP server registers 35 tools,** up from 30: `experiment_compare`, `checkpoint_branch_create`, `checkpoint_branch_list`, `checkpoint_branch_status` and `checkpoint_branch_cancel` are new.
+- **REST:** the OpenAPI spec comes from utoipa 6. Swagger UI 5.32.6 is bundled at build time; v0.4.0's build script downloaded Swagger UI 5.17.14. Every response in the spec carries a description.
+- **Optional backends:**
+  - candle 0.11.1 behind the `candle` feature (was 0.8);
+  - arrow and parquet 60.1.0 in `scriptbots-analytics` (was 58.4);
+  - Bevy, opt-in through `bevy_render`, uses the C zstd backend.
+- **Unchanged:** toolchain `nightly-2026-08-31`, MSRV 1.89 and edition 2024.
+
+### Added
+- **Experiments and checkpoints:**
+  - saved checkpoints start managed and replicated branch studies through the native Lab, the terminal, the CLI, REST, MCP and the browser;
+  - matched-seed studies run across brain families, with verified comparisons;
+  - scheduled and timed treatment studies;
+  - runs suspend at durable tick cuts and resume after a restart, and stopped API jobs recover from their durable definitions;
+  - run bundles carry and verify the final owner cut;
+  - retained checkpoint studies and catalogs can be discovered and reopened from every control interface.
+- **Map editor in the native Lab:**
+  - sample previews and undoable drafts;
+  - recipes saved and opened through native dialogs;
+  - field brushes for scalar constraints;
+  - hazards and per-cell erasing;
+  - custom exemplars from saved maps;
+  - rule prototype rosters and ordered adjacency rules;
+  - every terrain kind selectable from the legend;
+  - the shared accessibility palette.
+- **Replay and narrative:**
+  - narrative events can be reviewed in the World view, the terminal canvas and the TUI through bounded checkpoint replay;
+  - replay reconstructs config-audited event intervals, configuration schedules, observed agent commands, mixed config and agent histories, and intervention effects;
+  - analytics exposes typed narrative and replay timelines.
+- **Analytics and storage:**
+  - canonical and columnar exports stream with full source verification;
+  - matched-seed cohorts compare at exact endpoints;
+  - several runs compare through one finished database lease.
+- **Bevy viewer:**
+  - textured terrain with WGSL blending;
+  - rendered food;
+  - creature physiology, combat, profile and brain inspection in a paged HUD;
+  - camera presets and a follow tray;
+  - creature poses interpolated across toroidal seams;
+  - located ecological events;
+  - a bundled Inter UI font.
+- **Native renderer:**
+  - FXAA controls;
+  - natural materials;
+  - a creature physiology HUD with asynchronous brain inspection;
+  - keyboard-reachable HUD, map sandbox and timeline;
+  - a world camera shared with the Lab.
+- **Web:**
+  - view and control a remote simulation from the browser;
+  - a WebGPU renderer with Canvas fallback;
+  - owner continuations saved and restored across reloads;
+  - live brain activity inspection;
+  - a genome browser and intervention toolbox;
+  - checkpoint studies;
+  - local and remote narrative timelines.
+- **Control and runtime:**
+  - WebSocket commands are acknowledged and deduplicated;
+  - remote snapshots and narrative events stream within bounds;
+  - monitoring is resumable;
+  - agent inspections queue within port and caller deadlines (`OwnerReadTimeout`);
+  - step endpoints take strict object payloads.
+- **Brains and science:**
+  - FtBrain cohorts run on packed per-layer kernels, with canonical loci and activity inspection;
+  - a heritable f64 NeuroFlow family with preset checkpointing;
+  - tournaments admit FrankenTorch and NeuroFlow families;
+  - food-funded reproduction and a closed meadow experiment;
+  - archipelago migrations are recorded through the CLI.
+- **Provenance:** run manifests embed the compiler identity and record the actual Cargo target.
+- **Bevy creature inspection:** the inspection surface adds a per-eye compass, an eye limit and a creature-drive label. The status row is a 14px line that clips overflow, and a failed refresh shows as one short line ("REFRESH FAILED" or "TICKS OLD") instead of a multi-line diagnostic. ([f55abc2](https://github.com/Dicklesworthstone/rust_scriptbots/commit/f55abc298088cf068bb3bf145fe577d2f0b52de0))
+- **Browser experiment protocol:** the web client can create, list, inspect, cancel and resume matched-seed experiments on a remote host and request paired comparisons. It keeps full 64-bit seeds and resends a retried request byte for byte. ([fc23116](https://github.com/Dicklesworthstone/rust_scriptbots/commit/fc231167f49ffe2c33bb675b523f1ff543aaad6d))
+- **Matched-seed experiments in the browser:** a panel builds a two-arm experiment from exact decimal seeds (1 to 32 distinct unsigned 64-bit values), brain families, initial overrides and ordered intervention schedules. It follows, cancels, resumes or retries the experiment, reopens retained experiments after a reload, compares completed arms on a terminal metric, and exports the observations as JSON. A single seed pair is reported as descriptive only. The workflow is documented in `crates/scriptbots-web/web/README.md`. ([69aa9de](https://github.com/Dicklesworthstone/rust_scriptbots/commit/69aa9de0bfc57c998219aa3afb96d72a879ea746))
+- **Bevy creature maps and groundcover:** the inspection surface shows the selected creature's eye field, a 32-by-32 image of its forward vision, and a terrain map in world orientation with the selected palette, downsampled for large worlds. A groundcover study beside the world places authored and seeded procedural plants; it excludes floods and stops at water. Bevy's `jpeg` feature is enabled so the authored images load. ([832cacd](https://github.com/Dicklesworthstone/rust_scriptbots/commit/832cacd7ae2908a773392941025e8c75f8b5d09b), [ebaaa3a](https://github.com/Dicklesworthstone/rust_scriptbots/commit/ebaaa3a48bdf1a68026c30eda095fb68525e2705))
+- **Bevy camera zoom, creature card and spikes:** the manual camera can now close to four body radii, clamped between 40 and the existing 6000 maximum; a missing snapshot, or a radius that is not finite and positive, keeps the old 300 minimum, and automatic framing still uses 300. The creature card drops its static title and shows an owner-sample line, food delta per tick, the reproduction counter, up to two known parents and a trait row for smell, sound, hearing, eye and blood. The authored groundcover study, still separate from the shipping scene, can place either the eleven clump meshes or the six tiny meshes from the CC0 Poly Haven grass asset; J toggles a mip chain and K switches the mesh family. Spike drawing no longer scales the extension by body radius a second time: the cone keeps its rest tip at 2.295 radii and the extension is added beyond it. ([ab9290a](https://github.com/Dicklesworthstone/rust_scriptbots/commit/ab9290a7bcc825747294099029c142b42cbf6a02))
+- **Bevy ear sound cue and atmosphere study:** the two floating sound-arc quads are gone; the combined sound cue is written onto the emissive of both ear materials, a non-finite sound input contributes 0, and the HUD still shows both readings. The eye compass cells grow from 24px to 32px and the swatches shrink from 10px to 6px. An opt-in look-development study, enabled with `SCRIPTBOTS_ATMOSPHERE_STUDY=1`, lets L toggle Bevy's `Atmosphere::EARTH` on the primary camera only; the camera, the simulation, the lighting, the fog, the exposure and the quality tier stay as they were, and the study is not the default world renderer. The creature mouth is dimmed on the lit body so activity still reads, and P toggles an opt-in authored-groundcover albedo study, which T can scale from the published food field. ([cb1c0cd](https://github.com/Dicklesworthstone/rust_scriptbots/commit/cb1c0cd4f3157218ff2bd4459621a34e35c88397), [e7db5df](https://github.com/Dicklesworthstone/rust_scriptbots/commit/e7db5dfbbfad8891176f0a94d55c276a42a98952), [fcf3611](https://github.com/Dicklesworthstone/rust_scriptbots/commit/fcf36112c08a972087bbe9c9b079a4a2f36fa178), [ba6c630](https://github.com/Dicklesworthstone/rust_scriptbots/commit/ba6c630ca925d8f456e2cb34b7a9cf457dc26213))
+- **`scriptbots_core::to_canonical_value` is public.** It is the serializer behind the permalink config digest, and its output does not depend on serde_json's `arbitrary_precision` feature.
+
+### Changed
+- **crossterm 0.29.0 is vendored with upstream PR #1154.** A terminal resize is no longer dropped when it arrives in the same poll as a key press.
+- **The permalink config digest** no longer depends on serde_json's `arbitrary_precision` feature. Web fork permalinks use the same canonical digest, and links minted with the earlier `serde_json::to_value` digest still verify.
+- **Dependency moves:** see Compatibility and Security.
+- **REST experiment routes check the host session:** the `/api/v1/experiments` routes accept an optional `X-ScriptBots-Session` header, as the checkpoint and artifact routes do. A header that names a different host session is refused before any work is admitted or changed. Requests without the header behave as before. ([fc23116](https://github.com/Dicklesworthstone/rust_scriptbots/commit/fc231167f49ffe2c33bb675b523f1ff543aaad6d))
+
+### Fixed
+- **Replay and the CLI:**
+  - replay restores the recorded thread budget before rebuilding the host;
+  - science runs apply the resolved thread budget before the world is created;
+  - CLI receipt hints and control polling target the executable actually running.
+- **Experiments:**
+  - retry admission is atomic;
+  - verified bundles publish atomically;
+  - interrupted status publications and artifact downloads recover after a restart;
+  - MCP tool failures return actionable codes.
+- **Control:**
+  - configuration patches from stale publications are rejected;
+  - single-step retries keep their identity across REST and MCP;
+  - commands stay distinct after a checkpoint restart;
+  - startup resume is admitted before client commands are served.
+- **Storage:**
+  - journal progress is addressed by row id;
+  - large run-bundle hashes are streamed;
+  - sensing and narrative evidence identity is validated;
+  - columnar exports keep the Parquet file's schema-level metadata.
+- **Science:**
+  - branch studies honour branch timing and no longer pseudoreplicate trajectories;
+  - unsupported tournament inference is withheld.
+- **Web:**
+  - browser science runs on host time;
+  - simulation owners are replaced atomically;
+  - presentation recovers from transient frame and canvas failures.
+- **Rendering:**
+  - configured bloom and vignette reach GPU frames;
+  - GPUI's Wayland and X11 backends are enabled;
+  - sparse food stays visible.
+- **Tests and CI:**
+  - the `scriptbots-app` library tests compile again;
+  - the conformance and end-to-end tests expect the 35-tool MCP roster;
+  - `cargo clippy -p scriptbots-app -p scriptbots-runtime --all-targets -- -D warnings` and `cargo fmt --all --check` pass;
+  - the WASM graph guard parses uncolored cargo output;
+  - the Linux render regression job opts into the software adapter it already requested.
+- **Bevy terrain:** chunk materials stay dielectric: metallic 0, reflectance 0.5, no emission, and roughness from moisture (0.88 dry, down to 0.7 wet). A moisture change can no longer leave a stale metallic or emissive value on a chunk. The terrain shader uses the grass and rock textures as a small-scale lighting cue without moving the geometry used for creature contact and picking, and shades water and land in a shared chunk separately. Accessibility palettes keep their original shading. ([087e373](https://github.com/Dicklesworthstone/rust_scriptbots/commit/087e3739489a9ac621065b70bcbb1979fed1f8d5))
+
+### Security
+- tokio 1.53.3 (RUSTSEC-2026-0386), rustls-webpki 0.103.16 (RUSTSEC-2026-0382), webpki-roots 1.0.10 (RUSTSEC-2026-0381) and ctutils 0.4.4 (RUSTSEC-2026-0385). These are lockfile-only bumps.
+- arrow and parquet 60.1.0 fix RUSTSEC-2026-0442 (arrow-data). thrift leaves the lockfile, which clears RUSTSEC-2026-0435.
+- Bevy's C zstd backend removes ruzstd (RUSTSEC-2026-0344), and zstd-sys moves to 2.1.2 (RUSTSEC-2026-0410).
+- zip leaves the lockfile at 0.6.6, 1.1.4 and 3.0.0, which clears RUSTSEC-2026-0367, -0368, -0369 and -0429 on each:
+  - 0.6.6 went with the `tch` feature;
+  - 1.1.4 went with candle 0.11.1;
+  - 3.0.0 was replaced by 9.5.1 under utoipa-swagger-ui 10.
+- Dropping `tch` also removes zstd-safe 5.0.2. That clears RUSTSEC-2026-0403 and the unsound advisories RUSTSEC-2026-0395, -0397, -0399, -0400, -0401, -0402, -0404 and -0406.
+- async-executor 1.14.1 replaces the yanked 1.14.0.
+
+### Known issues
+- Known issue: RUSTSEC-2026-0486 (rustix < 1.1.6, unsound) is still reachable through fastmcp-client 0.10.0, which pins rustix =1.1.4. It clears when the workspace moves to a fastmcp release that pins rustix 1.1.6.
+- RUSTSEC-2026-0194 and RUSTSEC-2026-0195 (quick-xml 0.39.4) are still reachable through fnx-readwrite 0.2.2.
+- No reader for journal archives from earlier releases ([#6](https://github.com/Dicklesworthstone/rust_scriptbots/issues/6)); see Compatibility.
+- Two scriptbots-app checkpoint tests fail: `renderer::timeline_tests::native_lab_checkpoint_retry_preserves_the_real_cut_after_a_lost_receipt` (it panics on `verified saved receipt`) and `servers::tests::checkpoint_branch_rest_and_mcp_share_identity_schema_and_observed_completion` (its JSON-RPC call returns the error `checkpoint branch key reused with a different request`).
+- `every_catalog_scenario_satisfies_its_envelope_on_every_cohort_seed_and_replays_identically` (scriptbots-app `scenario_catalog`) fails: for `food_funded_meadow_v1` seed 11 the run simulates fewer ticks than the envelope horizon.
+- Two scriptbots-app terminal end-to-end tests fail: `live_frankentui_pty_routes_and_restores_terminal` (its PTY probe exits with status 1) and `live_palette_shutdown_serializes_its_durable_receipt_before_restoration` (its palette Shutdown probe exits with status 1; tracked in bd-2z0.6.8).
+- `bevy_scene_cpu_surrogate_raster_matches_semantic_golden` (scriptbots-bevy `snapshot`) fails: its mean channel difference from the semantic golden is 62.63, which the test rejects as too high.
+- Eleven scriptbots-render map sandbox tests fail (`command_characterization_tests::map_sandbox_*`): eight cannot read their map draft (`invalid type: map, expected f32`), and in three the first map cell is not fully inside the 480 by 1400 test window.
+- `lab_workflows::tests::gpui_lab_buttons_compare_and_review_checkpoint_without_advancing_live_owner` (scriptbots-render) fails: the native Lab result does not arrive.
+- Two scriptbots-web library tests fail under `cargo test`: `launch::tests::browser_forks_preserve_full_recipe_and_restart_at_tick_zero` (an equality assertion in `launch.rs`) and `tests::browser_checkpoint_refuses_cross_family_registry_substitution` (the browser owner is not checkpointable at that boundary).
+
+---
+
 ## [v0.4.0] - 2026-10-14
 
 Source release (GitHub Release notes, same venue as v0.3.0; no prebuilt binaries).
