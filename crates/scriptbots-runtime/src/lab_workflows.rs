@@ -1364,6 +1364,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "every projection variant and each refusal case, checked against one fixture"
+    )]
     fn lab_projection_keeps_every_variant_and_refuses_mismatched_or_unbounded_evidence() {
         let mut state = LabWorkflows::default();
         state.synchronize(HostSessionId::new(1), LabPanel::Experiments);
@@ -1619,6 +1623,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one save lifecycle: retry identity and worker capacity held until verification"
+    )]
     fn checkpoint_saves_retain_retry_identity_and_worker_capacity_until_verified() {
         let (started, observed_start) = std::sync::mpsc::channel();
         let (release, released) = std::sync::mpsc::channel();
@@ -1776,6 +1784,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one receipt lifecycle: identity, source and cut checks before review opens"
+    )]
     fn checkpoint_receipts_validate_identity_source_and_cut_before_enabling_review() {
         let session = HostSessionId::new(1);
         let request = LabWorkflowRequest::CreateCheckpoint {

@@ -1574,6 +1574,10 @@ impl ChannelHostDriver {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one match over every IngressMessage variant behind the single handoff gate"
+    )]
     fn process_ingress(&mut self, message: IngressMessage) {
         if self.handoff != HandoffState::Open {
             Self::refuse_handoff_ingress(message);

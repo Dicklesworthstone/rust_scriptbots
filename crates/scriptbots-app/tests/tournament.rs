@@ -447,7 +447,7 @@ fn neuroflow_tournament_refuses_genome_and_state_budgets_before_matches() {
     spec.cohort_size = 8;
     for (layers, field) in [
         (vec![256, 256, 256], "genome_payload_bytes"),
-        (vec![1000, 1].repeat(9), "evaluator_state_payload_bytes"),
+        ([1000, 1].repeat(9), "evaluator_state_payload_bytes"),
     ] {
         let mut config = configured_neuro_world();
         config.neuroflow.hidden_layers = layers;

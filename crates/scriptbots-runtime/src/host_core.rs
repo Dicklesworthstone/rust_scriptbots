@@ -7577,7 +7577,10 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines)] // interdependent 116-line checkpoint-continuation test; repo precedent: crates/scriptbots-core/tests/map_elites.rs:1108
+    #[expect(
+        clippy::too_many_lines,
+        reason = "interdependent checkpoint-continuation test"
+    )]
     fn full_host_checkpoint_continues_nonempty_owner_schedule_counters_and_exact_retries() {
         let declared = [
             scheduled(1, 1, serde_json::json!({"food_max": 0.61})),

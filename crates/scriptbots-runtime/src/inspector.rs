@@ -246,7 +246,7 @@ pub struct GenomeInspectionPage {
 }
 
 impl GenomeInspectionPage {
-    fn new(offset: usize, limit: usize, total: usize) -> Self {
+    const fn new(offset: usize, limit: usize, total: usize) -> Self {
         Self {
             offset,
             limit,
@@ -420,6 +420,10 @@ pub struct GenomeInspection {
 }
 
 /// Refuse malformed or impossible page arithmetic before allocating or enqueueing owner work.
+#[expect(
+    clippy::suspicious_operation_groupings,
+    reason = "loci align to GENOME_LOCUS_PAGE_SIZE and deltas to GENOME_DELTA_PAGE_SIZE"
+)]
 pub fn validate_genome_page_offsets(
     locus_offset: usize,
     delta_offset: usize,
@@ -945,6 +949,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one ready-wire fixture: full locus and delta pages plus large exact provenance"
+    )]
     fn genome_ready_wire_keeps_flat_complete_pages_and_exact_large_provenance() {
         let identity = u64::MAX.to_string();
         let revisions = InspectionRevisions {

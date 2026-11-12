@@ -317,7 +317,7 @@ impl BrowserInterventionReceipt {
 }
 
 /// One observed global ecological effect; it is not correlated to a command identity.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowserInterventionRecord {
     /// Monotonic audit sequence within the owner session.
@@ -349,7 +349,7 @@ pub struct BrowserInterventionGap {
 }
 
 /// Bounded page of global observed effects, independent of command lifecycle receipts.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowserInterventionHistory {
     /// Versioned browser effect-history contract.
@@ -1313,7 +1313,7 @@ mod tests {
         ));
         assert_eq!(host.world_tick(), Tick(1));
         assert!(host.latest_snapshot().applied_interventions.is_empty());
-        assert!(host.world().active_effects().is_empty());
+        assert_eq!(host.world().active_effects(), []);
     }
 
     #[test]
@@ -1350,7 +1350,7 @@ mod tests {
             "the forged guard would match after the real queued Resume"
         );
         assert!(resumed.applied_interventions.is_empty());
-        assert!(host.world().active_effects().is_empty());
+        assert_eq!(host.world().active_effects(), []);
         assert_eq!(host.world_tick(), Tick(0));
     }
 
@@ -1446,7 +1446,7 @@ mod tests {
         assert_eq!(next.records[0].seq, "6");
         let empty = BrowserInterventionHistory::capture(&snapshot, "17", "0", &first.latest_seq, 1)
             .unwrap();
-        assert!(empty.records.is_empty());
+        assert_eq!(empty.records, [] as [BrowserInterventionRecord; 0]);
         assert!(!empty.has_more);
         assert_eq!(empty.next_after_seq, first.latest_seq);
         assert!(

@@ -1,4 +1,4 @@
-//! Versioned, bounded NeuroFlow heredity and continuation.
+//! Versioned, bounded `NeuroFlow` heredity and continuation.
 //!
 //! The genome stores the configured architecture and exact f64 weights. Evaluator state
 //! stores the four per-neuron working arrays, the network error and the input cache, bound
@@ -33,11 +33,11 @@ const DIGEST_BYTES: usize = 32;
 const STATE_HEADER_BYTES: usize = STATE_MAGIC.len() + 2 * DIGEST_BYTES;
 const SCALAR_BYTES: usize = std::mem::size_of::<f64>();
 
-/// Checkpointable NeuroFlow family with exact f64 heredity.
+/// Checkpointable `NeuroFlow` family with exact f64 heredity.
 ///
 /// The configured constructor is part of the executable identity. Genomes from a different
 /// architecture, activation, learning rate or momentum are refused, including otherwise valid
-/// NeuroFlow genomes. Existing envelope limits impose tighter architecture bounds than the
+/// `NeuroFlow` genomes. Existing envelope limits impose tighter architecture bounds than the
 /// legacy runner; construction checks these before allocating a network or drawing randomness.
 ///
 /// Typed genome loci remain unavailable: the shared scalar-locus vocabulary stores f32 and
@@ -216,9 +216,8 @@ impl NeuroflowFamilyAdapter {
         if !bytes.len().is_multiple_of(SCALAR_BYTES) {
             return Err(self.invalid(kind, "truncated f64 scalar"));
         }
-        for (index, chunk) in bytes.chunks_exact(SCALAR_BYTES).enumerate() {
-            let value =
-                f64::from_le_bytes(chunk.try_into().expect("chunks_exact supplies one f64"));
+        for (index, chunk) in bytes.as_chunks::<SCALAR_BYTES>().0.iter().enumerate() {
+            let value = f64::from_le_bytes(*chunk);
             if !value.is_finite() {
                 return Err(self.invalid(kind, format!("scalar {index} is not finite")));
             }
@@ -267,7 +266,7 @@ impl NeuroflowFamilyAdapter {
     ) -> Result<FeedForwardSeed, BrainProtocolError> {
         self.validate_genome(genome)?;
         let mut scalars =
-            genome.payload()[self.genome_header.len()..].chunks_exact(SCALAR_BYTES);
+            genome.payload()[self.genome_header.len()..].as_chunks::<SCALAR_BYTES>().0.iter();
         let mut previous = INPUT_SIZE;
         let mut layers = Vec::with_capacity(self.config.hidden_layers.len() + 1);
         for outputs in self
@@ -290,7 +289,7 @@ impl NeuroflowFamilyAdapter {
             });
             previous = outputs;
         }
-        debug_assert!(scalars.next().is_none());
+        debug_assert_eq!(scalars.as_slice(), [] as [[u8; SCALAR_BYTES]; 0]);
         Ok(FeedForwardSeed {
             layers,
             learn_rate: self.config.learning_rate,
@@ -420,13 +419,11 @@ impl Default for NeuroflowFamilyAdapter {
     }
 }
 
-fn next_scalar(chunks: &mut std::slice::ChunksExact<'_, u8>) -> f64 {
+fn next_scalar(chunks: &mut std::slice::Iter<'_, [u8; SCALAR_BYTES]>) -> f64 {
     f64::from_le_bytes(
-        chunks
+        *chunks
             .next()
-            .expect("complete payload was validated before decoding")
-            .try_into()
-            .expect("chunks_exact supplies one f64"),
+            .expect("complete payload was validated before decoding"),
     )
 }
 
@@ -611,7 +608,8 @@ impl BrainFamilyCodec for NeuroflowFamilyAdapter {
             ));
         }
         let mut snapshot = self.genome_snapshot(genome)?;
-        let mut scalars = state.payload()[STATE_HEADER_BYTES..].chunks_exact(SCALAR_BYTES);
+        let mut scalars =
+            state.payload()[STATE_HEADER_BYTES..].as_chunks::<SCALAR_BYTES>().0.iter();
         snapshot.error = next_scalar(&mut scalars);
         let inputs: Vec<f64> = (0..INPUT_SIZE).map(|_| next_scalar(&mut scalars)).collect();
         for layer in &mut snapshot.layers {
@@ -626,7 +624,7 @@ impl BrainFamilyCodec for NeuroflowFamilyAdapter {
                 }
             }
         }
-        debug_assert!(scalars.next().is_none());
+        debug_assert_eq!(scalars.as_slice(), [] as [[u8; SCALAR_BYTES]; 0]);
         let standby =
             self.brain_from_snapshot(self.copy_snapshot(&snapshot), inputs.clone())?;
         let brain = self.brain_from_snapshot(snapshot, inputs)?;

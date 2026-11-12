@@ -3181,6 +3181,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one barrier scenario: the full journal, its retry and the no-duplicate checks"
+    )]
     fn transient_journal_full_retries_same_barrier_without_duplicate_science() {
         let state = Rc::new(RefCell::new(FullOnceJournalState::default()));
         let journal_state = Rc::clone(&state);
