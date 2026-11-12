@@ -7860,6 +7860,7 @@ struct AuthoredGroundcoverStudy {
     mipmapped: bool,
     clumps: bool,
     brighter: bool,
+    food_driven: bool,
     scale_factor: f32,
     spawned: bool,
 }
@@ -8027,6 +8028,7 @@ fn setup_authored_groundcover_study(
         mipmapped: false,
         clumps: false,
         brighter: false,
+        food_driven: false,
         scale_factor: 1.0,
         spawned: false,
     });
@@ -8034,7 +8036,8 @@ fn setup_authored_groundcover_study(
 
 // B isolates lighting, M compares scale, U compares color reconstruction,
 // J compares mip filtering, K compares mesh families, and P compares a
-// brighter linear albedo multiplier. Study only.
+// brighter linear albedo multiplier. T compares decorative cover with growth
+// driven by the published consumable food field. Study only.
 fn toggle_authored_groundcover_lighting(
     input: Res<ButtonInput<KeyCode>>,
     authored: Option<ResMut<AuthoredGroundcoverStudy>>,
@@ -8064,6 +8067,13 @@ fn toggle_authored_groundcover_lighting(
     if input.just_pressed(KeyCode::KeyK) {
         authored.clumps = !authored.clumps;
         info!(clumps = authored.clumps, "authored groundcover mesh study");
+    }
+    if input.just_pressed(KeyCode::KeyT) {
+        authored.food_driven = !authored.food_driven;
+        info!(
+            food_driven = authored.food_driven,
+            "authored food growth study"
+        );
     }
     if input.just_pressed(KeyCode::KeyP)
         && let Some(material) = materials.get_mut(&authored.material)
@@ -8187,6 +8197,13 @@ fn sync_authored_groundcover_study(
     }
     let spacing = terrain.cell_size as f32 / 5.0;
     let center = (rig.focus_smoothed / spacing).floor().as_ivec2();
+    let food_valid = !authored.food_driven
+        || valid_food_layer(
+            &frame.food,
+            frame.food_cell_size,
+            frame.food_max,
+            frame.world_size,
+        );
     for (plant, mut mesh, mut transform, mut visibility) in &mut plants {
         let grid = center
             + IVec2::new(
@@ -8219,7 +8236,20 @@ fn sync_authored_groundcover_study(
         } else {
             false
         };
-        let desired_visibility = if study.visible && cover {
+        let food_fraction = if authored.food_driven && food_valid && in_world {
+            let cell = (point / frame.food_cell_size as f32)
+                .floor()
+                .as_uvec2()
+                .min(UVec2::new(frame.food.width - 1, frame.food.height - 1));
+            let index = cell.y as usize * frame.food.width as usize + cell.x as usize;
+            (frame.food.cells[index] / frame.food_max).clamp(0.0, 1.0)
+        } else if authored.food_driven {
+            0.0
+        } else {
+            1.0
+        };
+        let visible = cover && food_fraction > 0.0;
+        let desired_visibility = if study.visible && visible {
             Visibility::Inherited
         } else {
             Visibility::Hidden
@@ -8227,7 +8257,7 @@ fn sync_authored_groundcover_study(
         if *visibility != desired_visibility {
             *visibility = desired_visibility;
         }
-        if !cover {
+        if !visible {
             continue;
         }
         let variant = ((groundcover_study_random(seed ^ 0x100) * variants.len() as f32) as usize)
@@ -8237,7 +8267,8 @@ fn sync_authored_groundcover_study(
         }
         let scale = terrain.cell_size as f32
             * (0.35 + 0.25 * groundcover_study_random(seed ^ 0x200))
-            * authored.scale_factor;
+            * authored.scale_factor
+            * food_fraction.sqrt();
         let height = sample_height_world(terrain, point, TERRAIN_HEIGHT_SCALE);
         let desired = Transform::from_xyz(
             point.x - frame.world_size.x * 0.5,
@@ -22274,6 +22305,7 @@ mod terrain_tests {
             mipmapped: false,
             clumps: false,
             brighter: false,
+            food_driven: false,
             scale_factor: 1.0,
             spawned: false,
         });
@@ -22285,6 +22317,7 @@ mod terrain_tests {
             input.press(KeyCode::KeyJ);
             input.press(KeyCode::KeyK);
             input.press(KeyCode::KeyP);
+            input.press(KeyCode::KeyT);
         }
         app.update();
         assert_eq!(
@@ -22306,6 +22339,11 @@ mod terrain_tests {
         );
         assert!(app.world().resource::<AuthoredGroundcoverStudy>().clumps);
         assert!(app.world().resource::<AuthoredGroundcoverStudy>().brighter);
+        assert!(
+            app.world()
+                .resource::<AuthoredGroundcoverStudy>()
+                .food_driven
+        );
         assert_eq!(
             app.world()
                 .resource::<Assets<StandardMaterial>>()
@@ -22331,6 +22369,7 @@ mod terrain_tests {
             input.release(KeyCode::KeyJ);
             input.release(KeyCode::KeyK);
             input.release(KeyCode::KeyP);
+            input.release(KeyCode::KeyT);
             input.clear();
             input.press(KeyCode::KeyB);
             input.press(KeyCode::KeyM);
@@ -22338,6 +22377,7 @@ mod terrain_tests {
             input.press(KeyCode::KeyJ);
             input.press(KeyCode::KeyK);
             input.press(KeyCode::KeyP);
+            input.press(KeyCode::KeyT);
         }
         app.update();
         assert!(
@@ -22355,6 +22395,11 @@ mod terrain_tests {
         );
         assert!(!app.world().resource::<AuthoredGroundcoverStudy>().clumps);
         assert!(!app.world().resource::<AuthoredGroundcoverStudy>().brighter);
+        assert!(
+            !app.world()
+                .resource::<AuthoredGroundcoverStudy>()
+                .food_driven
+        );
         assert_eq!(
             app.world()
                 .resource::<Assets<StandardMaterial>>()
@@ -22463,6 +22508,7 @@ mod terrain_tests {
             mipmapped: false,
             clumps: false,
             brighter: false,
+            food_driven: false,
             scale_factor: 1.0,
             spawned: false,
         });
@@ -22515,6 +22561,96 @@ mod terrain_tests {
         assert_eq!(
             *app.world().get::<Transform>(entity).unwrap(),
             original_transform
+        );
+
+        // The optional food view samples the actual food cell under each
+        // stable root. Intermediate amounts change size, not its position.
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            let frame = state.latest.as_mut().unwrap();
+            frame.food_cell_size = 50;
+            frame.food_max = 1.0;
+            frame.food = Arc::new(FoodLayerSnapshot {
+                width: 24,
+                height: 16,
+                cells: vec![1.0; 24 * 16],
+            });
+        }
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::KeyT);
+        app.update();
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .clear();
+        app.update();
+        assert_eq!(
+            *app.world().get::<Transform>(entity).unwrap(),
+            original_transform
+        );
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            Arc::make_mut(&mut state.latest.as_mut().unwrap().food)
+                .cells
+                .fill(0.25);
+        }
+        app.update();
+        let smaller = *app.world().get::<Transform>(entity).unwrap();
+        assert_eq!(smaller.scale, original_transform.scale * 0.5);
+        assert_eq!(smaller.translation.x, original_transform.translation.x);
+        assert_eq!(smaller.translation.z, original_transform.translation.z);
+        assert_eq!(app.world().get::<Mesh3d>(entity).unwrap().0, original_mesh);
+        let root = Vec2::new(smaller.translation.x + 600.0, 400.0 - smaller.translation.z);
+        let frame = app
+            .world()
+            .resource::<SnapshotState>()
+            .latest
+            .as_ref()
+            .unwrap();
+        let ground = sample_height_world(&frame.terrain_height, root, TERRAIN_HEIGHT_SCALE);
+        assert!((smaller.translation.y - 0.1 * smaller.scale.y - ground).abs() < 0.001);
+        let cell = (root / 50.0).floor().as_uvec2();
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            Arc::make_mut(&mut state.latest.as_mut().unwrap().food).cells
+                [(cell.y * 24 + cell.x) as usize] = 0.0;
+        }
+        app.update();
+        assert_eq!(
+            *app.world().get::<Visibility>(entity).unwrap(),
+            Visibility::Hidden
+        );
+        let mut plants = app
+            .world_mut()
+            .query_filtered::<&Visibility, With<AuthoredGroundcoverPlant>>();
+        let visible_elsewhere = plants
+            .iter(app.world())
+            .any(|visibility| *visibility == Visibility::Inherited);
+        assert!(
+            visible_elsewhere,
+            "emptying one food cell must not hide the whole field"
+        );
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            Arc::make_mut(&mut state.latest.as_mut().unwrap().food).cells
+                [(cell.y * 24 + cell.x) as usize] = 0.25;
+        }
+        app.update();
+        assert_eq!(
+            *app.world().get::<Visibility>(entity).unwrap(),
+            Visibility::Inherited
+        );
+        assert_eq!(*app.world().get::<Transform>(entity).unwrap(), smaller);
+        app.world_mut()
+            .resource_mut::<SnapshotState>()
+            .latest
+            .as_mut()
+            .unwrap()
+            .food_max = 0.0;
+        app.update();
+        assert_eq!(
+            *app.world().get::<Visibility>(entity).unwrap(),
+            Visibility::Hidden
         );
     }
 
