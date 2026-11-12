@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import { webcrypto } from "node:crypto";
 import test from "node:test";
 import { RemoteFrameTracker, RemoteStreamClient, consumeRemoteFrame } from "../remote.js";
+import { EXPERIMENT_LIMITS, prepareExperimentRequest } from "../experiment-protocol.js";
 import { EnvironmentRaster, environmentDescription } from "../renderers/environment.js";
 
 const SESSION = "340282366920938463463374607431768211455";
@@ -447,4 +448,104 @@ test("a synchronous reconnect during consumption retains the new connection's fr
   assert.equal(value.accept(source, () => {}), true);
   assert.equal(value.accept(source, () => {}), false);
   assert.equal(value.resume().after_revision, "10");
+});
+
+function experimentTransport() {
+  const client = new RemoteStreamClient({ url: "wss://lab.example/prefix/api/ws/stream?discard=yes#fragment", decodeFrame() {} });
+  client.state = "connected";
+  client.tracker.acknowledge("18446744073709551610");
+  const prepared = prepareExperimentRequest({ experiment_id: "cohort.example", seeds: ["9007199254740993", "18446744073709551615"],
+    variants: [{ variant_id: "control", brain_family: "mlp" }, { variant_id: "treatment", brain_family: "dwraon" }],
+    ticks_per_run: 20, max_concurrency: 1, idempotency_key: "one-exact-cohort" });
+  return { client, prepared, sessionId: client.tracker.sessionId };
+}
+
+test("cohort transport keeps exact u64 seeds, unchanged retry bytes and the negotiated source", async () => {
+  const original = globalThis.fetch, requests = [];
+  globalThis.fetch = async (url, options) => {
+    requests.push({ url: new URL(url), ...options });
+    return new Response('{"seed":18446744073709551615,"matched_seeds":[9007199254740993,18446744073709551615]}');
+  };
+  try {
+    const { client, prepared, sessionId } = experimentTransport();
+    const create = { sessionId, ...prepared };
+    const result = await client.createExperiment(create);
+    assert.equal(result.seed, "18446744073709551615");
+    assert.deepEqual(result.matched_seeds, ["9007199254740993", "18446744073709551615"]);
+    await client.createExperiment(create);
+    await client.listExperiments({ sessionId, cursor: "12" });
+    await client.experimentStatus("cohort.example", { sessionId });
+    await client.cancelExperiment("cohort.example", { sessionId });
+    await client.resumeExperiment("cohort.example", { sessionId });
+    await client.compareExperiment("cohort.example", { sessionId, baseline_variant: "control",
+      challenger_variant: "treatment", metric: "alive_agents" });
+    assert.deepEqual(requests.map((request) => [request.method, request.url.pathname]), [
+      ["POST", "/prefix/api/v1/experiments"], ["POST", "/prefix/api/v1/experiments"],
+      ["GET", "/prefix/api/v1/experiments"], ["GET", "/prefix/api/v1/experiments/cohort.example"],
+      ["POST", "/prefix/api/v1/experiments/cohort.example/cancel"],
+      ["POST", "/prefix/api/v1/experiments/cohort.example/resume"],
+      ["POST", "/prefix/api/v1/experiments/cohort.example/compare"],
+    ]);
+    for (const request of requests) {
+      assert.equal(request.headers["X-ScriptBots-Session"], sessionId);
+      assert.equal(request.credentials, "omit");
+      assert.equal(request.cache, "no-store");
+      assert.equal(request.url.protocol, "https:");
+      assert.equal(request.url.hash, "");
+    }
+    assert.equal(requests[0].body, requests[1].body);
+    assert.match(requests[0].body, /"seeds":\[9007199254740993,18446744073709551615\]/);
+    assert.ok(!requests[0].body.includes("sessionId"));
+    assert.equal(requests[2].url.search, "?limit=12&cursor=12");
+    assert.deepEqual(JSON.parse(requests[6].body), { baseline_variant: "control", challenger_variant: "treatment", metric: "alive_agents" });
+    const count = requests.length;
+    await assert.rejects(client.createExperiment({ ...create, body: create.body + " " }), /payload changed/);
+    await assert.rejects(client.experimentStatus("../escape", { sessionId }));
+    await assert.rejects(client.experimentStatus(".", { sessionId }));
+    await assert.rejects(client.cancelExperiment("cohort.example", { sessionId: "7" }));
+    await assert.rejects(client.listExperiments({ sessionId, cursor: "01" }));
+    await assert.rejects(client.compareExperiment("cohort.example", { sessionId, baseline_variant: "control", challenger_variant: "control", metric: "alive_agents" }));
+    await assert.rejects(client.compareExperiment("cohort.example", { sessionId, baseline_variant: "control", challenger_variant: "treatment", metric: "invented" }));
+    assert.equal(requests.length, count, "invalid source or payload never reached HTTP");
+  } finally { globalThis.fetch = original; }
+});
+
+test("experiment HTTP refusal differs from uncertain admission and cannot survive a changed connection", async () => {
+  const original = globalThis.fetch;
+  try {
+    const { client, prepared, sessionId } = experimentTransport();
+    for (const code of [400, 409, 422, 503, 500]) {
+      globalThis.fetch = async () => new Response('{"message":"bounded refusal"}', { status: code });
+      await assert.rejects(client.createExperiment({ sessionId, ...prepared }), (error) => {
+        assert.equal(error.status, code);
+        assert.equal(error.admission, [400, 409, 422].includes(code) ? "not_admitted" : "unknown");
+        return true;
+      });
+    }
+    let respond;
+    globalThis.fetch = () => new Promise((resolve) => { respond = resolve; });
+    const pending = client.createExperiment({ sessionId, ...prepared });
+    client.generation += 1;
+    respond(new Response("{}"));
+    await assert.rejects(pending, /connection changed.*unconfirmed/);
+  } finally { globalThis.fetch = original; }
+});
+
+test("experiment owner responses are actually byte-bounded and ambiguous numeric identities refuse", async () => {
+  const original = globalThis.fetch;
+  try {
+    const { client, sessionId } = experimentTransport();
+    let cancelled = false;
+    globalThis.fetch = async () => new Response(new ReadableStream({
+      start(controller) { controller.enqueue(new Uint8Array(EXPERIMENT_LIMITS.maxResponseBytes + 1)); },
+      cancel() { cancelled = true; },
+    }));
+    await assert.rejects(client.experimentStatus("cohort.example", { sessionId }), /exceeds/);
+    assert.equal(cancelled, true);
+    for (const wire of ['{"seed":18446744073709551616}', '{"generation":9007199254740993}',
+      '{"seed":1,"seed":2}', '{"seed":1e2}']) {
+      globalThis.fetch = async () => new Response(wire);
+      await assert.rejects(client.experimentStatus("cohort.example", { sessionId }));
+    }
+  } finally { globalThis.fetch = original; }
 });

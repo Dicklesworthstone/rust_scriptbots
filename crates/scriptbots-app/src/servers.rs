@@ -1684,7 +1684,7 @@ pub struct SpeedRequestBody {
             PaginatedArtifactsResponse
         )
     ),
-    info(title = "ScriptBots Control API", version = "0.0.0", description = "HTTP requests require the bound listener's IP/localhost authority or SCRIPTBOTS_CONTROL_ALLOWED_AUTHORITIES. Browser Origin must match a configured authority or SCRIPTBOTS_CONTROL_ALLOWED_ORIGINS. CLI clients may omit Origin. Checkpoint and artifact routes accept an optional X-ScriptBots-Session header containing the exact canonical decimal host session negotiated by the remote stream; mismatches are refused before any action. Forwarded headers are refused; this targeting policy does not authenticate callers."),
+    info(title = "ScriptBots Control API", version = "0.0.0", description = "HTTP requests require the bound listener's IP/localhost authority or SCRIPTBOTS_CONTROL_ALLOWED_AUTHORITIES. Browser Origin must match a configured authority or SCRIPTBOTS_CONTROL_ALLOWED_ORIGINS. CLI clients may omit Origin. Checkpoint, experiment and artifact routes accept an optional X-ScriptBots-Session header containing the exact canonical decimal host session negotiated by the remote stream; mismatches are refused before any action. Forwarded headers are refused; this targeting policy does not authenticate callers."),
     tags(
         (name = "control", description = "Runtime configuration controls"),
         (name = "map", description = "Procedural map generation and application controls"),
@@ -4465,7 +4465,30 @@ fn prepare_rest_server(
     let mut openapi = ApiDoc::openapi();
     openapi.info.version = env!("CARGO_PKG_VERSION").to_string();
 
-    let checkpoint_router = Router::new()
+    // Every browser Lab operation shares the owner-session fence before its
+    // handler can admit work, cancel a worker, read artifacts or run analysis.
+    let lab_router = Router::new()
+        // Experiments lifecycle
+        .route(
+            "/api/v1/experiments",
+            post(post_v1_experiments).get(get_v1_experiments),
+        )
+        .route(
+            "/api/v1/experiments/{experiment_id}",
+            get(get_v1_experiment_by_id),
+        )
+        .route(
+            "/api/v1/experiments/{experiment_id}/compare",
+            post(post_v1_experiment_compare).layer(DefaultBodyLimit::max(4096)),
+        )
+        .route(
+            "/api/v1/experiments/{experiment_id}/cancel",
+            post(post_v1_experiment_cancel),
+        )
+        .route(
+            "/api/v1/experiments/{experiment_id}/resume",
+            post(post_v1_experiment_resume),
+        )
         .route(
             "/api/v1/checkpoints",
             post(post_v1_checkpoints).get(get_v1_checkpoints),
@@ -4574,28 +4597,7 @@ fn prepare_rest_server(
         .route("/api/v1/version", get(get_v1_version))
         .route("/api/schema", get(get_schema))
         .route("/api/v1/schema", get(get_v1_schema))
-        // Experiments lifecycle
-        .route(
-            "/api/v1/experiments",
-            post(post_v1_experiments).get(get_v1_experiments),
-        )
-        .route(
-            "/api/v1/experiments/{experiment_id}",
-            get(get_v1_experiment_by_id),
-        )
-        .route(
-            "/api/v1/experiments/{experiment_id}/compare",
-            post(post_v1_experiment_compare).layer(DefaultBodyLimit::max(4096)),
-        )
-        .route(
-            "/api/v1/experiments/{experiment_id}/cancel",
-            post(post_v1_experiment_cancel),
-        )
-        .route(
-            "/api/v1/experiments/{experiment_id}/resume",
-            post(post_v1_experiment_resume),
-        )
-        .merge(checkpoint_router)
+        .merge(lab_router)
         .with_state(state);
 
     let swagger_router: Router<_> = SwaggerUi::new(config.swagger_path.clone())
@@ -6997,7 +6999,7 @@ mod tests {
         clippy::too_many_lines,
         reason = "one real HTTP listener proves all guarded routes, browser preflight and no-admission state"
     )]
-    async fn lab_http_session_guard_precedes_checkpoint_branch_and_artifact_actions() {
+    async fn lab_http_session_guard_precedes_checkpoint_experiment_and_artifact_actions() {
         let owner = test_host();
         let before = owner.port.scientific_digest_v1().unwrap();
         let browser_origin = "https://checkpoint-lab.example";
@@ -7005,6 +7007,8 @@ mod tests {
             rest_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             mcp_transport: McpTransportConfig::Disabled,
             allowed_origins: vec![browser_origin.to_owned()],
+            // A valid create can reach the owner without admitting a worker.
+            experiment_run_slots: 0,
             ..ControlServerConfig::default()
         })
         .unwrap();
@@ -7018,6 +7022,12 @@ mod tests {
             .build()
             .unwrap();
         for (method, path) in [
+            (reqwest::Method::POST, "/api/v1/experiments"),
+            (reqwest::Method::GET, "/api/v1/experiments"),
+            (reqwest::Method::GET, "/api/v1/experiments/missing"),
+            (reqwest::Method::POST, "/api/v1/experiments/missing/compare"),
+            (reqwest::Method::POST, "/api/v1/experiments/missing/cancel"),
+            (reqwest::Method::POST, "/api/v1/experiments/missing/resume"),
             (reqwest::Method::POST, "/api/v1/checkpoints"),
             (reqwest::Method::GET, "/api/v1/checkpoints"),
             (reqwest::Method::GET, "/api/v1/checkpoints/missing"),
@@ -7093,13 +7103,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rejected_preflight.status().as_u16(), 403);
-        for expected_session in [None, Some(session.as_str())] {
-            let mut request = client.get(&url);
+        for path in ["/api/v1/checkpoints", "/api/v1/experiments"] {
+            for expected_session in [None, Some(session.as_str())] {
+                let mut request = client.get(format!("http://{address}{path}"));
+                if let Some(value) = expected_session {
+                    request = request.header(LAB_SESSION_HEADER, value);
+                }
+                assert_eq!(request.send().await.unwrap().status().as_u16(), 200, "{path}");
+            }
+        }
+        let experiment_url = format!("http://{address}/api/v1/experiments");
+        let experiment = json!({
+            "experiment_id": "session-guard-cohort",
+            "variants": [{
+                "variant_id": "baseline", "brain_family": "mlp",
+                "config_overrides": {
+                    "world_width": 40, "world_height": 40, "food_cell_size": 10,
+                    "population_minimum": 2, "population_spawn_interval": 0
+                }
+            }],
+            "seeds": [7], "ticks_per_run": 2, "max_concurrency": 1,
+            "idempotency_key": "session-guard-cohort"
+        });
+        for (expected_session, expected_status) in [
+            (Some(stale.as_str()), 409),
+            (Some("01"), 400),
+            (Some(session.as_str()), 503),
+            (None, 503),
+        ] {
+            let mut request = client.post(&experiment_url).json(&experiment);
             if let Some(value) = expected_session {
                 request = request.header(LAB_SESSION_HEADER, value);
             }
-            assert_eq!(request.send().await.unwrap().status().as_u16(), 200);
+            assert_eq!(
+                request.send().await.unwrap().status().as_u16(),
+                expected_status,
+                "valid experiment admission with session {expected_session:?}"
+            );
         }
+        let experiments = handle.list_experiments(None, None).unwrap();
+        assert_eq!(experiments.total, 0);
+        assert_eq!(experiments.execution_capacity.reserved_run_slots, 0);
+        assert_eq!(experiments.execution_capacity.reserved_batches, 0);
+        assert_eq!(owner.port.scientific_digest_v1().unwrap(), before);
         let malformed = client
             .post(&url)
             .header(LAB_SESSION_HEADER, "01")
