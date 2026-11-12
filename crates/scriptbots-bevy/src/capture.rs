@@ -2048,6 +2048,7 @@ fn setup_capture_resources(
         base_radius: 1.0,
         body: meshes.add(Mesh::from(crate::AGENT_BODY_CAPSULE)),
         stripe: meshes.add(crate::creature_stripe_mesh()),
+        mouth: meshes.add(crate::creature_mouth_mesh()),
         wheel: meshes.add(Mesh::from(Torus::new(0.3, 0.6))),
         joint: meshes.add(crate::creature_joint_mesh()),
         spike: meshes.add(Mesh::from(Cone {
