@@ -200,6 +200,26 @@
         #intervention-history { max-height: 19rem; overflow: auto; padding-left: 1.25rem; font-size: 0.75rem; }
         #intervention-history li { margin: 0.5rem 0; overflow-wrap: anywhere; }
         #intervention-form-error, #intervention-history-gap { color: #fbbf24; }
+        #experiment-lab { display: block; border: 1px solid #334155; border-radius: 0.5rem; padding: 0.75rem; }
+        #experiment-lab summary { cursor: pointer; font-weight: 700; }
+        #experiment-lab p { font-size: 0.75rem; overflow-wrap: anywhere; }
+        #experiment-lab h3 { font-size: 0.85rem; margin: 0.9rem 0 0.4rem; }
+        #experiment-lab h4 { font-size: 0.8rem; margin: 0.5rem 0; }
+        #experiment-lab [hidden] { display: none; }
+        #experiment-lab button { width: 100%; margin: 0.2rem 0; }
+        #experiment-lab select { width: 100%; min-width: 0; box-sizing: border-box; }
+        #experiment-form, #experiment-form fieldset { display: grid; gap: 0.5rem; }
+        #experiment-form fieldset { min-width: 0; border: 1px solid #334155; border-radius: 0.35rem; margin: 0; }
+        #experiment-lab label { display: grid; gap: 0.25rem; margin: 0.4rem 0; }
+        #experiment-form input, #experiment-form textarea { box-sizing: border-box; width: 100%; min-width: 0; background: #0f172a; color: #e2e8f0; border: 1px solid #475569; border-radius: 0.25rem; padding: 0.4rem; }
+        #experiment-form textarea { resize: vertical; font-family: ui-monospace, monospace; font-size: 0.75rem; }
+        #experiment-form details { font-size: 0.75rem; }
+        #experiment-lab :focus-visible { outline: 2px solid #38bdf8; outline-offset: 2px; }
+        #experiment-form-error, #experiment-batch-error { color: #fbbf24; }
+        #experiment-runs { padding-left: 1.15rem; max-height: 30rem; overflow: auto; font-size: 0.75rem; }
+        #experiment-runs li { padding: 0.5rem 0; border-bottom: 1px solid #334155; overflow-wrap: anywhere; }
+        #experiment-runs p { margin: 0.25rem 0; }
+        #experiment-comparison { margin-top: 0.6rem; padding: 0.6rem; background: #101b2e; border: 1px solid #334155; border-radius: 0.35rem; }
         #checkpoint-lab { border: 1px solid #334155; border-radius: 0.5rem; padding: 0.75rem; }
         #checkpoint-lab summary { cursor: pointer; font-weight: 700; }
         #checkpoint-lab p { font-size: 0.75rem; overflow-wrap: anywhere; }
@@ -527,6 +547,119 @@
                 <button id="remote-retry" type="button" disabled>Retry Last Command with Same ID</button>
                 <div id="remote-receipt" role="status" aria-live="polite"></div>
             </div>
+            <details id="experiment-lab" class="controls">
+                <summary>Matched-seed experiments</summary>
+                <p id="experiment-source" role="status">Connect to a remote server to run independent matched-seed worlds.</p>
+                <p id="experiment-notice" role="status" aria-live="polite"></p>
+                <h3>Retained experiments</h3>
+                <p>Reopen a batch retained by this host, including after reconnecting. Selecting it reads its recorded status.</p>
+                <label>Experiment
+                    <select id="experiment-select" disabled><option value="">No retained experiments observed</option></select>
+                </label>
+                <button id="experiment-catalog-refresh" type="button" disabled>Refresh experiment catalog</button>
+                <button id="experiment-catalog-first" type="button" disabled>First catalog page</button>
+                <button id="experiment-catalog-next" type="button" disabled>Next catalog page</button>
+                <p id="experiment-catalog-detail"></p>
+                <p id="experiment-capacity"></p>
+                <h3>Create a two-arm experiment</h3>
+                <p>Each arm starts fresh worlds from the runner's defaults plus its overrides, using the same seed set. These runs do not start from the current canvas or a saved checkpoint. The current world stays separate.</p>
+                <form id="experiment-form">
+                    <label>Experiment ID (optional)
+                        <input id="experiment-id" type="text" maxlength="128" pattern="[A-Za-z0-9_-]+" placeholder="Host assigns an ID when blank" />
+                    </label>
+                    <label>Description (optional)
+                        <input id="experiment-description" type="text" maxlength="1024" placeholder="Question this experiment should answer" />
+                    </label>
+                    <label>Exact decimal seeds (comma or whitespace separated)
+                        <input id="experiment-seeds" type="text" value="11, 42, 137" maxlength="2048" spellcheck="false" required />
+                    </label>
+                    <p>Use 1–32 distinct unsigned 64-bit integers, from 0 through 18446744073709551615. One seed pair supports descriptive results only.</p>
+                    <label>Horizon per run (ticks)
+                        <input id="experiment-ticks" type="number" min="1" max="10000000" step="1" value="200" required />
+                    </label>
+                    <label>Maximum simultaneous runs
+                        <input id="experiment-concurrency" type="number" min="1" max="8" step="1" value="1" required />
+                    </label>
+                    <fieldset>
+                        <legend>Baseline arm</legend>
+                        <label>Arm ID
+                            <input id="experiment-baseline-id" type="text" pattern="[A-Za-z0-9_-]+" maxlength="64" value="baseline" required />
+                        </label>
+                        <label>Brain family
+                            <select id="experiment-baseline-family">
+                                <option value="mlp" selected>MLP baseline</option>
+                                <option value="dwraon">DWRAON baseline</option>
+                                <option value="assembly">Assembly (experimental)</option>
+                                <option value="ft">Ft</option>
+                            </select>
+                        </label>
+                        <details>
+                            <summary>Baseline configuration and schedule</summary>
+                            <label>Initial overrides (JSON object)
+                                <textarea id="experiment-baseline-config" rows="3" maxlength="16384" spellcheck="false">{"population_minimum":20}</textarea>
+                            </label>
+                            <label>Scheduled changes (JSON array)
+                                <textarea id="experiment-baseline-schedule" rows="3" maxlength="16384" spellcheck="false">[]</textarea>
+                            </label>
+                        </details>
+                    </fieldset>
+                    <fieldset>
+                        <legend>Challenger arm</legend>
+                        <label>Arm ID
+                            <input id="experiment-challenger-id" type="text" pattern="[A-Za-z0-9_-]+" maxlength="64" value="challenger" required />
+                        </label>
+                        <label>Brain family
+                            <select id="experiment-challenger-family">
+                                <option value="mlp">MLP baseline</option>
+                                <option value="dwraon" selected>DWRAON baseline</option>
+                                <option value="assembly">Assembly (experimental)</option>
+                                <option value="ft">Ft</option>
+                            </select>
+                        </label>
+                        <details>
+                            <summary>Challenger configuration and schedule</summary>
+                            <label>Initial overrides (JSON object)
+                                <textarea id="experiment-challenger-config" rows="3" maxlength="16384" spellcheck="false">{"population_minimum":20}</textarea>
+                            </label>
+                            <label>Scheduled changes (JSON array)
+                                <textarea id="experiment-challenger-schedule" rows="3" maxlength="16384" spellcheck="false">[]</textarea>
+                            </label>
+                        </details>
+                    </fieldset>
+                    <p>Keep initial overrides identical to compare only brain families. Configuration keys may use dotted paths. The host validates supported configuration and refuses seed or recording-policy changes in overrides.</p>
+                    <p>Schedule example: <code>[{"tick":100,"set":{"food_growth_rate":0.001}}]</code>. Use ordered ticks within the horizon and numeric live settings; changes at the same tick keep their order.</p>
+                    <button id="experiment-launch" type="submit" disabled>Create matched-seed experiment</button>
+                </form>
+                <p id="experiment-form-error" role="alert"></p>
+                <p id="experiment-admission" role="status"></p>
+                <button id="experiment-retry" type="button" disabled>Retry exact request</button>
+                <h3>Observed runs</h3>
+                <p id="experiment-status" role="status"></p>
+                <p id="experiment-batch-error"></p>
+                <button id="experiment-refresh" type="button" disabled>Refresh selected status</button>
+                <button id="experiment-cancel" type="button" disabled>Cancel unfinished runs</button>
+                <button id="experiment-resume" type="button" disabled>Resume unfinished runs</button>
+                <p>Progress is a saved checkpoint observation. It may lag the running world. Server bundle paths identify host files; they are not browser downloads.</p>
+                <p id="experiment-run-page"></p>
+                <button id="experiment-run-previous" type="button" disabled>Previous run page</button>
+                <button id="experiment-run-next" type="button" disabled>Next run page</button>
+                <ol id="experiment-runs" aria-label="Observed experiment runs"></ol>
+                <h3>Paired endpoint comparison</h3>
+                <p>Choose two fully completed arms and one terminal metric. Each distinct matched seed contributes one pair. Results report challenger minus baseline; larger values alone do not imply better fitness.</p>
+                <label>Baseline arm
+                    <select id="experiment-compare-baseline" disabled></select>
+                </label>
+                <label>Challenger arm
+                    <select id="experiment-compare-challenger" disabled></select>
+                </label>
+                <label>Endpoint metric
+                    <select id="experiment-metric" disabled></select>
+                </label>
+                <button id="experiment-compare" type="button" disabled>Compare completed arms</button>
+                <section id="experiment-comparison" aria-label="Observed paired comparison" hidden></section>
+                <button id="experiment-export" type="button" disabled>Export browser observation JSON</button>
+                <p id="experiment-export-status" role="status">Exports retain observed status and comparison. A matching admitted request is included only when this browser still has it. This export is separate from the server's run bundles.</p>
+            </details>
             <details id="checkpoint-lab" class="controls">
                 <summary>Saved-world experiments</summary>
                 <p id="lab-source" role="status">Connect to a remote server to save and study an evolved world.</p>

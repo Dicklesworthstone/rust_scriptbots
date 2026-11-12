@@ -11,6 +11,8 @@ import { InterventionController, renderInterventions, validateInterventionAction
 import { NarrativeController, renderNarrative, renderNarrativeSource } from "./narrative.js";
 import { validateLaunchInfo, launchInfoText, renderBuildComparison } from "./recipes.js";
 import { CheckpointLabController, renderCheckpointLab } from "./checkpoint-lab.js";
+import { ExperimentController } from "./experiments.js";
+import { readExperimentForm, renderExperimentLab, experimentObservationExport } from "./experiment-view.js";
 import { renderStudyReport } from "./study-report.js";
 
 const {
@@ -145,6 +147,92 @@ let lastRemoteRequestId = null;
 let lastRemoteCommandId = null;
 let lastRemoteStatusRequestId = null;
 
+const experimentPanel = document.getElementById("experiment-lab");
+const experimentForm = document.getElementById("experiment-form");
+const experimentFormError = document.getElementById("experiment-form-error");
+let experimentExportUrl = null;
+const experiments = new ExperimentController({
+  list: (request, signal) => remoteClient.listExperiments({ ...request, signal }),
+  create: (request, signal) => remoteClient.createExperiment(request, { signal }),
+  status: (request, signal) => remoteClient.experimentStatus(request.experimentId, { sessionId: request.sessionId, signal }),
+  cancel: (request, signal) => remoteClient.cancelExperiment(request.experimentId, { sessionId: request.sessionId, signal }),
+  resume: (request, signal) => remoteClient.resumeExperiment(request.experimentId, { sessionId: request.sessionId, signal }),
+  compare: (request, signal) => remoteClient.compareExperiment(request.experimentId, { ...request, signal }),
+  onChange: (controller) => renderExperimentLab(experimentPanel, controller),
+});
+
+function updateExperimentVisibility() {
+  const observed = remoteFrame && lastPaintedFrame?.sessionId === remoteFrame.identity.sessionId
+    && lastPaintedFrame.simulationGeneration === simulationGeneration;
+  experiments.setEnabled(remoteMode && remoteConnected && !!observed && !!experimentPanel?.open && !document.hidden);
+}
+
+function observeExperiments(frame) {
+  if (remoteMode && remoteConnected && remoteClient) {
+    experiments.observe(frame, remoteClient.url);
+    updateExperimentVisibility();
+  }
+}
+
+async function experimentAction(action) {
+  try {
+    if (experimentFormError) experimentFormError.textContent = "";
+    await action();
+  } catch (error) {
+    if (experimentFormError) experimentFormError.textContent = String(error.message || error).slice(0, 512);
+  }
+}
+
+experimentPanel?.addEventListener("toggle", updateExperimentVisibility);
+document.addEventListener("visibilitychange", updateExperimentVisibility);
+experimentForm?.addEventListener("submit", (event) => {
+  event.preventDefault();
+  if (!experimentForm.reportValidity()) return;
+  void experimentAction(() => experiments.launch(readExperimentForm(experimentForm)));
+});
+document.getElementById("experiment-select")?.addEventListener("change", (event) => {
+  if (event.target.value) void experimentAction(() => experiments.open(event.target.value));
+});
+for (const [id, action] of [
+  ["catalog-refresh", () => experiments.refreshCatalog(true)],
+  ["catalog-first", () => experiments.firstPage()],
+  ["catalog-next", () => experiments.nextPage()],
+  ["retry", () => experiments.retryLaunch()],
+  ["refresh", () => experiments.refreshStatus(true)],
+  ["cancel", () => experiments.cancel()],
+  ["resume", () => experiments.resume()],
+  ["run-previous", () => experiments.previousRuns()],
+  ["run-next", () => experiments.nextRuns()],
+  ["compare", () => experiments.compare({
+    baselineVariant: document.getElementById("experiment-compare-baseline").value,
+    challengerVariant: document.getElementById("experiment-compare-challenger").value,
+    metric: document.getElementById("experiment-metric").value,
+  })],
+]) {
+  document.getElementById("experiment-" + id)?.addEventListener("click", () => { void experimentAction(action); });
+}
+for (const id of ["compare-baseline", "compare-challenger", "metric"]) {
+  document.getElementById("experiment-" + id)?.addEventListener("change", () => experiments.clearComparison());
+}
+document.getElementById("experiment-export")?.addEventListener("click", () => {
+  const status = document.getElementById("experiment-export-status");
+  try {
+    const result = experimentObservationExport(experiments);
+    if (experimentExportUrl) URL.revokeObjectURL(experimentExportUrl);
+    experimentExportUrl = URL.createObjectURL(result.blob);
+    const anchor = document.createElement("a");
+    anchor.href = experimentExportUrl;
+    anchor.download = result.filename;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    if (status) status.textContent = "Browser observation JSON is ready to save. Your browser manages the final file save; server run bundles remain separate.";
+  } catch (error) {
+    if (status) status.textContent = "Export unavailable: " + String(error.message || error).slice(0, 512);
+  }
+});
+renderExperimentLab(experimentPanel, experiments);
+
 const checkpointLabPanel = document.getElementById("checkpoint-lab");
 const labForm = document.getElementById("lab-branch-form");
 const labFormError = document.getElementById("lab-form-error");
@@ -277,9 +365,9 @@ document.getElementById("lab-checkpoint-download")?.addEventListener("click", ()
 document.getElementById("lab-report-download")?.addEventListener("click", () => { void offerLabDownload(() => checkpointLab.downloadReport()); });
 document.getElementById("lab-artifact-download")?.addEventListener("click", () => { void offerLabDownload(() => checkpointLab.downloadSelectedArtifact()); });
 function startLabPolling() {
-  if (labPollTimer === null) labPollTimer = setInterval(() => { void checkpointLab.poll(); }, 1000);
+  if (labPollTimer === null) labPollTimer = setInterval(() => { void checkpointLab.poll(); void experiments.poll(); }, 1000);
 }
-window.addEventListener("pageshow", () => { updateCheckpointLabVisibility(); startLabPolling(); });
+window.addEventListener("pageshow", () => { updateCheckpointLabVisibility(); updateExperimentVisibility(); startLabPolling(); });
 updateLabTreatmentFields();
 renderCheckpointLab(checkpointLabPanel, checkpointLab);
 renderStudyReport(labReportPanel, checkpointLab.reportModel);
@@ -553,6 +641,7 @@ function hasPresentationFrame() {
 function updateRemoteControls() {
   updateInterventionVisibility();
   updateCheckpointLabVisibility();
+  updateExperimentVisibility();
   for (const input of [stepsSlider, populationSlider, resetButton, permalinkInput,
     loadPermalinkBtn, copyPermalinkBtn, forkPatchInput, forkBtn, loadForkedBtn, copyForkBtn]) {
     if (input) input.disabled = remoteMode;
@@ -668,7 +757,10 @@ function connectRemote() {
     queuedReset = false;
     interventions.setEnabled(false);
     remoteClient?.disconnect();
-    if (remoteClient?.url !== nextClient.url) checkpointLab.reset("Connected endpoint changed; choose a checkpoint from the new server.");
+    if (remoteClient?.url !== nextClient.url) {
+      checkpointLab.reset("Connected endpoint changed; choose a checkpoint from the new server.");
+      experiments.reset("Connected endpoint changed; choose an experiment from the new server.");
+    }
     remoteClient = nextClient;
     installedClient = true;
     remoteMode = true;
@@ -710,6 +802,7 @@ remoteReconnect.addEventListener("click", () => {
 remoteLocal.addEventListener("click", () => {
   interventions.setEnabled(false);
   checkpointLab.setEnabled(false);
+  experiments.setEnabled(false);
   remoteClient?.disconnect();
   remoteMode = false;
   remoteConnected = false;
@@ -872,6 +965,7 @@ function drawSnapshot(frame) {
     genomeInspector.observe(frame, simulationGeneration);
     observeInterventions(frame);
     observeCheckpointLab(frame);
+    observeExperiments(frame);
     return true;
   }
   try {
@@ -896,6 +990,7 @@ function drawSnapshot(frame) {
       genomeInspector.observe(frame, simulationGeneration);
       observeInterventions(frame);
       observeCheckpointLab(frame);
+      observeExperiments(frame);
       return true;
     }
   } catch (error) {
@@ -987,6 +1082,9 @@ function captureAdmittedFrame(frameIdentity) {
 window.addEventListener("pagehide", () => {
   narrative.setEnabled(false);
   checkpointLab.setEnabled(false);
+  experiments.setEnabled(false);
+  if (experimentExportUrl) URL.revokeObjectURL(experimentExportUrl);
+  experimentExportUrl = null;
   if (labPollTimer !== null) clearInterval(labPollTimer);
   labPollTimer = null;
   if (labDownloadUrl) URL.revokeObjectURL(labDownloadUrl);

@@ -2,6 +2,8 @@
 // supplied by the shared Rust/WASM protocol; this module owns connection and
 // consumer cursors, with no queue of historical canvas frames.
 import { MAX_LAB_ARTIFACT_BYTES, validateLabArtifact, validateLabIntervention } from "./checkpoint-lab.js";
+import { EXPERIMENT_LIMITS, EXPERIMENT_ENDPOINT_METRICS, parseExperimentJson,
+  prepareExperimentRequest } from "./experiment-protocol.js";
 
 const VERSION = 1;
 const STREAM_VERSION = 2;
@@ -30,7 +32,7 @@ export class RemoteOwnerHttpError extends Error {
 
 /** One deadline and one actual-byte ceiling cover every JSON owner response. */
 async function boundedOwnerJson(url, byteLimit, { signal, method = "GET", body, missingMessage,
-  sessionId, timeoutMs = 2000 } = {}) {
+  sessionId, timeoutMs = 2000, parse = JSON.parse } = {}) {
   const abort = new AbortController();
   const cancel = () => abort.abort();
   if (signal?.aborted) cancel();
@@ -63,7 +65,7 @@ async function boundedOwnerJson(url, byteLimit, { signal, method = "GET", body, 
     let offset = 0;
     for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
     let detail;
-    try { detail = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)); }
+    try { detail = parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)); }
     catch (error) {
       if (!response.ok) throw new RemoteOwnerHttpError(response.status, `Remote owner request failed (${response.status})`);
       throw error;
@@ -79,6 +81,13 @@ async function boundedOwnerJson(url, byteLimit, { signal, method = "GET", body, 
 
 function labIdentifier(value) {
   if (typeof value !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(value)) throw new Error("Invalid bounded Lab artifact identity");
+  return value;
+}
+
+function experimentIdentifier(value) {
+  if (typeof value !== "string" || !/^[A-Za-z0-9_.-]{1,128}$/.test(value) || value === "." || value.includes("..")) {
+    throw new Error("Invalid bounded experiment identity");
+  }
   return value;
 }
 
@@ -399,10 +408,10 @@ export class RemoteStreamClient {
   }
 
   /** Every Lab read/write is bound to the negotiated owner, including at the HTTP server. */
-  async labJson(path, sessionId, byteLimit, { signal, body, method = "GET", query = {} } = {}) {
+  async labJson(path, sessionId, byteLimit, { signal, body, method = "GET", query = {}, parse = JSON.parse } = {}) {
     const url = this.apiUrl(path, sessionId, query);
     const generation = this.generation;
-    const value = await boundedOwnerJson(url, byteLimit, { signal, body, method, sessionId, timeoutMs: 15000 });
+    const value = await boundedOwnerJson(url, byteLimit, { signal, body, method, sessionId, timeoutMs: 15000, parse });
     this.requireLabSource(sessionId, generation);
     return value;
   }
@@ -411,6 +420,48 @@ export class RemoteStreamClient {
     if (this.state !== "connected" || this.tracker.sessionId !== sessionId || this.generation !== generation) {
       throw new Error("The remote connection changed while the Lab request was pending; its outcome is unconfirmed");
     }
+  }
+
+  /** Isolated cohort execution shares the same negotiated owner and HTTP source fence. */
+  async listExperiments({ sessionId, cursor = null, limit = 12, signal } = {}) {
+    return this.labJson("/api/v1/experiments", sessionId, EXPERIMENT_LIMITS.maxResponseBytes,
+      { signal, query: labPageQuery(cursor, limit), parse: parseExperimentJson });
+  }
+
+  async createExperiment({ sessionId, request, body }, { signal } = {}) {
+    // Revalidate without regenerating the retry key, normalizing the seeds through
+    // Number, or capturing a changed form. An uncertain admission retries these bytes.
+    const prepared = prepareExperimentRequest(request);
+    if (typeof body !== "string" || body !== prepared.body) throw new Error("Experiment retry payload changed");
+    return this.labJson("/api/v1/experiments", sessionId, EXPERIMENT_LIMITS.maxResponseBytes,
+      { signal, method: "POST", body, parse: parseExperimentJson });
+  }
+
+  async experimentStatus(experimentId, { sessionId, signal } = {}) {
+    return this.labJson("/api/v1/experiments/" + experimentIdentifier(experimentId),
+      sessionId, EXPERIMENT_LIMITS.maxResponseBytes, { signal, parse: parseExperimentJson });
+  }
+
+  async cancelExperiment(experimentId, { sessionId, signal } = {}) {
+    return this.labJson("/api/v1/experiments/" + experimentIdentifier(experimentId) + "/cancel",
+      sessionId, EXPERIMENT_LIMITS.maxResponseBytes, { signal, method: "POST", parse: parseExperimentJson });
+  }
+
+  async resumeExperiment(experimentId, { sessionId, signal } = {}) {
+    return this.labJson("/api/v1/experiments/" + experimentIdentifier(experimentId) + "/resume",
+      sessionId, EXPERIMENT_LIMITS.maxResponseBytes, { signal, method: "POST", parse: parseExperimentJson });
+  }
+
+  /** The server restores complete endpoint evidence and performs its paired analysis. */
+  async compareExperiment(experimentId, { sessionId, baseline_variant, challenger_variant, metric, signal } = {}) {
+    experimentIdentifier(baseline_variant);
+    experimentIdentifier(challenger_variant);
+    if (baseline_variant === challenger_variant || !EXPERIMENT_ENDPOINT_METRICS.includes(metric)) {
+      throw new Error("Choose distinct experiment variants and a supported endpoint metric");
+    }
+    const body = JSON.stringify({ baseline_variant, challenger_variant, metric });
+    return this.labJson("/api/v1/experiments/" + experimentIdentifier(experimentId) + "/compare",
+      sessionId, EXPERIMENT_LIMITS.maxResponseBytes, { signal, method: "POST", body, parse: parseExperimentJson });
   }
 
   async listCheckpoints({ sessionId, cursor = null, limit = 12, signal } = {}) {
