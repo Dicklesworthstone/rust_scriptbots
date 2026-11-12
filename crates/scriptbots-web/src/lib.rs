@@ -40,7 +40,7 @@ use scriptbots_core::rng_domains::RngDomain;
 use scriptbots_core::{
     AgentData, AgentId, BrainBinding, BrainRunner, DynamicWorldSnapshot as SimulationSnapshot,
     Generation, INPUT_SIZE, OUTPUT_SIZE, Position, ScriptBotsConfig, SmallRngStream, Velocity,
-    WorldState,
+    WorldState, to_canonical_value,
 };
 #[cfg(test)]
 use scriptbots_core::{
@@ -1432,7 +1432,7 @@ impl SimHandle {
 
         let child_diff: Vec<(String, f64)> = merged.into_iter().collect();
         let base_config = base_config_for_scenario(&parent_link.scenario_id);
-        let scenario_json = serde_json::to_value(&base_config).map_err(|e| e.to_string())?;
+        let scenario_json = to_canonical_value(&base_config).map_err(|e| e.to_string())?;
         let config_digest = config_digest_with_diff(&scenario_json, &child_diff);
 
         let child_link = Permalink {

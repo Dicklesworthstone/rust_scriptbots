@@ -62,6 +62,7 @@ pub use interventions::{
     canonical_param_bytes, intervention_from_param_bytes, replay_journal_against_world,
     sort_interventions_deterministically, verify_journal_completeness,
 };
+pub use permalink::to_canonical_value;
 pub use replay::{
     ReplayScrubError, ReplayScrubFrame, ReplayScrubOutcome, replay_scrub_from_checkpoint,
 };

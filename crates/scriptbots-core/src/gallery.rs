@@ -509,8 +509,14 @@ pub fn reconstruct_config_from_permalink(link: &Permalink) -> Result<ScriptBotsC
     let mut config = base_config_for_scenario(&link.scenario_id);
     let scenario_json =
         to_canonical_value(&config).map_err(|e| format!("serialize base config: {e}"))?;
-    link.verify_config_digest(&scenario_json)
-        .map_err(|e| format!("config digest verification failed: {e}"))?;
+    if let Err(canonical) = link.verify_config_digest(&scenario_json) {
+        // Also accept the digest of `serde_json::to_value`, the form links were minted with before
+        // the canonical digest. The two differ only when `arbitrary_precision` is on in this build.
+        let legacy_json =
+            serde_json::to_value(&config).map_err(|e| format!("serialize base config: {e}"))?;
+        link.verify_config_digest(&legacy_json)
+            .map_err(|_| format!("config digest verification failed: {canonical}"))?;
+    }
 
     apply_knob_diff(&mut config, &link.knob_diff)?;
     config.rng_seed = Some(link.seed);

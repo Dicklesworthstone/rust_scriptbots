@@ -579,6 +579,9 @@ impl Permalink {
 /// knob path with its exact f64 bit pattern, in ascending path order — so two
 /// runs with the same reconstruction always agree and any tampering always
 /// disagrees.
+///
+/// Producers pass the scenario config through [`to_canonical_value`]: a
+/// `serde_json::to_value` result depends on `serde_json`'s `arbitrary_precision`.
 // bd-tqpj: knob paths are bounded to MAX_KNOB_PATH_BYTES before a diff can be
 // applied, so the pinned u16 wire length cannot truncate; the width is a digest input.
 #[allow(clippy::cast_possible_truncation)]
@@ -880,7 +883,7 @@ mod canonical_value {
     }
 }
 
-pub(crate) use canonical_value::to_canonical_value;
+pub use canonical_value::to_canonical_value;
 
 /// Serialize a config value with deterministic key order so digest inputs are
 /// stable regardless of map construction order.
