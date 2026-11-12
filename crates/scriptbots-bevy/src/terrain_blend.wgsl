@@ -46,9 +46,10 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     let water_modulation = vec3<f32>(clamp(1.0 + (water_luminance - water_mean) * 25.0, 0.3, 1.8));
     let natural_palette = clamp(dry_light_strength / 1.2, 0.0, 1.0);
     let water_detail = mix(water_photo, water_modulation, natural_palette);
+    let grass_photo = textureSample(grass_texture, grass_sampler, in.uv).rgb;
+    let rock_photo = textureSample(rock_texture, rock_sampler, in.uv).rgb;
     let photo_detail = (water_detail * weights.x
-        + textureSample(grass_texture, grass_sampler, in.uv).rgb * weights.y
-        + textureSample(rock_texture, rock_sampler, in.uv).rgb * rock_weight) / total;
+        + grass_photo * weights.y + rock_photo * rock_weight) / total;
     // Ease the dark photo modulation without washing out its local detail.
     // The square-root curve lifts shadows more than highlights, stays within
     // the base biome tint, and leaves the white accessibility texture white.
@@ -66,6 +67,28 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     let far_color = textureSample(far_color_texture, far_color_sampler, uv);
     let distance_cells = distance(view.world_position.xyz, in.world_position.xyz) / cell;
     let fade = smoothstep(8.0, 16.0, distance_cells) * far_color.a * far_color_mapping.w;
+    // Use the existing land photos as a small-scale lighting cue, without
+    // moving the geometry used by creature contact and picking. Screen-space
+    // surface gradients need no mesh tangents and fade before they alias in
+    // the distance. The accessibility palettes retain their original shading.
+    let land_photo = (grass_photo * weights.y + rock_photo * rock_weight) / total;
+    let height_hint = dot(land_photo, vec3<f32>(0.2126, 0.7152, 0.0722));
+    let dp_x = dpdx(in.world_position.xyz);
+    let dp_y = dpdy(in.world_position.xyz);
+    let n = pbr_input.N;
+    let r_x = cross(dp_y, n);
+    let r_y = cross(n, dp_x);
+    let determinant = dot(dp_x, r_x);
+    let gradient = (r_x * dpdx(height_hint) + r_y * dpdy(height_hint))
+        * (sign(determinant) / max(abs(determinant), 0.000001));
+    let relief = gradient * cell * 0.025 * natural_palette
+        * (1.0 - smoothstep(4.0, 12.0, distance_cells));
+    pbr_input.N = normalize(n - relief / max(1.0, length(relief) / 0.4));
+    // Water and land can share a chunk; use the interpolated biome weights to
+    // give water a smoother surface instead of applying a chunk-wide value.
+    pbr_input.material.perceptual_roughness = clamp(
+        pbr_input.material.perceptual_roughness * mix(1.0, 0.4, weights.x / total),
+        0.12, 1.0);
     let base = mix(pbr_input.material.base_color.rgb, far_color.rgb, fade);
     let peak = max(max(base.r, base.g), base.b);
     let max_gain = max(1.0, 1.0 / max(peak, 0.00001));

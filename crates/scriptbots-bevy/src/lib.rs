@@ -18502,23 +18502,22 @@ fn sync_terrain(
 }
 
 fn create_chunk_material(stats: &TerrainChunkStats) -> StandardMaterial {
-    let roughness = (0.45 + stats.mean_moisture * 0.4).clamp(0.1, 0.95);
-    let metallic = (stats.mean_slope * 0.35).clamp(0.0, 0.5);
-    let emissive_intensity =
-        (stats.mean_moisture * 0.12 + stats.height_factor * 0.05).clamp(0.0, 0.35);
-    let emissive = Color::linear_rgb(
-        emissive_intensity * 0.6,
-        emissive_intensity,
-        emissive_intensity * 0.8,
-    );
-    StandardMaterial {
+    let mut material = StandardMaterial {
         base_color: Color::WHITE,
-        perceptual_roughness: roughness,
-        metallic,
-        reflectance: (0.04 + stats.height_factor * 0.02).clamp(0.02, 0.08),
-        emissive: emissive.into(),
         ..Default::default()
-    }
+    };
+    set_terrain_surface_properties(&mut material, stats);
+    material
+}
+
+fn set_terrain_surface_properties(material: &mut StandardMaterial, stats: &TerrainChunkStats) {
+    // Soil, vegetation and water are dielectrics, not metals or light sources.
+    // Preserve a little variation in the underlying roughness map for wet soil;
+    // the terrain shader adjusts water separately within mixed-biome chunks.
+    material.perceptual_roughness = (0.88 - stats.mean_moisture * 0.18).clamp(0.7, 0.88);
+    material.metallic = 0.0;
+    material.reflectance = 0.5;
+    material.emissive = Color::BLACK.into();
 }
 
 // The distant color image is an optional visual filter. Keep its allocation
@@ -18974,20 +18973,7 @@ fn update_chunk_material(
     stats: &TerrainChunkStats,
 ) {
     if let Some(material) = materials.get_mut(handle) {
-        let material = &mut material.base;
-        let roughness = (0.45 + stats.mean_moisture * 0.4).clamp(0.1, 0.95);
-        let metallic = (stats.mean_slope * 0.35).clamp(0.0, 0.5);
-        let emissive_intensity =
-            (stats.mean_moisture * 0.12 + stats.height_factor * 0.05).clamp(0.0, 0.35);
-        material.perceptual_roughness = roughness;
-        material.metallic = metallic;
-        material.reflectance = (0.04 + stats.height_factor * 0.02).clamp(0.02, 0.08);
-        material.emissive = Color::linear_rgb(
-            emissive_intensity * 0.6,
-            emissive_intensity,
-            emissive_intensity * 0.8,
-        )
-        .into();
+        set_terrain_surface_properties(&mut material.base, stats);
     }
 }
 
@@ -19088,8 +19074,6 @@ struct BuiltChunk {
 #[derive(Clone, Copy)]
 struct TerrainChunkStats {
     mean_moisture: f32,
-    mean_slope: f32,
-    height_factor: f32,
     max_height: f32,
     world_extent: Vec2,
     detail_layer: usize,
@@ -19338,7 +19322,6 @@ fn build_chunk_mesh(
     let mut blend_weights = Vec::with_capacity(vertex_count);
     let mut colors = Vec::with_capacity(vertex_count);
     let mut sum_moisture = 0.0f64;
-    let mut sum_slope = 0.0f64;
     let mut max_height = f32::MIN;
     let mut biome_tiles = [0_usize; visual::SPLAT_LAYERS];
     let mut coarse_vertices = 0_usize;
@@ -19369,12 +19352,10 @@ fn build_chunk_mesh(
                 let global_x = grid.x / TERRAIN_SUBDIVISIONS;
                 let global_z = grid.y / TERRAIN_SUBDIVISIONS;
                 let sample = terrain.sample_tile(global_x, global_z);
-                let slope = compute_tile_slope(terrain, global_x, global_z);
                 if vx < verts_x - 1 && vz < verts_z - 1 {
                     biome_tiles[visual::terrain_kind_index(sample.kind)] += 1;
                 }
                 sum_moisture += sample.moisture as f64;
-                sum_slope += slope as f64;
                 coarse_vertices += 1;
             }
         }
@@ -19396,8 +19377,6 @@ fn build_chunk_mesh(
 
     let vertex_total = coarse_vertices as f64;
     let mean_moisture = (sum_moisture / vertex_total) as f32;
-    let mean_slope = (sum_slope / vertex_total) as f32;
-    let height_factor = (max_height / height_scale).clamp(0.0, 1.0);
     let world_extent = Vec2::new(
         bounds.size.x.max(1) as f32 * cell_size,
         bounds.size.y.max(1) as f32 * cell_size,
@@ -19416,14 +19395,7 @@ fn build_chunk_mesh(
         &normals,
         &colors,
         &blend_weights,
-        &[
-            mean_moisture,
-            mean_slope,
-            height_factor,
-            max_height,
-            world_extent.x,
-            world_extent.y,
-        ],
+        &[mean_moisture, max_height, world_extent.x, world_extent.y],
         detail_layer,
     );
     let mut mesh = Mesh::new(
@@ -19441,8 +19413,6 @@ fn build_chunk_mesh(
 
     let stats = TerrainChunkStats {
         mean_moisture,
-        mean_slope,
-        height_factor,
         max_height,
         world_extent,
         detail_layer,
@@ -22497,7 +22467,7 @@ mod terrain_tests {
                 &[0.9, 0.0],
                 0
             ),
-            "moisture/slope material changes must not preserve a stale PBR material"
+            "moisture material changes must not preserve a stale PBR material"
         );
         assert_ne!(
             TerrainChunkSignature::from_render_inputs(
@@ -22945,6 +22915,39 @@ mod terrain_tests {
 
         assert!(built.stats.mean_moisture > 0.0);
         assert!(built.stats.max_height > 0.0);
+    }
+
+    #[test]
+    fn terrain_material_remains_dielectric_and_nonemissive_after_updates() {
+        let snapshot = sample_world_snapshot();
+        let mut stats = build_chunk_mesh(
+            &snapshot,
+            TerrainChunkBounds {
+                origin: UVec2::ZERO,
+                size: snapshot.terrain_height.dims,
+            },
+            TERRAIN_HEIGHT_SCALE,
+            ColorPaletteMode::Natural,
+        )
+        .stats;
+        stats.mean_moisture = 0.0;
+        let mut base = create_chunk_material(&stats);
+        let dry_roughness = base.perceptual_roughness;
+        let texture = Handle::<Image>::default();
+        base.metallic_roughness_texture = Some(texture.clone());
+        let mut materials = Assets::<TerrainMaterial>::default();
+        let handle = materials.add(TerrainMaterial {
+            base,
+            extension: TerrainBlend::default(),
+        });
+        stats.mean_moisture = 1.0;
+        update_chunk_material(&mut materials, &handle, &stats);
+        let updated = &materials.get(&handle).unwrap().base;
+        assert!(updated.perceptual_roughness < dry_roughness);
+        assert_eq!(updated.metallic, 0.0);
+        assert_eq!(updated.reflectance, 0.5);
+        assert_eq!(updated.emissive, Color::BLACK.into());
+        assert_eq!(updated.metallic_roughness_texture.as_ref(), Some(&texture));
     }
 
     #[test]
