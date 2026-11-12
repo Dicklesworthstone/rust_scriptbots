@@ -3232,6 +3232,20 @@ fn submit_playback_command(
 const DIAGNOSTIC_REPORT_INTERVAL: u32 = 300;
 const CAMERA_MIN_DISTANCE: f32 = 300.0;
 const CAMERA_MAX_DISTANCE: f32 = 6000.0;
+// Automatic framing stays conservative; manual zoom may approach a creature
+// more closely while keeping the camera outside its body at larger scales.
+const CAMERA_MANUAL_MIN_DISTANCE: f32 = 40.0;
+const CAMERA_MANUAL_RADIUS_FACTOR: f32 = 4.0;
+
+fn camera_manual_min_distance(snapshot: Option<&WorldSnapshot>) -> f32 {
+    snapshot
+        .map(|frame| frame.agent_radius)
+        .filter(|radius| radius.is_finite() && *radius > 0.0)
+        .map_or(CAMERA_MIN_DISTANCE, |radius| {
+            (radius * CAMERA_MANUAL_RADIUS_FACTOR)
+                .clamp(CAMERA_MANUAL_MIN_DISTANCE, CAMERA_MAX_DISTANCE)
+        })
+}
 // Stop just short of vertical so the camera's up vector remains well-defined.
 const CAMERA_OVERHEAD_PITCH: f32 = -1.55;
 const CAMERA_SMOOTHING_LERP: f32 = 8.0;
@@ -3657,6 +3671,33 @@ enum CreatureBodyMetric {
 
 #[derive(Component)]
 struct CreatureBodyMetricLabel(CreatureBodyMetric);
+
+/// Owner-captured phenotype multiplier, displayed on a compact nonlinear scale.
+#[derive(Component)]
+struct CreatureTraitMarker(usize);
+
+#[derive(Component)]
+struct CreatureTraitReading(usize);
+
+#[derive(Component)]
+struct CreatureOwnerStatus;
+
+#[derive(Component, Clone, Copy)]
+enum CreatureLifeReading {
+    FoodDelta,
+    Reproduction,
+    Parents,
+}
+
+#[derive(Component)]
+struct CreatureFoodDeltaIndicator;
+
+#[derive(Component)]
+struct CreatureParentIndicator(usize);
+
+fn creature_trait_position(value: f32) -> Option<f32> {
+    (value.is_finite() && value >= 0.0).then(|| value / (1.0 + value))
+}
 
 #[derive(Clone, Copy)]
 enum CreatureSignalSource {
@@ -5873,7 +5914,7 @@ fn setup_scene(
                 left: Val::Px(12.0),
                 width: Val::Px(320.0),
                 max_width: Val::Percent(45.0),
-                max_height: Val::Percent(92.0),
+                max_height: Val::Percent(96.0),
                 padding: UiRect::all(Val::Px(10.0)),
                 flex_direction: FlexDirection::Column,
                 row_gap: Val::Px(4.0),
@@ -6015,7 +6056,7 @@ fn setup_scene(
                     padding: UiRect::all(Val::Px(12.0)),
                     border: UiRect::all(Val::Px(1.0)),
                     flex_direction: FlexDirection::Column,
-                    row_gap: Val::Px(3.0),
+                    row_gap: Val::Px(2.0),
                     ..default()
                 },
                 BackgroundColor(Color::srgba(0.08, 0.16, 0.14, 0.96)),
@@ -6023,11 +6064,6 @@ fn setup_scene(
                 BorderRadius::all(Val::Px(8.0)),
             ))
             .with_children(|card| {
-                card.spawn((
-                    Text::new("CREATURE  /  FIELD PROFILE"),
-                    ui_font(11.0),
-                    TextColor(Color::srgb(0.57, 0.78, 0.66)),
-                ));
                 card_identity = card
                     .spawn((
                         Text::default(),
@@ -6042,6 +6078,84 @@ fn setup_scene(
                         TextColor(Color::srgb(0.72, 0.83, 0.77)),
                     ))
                     .id();
+                card.spawn((
+                    Text::new("OWNER SAMPLE  ·  WAITING"),
+                    ui_font(9.0),
+                    TextColor(Color::srgb(0.65, 0.80, 0.71)),
+                    CreatureOwnerStatus,
+                ));
+                card.spawn(Node {
+                    flex_direction: FlexDirection::Row,
+                    column_gap: Val::Px(6.0),
+                    ..default()
+                })
+                .with_children(|row| {
+                    for (name, metric) in [
+                        ("FOOD Δ / TICK", CreatureLifeReading::FoodDelta),
+                        ("REPRO COUNTER", CreatureLifeReading::Reproduction),
+                        ("KNOWN PARENTS", CreatureLifeReading::Parents),
+                    ] {
+                        row.spawn(Node {
+                            flex_grow: 1.0,
+                            flex_basis: Val::Px(0.0),
+                            flex_direction: FlexDirection::Column,
+                            row_gap: Val::Px(1.0),
+                            ..default()
+                        })
+                        .with_children(|cell| {
+                            cell.spawn((
+                                Text::new(name),
+                                ui_font(9.0),
+                                TextColor(Color::srgb(0.65, 0.80, 0.71)),
+                            ));
+                            cell.spawn(Node {
+                                flex_direction: FlexDirection::Row,
+                                align_items: AlignItems::Center,
+                                column_gap: Val::Px(4.0),
+                                ..default()
+                            })
+                            .with_children(|value| {
+                                match metric {
+                                    CreatureLifeReading::FoodDelta => {
+                                        value.spawn((
+                                            Node {
+                                                display: Display::None,
+                                                width: Val::Px(6.0),
+                                                height: Val::Px(6.0),
+                                                ..default()
+                                            },
+                                            BackgroundColor(Color::srgb(0.40, 0.82, 0.57)),
+                                            BorderRadius::all(Val::Px(3.0)),
+                                            CreatureFoodDeltaIndicator,
+                                        ));
+                                    }
+                                    CreatureLifeReading::Parents => {
+                                        for index in 0..2 {
+                                            value.spawn((
+                                                Node {
+                                                    display: Display::None,
+                                                    width: Val::Px(6.0),
+                                                    height: Val::Px(6.0),
+                                                    ..default()
+                                                },
+                                                BackgroundColor(Color::srgb(0.22, 0.34, 0.29)),
+                                                BorderRadius::all(Val::Px(3.0)),
+                                                CreatureParentIndicator(index),
+                                            ));
+                                        }
+                                    }
+                                    CreatureLifeReading::Reproduction => {}
+                                }
+                                value.spawn((
+                                    Text::new("--"),
+                                    ui_font(12.0),
+                                    TextColor(Color::srgb(0.95, 0.98, 0.93)),
+                                    metric,
+                                ));
+                            });
+                        });
+                    }
+                });
                 card.spawn(Node {
                     flex_direction: FlexDirection::Row,
                     flex_wrap: FlexWrap::Wrap,
@@ -6390,6 +6504,78 @@ fn setup_scene(
                                         preference,
                                     ));
                                 });
+                        });
+                    }
+                });
+                card.spawn((
+                    Text::new("TRAITS  ·  1× CENTER  ·  NONLINEAR"),
+                    ui_font(9.0),
+                    TextColor(Color::srgb(0.65, 0.80, 0.71)),
+                ));
+                card.spawn(Node {
+                    flex_direction: FlexDirection::Row,
+                    column_gap: Val::Px(5.0),
+                    ..default()
+                })
+                .with_children(|row| {
+                    for (index, name) in ["SMELL", "SOUND", "HEARING", "EYE", "BLOOD"]
+                        .into_iter()
+                        .enumerate()
+                    {
+                        row.spawn(Node {
+                            flex_grow: 1.0,
+                            flex_basis: Val::Px(0.0),
+                            flex_direction: FlexDirection::Column,
+                            row_gap: Val::Px(3.0),
+                            ..default()
+                        })
+                        .with_children(|cell| {
+                            cell.spawn((
+                                Text::new(name),
+                                ui_font(9.0),
+                                TextColor(Color::srgb(0.65, 0.80, 0.71)),
+                            ));
+                            cell.spawn((
+                                Text::new("--"),
+                                ui_font(12.0),
+                                TextColor(Color::srgb(0.95, 0.98, 0.93)),
+                                CreatureTraitReading(index),
+                            ));
+                            cell.spawn((
+                                Node {
+                                    width: Val::Percent(100.0),
+                                    height: Val::Px(4.0),
+                                    ..default()
+                                },
+                                BackgroundColor(Color::srgb(0.22, 0.34, 0.29)),
+                                BorderRadius::all(Val::Px(2.0)),
+                            ))
+                            .with_children(|track| {
+                                track.spawn((
+                                    Node {
+                                        position_type: PositionType::Absolute,
+                                        left: Val::Percent(50.0),
+                                        width: Val::Px(1.0),
+                                        height: Val::Percent(100.0),
+                                        ..default()
+                                    },
+                                    BackgroundColor(Color::srgb(0.67, 0.76, 0.70)),
+                                ));
+                                track.spawn((
+                                    Node {
+                                        position_type: PositionType::Absolute,
+                                        display: Display::None,
+                                        width: Val::Px(5.0),
+                                        height: Val::Px(8.0),
+                                        top: Val::Px(-2.0),
+                                        margin: UiRect::left(Val::Px(-2.5)),
+                                        ..default()
+                                    },
+                                    BackgroundColor(Color::srgb(0.97, 0.73, 0.34)),
+                                    BorderRadius::all(Val::Px(2.0)),
+                                    CreatureTraitMarker(index),
+                                ));
+                            });
                         });
                     }
                 });
@@ -7568,11 +7754,20 @@ const GROUNDCOVER_STUDY_RADIUS: i64 = 1;
 
 // The authored-asset study is deliberately separate from the shipping scene.
 // Its source is the externally supplied Poly Haven grass_medium_01 1K glTF;
-// node transforms in that file arrange samples for display, so only its six
-// tiny mesh primitives are used here. The authoring asset is CC0.
+// node translations in that file arrange samples for display, so the study
+// places mesh primitives directly. The authoring asset is CC0.
 const AUTHORED_GROUNDCOVER_SIDE: usize = 20;
-const AUTHORED_GROUNDCOVER_FIRST_MESH: usize = 11;
-const AUTHORED_GROUNDCOVER_VARIANTS: usize = 6;
+const AUTHORED_GROUNDCOVER_CLUMP_COUNT: usize = 11;
+const AUTHORED_GROUNDCOVER_TINY_COUNT: usize = 6;
+
+fn authored_groundcover_mesh_range(clumps: bool) -> std::ops::Range<usize> {
+    if clumps {
+        0..AUTHORED_GROUNDCOVER_CLUMP_COUNT
+    } else {
+        AUTHORED_GROUNDCOVER_CLUMP_COUNT
+            ..AUTHORED_GROUNDCOVER_CLUMP_COUNT + AUTHORED_GROUNDCOVER_TINY_COUNT
+    }
+}
 
 #[derive(Resource)]
 struct AuthoredGroundcoverStudy {
@@ -7580,7 +7775,11 @@ struct AuthoredGroundcoverStudy {
     material: Handle<StandardMaterial>,
     raw_texture: Handle<Image>,
     straight_texture: Handle<Image>,
+    mip_raw_texture: Handle<Image>,
+    mip_straight_texture: Handle<Image>,
     original_color: bool,
+    mipmapped: bool,
+    clumps: bool,
     scale_factor: f32,
     spawned: bool,
 }
@@ -7617,6 +7816,58 @@ fn authored_groundcover_pixels(
     Some((raw, straight))
 }
 
+/// Downsample in linear light with opacity-weighted color so transparent
+/// black atlas pixels do not darken the visible edges of the grass.
+fn authored_groundcover_mips(width: u32, height: u32, pixels: &[u8]) -> (Vec<u8>, u32) {
+    let (mut w, mut h) = (width, height);
+    let mut level = pixels.to_vec();
+    let mut data = level.clone();
+    let mut levels = 1;
+    while w > 1 || h > 1 {
+        let (next_w, next_h) = ((w / 2).max(1), (h / 2).max(1));
+        let mut next = Vec::with_capacity((next_w * next_h * 4) as usize);
+        for y in 0..next_h {
+            for x in 0..next_w {
+                let mut weighted = [0.0_f32; 3];
+                let mut alpha_sum = 0.0;
+                let mut count = 0;
+                for sy in y * h / next_h..(y + 1) * h / next_h {
+                    for sx in x * w / next_w..(x + 1) * w / next_w {
+                        let index = ((sy * w + sx) * 4) as usize;
+                        let alpha = f32::from(level[index + 3]) / 255.0;
+                        for channel in 0..3 {
+                            weighted[channel] +=
+                                srgb_to_linear_component(f32::from(level[index + channel]) / 255.0)
+                                    * alpha;
+                        }
+                        alpha_sum += alpha;
+                        count += 1;
+                    }
+                }
+                for value in weighted {
+                    let linear = if alpha_sum > 0.0 {
+                        value / alpha_sum
+                    } else {
+                        0.0
+                    };
+                    let srgb = if linear <= 0.003_130_8 {
+                        linear * 12.92
+                    } else {
+                        1.055 * linear.powf(1.0 / 2.4) - 0.055
+                    };
+                    next.push((srgb.clamp(0.0, 1.0) * 255.0).round() as u8);
+                }
+                next.push((alpha_sum / count as f32 * 255.0).round() as u8);
+            }
+        }
+        data.extend_from_slice(&next);
+        level = next;
+        (w, h) = (next_w, next_h);
+        levels += 1;
+    }
+    (data, levels)
+}
+
 fn setup_authored_groundcover_study(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
@@ -7642,7 +7893,7 @@ fn setup_authored_groundcover_study(
             return;
         }
     };
-    let mut make_image = |pixels| {
+    let mut make_image = |pixels: Vec<u8>, mipmapped: bool| {
         let mut image = Image::new(
             Extent3d {
                 width,
@@ -7650,15 +7901,22 @@ fn setup_authored_groundcover_study(
                 depth_or_array_layers: 1,
             },
             TextureDimension::D2,
-            pixels,
+            pixels.clone(),
             TextureFormat::Rgba8UnormSrgb,
             RenderAssetUsages::default(),
         );
+        if mipmapped {
+            let (data, levels) = authored_groundcover_mips(width, height, &pixels);
+            image.data = Some(data);
+            image.texture_descriptor.mip_level_count = levels;
+        }
         image.sampler = bevy::image::ImageSampler::linear();
         images.add(image)
     };
-    let raw_texture = make_image(raw);
-    let straight_texture = make_image(straight);
+    let raw_texture = make_image(raw.clone(), false);
+    let straight_texture = make_image(straight.clone(), false);
+    let mip_raw_texture = make_image(raw, true);
+    let mip_straight_texture = make_image(straight, true);
     let material = materials.add(StandardMaterial {
         base_color_texture: Some(straight_texture.clone()),
         alpha_mode: AlphaMode::Mask(0.3),
@@ -7683,14 +7941,18 @@ fn setup_authored_groundcover_study(
         material,
         raw_texture,
         straight_texture,
+        mip_raw_texture,
+        mip_straight_texture,
         original_color: false,
+        mipmapped: false,
+        clumps: false,
         scale_factor: 1.0,
         spawned: false,
     });
 }
 
-// B isolates lighting, M compares scale, and U compares the original and
-// straight-color texture at the same paused camera position. Study only.
+// B isolates lighting, M compares scale, U compares color reconstruction,
+// J compares mip filtering, and K compares mesh families. Study only.
 fn toggle_authored_groundcover_lighting(
     input: Res<ButtonInput<KeyCode>>,
     authored: Option<ResMut<AuthoredGroundcoverStudy>>,
@@ -7717,17 +7979,27 @@ fn toggle_authored_groundcover_lighting(
             "authored groundcover scale study"
         );
     }
-    if input.just_pressed(KeyCode::KeyU)
-        && let Some(material) = materials.get_mut(&authored.material)
-    {
-        authored.original_color = !authored.original_color;
-        material.base_color_texture = Some(if authored.original_color {
-            authored.raw_texture.clone()
-        } else {
-            authored.straight_texture.clone()
-        });
+    if input.just_pressed(KeyCode::KeyK) {
+        authored.clumps = !authored.clumps;
+        info!(clumps = authored.clumps, "authored groundcover mesh study");
+    }
+    let change_color = input.just_pressed(KeyCode::KeyU);
+    let change_mips = input.just_pressed(KeyCode::KeyJ);
+    if change_color || change_mips {
+        authored.original_color ^= change_color;
+        authored.mipmapped ^= change_mips;
+        if let Some(material) = materials.get_mut(&authored.material) {
+            material.base_color_texture =
+                Some(match (authored.original_color, authored.mipmapped) {
+                    (true, true) => authored.mip_raw_texture.clone(),
+                    (false, true) => authored.mip_straight_texture.clone(),
+                    (true, false) => authored.raw_texture.clone(),
+                    (false, false) => authored.straight_texture.clone(),
+                });
+        }
         info!(
             original = authored.original_color,
+            mipmapped = authored.mipmapped,
             "authored groundcover color study"
         );
     }
@@ -7773,8 +8045,7 @@ fn sync_authored_groundcover_study(
     let Some(gltf) = gltfs.get(&authored.source) else {
         return;
     };
-    let Some(variants) = (AUTHORED_GROUNDCOVER_FIRST_MESH
-        ..AUTHORED_GROUNDCOVER_FIRST_MESH + AUTHORED_GROUNDCOVER_VARIANTS)
+    let Some(variants) = authored_groundcover_mesh_range(authored.clumps)
         .map(|index| {
             let mesh = gltf_meshes.get(gltf.meshes.get(index)?)?;
             let handle = mesh.primitives.first()?.mesh.clone();
@@ -8554,6 +8825,12 @@ struct CreatureCardData<'w, 's> {
     drive_labels: Query<'w, 's, (Entity, &'static CreatureDriveLabel)>,
     preferences: Query<'w, 's, (Entity, &'static CreaturePreference)>,
     preference_labels: Query<'w, 's, (Entity, &'static CreaturePreferenceLabel)>,
+    trait_markers: Query<'w, 's, (Entity, &'static CreatureTraitMarker)>,
+    trait_readings: Query<'w, 's, (Entity, &'static CreatureTraitReading)>,
+    owner_statuses: Query<'w, 's, Entity, With<CreatureOwnerStatus>>,
+    life_readings: Query<'w, 's, (Entity, &'static CreatureLifeReading)>,
+    food_delta_indicators: Query<'w, 's, Entity, With<CreatureFoodDeltaIndicator>>,
+    parent_indicators: Query<'w, 's, (Entity, &'static CreatureParentIndicator)>,
     brain_layers: Query<'w, 's, (Entity, &'static CreatureBrainLayer)>,
     brain_labels: Query<'w, 's, (Entity, &'static CreatureBrainLabel)>,
     brain_cells: Query<'w, 's, (Entity, &'static CreatureBrainCell)>,
@@ -8588,6 +8865,12 @@ fn update_creature_card(
         drive_labels,
         preferences,
         preference_labels,
+        trait_markers,
+        trait_readings,
+        owner_statuses,
+        life_readings,
+        food_delta_indicators,
+        parent_indicators,
         brain_layers,
         brain_labels,
         brain_cells,
@@ -8933,9 +9216,150 @@ fn update_creature_card(
             .as_ref()
             .filter(|sample| current.is_some_and(|target| sample.target.visible_at(target)))
     });
+    let trait_values = sample
+        .and_then(|sample| sample.trait_modifiers)
+        .map(|traits| {
+            [
+                traits.smell,
+                traits.sound,
+                traits.hearing,
+                traits.eye,
+                traits.blood,
+            ]
+        });
+    let life = sample.and_then(|sample| sample.life_summary);
+    for (entity, metric) in &life_readings {
+        let value = match (life, metric) {
+            (Some(life), CreatureLifeReading::FoodDelta) if life.food_delta.is_finite() => {
+                format!("{:+.3}", life.food_delta)
+            }
+            (Some(life), CreatureLifeReading::Reproduction)
+                if life.reproduction_counter.is_finite() =>
+            {
+                format!("{:.3}", life.reproduction_counter)
+            }
+            (Some(life), CreatureLifeReading::Parents) => format!(
+                "{}/2{}",
+                life.parents.iter().flatten().count(),
+                if life.hybrid { " · HYBRID" } else { "" },
+            ),
+            _ => "--".to_owned(),
+        };
+        if let Ok(mut text) = texts.get_mut(entity) {
+            set_hud_text_if_changed(&mut text, value);
+        }
+    }
+    for entity in &food_delta_indicators {
+        let value = life
+            .map(|life| life.food_delta)
+            .filter(|value| value.is_finite());
+        if let Ok(mut node) = nodes.get_mut(entity) {
+            let display = if value.is_some() {
+                Display::Flex
+            } else {
+                Display::None
+            };
+            if node.display != display {
+                node.display = display;
+            }
+        }
+        if let Some(value) = value {
+            let color = if value > 0.0 {
+                Color::srgb(0.40, 0.82, 0.57)
+            } else if value < 0.0 {
+                Color::srgb(0.97, 0.62, 0.35)
+            } else {
+                Color::srgb(0.55, 0.67, 0.60)
+            };
+            if let Ok(mut background) = backgrounds.get_mut(entity)
+                && background.0 != color
+            {
+                background.0 = color;
+            }
+        }
+    }
+    for (entity, indicator) in &parent_indicators {
+        let known = life.and_then(|life| life.parents.get(indicator.0).copied());
+        if let Ok(mut node) = nodes.get_mut(entity) {
+            let display = if known.is_some() {
+                Display::Flex
+            } else {
+                Display::None
+            };
+            if node.display != display {
+                node.display = display;
+            }
+        }
+        if let Some(parent) = known {
+            let color = if parent.is_some() {
+                Color::srgb(0.40, 0.82, 0.57)
+            } else {
+                Color::srgb(0.22, 0.34, 0.29)
+            };
+            if let Ok(mut background) = backgrounds.get_mut(entity)
+                && background.0 != color
+            {
+                background.0 = color;
+            }
+        }
+    }
+    for (entity, marker) in &trait_markers {
+        let position = trait_values
+            .and_then(|values| values.get(marker.0).copied())
+            .and_then(creature_trait_position);
+        if let Ok(mut node) = nodes.get_mut(entity) {
+            let display = if position.is_some() {
+                Display::Flex
+            } else {
+                Display::None
+            };
+            if node.display != display {
+                node.display = display;
+            }
+            if let Some(position) = position {
+                let left = Val::Percent(position * 100.0);
+                if node.left != left {
+                    node.left = left;
+                }
+            }
+        }
+    }
+    for (entity, reading) in &trait_readings {
+        let value = trait_values
+            .and_then(|values| values.get(reading.0).copied())
+            .filter(|value| creature_trait_position(*value).is_some());
+        if let Ok(mut text) = texts.get_mut(entity) {
+            set_hud_text_if_changed(
+                &mut text,
+                value.map_or_else(|| "--".to_owned(), |v| format!("{v:.2}×")),
+            );
+        }
+    }
     let refresh_failed = owner
         .as_ref()
         .is_some_and(|inspector| inspector.last_failure.is_some());
+    let owner_status = match (current, sample) {
+        (Some(current), Some(sample)) => format!(
+            "OWNER SAMPLE  ·  TICK {}  ·  {}{}",
+            sample.target.source.inspected_tick.0,
+            dashboard_sample_age(
+                current.source.inspected_tick.0 - sample.target.source.inspected_tick.0
+            ),
+            if refresh_failed {
+                "  ·  REFRESH FAILED"
+            } else {
+                ""
+            },
+        ),
+        _ if owner.is_none() => "OWNER SAMPLE  ·  UNAVAILABLE".to_owned(),
+        _ if refresh_failed => "OWNER SAMPLE  ·  REFRESH FAILED".to_owned(),
+        _ => "OWNER SAMPLE  ·  WAITING".to_owned(),
+    };
+    for entity in &owner_statuses {
+        if let Ok(mut text) = texts.get_mut(entity) {
+            set_hud_text_if_changed(&mut text, owner_status.clone());
+        }
+    }
     let signal_prefix = if refresh_failed {
         "SIGNALS  /  REFRESH FAILED"
     } else {
@@ -13997,10 +14421,31 @@ impl InspectorTarget {
     }
 }
 
+#[derive(Clone, Copy)]
+struct CreatureLifeSummary {
+    food_delta: f32,
+    reproduction_counter: f32,
+    parents: [Option<AgentUid>; 2],
+    hybrid: bool,
+}
+
+impl From<&scriptbots_runtime::channel::AgentInspectorData> for CreatureLifeSummary {
+    fn from(detail: &scriptbots_runtime::channel::AgentInspectorData) -> Self {
+        Self {
+            food_delta: detail.physiology.food_delta,
+            reproduction_counter: detail.life.reproduction_counter,
+            parents: detail.life.lineage,
+            hybrid: detail.life.hybrid,
+        }
+    }
+}
+
 struct OwnerInspectorSample {
     target: InspectorTarget,
     sensors: [f32; scriptbots_core::INPUT_SIZE],
     outputs: [f32; scriptbots_core::OUTPUT_SIZE],
+    trait_modifiers: Option<scriptbots_core::TraitModifiers>,
+    life_summary: Option<CreatureLifeSummary>,
     pages: Vec<String>,
     sections: InspectorSectionStarts,
     genome_paging: Option<scriptbots_core::genome_browser::BrowserPagingMeta>,
@@ -14365,6 +14810,7 @@ fn capture_owner_inspector_at(
     if genome_paging.is_some_and(|paging| paging.page_offset != genome_offset) {
         return Err("owner returned the wrong genome slice".to_owned());
     }
+    let life_summary = CreatureLifeSummary::from(&detail);
     let genome_deltas = detail
         .genome_browser
         .map_or_else(Vec::new, |genome| genome.deltas);
@@ -14372,6 +14818,8 @@ fn capture_owner_inspector_at(
         target: captured,
         sensors: detail.sensors,
         outputs: detail.outputs,
+        trait_modifiers: Some(detail.trait_modifiers),
+        life_summary: Some(life_summary),
         pages,
         sections,
         genome_paging,
@@ -15372,6 +15820,8 @@ mod owner_inspector_tests {
             target,
             sensors: detail.sensors,
             outputs: detail.outputs,
+            trait_modifiers: Some(detail.trait_modifiers),
+            life_summary: Some(CreatureLifeSummary::from(&detail)),
             pages,
             sections,
             genome_paging: detail.genome_browser.as_ref().map(|genome| genome.paging),
@@ -15419,6 +15869,8 @@ mod owner_inspector_tests {
             target,
             sensors: [0.0; scriptbots_core::INPUT_SIZE],
             outputs: [0.0; scriptbots_core::OUTPUT_SIZE],
+            trait_modifiers: None,
+            life_summary: None,
             pages: vec!["Life".into(), label.into()],
             sections: InspectorSectionStarts {
                 senses: 1,
@@ -16262,6 +16714,54 @@ mod owner_inspector_tests {
             .world_mut()
             .spawn((BackgroundColor(Color::WHITE), CreatureEyeSwatch(0)))
             .id();
+        let trait_marker = app
+            .world_mut()
+            .spawn((Node::default(), CreatureTraitMarker(0)))
+            .id();
+        let trait_reading = app
+            .world_mut()
+            .spawn((Text::default(), CreatureTraitReading(0)))
+            .id();
+        let trait_status = app
+            .world_mut()
+            .spawn((Text::default(), CreatureOwnerStatus))
+            .id();
+        let food_reading = app
+            .world_mut()
+            .spawn((Text::default(), CreatureLifeReading::FoodDelta))
+            .id();
+        let reproduction_reading = app
+            .world_mut()
+            .spawn((Text::default(), CreatureLifeReading::Reproduction))
+            .id();
+        let parents_reading = app
+            .world_mut()
+            .spawn((Text::default(), CreatureLifeReading::Parents))
+            .id();
+        let food_indicator = app
+            .world_mut()
+            .spawn((
+                Node::default(),
+                BackgroundColor(Color::WHITE),
+                CreatureFoodDeltaIndicator,
+            ))
+            .id();
+        let first_parent = app
+            .world_mut()
+            .spawn((
+                Node::default(),
+                BackgroundColor(Color::WHITE),
+                CreatureParentIndicator(0),
+            ))
+            .id();
+        let second_parent = app
+            .world_mut()
+            .spawn((
+                Node::default(),
+                BackgroundColor(Color::WHITE),
+                CreatureParentIndicator(1),
+            ))
+            .id();
         let eye_compass = app
             .world_mut()
             .spawn((BorderColor::all(Color::WHITE), CreatureEyeCompass(0)))
@@ -16336,6 +16836,145 @@ mod owner_inspector_tests {
             .agents[0]
             .eye_fov[0] = std::f32::consts::FRAC_PI_2;
         app.update();
+        assert_eq!(app.world().get::<Text>(food_reading).unwrap().0, "-0.120");
+        assert_eq!(
+            app.world().get::<Text>(reproduction_reading).unwrap().0,
+            "0.375"
+        );
+        assert_eq!(app.world().get::<Text>(parents_reading).unwrap().0, "0/2");
+        assert_eq!(
+            app.world()
+                .get::<BackgroundColor>(food_indicator)
+                .unwrap()
+                .0,
+            Color::srgb(0.97, 0.62, 0.35)
+        );
+        assert_eq!(
+            app.world().get::<Node>(first_parent).unwrap().display,
+            Display::Flex
+        );
+        {
+            let mut inspector = app.world_mut().non_send_resource_mut::<OwnerInspector>();
+            let life = inspector
+                .sample
+                .as_mut()
+                .unwrap()
+                .life_summary
+                .as_mut()
+                .unwrap();
+            life.food_delta = 0.5;
+            life.parents = [Some(AgentUid(7)), None];
+            life.hybrid = true;
+        }
+        app.update();
+        assert_eq!(app.world().get::<Text>(food_reading).unwrap().0, "+0.500");
+        assert_eq!(
+            app.world()
+                .get::<BackgroundColor>(food_indicator)
+                .unwrap()
+                .0,
+            Color::srgb(0.40, 0.82, 0.57)
+        );
+        assert_eq!(
+            app.world().get::<Text>(parents_reading).unwrap().0,
+            "1/2 · HYBRID"
+        );
+        assert_ne!(
+            app.world().get::<BackgroundColor>(first_parent),
+            app.world().get::<BackgroundColor>(second_parent)
+        );
+        {
+            let mut inspector = app.world_mut().non_send_resource_mut::<OwnerInspector>();
+            let life = inspector
+                .sample
+                .as_mut()
+                .unwrap()
+                .life_summary
+                .as_mut()
+                .unwrap();
+            life.food_delta = f32::NAN;
+            life.reproduction_counter = f32::INFINITY;
+        }
+        app.update();
+        assert_eq!(app.world().get::<Text>(food_reading).unwrap().0, "--");
+        assert_eq!(
+            app.world().get::<Text>(reproduction_reading).unwrap().0,
+            "--"
+        );
+        assert_eq!(
+            app.world().get::<Node>(food_indicator).unwrap().display,
+            Display::None
+        );
+        {
+            let mut inspector = app.world_mut().non_send_resource_mut::<OwnerInspector>();
+            inspector
+                .sample
+                .as_mut()
+                .unwrap()
+                .trait_modifiers
+                .as_mut()
+                .unwrap()
+                .smell = 1.0;
+        }
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(trait_marker).unwrap().left,
+            Val::Percent(50.0)
+        );
+        assert_eq!(app.world().get::<Text>(trait_reading).unwrap().0, "1.00×");
+        assert!(
+            app.world()
+                .get::<Text>(trait_status)
+                .unwrap()
+                .0
+                .contains("0 TICKS OLD")
+        );
+        {
+            let mut inspector = app.world_mut().non_send_resource_mut::<OwnerInspector>();
+            inspector
+                .sample
+                .as_mut()
+                .unwrap()
+                .trait_modifiers
+                .as_mut()
+                .unwrap()
+                .smell = f32::NAN;
+        }
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(trait_marker).unwrap().display,
+            Display::None
+        );
+        assert_eq!(app.world().get::<Text>(trait_reading).unwrap().0, "--");
+        {
+            let mut inspector = app.world_mut().non_send_resource_mut::<OwnerInspector>();
+            let sample = inspector.sample.as_mut().unwrap();
+            sample.trait_modifiers.as_mut().unwrap().smell = 0.5;
+            sample.target.uid = AgentUid(target.uid.0 + 1);
+        }
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(trait_marker).unwrap().display,
+            Display::None
+        );
+        assert_eq!(app.world().get::<Text>(trait_reading).unwrap().0, "--");
+        assert_eq!(app.world().get::<Text>(parents_reading).unwrap().0, "--");
+        assert_eq!(
+            app.world().get::<Node>(first_parent).unwrap().display,
+            Display::None
+        );
+        assert_eq!(
+            app.world().get::<Node>(second_parent).unwrap().display,
+            Display::None
+        );
+        app.world_mut()
+            .non_send_resource_mut::<OwnerInspector>()
+            .sample
+            .as_mut()
+            .unwrap()
+            .target = target;
+        app.update();
+        assert_eq!(app.world().get::<Text>(trait_reading).unwrap().0, "0.50×");
         assert_eq!(
             *app.world().get::<BorderColor>(eye_compass).unwrap(),
             BorderColor::all(Color::srgb(0.35, 0.50, 0.42))
@@ -18995,7 +19634,8 @@ fn control_camera(
     let shift_held = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
     let alt_held = keys.pressed(KeyCode::AltLeft) || keys.pressed(KeyCode::AltRight);
 
-    rig.distance = rig.distance.clamp(CAMERA_MIN_DISTANCE, CAMERA_MAX_DISTANCE);
+    let min_distance = camera_manual_min_distance(state.latest.as_ref());
+    rig.distance = rig.distance.clamp(min_distance, CAMERA_MAX_DISTANCE);
     let pointer_over_hud = hud_pointer_captured(ui_interactions.iter());
     let scroll_lines: f64 = mouse_wheel
         .read()
@@ -19011,7 +19651,7 @@ fn control_camera(
         // extreme finite device deltas from overflowing. Existing easing follows.
         rig.distance = (f64::from(rig.distance).ln() - scroll_lines * CAMERA_ZOOM_LOG_STEP)
             .clamp(
-                f64::from(CAMERA_MIN_DISTANCE).ln(),
+                f64::from(min_distance).ln(),
                 f64::from(CAMERA_MAX_DISTANCE).ln(),
             )
             .exp() as f32;
@@ -19306,7 +19946,7 @@ fn control_camera(
     let pitch = rig.pitch;
     let distance = rig
         .distance_smoothed
-        .clamp(CAMERA_MIN_DISTANCE, CAMERA_MAX_DISTANCE);
+        .clamp(min_distance, CAMERA_MAX_DISTANCE);
 
     let focus_height = state.latest.as_ref().map_or(0.0, |snapshot| {
         sample_height_world(
@@ -21449,6 +22089,24 @@ mod terrain_tests {
     }
 
     #[test]
+    fn authored_groundcover_mips_preserve_color_at_transparent_edges() {
+        let pixels = vec![255, 0, 0, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let (data, levels) = authored_groundcover_mips(2, 2, &pixels);
+        assert_eq!(levels, 2);
+        assert_eq!(&data[..16], pixels);
+        assert_eq!(&data[16..], &[255, 0, 0, 64]);
+
+        let (odd, levels) =
+            authored_groundcover_mips(3, 1, &[255, 255, 255, 255, 0, 0, 0, 0, 255, 255, 255, 255]);
+        assert_eq!(levels, 2);
+        assert_eq!(&odd[12..], &[255, 255, 255, 170]);
+        assert_eq!(
+            authored_groundcover_mips(1, 1, &[1, 2, 3, 4]),
+            (vec![1, 2, 3, 4], 1)
+        );
+    }
+
+    #[test]
     fn authored_groundcover_comparison_controls_are_reversible() {
         let mut app = App::new();
         app.init_resource::<ButtonInput<KeyCode>>()
@@ -21463,9 +22121,14 @@ mod terrain_tests {
                 ),
             );
         let original_palette = app.world().resource::<AccessibilityState>().palette();
-        let (raw_texture, straight_texture) = {
+        let (raw_texture, straight_texture, mip_raw_texture, mip_straight_texture) = {
             let mut images = app.world_mut().resource_mut::<Assets<Image>>();
-            (images.add(Image::default()), images.add(Image::default()))
+            (
+                images.add(Image::default()),
+                images.add(Image::default()),
+                images.add(Image::default()),
+                images.add(Image::default()),
+            )
         };
         let material = app
             .world_mut()
@@ -21479,7 +22142,11 @@ mod terrain_tests {
             material: material.clone(),
             raw_texture: raw_texture.clone(),
             straight_texture: straight_texture.clone(),
+            mip_raw_texture: mip_raw_texture.clone(),
+            mip_straight_texture,
             original_color: false,
+            mipmapped: false,
+            clumps: false,
             scale_factor: 1.0,
             spawned: false,
         });
@@ -21488,6 +22155,8 @@ mod terrain_tests {
             input.press(KeyCode::KeyB);
             input.press(KeyCode::KeyM);
             input.press(KeyCode::KeyU);
+            input.press(KeyCode::KeyJ);
+            input.press(KeyCode::KeyK);
         }
         app.update();
         assert_eq!(
@@ -21507,13 +22176,14 @@ mod terrain_tests {
                 .scale_factor,
             3.0
         );
+        assert!(app.world().resource::<AuthoredGroundcoverStudy>().clumps);
         assert_eq!(
             app.world()
                 .resource::<Assets<StandardMaterial>>()
                 .get(&material)
                 .unwrap()
                 .base_color_texture,
-            Some(raw_texture)
+            Some(mip_raw_texture)
         );
         {
             let mut input = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
@@ -21521,10 +22191,14 @@ mod terrain_tests {
             input.release(KeyCode::KeyB);
             input.release(KeyCode::KeyM);
             input.release(KeyCode::KeyU);
+            input.release(KeyCode::KeyJ);
+            input.release(KeyCode::KeyK);
             input.clear();
             input.press(KeyCode::KeyB);
             input.press(KeyCode::KeyM);
             input.press(KeyCode::KeyU);
+            input.press(KeyCode::KeyJ);
+            input.press(KeyCode::KeyK);
         }
         app.update();
         assert!(
@@ -21540,6 +22214,7 @@ mod terrain_tests {
                 .scale_factor,
             1.0
         );
+        assert!(!app.world().resource::<AuthoredGroundcoverStudy>().clumps);
         assert_eq!(
             app.world()
                 .resource::<Assets<StandardMaterial>>()
@@ -21547,6 +22222,150 @@ mod terrain_tests {
                 .unwrap()
                 .base_color_texture,
             Some(straight_texture)
+        );
+    }
+
+    #[test]
+    fn authored_groundcover_mesh_comparison_preserves_plant_roots() {
+        use bevy::gltf::{Gltf, GltfMesh, GltfPrimitive};
+
+        let mut app = App::new();
+        app.insert_resource(SnapshotState {
+            latest: Some(groundcover_study_fixture()),
+            ..default()
+        })
+        .insert_resource(CameraRig {
+            focus_smoothed: Vec2::new(400.0, 400.0),
+            ..default()
+        })
+        .init_resource::<GroundcoverStudyState>()
+        .init_resource::<ButtonInput<KeyCode>>()
+        .init_resource::<Assets<Mesh>>()
+        .init_resource::<Assets<GltfMesh>>()
+        .init_resource::<Assets<Gltf>>()
+        .init_resource::<Assets<StandardMaterial>>()
+        .add_systems(
+            Update,
+            (
+                sync_authored_groundcover_study,
+                toggle_authored_groundcover_lighting,
+            )
+                .chain(),
+        );
+        let mut primitives = Vec::new();
+        let mut mesh_handles = Vec::new();
+        for index in 0..AUTHORED_GROUNDCOVER_CLUMP_COUNT + AUTHORED_GROUNDCOVER_TINY_COUNT {
+            let mut mesh = Mesh::new(
+                bevy::render::render_resource::PrimitiveTopology::TriangleList,
+                RenderAssetUsages::default(),
+            );
+            mesh.insert_attribute(
+                Mesh::ATTRIBUTE_POSITION,
+                vec![[0.0, -0.1, 0.0], [0.0, 0.5, 0.0], [0.5, 0.0, 0.0]],
+            );
+            let mesh = app.world_mut().resource_mut::<Assets<Mesh>>().add(mesh);
+            mesh_handles.push(mesh.clone());
+            primitives.push(
+                app.world_mut()
+                    .resource_mut::<Assets<GltfMesh>>()
+                    .add(GltfMesh {
+                        index,
+                        name: format!("mesh {index}"),
+                        primitives: vec![GltfPrimitive {
+                            index: 0,
+                            parent_mesh_index: index,
+                            name: format!("primitive {index}"),
+                            mesh,
+                            material: None,
+                            extras: None,
+                            material_extras: None,
+                        }],
+                        extras: None,
+                    }),
+            );
+        }
+        let source = app.world_mut().resource_mut::<Assets<Gltf>>().add(Gltf {
+            scenes: vec![],
+            named_scenes: default(),
+            meshes: primitives,
+            named_meshes: default(),
+            materials: vec![],
+            named_materials: default(),
+            nodes: vec![],
+            named_nodes: default(),
+            skins: vec![],
+            named_skins: default(),
+            default_scene: None,
+            animations: vec![],
+            named_animations: default(),
+            source: None,
+        });
+        let material = app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial::default());
+        app.insert_resource(AuthoredGroundcoverStudy {
+            source,
+            material,
+            raw_texture: Handle::default(),
+            straight_texture: Handle::default(),
+            mip_raw_texture: Handle::default(),
+            mip_straight_texture: Handle::default(),
+            original_color: false,
+            mipmapped: false,
+            clumps: false,
+            scale_factor: 1.0,
+            spawned: false,
+        });
+        app.update();
+        // The first update queues plant spawns; the second positions them.
+        app.update();
+        let entity = {
+            let world = app.world_mut();
+            let mut plants =
+                world.query_filtered::<(Entity, &Visibility), With<AuthoredGroundcoverPlant>>();
+            plants
+                .iter(world)
+                .find_map(|(entity, visibility)| {
+                    (*visibility == Visibility::Inherited).then_some(entity)
+                })
+                .expect("fixture must produce visible groundcover")
+        };
+        let original_mesh = app.world().get::<Mesh3d>(entity).unwrap().0.clone();
+        let original_transform = *app.world().get::<Transform>(entity).unwrap();
+        assert!(mesh_handles[11..].contains(&original_mesh));
+
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::KeyK);
+        app.update();
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .clear();
+        app.update();
+        let clump_mesh = &app.world().get::<Mesh3d>(entity).unwrap().0;
+        assert!(mesh_handles[..11].contains(clump_mesh));
+        assert_ne!(clump_mesh, &original_mesh);
+        assert_eq!(
+            *app.world().get::<Transform>(entity).unwrap(),
+            original_transform
+        );
+
+        {
+            let mut input = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+            input.release(KeyCode::KeyK);
+            input.clear();
+            input.press(KeyCode::KeyK);
+        }
+        app.update();
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .clear();
+        app.update();
+        assert_eq!(app.world().get::<Mesh3d>(entity).unwrap().0, original_mesh);
+        assert_eq!(
+            *app.world().get::<Transform>(entity).unwrap(),
+            original_transform
         );
     }
 
@@ -22932,6 +23751,47 @@ mod terrain_tests {
             .unwrap();
         assert_eq!(body.phase, stripe.phase);
         assert_eq!(stripe.transform.translation, Vec3::ZERO);
+    }
+
+    #[test]
+    fn spike_base_is_embedded_in_body_without_moving_the_tip() {
+        let mut app = eye_geometry_test_app();
+        for radius in [0.2, 10.0, 50.0] {
+            for extension in [0.0, 3.0, 25.0] {
+                {
+                    let mut state = app.world_mut().resource_mut::<SnapshotState>();
+                    let snapshot = state.latest.as_mut().unwrap();
+                    snapshot.revision += 1;
+                    snapshot.agent_radius = radius;
+                    snapshot.agents[0].spike_length = extension;
+                }
+                app.update();
+                let record = &app.world().resource::<AgentRegistry>().records[&AgentUid(1)];
+                let mut body = *app.world().get::<Transform>(record.body.entity).unwrap();
+                // The body can shrink slightly while breathing; attachment must
+                // remain inside its smallest rendered capsule too.
+                body.scale *= 1.0 - BODY_IDLE_AMPLITUDE;
+                let inverse = body.compute_affine().inverse();
+                let spike = app.world().get::<Transform>(record.spike.entity).unwrap();
+                for step in 0..16 {
+                    let angle = step as f32 * std::f32::consts::TAU / 16.0;
+                    let base = spike.transform_point(Vec3::new(
+                        0.45 * angle.cos(),
+                        -0.5,
+                        0.45 * angle.sin(),
+                    ));
+                    let local = inverse.transform_point3(base);
+                    let axial = (local.y.abs() - AGENT_BODY_CAPSULE.half_length).max(0.0);
+                    assert!(
+                        local.x * local.x + local.z * local.z + axial * axial
+                            < AGENT_BODY_CAPSULE.radius.powi(2),
+                        "cone base escaped body at radius {radius}, extension {extension}"
+                    );
+                }
+                let tip = spike.transform_point(Vec3::Y * 0.5);
+                assert!((tip.x - (2.295 * radius + extension)).abs() < 0.001);
+            }
+        }
     }
 
     #[test]
@@ -26033,14 +26893,7 @@ mod terrain_tests {
             rotation,
             tick: 2,
         };
-        let spike_transform = |extension: f32| {
-            let length = 6.5 + extension;
-            Transform {
-                translation: Vec3::new(16.45 + length * 0.5, 0.6, 0.0),
-                rotation: Quat::from_rotation_z(-std::f32::consts::FRAC_PI_2),
-                scale: Vec3::new(4.8, length, 4.8),
-            }
-        };
+        let spike_transform = |extension: f32| spike_visual_transform(10.0, extension);
         let mut app = App::new();
         let mut time = Time::<()>::default();
         time.advance_by(std::time::Duration::from_secs_f32(1.0 / 60.0));
@@ -26084,7 +26937,7 @@ mod terrain_tests {
         let root = *app.world().get::<Transform>(root).unwrap();
         let spike = *app.world().get::<Transform>(spike).unwrap();
         assert!(
-            spike.scale.y > 6.5,
+            spike.scale.y > spike_transform(0.0).scale.y,
             "the displayed spike must still be retracting"
         );
         let mesh = Mesh::from(Cone {
@@ -26605,22 +27458,7 @@ fn apply_agent_visuals(
     update_agent_part_colors(materials, &record.nose, nose_color, nose_emissive)?;
 
     let spike_ready = visuals.spike_readiness;
-    // Core combat treats spike_length as a world-space extension beyond the
-    // creature radius. Scaling it by the body radius magnifies it twice.
-    let spike_length = scale_factor * 0.65 + agent.spike_length.max(0.0);
-    let spike_transform = Transform {
-        translation: Vec3::new(
-            body_length * 0.7 + spike_length * 0.5,
-            scale_factor * 0.06,
-            0.0,
-        ),
-        rotation: Quat::from_rotation_z(-FRAC_PI_2),
-        scale: Vec3::new(
-            (scale_factor * 0.48).max(0.04),
-            spike_length.max(0.06),
-            (scale_factor * 0.48).max(0.04),
-        ),
-    };
+    let spike_transform = spike_visual_transform(scale_factor, agent.spike_length);
     update_part_transform(commands, &record.spike, spike_transform);
     commands.entity(record.spike.entity).insert((
         SpikePoseTarget {
@@ -26944,6 +27782,23 @@ fn agent_ground_footprint(snapshot: &WorldSnapshot, agent: &AgentVisual) -> Agen
     AgentGroundFootprint {
         radius: snapshot.agent_radius.clamp(0.2, 1024.0),
         spike_extension: agent.spike_length.max(0.0),
+    }
+}
+
+/// Anchor the cone inside the front cap while retaining the previous tip:
+/// physical spike extension is already in world units, not body radii.
+fn spike_visual_transform(radius: f32, extension: f32) -> Transform {
+    const BASE: f32 = 1.13;
+    const REST_TIP: f32 = 2.295;
+    let length = (REST_TIP - BASE) * radius + extension.max(0.0);
+    Transform {
+        translation: Vec3::new(BASE * radius + length * 0.5, 0.06 * radius, 0.0),
+        rotation: Quat::from_rotation_z(-std::f32::consts::FRAC_PI_2),
+        scale: Vec3::new(
+            (0.48 * radius).max(0.04),
+            length.max(0.06),
+            (0.48 * radius).max(0.04),
+        ),
     }
 }
 
@@ -27363,15 +28218,12 @@ fn terrain_footprint_height(
         );
     }
     // The cone extends forward from the nose; sample its lower edge as well.
-    let spike = 0.65 * radius + footprint.spike_extension;
+    let spike_transform = spike_visual_transform(radius, footprint.spike_extension);
+    let base = spike_transform.transform_point(-Vec3::Y * 0.5).x;
+    let spike = spike_transform.scale.y;
     for (fraction, lower) in [(0.0, -0.156), (0.5, -0.048), (1.0, 0.06)] {
-        include(rotation * Vec3::new(1.645 * radius + spike * fraction, lower * radius, 0.0));
+        include(rotation * Vec3::new(base + spike * fraction, lower * radius, 0.0));
     }
-    let spike_transform = Transform {
-        translation: Vec3::new(1.645 * radius + spike * 0.5, 0.06 * radius, 0.0),
-        rotation: Quat::from_rotation_z(-std::f32::consts::FRAC_PI_2),
-        scale: Vec3::new(0.48 * radius, spike.max(0.06), 0.48 * radius),
-    };
     include_ground_mesh(
         &meshes.spike,
         spike_transform,
@@ -30034,8 +30886,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn close_shallow_camera_clears_elevated_terrain_and_targets_its_surface() {
+    fn assert_shallow_camera_clears_terrain(distance: f32) {
         let world = WorldState::new(ScriptBotsConfig::default()).expect("world init");
         let mut snapshot = WorldSnapshot::from_world(&world).expect("snapshot");
         Arc::make_mut(&mut snapshot.terrain_height.elevation).fill(0.9);
@@ -30047,8 +30898,8 @@ mod tests {
         app.insert_resource(Time::<()>::default())
             .insert_resource(CameraRig {
                 pitch: -0.05,
-                distance: CAMERA_MIN_DISTANCE,
-                distance_smoothed: CAMERA_MIN_DISTANCE,
+                distance,
+                distance_smoothed: distance,
                 follow_mode: FollowMode::Off,
                 ..default()
             })
@@ -30077,6 +30928,83 @@ mod tests {
                 .dot((target - transform.translation).normalize())
                 > 0.999
         );
+    }
+
+    #[test]
+    fn close_shallow_camera_clears_elevated_terrain_and_targets_its_surface() {
+        assert_shallow_camera_clears_terrain(CAMERA_MIN_DISTANCE);
+        assert_shallow_camera_clears_terrain(CAMERA_MANUAL_MIN_DISTANCE);
+    }
+
+    #[test]
+    fn manual_camera_zoom_reaches_a_safe_creature_scaled_closeup() {
+        let world = WorldState::new(ScriptBotsConfig::default()).expect("world init");
+        let mut snapshot = WorldSnapshot::from_world(&world).expect("snapshot");
+        assert_eq!(camera_manual_min_distance(None), CAMERA_MIN_DISTANCE);
+        snapshot.agent_radius = f32::NAN;
+        assert_eq!(
+            camera_manual_min_distance(Some(&snapshot)),
+            CAMERA_MIN_DISTANCE
+        );
+        snapshot.agent_radius = 10.0;
+        assert_eq!(camera_manual_min_distance(Some(&snapshot)), 40.0);
+        snapshot.agent_radius = 100.0;
+        assert_eq!(camera_manual_min_distance(Some(&snapshot)), 400.0);
+        snapshot.agent_radius = f32::MAX;
+        assert_eq!(
+            camera_manual_min_distance(Some(&snapshot)),
+            CAMERA_MAX_DISTANCE
+        );
+        snapshot.agent_radius = 10.0;
+
+        let mut rig = CameraRig::default();
+        rig.follow_clicked_creature(snapshot.agent_radius);
+        assert_eq!(rig.distance, 300.0, "automatic framing remains unchanged");
+        let mut app = App::new();
+        let mut time = Time::<()>::default();
+        time.advance_by(Duration::from_secs_f32(1.0 / 60.0));
+        app.insert_resource(time)
+            .insert_resource(rig)
+            .insert_resource(SnapshotState {
+                world_size: snapshot.world_size,
+                focus_point: snapshot.world_size * 0.5,
+                latest: Some(snapshot),
+                ..default()
+            })
+            .insert_resource(ButtonInput::<MouseButton>::default())
+            .insert_resource(ButtonInput::<KeyCode>::default())
+            .insert_resource(Messages::<MouseMotion>::default())
+            .insert_resource(Messages::<MouseWheel>::default())
+            .add_systems(Update, control_camera);
+        let camera = app
+            .world_mut()
+            .spawn((PrimaryCamera, Transform::default()))
+            .id();
+        for y in [f32::MAX, -1.0] {
+            app.world_mut()
+                .resource_mut::<Messages<MouseWheel>>()
+                .write(MouseWheel {
+                    unit: MouseScrollUnit::Line,
+                    x: 0.0,
+                    y,
+                    window: Entity::PLACEHOLDER,
+                });
+            app.update();
+            let rig = app.world().resource::<CameraRig>();
+            if y > 0.0 {
+                assert!((rig.distance - 40.0).abs() < 0.001);
+            } else {
+                assert!(rig.distance > 40.0 && rig.distance < 300.0);
+            }
+            assert!(
+                app.world()
+                    .entity(camera)
+                    .get::<Transform>()
+                    .unwrap()
+                    .translation
+                    .is_finite()
+            );
+        }
     }
 
     #[test]
