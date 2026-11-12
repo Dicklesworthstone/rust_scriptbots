@@ -3546,6 +3546,7 @@ struct CreatureEyeLimit {
 }
 
 const CREATURE_EYE_FIELD_SIDE: u32 = 32;
+type CreatureEyeFieldCache = [Option<(bevy::asset::AssetId<Image>, u32, u32)>; NUM_EYES];
 
 /// Render angular coverage in the creature's local frame: up is forward and
 /// positive bearings turn clockwise. Radius is illustrative, not eye range.
@@ -3597,7 +3598,7 @@ fn update_creature_eye_fields(
     state: Res<SnapshotState>,
     mut images: ResMut<Assets<Image>>,
     mut fields: Query<(&CreatureEyeField, &mut ImageNode)>,
-    mut cached: Local<[Option<(bevy::asset::AssetId<Image>, u32, u32)>; NUM_EYES]>,
+    mut cached: Local<CreatureEyeFieldCache>,
 ) {
     let Some(agent) = state.latest.as_ref().and_then(|frame| {
         frame
@@ -6444,7 +6445,7 @@ fn setup_scene(
                             TextColor(Color::srgb(0.65, 0.80, 0.71)),
                         ));
                     });
-                    for eye in 0..NUM_EYES {
+                    for (eye, field_image) in eye_fields.iter().enumerate() {
                         row.spawn((
                             Node {
                                 flex_grow: 1.0,
@@ -6495,7 +6496,7 @@ fn setup_scene(
                                             height: Val::Percent(100.0),
                                             ..default()
                                         },
-                                        ImageNode::new(eye_fields[eye].clone()),
+                                        ImageNode::new(field_image.clone()),
                                         CreatureEyeField(eye),
                                     ));
                                     compass.spawn((
