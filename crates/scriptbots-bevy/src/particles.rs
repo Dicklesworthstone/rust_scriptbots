@@ -723,7 +723,9 @@ impl CueScheduler {
     ) -> SpawnBatch {
         let count = self.count_for_cue(cue);
         let mut particles = Vec::with_capacity(count as usize);
-        self.schedule_into(tick, ordinal, cue, position, |particle| particles.push(particle));
+        self.schedule_into(tick, ordinal, cue, position, |particle| {
+            particles.push(particle)
+        });
         SpawnBatch { particles }
     }
 

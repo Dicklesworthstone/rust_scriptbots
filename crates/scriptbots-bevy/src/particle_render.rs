@@ -86,8 +86,7 @@ impl ParticleRow {
     // Absolute u64 ticks are subtracted before conversion, including beyond 2^53.
     #[allow(clippy::cast_precision_loss)]
     fn new(particle: &Particle, tick: u64, palette: ColorPaletteMode) -> Self {
-        let age = u32::try_from(tick.saturating_sub(particle.born_tick))
-            .unwrap_or(MAX_LIFETIME);
+        let age = u32::try_from(tick.saturating_sub(particle.born_tick)).unwrap_or(MAX_LIFETIME);
         debug_assert!(age < particle.duration_ticks && particle.duration_ticks <= MAX_LIFETIME);
         let color = srgb_to_linear_rgb(
             apply_palette_rgb(Vec3::from_array(particle.color), palette).to_array(),
@@ -256,7 +255,10 @@ impl ParticleScene {
         let source = EffectSource {
             session: snapshot.owner_source.map(|(owner, _)| owner.session_id),
             seed: snapshot.visual.seed,
-            dimensions: [snapshot.world_size.x.to_bits(), snapshot.world_size.y.to_bits()],
+            dimensions: [
+                snapshot.world_size.x.to_bits(),
+                snapshot.world_size.y.to_bits(),
+            ],
         };
         let publication = snapshot
             .owner_source
@@ -264,7 +266,9 @@ impl ParticleScene {
         let same_source = self.source == Some(source);
         let stale_publication = self.source.is_some_and(|previous| {
             previous.session.is_some() && previous.session == source.session
-        }) && publication.zip(self.last_publication).is_some_and(|(new, old)| new < old);
+        }) && publication
+            .zip(self.last_publication)
+            .is_some_and(|(new, old)| new < old);
         if stale_publication
             || (same_source && self.last_tick.is_some_and(|tick| snapshot.tick < tick))
         {
@@ -274,7 +278,11 @@ impl ParticleScene {
         validate_boundary(snapshot)?;
         if same_source && self.last_tick == Some(snapshot.tick) {
             if self.last_ordinal.is_some_and(|ordinal| {
-                snapshot.visual.events.last().is_none_or(|event| event.ordinal < ordinal)
+                snapshot
+                    .visual
+                    .events
+                    .last()
+                    .is_none_or(|event| event.ordinal < ordinal)
             }) || snapshot.visual.dropped < self.observed_producer_drops
             {
                 return Err("visual-event prefix regressed within one completed boundary");
@@ -291,9 +299,10 @@ impl ParticleScene {
         changed |= self.resize_pool(limit.min(self.max_rows).min(MAX_PARTICLES));
         if self.last_tick != Some(snapshot.tick) {
             if let Some(previous) = self.last_tick {
-                self.stats.skipped_boundaries = self.stats.skipped_boundaries.saturating_add(
-                    snapshot.tick.saturating_sub(previous).saturating_sub(1),
-                );
+                self.stats.skipped_boundaries = self
+                    .stats
+                    .skipped_boundaries
+                    .saturating_add(snapshot.tick.saturating_sub(previous).saturating_sub(1));
             }
             self.last_tick = Some(snapshot.tick);
             self.last_ordinal = None;
@@ -304,13 +313,21 @@ impl ParticleScene {
         }
         self.last_publication = publication;
         self.stats.producer_dropped_events = self.stats.producer_dropped_events.saturating_add(
-            snapshot.visual.dropped.saturating_sub(self.observed_producer_drops),
+            snapshot
+                .visual
+                .dropped
+                .saturating_sub(self.observed_producer_drops),
         );
         self.observed_producer_drops = snapshot.visual.dropped;
         self.pending.clear();
-        self.pending.extend(snapshot.visual.events.iter().copied().filter(|event| {
-            self.last_ordinal.is_none_or(|last| event.ordinal > last)
-        }));
+        self.pending.extend(
+            snapshot
+                .visual
+                .events
+                .iter()
+                .copied()
+                .filter(|event| self.last_ordinal.is_none_or(|last| event.ordinal > last)),
+        );
         self.last_ordinal = snapshot.visual.events.last().map(|event| event.ordinal);
         self.pending
             .sort_unstable_by_key(|event| (Reverse(event_priority(event.event)), event.ordinal));
@@ -336,35 +353,42 @@ impl ParticleScene {
                     + snapshot.agent_radius * 0.75,
                 snapshot.world_size.y * 0.5 - location.y,
             ];
-            let direction = Vec2::new(event.direction[0], -event.direction[1])
-                .normalize_or_zero();
+            let direction = Vec2::new(event.direction[0], -event.direction[1]).normalize_or_zero();
             // Interventions can stamp births before the current step advances.
             // Use the event's own integer tick for its recipe and age.
-            scheduler.schedule_into(event.tick.0, event.ordinal, &cue, position, |mut particle| {
-                particle.priority = priority;
-                if matches!(
-                    event.event,
-                    WorldVisualEvent::CombatHit { .. } | WorldVisualEvent::SpikeExtend
-                ) && direction != Vec2::ZERO
-                {
-                    let speed = Vec2::new(particle.velocity[0], particle.velocity[2]).length();
-                    let side = particle.velocity[2] * 0.3;
-                    particle.velocity[0] = direction.x * speed - direction.y * side;
-                    particle.velocity[2] = direction.y * speed + direction.x * side;
-                }
-                if snapshot.tick.saturating_sub(particle.born_tick)
-                    < u64::from(particle.duration_ticks)
-                    && self.pool.spawn(particle).is_none()
-                {
-                    self.stats.refused_particles = self.stats.refused_particles.saturating_add(1);
-                }
-            });
+            scheduler.schedule_into(
+                event.tick.0,
+                event.ordinal,
+                &cue,
+                position,
+                |mut particle| {
+                    particle.priority = priority;
+                    if matches!(
+                        event.event,
+                        WorldVisualEvent::CombatHit { .. } | WorldVisualEvent::SpikeExtend
+                    ) && direction != Vec2::ZERO
+                    {
+                        let speed = Vec2::new(particle.velocity[0], particle.velocity[2]).length();
+                        let side = particle.velocity[2] * 0.3;
+                        particle.velocity[0] = direction.x * speed - direction.y * side;
+                        particle.velocity[2] = direction.y * speed + direction.x * side;
+                    }
+                    if snapshot.tick.saturating_sub(particle.born_tick)
+                        < u64::from(particle.duration_ticks)
+                        && self.pool.spawn(particle).is_none()
+                    {
+                        self.stats.refused_particles =
+                            self.stats.refused_particles.saturating_add(1);
+                    }
+                },
+            );
             changed = true;
         }
         if changed || self.palette != Some(palette) {
             self.rows.clear();
             self.pool.for_each_live(|particle| {
-                self.rows.push(ParticleRow::new(particle, snapshot.tick, palette));
+                self.rows
+                    .push(ParticleRow::new(particle, snapshot.tick, palette));
             });
             self.palette = Some(palette);
             self.revision = self.revision.wrapping_add(1);
@@ -400,9 +424,7 @@ fn validate_boundary(snapshot: &WorldSnapshot) -> Result<(), &'static str> {
         return Err("visual-event world dimensions are not finite and positive");
     }
     for (ordinal, event) in snapshot.visual.events.iter().enumerate() {
-        if event.tick.0 > snapshot.tick
-            || usize::try_from(event.ordinal).ok() != Some(ordinal)
-        {
+        if event.tick.0 > snapshot.tick || usize::try_from(event.ordinal).ok() != Some(ordinal) {
             return Err("visual-event tick or accepted ordinal is invalid");
         }
         let payload_is_finite = match event.event {
@@ -470,9 +492,12 @@ fn billboard_mesh(capacity: usize) -> Mesh {
         }
         indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     }
-    Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
-        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
-        .with_inserted_indices(Indices::U32(indices))
+    Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+    .with_inserted_indices(Indices::U32(indices))
 }
 
 // Presentation can interpolate between observed cuts, never extrapolate science.
@@ -482,7 +507,11 @@ fn presentation_offset(snapshot: &WorldSnapshot) -> f32 {
     if snapshot.paused || snapshot.reduced_motion {
         return 0.0;
     }
-    let Some(previous) = snapshot.motion.as_ref().and_then(|motion| motion.previous.as_ref()) else {
+    let Some(previous) = snapshot
+        .motion
+        .as_ref()
+        .and_then(|motion| motion.previous.as_ref())
+    else {
         return 0.0;
     };
     let span = snapshot.tick.saturating_sub(previous.tick);
@@ -494,7 +523,11 @@ fn presentation_offset(snapshot: &WorldSnapshot) -> f32 {
 
 // GPU admission and handle installation form one transaction; splitting these
 // parameters would obscure which assets belong to the same resident batch.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::cast_precision_loss)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::cast_precision_loss
+)]
 fn synchronize_particles(
     mut commands: Commands,
     state: Res<SnapshotState>,
@@ -528,9 +561,13 @@ fn synchronize_particles(
     }
     scene.last_error = None;
     let required = scene.pool.capacity().max(1);
-    let rebuilt_buffer = scene.buffer.is_none() || scene.mesh.is_none() || required > scene.gpu_capacity;
+    let rebuilt_buffer =
+        scene.buffer.is_none() || scene.mesh.is_none() || required > scene.gpu_capacity;
     if rebuilt_buffer {
-        let capacity = required.next_power_of_two().min(scene.max_rows).min(MAX_PARTICLES);
+        let capacity = required
+            .next_power_of_two()
+            .min(scene.max_rows)
+            .min(MAX_PARTICLES);
         let mut buffer =
             ShaderStorageBuffer::with_size(capacity * ROW_BYTES, RenderAssetUsages::default());
         buffer.buffer_description.label = Some("scriptbots visual-event particles");
@@ -539,7 +576,11 @@ fn synchronize_particles(
         scene.mesh = Some(meshes.add(billboard_mesh(capacity)));
         scene.gpu_capacity = capacity;
     }
-    let buffer = scene.buffer.as_ref().expect("particle buffer admitted").clone();
+    let buffer = scene
+        .buffer
+        .as_ref()
+        .expect("particle buffer admitted")
+        .clone();
     let parameters = Vec4::new(
         scene.rows.len() as f32,
         presentation_offset(snapshot),
@@ -553,7 +594,9 @@ fn synchronize_particles(
             return;
         };
         if material.rows != buffer || material.parameters != parameters {
-            let material = materials.get_mut(handle).expect("particle material present");
+            let material = materials
+                .get_mut(handle)
+                .expect("particle material present");
             material.rows = buffer.clone();
             material.parameters = parameters;
         }
@@ -577,10 +620,16 @@ fn synchronize_particles(
         rebuilt_material = true;
     }
     let mesh = scene.mesh.as_ref().expect("particle mesh admitted").clone();
-    let material = scene.material.as_ref().expect("particle material admitted").clone();
+    let material = scene
+        .material
+        .as_ref()
+        .expect("particle material admitted")
+        .clone();
     if let Some(entity) = scene.entity.filter(|entity| batches.contains(*entity)) {
         if rebuilt_buffer || rebuilt_material {
-            commands.entity(entity).insert((Mesh3d(mesh), MeshMaterial3d(material)));
+            commands
+                .entity(entity)
+                .insert((Mesh3d(mesh), MeshMaterial3d(material)));
         }
     } else {
         scene.entity = Some(
@@ -627,7 +676,11 @@ fn upload_particles(
     buffers: Res<RenderAssets<GpuShaderStorageBuffer>>,
     queue: Res<RenderQueue>,
 ) {
-    let Some(buffer) = extracted.buffer.as_ref().and_then(|handle| buffers.get(handle)) else {
+    let Some(buffer) = extracted
+        .buffer
+        .as_ref()
+        .and_then(|handle| buffers.get(handle))
+    else {
         return;
     };
     let key = (buffer.buffer.id(), extracted.revision);
@@ -734,9 +787,7 @@ mod tests {
                 events
                     .iter()
                     .enumerate()
-                    .map(|(ordinal, event)| {
-                        located(tick, u32::try_from(ordinal).unwrap(), *event)
-                    })
+                    .map(|(ordinal, event)| located(tick, u32::try_from(ordinal).unwrap(), *event))
                     .collect(),
             ),
             dropped: 0,
@@ -763,7 +814,14 @@ mod tests {
             ..default()
         })
         .unwrap();
-        world.push_visual_event(Tick(0), None, None, Position::new(30.0, 40.0), [1.0, 0.0], birth());
+        world.push_visual_event(
+            Tick(0),
+            None,
+            None,
+            Position::new(30.0, 40.0),
+            [1.0, 0.0],
+            birth(),
+        );
         let root = world.agent_substream_protocol_v1().root_seed();
         let digest = world.world_digest_v1().unwrap();
         let direct = VisualFrame::from_world(&world);
@@ -815,8 +873,11 @@ mod tests {
         assert_eq!(scene.stats.accepted_cues, 2);
         assert_eq!(scene.stats.producer_dropped_events, 3);
 
-        Arc::make_mut(&mut snapshot.visual.events)
-            .push(located(10, 2, WorldVisualEvent::Reproduce));
+        Arc::make_mut(&mut snapshot.visual.events).push(located(
+            10,
+            2,
+            WorldVisualEvent::Reproduce,
+        ));
         observe(&mut scene, &snapshot, 256);
         assert_eq!(scene.stats.accepted_cues, 3);
         let rows = scene.rows.clone();
@@ -868,7 +929,11 @@ mod tests {
         assert!(scene.rows.iter().all(|row| row.0[2][0] == 1.0));
         let mut invalid = frame(10_001, &[birth()]);
         Arc::make_mut(&mut invalid.visual.events)[0].tick = Tick(10_002);
-        assert!(scene.observe(&invalid, 256, ColorPaletteMode::Natural).is_err());
+        assert!(
+            scene
+                .observe(&invalid, 256, ColorPaletteMode::Natural)
+                .is_err()
+        );
     }
 
     #[test]
@@ -878,8 +943,12 @@ mod tests {
             &[
                 WorldVisualEvent::Eat { amount: 0.4 },
                 birth(),
-                WorldVisualEvent::Death { cause: DeathCause::Starvation },
-                WorldVisualEvent::Death { cause: DeathCause::CombatCarnivore },
+                WorldVisualEvent::Death {
+                    cause: DeathCause::Starvation,
+                },
+                WorldVisualEvent::Death {
+                    cause: DeathCause::CombatCarnivore,
+                },
                 WorldVisualEvent::CombatHit { damage: 0.2 },
                 WorldVisualEvent::Reproduce,
                 WorldVisualEvent::SpikeExtend,
@@ -903,8 +972,12 @@ mod tests {
             }
         });
         assert!(sprites.into_iter().all(|present| present));
-        let expected = CueScheduler::new(snapshot.visual.seed)
-            .schedule(19, 1, &visual_cue_for_event(&birth()), [0.0; 3]);
+        let expected = CueScheduler::new(snapshot.visual.seed).schedule(
+            19,
+            1,
+            &visual_cue_for_event(&birth()),
+            [0.0; 3],
+        );
         let actual = actual_birth.unwrap();
         assert_eq!(actual.velocity, expected.particles[0].velocity);
         assert_eq!(actual.rotation, expected.particles[0].rotation);
@@ -915,7 +988,9 @@ mod tests {
     fn event_storms_and_quality_changes_respect_caps_and_preserve_critical_particles() {
         let mut events = vec![WorldVisualEvent::Eat { amount: 0.4 }; 100];
         events.extend(std::iter::repeat_n(
-            WorldVisualEvent::Death { cause: DeathCause::Starvation },
+            WorldVisualEvent::Death {
+                cause: DeathCause::Starvation,
+            },
             40,
         ));
         let snapshot = frame(12, &events);
@@ -938,10 +1013,18 @@ mod tests {
         assert_eq!(scene.stats.accepted_cues, 64);
         let before = scene.rows.clone();
         let oversized = frame(13, &vec![birth(); MAX_EVENTS + 1]);
-        assert!(scene.observe(&oversized, 8, ColorPaletteMode::Natural).is_err());
+        assert!(
+            scene
+                .observe(&oversized, 8, ColorPaletteMode::Natural)
+                .is_err()
+        );
         let mut corrupt = frame(13, &[birth()]);
         Arc::make_mut(&mut corrupt.visual.events)[0].ordinal = 2;
-        assert!(scene.observe(&corrupt, 8, ColorPaletteMode::Natural).is_err());
+        assert!(
+            scene
+                .observe(&corrupt, 8, ColorPaletteMode::Natural)
+                .is_err()
+        );
         assert_eq!(scene.rows, before);
     }
 
@@ -995,17 +1078,35 @@ mod tests {
         app.update();
         let scene = app.world().resource::<ParticleScene>();
         let original_entity = scene.entity.unwrap();
-        let handles = (scene.buffer.clone(), scene.mesh.clone(), scene.material.clone());
+        let handles = (
+            scene.buffer.clone(),
+            scene.mesh.clone(),
+            scene.material.clone(),
+        );
         assert!(!scene.rows.is_empty());
         assert!(app.world().get::<Mesh3d>(original_entity).is_some());
-        assert!(app.world().get::<MeshMaterial3d<ParticleMaterial>>(original_entity).is_some());
+        assert!(
+            app.world()
+                .get::<MeshMaterial3d<ParticleMaterial>>(original_entity)
+                .is_some()
+        );
         for _ in 0..8 {
             app.update();
         }
         let scene = app.world().resource::<ParticleScene>();
         assert_eq!(scene.stats.accepted_cues, 1);
-        assert_eq!((scene.buffer.clone(), scene.mesh.clone(), scene.material.clone()), handles);
-        assert_eq!(app.world().resource::<Assets<ShaderStorageBuffer>>().len(), 1);
+        assert_eq!(
+            (
+                scene.buffer.clone(),
+                scene.mesh.clone(),
+                scene.material.clone()
+            ),
+            handles
+        );
+        assert_eq!(
+            app.world().resource::<Assets<ShaderStorageBuffer>>().len(),
+            1
+        );
 
         app.world_mut().despawn(original_entity);
         app.world_mut().resource_mut::<ParticleScene>().reset();
@@ -1013,8 +1114,18 @@ mod tests {
         let scene = app.world().resource::<ParticleScene>();
         assert_ne!(scene.entity.unwrap(), original_entity);
         assert!(!scene.rows.is_empty());
-        assert_eq!((scene.buffer.clone(), scene.mesh.clone(), scene.material.clone()), handles);
-        assert_eq!(app.world().resource::<Assets<ShaderStorageBuffer>>().len(), 1);
+        assert_eq!(
+            (
+                scene.buffer.clone(),
+                scene.mesh.clone(),
+                scene.material.clone()
+            ),
+            handles
+        );
+        assert_eq!(
+            app.world().resource::<Assets<ShaderStorageBuffer>>().len(),
+            1
+        );
     }
 
     #[test]
@@ -1043,11 +1154,16 @@ mod tests {
         };
         assert_eq!(usize::try_from(*span).unwrap(), ROW_BYTES);
         assert_eq!(
-            members.iter().map(|member| member.offset).collect::<Vec<_>>(),
+            members
+                .iter()
+                .map(|member| member.offset)
+                .collect::<Vec<_>>(),
             vec![0, 16, 32, 48, 64, 80]
         );
         let row = ParticleRow(std::array::from_fn(|vector| {
-            std::array::from_fn(|component| f32::from(u16::try_from(vector * 4 + component).unwrap()))
+            std::array::from_fn(|component| {
+                f32::from(u16::try_from(vector * 4 + component).unwrap())
+            })
         }));
         let mut bytes = Vec::new();
         row.append_bytes(&mut bytes);

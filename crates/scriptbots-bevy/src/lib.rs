@@ -13,7 +13,7 @@ pub mod particles;
 use anyhow::{Context, Result, anyhow};
 use appearance::{AppearanceMaterial, AppearancePart, AppearancePlugin, AppearanceTable};
 use bevy::app::AppExit;
-use bevy::asset::{RenderAssetUsages, embedded_asset};
+use bevy::asset::{AssetPlugin, RenderAssetUsages, embedded_asset};
 use bevy::camera::RenderTarget;
 use bevy::camera::prelude::*;
 use bevy::core_pipeline::prepass::{DepthPrepass, NormalPrepass};
@@ -732,7 +732,7 @@ fn renderer_plugins(logging: LoggingOwnership) -> bevy::app::PluginGroupBuilder 
     // This renderer does not play audio. Bevy's default audio plugin opens an
     // output stream eagerly, which can repeatedly report device failures even
     // when no sound is requested. Enable it deliberately when audio is added.
-    let plugins = DefaultPlugins
+    let mut plugins = DefaultPlugins
         .set(WindowPlugin {
             primary_window: Some(Window {
                 title: "ScriptBots • Bevy Renderer".to_string(),
@@ -742,6 +742,14 @@ fn renderer_plugins(logging: LoggingOwnership) -> bevy::app::PluginGroupBuilder 
             ..Default::default()
         })
         .disable::<bevy::audio::AudioPlugin>();
+    // An external asset root is used only for the opt-in vegetation study.
+    // The normal renderer keeps Bevy's regular asset root.
+    if let Ok(root) = env::var("SCRIPTBOTS_GROUNDCOVER_ASSET_DIR") {
+        plugins = plugins.set(AssetPlugin {
+            file_path: root,
+            ..default()
+        });
+    }
     logging.configure_plugins(plugins)
 }
 
@@ -958,6 +966,8 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
                 update_genome_slice_button_visibility,
                 update_hud,
                 update_creature_card,
+                update_creature_eye_fields,
+                update_creature_terrain_map,
             )
                 .chain(),
         )
@@ -983,6 +993,30 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
         app.insert_resource(DiagnosticsTicker::new(DIAGNOSTIC_REPORT_INTERVAL))
             .add_plugins(FrameTimeDiagnosticsPlugin::default())
             .add_systems(Update, report_frame_metrics);
+    }
+
+    // A look-development study, not the default world renderer. It is kept
+    // opt-in until the actual GPU views and lifecycle have been reviewed.
+    if env::var("SCRIPTBOTS_GROUNDCOVER_ASSET_DIR").is_ok() {
+        app.init_resource::<GroundcoverStudyState>()
+            .add_systems(Startup, setup_authored_groundcover_study)
+            .add_systems(
+                Update,
+                (
+                    sync_authored_groundcover_study,
+                    toggle_authored_groundcover_lighting,
+                    toggle_groundcover_study,
+                )
+                    .chain()
+                    .after(control_camera),
+            );
+    } else if env::var("SCRIPTBOTS_GROUNDCOVER_STUDY").as_deref() == Ok("1") {
+        app.init_resource::<GroundcoverStudyState>().add_systems(
+            Update,
+            (sync_groundcover_study, toggle_groundcover_study)
+                .chain()
+                .after(control_camera),
+        );
     }
 
     let app_exit = app.run();
@@ -3496,6 +3530,10 @@ struct CreatureEyeSwatch(usize);
 #[derive(Component)]
 struct CreatureEyeCompass(usize);
 
+/// Filled angular field, drawn behind the eye color and boundary markers.
+#[derive(Component)]
+struct CreatureEyeField(usize);
+
 /// Marker for an eye's bearing relative to the creature's forward direction.
 #[derive(Component)]
 struct CreatureEyeBearing(usize);
@@ -3506,6 +3544,118 @@ struct CreatureEyeLimit {
     eye: usize,
     side: f32,
 }
+
+const CREATURE_EYE_FIELD_SIDE: u32 = 32;
+
+/// Render angular coverage in the creature's local frame: up is forward and
+/// positive bearings turn clockwise. Radius is illustrative, not eye range.
+fn creature_eye_field_image(bearing: f32, half_angle: f32) -> Image {
+    use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+    let mut pixels =
+        Vec::with_capacity((CREATURE_EYE_FIELD_SIDE * CREATURE_EYE_FIELD_SIDE * 4) as usize);
+    let valid = bearing.is_finite() && half_angle.is_finite() && half_angle > 0.0;
+    let center = CREATURE_EYE_FIELD_SIDE as f32 * 0.5;
+    let radius = center - 1.0;
+    for y in 0..CREATURE_EYE_FIELD_SIDE {
+        for x in 0..CREATURE_EYE_FIELD_SIDE {
+            let mut covered = 0_u8;
+            if valid {
+                for oy in [0.25_f32, 0.75] {
+                    for ox in [0.25_f32, 0.75] {
+                        let dx = x as f32 + ox - center;
+                        let dy = y as f32 + oy - center;
+                        let angle = dx.atan2(-dy) - bearing;
+                        let difference = angle.sin().atan2(angle.cos()).abs();
+                        if dx * dx + dy * dy <= radius * radius
+                            && (half_angle >= std::f32::consts::PI || difference < half_angle)
+                        {
+                            covered += 1;
+                        }
+                    }
+                }
+            }
+            pixels.extend_from_slice(&[86, 192, 161, covered * 28]);
+        }
+    }
+    let mut image = Image::new(
+        Extent3d {
+            width: CREATURE_EYE_FIELD_SIDE,
+            height: CREATURE_EYE_FIELD_SIDE,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        pixels,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(),
+    );
+    image.sampler = bevy::image::ImageSampler::linear();
+    image
+}
+
+/// Refresh only changed angular inputs, and recover an evicted image handle.
+fn update_creature_eye_fields(
+    state: Res<SnapshotState>,
+    mut images: ResMut<Assets<Image>>,
+    mut fields: Query<(&CreatureEyeField, &mut ImageNode)>,
+    mut cached: Local<[Option<(bevy::asset::AssetId<Image>, u32, u32)>; NUM_EYES]>,
+) {
+    let Some(agent) = state.latest.as_ref().and_then(|frame| {
+        frame
+            .agents
+            .iter()
+            .find(|agent| agent.selection == SelectionState::Selected)
+    }) else {
+        return;
+    };
+    for (field, mut node) in &mut fields {
+        let Some((&bearing, &half_angle)) =
+            agent.eye_dirs.get(field.0).zip(agent.eye_fov.get(field.0))
+        else {
+            continue;
+        };
+        let Some(entry) = cached.get_mut(field.0) else {
+            continue;
+        };
+        let key = (node.image.id(), bearing.to_bits(), half_angle.to_bits());
+        if *entry == Some(key) && images.get(&node.image).is_some() {
+            continue;
+        }
+        let image = creature_eye_field_image(bearing, half_angle);
+        if let Some(existing) = images.get(&node.image) {
+            if existing.data != image.data {
+                *images.get_mut(&node.image).expect("image checked above") = image;
+            }
+        } else {
+            node.image = images.add(image);
+        }
+        *entry = Some((node.image.id(), bearing.to_bits(), half_angle.to_bits()));
+    }
+}
+
+/// Position and heading on the selected creature's world map.
+#[derive(Component)]
+struct CreatureMapPosition;
+
+#[derive(Component)]
+struct CreatureMapHeading;
+
+/// The miniature uses the same terrain data and palette as the world.
+#[derive(Component)]
+struct CreatureTerrainMap;
+
+/// A fixed-size explanation when terrain cannot be represented in the map.
+#[derive(Component)]
+struct CreatureTerrainMapUnavailable;
+
+#[derive(Component, Clone, Copy)]
+enum CreatureBodyMetric {
+    Spike,
+    Boost,
+    Share,
+}
+
+#[derive(Component)]
+struct CreatureBodyMetricLabel(CreatureBodyMetric);
 
 #[derive(Clone, Copy)]
 enum CreatureSignalSource {
@@ -4472,7 +4622,11 @@ pub(crate) struct WorldSnapshot {
     reduced_motion: bool,
     paused: bool,
     world_size: Vec2,
+    /// Requested seed, when one was supplied by the world configuration.
+    world_seed: Option<u64>,
     agent_radius: f32,
+    /// The scientific radius, before the renderer's minimum display size.
+    physical_agent_radius: f32,
     terrain_color: TerrainColorMap,
     terrain_height: TerrainHeightSnapshot,
     /// The published consumable food field, shared with the host snapshot.
@@ -5213,7 +5367,9 @@ impl WorldSnapshot {
             reduced_motion: config.render.reduced_motion.unwrap_or(false),
             paused: snapshot.playback.paused,
             world_size: Vec2::new(width, height),
+            world_seed: config.rng_seed,
             agent_radius: config.bot_radius.max(1.0),
+            physical_agent_radius: config.bot_radius,
             terrain_color: TerrainColorMap {
                 width: terrain.width,
                 height: terrain.height,
@@ -5238,7 +5394,9 @@ impl WorldSnapshot {
             && self.reduced_motion == other.reduced_motion
             && self.paused == other.paused
             && self.world_size == other.world_size
+            && self.world_seed == other.world_seed
             && self.agent_radius == other.agent_radius
+            && self.physical_agent_radius == other.physical_agent_radius
             && self.terrain_color == other.terrain_color
             && self.terrain_height == other.terrain_height
             && self.food == other.food
@@ -5412,7 +5570,9 @@ impl WorldSnapshot {
             reduced_motion: config.render.reduced_motion.unwrap_or(false),
             paused: false,
             world_size: Vec2::new(width, height),
+            world_seed: config.rng_seed,
             agent_radius: config.bot_radius.max(1.0),
+            physical_agent_radius: config.bot_radius,
             terrain_color: TerrainColorMap {
                 width: terrain_w,
                 height: terrain_h,
@@ -5758,6 +5918,19 @@ fn setup_scene(
     let mut card_page_title = Entity::PLACEHOLDER;
     let mut card_page_body = Entity::PLACEHOLDER;
 
+    let map_image = images.add(Image::new(
+        bevy::render::render_resource::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        bevy::render::render_resource::TextureDimension::D2,
+        vec![26, 51, 43, 255],
+        bevy::render::render_resource::TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(),
+    ));
+    let eye_fields: [Handle<Image>; NUM_EYES] =
+        std::array::from_fn(|_| images.add(creature_eye_field_image(f32::NAN, 0.0)));
     commands.entity(hud_root).with_children(|parent| {
         parent.spawn((
             Text::new("SCRIPTBOTS  /  LIVE WORLD"),
@@ -5951,6 +6124,152 @@ fn setup_scene(
                 card.spawn(Node {
                     flex_direction: FlexDirection::Row,
                     column_gap: Val::Px(10.0),
+                    align_items: AlignItems::Center,
+                    ..default()
+                })
+                .with_children(|row| {
+                    row.spawn(Node {
+                        flex_direction: FlexDirection::Column,
+                        row_gap: Val::Px(3.0),
+                        ..default()
+                    })
+                    .with_children(|map| {
+                        map.spawn((
+                            Text::new("POSITION X→ Y↑ · GOLD: HEADING"),
+                            ui_font(10.0),
+                            TextColor(Color::srgb(0.65, 0.80, 0.71)),
+                        ));
+                        map.spawn((
+                            Node {
+                                width: Val::Px(105.0),
+                                height: Val::Px(48.0),
+                                border: UiRect::all(Val::Px(1.0)),
+                                ..default()
+                            },
+                            ImageNode::new(map_image.clone()),
+                            BackgroundColor(Color::WHITE),
+                            BorderColor::all(Color::srgb(0.35, 0.50, 0.42)),
+                            BorderRadius::all(Val::Px(4.0)),
+                            CreatureTerrainMap,
+                        ))
+                        .with_children(|map| {
+                            map.spawn((
+                                Node {
+                                    position_type: PositionType::Absolute,
+                                    display: Display::None,
+                                    width: Val::Px(8.0),
+                                    height: Val::Px(8.0),
+                                    margin: UiRect::all(Val::Px(-4.0)),
+                                    border: UiRect::all(Val::Px(1.0)),
+                                    ..default()
+                                },
+                                BackgroundColor(Color::srgb(0.47, 0.88, 0.75)),
+                                BorderColor::all(Color::srgb(0.03, 0.08, 0.06)),
+                                BorderRadius::all(Val::Px(4.0)),
+                                CreatureMapPosition,
+                            ))
+                            .with_children(|marker| {
+                                marker.spawn((
+                                    Node {
+                                        position_type: PositionType::Absolute,
+                                        display: Display::None,
+                                        width: Val::Px(4.0),
+                                        height: Val::Px(4.0),
+                                        margin: UiRect::all(Val::Px(-2.0)),
+                                        ..default()
+                                    },
+                                    BackgroundColor(Color::srgb(0.99, 0.75, 0.38)),
+                                    BorderRadius::all(Val::Px(2.0)),
+                                    CreatureMapHeading,
+                                ));
+                            });
+                        });
+                        map.spawn((
+                            Node {
+                                display: Display::None,
+                                width: Val::Px(105.0),
+                                height: Val::Px(48.0),
+                                align_items: AlignItems::Center,
+                                justify_content: JustifyContent::Center,
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgb(0.12, 0.18, 0.16)),
+                            BorderRadius::all(Val::Px(4.0)),
+                            CreatureTerrainMapUnavailable,
+                        ))
+                        .with_children(|placeholder| {
+                            placeholder.spawn((
+                                Text::new("MAP\nUNAVAILABLE"),
+                                ui_font(10.0),
+                                TextColor(Color::srgb(0.80, 0.89, 0.83)),
+                            ));
+                        });
+                    });
+                    row.spawn(Node {
+                        flex_grow: 1.0,
+                        flex_basis: Val::Px(0.0),
+                        flex_direction: FlexDirection::Column,
+                        row_gap: Val::Px(3.0),
+                        ..default()
+                    })
+                    .with_children(|meters| {
+                        meters.spawn((
+                            Text::new("SPIKE / RADIUS · OTHERS 0–1 · * CLAMPED"),
+                            ui_font(9.0),
+                            TextColor(Color::srgb(0.65, 0.80, 0.71)),
+                        ));
+                        for metric in [
+                            CreatureBodyMetric::Spike,
+                            CreatureBodyMetric::Boost,
+                            CreatureBodyMetric::Share,
+                        ] {
+                            meters
+                                .spawn(Node {
+                                    flex_direction: FlexDirection::Row,
+                                    align_items: AlignItems::Center,
+                                    column_gap: Val::Px(6.0),
+                                    ..default()
+                                })
+                                .with_children(|meter| {
+                                    meter.spawn((
+                                        Text::default(),
+                                        ui_font(10.0),
+                                        TextColor(Color::srgb(0.80, 0.89, 0.83)),
+                                        Node {
+                                            width: Val::Px(150.0),
+                                            ..default()
+                                        },
+                                        CreatureBodyMetricLabel(metric),
+                                    ));
+                                    meter
+                                        .spawn((
+                                            Node {
+                                                flex_grow: 1.0,
+                                                height: Val::Px(7.0),
+                                                ..default()
+                                            },
+                                            BackgroundColor(Color::srgb(0.15, 0.25, 0.21)),
+                                            BorderRadius::all(Val::Px(3.0)),
+                                        ))
+                                        .with_children(|track| {
+                                            track.spawn((
+                                                Node {
+                                                    width: Val::Percent(0.0),
+                                                    height: Val::Percent(100.0),
+                                                    ..default()
+                                                },
+                                                BackgroundColor(Color::srgb(0.97, 0.73, 0.34)),
+                                                BorderRadius::all(Val::Px(3.0)),
+                                                metric,
+                                            ));
+                                        });
+                                });
+                        }
+                    });
+                });
+                card.spawn(Node {
+                    flex_direction: FlexDirection::Row,
+                    column_gap: Val::Px(10.0),
                     ..default()
                 })
                 .with_children(|row| {
@@ -6028,6 +6347,33 @@ fn setup_scene(
                                     BorderRadius::all(Val::Px(3.0)),
                                 ))
                                 .with_children(|track| {
+                                    // Labels name the endpoints; colors make the
+                                    // selected position easier to read at a glance.
+                                    let colors = match preference {
+                                        CreaturePreference::Diet => [
+                                            Color::srgb(0.65, 0.35, 0.30),
+                                            Color::srgb(0.64, 0.53, 0.33),
+                                            Color::srgb(0.48, 0.64, 0.35),
+                                            Color::srgb(0.30, 0.68, 0.43),
+                                        ],
+                                        CreaturePreference::Temperature => [
+                                            Color::srgb(0.30, 0.55, 0.72),
+                                            Color::srgb(0.41, 0.66, 0.66),
+                                            Color::srgb(0.76, 0.68, 0.40),
+                                            Color::srgb(0.82, 0.43, 0.29),
+                                        ],
+                                    };
+                                    for color in colors {
+                                        track.spawn((
+                                            Node {
+                                                flex_grow: 1.0,
+                                                flex_basis: Val::Px(0.0),
+                                                height: Val::Percent(100.0),
+                                                ..default()
+                                            },
+                                            BackgroundColor(color),
+                                        ));
+                                    }
                                     track.spawn((
                                         Node {
                                             position_type: PositionType::Absolute,
@@ -6053,11 +6399,51 @@ fn setup_scene(
                     ..default()
                 })
                 .with_children(|row| {
-                    row.spawn((
-                        Text::new("EYES\n↑ FORWARD\nCOLOR / DENSITY"),
-                        ui_font(9.0),
-                        TextColor(Color::srgb(0.65, 0.80, 0.71)),
-                    ));
+                    row.spawn(Node {
+                        flex_direction: FlexDirection::Column,
+                        row_gap: Val::Px(1.0),
+                        ..default()
+                    })
+                    .with_children(|legend| {
+                        legend.spawn((
+                            Text::new("EYES  ↑ FWD"),
+                            ui_font(9.0),
+                            TextColor(Color::srgb(0.65, 0.80, 0.71)),
+                        ));
+                        for (color, label) in [
+                            (Color::srgb(0.46, 0.87, 0.75), "AIM / FOV"),
+                            (Color::srgb(0.97, 0.73, 0.34), "FOV EDGES"),
+                        ] {
+                            legend
+                                .spawn(Node {
+                                    flex_direction: FlexDirection::Row,
+                                    align_items: AlignItems::Center,
+                                    column_gap: Val::Px(3.0),
+                                    ..default()
+                                })
+                                .with_children(|line| {
+                                    line.spawn((
+                                        Node {
+                                            width: Val::Px(5.0),
+                                            height: Val::Px(5.0),
+                                            ..default()
+                                        },
+                                        BackgroundColor(color),
+                                        BorderRadius::all(Val::Px(2.5)),
+                                    ));
+                                    line.spawn((
+                                        Text::new(label),
+                                        ui_font(9.0),
+                                        TextColor(Color::srgb(0.65, 0.80, 0.71)),
+                                    ));
+                                });
+                        }
+                        legend.spawn((
+                            Text::new("COLOR / DENSITY"),
+                            ui_font(9.0),
+                            TextColor(Color::srgb(0.65, 0.80, 0.71)),
+                        ));
+                    });
                     for eye in 0..NUM_EYES {
                         row.spawn((
                             Node {
@@ -6102,6 +6488,16 @@ fn setup_scene(
                                     CreatureEyeCompass(eye),
                                 ))
                                 .with_children(|compass| {
+                                    compass.spawn((
+                                        Node {
+                                            position_type: PositionType::Absolute,
+                                            width: Val::Percent(100.0),
+                                            height: Val::Percent(100.0),
+                                            ..default()
+                                        },
+                                        ImageNode::new(eye_fields[eye].clone()),
+                                        CreatureEyeField(eye),
+                                    ));
                                     compass.spawn((
                                         Node {
                                             position_type: PositionType::Absolute,
@@ -7163,6 +7559,755 @@ fn same_terrain_except_daylight(a: &TerrainHeightSnapshot, b: &TerrainHeightSnap
         && a.kinds == b.kinds
 }
 
+// An opt-in visual study. These meshes are decorative: they are not food,
+// obstacles, or changes to the owner simulation. The deliberately small
+// camera window bounds the experiment while its appearance is evaluated.
+const GROUNDCOVER_STUDY_CHUNK_SIDE: u32 = 8;
+const GROUNDCOVER_STUDY_RADIUS: i64 = 1;
+
+// The authored-asset study is deliberately separate from the shipping scene.
+// Its source is the externally supplied Poly Haven grass_medium_01 1K glTF;
+// node transforms in that file arrange samples for display, so only its six
+// tiny mesh primitives are used here. The authoring asset is CC0.
+const AUTHORED_GROUNDCOVER_SIDE: usize = 20;
+const AUTHORED_GROUNDCOVER_FIRST_MESH: usize = 11;
+const AUTHORED_GROUNDCOVER_VARIANTS: usize = 6;
+
+#[derive(Resource)]
+struct AuthoredGroundcoverStudy {
+    source: Handle<bevy::gltf::Gltf>,
+    material: Handle<StandardMaterial>,
+    raw_texture: Handle<Image>,
+    straight_texture: Handle<Image>,
+    original_color: bool,
+    scale_factor: f32,
+    spawned: bool,
+}
+
+#[derive(Component)]
+struct AuthoredGroundcoverPlant(usize);
+
+/// Produce both the original color and a straight-color candidate for the
+/// separate opacity map. Very low opacity is bounded to avoid amplifying JPEG
+/// noise; zero-opacity pixels stay black. The candidate remains a visual test.
+fn authored_groundcover_pixels(
+    color: &::image::RgbImage,
+    opacity: &::image::GrayImage,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    if color.dimensions() != opacity.dimensions() || color.width() == 0 || color.height() == 0 {
+        return None;
+    }
+    let mut raw = Vec::with_capacity(color.width() as usize * color.height() as usize * 4);
+    let mut straight = Vec::with_capacity(raw.capacity());
+    for (rgb, alpha) in color.pixels().zip(opacity.pixels()) {
+        let alpha = alpha[0];
+        raw.extend_from_slice(&[rgb[0], rgb[1], rgb[2], alpha]);
+        let denominator = u32::from(alpha).max(16);
+        for channel in rgb.0 {
+            let value = if alpha == 0 {
+                0
+            } else {
+                ((u32::from(channel) * 255 + denominator / 2) / denominator).min(255) as u8
+            };
+            straight.push(value);
+        }
+        straight.push(alpha);
+    }
+    Some((raw, straight))
+}
+
+fn setup_authored_groundcover_study(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    mut images: ResMut<Assets<Image>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+    let Some(root) = env::var_os("SCRIPTBOTS_GROUNDCOVER_ASSET_DIR") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root).join("textures");
+    let decoded = (|| -> Result<_> {
+        let color = ::image::open(root.join("grass_medium_01_diff_1k.jpg"))?.to_rgb8();
+        let opacity = ::image::open(root.join("grass_medium_01_alpha_1k.png"))?.to_luma8();
+        let pixels = authored_groundcover_pixels(&color, &opacity)
+            .ok_or_else(|| anyhow!("grass color and opacity dimensions do not match"))?;
+        Ok((color.width(), color.height(), pixels))
+    })();
+    let (width, height, (raw, straight)) = match decoded {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            warn!(%error, "authored groundcover study could not load its texture");
+            return;
+        }
+    };
+    let mut make_image = |pixels| {
+        let mut image = Image::new(
+            Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            TextureDimension::D2,
+            pixels,
+            TextureFormat::Rgba8UnormSrgb,
+            RenderAssetUsages::default(),
+        );
+        image.sampler = bevy::image::ImageSampler::linear();
+        images.add(image)
+    };
+    let raw_texture = make_image(raw);
+    let straight_texture = make_image(straight);
+    let material = materials.add(StandardMaterial {
+        base_color_texture: Some(straight_texture.clone()),
+        alpha_mode: AlphaMode::Mask(0.3),
+        perceptual_roughness: 1.0,
+        // Keep authored normals on both sides; flipping back-face normals
+        // makes otherwise sunlit blades unnaturally dark.
+        cull_mode: None,
+        double_sided: false,
+        ..default()
+    });
+    let source = asset_server.load_with_settings(
+        "grass_medium_01_1k.gltf",
+        |settings: &mut bevy::gltf::GltfLoaderSettings| {
+            settings.load_materials = RenderAssetUsages::empty();
+            settings.load_animations = false;
+            settings.load_cameras = false;
+            settings.load_lights = false;
+        },
+    );
+    commands.insert_resource(AuthoredGroundcoverStudy {
+        source,
+        material,
+        raw_texture,
+        straight_texture,
+        original_color: false,
+        scale_factor: 1.0,
+        spawned: false,
+    });
+}
+
+// B isolates lighting, M compares scale, and U compares the original and
+// straight-color texture at the same paused camera position. Study only.
+fn toggle_authored_groundcover_lighting(
+    input: Res<ButtonInput<KeyCode>>,
+    authored: Option<ResMut<AuthoredGroundcoverStudy>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    let Some(mut authored) = authored else { return };
+    if input.just_pressed(KeyCode::KeyB)
+        && let Some(material) = materials.get_mut(&authored.material)
+    {
+        material.unlit = !material.unlit;
+        info!(
+            unlit = material.unlit,
+            "authored groundcover lighting study"
+        );
+    }
+    if input.just_pressed(KeyCode::KeyM) {
+        authored.scale_factor = if authored.scale_factor == 1.0 {
+            3.0
+        } else {
+            1.0
+        };
+        info!(
+            scale = authored.scale_factor,
+            "authored groundcover scale study"
+        );
+    }
+    if input.just_pressed(KeyCode::KeyU)
+        && let Some(material) = materials.get_mut(&authored.material)
+    {
+        authored.original_color = !authored.original_color;
+        material.base_color_texture = Some(if authored.original_color {
+            authored.raw_texture.clone()
+        } else {
+            authored.straight_texture.clone()
+        });
+        info!(
+            original = authored.original_color,
+            "authored groundcover color study"
+        );
+    }
+}
+
+#[derive(bevy::ecs::system::SystemParam)]
+struct AuthoredGroundcoverData<'w, 's> {
+    study: Res<'w, GroundcoverStudyState>,
+    authored: Option<ResMut<'w, AuthoredGroundcoverStudy>>,
+    gltfs: Res<'w, Assets<bevy::gltf::Gltf>>,
+    gltf_meshes: Res<'w, Assets<bevy::gltf::GltfMesh>>,
+    meshes: Res<'w, Assets<Mesh>>,
+    plants: Query<
+        'w,
+        's,
+        (
+            &'static AuthoredGroundcoverPlant,
+            &'static mut Mesh3d,
+            &'static mut Transform,
+            &'static mut Visibility,
+        ),
+    >,
+}
+
+fn sync_authored_groundcover_study(
+    snapshot: Res<SnapshotState>,
+    rig: Res<CameraRig>,
+    mut commands: Commands,
+    data: AuthoredGroundcoverData,
+) {
+    let AuthoredGroundcoverData {
+        study,
+        authored,
+        gltfs,
+        gltf_meshes,
+        meshes,
+        mut plants,
+    } = data;
+    let Some(mut authored) = authored else { return };
+    let Some(frame) = snapshot.latest.as_ref() else {
+        return;
+    };
+    let Some(gltf) = gltfs.get(&authored.source) else {
+        return;
+    };
+    let Some(variants) = (AUTHORED_GROUNDCOVER_FIRST_MESH
+        ..AUTHORED_GROUNDCOVER_FIRST_MESH + AUTHORED_GROUNDCOVER_VARIANTS)
+        .map(|index| {
+            let mesh = gltf_meshes.get(gltf.meshes.get(index)?)?;
+            let handle = mesh.primitives.first()?.mesh.clone();
+            let positions = meshes
+                .get(&handle)?
+                .attribute(Mesh::ATTRIBUTE_POSITION)?
+                .as_float3()?;
+            let bottom = positions.iter().map(|p| p[1]).reduce(f32::min)?;
+            bottom.is_finite().then_some((handle, bottom))
+        })
+        .collect::<Option<Vec<_>>>()
+    else {
+        return;
+    };
+    if !authored.spawned {
+        for slot in 0..AUTHORED_GROUNDCOVER_SIDE * AUTHORED_GROUNDCOVER_SIDE {
+            commands.spawn((
+                Mesh3d(variants[slot % variants.len()].0.clone()),
+                MeshMaterial3d(authored.material.clone()),
+                Transform::default(),
+                Visibility::Hidden,
+                bevy::light::NotShadowCaster,
+                GroundcoverStudyChunk,
+                AuthoredGroundcoverPlant(slot),
+            ));
+        }
+        authored.spawned = true;
+    }
+    let terrain = &frame.terrain_height;
+    let count = (terrain.dims.x as usize).checked_mul(terrain.dims.y as usize);
+    if !far_terrain_color_supported(terrain.dims)
+        || terrain.cell_size == 0
+        || count != Some(terrain.kinds.len())
+        || count != Some(terrain.water_depth.len())
+        || count != Some(terrain.elevation.len())
+        || count != Some(terrain.moisture.len())
+        || count != Some(terrain.accent.len())
+        || count != Some(terrain.fertility.len())
+        || count != Some(terrain.temperature.len())
+        || !terrain.elevation.iter().all(|v| v.is_finite())
+        || !frame.world_size.is_finite()
+        || frame.world_size.min_element() <= 0.0
+        || !rig.focus_smoothed.is_finite()
+    {
+        for (_, _, _, mut visibility) in &mut plants {
+            *visibility = Visibility::Hidden;
+        }
+        return;
+    }
+    let spacing = terrain.cell_size as f32 / 5.0;
+    let center = (rig.focus_smoothed / spacing).floor().as_ivec2();
+    for (plant, mut mesh, mut transform, mut visibility) in &mut plants {
+        let grid = center
+            + IVec2::new(
+                (plant.0 % AUTHORED_GROUNDCOVER_SIDE) as i32,
+                (plant.0 / AUTHORED_GROUNDCOVER_SIDE) as i32,
+            )
+            - IVec2::splat((AUTHORED_GROUNDCOVER_SIDE / 2) as i32);
+        let seed = frame.world_seed.unwrap_or(0)
+            ^ (grid.x as i64 as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            ^ (grid.y as i64 as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        let point = (grid.as_vec2()
+            + Vec2::new(
+                groundcover_study_random(seed ^ 0x20),
+                groundcover_study_random(seed ^ 0x40),
+            ))
+            * spacing;
+        let in_world = point.cmpge(Vec2::ZERO).all() && point.cmplt(frame.world_size).all();
+        let cover = if in_world {
+            let tile_pos = (point / terrain.cell_size as f32).floor().as_uvec2();
+            let tile = terrain.sample_tile(
+                tile_pos.x.min(terrain.dims.x - 1),
+                tile_pos.y.min(terrain.dims.y - 1),
+            );
+            !matches!(
+                tile.kind,
+                TerrainKind::DeepWater | TerrainKind::ShallowWater
+            ) && tile.water_depth.is_finite()
+                && tile.water_depth <= 0.0
+                && groundcover_study_cover(terrain, point) > groundcover_study_random(seed ^ 0x80)
+        } else {
+            false
+        };
+        let desired_visibility = if study.visible && cover {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+        if *visibility != desired_visibility {
+            *visibility = desired_visibility;
+        }
+        if !cover {
+            continue;
+        }
+        let variant = ((groundcover_study_random(seed ^ 0x100) * variants.len() as f32) as usize)
+            .min(variants.len() - 1);
+        if mesh.0 != variants[variant].0 {
+            mesh.0 = variants[variant].0.clone();
+        }
+        let scale = terrain.cell_size as f32
+            * (0.35 + 0.25 * groundcover_study_random(seed ^ 0x200))
+            * authored.scale_factor;
+        let height = sample_height_world(terrain, point, TERRAIN_HEIGHT_SCALE);
+        let desired = Transform::from_xyz(
+            point.x - frame.world_size.x * 0.5,
+            height - variants[variant].1 * scale,
+            frame.world_size.y * 0.5 - point.y,
+        )
+        .with_rotation(Quat::from_rotation_y(
+            groundcover_study_random(seed ^ 0x400) * std::f32::consts::TAU,
+        ))
+        .with_scale(Vec3::splat(scale));
+        if *transform != desired {
+            *transform = desired;
+        }
+    }
+}
+
+#[derive(Component)]
+struct GroundcoverStudyChunk;
+
+struct GroundcoverStudyRecord {
+    entity: Entity,
+    mesh: Handle<Mesh>,
+    signature: [u8; 32],
+}
+
+#[derive(Resource)]
+struct GroundcoverStudyState {
+    chunks: HashMap<TerrainChunkKey, GroundcoverStudyRecord>,
+    empty: HashMap<TerrainChunkKey, [u8; 32]>,
+    material: Option<Handle<StandardMaterial>>,
+    visible: bool,
+}
+
+impl Default for GroundcoverStudyState {
+    fn default() -> Self {
+        Self {
+            chunks: HashMap::new(),
+            empty: HashMap::new(),
+            material: None,
+            visible: true,
+        }
+    }
+}
+
+fn groundcover_study_random(mut value: u64) -> f32 {
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^= value >> 31;
+    (value >> 40) as f32 / 16_777_216.0
+}
+
+/// Interpolate vegetation eligibility between tile centers so biome edges do
+/// not turn into a visible grid. This is decorative density, not food.
+fn groundcover_study_cover(terrain: &TerrainHeightSnapshot, position: Vec2) -> f32 {
+    let grid = (position / terrain.cell_size as f32 - Vec2::splat(0.5))
+        .clamp(Vec2::ZERO, (terrain.dims - UVec2::ONE).as_vec2());
+    let lower = grid.floor().as_uvec2();
+    let upper = (lower + UVec2::ONE).min(terrain.dims - UVec2::ONE);
+    let fraction = grid - lower.as_vec2();
+    let cover = |x, y| {
+        let tile = terrain.sample_tile(x, y);
+        if matches!(tile.kind, TerrainKind::Grass | TerrainKind::Bloom)
+            && tile.water_depth.is_finite()
+            && tile.water_depth <= 0.0
+        {
+            1.0
+        } else {
+            0.0
+        }
+    };
+    let low = cover(lower.x, lower.y) * (1.0 - fraction.x) + cover(upper.x, lower.y) * fraction.x;
+    let high = cover(lower.x, upper.y) * (1.0 - fraction.x) + cover(upper.x, upper.y) * fraction.x;
+    low * (1.0 - fraction.y) + high * fraction.y
+}
+
+fn groundcover_study_signature(
+    frame: &WorldSnapshot,
+    bounds: TerrainChunkBounds,
+    palette: ColorPaletteMode,
+) -> [u8; 32] {
+    let terrain = &frame.terrain_height;
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"scriptbots.groundcover-study.v1");
+    hash.update(&frame.world_seed.unwrap_or(0).to_le_bytes());
+    for value in [
+        terrain.dims.x,
+        terrain.dims.y,
+        terrain.cell_size,
+        bounds.origin.x,
+        bounds.origin.y,
+        bounds.size.x,
+        bounds.size.y,
+    ] {
+        hash.update(&value.to_le_bytes());
+    }
+    for value in [frame.world_size.x, frame.world_size.y] {
+        hash.update(&value.to_bits().to_le_bytes());
+    }
+    hash.update(&[match palette {
+        ColorPaletteMode::Natural => 0,
+        ColorPaletteMode::Deuteranopia => 1,
+        ColorPaletteMode::Protanopia => 2,
+        ColorPaletteMode::Tritanopia => 3,
+        ColorPaletteMode::HighContrast => 4,
+    }]);
+    // Cubic terrain interpolation and slope sampling reach beyond the chunk.
+    let first = bounds.origin.saturating_sub(UVec2::splat(3));
+    let end = (bounds.origin + bounds.size + UVec2::splat(3)).min(terrain.dims);
+    for y in first.y..end.y {
+        for x in first.x..end.x {
+            let tile = terrain.sample_tile(x, y);
+            hash.update(&[match tile.kind {
+                TerrainKind::DeepWater => 0,
+                TerrainKind::ShallowWater => 1,
+                TerrainKind::Sand => 2,
+                TerrainKind::Grass => 3,
+                TerrainKind::Bloom => 4,
+                TerrainKind::Rock => 5,
+            }]);
+            for value in [
+                tile.elevation,
+                tile.moisture,
+                tile.fertility,
+                tile.water_depth,
+            ] {
+                hash.update(&value.to_bits().to_le_bytes());
+            }
+        }
+    }
+    *hash.finalize().as_bytes()
+}
+
+fn build_groundcover_study_mesh(
+    frame: &WorldSnapshot,
+    bounds: TerrainChunkBounds,
+    palette: ColorPaletteMode,
+) -> Option<Mesh> {
+    let terrain = &frame.terrain_height;
+    let cell = terrain.cell_size as f32;
+    let half = frame.world_size * 0.5;
+    let mut positions = Vec::new();
+    let mut normals = Vec::new();
+    let mut colors = Vec::new();
+    let mut indices = Vec::new();
+    for y in bounds.origin.y..bounds.origin.y + bounds.size.y {
+        for x in bounds.origin.x..bounds.origin.x + bounds.size.x {
+            let tile = terrain.sample_tile(x, y);
+            if matches!(
+                tile.kind,
+                TerrainKind::DeepWater | TerrainKind::ShallowWater
+            ) || !tile.water_depth.is_finite()
+                || tile.water_depth > 0.0
+                || !tile.moisture.is_finite()
+                || !tile.fertility.is_finite()
+            {
+                continue;
+            }
+            let lushness = visual::terrain_lushness(tile.moisture, tile.fertility);
+            for plant in 0..36_u32 {
+                let seed = frame.world_seed.unwrap_or(0)
+                    ^ u64::from(x).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                    ^ u64::from(y).wrapping_mul(0xbf58_476d_1ce4_e5b9)
+                    ^ u64::from(plant).wrapping_mul(0x94d0_49bb_1331_11eb);
+                // Jittered strata keep dense coverage without an obvious grid.
+                let jitter_x = groundcover_study_random(seed ^ 0x21a5);
+                let jitter_y = groundcover_study_random(seed ^ 0x789b);
+                let root = Vec2::new(
+                    (x as f32 + (plant % 6) as f32 / 6.0 + jitter_x / 6.0) * cell,
+                    (y as f32 + (plant / 6) as f32 / 6.0 + jitter_y / 6.0) * cell,
+                );
+                let density = groundcover_study_cover(terrain, root) * (0.38 + 0.58 * lushness);
+                if groundcover_study_random(seed ^ 0x1627) >= density {
+                    continue;
+                }
+                let size = cell * (0.025 + 0.027 * groundcover_study_random(seed ^ 0x41a3));
+                for blade in 0..3_u64 {
+                    let key = seed ^ blade.wrapping_mul(0xd6e8_feb8_6659_fd93);
+                    let angle = groundcover_study_random(key ^ 0x91) * std::f32::consts::TAU;
+                    let outward = Vec2::new(angle.cos(), angle.sin());
+                    let across = Vec2::new(-outward.y, outward.x);
+                    let length = size * (0.65 + 0.65 * groundcover_study_random(key ^ 0x92));
+                    let width = size * (0.10 + 0.08 * groundcover_study_random(key ^ 0x93));
+                    let variation = groundcover_study_random(key ^ 0x94);
+                    let rgb = apply_palette_rgb(
+                        Vec3::new(
+                            0.29 + variation * 0.10,
+                            0.43 + lushness * 0.12,
+                            0.13 + variation * 0.05,
+                        ),
+                        palette,
+                    );
+                    let base = positions.len() as u32;
+                    let normal = Vec3::new(-outward.x * 0.30, 0.95, outward.y * 0.30).normalize();
+                    for (segment, taper) in [0.65_f32, 1.0, 0.65, 0.0].into_iter().enumerate() {
+                        let t = segment as f32 / 3.0;
+                        let center = root + outward * length * 0.7 * t * t;
+                        let rise = length * 1.45 * (t * std::f32::consts::FRAC_PI_2).sin();
+                        for side in [-1.0_f32, 1.0] {
+                            let point = (center + across * side * width * taper)
+                                .clamp(Vec2::ZERO, frame.world_size);
+                            let ground = sample_height_world(terrain, point, TERRAIN_HEIGHT_SCALE);
+                            positions.push([
+                                point.x - half.x,
+                                ground + rise + 0.015,
+                                half.y - point.y,
+                            ]);
+                            normals.push(normal.to_array());
+                            let shade = 0.74 + 0.26 * t;
+                            let linear = Color::srgb(rgb.x * shade, rgb.y * shade, rgb.z * shade)
+                                .to_linear();
+                            colors.push([linear.red, linear.green, linear.blue, 1.0]);
+                        }
+                    }
+                    for segment in 0..3_u32 {
+                        let i = base + segment * 2;
+                        // Both windings use the same upward-facing normals.
+                        // Bevy's double-sided PBR mode flips back-face normals
+                        // downward, making half these leaves nearly black.
+                        indices.extend_from_slice(&[
+                            i,
+                            i + 1,
+                            i + 2,
+                            i + 2,
+                            i + 1,
+                            i,
+                            i + 1,
+                            i + 3,
+                            i + 2,
+                            i + 2,
+                            i + 3,
+                            i + 1,
+                        ]);
+                    }
+                }
+            }
+        }
+    }
+    if positions.is_empty() {
+        return None;
+    }
+    let mut mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+    );
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
+    mesh.insert_indices(Indices::U32(indices));
+    Some(mesh)
+}
+
+fn sync_groundcover_study(
+    snapshot: Res<SnapshotState>,
+    rig: Res<CameraRig>,
+    accessibility: Res<AccessibilityState>,
+    mut study: ResMut<GroundcoverStudyState>,
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    let Some(frame) = snapshot.latest.as_ref() else {
+        return;
+    };
+    let terrain = &frame.terrain_height;
+    let count = (terrain.dims.x as usize).checked_mul(terrain.dims.y as usize);
+    let valid = far_terrain_color_supported(terrain.dims)
+        && terrain.cell_size > 0
+        && frame.world_size.is_finite()
+        && frame.world_size.min_element() > 0.0
+        && rig.focus_smoothed.is_finite()
+        && count == Some(terrain.elevation.len())
+        && count == Some(terrain.moisture.len())
+        && count == Some(terrain.accent.len())
+        && count == Some(terrain.fertility.len())
+        && count == Some(terrain.temperature.len())
+        && count == Some(terrain.water_depth.len())
+        && count == Some(terrain.kinds.len())
+        && terrain
+            .elevation
+            .iter()
+            .all(|value| value.is_finite() && (0.0..=1.0).contains(value));
+    let mut seen = HashSet::new();
+    if valid {
+        let span = terrain.cell_size as f32 * GROUNDCOVER_STUDY_CHUNK_SIDE as f32;
+        let focus = rig.focus_smoothed.clamp(Vec2::ZERO, frame.world_size);
+        let center_x = (focus.x / span).floor() as i64;
+        let center_y = (focus.y / span).floor() as i64;
+        let chunks_x = terrain.dims.x.div_ceil(GROUNDCOVER_STUDY_CHUNK_SIDE);
+        let chunks_y = terrain.dims.y.div_ceil(GROUNDCOVER_STUDY_CHUNK_SIDE);
+        let palette = accessibility.palette();
+        let material_missing = study
+            .material
+            .as_ref()
+            .is_none_or(|id| materials.get(id).is_none());
+        if material_missing {
+            study.material = Some(materials.add(StandardMaterial {
+                base_color: Color::WHITE,
+                perceptual_roughness: 1.0,
+                metallic: 0.0,
+                ..default()
+            }));
+        }
+        let material = study
+            .material
+            .as_ref()
+            .expect("material just created")
+            .clone();
+        for cy in center_y - GROUNDCOVER_STUDY_RADIUS..=center_y + GROUNDCOVER_STUDY_RADIUS {
+            for cx in center_x - GROUNDCOVER_STUDY_RADIUS..=center_x + GROUNDCOVER_STUDY_RADIUS {
+                if cx < 0 || cy < 0 || cx >= i64::from(chunks_x) || cy >= i64::from(chunks_y) {
+                    continue;
+                }
+                let key = TerrainChunkKey {
+                    x: cx as u32,
+                    y: cy as u32,
+                };
+                seen.insert(key);
+                let origin = UVec2::new(key.x, key.y) * GROUNDCOVER_STUDY_CHUNK_SIDE;
+                let bounds = TerrainChunkBounds {
+                    origin,
+                    size: (terrain.dims - origin).min(UVec2::splat(GROUNDCOVER_STUDY_CHUNK_SIDE)),
+                };
+                let signature = groundcover_study_signature(frame, bounds, palette);
+                if study.empty.get(&key) == Some(&signature) {
+                    continue;
+                }
+                let unchanged = study.chunks.get(&key).is_some_and(|record| {
+                    record.signature == signature && meshes.get(&record.mesh).is_some()
+                });
+                if unchanged {
+                    if material_missing {
+                        let entity = study.chunks[&key].entity;
+                        commands
+                            .entity(entity)
+                            .insert(MeshMaterial3d(material.clone()));
+                    }
+                    continue;
+                }
+                match build_groundcover_study_mesh(frame, bounds, palette) {
+                    Some(mesh) => {
+                        let aabb = bevy::camera::primitives::MeshAabb::compute_aabb(&mesh);
+                        study.empty.remove(&key);
+                        if let Some(record) = study.chunks.get_mut(&key) {
+                            if let Some(existing) = meshes.get_mut(&record.mesh) {
+                                *existing = mesh;
+                            } else {
+                                record.mesh = meshes.add(mesh);
+                                commands
+                                    .entity(record.entity)
+                                    .insert(Mesh3d(record.mesh.clone()));
+                            }
+                            commands
+                                .entity(record.entity)
+                                .insert(MeshMaterial3d(material.clone()));
+                            if let Some(aabb) = aabb {
+                                commands.entity(record.entity).insert(aabb);
+                            }
+                            record.signature = signature;
+                        } else {
+                            let mesh = meshes.add(mesh);
+                            let visibility = if study.visible {
+                                Visibility::Inherited
+                            } else {
+                                Visibility::Hidden
+                            };
+                            let mut entity = commands.spawn((
+                                Mesh3d(mesh.clone()),
+                                MeshMaterial3d(material.clone()),
+                                Transform::default(),
+                                visibility,
+                                bevy::light::NotShadowCaster,
+                                GroundcoverStudyChunk,
+                            ));
+                            if let Some(aabb) = aabb {
+                                entity.insert(aabb);
+                            }
+                            let entity = entity.id();
+                            study.chunks.insert(
+                                key,
+                                GroundcoverStudyRecord {
+                                    entity,
+                                    mesh,
+                                    signature,
+                                },
+                            );
+                        }
+                    }
+                    None => {
+                        if let Some(old) = study.chunks.remove(&key) {
+                            commands.entity(old.entity).despawn();
+                            meshes.remove(&old.mesh);
+                        }
+                        study.empty.insert(key, signature);
+                    }
+                }
+            }
+        }
+    }
+    let stale: Vec<_> = study
+        .chunks
+        .keys()
+        .copied()
+        .filter(|key| !seen.contains(key))
+        .collect();
+    for key in stale {
+        if let Some(old) = study.chunks.remove(&key) {
+            commands.entity(old.entity).despawn();
+            meshes.remove(&old.mesh);
+        }
+    }
+    study.empty.retain(|key, _| seen.contains(key));
+}
+
+fn toggle_groundcover_study(
+    input: Res<ButtonInput<KeyCode>>,
+    mut study: ResMut<GroundcoverStudyState>,
+    mut chunks: Query<&mut Visibility, With<GroundcoverStudyChunk>>,
+) {
+    if input.just_pressed(KeyCode::KeyV) {
+        study.visible = !study.visible;
+        for mut visibility in &mut chunks {
+            *visibility = if study.visible {
+                Visibility::Inherited
+            } else {
+                Visibility::Hidden
+            };
+        }
+    }
+}
+
 fn terrain_chunk_colors(
     terrain: &TerrainHeightSnapshot,
     bounds: TerrainChunkBounds,
@@ -7399,6 +8544,10 @@ struct CreatureCardData<'w, 's> {
     eye_compasses: Query<'w, 's, (Entity, &'static CreatureEyeCompass)>,
     eye_bearings: Query<'w, 's, (Entity, &'static CreatureEyeBearing)>,
     eye_limits: Query<'w, 's, (Entity, &'static CreatureEyeLimit)>,
+    map_positions: Query<'w, 's, Entity, With<CreatureMapPosition>>,
+    map_headings: Query<'w, 's, Entity, With<CreatureMapHeading>>,
+    body_metrics: Query<'w, 's, (Entity, &'static CreatureBodyMetric)>,
+    body_labels: Query<'w, 's, (Entity, &'static CreatureBodyMetricLabel)>,
     vitals: Query<'w, 's, (Entity, &'static CreatureVitalBar)>,
     drives: Query<'w, 's, (Entity, &'static CreatureDrive)>,
     drive_labels: Query<'w, 's, (Entity, &'static CreatureDriveLabel)>,
@@ -7429,6 +8578,10 @@ fn update_creature_card(
         eye_compasses,
         eye_bearings,
         eye_limits,
+        map_positions,
+        map_headings,
+        body_metrics,
+        body_labels,
         vitals,
         drives,
         drive_labels,
@@ -7483,6 +8636,124 @@ fn update_creature_card(
     let (Some(frame), Some(agent)) = (state.latest.as_ref(), selected) else {
         return;
     };
+    let map_position = (agent.position.is_finite()
+        && frame.world_size.is_finite()
+        && frame.world_size.x > 0.0
+        && frame.world_size.y > 0.0
+        && agent.position.x >= 0.0
+        && agent.position.y >= 0.0
+        && agent.position.x <= frame.world_size.x
+        && agent.position.y <= frame.world_size.y)
+        .then(|| agent.position / frame.world_size);
+    for entity in &map_positions {
+        if let Ok(mut node) = nodes.get_mut(entity) {
+            let display = if map_position.is_some() {
+                Display::Flex
+            } else {
+                Display::None
+            };
+            if node.display != display {
+                node.display = display;
+            }
+            if let Some(position) = map_position {
+                let left = Val::Percent(position.x * 100.0);
+                let top = Val::Percent((1.0 - position.y) * 100.0);
+                if node.left != left {
+                    node.left = left;
+                }
+                if node.top != top {
+                    node.top = top;
+                }
+            }
+        }
+    }
+    for entity in &map_headings {
+        if let Ok(mut node) = nodes.get_mut(entity) {
+            let display = if agent.heading.is_finite() {
+                Display::Flex
+            } else {
+                Display::None
+            };
+            if node.display != display {
+                node.display = display;
+            }
+            if agent.heading.is_finite() {
+                let left = Val::Px(4.0 + 7.0 * agent.heading.cos());
+                let top = Val::Px(4.0 - 7.0 * agent.heading.sin());
+                if node.left != left {
+                    node.left = left;
+                }
+                if node.top != top {
+                    node.top = top;
+                }
+            }
+        }
+    }
+    let body_value = |metric: CreatureBodyMetric| match metric {
+        CreatureBodyMetric::Spike => agent.spike_length,
+        CreatureBodyMetric::Boost => agent.boost,
+        CreatureBodyMetric::Share => agent.reproduction_intent,
+    };
+    let body_fraction = |metric: CreatureBodyMetric| {
+        let value = body_value(metric);
+        if !value.is_finite() {
+            return None;
+        }
+        match metric {
+            CreatureBodyMetric::Spike
+                if frame.physical_agent_radius.is_finite() && frame.physical_agent_radius > 0.0 =>
+            {
+                Some(value / frame.physical_agent_radius)
+            }
+            CreatureBodyMetric::Spike => None,
+            CreatureBodyMetric::Boost | CreatureBodyMetric::Share => Some(value),
+        }
+    };
+    for (entity, metric) in &body_metrics {
+        let value = body_fraction(*metric);
+        if let Ok(mut node) = nodes.get_mut(entity) {
+            let display = if value.is_some() {
+                Display::Flex
+            } else {
+                Display::None
+            };
+            if node.display != display {
+                node.display = display;
+            }
+            if let Some(value) = value {
+                let width = Val::Percent(value.clamp(0.0, 1.0) * 100.0);
+                if node.width != width {
+                    node.width = width;
+                }
+            }
+        }
+    }
+    for (entity, label) in &body_labels {
+        let value = body_value(label.0);
+        let name = match label.0 {
+            CreatureBodyMetric::Spike if agent.spiked => "SPIKE · HIT RECEIVED",
+            CreatureBodyMetric::Spike => "SPIKE",
+            CreatureBodyMetric::Boost => "BOOST",
+            CreatureBodyMetric::Share => "SHARE",
+        };
+        let reading = if value.is_finite() && body_fraction(label.0).is_none() {
+            format!("{value:.2} · R --")
+        } else if value.is_finite() {
+            format!(
+                "{value:.2}{}",
+                if body_fraction(label.0).is_none_or(|fraction| (0.0..=1.0).contains(&fraction)) {
+                    ""
+                } else {
+                    "*"
+                }
+            )
+        } else {
+            "--".to_owned()
+        };
+        if let Ok(mut text) = texts.get_mut(entity) {
+            set_hud_text_if_changed(&mut text, format!("{name}  {reading}"));
+        }
+    }
     for (entity, compass) in &eye_compasses {
         let full_view = agent
             .eye_dirs
@@ -7537,7 +8808,7 @@ fn update_creature_card(
             .zip(agent.eye_fov.get(limit.eye))
             .and_then(|(&bearing, &fov)| {
                 (bearing.is_finite() && fov.is_finite() && fov > 0.0 && fov < std::f32::consts::PI)
-                    .then(|| bearing + limit.side * fov)
+                    .then_some(bearing + limit.side * fov)
             });
         if let Ok(mut node) = nodes.get_mut(entity) {
             let display = if angle.is_some() {
@@ -7827,22 +9098,17 @@ fn update_creature_card(
         .count();
     let detail = InspectorDetail::from_agent(agent, selected_count.saturating_sub(1));
     let context = format!(
-        "{} | position {:.0}, {:.0}{}{}\n\
-         Speed {:.2}/tick | heading {:.2} rad\n\
-         Spike {:.2} | boost {}",
+        "{}  ·  position {:.0}, {:.0}  ·  speed {:.2}/tick{}{}",
         detail.diet(),
         agent.position.x,
         agent.position.y,
-        if detail.spiked { " | spike hit" } else { "" },
+        agent.velocity.length(),
+        if detail.spiked { "  ·  spike hit" } else { "" },
         if detail.also_selected > 0 {
             format!(" | +{} selected", detail.also_selected)
         } else {
             String::new()
         },
-        agent.velocity.length(),
-        agent.heading,
-        agent.spike_length,
-        if agent.boost > 0.5 { "on" } else { "off" },
     );
     let (status, title, body) = owner.as_ref().map_or_else(
         || {
@@ -10452,6 +11718,13 @@ mod adaptive_governor_tests {
             .collect();
         compasses.sort_unstable();
         assert_eq!(compasses, (0..NUM_EYES).collect::<Vec<_>>());
+        let mut fields: Vec<_> = world
+            .query::<&CreatureEyeField>()
+            .iter(world)
+            .map(|eye| eye.0)
+            .collect();
+        fields.sort_unstable();
+        assert_eq!(fields, (0..NUM_EYES).collect::<Vec<_>>());
         let mut bearings: Vec<_> = world
             .query::<&CreatureEyeBearing>()
             .iter(world)
@@ -15520,6 +16793,8 @@ mod owner_inspector_tests {
     fn creature_card_motion_follows_selected_snapshot_without_owner_detail() {
         let owner = TestOwner::new();
         let mut frame = owner.frame();
+        frame.agent_radius = 10.0;
+        frame.physical_agent_radius = 10.0;
         let agent = frame.agents.first_mut().expect("selected test creature");
         agent.velocity = Vec2::new(3.0, 4.0);
         agent.heading = 1.25;
@@ -15527,6 +16802,8 @@ mod owner_inspector_tests {
         agent.wheel_right = 0.65;
         agent.spike_length = 7.5;
         agent.boost = 1.0;
+        agent.spiked = true;
+        agent.position = frame.world_size * Vec2::new(0.25, 0.75);
 
         let mut app = App::new();
         app.insert_resource(SnapshotState {
@@ -15564,12 +16841,46 @@ mod owner_inspector_tests {
             .world_mut()
             .spawn((Text::default(), CreatureDriveLabel(CreatureDrive::Left)))
             .id();
+        let map_position = app
+            .world_mut()
+            .spawn((Node::default(), CreatureMapPosition))
+            .id();
+        let map_heading = app
+            .world_mut()
+            .spawn((Node::default(), CreatureMapHeading))
+            .id();
+        let spike_bar = app
+            .world_mut()
+            .spawn((Node::default(), CreatureBodyMetric::Spike))
+            .id();
+        let spike_label = app
+            .world_mut()
+            .spawn((
+                Text::default(),
+                CreatureBodyMetricLabel(CreatureBodyMetric::Spike),
+            ))
+            .id();
         app.insert_resource(card)
             .add_systems(Update, update_creature_card);
         app.update();
         let text = &app.world().get::<Text>(context).unwrap().0;
-        assert!(text.contains("Speed 5.00/tick | heading 1.25 rad"));
-        assert!(text.contains("Spike 7.50 | boost on"));
+        assert!(text.contains("speed 5.00/tick"));
+        let marker = app.world().get::<Node>(map_position).unwrap();
+        assert_eq!(
+            (marker.left, marker.top),
+            (Val::Percent(25.0), Val::Percent(25.0))
+        );
+        let heading = app.world().get::<Node>(map_heading).unwrap();
+        assert_eq!(heading.left, Val::Px(4.0 + 7.0 * 1.25_f32.cos()));
+        assert_eq!(heading.top, Val::Px(4.0 - 7.0 * 1.25_f32.sin()));
+        assert_eq!(
+            app.world().get::<Node>(spike_bar).unwrap().width,
+            Val::Percent(75.0)
+        );
+        assert_eq!(
+            app.world().get::<Text>(spike_label).unwrap().0,
+            "SPIKE · HIT RECEIVED  7.50"
+        );
         assert_eq!(
             app.world().get::<Node>(left_bar).unwrap().width,
             Val::Percent(0.0)
@@ -15593,13 +16904,26 @@ mod owner_inspector_tests {
             agent.velocity = Vec2::ZERO;
             agent.wheel_left = 0.2;
             agent.wheel_right = -0.4;
-            agent.spike_length = 0.0;
+            agent.spike_length = 12.0;
             agent.boost = 0.0;
+            agent.spiked = false;
+            agent.position.x = -1.0;
         }
         app.update();
         let text = &app.world().get::<Text>(context).unwrap().0;
-        assert!(text.contains("Speed 0.00/tick"));
-        assert!(text.contains("Spike 0.00 | boost off"));
+        assert!(text.contains("speed 0.00/tick"));
+        assert_eq!(
+            app.world().get::<Node>(spike_bar).unwrap().width,
+            Val::Percent(100.0)
+        );
+        assert_eq!(
+            app.world().get::<Text>(spike_label).unwrap().0,
+            "SPIKE  12.00*"
+        );
+        assert_eq!(
+            app.world().get::<Node>(map_position).unwrap().display,
+            Display::None
+        );
         assert_eq!(
             app.world().get::<Node>(left_bar).unwrap().width,
             Val::Percent(20.0)
@@ -15618,9 +16942,56 @@ mod owner_inspector_tests {
             .latest
             .as_mut()
             .unwrap()
-            .agents[0]
-            .wheel_left = f32::NAN;
+            .physical_agent_radius = 0.0;
         app.update();
+        assert_eq!(
+            app.world().get::<Node>(spike_bar).unwrap().display,
+            Display::None
+        );
+        assert_eq!(
+            app.world().get::<Text>(spike_label).unwrap().0,
+            "SPIKE  12.00 · R --"
+        );
+
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            let frame = state.latest.as_mut().unwrap();
+            frame.agent_radius = 1.0; // rendering minimum
+            frame.physical_agent_radius = 0.25;
+            frame.agents[0].spike_length = 0.125;
+        }
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(spike_bar).unwrap().width,
+            Val::Percent(50.0)
+        );
+        assert_eq!(
+            app.world().get::<Node>(spike_bar).unwrap().display,
+            Display::Flex
+        );
+
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            let agent = &mut state.latest.as_mut().unwrap().agents[0];
+            agent.wheel_left = f32::NAN;
+            agent.position.x = f32::NAN;
+            agent.heading = f32::NAN;
+            agent.spike_length = f32::NAN;
+        }
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(map_position).unwrap().display,
+            Display::None
+        );
+        assert_eq!(
+            app.world().get::<Node>(map_heading).unwrap().display,
+            Display::None
+        );
+        assert_eq!(
+            app.world().get::<Node>(spike_bar).unwrap().display,
+            Display::None
+        );
+        assert_eq!(app.world().get::<Text>(spike_label).unwrap().0, "SPIKE  --");
         assert_eq!(
             app.world().get::<Node>(left_bar).unwrap().width,
             Val::Percent(0.0)
@@ -18511,13 +19882,22 @@ fn create_chunk_material(stats: &TerrainChunkStats) -> StandardMaterial {
 }
 
 fn set_terrain_surface_properties(material: &mut StandardMaterial, stats: &TerrainChunkStats) {
-    // Soil, vegetation and water are dielectrics, not metals or light sources.
-    // Preserve a little variation in the underlying roughness map for wet soil;
-    // the terrain shader adjusts water separately within mixed-biome chunks.
-    material.perceptual_roughness = (0.88 - stats.mean_moisture * 0.18).clamp(0.7, 0.88);
-    material.metallic = 0.0;
-    material.reflectance = 0.5;
-    material.emissive = Color::BLACK.into();
+    // Preserve the existing exposure balance until the scene lighting is
+    // calibrated. The physically motivated replacement was visibly too dark
+    // or washed out in live comparisons under the current lighting rig.
+    let roughness = (0.45 + stats.mean_moisture * 0.4).clamp(0.1, 0.95);
+    let metallic = (stats.mean_slope * 0.35).clamp(0.0, 0.5);
+    let emissive_intensity =
+        (stats.mean_moisture * 0.12 + stats.height_factor * 0.05).clamp(0.0, 0.35);
+    material.perceptual_roughness = roughness;
+    material.metallic = metallic;
+    material.reflectance = (0.04 + stats.height_factor * 0.02).clamp(0.02, 0.08);
+    material.emissive = Color::linear_rgb(
+        emissive_intensity * 0.6,
+        emissive_intensity,
+        emissive_intensity * 0.8,
+    )
+    .into();
 }
 
 // The distant color image is an optional visual filter. Keep its allocation
@@ -19074,6 +20454,8 @@ struct BuiltChunk {
 #[derive(Clone, Copy)]
 struct TerrainChunkStats {
     mean_moisture: f32,
+    mean_slope: f32,
+    height_factor: f32,
     max_height: f32,
     world_extent: Vec2,
     detail_layer: usize,
@@ -19322,6 +20704,7 @@ fn build_chunk_mesh(
     let mut blend_weights = Vec::with_capacity(vertex_count);
     let mut colors = Vec::with_capacity(vertex_count);
     let mut sum_moisture = 0.0f64;
+    let mut sum_slope = 0.0f64;
     let mut max_height = f32::MIN;
     let mut biome_tiles = [0_usize; visual::SPLAT_LAYERS];
     let mut coarse_vertices = 0_usize;
@@ -19352,10 +20735,12 @@ fn build_chunk_mesh(
                 let global_x = grid.x / TERRAIN_SUBDIVISIONS;
                 let global_z = grid.y / TERRAIN_SUBDIVISIONS;
                 let sample = terrain.sample_tile(global_x, global_z);
+                let slope = compute_tile_slope(terrain, global_x, global_z);
                 if vx < verts_x - 1 && vz < verts_z - 1 {
                     biome_tiles[visual::terrain_kind_index(sample.kind)] += 1;
                 }
                 sum_moisture += sample.moisture as f64;
+                sum_slope += slope as f64;
                 coarse_vertices += 1;
             }
         }
@@ -19377,6 +20762,8 @@ fn build_chunk_mesh(
 
     let vertex_total = coarse_vertices as f64;
     let mean_moisture = (sum_moisture / vertex_total) as f32;
+    let mean_slope = (sum_slope / vertex_total) as f32;
+    let height_factor = (max_height / height_scale).clamp(0.0, 1.0);
     let world_extent = Vec2::new(
         bounds.size.x.max(1) as f32 * cell_size,
         bounds.size.y.max(1) as f32 * cell_size,
@@ -19395,7 +20782,14 @@ fn build_chunk_mesh(
         &normals,
         &colors,
         &blend_weights,
-        &[mean_moisture, max_height, world_extent.x, world_extent.y],
+        &[
+            mean_moisture,
+            mean_slope,
+            height_factor,
+            max_height,
+            world_extent.x,
+            world_extent.y,
+        ],
         detail_layer,
     );
     let mut mesh = Mesh::new(
@@ -19413,6 +20807,8 @@ fn build_chunk_mesh(
 
     let stats = TerrainChunkStats {
         mean_moisture,
+        mean_slope,
+        height_factor,
         max_height,
         world_extent,
         detail_layer,
@@ -19533,6 +20929,190 @@ fn terrain_tile_surface_srgb(
     let sample = terrain.sample_tile(x, z);
     let slope = compute_tile_slope(terrain, x, z);
     terrain_tile_surface_srgb_from_sample(sample, slope, terrain.daylight, palette)
+}
+
+#[derive(Clone, Copy)]
+struct CreatureMapSample {
+    color: [f32; 3],
+    water: bool,
+}
+
+/// Low-pass the sampled overview without blending land into water.
+fn creature_map_surface_srgb(
+    samples: &[CreatureMapSample],
+    dims: UVec2,
+    x: u32,
+    y: u32,
+    palette: ColorPaletteMode,
+) -> [f32; 3] {
+    let at = |x: u32, y: u32| samples[(y * dims.x + x) as usize];
+    let center = at(x, y);
+    if dims.x < 3 || dims.y < 3 || palette == ColorPaletteMode::HighContrast {
+        return center.color;
+    }
+    let mut sum = Vec3::ZERO;
+    let mut total = 0.0;
+    for (dy, wy) in [(-1, 1.0), (0, 2.0), (1, 1.0)] {
+        for (dx, wx) in [(-1, 1.0), (0, 2.0), (1, 1.0)] {
+            let sx = x.saturating_add_signed(dx).min(dims.x - 1);
+            let sy = y.saturating_add_signed(dy).min(dims.y - 1);
+            let sample = at(sx, sy);
+            if sample.water == center.water {
+                let weight = wx * wy;
+                sum += Vec3::from_array(sample.color) * weight;
+                total += weight;
+            }
+        }
+    }
+    (sum / total).to_array()
+}
+
+/// Build the map in the same orientation as the CPU world projection: world Y
+/// increases upward. Invalid terrain is refused rather than shown as a map.
+fn creature_terrain_map_image(
+    terrain: &TerrainHeightSnapshot,
+    palette: ColorPaletteMode,
+) -> Option<Image> {
+    use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+    let width = terrain.dims.x;
+    let height = terrain.dims.y;
+    // Match the existing bounded terrain-image budget; an unsupported world
+    // must not allocate or upload an unbounded HUD texture.
+    if !far_terrain_color_supported(terrain.dims) {
+        return None;
+    }
+    let count = (width as usize).checked_mul(height as usize)?;
+    if count == 0
+        || terrain.elevation.len() != count
+        || terrain.moisture.len() != count
+        || terrain.accent.len() != count
+        || terrain.water_depth.len() != count
+        || terrain.fertility.len() != count
+        || terrain.temperature.len() != count
+        || terrain.kinds.len() != count
+    {
+        return None;
+    }
+    // Bound filtering work as well as GPU storage. Center samples retain the
+    // full world extent; a local filter suppresses the cell-scale speckle.
+    let output_width = width.min(128);
+    let output_height = height.min(64);
+    let output_count = (output_width as usize).checked_mul(output_height as usize)?;
+    // Compute each costly terrain color once; neighboring output pixels reuse
+    // it, even while the day/night cycle changes the miniature every tick.
+    let mut samples = Vec::with_capacity(output_count);
+    for output_y in 0..output_height {
+        let source_y = height
+            - 1
+            - (((u64::from(output_y) * 2 + 1) * u64::from(height)) / (u64::from(output_height) * 2))
+                as u32;
+        for output_x in 0..output_width {
+            let source_x = (((u64::from(output_x) * 2 + 1) * u64::from(width))
+                / (u64::from(output_width) * 2)) as u32;
+            let tile = terrain.sample_tile(source_x, source_y);
+            samples.push(CreatureMapSample {
+                color: terrain_tile_surface_srgb(terrain, source_x, source_y, palette),
+                water: matches!(
+                    tile.kind,
+                    TerrainKind::DeepWater | TerrainKind::ShallowWater
+                ) || tile.water_depth > 0.0,
+            });
+        }
+    }
+    let mut pixels = Vec::with_capacity(output_count.checked_mul(4)?);
+    for output_y in 0..output_height {
+        for output_x in 0..output_width {
+            for value in creature_map_surface_srgb(
+                &samples,
+                UVec2::new(output_width, output_height),
+                output_x,
+                output_y,
+                palette,
+            ) {
+                pixels.push((value.clamp(0.0, 1.0) * 255.0).round() as u8);
+            }
+            pixels.push(255);
+        }
+    }
+    let mut image = Image::new(
+        Extent3d {
+            width: output_width,
+            height: output_height,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        pixels,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(),
+    );
+    image.sampler = bevy::image::ImageSampler::linear();
+    Some(image)
+}
+
+fn update_creature_terrain_map(
+    state: Res<SnapshotState>,
+    accessibility: Res<AccessibilityState>,
+    mut images: ResMut<Assets<Image>>,
+    mut maps: Query<
+        (&mut ImageNode, &mut Node),
+        (
+            With<CreatureTerrainMap>,
+            Without<CreatureTerrainMapUnavailable>,
+        ),
+    >,
+    mut placeholders: Query<
+        &mut Node,
+        (
+            With<CreatureTerrainMapUnavailable>,
+            Without<CreatureTerrainMap>,
+        ),
+    >,
+    mut cached: Local<Option<(TerrainHeightSnapshot, ColorPaletteMode)>>,
+) {
+    let (Some(frame), Ok((mut map, mut node))) = (state.latest.as_ref(), maps.single_mut()) else {
+        return;
+    };
+    let palette = accessibility.palette();
+    if cached.as_ref().is_some_and(|(terrain, previous_palette)| {
+        terrain == &frame.terrain_height && *previous_palette == palette
+    }) && images.get(&map.image).is_some()
+    {
+        return;
+    }
+    let available = if let Some(image) = creature_terrain_map_image(&frame.terrain_height, palette)
+    {
+        if let Some(existing) = images.get(&map.image) {
+            if (existing.data != image.data
+                || existing.texture_descriptor.size != image.texture_descriptor.size)
+                && let Some(existing) = images.get_mut(&map.image)
+            {
+                *existing = image;
+            }
+        } else {
+            map.image = images.add(image);
+        }
+        *cached = Some((frame.terrain_height.clone(), palette));
+        if node.display != Display::Flex {
+            node.display = Display::Flex;
+        }
+        true
+    } else {
+        *cached = None;
+        if node.display != Display::None {
+            node.display = Display::None;
+        }
+        false
+    };
+    for mut placeholder in &mut placeholders {
+        let display = if available {
+            Display::None
+        } else {
+            Display::Flex
+        };
+        if placeholder.display != display {
+            placeholder.display = display;
+        }
+    }
 }
 
 fn terrain_tile_surface_srgb_from_sample(
@@ -19734,6 +21314,535 @@ mod terrain_tests {
         TerrainLayer::from_tiles(2, 2, 50, tiles).expect("construct terrain layer")
     }
 
+    fn groundcover_study_fixture() -> WorldSnapshot {
+        let mut frame = sample_world_snapshot();
+        let mut tile = sample_layer().tiles()[0];
+        tile.elevation = 0.55;
+        tile.moisture = 0.75;
+        let layer = TerrainLayer::from_tiles(24, 16, 50, vec![tile; 24 * 16]).unwrap();
+        frame.terrain_height =
+            TerrainHeightSnapshot::new(&layer, None, visual::DAYLIGHT_STATIC).unwrap();
+        frame.world_size = Vec2::new(1200.0, 800.0);
+        frame.world_seed = Some(42);
+        frame
+    }
+
+    #[test]
+    fn creature_eye_field_shows_forward_rotation_wrap_and_invalid_values() {
+        let alpha = |image: &Image, x: u32, y: u32| {
+            image.data.as_ref().unwrap()[((y * CREATURE_EYE_FIELD_SIDE + x) * 4 + 3) as usize]
+        };
+        let forward = creature_eye_field_image(0.0, std::f32::consts::FRAC_PI_4);
+        assert!(alpha(&forward, 16, 4) > 0);
+        assert_eq!(alpha(&forward, 16, 27), 0);
+        assert_eq!(alpha(&forward, 27, 16), 0);
+        let right =
+            creature_eye_field_image(std::f32::consts::FRAC_PI_2, std::f32::consts::FRAC_PI_4);
+        assert!(alpha(&right, 27, 16) > 0);
+        assert_eq!(alpha(&right, 16, 4), 0);
+        let wrapped = creature_eye_field_image(-std::f32::consts::PI, 0.5);
+        assert!(alpha(&wrapped, 16, 27) > 0);
+        assert_eq!(alpha(&wrapped, 16, 4), 0);
+        let full = creature_eye_field_image(0.0, std::f32::consts::PI);
+        assert!(alpha(&full, 16, 4) > 0 && alpha(&full, 16, 27) > 0);
+        for invalid in [(f32::NAN, 1.0), (0.0, f32::NAN), (0.0, 0.0), (0.0, -1.0)] {
+            assert!(
+                creature_eye_field_image(invalid.0, invalid.1)
+                    .data
+                    .unwrap()
+                    .chunks_exact(4)
+                    .all(|pixel| pixel[3] == 0)
+            );
+        }
+    }
+
+    #[test]
+    fn creature_eye_fields_follow_selection_and_recover_missing_image() {
+        let mut frame = sample_world_snapshot();
+        let mut agent = sample_agent_visual();
+        agent.selection = SelectionState::Selected;
+        agent.eye_dirs[0] = 0.0;
+        agent.eye_fov[0] = std::f32::consts::FRAC_PI_4;
+        frame.agents.push(agent);
+        let mut app = App::new();
+        app.insert_resource(SnapshotState {
+            latest: Some(frame),
+            ..default()
+        })
+        .init_resource::<Assets<Image>>()
+        .add_systems(Update, update_creature_eye_fields);
+        let image = app
+            .world_mut()
+            .resource_mut::<Assets<Image>>()
+            .add(creature_eye_field_image(f32::NAN, 0.0));
+        let entity = app
+            .world_mut()
+            .spawn((CreatureEyeField(0), ImageNode::new(image.clone())))
+            .id();
+        app.update();
+        let pixels = |app: &App, handle: &Handle<Image>| {
+            app.world()
+                .resource::<Assets<Image>>()
+                .get(handle)
+                .unwrap()
+                .data
+                .clone()
+        };
+        assert_eq!(
+            pixels(&app, &image),
+            creature_eye_field_image(0.0, std::f32::consts::FRAC_PI_4).data
+        );
+        app.world_mut()
+            .resource_mut::<SnapshotState>()
+            .latest
+            .as_mut()
+            .unwrap()
+            .agents[0]
+            .eye_dirs[0] = std::f32::consts::FRAC_PI_2;
+        app.update();
+        assert_eq!(
+            pixels(&app, &image),
+            creature_eye_field_image(std::f32::consts::FRAC_PI_2, std::f32::consts::FRAC_PI_4).data
+        );
+        let _ = app
+            .world_mut()
+            .resource_mut::<Assets<Image>>()
+            .remove(&image);
+        app.update();
+        let recovered = &app.world().get::<ImageNode>(entity).unwrap().image;
+        assert_ne!(recovered.id(), image.id());
+        assert_eq!(
+            pixels(&app, recovered),
+            creature_eye_field_image(std::f32::consts::FRAC_PI_2, std::f32::consts::FRAC_PI_4).data
+        );
+    }
+
+    #[test]
+    fn authored_groundcover_combines_color_and_grayscale_opacity() {
+        let color = ::image::RgbImage::from_raw(2, 1, vec![12, 34, 56, 78, 90, 123]).unwrap();
+        let opacity = ::image::GrayImage::from_raw(2, 1, vec![0, 192]).unwrap();
+        assert_eq!(
+            authored_groundcover_pixels(&color, &opacity),
+            Some((
+                vec![12, 34, 56, 0, 78, 90, 123, 192],
+                vec![0, 0, 0, 0, 104, 120, 163, 192],
+            ))
+        );
+        let faint_color = ::image::RgbImage::from_raw(1, 1, vec![1, 4, 20]).unwrap();
+        let faint_alpha = ::image::GrayImage::from_raw(1, 1, vec![1]).unwrap();
+        assert_eq!(
+            authored_groundcover_pixels(&faint_color, &faint_alpha)
+                .unwrap()
+                .1,
+            vec![16, 64, 255, 1]
+        );
+        let wrong_size = ::image::GrayImage::new(1, 1);
+        assert!(authored_groundcover_pixels(&color, &wrong_size).is_none());
+        assert!(
+            authored_groundcover_pixels(
+                &::image::RgbImage::new(0, 0),
+                &::image::GrayImage::new(0, 0),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn authored_groundcover_comparison_controls_are_reversible() {
+        let mut app = App::new();
+        app.init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<Assets<Image>>()
+            .init_resource::<Assets<StandardMaterial>>()
+            .init_resource::<AccessibilityState>()
+            .add_systems(
+                Update,
+                (
+                    toggle_authored_groundcover_lighting,
+                    handle_palette_shortcuts,
+                ),
+            );
+        let original_palette = app.world().resource::<AccessibilityState>().palette();
+        let (raw_texture, straight_texture) = {
+            let mut images = app.world_mut().resource_mut::<Assets<Image>>();
+            (images.add(Image::default()), images.add(Image::default()))
+        };
+        let material = app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial {
+                base_color_texture: Some(straight_texture.clone()),
+                ..default()
+            });
+        app.insert_resource(AuthoredGroundcoverStudy {
+            source: Handle::default(),
+            material: material.clone(),
+            raw_texture: raw_texture.clone(),
+            straight_texture: straight_texture.clone(),
+            original_color: false,
+            scale_factor: 1.0,
+            spawned: false,
+        });
+        {
+            let mut input = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+            input.press(KeyCode::KeyB);
+            input.press(KeyCode::KeyM);
+            input.press(KeyCode::KeyU);
+        }
+        app.update();
+        assert_eq!(
+            app.world().resource::<AccessibilityState>().palette(),
+            original_palette
+        );
+        assert!(
+            app.world()
+                .resource::<Assets<StandardMaterial>>()
+                .get(&material)
+                .unwrap()
+                .unlit
+        );
+        assert_eq!(
+            app.world()
+                .resource::<AuthoredGroundcoverStudy>()
+                .scale_factor,
+            3.0
+        );
+        assert_eq!(
+            app.world()
+                .resource::<Assets<StandardMaterial>>()
+                .get(&material)
+                .unwrap()
+                .base_color_texture,
+            Some(raw_texture)
+        );
+        {
+            let mut input = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+            input.clear();
+            input.release(KeyCode::KeyB);
+            input.release(KeyCode::KeyM);
+            input.release(KeyCode::KeyU);
+            input.clear();
+            input.press(KeyCode::KeyB);
+            input.press(KeyCode::KeyM);
+            input.press(KeyCode::KeyU);
+        }
+        app.update();
+        assert!(
+            !app.world()
+                .resource::<Assets<StandardMaterial>>()
+                .get(&material)
+                .unwrap()
+                .unlit
+        );
+        assert_eq!(
+            app.world()
+                .resource::<AuthoredGroundcoverStudy>()
+                .scale_factor,
+            1.0
+        );
+        assert_eq!(
+            app.world()
+                .resource::<Assets<StandardMaterial>>()
+                .get(&material)
+                .unwrap()
+                .base_color_texture,
+            Some(straight_texture)
+        );
+    }
+
+    #[test]
+    fn groundcover_study_is_seeded_bounded_and_excludes_floods() {
+        let mut frame = groundcover_study_fixture();
+        let bounds = TerrainChunkBounds {
+            origin: UVec2::ZERO,
+            size: UVec2::splat(8),
+        };
+        let positions = |mesh: &Mesh| {
+            let Some(VertexAttributeValues::Float32x3(values)) =
+                mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+            else {
+                panic!("groundcover must contain 3D positions");
+            };
+            values.clone()
+        };
+        let first =
+            build_groundcover_study_mesh(&frame, bounds, ColorPaletteMode::Natural).unwrap();
+        let repeated =
+            build_groundcover_study_mesh(&frame, bounds, ColorPaletteMode::Natural).unwrap();
+        let original = positions(&first);
+        let Some(Indices::U32(indices)) = first.indices() else {
+            panic!("groundcover must use indexed triangles");
+        };
+        for pair in indices.chunks_exact(6) {
+            assert_eq!([pair[0], pair[1], pair[2]], [pair[5], pair[4], pair[3]]);
+        }
+        assert!(!original.is_empty());
+        assert_eq!(original, positions(&repeated));
+        assert!(original.len() <= 8 * 8 * 36 * 3 * 8);
+        assert!(original.iter().flatten().all(|value| value.is_finite()));
+        for point in &original {
+            let world = Vec2::new(
+                point[0] + frame.world_size.x * 0.5,
+                frame.world_size.y * 0.5 - point[2],
+            );
+            assert!(
+                point[1] >= sample_height_world(&frame.terrain_height, world, TERRAIN_HEIGHT_SCALE)
+            );
+        }
+        frame.world_seed = Some(43);
+        let changed =
+            build_groundcover_study_mesh(&frame, bounds, ColorPaletteMode::Natural).unwrap();
+        assert_ne!(original, positions(&changed));
+        frame.terrain_height.water_depth.fill(1.0);
+        assert!(build_groundcover_study_mesh(&frame, bounds, ColorPaletteMode::Natural).is_none());
+    }
+
+    #[test]
+    fn groundcover_study_transitions_between_biomes_and_respects_water() {
+        let mut grass = sample_layer().tiles()[0];
+        grass.elevation = 0.55;
+        let mut rock = grass;
+        rock.kind = TerrainKind::Rock;
+        let layer = TerrainLayer::from_tiles(2, 1, 50, vec![grass, rock]).unwrap();
+        let terrain = TerrainHeightSnapshot::new(&layer, None, visual::DAYLIGHT_STATIC).unwrap();
+        let value = |x| groundcover_study_cover(&terrain, Vec2::new(x, 25.0));
+        assert_eq!(value(25.0), 1.0);
+        assert_eq!(value(50.0), 0.5);
+        assert_eq!(value(75.0), 0.0);
+        let flooded =
+            TerrainHeightSnapshot::new(&layer, Some(&[1.0, 0.0]), visual::DAYLIGHT_STATIC).unwrap();
+        assert_eq!(
+            groundcover_study_cover(&flooded, Vec2::new(25.0, 25.0)),
+            0.0
+        );
+    }
+
+    #[test]
+    fn groundcover_study_reuses_overlapping_chunks_and_clears_flooded_meshes() {
+        let mut app = App::new();
+        app.insert_resource(SnapshotState {
+            latest: Some(groundcover_study_fixture()),
+            ..default()
+        })
+        .insert_resource(CameraRig {
+            focus_smoothed: Vec2::new(400.0, 400.0),
+            ..default()
+        })
+        .init_resource::<AccessibilityState>()
+        .init_resource::<GroundcoverStudyState>()
+        .init_resource::<Assets<Mesh>>()
+        .init_resource::<Assets<StandardMaterial>>()
+        .add_systems(Update, sync_groundcover_study);
+        app.update();
+        let study = app.world().resource::<GroundcoverStudyState>();
+        let material = app
+            .world()
+            .resource::<Assets<StandardMaterial>>()
+            .get(study.material.as_ref().unwrap())
+            .unwrap();
+        assert!(!material.double_sided);
+        assert!(material.cull_mode.is_some());
+        let before: HashMap<_, _> = app
+            .world()
+            .resource::<GroundcoverStudyState>()
+            .chunks
+            .iter()
+            .map(|(key, record)| (*key, (record.entity, record.mesh.clone())))
+            .collect();
+        assert_eq!(before.len(), 6);
+        app.update();
+        for (key, (entity, mesh)) in &before {
+            let record = &app.world().resource::<GroundcoverStudyState>().chunks[key];
+            assert_eq!((record.entity, &record.mesh), (*entity, mesh));
+        }
+        app.world_mut().resource_mut::<CameraRig>().focus_smoothed.x = 800.0;
+        app.update();
+        let after = &app.world().resource::<GroundcoverStudyState>().chunks;
+        assert_eq!(after.len(), 4);
+        for (key, record) in after {
+            assert_eq!(
+                (record.entity, &record.mesh),
+                (before[key].0, &before[key].1)
+            );
+        }
+        app.world_mut()
+            .resource_mut::<SnapshotState>()
+            .latest
+            .as_mut()
+            .unwrap()
+            .terrain_height
+            .water_depth
+            .fill(1.0);
+        app.update();
+        assert!(
+            app.world()
+                .resource::<GroundcoverStudyState>()
+                .chunks
+                .is_empty()
+        );
+        assert_eq!(app.world().resource::<Assets<Mesh>>().len(), 0);
+    }
+
+    #[test]
+    fn creature_map_uses_world_orientation_and_the_selected_palette() {
+        let terrain = TerrainHeightSnapshot::new(&sample_layer(), None, visual::DAYLIGHT_STATIC)
+            .expect("terrain");
+        let image = creature_terrain_map_image(&terrain, ColorPaletteMode::Natural).unwrap();
+        let pixels = image.data.as_ref().unwrap();
+        for (index, (x, y)) in [(0, 1), (1, 1), (0, 0), (1, 0)].into_iter().enumerate() {
+            let expected = terrain_tile_surface_srgb(&terrain, x, y, ColorPaletteMode::Natural)
+                .map(|value| (value.clamp(0.0, 1.0) * 255.0).round() as u8);
+            assert_eq!(&pixels[index * 4..index * 4 + 3], &expected);
+            assert_eq!(pixels[index * 4 + 3], 255);
+        }
+        let alternate =
+            creature_terrain_map_image(&terrain, ColorPaletteMode::HighContrast).unwrap();
+        assert_ne!(image.data, alternate.data);
+        let mut invalid = terrain;
+        invalid.moisture.pop();
+        assert!(creature_terrain_map_image(&invalid, ColorPaletteMode::Natural).is_none());
+        invalid.dims = UVec2::new(2049, 1);
+        assert!(creature_terrain_map_image(&invalid, ColorPaletteMode::Natural).is_none());
+    }
+
+    #[test]
+    fn creature_map_downsamples_large_supported_worlds() {
+        let tile = sample_layer().tiles()[0];
+        let layer = TerrainLayer::from_tiles(300, 130, 50, vec![tile; 300 * 130]).unwrap();
+        let terrain = TerrainHeightSnapshot::new(&layer, None, visual::DAYLIGHT_STATIC).unwrap();
+        let image = creature_terrain_map_image(&terrain, ColorPaletteMode::Natural).unwrap();
+        assert_eq!((image.width(), image.height()), (128, 64));
+        assert_eq!(image.data.as_ref().unwrap().len(), 128 * 64 * 4);
+    }
+
+    #[test]
+    fn creature_map_smooths_land_noise_without_bleeding_across_water() {
+        let mut samples = vec![
+            CreatureMapSample {
+                color: [0.1, 0.2, 0.3],
+                water: false
+            };
+            9
+        ];
+        samples[4].color = [0.9, 0.3, 0.1];
+        let filtered =
+            creature_map_surface_srgb(&samples, UVec2::splat(3), 1, 1, ColorPaletteMode::Natural);
+        // The 3x3 kernel assigns the center one quarter of the total weight.
+        for (actual, expected) in filtered.into_iter().zip([0.3, 0.225, 0.25]) {
+            assert!((actual - expected).abs() < 0.000_001);
+        }
+        samples[4].water = true;
+        assert_eq!(
+            creature_map_surface_srgb(&samples, UVec2::splat(3), 1, 1, ColorPaletteMode::Natural),
+            samples[4].color
+        );
+
+        let mut tile = sample_layer().tiles()[0];
+        tile.elevation = 0.6;
+        let layer = TerrainLayer::from_tiles(3, 3, 50, vec![tile; 9]).unwrap();
+        let mut depth = vec![0.0; 9];
+        depth[4] = 1.0;
+        let terrain =
+            TerrainHeightSnapshot::new(&layer, Some(&depth), visual::DAYLIGHT_STATIC).unwrap();
+        let high_contrast = creature_terrain_map_image(&terrain, ColorPaletteMode::HighContrast)
+            .unwrap()
+            .data
+            .unwrap();
+        let expected = terrain_tile_surface_srgb(&terrain, 1, 1, ColorPaletteMode::HighContrast)
+            .map(|value| (value.clamp(0.0, 1.0) * 255.0).round() as u8);
+        assert_eq!(&high_contrast[16..19], &expected);
+
+        let water = terrain_tile_surface_srgb(&terrain, 1, 1, ColorPaletteMode::Natural);
+        let image = creature_terrain_map_image(&terrain, ColorPaletteMode::Natural).unwrap();
+        let expected = water.map(|value| (value.clamp(0.0, 1.0) * 255.0).round() as u8);
+        assert_eq!(&image.data.unwrap()[16..19], &expected);
+    }
+
+    #[test]
+    fn creature_map_recovers_a_missing_image_and_hides_invalid_terrain() {
+        let frame = sample_world_snapshot();
+        let mut app = App::new();
+        app.insert_resource(Assets::<Image>::default());
+        app.insert_resource(AccessibilityState::default());
+        app.insert_resource(SnapshotState {
+            latest: Some(frame),
+            ..default()
+        });
+        let handle = app
+            .world_mut()
+            .resource_mut::<Assets<Image>>()
+            .add(Image::default());
+        let map = app
+            .world_mut()
+            .spawn((
+                ImageNode::new(handle.clone()),
+                Node::default(),
+                CreatureTerrainMap,
+            ))
+            .id();
+        let placeholder = app
+            .world_mut()
+            .spawn((
+                Node {
+                    display: Display::None,
+                    ..default()
+                },
+                CreatureTerrainMapUnavailable,
+            ))
+            .id();
+        app.add_systems(Update, update_creature_terrain_map);
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<Assets<Image>>()
+                .get(&handle)
+                .unwrap()
+                .width(),
+            2
+        );
+        app.world_mut()
+            .resource_mut::<Assets<Image>>()
+            .remove(handle.id());
+        app.update();
+        let replacement = app.world().get::<ImageNode>(map).unwrap().image.clone();
+        assert_ne!(replacement, handle);
+        assert!(
+            app.world()
+                .resource::<Assets<Image>>()
+                .get(&replacement)
+                .is_some()
+        );
+        let removed = app
+            .world_mut()
+            .resource_mut::<SnapshotState>()
+            .latest
+            .as_mut()
+            .unwrap()
+            .terrain_height
+            .moisture
+            .pop()
+            .unwrap();
+        app.update();
+        assert_eq!(app.world().get::<Node>(map).unwrap().display, Display::None);
+        assert_eq!(
+            app.world().get::<Node>(placeholder).unwrap().display,
+            Display::Flex
+        );
+        app.world_mut()
+            .resource_mut::<SnapshotState>()
+            .latest
+            .as_mut()
+            .unwrap()
+            .terrain_height
+            .moisture
+            .push(removed);
+        app.update();
+        assert_eq!(app.world().get::<Node>(map).unwrap().display, Display::Flex);
+        assert_eq!(
+            app.world().get::<Node>(placeholder).unwrap().display,
+            Display::None
+        );
+    }
+
     pub(super) fn sample_world_snapshot() -> WorldSnapshot {
         let layer = sample_layer();
         let height =
@@ -19755,7 +21864,9 @@ mod terrain_tests {
             reduced_motion: false,
             paused: false,
             world_size,
+            world_seed: Some(42),
             agent_radius: 12.0,
+            physical_agent_radius: 12.0,
             terrain_color: color,
             terrain_height: height,
             food: Arc::new(FoodLayerSnapshot {
@@ -21948,7 +24059,9 @@ mod terrain_tests {
             reduced_motion: false,
             paused: false,
             world_size: Vec2::splat(150.0),
+            world_seed: Some(42),
             agent_radius: 12.0,
+            physical_agent_radius: 12.0,
             terrain_color: TerrainColorMap {
                 width: 3,
                 height: 3,
@@ -22918,7 +25031,7 @@ mod terrain_tests {
     }
 
     #[test]
-    fn terrain_material_remains_dielectric_and_nonemissive_after_updates() {
+    fn terrain_material_updates_without_losing_roughness_texture() {
         let snapshot = sample_world_snapshot();
         let mut stats = build_chunk_mesh(
             &snapshot,
@@ -22943,10 +25056,8 @@ mod terrain_tests {
         stats.mean_moisture = 1.0;
         update_chunk_material(&mut materials, &handle, &stats);
         let updated = &materials.get(&handle).unwrap().base;
-        assert!(updated.perceptual_roughness < dry_roughness);
-        assert_eq!(updated.metallic, 0.0);
-        assert_eq!(updated.reflectance, 0.5);
-        assert_eq!(updated.emissive, Color::BLACK.into());
+        assert!(updated.perceptual_roughness > dry_roughness);
+        assert!((updated.metallic - stats.mean_slope * 0.35).abs() < f32::EPSILON);
         assert_eq!(updated.metallic_roughness_texture.as_ref(), Some(&texture));
     }
 
