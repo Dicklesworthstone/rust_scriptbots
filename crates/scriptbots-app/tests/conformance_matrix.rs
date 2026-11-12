@@ -336,11 +336,16 @@ fn test_mcp_protocol_negotiation_and_tool_discovery() {
         "experiment_create",
         "experiment_list",
         "experiment_status",
+        "experiment_compare",
         "experiment_cancel",
         "experiment_resume",
         "checkpoint_create",
         "checkpoint_list",
         "checkpoint_status",
+        "checkpoint_branch_create",
+        "checkpoint_branch_list",
+        "checkpoint_branch_status",
+        "checkpoint_branch_cancel",
         "artifact_list",
         "artifact_get",
     ];
@@ -350,7 +355,7 @@ fn test_mcp_protocol_negotiation_and_tool_discovery() {
             "expected tool '{expected}' missing from roster: {tool_names:?}"
         );
     }
-    assert_eq!(tool_names.len(), 30);
+    assert_eq!(tool_names.len(), 35);
 }
 
 #[test]
@@ -926,11 +931,11 @@ fn test_version_and_schema_cross_surface_parity() {
     assert_eq!(schema1_json["title"], mcp_schema["title"]);
     assert_eq!(
         schema1_json["mcp_tools"].as_array().map(|a| a.len()),
-        Some(30)
+        Some(35)
     );
     assert_eq!(
         mcp_schema["mcp_tools"].as_array().map(|a| a.len()),
-        Some(30)
+        Some(35)
     );
     assert!(schema1_json["routes"].as_array().map_or(0, |a| a.len()) >= 20);
 }

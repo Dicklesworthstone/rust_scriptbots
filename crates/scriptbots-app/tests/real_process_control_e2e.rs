@@ -1718,7 +1718,7 @@ fn real_process_server_mode_applies_commands_and_refuses_an_unpresented_screensh
         let tools = list_json["result"]["tools"]
             .as_array()
             .expect("tools array");
-        assert_eq!(tools.len(), 30, "MCP tools/list must return all 30 tools");
+        assert_eq!(tools.len(), 35, "MCP tools/list must return all 35 tools");
 
         // MCP tools/call get_status
         let status_payload = br#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_status","arguments":{}}}"#;
@@ -3136,7 +3136,7 @@ fn real_process_experiments_checkpoints_artifacts_e2e() -> Result<()> {
         let (s_code, s_body) = http(rest_addr, "GET", "/api/v1/schema")?;
         assert_eq!(s_code, 200);
         let s_json: serde_json::Value = serde_json::from_str(&s_body)?;
-        assert_eq!(s_json["mcp_tools"].as_array().map(|a| a.len()), Some(30));
+        assert_eq!(s_json["mcp_tools"].as_array().map(|a| a.len()), Some(35));
         log_event(serde_json::json!({
             "schema": "scriptbots.e2e-experiment-checkpoint-artifact.v1",
             "transport": "rest",
@@ -3181,8 +3181,8 @@ fn real_process_experiments_checkpoints_artifacts_e2e() -> Result<()> {
         let tools = list_json["result"]["tools"].as_array().expect("tools");
         assert_eq!(
             tools.len(),
-            30,
-            "FastMCP tools roster must have exactly 30 tools"
+            35,
+            "FastMCP tools roster must have exactly 35 tools"
         );
 
         // --- 3. Fault Injection ---
