@@ -995,6 +995,13 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
             .add_systems(Update, report_frame_metrics);
     }
 
+    // Compare the existing clear-color sky with Bevy's scattering in the
+    // same scene before changing the normal renderer or its lighting.
+    if env::var("SCRIPTBOTS_ATMOSPHERE_STUDY").as_deref() == Ok("1") {
+        app.init_resource::<AtmosphereStudy>()
+            .add_systems(Update, toggle_atmosphere_study);
+    }
+
     // A look-development study, not the default world renderer. It is kept
     // opt-in until the actual GPU views and lifecycle have been reviewed.
     if env::var("SCRIPTBOTS_GROUNDCOVER_ASSET_DIR").is_ok() {
@@ -1507,7 +1514,7 @@ impl AgentMaterialAccess<'_> {
         } = self
         {
             let rows = population
-                .checked_mul(14 + 2 * NUM_EYES)
+                .checked_mul(AGENT_FIXED_PARTS + 2 * NUM_EYES)
                 .ok_or_else(|| anyhow!("creature appearance population overflow"))?;
             table.reserve(rows, materials, buffers)?;
         }
@@ -1527,6 +1534,8 @@ struct EyePart {
     pupil: PartRef,
 }
 
+const AGENT_FIXED_PARTS: usize = 12;
+
 struct AgentRecord {
     root: Entity,
     body: PartRef,
@@ -1541,8 +1550,6 @@ struct AgentRecord {
     ear_right: PartRef,
     selection: PartRef,
     indicator: PartRef,
-    sound_inner: PartRef,
-    sound_outer: PartRef,
     eyes: Vec<EyePart>,
 }
 
@@ -1851,6 +1858,7 @@ pub(crate) struct AgentMeshes {
     base_radius: f32,
     body: Handle<Mesh>,
     stripe: Handle<Mesh>,
+    mouth: Handle<Mesh>,
     wheel: Handle<Mesh>,
     joint: Handle<Mesh>,
     spike: Handle<Mesh>,
@@ -1957,6 +1965,53 @@ pub(crate) fn creature_stripe_mesh() -> Mesh {
             let c = a + 1;
             let d = b + 1;
             indices.extend_from_slice(&[a, c, b, b, c, d]);
+        }
+    }
+    let mut mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+    );
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+    mesh.insert_indices(Indices::U32(indices));
+    mesh
+}
+
+/// An oval on the lower front cap, expressed in agent-radius units. The
+/// vertices follow the same scaled capsule as the body, with a small offset
+/// to avoid fighting its surface. It shares the body's idle animation.
+pub(crate) fn creature_mouth_mesh() -> Mesh {
+    const SEGMENTS: u32 = 32;
+    const RINGS: u32 = 4;
+    const HALF_CYLINDER: f32 = 2.35 * 0.8 / 2.6;
+    const CAP_LENGTH: f32 = 2.35 * 0.5 - HALF_CYLINDER;
+    const RADIUS: f32 = 0.88;
+    let mut positions = Vec::new();
+    let mut normals = Vec::new();
+    let mut uvs = Vec::new();
+    for ring in 0..=RINGS {
+        let r = ring as f32 / RINGS as f32;
+        for segment in 0..=SEGMENTS {
+            let angle = segment as f32 * std::f32::consts::TAU / SEGMENTS as f32;
+            let (sin, cos) = angle.sin_cos();
+            let y = -0.38 + 0.10 * r * sin;
+            let z = 0.31 * r * cos;
+            let cap = (1.0 - (y * y + z * z) / RADIUS.powi(2)).sqrt();
+            let x = HALF_CYLINDER + CAP_LENGTH * cap + 0.012;
+            let normal =
+                Vec3::new(cap / CAP_LENGTH, y / RADIUS.powi(2), z / RADIUS.powi(2)).normalize();
+            positions.push([x, y, z]);
+            normals.push(normal.to_array());
+            uvs.push([0.5 + 0.5 * r * cos, 0.5 + 0.5 * r * sin]);
+        }
+    }
+    let mut indices = Vec::new();
+    for ring in 0..RINGS {
+        for segment in 0..SEGMENTS {
+            let a = ring * (SEGMENTS + 1) + segment;
+            let b = a + SEGMENTS + 1;
+            indices.extend_from_slice(&[a, a + 1, b, b, a + 1, b + 1]);
         }
     }
     let mut mesh = Mesh::new(
@@ -2313,7 +2368,7 @@ fn cleanup_agent_materials(
 }
 
 fn agent_parts(record: &AgentRecord) -> impl Iterator<Item = &PartRef> {
-    [
+    let fixed: [&PartRef; AGENT_FIXED_PARTS] = [
         &record.body,
         &record.stripe,
         &record.wheel_left,
@@ -2326,11 +2381,10 @@ fn agent_parts(record: &AgentRecord) -> impl Iterator<Item = &PartRef> {
         &record.ear_right,
         &record.selection,
         &record.indicator,
-        &record.sound_inner,
-        &record.sound_outer,
-    ]
-    .into_iter()
-    .chain(record.eyes.iter().flat_map(|eye| [&eye.sclera, &eye.pupil]))
+    ];
+    fixed
+        .into_iter()
+        .chain(record.eyes.iter().flat_map(|eye| [&eye.sclera, &eye.pupil]))
 }
 
 fn despawn_agent_entities(record: AgentRecord, commands: &mut Commands) {
@@ -2352,8 +2406,6 @@ fn despawn_agent_entities(record: AgentRecord, commands: &mut Commands) {
         ear_right,
         selection,
         indicator,
-        sound_inner,
-        sound_outer,
         eyes,
     } = record;
 
@@ -2374,9 +2426,6 @@ fn despawn_agent_entities(record: AgentRecord, commands: &mut Commands) {
     despawn(commands, ear_right);
     despawn(commands, selection);
     despawn(commands, indicator);
-    despawn(commands, sound_inner);
-    despawn(commands, sound_outer);
-
     commands.entity(root).despawn();
 }
 
@@ -5724,6 +5773,34 @@ fn terrain_sky_color() -> Color {
     Color::srgb(r, g, b)
 }
 
+#[derive(Resource, Default)]
+struct AtmosphereStudy {
+    enabled: bool,
+}
+
+/// L is available only in the opt-in study, so the comparison keeps the
+/// camera, simulation, lighting, fog, exposure, and quality tier unchanged.
+fn toggle_atmosphere_study(
+    mut commands: Commands,
+    keys: Res<ButtonInput<KeyCode>>,
+    mut study: ResMut<AtmosphereStudy>,
+    cameras: Query<Entity, With<PrimaryCamera>>,
+) {
+    if !keys.just_pressed(KeyCode::KeyL) {
+        return;
+    }
+    study.enabled = !study.enabled;
+    for camera in &cameras {
+        if study.enabled {
+            commands.entity(camera).insert(bevy::pbr::Atmosphere::EARTH);
+        } else {
+            commands
+                .entity(camera)
+                .remove::<(bevy::pbr::Atmosphere, bevy::pbr::AtmosphereSettings)>();
+        }
+    }
+}
+
 fn setup_scene(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -5780,6 +5857,7 @@ fn setup_scene(
 
     let body_mesh = meshes.add(Mesh::from(AGENT_BODY_CAPSULE));
     let stripe_mesh = meshes.add(creature_stripe_mesh());
+    let mouth_mesh = meshes.add(creature_mouth_mesh());
     let wheel_mesh = meshes.add(Mesh::from(Torus::new(0.3, 0.6)));
     let joint_mesh = meshes.add(creature_joint_mesh());
     let spike_mesh = meshes.add(Mesh::from(Cone {
@@ -5793,6 +5871,7 @@ fn setup_scene(
         base_radius: 1.0,
         body: body_mesh,
         stripe: stripe_mesh,
+        mouth: mouth_mesh,
         wheel: wheel_mesh,
         joint: joint_mesh,
         spike: spike_mesh,
@@ -6663,15 +6742,15 @@ fn setup_scene(
                                 ));
                                 cell.spawn((
                                     Node {
-                                        width: Val::Px(24.0),
-                                        height: Val::Px(24.0),
+                                        width: Val::Px(32.0),
+                                        height: Val::Px(32.0),
                                         flex_shrink: 0.0,
                                         border: UiRect::all(Val::Px(1.0)),
                                         ..default()
                                     },
                                     BackgroundColor(Color::srgb(0.08, 0.16, 0.14)),
                                     BorderColor::all(Color::srgb(0.35, 0.50, 0.42)),
-                                    BorderRadius::all(Val::Px(12.0)),
+                                    BorderRadius::all(Val::Px(16.0)),
                                     CreatureEyeCompass(eye),
                                 ))
                                 .with_children(|compass| {
@@ -6690,17 +6769,17 @@ fn setup_scene(
                                             position_type: PositionType::Absolute,
                                             left: Val::Percent(50.0),
                                             top: Val::Percent(50.0),
-                                            width: Val::Px(10.0),
-                                            height: Val::Px(10.0),
+                                            width: Val::Px(6.0),
+                                            height: Val::Px(6.0),
                                             margin: UiRect {
-                                                left: Val::Px(-5.0),
-                                                top: Val::Px(-5.0),
+                                                left: Val::Px(-3.0),
+                                                top: Val::Px(-3.0),
                                                 ..default()
                                             },
                                             ..default()
                                         },
                                         BackgroundColor(Color::srgb(0.17, 0.22, 0.20)),
-                                        BorderRadius::all(Val::Px(5.0)),
+                                        BorderRadius::all(Val::Px(3.0)),
                                         CreatureEyeSwatch(eye),
                                     ));
                                     // A fixed notch marks forward; the brighter dot
@@ -12709,6 +12788,42 @@ mod adaptive_governor_tests {
 #[cfg(test)]
 mod quality_tier_consumer_tests {
     use super::*;
+
+    #[test]
+    fn atmosphere_study_toggles_only_the_primary_camera() {
+        let mut app = App::new();
+        app.init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<AtmosphereStudy>()
+            .add_systems(Update, toggle_atmosphere_study);
+        let primary = app.world_mut().spawn((PrimaryCamera, Hdr)).id();
+        let other = app.world_mut().spawn(Hdr).id();
+
+        app.update();
+        assert!(app.world().get::<bevy::pbr::Atmosphere>(primary).is_none());
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::KeyL);
+        app.update();
+        assert!(app.world().get::<bevy::pbr::Atmosphere>(primary).is_some());
+        assert!(app.world().get::<bevy::pbr::Atmosphere>(other).is_none());
+        assert!(app.world().resource::<AtmosphereStudy>().enabled);
+
+        {
+            let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+            keys.release(KeyCode::KeyL);
+            keys.clear();
+            keys.press(KeyCode::KeyL);
+        }
+        app.update();
+        assert!(app.world().get::<bevy::pbr::Atmosphere>(primary).is_none());
+        assert!(
+            app.world()
+                .get::<bevy::pbr::AtmosphereSettings>(primary)
+                .is_none()
+        );
+        assert!(app.world().get::<Hdr>(primary).is_some());
+        assert!(!app.world().resource::<AtmosphereStudy>().enabled);
+    }
 
     #[test]
     fn adaptive_quality_updates_the_visible_label_and_preserves_software_ceiling() {
@@ -23754,6 +23869,45 @@ mod terrain_tests {
     }
 
     #[test]
+    fn mouth_follows_front_cap_and_body_idle_motion() {
+        let mesh = creature_mouth_mesh();
+        let VertexAttributeValues::Float32x3(points) =
+            mesh.attribute(Mesh::ATTRIBUTE_POSITION).unwrap()
+        else {
+            panic!("mouth positions missing");
+        };
+        let Indices::U32(indices) = mesh.indices().unwrap() else {
+            panic!("mouth indices missing");
+        };
+        let surface = |p: Vec3| {
+            let half = 2.35 * 0.8 / 2.6;
+            let cap_length = 2.35 * 0.5 - half;
+            half + cap_length * (1.0 - (p.y * p.y + p.z * p.z) / 0.88_f32.powi(2)).sqrt()
+        };
+        for tri in indices.chunks_exact(3) {
+            let [a, b, c] = [tri[0], tri[1], tri[2]].map(|i| Vec3::from_array(points[i as usize]));
+            for p in [a, b, c, (a + b + c) / 3.0] {
+                let clearance = p.x - surface(p);
+                assert!((0.005..0.02).contains(&clearance), "clearance {clearance}");
+                assert!(p.y < -0.27, "mouth overlaps the spike axis");
+            }
+        }
+        let app = eye_geometry_test_app();
+        let record = &app.world().resource::<AgentRegistry>().records[&AgentUid(1)];
+        let body = app
+            .world()
+            .get::<IdleBodyTarget>(record.body.entity)
+            .unwrap();
+        let mouth = app
+            .world()
+            .get::<IdleBodyTarget>(record.mouth.entity)
+            .unwrap();
+        assert_eq!(body.phase, mouth.phase);
+        assert_eq!(mouth.transform.translation, Vec3::ZERO);
+        assert_eq!(mouth.transform.rotation, Quat::IDENTITY);
+    }
+
+    #[test]
     fn spike_base_is_embedded_in_body_without_moving_the_tip() {
         let mut app = eye_geometry_test_app();
         for radius in [0.2, 10.0, 50.0] {
@@ -23890,17 +24044,22 @@ mod terrain_tests {
     }
 
     #[test]
-    fn changed_agent_snapshot_updates_pupil_and_sound_visibility() {
+    fn changed_agent_snapshot_updates_pupil_and_ear_sound_cue() {
         let mut app = eye_geometry_test_app();
-        let (pupil, sound) = {
+        let (pupil, ear) = {
             let record = &app.world().resource::<AgentRegistry>().records[&AgentUid(1)];
-            (record.eyes[0].pupil.entity, record.sound_inner.entity)
+            (
+                record.eyes[0].pupil.entity,
+                record.ear_left.material.clone().unwrap(),
+            )
         };
         let before = app.world().get::<Transform>(pupil).unwrap().translation;
-        assert_eq!(
-            *app.world().get::<Visibility>(sound).unwrap(),
-            Visibility::Visible
-        );
+        let sound = app
+            .world()
+            .resource::<Assets<StandardMaterial>>()
+            .get(&ear)
+            .unwrap()
+            .emissive;
         {
             let mut state = app.world_mut().resource_mut::<SnapshotState>();
             let snapshot = state.latest.as_mut().unwrap();
@@ -23914,10 +24073,59 @@ mod terrain_tests {
             app.world().get::<Transform>(pupil).unwrap().translation,
             before
         );
-        assert_eq!(
-            *app.world().get::<Visibility>(sound).unwrap(),
-            Visibility::Hidden
-        );
+        let silent = app
+            .world()
+            .resource::<Assets<StandardMaterial>>()
+            .get(&ear)
+            .unwrap()
+            .emissive;
+        assert_ne!(sound, silent);
+    }
+
+    #[test]
+    fn ear_sound_cue_reacts_to_both_inputs_across_palettes_and_selection() {
+        let mut app = eye_geometry_test_app();
+        let ears = {
+            let record = &app.world().resource::<AgentRegistry>().records[&AgentUid(1)];
+            [
+                record.ear_left.material.clone().unwrap(),
+                record.ear_right.material.clone().unwrap(),
+            ]
+        };
+        for palette in [
+            ColorPaletteMode::Natural,
+            ColorPaletteMode::Deuteranopia,
+            ColorPaletteMode::Protanopia,
+            ColorPaletteMode::Tritanopia,
+            ColorPaletteMode::HighContrast,
+        ] {
+            app.world_mut().resource_mut::<AccessibilityState>().palette = palette;
+            let mut readings = Vec::new();
+            for (vocal, ambient, selection) in [
+                (0.0, 0.0, SelectionState::None),
+                (0.0, 1.0, SelectionState::None),
+                (1.0, 0.0, SelectionState::None),
+                (1.0, 0.0, SelectionState::Selected),
+            ] {
+                {
+                    let mut state = app.world_mut().resource_mut::<SnapshotState>();
+                    let snapshot = state.latest.as_mut().unwrap();
+                    snapshot.revision += 1;
+                    snapshot.agents[0].sound_output = vocal;
+                    snapshot.agents[0].sound_level = ambient;
+                    snapshot.agents[0].selection = selection;
+                }
+                app.update();
+                let materials = app.world().resource::<Assets<StandardMaterial>>();
+                let left = materials.get(&ears[0]).unwrap().emissive;
+                let right = materials.get(&ears[1]).unwrap().emissive;
+                assert_eq!(left, right);
+                readings.push(left);
+            }
+            assert_ne!(readings[0], readings[1], "ambient sound in {palette:?}");
+            assert_ne!(readings[0], readings[2], "vocal sound in {palette:?}");
+            assert_eq!(readings[2], readings[3], "selection in {palette:?}");
+        }
     }
 
     #[test]
@@ -26743,6 +26951,101 @@ mod terrain_tests {
     }
 
     #[test]
+    fn wheel_suspension_keeps_contact_with_extended_spike_on_uneven_terrain() {
+        let mut snapshot = sample_world_snapshot();
+        snapshot.world_size = Vec2::splat(300.0);
+        snapshot.agent_radius = 10.0;
+        snapshot.terrain_height.dims = UVec2::splat(4);
+        snapshot.terrain_height.cell_size = 100;
+        snapshot.terrain_height.elevation = vec![
+            0.1, 0.2, 0.1, 0.2, 0.3, 0.6, 0.2, 0.4, 0.1, 0.4, 0.8, 0.3, 0.2, 0.1, 0.4, 0.2,
+        ]
+        .into();
+        let mut agent = sample_agent_visual();
+        let initial = AgentPoseTarget {
+            translation: Vec3::ZERO,
+            rotation: Quat::IDENTITY,
+            tick: 1,
+        };
+        let mut app = App::new();
+        app.insert_resource(SnapshotState {
+            latest: Some(snapshot.clone()),
+            ..default()
+        })
+        .add_systems(Update, conform_agent_wheels);
+        let root = app
+            .world_mut()
+            .spawn((
+                Transform::default(),
+                agent_ground_footprint(&snapshot, &agent),
+                AgentDisplayPose {
+                    translation: initial.translation,
+                    rotation: initial.rotation,
+                    previous_target: initial,
+                },
+            ))
+            .id();
+        let wheels = [-1.0, 1.0].map(|side| {
+            app.world_mut()
+                .spawn((Transform::default(), WheelGroundContact { root, side }))
+                .id()
+        });
+        let mut worst = (f32::NEG_INFINITY, Vec2::ZERO, 0.0, 0.0, 0.0);
+        for spike in [0.0_f32, 8.2] {
+            agent.spike_length = spike;
+            *app.world_mut()
+                .get_mut::<AgentGroundFootprint>(root)
+                .unwrap() = agent_ground_footprint(&snapshot, &agent);
+            for x in [75.0_f32, 95.0, 150.0, 195.0, 225.0] {
+                for y in [75.0_f32, 95.0, 150.0, 195.0, 225.0] {
+                    for heading in [0.0_f32, 0.8, -1.7, 2.4] {
+                        agent.position = Vec2::new(x, y);
+                        agent.heading = heading;
+                        let (translation, rotation) = agent_surface_pose(&snapshot, &agent);
+                        *app.world_mut().get_mut::<Transform>(root).unwrap() =
+                            Transform::from_translation(translation).with_rotation(rotation);
+                        app.update();
+                        for (side, wheel) in [-1.0_f32, 1.0].into_iter().zip(wheels) {
+                            let wheel = app.world().get::<Transform>(wheel).unwrap();
+                            let mut clearance = f32::INFINITY;
+                            include_ground_mesh(
+                                &ground_mesh_samples().wheel,
+                                Transform::from_translation(wheel.translation)
+                                    .with_scale(Vec3::splat(snapshot.agent_radius)),
+                                rotation,
+                                agent.position,
+                                &snapshot.terrain_height,
+                                |offset| {
+                                    let at = agent.position + Vec2::new(offset.x, -offset.z);
+                                    let ground = sample_height_world(
+                                        &snapshot.terrain_height,
+                                        at,
+                                        TERRAIN_HEIGHT_SCALE,
+                                    );
+                                    clearance = clearance.min(translation.y + offset.y - ground);
+                                },
+                            );
+                            assert!(clearance.is_finite() && clearance >= -0.01);
+                            if clearance > worst.0 {
+                                worst = (clearance, agent.position, heading, spike, side);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            worst.0 <= 0.05,
+            "wheel gap {} at {:?}, heading {}, spike {}, side {}",
+            worst.0,
+            worst.1,
+            worst.2,
+            worst.3,
+            worst.4
+        );
+    }
+
+    #[test]
     fn planar_support_shortcut_distinguishes_terrain_seams() {
         let dims = UVec2::new(4, 4);
         let lower = terrain_triangle_at(Vec2::new(1.2, 1.3), dims);
@@ -27094,7 +27397,7 @@ fn spawn_agent_entity(
 
     let mouth = spawn_part(
         commands,
-        &meshes.quad,
+        &meshes.mouth,
         materials,
         Color::srgb(0.72, 0.2, 0.16),
         Color::linear_rgb(0.3, 0.08, 0.06),
@@ -27207,32 +27510,6 @@ fn spawn_agent_entity(
     )?;
     commands.entity(root).add_child(indicator.entity);
 
-    let sound_inner = spawn_part(
-        commands,
-        &meshes.quad,
-        materials,
-        Color::srgba(0.3, 0.55, 0.95, 0.0),
-        Color::linear_rgb(0.0, 0.0, 0.0),
-        AlphaMode::Add,
-        true,
-        true,
-        Transform::IDENTITY,
-    )?;
-    commands.entity(root).add_child(sound_inner.entity);
-
-    let sound_outer = spawn_part(
-        commands,
-        &meshes.quad,
-        materials,
-        Color::srgba(0.15, 0.45, 0.95, 0.0),
-        Color::linear_rgb(0.0, 0.0, 0.0),
-        AlphaMode::Add,
-        true,
-        true,
-        Transform::IDENTITY,
-    )?;
-    commands.entity(root).add_child(sound_outer.entity);
-
     let mut eyes = Vec::with_capacity(NUM_EYES);
     let sclera_srgb = visual::visual_style().agents.eye_sclera_srgb;
     let pupil_srgb = visual::visual_style().agents.eye_pupil_srgb;
@@ -27286,8 +27563,6 @@ fn spawn_agent_entity(
         ear_right,
         selection,
         indicator,
-        sound_inner,
-        sound_outer,
         eyes,
     };
 
@@ -27416,21 +27691,19 @@ fn apply_agent_visuals(
     update_agent_part_colors(materials, &record.wheel_left, left_color, left_emissive)?;
     update_agent_part_colors(materials, &record.wheel_right, right_color, right_emissive)?;
 
-    let vocal_energy = clamp01(agent.sound_output.abs() * agent.sound_multiplier.max(0.1));
-    let mouth_activity = visuals.mouth_activity;
-    let mouth_height = scale_factor * (0.25 + 0.6 * mouth_activity);
-    let mouth_depth = scale_factor * 0.12;
-    let mouth_width = body_radius * 0.95;
-    let mouth_transform = Transform {
-        translation: Vec3::new(body_length * 0.58, scale_factor * 0.04, 0.0),
-        rotation: Quat::from_rotation_y(FRAC_PI_2),
-        scale: Vec3::new(
-            mouth_depth.max(0.02),
-            mouth_height.max(0.05),
-            mouth_width.max(0.05),
-        ),
+    let vocal_energy = if agent.sound_output.is_finite() && agent.sound_multiplier.is_finite() {
+        clamp01(agent.sound_output.abs() * agent.sound_multiplier.max(0.1))
+    } else {
+        0.0
     };
+    let mouth_activity = visuals.mouth_activity;
+    let mouth_transform = Transform::from_scale(Vec3::splat(scale_factor));
     update_part_transform(commands, &record.mouth, mouth_transform);
+    commands.entity(record.mouth.entity).insert(IdleBodyTarget {
+        transform: mouth_transform,
+        phase: (agent.uid.0.wrapping_mul(2_654_435_761) % 1024) as f32
+            * (std::f32::consts::TAU / 1024.0),
+    });
     let mouth_rgb = Vec3::from_array(visuals.mouth_color);
     let mouth_color = srgb_from_vec_with_palette(mouth_rgb, 0.9, palette);
     let mouth_emissive = palette_emissive_from_vec(
@@ -27535,8 +27808,17 @@ fn apply_agent_visuals(
     let ear_base = Vec3::from_array(visual::visual_style().agents.ear_srgb);
     let ear_rgb = ear_base * (0.9 + hearing * 0.45);
     let ear_color = srgb_from_vec_with_palette(ear_rgb, 1.0, palette);
+    // Keep the combined sound cue on the creature instead of drawing thin
+    // floating planes in front of its face. The HUD retains both readings.
+    let ambient_sound = if agent.sound_level.is_finite() {
+        clamp01(agent.sound_level)
+    } else {
+        0.0
+    };
+    let sound_activity = (vocal_energy * 0.8 + ambient_sound * 0.4).clamp(0.0, 1.0);
     let ear_emissive = palette_emissive_from_vec(
-        Vec3::new(ear_rgb.x * 0.18, ear_rgb.y * 0.2, ear_rgb.z * 0.15),
+        Vec3::new(ear_rgb.x * 0.18, ear_rgb.y * 0.2, ear_rgb.z * 0.15)
+            + Vec3::new(0.18, 0.28, 0.45) * sound_activity,
         palette,
     );
     update_agent_part_colors(materials, &record.ear_left, ear_color, ear_emissive)?;
@@ -27610,71 +27892,6 @@ fn apply_agent_visuals(
         indicator_emissive,
     )?;
     set_part_visibility(commands, &record.indicator, indicator_alpha > 0.05);
-
-    let ambient_sound = clamp01(agent.sound_level);
-    let arc_strength = (vocal_energy * 0.8 + ambient_sound * 0.4).clamp(0.0, 1.0);
-    let arc_base_translation = Vec3::new(
-        body_length * (0.75 + arc_strength * 0.25),
-        scale_factor * 0.05,
-        0.0,
-    );
-    let arc_rotation = Quat::from_rotation_y(FRAC_PI_2);
-
-    let inner_visible = arc_strength > 0.02;
-    set_part_visibility(commands, &record.sound_inner, inner_visible);
-    if inner_visible {
-        let inner_scale = Vec3::new(
-            (scale_factor * 0.08).max(0.01),
-            (scale_factor * (0.35 + arc_strength * 0.55)).max(0.05),
-            (scale_factor * 0.05).max(0.01),
-        );
-        let inner_transform = Transform {
-            translation: arc_base_translation + Vec3::new(0.0, scale_factor * 0.04, 0.0),
-            rotation: arc_rotation,
-            scale: inner_scale,
-        };
-        update_part_transform(commands, &record.sound_inner, inner_transform);
-        let inner_rgb = Vec3::new(0.32, 0.6, 1.0);
-        let inner_alpha = 0.15 + arc_strength * 0.55;
-        let inner_color = srgb_from_vec_with_palette(inner_rgb, inner_alpha, palette);
-        let inner_emissive = palette_emissive_from_vec(
-            Vec3::new(
-                inner_rgb.x * (0.6 + arc_strength * 0.8),
-                inner_rgb.y * (0.6 + arc_strength * 0.8),
-                inner_rgb.z * (0.9 + arc_strength * 0.9),
-            ),
-            palette,
-        );
-        update_agent_part_colors(materials, &record.sound_inner, inner_color, inner_emissive)?;
-    }
-
-    let outer_visible = arc_strength > 0.04;
-    set_part_visibility(commands, &record.sound_outer, outer_visible);
-    if outer_visible {
-        let outer_scale = Vec3::new(
-            (scale_factor * 0.12).max(0.02),
-            (scale_factor * (0.55 + arc_strength * 0.85)).max(0.08),
-            (scale_factor * 0.05).max(0.01),
-        );
-        let outer_transform = Transform {
-            translation: arc_base_translation + Vec3::new(0.0, scale_factor * 0.02, 0.0),
-            rotation: arc_rotation,
-            scale: outer_scale,
-        };
-        update_part_transform(commands, &record.sound_outer, outer_transform);
-        let outer_rgb = Vec3::new(0.18, 0.45, 0.95);
-        let outer_alpha = 0.08 + arc_strength * 0.45;
-        let outer_color = srgb_from_vec_with_palette(outer_rgb, outer_alpha, palette);
-        let outer_emissive = palette_emissive_from_vec(
-            Vec3::new(
-                outer_rgb.x * (0.4 + arc_strength * 0.7),
-                outer_rgb.y * (0.4 + arc_strength * 0.7),
-                outer_rgb.z * (0.6 + arc_strength * 0.8),
-            ),
-            palette,
-        );
-        update_agent_part_colors(materials, &record.sound_outer, outer_color, outer_emissive)?;
-    }
 
     let eye_base = scale_factor * (0.12 + clamp01(agent.trait_modifiers.eye) * 0.07);
     let pupil_scale = eye_base * 0.45;

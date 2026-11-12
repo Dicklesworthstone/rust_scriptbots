@@ -457,9 +457,9 @@ impl Plugin for AppearancePlugin {
 mod tests {
     use super::*;
     use crate::{
-        AccessibilityState, AgentMeshes, AgentRegistry, ColorPaletteMode, ReflectionProbeAssets,
-        SnapshotState, TerrainChunkRegistry, TerrainMaterial, WheelSuspensionJoint, WorldSnapshot,
-        agent_parts, sync_world,
+        AGENT_FIXED_PARTS, AccessibilityState, AgentMeshes, AgentRegistry, ColorPaletteMode,
+        ReflectionProbeAssets, SnapshotState, TerrainChunkRegistry, TerrainMaterial,
+        WheelSuspensionJoint, WorldSnapshot, agent_parts, sync_world,
     };
     use bevy::mesh::MeshTag;
     use scriptbots_core::{AgentUid, NUM_EYES, SelectionState};
@@ -893,7 +893,14 @@ mod tests {
         let mut app = scene(true, fixture());
         app.update();
         let buffer = app.world().resource::<AppearanceTable>().buffer.clone();
-        let rows = 2 * (14 + 2 * NUM_EYES);
+        let rows: usize = app
+            .world()
+            .resource::<AgentRegistry>()
+            .records
+            .values()
+            .map(|record| agent_parts(record).count())
+            .sum();
+        assert_eq!(rows, 2 * (AGENT_FIXED_PARTS + 2 * NUM_EYES));
         for wave in 1..8 {
             let mut snapshot = fixture();
             snapshot.revision += wave;
