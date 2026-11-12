@@ -15,7 +15,6 @@ kira,0.10.1,adapt,"Wasm build lacks streaming and gapless playback","Ship muted 
 candle-core,0.4.1,adapt,"Has wasm support but needs feature selection","Disable heavyweight backends initially; evaluate per feature",Brain Team,Phase 5
 candle-nn,0.4.1,adapt,"Same as candle-core","Gate behind `ml` feature; document wasm opt-in",Brain Team,Phase 5
 tract-onnx,0.21.6,native-only,"Relies on `tract-linalg` with pthreads/native code","Disable in wasm builds; explore ONNX Runtime wasm later",Brain Team,Phase 5
-tch,0.18.0,native-only,"Wrapper over libtorch (native binaries)","Disable for wasm crate",Brain Team,Phase 5
 rstar,0.12.2,removed,"Dependency-only feature had no implementation","Reintroduce only with a real backend and conformance coverage",Index Owner,N/A
 kiddo,4.2.0,removed,"Dependency-only feature had no implementation","Reintroduce only with a real backend and conformance coverage",Index Owner,N/A
 neuroflow,0.2.0,adapt,"Pure Rust but uses std threads in some examples","Audit features; consider disabling parallel training",Brain Team,Phase 5

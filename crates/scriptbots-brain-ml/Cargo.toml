@@ -11,7 +11,6 @@ blake3 = { workspace = true }
 candle-core = { version = "0.8.2", optional = true }
 candle-nn = { version = "0.8.2", optional = true }
 tract-onnx = { version = "0.23.1", optional = true }
-tch = { version = "0.18.0", optional = true }
 ft-api = { workspace = true, optional = true }
 ft-core = { workspace = true, optional = true }
 ft-kernel-cpu = { workspace = true, optional = true }
@@ -25,7 +24,6 @@ rand = { workspace = true }
 default = []
 candle = ["candle-core", "candle-nn"]
 tract = ["tract-onnx"]
-tch = ["dep:tch"]
 brain-ft = [
     "dep:ft-api",
     "dep:ft-core",

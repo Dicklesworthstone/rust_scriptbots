@@ -37,7 +37,7 @@ rust_scriptbots/
 │   ├── scriptbots-core       # Simulation core (WorldState, AgentState, tick pipeline, config)
 │   ├── scriptbots-runtime    # Sole-owner HostCore, protocol, fixed-deadline lifecycle, null frontend
 │   ├── scriptbots-brain      # Brain trait + base implementations (mlp, dwraon, assembly)
-│   ├── scriptbots-brain-ml   # Candle tensors, Tract/tch probes, optional Frankentorch FtBrain
+│   ├── scriptbots-brain-ml   # Candle tensors, Tract probe, optional Frankentorch FtBrain
 │   ├── scriptbots-brain-neuro# NeuroFlow brain (optional), feature-gated
 │   ├── scriptbots-index      # Uniform-grid index; alternate backends are not implemented
 │   ├── scriptbots-storage    # FrankenSQLite persistence worker & analytics snapshots
@@ -123,7 +123,7 @@ Data flows left-to-right; control surfaces are orthogonal and non-invasive:
 - **`scriptbots-core`**: Simulation core with `WorldState`, `AgentState`, deterministic staged tick pipeline, config, sensor/actuation scaffolding, and brain registry bindings.
 - **`scriptbots-runtime`**: Renderer-neutral command, immutable lifecycle evidence, two-axis status, snapshot, and event-cursor contracts with typed revision domains; the sole-owner `HostCore`; a pure injected-time fixed-deadline adapter; and an optional Asupersync `=0.5.0` native lifecycle (migration validation pending). It depends on core but not storage, servers, or renderers. The default and WASM-facing surface remains runtime-neutral; Asupersync is activated only by `native-asupersync` on native targets.
 - **`scriptbots-brain`**: `Brain` trait + baseline implementations and adapters; experimental `assembly` behind a feature.
-- **`scriptbots-brain-ml`**: Feature-gated Candle tensor inference and the retained `ml.placeholder` sensor-copy fallback for Tract, tch and no-backend builds, plus the non-default code-first Frankentorch `FtBrain` family. Candle is not registered as a production heritable family. FtBrain is wired under `brain-ft`; its pinned DSR compile, determinism, and benchmark proof remains pending under `bd-2z0.3.12.3`.
+- **`scriptbots-brain-ml`**: Feature-gated Candle tensor inference and the retained `ml.placeholder` sensor-copy fallback for Tract and no-backend builds, plus the non-default code-first Frankentorch `FtBrain` family. Candle is not registered as a production heritable family. FtBrain is wired under `brain-ft`; its pinned DSR compile, determinism, and benchmark proof remains pending under `bd-2z0.3.12.3`.
 - **`scriptbots-brain-neuro`**: Optional NeuroFlow-based brain; controllable at runtime via config/env (see below).
 - **`scriptbots-index`**: Production uniform-grid neighborhood index. Alternate backends are not advertised until they have real implementations and conformance coverage.
 - **`scriptbots-storage`**: FrankenSQLite persistence with transactional batched writes, bounded admission, explicit flush/shutdown commit receipts, and immutable latest-value analytics snapshots for frontends.
@@ -485,13 +485,13 @@ cargo check --target wasm32-unknown-unknown -p scriptbots-web
 - **`scriptbots-index`**: the uniform-grid backend is unconditional; there are no backend-selection feature flags.
 - **`scriptbots-brain-ml`**:
   - `candle` enables real tensor forward/batch inference, without production heritable-family registration.
-  - `tract`, `tch`, and no-backend builds retain the sensor-copy `ml.placeholder` fallback.
+  - `tract` and no-backend builds retain the sensor-copy `ml.placeholder` fallback.
   - `brain-ft` exposes `FtBrainConfig`, `FtBrainFamily`, and `FT_BRAIN_KIND`.
   - FtBrain also exposes architecture-scoped canonical bias, weight and source-target loci to shared heredity/genome inspection. Activity inspection reconstructs the exact feed-forward computation from recorded owner inputs and verifies recorded output bits; its provenance explicitly says reconstructed. Unrecorded/indistinguishable-zero or mismatched observations are typed unavailable results. Producer work and retained graphs are bounded, and clipped weights remain visible without claiming a complete input explanation. Genome/state codecs and the adapter identity are unchanged. The exact libraries and Ft test source passed a pinned DSR type check; executable regressions remain unqualified because code generation hit the host memory limit.
   - FtBrain cohorts retain distinct weights for every agent and evaluate one packed F32 batched matrix contraction per layer. Core retains successful cohort evaluators across ticks while the exact factory, architecture, ordered stable identities, genomes/provenance and scalar checkpoints still match. This preserves packed weights and scratch between ticks. Membership changes or failures evict cached evaluators; checkpoints and scientific digests omit this execution cache. Scalar preimages and complete successor reconstruction still enforce atomic rejection, so this is not an end-to-end throughput claim. Adapter semantic version 3 identifies the packed executor; canonical genome and evaluator-state codecs are unchanged. Targeted DSR checks cover eight evolving scalar/cohort stages with one cohort construction, mutation/rebind/factory invalidation, warmed failure rollback and checkpoint continuation, plus the scalar-only feature lane.
   - The pinned Frankentorch `vector_to_parameters` path is not F32-safe, so FtBrain keeps a canonical flat F32 genome and materializes its layer slices without widening through F64. Resolution of that upstream gap and full benchmark qualification remain part of `bd-2z0.3.12.3`.
 
-Note: NeuroFlow and the native brain implementations are functional. Candle has real library inference; Tract/tch inference and alternate spatial-index backends remain unimplemented. The ML disposition keeps placeholders out of production populations and selects FtBrain as the app-level ML family. FtBrain has real code-first inference, but is not accepted as complete until its pinned DSR evidence is green.
+Note: NeuroFlow and the native brain implementations are functional. Candle has real library inference; Tract inference and alternate spatial-index backends remain unimplemented. The ML disposition keeps placeholders out of production populations and selects FtBrain as the app-level ML family. FtBrain has real code-first inference, but is not accepted as complete until its pinned DSR evidence is green.
 
 ### NeuroFlow runtime configuration (optional)
 If built with the `neuro` feature, runtime toggles can be applied via env vars before launch:

@@ -139,8 +139,6 @@ jobs:
         env:
           CARGO_BUILD_TARGET: ${{ matrix.cargo_target }}
 
-      # Note: We don't use --all-features because the 'tch' feature requires
-      # libtorch to be installed manually, which isn't available in CI.
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
         env:
