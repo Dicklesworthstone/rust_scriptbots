@@ -2000,7 +2000,16 @@ fn configure_capture_ssao(world: &mut World, requested: bool) {
 /// The app-lifetime rig: HDR capture camera + sun. Spawned once in Startup
 /// (see [`build_capture_app`] for the pre-finish requirement). The camera
 /// starts inactive; sessions toggle it around readbacks.
-fn setup_capture_rig(mut commands: Commands, target: Res<CaptureTarget>) {
+fn setup_capture_rig(
+    mut commands: Commands,
+    target: Res<CaptureTarget>,
+    mut images: ResMut<Assets<Image>>,
+) {
+    let sky_image = images.add(crate::sky_backdrop_image());
+    commands.insert_resource(crate::SkyBackdrop {
+        image: sky_image.clone(),
+        daylight_step: 255,
+    });
     commands.spawn((
         Camera3d::default(),
         Camera {
@@ -2018,6 +2027,7 @@ fn setup_capture_rig(mut commands: Commands, target: Res<CaptureTarget>) {
         bevy::render::view::Hdr,
         CaptureCamera,
         crate::WorldLightingCamera,
+        crate::sky_backdrop_camera(sky_image),
     ));
 
     let light_transform =
@@ -2224,6 +2234,23 @@ mod tests {
             panic!("selection ring positions missing")
         };
         assert_eq!(points.len(), 390);
+    }
+
+    #[test]
+    fn capture_camera_uses_the_daylight_sky_backdrop() {
+        let mut app = corruption_app(false);
+        let world = app.world_mut();
+        let skybox = world
+            .query_filtered::<&bevy::core_pipeline::Skybox, With<CaptureCamera>>()
+            .single(world)
+            .expect("capture camera has a sky backdrop");
+        assert_eq!(skybox.image, world.resource::<crate::SkyBackdrop>().image);
+        assert!(
+            world
+                .resource::<Assets<Image>>()
+                .get(&skybox.image)
+                .is_some()
+        );
     }
 
     #[test]

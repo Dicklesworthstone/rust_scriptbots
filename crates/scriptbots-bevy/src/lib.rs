@@ -965,6 +965,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
                 handle_inspector_page.run_if(lab_workflows::camera_controls_allowed),
                 update_genome_slice_button_visibility,
                 update_hud,
+                update_population_trend,
                 update_creature_card,
                 update_creature_eye_fields,
                 update_creature_terrain_map,
@@ -4890,9 +4891,7 @@ fn run_brain_projection_worker(
 
 /// Sample budget for each HUD sparkline (bd-2z0.14.1.16).
 ///
-/// GPUI's `HistoryChartData::from_entries` uses the same stride-decimation
-/// policy with a budget of 120, sized for a 220px polyline. A text sparkline
-/// is one glyph per sample, so the budget differs while the policy does not.
+/// Keep the on-screen chart bounded even when retained history is long.
 const HUD_SPARKLINE_SAMPLES: usize = 32;
 
 /// Eight relative levels that are available in Bevy's bundled default font.
@@ -4900,14 +4899,14 @@ const SPARK_GLYPHS: [&str; 8] = ["0", "1", "2", "3", "4", "5", "6", "7"];
 
 /// Decimated population/birth/death series behind the HUD sparklines.
 ///
-/// Mirrors GPUI's chart rather than deriving a second history projection:
-/// same three series, same `< 2` guard, same stride decimation, and the same
-/// per-series scaling by that series' own maximum (bd-2z0.14.1.16).
+/// The first and last retained summaries are included so the chart can name
+/// its real time span and does not silently omit the newest sample.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct HudHistory {
-    agents: Vec<u32>,
-    births: Vec<u32>,
-    deaths: Vec<u32>,
+    ticks: Vec<u64>,
+    agents: Vec<usize>,
+    births: Vec<usize>,
+    deaths: Vec<usize>,
 }
 
 impl HudHistory {
@@ -4921,15 +4920,14 @@ impl HudHistory {
         if entries.len() < 2 {
             return Self::default();
         }
-        let stride = entries.len().div_ceil(HUD_SPARKLINE_SAMPLES).max(1);
+        let count = entries.len().min(HUD_SPARKLINE_SAMPLES);
         let mut out = Self::default();
-        for summary in entries.iter().step_by(stride) {
-            out.agents
-                .push(u32::try_from(summary.agent_count).unwrap_or(u32::MAX));
-            out.births
-                .push(u32::try_from(summary.births).unwrap_or(u32::MAX));
-            out.deaths
-                .push(u32::try_from(summary.deaths).unwrap_or(u32::MAX));
+        for index in 0..count {
+            let summary = entries[index * (entries.len() - 1) / (count - 1)];
+            out.ticks.push(summary.tick.0);
+            out.agents.push(summary.agent_count);
+            out.births.push(summary.births);
+            out.deaths.push(summary.deaths);
         }
         out
     }
@@ -4938,6 +4936,15 @@ impl HudHistory {
         self.agents.is_empty()
     }
 }
+
+#[derive(Component)]
+struct PopulationTrendPanel;
+
+#[derive(Component)]
+struct PopulationTrendCaption;
+
+#[derive(Component)]
+struct PopulationTrendBar(usize);
 
 impl BrainOverlay {
     fn capture_host(
@@ -5190,7 +5197,7 @@ fn format_sparkline_signed(values: &[f32]) -> String {
 /// Per-series scaling matches GPUI: births and deaths are small numbers beside
 /// a population in the hundreds, so a shared scale would flatten them into a
 /// dead line and hide exactly the events worth seeing.
-fn format_sparkline(series: &[u32]) -> String {
+fn format_sparkline(series: &[usize]) -> String {
     let Some(&max) = series.iter().max() else {
         return String::new();
     };
@@ -5200,7 +5207,7 @@ fn format_sparkline(series: &[u32]) -> String {
     series
         .iter()
         .map(|&v| {
-            let level = (u64::from(v) * 7 / u64::from(max)) as usize;
+            let level = ((v as u128) * 7 / (max as u128)) as usize;
             SPARK_GLYPHS[level.min(SPARK_GLYPHS.len() - 1)]
         })
         .collect()
@@ -5211,9 +5218,9 @@ fn format_history_panel(history: &HudHistory) -> String {
     if history.is_empty() {
         return "History: collecting...".to_string();
     }
-    let peak = |s: &[u32]| s.iter().max().copied().unwrap_or(0);
+    let peak = |s: &[usize]| s.iter().max().copied().unwrap_or(0);
     format!(
-        "History ({} samples, relative levels 0-7)\n  Agents {} peak {}\n  Births {} peak {}\n  Deaths {} peak {}",
+        "History ({} samples, relative levels 0-7)\n  Agents {} sampled peak {}\n  Births {} sampled peak {}\n  Deaths {} sampled peak {}",
         history.agents.len(),
         format_sparkline(&history.agents),
         peak(&history.agents),
@@ -5734,6 +5741,8 @@ fn apply_daynight_lighting(
     ambient: Option<ResMut<AmbientLight>>,
     mut suns: Query<&mut DirectionalLight, With<TierDrivenSunLight>>,
     mut cameras: Query<&mut Camera, With<WorldLightingCamera>>,
+    backdrop: Option<ResMut<SkyBackdrop>>,
+    images: Option<ResMut<Assets<Image>>>,
 ) {
     let Some(snapshot) = &state.latest else {
         return;
@@ -5757,6 +5766,15 @@ fn apply_daynight_lighting(
             camera.clear_color = ClearColorConfig::Custom(sky);
         }
     }
+    if let (Some(mut backdrop), Some(mut images)) = (backdrop, images) {
+        let step = sky_daylight_step(day);
+        if step != backdrop.daylight_step
+            && let Some(image) = images.get_mut(&backdrop.image)
+        {
+            image.data = Some(sky_cubemap_pixels(f32::from(step) / 255.0));
+            backdrop.daylight_step = step;
+        }
+    }
 }
 
 fn sky_color_at_daylight(day: f32) -> Color {
@@ -5773,6 +5791,90 @@ fn terrain_sky_color() -> Color {
     Color::srgb(r, g, b)
 }
 
+// The backdrop is a cubemap rather than a finite dome, so it follows camera
+// rotation without moving with the camera or intersecting the terrain.
+const SKY_CUBEMAP_SIDE: u32 = 32;
+
+#[derive(Resource)]
+struct SkyBackdrop {
+    image: Handle<Image>,
+    daylight_step: u8,
+}
+
+fn sky_daylight_step(day: f32) -> u8 {
+    if day.is_finite() {
+        (day.clamp(0.0, 1.0) * 255.0).round() as u8
+    } else {
+        255
+    }
+}
+
+fn sky_gradient_srgb(day: f32, up: f32) -> [f32; 3] {
+    let horizon = sky_color_at_daylight(day).to_srgba();
+    let zenith = Vec3::new(0.035, 0.065, 0.14).lerp(Vec3::new(0.25, 0.43, 0.63), day);
+    let horizon = Vec3::new(horizon.red, horizon.green, horizon.blue);
+    let blend = up.max(0.0).sqrt() * 0.8;
+    horizon.lerp(zenith, blend).to_array()
+}
+
+fn sky_cubemap_pixels(day: f32) -> Vec<u8> {
+    let mut pixels = Vec::with_capacity((SKY_CUBEMAP_SIDE * SKY_CUBEMAP_SIDE * 6 * 4) as usize);
+    for face in 0..6 {
+        for y in 0..SKY_CUBEMAP_SIDE {
+            for x in 0..SKY_CUBEMAP_SIDE {
+                let u = 2.0 * (x as f32 + 0.5) / SKY_CUBEMAP_SIDE as f32 - 1.0;
+                let v = 2.0 * (y as f32 + 0.5) / SKY_CUBEMAP_SIDE as f32 - 1.0;
+                let direction = match face {
+                    0 => Vec3::new(1.0, -v, -u),
+                    1 => Vec3::new(-1.0, -v, u),
+                    2 => Vec3::new(u, 1.0, v),
+                    3 => Vec3::new(u, -1.0, -v),
+                    4 => Vec3::new(u, -v, 1.0),
+                    _ => Vec3::new(-u, -v, -1.0),
+                };
+                for channel in sky_gradient_srgb(day, direction.normalize().y) {
+                    pixels.push((channel.clamp(0.0, 1.0) * 255.0).round() as u8);
+                }
+                pixels.push(255);
+            }
+        }
+    }
+    pixels
+}
+
+fn sky_backdrop_image() -> Image {
+    use bevy::render::render_resource::{
+        Extent3d, TextureDimension, TextureFormat, TextureViewDescriptor, TextureViewDimension,
+    };
+    let mut image = Image::new(
+        Extent3d {
+            width: SKY_CUBEMAP_SIDE,
+            height: SKY_CUBEMAP_SIDE,
+            depth_or_array_layers: 6,
+        },
+        TextureDimension::D2,
+        sky_cubemap_pixels(1.0),
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(),
+    );
+    image.texture_view_descriptor = Some(TextureViewDescriptor {
+        dimension: Some(TextureViewDimension::Cube),
+        ..default()
+    });
+    image.sampler = bevy::image::ImageSampler::linear();
+    image
+}
+
+fn sky_backdrop_camera(image: Handle<Image>) -> bevy::core_pipeline::Skybox {
+    bevy::core_pipeline::Skybox {
+        image,
+        // Skybox applies camera exposure in extraction; this makes its
+        // default-exposure horizon match the existing HDR clear color.
+        brightness: 1.0 / bevy::camera::Exposure::default().exposure(),
+        ..default()
+    }
+}
+
 #[derive(Resource, Default)]
 struct AtmosphereStudy {
     enabled: bool,
@@ -5785,6 +5887,7 @@ fn toggle_atmosphere_study(
     keys: Res<ButtonInput<KeyCode>>,
     mut study: ResMut<AtmosphereStudy>,
     cameras: Query<Entity, With<PrimaryCamera>>,
+    backdrop: Option<Res<SkyBackdrop>>,
 ) {
     if !keys.just_pressed(KeyCode::KeyL) {
         return;
@@ -5792,11 +5895,19 @@ fn toggle_atmosphere_study(
     study.enabled = !study.enabled;
     for camera in &cameras {
         if study.enabled {
-            commands.entity(camera).insert(bevy::pbr::Atmosphere::EARTH);
+            commands
+                .entity(camera)
+                .remove::<bevy::core_pipeline::Skybox>()
+                .insert(bevy::pbr::Atmosphere::EARTH);
         } else {
             commands
                 .entity(camera)
                 .remove::<(bevy::pbr::Atmosphere, bevy::pbr::AtmosphereSettings)>();
+            if let Some(backdrop) = &backdrop {
+                commands
+                    .entity(camera)
+                    .insert(sky_backdrop_camera(backdrop.image.clone()));
+            }
         }
     }
 }
@@ -5809,6 +5920,11 @@ fn setup_scene(
     effective: Res<EffectiveRenderSettings>,
 ) {
     let camera_transform = Transform::from_xyz(0.0, 1800.0, 1400.0).looking_at(Vec3::ZERO, Vec3::Y);
+    let sky_image = images.add(sky_backdrop_image());
+    commands.insert_resource(SkyBackdrop {
+        image: sky_image.clone(),
+        daylight_step: 255,
+    });
     let camera = commands
         .spawn((
             Camera3d::default(),
@@ -5825,6 +5941,7 @@ fn setup_scene(
             Hdr,
             PrimaryCamera,
             WorldLightingCamera,
+            sky_backdrop_camera(sky_image),
         ))
         .id();
     // Inserted separately rather than in the tuple because it is CONDITIONAL:
@@ -6115,6 +6232,48 @@ fn setup_scene(
                 TextColor(secondary_text_color),
             ))
             .id();
+        parent
+            .spawn((
+                Node {
+                    flex_direction: FlexDirection::Column,
+                    row_gap: Val::Px(3.0),
+                    margin: UiRect::axes(Val::Px(0.0), Val::Px(4.0)),
+                    ..default()
+                },
+                PopulationTrendPanel,
+            ))
+            .with_children(|trend| {
+                trend.spawn((
+                    Text::new("Population history · collecting samples"),
+                    ui_font(11.0),
+                    TextColor(Color::srgb(0.72, 0.85, 0.77)),
+                    PopulationTrendCaption,
+                ));
+                trend
+                    .spawn(Node {
+                        height: Val::Px(24.0),
+                        width: Val::Percent(100.0),
+                        align_items: AlignItems::End,
+                        column_gap: Val::Px(2.0),
+                        ..default()
+                    })
+                    .with_children(|bars| {
+                        for index in 0..HUD_SPARKLINE_SAMPLES {
+                            bars.spawn((
+                                Node {
+                                    display: Display::None,
+                                    flex_grow: 1.0,
+                                    min_width: Val::Px(0.0),
+                                    height: Val::Percent(0.0),
+                                    ..default()
+                                },
+                                BackgroundColor(Color::srgb(0.35, 0.76, 0.58)),
+                                BorderRadius::all(Val::Px(2.0)),
+                                PopulationTrendBar(index),
+                            ));
+                        }
+                    });
+            });
         command_summary = parent
             .spawn((
                 Text::default(),
@@ -8265,10 +8424,14 @@ fn sync_authored_groundcover_study(
         if mesh.0 != variants[variant].0 {
             mesh.0 = variants[variant].0.clone();
         }
+        // At low food levels, square-root scaling made these plants nearly
+        // invisible in a live view. Try a fourth-root response: it remains
+        // continuous and monotonic, vanishes at zero, and leaves the food
+        // field unchanged. Its visual effect still needs live evaluation.
         let scale = terrain.cell_size as f32
             * (0.35 + 0.25 * groundcover_study_random(seed ^ 0x200))
             * authored.scale_factor
-            * food_fraction.sqrt();
+            * food_fraction.sqrt().sqrt();
         let height = sample_height_world(terrain, point, TERRAIN_HEIGHT_SCALE);
         let desired = Transform::from_xyz(
             point.x - frame.world_size.x * 0.5,
@@ -9688,6 +9851,83 @@ fn update_creature_card(
     ] {
         if let Ok(mut text) = texts.get_mut(entity) {
             set_hud_text_if_changed(&mut text, value);
+        }
+    }
+}
+
+fn update_population_trend(
+    state: Res<SnapshotState>,
+    mut panels: Query<&mut Node, (With<PopulationTrendPanel>, Without<PopulationTrendBar>)>,
+    mut bars: Query<
+        (&PopulationTrendBar, &mut Node, &mut BackgroundColor),
+        Without<PopulationTrendPanel>,
+    >,
+    mut captions: Query<&mut Text, With<PopulationTrendCaption>>,
+) {
+    let Some(snapshot) = &state.latest else {
+        return;
+    };
+    let selected = snapshot
+        .agents
+        .iter()
+        .any(|agent| agent.selection == SelectionState::Selected);
+    for mut panel in &mut panels {
+        let display = if selected {
+            Display::None
+        } else {
+            Display::Flex
+        };
+        if panel.display != display {
+            panel.display = display;
+        }
+    }
+    if selected {
+        return;
+    }
+
+    let history = &snapshot.history;
+    let maximum = history.agents.iter().copied().max().unwrap_or(0);
+    let caption = match (
+        history.ticks.first(),
+        history.ticks.last(),
+        history.agents.last(),
+    ) {
+        (Some(first), Some(last), Some(latest)) => format!(
+            "Population · latest {latest} · sampled max {maximum}\n{} samples · ticks {first}–{last}",
+            history.agents.len()
+        ),
+        _ => "Population history · collecting samples".to_owned(),
+    };
+    for mut text in &mut captions {
+        set_hud_text_if_changed(&mut text, caption.clone());
+    }
+    for (bar, mut node, mut color) in &mut bars {
+        let value = history.agents.get(bar.0).copied();
+        let display = if value.is_some() {
+            Display::Flex
+        } else {
+            Display::None
+        };
+        let height = value.map_or(0.0, |value| {
+            if maximum == 0 {
+                0.0
+            } else {
+                value as f32 / maximum as f32 * 100.0
+            }
+        });
+        if node.display != display {
+            node.display = display;
+        }
+        if node.height != Val::Percent(height) {
+            node.height = Val::Percent(height);
+        }
+        let desired = if value.is_some() && bar.0 + 1 == history.agents.len() {
+            Color::srgb(0.96, 0.75, 0.36)
+        } else {
+            Color::srgb(0.35, 0.76, 0.58)
+        };
+        if color.0 != desired {
+            color.0 = desired;
         }
     }
 }
@@ -12455,6 +12695,11 @@ mod adaptive_governor_tests {
             .single(world)
             .expect("one world camera");
         let world_order = world_camera.order;
+        let skybox = world
+            .query_filtered::<&bevy::core_pipeline::Skybox, With<PrimaryCamera>>()
+            .single(world)
+            .expect("world camera has a sky backdrop");
+        assert_eq!(skybox.image, world.resource::<SkyBackdrop>().image);
         let hud_camera = world
             .query_filtered::<&Camera, With<Camera2d>>()
             .single(world)
@@ -12837,7 +13082,15 @@ mod quality_tier_consumer_tests {
         app.init_resource::<ButtonInput<KeyCode>>()
             .init_resource::<AtmosphereStudy>()
             .add_systems(Update, toggle_atmosphere_study);
-        let primary = app.world_mut().spawn((PrimaryCamera, Hdr)).id();
+        let image = Handle::<Image>::default();
+        app.insert_resource(SkyBackdrop {
+            image: image.clone(),
+            daylight_step: 255,
+        });
+        let primary = app
+            .world_mut()
+            .spawn((PrimaryCamera, Hdr, sky_backdrop_camera(image.clone())))
+            .id();
         let other = app.world_mut().spawn(Hdr).id();
 
         app.update();
@@ -12847,6 +13100,11 @@ mod quality_tier_consumer_tests {
             .press(KeyCode::KeyL);
         app.update();
         assert!(app.world().get::<bevy::pbr::Atmosphere>(primary).is_some());
+        assert!(
+            app.world()
+                .get::<bevy::core_pipeline::Skybox>(primary)
+                .is_none()
+        );
         assert!(app.world().get::<bevy::pbr::Atmosphere>(other).is_none());
         assert!(app.world().resource::<AtmosphereStudy>().enabled);
 
@@ -12864,6 +13122,13 @@ mod quality_tier_consumer_tests {
                 .is_none()
         );
         assert!(app.world().get::<Hdr>(primary).is_some());
+        assert_eq!(
+            app.world()
+                .get::<bevy::core_pipeline::Skybox>(primary)
+                .unwrap()
+                .image,
+            image
+        );
         assert!(!app.world().resource::<AtmosphereStudy>().enabled);
     }
 
@@ -14336,8 +14601,8 @@ mod hud_history_sparkline_tests {
         assert!(!HudHistory::from_history(two.iter()).is_empty());
     }
 
-    /// Stride decimation caps every series at the sample budget regardless of
-    /// how long the run has been going.
+    /// Decimation caps every series at the sample budget regardless of how
+    /// long the run has been going.
     #[test]
     fn long_history_is_decimated_to_the_budget() {
         let long: Vec<TickSummary> = (0..5000).map(|t| summary(t, 100, 1, 1)).collect();
@@ -14349,6 +14614,110 @@ mod hud_history_sparkline_tests {
         );
         assert_eq!(h.agents.len(), h.births.len());
         assert_eq!(h.agents.len(), h.deaths.len());
+        assert_eq!(h.ticks.first(), Some(&0));
+        assert_eq!(h.ticks.last(), Some(&4999));
+    }
+
+    #[test]
+    fn history_keeps_large_counts_without_truncating_them() {
+        let entries = [summary(1, 0, 0, 0), summary(2, usize::MAX, 0, 0)];
+        let history = HudHistory::from_history(entries.iter());
+        assert_eq!(history.agents.last(), Some(&usize::MAX));
+        assert_eq!(format_sparkline(&history.agents), "07");
+    }
+
+    #[test]
+    fn population_trend_displays_current_sample_and_hides_for_a_creature() {
+        let entries = [
+            summary(5, 5, 0, 0),
+            summary(6, 10, 0, 0),
+            summary(7, 0, 0, 0),
+        ];
+        let mut snapshot = super::terrain_tests::sample_world_snapshot();
+        snapshot.history = HudHistory::from_history(entries.iter());
+        let mut app = App::new();
+        app.insert_resource(Assets::<Mesh>::default())
+            .insert_resource(Assets::<Image>::default())
+            .insert_resource(resolve_effective_render_settings_for_gpu(
+                &RenderSettings::default(),
+                None,
+            ))
+            .insert_resource(SnapshotState {
+                latest: Some(snapshot),
+                ..default()
+            })
+            .add_systems(Startup, setup_scene)
+            .add_systems(Update, update_population_trend);
+        app.update();
+
+        let world = app.world_mut();
+        let caption = world
+            .query_filtered::<&Text, With<PopulationTrendCaption>>()
+            .single(world)
+            .unwrap();
+        assert!(caption.0.contains("latest 0 · sampled max 10"));
+        assert!(caption.0.contains("3 samples · ticks 5–7"));
+        let mut bars = world.query::<(&PopulationTrendBar, &Node, &BackgroundColor)>();
+        let mut shown: Vec<_> = bars
+            .iter(world)
+            .filter(|(_, node, _)| node.display == Display::Flex)
+            .map(|(bar, node, color)| (bar.0, node.height, color.0))
+            .collect();
+        shown.sort_by_key(|bar| bar.0);
+        assert_eq!(shown.len(), 3);
+        assert_eq!(shown[0].1, Val::Percent(50.0));
+        assert_eq!(shown[1].1, Val::Percent(100.0));
+        assert_eq!(shown[2].1, Val::Percent(0.0));
+        assert_ne!(
+            shown[1].2, shown[2].2,
+            "the latest sample has its own color"
+        );
+
+        let mut agent = super::terrain_tests::sample_agent_visual();
+        agent.selection = SelectionState::Selected;
+        app.world_mut()
+            .resource_mut::<SnapshotState>()
+            .latest
+            .as_mut()
+            .unwrap()
+            .agents
+            .push(agent);
+        app.update();
+        let world = app.world_mut();
+        let panel = world
+            .query_filtered::<&Node, With<PopulationTrendPanel>>()
+            .single(world)
+            .unwrap();
+        assert_eq!(
+            panel.display,
+            Display::None,
+            "creature details retain their space"
+        );
+
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            let snapshot = state.latest.as_mut().unwrap();
+            snapshot.agents.clear();
+            snapshot.history = HudHistory::default();
+        }
+        app.update();
+        let world = app.world_mut();
+        let panel = world
+            .query_filtered::<&Node, With<PopulationTrendPanel>>()
+            .single(world)
+            .unwrap();
+        assert_eq!(panel.display, Display::Flex);
+        let caption = world
+            .query_filtered::<&Text, With<PopulationTrendCaption>>()
+            .single(world)
+            .unwrap();
+        assert_eq!(caption.0, "Population history · collecting samples");
+        assert!(
+            world
+                .query::<(&PopulationTrendBar, &Node)>()
+                .iter(world)
+                .all(|(_, node)| node.display == Display::None)
+        );
     }
 
     /// Each series scales by its OWN maximum. Births in single digits beside a
@@ -22592,7 +22961,7 @@ mod terrain_tests {
             let mut state = app.world_mut().resource_mut::<SnapshotState>();
             Arc::make_mut(&mut state.latest.as_mut().unwrap().food)
                 .cells
-                .fill(0.25);
+                .fill(0.0625);
         }
         app.update();
         let smaller = *app.world().get::<Transform>(entity).unwrap();
@@ -22633,7 +23002,7 @@ mod terrain_tests {
         {
             let mut state = app.world_mut().resource_mut::<SnapshotState>();
             Arc::make_mut(&mut state.latest.as_mut().unwrap().food).cells
-                [(cell.y * 24 + cell.x) as usize] = 0.25;
+                [(cell.y * 24 + cell.x) as usize] = 0.0625;
         }
         app.update();
         assert_eq!(
@@ -25542,6 +25911,68 @@ mod terrain_tests {
         );
         assert!(
             matches!(app.world().get::<Camera>(camera).unwrap().clear_color, ClearColorConfig::Custom(color) if color == terrain_sky_color())
+        );
+    }
+
+    #[test]
+    fn sky_backdrop_tracks_daylight_and_meets_the_horizon_color() {
+        for day in [0.0, 0.5, 1.0] {
+            let horizon = sky_color_at_daylight(day).to_srgba();
+            assert_eq!(
+                sky_gradient_srgb(day, 0.0),
+                [horizon.red, horizon.green, horizon.blue]
+            );
+            assert_eq!(sky_gradient_srgb(day, -1.0), sky_gradient_srgb(day, 0.0));
+            assert_ne!(sky_gradient_srgb(day, 1.0), sky_gradient_srgb(day, 0.0));
+        }
+
+        let mut app = App::new();
+        app.init_resource::<Assets<Image>>();
+        let image = app
+            .world_mut()
+            .resource_mut::<Assets<Image>>()
+            .add(sky_backdrop_image());
+        let initial = app.world().resource::<Assets<Image>>().get(&image).unwrap();
+        assert_eq!(initial.texture_descriptor.size.depth_or_array_layers, 6);
+        assert_eq!(
+            initial.data.as_ref().unwrap().len(),
+            (SKY_CUBEMAP_SIDE * SKY_CUBEMAP_SIDE * 6 * 4) as usize
+        );
+        assert_eq!(
+            initial.texture_view_descriptor.as_ref().unwrap().dimension,
+            Some(bevy::render::render_resource::TextureViewDimension::Cube)
+        );
+        let daylight_pixels = initial.data.clone();
+        app.insert_resource(SkyBackdrop {
+            image: image.clone(),
+            daylight_step: 255,
+        });
+        let mut snapshot = sample_world_snapshot();
+        snapshot.day_night_active = true;
+        snapshot.terrain_height.daylight = visual::DAYLIGHT_NIGHT_FLOOR;
+        app.insert_resource(SnapshotState {
+            latest: Some(snapshot),
+            ..default()
+        });
+        app.add_systems(Update, apply_daynight_lighting);
+        app.update();
+        assert_eq!(app.world().resource::<SkyBackdrop>().daylight_step, 0);
+        let night_pixels = app
+            .world()
+            .resource::<Assets<Image>>()
+            .get(&image)
+            .unwrap()
+            .data
+            .clone();
+        assert_ne!(night_pixels, daylight_pixels);
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<Assets<Image>>()
+                .get(&image)
+                .unwrap()
+                .data,
+            night_pixels
         );
     }
 
