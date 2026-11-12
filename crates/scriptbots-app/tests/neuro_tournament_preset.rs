@@ -39,8 +39,7 @@ fn shipped_neuroflow_smoke_runs_through_the_real_cli_and_retains_family_evidence
     use std::{fs, path::Path, process::Command};
 
     let root = tempfile::tempdir().unwrap();
-    let spec = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tournament/neuro_comparison.toml");
+    let spec = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tournament/neuro_comparison.toml");
     let output = root.path().join("comparison");
     let result = Command::new(env!("CARGO_BIN_EXE_scriptbots-app"))
         .current_dir(root.path())
@@ -76,7 +75,10 @@ fn shipped_neuroflow_smoke_runs_through_the_real_cli_and_retains_family_evidence
                     && warning.contains("not recorded tick-zero activity")
             })
     }));
-    assert!(rows.iter().all(|row| matches!(row.family.as_str(), "mlp" | "neuro")));
+    assert!(
+        rows.iter()
+            .all(|row| matches!(row.family.as_str(), "mlp" | "neuro"))
+    );
     let ratings: serde_json::Value =
         serde_json::from_slice(&fs::read(output.join("ratings.json")).unwrap()).unwrap();
     assert!(ratings.is_object() || ratings.is_array());

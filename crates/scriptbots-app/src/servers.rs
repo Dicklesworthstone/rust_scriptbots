@@ -7172,7 +7172,11 @@ mod tests {
                 if let Some(value) = expected_session {
                     request = request.header(LAB_SESSION_HEADER, value);
                 }
-                assert_eq!(request.send().await.unwrap().status().as_u16(), 200, "{path}");
+                assert_eq!(
+                    request.send().await.unwrap().status().as_u16(),
+                    200,
+                    "{path}"
+                );
             }
         }
         let experiment_url = format!("http://{address}/api/v1/experiments");

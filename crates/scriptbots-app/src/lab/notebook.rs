@@ -1849,7 +1849,8 @@ mod tests {
             "render.post.bloom.intensity".to_owned(),
             serde_json::json!(0.5),
         )]);
-        let error = reproduction_config(&reference).expect_err("unset nested block must be refused");
+        let error =
+            reproduction_config(&reference).expect_err("unset nested block must be refused");
         assert!(
             error.to_string().contains("unknown segment `bloom`"),
             "{error}"

@@ -8,8 +8,7 @@ use scriptbots_analytics::{
     AnalyticsError, NARRATIVE_VALIDATE_SCHEMA_VERSION, ReaderCtx, Registry, ReportParams,
 };
 use scriptbots_core::narrative::{
-    EventKind, EventRecord, METRIC_COMBAT, METRIC_ENERGY, METRIC_POPULATION,
-    NarrativeInputRecordV1,
+    EventKind, EventRecord, METRIC_COMBAT, METRIC_ENERGY, METRIC_POPULATION, NarrativeInputRecordV1,
 };
 use scriptbots_core::{
     AgentData, Intervention, MetricSample, PersistenceBatch, Position, Region, ReplayEvent,
@@ -66,11 +65,7 @@ fn event(tick: u64, kind: EventKind, metric: &str) -> EventRecord {
 /// Summaries and canonical inputs agree exactly. Batches use an explicit sparse
 /// persistence cadence (the config default, `0`, disables persistence); generic
 /// dashboard metrics deliberately carry no evidence of the planted shift.
-fn create_fixture(
-    dir: &tempfile::TempDir,
-    events: &[EventRecord],
-    include_inputs: bool,
-) -> String {
+fn create_fixture(dir: &tempfile::TempDir, events: &[EventRecord], include_inputs: bool) -> String {
     let path = dir.path().join("series.sqlite").display().to_string();
     let mut storage = Storage::create_unattributed_file(&path).expect("create fixture");
     let config = ScriptBotsConfig {
@@ -387,13 +382,18 @@ fn real_world_default_persistence_certifies_an_event_between_batch_boundaries() 
             .step(&mut world)
             .expect("production step and persistence admission");
     }
-    session.finalize(&mut world).expect("finalize partial batch");
+    session
+        .finalize(&mut world)
+        .expect("finalize partial batch");
     drop(world);
     pipeline.shutdown().expect("durable shutdown");
 
     let cx = ReaderCtx::open(&path).expect("finished reader");
     assert!(
-        !cx.reader.summary_ticks().expect("batch boundaries").contains(&97),
+        !cx.reader
+            .summary_ticks()
+            .expect("batch boundaries")
+            .contains(&97),
         "the extinction tick must not be a dashboard summary boundary"
     );
     let output = Registry::builtin()

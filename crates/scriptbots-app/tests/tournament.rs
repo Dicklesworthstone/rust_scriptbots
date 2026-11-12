@@ -285,7 +285,11 @@ fn neuroflow_spec_aliases_share_identity_and_named_arms_remain_distinct() {
     for alias in ["neuro", "neuroflow", "ml.neuroflow"] {
         assert_eq!(to_brain_kind(alias), BrainKind::new("neuro"));
     }
-    for named in ["neuro-control", "neuroflow.treatment", "ml.neuroflow-control"] {
+    for named in [
+        "neuro-control",
+        "neuroflow.treatment",
+        "ml.neuroflow-control",
+    ] {
         assert_eq!(to_brain_kind(named).as_str(), named);
         assert_ne!(to_brain_kind(named), to_brain_kind("neuro"));
     }
@@ -310,7 +314,10 @@ fn neuroflow_spec_aliases_share_identity_and_named_arms_remain_distinct() {
     let named = spec.to_spec().unwrap();
     assert_eq!(
         named.families,
-        vec![BrainKind::new("neuro-control"), BrainKind::new("neuroflow.treatment")]
+        vec![
+            BrainKind::new("neuro-control"),
+            BrainKind::new("neuroflow.treatment")
+        ]
     );
     let assignments = plan(&named).expect("named same-family controls remain legal");
     assert_eq!(assignments.len(), 2);
@@ -355,8 +362,14 @@ fn configured_neuroflow_matches_preserve_exact_parallel_genomes_and_arm_evidence
         assert_eq!(first.outcome, repeated.outcome);
         assert_eq!(first.config_digest, repeated.config_digest);
         assert_eq!(first.agents_final, repeated.agents_final);
-        assert_eq!(first.initial_genome_digests, repeated.initial_genome_digests);
-        assert_eq!(first.initial_mutation_rates, repeated.initial_mutation_rates);
+        assert_eq!(
+            first.initial_genome_digests,
+            repeated.initial_genome_digests
+        );
+        assert_eq!(
+            first.initial_mutation_rates,
+            repeated.initial_mutation_rates
+        );
         assert_eq!(
             first.initial_brain_source_scalars,
             repeated.initial_brain_source_scalars
@@ -430,12 +443,17 @@ fn neuroflow_constructor_changes_bind_genomes_and_preserve_the_other_family_seed
             baseline.initial_genome_digests[&neuro]
         );
         assert_eq!(
-            report.initial_genome_digests[&MLP_A],
-            baseline.initial_genome_digests[&MLP_A],
+            report.initial_genome_digests[&MLP_A], baseline.initial_genome_digests[&MLP_A],
             "changing NeuroFlow settings must not displace the other family's brain seed"
         );
-        assert_eq!(report.initial_mutation_rates, baseline.initial_mutation_rates);
-        assert_eq!(report.initial_brain_source_scalars[&neuro], expected_scalars);
+        assert_eq!(
+            report.initial_mutation_rates,
+            baseline.initial_mutation_rates
+        );
+        assert_eq!(
+            report.initial_brain_source_scalars[&neuro],
+            expected_scalars
+        );
     }
 }
 
@@ -451,7 +469,9 @@ fn neuroflow_tournament_refuses_genome_and_state_budgets_before_matches() {
     ] {
         let mut config = configured_neuro_world();
         config.neuroflow.hidden_layers = layers;
-        config.validate().expect("architecture remains within core config bounds");
+        config
+            .validate()
+            .expect("architecture remains within core config bounds");
         let error = run_tournament_with_jobs(&spec, &config, 2)
             .expect_err("configured versioned payload exceeds its declared budget");
         assert!(matches!(
@@ -476,18 +496,11 @@ fn neuroflow_leaderboard_retains_configured_topology_and_equal_parameter_refusal
         .expect("explicit NeuroFlow CLI entry");
     let config = configured_neuro_world();
     let build = BuildProvenanceV0::current();
-    let constrained = execute_leaderboard_tournament(
-        &spec,
-        None,
-        true,
-        &config,
-        &build,
-        None,
-        None,
-        true,
-        1,
-    )
-    .expect_err("the 200-cell profile cannot certify the configured NeuroFlow architecture");
+    let constrained =
+        execute_leaderboard_tournament(&spec, None, true, &config, &build, None, None, true, 1)
+            .expect_err(
+                "the 200-cell profile cannot certify the configured NeuroFlow architecture",
+            );
     assert!(matches!(
         constrained,
         TournamentError::Publication { reason }
@@ -497,18 +510,9 @@ fn neuroflow_leaderboard_retains_configured_topology_and_equal_parameter_refusal
     // Explicitly compare different architectures without retaining an equal-cell-count claim.
     spec.parameters = None;
     spec.tournament.title = "Configured NeuroFlow architecture comparison".to_owned();
-    let outcome = execute_leaderboard_tournament(
-        &spec,
-        None,
-        true,
-        &config,
-        &build,
-        None,
-        None,
-        true,
-        2,
-    )
-    .expect("configured NeuroFlow leaderboard with an independent identical rerun");
+    let outcome =
+        execute_leaderboard_tournament(&spec, None, true, &config, &build, None, None, true, 2)
+            .expect("configured NeuroFlow leaderboard with an independent identical rerun");
     assert_eq!(outcome.total_matches, 4);
     assert_eq!(outcome.eligible_rows, 8);
     assert_eq!(outcome.excluded_rows, 0);
@@ -525,8 +529,16 @@ fn neuroflow_leaderboard_retains_configured_topology_and_equal_parameter_refusal
                     && warning.contains("not recorded tick-zero activity")
             })
     }));
-    assert!(outcome.leaderboard_md.contains("NeuroFlow counts validated genome"));
-    assert!(outcome.leaderboard_md.contains("without claiming tick-zero activity"));
+    assert!(
+        outcome
+            .leaderboard_md
+            .contains("NeuroFlow counts validated genome")
+    );
+    assert!(
+        outcome
+            .leaderboard_md
+            .contains("without claiming tick-zero activity")
+    );
     assert!(outcome.leaderboard_md.contains("neuro-survival_share"));
 }
 

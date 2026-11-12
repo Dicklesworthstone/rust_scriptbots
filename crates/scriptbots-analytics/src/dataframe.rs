@@ -621,8 +621,7 @@ where
             let current = self.current.as_ref().ok_or_else(|| {
                 DataFrameError::Verification("Missing current read-back batch".to_owned())
             })?;
-            let count =
-                (expected.num_rows() - source_offset).min(current.num_rows() - self.offset);
+            let count = (expected.num_rows() - source_offset).min(current.num_rows() - self.offset);
             verify_record_batches(
                 &expected.slice(source_offset, count),
                 &current.slice(self.offset, count),
@@ -797,12 +796,7 @@ pub fn export_database_table(
                 &prov,
             )?;
             if verify {
-                verify_storage_table_export(
-                    reader,
-                    &prov,
-                    &receipt,
-                    File::open(&target_path)?,
-                )?;
+                verify_storage_table_export(reader, &prov, &receipt, File::open(&target_path)?)?;
             }
         }
         AnalyticsExportFormat::Parquet => {
@@ -819,8 +813,7 @@ pub fn export_database_table(
             })?;
             writer.close()?;
             if verify {
-                let builder =
-                    ParquetRecordBatchReaderBuilder::try_new(File::open(&target_path)?)?;
+                let builder = ParquetRecordBatchReaderBuilder::try_new(File::open(&target_path)?)?;
                 let schema = builder.schema().clone();
                 let batches = builder.with_batch_size(EXPORT_PAGE_ROWS).build()?;
                 // Parquet drops schema-level metadata from decoded batches; rebuild each
@@ -1266,9 +1259,7 @@ pub fn summarize_run(
                     summary_diet_class(row.herbivore_tendency),
                 );
                 let group = diet_deviations.get_mut(&key).ok_or_else(|| {
-                    DataFrameError::Verification(
-                        "Agent groups changed during summary".into(),
-                    )
+                    DataFrameError::Verification("Agent groups changed during summary".into())
                 })?;
                 let squared_health = (f64::from(row.health) - group.row.mean_health).powi(2);
                 let squared_energy = (f64::from(row.energy) - group.row.mean_energy).powi(2);
@@ -1330,8 +1321,7 @@ pub fn summarize_run(
             .cmp(&right.metric_name)
             .then(left.tick.cmp(&right.tick))
     });
-    for points in
-        rolling_metrics.chunk_by_mut(|left, right| left.metric_name == right.metric_name)
+    for points in rolling_metrics.chunk_by_mut(|left, right| left.metric_name == right.metric_name)
     {
         let values: Vec<Scalar> = points
             .iter()
@@ -1602,7 +1592,10 @@ mod tests {
         let mut changed_rows = rows;
         changed_rows[3].value += 1.0;
         let mut changed = readback(vec![metric_rows_to_batch(&prov, &changed_rows).unwrap()]);
-        assert!(changed.compare(&expected).is_err(), "interior value mutation");
+        assert!(
+            changed.compare(&expected).is_err(),
+            "interior value mutation"
+        );
 
         let mut corrupt_tail = BatchReadback::new(
             vec![
@@ -1679,21 +1672,27 @@ mod tests {
         };
         let expected = make(vec![Some(-0.0), None], vec![None, Some(-0.0)]);
         verify_record_batches(&expected, &expected).unwrap();
-        assert!(verify_record_batches(
-            &expected,
-            &make(vec![Some(0.0), None], vec![None, Some(-0.0)]),
-        )
-        .is_err());
-        assert!(verify_record_batches(
-            &expected,
-            &make(vec![Some(-0.0), None], vec![None, Some(0.0)]),
-        )
-        .is_err());
-        assert!(verify_record_batches(
-            &expected,
-            &make(vec![Some(-0.0), Some(0.0)], vec![None, Some(-0.0)]),
-        )
-        .is_err());
+        assert!(
+            verify_record_batches(
+                &expected,
+                &make(vec![Some(0.0), None], vec![None, Some(-0.0)]),
+            )
+            .is_err()
+        );
+        assert!(
+            verify_record_batches(
+                &expected,
+                &make(vec![Some(-0.0), None], vec![None, Some(0.0)]),
+            )
+            .is_err()
+        );
+        assert!(
+            verify_record_batches(
+                &expected,
+                &make(vec![Some(-0.0), Some(0.0)], vec![None, Some(-0.0)]),
+            )
+            .is_err()
+        );
     }
 
     #[test]

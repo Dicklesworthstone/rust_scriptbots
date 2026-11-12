@@ -546,7 +546,10 @@ fn verify_cli_study(output: &Path, plan: &BranchStudyPlan) -> BranchStudyReport 
         )
         .expect("typed branch evidence JSON");
         assert_eq!(evidence["schema_version"], report.schema_version);
-        assert_eq!(evidence["source"], serde_json::to_value(&report.source).unwrap());
+        assert_eq!(
+            evidence["source"],
+            serde_json::to_value(&report.source).unwrap()
+        );
         assert_eq!(evidence["branch_id"], branch.branch_id);
         assert_eq!(evidence["base_seed"], plan.base_seed);
         assert_eq!(evidence["checkpoint_tick"], plan.checkpoint_tick);
@@ -923,12 +926,7 @@ fn replicated_branch_study_cli_refuses_duplicate_seeds_and_aggregate_work_before
 fn evolved_import_fixture(
     preset: scriptbots_app::BrainPreset,
 ) -> (BranchStudyPlan, scriptbots_core::WorldState) {
-    let mut plan = tiny_cli_plan(BranchStudyPlan::standard_five_branch(
-        "saved-cut",
-        42,
-        2,
-        4,
-    ));
+    let mut plan = tiny_cli_plan(BranchStudyPlan::standard_five_branch("saved-cut", 42, 2, 4));
     plan.brain_preset = preset;
     plan.branches
         .retain(|branch| matches!(branch.branch_id.as_str(), "control" | "resource_shock"));
@@ -1020,8 +1018,7 @@ fn saved_checkpoint_plan_cli_matches_original_control_and_direct_core_treatment(
             scriptbots_core::WorldState::restore_checkpoint_v1(&checkpoint, registry).unwrap();
         let due = plan.checkpoint_tick + 2;
         let expected_control = direct_import_trajectory(original, plan.horizon_ticks, None);
-        let expected_treatment =
-            direct_import_trajectory(treatment, plan.horizon_ticks, Some(due));
+        let expected_treatment = direct_import_trajectory(treatment, plan.horizon_ticks, Some(due));
         assert_eq!(expected_control[0], expected_treatment[0]);
         assert_ne!(
             expected_control.last().unwrap().1,
@@ -1042,7 +1039,10 @@ fn saved_checkpoint_plan_cli_matches_original_control_and_direct_core_treatment(
             true,
         );
         let report = verify_cli_study(&output, &plan);
-        assert_eq!(report.pre_intervention_digest, checkpoint.source_digest().overall);
+        assert_eq!(
+            report.pre_intervention_digest,
+            checkpoint.source_digest().overall
+        );
         assert_eq!(
             report.source,
             BranchStudySource::SavedCheckpoint {
@@ -1068,7 +1068,10 @@ fn saved_checkpoint_plan_cli_matches_original_control_and_direct_core_treatment(
                 .into_iter()
                 .map(|sample| (sample.tick, sample.digest))
                 .collect();
-            assert_eq!(&observed, expected, "every saved-cut transition for {label}/{branch_id}");
+            assert_eq!(
+                &observed, expected,
+                "every saved-cut transition for {label}/{branch_id}"
+            );
         }
 
         let retained = retained_study_bytes(&output);
@@ -1127,7 +1130,10 @@ fn saved_checkpoint_plan_cli_refuses_mismatches_and_unsafe_inputs_without_output
             ],
             false,
         );
-        assert!(!output.exists(), "identity refusal must precede output reservation");
+        assert!(
+            !output.exists(),
+            "identity refusal must precede output reservation"
+        );
     }
 
     let malformed = root.path().join("malformed-source.bin");
@@ -1199,6 +1205,9 @@ fn saved_checkpoint_plan_cli_refuses_mismatches_and_unsafe_inputs_without_output
         false,
     );
     assert!(diagnostic(&refusal.stderr).contains("checkpoint"));
-    assert!(!output.exists(), "one saved world cannot become independent founding replicates");
+    assert!(
+        !output.exists(),
+        "one saved world cannot become independent founding replicates"
+    );
     assert_eq!(fs::read(&source).unwrap(), bytes);
 }

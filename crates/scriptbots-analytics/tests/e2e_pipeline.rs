@@ -653,7 +653,12 @@ fn test_analytics_e2e_full_pipeline_and_invariants() {
         invariant: "null_noise_not_significant".to_string(),
         expected: serde_json::json!({ "significant_fdr": false }),
         observed: serde_json::json!({ "significant_fdr": !combat_not_significant }),
-        status: if combat_not_significant { "pass" } else { "fail" }.to_string(),
+        status: if combat_not_significant {
+            "pass"
+        } else {
+            "fail"
+        }
+        .to_string(),
     });
     assert!(
         combat_not_significant,

@@ -940,8 +940,7 @@ pub mod execution {
             #[cfg(not(feature = "neuro"))]
             return Err(TournamentError::UnavailableBrainFamily {
                 family: name.to_owned(),
-                reason: "NeuroFlow tournaments require a build with the neuro feature"
-                    .to_owned(),
+                reason: "NeuroFlow tournaments require a build with the neuro feature".to_owned(),
             });
         }
         Err(TournamentError::UnbalancedOrders {
@@ -955,10 +954,11 @@ pub mod execution {
     fn neuroflow_adapter(
         config: &ScriptBotsConfig,
     ) -> Result<NeuroflowFamilyAdapter, TournamentError> {
-        NeuroflowFamilyAdapter::new(NeuroflowBrainConfig::from_settings(&config.neuroflow))
-            .map_err(|error| TournamentError::UnbalancedOrders {
+        NeuroflowFamilyAdapter::new(NeuroflowBrainConfig::from_settings(&config.neuroflow)).map_err(
+            |error| TournamentError::UnbalancedOrders {
                 reason: format!("NeuroFlow adapter construction: {error}"),
-            })
+            },
+        )
     }
 
     pub(super) fn is_frankentorch_family(name: &str) -> bool {

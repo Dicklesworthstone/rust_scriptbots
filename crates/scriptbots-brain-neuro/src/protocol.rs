@@ -159,11 +159,8 @@ impl NeuroflowFamilyAdapter {
                 .to_le_bytes(),
         );
         for &width in &config.hidden_layers {
-            genome_header.extend_from_slice(
-                &u32::try_from(width)
-                    .map_err(|_| overflow())?
-                    .to_le_bytes(),
-            );
+            genome_header
+                .extend_from_slice(&u32::try_from(width).map_err(|_| overflow())?.to_le_bytes());
         }
         debug_assert_eq!(genome_header.len(), header_bytes);
         let family_id = BrainFamilyId::new(FAMILY_ID)
@@ -230,7 +227,11 @@ impl NeuroflowFamilyAdapter {
         if bytes.len() != self.genome_bytes {
             return Err(self.invalid(
                 kind,
-                format!("expected {} bytes, found {}", self.genome_bytes, bytes.len()),
+                format!(
+                    "expected {} bytes, found {}",
+                    self.genome_bytes,
+                    bytes.len()
+                ),
             ));
         }
         if !bytes.starts_with(&self.genome_header) {
@@ -265,8 +266,10 @@ impl NeuroflowFamilyAdapter {
         genome: &BrainGenomeEnvelope,
     ) -> Result<FeedForwardSeed, BrainProtocolError> {
         self.validate_genome(genome)?;
-        let mut scalars =
-            genome.payload()[self.genome_header.len()..].as_chunks::<SCALAR_BYTES>().0.iter();
+        let mut scalars = genome.payload()[self.genome_header.len()..]
+            .as_chunks::<SCALAR_BYTES>()
+            .0
+            .iter();
         let mut previous = INPUT_SIZE;
         let mut layers = Vec::with_capacity(self.config.hidden_layers.len() + 1);
         for outputs in self
@@ -368,12 +371,10 @@ impl NeuroflowFamilyAdapter {
         genome_digest: &[u8; DIGEST_BYTES],
         brain: &NeuroflowBrain,
     ) -> Result<BrainEvaluatorStateEnvelope, BrainProtocolError> {
-        let snapshot = brain.network_snapshot().map_err(|error| {
-            self.invalid(BrainEnvelopeKind::EvaluatorState, error.to_string())
-        })?;
-        if brain.inputs.len() != INPUT_SIZE
-            || brain.inputs.iter().any(|value| !value.is_finite())
-        {
+        let snapshot = brain
+            .network_snapshot()
+            .map_err(|error| self.invalid(BrainEnvelopeKind::EvaluatorState, error.to_string()))?;
+        if brain.inputs.len() != INPUT_SIZE || brain.inputs.iter().any(|value| !value.is_finite()) {
             return Err(self.invalid(BrainEnvelopeKind::EvaluatorState, "invalid input cache"));
         }
         let mut payload = self.state_header(genome_digest);
@@ -608,8 +609,10 @@ impl BrainFamilyCodec for NeuroflowFamilyAdapter {
             ));
         }
         let mut snapshot = self.genome_snapshot(genome)?;
-        let mut scalars =
-            state.payload()[STATE_HEADER_BYTES..].as_chunks::<SCALAR_BYTES>().0.iter();
+        let mut scalars = state.payload()[STATE_HEADER_BYTES..]
+            .as_chunks::<SCALAR_BYTES>()
+            .0
+            .iter();
         snapshot.error = next_scalar(&mut scalars);
         let inputs: Vec<f64> = (0..INPUT_SIZE).map(|_| next_scalar(&mut scalars)).collect();
         for layer in &mut snapshot.layers {
@@ -625,8 +628,7 @@ impl BrainFamilyCodec for NeuroflowFamilyAdapter {
             }
         }
         debug_assert_eq!(scalars.as_slice(), [] as [[u8; SCALAR_BYTES]; 0]);
-        let standby =
-            self.brain_from_snapshot(self.copy_snapshot(&snapshot), inputs.clone())?;
+        let standby = self.brain_from_snapshot(self.copy_snapshot(&snapshot), inputs.clone())?;
         let brain = self.brain_from_snapshot(snapshot, inputs)?;
         Ok(Box::new(NeuroflowEvaluator {
             family: self.clone(),
@@ -685,9 +687,7 @@ mod tests {
     }
 
     fn sensors(tick: u16) -> [f32; INPUT_SIZE] {
-        std::array::from_fn(|index| {
-            f32::from((u16::try_from(index).unwrap() + tick) % 17) / 16.0
-        })
+        std::array::from_fn(|index| f32::from((u16::try_from(index).unwrap() + tick) % 17) / 16.0)
     }
 
     #[test]
@@ -717,7 +717,9 @@ mod tests {
         ] {
             assert_ne!(
                 baseline.adapter_identity(),
-                NeuroflowFamilyAdapter::new(config).unwrap().adapter_identity()
+                NeuroflowFamilyAdapter::new(config)
+                    .unwrap()
+                    .adapter_identity()
             );
         }
         assert!(matches!(
@@ -786,10 +788,12 @@ mod tests {
                 for tick in 0..12 {
                     assert_eq!(
                         legacy.tick(&sensors(tick)).map(f32::to_bits),
-                        evaluator.evaluate(&sensors(tick)).unwrap().map(f32::to_bits),
+                        evaluator
+                            .evaluate(&sensors(tick))
+                            .unwrap()
+                            .map(f32::to_bits),
                     );
-                    let request =
-                        BrainInspection::Activations(BrainInspectionLimits::default());
+                    let request = BrainInspection::Activations(BrainInspectionLimits::default());
                     assert_eq!(
                         legacy.inspect(request).unwrap(),
                         evaluator.inspect(request).unwrap()
@@ -1210,7 +1214,11 @@ mod tests {
             .unwrap();
         let parent_genome = world.agent_brain_genome(parent).unwrap().clone();
         world.step().unwrap();
-        assert_eq!(world.agent_count(), 2, "the fixture must actually reproduce");
+        assert_eq!(
+            world.agent_count(),
+            2,
+            "the fixture must actually reproduce"
+        );
         let child = world
             .agents()
             .iter_handles()
@@ -1218,7 +1226,10 @@ mod tests {
             .unwrap();
         let child_genome = world.agent_brain_genome(child).unwrap();
         assert_eq!(child_genome.material_hash(), parent_genome.material_hash());
-        assert_eq!(child_genome.provenance().parents[0], world.agent_uid(parent));
+        assert_eq!(
+            child_genome.provenance().parents[0],
+            world.agent_uid(parent)
+        );
         let mut rng = SmallRngStream::seed_from_u64(0);
         assert_eq!(
             world.agent_brain_evaluator_state(child).unwrap().unwrap(),

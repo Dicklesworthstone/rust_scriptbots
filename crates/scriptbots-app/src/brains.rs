@@ -358,10 +358,9 @@ pub fn create_brain_registry_for_config(
 ) -> Result<BrainRegistry> {
     #[cfg(feature = "neuro")]
     if preset == BrainPreset::Neuro {
-        let adapter = NeuroflowFamilyAdapter::new(NeuroflowBrainConfig::from_settings(
-            &config.neuroflow,
-        ))
-        .context("failed to construct the configured versioned NeuroFlow brain family")?;
+        let adapter =
+            NeuroflowFamilyAdapter::new(NeuroflowBrainConfig::from_settings(&config.neuroflow))
+                .context("failed to construct the configured versioned NeuroFlow brain family")?;
         let mut registry = BrainRegistry::new();
         registry
             .register_family(NeuroflowBrain::KIND.as_str(), Box::new(adapter))
@@ -482,8 +481,7 @@ mod tests {
         let mut activation = config.clone();
         activation.neuroflow.activation = scriptbots_core::NeuroflowActivationKind::Relu;
         for changed in [architecture, activation] {
-            let registry =
-                create_brain_registry_for_config(BrainPreset::Neuro, &changed).unwrap();
+            let registry = create_brain_registry_for_config(BrainPreset::Neuro, &changed).unwrap();
             assert!(matches!(
                 WorldState::restore_checkpoint_v1(&checkpoint, registry),
                 Err(scriptbots_core::WorldCheckpointError::RegistryMismatch { .. })
@@ -502,8 +500,7 @@ mod tests {
         edited.neuroflow.hidden_layers = vec![11, 5];
         world.apply_config_update(edited.clone()).unwrap();
         let edited_checkpoint = world.checkpoint_v1().unwrap();
-        let current_recipe =
-            create_brain_registry_for_config(BrainPreset::Neuro, &edited).unwrap();
+        let current_recipe = create_brain_registry_for_config(BrainPreset::Neuro, &edited).unwrap();
         assert!(matches!(
             WorldState::restore_checkpoint_v1(&edited_checkpoint, current_recipe),
             Err(scriptbots_core::WorldCheckpointError::RegistryMismatch { .. })

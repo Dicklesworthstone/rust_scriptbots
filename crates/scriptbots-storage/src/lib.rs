@@ -3963,8 +3963,7 @@ fn validate_v3_exact_gpu_sense_evidence(
     // Check the JSON number too: a forged nonzero f64 can underflow to zero
     // while serde narrows it into the portable f32 field.
     let raw_delta =
-        manifest_required_value(manifest, "/sense_policy/gate_evidence/max_sensor_delta")?
-            .as_f64();
+        manifest_required_value(manifest, "/sense_policy/gate_evidence/max_sensor_delta")?.as_f64();
     if raw_delta != Some(0.0)
         || !evidence.max_sensor_delta.is_finite()
         || evidence.max_sensor_delta != 0.0
@@ -10216,10 +10215,7 @@ fn load_archive_cells(
     Ok(cells)
 }
 
-fn max_tick_for_run(
-    connection: &Connection,
-    run_id: RunId,
-) -> Result<Option<u64>, StorageError> {
+fn max_tick_for_run(connection: &Connection, run_id: RunId) -> Result<Option<u64>, StorageError> {
     let row = connection.query_row_with_params(
         "SELECT MAX(tick) FROM tick_summaries WHERE run_id = ?1",
         &[sqlite_run_id(run_id)],
@@ -31809,7 +31805,11 @@ mod tests {
             })
         ));
         assert!(reader.metrics_at_tick(1, 0).is_err());
-        assert!(reader.metrics_at_tick(1, MAX_STORAGE_QUERY_PAGE + 1).is_err());
+        assert!(
+            reader
+                .metrics_at_tick(1, MAX_STORAGE_QUERY_PAGE + 1)
+                .is_err()
+        );
         assert!(reader.metrics_at_tick(u64::MAX, 3).is_err());
         reader.close()?;
 
@@ -31842,9 +31842,11 @@ mod tests {
             RunManifestRecord::unattributed(first_id),
         )?;
         let mut first_batch = sample_batch(1, 10.0);
-        first_batch.replay_events.push(sample_narrative_event(
-            sample_narrative_record(1, 10.0, 0, 0, 64),
-        ));
+        first_batch
+            .replay_events
+            .push(sample_narrative_event(sample_narrative_record(
+                1, 10.0, 0, 0, 64,
+            )));
         storage.persist(&first_batch)?;
         storage.flush()?;
         storage.close()?;
@@ -31882,15 +31884,27 @@ mod tests {
         selected.verify_database_path(&path_string)?;
         assert!(matches!(
             reader.select_finished_run(None),
-            Err(StorageError::InvalidData { context: "runs.run_id", .. })
+            Err(StorageError::InvalidData {
+                context: "runs.run_id",
+                ..
+            })
         ));
         assert!(matches!(
             reader.select_finished_run(Some(RunId::new(999))),
-            Err(StorageError::InvalidData { context: "runs.run_id", .. })
+            Err(StorageError::InvalidData {
+                context: "runs.run_id",
+                ..
+            })
         ));
         assert!(matches!(
-            Storage::append_run(&path_string, RunManifestRecord::unattributed(RunId::new(303))),
-            Err(StorageError::InvalidData { context: "storage.path_lease", .. })
+            Storage::append_run(
+                &path_string,
+                RunManifestRecord::unattributed(RunId::new(303))
+            ),
+            Err(StorageError::InvalidData {
+                context: "storage.path_lease",
+                ..
+            })
         ));
         assert_eq!(reader.run_id(), first_id);
         assert_eq!(reader.max_tick()?, Some(1));
@@ -31898,8 +31912,10 @@ mod tests {
         reader.close()?;
 
         // The view did not transfer or leak ownership of the connection or its writer lease.
-        let third =
-            Storage::append_run(&path_string, RunManifestRecord::unattributed(RunId::new(303)))?;
+        let third = Storage::append_run(
+            &path_string,
+            RunManifestRecord::unattributed(RunId::new(303)),
+        )?;
         third.close()?;
         Ok(())
     }
@@ -31936,7 +31952,10 @@ mod tests {
         let selected = reader.select_finished_run(Some(second_id))?;
         assert!(matches!(
             selected.metrics_at_tick(9, 3),
-            Err(StorageError::InvalidData { context: "metrics_at_tick.island_scope", .. })
+            Err(StorageError::InvalidData {
+                context: "metrics_at_tick.island_scope",
+                ..
+            })
         ));
         reader.close()?;
 
@@ -31948,7 +31967,10 @@ mod tests {
         connection.close()?;
         assert!(matches!(
             StorageReader::open_finished_for_run(&path_string, first_id),
-            Err(StorageError::InvalidData { context: "runs.manifest_digest", .. })
+            Err(StorageError::InvalidData {
+                context: "runs.manifest_digest",
+                ..
+            })
         ));
         Ok(())
     }

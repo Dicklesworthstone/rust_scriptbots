@@ -790,10 +790,16 @@ pub fn render_experiments_screen(
             );
             print_text(frame, 2, y_start + 2, &status);
 
-            let baseline = data.comparison_baseline.as_deref().unwrap_or("selected row");
-            print_text(frame, 2, y_start + 3, &format!(
-                "  [Enter] pin baseline ({baseline}); [C] compare a different variant"
-            ));
+            let baseline = data
+                .comparison_baseline
+                .as_deref()
+                .unwrap_or("selected row");
+            print_text(
+                frame,
+                2,
+                y_start + 3,
+                &format!("  [Enter] pin baseline ({baseline}); [C] compare a different variant"),
+            );
             print_text(frame, 2, y_start + 4, "  ACTIVE EXPERIMENTAL ARMS:");
             print_text(
                 frame,
@@ -849,25 +855,51 @@ pub fn render_experiments_screen(
             let comp_y = y_start + 12;
             print_text(frame, 2, comp_y, "  MATCHED-SEED ENDPOINT COMPARISON:");
             if let Some(comp) = &data.comparison_summary {
-                print_text(frame, 4, comp_y + 1, &format!(
-                    "Baseline: {}  Challenger: {}", comp.baseline_variant, comp.challenger_variant
-                ));
-                let metric = if comp.metric == "alive_agents" { "Population (agents)" } else { &comp.metric };
-                print_text(frame, 4, comp_y + 2, &format!(
-                    "{metric} at tick {}: paired n={}", comp.endpoint_tick, comp.matched_seeds.len()
-                ));
-                let interval = observation_text(comp.ci_95, |(low, high)| format!("[{low:+.3}, {high:+.3}]"));
-                print_text(frame, 4, comp_y + 3, &format!(
-                    "Challenger - baseline: {:+.3}; 95% CI: {interval}", comp.mean_difference
-                ));
+                print_text(
+                    frame,
+                    4,
+                    comp_y + 1,
+                    &format!(
+                        "Baseline: {}  Challenger: {}",
+                        comp.baseline_variant, comp.challenger_variant
+                    ),
+                );
+                let metric = if comp.metric == "alive_agents" {
+                    "Population (agents)"
+                } else {
+                    &comp.metric
+                };
+                print_text(
+                    frame,
+                    4,
+                    comp_y + 2,
+                    &format!(
+                        "{metric} at tick {}: paired n={}",
+                        comp.endpoint_tick,
+                        comp.matched_seeds.len()
+                    ),
+                );
+                let interval =
+                    observation_text(comp.ci_95, |(low, high)| format!("[{low:+.3}, {high:+.3}]"));
+                print_text(
+                    frame,
+                    4,
+                    comp_y + 3,
+                    &format!(
+                        "Challenger - baseline: {:+.3}; 95% CI: {interval}",
+                        comp.mean_difference
+                    ),
+                );
                 print_text(
                     frame,
                     4,
                     comp_y + 4,
-                    &format!("Paired p: {}; adjusted p: {}; Cohen dz: {}",
+                    &format!(
+                        "Paired p: {}; adjusted p: {}; Cohen dz: {}",
                         observation_text(comp.p_value, |value| format!("{value:.4}")),
                         observation_text(comp.adjusted_p_value, |value| format!("{value:.4}")),
-                        observation_text(comp.standardized_effect, |value| format!("{value:+.3}"))),
+                        observation_text(comp.standardized_effect, |value| format!("{value:+.3}"))
+                    ),
                 );
                 let inference = if comp.descriptive_only {
                     "Descriptive only; no significance claim"
@@ -879,7 +911,11 @@ pub fn render_experiments_screen(
                     "Inferential result unavailable"
                 };
                 print_text(frame, 4, comp_y + 5, inference);
-                if let Some(reason) = comp.undefined_effect_reason.as_ref().or(comp.underpowered_reason.as_ref()) {
+                if let Some(reason) = comp
+                    .undefined_effect_reason
+                    .as_ref()
+                    .or(comp.underpowered_reason.as_ref())
+                {
                     print_text(frame, 4, comp_y + 6, reason);
                 }
             } else {
