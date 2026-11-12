@@ -7859,6 +7859,7 @@ struct AuthoredGroundcoverStudy {
     original_color: bool,
     mipmapped: bool,
     clumps: bool,
+    brighter: bool,
     scale_factor: f32,
     spawned: bool,
 }
@@ -8025,13 +8026,15 @@ fn setup_authored_groundcover_study(
         original_color: false,
         mipmapped: false,
         clumps: false,
+        brighter: false,
         scale_factor: 1.0,
         spawned: false,
     });
 }
 
 // B isolates lighting, M compares scale, U compares color reconstruction,
-// J compares mip filtering, and K compares mesh families. Study only.
+// J compares mip filtering, K compares mesh families, and P compares a
+// brighter linear albedo multiplier. Study only.
 fn toggle_authored_groundcover_lighting(
     input: Res<ButtonInput<KeyCode>>,
     authored: Option<ResMut<AuthoredGroundcoverStudy>>,
@@ -8061,6 +8064,14 @@ fn toggle_authored_groundcover_lighting(
     if input.just_pressed(KeyCode::KeyK) {
         authored.clumps = !authored.clumps;
         info!(clumps = authored.clumps, "authored groundcover mesh study");
+    }
+    if input.just_pressed(KeyCode::KeyP)
+        && let Some(material) = materials.get_mut(&authored.material)
+    {
+        authored.brighter = !authored.brighter;
+        let gain = if authored.brighter { 3.0 } else { 1.0 };
+        material.base_color = Color::linear_rgba(gain, gain, gain, 1.0);
+        info!(gain, "authored groundcover albedo study");
     }
     let change_color = input.just_pressed(KeyCode::KeyU);
     let change_mips = input.just_pressed(KeyCode::KeyJ);
@@ -22262,6 +22273,7 @@ mod terrain_tests {
             original_color: false,
             mipmapped: false,
             clumps: false,
+            brighter: false,
             scale_factor: 1.0,
             spawned: false,
         });
@@ -22272,6 +22284,7 @@ mod terrain_tests {
             input.press(KeyCode::KeyU);
             input.press(KeyCode::KeyJ);
             input.press(KeyCode::KeyK);
+            input.press(KeyCode::KeyP);
         }
         app.update();
         assert_eq!(
@@ -22292,6 +22305,15 @@ mod terrain_tests {
             3.0
         );
         assert!(app.world().resource::<AuthoredGroundcoverStudy>().clumps);
+        assert!(app.world().resource::<AuthoredGroundcoverStudy>().brighter);
+        assert_eq!(
+            app.world()
+                .resource::<Assets<StandardMaterial>>()
+                .get(&material)
+                .unwrap()
+                .base_color,
+            Color::linear_rgba(3.0, 3.0, 3.0, 1.0)
+        );
         assert_eq!(
             app.world()
                 .resource::<Assets<StandardMaterial>>()
@@ -22308,12 +22330,14 @@ mod terrain_tests {
             input.release(KeyCode::KeyU);
             input.release(KeyCode::KeyJ);
             input.release(KeyCode::KeyK);
+            input.release(KeyCode::KeyP);
             input.clear();
             input.press(KeyCode::KeyB);
             input.press(KeyCode::KeyM);
             input.press(KeyCode::KeyU);
             input.press(KeyCode::KeyJ);
             input.press(KeyCode::KeyK);
+            input.press(KeyCode::KeyP);
         }
         app.update();
         assert!(
@@ -22330,6 +22354,15 @@ mod terrain_tests {
             1.0
         );
         assert!(!app.world().resource::<AuthoredGroundcoverStudy>().clumps);
+        assert!(!app.world().resource::<AuthoredGroundcoverStudy>().brighter);
+        assert_eq!(
+            app.world()
+                .resource::<Assets<StandardMaterial>>()
+                .get(&material)
+                .unwrap()
+                .base_color,
+            Color::linear_rgba(1.0, 1.0, 1.0, 1.0)
+        );
         assert_eq!(
             app.world()
                 .resource::<Assets<StandardMaterial>>()
@@ -22429,6 +22462,7 @@ mod terrain_tests {
             original_color: false,
             mipmapped: false,
             clumps: false,
+            brighter: false,
             scale_factor: 1.0,
             spawned: false,
         });
@@ -23905,6 +23939,51 @@ mod terrain_tests {
         assert_eq!(body.phase, mouth.phase);
         assert_eq!(mouth.transform.translation, Vec3::ZERO);
         assert_eq!(mouth.transform.rotation, Quat::IDENTITY);
+    }
+
+    #[test]
+    fn mouth_material_tracks_activity_with_a_subdued_palette_color() {
+        let mut app = eye_geometry_test_app();
+        let handle = app.world().resource::<AgentRegistry>().records[&AgentUid(1)]
+            .mouth
+            .material
+            .clone()
+            .unwrap();
+        for palette in [
+            ColorPaletteMode::Natural,
+            ColorPaletteMode::Deuteranopia,
+            ColorPaletteMode::Protanopia,
+            ColorPaletteMode::Tritanopia,
+            ColorPaletteMode::HighContrast,
+        ] {
+            let mut colors = Vec::new();
+            for sound in [0.0, 1.0] {
+                app.world_mut().resource_mut::<AccessibilityState>().palette = palette;
+                let mut state = app.world_mut().resource_mut::<SnapshotState>();
+                let snapshot = state.latest.as_mut().unwrap();
+                snapshot.revision += 1;
+                snapshot.agents[0].sound_output = sound;
+                snapshot.agents[0].sound_level = 0.0;
+                snapshot.agents[0].food_delta = 0.0;
+                let expected = srgb_from_vec_with_palette(
+                    Vec3::from_array(
+                        canonical_agent_visual_params(&snapshot.agents[0]).mouth_color,
+                    ) * 0.32,
+                    0.9,
+                    palette,
+                );
+                app.update();
+                let color = app
+                    .world()
+                    .resource::<Assets<StandardMaterial>>()
+                    .get(&handle)
+                    .unwrap()
+                    .base_color;
+                assert_eq!(color, expected);
+                colors.push(color);
+            }
+            assert_ne!(colors[0], colors[1], "{palette:?} loses activity");
+        }
     }
 
     #[test]
@@ -25775,7 +25854,7 @@ mod terrain_tests {
     }
 
     #[test]
-    fn bevy_agent_ornament_colors_match_the_core_visual_authority_for_every_palette() {
+    fn core_ornament_colors_convert_consistently_for_every_palette() {
         let agent = sample_agent_visual();
         let visuals = canonical_agent_visual_params(&agent);
 
@@ -27704,7 +27783,9 @@ fn apply_agent_visuals(
         phase: (agent.uid.0.wrapping_mul(2_654_435_761) % 1024) as f32
             * (std::f32::consts::TAU / 1024.0),
     });
-    let mouth_rgb = Vec3::from_array(visuals.mouth_color);
+    // The core colors are tuned for a dark 2D field. On the lit 3D body the
+    // full-strength unlit pink reads as a floating mark rather than a mouth.
+    let mouth_rgb = Vec3::from_array(visuals.mouth_color) * 0.32;
     let mouth_color = srgb_from_vec_with_palette(mouth_rgb, 0.9, palette);
     let mouth_emissive = palette_emissive_from_vec(
         Vec3::new(
