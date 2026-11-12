@@ -168,6 +168,69 @@ history/credit handling; nonempty narrative delivery requires observed records.
   `registerBrain("mlp" | "dwraon" | "assembly" | "wander" | "none")` on the
   `SimHandle`. Invalid choices preserve the current world.
 
+### Remote matched-seed experiments
+
+Connect to the existing remote host, wait for its canvas frame, then open
+**Matched-seed experiments**. The panel creates fresh worlds through the host's
+experiment runner. Each arm starts from the runner's defaults plus its own
+initial overrides; it does not start from the current canvas or a checkpoint.
+
+1. Enter distinct baseline and challenger arm IDs and choose their brain
+   families. Keep the initial overrides identical when comparing only families.
+2. Enter exact decimal seeds, separated by commas or whitespace. Every arm uses
+   the same seed set. The form accepts 1–32 distinct unsigned 64-bit seeds;
+   values above JavaScript's safe integer range remain exact.
+3. Choose the horizon and concurrency. The initial form uses seeds 11, 42 and
+   137, 200 ticks, one simultaneous run, and a population minimum of 20 in
+   each arm. These are editable experiment inputs, not changes to world defaults.
+4. Expand either arm to edit its initial JSON overrides or ordered numeric
+   intervention schedule. For example,
+   `[{"tick":100,"set":{"food_growth_rate":0.001}}]` changes that arm's growth
+   rate at tick 100. Schedule ticks must be inside the horizon; same-tick
+   statements retain their declared order. The host validates supported settings.
+5. Select **Create matched-seed experiment**. Follow the observed batch and run
+   states, or use **Cancel unfinished runs** and **Resume unfinished runs** for
+   an eligible stopped batch. Closing the panel stops browser reads and leaves
+   the host's experiment lifecycle under its existing owner.
+
+If admission is uncertain, **Retry exact request** retains the original seed
+tokens, configuration, schedule and idempotency key. Editing the form does not
+alter that retry. Network actions require the same observed host session;
+the server refuses an old `X-ScriptBots-Session` before admitting or changing
+work. An endpoint or session change clears its observations rather than
+resubmitting the request to another host. After a reload or reconnect, page
+through **Retained experiments** and choose a batch to read its current status.
+Historical selection never launches or resumes scientific work.
+
+The panel shows at most 16 run records at once. A running world's displayed
+progress comes from its last observed published or recovered checkpoint and
+may lag execution. Terminal ticks are shown only for completed runs. Capacity
+rows report the host's configured reservations, including zero-slot admission
+shutdown. A server bundle path identifies a retained host file; it is not a
+browser download link.
+
+When both chosen cohorts have completed every declared seed, select baseline,
+challenger and a terminal metric, then choose **Compare completed arms**.
+Results report challenger minus baseline across the independent matched seeds,
+with the host's interval, effect size, significance and uncertainty fields.
+One seed pair is descriptive only. Repeated ticks are not independent
+replicates, a larger endpoint is not a fitness verdict, and separate metric
+requests do not form one jointly corrected analysis. The comparison must match
+the observed plan digest, status generation, endpoint and complete seed set.
+
+**Export browser observation JSON** retains the observed status, comparison
+and exact decimal seed identities. It includes canonical request JSON only if
+this browser still holds an observed admission for the selected experiment.
+Historical selection cannot recover a missing original request. The export
+identifies its browser-observation scope and is separate from server run bundles.
+
+Requests and responses have explicit browser bounds (64 KiB creation and
+1 MiB response). The backend remains responsible for scientific execution,
+configuration validation, durable records and paired inference. Source-level
+regressions were added for this workflow, but the execution environment was
+unavailable before DSR could run them; browser and native qualification remain
+open under the existing acceptance work.
+
 ### Remote checkpoint studies
 
 The browser uses the server's existing bounded checkpoint and managed-study

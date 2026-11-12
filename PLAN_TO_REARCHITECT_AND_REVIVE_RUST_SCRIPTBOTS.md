@@ -2,6 +2,51 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Browser matched-seed experiment workflow (2026-11-12):**
+[Source implemented and reviewed — Codex; executable and browser qualification open]
+
+Continue `bd-2z0.12.3` by connecting the browser to the existing experiment
+owner's fresh-world, matched-seed cohorts. The new panel creates two arms with
+explicit families, initial overrides and ordered numeric intervention schedules;
+it pages retained batches, observes saved checkpoint progress, cancels or resumes
+unfinished work and compares completed cohorts. These worlds use the runner's
+defaults plus their declared overrides; the current canvas and saved checkpoint
+studies remain separate scientific sources.
+
+Capture one immutable admission request and retry its exact bytes after an
+uncertain response. Full-width u64 seeds remain decimal strings in browser
+observations and exact integer tokens in request JSON. Bounded readers refuse
+duplicate fields, incomplete seed matrices, changed plans, regressing
+generations and contradictory terminal evidence. Session changes invalidate
+late observations. The experiment API now enforces the existing optional Lab
+session header before handlers can admit work, cancel, resume or compare;
+headerless clients retain their established behavior.
+
+Paired results bind the selected experiment, plan digest, status generation,
+endpoint, arms and every matched seed. One independent pair stays descriptive;
+unavailable effect sizes retain their explanation. Larger endpoints are not
+fitness verdicts, and separate metric requests are not one jointly corrected
+analysis. Observation export includes the original request only when this
+browser retains an observed admission for that exact selected experiment;
+historical status cannot reconstruct a missing plan or become a server bundle.
+
+Controls require an observed frame from the connected host. Hidden panels,
+local mode, disconnects and page exit stop reads and discard late responses.
+Catalog and run presentation are bounded; progress is a published or recovered
+checkpoint observation rather than a fabricated live tick. Source review also
+corrected catalog admission for configurable shared capacity, including zero
+slots and values above the default.
+
+Authored protocol, transport, controller and view regressions cover exact
+numeric provenance, uncertain retry, source replacement, lifecycle, pagination,
+comparison scope and export attribution. The existing real-HTTP session guard
+regression now covers experiment routes and valid admission with stale,
+malformed, matching and absent session headers. The execution environment
+became unavailable before DSR checks could run; no new Node, browser, native
+compile, Rustfmt or runtime test pass is claimed. These files were reconstructed
+from the reviewed changes and preserved through the GitHub connector. Parent
+acceptance and packaged-browser qualification remain open.
+
 **Retained study discovery and measured browser outcomes (2026-11-11):**
 [Implemented and source reviewed — Codex; DSR web checks passed, native/browser qualification open]
 
