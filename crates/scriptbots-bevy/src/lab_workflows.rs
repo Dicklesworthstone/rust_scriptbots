@@ -8,8 +8,8 @@ use super::*;
 use scriptbots_runtime::{
     HostSessionId,
     lab_workflows::{
-        LAB_PAGE_SIZE, LabAction, LabCheckpointSaveState, LabPanel, LabWorkflowSubmit,
-        LabWorkflows, VARIANTS_PER_PAGE, comparison_lines,
+        LAB_PAGE_SIZE, LabAction, LabCheckpointSaveState, LabEventIdentity, LabEventReview,
+        LabPanel, LabWorkflowSubmit, LabWorkflows, VARIANTS_PER_PAGE, comparison_lines,
     },
 };
 
@@ -91,9 +91,44 @@ impl PanelRow {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+enum ReviewSource {
+    Checkpoint(String),
+    NarrativeEvent {
+        event: LabEventIdentity,
+        checkpoint_id: String,
+        base_tick: u64,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ReviewFrame {
-    checkpoint_id: String,
+    source: ReviewSource,
     tick: u64,
+}
+
+impl ReviewFrame {
+    fn heading(&self) -> &'static str {
+        match &self.source {
+            ReviewSource::Checkpoint(_) => "SCRIPTBOTS  /  SAVED CHECKPOINT",
+            ReviewSource::NarrativeEvent { .. } => "SCRIPTBOTS  /  EVENT REVIEW",
+        }
+    }
+
+    fn description(&self) -> String {
+        match &self.source {
+            ReviewSource::Checkpoint(id) => format!("SAVED CHECKPOINT {id} | TICK {}", self.tick),
+            ReviewSource::NarrativeEvent {
+                event,
+                checkpoint_id,
+                base_tick,
+            } => format!(
+                "EVENT #{} | TICK {} | SOURCE CHECKPOINT {checkpoint_id} AT TICK {base_tick} | SESSION {}",
+                event.ordinal,
+                self.tick,
+                event.session_id.get(),
+            ),
+        }
+    }
 }
 
 /// A page into the owner's immutable ring, addressed by absolute event ordinal.
@@ -276,6 +311,48 @@ impl LabPresentation {
         state: &mut SnapshotState,
         motion: &mut AgentMotionSettings,
     ) -> bool {
+        self.show_history(
+            ReviewSource::Checkpoint(checkpoint_id),
+            snapshot,
+            state,
+            motion,
+        )
+    }
+
+    fn show_event_review(
+        &mut self,
+        review: LabEventReview,
+        state: &mut SnapshotState,
+        motion: &mut AgentMotionSettings,
+    ) -> bool {
+        if self
+            .selected_event()
+            .is_none_or(|(event, record)| event != review.event || record != &review.record)
+            || review.snapshot.session_id != review.event.session_id
+            || review.snapshot.world.tick != review.event.tick
+            || review.base_tick > review.event.tick
+        {
+            return false;
+        }
+        self.show_history(
+            ReviewSource::NarrativeEvent {
+                event: review.event,
+                checkpoint_id: review.checkpoint_id,
+                base_tick: review.base_tick,
+            },
+            &review.snapshot,
+            state,
+            motion,
+        )
+    }
+
+    fn show_history(
+        &mut self,
+        source: ReviewSource,
+        snapshot: &RenderSnapshot,
+        state: &mut SnapshotState,
+        motion: &mut AgentMotionSettings,
+    ) -> bool {
         let Some(mut saved) = WorldSnapshot::from_snapshot(snapshot) else {
             return false;
         };
@@ -290,7 +367,7 @@ impl LabPresentation {
             self.live = state.latest.take();
         }
         self.review = Some(ReviewFrame {
-            checkpoint_id,
+            source,
             tick: saved.tick,
         });
         motion.enabled = false;
@@ -324,6 +401,22 @@ impl LabPresentation {
         if self.source == Some(session_id) {
             self.narrative.select(ordinal);
         }
+    }
+
+    fn selected_event(
+        &self,
+    ) -> Option<(LabEventIdentity, &scriptbots_core::narrative::EventRecord)> {
+        let session_id = self.source?;
+        let ordinal = self.narrative.selected?;
+        let record = self.narrative.record(ordinal)?;
+        Some((
+            LabEventIdentity {
+                session_id,
+                ordinal,
+                tick: record.tick.0,
+            },
+            record,
+        ))
     }
 
     pub(super) fn reviewing(&self) -> bool {
@@ -491,6 +584,7 @@ pub(super) fn update(
     if let Some(session) = presentation.source {
         model.synchronize(session, presentation.panel);
     }
+    model.select_event(presentation.selected_event());
     let mut action = rows.iter().find_map(|(row, interaction)| {
         if row.enabled && *interaction == Interaction::Pressed {
             row.action.clone()
@@ -610,6 +704,7 @@ pub(super) fn update(
     if let Some(session) = presentation.source {
         model.synchronize(session, presentation.panel);
     }
+    model.select_event(presentation.selected_event());
     if let Some((id, snapshot)) = model.poll() {
         if presentation.show_checkpoint(id, &snapshot, &mut state, &mut motion) {
             presentation.change_panel(LabPanel::Inactive);
@@ -625,6 +720,21 @@ pub(super) fn update(
             model.set_notice(
                 "Checkpoint review failed: visual layers are incomplete; the displayed world is unchanged.",
             );
+        }
+    }
+    if let Some(review) = model.take_event_review() {
+        if presentation.show_event_review(review, &mut state, &mut motion) {
+            presentation.change_panel(LabPanel::Inactive);
+            presentation.keyboard_captured = true;
+            if let Some(session) = presentation.source {
+                model.synchronize(session, LabPanel::Inactive);
+            }
+            model.set_notice("Viewing the selected event's reconstructed world. Return live to resume live-world controls.");
+            rig.pending_clicked_follow = None;
+            rig.clicked_follow_notice = None;
+            rig.queue_fit(FitCommand::World);
+        } else {
+            model.set_notice("Event review could not match the selected evidence or complete visual layers; the displayed world is unchanged.");
         }
     }
     model.maybe_refresh();
@@ -655,8 +765,8 @@ fn panel_rows(model: &LabWorkflows, presentation: &LabPresentation) -> Vec<Panel
     ];
     if let Some(review) = &presentation.review {
         rows.push(PanelRow::text(format!(
-            "DISPLAYING SAVED CHECKPOINT {} AT TICK {}. Return to live to enable world controls.",
-            review.checkpoint_id, review.tick,
+            "DISPLAYING {}. Return to live to enable world controls.",
+            review.description(),
         )));
         rows.push(PanelRow::workflow(
             "Return to live world",
@@ -665,7 +775,7 @@ fn panel_rows(model: &LabWorkflows, presentation: &LabPresentation) -> Vec<Panel
         ));
     }
     if presentation.panel == LabPanel::Narrative {
-        narrative_rows(presentation, &mut rows);
+        narrative_rows(model, presentation, &mut rows);
         return rows;
     }
     if model.submit.is_none() {
@@ -717,7 +827,7 @@ fn panel_rows(model: &LabWorkflows, presentation: &LabPresentation) -> Vec<Panel
     rows
 }
 
-fn narrative_rows(presentation: &LabPresentation, rows: &mut Vec<PanelRow>) {
+fn narrative_rows(model: &LabWorkflows, presentation: &LabPresentation, rows: &mut Vec<PanelRow>) {
     use scriptbots_core::narrative_text::fixed;
 
     let timeline = &presentation.narrative;
@@ -739,6 +849,16 @@ fn narrative_rows(presentation: &LabPresentation, rows: &mut Vec<PanelRow>) {
     }
     if let Some(notice) = &timeline.notice {
         rows.push(PanelRow::text(notice.clone()));
+    }
+    if let Some(notice) = &model.notice {
+        rows.push(PanelRow::text(notice.clone()));
+    }
+    if model.is_busy() {
+        rows.push(PanelRow::workflow(
+            "Discard pending review result",
+            LabAction::CancelRequest,
+            true,
+        ));
     }
     if timeline.dropped > 0 {
         rows.push(PanelRow::text(format!(
@@ -815,6 +935,20 @@ fn narrative_rows(presentation: &LabPresentation, rows: &mut Vec<PanelRow>) {
             fixed(f64::from(record.severity), 3),
             record.subject.map_or_else(|| "unspecified".into(), scriptbots_core::narrative::SubjectRef::to_db_string),
         )));
+        rows.push(PanelRow::workflow(
+            "Review selected event tick in the world",
+            LabAction::ReviewEvent(LabEventIdentity {
+                session_id: session,
+                ordinal,
+                tick: record.tick.0,
+            }),
+            model.submit.is_some() && !model.is_busy(),
+        ));
+        rows.push(PanelRow::text(if model.submit.is_some() {
+            "Review needs a retained checkpoint at or before this event and complete recorded inputs. Save checkpoints from the live world before events you may want to revisit."
+        } else {
+            "Historical reconstruction is unavailable in this launch; the canonical event evidence remains readable."
+        }));
     }
 }
 
@@ -1114,11 +1248,11 @@ pub(super) fn refresh_panel(
         if let Ok(mut text) = texts.get_mut(entity) {
             set_hud_text_if_changed(
                 &mut text,
-                if presentation.review.is_some() {
-                    "SCRIPTBOTS  /  SAVED CHECKPOINT".into()
-                } else {
-                    "SCRIPTBOTS  /  LIVE WORLD".into()
-                },
+                presentation
+                    .review
+                    .as_ref()
+                    .map_or("SCRIPTBOTS  /  LIVE WORLD", ReviewFrame::heading)
+                    .into(),
             );
         }
     }
@@ -1137,8 +1271,8 @@ pub(super) fn refresh_panel(
             set_hud_text_if_changed(
                 &mut text,
                 format!(
-                    "SAVED CHECKPOINT {} | TICK {} | Live world continues separately. Click here or press Escape to return live.",
-                    review.checkpoint_id, review.tick,
+                    "{} | Live world continues separately. Click here or press Escape to return live.",
+                    review.description(),
                 ),
             );
         }
@@ -1460,6 +1594,22 @@ mod tests {
                 .iter()
                 .any(|row| row.text.contains("services are unavailable"))
         );
+        let expected = LabAction::ReviewEvent(LabEventIdentity {
+            session_id: HostSessionId::new(71),
+            ordinal: 100,
+            tick: 100,
+        });
+        let review = rows
+            .iter()
+            .find(|row| row.action == Some(PanelAction::Workflow(expected.clone())))
+            .expect("selected evidence has a source-bound review action");
+        assert!(!review.enabled, "reconstruction needs application services");
+        let services = consumer(Some(Arc::new(
+            |_| Err("not submitted while drawing".into()),
+        )));
+        assert!(panel_rows(&services, &presentation).iter().any(|row| {
+            row.action == Some(PanelAction::Workflow(expected.clone())) && row.enabled
+        }));
 
         presentation.narrative.records = Arc::new(Vec::new());
         let rows = panel_rows(&consumer(None), &presentation);
@@ -1530,6 +1680,90 @@ mod tests {
         assert!(state.last_applied_palette.is_none());
         assert!(motion.enabled);
         assert!(presentation.world_controls_allowed());
+    }
+
+    fn selected_event_review() -> LabEventReview {
+        let mut snapshot = (*saved_snapshot()).clone();
+        snapshot.session_id = HostSessionId::new(71);
+        LabEventReview {
+            event: LabEventIdentity {
+                session_id: snapshot.session_id,
+                ordinal: 1,
+                tick: snapshot.world.tick,
+            },
+            record: narrative_record(snapshot.world.tick),
+            checkpoint_id: "event-source-checkpoint".into(),
+            base_tick: 0,
+            snapshot: Arc::new(snapshot),
+        }
+    }
+
+    #[test]
+    fn event_review_preserves_source_provenance_and_returns_to_the_newest_live_world() {
+        let mut presentation = LabPresentation::default();
+        let mut state = SnapshotState::default();
+        let mut motion = AgentMotionSettings { enabled: true };
+        let mut live = live_frame(12);
+        live.narrative_events = Arc::new(vec![narrative_record(0)]);
+        presentation.receive_live(live.clone(), &mut state, &mut motion);
+        presentation.narrative.select(1);
+        assert!(presentation.show_event_review(selected_event_review(), &mut state, &mut motion));
+        let review = presentation.review.as_ref().unwrap();
+        assert_eq!(review.heading(), "SCRIPTBOTS  /  EVENT REVIEW");
+        assert!(review.description().contains("EVENT #1 | TICK 0"));
+        assert!(
+            review
+                .description()
+                .contains("SOURCE CHECKPOINT event-source-checkpoint AT TICK 0")
+        );
+        assert!(review.description().contains("SESSION 71"));
+        let historical = state.latest.as_ref().unwrap();
+        assert_eq!(historical.tick, 0);
+        assert!(historical.owner_source.is_none() && historical.motion.is_none());
+        assert!(historical.paused && historical.reduced_motion);
+        assert!(!motion.enabled && !presentation.world_controls_allowed());
+
+        live.tick = 29;
+        live.revision = 29;
+        presentation.receive_live(live, &mut state, &mut motion);
+        assert_eq!(state.latest.as_ref().unwrap().tick, 0);
+        presentation.return_live(&mut state, &mut motion);
+        assert_eq!(state.latest.as_ref().unwrap().tick, 29);
+        assert!(state.latest.as_ref().unwrap().owner_source.is_some());
+        assert!(presentation.review.is_none() && presentation.live.is_none());
+        assert!(motion.enabled && presentation.world_controls_allowed());
+    }
+
+    #[test]
+    fn event_review_refuses_changed_evidence_or_incomplete_visuals_without_replacing_live() {
+        let mut presentation = LabPresentation::default();
+        let mut state = SnapshotState::default();
+        let mut motion = AgentMotionSettings { enabled: true };
+        let mut live = live_frame(12);
+        live.narrative_events = Arc::new(vec![narrative_record(0)]);
+        presentation.receive_live(live, &mut state, &mut motion);
+        presentation.narrative.select(1);
+        for mismatch in 0..6 {
+            let mut review = selected_event_review();
+            match mismatch {
+                0 => review.event.ordinal += 1,
+                1 => review.record.human_text = "different canonical evidence".into(),
+                2 => Arc::make_mut(&mut review.snapshot).session_id = HostSessionId::new(99),
+                3 => Arc::make_mut(&mut review.snapshot).world.tick += 1,
+                4 => review.base_tick = review.event.tick + 1,
+                5 => Arc::make_mut(&mut Arc::make_mut(&mut review.snapshot).layers.food)
+                    .cells
+                    .clear(),
+                _ => unreachable!(),
+            }
+            assert!(
+                !presentation.show_event_review(review, &mut state, &mut motion),
+                "mismatch {mismatch} must be refused"
+            );
+            assert_eq!(state.latest.as_ref().unwrap().tick, 12);
+            assert!(presentation.review.is_none() && presentation.live.is_none());
+            assert!(motion.enabled);
+        }
     }
 
     #[test]

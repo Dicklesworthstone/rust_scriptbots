@@ -1,8 +1,8 @@
 //! Renderer-independent consumers of application-owned Lab services.
 //!
 //! A single bounded worker performs application reads and requests. Frontends
-//! render these observations and apply returned checkpoint frames only to their
-//! presentation; this module never owns a world, database or experiment runner.
+//! render these observations and apply returned checkpoint or event frames only
+//! to their presentation; this module never owns a world, database or experiment runner.
 
 use crate::{HostSessionId, RenderSnapshot};
 use std::{
@@ -26,6 +26,36 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const LAB_WORKER_STACK_BYTES: usize = 32 * 1024 * 1024;
 static CHECKPOINT_CLIENT_NAMESPACE: OnceLock<u128> = OnceLock::new();
 static NEXT_CHECKPOINT_REQUEST: AtomicU64 = AtomicU64::new(1);
+
+/// One canonical narrative event within a publishing owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LabEventIdentity {
+    /// Owner whose bounded narrative ring supplied the event.
+    pub session_id: HostSessionId,
+    /// One-based absolute ordinal, including events evicted before the ring.
+    pub ordinal: u64,
+    /// Exact historical tick named by the canonical event.
+    pub tick: u64,
+}
+
+/// A reconstructed event observation with its actual saved source.
+pub struct LabEventReview {
+    /// Event requested by the user and checked against the owner's ring.
+    pub event: LabEventIdentity,
+    /// Complete canonical evidence captured before reconstruction.
+    pub record: scriptbots_core::narrative::EventRecord,
+    /// Retained checkpoint from which the application reconstructed the target.
+    pub checkpoint_id: String,
+    /// Actual tick of that source checkpoint.
+    pub base_tick: u64,
+    /// Historical presentation, never a replacement for the live owner.
+    pub snapshot: Arc<RenderSnapshot>,
+}
+
+struct SelectedEvent {
+    identity: LabEventIdentity,
+    record: scriptbots_core::narrative::EventRecord,
+}
 
 /// A request to application data services, never a direct world operation.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,6 +105,11 @@ pub enum LabWorkflowRequest {
     ReviewCheckpoint {
         /// Stable retained checkpoint identity.
         checkpoint_id: String,
+    },
+    /// Reconstruct a retained canonical event through the existing replay service.
+    ReviewEvent {
+        /// Observed owner, absolute event ordinal and exact historical tick.
+        event: LabEventIdentity,
     },
 }
 
@@ -263,6 +298,8 @@ pub enum LabWorkflowResponse {
         /// Reconstructed scientific presentation.
         snapshot: Arc<RenderSnapshot>,
     },
+    /// Verified event target and its retained checkpoint provenance.
+    EventFrame(LabEventReview),
 }
 
 /// Application adapter invoked on the model's bounded background worker.
@@ -314,6 +351,8 @@ pub enum LabAction {
     CreateCheckpoint,
     /// Request a presentation-only reconstruction.
     ReviewCheckpoint,
+    /// Review exactly the event that was selected when this action was rendered.
+    ReviewEvent(LabEventIdentity),
     /// Discard a pending result, retaining its occupied worker slot.
     CancelRequest,
     /// Invalidate pending review; the frontend restores its own live view.
@@ -364,6 +403,8 @@ pub struct LabWorkflows {
     pub selected_checkpoint: Option<String>,
     /// One bounded save record; an old-source record is informational only.
     pub latest_checkpoint_save: Option<LabCheckpointSave>,
+    selected_event: Option<SelectedEvent>,
+    event_review: Option<LabEventReview>,
     /// Bounded user-facing operation state or failure.
     pub notice: Option<String>,
     last_refresh: Option<Instant>,
@@ -492,6 +533,7 @@ impl LabWorkflows {
         // refuses when this counter is exhausted.
         self.context = self.context.saturating_add(1);
         self.last_refresh = None;
+        self.event_review = None;
         if let Some(save) = &mut self.latest_checkpoint_save
             && matches!(save.state, LabCheckpointSaveState::Pending)
         {
@@ -512,6 +554,46 @@ impl LabWorkflows {
             self.invalidate();
             self.panel = panel;
         }
+    }
+
+    /// Bind a selection to its complete canonical evidence, without cloning on
+    /// every live publication. Eviction or changed content invalidates pending
+    /// narrative work, without disturbing services in another visible panel.
+    pub fn select_event(
+        &mut self,
+        selection: Option<(LabEventIdentity, &scriptbots_core::narrative::EventRecord)>,
+    ) {
+        let selection = selection.filter(|(event, record)| {
+            self.session == Some(event.session_id)
+                && event.ordinal > 0
+                && event.tick == record.tick.0
+        });
+        let unchanged = match (&self.selected_event, &selection) {
+            (None, None) => true,
+            (Some(previous), Some((event, record))) => {
+                previous.identity == *event && &previous.record == *record
+            }
+            _ => false,
+        };
+        if unchanged {
+            return;
+        }
+        // Live retention still changes while another panel is open. Its
+        // checkpoint save or experiment read does not depend on this selection;
+        // the panel transition already invalidated any older event request.
+        if self.panel == LabPanel::Narrative {
+            self.invalidate();
+        }
+        self.selected_event = selection.map(|(identity, record)| SelectedEvent {
+            identity,
+            record: record.clone(),
+        });
+    }
+
+    /// Take one accepted event frame after polling the bounded worker.
+    /// Any intervening selection, source or panel change clears this result.
+    pub fn take_event_review(&mut self) -> Option<LabEventReview> {
+        self.event_review.take()
     }
 
     fn note_prior_checkpoint_save(&mut self) {
@@ -754,8 +836,9 @@ impl LabWorkflows {
 
     /// Consume one worker result without blocking the frontend.
     ///
-    /// Only an accepted, still-selected checkpoint returns a frame. The frontend
-    /// must honor any newer local live-view intent before displaying it.
+    /// An accepted, still-selected checkpoint returns a frame. An accepted event
+    /// is available through [`Self::take_event_review`]. The frontend must honor
+    /// any newer local live-view intent before displaying either result.
     pub fn poll(&mut self) -> Option<(String, Arc<RenderSnapshot>)> {
         let job = self.job.as_ref()?;
         let result = match job.result.try_recv() {
@@ -866,6 +949,28 @@ impl LabWorkflows {
                     snapshot.world.tick
                 ));
                 return Some((returned_id, snapshot));
+            }
+            (
+                LabWorkflowRequest::ReviewEvent { event },
+                LabWorkflowResponse::EventFrame(review),
+            ) if self.panel == LabPanel::Narrative
+                && self.session == Some(event.session_id)
+                && self.selected_event.as_ref().is_some_and(|selected| {
+                    selected.identity == *event && selected.record == review.record
+                })
+                && review.event == *event
+                && review.record.tick.0 == event.tick
+                && review.snapshot.session_id == event.session_id
+                && review.snapshot.world.tick == event.tick
+                && review.base_tick <= event.tick
+                && identity_is_bounded(&review.checkpoint_id) =>
+            {
+                self.notice = Some(format!(
+                    "Reconstructed event #{} at tick {} from checkpoint {} at tick {}.",
+                    event.ordinal, event.tick, review.checkpoint_id, review.base_tick,
+                ));
+                self.event_review = Some(review);
+                return None;
             }
             _ => false,
         };
@@ -1035,6 +1140,7 @@ impl LabWorkflows {
         self.checkpoints = None;
         self.checkpoint_cursor = None;
         self.selected_checkpoint = None;
+        self.selected_event = None;
         self.notice = None;
         self.variant_offset = 0;
     }
@@ -1121,6 +1227,20 @@ impl LabWorkflows {
                     self.start(LabWorkflowRequest::ReviewCheckpoint {
                         checkpoint_id: row.checkpoint_id.clone(),
                     });
+                }
+            }
+            LabAction::ReviewEvent(event) => {
+                if self.panel == LabPanel::Narrative
+                    && self.session == Some(event.session_id)
+                    && self
+                        .selected_event
+                        .as_ref()
+                        .is_some_and(|selected| selected.identity == event)
+                {
+                    self.event_review = None;
+                    self.start(LabWorkflowRequest::ReviewEvent { event });
+                } else {
+                    self.set_notice("Select the same retained event in the current owner's timeline before reviewing it.");
                 }
             }
             LabAction::CreateCheckpoint => self.create_checkpoint(),
@@ -1587,6 +1707,251 @@ mod tests {
         assert!(state.checkpoints.is_none() && state.selected_checkpoint.is_none());
         assert!(state.submit.is_none());
         assert_eq!(state.session, Some(frame.session_id));
+    }
+
+    // Synthetic protocol evidence isolates source, identity and completion guards.
+    // Application tests separately reconstruct a real production detector event.
+    fn event_protocol_fixture() -> (
+        Arc<RenderSnapshot>,
+        LabEventIdentity,
+        scriptbots_core::narrative::EventRecord,
+    ) {
+        let world = scriptbots_core::WorldState::new(scriptbots_core::ScriptBotsConfig {
+            rng_seed: Some(42),
+            world_width: 40,
+            world_height: 40,
+            food_cell_size: 10,
+            population_minimum: 0,
+            persistence_interval: 0,
+            ..scriptbots_core::ScriptBotsConfig::default()
+        })
+        .unwrap();
+        let frame = crate::HostCore::new(
+            HostSessionId::new(17),
+            world,
+            crate::HostCoreOptions::default(),
+        )
+        .unwrap()
+        .latest_snapshot();
+        let event = LabEventIdentity {
+            session_id: frame.session_id,
+            ordinal: 41,
+            tick: frame.world.tick,
+        };
+        let record = scriptbots_core::narrative::EventRecord {
+            schema_version: 1,
+            tick: scriptbots_core::Tick(event.tick),
+            kind: scriptbots_core::narrative::EventKind::Extinction,
+            severity: 1.0,
+            magnitude: 20.0,
+            window: (0, event.tick),
+            metric: "population".into(),
+            before: 20.0,
+            after: 0.0,
+            score: 5.0,
+            subject: None,
+            human_text: "protocol fixture: population reached zero".into(),
+        };
+        (frame, event, record)
+    }
+
+    #[test]
+    fn event_review_requires_the_selected_evidence_owner_target_and_source_checkpoint() {
+        let (frame, event, record) = event_protocol_fixture();
+        let mut state = LabWorkflows::default();
+        state.synchronize(event.session_id, LabPanel::Narrative);
+        state.select_event(Some((event, &record)));
+        let context = state.context;
+        state.select_event(Some((event, &record)));
+        assert_eq!(
+            state.context, context,
+            "unchanged evidence stays reviewable"
+        );
+        let response = || LabEventReview {
+            event,
+            record: record.clone(),
+            checkpoint_id: "actual-retained-cut".into(),
+            base_tick: 0,
+            snapshot: Arc::clone(&frame),
+        };
+        let request = LabWorkflowRequest::ReviewEvent { event };
+        assert!(
+            deliver(
+                &mut state,
+                request.clone(),
+                LabWorkflowResponse::EventFrame(response())
+            )
+            .is_none()
+        );
+        let accepted = state.take_event_review().expect("exact selected event");
+        assert_eq!(accepted.event, event);
+        assert_eq!(accepted.record, record);
+        assert!(Arc::ptr_eq(&accepted.snapshot, &frame));
+        assert!(
+            state.take_event_review().is_none(),
+            "one result is consumed once"
+        );
+
+        for mismatch in 0..8 {
+            let mut changed = response();
+            match mismatch {
+                0 => changed.event.ordinal += 1,
+                1 => Arc::make_mut(&mut changed.snapshot).session_id = HostSessionId::new(99),
+                2 => Arc::make_mut(&mut changed.snapshot).world.tick += 1,
+                3 => changed.base_tick = event.tick + 1,
+                4 => changed.record.before += 1.0,
+                5 => changed.checkpoint_id.clear(),
+                6 => changed.record.tick.0 += 1,
+                7 => changed.event.tick += 1,
+                _ => unreachable!(),
+            }
+            assert!(
+                deliver(
+                    &mut state,
+                    request.clone(),
+                    LabWorkflowResponse::EventFrame(changed)
+                )
+                .is_none()
+            );
+            assert!(
+                state.take_event_review().is_none(),
+                "mismatch {mismatch} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn event_review_discards_late_results_after_every_selection_or_live_view_change() {
+        let (frame, event, record) = event_protocol_fixture();
+        for change in 0..6 {
+            let mut state = LabWorkflows::default();
+            state.synchronize(event.session_id, LabPanel::Narrative);
+            state.select_event(Some((event, &record)));
+            let (send, result) = std::sync::mpsc::sync_channel(1);
+            state.generation += 1;
+            state.job = Some(LabJob {
+                request: LabWorkflowRequest::ReviewEvent { event },
+                generation: state.generation,
+                context: state.context,
+                session: event.session_id,
+                result,
+            });
+            match change {
+                0 => state.dispatch(LabAction::ReturnLive),
+                1 => state.select_event(None),
+                2 => {
+                    let mut replacement = record.clone();
+                    replacement.human_text = "different evidence at the same identity".into();
+                    state.select_event(Some((event, &replacement)));
+                }
+                3 => state.synchronize(HostSessionId::new(99), LabPanel::Narrative),
+                4 => state.synchronize(event.session_id, LabPanel::Checkpoints),
+                5 => state.select_event(Some((
+                    LabEventIdentity {
+                        ordinal: event.ordinal + 1,
+                        ..event
+                    },
+                    &record,
+                ))),
+                _ => unreachable!(),
+            }
+            assert!(
+                state.is_busy(),
+                "change {change} cannot release an occupied worker"
+            );
+            assert!(
+                send.send(Ok(LabWorkflowResponse::EventFrame(LabEventReview {
+                    event,
+                    record: record.clone(),
+                    checkpoint_id: "actual-retained-cut".into(),
+                    base_tick: 0,
+                    snapshot: Arc::clone(&frame),
+                })))
+                .is_ok()
+            );
+            assert!(state.poll().is_none());
+            assert!(!state.is_busy());
+            assert!(
+                state.take_event_review().is_none(),
+                "change {change} invalidates the old result"
+            );
+        }
+    }
+
+    #[test]
+    fn event_review_refuses_stale_actions_before_starting_a_worker() {
+        let (_, event, record) = event_protocol_fixture();
+        let mut state = LabWorkflows {
+            submit: Some(Arc::new(|_| Err("unexpected stale action".into()))),
+            ..LabWorkflows::default()
+        };
+        state.synchronize(event.session_id, LabPanel::Narrative);
+        state.select_event(Some((event, &record)));
+        for stale in [
+            LabEventIdentity {
+                session_id: HostSessionId::new(99),
+                ..event
+            },
+            LabEventIdentity {
+                ordinal: event.ordinal + 1,
+                ..event
+            },
+            LabEventIdentity {
+                tick: event.tick + 1,
+                ..event
+            },
+        ] {
+            state.dispatch(LabAction::ReviewEvent(stale));
+            assert!(!state.is_busy());
+        }
+        state.select_event(None);
+        state.dispatch(LabAction::ReviewEvent(event));
+        assert!(
+            !state.is_busy(),
+            "evicted evidence cannot be reconstructed by a stale button"
+        );
+    }
+
+    #[test]
+    fn narrative_eviction_preserves_a_pending_checkpoint_save_in_its_own_panel() {
+        let (_, event, record) = event_protocol_fixture();
+        let (started, observed_start) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let released = Mutex::new(released);
+        let mut state = LabWorkflows {
+            submit: Some(Arc::new(move |request| {
+                started.send(()).unwrap();
+                released
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+                Ok(saved_response(&request, saved_checkpoint()))
+            })),
+            ..LabWorkflows::default()
+        };
+        state.synchronize(event.session_id, LabPanel::Narrative);
+        state.select_event(Some((event, &record)));
+        state.synchronize(event.session_id, LabPanel::Checkpoints);
+        state.dispatch(LabAction::CreateCheckpoint);
+        observed_start.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(state.is_busy());
+        state.select_event(None);
+        assert!(
+            state.selected_event.is_none(),
+            "eviction still updates cached evidence"
+        );
+        assert!(matches!(
+            state.latest_checkpoint_save.as_ref().unwrap().state,
+            LabCheckpointSaveState::Pending
+        ));
+        release.send(()).unwrap();
+        drain_worker(&mut state);
+        assert_eq!(
+            state.latest_checkpoint_save.as_ref().unwrap().state,
+            LabCheckpointSaveState::Saved(saved_checkpoint())
+        );
+        assert_eq!(state.selected_checkpoint.as_deref(), Some("retained-cut"));
     }
 
     fn saved_checkpoint() -> LabCheckpoint {

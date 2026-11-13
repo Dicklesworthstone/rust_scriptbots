@@ -4218,9 +4218,64 @@ pub mod renderer {
                             checkpoint_id,
                             snapshot,
                         }),
+                    LabWorkflowRequest::ReviewEvent { event } => review_lab_event(&control, event),
                 };
             result.map_err(|error| error.to_string())
         })
+    }
+
+    #[cfg(any(feature = "gui", feature = "bevy_render", test))]
+    fn retained_lab_event(
+        snapshot: &scriptbots_runtime::RenderSnapshot,
+        event: scriptbots_runtime::lab_workflows::LabEventIdentity,
+    ) -> Result<&scriptbots_core::narrative::EventRecord, crate::control::ControlError> {
+        let index = event
+            .ordinal
+            .checked_sub(snapshot.narrative_dropped_events)
+            .and_then(|offset| offset.checked_sub(1))
+            .and_then(|index| usize::try_from(index).ok());
+        if snapshot.session_id == event.session_id
+            && event.tick <= snapshot.world.tick
+            && let Some(record) = index.and_then(|index| snapshot.narrative_events.get(index))
+            && record.tick.0 == event.tick
+        {
+            return Ok(record);
+        }
+        Err(crate::control::ControlError::Conflict(
+            "selected narrative event is no longer retained at that identity and tick in this owner".into(),
+        ))
+    }
+
+    #[cfg(any(feature = "gui", feature = "bevy_render", test))]
+    fn review_lab_event(
+        control: &crate::control::ControlHandle,
+        event: scriptbots_runtime::lab_workflows::LabEventIdentity,
+    ) -> Result<scriptbots_runtime::lab_workflows::LabWorkflowResponse, crate::control::ControlError>
+    {
+        use scriptbots_runtime::lab_workflows::{LabEventReview, LabWorkflowResponse};
+
+        let source = control.read_snapshot()?;
+        let record = retained_lab_event(&source, event)?.clone();
+        let review = control.event_canvas(event.tick)?;
+        // Reconstruction happens off the render thread. Check the actual source
+        // again before returning, rather than attaching an old result to a new owner.
+        let current = control.read_snapshot()?;
+        if retained_lab_event(&current, event)? != &record
+            || review.snapshot.session_id != event.session_id
+            || review.snapshot.world.tick != event.tick
+            || review.base_tick > event.tick
+        {
+            return Err(crate::control::ControlError::Conflict(
+                "event reconstruction changed its source, canonical evidence or target tick".into(),
+            ));
+        }
+        Ok(LabWorkflowResponse::EventFrame(LabEventReview {
+            event,
+            record,
+            checkpoint_id: review.checkpoint_id,
+            base_tick: review.base_tick,
+            snapshot: review.snapshot,
+        }))
     }
 
     #[cfg(any(feature = "gui", feature = "bevy_render", test))]
@@ -4533,6 +4588,163 @@ pub mod renderer {
             );
             assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
             assert_eq!(host.port.snapshot_hub().latest().world.tick, 1);
+        }
+
+        #[test]
+        // Real detector evidence, recorded interventions, saved source and async consumer.
+        #[allow(clippy::too_many_lines)]
+        fn native_lab_event_review_reconstructs_a_real_narrative_event_without_changing_live() {
+            use scriptbots_core::{
+                CohortSource, Intervention, InterventionCommand, InterventionSurface, Placement,
+                Region, narrative::EventKind,
+            };
+            use scriptbots_runtime::lab_workflows::{
+                LabAction, LabEventIdentity, LabPanel, LabWorkflowRequest, LabWorkflows,
+            };
+
+            let directory = tempfile::tempdir().unwrap();
+            let mut world = scriptbots_core::WorldState::new(ScriptBotsConfig {
+                rng_seed: Some(42),
+                world_width: 120,
+                world_height: 120,
+                food_cell_size: 20,
+                persistence_interval: 0,
+                closed: true,
+                topography_enabled: false,
+                population_minimum: 0,
+                population_spawn_interval: 0,
+                initial_food: 0.0,
+                food_growth_rate: 0.0,
+                metabolism_drain: 0.0,
+                movement_drain: 0.0,
+                temperature_discomfort_rate: 0.0,
+                aging_health_decay_rate: 0.0,
+                spike_damage: 0.0,
+                spike_energy_cost: 0.0,
+                reproduction_energy_threshold: f32::MAX,
+                narrative_interval: 1,
+                narrative_capacity: 32,
+                history_capacity: 128,
+                ..ScriptBotsConfig::default()
+            })
+            .unwrap();
+            let brains = crate::install_brains(&mut world, crate::BrainPreset::Mlp)
+                .unwrap()
+                .population;
+            crate::seed_founders(&mut world, &brains, crate::FounderRecipe::Spread).unwrap();
+            let host = TestHost::spawn(world);
+            let handle = host
+                .handle()
+                .with_artifacts_dir(directory.path().to_path_buf())
+                .unwrap();
+            let checkpoint = handle
+                .create_checkpoint(crate::control::CheckpointCreateRequest::default())
+                .unwrap();
+            for _ in 0..16 {
+                host.wait_applied(&handle.step().unwrap());
+            }
+            assert!(!handle.read_snapshot().unwrap().world.agents.is_empty());
+            host.wait_applied(
+                &handle
+                    .intervene(
+                        InterventionCommand::new(
+                            Intervention::Meteor {
+                                region: Region::All,
+                                lethality: 10.0,
+                                scorch: 0.0,
+                            },
+                            InterventionSurface::Script,
+                            "native-narrative-review",
+                        ),
+                        None,
+                    )
+                    .unwrap(),
+            );
+            host.wait_applied(&handle.step().unwrap());
+            let target = handle.read_snapshot().unwrap();
+            assert_eq!(target.world.tick, 17);
+            assert!(target.world.agents.is_empty());
+            let (index, record) = target
+                .narrative_events
+                .iter()
+                .enumerate()
+                .find(|(_, record)| record.kind == EventKind::Extinction)
+                .expect("production detector must narrate the actual extinction");
+            assert_eq!(record.tick.0, target.world.tick);
+            let record = record.clone();
+            let event = LabEventIdentity {
+                session_id: target.session_id,
+                ordinal: target.narrative_dropped_events + u64::try_from(index).unwrap() + 1,
+                tick: record.tick.0,
+            };
+
+            // Make the live canvas observably different from the extinct target.
+            host.wait_applied(
+                &handle
+                    .intervene(
+                        InterventionCommand::new(
+                            Intervention::InjectCohort {
+                                count: 3,
+                                genome: CohortSource::RegisteredBrain { key: brains[0] },
+                                placement: Placement::Seeded {
+                                    region: Region::All,
+                                    seed: 91,
+                                },
+                                herbivore_tendency: 0.75,
+                            },
+                            InterventionSurface::Script,
+                            "native-narrative-review",
+                        ),
+                        None,
+                    )
+                    .unwrap(),
+            );
+            for _ in 0..4 {
+                host.wait_applied(&handle.step().unwrap());
+            }
+            let live = handle.read_snapshot().unwrap();
+            assert_eq!(live.world.agents.len(), 3);
+            let digest = host.port.scientific_digest_v1().unwrap();
+            let provider = lab_workflow_submit(handle.clone());
+            let mut model = LabWorkflows::default();
+            model.submit = Some(Arc::clone(&provider));
+            model.synchronize(event.session_id, LabPanel::Narrative);
+            model.select_event(Some((event, &record)));
+            model.dispatch(LabAction::ReviewEvent(event));
+            assert!(finish_native_lab_request(&mut model).is_none());
+            let review = model
+                .take_event_review()
+                .unwrap_or_else(|| panic!("actual event review failed: {:?}", model.notice));
+            assert_eq!(review.event, event);
+            assert_eq!(review.record, record);
+            assert_eq!(review.checkpoint_id, checkpoint.checkpoint_id);
+            assert_eq!(review.base_tick, checkpoint.tick);
+            assert_eq!(review.snapshot.session_id, target.session_id);
+            assert_eq!(review.snapshot.world.tick, target.world.tick);
+            assert_eq!(review.snapshot.world.world, target.world.world);
+            assert_eq!(review.snapshot.world.agents, target.world.agents);
+            assert_ne!(review.snapshot.world.agents, live.world.agents);
+            assert_eq!(review.snapshot.layers.food, target.layers.food);
+            assert!(review.snapshot.agent_visuals_complete());
+
+            for invalid in [
+                LabEventIdentity {
+                    session_id: scriptbots_runtime::HostSessionId::new(99),
+                    ..event
+                },
+                LabEventIdentity {
+                    ordinal: 0,
+                    ..event
+                },
+                LabEventIdentity {
+                    tick: event.tick + 1,
+                    ..event
+                },
+            ] {
+                assert!(provider(LabWorkflowRequest::ReviewEvent { event: invalid }).is_err());
+            }
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), digest);
+            assert!(Arc::ptr_eq(&handle.read_snapshot().unwrap(), &live));
         }
 
         #[test]

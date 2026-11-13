@@ -1092,6 +1092,18 @@ reassigned to a different event. Changing the owner session clears old selection
 This read-only timeline also works without application services; the retained
 ring is not presented as a complete or durable run history.
 
+With application services available, choose **Review selected event tick in the
+world** to reconstruct that event's historical world. Review requires a retained
+checkpoint at or before the target tick and its replay evidence. **EVENT REVIEW**
+names the event, target tick, owner session, source checkpoint, and source tick.
+The request is checked against the complete selected record before and after
+reconstruction; changing or losing that evidence refuses the stale result.
+The live simulation keeps its current world. The historical view disables live
+organism picking and simulation commands, and **Return live** restores the newest
+publication. You can save a source checkpoint through F7 before observing later
+events. Background narrative eviction leaves unrelated checkpoint saves and
+experiment requests intact.
+
 The experiment pane reads the same application services as GPUI. It lists retained
 batches, shows every variant through bounded pages, and reports completed,
 running and failed runs. Select baseline and challenger arms to compare verified
@@ -1120,9 +1132,10 @@ verification run outside the render loop. Bevy retains at most one saved
 presentation and one newest live publication, and reuses a bounded pool of UI
 rows.
 
-This increment covers experiment inspection/comparison and checkpoint saving and
-review under `bd-2z0.7.6.1`. Replay seeking, first-divergence display, artifact
-export and full native/GPU acceptance remain unfinished parts of that bead.
+These panes cover experiment inspection/comparison, checkpoint saving and review,
+and reconstruction at a selected narrative event tick under `bd-2z0.7.6.1` and
+`bd-ji3a`. General replay seeking, first-divergence display, artifact export and
+full native/GPU acceptance remain unfinished parts of those workflows.
 Normal simulation epoch progression preserves a saved view; a change of host
 session invalidates stale observations and results.
 
