@@ -1076,11 +1076,21 @@ unconfirmed. Paused and single-step snapshots settle agent positions, headings,
 spikes, and idle-body deformation immediately at their recorded poses; camera
 navigation remains available while paused.
 
-### Native Lab experiments and saved checkpoints
+### Native Lab experiments, saved checkpoints, and event timeline
 
-In Bevy, use **Lab (F6)** to open the experiment pane or **F7** to open saved
-checkpoints. Tab or Up/Down selects an enabled action, Enter activates it, and
+In Bevy, use **Lab (F6)** to open the experiment pane, **F7** to open saved
+checkpoints, or **F8** to open the event timeline. Tab or Up/Down selects an enabled action, Enter activates it, and
 PageUp/PageDown or the mouse wheel scrolls the panel. Escape closes the panel.
+
+The event timeline reads the canonical narrative records from the newest live
+publication, including while a saved world is being reviewed. It shows 12 events
+per page and preserves a selected event and pinned page as new events arrive.
+Selecting an event exposes its recorded tick, subject, severity, magnitude,
+before/after values, and observation window. Retention gaps are explicit: if
+an event leaves the bounded history, its selection is cleared rather than
+reassigned to a different event. Changing the owner session clears old selections.
+This read-only timeline also works without application services; the retained
+ring is not presented as a complete or durable run history.
 
 The experiment pane reads the same application services as GPUI. It lists retained
 batches, shows every variant through bounded pages, and reports completed,

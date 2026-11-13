@@ -279,6 +279,8 @@ pub enum LabPanel {
     Experiments,
     /// Saved scientific cuts.
     Checkpoints,
+    /// Canonical events read from immutable live publications.
+    Narrative,
 }
 
 /// Frontend intent reduced by the shared model.
@@ -933,7 +935,7 @@ impl LabWorkflows {
 
     fn refresh_request(&self) -> Option<LabWorkflowRequest> {
         match self.panel {
-            LabPanel::Inactive => None,
+            LabPanel::Inactive | LabPanel::Narrative => None,
             LabPanel::Experiments => Some(self.selected_experiment.as_ref().map_or_else(
                 || LabWorkflowRequest::ListExperiments {
                     cursor: self.experiment_cursor.clone(),
@@ -959,7 +961,7 @@ impl LabWorkflows {
             return;
         }
         let needs_refresh = match self.panel {
-            LabPanel::Inactive => false,
+            LabPanel::Inactive | LabPanel::Narrative => false,
             LabPanel::Checkpoints => self.checkpoints.is_none(),
             LabPanel::Experiments => {
                 self.selected_experiment.is_none()

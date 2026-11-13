@@ -17,6 +17,7 @@ use scriptbots_runtime::{
 // fit in this fixed pool. Retention is independent of experiment/run history.
 const MAX_PANEL_ROWS: usize = 80;
 const ROW_GAP: f32 = 5.0;
+const NARRATIVE_PAGE_SIZE: usize = 12;
 
 #[derive(Component)]
 pub(super) struct OpenLabButton;
@@ -29,6 +30,13 @@ enum PanelAction {
     Panel(LabPanel),
     Close,
     Workflow(LabAction),
+    NarrativeOlder,
+    NarrativeNewer,
+    NarrativeLatest,
+    SelectNarrative {
+        session_id: HostSessionId,
+        ordinal: u64,
+    },
 }
 
 #[derive(Component, Default)]
@@ -88,6 +96,135 @@ struct ReviewFrame {
     tick: u64,
 }
 
+/// A page into the owner's immutable ring, addressed by absolute event ordinal.
+/// New events cannot move a pinned page or silently select another event.
+#[derive(Default)]
+struct NarrativeTimeline {
+    observed_tick: Option<u64>,
+    records: Arc<Vec<scriptbots_core::narrative::EventRecord>>,
+    dropped: u64,
+    newest_on_page: Option<u64>,
+    selected: Option<u64>,
+    notice: Option<String>,
+}
+
+impl NarrativeTimeline {
+    fn latest_ordinal(&self) -> Option<u64> {
+        self.dropped
+            .checked_add(u64::try_from(self.records.len()).ok()?)
+    }
+
+    fn record(&self, ordinal: u64) -> Option<&scriptbots_core::narrative::EventRecord> {
+        let index = usize::try_from(ordinal.checked_sub(self.dropped)?.checked_sub(1)?).ok()?;
+        self.records.get(index)
+    }
+
+    fn observe(&mut self, snapshot: &WorldSnapshot) {
+        self.observed_tick = Some(snapshot.tick);
+        if Arc::ptr_eq(&self.records, &snapshot.narrative_events)
+            && self.dropped == snapshot.narrative_dropped_events
+        {
+            return;
+        }
+        let previous_latest = self.latest_ordinal();
+        let previous_records = Arc::clone(&self.records);
+        let previous_dropped = self.dropped;
+        self.records = Arc::clone(&snapshot.narrative_events);
+        self.dropped = snapshot.narrative_dropped_events;
+        let Some(latest) = self.latest_ordinal() else {
+            self.selected = None;
+            self.newest_on_page = None;
+            self.notice = Some("Narrative event ordinals exceed the supported range.".into());
+            return;
+        };
+        if self.dropped < previous_dropped || previous_latest.is_some_and(|value| latest < value) {
+            self.selected = None;
+            self.newest_on_page = None;
+            self.notice =
+                Some("Narrative history restarted; the previous selection was cleared.".into());
+        } else if let Some(ordinal) = self.selected {
+            let previous = ordinal
+                .checked_sub(previous_dropped)
+                .and_then(|offset| offset.checked_sub(1))
+                .and_then(|index| usize::try_from(index).ok())
+                .and_then(|index| previous_records.get(index));
+            if self.record(ordinal) != previous {
+                self.selected = None;
+                self.notice = Some(format!(
+                    "Event #{ordinal} is no longer retained unchanged; the previous selection was cleared."
+                ));
+            }
+        }
+        if let Some(end) = self.newest_on_page {
+            if end <= self.dropped {
+                self.newest_on_page = self
+                    .dropped
+                    .checked_add(NARRATIVE_PAGE_SIZE as u64)
+                    .map(|value| value.min(latest));
+                self.notice = Some(
+                    "The viewed page left retained history; showing the oldest available page."
+                        .into(),
+                );
+            } else {
+                self.newest_on_page = Some(end.min(latest));
+            }
+        }
+    }
+
+    fn page(&self) -> Vec<(u64, &scriptbots_core::narrative::EventRecord)> {
+        let Some(latest) = self.latest_ordinal() else {
+            return Vec::new();
+        };
+        let end = self.newest_on_page.unwrap_or(latest).min(latest);
+        let Some(count) = end
+            .checked_sub(self.dropped)
+            .and_then(|value| usize::try_from(value).ok())
+        else {
+            return Vec::new();
+        };
+        self.records
+            .iter()
+            .take(count)
+            .enumerate()
+            .rev()
+            .take(NARRATIVE_PAGE_SIZE)
+            .map(|(index, record)| (self.dropped + index as u64 + 1, record))
+            .collect()
+    }
+
+    fn can_show_older(&self) -> bool {
+        self.page()
+            .last()
+            .is_some_and(|(ordinal, _)| *ordinal > self.dropped.saturating_add(1))
+    }
+
+    fn can_show_newer(&self) -> bool {
+        self.newest_on_page
+            .zip(self.latest_ordinal())
+            .is_some_and(|(end, latest)| end < latest)
+    }
+
+    fn older(&mut self) {
+        if self.can_show_older() {
+            self.newest_on_page = self.page().last().map(|(ordinal, _)| ordinal - 1);
+        }
+    }
+
+    fn newer(&mut self) {
+        if let Some((end, latest)) = self.newest_on_page.zip(self.latest_ordinal()) {
+            let next = end.saturating_add(NARRATIVE_PAGE_SIZE as u64).min(latest);
+            self.newest_on_page = (next < latest).then_some(next);
+        }
+    }
+
+    fn select(&mut self, ordinal: u64) {
+        if self.record(ordinal).is_some() {
+            self.selected = Some(ordinal);
+            self.notice = None;
+        }
+    }
+}
+
 /// At most one saved projection and the newest live projection are retained.
 /// A source change exits review rather than mixing observations from owners.
 #[derive(Resource, Default)]
@@ -98,6 +235,7 @@ pub(super) struct LabPresentation {
     source_changed: bool,
     live: Option<WorldSnapshot>,
     review: Option<ReviewFrame>,
+    narrative: NarrativeTimeline,
     keyboard_captured: bool,
     focus: Option<usize>,
     focus_changed: bool,
@@ -116,8 +254,12 @@ impl LabPresentation {
             self.source = source;
             self.review = None;
             self.live = None;
+            self.narrative = NarrativeTimeline::default();
             // Revision integers are meaningful only within their source.
             state.last_applied_palette = None;
+        }
+        if source.is_some() {
+            self.narrative.observe(&snapshot);
         }
         if self.review.is_some() {
             self.live = Some(snapshot);
@@ -175,6 +317,12 @@ impl LabPresentation {
             self.panel = panel;
             self.focus = None;
             self.focus_changed = true;
+        }
+    }
+
+    fn select_narrative(&mut self, session_id: HostSessionId, ordinal: u64) {
+        if self.source == Some(session_id) {
+            self.narrative.select(ordinal);
         }
     }
 
@@ -366,6 +514,10 @@ pub(super) fn update(
         action = Some(PanelAction::Panel(LabPanel::Checkpoints));
         presentation.keyboard_captured = true;
     }
+    if keys.just_pressed(KeyCode::F8) {
+        action = Some(PanelAction::Panel(LabPanel::Narrative));
+        presentation.keyboard_captured = true;
+    }
     if banners
         .iter()
         .any(|interaction| *interaction == Interaction::Pressed)
@@ -426,6 +578,15 @@ pub(super) fn update(
                 presentation.keyboard_captured = true;
                 presentation.change_panel(LabPanel::Inactive);
             }
+            PanelAction::NarrativeOlder => presentation.narrative.older(),
+            PanelAction::NarrativeNewer => presentation.narrative.newer(),
+            PanelAction::NarrativeLatest => presentation.narrative.newest_on_page = None,
+            PanelAction::SelectNarrative {
+                session_id,
+                ordinal,
+            } => {
+                presentation.select_narrative(session_id, ordinal);
+            }
             PanelAction::Workflow(action) => {
                 // A row may have been painted before review/source changed.
                 // Never let that stale input capture the hidden live owner.
@@ -473,7 +634,7 @@ fn panel_rows(model: &LabWorkflows, presentation: &LabPresentation) -> Vec<Panel
     let mut rows = vec![
         PanelRow::text("EVOLUTION LAB"),
         PanelRow::text(
-            "F6: Lab | F7: checkpoints | Tab / arrows / Enter: select | PageUp / PageDown: scroll | Escape: close",
+            "F6: Lab | F7: checkpoints | F8: timeline | Tab / arrows / Enter: select | PageUp / PageDown: scroll | Escape: close",
         ),
         PanelRow::button(
             "Experiments",
@@ -483,6 +644,11 @@ fn panel_rows(model: &LabWorkflows, presentation: &LabPresentation) -> Vec<Panel
         PanelRow::button(
             "Saved checkpoints",
             PanelAction::Panel(LabPanel::Checkpoints),
+            true,
+        ),
+        PanelRow::button(
+            "Narrated timeline",
+            PanelAction::Panel(LabPanel::Narrative),
             true,
         ),
         PanelRow::button("Close panel", PanelAction::Close, true),
@@ -497,6 +663,10 @@ fn panel_rows(model: &LabWorkflows, presentation: &LabPresentation) -> Vec<Panel
             LabAction::ReturnLive,
             true,
         ));
+    }
+    if presentation.panel == LabPanel::Narrative {
+        narrative_rows(presentation, &mut rows);
+        return rows;
     }
     if model.submit.is_none() {
         rows.push(PanelRow::text(
@@ -533,7 +703,7 @@ fn panel_rows(model: &LabWorkflows, presentation: &LabPresentation) -> Vec<Panel
     match presentation.panel {
         LabPanel::Experiments => experiment_rows(model, idle, &mut rows),
         LabPanel::Checkpoints => checkpoint_rows(model, presentation, idle, &mut rows),
-        LabPanel::Inactive => {}
+        LabPanel::Inactive | LabPanel::Narrative => {}
     }
     // Fail visibly if future extensions outgrow the widget pool; never silently
     // omit the end of a scientific comparison or its provenance.
@@ -545,6 +715,107 @@ fn panel_rows(model: &LabWorkflows, presentation: &LabPresentation) -> Vec<Panel
         rows.push(PanelRow::button("Close panel", PanelAction::Close, true));
     }
     rows
+}
+
+fn narrative_rows(presentation: &LabPresentation, rows: &mut Vec<PanelRow>) {
+    use scriptbots_core::narrative_text::fixed;
+
+    let timeline = &presentation.narrative;
+    let Some((session, tick)) = presentation.source.zip(timeline.observed_tick) else {
+        rows.push(PanelRow::text("Waiting for identified scientific history."));
+        return;
+    };
+    rows.push(PanelRow::text(format!(
+        "LIVE NARRATIVE | session {} | observed tick {tick}",
+        session.get(),
+    )));
+    rows.push(PanelRow::text(
+        "These are the owner's canonical scientific events. Select an event to inspect its recorded evidence.",
+    ));
+    if presentation.review.is_some() {
+        rows.push(PanelRow::text(
+            "The timeline follows the live owner while the world shows a saved observation.",
+        ));
+    }
+    if let Some(notice) = &timeline.notice {
+        rows.push(PanelRow::text(notice.clone()));
+    }
+    if timeline.dropped > 0 {
+        rows.push(PanelRow::text(format!(
+            "Retention gap: {} earlier events are outside the owner's in-memory history.",
+            timeline.dropped,
+        )));
+    }
+    rows.push(PanelRow::text(
+        "This observation does not confirm durable event storage.",
+    ));
+    let page = timeline.page();
+    if page.is_empty() {
+        rows.push(PanelRow::text(
+            "No narrative events are retained in this observation.",
+        ));
+        return;
+    }
+    rows.push(PanelRow::button(
+        "Older events",
+        PanelAction::NarrativeOlder,
+        timeline.can_show_older(),
+    ));
+    rows.push(PanelRow::button(
+        "Newer events",
+        PanelAction::NarrativeNewer,
+        timeline.can_show_newer(),
+    ));
+    rows.push(PanelRow::button(
+        if timeline.newest_on_page.is_none() {
+            "Following newest events"
+        } else {
+            "Follow newest events"
+        },
+        PanelAction::NarrativeLatest,
+        timeline.newest_on_page.is_some(),
+    ));
+    for (ordinal, record) in page {
+        rows.push(PanelRow::button(
+            format!(
+                "{}#{ordinal} | tick {} | {}",
+                if timeline.selected == Some(ordinal) {
+                    "Selected: "
+                } else {
+                    ""
+                },
+                record.tick.0,
+                record.human_text,
+            ),
+            PanelAction::SelectNarrative {
+                session_id: session,
+                ordinal,
+            },
+            true,
+        ));
+    }
+    if let Some((ordinal, record)) = timeline
+        .selected
+        .and_then(|ordinal| timeline.record(ordinal).map(|record| (ordinal, record)))
+    {
+        rows.push(PanelRow::text(format!(
+            "EVENT #{ordinal} | {} | {} | tick {}\n{}",
+            record.kind.as_str(),
+            record.metric,
+            record.tick.0,
+            record.human_text,
+        )));
+        rows.push(PanelRow::text(format!(
+            "Recorded window: ticks {}-{} | before {} | after {}\nMagnitude {} | severity {} | subject {}",
+            record.window.0,
+            record.window.1,
+            fixed(record.before, 3),
+            fixed(record.after, 3),
+            fixed(record.magnitude, 3),
+            fixed(f64::from(record.severity), 3),
+            record.subject.map_or_else(|| "unspecified".into(), scriptbots_core::narrative::SubjectRef::to_db_string),
+        )));
+    }
 }
 
 fn experiment_rows(model: &LabWorkflows, idle: bool, rows: &mut Vec<PanelRow>) {
@@ -1021,6 +1292,206 @@ mod tests {
         )
         .expect("drawing host")
         .latest_snapshot()
+    }
+
+    fn narrative_record(tick: u64) -> scriptbots_core::narrative::EventRecord {
+        scriptbots_core::narrative::EventRecord {
+            schema_version: 1,
+            tick: scriptbots_core::Tick(tick),
+            kind: scriptbots_core::narrative::EventKind::PopulationCrash,
+            severity: 0.7,
+            magnitude: 70.0,
+            window: (tick.saturating_sub(10), tick),
+            metric: "population".into(),
+            before: 100.0,
+            after: 30.0,
+            score: 9.5,
+            subject: None,
+            human_text: format!("t={tick} population fell 70% (100 -> 30)"),
+        }
+    }
+
+    #[test]
+    fn narrative_projection_shares_the_canonical_ring_and_observes_same_tick_changes() {
+        let original = saved_snapshot();
+        let mut snapshot = (*original).clone();
+        let mut other_event = narrative_record(0);
+        other_event.kind = scriptbots_core::narrative::EventKind::EnergyRecovery;
+        other_event.metric = "mean_energy".into();
+        other_event.human_text = "the exact second canonical event at this same tick".into();
+        snapshot.narrative_events = Arc::new(vec![narrative_record(0), other_event]);
+        snapshot.narrative_dropped_events = 40;
+        let projected = WorldSnapshot::from_snapshot(&snapshot).unwrap();
+        assert!(Arc::ptr_eq(
+            &projected.narrative_events,
+            &snapshot.narrative_events
+        ));
+        assert_eq!(projected.narrative_dropped_events, 40);
+        assert!(!projected.same_render_content(&WorldSnapshot::from_snapshot(&original).unwrap()));
+        let mut timeline = NarrativeTimeline::default();
+        timeline.observe(&projected);
+        assert_eq!(
+            timeline
+                .page()
+                .iter()
+                .map(|(ordinal, _)| *ordinal)
+                .collect::<Vec<_>>(),
+            [42, 41]
+        );
+        assert_eq!(timeline.record(42), snapshot.narrative_events.get(1));
+        assert!(
+            projected.events.is_empty(),
+            "tick-summary activity is a separate feed"
+        );
+    }
+
+    #[test]
+    fn narrative_pages_and_selection_survive_new_events_and_refuse_evicted_identity() {
+        let mut frame = live_frame(100);
+        frame.narrative_events = Arc::new((1..=30).map(narrative_record).collect());
+        let mut timeline = NarrativeTimeline::default();
+        timeline.observe(&frame);
+        assert_eq!(timeline.page().len(), NARRATIVE_PAGE_SIZE);
+        assert_eq!(timeline.page().first().unwrap().0, 30);
+        timeline.older();
+        timeline.select(12);
+        assert_eq!(timeline.page().first().unwrap().0, 18);
+        assert_eq!(timeline.page().last().unwrap().0, 7);
+
+        frame.narrative_events = Arc::new((1..=35).map(narrative_record).collect());
+        timeline.observe(&frame);
+        assert_eq!(
+            timeline.page().first().unwrap().0,
+            18,
+            "new events must not move the page"
+        );
+        assert_eq!(timeline.selected, Some(12));
+        timeline.older();
+        assert_eq!(timeline.page().last().unwrap().0, 1);
+        assert!(!timeline.can_show_older());
+        timeline.newer();
+        assert_eq!(timeline.page().first().unwrap().0, 18);
+        timeline.newer();
+        timeline.newer();
+        assert_eq!(timeline.page().first().unwrap().0, 35);
+        assert!(timeline.newest_on_page.is_none());
+
+        timeline.newest_on_page = Some(18);
+        frame.narrative_events = Arc::new((21..=35).map(narrative_record).collect());
+        frame.narrative_dropped_events = 20;
+        timeline.observe(&frame);
+        assert_eq!(
+            timeline.selected, None,
+            "an evicted ordinal must not select a replacement"
+        );
+        assert_eq!(timeline.page().last().unwrap().0, 21);
+        assert!(
+            timeline
+                .notice
+                .as_ref()
+                .unwrap()
+                .contains("oldest available")
+        );
+        timeline.select(12);
+        assert_eq!(timeline.selected, None);
+        assert!(Arc::ptr_eq(&timeline.records, &frame.narrative_events));
+    }
+
+    #[test]
+    fn narrative_owner_change_clears_selection_even_when_ticks_and_ordinals_repeat() {
+        let mut presentation = LabPresentation::default();
+        let mut state = SnapshotState::default();
+        let mut motion = AgentMotionSettings { enabled: true };
+        let mut frame = live_frame(100);
+        frame.narrative_events = Arc::new(vec![narrative_record(50)]);
+        presentation.receive_live(frame.clone(), &mut state, &mut motion);
+        presentation.narrative.select(1);
+        presentation.narrative.newest_on_page = Some(1);
+        frame.owner_source.as_mut().unwrap().0.session_id = HostSessionId::new(99);
+        frame.narrative_events = Arc::new(vec![narrative_record(60)]);
+        presentation.receive_live(frame, &mut state, &mut motion);
+        assert_eq!(presentation.narrative.selected, None);
+        assert!(presentation.narrative.newest_on_page.is_none());
+        assert_eq!(presentation.narrative.record(1).unwrap().tick.0, 60);
+        presentation.select_narrative(HostSessionId::new(71), 1);
+        assert_eq!(
+            presentation.narrative.selected, None,
+            "a previous owner's button must be inert"
+        );
+        presentation.select_narrative(HostSessionId::new(99), 1);
+        assert_eq!(presentation.narrative.selected, Some(1));
+    }
+
+    #[test]
+    fn narrative_panel_is_bounded_and_readable_without_application_services() {
+        let mut presentation = LabPresentation {
+            panel: LabPanel::Narrative,
+            ..default()
+        };
+        let mut state = SnapshotState::default();
+        let mut motion = AgentMotionSettings { enabled: true };
+        let mut frame = live_frame(100);
+        frame.narrative_events = Arc::new((21..=100).map(narrative_record).collect());
+        frame.narrative_dropped_events = 20;
+        presentation.receive_live(frame, &mut state, &mut motion);
+        presentation.narrative.select(100);
+        let rows = panel_rows(&consumer(None), &presentation);
+        assert!(rows.len() <= MAX_PANEL_ROWS);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| matches!(&row.action, Some(PanelAction::SelectNarrative { .. })))
+                .count(),
+            NARRATIVE_PAGE_SIZE
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.text.contains("t=100 population fell 70% (100 -> 30)"))
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.text.contains("Retention gap: 20"))
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.text.contains("Recorded window: ticks 90-100"))
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.text.contains("services are unavailable"))
+        );
+
+        presentation.narrative.records = Arc::new(Vec::new());
+        let rows = panel_rows(&consumer(None), &presentation);
+        assert!(
+            !rows
+                .iter()
+                .any(|row| matches!(&row.action, Some(PanelAction::SelectNarrative { .. })))
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.text.contains("No narrative events are retained"))
+        );
+    }
+
+    #[test]
+    fn narrative_shortcut_opens_the_existing_modal_and_captures_world_controls() {
+        let mut app = App::new();
+        let mut keys = ButtonInput::<KeyCode>::default();
+        keys.press(KeyCode::F8);
+        app.insert_resource(keys)
+            .init_resource::<LabPresentation>()
+            .insert_resource(AgentMotionSettings { enabled: true })
+            .init_resource::<SnapshotState>()
+            .init_resource::<CameraRig>()
+            .insert_non_send_resource(consumer(None))
+            .add_systems(Update, update);
+        app.update();
+        let presentation = app.world().resource::<LabPresentation>();
+        assert_eq!(presentation.panel, LabPanel::Narrative);
+        assert!(presentation.keyboard_captured);
+        assert!(!presentation.world_controls_allowed());
+        assert!(!presentation.camera_controls_allowed());
     }
 
     #[test]

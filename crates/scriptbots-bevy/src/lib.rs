@@ -4805,6 +4805,10 @@ pub(crate) struct WorldSnapshot {
     /// Bounded by [`HUD_EVENT_FEED_CAPACITY`] at construction, so a long run
     /// or a births/deaths storm cannot grow the snapshot without limit.
     events: Vec<HudEvent>,
+    /// Canonical scientific narratives, shared from the owner's bounded ring.
+    narrative_events: Arc<Vec<scriptbots_core::narrative::EventRecord>>,
+    /// Records evicted before this ring; retained event ordinals never restart.
+    narrative_dropped_events: u64,
     /// Exact positioned event boundary; HUD summaries are not event evidence.
     visual: particle_render::VisualFrame,
 }
@@ -5545,6 +5549,8 @@ impl WorldSnapshot {
             night_ambient: night_ambient_floor(&config.render),
             agents,
             events: HudEvent::recent_from_history(snapshot.summary_history.iter()),
+            narrative_events: Arc::clone(&snapshot.narrative_events),
+            narrative_dropped_events: snapshot.narrative_dropped_events,
             visual: particle_render::VisualFrame::from_snapshot(snapshot),
             history: HudHistory::from_history(snapshot.summary_history.iter()),
             brain: BrainOverlay::default(),
@@ -5568,6 +5574,8 @@ impl WorldSnapshot {
             && self.night_ambient == other.night_ambient
             && self.agents == other.agents
             && self.events == other.events
+            && self.narrative_events == other.narrative_events
+            && self.narrative_dropped_events == other.narrative_dropped_events
             && self.visual == other.visual
             && self.history == other.history
             && self.brain == other.brain
@@ -5752,6 +5760,8 @@ impl WorldSnapshot {
             night_ambient: night_ambient_floor(&config.render),
             agents,
             events: HudEvent::recent_from_history(world.history()),
+            narrative_events: Arc::new(world.narrative_events().iter().cloned().collect()),
+            narrative_dropped_events: world.narrative_dropped_events(),
             visual: particle_render::VisualFrame::from_world(world),
             history: HudHistory::from_history(world.history()),
             // Left empty here on purpose: issuing an inspection request needs a
@@ -23716,6 +23726,8 @@ mod terrain_tests {
             night_ambient: 0.35,
             agents: Vec::new(),
             events: Vec::new(),
+            narrative_events: Arc::new(Vec::new()),
+            narrative_dropped_events: 0,
             visual: particle_render::VisualFrame::default(),
             history: HudHistory::default(),
             brain: BrainOverlay::default(),
@@ -26094,6 +26106,8 @@ mod terrain_tests {
             night_ambient: 0.35,
             agents: Vec::new(),
             events: Vec::new(),
+            narrative_events: Arc::new(Vec::new()),
+            narrative_dropped_events: 0,
             visual: particle_render::VisualFrame::default(),
             history: HudHistory::default(),
             brain: BrainOverlay::default(),
