@@ -156,6 +156,23 @@ fn planted_shift_is_certified_from_complete_inputs_across_pages() {
         TERMINAL_TICK
     );
     assert_eq!(output.machine["truncated"], false);
+    assert_eq!(
+        output.machine["inference"]["confidence_interval"],
+        "circular_moving_block_bootstrap_percentile_v1"
+    );
+    assert_eq!(
+        output.machine["inference"]["p_value"],
+        "length_stratified_whole_block_permutation_v1"
+    );
+    assert_eq!(
+        output.machine["inference"]["interpretation"],
+        "exploratory_selected_events"
+    );
+    assert_eq!(output.machine["inference"]["block_len"], 5);
+    assert_eq!(output.machine["inference"]["resamples"], 200);
+    assert_eq!(output.machine["inference"]["permutations"], 200);
+    assert!(output.human_md.contains("Exploratory"));
+    assert!(output.human_md.contains("do not correct for event selection"));
 
     let rows = output.machine["events"].as_array().expect("events");
     assert_eq!(rows.len(), 1);
@@ -170,6 +187,48 @@ fn planted_shift_is_certified_from_complete_inputs_across_pages() {
     );
     assert!(output.human_md.contains("consecutive simulation ticks"));
     assert!(output.human_md.contains("yes"));
+}
+
+#[test]
+fn declared_block_length_changes_the_published_interval_from_persisted_inputs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = create_fixture(
+        &dir,
+        &[event(100, EventKind::PopulationBoom, METRIC_POPULATION)],
+        true,
+    );
+    let cx = ReaderCtx::open(&path).expect("open reader");
+    let registry = Registry::builtin();
+    let analyze = |block_len| {
+        let params = ReportParams::from_pairs([
+            "window=30".to_owned(),
+            "resamples=200".to_owned(),
+            "permutations=200".to_owned(),
+            format!("block_len={block_len}"),
+        ])
+        .expect("params");
+        registry
+            .run("narrative-validate", &cx, &params)
+            .expect("analyse complete persisted inputs")
+    };
+    let points = analyze(1);
+    let blocks = analyze(5);
+    let point_row = &points.machine["events"][0];
+    let block_row = &blocks.machine["events"][0];
+
+    // The fixture has an exact five-tick period on each side of the +30
+    // shift. Every circular block of length five has the same sum; point
+    // resampling instead destroys that temporal structure.
+    assert_eq!(point_row["shift"], block_row["shift"]);
+    assert_eq!(block_row["shift"], 30.0);
+    assert_eq!(block_row["ci_lower"], 30.0);
+    assert_eq!(block_row["ci_upper"], 30.0);
+    assert!(point_row["ci_lower"].as_f64().expect("point lower") < 30.0);
+    assert!(point_row["ci_upper"].as_f64().expect("point upper") > 30.0);
+    assert_eq!(points.machine["inference"]["block_len"], 1);
+    assert_eq!(blocks.machine["inference"]["block_len"], 5);
+    assert_eq!(points.machine["inputs_read"], TERMINAL_TICK);
+    assert_eq!(blocks.machine["inputs_read"], TERMINAL_TICK);
 }
 
 #[test]
@@ -432,7 +491,7 @@ fn empty_database_handles_gracefully() {
     assert!(
         output
             .human_md
-            .contains("No narrative events could be certified")
+            .contains("No narrative events had a supported, complete window")
     );
 }
 

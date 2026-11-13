@@ -2,6 +2,28 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Time-series inference uses its declared temporal blocks (2026-11-13):**
+[Source implemented and independently reviewed — Codex; executable qualification open]
+
+The statistical path associated with `bd-2z0.11.6` previously applied
+`block_len` only to an after-window context interval that both reports discarded.
+Published shift intervals and p-values resampled individual ticks. Both now use
+the declared temporal blocks: a circular moving-block percentile interval and
+a whole-block permutation test that preserves group sizes and partial tails.
+Controls require two complete blocks per window and are validated even when
+there are no candidate events. Overflowing event windows are safely skipped.
+
+Narrative report schema V3 and metric change-point schema V2 record the actual
+methods, draw counts, block length, confidence, threshold and seed. Both reports
+explicitly describe data-selected events as exploratory; their nominal BH flags
+do not establish unconditional false-discovery control. Metric reports now honor
+all declared resampling controls. New regressions cover correlated plateaus,
+temporal ordering, short tails, exact persisted tick inputs, invalid empty-input
+requests and truthful machine metadata. Original assertions remain in place.
+These regressions and the native code have not executed: no usable execution
+environment was available. No DSR, compiler, Rustfmt, Clippy or UBS pass is claimed;
+original acceptance and tracker status remain unchanged.
+
 **Experiment checkpoint promotion safety (2026-11-12):**
 [Source implemented and independently reviewed — Codex; executable qualification open]
 

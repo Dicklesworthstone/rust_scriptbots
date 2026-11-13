@@ -13,13 +13,13 @@
 //!
 //! `fsci-stats` is the strongest analytics fit in the franken family, but it is **git-only and
 //! nightly-only**. An offline analysis binary should not inherit a nightly-toolchain requirement
-//! for four textbook estimators. This module implements exactly those estimators natively — pure
-//! functions over `&[f64]`, no dependencies, an inline deterministic RNG — and proves them with
-//! the calibration goldens `bd-2z0.11.6` specifies (CI coverage ≥ 94% on known step changes;
-//! permutation p-values uniform under the null). That is the concrete evidence the adapter
-//! decision needs: it shows the native path is sufficient for the certification we actually do.
-//! If a report later needs fsci's 95+ distributions, adopt it there — but the core estimators do
-//! not require it, and this file demonstrates that rather than asserting it.
+//! for basic resampling estimators. This module supplies independent-observation estimators and
+//! time-series block alternatives as pure functions over `&[f64]`, with no statistics
+//! dependency and an inline deterministic RNG. The existing calibration fixtures exercise
+//! independent samples; they do not establish coverage or false-positive control for arbitrary
+//! ecological time series. The block methods document their additional dependence and
+//! stationarity assumptions, and detector-selected boundaries remain exploratory.
+//! If a report needs a broader distribution library, adopt it at that boundary.
 //!
 //! # Determinism
 //!
@@ -105,6 +105,22 @@ pub enum StatsError {
         block: usize,
         /// The number of values in the source series.
         series_len: usize,
+    },
+    /// A time-series window has too few complete blocks for resampling inference.
+    #[error(
+        "block length {block} leaves fewer than two complete blocks in a series of length {series_len}"
+    )]
+    InsufficientBlocks {
+        /// The requested block length.
+        block: usize,
+        /// The number of observations in the window.
+        series_len: usize,
+    },
+    /// A false-discovery-rate target outside (0, 1].
+    #[error("false-discovery-rate target must be finite and in (0, 1]; got {rate}")]
+    InvalidFalseDiscoveryRate {
+        /// The invalid requested target.
+        rate: f64,
     },
     /// An input that must be finite contained NaN or an infinity.
     #[error("statistic `{what}` received a non-finite value")]
@@ -198,10 +214,10 @@ impl ConfidenceInterval {
 
 /// Percentile bootstrap CI for the difference in means between two independent samples.
 ///
-/// This is the estimator the narrative-validate report needs: given a metric's window BEFORE an
-/// event and its window AFTER, how large is the shift and how uncertain is that size? Resamples
-/// each side independently with replacement, recomputes the mean difference, and takes the
-/// central `confidence` mass of the bootstrap distribution.
+/// Use this for independent observations, such as one endpoint per independent simulation run.
+/// Resamples each side independently with replacement, recomputes the mean difference, and
+/// takes the central `confidence` mass of the bootstrap distribution. Consecutive time-series
+/// ticks need [`moving_block_bootstrap_mean_difference_ci`] instead.
 pub fn bootstrap_mean_difference_ci(
     before: &[f64],
     after: &[f64],
@@ -224,6 +240,63 @@ pub fn bootstrap_mean_difference_ci(
     for _ in 0..n_resamples {
         let b = resample_mean(before, &mut rng);
         let a = resample_mean(after, &mut rng);
+        diffs.push(a - b);
+    }
+
+    let alpha = 1.0 - confidence;
+    Ok(ConfidenceInterval {
+        point,
+        lower: quantile(&diffs, alpha / 2.0)?,
+        upper: quantile(&diffs, 1.0 - alpha / 2.0)?,
+        confidence,
+        resamples: n_resamples,
+    })
+}
+
+/// Circular moving-block percentile CI for a difference of time-series means.
+///
+/// Resamples each window independently using contiguous blocks with circular wraparound.
+/// Exactly the original number of observations is retained on each side, including a final
+/// partial block. Every starting position has equal probability. The block length is used as
+/// declared, never clamped, and each window must contain at least two complete blocks.
+///
+/// This preserves dependence within blocks, not across their boundaries. Coverage is
+/// approximate and requires approximately stationary, short-range-dependent observations
+/// within each window and a suitable block length. Adjacent windows are treated as separate
+/// segments. It does not correct for choosing the event after inspecting the same series.
+///
+/// The circular construction follows Politis and Romano's block-resampling approach:
+/// <https://statistics.stanford.edu/technical-reports/circular-block-resampling-procedure-stationary-data>.
+///
+/// # Errors
+///
+/// Refuses empty or non-finite windows, invalid confidence or draw counts, and block
+/// lengths that leave fewer than two complete blocks in either window.
+pub fn moving_block_bootstrap_mean_difference_ci(
+    before: &[f64],
+    after: &[f64],
+    block_len: usize,
+    n_resamples: usize,
+    confidence: f64,
+    seed: u64,
+) -> Result<ConfidenceInterval, StatsError> {
+    validate_ci_inputs(
+        before,
+        "block_difference.before",
+        after,
+        "block_difference.after",
+        n_resamples,
+        confidence,
+    )?;
+    validate_time_series_block_len(before.len(), block_len)?;
+    validate_time_series_block_len(after.len(), block_len)?;
+
+    let point = mean(after)? - mean(before)?;
+    let mut rng = DeterministicRng::new(seed);
+    let mut diffs = Vec::with_capacity(n_resamples);
+    for _ in 0..n_resamples {
+        let b = circular_block_resample_mean(before, block_len, &mut rng);
+        let a = circular_block_resample_mean(after, block_len, &mut rng);
         diffs.push(a - b);
     }
 
@@ -370,6 +443,105 @@ pub fn permutation_test_mean_difference(
     })
 }
 
+/// Whole-block permutation test for a difference of time-series means.
+///
+/// Partitions each window into complete contiguous `block_len` blocks and an optional
+/// shorter tail. Complete blocks are exchanged as units, preserving each group's block
+/// count and all within-block values. Equal-length tails form their own two-block stratum;
+/// unequal-length tails stay with their original group. No observation is dropped, padded,
+/// or relabelled individually. With `block_len == 1`, this delegates to the IID routine.
+///
+/// The null is exchangeability of equal-length blocks, which is stronger than equality of
+/// means. For serially dependent observations this is an approximation: dependence crossing
+/// block boundaries is not preserved. Each side must contain at least two complete blocks;
+/// that minimum is an admissibility check, not proof that a block length is adequate.
+///
+/// Whole-block rearrangement is the principle used by Kirch (2007), section 1:
+/// <https://www.imst1.ovgu.de/imst1_media/Publikationen/Zeitschriften/preprint_kirch07.pdf>.
+/// The tail stratum preserves exact sample sizes. This routine tests a fixed boundary and
+/// does not account for a detector selecting that boundary from the same observations.
+///
+/// # Errors
+///
+/// Refuses empty or non-finite windows, zero permutations, and block lengths that leave
+/// fewer than two complete blocks in either window.
+pub fn block_permutation_test_mean_difference(
+    before: &[f64],
+    after: &[f64],
+    block_len: usize,
+    n_permutations: usize,
+    seed: u64,
+) -> Result<PermutationTest, StatsError> {
+    if before.is_empty() {
+        return Err(StatsError::EmptySample {
+            what: "block_permutation.before",
+        });
+    }
+    if after.is_empty() {
+        return Err(StatsError::EmptySample {
+            what: "block_permutation.after",
+        });
+    }
+    finite_guard(before, "block_permutation.before")?;
+    finite_guard(after, "block_permutation.after")?;
+    validate_time_series_block_len(before.len(), block_len)?;
+    validate_time_series_block_len(after.len(), block_len)?;
+    if n_permutations == 0 {
+        return Err(StatsError::ZeroResamples);
+    }
+    if block_len == 1 {
+        return permutation_test_mean_difference(before, after, n_permutations, seed);
+    }
+
+    let observed = mean(after)? - mean(before)?;
+    let before_blocks = before.len() / block_len;
+    let after_blocks = after.len() / block_len;
+    let before_split = before_blocks * block_len;
+    let after_split = after_blocks * block_len;
+    let mut blocks: Vec<&[f64]> = before[..before_split]
+        .chunks_exact(block_len)
+        .chain(after[..after_split].chunks_exact(block_len))
+        .collect();
+    let before_tail = &before[before_split..];
+    let after_tail = &after[after_split..];
+    let exchange_tails = !before_tail.is_empty() && before_tail.len() == after_tail.len();
+    let mut rng = DeterministicRng::new(seed);
+    let mut at_least_as_extreme = 0usize;
+
+    for _ in 0..n_permutations {
+        for i in (1..blocks.len()).rev() {
+            let j = rng.index(i + 1);
+            blocks.swap(i, j);
+        }
+        let (b_tail, a_tail) = if exchange_tails && rng.index(2) == 1 {
+            (after_tail, before_tail)
+        } else {
+            (before_tail, after_tail)
+        };
+        let perm_before = blocks[..before_blocks]
+            .iter()
+            .flat_map(|block| block.iter())
+            .chain(b_tail.iter())
+            .sum::<f64>()
+            / before.len() as f64;
+        let perm_after = blocks[before_blocks..]
+            .iter()
+            .flat_map(|block| block.iter())
+            .chain(a_tail.iter())
+            .sum::<f64>()
+            / after.len() as f64;
+        if (perm_after - perm_before).abs() >= observed.abs() {
+            at_least_as_extreme += 1;
+        }
+    }
+
+    Ok(PermutationTest {
+        observed,
+        p_value: (at_least_as_extreme as f64 + 1.0) / (n_permutations as f64 + 1.0),
+        permutations: n_permutations,
+    })
+}
+
 /// Cohen's d: the standardized mean difference, using the pooled standard deviation.
 ///
 /// A parametric effect size — meaningful when the two groups are roughly normal with similar
@@ -490,6 +662,48 @@ pub fn cliffs_delta(before: &[f64], after: &[f64]) -> Result<f64, StatsError> {
 }
 
 // --- internal helpers ------------------------------------------------------------------------
+
+/// Validate the minimum replication needed by the time-series comparison methods.
+pub(crate) const fn validate_time_series_block_len(
+    series_len: usize,
+    block_len: usize,
+) -> Result<(), StatsError> {
+    if block_len == 0 || block_len > series_len {
+        return Err(StatsError::InvalidBlockLength {
+            block: block_len,
+            series_len,
+        });
+    }
+    if series_len / block_len < 2 {
+        return Err(StatsError::InsufficientBlocks {
+            block: block_len,
+            series_len,
+        });
+    }
+    Ok(())
+}
+
+fn circular_block_resample_mean(
+    sample: &[f64],
+    block_len: usize,
+    rng: &mut DeterministicRng,
+) -> f64 {
+    let mut sum = 0.0;
+    let mut consumed = 0;
+    while consumed < sample.len() {
+        let mut index = rng.index(sample.len());
+        let count = block_len.min(sample.len() - consumed);
+        for _ in 0..count {
+            sum += sample[index];
+            index += 1;
+            if index == sample.len() {
+                index = 0;
+            }
+        }
+        consumed += count;
+    }
+    sum / sample.len() as f64
+}
 
 fn finite_guard(sample: &[f64], what: &'static str) -> Result<(), StatsError> {
     if sample.iter().all(|value| value.is_finite()) {
@@ -769,6 +983,187 @@ mod tests {
             p1, p2,
             "same seed and inputs must give a bit-identical permutation p-value"
         );
+    }
+
+    #[test]
+    fn one_point_blocks_reproduce_independent_sample_estimators_exactly() {
+        let before = [0.0, 2.0, 4.0, 6.0, 8.0];
+        let after = [1.0, 3.0, 5.0, 7.0, 9.0, 11.0];
+        assert_eq!(
+            moving_block_bootstrap_mean_difference_ci(&before, &after, 1, 128, 0.95, 42)
+                .unwrap(),
+            bootstrap_mean_difference_ci(&before, &after, 128, 0.95, 42).unwrap()
+        );
+        assert_eq!(
+            block_permutation_test_mean_difference(&before, &after, 1, 128, 42).unwrap(),
+            permutation_test_mean_difference(&before, &after, 128, 42).unwrap()
+        );
+    }
+
+    #[test]
+    fn whole_block_permutation_counts_plateaus_as_units_not_independent_ticks() {
+        // Four plateaus, not 32 independent observations. With power-of-two lengths every
+        // sum and division is exact, so the block test must equal permutation of their means.
+        let before: Vec<f64> = [0.0, 2.0]
+            .into_iter()
+            .flat_map(|value| std::iter::repeat_n(value, 8))
+            .collect();
+        let after: Vec<f64> = [1.0, 3.0]
+            .into_iter()
+            .flat_map(|value| std::iter::repeat_n(value, 8))
+            .collect();
+        let blocked =
+            block_permutation_test_mean_difference(&before, &after, 8, 256, 42).unwrap();
+        let independent_blocks =
+            permutation_test_mean_difference(&[0.0, 2.0], &[1.0, 3.0], 256, 42).unwrap();
+        assert_eq!(blocked, independent_blocks);
+
+        let duplicated_ticks =
+            permutation_test_mean_difference(&before, &after, 256, 42).unwrap();
+        assert!(
+            blocked.p_value > duplicated_ticks.p_value,
+            "duplicating observations inside a block must not create independent replication"
+        );
+    }
+
+    #[test]
+    fn circular_difference_intervals_observe_temporal_order_and_known_shifts() {
+        let clustered_before: Vec<f64> = [0.0, 2.0]
+            .into_iter()
+            .flat_map(|value| std::iter::repeat_n(value, 8))
+            .collect();
+        let clustered_after: Vec<f64> = [0.25, 2.25]
+            .into_iter()
+            .flat_map(|value| std::iter::repeat_n(value, 8))
+            .collect();
+        let alternating_before: Vec<f64> = [0.0, 2.0].repeat(8);
+        let alternating_after: Vec<f64> = [0.25, 2.25].repeat(8);
+        let clustered = moving_block_bootstrap_mean_difference_ci(
+            &clustered_before,
+            &clustered_after,
+            8,
+            256,
+            0.95,
+            17,
+        )
+        .unwrap();
+        let alternating = moving_block_bootstrap_mean_difference_ci(
+            &alternating_before,
+            &alternating_after,
+            8,
+            256,
+            0.95,
+            17,
+        )
+        .unwrap();
+        // Every circular block of eight alternating values has its original mean. The
+        // clustered series has the identical marginals but variable block means.
+        assert_eq!(alternating.lower, 0.25);
+        assert_eq!(alternating.upper, 0.25);
+        assert_eq!(clustered.point, alternating.point);
+        assert!(clustered.upper > clustered.lower);
+        assert!(clustered.covers(0.0));
+
+        let shifted: Vec<f64> = clustered_after.iter().map(|value| value + 10.0).collect();
+        let separated = moving_block_bootstrap_mean_difference_ci(
+            &clustered_before,
+            &shifted,
+            8,
+            256,
+            0.95,
+            17,
+        )
+        .unwrap();
+        // Every possible resample is separated by at least eight units, so this assertion
+        // checks a known effect without relying on nominal Monte-Carlo coverage.
+        assert!(separated.lower >= 8.0);
+        assert_eq!(separated.point, 10.25);
+    }
+
+    #[test]
+    fn block_permutation_retains_equal_and_unequal_partial_tails() {
+        let before = [0.0, 0.0, 0.0, 0.0, 100.0];
+        let after = [0.0, 0.0, 0.0, 0.0, -100.0];
+        let equal =
+            block_permutation_test_mean_difference(&before, &after, 2, 128, 5).unwrap();
+        assert_eq!(equal.observed, -40.0);
+        // Whole tail pairs either remain or swap. Both outcomes have |difference| = 40.
+        // Dropping tails, padding them or mixing them with individual points fails this.
+        assert_eq!(equal.p_value, 1.0);
+
+        let no_tail = [0.0; 6];
+        let unequal =
+            block_permutation_test_mean_difference(&before, &no_tail, 2, 128, 5).unwrap();
+        assert_eq!(unequal.observed, -20.0);
+        assert_eq!(unequal.p_value, 1.0);
+
+        let constant_before = [3.0; 5];
+        let constant_after = [7.0; 7];
+        let ci = moving_block_bootstrap_mean_difference_ci(
+            &constant_before,
+            &constant_after,
+            2,
+            128,
+            0.95,
+            5,
+        )
+        .unwrap();
+        assert_eq!((ci.point, ci.lower, ci.upper), (4.0, 4.0, 4.0));
+    }
+
+    #[test]
+    fn block_comparisons_are_deterministic_and_refuse_unsupported_controls() {
+        let before = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0];
+        let after = [2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
+        let ci =
+            moving_block_bootstrap_mean_difference_ci(&before, &after, 2, 128, 0.95, 123)
+                .unwrap();
+        assert_eq!(
+            ci,
+            moving_block_bootstrap_mean_difference_ci(&before, &after, 2, 128, 0.95, 123)
+                .unwrap()
+        );
+        let p =
+            block_permutation_test_mean_difference(&before, &after, 2, 128, 123).unwrap();
+        assert_eq!(
+            p,
+            block_permutation_test_mean_difference(&before, &after, 2, 128, 123).unwrap()
+        );
+        for block in [0, 4, 6, 7] {
+            assert!(
+                moving_block_bootstrap_mean_difference_ci(
+                    &before, &after, block, 128, 0.95, 123
+                )
+                .is_err()
+            );
+            assert!(
+                block_permutation_test_mean_difference(&before, &after, block, 128, 123)
+                    .is_err()
+            );
+        }
+        assert!(matches!(
+            block_permutation_test_mean_difference(&before, &after, 4, 128, 123),
+            Err(StatsError::InsufficientBlocks {
+                block: 4,
+                series_len: 6,
+            })
+        ));
+        assert!(matches!(
+            block_permutation_test_mean_difference(&before, &after, 2, 0, 123),
+            Err(StatsError::ZeroResamples)
+        ));
+        assert!(matches!(
+            moving_block_bootstrap_mean_difference_ci(&before, &after, 2, 0, 0.95, 123),
+            Err(StatsError::ZeroResamples)
+        ));
+        assert!(matches!(
+            moving_block_bootstrap_mean_difference_ci(&before, &after, 2, 128, f64::NAN, 123),
+            Err(StatsError::InvalidConfidence { .. })
+        ));
+        assert!(matches!(
+            block_permutation_test_mean_difference(&before, &[f64::NAN; 6], 2, 128, 123),
+            Err(StatsError::NonFinite { .. })
+        ));
     }
 
     #[test]
