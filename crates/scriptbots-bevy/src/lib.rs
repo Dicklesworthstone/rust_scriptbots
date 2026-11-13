@@ -3849,6 +3849,12 @@ struct CreatureBrainCell {
     index: usize,
 }
 
+#[derive(Component)]
+struct CreatureBrainSlot {
+    layer: usize,
+    index: usize,
+}
+
 fn toggle_creature_details(
     buttons: Query<&Interaction, (Changed<Interaction>, With<CreatureDetailsButton>)>,
     mut sections: Query<&mut Node, With<CreatureDetailsSection>>,
@@ -7172,23 +7178,47 @@ fn setup_scene(
                         ));
                         row.spawn(Node {
                             flex_direction: FlexDirection::Row,
-                            flex_wrap: FlexWrap::Wrap,
-                            column_gap: Val::Percent(0.25),
-                            row_gap: Val::Px(2.0),
+                            column_gap: Val::Percent(0.08),
                             ..default()
                         })
                         .with_children(|grid| {
                             for index in 0..BRAIN_DASHBOARD_BINS {
                                 grid.spawn((
                                     Node {
-                                        width: Val::Percent(3.9),
-                                        height: Val::Px(7.0),
+                                        width: Val::Percent(2.0),
+                                        height: Val::Px(24.0),
+                                        flex_shrink: 0.0,
                                         ..default()
                                     },
                                     BackgroundColor(Color::srgb(0.15, 0.25, 0.21)),
+                                    BorderColor::all(Color::srgb(0.85, 0.88, 0.82)),
                                     BorderRadius::all(Val::Px(2.0)),
-                                    CreatureBrainCell { layer, index },
-                                ));
+                                    CreatureBrainSlot { layer, index },
+                                ))
+                                .with_children(|slot| {
+                                    slot.spawn((
+                                        Node {
+                                            position_type: PositionType::Absolute,
+                                            top: Val::Percent(50.0),
+                                            width: Val::Percent(100.0),
+                                            height: Val::Px(1.0),
+                                            ..default()
+                                        },
+                                        BackgroundColor(Color::srgb(0.45, 0.56, 0.50)),
+                                    ));
+                                    slot.spawn((
+                                        Node {
+                                            position_type: PositionType::Absolute,
+                                            top: Val::Percent(50.0),
+                                            width: Val::Percent(100.0),
+                                            height: Val::Percent(0.0),
+                                            ..default()
+                                        },
+                                        BackgroundColor(Color::srgb(0.15, 0.25, 0.21)),
+                                        BorderRadius::all(Val::Px(2.0)),
+                                        CreatureBrainCell { layer, index },
+                                    ));
+                                });
                             }
                         });
                     });
@@ -9118,6 +9148,7 @@ struct CreatureCardData<'w, 's> {
     brain_layers: Query<'w, 's, (Entity, &'static CreatureBrainLayer)>,
     brain_labels: Query<'w, 's, (Entity, &'static CreatureBrainLabel)>,
     brain_cells: Query<'w, 's, (Entity, &'static CreatureBrainCell)>,
+    brain_slots: Query<'w, 's, (Entity, &'static CreatureBrainSlot)>,
 }
 
 /// Present selected snapshot data independently of the asynchronous owner
@@ -9158,6 +9189,7 @@ fn update_creature_card(
         brain_layers,
         brain_labels,
         brain_cells,
+        brain_slots,
     } = data;
     let Some(card) = card else { return };
     let selected = state.latest.as_ref().and_then(|frame| {
@@ -9705,7 +9737,7 @@ fn update_creature_card(
             .take(BRAIN_OVERLAY_MAX_LAYERS)
             .any(|layer| layer.shown.len() > BRAIN_DASHBOARD_BINS);
         format!(
-            "BRAIN  /  TICK {}  ·  {}  ·  BLUE − / AMBER +  ·  ±1 HALF COLOR{}{}",
+            "BRAIN  ·  TICK {}  ·  {}  ·  ↑+ / ↓−  ·  ±1 HALF  ·  OUTLINE MISSING{}{}",
             brain.source_tick,
             dashboard_sample_age(frame.tick.saturating_sub(brain.source_tick)),
             if summarized { "  ·  GROUP PEAKS" } else { "" },
@@ -9760,19 +9792,49 @@ fn update_creature_card(
             );
         }
     }
+    for (entity, slot) in &brain_slots {
+        let layer = brain.layers.get(slot.layer).filter(|_| ready);
+        if let Ok(mut node) = nodes.get_mut(entity) {
+            let exists =
+                layer.is_some_and(|layer| slot.index < layer.shown.len().min(BRAIN_DASHBOARD_BINS));
+            let display = if exists { Display::Flex } else { Display::None };
+            if node.display != display {
+                node.display = display;
+            }
+            let unavailable = exists
+                && layer
+                    .is_some_and(|layer| brain_dashboard_bin(&layer.shown, slot.index).is_none());
+            let border = if unavailable {
+                UiRect::all(Val::Px(1.0))
+            } else {
+                UiRect::all(Val::Px(0.0))
+            };
+            if node.border != border {
+                node.border = border;
+            }
+        }
+    }
     for (entity, cell) in &brain_cells {
         let layer = brain.layers.get(cell.layer).filter(|_| ready);
         let value = layer.and_then(|layer| brain_dashboard_bin(&layer.shown, cell.index));
         if let Ok(mut node) = nodes.get_mut(entity) {
-            let display = if layer
-                .is_some_and(|layer| cell.index < layer.shown.len().min(BRAIN_DASHBOARD_BINS))
-            {
+            let display = if value.is_some() {
                 Display::Flex
             } else {
                 Display::None
             };
             if node.display != display {
                 node.display = display;
+            }
+            if let Some(value) = value {
+                let height = brain_dashboard_strength(value) * 50.0;
+                let top = if value > 0.0 { 50.0 - height } else { 50.0 };
+                if node.height != Val::Percent(height) {
+                    node.height = Val::Percent(height);
+                }
+                if node.top != Val::Percent(top) {
+                    node.top = Val::Percent(top);
+                }
             }
         }
         let color = match value {
@@ -17173,7 +17235,7 @@ mod owner_inspector_tests {
     }
 
     #[test]
-    fn creature_card_tracks_selection_real_detail_pages_and_failure() {
+    fn creature_card_tracks_selection_details_and_signed_brain_activity() {
         let mut owner = TestOwner::new();
         owner.serve();
         let frame = owner.frame();
@@ -17334,6 +17396,7 @@ mod owner_inspector_tests {
         let positive = app
             .world_mut()
             .spawn((
+                Node::default(),
                 BackgroundColor(Color::BLACK),
                 CreatureBrainCell { layer: 0, index: 0 },
             ))
@@ -17341,9 +17404,30 @@ mod owner_inspector_tests {
         let negative = app
             .world_mut()
             .spawn((
+                Node::default(),
                 BackgroundColor(Color::BLACK),
                 CreatureBrainCell { layer: 0, index: 1 },
             ))
+            .id();
+        let zero = app
+            .world_mut()
+            .spawn((
+                Node::default(),
+                BackgroundColor(Color::BLACK),
+                CreatureBrainCell { layer: 0, index: 2 },
+            ))
+            .id();
+        let invalid = app
+            .world_mut()
+            .spawn((
+                Node::default(),
+                BackgroundColor(Color::BLACK),
+                CreatureBrainCell { layer: 0, index: 3 },
+            ))
+            .id();
+        let invalid_slot = app
+            .world_mut()
+            .spawn((Node::default(), CreatureBrainSlot { layer: 0, index: 3 }))
             .id();
         app.insert_resource(card)
             .add_systems(Update, update_creature_card);
@@ -17853,6 +17937,51 @@ mod owner_inspector_tests {
                 .unwrap()
                 .0
                 .contains("shown +2.00 to +10.00")
+        );
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            let layer = &mut state.latest.as_mut().unwrap().brain.layers[0];
+            layer.shown = vec![1.0, -1.0, 0.0, f32::NAN];
+            layer.total = 4;
+        }
+        app.update();
+        let positive_node = app.world().get::<Node>(positive).unwrap();
+        assert_eq!(positive_node.top, Val::Percent(25.0));
+        assert_eq!(positive_node.height, Val::Percent(25.0));
+        let negative_node = app.world().get::<Node>(negative).unwrap();
+        assert_eq!(negative_node.top, Val::Percent(50.0));
+        assert_eq!(negative_node.height, Val::Percent(25.0));
+        let zero_node = app.world().get::<Node>(zero).unwrap();
+        assert_eq!(zero_node.display, Display::Flex);
+        assert_eq!(zero_node.height, Val::Percent(0.0));
+        assert_eq!(
+            app.world().get::<Node>(invalid).unwrap().display,
+            Display::None
+        );
+        assert_eq!(
+            app.world().get::<Node>(invalid_slot).unwrap().display,
+            Display::Flex
+        );
+        assert_eq!(
+            app.world().get::<Node>(invalid_slot).unwrap().border,
+            UiRect::all(Val::Px(1.0))
+        );
+        app.world_mut()
+            .resource_mut::<SnapshotState>()
+            .latest
+            .as_mut()
+            .unwrap()
+            .brain
+            .layers[0]
+            .shown[3] = -0.5;
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(invalid).unwrap().display,
+            Display::Flex
+        );
+        assert_eq!(
+            app.world().get::<Node>(invalid_slot).unwrap().border,
+            UiRect::all(Val::Px(0.0))
         );
         app.world_mut()
             .resource_mut::<SnapshotState>()
