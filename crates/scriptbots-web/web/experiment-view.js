@@ -35,7 +35,7 @@ function arm(form, prefix) {
     throw new Error("Each arm ID must contain 1–64 letters, digits, underscores, or hyphens.");
   }
   const family = field(form, prefix + "-family");
-  if (!["mlp", "dwraon", "assembly", "ft"].includes(family)) throw new Error("Choose an available brain family.");
+  if (!["mlp", "dwraon", "assembly", "neuroflow", "ft"].includes(family)) throw new Error("Choose an available brain family.");
   return {
     variant_id: variantId,
     brain_family: family,

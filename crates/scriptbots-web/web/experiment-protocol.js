@@ -32,6 +32,7 @@ const FAMILIES = Object.freeze({
   mlp: "mlp.baseline", "mlp.baseline": "mlp.baseline",
   dwraon: "dwraon.baseline", "dwraon.baseline": "dwraon.baseline",
   assembly: "assembly.experimental", "assembly.experimental": "assembly.experimental",
+  neuro: "ml.neuroflow", neuroflow: "ml.neuroflow", "ml.neuroflow": "ml.neuroflow",
   ft: "ft", frankentorch: "ft",
 });
 const CANONICAL_FAMILIES = new Set(Object.values(FAMILIES));

@@ -1840,6 +1840,19 @@ control; every later arm is compared with it through the existing matched-seed
 analysis. Result ingestion and notebook reproduction bind each arm to its actual
 family, launch configuration and exact ordered schedule.
 
+Builds with the `neuro` feature also admit `neuro`, `neuroflow`, and
+`ml.neuroflow`, recording the canonical family as `ml.neuroflow`. For example,
+`"brain_families": ["mlp", "neuroflow"]` compares the two executable families
+under the same seed schedule. The browser's remote experiment form exposes this
+choice too. Feature-disabled hosts refuse it before reserving execution capacity
+or creating artifacts.
+
+These isolated experiments use their own default NeuroFlow architecture and
+activation; they do not inherit the live host's settings, and the existing
+numeric-factor API does not sweep those fields. Resume and portable-bundle
+verification reconstruct the adapter from the immutable launch manifest, so later
+raw configuration changes cannot replace the family's original constructor.
+
 The experiment REST API (`POST /api/v1/experiments`) and MCP `experiment_create`
 also accept timed configuration treatments on each variant:
 

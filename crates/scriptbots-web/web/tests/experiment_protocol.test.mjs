@@ -105,6 +105,36 @@ test("arm aliases and object key order cannot disguise identical declared compar
   assert.throws(() => prepareExperimentRequest(request), /arm identities/);
 });
 
+test("NeuroFlow requests canonicalize aliases and require the actual family in retained status", () => {
+  for (const alias of ["neuro", "neuroflow", "ml.neuroflow"]) {
+    const request = requestFixture();
+    request.variants[1].brain_family = alias;
+    const prepared = prepareExperimentRequest(request);
+    assert.equal(prepared.request.variants[1].brain_family, "ml.neuroflow");
+    assert.equal(prepareExperimentRequest(prepared.request).body, prepared.body);
+
+    const observed = statusFixture();
+    for (const run of observed.runs) {
+      if (run.variant_id === "treatment") run.brain_family = "ml.neuroflow";
+    }
+    const status = validateExperimentStatus(observed, { request: prepared });
+    assert.deepEqual(
+      status.runs.filter((run) => run.variant_id === "treatment").map((run) => run.brain_family),
+      ["ml.neuroflow", "ml.neuroflow"],
+    );
+    for (const noncanonical of ["neuro", "neuroflow", "neuroflow-f64-v1"]) {
+      const invalid = clone(observed);
+      invalid.runs[2].brain_family = noncanonical;
+      assert.throws(() => validateExperimentStatus(invalid, { request: prepared }), /canonical installed-family/);
+    }
+    const wrongFamily = clone(observed);
+    for (const run of wrongFamily.runs) {
+      if (run.variant_id === "treatment") run.brain_family = "mlp.baseline";
+    }
+    assert.throws(() => validateExperimentStatus(wrongFamily, { request: prepared }), /immutable request/);
+  }
+});
+
 test("request identities, counts and controls are bounded before admission", () => {
   const mutations = [
     (r) => { r.variants.length = 1; },
@@ -112,7 +142,7 @@ test("request identities, counts and controls are bounded before admission", () 
     (r) => { r.experiment_id = "../other"; },
     (r) => { r.experiment_id = "a".repeat(128); },
     (r) => { r.variants[0].variant_id = "a".repeat(65); },
-    (r) => { r.variants[0].brain_family = "neuroflow"; },
+    (r) => { r.variants[0].brain_family = "unregistered-family"; },
     (r) => { r.variants[0].ignored_setting = true; },
     (r) => { r.ticks_per_run = 0; },
     (r) => { r.ticks_per_run = EXPERIMENT_LIMITS.maxTicks + 1; },

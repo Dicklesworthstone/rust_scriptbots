@@ -9004,6 +9004,155 @@ pub(crate) mod tests {
             .expect("join any unexpected experiment worker");
     }
 
+    #[cfg(feature = "neuro")]
+    #[test]
+    fn experiment_creation_compares_neuroflow_and_exports_restorable_configured_bundle() {
+        let root = tempfile::tempdir().unwrap();
+        let (_unused_handle, host) = handle();
+        let (runtime, _submit) = crate::ControlRuntime::launch(
+            host.port.clone(),
+            crate::ControlServerConfig {
+                rest_enabled: false,
+                mcp_transport: crate::servers::McpTransportConfig::Disabled,
+                ..crate::ControlServerConfig::default()
+            },
+        )
+        .unwrap();
+        let handle = runtime
+            .control_handle()
+            .unwrap()
+            .with_artifacts_dir(root.path().to_path_buf())
+            .unwrap();
+        let live_digest = host.port.scientific_digest_v1().unwrap();
+        let live_snapshot = handle.read_snapshot().unwrap();
+        assert!(handle.version().features.iter().any(|f| f == "neuro"));
+
+        let mut request = experiment_creation_request();
+        request.experiment_id = Some("neuro-api-run".into());
+        request.idempotency_key = Some("neuro-api-run-key".into());
+        let mut neuro = request.variants[0].clone();
+        neuro.variant_id = "neuro".into();
+        neuro.brain_family = " NeUrOfLoW ".into();
+        request.variants.push(neuro);
+        let expected_runs = request.variants.len() * request.seeds.len();
+        let expected_seed = request.seeds[0];
+        let expected_ticks = request.ticks_per_run.unwrap();
+        let created = handle
+            .create_experiment(request)
+            .expect("admit the real matched MLP/NeuroFlow cohort");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let completed = loop {
+            let status = handle.get_experiment(&created.experiment_id).unwrap();
+            if status.status == "completed" {
+                break status;
+            }
+            assert_ne!(status.status, "failed", "{status:?}");
+            assert!(std::time::Instant::now() < deadline, "{status:?}");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        assert_eq!(completed.total_runs, expected_runs);
+        assert_eq!(completed.completed_runs, expected_runs);
+        assert_eq!(completed.failed_runs, 0);
+        assert_eq!(completed.runs.len(), expected_runs);
+        let baseline = completed
+            .runs
+            .iter()
+            .find(|run| run.variant_id == "baseline")
+            .unwrap();
+        assert_eq!(baseline.brain_family, "mlp.baseline");
+        let run = completed
+            .runs
+            .iter()
+            .find(|run| run.variant_id == "neuro")
+            .unwrap();
+        assert_eq!(run.brain_family, "ml.neuroflow");
+        assert_eq!(run.state, "completed");
+        assert_eq!(run.seed, expected_seed);
+        assert_eq!(run.total_ticks, expected_ticks);
+        assert_ne!(run.final_digest, baseline.final_digest);
+        let bundle_dir = Path::new(run.bundle_path.as_ref().expect("published NeuroFlow bundle"));
+        let verified = crate::experiment_runner::verify_portable_run_bundle(bundle_dir)
+            .expect("restore configured NeuroFlow from its portable final checkpoint");
+        let final_state = verified.final_state.expect("observed NeuroFlow final science");
+        assert_eq!(final_state.run_id, run.run_id);
+        assert_eq!(final_state.tick, expected_ticks);
+        assert_eq!(
+            Some(final_state.scientific_digest.as_str()),
+            run.final_digest.as_deref()
+        );
+        let bundle: scriptbots_storage::RunBundleV1 =
+            serde_json::from_slice(&fs::read(bundle_dir.join("bundle_manifest.json")).unwrap())
+                .unwrap();
+        let manifest: crate::RunManifestV3 =
+            serde_json::from_str(&bundle.manifest.manifest_json).unwrap();
+        assert_eq!(manifest.brain_roster.len(), 1);
+        assert_eq!(manifest.brain_roster[0].kind, "ml.neuroflow");
+        assert_eq!(manifest.root_seed, expected_seed);
+        assert_eq!(
+            manifest.identity.requested_tick_budget,
+            Some(expected_ticks)
+        );
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), live_digest);
+        let after = handle.read_snapshot().unwrap();
+        assert_eq!(after.config, live_snapshot.config);
+        assert_eq!(after.world.tick, live_snapshot.world.tick);
+        runtime.shutdown().expect("join NeuroFlow experiment worker");
+    }
+
+    #[cfg(not(feature = "neuro"))]
+    #[test]
+    fn experiment_creation_refuses_neuroflow_aliases_before_admission_without_feature() {
+        let root = tempfile::tempdir().unwrap();
+        let (_unused_handle, host) = handle();
+        let (runtime, _submit) = crate::ControlRuntime::launch(
+            host.port.clone(),
+            crate::ControlServerConfig {
+                rest_enabled: false,
+                mcp_transport: crate::servers::McpTransportConfig::Disabled,
+                ..crate::ControlServerConfig::default()
+            },
+        )
+        .unwrap();
+        let handle = runtime
+            .control_handle()
+            .unwrap()
+            .with_artifacts_dir(root.path().to_path_buf())
+            .unwrap()
+            .with_experiment_run_capacity(1)
+            .unwrap();
+        let live_digest = host.port.scientific_digest_v1().unwrap();
+        let capacity = handle
+            .list_experiments(None, None)
+            .unwrap()
+            .execution_capacity;
+        assert_eq!(capacity.reserved_run_slots, 0);
+        assert_eq!(capacity.reserved_batches, 0);
+        assert!(!handle.version().features.iter().any(|f| f == "neuro"));
+
+        for alias in [" NeUrO ", " NeUrOfLoW ", " Ml.NeUrOfLoW "] {
+            let mut request = experiment_creation_request();
+            request.experiment_id = Some("unavailable-neuro".into());
+            request.variants[0].brain_family = alias.into();
+            let error = handle
+                .create_experiment(request)
+                .expect_err("disabled NeuroFlow must fail before experiment side effects");
+            assert!(matches!(
+                error,
+                ControlError::BadRequest(reason) if reason.contains("neuro feature")
+            ));
+            assert!(!root.path().join("experiments").exists());
+            assert!(handle.data_services.experiments.lock().unwrap().is_empty());
+            assert!(handle.data_services.idempotency.lock().unwrap().is_empty());
+            let listed = handle.list_experiments(None, None).unwrap();
+            assert_eq!(listed.total, 0);
+            assert_eq!(listed.execution_capacity, capacity);
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), live_digest);
+        }
+        runtime
+            .shutdown()
+            .expect("join any unexpected experiment worker");
+    }
+
     #[test]
     fn experiment_creation_concurrent_retry_admits_one_real_batch() {
         let (handle, _host) = handle();

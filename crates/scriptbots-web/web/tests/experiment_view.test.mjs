@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { readExperimentForm, renderExperimentLab, experimentObservationExport } from "../experiment-view.js";
+import { prepareExperimentRequest } from "../experiment-protocol.js";
 
 class Element {
   constructor(ownerDocument, tag = "div") {
@@ -104,6 +105,22 @@ test("form retains exact u64 seeds, per-arm overrides, and ordered same-tick int
   assert.equal(request.variants[1].brain_family, "assembly");
   assert.deepEqual(request.variants[1].interventions.map((entry) => entry.set.food_growth_rate), [0.001, 0.002]);
   assert.equal(Object.hasOwn(request, "idempotency_key"), false);
+});
+
+test("remote experiment form admits NeuroFlow and preserves the native canonical family", () => {
+  for (const arm of ["baseline", "challenger"]) {
+    const request = readExperimentForm(form({ [arm + "-family"]: "neuroflow" }));
+    const index = arm === "baseline" ? 0 : 1;
+    assert.equal(request.variants[index].brain_family, "neuroflow");
+    const prepared = prepareExperimentRequest({
+      ...request,
+      idempotency_key: "neuroflow-form-request",
+    });
+    assert.equal(prepared.request.variants[index].brain_family, "ml.neuroflow");
+    assert.deepEqual(prepared.request.seeds, ["11", "42", "137"]);
+    assert.equal(prepared.request.ticks_per_run, 200);
+    assert.deepEqual(prepared.request.variants[index].config_overrides, { population_minimum: 20 });
+  }
 });
 
 test("form refuses malformed seed identities, limits, duplicate arms, and invalid editors", () => {

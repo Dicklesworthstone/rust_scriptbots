@@ -2,6 +2,36 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**NeuroFlow admitted to matched-seed experiments (2026-11-13):**
+[Source implemented and independently reviewed — Codex; executable qualification open]
+
+Connect the existing optional NeuroFlow family to the matched-seed runner,
+central compiled-family catalog, Lab admission and remote browser controls.
+With `neuro` enabled, `neuro`, `neuroflow` and `ml.neuroflow` resolve
+to canonical `ml.neuroflow`; without it, every alias refuses before admission
+side effects. Executable family construction is preflighted before owners,
+workers or artifacts exist. Dependencies and feature defaults are unchanged.
+
+Checkpoint resume and portable-bundle verification reconstruct the adapter from
+the immutable launch manifest's normalized configuration, not potentially changed
+live settings. Isolated experiments use their own default NeuroFlow architecture
+and activation; this increment does not introduce architecture-factor controls
+or claim inheritance from the live host. The browser offers the remote family
+and preserves canonical request/status binding.
+
+New and extended regressions exercise actual NeuroFlow owners through original
+constructor preservation after a raw configuration change, exact checkpoint
+continuation, concurrency one/two, scheduled-treatment resume, API completion and
+portable export/restore. Feature-disabled API tests check no retained catalog,
+idempotency, capacity or artifact mutation. Browser tests cover aliases and form
+serialization while retaining unknown-family refusal. C1's checkpoint promotion
+guard and regression are preserved exactly.
+
+Native and browser changes are source reviewed; no tests or formatting checks
+executed because the execution environment remains unavailable. No DSR, compiler,
+Clippy or UBS pass is claimed. Brain-family performance/determinism acceptance
+(`bd-2z0.3.12.5`) and original tracker status remain open.
+
 **Exact inference for small matched-seed cohorts (2026-11-13):**
 [Source implemented and independently reviewed — Codex; executable qualification open]
 

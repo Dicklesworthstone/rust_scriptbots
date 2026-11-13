@@ -1698,7 +1698,11 @@ mod tests {
 
     #[test]
     fn brain_family_validation_uses_the_compiled_runner_catalog() {
-        for requested in ["imaginary", "neuroflow"] {
+        for requested in [
+            "imaginary",
+            #[cfg(not(feature = "neuro"))]
+            "neuroflow",
+        ] {
             let mut proposed = spec();
             proposed.brain_families = vec![requested.to_owned()];
             let errors = validate_spec(&proposed, OPERATOR_BUDGET).unwrap_err();
@@ -1712,6 +1716,29 @@ mod tests {
             proposed.brain_families = vec![family.to_owned()];
             let validated = validate_spec(&proposed, OPERATOR_BUDGET).unwrap();
             assert!(validated.arms.iter().all(|arm| arm.brain_family == family));
+        }
+        for alias in ["neuro", "neuroflow", "ml.neuroflow"] {
+            let mut optional = spec();
+            optional.brain_families = vec![alias.to_owned()];
+            #[cfg(feature = "neuro")]
+            assert!(
+                validate_spec(&optional, OPERATOR_BUDGET)
+                    .unwrap()
+                    .arms
+                    .iter()
+                    .all(|arm| arm.brain_family == "ml.neuroflow")
+            );
+            #[cfg(not(feature = "neuro"))]
+            assert!(
+                validate_spec(&optional, OPERATOR_BUDGET)
+                    .unwrap_err()
+                    .iter()
+                    .any(|error| matches!(
+                        error,
+                        SpecError::InvalidBrainFamily { name, reason }
+                            if name == alias && reason.contains("neuro feature")
+                    ))
+            );
         }
         let mut optional = spec();
         optional.brain_families = vec!["frankentorch".to_owned()];
