@@ -409,7 +409,9 @@ fn checkpoint_receipt_is_bounded(checkpoint: &LabCheckpoint) -> bool {
         && checkpoint.byte_size > 0
         && checkpoint.byte_size <= scriptbots_core::MAX_WORLD_CHECKPOINT_BYTES as u64
         && u64::try_from(checkpoint.agent_count).is_ok_and(|count| count <= checkpoint.byte_size)
-        && checkpoint.world_digest.len() == 64
+        // WorldDigestV1 is FNV-1a64; artifact BLAKE3/SHA-256 checksums are
+        // separate fields and must never stand in for this scientific digest.
+        && checkpoint.world_digest.len() == std::mem::size_of::<u64>() * 2
         && checkpoint
             .world_digest
             .bytes()
@@ -1591,7 +1593,41 @@ mod tests {
             tick: 42,
             agent_count: 3,
             byte_size: 1024,
-            world_digest: "a".repeat(64),
+            world_digest: "a".repeat(std::mem::size_of::<u64>() * 2),
+        }
+    }
+
+    #[test]
+    fn checkpoint_receipt_accepts_the_actual_world_digest_format() {
+        let world = scriptbots_core::WorldState::new(scriptbots_core::ScriptBotsConfig {
+            rng_seed: Some(42),
+            world_width: 40,
+            world_height: 40,
+            food_cell_size: 10,
+            population_minimum: 0,
+            persistence_interval: 0,
+            ..scriptbots_core::ScriptBotsConfig::default()
+        })
+        .unwrap();
+        let digest = world.world_digest_v1().unwrap();
+        digest.validate_contract().unwrap();
+        let mut checkpoint = saved_checkpoint();
+        checkpoint.world_digest = digest.overall;
+        assert!(checkpoint_receipt_is_bounded(&checkpoint));
+
+        for invalid in [
+            String::new(),
+            "a".repeat(15),
+            "a".repeat(17),
+            "a".repeat(64),
+            "A".repeat(16),
+            "g".repeat(16),
+        ] {
+            checkpoint.world_digest = invalid;
+            assert!(
+                !checkpoint_receipt_is_bounded(&checkpoint),
+                "a malformed digest or artifact checksum is not a scientific state digest"
+            );
         }
     }
 
@@ -1834,7 +1870,10 @@ mod tests {
         checkpoint.agent_count = usize::MAX;
         invalid_cuts.push(checkpoint);
         let mut checkpoint = saved_checkpoint();
-        checkpoint.world_digest = "A".repeat(64);
+        checkpoint.world_digest = "A".repeat(16);
+        invalid_cuts.push(checkpoint);
+        let mut checkpoint = saved_checkpoint();
+        checkpoint.world_digest = "a".repeat(64);
         invalid_cuts.push(checkpoint);
         for checkpoint in invalid_cuts {
             deliver(

@@ -1439,7 +1439,7 @@ mod tests {
                 tick: 37,
                 agent_count: 9,
                 byte_size: 640,
-                world_digest: "a".repeat(64),
+                world_digest: "a".repeat(16),
             });
         let rows = panel_rows(&model, &presentation);
         assert!(
@@ -1449,7 +1449,7 @@ mod tests {
         );
         assert!(
             rows.iter()
-                .any(|row| row.text == format!("Saved world digest: {}", "a".repeat(64)))
+                .any(|row| row.text == format!("Saved world digest: {}", "a".repeat(16)))
         );
         assert!(rows.len() <= MAX_PANEL_ROWS);
 

@@ -6318,7 +6318,11 @@ fn map_control_error(err: ControlError) -> McpError {
         ControlError::NotFound(msg) => McpError::new(McpErrorCode::InvalidParams, msg),
         ControlError::BadRequest(msg) => McpError::new(McpErrorCode::InvalidParams, msg),
         ControlError::PayloadTooLarge(msg) => McpError::new(McpErrorCode::InvalidParams, msg),
-        ControlError::Conflict(msg) => McpError::new(McpErrorCode::InvalidParams, msg),
+        // The request decoded and satisfied the tool schema, but conflicts with
+        // retained application state (for example an admitted retry identity).
+        // MCP reports this business-logic refusal as an actionable tool result;
+        // malformed arguments still use the protocol error above.
+        ControlError::Conflict(msg) => McpError::new(McpErrorCode::ToolExecutionError, msg),
         ControlError::UnknownPath(path) => McpError::new(
             McpErrorCode::InvalidParams,
             format!("unknown knob path: {path}"),
@@ -8829,6 +8833,10 @@ mod tests {
                     "{refused}"
                 );
             } else {
+                assert!(
+                    refused.get("error").is_none(),
+                    "a retained retry conflict is a tool execution result: {refused}"
+                );
                 assert_eq!(refused["result"]["isError"], true, "{refused}");
                 assert!(
                     refused["result"]["content"][0]["text"]

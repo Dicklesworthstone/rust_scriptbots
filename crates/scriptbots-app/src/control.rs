@@ -5287,7 +5287,7 @@ impl ControlHandle {
                 || job.definition.request_hash != request_hash
             {
                 return Err(ControlError::Conflict(
-                    "checkpoint branch key reused with a different request".to_owned(),
+                    "checkpoint branch idempotency key reused with a different request".to_owned(),
                 ));
             }
             return job.status_dto();
