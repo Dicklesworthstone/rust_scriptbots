@@ -562,6 +562,9 @@ cargo build -p scriptbots-brain-ml --features candle # library tensor inference;
    populations through sole-owner hosts in one new database. Requires an explicit
    `rng_seed` and `persistence_interval=1`. Islands step in ascending order with separate
    derived seeds; the inner Rayon pool defaults to one thread and honors `--threads`.
+   Each island executes the selected founder recipe: scenario-free runs use 20
+   seeded uniform founders, and explicit scenarios use the 16-founder corner grid.
+   The executed recipe must match the launch manifest before storage is created.
    Each complete tick is atomically applied and flushed before the next tick begins.
    Genomes, narrative records, interaction edges, and lineage edges retain island IDs; genome read APIs
    require an explicit island, and narrative search results include it in each event identity.

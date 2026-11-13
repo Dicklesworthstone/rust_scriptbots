@@ -19,7 +19,7 @@ use scriptbots_runtime::{
 };
 use scriptbots_storage::{ArchipelagoBarrierSink, RunManifestRecord, Storage, StorageReader};
 
-use crate::{BrainPreset, BuildProvenanceV0, install_brains, seed_founding_population};
+use crate::{BrainPreset, BuildProvenanceV0, FounderRecipe, install_brains, seed_founders};
 
 const MAX_CAPTURE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_RECORDED_TICKS: u64 = 10_000_000;
@@ -194,11 +194,16 @@ pub fn parse_island_overlay(spec: &str) -> Result<(u32, serde_json::Value)> {
     Ok((id, value))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "explicit launch inputs retain the selected brain and founder recipes at construction"
+)]
 fn build_recorded_archipelago(
     config: &ScriptBotsConfig,
     island_count: u32,
     root_seed: u64,
     preset: BrainPreset,
+    founders: FounderRecipe,
     overlays: &BTreeMap<u32, serde_json::Value>,
     capture: &Rc<RefCell<BarrierCapture>>,
     policy: (Topology, Option<ArchipelagoMigration>),
@@ -230,7 +235,7 @@ fn build_recorded_archipelago(
             let result = (|| -> Result<WorldState> {
                 let mut world = WorldState::new(meta.effective_config.clone())?;
                 let installed = install_brains(&mut world, preset)?;
-                seed_founding_population(&mut world, installed.population())?;
+                seed_founders(&mut world, installed.population(), founders)?;
                 Ok(world)
             })();
             result.map_err(|error| {
@@ -264,11 +269,16 @@ fn build_recorded_archipelago(
 ///
 /// Refuses invalid run bounds, missing per-tick capture, unsupported brain construction,
 /// inconsistent provenance, existing output files, incomplete barriers, and storage failures.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the recorded launch binds brain and founder selection to its manifest and output"
+)]
 pub fn run_recorded_archipelago(
     mut config: ScriptBotsConfig,
     island_count: u32,
     ticks: u64,
     preset: BrainPreset,
+    founders: FounderRecipe,
     path: &str,
     options: &RecordedArchipelagoOptions,
     manifest_for_world: impl FnOnce(&WorldState) -> Result<RunManifestRecord>,
@@ -326,6 +336,7 @@ pub fn run_recorded_archipelago(
         island_count,
         root_seed,
         preset,
+        founders,
         &parsed_overlays,
         &capture,
         policy,
@@ -333,6 +344,15 @@ pub fn run_recorded_archipelago(
     let islands: Vec<_> = archipelago.islands().cloned().collect();
     let mut manifest = archipelago.with_island_world(IslandId(0), manifest_for_world)??;
     let mut manifest_json: serde_json::Value = serde_json::from_str(&manifest.manifest_json)?;
+    let population_recipe = manifest_json
+        .pointer("/scenario/population_recipe")
+        .and_then(serde_json::Value::as_str)
+        .context("recorded archipelago manifest must declare scenario.population_recipe")?;
+    ensure!(
+        FounderRecipe::from_population_recipe(population_recipe) == Some(founders),
+        "recorded archipelago founder recipe {} differs from manifest declaration {population_recipe}",
+        founders.id()
+    );
     let manifest_object = manifest_json
         .as_object_mut()
         .context("run manifest must be a JSON object")?;
@@ -341,6 +361,7 @@ pub fn run_recorded_archipelago(
         serde_json::json!({
             "schema": "scriptbots.recorded-archipelago.v1", "root_seed": root_seed,
             "primary_manifest_island": 0, "island_count": island_count,
+            "founder_recipe": founders.id(),
             "ticks": ticks, "barrier_interval": 1, "migration": migration_status,
             "migration_policy": migration_policy,
             "tick_summary_phase": "before_migration", "membership_phase": "after_migration",
@@ -420,6 +441,7 @@ pub fn run_recorded_archipelago(
             "schema": "scriptbots.recorded-archipelago.v1", "status": "complete",
             "db": path, "run_id": run_id, "root_seed": root_seed, "ticks": ticks,
             "island_count": island_count, "migration": migration_status,
+            "founder_recipe": founders.id(),
             "migration_policy": migration_policy, "migration_count": migration_count,
             "rayon_threads": rayon_threads,
             "step_topology": "sequential_ascending", "host_journal": "committed_volatile",
@@ -552,6 +574,60 @@ mod tests {
         CommandEnvelope, CommandId, HostCommand, HostCore, HostPort, JournalState,
         ManualHostDriver, ManualInstant, PlaybackSnapshot,
     };
+
+    #[test]
+    fn recorded_founders_must_match_the_manifest_before_storage_creation() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let config = ScriptBotsConfig {
+            rng_seed: Some(42),
+            persistence_interval: 1,
+            closed: true,
+            world_width: 600,
+            world_height: 600,
+            ..Default::default()
+        };
+        for (index, (executed, declared)) in [
+            (FounderRecipe::Spread, FounderRecipe::CornerGrid.id()),
+            (FounderRecipe::CornerGrid, FounderRecipe::Spread.id()),
+            (FounderRecipe::Spread, "unknown-founder-recipe"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let database = directory.path().join(format!("mismatched-{index}.sqlite"));
+            let error = run_recorded_archipelago(
+                config.clone(),
+                2,
+                1,
+                BrainPreset::Mlp,
+                executed,
+                database.to_str().context("test database path")?,
+                &RecordedArchipelagoOptions::default(),
+                |world| {
+                    let mut scenario =
+                        crate::ScenarioIdentityV0::caller_seeded("recorded-founders");
+                    scenario.population_recipe = format!("{declared};brain=mlp");
+                    let manifest = crate::RunManifestV3::from_world_with_provenance(
+                        crate::RunIdentityV1::new(
+                            scriptbots_runtime::RunId::new(1),
+                            0,
+                            Some(1),
+                            None,
+                        ),
+                        scenario,
+                        world,
+                        BuildProvenanceV0::current(),
+                    )?;
+                    Ok(manifest.to_storage_record()?)
+                },
+            )
+            .expect_err("contradictory founder provenance must not create a run database");
+            assert!(error.to_string().contains("founder recipe"), "{error:#}");
+            assert!(!database.exists());
+        }
+        assert!(directory.path().read_dir()?.next().is_none());
+        Ok(())
+    }
 
     #[test]
     fn recorded_migration_is_opt_in_with_explicit_runtime_defaults() -> Result<()> {

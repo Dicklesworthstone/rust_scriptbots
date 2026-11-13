@@ -591,6 +591,7 @@ fn main() -> Result<()> {
 
     if let Some(islands) = cli.run_archipelago {
         ensure_recorded_archipelago_scenario(&launch_scenario)?;
+        let founders = founder_recipe_of(&launch_scenario)?;
         let path = cli
             .archipelago_db
             .as_ref()
@@ -624,6 +625,7 @@ fn main() -> Result<()> {
                 islands,
                 ticks,
                 cli.brain,
+                founders,
                 path,
                 &cli.archipelago_options,
                 |world| {
