@@ -3587,6 +3587,13 @@ struct CreatureSignalBar {
     index: usize,
 }
 
+/// The track communicates whether the bar is unavailable or clipped.
+#[derive(Component)]
+struct CreatureSignalTrack {
+    source: CreatureSignalSource,
+    index: usize,
+}
+
 /// Color perceived by one eye in the current owner-inspection sample.
 #[derive(Component)]
 struct CreatureEyeSwatch(usize);
@@ -3754,6 +3761,15 @@ fn creature_trait_position(value: f32) -> Option<f32> {
 enum CreatureSignalSource {
     Sensor,
     Output,
+}
+
+fn creature_signal_track_color(value: Option<f32>) -> Color {
+    match value {
+        None => Color::srgb(0.63, 0.70, 0.67),
+        Some(value) if !value.is_finite() => Color::srgb(0.63, 0.70, 0.67),
+        Some(value) if !(0.0..=1.0).contains(&value) => Color::srgb(0.97, 0.73, 0.34),
+        Some(_) => Color::srgb(0.15, 0.25, 0.21),
+    }
 }
 
 fn creature_eye_rgb(sensors: &[f32], eye: usize) -> Option<[f32; 3]> {
@@ -6247,6 +6263,13 @@ fn setup_scene(
                         TextColor(primary_text_color),
                     ))
                     .id();
+                playback = row
+                    .spawn((
+                        Text::new("Playback: --"),
+                        secondary_font.clone(),
+                        TextColor(secondary_text_color),
+                    ))
+                    .id();
             });
         selection = parent
             .spawn((
@@ -6271,13 +6294,6 @@ fn setup_scene(
                 TextColor(primary_text_color),
                 hud_diagnostic_node(),
                 HudDiagnostic,
-            ))
-            .id();
-        playback = parent
-            .spawn((
-                Text::new("Playback: --"),
-                secondary_font.clone(),
-                TextColor(secondary_text_color),
             ))
             .id();
         parent
@@ -7050,11 +7066,17 @@ fn setup_scene(
                                 cell.spawn((
                                     Node {
                                         width: Val::Percent(100.0),
-                                        height: Val::Px(4.0),
+                                        height: Val::Px(6.0),
+                                        border: UiRect::all(Val::Px(1.0)),
                                         ..default()
                                     },
                                     BackgroundColor(Color::srgb(0.15, 0.25, 0.21)),
+                                    BorderColor::all(creature_signal_track_color(None)),
                                     BorderRadius::all(Val::Px(2.0)),
+                                    CreatureSignalTrack {
+                                        source: CreatureSignalSource::Sensor,
+                                        index: channel.index,
+                                    },
                                 ))
                                 .with_children(|track| {
                                     track.spawn((
@@ -7097,6 +7119,11 @@ fn setup_scene(
                         ))
                         .id();
                 });
+                card.spawn((
+                    Text::new("OUTLINE: GRAY = UNAVAILABLE  ·  AMBER = OUTSIDE 0–1"),
+                    ui_font(9.0),
+                    TextColor(Color::srgb(0.65, 0.80, 0.71)),
+                ));
                 for (title, source, labels) in [
                     (
                         "OTHER SENSORS  ·  BARS CLAMPED TO 0–1",
@@ -7168,11 +7195,14 @@ fn setup_scene(
                                 cell.spawn((
                                     Node {
                                         width: Val::Percent(100.0),
-                                        height: Val::Px(4.0),
+                                        height: Val::Px(6.0),
+                                        border: UiRect::all(Val::Px(1.0)),
                                         ..default()
                                     },
                                     BackgroundColor(Color::srgb(0.15, 0.25, 0.21)),
+                                    BorderColor::all(creature_signal_track_color(None)),
                                     BorderRadius::all(Val::Px(2.0)),
+                                    CreatureSignalTrack { source, index },
                                 ))
                                 .with_children(|track| {
                                     track.spawn((
@@ -9169,6 +9199,7 @@ struct CreatureCardData<'w, 's> {
     backgrounds: Query<'w, 's, &'static mut BackgroundColor>,
     borders: Query<'w, 's, &'static mut BorderColor>,
     bars: Query<'w, 's, (Entity, &'static CreatureSignalBar)>,
+    signal_tracks: Query<'w, 's, (Entity, &'static CreatureSignalTrack)>,
     eyes: Query<'w, 's, (Entity, &'static CreatureEyeSwatch)>,
     eye_compasses: Query<'w, 's, (Entity, &'static CreatureEyeCompass)>,
     eye_bearings: Query<'w, 's, (Entity, &'static CreatureEyeBearing)>,
@@ -9210,6 +9241,7 @@ fn update_creature_card(
         mut backgrounds,
         mut borders,
         bars,
+        signal_tracks,
         eyes,
         eye_compasses,
         eye_bearings,
@@ -9748,13 +9780,27 @@ fn update_creature_card(
             background.0 = color;
         }
     }
-    for (entity, bar) in &bars {
-        let value = sample.and_then(|sample| match bar.source {
-            CreatureSignalSource::Sensor => sample.sensors.get(bar.index),
-            CreatureSignalSource::Output => sample.outputs.get(bar.index),
-        });
-        let fraction = value
+    let signal_value = |source, index| {
+        sample
+            .and_then(|sample| match source {
+                CreatureSignalSource::Sensor => sample.sensors.get(index),
+                CreatureSignalSource::Output => sample.outputs.get(index),
+            })
             .copied()
+    };
+    for (entity, track) in &signal_tracks {
+        let color = BorderColor::all(creature_signal_track_color(signal_value(
+            track.source,
+            track.index,
+        )));
+        if let Ok(mut border) = borders.get_mut(entity)
+            && *border != color
+        {
+            *border = color;
+        }
+    }
+    for (entity, bar) in &bars {
+        let fraction = signal_value(bar.source, bar.index)
             .filter(|value| value.is_finite())
             .unwrap_or(0.0)
             .clamp(0.0, 1.0);
@@ -10203,6 +10249,8 @@ fn update_hud(
             let speed = control_snapshot.speed_multiplier.clamp(0.0, 999.9);
             let mut message = if lab.as_ref().is_some_and(|lab| lab.reviewing()) {
                 format!("Saved view at tick {tick} | live owner {playback_status}")
+            } else if selected_count > 0 && !diagnostics_visible {
+                format!("{playback_status} x{speed:.1}")
             } else if speed > 0.0 {
                 format!("Playback: {} | x{speed:>4.1}", playback_status)
             } else {
@@ -12617,6 +12665,20 @@ mod adaptive_governor_tests {
         app.update();
 
         let world = app.world_mut();
+        let hud = world.resource::<HudElements>();
+        let summary_row = world.get::<ChildOf>(hud.tick).unwrap().parent();
+        assert_eq!(
+            world.get::<ChildOf>(hud.agents).unwrap().parent(),
+            summary_row
+        );
+        assert_eq!(
+            world.get::<ChildOf>(hud.playback).unwrap().parent(),
+            summary_row
+        );
+        assert_eq!(
+            world.get::<Node>(summary_row).unwrap().flex_wrap,
+            FlexWrap::Wrap
+        );
         let signal_status = world.resource::<CreatureCardElements>().signal_status;
         let status_row = world
             .get::<ChildOf>(signal_status)
@@ -17390,6 +17452,26 @@ mod owner_inspector_tests {
                 },
             ))
             .id();
+        let food_track = app
+            .world_mut()
+            .spawn((
+                BorderColor::all(Color::WHITE),
+                CreatureSignalTrack {
+                    source: CreatureSignalSource::Sensor,
+                    index: 4,
+                },
+            ))
+            .id();
+        let boost_track = app
+            .world_mut()
+            .spawn((
+                BorderColor::all(Color::WHITE),
+                CreatureSignalTrack {
+                    source: CreatureSignalSource::Output,
+                    index: OutputChannel::Boost.index(),
+                },
+            ))
+            .id();
         let eye_swatch = app
             .world_mut()
             .spawn((BackgroundColor(Color::WHITE), CreatureEyeSwatch(0)))
@@ -17661,6 +17743,13 @@ mod owner_inspector_tests {
         );
         assert_eq!(app.world().get::<Text>(trait_reading).unwrap().0, "--");
         assert_eq!(app.world().get::<Text>(parents_reading).unwrap().0, "--");
+        for entity in [food_track, boost_track] {
+            assert_eq!(
+                *app.world().get::<BorderColor>(entity).unwrap(),
+                BorderColor::all(Color::srgb(0.63, 0.70, 0.67)),
+                "a different creature's sample must appear unavailable"
+            );
+        }
         assert_eq!(
             app.world().get::<Node>(first_parent).unwrap().display,
             Display::None
@@ -17851,6 +17940,58 @@ mod owner_inspector_tests {
         {
             let mut owner = app.world_mut().non_send_resource_mut::<OwnerInspector>();
             owner.sample.as_mut().unwrap().sensors[1] = 0.02;
+        }
+        app.update();
+        for entity in [food_track, boost_track] {
+            assert_eq!(
+                *app.world().get::<BorderColor>(entity).unwrap(),
+                BorderColor::all(Color::srgb(0.15, 0.25, 0.21))
+            );
+        }
+        {
+            let mut owner = app.world_mut().non_send_resource_mut::<OwnerInspector>();
+            let sample = owner.sample.as_mut().unwrap();
+            sample.sensors[4] = f32::NAN;
+            sample.outputs[OutputChannel::Boost.index()] = 1.5;
+        }
+        app.update();
+        assert_eq!(
+            *app.world().get::<BorderColor>(food_track).unwrap(),
+            BorderColor::all(Color::srgb(0.63, 0.70, 0.67))
+        );
+        assert_eq!(
+            *app.world().get::<BorderColor>(boost_track).unwrap(),
+            BorderColor::all(Color::srgb(0.97, 0.73, 0.34))
+        );
+        assert_eq!(
+            app.world().get::<Node>(food_bar).unwrap().width,
+            Val::Percent(0.0)
+        );
+        assert_eq!(
+            app.world().get::<Node>(boost_bar).unwrap().width,
+            Val::Percent(100.0)
+        );
+        {
+            let mut owner = app.world_mut().non_send_resource_mut::<OwnerInspector>();
+            let sample = owner.sample.as_mut().unwrap();
+            sample.sensors[4] = 0.0;
+            sample.outputs[OutputChannel::Boost.index()] = -0.5;
+        }
+        app.update();
+        assert_eq!(
+            *app.world().get::<BorderColor>(food_track).unwrap(),
+            BorderColor::all(Color::srgb(0.15, 0.25, 0.21)),
+            "a valid zero must look different from an unavailable value"
+        );
+        assert_eq!(
+            *app.world().get::<BorderColor>(boost_track).unwrap(),
+            BorderColor::all(Color::srgb(0.97, 0.73, 0.34))
+        );
+        {
+            let mut owner = app.world_mut().non_send_resource_mut::<OwnerInspector>();
+            let sample = owner.sample.as_mut().unwrap();
+            sample.sensors[4] = 0.05;
+            sample.outputs[OutputChannel::Boost.index()] = 0.35;
         }
         app.update();
         for (entity, expected) in [(food_bar, 5.0), (boost_bar, 35.0), (energy_bar, 36.5)] {
@@ -31294,6 +31435,10 @@ mod tests {
             .tick += 1;
         app.update();
         assert_eq!(
+            app.world().get::<Text>(hud_ids.5).unwrap().as_str(),
+            "Paused x0.0 | Spike hits detected (3)"
+        );
+        assert_eq!(
             app.world().get::<Text>(hud_ids.4).unwrap().as_str(),
             camera_text
         );
@@ -31301,8 +31446,23 @@ mod tests {
             app.world().get::<Text>(hud_ids.0).unwrap().as_str(),
             format!("Tick: {}", snapshot.tick + 1)
         );
+        app.world()
+            .resource::<SimulationControl>()
+            .update(|state| state.auto_pause_reason = None);
+        app.update();
+        assert_eq!(
+            app.world().get::<Text>(hud_ids.5).unwrap().as_str(),
+            "Paused x0.0"
+        );
+        app.world()
+            .resource::<SimulationControl>()
+            .update(|state| state.auto_pause_reason = Some("Spike hits detected (3)".to_owned()));
         app.world_mut().resource_mut::<HudDiagnostics>().0 = true;
         app.update();
+        assert_eq!(
+            app.world().get::<Text>(hud_ids.5).unwrap().as_str(),
+            "Playback: Paused | x0.0 | Spike hits detected (3)"
+        );
         assert_ne!(
             app.world().get::<Text>(hud_ids.4).unwrap().as_str(),
             camera_text
