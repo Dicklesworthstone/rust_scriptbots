@@ -2279,6 +2279,53 @@ mod tests {
         }
     }
 
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_checkpoint_saves_fresh_families_without_advancing_science() {
+        for preset in [BrainPreset::Mlp, BrainPreset::Dwraon, BrainPreset::Assembly] {
+            for population in [0, 3] {
+                let mut spec = checkpoint_world(Some(preset), SeedStrategy::None).spec;
+                spec.initial_population = population;
+                let mut original = Simulation::new(spec).unwrap();
+                let before = original.core.scientific_digest_v1().unwrap();
+                let revisions = original.core.latest_snapshot().revisions;
+                let bytes = original.checkpoint().unwrap();
+                assert_eq!(original.core.world_tick().0, 0);
+                assert_eq!(original.core.scientific_digest_v1().unwrap(), before);
+                assert_eq!(original.core.latest_snapshot().revisions, revisions);
+                let decoded = scriptbots_runtime::VolatileHostCheckpointV1::decode(&bytes).unwrap();
+                assert_eq!(
+                    decoded
+                        .host_checkpoint()
+                        .journal_cut()
+                        .last_journal_sequence,
+                    0
+                );
+                assert_eq!(
+                    decoded
+                        .host_checkpoint()
+                        .journal_cut()
+                        .last_scientific_event_sequence,
+                    0
+                );
+                let mut restored = Simulation::from_checkpoint(&bytes).unwrap();
+                assert_eq!(restored.spec.default_brain, Some(preset));
+                assert_eq!(restored.core.world().agent_count(), population);
+                assert_eq!(restored.checkpoint().unwrap(), bytes);
+                for steps in [1, 4] {
+                    original.tick(steps).unwrap();
+                    restored.tick(steps).unwrap();
+                    assert_eq!(
+                        original.core.scientific_digest_v1().unwrap(),
+                        restored.core.scientific_digest_v1().unwrap(),
+                        "{} with {population} founders must continue exactly",
+                        preset.name()
+                    );
+                }
+            }
+        }
+    }
+
     fn web_intervention_request(simulation: &Simulation) -> BrowserInterventionRequest {
         let source = simulation.core.latest_snapshot();
         BrowserInterventionRequest {

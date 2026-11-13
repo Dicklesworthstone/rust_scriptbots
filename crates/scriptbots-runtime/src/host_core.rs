@@ -731,6 +731,31 @@ impl HostCheckpointV1 {
 
     fn validate_owner_counters(&self) -> Result<(), HostCheckpointError> {
         let state = &self.state;
+        // A bound, untouched journal has a real empty prefix. It cannot prove
+        // completed commands, scheduled work or scientific events from this owner.
+        if state.cut.last_journal_sequence == 0
+            && (state.revisions.control.get() != 0
+                || state.revisions.scientific.get() != self.tick().0
+                || state.next_admission.get() != 1
+                || state.next_protocol_event.get() != 1
+                || state.next_audit_order != 1
+                || state.next_lifecycle_command_sequence != state.cut.session_id.get()
+                || !state.commands.is_empty()
+                || !state.archived.is_empty()
+                || state.last_applied.is_some()
+                || !state.protocol_events.is_empty()
+                || !state.step_traces.is_empty()
+                || state
+                    .completed_schedule_sequence
+                    .is_some_and(|sequence| sequence != 0)
+                || !state.scheduled_patches.is_empty()
+                || state.last_arrival.is_some())
+        {
+            return Err(checkpoint_error(
+                "journal.empty_prefix",
+                "empty journal prefix cannot carry completed owner work",
+            ));
+        }
         if state.cut.last_journal_sequence == u64::MAX
             || state.cut.last_scientific_event_sequence > state.cut.last_journal_sequence
             || state.next_admission.get() == 0
@@ -1095,6 +1120,7 @@ pub enum HostCoreBuildError {
 /// independent protocol axes.
 #[derive(Debug)]
 pub struct VolatileJournal {
+    session_id: Option<HostSessionId>,
     highest_accepted: Option<JournalBatchId>,
     continuation_eligible: bool,
     archive: VolatileJournalArchive,
@@ -1148,7 +1174,6 @@ impl VolatileJournalCheckpointV1 {
             .min(self.capacity);
         if self.schema_version != 1
             || self.cut.commitment_requirement != ShutdownCommitRequirement::CommittedVolatile
-            || self.cut.last_journal_sequence == 0
             || self.cut.last_journal_sequence == u64::MAX
             || self.cut.last_scientific_event_sequence > self.cut.last_journal_sequence
             || self.capacity > MAX_HOST_CHECKPOINT_ENTRIES
@@ -1205,11 +1230,11 @@ impl VolatileJournalCheckpointV1 {
 
     fn restore(&self) -> Result<VolatileJournal, HostCheckpointError> {
         self.validate()?;
-        let mut journal = VolatileJournal::with_capacity(self.capacity);
-        journal.highest_accepted = Some(JournalBatchId::new(
-            self.cut.session_id,
-            self.cut.last_journal_sequence,
-        ));
+        let mut journal = VolatileJournal::for_session(self.cut.session_id, self.capacity);
+        // An empty cut binds the actual session but has accepted no batch. Do not
+        // manufacture a sequence-zero receipt or advance the first real batch.
+        journal.highest_accepted = (self.cut.last_journal_sequence != 0)
+            .then(|| JournalBatchId::new(self.cut.session_id, self.cut.last_journal_sequence));
         journal.archive.scientific_entries = self.scientific_entries.iter().cloned().collect();
         journal.event_view.store(Arc::new(volatile_event_view(
             &journal.archive,
@@ -1232,6 +1257,7 @@ impl VolatileJournal {
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
+            session_id: None,
             highest_accepted: None,
             continuation_eligible: true,
             archive: VolatileJournalArchive {
@@ -1242,6 +1268,18 @@ impl VolatileJournal {
             event_view: Arc::new(ArcSwap::from_pointee(VolatileEventArchiveView::default())),
             receipts: VecDeque::new(),
         }
+    }
+
+    /// Construct an empty volatile journal bound to one real owner session.
+    ///
+    /// Unlike an unbound adapter, this can capture its empty prefix before the
+    /// first command or science tick. No batch has been admitted or committed;
+    /// another session cannot subsequently claim this journal.
+    #[must_use]
+    pub fn for_session(session_id: HostSessionId, capacity: usize) -> Self {
+        let mut journal = Self::with_capacity(capacity);
+        journal.session_id = Some(session_id);
+        journal
     }
 
     /// Exact admitted batches whose volatile commitment receipt is still pending.
@@ -1401,7 +1439,7 @@ impl JournalPort for VolatileJournal {
     }
 
     fn continuation_cut(&self) -> Option<HostJournalCutV1> {
-        let highest = self.highest_accepted?;
+        let session_id = self.session_id?;
         if !self.continuation_eligible
             || !self.receipts.is_empty()
             || !self.archive.entries.is_empty()
@@ -1414,8 +1452,8 @@ impl JournalPort for VolatileJournal {
             return None;
         }
         Some(HostJournalCutV1 {
-            session_id: highest.session_id(),
-            last_journal_sequence: highest.sequence(),
+            session_id,
+            last_journal_sequence: self.highest_accepted.map_or(0, JournalBatchId::sequence),
             last_scientific_event_sequence: self
                 .archive
                 .scientific_entries
@@ -1427,17 +1465,17 @@ impl JournalPort for VolatileJournal {
 
     fn try_admit(&mut self, batch: &Arc<JournalBatch>) -> JournalAdmission {
         let batch_id = batch.id();
+        if self
+            .session_id
+            .is_some_and(|session_id| session_id != batch_id.session_id())
+        {
+            return JournalAdmission::Closed { batch_id };
+        }
         if self.highest_accepted.is_some_and(|highest| {
             highest.session_id() == batch_id.session_id()
                 && highest.sequence() >= batch_id.sequence()
         }) {
             return JournalAdmission::Accepted { batch_id };
-        }
-        if self
-            .highest_accepted
-            .is_some_and(|highest| highest.session_id() != batch_id.session_id())
-        {
-            return JournalAdmission::Closed { batch_id };
         }
         let scientific_entry = match batch.scientific_event_sequence() {
             None => None,
@@ -1487,6 +1525,7 @@ impl JournalPort for VolatileJournal {
             .map_or(Some(1), |highest| highest.sequence().checked_add(1));
         self.continuation_eligible &=
             expected == Some(batch_id.sequence()) && !batch.is_applied_shutdown();
+        self.session_id = Some(batch_id.session_id());
         self.highest_accepted = Some(batch_id);
         self.receipts.push_back(JournalReceipt::new(
             batch_id,
@@ -3254,7 +3293,8 @@ impl HostCore {
             session_id,
             world,
             options,
-            Box::new(VolatileJournal::with_capacity(
+            Box::new(VolatileJournal::for_session(
+                session_id,
                 options.volatile_event_history_capacity,
             )),
         )
@@ -6981,6 +7021,168 @@ mod tests {
             assert_eq!(restored.world_tick(), Tick(completed + 1));
             assert_continued_owner_outputs(&restored, &oracle);
         }
+    }
+
+    #[test]
+    fn volatile_host_checkpoint_preserves_a_fresh_owner_without_inventing_work() {
+        for initialized_clock in [false, true] {
+            let make_owner = || {
+                HostCore::new(
+                    HostSessionId::new(0xc023),
+                    continuation_world(),
+                    options(true),
+                )
+                .unwrap()
+            };
+            let mut original = make_owner();
+            let mut oracle = make_owner();
+            if initialized_clock {
+                original.drive(ManualInstant::from_nanos(0)).unwrap();
+                oracle.drive(ManualInstant::from_nanos(0)).unwrap();
+            }
+            let before = original.scientific_digest_v1().unwrap();
+            let checkpoint = original.capture_volatile_host_checkpoint_v1().unwrap();
+            assert_eq!(checkpoint.host_checkpoint().tick(), Tick::zero());
+            assert_eq!(
+                checkpoint
+                    .host_checkpoint()
+                    .journal_cut()
+                    .last_journal_sequence,
+                0
+            );
+            assert_eq!(
+                checkpoint
+                    .host_checkpoint()
+                    .journal_cut()
+                    .last_scientific_event_sequence,
+                0
+            );
+            assert!(checkpoint.host.state.commands.is_empty());
+            assert!(checkpoint.journal.scientific_entries.is_empty());
+            assert_eq!(original.scientific_digest_v1().unwrap(), before);
+            assert_eq!(original.next_journal_sequence, 1);
+            let encoded = checkpoint.encode().unwrap();
+            assert_eq!(
+                original
+                    .capture_volatile_host_checkpoint_v1()
+                    .unwrap()
+                    .encode()
+                    .unwrap(),
+                encoded
+            );
+            let decoded = VolatileHostCheckpointV1::decode(&encoded).unwrap();
+            assert_eq!(decoded.encode().unwrap(), encoded);
+            assert!(
+                decoded
+                    .journal
+                    .restore()
+                    .unwrap()
+                    .highest_accepted
+                    .is_none()
+            );
+            let world = decoded
+                .host_checkpoint()
+                .restore_world(scriptbots_core::BrainRegistry::new())
+                .unwrap();
+            let persistence = world.bind_persistence(Box::new(NullPersistence)).unwrap();
+            let mut restored = HostCore::restore_volatile_host_checkpoint_v1(
+                &decoded,
+                world,
+                persistence,
+                None,
+                ManualInstant::from_nanos(100),
+            )
+            .unwrap();
+            assert_continued_owner_outputs(&restored, &oracle);
+            let envelope = CommandEnvelope::new(CommandId::new(1), HostCommand::Step);
+            settle_continuation_command(&mut restored, envelope.clone(), 200);
+            settle_continuation_command(&mut oracle, envelope, 200);
+            assert_eq!(restored.world_tick(), Tick(1));
+            assert_continued_owner_outputs(&restored, &oracle);
+            assert_eq!(
+                restored
+                    .capture_volatile_host_checkpoint_v1()
+                    .unwrap()
+                    .journal
+                    .cut,
+                oracle
+                    .capture_volatile_host_checkpoint_v1()
+                    .unwrap()
+                    .journal
+                    .cut,
+            );
+        }
+    }
+
+    #[test]
+    fn volatile_host_checkpoint_empty_prefix_keeps_session_and_history_guards() {
+        let session_id = HostSessionId::new(0xc024);
+        let other_session = HostSessionId::new(0xc025);
+        let mut journal = VolatileJournal::for_session(session_id, 2);
+        let empty = journal.capture_volatile_checkpoint_v1(session_id).unwrap();
+        assert_eq!(empty.cut.last_journal_sequence, 0);
+        assert!(
+            journal
+                .capture_volatile_checkpoint_v1(other_session)
+                .is_err()
+        );
+        let batch = |session_id| {
+            Arc::new(JournalBatch::new(
+                JournalBatchId::new(session_id, 1),
+                None,
+                None,
+                AppliedCommand {
+                    tick: Tick::zero(),
+                    revisions: HostRevisions::default(),
+                },
+                None,
+                None,
+            ))
+        };
+        assert!(matches!(
+            journal.try_admit(&batch(other_session)),
+            JournalAdmission::Closed { .. }
+        ));
+        assert_eq!(journal.continuation_cut(), Some(empty.cut));
+        assert!(journal.try_admit(&batch(session_id)).is_accepted());
+        assert!(journal.capture_volatile_checkpoint_v1(session_id).is_err());
+        assert_eq!(journal.poll_receipts(1).len(), 1);
+        assert_eq!(
+            journal
+                .capture_volatile_checkpoint_v1(session_id)
+                .unwrap()
+                .cut
+                .last_journal_sequence,
+            1
+        );
+
+        let mut corrupt_empty = empty;
+        corrupt_empty.cut.last_scientific_event_sequence = 1;
+        assert!(corrupt_empty.validate().is_err());
+        assert!(
+            VolatileJournal::for_session(session_id, 0)
+                .capture_volatile_checkpoint_v1(session_id)
+                .is_err()
+        );
+
+        let mut owner = HostCore::new(session_id, continuation_world(), options(true)).unwrap();
+        settle_continuation_command(
+            &mut owner,
+            CommandEnvelope::new(CommandId::new(1), HostCommand::Step),
+            0,
+        );
+        let mut erased = owner.capture_volatile_host_checkpoint_v1().unwrap();
+        erased.host.state.cut.last_journal_sequence = 0;
+        erased.host.state.cut.last_scientific_event_sequence = 0;
+        erased.journal.cut = erased.host.state.cut;
+        erased.journal.scientific_entries.clear();
+        assert!(matches!(
+            erased.encode(),
+            Err(HostCheckpointError::Contract {
+                path: "journal.empty_prefix",
+                ..
+            })
+        ));
     }
 
     #[test]

@@ -3455,12 +3455,13 @@ pub trait JournalPort {
         })
     }
 
-    /// Actual adapter-observed continued-session prefix, if this adapter was opened for restore.
+    /// Actual adapter-observed session prefix, when eligible for continuation.
     ///
-    /// Fresh adapters return `None`. A continuation adapter must return this only after checking
-    /// its real session, contiguous journal/event prefixes, commitment threshold, and absence of
-    /// completed shutdown or an advanced tail. The runtime compares this data with the exact
-    /// captured owner cut; this method itself performs no I/O or caller assertion of durability.
+    /// Unbound adapters return `None`. An explicitly session-bound volatile adapter may expose
+    /// its empty prefix before accepting any batch. A continuation adapter must return this only
+    /// after checking its real session, contiguous journal/event prefixes, commitment threshold,
+    /// and absence of completed shutdown or an advanced tail. The runtime compares this data with
+    /// the exact captured owner cut; this method itself performs no I/O or assertion of durability.
     fn continuation_cut(&self) -> Option<HostJournalCutV1> {
         None
     }
