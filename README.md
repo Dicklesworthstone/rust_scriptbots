@@ -2213,6 +2213,32 @@ to retain the intervening edit. Playback-only changes do not invalidate that gua
 
 #### Experiments from the shell
 
+Run a matched-seed experiment directly with the application binary:
+
+```bash
+cargo run -p scriptbots-app --bin scriptbots-app -- experiment --example > experiment-plan.json
+cargo run -p scriptbots-app --bin scriptbots-app -- experiment \
+  --plan experiment-plan.json --out runs/matched-experiment
+```
+
+The example is an editable MLP/DWRAON study. Its strict version-1 plan declares
+`experiment_id`, `cohort_id`, exact integer `seeds`, `variants`, `ticks_per_run`,
+and `max_concurrency`. Variants use the same configuration overrides and ordered
+interventions as the existing experiment runner. Input is limited to a regular
+JSON file of at most 1 MiB, and the runner validates the entire plan before
+creating output. This command runs locally without a control server or LLM.
+
+The output directory contains canonical `status.json`, resumable checkpoint cuts,
+and portable per-run artifacts under `bundles/`. Repeat the identical command to
+continue unfinished work from its validated cuts. Already completed runs have
+their bundles verified and retain their original output. A changed plan, malformed
+saved state, or unrelated nonempty output directory is refused with retained
+artifacts preserved. Successful stdout is the canonical status JSON; failed or
+incomplete batches exit with a nonzero status. Inspect `failed_runs`, individual
+run errors, and retained files before retrying.
+
+For a running control server, use the control CLI:
+
 The control CLI exposes the same matched-seed experiment service as REST and MCP.
 Save an experiment request such as the `food-pause-recovery` example above to
 `experiment.json`, then submit it to a running server:

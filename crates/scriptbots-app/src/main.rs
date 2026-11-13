@@ -465,6 +465,10 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    if let Some(AppSubcommand::Experiment(ref experiment_args)) = cli.subcommand {
+        return run_experiment_subcommand(experiment_args);
+    }
+
     if let Some(AppSubcommand::Replay(ref replay_args)) = cli.subcommand {
         run_replay_subcommand(replay_args)?;
         return Ok(());
@@ -3761,12 +3765,192 @@ enum AppSubcommand {
     Tournament(scriptbots_app::tournament::TournamentArgs),
     /// Compare ecological interventions restored from one shared scientific checkpoint.
     BranchStudy(BranchStudyArgs),
+    /// Execute or resume a bounded matched-seed experiment and export portable run bundles.
+    Experiment(ExperimentArgs),
     /// Replay an intervention journal or scripted experiment and verify against world characterization digest.
     Replay(ReplayArgs),
     /// Headless highlight reel montage exporter (ASCII/GIF) (bd-16g.9.2).
     Reel(ReelArgs),
     /// Deterministic offline soundtrack render for reels + tick-rate impact gate (bd-16g.14.2).
     RenderAudio(scriptbots_app::render_audio::RenderAudioArgs),
+}
+
+#[derive(clap::Args, Debug, Clone, PartialEq)]
+pub struct ExperimentArgs {
+    /// Strict version-1 JSON plan containing variants, shared seeds, and execution bounds.
+    #[arg(long, required_unless_present = "example", conflicts_with = "example")]
+    pub plan: Option<PathBuf>,
+    /// Output directory containing status.json and bundles/. Repeat with the same plan to resume.
+    #[arg(
+        long,
+        short = 'o',
+        required_unless_present = "example",
+        conflicts_with = "example"
+    )]
+    pub out: Option<PathBuf>,
+    /// Print an editable matched MLP/DWRAON experiment plan without starting a run.
+    #[arg(long, conflicts_with_all = ["plan", "out"])]
+    pub example: bool,
+}
+
+/// The CLI adds only a versioned document boundary. Scenario arms and all
+/// scientific admission remain owned by the canonical experiment runner.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExperimentPlanV1 {
+    schema_version: u16,
+    experiment_id: String,
+    cohort_id: String,
+    seeds: Vec<u64>,
+    variants: Vec<scriptbots_app::experiment_runner::ScenarioVariant>,
+    ticks_per_run: u64,
+    max_concurrency: usize,
+}
+
+fn run_experiment_subcommand(args: &ExperimentArgs) -> Result<()> {
+    use scriptbots_app::experiment_runner::{
+        MatchedSeedCohort, MatchedSeedExperimentRunner, ScenarioVariant,
+    };
+    use std::io::Read as _;
+
+    if args.example {
+        let plan = ExperimentPlanV1 {
+            schema_version: 1,
+            experiment_id: "mlp-versus-dwraon".to_string(),
+            cohort_id: "example-seeds".to_string(),
+            seeds: vec![11, 42, 137],
+            variants: ["mlp", "dwraon"]
+                .into_iter()
+                .map(|family| ScenarioVariant {
+                    variant_id: family.to_string(),
+                    brain_family: family.to_string(),
+                    config_overrides: BTreeMap::from([
+                        ("world_width".to_string(), serde_json::json!(600)),
+                        ("world_height".to_string(), serde_json::json!(600)),
+                        ("food_cell_size".to_string(), serde_json::json!(50)),
+                    ]),
+                    interventions: Vec::new(),
+                })
+                .collect(),
+            ticks_per_run: 40,
+            max_concurrency: 2,
+        };
+        let mut stdout = io::stdout().lock();
+        serde_json::to_writer_pretty(&mut stdout, &plan)?;
+        writeln!(stdout)?;
+        return Ok(());
+    }
+
+    let plan_path = args.plan.as_ref().context("--plan is required")?;
+    let output_dir = args.out.as_ref().context("--out is required")?;
+    const MAX_PLAN_BYTES: u64 = 1024 * 1024;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    // A named pipe must not block before the regular-file admission check.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(plan_path)
+        .with_context(|| format!("failed to open experiment plan {}", plan_path.display()))?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > MAX_PLAN_BYTES {
+        bail!("experiment plan must be a regular file of at most {MAX_PLAN_BYTES} bytes");
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_PLAN_BYTES + 1).read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_PLAN_BYTES {
+        bail!("experiment plan exceeds {MAX_PLAN_BYTES} bytes");
+    }
+    let plan: ExperimentPlanV1 = serde_json::from_slice(&bytes)
+        .with_context(|| format!("invalid experiment plan {}", plan_path.display()))?;
+    if plan.schema_version != 1 {
+        bail!(
+            "unsupported experiment plan schema_version {}; expected 1",
+            plan.schema_version
+        );
+    }
+    let runner = MatchedSeedExperimentRunner::new(
+        plan.experiment_id,
+        MatchedSeedCohort {
+            cohort_id: plan.cohort_id,
+            seeds: plan.seeds,
+        },
+        plan.variants,
+        plan.ticks_per_run,
+        plan.max_concurrency,
+        output_dir.join("bundles"),
+    );
+    // Resolve families, typed config, schedules, and resource bounds before the
+    // runner acquires its persistent writer lease or creates any output paths.
+    runner
+        .plan_batch()
+        .context("experiment plan was refused before creating artifacts")?;
+    admit_experiment_output(output_dir)?;
+    let status_path = output_dir.join("status.json");
+    let status = runner.execute_batch(&status_path).with_context(|| {
+        format!(
+            "experiment execution or resume failed; retained artifacts in {} were preserved",
+            output_dir.display()
+        )
+    })?;
+    let mut stdout = io::stdout().lock();
+    serde_json::to_writer_pretty(&mut stdout, &status)?;
+    writeln!(stdout)?;
+    stdout.flush()?;
+    if status.failed_runs != 0 || status.completed_runs != status.total_runs {
+        bail!(
+            "experiment completed {} of {} runs with {} failures; inspect {} before retrying",
+            status.completed_runs,
+            status.total_runs,
+            status.failed_runs,
+            status_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn admit_experiment_output(output_dir: &Path) -> Result<()> {
+    if output_dir.as_os_str().is_empty() {
+        bail!("experiment output directory must not be empty");
+    }
+    match fs::symlink_metadata(output_dir) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("cannot inspect experiment output directory"),
+        Ok(metadata) if !metadata.file_type().is_dir() => {
+            bail!("experiment output must be a directory, not a file or symlink");
+        }
+        Ok(_) => {}
+    }
+    for name in ["status.json", "status.json.tmp"] {
+        match fs::symlink_metadata(output_dir.join(name)) {
+            Ok(_) => {
+                // The runner alone validates the saved plan, status generations,
+                // checkpoint lineage, and completed bundles, including bad state.
+                return Ok(());
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("cannot inspect saved experiment status"),
+        }
+    }
+    let mut entries = fs::read_dir(output_dir)?;
+    let Some(entry) = entries.next().transpose()? else {
+        return Ok(());
+    };
+    if entry.file_name() == "status.json.lock" && entries.next().transpose()?.is_none() {
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.file_type().is_file() && metadata.len() == 0 {
+            // A process can die after taking the lease but before publishing its
+            // initial status. The canonical lease still enforces single-writer use.
+            return Ok(());
+        }
+    }
+    bail!(
+        "experiment output {} is nonempty and has no saved status; choose an empty directory or the original experiment directory",
+        output_dir.display()
+    )
 }
 
 #[derive(clap::Args, Debug, Clone, PartialEq)]

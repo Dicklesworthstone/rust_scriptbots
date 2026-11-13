@@ -1,12 +1,12 @@
-//! Real-process control-plane E2E for bd-0n87 (criterion 8 of bd-88yj).
+//! Real-process control-plane and standalone experiment CLI E2E.
 //!
 //! Every other control-plane proof in this workspace builds a `ControlRuntime`
 //! in-process. That is the adjacent thing: it skips `main.rs` wiring, CLI and env
 //! config parsing, renderer-mode resolution, and process lifecycle — which is
 //! precisely the surface a user meets first. This drives the SHIPPED BINARY.
 //!
-//! NOTHING HERE IS STUBBED. A real child process, its real REST listener on an
-//! OS-assigned port, real HTTP over a real socket, and child kill/reap at the end.
+//! NOTHING HERE IS STUBBED. Real child processes exercise CLI input and durable
+//! output or real REST listeners on OS-assigned ports, with bounded kill/reap.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -334,6 +334,92 @@ fn cadence_replay_command() -> Command {
         .args(["--set", "persistence_interval=1"])
         .env("RUST_LOG", "warn,scriptbots_app=info");
     command
+}
+
+fn experiment_cli_command() -> Command {
+    let mut command = Command::new(binary());
+    for (name, _) in std::env::vars_os() {
+        let bytes = name.as_encoded_bytes();
+        if bytes.starts_with(b"SCRIPTBOTS_") || bytes.starts_with(b"SB_") {
+            command.env_remove(name);
+        }
+    }
+    command
+        .arg("experiment")
+        .env("RUST_LOG", "warn,scriptbots_app=info");
+    command
+}
+
+fn spawn_retained_experiment_cli(
+    directory: &Path,
+    label: &str,
+    command: &mut Command,
+) -> Result<ChildGuard> {
+    let log = |suffix: &str| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(directory.join(format!("{label}.{suffix}")))
+    };
+    serde_json::to_writer_pretty(
+        log("command.json")?,
+        &serde_json::json!({"command": format!("{command:?}")}),
+    )?;
+    let child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log("stdout")?))
+        .stderr(Stdio::from(log("stderr")?))
+        .spawn()?;
+    Ok(ChildGuard(Some(child)))
+}
+
+fn retained_experiment_cli(
+    directory: &Path,
+    label: &str,
+    command: &mut Command,
+) -> Result<std::process::Output> {
+    let mut child = spawn_retained_experiment_cli(directory, label, command)?;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let status = loop {
+        if let Some(status) = child.0.as_mut().unwrap().try_wait()? {
+            break status;
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "experiment CLI timed out; logs retained in {} for {label}",
+            directory.display()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    serde_json::to_writer_pretty(
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(directory.join(format!("{label}.exit.json")))?,
+        &serde_json::json!({"exit_code": status.code(), "success": status.success()}),
+    )?;
+    Ok(std::process::Output {
+        status,
+        stdout: std::fs::read(directory.join(format!("{label}.stdout")))?,
+        stderr: std::fs::read(directory.join(format!("{label}.stderr")))?,
+    })
+}
+
+fn small_experiment_cli_plan(ticks: u64) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "experiment_id": "standalone-continuation",
+        "cohort_id": "same-seed",
+        "seeds": [92],
+        "variants": [{
+            "variant_id": "mlp", "brain_family": "mlp",
+            "config_overrides": {
+                "world_width": 600, "world_height": 600, "food_cell_size": 50
+            }
+        }],
+        "ticks_per_run": ticks,
+        "max_concurrency": 1
+    })
 }
 
 fn apply_cadence_control(addr: SocketAddr, path: &str, body: &[u8]) -> Result<()> {
@@ -2283,6 +2369,514 @@ fn real_process_cli_replay_journal_roundtrip_and_divergence() -> Result<()> {
         "CLI replay with tampered journal must fail"
     );
 
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn real_process_experiment_cli_executes_matched_plan_and_reuses_verified_bundles() -> Result<()> {
+    use scriptbots_app::experiment_runner::{
+        ExperimentBatchStatus, RunState, verify_portable_run_bundle,
+    };
+
+    let directory = tempdir()?.keep();
+    println!(
+        "standalone matched experiment evidence: {}",
+        directory.display()
+    );
+    let example = retained_experiment_cli(
+        &directory,
+        "example",
+        experiment_cli_command().arg("--example"),
+    )?;
+    assert!(
+        example.status.success(),
+        "{}",
+        String::from_utf8_lossy(&example.stderr)
+    );
+    let mut plan: serde_json::Value = serde_json::from_slice(&example.stdout)?;
+    assert_eq!(plan["schema_version"], 1);
+    assert_eq!(
+        plan["variants"]
+            .as_array()
+            .context("example variants")?
+            .len(),
+        2
+    );
+    plan["seeds"] = serde_json::json!([7, u64::MAX]);
+    plan["ticks_per_run"] = serde_json::json!(3);
+    for variant in plan["variants"]
+        .as_array_mut()
+        .context("example variants")?
+    {
+        variant["interventions"] = serde_json::json!([
+            {"tick": 1, "set": {"food_growth_rate": 0.01}}
+        ]);
+    }
+    let plan_path = directory.join("plan.json");
+    std::fs::write(&plan_path, serde_json::to_vec_pretty(&plan)?)?;
+    let output_dir = directory.join("output");
+    std::fs::create_dir(&output_dir)?;
+    // This is the real crash window before the first status publication. An
+    // empty lease file must not make an otherwise fresh experiment unusable.
+    std::fs::write(output_dir.join("status.json.lock"), [])?;
+    let completed = retained_experiment_cli(
+        &directory,
+        "completed",
+        experiment_cli_command()
+            .arg("--plan")
+            .arg(&plan_path)
+            .arg("--out")
+            .arg(&output_dir),
+    )?;
+    assert!(
+        completed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&completed.stderr)
+    );
+    let status: ExperimentBatchStatus = serde_json::from_slice(&completed.stdout)?;
+    assert_eq!(
+        (status.total_runs, status.completed_runs, status.failed_runs),
+        (4, 4, 0)
+    );
+    let status_path = output_dir.join("status.json");
+    let original_status = std::fs::read(&status_path)?;
+    assert_eq!(
+        completed.stdout, original_status,
+        "stdout is the canonical status document"
+    );
+    let mut cells = std::collections::BTreeSet::new();
+    let mut digests = std::collections::BTreeSet::new();
+    let mut original_artifacts = Vec::new();
+    for run in &status.runs {
+        assert_eq!(run.state, RunState::Completed);
+        assert_eq!(run.total_ticks, 3);
+        cells.insert((run.brain_family.clone(), run.seed));
+        let bundle_dir = output_dir.join("bundles").join(&run.run_id);
+        let verified = verify_portable_run_bundle(&bundle_dir)?;
+        let restored = verified
+            .final_state
+            .context("bundle carries executable final science")?;
+        assert_eq!(restored.tick, 3);
+        assert_eq!(restored.run_id, run.run_id);
+        assert_eq!(Some(&restored.scientific_digest), run.final_digest.as_ref());
+        digests.insert(restored.scientific_digest);
+        let bundle: scriptbots_storage::RunBundleV1 =
+            serde_json::from_slice(&std::fs::read(bundle_dir.join("bundle_manifest.json"))?)?;
+        let manifest: scriptbots_app::RunManifestV3 =
+            serde_json::from_str(&bundle.manifest.manifest_json)?;
+        assert_eq!(manifest.root_seed, run.seed);
+        assert_eq!(manifest.brain_roster[0].kind, run.brain_family);
+        assert_eq!(manifest.scenario.interventions.len(), 1);
+        assert_eq!(manifest.scenario.interventions[0].tick, 1);
+        assert_eq!(
+            manifest.scenario.interventions[0].set,
+            serde_json::json!({"food_growth_rate": 0.01})
+        );
+        for relative in [
+            "bundle_manifest.json",
+            "exports/summary.csv",
+            "evidence/run.json",
+            "checkpoints/final.checkpoint",
+        ] {
+            let path = bundle_dir.join(relative);
+            original_artifacts.push((path.clone(), std::fs::read(path)?));
+        }
+        let checkpoint = output_dir
+            .join("bundles")
+            .join(format!("{}.checkpoint", run.run_id));
+        original_artifacts.push((checkpoint.clone(), std::fs::read(checkpoint)?));
+    }
+    assert_eq!(
+        cells,
+        std::collections::BTreeSet::from([
+            ("mlp.baseline".to_string(), 7),
+            ("mlp.baseline".to_string(), u64::MAX),
+            ("dwraon.baseline".to_string(), 7),
+            ("dwraon.baseline".to_string(), u64::MAX),
+        ])
+    );
+    assert_eq!(
+        digests.len(),
+        4,
+        "each admitted family/seed cell executes distinct state"
+    );
+    let repeated = retained_experiment_cli(
+        &directory,
+        "repeated",
+        experiment_cli_command()
+            .arg("--plan")
+            .arg(&plan_path)
+            .arg("--out")
+            .arg(&output_dir),
+    )?;
+    assert!(
+        repeated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&repeated.stderr)
+    );
+    assert_eq!(repeated.stdout, original_status);
+    plan["ticks_per_run"] = serde_json::json!(4);
+    let changed_plan = directory.join("changed-plan.json");
+    std::fs::write(&changed_plan, serde_json::to_vec_pretty(&plan)?)?;
+    let refused = retained_experiment_cli(
+        &directory,
+        "changed-plan",
+        experiment_cli_command()
+            .arg("--plan")
+            .arg(&changed_plan)
+            .arg("--out")
+            .arg(&output_dir),
+    )?;
+    assert!(
+        !refused.status.success(),
+        "a different plan must not reuse this experiment"
+    );
+    assert_eq!(std::fs::read(&status_path)?, original_status);
+    for (path, bytes) in original_artifacts {
+        assert_eq!(
+            std::fs::read(&path)?,
+            bytes,
+            "retained artifact {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn real_process_experiment_cli_refuses_bad_plans_before_creating_artifacts() -> Result<()> {
+    let directory = tempdir()?.keep();
+    println!(
+        "standalone experiment refusal evidence: {}",
+        directory.display()
+    );
+    let base = small_experiment_cli_plan(2);
+    for case in [
+        "schema",
+        "unknown-field",
+        "unknown-arm-field",
+        "duplicate-seed",
+        "unknown-family",
+        "fractional-integer",
+        "grid-budget",
+        "late-treatment",
+        "zero-concurrency",
+    ] {
+        let mut plan = base.clone();
+        let expected_error = match case {
+            "schema" => {
+                plan["schema_version"] = serde_json::json!(2);
+                "unsupported experiment plan schema_version"
+            }
+            "unknown-field" => {
+                plan["tick_per_run"] = serde_json::json!(2);
+                "invalid experiment plan"
+            }
+            "unknown-arm-field" => {
+                plan["variants"][0]["config_override"] = serde_json::json!({});
+                "invalid experiment plan"
+            }
+            "duplicate-seed" => {
+                plan["seeds"] = serde_json::json!([92, 92]);
+                "experiment plan was refused before creating artifacts"
+            }
+            "unknown-family" => {
+                plan["variants"][0]["brain_family"] = serde_json::json!("unregistered-family");
+                "experiment plan was refused before creating artifacts"
+            }
+            "fractional-integer" => {
+                plan["variants"][0]["config_overrides"]["population_minimum"] =
+                    serde_json::json!(1.5);
+                "experiment plan was refused before creating artifacts"
+            }
+            "grid-budget" => {
+                plan["variants"][0]["config_overrides"]["world_width"] = serde_json::json!(6000);
+                plan["variants"][0]["config_overrides"]["world_height"] = serde_json::json!(3000);
+                plan["variants"][0]["config_overrides"]["food_cell_size"] = serde_json::json!(1);
+                "experiment plan was refused before creating artifacts"
+            }
+            "late-treatment" => {
+                plan["variants"][0]["interventions"] = serde_json::json!([
+                    {"tick": 100, "set": {"food_growth_rate": 0.01}}
+                ]);
+                "experiment plan was refused before creating artifacts"
+            }
+            "zero-concurrency" => {
+                plan["max_concurrency"] = serde_json::json!(0);
+                "experiment plan was refused before creating artifacts"
+            }
+            _ => unreachable!(),
+        };
+        let plan_path = directory.join(format!("{case}.json"));
+        let output_dir = directory.join(format!("{case}-output"));
+        std::fs::write(&plan_path, serde_json::to_vec_pretty(&plan)?)?;
+        let result = retained_experiment_cli(
+            &directory,
+            case,
+            experiment_cli_command()
+                .arg("--plan")
+                .arg(&plan_path)
+                .arg("--out")
+                .arg(&output_dir),
+        )?;
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(!result.status.success(), "{case}");
+        assert!(stderr.contains(expected_error), "{case}: {stderr}");
+        assert!(!output_dir.exists(), "{case} created experiment artifacts");
+    }
+    let oversized = directory.join("oversized.json");
+    std::fs::File::create(&oversized)?.set_len(1024 * 1024 + 1)?;
+    let malformed = directory.join("malformed.json");
+    std::fs::write(&malformed, br#"{"schema_version": 1,"#)?;
+    let non_file = directory.join("plan-directory");
+    std::fs::create_dir(&non_file)?;
+    for (label, path) in [
+        ("oversized", oversized),
+        ("malformed", malformed),
+        ("non-file", non_file),
+    ] {
+        let output_dir = directory.join(format!("{label}-output"));
+        let result = retained_experiment_cli(
+            &directory,
+            label,
+            experiment_cli_command()
+                .arg("--plan")
+                .arg(path)
+                .arg("--out")
+                .arg(&output_dir),
+        )?;
+        assert!(!result.status.success(), "{label}");
+        assert!(!output_dir.exists(), "{label} created experiment artifacts");
+    }
+    let valid = directory.join("valid.json");
+    std::fs::write(&valid, serde_json::to_vec_pretty(&base)?)?;
+    let unrelated = directory.join("unrelated");
+    std::fs::create_dir(&unrelated)?;
+    std::fs::write(unrelated.join("keep.txt"), b"prior unrelated output")?;
+    let refused = retained_experiment_cli(
+        &directory,
+        "unrelated",
+        experiment_cli_command()
+            .arg("--plan")
+            .arg(&valid)
+            .arg("--out")
+            .arg(&unrelated),
+    )?;
+    assert!(!refused.status.success());
+    assert_eq!(
+        std::fs::read(unrelated.join("keep.txt"))?,
+        b"prior unrelated output"
+    );
+    assert_eq!(std::fs::read_dir(&unrelated)?.count(), 1);
+    #[cfg(unix)]
+    {
+        let linked = directory.join("linked-output");
+        std::os::unix::fs::symlink(&unrelated, &linked)?;
+        let refused = retained_experiment_cli(
+            &directory,
+            "linked-output",
+            experiment_cli_command()
+                .arg("--plan")
+                .arg(&valid)
+                .arg("--out")
+                .arg(&linked),
+        )?;
+        assert!(!refused.status.success());
+        assert_eq!(std::fs::read_dir(&unrelated)?.count(), 1);
+    }
+    let corrupt = directory.join("corrupt-status");
+    std::fs::create_dir(&corrupt)?;
+    let saved_bytes = b"interrupted or corrupt state must remain available for inspection";
+    std::fs::write(corrupt.join("status.json"), saved_bytes)?;
+    for attempt in 0..2 {
+        let refused = retained_experiment_cli(
+            &directory,
+            &format!("corrupt-status-{attempt}"),
+            experiment_cli_command()
+                .arg("--plan")
+                .arg(&valid)
+                .arg("--out")
+                .arg(&corrupt),
+        )?;
+        assert!(!refused.status.success());
+        assert_eq!(std::fs::read(corrupt.join("status.json"))?, saved_bytes);
+        assert!(
+            !corrupt.join("bundles").exists(),
+            "bad state must not restart from tick zero"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn real_process_experiment_cli_continues_exact_cut_after_process_kill() -> Result<()> {
+    use scriptbots_app::experiment_runner::{
+        ExperimentBatchStatus, RunState, verify_portable_run_bundle,
+    };
+
+    const TICKS: u64 = 48;
+    const MINIMUM_SAVED_CUTS: usize = 3;
+    let directory = tempdir()?.keep();
+    println!(
+        "standalone exact continuation evidence: {}",
+        directory.display()
+    );
+    let mut plan = small_experiment_cli_plan(TICKS);
+    plan["variants"][0]["interventions"] = serde_json::json!([
+        {"tick": 0, "set": {"food_growth_rate": 0.005}},
+        {"tick": 8, "set": {"food_growth_rate": 0.01}}
+    ]);
+    let plan_path = directory.join("plan.json");
+    std::fs::write(&plan_path, serde_json::to_vec_pretty(&plan)?)?;
+    let output_dir = directory.join("interrupted");
+    let mut first = spawn_retained_experiment_cli(
+        &directory,
+        "first",
+        experiment_cli_command()
+            .arg("--plan")
+            .arg(&plan_path)
+            .arg("--out")
+            .arg(&output_dir),
+    )?;
+    let status_path = output_dir.join("status.json");
+    let mut run_id = None;
+    let mut observed = std::collections::BTreeSet::new();
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while observed.len() < MINIMUM_SAVED_CUTS {
+        if run_id.is_none()
+            && let Ok(bytes) = std::fs::read(&status_path)
+            && let Ok(status) = serde_json::from_slice::<ExperimentBatchStatus>(&bytes)
+        {
+            assert_eq!(status.runs.len(), 1);
+            run_id = Some(status.runs[0].run_id.clone());
+        }
+        if let Some(run_id) = &run_id
+            && let Ok(bytes) = std::fs::read(
+                output_dir
+                    .join("bundles")
+                    .join(format!("{run_id}.checkpoint")),
+            )
+            && let Some(end) = bytes.len().checked_sub(blake3::OUT_LEN)
+            && blake3::hash(&bytes[..end]).as_bytes() == &bytes[end..]
+        {
+            observed.insert(blake3::hash(&bytes).to_hex().to_string());
+        }
+        assert!(
+            first.0.as_mut().unwrap().try_wait()?.is_none(),
+            "CLI exited before interruption"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "distinct complete checkpoint cuts did not appear"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    first.0.as_mut().unwrap().kill()?;
+    assert!(!first.0.as_mut().unwrap().wait()?.success());
+    let interrupted_bytes = std::fs::read(&status_path)?;
+    std::fs::write(
+        directory.join("interrupted-status.json"),
+        &interrupted_bytes,
+    )?;
+    let interrupted: ExperimentBatchStatus = serde_json::from_slice(&interrupted_bytes)?;
+    assert_eq!(interrupted.runs[0].state, RunState::Running);
+    let run_id = run_id.context("actual CLI run identity")?;
+    let checkpoint = output_dir
+        .join("bundles")
+        .join(format!("{run_id}.checkpoint"));
+    std::fs::write(
+        directory.join("interrupted-cut.checkpoint"),
+        std::fs::read(&checkpoint)?,
+    )?;
+
+    let resumed = retained_experiment_cli(
+        &directory,
+        "resumed",
+        experiment_cli_command()
+            .arg("--plan")
+            .arg(&plan_path)
+            .arg("--out")
+            .arg(&output_dir),
+    )?;
+    assert!(
+        resumed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    let completed: ExperimentBatchStatus = serde_json::from_slice(&resumed.stdout)?;
+    assert_eq!(
+        (
+            completed.total_runs,
+            completed.completed_runs,
+            completed.failed_runs
+        ),
+        (1, 1, 0)
+    );
+    assert_eq!(completed.runs[0].total_ticks, TICKS);
+    let resume_log = String::from_utf8(resumed.stderr)?;
+    let restored_ticks = resume_log
+        .lines()
+        .filter(|line| line.contains("restored durable experiment continuation cut"))
+        .filter_map(|line| {
+            let plain = plain_server_log(line);
+            plain
+                .split_once("checkpoint_tick=")?
+                .1
+                .split_whitespace()
+                .next()?
+                .parse::<u64>()
+                .ok()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(restored_ticks.len(), 1, "actual restore log: {resume_log}");
+    let minimum_tick = u64::try_from(MINIMUM_SAVED_CUTS - 1)?;
+    assert!(
+        (minimum_tick..TICKS).contains(&restored_ticks[0]),
+        "restored tick {}",
+        restored_ticks[0]
+    );
+
+    let oracle_dir = directory.join("oracle");
+    let oracle = retained_experiment_cli(
+        &directory,
+        "oracle",
+        experiment_cli_command()
+            .arg("--plan")
+            .arg(&plan_path)
+            .arg("--out")
+            .arg(&oracle_dir),
+    )?;
+    assert!(
+        oracle.status.success(),
+        "{}",
+        String::from_utf8_lossy(&oracle.stderr)
+    );
+    let expected: ExperimentBatchStatus = serde_json::from_slice(&oracle.stdout)?;
+    assert_eq!(expected.completed_runs, 1);
+    assert_eq!(expected.failed_runs, 0);
+    assert_eq!(completed.plan_digest, expected.plan_digest);
+    assert_eq!(completed.runs[0].run_id, expected.runs[0].run_id);
+    assert_eq!(
+        completed.runs[0].final_digest,
+        expected.runs[0].final_digest
+    );
+    for root in [&output_dir, &oracle_dir] {
+        let restored = verify_portable_run_bundle(&root.join("bundles").join(&run_id))?
+            .final_state
+            .context("portable final science")?;
+        assert_eq!(restored.tick, TICKS);
+        assert_eq!(
+            Some(restored.scientific_digest),
+            completed.runs[0].final_digest
+        );
+    }
+    println!(
+        "standalone CLI restored tick {}, reached {TICKS}, matched uninterrupted digest {:?}",
+        restored_ticks[0], completed.runs[0].final_digest
+    );
     Ok(())
 }
 
