@@ -1398,9 +1398,15 @@ null p-values and no FDR discoveries. Unknown or mismatched seed provenance is
 explicit in `seed_pairing`. Differences use shared endpoint metrics; conditionally
 emitted metrics found in only one run are disclosed in `control_only_metrics` or
 `treatment_only_metrics` and retained in that source's values. `compare-runs` now
-uses report envelope schema **2**
-and machine schema `scriptbots.run-comparison.v2`; consumers of the old
-trajectory-based inference must migrate to the cohort contract.
+uses report envelope schema **2** and machine schema `scriptbots.run-comparison.v3`.
+Each inferential row records `p_value_procedure` and `sign_assignments_evaluated`:
+cohorts of at most twelve independent seed pairs enumerate all `2^n` sign
+assignments; larger cohorts retain seeded Monte Carlo sampling. The configured
+`n_permutations` is the requested Monte Carlo budget, distinct from the actual
+evaluation count. Descriptive rows have no procedure and evaluate zero assignments.
+Both paired tests require within-pair exchangeability under the null; matched
+seeds alone do not establish that assumption. Consumers of the old trajectory-based
+inference must migrate to the cohort contract.
 
 ### Pipeline and maintenance
 
@@ -1901,7 +1907,9 @@ against an untreated control. For example:
 The runner preflights every expanded treatment before execution. Lab ingestion
 requires the bundle's schedule to equal the planned arm, and notebook reproduction
 re-executes that schedule. Lab scientific-row provenance is now version **4** and
-the reproduction input envelope is version **2**. Earlier provenance is explicitly
+the reproduction input envelope is version **3**, binding the paired p-value
+procedure and actual sign-assignment count. Lab notebooks show those fields
+separately from the requested Monte Carlo budget. Earlier provenance is explicitly
 not comparable; changing a schedule cannot be hidden by retaining the same launch
 configuration. Reproduction inputs are bounded to 32 MiB before output is written.
 

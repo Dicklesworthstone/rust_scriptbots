@@ -10,7 +10,7 @@ use std::path::Path;
 
 use scriptbots_analytics::{
     AnalyticsError, MAX_COMPARISON_COHORT_BYTES, MAX_COMPARISON_METRICS, MAX_COMPARISON_PAIRS,
-    RUN_COMPARISON_COHORT_SCHEMA_V1, RUN_COMPARISON_SCHEMA_V2, ReaderCtx, Registry, ReportOutput,
+    RUN_COMPARISON_COHORT_SCHEMA_V1, RUN_COMPARISON_SCHEMA_V3, ReaderCtx, Registry, ReportOutput,
     ReportParams,
 };
 use scriptbots_core::narrative::NarrativeInputRecordV1;
@@ -459,8 +459,10 @@ fn independent_seed_endpoints_detect_the_planted_effect_and_preserve_the_null() 
     let path = write_cohort(dir.path(), "study.json", &value);
     let report = compare_cohort(&control[0], &path).expect("matched-seed comparison");
     assert_eq!(report.schema_version, 2);
+    assert!(report.human_md.contains("paired_sign_flip_exact | 4096"));
+    assert!(report.human_md.contains("requested Monte Carlo budget is 4000"));
     let machine = report.machine;
-    assert_eq!(machine["schema"], RUN_COMPARISON_SCHEMA_V2);
+    assert_eq!(machine["schema"], RUN_COMPARISON_SCHEMA_V3);
     assert_eq!(machine["mode"], "matched_seed_cohort");
     assert_eq!(machine["inference_status"], "computed");
     assert_eq!(machine["independent_pairs"], control.len());
@@ -481,7 +483,10 @@ fn independent_seed_endpoints_detect_the_planted_effect_and_preserve_the_null() 
         "the planted +5 effect must survive across-metric FDR (p={})",
         shifting["p_value"]
     );
-    assert!(shifting["p_value"].as_f64().unwrap() < 0.05);
+    assert_eq!(shifting["p_value"], 2.0 / 4_096.0);
+    assert_eq!(shifting["p_value_procedure"], "paired_sign_flip_exact");
+    assert_eq!(shifting["sign_assignments_evaluated"], 4_096);
+    assert_eq!(machine["n_permutations"], 4_000);
     assert!(
         shifting["ci_lower"].as_f64().unwrap() > 0.0,
         "the CI on the effect must exclude zero: [{}, {}]",
@@ -490,6 +495,9 @@ fn independent_seed_endpoints_detect_the_planted_effect_and_preserve_the_null() 
     );
 
     let flat = metric(&machine, "flat").expect("flat must be compared");
+    assert_eq!(flat["p_value"], 1.0);
+    assert_eq!(flat["p_value_procedure"], "paired_sign_flip_exact");
+    assert_eq!(flat["sign_assignments_evaluated"], 4_096);
     assert!(
         !flat["significant_fdr"].as_bool().unwrap(),
         "the unchanged `flat` metric was certified as a treatment effect (p={}); false positive",
@@ -524,6 +532,44 @@ fn independent_seed_endpoints_detect_the_planted_effect_and_preserve_the_null() 
 }
 
 #[test]
+fn five_seed_cohort_reports_the_complete_null_and_actual_assignment_count() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut control = Vec::new();
+    let mut treatment = Vec::new();
+    for seed in 1..=5_u32 {
+        control.push(attributed_run(
+            dir.path(),
+            &format!("control-{seed}.sqlite"),
+            manifest(RunId::new(100 + u128::from(seed)), u64::from(seed), "control", 1),
+            &[(1, 10.0, 7.0)],
+        ));
+        treatment.push(attributed_run(
+            dir.path(),
+            &format!("treatment-{seed}.sqlite"),
+            manifest(
+                RunId::new(200 + u128::from(seed)),
+                u64::from(seed),
+                "treatment",
+                1,
+            ),
+            &[(1, 11.0, 7.0)],
+        ));
+    }
+    let value = cohort_value(1, &control, &treatment);
+    let path = write_cohort(dir.path(), "five-seed-study.json", &value);
+    let report = compare_cohort(&control[0], &path).expect("small matched-seed comparison");
+    assert_eq!(report.machine["schema"], RUN_COMPARISON_SCHEMA_V3);
+    assert_eq!(report.machine["independent_pairs"], 5);
+    assert_eq!(report.machine["n_permutations"], 4_000);
+    let shifting = metric(&report.machine, "shifting").unwrap();
+    assert_eq!(shifting["p_value"], 2.0 / 32.0);
+    assert_eq!(shifting["p_value_procedure"], "paired_sign_flip_exact");
+    assert_eq!(shifting["sign_assignments_evaluated"], 32);
+    assert_eq!(shifting["significant_fdr"], false);
+    assert!(report.human_md.contains("paired_sign_flip_exact | 32"));
+}
+
+#[test]
 fn arbitrarily_many_ticks_in_one_pair_remain_descriptive() {
     let dir = tempfile::tempdir().expect("tempdir");
     let ticks: Vec<u64> = (1..=200).collect();
@@ -550,6 +596,8 @@ fn arbitrarily_many_ticks_in_one_pair_remain_descriptive() {
     let shifting = metric(&machine, "shifting").unwrap();
     assert_eq!(shifting["n_pairs"], 1);
     assert!(shifting["p_value"].is_null());
+    assert!(shifting["p_value_procedure"].is_null());
+    assert_eq!(shifting["sign_assignments_evaluated"], 0);
     assert!(shifting["ci_lower"].is_null());
     assert!(shifting["ci_upper"].is_null());
     assert!(!shifting["significant_fdr"].as_bool().unwrap());

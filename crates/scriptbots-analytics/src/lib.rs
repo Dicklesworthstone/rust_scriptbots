@@ -2061,8 +2061,8 @@ impl Report for MetricChangepoints {
 
 /// Input contract for a predeclared matched-seed endpoint comparison.
 pub const RUN_COMPARISON_COHORT_SCHEMA_V1: &str = "scriptbots.run-comparison-cohort.v1";
-/// Report-specific contract distinguishing independent seed pairs from trajectory samples.
-pub const RUN_COMPARISON_SCHEMA_V2: &str = "scriptbots.run-comparison.v2";
+/// Report contract identifying the actual seed-level p-value procedure and evaluation count.
+pub const RUN_COMPARISON_SCHEMA_V3: &str = "scriptbots.run-comparison.v3";
 
 /// Maximum encoded cohort JSON size; enforced again while reading a growing file.
 pub const MAX_COMPARISON_COHORT_BYTES: usize = 1_048_576;
@@ -2133,6 +2133,7 @@ struct RunComparisonMachine {
     confidence: f64,
     resampling_seed: u64,
     n_resamples: usize,
+    /// Requested Monte Carlo budget; each metric records its actual procedure and work.
     n_permutations: usize,
     metrics_compared: usize,
     significant: usize,
@@ -2183,6 +2184,9 @@ struct RunComparisonRow {
     ci_lower: Option<f64>,
     ci_upper: Option<f64>,
     p_value: Option<f64>,
+    /// Absent for descriptive rows, which evaluate no sign assignments.
+    p_value_procedure: Option<&'static str>,
+    sign_assignments_evaluated: usize,
     /// Also absent when a zero-spread difference has no finite standardized effect size.
     cohens_dz: Option<f64>,
     fraction_positive: f64,
@@ -2540,6 +2544,8 @@ fn compare_endpoint_metrics(
                     ci_lower: None,
                     ci_upper: None,
                     p_value: None,
+                    p_value_procedure: None,
+                    sign_assignments_evaluated: 0,
                     cohens_dz: None,
                     fraction_positive: if difference > 0.0 { 1.0 } else { 0.0 },
                     significant_fdr: false,
@@ -2583,6 +2589,8 @@ fn compare_endpoint_metrics(
                 ci_lower: Some(comparison.difference_ci.lower),
                 ci_upper: Some(comparison.difference_ci.upper),
                 p_value: Some(comparison.p_value),
+                p_value_procedure: Some(comparison.p_value_procedure.as_str()),
+                sign_assignments_evaluated: comparison.sign_assignments_evaluated,
                 cohens_dz: comparison
                     .cohens_dz
                     .is_finite()
@@ -2633,7 +2641,7 @@ fn comparison_machine(
         .cloned()
         .collect();
     Ok(RunComparisonMachine {
-        schema: RUN_COMPARISON_SCHEMA_V2,
+        schema: RUN_COMPARISON_SCHEMA_V3,
         mode: if infer {
             "matched_seed_cohort"
         } else {
@@ -2730,8 +2738,14 @@ fn render_run_comparison_markdown(machine: &RunComparisonMachine) -> String {
             md,
             "{} of {} predeclared metrics meet the Benjamini–Hochberg FDR threshold {}. \
              Confidence intervals resample seed pairs, and permutation tests flip paired \
-             endpoint differences. Each run contributes one observation per metric.\n",
-            machine.significant, machine.metrics_compared, machine.fdr
+             endpoint differences. Each run contributes one observation per metric. \
+             Cohorts of at most twelve pairs enumerate all sign assignments; larger cohorts \
+             use Monte Carlo sampling. Both require within-pair exchangeability under the null. \
+             The requested Monte Carlo budget is {}; actual evaluations appear per metric.\n",
+            machine.significant,
+            machine.metrics_compared,
+            machine.fdr,
+            machine.n_permutations
         );
     } else {
         let _ = writeln!(
@@ -2754,10 +2768,11 @@ fn render_run_comparison_markdown(machine: &RunComparisonMachine) -> String {
     }
     let _ = writeln!(
         md,
-        "| metric | run pairs | Δ (treat−ctrl) | {:.0}% CI | p | d_z | +frac | FDR discovery |",
+        "| metric | run pairs | Δ (treat−ctrl) | {:.0}% CI | p | p procedure | \
+         sign assignments | d_z | +frac | FDR discovery |",
         machine.confidence * 100.0
     );
-    let _ = writeln!(md, "|---|---|---|---|---|---|---|---|");
+    let _ = writeln!(md, "|---|---|---|---|---|---|---|---|---|---|");
     for row in &machine.metrics {
         let interval = row.ci_lower.zip(row.ci_upper).map_or_else(
             || "—".to_owned(),
@@ -2766,17 +2781,24 @@ fn render_run_comparison_markdown(machine: &RunComparisonMachine) -> String {
         let p_value = row
             .p_value
             .map_or_else(|| "—".to_owned(), |value| format!("{value:.4}"));
+        let procedure = row.p_value_procedure.unwrap_or("—");
+        let assignments = row.p_value_procedure.map_or_else(
+            || "—".to_owned(),
+            |_| row.sign_assignments_evaluated.to_string(),
+        );
         let effect = row
             .cohens_dz
             .map_or_else(|| "—".to_owned(), |value| format!("{value:.3}"));
         let _ = writeln!(
             md,
-            "| {} | {} | {:+.4} | {} | {} | {} | {:.2} | {} |",
+            "| {} | {} | {:+.4} | {} | {} | {} | {} | {} | {:.2} | {} |",
             row.metric,
             row.n_pairs,
             row.mean_difference,
             interval,
             p_value,
+            procedure,
+            assignments,
             effect,
             row.fraction_positive,
             if machine.inference_status != "computed" {

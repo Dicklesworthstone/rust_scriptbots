@@ -2,6 +2,32 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Exact inference for small matched-seed cohorts (2026-11-13):**
+[Source implemented and independently reviewed — Codex; executable qualification open]
+
+The matched-seed analysis paths associated with `bd-2z0.11.6` and
+`bd-7453` now enumerate every paired sign assignment for cohorts of at most
+twelve independent seeds (at most 4,096 evaluations). This removes avoidable
+sampling variability where the complete null is inexpensive: five consistently
+positive pairs have an exact two-sided p-value of 2/32, not a sampled decision
+that can cross 0.05. Larger cohorts retain their existing seeded Monte Carlo
+draw order and add-one correction. Matching seeds alone does not establish the
+within-pair exchangeability assumption required by either procedure.
+
+Both statistics layers expose the actual procedure and assignment count. Lab
+notebooks bind those fields to reanalyzed evidence and distinguish them from
+the requested sampling budget. Offline comparison machine schema V3 and Lab
+reproduction input schema 3 carry the revised contract; descriptive singleton
+reports continue to omit inference. Normalized compensated enumeration includes
+floating-point ties conservatively, and non-finite derived paired values refuse.
+
+Ten new regressions cover exact manual oracles, zero multiplicity, directional
+tails, scaling/cancellation, seed and budget independence, the 12/13-pair boundary,
+invalid derived values, forged notebook metadata and the finished-database report.
+They are authored and source reviewed, not executed. No usable execution
+environment was available; no DSR, compiler, Rustfmt, Clippy or UBS pass is claimed.
+Original bead acceptance and tracker status remain unchanged.
+
 **Time-series inference uses its declared temporal blocks (2026-11-13):**
 [Source implemented and independently reviewed — Codex; executable qualification open]
 
