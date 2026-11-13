@@ -278,10 +278,15 @@ impl TestName {
     }
 }
 
+/// Largest paired cohort whose complete sign-flip null is evaluated.
+pub(crate) const MAX_EXACT_SIGN_FLIP_PAIRS: usize = 12;
+
 /// Procedure used to obtain a p-value for each matched effect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PValueProcedure {
+    /// Complete enumeration of at most 4,096 paired sign assignments.
+    PairedSignFlipExact,
     /// Monte Carlo sign-flip test over the paired treatment-minus-control differences.
     PairedSignFlipMonteCarlo,
 }
@@ -290,6 +295,7 @@ impl PValueProcedure {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::PairedSignFlipExact => "paired_sign_flip_exact",
             Self::PairedSignFlipMonteCarlo => "paired_sign_flip_monte_carlo",
         }
     }
@@ -384,6 +390,8 @@ pub struct AnalysisParams {
     pub correction: Correction,
     pub alternative: AlternativeHypothesis,
     pub bootstrap_iterations: usize,
+    /// Requested Monte Carlo budget for cohorts larger than twelve pairs.
+    /// Smaller cohorts use complete enumeration and report its actual assignment count.
     pub permutation_iterations: u32,
     pub resampling_seed: u64,
     pub recommended_pairs: usize,
@@ -458,6 +466,8 @@ pub struct PairedEffect {
     pub test: TestName,
     pub alternative: AlternativeHypothesis,
     pub p_value: f64,
+    pub p_value_procedure: PValueProcedure,
+    pub sign_assignments_evaluated: usize,
 }
 
 /// Generic effect size record carrying strict provenance and honesty metadata.
@@ -505,6 +515,9 @@ pub struct MatchedSeedAnalysis {
     pub params: AnalysisParams,
     /// Typed identity of the p-value procedure used for every effect.
     pub p_value_procedure: PValueProcedure,
+    /// Actual assignments evaluated per effect, distinct from the requested Monte Carlo budget.
+    /// All arms share the same validated matched seeds and therefore the same null cardinality.
+    pub sign_assignments_evaluated: usize,
     /// Typed identity of the confidence-interval procedure used for every effect.
     pub confidence_interval_procedure: ConfidenceIntervalProcedure,
     pub effects: Vec<MatchedEffect>,
@@ -534,19 +547,7 @@ pub struct AdjustedComparison {
     pub correction: Correction,
 }
 
-/// Paired Monte Carlo sign-flip p-value for the mean difference (bd-h189).
-///
-/// Replaces a hardcoded `p_value: 0.05`. Under the null "the pairing carries no signal",
-/// each paired difference's sign is exchangeable, so sampled sign assignments build a
-/// distribution-free Monte Carlo null directly from the observed data.
-///
-/// Deterministic by construction. The generator is an inline xorshift64 seeded by the
-/// caller, so the same cohorts always yield the same p-value — this module's other
-/// randomised routine, `bootstrap_ci`, is deterministic for the same reason.
-///
-/// Uses the `(count + 1) / (iterations + 1)` correction, so the result is never exactly
-/// zero: a permutation test can bound a p-value from above but cannot prove it is zero, and
-/// reporting 0.0 would claim more than the procedure supports.
+/// Fixed-order compensated sum for paired reductions and resampling.
 fn compensated_sum(values: impl IntoIterator<Item = f64>) -> f64 {
     let mut sum = 0.0;
     let mut compensation = 0.0;
@@ -559,16 +560,75 @@ fn compensated_sum(values: impl IntoIterator<Item = f64>) -> f64 {
     sum
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PairedPermutation {
+    p_value: f64,
+    procedure: PValueProcedure,
+    sign_assignments_evaluated: usize,
+}
+
+/// Evaluate every sign assignment under the within-pair exchangeability null.
+/// Matching seeds alone does not establish that assumption.
+fn exact_paired_permutation_p_value(
+    diffs: &[f64],
+    alternative: AlternativeHypothesis,
+) -> f64 {
+    debug_assert!(!diffs.is_empty() && diffs.len() <= MAX_EXACT_SIGN_FLIP_PAIRS);
+    let scale = diffs.iter().map(|value| value.abs()).fold(0.0, f64::max);
+    // Keep every sum finite and include floating-point ties conservatively, even when
+    // cancellation makes the observed sum near zero. No absolute unit-dependent epsilon.
+    let normalized: Vec<f64> = if scale == 0.0 {
+        vec![0.0; diffs.len()]
+    } else {
+        diffs.iter().map(|value| value / scale).collect()
+    };
+    let observed = compensated_sum(normalized.iter().copied());
+    let tolerance =
+        16.0 * f64::EPSILON * compensated_sum(normalized.iter().map(|value| value.abs()));
+    let assignments = 1_usize << diffs.len();
+    let mut extreme = 0_usize;
+    for mask in 0..assignments {
+        let permuted = compensated_sum(normalized.iter().enumerate().map(|(index, value)| {
+            if mask & (1_usize << index) == 0 {
+                *value
+            } else {
+                -*value
+            }
+        }));
+        let is_extreme = match alternative {
+            AlternativeHypothesis::TwoSided => permuted.abs() >= observed.abs() - tolerance,
+            AlternativeHypothesis::TreatmentGreater => permuted >= observed - tolerance,
+            AlternativeHypothesis::TreatmentLess => permuted <= observed + tolerance,
+        };
+        if is_extreme {
+            extreme += 1;
+        }
+    }
+    // The complete null already includes the observed assignment; no add-one correction.
+    extreme as f64 / assignments as f64
+}
+
+/// Exact paired sign-flip inference for small cohorts, seeded Monte Carlo otherwise.
+///
+/// Enumeration is bounded by 4,096 assignments and does not use the sampling seed or budget.
+/// Larger cohorts retain the existing xorshift draw order and conservative add-one correction.
 fn paired_permutation_p_value(
     diffs: &[f64],
     iterations: u32,
     seed: u64,
     alternative: AlternativeHypothesis,
-) -> f64 {
+) -> PairedPermutation {
     debug_assert!(
         !diffs.is_empty(),
         "caller rejects empty cohorts before this point"
     );
+    if diffs.len() <= MAX_EXACT_SIGN_FLIP_PAIRS {
+        return PairedPermutation {
+            p_value: exact_paired_permutation_p_value(diffs, alternative),
+            procedure: PValueProcedure::PairedSignFlipExact,
+            sign_assignments_evaluated: 1_usize << diffs.len(),
+        };
+    }
     let n = diffs.len() as f64;
     let observed = compensated_sum(diffs.iter().copied()) / n;
 
@@ -602,7 +662,11 @@ fn paired_permutation_p_value(
             extreme_count += 1;
         }
     }
-    (extreme_count + 1) as f64 / (u64::from(iterations) + 1) as f64
+    PairedPermutation {
+        p_value: (extreme_count + 1) as f64 / (u64::from(iterations) + 1) as f64,
+        procedure: PValueProcedure::PairedSignFlipMonteCarlo,
+        sign_assignments_evaluated: iterations as usize,
+    }
 }
 
 #[derive(Debug)]
@@ -613,6 +677,8 @@ struct PairedComponents {
     standardized_effect: Option<f64>,
     ci_95: Option<(f64, f64)>,
     p_value: f64,
+    p_value_procedure: PValueProcedure,
+    sign_assignments_evaluated: usize,
 }
 
 fn paired_components(
@@ -669,11 +735,18 @@ fn paired_components(
         if !control_value.is_finite() || !treatment_value.is_finite() {
             return Err(StatsError::NonFiniteValue);
         }
-        diffs.push(treatment_value - control_value);
+        let difference = treatment_value - control_value;
+        if !difference.is_finite() {
+            return Err(StatsError::NonFiniteValue);
+        }
+        diffs.push(difference);
     }
 
     let n = diffs.len() as f64;
     let mean_difference = compensated_sum(diffs.iter().copied()) / n;
+    if !mean_difference.is_finite() {
+        return Err(StatsError::NonFiniteValue);
+    }
     let variance = (diffs.len() >= 2).then(|| {
         compensated_sum(
             diffs
@@ -681,6 +754,9 @@ fn paired_components(
                 .map(|difference| (difference - mean_difference).powi(2)),
         ) / (n - 1.0)
     });
+    if variance.is_some_and(|value| !value.is_finite()) {
+        return Err(StatsError::NonFiniteValue);
+    }
     let difference_range = diffs
         .iter()
         .fold((f64::INFINITY, f64::NEG_INFINITY), |(min, max), value| {
@@ -691,6 +767,9 @@ fn paired_components(
         .map(f64::sqrt)
         .filter(|spread| *spread > degenerate_tolerance);
     let standardized_effect = sd_difference.map(|spread| mean_difference / spread);
+    if standardized_effect.is_some_and(|value| !value.is_finite()) {
+        return Err(StatsError::NonFiniteValue);
+    }
     let ci_95 = if diffs.len() < 2 {
         None
     } else {
@@ -700,7 +779,7 @@ fn paired_components(
             params.resampling_seed,
         )?)
     };
-    let p_value = paired_permutation_p_value(
+    let permutation = paired_permutation_p_value(
         &diffs,
         params.permutation_iterations,
         params.resampling_seed ^ 0x00F1_1900,
@@ -713,7 +792,9 @@ fn paired_components(
         sd_difference,
         standardized_effect,
         ci_95,
-        p_value,
+        p_value: permutation.p_value,
+        p_value_procedure: permutation.procedure,
+        sign_assignments_evaluated: permutation.sign_assignments_evaluated,
     })
 }
 
@@ -758,6 +839,8 @@ pub fn paired_diff(
         test: TestName::PairedDifference,
         alternative: params.alternative,
         p_value: components.p_value,
+        p_value_procedure: components.p_value_procedure,
+        sign_assignments_evaluated: components.sign_assignments_evaluated,
     })
 }
 
@@ -1205,6 +1288,9 @@ pub fn analyze_matched_seed_runs(
     if provisional.is_empty() {
         return Err(StatsError::InsufficientArms);
     }
+    // Every treatment was paired against the same complete control seed set.
+    let p_value_procedure = provisional[0].components.p_value_procedure;
+    let sign_assignments_evaluated = provisional[0].components.sign_assignments_evaluated;
 
     let adjusted = adjust_multiple_comparisons(
         &provisional
@@ -1261,7 +1347,8 @@ pub fn analyze_matched_seed_runs(
     Ok(MatchedSeedAnalysis {
         metrics: metrics.to_vec(),
         params,
-        p_value_procedure: PValueProcedure::PairedSignFlipMonteCarlo,
+        p_value_procedure,
+        sign_assignments_evaluated,
         confidence_interval_procedure: ConfidenceIntervalProcedure::PercentileBootstrap,
         effects,
     })
@@ -2089,6 +2176,120 @@ mod tests {
             ),
             Err(StatsError::UnmatchedSeeds)
         );
+    }
+
+    #[test]
+    fn exact_small_cohort_does_not_sample_an_avoidable_significance_decision() {
+        let summaries = (1_u64..=5)
+            .flat_map(|seed| {
+                [
+                    report_summary(&format!("c{seed}"), 0, seed, [("score", 0.0)]),
+                    report_summary(&format!("t{seed}"), 1, seed, [("score", 1.0)]),
+                ]
+            })
+            .collect::<Vec<_>>();
+        for permutation_iterations in [1, 100, 1_000, 4_000] {
+            for resampling_seed in [0, 0x00F1_1906, 73] {
+                let analysis = analyze_matched_seed_runs(
+                    &summaries,
+                    &["score".to_owned()],
+                    AnalysisParams {
+                        bootstrap_iterations: 16,
+                        permutation_iterations,
+                        resampling_seed,
+                        ..AnalysisParams::default()
+                    },
+                )
+                .unwrap();
+                // Two of the 32 assignments are as extreme as five positive differences.
+                // The former 1,000-draw lane with seed 0x00F1_1906 reported 41/1,001.
+                assert_eq!(analysis.effects[0].raw_p_value, 2.0 / 32.0);
+                assert!(!analysis.effects[0].adjusted.rejected);
+                assert_eq!(analysis.p_value_procedure, PValueProcedure::PairedSignFlipExact);
+                assert_eq!(analysis.sign_assignments_evaluated, 32);
+                assert!(analysis.effects[0].underpowered_reason.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn exact_sign_assignment_tails_match_enumerable_nulls_and_preserve_units() {
+        for (differences, two_sided, greater, less) in [
+            (vec![1.0; 5], 2.0 / 32.0, 1.0 / 32.0, 1.0),
+            (vec![-1.0; 5], 2.0 / 32.0, 1.0, 1.0 / 32.0),
+            (vec![0.0; 5], 1.0, 1.0, 1.0),
+            (vec![1.0, -1.0], 1.0, 0.75, 0.75),
+            (vec![0.0, 1.0, 2.0], 0.5, 0.25, 1.0),
+            (vec![0.1, 0.2, -0.3], 1.0, 0.625, 0.625),
+        ] {
+            for scale in [1.0, 1e-200, 1e200] {
+                let scaled = differences.iter().map(|value| value * scale).collect::<Vec<_>>();
+                for (alternative, expected) in [
+                    (AlternativeHypothesis::TwoSided, two_sided),
+                    (AlternativeHypothesis::TreatmentGreater, greater),
+                    (AlternativeHypothesis::TreatmentLess, less),
+                ] {
+                    let result = paired_permutation_p_value(&scaled, 1, 6, alternative);
+                    assert_eq!(result.p_value, expected);
+                    assert_eq!(result.procedure, PValueProcedure::PairedSignFlipExact);
+                    assert_eq!(result.sign_assignments_evaluated, 1_usize << scaled.len());
+                }
+            }
+        }
+        let singleton =
+            paired_permutation_p_value(&[4.0], 1, 6, AlternativeHypothesis::TwoSided);
+        assert_eq!(singleton.p_value, 1.0);
+        assert_eq!(singleton.sign_assignments_evaluated, 2);
+    }
+
+    #[test]
+    fn exact_null_cardinality_is_capped_and_large_cohorts_retain_monte_carlo() {
+        let exact =
+            paired_permutation_p_value(&[1.0; 12], 7, 6, AlternativeHypothesis::TwoSided);
+        assert_eq!(exact.p_value, 2.0 / 4_096.0);
+        assert_eq!(exact.procedure, PValueProcedure::PairedSignFlipExact);
+        assert_eq!(exact.sign_assignments_evaluated, 4_096);
+        let sampled =
+            paired_permutation_p_value(&[1.0; 13], 7, 6, AlternativeHypothesis::TwoSided);
+        assert_eq!(sampled.procedure, PValueProcedure::PairedSignFlipMonteCarlo);
+        assert_eq!(sampled.sign_assignments_evaluated, 7);
+        assert!(sampled.p_value >= 1.0 / 8.0);
+    }
+
+    #[test]
+    fn paired_analysis_refuses_nonfinite_derived_values_from_finite_inputs() {
+        for (control, treatment) in [
+            ([-f64::MAX; 2], [f64::MAX; 2]),
+            ([0.0; 2], [f64::MAX; 2]),
+            ([0.0; 2], [1e200, -1e200]),
+        ] {
+            let summaries = (0..2)
+                .flat_map(|index| {
+                    [
+                        report_summary(
+                            &format!("c{index}"),
+                            0,
+                            index as u64,
+                            [("score", control[index])],
+                        ),
+                        report_summary(
+                            &format!("t{index}"),
+                            1,
+                            index as u64,
+                            [("score", treatment[index])],
+                        ),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                analyze_matched_seed_runs(
+                    &summaries,
+                    &["score".to_owned()],
+                    AnalysisParams::default(),
+                ),
+                Err(StatsError::NonFiniteValue)
+            );
+        }
     }
 
     #[test]

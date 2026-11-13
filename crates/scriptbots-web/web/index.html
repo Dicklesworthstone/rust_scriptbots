@@ -589,6 +589,7 @@
                             <select id="experiment-baseline-family">
                                 <option value="mlp" selected>MLP baseline</option>
                                 <option value="dwraon">DWRAON baseline</option>
+                                <option value="neuroflow">NeuroFlow (requires host support)</option>
                                 <option value="assembly">Assembly (experimental)</option>
                                 <option value="ft">Ft</option>
                             </select>
@@ -612,6 +613,7 @@
                             <select id="experiment-challenger-family">
                                 <option value="mlp">MLP baseline</option>
                                 <option value="dwraon" selected>DWRAON baseline</option>
+                                <option value="neuroflow">NeuroFlow (requires host support)</option>
                                 <option value="assembly">Assembly (experimental)</option>
                                 <option value="ft">Ft</option>
                             </select>
@@ -626,7 +628,7 @@
                             </label>
                         </details>
                     </fieldset>
-                    <p>Keep initial overrides identical to compare only brain families. Configuration keys may use dotted paths. The host validates supported configuration and refuses seed or recording-policy changes in overrides.</p>
+                    <p>Keep initial overrides identical to compare only brain families. NeuroFlow uses the experiment defaults for architecture and activation; this form does not sweep those settings. The host must include NeuroFlow support. Configuration keys may use dotted paths. The host validates supported configuration and refuses seed or recording-policy changes in overrides.</p>
                     <p>Schedule example: <code>[{"tick":100,"set":{"food_growth_rate":0.001}}]</code>. Use ordered ticks within the horizon and numeric live settings; changes at the same tick keep their order.</p>
                     <button id="experiment-launch" type="submit" disabled>Create matched-seed experiment</button>
                 </form>

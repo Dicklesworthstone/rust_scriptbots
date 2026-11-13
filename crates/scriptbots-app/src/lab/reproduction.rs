@@ -17,8 +17,9 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
-// v2 binds timed schedules in both executable variants and v4 scientific rows.
-const SCHEMA: u32 = 2;
+// v3 also binds the actual paired-inference procedure and sign-assignment counts;
+// timed schedules remain bound in executable variants and v4 scientific rows.
+const SCHEMA: u32 = 3;
 const MAX_INPUT_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, clap::Args)]

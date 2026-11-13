@@ -2,6 +2,104 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**NeuroFlow admitted to matched-seed experiments (2026-11-13):**
+[Source implemented and independently reviewed — Codex; executable qualification open]
+
+Connect the existing optional NeuroFlow family to the matched-seed runner,
+central compiled-family catalog, Lab admission and remote browser controls.
+With `neuro` enabled, `neuro`, `neuroflow` and `ml.neuroflow` resolve
+to canonical `ml.neuroflow`; without it, every alias refuses before admission
+side effects. Executable family construction is preflighted before owners,
+workers or artifacts exist. Dependencies and feature defaults are unchanged.
+
+Checkpoint resume and portable-bundle verification reconstruct the adapter from
+the immutable launch manifest's normalized configuration, not potentially changed
+live settings. Isolated experiments use their own default NeuroFlow architecture
+and activation; this increment does not introduce architecture-factor controls
+or claim inheritance from the live host. The browser offers the remote family
+and preserves canonical request/status binding.
+
+New and extended regressions exercise actual NeuroFlow owners through original
+constructor preservation after a raw configuration change, exact checkpoint
+continuation, concurrency one/two, scheduled-treatment resume, API completion and
+portable export/restore. Feature-disabled API tests check no retained catalog,
+idempotency, capacity or artifact mutation. Browser tests cover aliases and form
+serialization while retaining unknown-family refusal. C1's checkpoint promotion
+guard and regression are preserved exactly.
+
+Native and browser changes are source reviewed; no tests or formatting checks
+executed because the execution environment remains unavailable. No DSR, compiler,
+Clippy or UBS pass is claimed. Brain-family performance/determinism acceptance
+(`bd-2z0.3.12.5`) and original tracker status remain open.
+
+**Exact inference for small matched-seed cohorts (2026-11-13):**
+[Source implemented and independently reviewed — Codex; executable qualification open]
+
+The matched-seed analysis paths associated with `bd-2z0.11.6` and
+`bd-7453` now enumerate every paired sign assignment for cohorts of at most
+twelve independent seeds (at most 4,096 evaluations). This removes avoidable
+sampling variability where the complete null is inexpensive: five consistently
+positive pairs have an exact two-sided p-value of 2/32, not a sampled decision
+that can cross 0.05. Larger cohorts retain their existing seeded Monte Carlo
+draw order and add-one correction. Matching seeds alone does not establish the
+within-pair exchangeability assumption required by either procedure.
+
+Both statistics layers expose the actual procedure and assignment count. Lab
+notebooks bind those fields to reanalyzed evidence and distinguish them from
+the requested sampling budget. Offline comparison machine schema V3 and Lab
+reproduction input schema 3 carry the revised contract; descriptive singleton
+reports continue to omit inference. Normalized compensated enumeration includes
+floating-point ties conservatively, and non-finite derived paired values refuse.
+
+Ten new regressions cover exact manual oracles, zero multiplicity, directional
+tails, scaling/cancellation, seed and budget independence, the 12/13-pair boundary,
+invalid derived values, forged notebook metadata and the finished-database report.
+They are authored and source reviewed, not executed. No usable execution
+environment was available; no DSR, compiler, Rustfmt, Clippy or UBS pass is claimed.
+Original bead acceptance and tracker status remain unchanged.
+
+**Time-series inference uses its declared temporal blocks (2026-11-13):**
+[Source implemented and independently reviewed — Codex; executable qualification open]
+
+The statistical path associated with `bd-2z0.11.6` previously applied
+`block_len` only to an after-window context interval that both reports discarded.
+Published shift intervals and p-values resampled individual ticks. Both now use
+the declared temporal blocks: a circular moving-block percentile interval and
+a whole-block permutation test that preserves group sizes and partial tails.
+Controls require two complete blocks per window and are validated even when
+there are no candidate events. Overflowing event windows are safely skipped.
+
+Narrative report schema V3 and metric change-point schema V2 record the actual
+methods, draw counts, block length, confidence, threshold and seed. Both reports
+explicitly describe data-selected events as exploratory; their nominal BH flags
+do not establish unconditional false-discovery control. Metric reports now honor
+all declared resampling controls. New regressions cover correlated plateaus,
+temporal ordering, short tails, exact persisted tick inputs, invalid empty-input
+requests and truthful machine metadata. Original assertions remain in place.
+These regressions and the native code have not executed: no usable execution
+environment was available. No DSR, compiler, Rustfmt, Clippy or UBS pass is claimed;
+original acceptance and tracker status remain unchanged.
+
+**Experiment checkpoint promotion safety (2026-11-12):**
+[Source implemented and independently reviewed — Codex; executable qualification open]
+
+Continue the crash-safe resume contract in `bd-2z0.5.11`. An interrupted
+temporary successor previously passed canonical framing, plan, capacity and
+parent/tick checks before replacing the committed checkpoint, while executable
+brain-registry and reconstructed scientific-state checks happened only afterward.
+Recovery now restores the candidate owner through the production adapter boundary
+before synchronizing or promoting its file. A refusal preserves the exact parent
+and temporary evidence. Ordinary reads without a temporary successor retain their
+existing restoration path.
+
+The added regression captures genuine MLP and DWRAON owners, wraps the foreign
+owner in matching metadata with authentic checksums, and checks repeated refusal,
+byte-identical retained files and continued parent restorability. Its positive
+control promotes a genuine MLP successor and compares the restored scientific
+digest. The test is authored but has not executed: this session has GitHub access
+and no usable execution environment. No DSR, compiler, Rustfmt, Clippy or UBS pass
+is claimed. Original acceptance and tracker status remain unchanged.
+
 **Checkpoint usability and experiment resource admission (2026-11-13):**
 [Source implemented and independently reviewed — Codex; browser DSR passed,
 native and full-workspace qualification open]

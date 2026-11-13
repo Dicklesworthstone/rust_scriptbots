@@ -1,8 +1,8 @@
 //! Notebook renderer with provenance enforcement and reproduce.sh emission (bd-16g.1.5).
 
 use super::stats::{
-    AnalysisParams, ConfidenceIntervalProcedure, MatchedEffect, MatchedSeedAnalysis,
-    PValueProcedure, RunSummary, StatsError, analyze_matched_seed_runs,
+    AnalysisParams, ConfidenceIntervalProcedure, MAX_EXACT_SIGN_FLIP_PAIRS, MatchedEffect,
+    MatchedSeedAnalysis, PValueProcedure, RunSummary, StatsError, analyze_matched_seed_runs,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -75,6 +75,7 @@ pub struct EffectRef {
     effect: MatchedEffect,
     params: AnalysisParams,
     p_value_procedure: PValueProcedure,
+    sign_assignments_evaluated: usize,
     confidence_interval_procedure: ConfidenceIntervalProcedure,
 }
 
@@ -231,6 +232,7 @@ pub fn claims_from_analysis(
                     effect: effect.clone(),
                     params: analysis.params,
                     p_value_procedure: analysis.p_value_procedure,
+                    sign_assignments_evaluated: analysis.sign_assignments_evaluated,
                     confidence_interval_procedure: analysis.confidence_interval_procedure,
                 })),
                 falsifier: falsifier.to_owned(),
@@ -991,6 +993,19 @@ fn validate_effect(reference: &EffectRef) -> Result<(), NotebookRenderError> {
     {
         format_float_safe(value)?;
     }
+    let assignment_evidence_matches = match reference.p_value_procedure {
+        PValueProcedure::PairedSignFlipExact => {
+            effect.n_pairs <= MAX_EXACT_SIGN_FLIP_PAIRS
+                && reference.sign_assignments_evaluated == (1_usize << effect.n_pairs)
+        }
+        PValueProcedure::PairedSignFlipMonteCarlo => {
+            effect.n_pairs > MAX_EXACT_SIGN_FLIP_PAIRS
+                && reference.sign_assignments_evaluated == params.permutation_iterations as usize
+        }
+    };
+    if !assignment_evidence_matches {
+        return Err(contract_error("sign_assignment_evidence"));
+    }
     if effect.raw_p_value != effect.adjusted.raw_p_value
         || effect.alternative != params.alternative
         || effect.adjusted.correction != params.correction
@@ -1032,7 +1047,8 @@ fn render_effect(markdown: &mut String, reference: &EffectRef) -> Result<(), Not
     markdown.push_str(&format!(
         "- **Metric**: {}\n- **Control / Treatment Arm**: {} / {}\n\
          - **Estimator**: {}\n- **P-value Procedure**: {}\n\
-         - **Permutation Iterations**: {}\n- **Confidence Interval Procedure**: {}\n\
+         - **Sign Assignments Evaluated**: {}\n- **Requested Monte Carlo Budget**: {}\n\
+         - **Confidence Interval Procedure**: {}\n\
          - **Bootstrap Iterations**: {}\n- **Resampling Seed**: {}\n\
          - **Alternative**: {}\n- **Family Alpha**: {}\n- **Recommended Pairs**: {}\n\
          - **Matched Pairs**: {}\n\
@@ -1042,6 +1058,7 @@ fn render_effect(markdown: &mut String, reference: &EffectRef) -> Result<(), Not
         effect.treatment_arm,
         effect.estimator.as_str(),
         reference.p_value_procedure.as_str(),
+        reference.sign_assignments_evaluated,
         reference.params.permutation_iterations,
         reference.confidence_interval_procedure.as_str(),
         reference.params.bootstrap_iterations,
@@ -1208,12 +1225,12 @@ mod tests {
             undefined_reason: Some(UndefinedReason::InsufficientPairs { have: 1, need: 2 }),
             ci_95: None,
             ci_undefined_reason: Some(UndefinedReason::InsufficientPairs { have: 1, need: 2 }),
-            raw_p_value: 0.5,
+            raw_p_value: 1.0,
             adjusted: AdjustedComparison {
                 original_index: 0,
                 rank: 1,
-                raw_p_value: 0.5,
-                adjusted_p_value: 0.5,
+                raw_p_value: 1.0,
+                adjusted_p_value: 1.0,
                 adjusted_alpha: 0.05,
                 rejected: false,
                 correction: Correction::BenjaminiHochberg,
@@ -1226,11 +1243,25 @@ mod tests {
     }
 
     fn effect_ref(runs: Vec<RunRef>, effect: MatchedEffect) -> EffectRef {
+        let params = AnalysisParams::default();
+        let (p_value_procedure, sign_assignments_evaluated) =
+            if effect.n_pairs <= MAX_EXACT_SIGN_FLIP_PAIRS {
+                (
+                    PValueProcedure::PairedSignFlipExact,
+                    1_usize << effect.n_pairs,
+                )
+            } else {
+                (
+                    PValueProcedure::PairedSignFlipMonteCarlo,
+                    params.permutation_iterations as usize,
+                )
+            };
         EffectRef {
             runs,
             effect,
-            params: AnalysisParams::default(),
-            p_value_procedure: PValueProcedure::PairedSignFlipMonteCarlo,
+            params,
+            p_value_procedure,
+            sign_assignments_evaluated,
             confidence_interval_procedure: ConfidenceIntervalProcedure::PercentileBootstrap,
         }
     }
@@ -1366,6 +1397,49 @@ mod tests {
     }
 
     #[test]
+    fn notebook_refuses_false_sign_assignment_procedure_and_counts() {
+        let mut reference =
+            effect_ref(vec![run("control", 0, 42), run("treatment", 1, 42)], effect());
+        validate_effect(&reference).unwrap();
+        reference.sign_assignments_evaluated = 3;
+        assert_eq!(
+            validate_effect(&reference),
+            Err(NotebookRenderError::EffectContractMismatch {
+                metric: "alive_agents".to_owned(),
+                field: "sign_assignment_evidence",
+            })
+        );
+        reference.sign_assignments_evaluated = 2;
+        reference.p_value_procedure = PValueProcedure::PairedSignFlipMonteCarlo;
+        assert_eq!(
+            validate_effect(&reference),
+            Err(NotebookRenderError::EffectContractMismatch {
+                metric: "alive_agents".to_owned(),
+                field: "sign_assignment_evidence",
+            })
+        );
+
+        let summaries = [
+            summary("control-1", 0, 1, 10.0),
+            summary("control-2", 0, 2, 12.0),
+            summary("treatment-1", 1, 1, 14.0),
+            summary("treatment-2", 1, 2, 13.0),
+        ];
+        let mut analysis = analyze_matched_seed_runs(
+            &summaries,
+            &["alive_agents".to_owned()],
+            AnalysisParams::default(),
+        )
+        .unwrap();
+        assert_eq!(analysis.sign_assignments_evaluated, 4);
+        analysis.sign_assignments_evaluated = 3;
+        assert_eq!(
+            claims_from_analysis(&analysis, &summaries, "hypothesis", "falsifier"),
+            Err(NotebookRenderError::AnalysisResultMismatch)
+        );
+    }
+
+    #[test]
     fn notebook_artifact_refuses_a_zero_check_verifier() {
         let runs = vec![run("control", 0, 42), run("treatment", 1, 42)];
         let temp_dir = tempfile::tempdir().unwrap();
@@ -1435,8 +1509,9 @@ mod tests {
         for required in [
             "Statistics Authority: scriptbots_app::lab::stats",
             "Estimator**: paired_difference",
-            "P-value Procedure**: paired_sign_flip_monte_carlo",
-            "Permutation Iterations**: 4000",
+            "P-value Procedure**: paired_sign_flip_exact",
+            "Sign Assignments Evaluated**: 2",
+            "Requested Monte Carlo Budget**: 4000",
             "Confidence Interval Procedure**: percentile_bootstrap",
             "Bootstrap Iterations**: 2000",
             "Resampling Seed**: 29779",
@@ -1446,7 +1521,7 @@ mod tests {
             "undefined (insufficient_pairs(have=1, need=2))",
             "95% Bootstrap CI**: undefined",
             "Correction**: benjamini_hochberg",
-            "Adjusted p-value**: 0.5000",
+            "Adjusted p-value**: 1.0000",
             "fewer_than_recommended_pairs(have=1, recommended=10)",
         ] {
             assert!(

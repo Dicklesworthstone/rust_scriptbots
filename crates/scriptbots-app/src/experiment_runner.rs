@@ -10,6 +10,8 @@ use scriptbots_brain::{
 };
 #[cfg(feature = "brain-ft")]
 use scriptbots_brain_ml::{FT_BRAIN_KIND, FtBrainFamily};
+#[cfg(feature = "neuro")]
+use scriptbots_brain_neuro::{NeuroflowBrain, NeuroflowBrainConfig, NeuroflowFamilyAdapter};
 use scriptbots_core::{
     BrainFamilyAdapter, BrainRegistry, NullPersistence, ScriptBotsConfig, Tick, WorldState,
     knob_range,
@@ -370,6 +372,8 @@ pub(crate) const EXPERIMENT_BRAIN_FAMILIES: &[&str] = &[
     AssemblyBrain::KIND.as_str(),
     #[cfg(feature = "brain-ft")]
     FT_BRAIN_KIND,
+    #[cfg(feature = "neuro")]
+    NeuroflowBrain::KIND.as_str(),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -379,6 +383,8 @@ enum ResolvedBrainFamily {
     Assembly,
     #[cfg(feature = "brain-ft")]
     FrankenTorch,
+    #[cfg(feature = "neuro")]
+    Neuroflow,
 }
 
 impl ResolvedBrainFamily {
@@ -396,11 +402,15 @@ impl ResolvedBrainFamily {
                 reason: "FrankenTorch experiments require a build with the brain-ft feature"
                     .to_owned(),
             }),
-            "neuroflow" => {
+            #[cfg(feature = "neuro")]
+            "neuro" | "neuroflow" | "ml.neuroflow" => Ok(Self::Neuroflow),
+            #[cfg(not(feature = "neuro"))]
+            "neuro" | "neuroflow" | "ml.neuroflow" => {
                 Err(ExperimentRunnerError::UnavailableBrainFamily {
                     variant_id: variant.variant_id.clone(),
                     brain_family: variant.brain_family.clone(),
-                    reason: "this runner build has no canonical family installation for that feature; execution is refused instead of substituting another family".to_owned(),
+                    reason: "NeuroFlow experiments require a build with the neuro feature"
+                        .to_owned(),
                 })
             }
             _ => Err(ExperimentRunnerError::UnknownBrainFamily {
@@ -417,10 +427,18 @@ impl ResolvedBrainFamily {
             Self::Assembly => AssemblyBrain::KIND.as_str(),
             #[cfg(feature = "brain-ft")]
             Self::FrankenTorch => FT_BRAIN_KIND,
+            #[cfg(feature = "neuro")]
+            Self::Neuroflow => NeuroflowBrain::KIND.as_str(),
         }
     }
 
-    fn adapter(self, run_id: &str) -> Result<Box<dyn BrainFamilyAdapter>, ExperimentRunnerError> {
+    fn adapter(
+        self,
+        constructor_config: &ScriptBotsConfig,
+        run_id: &str,
+    ) -> Result<Box<dyn BrainFamilyAdapter>, ExperimentRunnerError> {
+        #[cfg(not(feature = "neuro"))]
+        let _ = constructor_config;
         Ok(match self {
             Self::Mlp => Box::new(MlpBrainFamily::new()),
             Self::Dwraon => Box::new(DwraonFamilyAdapter::default()),
@@ -435,12 +453,23 @@ impl ResolvedBrainFamily {
             }
             #[cfg(feature = "brain-ft")]
             Self::FrankenTorch => Box::new(FtBrainFamily::default()),
+            #[cfg(feature = "neuro")]
+            Self::Neuroflow => Box::new(
+                NeuroflowFamilyAdapter::new(NeuroflowBrainConfig::from_settings(
+                    &constructor_config.neuroflow,
+                ))
+                .map_err(|source| ExperimentRunnerError::Construction {
+                    run_id: run_id.to_owned(),
+                    reason: format!("configured NeuroFlow family construction failed: {source}"),
+                })?,
+            ),
         })
     }
 
     fn register(self, world: &mut WorldState, run_id: &str) -> Result<u64, ExperimentRunnerError> {
+        let adapter = self.adapter(world.config(), run_id)?;
         world
-            .register_brain_family(self.canonical_name(), self.adapter(run_id)?)
+            .register_brain_family(self.canonical_name(), adapter)
             .map_err(|source| ExperimentRunnerError::Construction {
                 run_id: run_id.to_owned(),
                 reason: format!(
@@ -657,9 +686,22 @@ fn restore_run_owner(
     path: &Path,
 ) -> Result<HostCore, ExperimentRunnerError> {
     validate_run_checkpoint_capacity(checkpoint, path, MAX_RUN_POPULATION)?;
+    // Adapter identity belongs to the original constructor recipe. Current raw
+    // world settings can change without replacing the installed genome family.
+    let constructor_config: ScriptBotsConfig =
+        serde_json::from_value(checkpoint.metadata.manifest.normalized_config.clone())
+            .map_err(|error| invalid_checkpoint(path, error))?;
+    constructor_config
+        .validate()
+        .map_err(|error| invalid_checkpoint(path, error))?;
     let mut registry = BrainRegistry::new();
     registry
-        .register_family(family.canonical_name(), family.adapter(run_id)?)
+        .register_family(
+            family.canonical_name(),
+            family
+                .adapter(&constructor_config, run_id)
+                .map_err(|error| invalid_checkpoint(path, error))?,
+        )
         .map_err(|error| invalid_checkpoint(path, error))?;
     let world = checkpoint
         .owner
@@ -2437,6 +2479,19 @@ impl MatchedSeedExperimentRunner {
                         ),
                     }
                 })?;
+            // Check the configured executable family before any owner, output or
+            // worker exists. NeuroFlow's versioned envelope bounds are stricter
+            // than the general world configuration's architecture bounds.
+            drop(
+                family
+                    .adapter(&normalized_config, &variant.variant_id)
+                    .map_err(|error| ExperimentRunnerError::InvalidPlan {
+                        reason: format!(
+                            "variant `{}` has an invalid configured brain family: {error}",
+                            variant.variant_id
+                        ),
+                    })?,
+            );
             // Use the constructor's validated dimensions, not a copied rounding
             // rule. WorldState::build uses this exact grid for food and terrain.
             let (width, height) = normalized_config.food_dimensions().map_err(|error| {
@@ -2970,6 +3025,13 @@ impl MatchedSeedExperimentRunner {
                 "temporary cut does not extend the exact committed parent by one tick",
             ));
         }
+        // Decoding validates the data envelope, but executable adapters and the
+        // recomputed scientific digest are checked only by restoring the owner.
+        // Refuse an unrestorable successor while the exact committed parent and
+        // temporary evidence still exist. Ordinary reads without a temporary cut
+        // keep their existing single-restore path.
+        let family = ResolvedBrainFamily::resolve(variant)?;
+        drop(restore_run_owner(&candidate, family, run_id, &temporary)?);
         File::open(&temporary)
             .and_then(|file| file.sync_all())
             .map_err(|source| ExperimentRunnerError::Io {
@@ -5262,6 +5324,77 @@ mod tests {
     }
 
     #[test]
+    fn neuroflow_arm_admission_matches_the_compiled_family() {
+        let directory = tempfile::tempdir().unwrap();
+        for requested_family in ["neuro", "neuroflow", "ml.neuroflow"] {
+            let variant = ScenarioVariant {
+                variant_id: "neuro".into(),
+                brain_family: requested_family.into(),
+                config_overrides: BTreeMap::new(),
+                interventions: Vec::new(),
+            };
+            let runner = MatchedSeedExperimentRunner::new(
+                "neuro-plan",
+                MatchedSeedCohort {
+                    cohort_id: "cohort".into(),
+                    seeds: vec![71],
+                },
+                vec![variant.clone()],
+                2,
+                1,
+                directory.path().join("bundles"),
+            );
+            #[cfg(feature = "neuro")]
+            {
+                assert_eq!(
+                    canonical_experiment_brain_family(&variant.variant_id, requested_family)
+                        .unwrap(),
+                    "ml.neuroflow"
+                );
+                assert!(EXPERIMENT_BRAIN_FAMILIES.contains(&"ml.neuroflow"));
+                let plan = runner.plan_batch().expect("compiled family is executable");
+                assert_eq!(plan[0].brain_family, "ml.neuroflow");
+
+                let duplicate = MatchedSeedExperimentRunner {
+                    variants: vec![
+                        variant,
+                        ScenarioVariant {
+                            variant_id: "same-science".into(),
+                            brain_family: "ml.neuroflow".into(),
+                            config_overrides: BTreeMap::new(),
+                            interventions: Vec::new(),
+                        },
+                    ],
+                    ..runner
+                };
+                assert!(matches!(
+                    duplicate.plan_batch(),
+                    Err(ExperimentRunnerError::InvalidPlan { .. })
+                ));
+            }
+            #[cfg(not(feature = "neuro"))]
+            {
+                assert!(!EXPERIMENT_BRAIN_FAMILIES.contains(&"ml.neuroflow"));
+                for result in [
+                    validate_experiment_brain_family(&variant.variant_id, requested_family),
+                    runner.plan_batch().map(|_| ()),
+                    runner
+                        .load_or_create_status(&directory.path().join("status.json"))
+                        .map(|_| ()),
+                ] {
+                    let error = result.expect_err("missing family must not silently fall back");
+                    assert!(matches!(
+                        error,
+                        ExperimentRunnerError::UnavailableBrainFamily { .. }
+                    ));
+                    assert!(error.to_string().contains("neuro feature"));
+                }
+            }
+        }
+        assert!(directory.path().read_dir().unwrap().next().is_none());
+    }
+
+    #[test]
     fn single_run_refuses_an_arm_changed_after_plan_validation() {
         let planned_variant = ScenarioVariant {
             variant_id: "mlp_base".into(),
@@ -5374,24 +5507,27 @@ mod tests {
             Err(ExperimentRunnerError::UnknownBrainFamily { .. })
         ));
 
-        let unavailable = MatchedSeedExperimentRunner::new(
-            "exp-unavailable",
-            MatchedSeedCohort {
-                cohort_id: "cohort".into(),
-                seeds: vec![1],
-            },
-            vec![ScenarioVariant {
-                brain_family: "neuroflow".into(),
-                ..base_variant
-            }],
-            1,
-            1,
-            output,
-        );
-        assert!(matches!(
-            unavailable.plan_batch(),
-            Err(ExperimentRunnerError::UnavailableBrainFamily { .. })
-        ));
+        #[cfg(not(feature = "neuro"))]
+        {
+            let unavailable = MatchedSeedExperimentRunner::new(
+                "exp-unavailable",
+                MatchedSeedCohort {
+                    cohort_id: "cohort".into(),
+                    seeds: vec![1],
+                },
+                vec![ScenarioVariant {
+                    brain_family: "neuroflow".into(),
+                    ..base_variant
+                }],
+                1,
+                1,
+                output,
+            );
+            assert!(matches!(
+                unavailable.plan_batch(),
+                Err(ExperimentRunnerError::UnavailableBrainFamily { .. })
+            ));
+        }
     }
 
     fn grid_test_variant(
@@ -6241,9 +6377,16 @@ mod tests {
 
     #[test]
     fn scheduled_interventions_resume_before_and_after_exact_due_boundaries() {
-        for completed_ticks in [0_u64, 1, 2, 3, 4] {
+        for (family_name, completed_ticks) in [
+            "mlp",
+            #[cfg(feature = "neuro")]
+            "neuroflow",
+        ]
+        .into_iter()
+        .flat_map(|family| [0_u64, 1, 2, 3, 4].map(|tick| (family, tick)))
+        {
             let directory = tempfile::tempdir().unwrap();
-            let variant = intervention_test_variant(
+            let mut variant = intervention_test_variant(
                 "drought-recovery",
                 vec![
                     ScenarioInterventionV1 {
@@ -6260,6 +6403,7 @@ mod tests {
                     },
                 ],
             );
+            variant.brain_family = family_name.into();
             let mut runner = MatchedSeedExperimentRunner::new(
                 "scheduled-continuation",
                 MatchedSeedCohort {
@@ -7085,6 +7229,137 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "neuro")]
+    #[test]
+    fn neuroflow_checkpoint_restore_preserves_the_original_constructor_recipe() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut runner = progress_runner(directory.path(), vec![71]);
+        runner.variants[0].variant_id = "neuro".into();
+        runner.variants[0].brain_family = "neuroflow".into();
+        let plan = runner.validated_plan().unwrap();
+        let record = &plan.runs[0];
+        let (variant, family) = &plan.variants[&record.variant_id];
+        let path = runner.run_checkpoint_path(&record.run_id);
+        let mut checkpoint = runner
+            .initial_run_checkpoint(
+                variant,
+                *family,
+                record.seed,
+                &record.run_id,
+                &plan.digest,
+            )
+            .unwrap();
+        let original_manifest = checkpoint.metadata.manifest.canonical_json_bytes().unwrap();
+        let mut oracle = restore_run_owner(&checkpoint, *family, &record.run_id, &path).unwrap();
+        let original_registry = checkpoint
+            .owner
+            .host_checkpoint()
+            .world_checkpoint()
+            .required_brain_registry();
+        assert!(oracle.world().agent_count() > 0);
+        let (_, namespace) = host_identifiers(&record.run_id);
+        let mut frontend = NullFrontend::new(oracle.local_port(), namespace);
+        let mut now = 0;
+
+        // A live owner accepts complete settings edits without replacing its
+        // already installed family. This tests restore identity directly; it
+        // does not add new architecture knobs to the experiment proposal API.
+        let mut edited = oracle.world().config().clone();
+        edited.neuroflow.hidden_layers = vec![11, 5];
+        edited.neuroflow.activation = scriptbots_core::NeuroflowActivationKind::Relu;
+        edited.validate().unwrap();
+        let submitted = frontend
+            .submit_envelope(CommandEnvelope::new(
+                CommandId::from_client_sequence(namespace, 1),
+                HostCommand::UpdateConfig(Box::new(edited.clone())),
+            ))
+            .unwrap();
+        drive_command_to_volatile_commit(
+            &record.run_id,
+            "update raw NeuroFlow settings",
+            &mut frontend,
+            &mut oracle,
+            submitted.command_id(),
+            0,
+            0,
+            &mut now,
+        )
+        .unwrap();
+        seal_run_checkpoint(&record.run_id, &mut frontend, &mut oracle, &mut now).unwrap();
+        checkpoint.owner = oracle.capture_volatile_host_checkpoint_v1().unwrap();
+        assert_eq!(checkpoint.owner.host_checkpoint().config(), &edited);
+        assert_eq!(
+            checkpoint.metadata.manifest.canonical_json_bytes().unwrap(),
+            original_manifest
+        );
+        assert_eq!(
+            checkpoint
+                .owner
+                .host_checkpoint()
+                .world_checkpoint()
+                .required_brain_registry(),
+            original_registry
+        );
+        let encoded = checkpoint.encode(&path).unwrap();
+        let mut decoded = RunCheckpointV1::decode(&encoded, &path).unwrap();
+        let mut restored = restore_run_owner(&decoded, *family, &record.run_id, &path)
+            .expect("the launch manifest retains the installed NeuroFlow constructor");
+        assert_eq!(
+            restored.scientific_digest_v1().unwrap(),
+            oracle.scientific_digest_v1().unwrap()
+        );
+        assert_eq!(restored.world().config(), &edited);
+
+        // Substituting the current raw settings supplies a different valid
+        // adapter, whose identity must be rejected before any continued science.
+        let constructor = decoded.metadata.manifest.normalized_config.clone();
+        decoded.metadata.manifest.normalized_config = serde_json::to_value(&edited).unwrap();
+        let error = restore_run_owner(&decoded, *family, &record.run_id, &path)
+            .err()
+            .expect("current settings cannot replace the original constructor recipe");
+        assert!(matches!(
+            error,
+            ExperimentRunnerError::InvalidCheckpoint { .. }
+        ));
+        assert!(error.to_string().contains("prepared brain registry"));
+        decoded.metadata.manifest.normalized_config = constructor;
+        assert_eq!(
+            decoded.metadata.manifest.canonical_json_bytes().unwrap(),
+            original_manifest
+        );
+
+        let mut resumed_frontend = NullFrontend::new(restored.local_port(), namespace);
+        let mut resumed_now = 0;
+        for tick in 1..=2 {
+            let command = CommandEnvelope::new(
+                CommandId::from_client_sequence(namespace, tick + 1),
+                HostCommand::Step,
+            );
+            for (owner, client, clock) in [
+                (&mut oracle, &mut frontend, &mut now),
+                (&mut restored, &mut resumed_frontend, &mut resumed_now),
+            ] {
+                let submitted = client.submit_envelope(command.clone()).unwrap();
+                drive_command_to_volatile_commit(
+                    &record.run_id,
+                    "continue configured NeuroFlow owner",
+                    client,
+                    owner,
+                    submitted.command_id(),
+                    tick,
+                    0,
+                    clock,
+                )
+                .unwrap();
+                seal_run_checkpoint(&record.run_id, client, owner, clock).unwrap();
+            }
+            assert_eq!(
+                restored.scientific_digest_v1().unwrap(),
+                oracle.scientific_digest_v1().unwrap()
+            );
+        }
+    }
+
     #[test]
     fn running_checkpoint_continues_real_families_and_retains_original_owner_cut() {
         for family_name in [
@@ -7092,6 +7367,8 @@ mod tests {
             "dwraon",
             #[cfg(feature = "brain-ft")]
             "ft",
+            #[cfg(feature = "neuro")]
+            "neuroflow",
         ] {
             for completed_ticks in [0_u64, 2, 4] {
                 let directory = tempfile::tempdir().expect("continuation directory");
@@ -7361,6 +7638,8 @@ mod tests {
             "dwraon",
             #[cfg(feature = "brain-ft")]
             "ft",
+            #[cfg(feature = "neuro")]
+            "neuroflow",
         ]
         .map(|family| ScenarioVariant {
             variant_id: family.into(),
@@ -7415,6 +7694,165 @@ mod tests {
         assert_eq!(
             outcomes[0].values().collect::<BTreeSet<_>>().len(),
             outcomes[0].len()
+        );
+    }
+
+    #[test]
+    fn checkpoint_recovery_restores_candidate_before_replacing_the_committed_cut() {
+        let directory = tempfile::tempdir().unwrap();
+        let runner = progress_runner(directory.path(), vec![7]);
+        let plan = runner.validated_plan().unwrap();
+        let record = &plan.runs[0];
+        let (variant, family) = &plan.variants[&record.variant_id];
+        runner
+            .prepare_run_checkpoint(
+                variant,
+                *family,
+                record.seed,
+                &record.run_id,
+                &plan.digest,
+            )
+            .unwrap();
+        let path = runner.run_checkpoint_path(&record.run_id);
+        let temporary = status_temporary_path(&path).unwrap();
+        let parent_bytes = fs::read(&path).unwrap();
+        let parent = RunCheckpointV1::decode(&parent_bytes, &path).unwrap();
+        let parent_digest = blake3::hash(&parent_bytes).to_hex().to_string();
+        let _lease = ExperimentStatusWriterLease::acquire(&path).unwrap();
+
+        // Capture actual one-tick owners from both executable families. Their
+        // metadata and outer checksums cannot prove the expected family was run.
+        let next_owner = |checkpoint: &RunCheckpointV1, chosen: ResolvedBrainFamily| {
+            let mut owner = restore_run_owner(checkpoint, chosen, &record.run_id, &path).unwrap();
+            let (_, namespace) = host_identifiers(&record.run_id);
+            let mut frontend = NullFrontend::new(owner.local_port(), namespace);
+            let mut now = 0;
+            let submitted = frontend
+                .submit_envelope(CommandEnvelope::new(
+                    CommandId::from_client_sequence(namespace, 1),
+                    HostCommand::Step,
+                ))
+                .unwrap();
+            drive_command_to_volatile_commit(
+                &record.run_id,
+                "candidate owner step",
+                &mut frontend,
+                &mut owner,
+                submitted.command_id(),
+                1,
+                0,
+                &mut now,
+            )
+            .unwrap();
+            seal_run_checkpoint(&record.run_id, &mut frontend, &mut owner, &mut now).unwrap();
+            owner.capture_volatile_host_checkpoint_v1().unwrap()
+        };
+        let mut valid = RunCheckpointV1 {
+            metadata: parent.metadata.clone(),
+            owner: next_owner(&parent, *family),
+        };
+        valid.metadata.parent_digest = Some(parent_digest.clone());
+        let other_family = runner
+            .initial_run_checkpoint(
+                variant,
+                ResolvedBrainFamily::Dwraon,
+                record.seed,
+                &record.run_id,
+                &plan.digest,
+            )
+            .unwrap();
+        let mut wrong_family = RunCheckpointV1 {
+            metadata: parent.metadata.clone(),
+            owner: next_owner(&other_family, ResolvedBrainFamily::Dwraon),
+        };
+        wrong_family.metadata.parent_digest = Some(parent_digest);
+        let wrong_bytes = wrong_family.encode(&temporary).unwrap();
+        let decoded = RunCheckpointV1::decode(&wrong_bytes, &temporary).unwrap();
+        runner
+            .validate_run_checkpoint(
+                &temporary,
+                &decoded,
+                variant,
+                record.seed,
+                &record.run_id,
+                &plan.digest,
+            )
+            .expect("the authentic owner passes framing, metadata, capacity and schedule checks");
+        assert_ne!(
+            decoded
+                .owner
+                .host_checkpoint()
+                .world_checkpoint()
+                .required_brain_registry(),
+            parent
+                .owner
+                .host_checkpoint()
+                .world_checkpoint()
+                .required_brain_registry()
+        );
+        assert!(
+            restore_run_owner(&decoded, *family, &record.run_id, &temporary).is_err(),
+            "the declared MLP executable cannot restore the real DWRAON owner"
+        );
+        fs::write(&temporary, &wrong_bytes).unwrap();
+
+        for _ in 0..2 {
+            let error = runner
+                .load_run_checkpoint(
+                    variant,
+                    record.seed,
+                    &record.run_id,
+                    &plan.digest,
+                    MAX_RUN_POPULATION,
+                )
+                .err()
+                .expect("an unrestorable successor must not replace the recoverable parent");
+            assert!(
+                matches!(
+                    &error,
+                    ExperimentRunnerError::InvalidCheckpoint { path: refused, reason }
+                        if refused == &temporary && reason.contains("prepared brain registry")
+                ),
+                "{error}"
+            );
+            assert_eq!(fs::read(&path).unwrap(), parent_bytes);
+            assert_eq!(fs::read(&temporary).unwrap(), wrong_bytes);
+            assert!(!path.with_extension("checkpoint.interrupted").exists());
+            assert_eq!(
+                restore_run_owner(&parent, *family, &record.run_id, &path)
+                    .unwrap()
+                    .world_tick()
+                    .0,
+                0
+            );
+        }
+
+        // The same recovery path still admits a genuine, executable successor.
+        let valid_bytes = valid.encode(&temporary).unwrap();
+        let expected = restore_run_owner(&valid, *family, &record.run_id, &temporary)
+            .unwrap()
+            .scientific_digest_v1()
+            .unwrap();
+        fs::write(&temporary, &valid_bytes).unwrap();
+        let recovered = runner
+            .load_run_checkpoint(
+                variant,
+                record.seed,
+                &record.run_id,
+                &plan.digest,
+                MAX_RUN_POPULATION,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.owner.host_checkpoint().tick().0, 1);
+        assert_eq!(fs::read(&path).unwrap(), valid_bytes);
+        assert!(!temporary.exists());
+        assert_eq!(
+            restore_run_owner(&recovered, *family, &record.run_id, &path)
+                .unwrap()
+                .scientific_digest_v1()
+                .unwrap(),
+            expected
         );
     }
 
@@ -8537,6 +8975,13 @@ mod tests {
                 config_overrides: BTreeMap::new(),
                 interventions: Vec::new(),
             },
+            #[cfg(feature = "neuro")]
+            ScenarioVariant {
+                variant_id: "variant_neuro".into(),
+                brain_family: "neuro".into(),
+                config_overrides: BTreeMap::new(),
+                interventions: Vec::new(),
+            },
         ];
 
         let expected_runs = variants.len() * cohort.seeds.len();
@@ -8553,6 +8998,16 @@ mod tests {
         assert_eq!(status.runs[2].brain_family, "assembly.experimental");
         #[cfg(feature = "brain-ft")]
         assert_eq!(status.runs[3].brain_family, "ft");
+        #[cfg(feature = "neuro")]
+        assert_eq!(
+            status
+                .runs
+                .iter()
+                .find(|run| run.variant_id == "variant_neuro")
+                .unwrap()
+                .brain_family,
+            "ml.neuroflow"
+        );
         assert_ne!(
             status.runs[0].final_digest, status.runs[1].final_digest,
             "real distinct family registries must produce distinct full world digests"

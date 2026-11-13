@@ -1,45 +1,67 @@
-//! Statistical certification of narrative events (bd-2z0.11.6, item 1).
+//! Exploratory statistical assessment of narrative events (bd-2z0.11.6).
 //!
-//! # The question this answers
+//! The detector selects a boundary from a metric series. This module describes the mean shift
+//! around that boundary with a circular moving-block bootstrap CI and a whole-block permutation
+//! test. Contiguous ticks are not independent replicates. Both inferential results use the
+//! declared block length; the after-window mean CI is additional context, not the only place
+//! serial dependence is considered.
 //!
-//! The detector in `scriptbots-core::detect` fires an `EventRecord` whenever a metric shifts.
-//! It is deliberately generous — and its own materiality note records that a purely statistical
-//! stream produced **853 events per 10k ticks** on a real run, which is not a story, it is
-//! static. Materiality (bd-16g.2.3) filters events by whether a human would *care*. This module
-//! answers the orthogonal question: of the events that survive materiality, which ones are
-//! statistically **real**, and which are the tail of noise?
+//! These are approximate time-series methods. Windows must be approximately stationary within
+//! each segment; the block length must capture the relevant short-range dependence; the test
+//! assumes exchangeable equal-length blocks under its null. Dependence across block boundaries
+//! and selection of a boundary from the same observations are not corrected.
 //!
-//! # Why false-discovery-rate control is the whole point
+//! Benjamini-Hochberg is applied to the reported p-values as an explicit thresholding rule.
+//! Its usual FDR guarantee requires valid p-values and the relevant hypothesis-dependence
+//! conditions. It does not repair invalid exchangeability or data-dependent event selection.
+//! Consequently reports on detected events are exploratory, not confirmatory discoveries.
 //!
-//! Certifying one event is just [`crate::stats`]: permutation test on the before/after windows,
-//! a bootstrap CI on the shift, effect sizes. The trap is that a run flags MANY events, and if
-//! you test each at α = 0.05 you *expect* one false positive in every twenty by construction —
-//! so a long run manufactures "significant" events out of pure noise no matter how clean each
-//! individual test is. That is exactly the false-positive budget bd-16g.2.3 exists to protect,
-//! and eyeballed per-event thresholds cannot protect it.
-//!
-//! The fix is Benjamini-Hochberg: control the *false discovery rate* across the whole set of
-//! events at once — the expected fraction of flagged events that are false. It is the principled
-//! replacement for a per-event threshold, and [`benjamini_hochberg`] implements it as a pure,
-//! separately-tested function so the correction can never quietly diverge from the textbook
-//! procedure.
-//!
-//! # Purity and determinism
-//!
-//! Everything here is a pure function of a metric series, a set of event positions, and a seed.
-//! No database, no clock, no I/O. The DB-reading glue that loads real `EventRecord`s and their
-//! metric windows is a thin adapter a report adds on top; the certification logic — the part that
-//! is easy to get subtly wrong — is proven here on synthetic series with known ground truth.
+//! Inputs, resampling controls, methods and seeds are explicit. No database, clock, or
+//! simulation state is read here; reports bind these computations to their observed evidence.
 
 // The Benjamini-Hochberg rank threshold `(k / m) · q` casts small integer counts to f64 — sizes
 // exact in f64 for any realistic run. Allowed module-wide, as in `stats`, rather than scattering
 // identical pragmas through the correction.
 #![allow(clippy::cast_precision_loss)]
 
+use serde::{Deserialize, Serialize};
+
 use crate::stats::{
-    self, ConfidenceInterval, EffectSizeEstimator, StatsError, bootstrap_mean_difference_ci,
-    cliffs_delta, cohens_d, moving_block_bootstrap_mean_ci, permutation_test_mean_difference,
+    self, ConfidenceInterval, EffectSizeEstimator, StatsError,
+    block_permutation_test_mean_difference, cliffs_delta, cohens_d,
+    moving_block_bootstrap_mean_ci, moving_block_bootstrap_mean_difference_ci,
 };
+
+/// Versioned interval method recorded by persisted reports.
+pub const SHIFT_CI_METHOD: &str = "circular_moving_block_bootstrap_percentile_v1";
+/// Versioned significance method recorded by persisted reports.
+pub const SIGNIFICANCE_METHOD: &str = "length_stratified_whole_block_permutation_v1";
+
+/// Exact controls and interpretation of a reported time-series assessment.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CertificationMethod {
+    /// Versioned confidence-interval algorithm.
+    pub confidence_interval: String,
+    /// Versioned p-value algorithm.
+    pub p_value: String,
+    /// Contiguous observations per full resampling block.
+    pub block_len: usize,
+    /// Bootstrap draws used for the percentile interval.
+    pub resamples: usize,
+    /// Whole-block label permutations used for the p-value.
+    pub permutations: usize,
+    /// Nominal interval coverage under the method's assumptions.
+    pub confidence: f64,
+    /// Target used by the Benjamini-Hochberg thresholding rule.
+    pub fdr: f64,
+    /// Root seed; individual estimators derive their documented streams from it.
+    pub seed: u64,
+    /// Declares the data-selected, exploratory scope of detector reports.
+    pub interpretation: String,
+    /// Assumptions and limitations that the reported thresholds do not establish.
+    pub assumptions: String,
+}
 
 /// Parameters governing a certification pass.
 ///
@@ -52,15 +74,16 @@ pub struct CertificationParams {
     pub window: usize,
     /// Bootstrap resamples for the shift's confidence interval.
     pub n_resamples: usize,
-    /// Permutations for the significance test.
+    /// Whole-block label permutations for the significance test.
     pub n_permutations: usize,
     /// Confidence level for the shift CI, e.g. `0.95`.
     pub confidence: f64,
-    /// Target false-discovery rate for the Benjamini-Hochberg pass across a run's events.
+    /// Target for Benjamini-Hochberg thresholding across the tested events.
+    /// This alone does not establish FDR control for data-selected boundaries.
     pub fdr: f64,
-    /// Moving-block length for the block bootstrap. Metric series are autocorrelated, so a
-    /// per-point bootstrap would understate the uncertainty; this should scale with the series'
-    /// correlation length.
+    /// Contiguous block length for both the shift CI and significance test.
+    /// Each window must hold at least two complete blocks; the declared value is never clamped.
+    /// Choosing an adequate correlation length remains the caller's responsibility.
     pub block_len: usize,
     /// Seed for all resampling. Fixed ⇒ the certification is reproducible.
     pub seed: u64,
@@ -80,16 +103,75 @@ impl Default for CertificationParams {
     }
 }
 
-/// The certification verdict for a single event.
+impl CertificationParams {
+    /// Validate statistical controls before attempting or skipping any event windows.
+    ///
+    /// Invalid controls are errors even for an empty candidate list. The minimum of two
+    /// complete blocks per side prevents a full-window circular resample from being reported
+    /// as a zero-uncertainty estimate; it does not certify the block-length choice.
+    ///
+    /// # Errors
+    ///
+    /// Refuses windows smaller than two observations, unsupported block lengths, zero
+    /// draw counts, and invalid confidence or false-discovery-rate targets.
+    pub fn validate(&self) -> Result<(), StatsError> {
+        if self.window < 2 {
+            return Err(StatsError::EmptySample {
+                what: "certify.window (needs at least two observations per side)",
+            });
+        }
+        stats::validate_time_series_block_len(self.window, self.block_len)?;
+        if self.n_resamples == 0 || self.n_permutations == 0 {
+            return Err(StatsError::ZeroResamples);
+        }
+        if !(0.0 < self.confidence && self.confidence < 1.0) {
+            return Err(StatsError::InvalidConfidence {
+                level: self.confidence,
+            });
+        }
+        if !(self.fdr.is_finite() && 0.0 < self.fdr && self.fdr <= 1.0) {
+            return Err(StatsError::InvalidFalseDiscoveryRate { rate: self.fdr });
+        }
+        Ok(())
+    }
+
+    /// Describe the configured estimators without claiming their assumptions were verified.
+    ///
+    /// Call [`Self::validate`] before publishing numerical results. The root seed drives
+    /// the shift CI directly, the contextual after mean uses `seed ^ 0xA5A5`, and the
+    /// significance test uses `seed ^ 0x1234`.
+    #[must_use]
+    pub fn method(&self) -> CertificationMethod {
+        CertificationMethod {
+            confidence_interval: SHIFT_CI_METHOD.to_owned(),
+            p_value: SIGNIFICANCE_METHOD.to_owned(),
+            block_len: self.block_len,
+            resamples: self.n_resamples,
+            permutations: self.n_permutations,
+            confidence: self.confidence,
+            fdr: self.fdr,
+            seed: self.seed,
+            interpretation: "exploratory_selected_events".to_owned(),
+            assumptions: "Approximately stationary short-range dependence within each window; \
+                exchangeable equal-length blocks under the null. Dependence across block \
+                boundaries and event selection from the same data are not corrected. \
+                Benjamini-Hochberg flags do not establish unconditional false-discovery control."
+                .to_owned(),
+        }
+    }
+}
+
+/// The exploratory assessment of a single event.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EventCertification {
     /// Index into the metric series where the event fired.
     pub event_index: usize,
-    /// Confidence interval on the mean shift (`after - before`).
+    /// Circular moving-block percentile interval on the mean shift (`after - before`).
     pub shift_ci: ConfidenceInterval,
     /// Autocorrelation-aware CI on the after-window mean alone, for context.
     pub after_mean_ci: ConfidenceInterval,
-    /// Two-sided permutation p-value against the null that the event changed nothing.
+    /// Two-sided whole-block permutation p-value under block exchangeability.
+    /// It does not correct for selecting the event from these same observations.
     pub p_value: f64,
     /// Parametric effect size (standardized mean difference).
     pub cohens_d: f64,
@@ -107,12 +189,12 @@ pub struct EventCertification {
     pub n_before: usize,
     /// Number of samples in the after window that was tested.
     pub n_after: usize,
-    /// `p_value < alpha` with NO multiple-testing correction. Reported for transparency, but it
-    /// is NOT the field to act on across a run — that is what `significant_fdr` is for.
+    /// `p_value <= fdr` before multiple-testing thresholding.
+    /// This is an exploratory flag, not independent confirmation of a selected event.
     pub significant_uncorrected: bool,
-    /// Survives Benjamini-Hochberg control at the run's target FDR. This is the honest verdict
-    /// for an event that is one of many. For a single isolated event it equals the uncorrected
-    /// result, because there is nothing to correct against.
+    /// Survives the Benjamini-Hochberg thresholding rule at the configured target.
+    /// FDR control additionally requires valid p-values and hypothesis-dependence assumptions;
+    /// this flag does not establish them. A single event has the uncorrected flag.
     pub significant_fdr: bool,
 }
 
@@ -120,38 +202,41 @@ pub struct EventCertification {
 ///
 /// With a single event there is no multiple-testing to correct, so `significant_fdr` equals
 /// `significant_uncorrected`. Use [`certify_run`] for the realistic case of many events, where
-/// the FDR control is the entire value.
+/// the same thresholding rule is applied across all tested events.
 pub fn certify_event(
     series: &[f64],
     event_index: usize,
     params: &CertificationParams,
 ) -> Result<EventCertification, StatsError> {
+    params.validate()?;
     let (before, after) = windows(series, event_index, params.window)?;
 
-    let shift_ci = bootstrap_mean_difference_ci(
+    let shift_ci = moving_block_bootstrap_mean_difference_ci(
         before,
         after,
+        params.block_len,
         params.n_resamples,
         params.confidence,
         params.seed,
     )?;
     let after_mean_ci = moving_block_bootstrap_mean_ci(
         after,
-        params.block_len.min(after.len()).max(1),
+        params.block_len,
         params.n_resamples,
         params.confidence,
         params.seed ^ 0xA5A5,
     )?;
-    let test = permutation_test_mean_difference(
+    let test = block_permutation_test_mean_difference(
         before,
         after,
+        params.block_len,
         params.n_permutations,
         params.seed ^ 0x1234,
     )?;
     let d = cohens_d(before, after)?;
     let delta = cliffs_delta(before, after)?;
 
-    let uncorrected = test.p_value < params.fdr;
+    let uncorrected = test.p_value <= params.fdr;
     Ok(EventCertification {
         event_index,
         shift_ci,
@@ -174,10 +259,10 @@ pub fn certify_event(
 
 /// Certify every event in a run, then apply Benjamini-Hochberg across all of them.
 ///
-/// This is the realistic path. Each event is tested independently; then the whole vector of
-/// p-values is passed through [`benjamini_hochberg`] at `params.fdr`, and `significant_fdr` is set
-/// from the corrected decision. An event that would clear an isolated α = 0.05 test can fail here
-/// — correctly — because it is competing against every other event flagged in the same run.
+/// Each event receives a block-based assessment; then the vector of p-values is passed through
+/// [`benjamini_hochberg`] at `params.fdr`. This applies the thresholding rule, without claiming
+/// that overlapping windows are independent or that data-selected events have valid
+/// confirmatory p-values. The rule cannot repair either assumption.
 ///
 /// Events whose windows fall outside the series (too close to the start or end) are DROPPED with
 /// their index recorded in the returned `skipped` list, never silently ignored: an event the
@@ -187,6 +272,7 @@ pub fn certify_run(
     event_indices: &[usize],
     params: &CertificationParams,
 ) -> Result<RunCertification, StatsError> {
+    params.validate()?;
     let mut certifications = Vec::new();
     let mut skipped = Vec::new();
     for &event_index in event_indices {
@@ -224,8 +310,7 @@ pub struct RunCertification {
     pub skipped: Vec<usize>,
     /// The false-discovery rate the Benjamini-Hochberg pass targeted.
     pub target_fdr: f64,
-    /// How many events survived FDR control — the count a report should headline, not the raw
-    /// number of events the detector fired.
+    /// How many events survived the exploratory Benjamini-Hochberg thresholding rule.
     pub discoveries: usize,
 }
 
@@ -283,13 +368,18 @@ fn windows(
             what: "certify.window",
         });
     }
-    if event_index < window || event_index + window > series.len() {
+    let Some(end) = event_index.checked_add(window) else {
+        return Err(StatsError::EmptySample {
+            what: "certify.out_of_range",
+        });
+    };
+    if event_index < window || end > series.len() {
         return Err(StatsError::EmptySample {
             what: "certify.out_of_range",
         });
     }
     let before = &series[event_index - window..event_index];
-    let after = &series[event_index..event_index + window];
+    let after = &series[event_index..end];
     Ok((before, after))
 }
 
@@ -597,6 +687,197 @@ mod tests {
         assert_eq!(
             a, b,
             "same series, index and params must give a bit-identical certification"
+        );
+    }
+
+    #[test]
+    fn reported_shift_and_significance_use_the_declared_blocks() {
+        let before: Vec<f64> = [0.0, 2.0]
+            .into_iter()
+            .flat_map(|value| std::iter::repeat_n(value, 16))
+            .collect();
+        let after: Vec<f64> = [1.0, 3.0]
+            .into_iter()
+            .flat_map(|value| std::iter::repeat_n(value, 16))
+            .collect();
+        let series: Vec<f64> = before.iter().chain(&after).copied().collect();
+        let params = CertificationParams {
+            window: before.len(),
+            block_len: 16,
+            n_resamples: 256,
+            n_permutations: 256,
+            seed: 42,
+            ..CertificationParams::default()
+        };
+        let blocked = certify_event(&series, before.len(), &params).unwrap();
+        let independent = certify_event(
+            &series,
+            before.len(),
+            &CertificationParams {
+                block_len: 1,
+                ..params
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            blocked.shift_ci,
+            stats::moving_block_bootstrap_mean_difference_ci(
+                &before,
+                &after,
+                params.block_len,
+                params.n_resamples,
+                params.confidence,
+                params.seed,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            blocked.p_value,
+            stats::block_permutation_test_mean_difference(
+                &before,
+                &after,
+                params.block_len,
+                params.n_permutations,
+                params.seed ^ 0x1234,
+            )
+            .unwrap()
+            .p_value
+        );
+        assert!(
+            independent.significant_uncorrected,
+            "the IID control must expose the pseudoreplication defect"
+        );
+        assert!(
+            !blocked.significant_uncorrected,
+            "four correlated plateaus are insufficient independent evidence for this shift"
+        );
+        assert_ne!(blocked.shift_ci, independent.shift_ci);
+        assert_ne!(blocked.p_value, independent.p_value);
+        let run = certify_run(&series, &[before.len()], &params).unwrap();
+        assert_eq!(run.discoveries, 0);
+    }
+
+    #[test]
+    fn invalid_controls_refuse_empty_and_out_of_range_event_sets() {
+        let defaults = CertificationParams::default();
+        let invalid = [
+            CertificationParams {
+                window: 0,
+                ..defaults
+            },
+            CertificationParams {
+                window: 1,
+                block_len: 1,
+                ..defaults
+            },
+            CertificationParams {
+                block_len: 0,
+                ..defaults
+            },
+            CertificationParams {
+                block_len: defaults.window,
+                ..defaults
+            },
+            CertificationParams {
+                block_len: 16,
+                ..defaults
+            },
+            CertificationParams {
+                n_resamples: 0,
+                ..defaults
+            },
+            CertificationParams {
+                n_permutations: 0,
+                ..defaults
+            },
+            CertificationParams {
+                confidence: 0.0,
+                ..defaults
+            },
+            CertificationParams {
+                confidence: 1.0,
+                ..defaults
+            },
+            CertificationParams {
+                confidence: f64::NAN,
+                ..defaults
+            },
+            CertificationParams {
+                fdr: 0.0,
+                ..defaults
+            },
+            CertificationParams {
+                fdr: -0.1,
+                ..defaults
+            },
+            CertificationParams {
+                fdr: 1.1,
+                ..defaults
+            },
+            CertificationParams {
+                fdr: f64::INFINITY,
+                ..defaults
+            },
+            CertificationParams {
+                fdr: f64::NAN,
+                ..defaults
+            },
+        ];
+        for params in invalid {
+            assert!(params.validate().is_err());
+            assert!(certify_run(&[], &[], &params).is_err());
+            assert!(certify_run(&[1.0; 8], &[usize::MAX], &params).is_err());
+            assert!(certify_event(&[1.0; 8], usize::MAX, &params).is_err());
+        }
+    }
+
+    #[test]
+    fn overflowing_event_windows_are_skipped_without_partial_evidence() {
+        let params = CertificationParams {
+            window: 2,
+            block_len: 1,
+            n_resamples: 32,
+            n_permutations: 32,
+            ..CertificationParams::default()
+        };
+        let run = certify_run(&[1.0; 8], &[usize::MAX, 0, 4], &params).unwrap();
+        assert_eq!(run.skipped, vec![usize::MAX, 0]);
+        assert_eq!(run.certifications.len(), 1);
+        assert_eq!(run.certifications[0].event_index, 4);
+        assert_eq!(run.discoveries, 0);
+    }
+
+    #[test]
+    fn method_metadata_binds_actual_controls_and_exploratory_interpretation() {
+        let params = CertificationParams {
+            window: 24,
+            block_len: 6,
+            n_resamples: 128,
+            n_permutations: 256,
+            confidence: 0.9,
+            fdr: 0.1,
+            seed: 123,
+        };
+        params.validate().unwrap();
+        let method = params.method();
+        assert_eq!(method.confidence_interval, SHIFT_CI_METHOD);
+        assert_eq!(method.p_value, SIGNIFICANCE_METHOD);
+        assert_eq!(method.block_len, 6);
+        assert_eq!(method.resamples, 128);
+        assert_eq!(method.permutations, 256);
+        assert_eq!(method.confidence, 0.9);
+        assert_eq!(method.fdr, 0.1);
+        assert_eq!(method.seed, 123);
+        assert_eq!(method.interpretation, "exploratory_selected_events");
+        assert!(method.assumptions.contains("exchangeable equal-length blocks"));
+        assert!(method.assumptions.contains("event selection"));
+        assert_eq!(
+            serde_json::from_str::<CertificationMethod>(
+                &serde_json::to_string(&method).unwrap()
+            )
+            .unwrap(),
+            method
         );
     }
 

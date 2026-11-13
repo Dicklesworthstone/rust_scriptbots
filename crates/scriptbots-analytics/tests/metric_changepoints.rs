@@ -156,3 +156,65 @@ fn a_window_larger_than_any_series_examines_nothing_without_erroring() {
     assert_eq!(out.machine["metrics_examined"], 0);
     assert_eq!(out.machine["significant"], 0);
 }
+
+#[test]
+fn report_exposes_the_actual_block_methods_and_refuses_invalid_controls_on_empty_data() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("empty.sqlite").display().to_string();
+    let mut storage = Storage::create_unattributed_file(&path).expect("create empty run");
+    storage.flush().expect("flush");
+    storage.close().expect("close");
+    let cx = ReaderCtx::open(&path).expect("reader");
+    let registry = Registry::builtin();
+    let params = ReportParams::from_pairs([
+        "window=24".to_owned(),
+        "block_len=3".to_owned(),
+        "resamples=123".to_owned(),
+        "permutations=321".to_owned(),
+    ])
+    .expect("params");
+    let out = registry
+        .run("metric-changepoints", &cx, &params)
+        .expect("empty analysis");
+    assert_eq!(out.schema_version, 2);
+    assert_eq!(out.machine["metrics_examined"], 0);
+    assert_eq!(
+        out.machine["inference"]["confidence_interval"],
+        "circular_moving_block_bootstrap_percentile_v1"
+    );
+    assert_eq!(
+        out.machine["inference"]["p_value"],
+        "length_stratified_whole_block_permutation_v1"
+    );
+    assert_eq!(out.machine["inference"]["block_len"], 3);
+    assert_eq!(out.machine["inference"]["resamples"], 123);
+    assert_eq!(out.machine["inference"]["permutations"], 321);
+    assert_eq!(
+        out.machine["inference"]["interpretation"],
+        "exploratory_selected_events"
+    );
+    assert!(out.human_md.contains("do not correct for this selection"));
+    assert!(out.human_md.contains("need not be adjacent simulation ticks"));
+
+    for raw in [
+        "window=0",
+        "window=1",
+        "block_len=0",
+        "block_len=16",
+        "fdr=NaN",
+        "fdr=0",
+        "fdr=2",
+        "resamples=0",
+        "permutations=0",
+        "blocks=5",
+    ] {
+        let invalid = ReportParams::from_pairs([raw.to_owned()]).expect("syntax");
+        assert!(
+            matches!(
+                registry.run("metric-changepoints", &cx, &invalid),
+                Err(scriptbots_analytics::AnalyticsError::BadParam { .. })
+            ),
+            "invalid controls must fail even with no metric rows: {raw}"
+        );
+    }
+}
