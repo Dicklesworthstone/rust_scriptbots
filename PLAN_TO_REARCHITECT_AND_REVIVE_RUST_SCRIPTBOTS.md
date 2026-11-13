@@ -2,6 +2,26 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Experiment checkpoint promotion safety (2026-11-12):**
+[Source implemented and independently reviewed — Codex; executable qualification open]
+
+Continue the crash-safe resume contract in `bd-2z0.5.11`. An interrupted
+temporary successor previously passed canonical framing, plan, capacity and
+parent/tick checks before replacing the committed checkpoint, while executable
+brain-registry and reconstructed scientific-state checks happened only afterward.
+Recovery now restores the candidate owner through the production adapter boundary
+before synchronizing or promoting its file. A refusal preserves the exact parent
+and temporary evidence. Ordinary reads without a temporary successor retain their
+existing restoration path.
+
+The added regression captures genuine MLP and DWRAON owners, wraps the foreign
+owner in matching metadata with authentic checksums, and checks repeated refusal,
+byte-identical retained files and continued parent restorability. Its positive
+control promotes a genuine MLP successor and compares the restored scientific
+digest. The test is authored but has not executed: this session has GitHub access
+and no usable execution environment. No DSR, compiler, Rustfmt, Clippy or UBS pass
+is claimed. Original acceptance and tracker status remain unchanged.
+
 **Checkpoint usability and experiment resource admission (2026-11-13):**
 [Source implemented and independently reviewed — Codex; browser DSR passed,
 native and full-workspace qualification open]

@@ -2970,6 +2970,13 @@ impl MatchedSeedExperimentRunner {
                 "temporary cut does not extend the exact committed parent by one tick",
             ));
         }
+        // Decoding validates the data envelope, but executable adapters and the
+        // recomputed scientific digest are checked only by restoring the owner.
+        // Refuse an unrestorable successor while the exact committed parent and
+        // temporary evidence still exist. Ordinary reads without a temporary cut
+        // keep their existing single-restore path.
+        let family = ResolvedBrainFamily::resolve(variant)?;
+        drop(restore_run_owner(&candidate, family, run_id, &temporary)?);
         File::open(&temporary)
             .and_then(|file| file.sync_all())
             .map_err(|source| ExperimentRunnerError::Io {
@@ -7415,6 +7422,165 @@ mod tests {
         assert_eq!(
             outcomes[0].values().collect::<BTreeSet<_>>().len(),
             outcomes[0].len()
+        );
+    }
+
+    #[test]
+    fn checkpoint_recovery_restores_candidate_before_replacing_the_committed_cut() {
+        let directory = tempfile::tempdir().unwrap();
+        let runner = progress_runner(directory.path(), vec![7]);
+        let plan = runner.validated_plan().unwrap();
+        let record = &plan.runs[0];
+        let (variant, family) = &plan.variants[&record.variant_id];
+        runner
+            .prepare_run_checkpoint(
+                variant,
+                *family,
+                record.seed,
+                &record.run_id,
+                &plan.digest,
+            )
+            .unwrap();
+        let path = runner.run_checkpoint_path(&record.run_id);
+        let temporary = status_temporary_path(&path).unwrap();
+        let parent_bytes = fs::read(&path).unwrap();
+        let parent = RunCheckpointV1::decode(&parent_bytes, &path).unwrap();
+        let parent_digest = blake3::hash(&parent_bytes).to_hex().to_string();
+        let _lease = ExperimentStatusWriterLease::acquire(&path).unwrap();
+
+        // Capture actual one-tick owners from both executable families. Their
+        // metadata and outer checksums cannot prove the expected family was run.
+        let next_owner = |checkpoint: &RunCheckpointV1, chosen: ResolvedBrainFamily| {
+            let mut owner = restore_run_owner(checkpoint, chosen, &record.run_id, &path).unwrap();
+            let (_, namespace) = host_identifiers(&record.run_id);
+            let mut frontend = NullFrontend::new(owner.local_port(), namespace);
+            let mut now = 0;
+            let submitted = frontend
+                .submit_envelope(CommandEnvelope::new(
+                    CommandId::from_client_sequence(namespace, 1),
+                    HostCommand::Step,
+                ))
+                .unwrap();
+            drive_command_to_volatile_commit(
+                &record.run_id,
+                "candidate owner step",
+                &mut frontend,
+                &mut owner,
+                submitted.command_id(),
+                1,
+                0,
+                &mut now,
+            )
+            .unwrap();
+            seal_run_checkpoint(&record.run_id, &mut frontend, &mut owner, &mut now).unwrap();
+            owner.capture_volatile_host_checkpoint_v1().unwrap()
+        };
+        let mut valid = RunCheckpointV1 {
+            metadata: parent.metadata.clone(),
+            owner: next_owner(&parent, *family),
+        };
+        valid.metadata.parent_digest = Some(parent_digest.clone());
+        let other_family = runner
+            .initial_run_checkpoint(
+                variant,
+                ResolvedBrainFamily::Dwraon,
+                record.seed,
+                &record.run_id,
+                &plan.digest,
+            )
+            .unwrap();
+        let mut wrong_family = RunCheckpointV1 {
+            metadata: parent.metadata.clone(),
+            owner: next_owner(&other_family, ResolvedBrainFamily::Dwraon),
+        };
+        wrong_family.metadata.parent_digest = Some(parent_digest);
+        let wrong_bytes = wrong_family.encode(&temporary).unwrap();
+        let decoded = RunCheckpointV1::decode(&wrong_bytes, &temporary).unwrap();
+        runner
+            .validate_run_checkpoint(
+                &temporary,
+                &decoded,
+                variant,
+                record.seed,
+                &record.run_id,
+                &plan.digest,
+            )
+            .expect("the authentic owner passes framing, metadata, capacity and schedule checks");
+        assert_ne!(
+            decoded
+                .owner
+                .host_checkpoint()
+                .world_checkpoint()
+                .required_brain_registry(),
+            parent
+                .owner
+                .host_checkpoint()
+                .world_checkpoint()
+                .required_brain_registry()
+        );
+        assert!(
+            restore_run_owner(&decoded, *family, &record.run_id, &temporary).is_err(),
+            "the declared MLP executable cannot restore the real DWRAON owner"
+        );
+        fs::write(&temporary, &wrong_bytes).unwrap();
+
+        for _ in 0..2 {
+            let error = runner
+                .load_run_checkpoint(
+                    variant,
+                    record.seed,
+                    &record.run_id,
+                    &plan.digest,
+                    MAX_RUN_POPULATION,
+                )
+                .err()
+                .expect("an unrestorable successor must not replace the recoverable parent");
+            assert!(
+                matches!(
+                    &error,
+                    ExperimentRunnerError::InvalidCheckpoint { path: refused, reason }
+                        if refused == &temporary && reason.contains("prepared brain registry")
+                ),
+                "{error}"
+            );
+            assert_eq!(fs::read(&path).unwrap(), parent_bytes);
+            assert_eq!(fs::read(&temporary).unwrap(), wrong_bytes);
+            assert!(!path.with_extension("checkpoint.interrupted").exists());
+            assert_eq!(
+                restore_run_owner(&parent, *family, &record.run_id, &path)
+                    .unwrap()
+                    .world_tick()
+                    .0,
+                0
+            );
+        }
+
+        // The same recovery path still admits a genuine, executable successor.
+        let valid_bytes = valid.encode(&temporary).unwrap();
+        let expected = restore_run_owner(&valid, *family, &record.run_id, &temporary)
+            .unwrap()
+            .scientific_digest_v1()
+            .unwrap();
+        fs::write(&temporary, &valid_bytes).unwrap();
+        let recovered = runner
+            .load_run_checkpoint(
+                variant,
+                record.seed,
+                &record.run_id,
+                &plan.digest,
+                MAX_RUN_POPULATION,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.owner.host_checkpoint().tick().0, 1);
+        assert_eq!(fs::read(&path).unwrap(), valid_bytes);
+        assert!(!temporary.exists());
+        assert_eq!(
+            restore_run_owner(&recovered, *family, &record.run_id, &path)
+                .unwrap()
+                .scientific_digest_v1()
+                .unwrap(),
+            expected
         );
     }
 
