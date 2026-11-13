@@ -961,6 +961,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
             sync_camera_tonemapping,
             (
                 poll_owner_inspector,
+                reveal_creature_details,
                 toggle_creature_details,
                 handle_inspector_page.run_if(lab_workflows::camera_controls_allowed),
                 update_genome_slice_button_visibility,
@@ -3835,7 +3836,12 @@ struct CreaturePreferenceLabel(CreaturePreference);
 struct CreatureDetailsButton;
 
 #[derive(Component)]
-struct CreatureDetailsSection;
+struct CreatureDetailsButtonLabel;
+
+#[derive(Component, Default)]
+struct CreatureDetailsSection {
+    reveal_next_frame: bool,
+}
 
 #[derive(Component)]
 struct CreatureBrainLayer(usize);
@@ -3857,18 +3863,54 @@ struct CreatureBrainSlot {
 
 fn toggle_creature_details(
     buttons: Query<&Interaction, (Changed<Interaction>, With<CreatureDetailsButton>)>,
-    mut sections: Query<&mut Node, With<CreatureDetailsSection>>,
+    mut sections: Query<(&mut Node, &mut CreatureDetailsSection)>,
+    mut labels: Query<&mut Text, With<CreatureDetailsButtonLabel>>,
+    mut panels: Query<&mut ScrollPosition, With<HudScenePanel>>,
 ) {
     for interaction in &buttons {
         if *interaction == Interaction::Pressed {
-            for mut section in &mut sections {
-                section.display = if section.display == Display::None {
+            for (mut node, mut section) in &mut sections {
+                let opening = node.display == Display::None;
+                node.display = if opening {
                     Display::Flex
                 } else {
                     Display::None
                 };
+                section.reveal_next_frame = opening;
+                for mut label in &mut labels {
+                    let text = if opening {
+                        "Hide detailed readings"
+                    } else {
+                        "Show detailed readings"
+                    };
+                    set_hud_text_if_changed(&mut label, text.to_owned());
+                }
+                if !opening {
+                    for mut scroll in &mut panels {
+                        scroll.0.y = 0.0;
+                    }
+                }
             }
         }
+    }
+}
+
+/// The expanded section is laid out after Update, so reveal it on the next
+/// frame using the panel's new content height rather than its collapsed size.
+fn reveal_creature_details(
+    mut sections: Query<(&Node, &mut CreatureDetailsSection)>,
+    mut panels: Query<(&ComputedNode, &mut ScrollPosition), With<HudScenePanel>>,
+) {
+    for (node, mut section) in &mut sections {
+        if !section.reveal_next_frame || node.display == Display::None {
+            continue;
+        }
+        for (computed, mut scroll) in &mut panels {
+            scroll.0.y = ((computed.content_size.y - computed.size.y).max(0.0)
+                * computed.inverse_scale_factor)
+                .max(0.0);
+        }
+        section.reveal_next_frame = false;
     }
 }
 
@@ -7237,9 +7279,10 @@ fn setup_scene(
                 ))
                 .with_children(|button| {
                     button.spawn((
-                        Text::new("Detailed readings"),
+                        Text::new("Show detailed readings"),
                         ui_font(12.0),
                         TextColor(secondary_text_color),
+                        CreatureDetailsButtonLabel,
                     ));
                 });
                 card.spawn((
@@ -7249,7 +7292,7 @@ fn setup_scene(
                         row_gap: Val::Px(7.0),
                         ..default()
                     },
-                    CreatureDetailsSection,
+                    CreatureDetailsSection::default(),
                 ))
                 .with_children(|card| {
                     card.spawn(Node {
@@ -10407,7 +10450,7 @@ mod hud_inspector_tests {
     }
 
     #[test]
-    fn creature_details_toggle_without_hiding_the_overview() {
+    fn creature_details_reveal_after_layout_and_restore_the_overview() {
         let mut app = App::new();
         let section = app
             .world_mut()
@@ -10416,15 +10459,38 @@ mod hud_inspector_tests {
                     display: Display::None,
                     ..default()
                 },
-                CreatureDetailsSection,
+                CreatureDetailsSection::default(),
             ))
             .id();
         let button = app
             .world_mut()
             .spawn((Interaction::None, CreatureDetailsButton))
             .id();
+        let label = app
+            .world_mut()
+            .spawn((
+                Text::new("Show detailed readings"),
+                CreatureDetailsButtonLabel,
+            ))
+            .id();
+        let panel = app
+            .world_mut()
+            .spawn((
+                ComputedNode {
+                    size: Vec2::new(400.0, 300.0),
+                    content_size: Vec2::new(400.0, 300.0),
+                    inverse_scale_factor: 0.5,
+                    ..default()
+                },
+                ScrollPosition::default(),
+                HudScenePanel,
+            ))
+            .id();
         let overview = app.world_mut().spawn(Node::default()).id();
-        app.add_systems(Update, toggle_creature_details);
+        app.add_systems(
+            Update,
+            (reveal_creature_details, toggle_creature_details).chain(),
+        );
         app.update();
         *app.world_mut().get_mut::<Interaction>(button).unwrap() = Interaction::Pressed;
         app.update();
@@ -10436,6 +10502,27 @@ mod hud_inspector_tests {
             app.world().get::<Node>(overview).unwrap().display,
             Display::Flex
         );
+        assert_eq!(
+            app.world().get::<Text>(label).unwrap().0,
+            "Hide detailed readings"
+        );
+        assert_eq!(app.world().get::<ScrollPosition>(panel).unwrap().0.y, 0.0);
+        // The expanded content size is available only after UI layout.
+        app.world_mut()
+            .get_mut::<ComputedNode>(panel)
+            .unwrap()
+            .content_size
+            .y = 700.0;
+        app.update();
+        assert_eq!(app.world().get::<ScrollPosition>(panel).unwrap().0.y, 200.0);
+        // A later frame must not override the user's own scroll position.
+        app.world_mut()
+            .get_mut::<ScrollPosition>(panel)
+            .unwrap()
+            .0
+            .y = 50.0;
+        app.update();
+        assert_eq!(app.world().get::<ScrollPosition>(panel).unwrap().0.y, 50.0);
         *app.world_mut().get_mut::<Interaction>(button).unwrap() = Interaction::None;
         app.update();
         *app.world_mut().get_mut::<Interaction>(button).unwrap() = Interaction::Pressed;
@@ -10444,6 +10531,11 @@ mod hud_inspector_tests {
             app.world().get::<Node>(section).unwrap().display,
             Display::None
         );
+        assert_eq!(
+            app.world().get::<Text>(label).unwrap().0,
+            "Show detailed readings"
+        );
+        assert_eq!(app.world().get::<ScrollPosition>(panel).unwrap().0.y, 0.0);
     }
 
     #[test]
