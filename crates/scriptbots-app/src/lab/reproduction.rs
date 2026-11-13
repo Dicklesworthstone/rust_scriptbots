@@ -1,9 +1,9 @@
 //! Retained-evidence verification and same-build canonical cohort re-execution.
 use super::notebook::{NotebookContext, RunRef};
-use super::spec::Arm;
+use super::spec::{Arm, InteractionContrast};
 use super::stats::{
     AnalysisParams, LAB_RUN_SUMMARY_VERSION, MatchedSeedAnalysis, RunSummary,
-    analyze_matched_seed_runs,
+    analyze_matched_seed_runs_with_interactions,
 };
 use crate::experiment_runner::{
     ExperimentBatchStatus, MatchedSeedCohort, MatchedSeedExperimentRunner, RunRecord, RunState,
@@ -17,9 +17,9 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
-// v3 also binds the actual paired-inference procedure and sign-assignment counts;
-// timed schedules remain bound in executable variants and v4 scientific rows.
-const SCHEMA: u32 = 3;
+// v4 binds the complete predeclared interaction design and the joint correction
+// family, as well as timed treatments, v4 scientific rows and actual inference work.
+const SCHEMA: u32 = 4;
 const MAX_INPUT_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, clap::Args)]
@@ -69,6 +69,8 @@ struct ReproductionInput {
     ticks: u64,
     context: NotebookContext,
     runs: Vec<SerializedRun>,
+    // Required even when empty: the declaration is distinct from the result table.
+    interaction_contrasts: Vec<InteractionContrast>,
     analysis: Option<MatchedSeedAnalysis>,
     configs: Vec<String>,
 }
@@ -357,10 +359,17 @@ pub(crate) fn emit(
     session_id: &str,
     runs: &[RunRef],
     context: &NotebookContext,
-    analysis_choices: Option<(Vec<String>, AnalysisParams)>,
+    analysis_choices: Option<(Vec<String>, AnalysisParams, Vec<InteractionContrast>)>,
     configs: Vec<String>,
     out: &Path,
 ) -> Result<String> {
+    let (metrics, params, interaction_contrasts) = analysis_choices.unwrap_or_else(|| {
+        (
+            vec!["alive_agents".to_owned()],
+            AnalysisParams::default(),
+            Vec::new(),
+        )
+    });
     let mut input = ReproductionInput {
         schema: SCHEMA,
         session_id: session_id.to_owned(),
@@ -373,6 +382,7 @@ pub(crate) fn emit(
         ticks: 0,
         context: context.clone(),
         runs: Vec::new(),
+        interaction_contrasts,
         analysis: None,
         configs,
     };
@@ -459,10 +469,13 @@ pub(crate) fn emit(
                 reference.run_id
             );
         }
-        let (metrics, params) = analysis_choices
-            .unwrap_or_else(|| (vec!["alive_agents".to_owned()], AnalysisParams::default()));
         if input.variants.len() >= 2 {
-            input.analysis = Some(analyze_matched_seed_runs(&summaries, &metrics, params)?);
+            input.analysis = Some(analyze_matched_seed_runs_with_interactions(
+                &summaries,
+                &metrics,
+                params,
+                &input.interaction_contrasts,
+            )?);
         }
         input.runs = summaries.iter().map(SerializedRun::from_summary).collect();
     }
@@ -518,6 +531,16 @@ pub fn run(args: &ReproduceArgs) -> Result<()> {
     );
     let input: ReproductionInput = serde_json::from_slice(&bytes)?;
     ensure!(input.schema == SCHEMA, "reproduction schema mismatch");
+    match &input.analysis {
+        Some(analysis) => ensure!(
+            analysis.interaction_contrasts == input.interaction_contrasts,
+            "retained analysis differs from the declared interaction family"
+        ),
+        None => ensure!(
+            input.interaction_contrasts.is_empty(),
+            "declared interactions require a retained analysis"
+        ),
+    }
     ensure!(
         same_build_identity(&input.context.build),
         "expected source/build provenance mismatch"
@@ -592,7 +615,12 @@ pub fn run(args: &ReproduceArgs) -> Result<()> {
     compare_rows(&input.runs, &retained)?;
     if let Some(analysis) = &input.analysis {
         ensure!(
-            analyze_matched_seed_runs(&retained, &analysis.metrics, analysis.params)? == *analysis,
+            analyze_matched_seed_runs_with_interactions(
+                &retained,
+                &analysis.metrics,
+                analysis.params,
+                &input.interaction_contrasts,
+            )? == *analysis,
             "retained canonical analysis differs"
         );
     }
@@ -646,7 +674,14 @@ pub fn run(args: &ReproduceArgs) -> Result<()> {
     let analysis = input
         .analysis
         .as_ref()
-        .map(|expected| analyze_matched_seed_runs(&regenerated, &expected.metrics, expected.params))
+        .map(|expected| {
+            analyze_matched_seed_runs_with_interactions(
+                &regenerated,
+                &expected.metrics,
+                expected.params,
+                &input.interaction_contrasts,
+            )
+        })
         .transpose()?;
     ensure!(
         analysis == input.analysis,

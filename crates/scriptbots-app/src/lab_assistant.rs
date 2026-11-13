@@ -11,13 +11,19 @@ use crate::lab::llm::{
     LlmClient, LlmError, LlmMessage, LlmRequest, PROPOSE_EXPERIMENT_TOOL_NAME, StopReason,
     propose_experiment_tool,
 };
-use crate::lab::notebook::{NotebookRenderError, NotebookRenderer, claims_from_analysis, run_refs};
+#[cfg(test)]
+use crate::lab::notebook::claims_from_analysis;
+use crate::lab::notebook::{
+    NotebookRenderError, NotebookRenderer, claims_from_analysis_with_interactions, run_refs,
+};
 use crate::lab::spec::{
     Arm, ExperimentSpec, SpecBudget, SpecError, ValidatedSpec, render_errors, validate_spec,
 };
+#[cfg(test)]
+use crate::lab::stats::analyze_matched_seed_runs;
 use crate::lab::stats::{
     AnalysisParams, MatchedSeedAnalysis, RunSummary, RunSummaryParts, StatsError,
-    analyze_matched_seed_runs,
+    analyze_matched_seed_runs_with_interactions,
 };
 use scriptbots_storage::RunBundleV1;
 use serde::{Deserialize, Serialize};
@@ -723,7 +729,11 @@ impl LabStateMachine {
                      tool exactly once; prose is not an experiment. Config factors, brain families \
                      and intervention_schedules form a full treatment product over matched seeds. \
                      The first expanded arm is the baseline; put an empty schedule first to compare \
-                     an untreated control with timed numeric config patches. Same-tick patch order matters."
+                     an untreated control with timed numeric config patches. Same-tick patch order matters. \
+                     Set include_pairwise_interactions=true only when the hypothesis calls for interactions \
+                     between at least two varying axes. This predeclares every two-axis contrast against \
+                     the first levels, with other axes held at their first levels; it does not estimate \
+                     interactions averaged over the full grid."
                 .to_owned(),
             messages: vec![LlmMessage {
                 role: "user".to_owned(),
@@ -1004,10 +1014,11 @@ impl LabStateMachine {
             .as_ref()
             .ok_or_else(|| LabError::State("Analyze phase has no validated spec".to_owned()))?;
         let started = std::time::Instant::now();
-        let analysis = match analyze_matched_seed_runs(
+        let analysis = match analyze_matched_seed_runs_with_interactions(
             &self.run_summaries,
             &validated.spec.metrics,
             AnalysisParams::default(),
+            &validated.interaction_contrasts,
         ) {
             Ok(analysis) => analysis,
             Err(error) => {
@@ -1034,6 +1045,7 @@ impl LabStateMachine {
             stage = "analyze",
             inputs = self.run_summaries.len(),
             effects = analysis.effects.len(),
+            interactions = analysis.interactions.len(),
             correction = analysis.params.correction.as_str(),
             alternative = analysis.params.alternative.as_str(),
             bootstrap_iterations = analysis.params.bootstrap_iterations,
@@ -1140,9 +1152,10 @@ impl LabStateMachine {
                 validated.spec.hypothesis, validated.spec_id
             )
         };
-        let claims = match claims_from_analysis(
+        let claims = match claims_from_analysis_with_interactions(
             analysis,
             &self.run_summaries,
+            &validated.interaction_contrasts,
             &validated.spec.hypothesis,
             &validated.spec.falsifier,
         ) {
@@ -1192,6 +1205,7 @@ impl LabStateMachine {
             rationale = "notebook rendered and verified",
             stage = "report",
             effects = analysis.effects.len(),
+            interactions = analysis.interactions.len(),
             notebook_bytes = rendered.len(),
             "provenance-checked lab notebook rendered"
         );

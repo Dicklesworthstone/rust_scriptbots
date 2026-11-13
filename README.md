@@ -1853,6 +1853,40 @@ control; every later arm is compared with it through the existing matched-seed
 analysis. Result ingestion and notebook reproduction bind each arm to its actual
 family, launch configuration and exact ordered schedule.
 
+To ask whether two treatment axes change each other's effects, set
+`include_pairwise_interactions` in the proposal before execution. For example:
+
+```json
+{
+  "hypothesis": "Food growth affects MLP and DWRAON populations differently",
+  "falsifier": "The matched-seed interaction remains compatible with zero",
+  "factors": [{"knob_path": "food_growth_rate", "values": [0.01, 0.05]}],
+  "brain_families": ["mlp", "dwraon"],
+  "seeds": {"base": 41, "count": 8},
+  "ticks_per_run": 1000,
+  "metrics": ["alive_agents", "total_food"],
+  "include_pairwise_interactions": true,
+  "budget": {"runs": 32, "ticks": 32000}
+}
+```
+
+This predeclares every two-axis contrast between nonbaseline levels of configuration,
+family, and ordered-schedule axes. At least two axes must vary, and the complete
+treatment grid must fit the existing 32-arm limit. Each seed contributes one
+unscaled difference-in-differences: `both - first - second + baseline`. Other axes
+stay at their first declared levels, so the result is conditional on those levels.
+It is not averaged over the remaining factorial cells. The notebook names the
+exact levels, all four source arms, and their verified run evidence.
+
+Baseline comparisons and interaction tests share one multiple-comparison family;
+bootstrap intervals resample whole seed contrasts. Sign-flip inference requires
+independent seed contrasts symmetric about zero under the null. Matching seeds
+does not establish that assumption. Reproduction schema 4 retains the declared
+design separately from the result table and rederives both from verified source
+treatments and outcomes. Missing cells, changed labels, omitted contrasts, and
+inconsistent results are refused. Omitting the flag preserves baseline-only
+analysis and existing proposal identities.
+
 Builds with the `neuro` feature also admit `neuro`, `neuroflow`, and
 `ml.neuroflow`, recording the canonical family as `ml.neuroflow`. For example,
 `"brain_families": ["mlp", "neuroflow"]` compares the two executable families

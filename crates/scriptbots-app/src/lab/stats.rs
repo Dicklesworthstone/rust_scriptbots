@@ -1,5 +1,6 @@
 //! Analysis layer: effect sizes with CIs over matched-seed run summaries (bd-16g.1.4).
 
+use super::spec::{Arm, InteractionContrast, derive_interaction_contrasts};
 use rand::Rng;
 use scriptbots_core::SmallRngStream;
 use serde::{Deserialize, Serialize};
@@ -452,6 +453,8 @@ pub enum StatsError {
     /// The input family cannot be ranked without losing integer precision.
     #[error("Too many simultaneous comparisons to rank")]
     TooManyComparisons,
+    #[error("Invalid conditional interaction design: {reason}")]
+    InvalidInteractionDesign { reason: String },
 }
 
 /// Detailed paired effect size and confidence interval for matched-seed runs.
@@ -506,6 +509,24 @@ pub struct MatchedEffect {
     pub underpowered_reason: Option<UnderpoweredReason>,
 }
 
+/// A conditional, unscaled difference-in-differences across four observed arms.
+///
+/// Each independent seed contributes exactly one value, `(both - second) -
+/// (first - baseline)`. Other treatment axes remain at their first declared
+/// levels. This is not an interaction averaged over the remaining factorial grid.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MatchedInteraction {
+    pub metric: String,
+    pub contrast: InteractionContrast,
+    pub n_seeds: usize,
+    pub mean_difference_in_differences: f64,
+    pub ci_95: Option<(f64, f64)>,
+    pub ci_undefined_reason: Option<UndefinedReason>,
+    pub raw_p_value: f64,
+    pub adjusted: AdjustedComparison,
+    pub underpowered_reason: Option<UnderpoweredReason>,
+}
+
 /// Complete, ordered output of one matched-seed report.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MatchedSeedAnalysis {
@@ -521,6 +542,12 @@ pub struct MatchedSeedAnalysis {
     /// Typed identity of the confidence-interval procedure used for every effect.
     pub confidence_interval_procedure: ConfidenceIntervalProcedure,
     pub effects: Vec<MatchedEffect>,
+    /// Complete predeclared interaction family, independently checked against
+    /// the source arms before outcomes are reduced. Empty for baseline-only reports.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interaction_contrasts: Vec<InteractionContrast>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interactions: Vec<MatchedInteraction>,
 }
 
 /// One hypothesis after a multiple-comparison adjustment.
@@ -569,10 +596,7 @@ struct PairedPermutation {
 
 /// Evaluate every sign assignment under the within-pair exchangeability null.
 /// Matching seeds alone does not establish that assumption.
-fn exact_paired_permutation_p_value(
-    diffs: &[f64],
-    alternative: AlternativeHypothesis,
-) -> f64 {
+fn exact_paired_permutation_p_value(diffs: &[f64], alternative: AlternativeHypothesis) -> f64 {
     debug_assert!(!diffs.is_empty() && diffs.len() <= MAX_EXACT_SIGN_FLIP_PAIRS);
     let scale = diffs.iter().map(|value| value.abs()).fold(0.0, f64::max);
     // Keep every sum finite and include floating-point ties conservatively, even when
@@ -742,6 +766,19 @@ fn paired_components(
         diffs.push(difference);
     }
 
+    paired_difference_components(&diffs, params)
+}
+
+fn paired_difference_components(
+    diffs: &[f64],
+    params: &AnalysisParams,
+) -> Result<PairedComponents, StatsError> {
+    if diffs.is_empty() {
+        return Err(StatsError::NoSamples);
+    }
+    if diffs.iter().any(|value| !value.is_finite()) {
+        return Err(StatsError::NonFiniteValue);
+    }
     let n = diffs.len() as f64;
     let mean_difference = compensated_sum(diffs.iter().copied()) / n;
     if !mean_difference.is_finite() {
@@ -774,13 +811,13 @@ fn paired_components(
         None
     } else {
         Some(bootstrap_ci(
-            &diffs,
+            diffs,
             params.bootstrap_iterations,
             params.resampling_seed,
         )?)
     };
     let permutation = paired_permutation_p_value(
-        &diffs,
+        diffs,
         params.permutation_iterations,
         params.resampling_seed ^ 0x00F1_1900,
         params.alternative,
@@ -1231,6 +1268,14 @@ pub fn analyze_matched_seed_runs(
     metrics: &[String],
     params: AnalysisParams,
 ) -> Result<MatchedSeedAnalysis, StatsError> {
+    analyze_matched_seed_runs_with_interactions(summaries, metrics, params, &[])
+}
+
+fn matched_analysis_arms(
+    summaries: &[RunSummary],
+    metrics: &[String],
+    params: &AnalysisParams,
+) -> Result<BTreeMap<u16, Vec<RunSummary>>, StatsError> {
     if summaries.is_empty() || metrics.is_empty() {
         return Err(StatsError::NoSamples);
     }
@@ -1267,6 +1312,167 @@ pub fn analyze_matched_seed_runs(
     if arms.len() < 2 {
         return Err(StatsError::InsufficientArms);
     }
+    if !arms.contains_key(&0) {
+        return Err(StatsError::MissingControlArm);
+    }
+    Ok(arms)
+}
+
+fn validate_interaction_design(
+    arms: &BTreeMap<u16, Vec<RunSummary>>,
+    contrasts: &[InteractionContrast],
+) -> Result<(), StatsError> {
+    let invalid = |reason: &str| StatsError::InvalidInteractionDesign {
+        reason: reason.to_owned(),
+    };
+    let endpoint = arms
+        .get(&0)
+        .and_then(|runs| runs.first())
+        .ok_or(StatsError::MissingControlArm)?
+        .ticks;
+    let mut treatments = Vec::with_capacity(arms.len());
+    for (index, (&arm_id, rows)) in arms.iter().enumerate() {
+        if usize::from(arm_id) != index {
+            return Err(invalid("interaction arm IDs must be contiguous from zero"));
+        }
+        let first = rows.first().ok_or(StatsError::NoSamples)?;
+        if rows.iter().any(|row| {
+            row.ticks != endpoint
+                || row.variant_id != first.variant_id
+                || row.config_overrides != first.config_overrides
+                || row.brain_family != first.brain_family
+                || row.interventions != first.interventions
+        }) {
+            return Err(invalid(
+                "each arm must retain one treatment and a common observed endpoint across seeds",
+            ));
+        }
+        treatments.push(Arm {
+            brain_family: first.brain_family.clone(),
+            config_overrides: first.config_overrides.clone(),
+            interventions: first.interventions.clone(),
+        });
+    }
+    let expected = derive_interaction_contrasts(&treatments)
+        .map_err(|reason| StatsError::InvalidInteractionDesign { reason })?;
+    if expected != contrasts {
+        return Err(invalid(
+            "declared contrasts must equal the complete family derived from the observed treatment grid",
+        ));
+    }
+    Ok(())
+}
+
+fn interaction_components(
+    arms: &BTreeMap<u16, Vec<RunSummary>>,
+    contrast: &InteractionContrast,
+    metric: &str,
+    params: &AnalysisParams,
+) -> Result<PairedComponents, StatsError> {
+    let mut cells = Vec::with_capacity(4);
+    for arm_id in contrast.arm_ids {
+        let mut rows = arms
+            .get(&arm_id)
+            .ok_or_else(|| StatsError::InvalidInteractionDesign {
+                reason: format!("interaction cell arm {arm_id} is missing"),
+            })?
+            .iter()
+            .collect::<Vec<_>>();
+        rows.sort_by_key(|run| run.seed);
+        cells.push(rows);
+    }
+    if cells.iter().any(|rows| rows.len() != cells[0].len()) {
+        return Err(StatsError::UnmatchedSeeds);
+    }
+    let mut differences = Vec::with_capacity(cells[0].len());
+    for (index, baseline) in cells[0].iter().enumerate() {
+        let mut values = [0.0; 4];
+        for (cell, rows) in cells.iter().enumerate() {
+            if rows[index].seed != baseline.seed {
+                return Err(StatsError::UnmatchedSeeds);
+            }
+            values[cell] = *rows[index]
+                .metrics
+                .get(metric)
+                .ok_or_else(|| StatsError::MissingMetric(metric.to_owned()))?;
+        }
+        let first_at_baseline = values[1] - values[0];
+        let first_with_second = values[3] - values[2];
+        if values.iter().any(|value| !value.is_finite())
+            || !first_at_baseline.is_finite()
+            || !first_with_second.is_finite()
+        {
+            return Err(StatsError::NonFiniteValue);
+        }
+        differences.push(first_with_second - first_at_baseline);
+    }
+    paired_difference_components(&differences, params)
+}
+
+fn matched_effect(
+    metric: String,
+    treatment_arm: u16,
+    components: PairedComponents,
+    adjusted: AdjustedComparison,
+    params: &AnalysisParams,
+) -> MatchedEffect {
+    let undefined_reason = if components.n_pairs < 2 {
+        Some(UndefinedReason::InsufficientPairs {
+            have: components.n_pairs,
+            need: 2,
+        })
+    } else if components.standardized_effect.is_none() {
+        Some(UndefinedReason::ZeroVariance)
+    } else {
+        None
+    };
+    MatchedEffect {
+        metric,
+        control_arm: 0,
+        treatment_arm,
+        n_pairs: components.n_pairs,
+        estimator: TestName::PairedDifference,
+        alternative: params.alternative,
+        mean_difference: components.mean_difference,
+        standardized_effect: components.standardized_effect,
+        undefined_reason,
+        ci_95: components.ci_95,
+        ci_undefined_reason: components.ci_95.is_none().then_some(
+            UndefinedReason::InsufficientPairs {
+                have: components.n_pairs,
+                need: 2,
+            },
+        ),
+        raw_p_value: components.p_value,
+        adjusted,
+        underpowered_reason: (components.n_pairs < params.recommended_pairs).then_some(
+            UnderpoweredReason::FewerThanRecommendedPairs {
+                have: components.n_pairs,
+                recommended: params.recommended_pairs,
+            },
+        ),
+    }
+}
+
+/// Analyze baseline comparisons and a predeclared conditional interaction family.
+///
+/// An enabled interaction design must exactly match the complete family derived
+/// from the observed treatment metadata, including all levels and four cell IDs.
+/// Each seed supplies one difference-in-differences; no synthetic run rows or
+/// extra independent observations are created. Bootstrap intervals resample seeds.
+/// The interaction sign-flip null requires independent seed contrasts symmetric
+/// about zero, which is not established by seed matching alone. All baseline and
+/// interaction p-values enter one correction family in the published order.
+pub fn analyze_matched_seed_runs_with_interactions(
+    summaries: &[RunSummary],
+    metrics: &[String],
+    params: AnalysisParams,
+    interaction_contrasts: &[InteractionContrast],
+) -> Result<MatchedSeedAnalysis, StatsError> {
+    let arms = matched_analysis_arms(summaries, metrics, &params)?;
+    if !interaction_contrasts.is_empty() {
+        validate_interaction_design(&arms, interaction_contrasts)?;
+    }
     let control = arms.get(&0).ok_or(StatsError::MissingControlArm)?;
 
     struct Provisional {
@@ -1288,6 +1494,16 @@ pub fn analyze_matched_seed_runs(
     if provisional.is_empty() {
         return Err(StatsError::InsufficientArms);
     }
+    let mut provisional_interactions = Vec::new();
+    for contrast in interaction_contrasts {
+        for metric in metrics {
+            provisional_interactions.push((
+                metric.clone(),
+                contrast.clone(),
+                interaction_components(&arms, contrast, metric, &params)?,
+            ));
+        }
+    }
     // Every treatment was paired against the same complete control seed set.
     let p_value_procedure = provisional[0].components.p_value_procedure;
     let sign_assignments_evaluated = provisional[0].components.sign_assignments_evaluated;
@@ -1296,52 +1512,57 @@ pub fn analyze_matched_seed_runs(
         &provisional
             .iter()
             .map(|result| result.components.p_value)
+            .chain(
+                provisional_interactions
+                    .iter()
+                    .map(|(_, _, components)| components.p_value),
+            )
             .collect::<Vec<_>>(),
         params.alpha,
         params.correction,
     )?;
 
+    let mut adjusted = adjusted.into_iter();
+    let baseline_count = provisional.len();
     let effects = provisional
         .into_iter()
-        .zip(adjusted)
+        .zip(adjusted.by_ref().take(baseline_count))
         .map(|(result, adjusted)| {
-            let undefined_reason = if result.components.n_pairs < 2 {
-                Some(UndefinedReason::InsufficientPairs {
-                    have: result.components.n_pairs,
-                    need: 2,
-                })
-            } else if result.components.standardized_effect.is_none() {
-                Some(UndefinedReason::ZeroVariance)
-            } else {
-                None
-            };
-            let underpowered_reason = (result.components.n_pairs < params.recommended_pairs)
-                .then_some(UnderpoweredReason::FewerThanRecommendedPairs {
-                    have: result.components.n_pairs,
-                    recommended: params.recommended_pairs,
-                });
-            MatchedEffect {
-                metric: result.metric,
-                control_arm: 0,
-                treatment_arm: result.treatment_arm,
-                n_pairs: result.components.n_pairs,
-                estimator: TestName::PairedDifference,
-                alternative: params.alternative,
-                mean_difference: result.components.mean_difference,
-                standardized_effect: result.components.standardized_effect,
-                undefined_reason,
-                ci_95: result.components.ci_95,
-                ci_undefined_reason: result.components.ci_95.is_none().then_some(
+            matched_effect(
+                result.metric,
+                result.treatment_arm,
+                result.components,
+                adjusted,
+                &params,
+            )
+        })
+        .collect();
+    let interactions = provisional_interactions
+        .into_iter()
+        .zip(adjusted)
+        .map(
+            |((metric, contrast, components), adjusted)| MatchedInteraction {
+                metric,
+                contrast,
+                n_seeds: components.n_pairs,
+                mean_difference_in_differences: components.mean_difference,
+                ci_95: components.ci_95,
+                ci_undefined_reason: components.ci_95.is_none().then_some(
                     UndefinedReason::InsufficientPairs {
-                        have: result.components.n_pairs,
+                        have: components.n_pairs,
                         need: 2,
                     },
                 ),
-                raw_p_value: result.components.p_value,
+                raw_p_value: components.p_value,
                 adjusted,
-                underpowered_reason,
-            }
-        })
+                underpowered_reason: (components.n_pairs < params.recommended_pairs).then_some(
+                    UnderpoweredReason::FewerThanRecommendedPairs {
+                        have: components.n_pairs,
+                        recommended: params.recommended_pairs,
+                    },
+                ),
+            },
+        )
         .collect();
 
     Ok(MatchedSeedAnalysis {
@@ -1351,6 +1572,8 @@ pub fn analyze_matched_seed_runs(
         sign_assignments_evaluated,
         confidence_interval_procedure: ConfidenceIntervalProcedure::PercentileBootstrap,
         effects,
+        interaction_contrasts: interaction_contrasts.to_vec(),
+        interactions,
     })
 }
 
@@ -1411,6 +1634,230 @@ mod tests {
         assert_eq!(effect.mean_diff, 15.0);
         // The standardized effect must be a real quotient now, never the old 0.0 fallback.
         assert!(effect.cohens_dz.is_finite() && effect.cohens_dz != 0.0);
+    }
+
+    fn factorial_row(arm_id: u16, seed: u64, growth: f64, decay: f64, value: f64) -> RunSummary {
+        RunSummary::from_verified_parts(RunSummaryParts {
+            run_id: format!("factorial-arm-{arm_id}-seed-{seed}"),
+            arm_id,
+            seed,
+            config_digest: format!("config-{arm_id}-{seed}"),
+            digest: format!("world-{arm_id}-{seed}"),
+            ticks: 100,
+            metrics: BTreeMap::from([("score".to_owned(), value)]),
+            summary_artifact_digest: format!("summary-{arm_id}-{seed}"),
+            summary_path: None,
+            variant_id: format!("arm-{arm_id:03}"),
+            config_overrides: BTreeMap::from([
+                ("food_growth_rate".to_owned(), serde_json::json!(growth)),
+                ("food_decay_rate".to_owned(), serde_json::json!(decay)),
+            ]),
+            interventions: Vec::new(),
+            brain_family: "mlp.baseline".to_owned(),
+        })
+    }
+
+    fn factorial_fixture(
+        first: f64,
+        second: f64,
+        interactions: &[f64],
+    ) -> (Vec<RunSummary>, Vec<InteractionContrast>) {
+        let mut rows = Vec::new();
+        for (index, interaction) in interactions.iter().enumerate() {
+            let seed = u64::try_from(index + 1).unwrap();
+            let baseline = 100.0 * f64::from(u32::try_from(index + 1).unwrap());
+            for (arm_id, growth, decay, effect) in [
+                (0, 0.01, 0.0, 0.0),
+                (1, 0.01, 0.1, first),
+                (2, 0.02, 0.0, second),
+                (3, 0.02, 0.1, first + second + interaction),
+            ] {
+                rows.push(factorial_row(
+                    arm_id,
+                    seed,
+                    growth,
+                    decay,
+                    baseline + effect,
+                ));
+            }
+        }
+        let arms = rows[..4]
+            .iter()
+            .map(|row| Arm {
+                brain_family: row.brain_family.clone(),
+                config_overrides: row.config_overrides.clone(),
+                interventions: row.interventions.clone(),
+            })
+            .collect::<Vec<_>>();
+        (rows, derive_interaction_contrasts(&arms).unwrap())
+    }
+
+    #[test]
+    fn conditional_interaction_recovers_planted_signs_and_preserves_seed_replication() {
+        let metrics = vec!["score".to_owned()];
+        let params = AnalysisParams {
+            bootstrap_iterations: 32,
+            ..AnalysisParams::default()
+        };
+        for planted in [-4.0, 0.0, 4.0] {
+            let (mut rows, design) = factorial_fixture(3.0, 5.0, &[planted; 12]);
+            let analysis =
+                analyze_matched_seed_runs_with_interactions(&rows, &metrics, params, &design)
+                    .unwrap();
+            assert_eq!(analysis.effects.len(), 3);
+            assert_eq!(analysis.interactions.len(), 1);
+            let interaction = &analysis.interactions[0];
+            assert_eq!(
+                interaction.n_seeds, 12,
+                "four cells do not create four replicates"
+            );
+            assert_eq!(interaction.contrast.arm_ids, [0, 1, 2, 3]);
+            assert_eq!(interaction.mean_difference_in_differences, planted);
+            assert_eq!(interaction.ci_95, Some((planted, planted)));
+            assert_eq!(
+                interaction.raw_p_value,
+                if planted == 0.0 { 1.0 } else { 2.0 / 4_096.0 }
+            );
+            assert_eq!(analysis.sign_assignments_evaluated, 4_096);
+            assert_eq!(interaction.adjusted.rejected, planted != 0.0);
+            rows.reverse();
+            assert_eq!(
+                analyze_matched_seed_runs_with_interactions(&rows, &metrics, params, &design)
+                    .unwrap(),
+                analysis
+            );
+        }
+        let (rows, design) = factorial_fixture(3.0, 5.0, &[4.0]);
+        let singleton =
+            analyze_matched_seed_runs_with_interactions(&rows, &metrics, params, &design).unwrap();
+        assert_eq!(singleton.interactions[0].n_seeds, 1);
+        assert_eq!(singleton.interactions[0].raw_p_value, 1.0);
+        assert!(singleton.interactions[0].ci_95.is_none());
+        assert!(singleton.interactions[0].underpowered_reason.is_some());
+    }
+
+    #[test]
+    fn interaction_tests_share_the_complete_baseline_correction_family() {
+        let (rows, design) = factorial_fixture(1.0, -1.0, &[0.0; 6]);
+        let metrics = vec!["score".to_owned()];
+        let params = AnalysisParams {
+            bootstrap_iterations: 32,
+            ..AnalysisParams::default()
+        };
+        let baseline = analyze_matched_seed_runs(&rows, &metrics, params).unwrap();
+        assert_eq!(
+            baseline,
+            analyze_matched_seed_runs_with_interactions(&rows, &metrics, params, &[]).unwrap()
+        );
+        assert!(baseline.effects[0].adjusted.rejected);
+        let joint =
+            analyze_matched_seed_runs_with_interactions(&rows, &metrics, params, &design).unwrap();
+        assert_eq!(joint.effects[0].raw_p_value, 2.0 / 64.0);
+        assert_eq!(joint.effects[0].adjusted.adjusted_p_value, 0.0625);
+        assert!(!joint.effects[0].adjusted.rejected);
+        assert_eq!(joint.interactions[0].raw_p_value, 1.0);
+        assert_eq!(joint.interactions[0].adjusted.original_index, 3);
+        let encoded = serde_json::to_value(baseline).unwrap();
+        assert!(encoded.get("interaction_contrasts").is_none());
+        assert!(encoded.get("interactions").is_none());
+    }
+
+    #[test]
+    fn interaction_design_is_checked_against_observed_cells_and_treatments() {
+        let (rows, design) = factorial_fixture(1.0, 2.0, &[3.0; 2]);
+        let analyze = |rows: &[RunSummary], contrasts: &[InteractionContrast]| {
+            analyze_matched_seed_runs_with_interactions(
+                rows,
+                &["score".to_owned()],
+                AnalysisParams {
+                    bootstrap_iterations: 16,
+                    ..AnalysisParams::default()
+                },
+                contrasts,
+            )
+        };
+        let mut wrong_cells = design.clone();
+        wrong_cells[0].arm_ids[3] = 2;
+        let mut wrong_levels = design.clone();
+        wrong_levels[0].first.treatment = serde_json::json!(99.0);
+        let mut wrong_axis = design.clone();
+        wrong_axis[0].first.axis = super::super::spec::InteractionAxis::BrainFamily;
+        for altered in [wrong_cells, wrong_levels, wrong_axis] {
+            assert!(matches!(
+                analyze(&rows, &altered),
+                Err(StatsError::InvalidInteractionDesign { .. })
+            ));
+        }
+        let missing_cell = rows
+            .iter()
+            .filter(|row| row.arm_id != 3)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            analyze(&missing_cell, &design),
+            Err(StatsError::InvalidInteractionDesign { .. })
+        ));
+        let mut missing_seed = rows.clone();
+        missing_seed.pop();
+        assert_eq!(
+            analyze(&missing_seed, &design),
+            Err(StatsError::UnmatchedSeeds)
+        );
+        let mut duplicate = rows.clone();
+        duplicate.push(rows[0].clone());
+        assert!(matches!(
+            analyze(&duplicate, &design),
+            Err(StatsError::DuplicateSeed { .. })
+        ));
+        let mut changing_treatment = rows.clone();
+        changing_treatment[7] = factorial_row(3, 2, 0.03, 0.1, 206.0);
+        assert!(matches!(
+            analyze(&changing_treatment, &design),
+            Err(StatsError::InvalidInteractionDesign { .. })
+        ));
+        let mut missing_metric = rows.clone();
+        missing_metric[7].metrics.clear();
+        // Modified evidence is refused before even a plausible contrast can be computed.
+        assert!(matches!(
+            analyze(&missing_metric, &design),
+            Err(StatsError::RunSummaryIntegrity { .. })
+        ));
+        let mut nonfinite = rows;
+        nonfinite[7] = factorial_row(3, 2, 0.02, 0.1, f64::INFINITY);
+        assert_eq!(
+            analyze(&nonfinite, &design),
+            Err(StatsError::NonFiniteValue)
+        );
+    }
+
+    #[test]
+    fn interaction_analysis_refuses_selectively_omitted_level_contrasts() {
+        let mut rows = Vec::new();
+        let mut arms = Vec::new();
+        for (growth_index, growth) in [0.01, 0.02, 0.03].into_iter().enumerate() {
+            for (decay_index, decay) in [0.0, 0.1].into_iter().enumerate() {
+                let arm_id = u16::try_from(growth_index * 2 + decay_index).unwrap();
+                for seed in [1, 2] {
+                    rows.push(factorial_row(arm_id, seed, growth, decay, growth + decay));
+                }
+                arms.push(Arm {
+                    brain_family: "mlp.baseline".to_owned(),
+                    config_overrides: rows.last().unwrap().config_overrides.clone(),
+                    interventions: Vec::new(),
+                });
+            }
+        }
+        let design = derive_interaction_contrasts(&arms).unwrap();
+        assert_eq!(design.len(), 2);
+        assert!(matches!(
+            analyze_matched_seed_runs_with_interactions(
+                &rows,
+                &["score".to_owned()],
+                AnalysisParams::default(),
+                &design[..1],
+            ),
+            Err(StatsError::InvalidInteractionDesign { .. })
+        ));
     }
 
     /// bd-7453: a degenerate spread must be REFUSED, not reported as "no effect".
@@ -2205,7 +2652,10 @@ mod tests {
                 // The former 1,000-draw lane with seed 0x00F1_1906 reported 41/1,001.
                 assert_eq!(analysis.effects[0].raw_p_value, 2.0 / 32.0);
                 assert!(!analysis.effects[0].adjusted.rejected);
-                assert_eq!(analysis.p_value_procedure, PValueProcedure::PairedSignFlipExact);
+                assert_eq!(
+                    analysis.p_value_procedure,
+                    PValueProcedure::PairedSignFlipExact
+                );
                 assert_eq!(analysis.sign_assignments_evaluated, 32);
                 assert!(analysis.effects[0].underpowered_reason.is_some());
             }
@@ -2223,7 +2673,10 @@ mod tests {
             (vec![0.1, 0.2, -0.3], 1.0, 0.625, 0.625),
         ] {
             for scale in [1.0, 1e-200, 1e200] {
-                let scaled = differences.iter().map(|value| value * scale).collect::<Vec<_>>();
+                let scaled = differences
+                    .iter()
+                    .map(|value| value * scale)
+                    .collect::<Vec<_>>();
                 for (alternative, expected) in [
                     (AlternativeHypothesis::TwoSided, two_sided),
                     (AlternativeHypothesis::TreatmentGreater, greater),
@@ -2236,21 +2689,18 @@ mod tests {
                 }
             }
         }
-        let singleton =
-            paired_permutation_p_value(&[4.0], 1, 6, AlternativeHypothesis::TwoSided);
+        let singleton = paired_permutation_p_value(&[4.0], 1, 6, AlternativeHypothesis::TwoSided);
         assert_eq!(singleton.p_value, 1.0);
         assert_eq!(singleton.sign_assignments_evaluated, 2);
     }
 
     #[test]
     fn exact_null_cardinality_is_capped_and_large_cohorts_retain_monte_carlo() {
-        let exact =
-            paired_permutation_p_value(&[1.0; 12], 7, 6, AlternativeHypothesis::TwoSided);
+        let exact = paired_permutation_p_value(&[1.0; 12], 7, 6, AlternativeHypothesis::TwoSided);
         assert_eq!(exact.p_value, 2.0 / 4_096.0);
         assert_eq!(exact.procedure, PValueProcedure::PairedSignFlipExact);
         assert_eq!(exact.sign_assignments_evaluated, 4_096);
-        let sampled =
-            paired_permutation_p_value(&[1.0; 13], 7, 6, AlternativeHypothesis::TwoSided);
+        let sampled = paired_permutation_p_value(&[1.0; 13], 7, 6, AlternativeHypothesis::TwoSided);
         assert_eq!(sampled.procedure, PValueProcedure::PairedSignFlipMonteCarlo);
         assert_eq!(sampled.sign_assignments_evaluated, 7);
         assert!(sampled.p_value >= 1.0 / 8.0);

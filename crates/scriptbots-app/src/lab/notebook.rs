@@ -1,8 +1,10 @@
 //! Notebook renderer with provenance enforcement and reproduce.sh emission (bd-16g.1.5).
 
+use super::spec::{Arm, InteractionContrast, derive_interaction_contrasts};
 use super::stats::{
     AnalysisParams, ConfidenceIntervalProcedure, MAX_EXACT_SIGN_FLIP_PAIRS, MatchedEffect,
-    MatchedSeedAnalysis, PValueProcedure, RunSummary, StatsError, analyze_matched_seed_runs,
+    MatchedInteraction, MatchedSeedAnalysis, PValueProcedure, RunSummary, StatsError,
+    analyze_matched_seed_runs_with_interactions,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -61,6 +63,7 @@ pub struct RunRef {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub enum Support {
     Effect(Box<EffectRef>),
+    Interaction(Box<InteractionRef>),
     Descriptive(Vec<RunRef>),
 }
 
@@ -77,6 +80,21 @@ pub struct EffectRef {
     p_value_procedure: PValueProcedure,
     sign_assignments_evaluated: usize,
     confidence_interval_procedure: ConfidenceIntervalProcedure,
+    analysis_metrics: Vec<String>,
+    interaction_contrasts: Vec<InteractionContrast>,
+}
+
+/// Four-arm support issued only after the complete predeclared analysis is rederived.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct InteractionRef {
+    runs: Vec<RunRef>,
+    effect: MatchedInteraction,
+    params: AnalysisParams,
+    p_value_procedure: PValueProcedure,
+    sign_assignments_evaluated: usize,
+    confidence_interval_procedure: ConfidenceIntervalProcedure,
+    analysis_metrics: Vec<String>,
+    interaction_contrasts: Vec<InteractionContrast>,
 }
 
 /// Scientific claim requiring mandatory provenance support and falsifier criteria.
@@ -187,8 +205,32 @@ pub fn claims_from_analysis(
     declared_hypothesis: &str,
     falsifier: &str,
 ) -> Result<Vec<Claim>, NotebookRenderError> {
-    let rederived = analyze_matched_seed_runs(summaries, &analysis.metrics, analysis.params)
-        .map_err(NotebookRenderError::AnalysisVerification)?;
+    claims_from_analysis_with_interactions(analysis, summaries, &[], declared_hypothesis, falsifier)
+}
+
+/// Bind the result to the interaction family declared by the validated proposal.
+///
+/// The caller supplies that pre-execution declaration separately from the result,
+/// so deleting or replacing interaction metadata cannot turn an enabled study into
+/// a baseline-only claim. Reanalysis also verifies every contrast against the
+/// complete observed treatment grid, including exact axis values and cell IDs.
+pub fn claims_from_analysis_with_interactions(
+    analysis: &MatchedSeedAnalysis,
+    summaries: &[RunSummary],
+    declared_interactions: &[InteractionContrast],
+    declared_hypothesis: &str,
+    falsifier: &str,
+) -> Result<Vec<Claim>, NotebookRenderError> {
+    if analysis.interaction_contrasts != declared_interactions {
+        return Err(NotebookRenderError::AnalysisResultMismatch);
+    }
+    let rederived = analyze_matched_seed_runs_with_interactions(
+        summaries,
+        &analysis.metrics,
+        analysis.params,
+        declared_interactions,
+    )
+    .map_err(NotebookRenderError::AnalysisVerification)?;
     if rederived != *analysis {
         return Err(NotebookRenderError::AnalysisResultMismatch);
     }
@@ -201,7 +243,7 @@ pub fn claims_from_analysis(
         rows.sort_by_key(|summary| summary.seed);
     }
 
-    analysis
+    let mut claims = analysis
         .effects
         .iter()
         .map(|effect| {
@@ -234,11 +276,47 @@ pub fn claims_from_analysis(
                     p_value_procedure: analysis.p_value_procedure,
                     sign_assignments_evaluated: analysis.sign_assignments_evaluated,
                     confidence_interval_procedure: analysis.confidence_interval_procedure,
+                    analysis_metrics: analysis.metrics.clone(),
+                    interaction_contrasts: declared_interactions.to_vec(),
                 })),
                 falsifier: falsifier.to_owned(),
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    for effect in &analysis.interactions {
+        let runs = effect
+            .contrast
+            .arm_ids
+            .iter()
+            .flat_map(|arm_id| by_arm.get(arm_id).into_iter().flatten())
+            .map(|summary| RunRef::from(*summary))
+            .collect::<Vec<_>>();
+        if runs.len() != effect.n_seeds.saturating_mul(4) {
+            return Err(NotebookRenderError::EffectContractMismatch {
+                metric: effect.metric.clone(),
+                field: "four_cell_run_count",
+            });
+        }
+        claims.push(Claim {
+            text: format!(
+                "Conditional interaction evaluation of the declared hypothesis {:?} \
+                 [metric={}, cells={:?}; other axes at their first levels]",
+                declared_hypothesis, effect.metric, effect.contrast.arm_ids
+            ),
+            support: Support::Interaction(Box::new(InteractionRef {
+                runs,
+                effect: effect.clone(),
+                params: analysis.params,
+                p_value_procedure: analysis.p_value_procedure,
+                sign_assignments_evaluated: analysis.sign_assignments_evaluated,
+                confidence_interval_procedure: analysis.confidence_interval_procedure,
+                analysis_metrics: analysis.metrics.clone(),
+                interaction_contrasts: declared_interactions.to_vec(),
+            })),
+            falsifier: falsifier.to_owned(),
+        });
+    }
+    Ok(claims)
 }
 
 /// Format float value safely, rejecting non-finite numbers.
@@ -434,6 +512,10 @@ impl NotebookRenderer {
                     validate_effect(reference)?;
                     &reference.runs
                 }
+                Support::Interaction(reference) => {
+                    validate_interaction(reference)?;
+                    &reference.runs
+                }
                 Support::Descriptive(runs) => runs,
             };
             if referenced_runs.is_empty() {
@@ -557,6 +639,15 @@ impl NotebookRenderer {
                     reference.p_value_procedure.as_str(), reference.confidence_interval_procedure.as_str(),
                     markdown_literal("analysis_params", &canonical_metadata(&serde_json::to_value(reference.params)
                         .map_err(|error| NotebookRenderError::Io(error.to_string()))?)?)?));
+            } else if let Support::Interaction(reference) = &claim.support {
+                markdown.push_str(&format!(
+                    "- Conditional interaction methods for {}: one unscaled difference-in-differences per independent seed; other axes held at their first levels. Bootstrap resamples complete seed contrasts. Sign-flip inference requires independent contrasts symmetric about zero under the null; matching seeds alone does not establish this assumption. Baseline and interaction tests share one correction family. Parameters={}\n",
+                    markdown_literal("metric", &reference.effect.metric)?,
+                    markdown_literal("analysis_params", &canonical_metadata(
+                        &serde_json::to_value(reference.params)
+                            .map_err(|error| NotebookRenderError::Io(error.to_string()))?
+                    )?)?,
+                ));
             }
         }
         markdown.push_str("\n## 3. Results\n");
@@ -567,6 +658,7 @@ impl NotebookRenderer {
             markdown.push_str(&format!("### Evidence {}\n", index + 1));
             match &claim.support {
                 Support::Effect(reference) => render_effect(&mut markdown, reference)?,
+                Support::Interaction(reference) => render_interaction(&mut markdown, reference)?,
                 Support::Descriptive(runs) => markdown.push_str(&format!(
                     "Descriptive evidence from {} completed run(s); no effect estimate, interval or hypothesis test was computed.\n", runs.len())),
             }
@@ -590,7 +682,7 @@ impl NotebookRenderer {
             ));
 
             match &claim.support {
-                Support::Effect(_) => markdown.push_str(&format!(
+                Support::Effect(_) | Support::Interaction(_) => markdown.push_str(&format!(
                     "- Typed effect support: Evidence {} in Results.\n",
                     index + 1
                 )),
@@ -782,21 +874,31 @@ impl NotebookRenderer {
             }
         }
 
-        let analysis_choices = claims.iter().find_map(|claim| match &claim.support {
-            Support::Effect(reference) => {
-                let metrics = claims
-                    .iter()
-                    .filter_map(|claim| match &claim.support {
-                        Support::Effect(effect) => Some(effect.effect.metric.clone()),
-                        Support::Descriptive(_) => None,
-                    })
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect();
-                Some((metrics, reference.params))
+        let mut analysis_choices = None;
+        for claim in claims {
+            let choices = match &claim.support {
+                Support::Effect(reference) => Some((
+                    reference.analysis_metrics.clone(),
+                    reference.params,
+                    reference.interaction_contrasts.clone(),
+                )),
+                Support::Interaction(reference) => Some((
+                    reference.analysis_metrics.clone(),
+                    reference.params,
+                    reference.interaction_contrasts.clone(),
+                )),
+                Support::Descriptive(_) => None,
+            };
+            if let Some(choices) = choices {
+                if analysis_choices
+                    .as_ref()
+                    .is_some_and(|prior| *prior != choices)
+                {
+                    return Err(NotebookRenderError::AnalysisResultMismatch);
+                }
+                analysis_choices = Some(choices);
             }
-            Support::Descriptive(_) => None,
-        });
+        }
         let configs = known_runs
             .iter()
             .map(reproduction_config)
@@ -1042,6 +1144,241 @@ fn validate_effect(reference: &EffectRef) -> Result<(), NotebookRenderError> {
     Ok(())
 }
 
+fn validate_interaction(reference: &InteractionRef) -> Result<(), NotebookRenderError> {
+    let effect = &reference.effect;
+    let invalid = |field| NotebookRenderError::EffectContractMismatch {
+        metric: effect.metric.clone(),
+        field,
+    };
+    let ids = effect.contrast.arm_ids;
+    if effect.n_seeds == 0
+        || ids[0] != 0
+        || ids.into_iter().collect::<BTreeSet<_>>().len() != 4
+        || reference.runs.len() != effect.n_seeds.saturating_mul(4)
+        || reference.runs.iter().any(|run| !ids.contains(&run.arm_id))
+        || !reference.analysis_metrics.contains(&effect.metric)
+        || reference
+            .interaction_contrasts
+            .iter()
+            .filter(|contrast| **contrast == effect.contrast)
+            .count()
+            != 1
+    {
+        return Err(invalid("four_cell_membership"));
+    }
+    let mut cells = Vec::with_capacity(4);
+    let mut expected_seeds = None;
+    let mut endpoint = None;
+    for arm_id in ids {
+        let rows = reference
+            .runs
+            .iter()
+            .filter(|run| run.arm_id == arm_id)
+            .collect::<Vec<_>>();
+        let seeds = rows.iter().map(|run| run.seed).collect::<BTreeSet<_>>();
+        if rows.len() != effect.n_seeds
+            || seeds.len() != effect.n_seeds
+            || expected_seeds.as_ref().is_some_and(|prior| prior != &seeds)
+        {
+            return Err(invalid("four_cell_matched_seeds"));
+        }
+        let first = rows
+            .first()
+            .copied()
+            .ok_or_else(|| invalid("missing_cell"))?;
+        if endpoint.is_some_and(|tick| tick != first.total_ticks)
+            || rows.iter().any(|run| {
+                run.total_ticks != first.total_ticks
+                    || run.brain_family != first.brain_family
+                    || run.config_overrides != first.config_overrides
+                    || run.interventions != first.interventions
+                    || run.variant_id != first.variant_id
+            })
+        {
+            return Err(invalid("four_cell_treatment_identity"));
+        }
+        expected_seeds = Some(seeds);
+        endpoint = Some(first.total_ticks);
+        cells.push(Arm {
+            brain_family: first.brain_family.clone(),
+            config_overrides: first.config_overrides.clone(),
+            interventions: first.interventions.clone(),
+        });
+    }
+    let mut expected =
+        derive_interaction_contrasts(&cells).map_err(|_| invalid("four_cell_axis_levels"))?;
+    if expected.len() != 1 {
+        return Err(invalid("four_cell_axis_levels"));
+    }
+    for arm_id in &mut expected[0].arm_ids {
+        *arm_id = ids[usize::from(*arm_id)];
+    }
+    if expected[0] != effect.contrast {
+        return Err(invalid("four_cell_axis_levels"));
+    }
+    validate_interaction_inference(reference)
+}
+
+fn validate_interaction_inference(reference: &InteractionRef) -> Result<(), NotebookRenderError> {
+    let effect = &reference.effect;
+    let params = reference.params;
+    let invalid = |field| NotebookRenderError::EffectContractMismatch {
+        metric: effect.metric.clone(),
+        field,
+    };
+    for value in [
+        Some(effect.mean_difference_in_differences),
+        Some(effect.raw_p_value),
+        Some(effect.adjusted.raw_p_value),
+        Some(effect.adjusted.adjusted_p_value),
+        Some(effect.adjusted.adjusted_alpha),
+        effect.ci_95.map(|interval| interval.0),
+        effect.ci_95.map(|interval| interval.1),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        format_float_safe(value)?;
+    }
+    let assignments_match = match reference.p_value_procedure {
+        PValueProcedure::PairedSignFlipExact => {
+            effect.n_seeds <= MAX_EXACT_SIGN_FLIP_PAIRS
+                && reference.sign_assignments_evaluated == (1_usize << effect.n_seeds)
+        }
+        PValueProcedure::PairedSignFlipMonteCarlo => {
+            effect.n_seeds > MAX_EXACT_SIGN_FLIP_PAIRS
+                && reference.sign_assignments_evaluated == params.permutation_iterations as usize
+        }
+    };
+    if !assignments_match
+        || params.bootstrap_iterations == 0
+        || params.permutation_iterations == 0
+        || params.recommended_pairs == 0
+        || !params.alpha.is_finite()
+        || params.alpha <= 0.0
+        || params.alpha >= 1.0
+        || effect.raw_p_value != effect.adjusted.raw_p_value
+        || effect.adjusted.correction != params.correction
+        || effect.adjusted.rank == 0
+        || !(0.0..=1.0).contains(&effect.raw_p_value)
+        || !(0.0..=1.0).contains(&effect.adjusted.adjusted_p_value)
+        || effect.adjusted.adjusted_alpha <= 0.0
+        || effect.adjusted.adjusted_alpha >= 1.0
+    {
+        return Err(invalid("interaction_inference_evidence"));
+    }
+    match (effect.ci_95, effect.ci_undefined_reason) {
+        (Some((lower, upper)), None) if effect.n_seeds >= 2 && lower <= upper => {}
+        (None, Some(super::stats::UndefinedReason::InsufficientPairs { have: 1, need: 2 }))
+            if effect.n_seeds == 1 => {}
+        _ => return Err(invalid("interaction_confidence_interval")),
+    }
+    match (
+        effect.n_seeds < params.recommended_pairs,
+        effect.underpowered_reason,
+    ) {
+        (
+            true,
+            Some(super::stats::UnderpoweredReason::FewerThanRecommendedPairs { have, recommended }),
+        ) if have == effect.n_seeds && recommended == params.recommended_pairs => {}
+        (false, None) => {}
+        _ => return Err(invalid("interaction_underpowered_contract")),
+    }
+    Ok(())
+}
+
+fn render_interaction(
+    markdown: &mut String,
+    reference: &InteractionRef,
+) -> Result<(), NotebookRenderError> {
+    let effect = &reference.effect;
+    markdown.push_str(&format!(
+        "- **Metric**: {}\n- **Estimator**: conditional difference-in-differences\n\
+         - **Cells [baseline, first only, second only, both]**: {:?}\n\
+         - **Mean [(both - second) - (first - baseline)]**: {}\n\
+         - **Independent Matched Seeds**: {}\n\
+         - **P-value Procedure**: {}\n- **Sign Assignments Evaluated**: {}\n\
+         - **Requested Monte Carlo Budget**: {}\n\
+         - **Confidence Interval Procedure**: {}\n- **Bootstrap Iterations**: {}\n\
+         - **Resampling Seed**: {}\n- **Alternative**: {}\n- **Family Alpha**: {}\n",
+        markdown_literal("metric", &effect.metric)?,
+        effect.contrast.arm_ids,
+        format_float_safe(effect.mean_difference_in_differences)?,
+        effect.n_seeds,
+        reference.p_value_procedure.as_str(),
+        reference.sign_assignments_evaluated,
+        reference.params.permutation_iterations,
+        reference.confidence_interval_procedure.as_str(),
+        reference.params.bootstrap_iterations,
+        reference.params.resampling_seed,
+        reference.params.alternative.as_str(),
+        format_float_safe(reference.params.alpha)?,
+    ));
+    for (label, levels) in [
+        ("First", &effect.contrast.first),
+        ("Second", &effect.contrast.second),
+    ] {
+        let encoded = serde_json::to_value(levels)
+            .map_err(|error| NotebookRenderError::Io(error.to_string()))?;
+        markdown.push_str(&format!(
+            "- **{label} Axis and Exact Levels**: {}\n",
+            markdown_literal("interaction_levels", &canonical_metadata(&encoded)?)?,
+        ));
+    }
+    markdown.push_str("- **Conditioning**: every other treatment axis is held at its first declared level. This estimate is unscaled and is not averaged over other factorial cells. Positive values mean the first treatment's effect is more positive with the second treatment; they do not alone imply a beneficial ecological outcome.\n");
+    match (effect.ci_95, effect.ci_undefined_reason) {
+        (Some((lower, upper)), None) => markdown.push_str(&format!(
+            "- **95% Bootstrap CI**: [{}, {}]\n",
+            format_float_safe(lower)?,
+            format_float_safe(upper)?,
+        )),
+        (None, Some(reason)) => markdown.push_str(&format!(
+            "- **95% Bootstrap CI**: undefined ({})\n",
+            reason.description()
+        )),
+        _ => return Err(NotebookRenderError::AnalysisResultMismatch),
+    }
+    markdown.push_str(&format!(
+        "- **Raw p-value**: {}\n- **Correction (baseline and interaction family)**: {}\n\
+         - **Adjusted p-value**: {}\n- **Rank-specific alpha**: {}\n- **Null Rejected**: {}\n",
+        format_float_safe(effect.raw_p_value)?,
+        effect.adjusted.correction.as_str(),
+        format_float_safe(effect.adjusted.adjusted_p_value)?,
+        format_float_safe(effect.adjusted.adjusted_alpha)?,
+        effect.adjusted.rejected,
+    ));
+    if let Some(reason) = effect.underpowered_reason {
+        markdown.push_str(&format!(
+            "- **Caveat (Underpowered)**: {}\n",
+            reason.description()
+        ));
+    }
+    render_run_evidence(markdown, &reference.runs)
+}
+
+fn render_run_evidence(
+    markdown: &mut String,
+    evidence: &[RunRef],
+) -> Result<(), NotebookRenderError> {
+    markdown.push_str("- **Structured Input Evidence**:\n");
+    let mut runs = evidence.iter().collect::<Vec<_>>();
+    runs.sort_by_key(|run| (run.arm_id, run.seed, run.run_id.as_str()));
+    for run in runs {
+        markdown.push_str(&format!(
+            "  - run_id={}, arm={}, seed={}, config_digest={}, world_digest={}, \
+             summary_digest={}, analysis_input_digest={}\n",
+            markdown_literal("run_id", &run.run_id)?,
+            run.arm_id,
+            run.seed,
+            markdown_literal("config_digest", &run.config_digest)?,
+            markdown_literal("world_digest", &run.digest)?,
+            markdown_literal("summary_artifact_digest", &run.summary_artifact_digest)?,
+            markdown_literal("analysis_input_digest", &run.analysis_input_digest)?,
+        ));
+    }
+    Ok(())
+}
+
 fn render_effect(markdown: &mut String, reference: &EffectRef) -> Result<(), NotebookRenderError> {
     let effect = &reference.effect;
     markdown.push_str(&format!(
@@ -1125,22 +1462,7 @@ fn render_effect(markdown: &mut String, reference: &EffectRef) -> Result<(), Not
             reason.description()
         ));
     }
-    markdown.push_str("- **Structured Input Evidence**:\n");
-    let mut runs = reference.runs.iter().collect::<Vec<_>>();
-    runs.sort_by_key(|run| (run.arm_id, run.seed, run.run_id.as_str()));
-    for run in runs {
-        markdown.push_str(&format!(
-            "  - run_id={}, arm={}, seed={}, config_digest={}, world_digest={}, \
-             summary_digest={}, analysis_input_digest={}\n",
-            markdown_literal("run_id", &run.run_id)?,
-            run.arm_id,
-            run.seed,
-            markdown_literal("config_digest", &run.config_digest)?,
-            markdown_literal("world_digest", &run.digest)?,
-            markdown_literal("summary_artifact_digest", &run.summary_artifact_digest)?,
-            markdown_literal("analysis_input_digest", &run.analysis_input_digest)?,
-        ));
-    }
+    render_run_evidence(markdown, &reference.runs)?;
     // Fixed geometry, locale-independent numeric formatting, and no user-controlled SVG markup.
     // Normalize before arithmetic so even finite values near f64::MAX cannot overflow.
     let (lower, upper) = effect
@@ -1170,7 +1492,7 @@ mod tests {
     use super::*;
     use crate::lab::stats::{
         AdjustedComparison, AlternativeHypothesis, Correction, RunSummaryParts, TestName,
-        UndefinedReason, UnderpoweredReason,
+        UndefinedReason, UnderpoweredReason, analyze_matched_seed_runs,
     };
     use std::collections::BTreeMap;
 
@@ -1258,11 +1580,13 @@ mod tests {
             };
         EffectRef {
             runs,
+            analysis_metrics: vec![effect.metric.clone()],
             effect,
             params,
             p_value_procedure,
             sign_assignments_evaluated,
             confidence_interval_procedure: ConfidenceIntervalProcedure::PercentileBootstrap,
+            interaction_contrasts: Vec::new(),
         }
     }
 
@@ -1293,6 +1617,161 @@ mod tests {
             support: Support::Effect(Box::new(effect_ref(runs, effect()))),
             falsifier: "The adjusted interval and test show no change".to_owned(),
         }
+    }
+
+    fn interaction_fixture() -> (Vec<RunSummary>, Vec<InteractionContrast>) {
+        let mut summaries = Vec::new();
+        for seed in 1..=3_u32 {
+            for (arm_id, growth, family, effect) in [
+                (0, 0.01, "mlp.baseline", 0.0),
+                (1, 0.01, "dwraon.baseline", 1.0),
+                (2, 0.02, "mlp.baseline", 2.0),
+                (3, 0.02, "dwraon.baseline", 7.0),
+            ] {
+                summaries.push(RunSummary::from_verified_parts(RunSummaryParts {
+                    run_id: format!("interaction-{arm_id}-{seed}"),
+                    arm_id,
+                    seed: u64::from(seed),
+                    config_digest: format!("config-{arm_id}-{seed}"),
+                    digest: format!("world-{arm_id}-{seed}"),
+                    ticks: 100,
+                    metrics: BTreeMap::from([(
+                        "alive_agents".to_owned(),
+                        10.0 + f64::from(seed) + effect,
+                    )]),
+                    summary_artifact_digest: format!("summary-{arm_id}-{seed}"),
+                    summary_path: None,
+                    variant_id: format!("arm-{arm_id:03}"),
+                    config_overrides: BTreeMap::from([(
+                        "food_growth_rate".to_owned(),
+                        serde_json::json!(growth),
+                    )]),
+                    interventions: Vec::new(),
+                    brain_family: family.to_owned(),
+                }));
+            }
+        }
+        let arms = summaries[..4]
+            .iter()
+            .map(|row| Arm {
+                brain_family: row.brain_family.clone(),
+                config_overrides: row.config_overrides.clone(),
+                interventions: row.interventions.clone(),
+            })
+            .collect::<Vec<_>>();
+        (summaries, derive_interaction_contrasts(&arms).unwrap())
+    }
+
+    #[test]
+    fn conditional_interaction_claims_retain_four_cells_and_declared_levels() {
+        let (summaries, design) = interaction_fixture();
+        let analysis = analyze_matched_seed_runs_with_interactions(
+            &summaries,
+            &["alive_agents".to_owned()],
+            AnalysisParams {
+                bootstrap_iterations: 32,
+                ..AnalysisParams::default()
+            },
+            &design,
+        )
+        .unwrap();
+        let claims = claims_from_analysis_with_interactions(
+            &analysis,
+            &summaries,
+            &design,
+            "growth and family interact",
+            "interaction is zero",
+        )
+        .unwrap();
+        assert_eq!(claims.len(), 4);
+        let Support::Interaction(reference) = &claims[3].support else {
+            panic!("conditional contrast requires typed four-cell support");
+        };
+        assert_eq!(reference.runs.len(), 12);
+        assert_eq!(reference.effect.contrast.arm_ids, [0, 2, 1, 3]);
+        assert_eq!(reference.effect.mean_difference_in_differences, 4.0);
+        assert_eq!(reference.effect.n_seeds, 3);
+        assert_eq!(reference.sign_assignments_evaluated, 8);
+        let rendered = NotebookRenderer::render_markdown(
+            "Conditional effects",
+            &claims,
+            &run_refs(&summaries),
+            &notebook_context(),
+        )
+        .unwrap();
+        assert!(rendered.contains("conditional difference-in-differences"));
+        assert!(rendered.contains("Independent Matched Seeds**: 3"));
+        assert!(rendered.contains("other axes held at their first levels"));
+        assert!(rendered.contains("symmetric about zero under the null"));
+        assert!(rendered.contains("baseline and interaction family"));
+    }
+
+    #[test]
+    fn interaction_claims_refuse_relabeling_missing_cells_and_removed_declarations() {
+        let (summaries, design) = interaction_fixture();
+        let analysis = analyze_matched_seed_runs_with_interactions(
+            &summaries,
+            &["alive_agents".to_owned()],
+            AnalysisParams {
+                bootstrap_iterations: 16,
+                ..AnalysisParams::default()
+            },
+            &design,
+        )
+        .unwrap();
+        let claims = |candidate: &MatchedSeedAnalysis| {
+            claims_from_analysis_with_interactions(
+                candidate,
+                &summaries,
+                &design,
+                "hypothesis",
+                "falsifier",
+            )
+        };
+        let mut wrong_estimate = analysis.clone();
+        wrong_estimate.interactions[0].mean_difference_in_differences += 1.0;
+        assert_eq!(
+            claims(&wrong_estimate),
+            Err(NotebookRenderError::AnalysisResultMismatch)
+        );
+        let mut removed = analysis.clone();
+        removed.interaction_contrasts.clear();
+        removed.interactions.clear();
+        assert_eq!(
+            claims(&removed),
+            Err(NotebookRenderError::AnalysisResultMismatch)
+        );
+        assert_eq!(
+            claims_from_analysis(&analysis, &summaries, "hypothesis", "falsifier"),
+            Err(NotebookRenderError::AnalysisResultMismatch),
+            "an interaction result cannot enter the baseline-only claim authority"
+        );
+        let issued = claims(&analysis).unwrap();
+        let Support::Interaction(original) = &issued[3].support else {
+            panic!("interaction support");
+        };
+        let mut forged = (**original).clone();
+        forged.effect.contrast.first.treatment = serde_json::json!(0.99);
+        forged.interaction_contrasts[0] = forged.effect.contrast.clone();
+        assert!(matches!(
+            validate_interaction(&forged),
+            Err(NotebookRenderError::EffectContractMismatch {
+                field: "four_cell_axis_levels",
+                ..
+            })
+        ));
+        let mut missing = (**original).clone();
+        missing.runs.pop();
+        assert!(validate_interaction(&missing).is_err());
+        let mut wrong_seed = (**original).clone();
+        wrong_seed.runs[0].seed = 99;
+        assert!(matches!(
+            validate_interaction(&wrong_seed),
+            Err(NotebookRenderError::EffectContractMismatch {
+                field: "four_cell_matched_seeds",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -1398,8 +1877,10 @@ mod tests {
 
     #[test]
     fn notebook_refuses_false_sign_assignment_procedure_and_counts() {
-        let mut reference =
-            effect_ref(vec![run("control", 0, 42), run("treatment", 1, 42)], effect());
+        let mut reference = effect_ref(
+            vec![run("control", 0, 42), run("treatment", 1, 42)],
+            effect(),
+        );
         validate_effect(&reference).unwrap();
         reference.sign_assignments_evaluated = 3;
         assert_eq!(

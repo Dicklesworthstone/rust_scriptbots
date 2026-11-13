@@ -51,6 +51,8 @@ pub const MAX_VALUES_PER_FACTOR: usize = 8;
 pub const MAX_INTERVENTION_SCHEDULES: usize = 8;
 /// Most arms (configuration factors times families times schedules) one spec may expand to.
 pub const MAX_ARMS: usize = 32;
+/// Most predeclared conditional interaction contrasts in one report.
+pub const MAX_INTERACTION_CONTRASTS: usize = 32;
 /// Most seeds in a cohort.
 pub const MAX_SEEDS: u16 = 64;
 /// Longest run, in ticks.
@@ -123,7 +125,7 @@ pub struct ExperimentSpec {
     /// the runner's MLP family. Each configuration assignment runs every family
     /// with the same seed cohort; aliases normalize before arm identity checks.
     /// The first configuration, family and schedule form the baseline for every other
-    /// arm; the analysis does not estimate factorial interaction effects.
+    /// arm. Conditional two-axis interactions can be requested separately.
     #[serde(default = "default_brain_families")]
     pub brain_families: Vec<String>,
     /// Ordered timed treatments to compare. Defaults to one empty schedule.
@@ -141,6 +143,13 @@ pub struct ExperimentSpec {
     /// available in every completed run. Population means and maxima are
     /// unavailable after extinction and are never silently replaced by zero.
     pub metrics: Vec<String>,
+    /// Also estimate every two-axis difference-in-differences against the first
+    /// declared levels, with all other axes held at their first levels. Includes
+    /// configuration, brain-family and schedule axes. These conditional contrasts
+    /// are not effects averaged over the other factors. All baseline comparisons
+    /// and interaction tests share one multiple-comparison correction family.
+    #[serde(default, skip_serializing_if = "interaction_analysis_disabled")]
+    pub include_pairwise_interactions: bool,
     /// The ceiling this spec must fit inside.
     pub budget: SpecBudget,
 }
@@ -151,6 +160,10 @@ fn default_brain_families() -> Vec<String> {
 
 fn default_intervention_schedules() -> Vec<Vec<ScenarioInterventionV1>> {
     vec![Vec::new()]
+}
+
+const fn interaction_analysis_disabled(value: &bool) -> bool {
+    !*value
 }
 
 /// One complete treatment assignment, including its canonical registered family.
@@ -165,6 +178,178 @@ pub struct Arm {
     pub interventions: Vec<ScenarioInterventionV1>,
 }
 
+/// An independently declared treatment axis, never an outcome-selected grouping.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum InteractionAxis {
+    ConfigFactor { knob_path: String },
+    BrainFamily,
+    InterventionSchedule,
+}
+
+/// Exact levels whose conditional treatment effects are compared.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InteractionLevels {
+    pub axis: InteractionAxis,
+    pub baseline: serde_json::Value,
+    pub treatment: serde_json::Value,
+}
+
+/// One predeclared four-cell contrast, conditional on the other axes' first levels.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InteractionContrast {
+    pub first: InteractionLevels,
+    pub second: InteractionLevels,
+    /// Ordered cells [baseline, first only, second only, both], with coefficients
+    /// [+1, -1, -1, +1]. The estimate is not divided by two or four.
+    pub arm_ids: [u16; 4],
+}
+
+fn interaction_axis_value(arm: &Arm, axis: &InteractionAxis) -> Result<serde_json::Value, String> {
+    match axis {
+        InteractionAxis::ConfigFactor { knob_path } => arm
+            .config_overrides
+            .get(knob_path)
+            .cloned()
+            .ok_or_else(|| format!("interaction axis {knob_path:?} is absent from an arm")),
+        InteractionAxis::BrainFamily => Ok(serde_json::json!(arm.brain_family)),
+        InteractionAxis::InterventionSchedule => {
+            serde_json::to_value(&arm.interventions).map_err(|error| error.to_string())
+        }
+    }
+}
+
+fn set_interaction_axis(
+    arm: &mut Arm,
+    axis: &InteractionAxis,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    match axis {
+        InteractionAxis::ConfigFactor { knob_path } => {
+            let current = arm
+                .config_overrides
+                .get_mut(knob_path)
+                .ok_or_else(|| format!("interaction axis {knob_path:?} is absent from an arm"))?;
+            *current = value.clone();
+        }
+        InteractionAxis::BrainFamily => {
+            arm.brain_family = value
+                .as_str()
+                .ok_or_else(|| "interaction family level must be a string".to_owned())?
+                .to_owned();
+        }
+        InteractionAxis::InterventionSchedule => {
+            arm.interventions =
+                serde_json::from_value(value.clone()).map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// Derive the complete interaction family from treatment metadata alone.
+///
+/// Validation and reanalysis use this same authority. Axes are ordered by config
+/// path, then family and schedule; levels retain their first appearance in arm
+/// order. Equal metadata within an arm and complete seed pairing are checked by
+/// the statistics consumer before it calls this function. No outcome is read.
+pub(crate) fn derive_interaction_contrasts(
+    arms: &[Arm],
+) -> Result<Vec<InteractionContrast>, String> {
+    if arms.is_empty() || arms.len() > MAX_ARMS {
+        return Err(format!("interaction design requires 1..={MAX_ARMS} arms"));
+    }
+    let baseline = &arms[0];
+    for (index, arm) in arms.iter().enumerate() {
+        if arm
+            .config_overrides
+            .keys()
+            .ne(baseline.config_overrides.keys())
+        {
+            return Err("interaction arms must declare the same configuration axes".to_owned());
+        }
+        if arms[..index].contains(arm) {
+            return Err("interaction design contains duplicate treatment assignments".to_owned());
+        }
+    }
+    let axes = baseline
+        .config_overrides
+        .keys()
+        .cloned()
+        .map(|knob_path| InteractionAxis::ConfigFactor { knob_path })
+        .chain([
+            InteractionAxis::BrainFamily,
+            InteractionAxis::InterventionSchedule,
+        ]);
+    let mut varying = Vec::new();
+    let mut combinations = 1_usize;
+    for axis in axes {
+        let mut levels = Vec::new();
+        for arm in arms {
+            let value = interaction_axis_value(arm, &axis)?;
+            if !levels.contains(&value) {
+                levels.push(value);
+            }
+        }
+        combinations = combinations
+            .checked_mul(levels.len())
+            .ok_or_else(|| "interaction design cardinality overflow".to_owned())?;
+        if levels.len() > 1 {
+            varying.push((axis, levels));
+        }
+    }
+    if combinations != arms.len() {
+        return Err(
+            "interaction analysis requires the complete Cartesian treatment grid".to_owned(),
+        );
+    }
+    if varying.len() < 2 {
+        return Err("interaction analysis requires at least two varying treatment axes".to_owned());
+    }
+    let locate = |arm: &Arm| -> Result<u16, String> {
+        let index = arms
+            .iter()
+            .position(|candidate| candidate == arm)
+            .ok_or_else(|| "interaction design is missing an observed cell".to_owned())?;
+        u16::try_from(index).map_err(|error| error.to_string())
+    };
+    let mut contrasts = Vec::new();
+    for (first_index, (first_axis, first_levels)) in varying.iter().enumerate() {
+        for (second_axis, second_levels) in varying.iter().skip(first_index + 1) {
+            for first_value in first_levels.iter().skip(1) {
+                for second_value in second_levels.iter().skip(1) {
+                    if contrasts.len() == MAX_INTERACTION_CONTRASTS {
+                        return Err(format!(
+                            "interaction contrast count exceeds {MAX_INTERACTION_CONTRASTS}"
+                        ));
+                    }
+                    let mut first = baseline.clone();
+                    set_interaction_axis(&mut first, first_axis, first_value)?;
+                    let mut second = baseline.clone();
+                    set_interaction_axis(&mut second, second_axis, second_value)?;
+                    let mut both = first.clone();
+                    set_interaction_axis(&mut both, second_axis, second_value)?;
+                    contrasts.push(InteractionContrast {
+                        first: InteractionLevels {
+                            axis: first_axis.clone(),
+                            baseline: first_levels[0].clone(),
+                            treatment: first_value.clone(),
+                        },
+                        second: InteractionLevels {
+                            axis: second_axis.clone(),
+                            baseline: second_levels[0].clone(),
+                            treatment: second_value.clone(),
+                        },
+                        arm_ids: [0, locate(&first)?, locate(&second)?, locate(&both)?],
+                    });
+                }
+            }
+        }
+    }
+    Ok(contrasts)
+}
+
 /// A spec that has been checked and expanded.
 ///
 /// Two validations of the same spec produce a byte-identical `ValidatedSpec`, and
@@ -176,8 +361,12 @@ pub struct ValidatedSpec {
     pub spec: ExperimentSpec,
     /// Every configuration assignment in factor declaration order, with families
     /// then schedules in declaration order inside each assignment. The first arm is the control
-    /// for every treatment comparison, not a factorial interaction model.
+    /// for every treatment comparison. Requested interactions are derived from
+    /// this same complete grid before any run executes.
     pub arms: Vec<Arm>,
+    /// Complete predeclared conditional interaction family; empty when disabled.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interaction_contrasts: Vec<InteractionContrast>,
     /// The cohort, ascending.
     pub seeds: Vec<u64>,
     /// Whether an arm changes the launch family or touches a knob that cannot
@@ -674,6 +863,7 @@ pub fn tool_input_schema() -> Result<serde_json::Value, serde_json::Error> {
                 "max_interventions_per_schedule": MAX_EXPERIMENT_INTERVENTIONS,
                 "max_intervention_patch_bytes": MAX_EXPERIMENT_INTERVENTION_PATCH_BYTES,
                 "max_arms": MAX_ARMS,
+                "max_interaction_contrasts": MAX_INTERACTION_CONTRASTS,
                 "max_seeds": MAX_SEEDS,
                 "max_ticks_per_run": MAX_TICKS_PER_RUN,
                 "max_string_length": MAX_STRING_LEN,
@@ -972,10 +1162,17 @@ pub fn validate_spec(
 
     let mut canonical_spec = spec.clone();
     canonical_spec.brain_families = families.into_iter().map(str::to_owned).collect();
+    let interaction_contrasts = if canonical_spec.include_pairwise_interactions {
+        derive_interaction_contrasts(&arms)
+            .map_err(|reason| vec![SpecError::InvalidExecutionPlan { reason }])?
+    } else {
+        Vec::new()
+    };
     let spec_id = content_hash(&canonical_spec, &arms, &seeds);
     Ok(ValidatedSpec {
         spec: canonical_spec,
         arms,
+        interaction_contrasts,
         seeds,
         fresh_world_only,
         spec_id,
@@ -1250,6 +1447,7 @@ mod tests {
             seeds: SeedPlan { base: 1, count: 4 },
             ticks_per_run: 2_000,
             metrics: vec!["alive_agents".to_owned()],
+            include_pairwise_interactions: false,
             budget: SpecBudget {
                 runs: 64,
                 ticks: 10_000_000,
@@ -1337,6 +1535,119 @@ mod tests {
                 max: MAX_ARMS,
             }
         )));
+    }
+
+    #[test]
+    fn interaction_opt_in_preserves_default_identity_and_predeclares_every_level() {
+        let original = spec();
+        let encoded = serde_json::to_value(&original).unwrap();
+        assert!(encoded.get("include_pairwise_interactions").is_none());
+        let mut explicit_off = encoded;
+        explicit_off["include_pairwise_interactions"] = serde_json::json!(false);
+        let explicit_off: ExperimentSpec = serde_json::from_value(explicit_off).unwrap();
+        let baseline = validate_spec(&original, OPERATOR_BUDGET).unwrap();
+        assert_eq!(
+            baseline,
+            validate_spec(&explicit_off, OPERATOR_BUDGET).unwrap()
+        );
+        assert!(baseline.interaction_contrasts.is_empty());
+
+        let mut enabled = original;
+        enabled.include_pairwise_interactions = true;
+        let errors = validate_spec(&enabled, OPERATOR_BUDGET).unwrap_err();
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            SpecError::InvalidExecutionPlan { reason }
+                if reason.contains("at least two varying")
+        )));
+        enabled.brain_families = vec!["mlp".to_owned(), "dwraon".to_owned()];
+        let declared = validate_spec(&enabled, OPERATOR_BUDGET).unwrap();
+        assert_eq!(declared.arms.len(), 6);
+        assert_eq!(declared.interaction_contrasts.len(), 2);
+        assert_eq!(declared.interaction_contrasts[0].arm_ids, [0, 2, 1, 3]);
+        assert_eq!(declared.interaction_contrasts[1].arm_ids, [0, 4, 1, 5]);
+        assert_eq!(
+            declared.interaction_contrasts[0].second.baseline,
+            serde_json::json!("mlp.baseline")
+        );
+        assert_eq!(
+            declared.interaction_contrasts[0].second.treatment,
+            serde_json::json!("dwraon.baseline")
+        );
+        enabled.include_pairwise_interactions = false;
+        let without_interactions = validate_spec(&enabled, OPERATOR_BUDGET).unwrap();
+        assert_eq!(declared.arms, without_interactions.arms);
+        assert_eq!(declared.cost(), without_interactions.cost());
+        assert_ne!(declared.spec_id, without_interactions.spec_id);
+    }
+
+    #[test]
+    fn conditional_interactions_hold_other_family_and_schedule_axes_at_baseline() {
+        let mut proposed = spec();
+        proposed.factors[0].values.truncate(2);
+        proposed.brain_families = vec!["mlp".to_owned(), "dwraon".to_owned()];
+        proposed
+            .intervention_schedules
+            .push(vec![ScenarioInterventionV1 {
+                tick: 1,
+                set: serde_json::json!({"food_decay_rate": 0.001}),
+            }]);
+        proposed.include_pairwise_interactions = true;
+        let validated = validate_spec(&proposed, OPERATOR_BUDGET).unwrap();
+        assert_eq!(validated.arms.len(), 8);
+        assert_eq!(validated.interaction_contrasts.len(), 3);
+        let cells = validated
+            .interaction_contrasts
+            .iter()
+            .map(|contrast| contrast.arm_ids)
+            .collect::<Vec<_>>();
+        assert_eq!(cells, [[0, 4, 2, 6], [0, 4, 1, 5], [0, 2, 1, 3]]);
+        let schedule = &validated.interaction_contrasts[2].second;
+        assert_eq!(schedule.axis, InteractionAxis::InterventionSchedule);
+        assert_eq!(schedule.baseline, serde_json::json!([]));
+        assert_eq!(
+            schedule.treatment,
+            serde_json::to_value(&proposed.intervention_schedules[1]).unwrap()
+        );
+        let mut missing = validated.arms.clone();
+        missing.pop();
+        assert!(
+            derive_interaction_contrasts(&missing)
+                .unwrap_err()
+                .contains("complete Cartesian")
+        );
+        let mut duplicated = validated.arms.clone();
+        duplicated[7] = duplicated[0].clone();
+        assert!(
+            derive_interaction_contrasts(&duplicated)
+                .unwrap_err()
+                .contains("duplicate")
+        );
+    }
+
+    #[test]
+    fn interaction_family_remains_bounded_at_the_largest_two_axis_grid() {
+        let mut proposed = spec();
+        proposed.factors = vec![
+            Factor {
+                knob_path: "food_growth_rate".to_owned(),
+                values: (1..=8)
+                    .map(|level| serde_json::json!(f64::from(level) * 0.01))
+                    .collect(),
+            },
+            Factor {
+                knob_path: "food_decay_rate".to_owned(),
+                values: (0..4)
+                    .map(|level| serde_json::json!(f64::from(level) * 0.01))
+                    .collect(),
+            },
+        ];
+        proposed.seeds.count = 1;
+        proposed.include_pairwise_interactions = true;
+        let validated = validate_spec(&proposed, OPERATOR_BUDGET).unwrap();
+        assert_eq!(validated.arms.len(), MAX_ARMS);
+        assert_eq!(validated.interaction_contrasts.len(), 7 * 3);
+        assert!(validated.interaction_contrasts.len() <= MAX_INTERACTION_CONTRASTS);
     }
 
     #[test]
@@ -2159,6 +2470,15 @@ mod tests {
                 .iter()
                 .any(|field| field.as_str() == Some("intervention_schedules"))
         );
+        assert!(
+            !required
+                .iter()
+                .any(|field| field.as_str() == Some("include_pairwise_interactions"))
+        );
+        assert_eq!(
+            schema.pointer("/properties/include_pairwise_interactions/type"),
+            Some(&serde_json::json!("boolean"))
+        );
         assert_eq!(
             schema.pointer("/properties/intervention_schedules/default"),
             Some(&serde_json::json!([[]]))
@@ -2184,6 +2504,10 @@ mod tests {
         assert_eq!(
             schema.pointer("/x-scriptbots-validation-limits/max_arms"),
             Some(&serde_json::json!(MAX_ARMS))
+        );
+        assert_eq!(
+            schema.pointer("/x-scriptbots-validation-limits/max_interaction_contrasts"),
+            Some(&serde_json::json!(MAX_INTERACTION_CONTRASTS))
         );
         assert_eq!(
             schema.pointer("/x-scriptbots-seed-policy/factor_path"),
