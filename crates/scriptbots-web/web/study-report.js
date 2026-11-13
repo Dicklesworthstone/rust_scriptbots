@@ -5,7 +5,8 @@ const MAX_REPORT_NODES = 8192;
 const MAX_REPORT_DEPTH = 24;
 const MAX_HORIZON_TICKS = 10000;
 const ID = /^[A-Za-z0-9_-]{1,128}$/;
-const DIGEST = /^[0-9a-f]{64}$/;
+const WORLD_DIGEST = /^[0-9a-f]{16}$/;
+const CHECKSUM = /^[0-9a-f]{64}$/;
 const METRICS = [
   ["population", "Population", true],
   ["food_total", "Ground food", false],
@@ -29,8 +30,12 @@ function identifier(value, label) {
   if (typeof value !== "string" || !ID.test(value)) refuse(label + " is invalid");
   return value;
 }
-function digest(value, label) {
-  if (typeof value !== "string" || !DIGEST.test(value)) refuse(label + " is invalid");
+function worldDigest(value, label) {
+  if (typeof value !== "string" || !WORLD_DIGEST.test(value)) refuse(label + " is invalid");
+  return value;
+}
+function checksum(value, label) {
+  if (typeof value !== "string" || !CHECKSUM.test(value)) refuse(label + " is invalid");
   return value;
 }
 function shape(value, required, optional = [], label = "record") {
@@ -157,7 +162,7 @@ function contextIdentity(context) {
   identifier(status.branch_id, "study identity");
   identifier(status.checkpoint_id, "checkpoint identity");
   identifier(status.artifact_id, "report artifact identity");
-  digest(status.world_digest_v1, "saved world digest");
+  worldDigest(status.world_digest_v1, "saved world digest");
   return status;
 }
 
@@ -174,8 +179,8 @@ function readArm(value, status, rootSeed) {
   if (tick(sample.tick, "terminal tick", low, high) !== high) refuse("terminal sample does not reach the admitted target");
   const terminal = { tick: high };
   for (const [key, label, integral] of METRICS) terminal[key] = integral ? count(sample[key], label) : finite(sample[key], label, 0);
-  terminal.digest = digest(sample.digest_overall, "terminal sample digest");
-  if (digest(value.final_digest, "final digest") !== terminal.digest) refuse("final digest differs from the terminal sample");
+  terminal.digest = worldDigest(sample.digest_overall, "terminal sample digest");
+  if (worldDigest(value.final_digest, "final digest") !== terminal.digest) refuse("final digest differs from the terminal sample");
 
   const extinction = value.extinction;
   shape(extinction, ["extinct", "extinction_tick", "min_population", "final_population"], [], "extinction");
@@ -276,7 +281,7 @@ export async function parseSavedStudyReport(blob, context) {
   if (report.study_id !== status.branch_id || report.control_branch_id !== "control"
       || count(report.checkpoint_tick, "saved tick") !== status.source_tick
       || count(report.horizon_ticks, "horizon") !== status.target_tick - status.source_tick
-      || digest(report.pre_intervention_digest, "initial digest") !== status.world_digest_v1
+      || worldDigest(report.pre_intervention_digest, "initial digest") !== status.world_digest_v1
       || report.pre_intervention_digest_verified_for_all_branches !== true) refuse("report does not match the selected saved-world study");
   const rootSeed = seed(report.base_seed, "starting seed");
   shape(report.source, ["kind", "artifact_path", "byte_size", "checksum_blake3"], [], "saved source");
@@ -284,7 +289,7 @@ export async function parseSavedStudyReport(blob, context) {
   if (report.source.kind !== "saved_checkpoint" || report.source.artifact_path !== "source_checkpoint.bin" || sourceBytes < 1) {
     refuse("report is not a retained saved-checkpoint study");
   }
-  const sourceChecksum = digest(report.source.checksum_blake3, "saved source checksum");
+  const sourceChecksum = checksum(report.source.checksum_blake3, "saved source checksum");
   const checkpoint = context.checkpoint;
   if (checkpoint != null && (!object(checkpoint) || checkpoint.checkpoint_id !== status.checkpoint_id
       || checkpoint.tick !== status.source_tick || checkpoint.world_digest_v1 !== status.world_digest_v1
@@ -312,7 +317,7 @@ export async function parseSavedStudyReport(blob, context) {
       refuse("report download differs from the selected artifact receipt");
     }
     artifact = { id: value.artifact_id, byteSize: value.byte_size,
-      checksumSha256: digest(value.checksum_sha256, "downloaded report checksum") };
+      checksumSha256: checksum(value.checksum_sha256, "downloaded report checksum") };
   }
   const endpoints = METRICS.map(([metric, label, integral]) => ({ metric, label, integral,
     control: control.terminal[metric], treatment: treatment ? treatment.terminal[metric] : null,

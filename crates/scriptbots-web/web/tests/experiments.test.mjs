@@ -7,6 +7,7 @@ const SESSION = "18446744073709551610";
 const SOURCE = "wss://lab.example/prefix/ws";
 const PLAN = "a".repeat(64);
 const DIGEST = "b".repeat(64);
+const WORLD_DIGEST = "b".repeat(16);
 const clone = (value) => structuredClone(value);
 const flush = async () => { for (let i = 0; i < 8; i += 1) await Promise.resolve(); };
 
@@ -35,7 +36,7 @@ function status({ id = "cohort", seeds = request().seeds, state = "running", gen
       checkpoint_progress: completed
         ? { state: "observed", tick: 20, checkpoint_digest: DIGEST, source: "published" }
         : { state: "unavailable", reason: started ? "awaiting_publication" : "not_started" },
-      final_digest: completed ? DIGEST : null,
+      final_digest: completed ? WORLD_DIGEST : null,
       bundle_path: completed ? "/retained/" + id + "/" + variant + "-" + seed : null,
       error_reason: null,
     };

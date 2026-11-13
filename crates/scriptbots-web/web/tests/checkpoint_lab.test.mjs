@@ -11,13 +11,14 @@ import { MAX_STUDY_REPORT_BYTES } from "../study-report.js";
 
 const SESSION = "18446744073709551610";
 const DIGEST = "a".repeat(64);
+const WORLD_DIGEST = "a".repeat(16);
 const SOURCE = "wss://lab.example/nested/api/ws/stream";
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 const frame = (sessionId = SESSION) => ({ identity: { sessionId, tick: "120" }, snapshot: { epoch: "0" } });
 
 function checkpoint(changes = {}) {
   return { checkpoint_id: "ckpt-saved-t100", tick: 100, agent_count: 12, byte_size: 1024,
-    world_digest_v1: DIGEST, checksum_blake3: "b".repeat(64), checksum_sha256: "c".repeat(64),
+    world_digest_v1: WORLD_DIGEST, checksum_blake3: "b".repeat(64), checksum_sha256: "c".repeat(64),
     schema: "scriptbots.world-checkpoint.v1.3", created_at_utc: "1794000000", ...changes };
 }
 
@@ -94,6 +95,9 @@ test("checkpoint selection requires exact metadata and complete bounded page cur
   for (const changes of [{ tick: Number.MAX_SAFE_INTEGER + 1 }, { byte_size: Number.MAX_SAFE_INTEGER + 1 },
     { byte_size: 0 }, { checkpoint_id: undefined }, { checkpoint_id: ["saved-cut"] },
     { world_digest_v1: [DIGEST] }, { checksum_blake3: [DIGEST] }, { checksum_sha256: [DIGEST] },
+    { world_digest_v1: DIGEST }, { world_digest_v1: "a".repeat(15) }, { world_digest_v1: "a".repeat(17) },
+    { world_digest_v1: "A".repeat(16) }, { world_digest_v1: "g".repeat(16) },
+    { checksum_blake3: WORLD_DIGEST }, { checksum_sha256: WORLD_DIGEST },
     { agent_count: 1025 }, { world_digest_v1: "not-a-digest" }, { checkpoint_id: "../wrong" },
     { schema: "render-frame" }, { checksum_sha256: "C".repeat(64) }]) {
     assert.throws(() => validateLabCheckpoint(checkpoint(changes)));
@@ -134,7 +138,7 @@ test("branch observations bind the saved digest and horizon and cannot regress a
   assert.equal(validateLabBranchStatus(running, request, checkpoint()), running);
   const complete = status(request, checkpoint(), { status: "completed", artifact_id: artifact().artifact_id });
   validateLabBranchStatus(complete, request, checkpoint(), running);
-  for (const changes of [{ checkpoint_id: "ckpt-other" }, { world_digest_v1: "d".repeat(64) },
+  for (const changes of [{ checkpoint_id: "ckpt-other" }, { world_digest_v1: "d".repeat(16) },
     { target_tick: 221 }, { source_tick: 101 }, { branch_name: "different" }, { status: "completed" },
     { artifact_id: "premature-report" }, { status: "fake" }, { branch_id: undefined }, { branch_id: ["branch-one"] }]) {
     assert.throws(() => validateLabBranchStatus({ ...running, ...changes }, request, checkpoint()));
@@ -417,7 +421,7 @@ test("unrelated or changed downloads are refused before becoming downloadable fi
 test("an existing catalog row cannot replace a selected cut with different scientific bytes", async () => {
   const h = await harness();
   const original = h.controller.selected;
-  h.controller.services.list = async () => page([checkpoint({ world_digest_v1: "d".repeat(64) })]);
+  h.controller.services.list = async () => page([checkpoint({ world_digest_v1: "d".repeat(16) })]);
   assert.equal(await h.controller.refresh(true), null);
   assert.equal(h.controller.selected, original);
   assert.match(h.controller.notice, /changed its scientific identity/);
@@ -438,7 +442,10 @@ test("retained study pages identify each branch independently of its shared chec
   assert.throws(() => validateLabBranchPage(historyPage(rows, { total: 13, has_more: true, next_cursor: "13" })));
   assert.throws(() => validateLabBranchObservation({ ...first, checkpoint_id: "different" }, first));
   assert.throws(() => validateLabBranchObservation({ ...first, target_tick: 225 }, first));
-  assert.throws(() => validateLabBranchObservation({ ...first, world_digest_v1: "d".repeat(64) }, first));
+  assert.throws(() => validateLabBranchObservation({ ...first, world_digest_v1: "d".repeat(16) }, first));
+  for (const world_digest_v1 of [DIGEST, "a".repeat(15), "a".repeat(17), "A".repeat(16)]) {
+    assert.throws(() => validateLabBranchObservation({ ...first, world_digest_v1 }));
+  }
 });
 
 test("selecting completed history reads exact retained status and downloads without reconstructing or submitting a study", async () => {
@@ -516,7 +523,7 @@ test("history selection refuses changed scientific evidence and never regresses 
   await first;
   const observed = h.controller.branch;
   const changed = h.controller.selectStudy(running.branch_id);
-  h.queues.status[1].resolve({ ...complete, world_digest_v1: "d".repeat(64) });
+  h.queues.status[1].resolve({ ...complete, world_digest_v1: "d".repeat(16) });
   assert.equal(await changed, null);
   assert.equal(h.controller.branch, observed);
   assert.match(h.controller.notice, /does not match/);

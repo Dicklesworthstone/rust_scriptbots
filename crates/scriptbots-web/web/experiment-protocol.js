@@ -26,6 +26,7 @@ const MAX_JSON_NODES = 100_000;
 const MAX_JSON_DEPTH = 24;
 const U64_MAX = (1n << 64n) - 1n;
 const DIGEST = /^[0-9a-f]{64}$/;
+const WORLD_DIGEST = /^[0-9a-f]{16}$/;
 const STATES = ["pending", "running", "cancelling", "cancelled", "stopped", "completed", "failed"];
 const FAMILIES = Object.freeze({
   mlp: "mlp.baseline", "mlp.baseline": "mlp.baseline",
@@ -74,6 +75,10 @@ function boolean(value, label) {
 }
 function digest(value, label) {
   if (typeof value !== "string" || !DIGEST.test(value)) refuse(label + " is not a canonical digest");
+  return value;
+}
+function worldDigest(value, label) {
+  if (typeof value !== "string" || !WORLD_DIGEST.test(value)) refuse(label + " is not a canonical scientific digest");
   return value;
 }
 function unsigned(value, label) {
@@ -341,7 +346,7 @@ function runRecord(value, experimentId) {
   const horizon = integer(value.target_ticks, "target tick", 1, EXPERIMENT_LIMITS.maxTicks);
   const total = integer(value.total_ticks, "terminal ticks", 0, horizon);
   const error = nullableText(value.error_reason, "run failure");
-  const finalDigest = value.final_digest === null ? null : digest(value.final_digest, "final world digest");
+  const finalDigest = value.final_digest === null ? null : worldDigest(value.final_digest, "final world digest");
   const bundle = nullableText(value.bundle_path, "retained bundle path");
   if (!["pending", "running", "completed", "failed"].includes(value.state)) refuse("unsupported run lifecycle state");
   if (value.state === "completed") {

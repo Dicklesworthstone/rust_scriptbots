@@ -3,10 +3,11 @@ import assert from "node:assert/strict";
 import { MAX_STUDY_REPORT_BYTES, parseSavedStudyReport, renderStudyReport } from "../study-report.js";
 
 const hash = (letter) => letter.repeat(64);
+const worldDigest = (letter) => letter.repeat(16);
 const status = Object.freeze({
   branch_id: "branch-browser-study", checkpoint_id: "ckpt-browser-source",
   branch_name: "browser-study", status: "completed", source_tick: 10, target_tick: 12,
-  world_digest_v1: hash("b"), artifact_id: "checkpoint-branch-report",
+  world_digest_v1: worldDigest("b"), artifact_id: "checkpoint-branch-report",
 });
 const checkpoint = Object.freeze({
   checkpoint_id: status.checkpoint_id, tick: 10, byte_size: 128, agent_count: 3,
@@ -17,7 +18,7 @@ const checkpoint = Object.freeze({
 // field names. These hand-computed observations are not real-run science evidence.
 function reportFixture() {
   const sample = { tick: 12, population: 3, food_total: 10, births: 0, deaths: 0,
-    total_energy: 3, average_health: 1, spike_hits: 0, digest_overall: hash("c") };
+    total_energy: 3, average_health: 1, spike_hits: 0, digest_overall: worldDigest("c") };
   const recovery = { baseline_tick: 10, pre_intervention_population: 3, trough_population: 3,
     trough_tick: 10, final_population: 3, recovered: true, recovery_ratio: 1, recovery_ticks: 1 };
   const control = {
@@ -27,7 +28,7 @@ function reportFixture() {
     recovery,
     hysteresis: { integrated_trajectory_deficit: 0, normalized_trajectory_difference: 0,
       terminal_trajectory_gap: 0, hysteresis_index: 0, path_dependence_detected: false },
-    effect_sizes: {}, final_digest: hash("c"), terminal_sample: sample,
+    effect_sizes: {}, final_digest: worldDigest("c"), terminal_sample: sample,
     bundle_path: "/retained/branches/branch-browser-study/study/bundle_control", bundle_verified: true,
   };
   const effect = (metric, mean, sd) => ({ metric,
@@ -35,8 +36,8 @@ function reportFixture() {
   const treatment = {
     branch_id: "treatment", description: "browser-study: requested intervention",
     command_applied_tick: 10,
-    first_divergence: { branch_id: "treatment", tick: 11, stage: "food", control_digest: hash("e"),
-      branch_digest: hash("f"), command_applied_tick: 10, details: "first differing food lane" },
+    first_divergence: { branch_id: "treatment", tick: 11, stage: "food", control_digest: worldDigest("e"),
+      branch_digest: worldDigest("f"), command_applied_tick: 10, details: "first differing food lane" },
     extinction: { extinct: false, extinction_tick: null, min_population: 2, final_population: 2 },
     recovery: { ...recovery, trough_population: 2, trough_tick: 11, final_population: 2,
       recovered: false, recovery_ratio: 2 / 3, recovery_ticks: null },
@@ -45,14 +46,14 @@ function reportFixture() {
     effect_sizes: { population: effect("population", -2 / 3, Math.sqrt(1 / 3)),
       food_total: effect("food_total", -8 / 3, Math.sqrt(16 / 3)),
       total_energy: effect("total_energy", -5 / 6, Math.sqrt(7 / 12)) },
-    final_digest: hash("d"), terminal_sample: { ...sample, population: 2, food_total: 6,
-      total_energy: 1.5, average_health: 0.75, deaths: 1, spike_hits: 1, digest_overall: hash("d") },
+    final_digest: worldDigest("d"), terminal_sample: { ...sample, population: 2, food_total: 6,
+      total_energy: 1.5, average_health: 0.75, deaths: 1, spike_hits: 1, digest_overall: worldDigest("d") },
     bundle_path: "/retained/branches/branch-browser-study/study/bundle_treatment", bundle_verified: true,
   };
   return {
     study_id: status.branch_id, schema_version: 4, base_seed: 42,
     source: { kind: "saved_checkpoint", artifact_path: "source_checkpoint.bin", byte_size: 128, checksum_blake3: hash("a") },
-    checkpoint_tick: 10, horizon_ticks: 2, pre_intervention_digest: hash("b"),
+    checkpoint_tick: 10, horizon_ticks: 2, pre_intervention_digest: worldDigest("b"),
     pre_intervention_digest_verified_for_all_branches: true, control_branch_id: "control",
     branch_reports: [control, treatment], summary_markdown: "# Saved study\nDescriptive trajectory comparison.",
   };
@@ -88,6 +89,23 @@ test("schema 4 saved report binds source and separates endpoint deltas from traj
   assert.throws(() => { model.endpoints[0].difference = 900; }, TypeError);
 });
 
+test("reports admit FNV scientific digests without accepting truncated artifact checksums", async () => {
+  assert.equal((await parse(reportFixture())).arms[0].terminal.digest, worldDigest("c"));
+  for (const invalid of [hash("c"), "c".repeat(15), "c".repeat(17), "C".repeat(16), "g".repeat(16)]) {
+    const report = reportFixture();
+    report.branch_reports[0].final_digest = invalid;
+    report.branch_reports[0].terminal_sample.digest_overall = invalid;
+    await assert.rejects(parse(report), /terminal sample digest/);
+  }
+  const source = reportFixture();
+  source.source.checksum_blake3 = worldDigest("a");
+  await assert.rejects(parse(source), /saved source checksum/);
+  const { blob, context } = input();
+  context.artifact.checksum_sha256 = worldDigest("e");
+  await assert.rejects(parseSavedStudyReport(blob, context), /downloaded report checksum/);
+  await assert.rejects(parse(reportFixture(), { status: { ...status, world_digest_v1: hash("b") } }), /saved world digest/);
+});
+
 test("exact full-width u64 seed survives JSON reading and binds every comparison", async () => {
   const wire = JSON.stringify(reportFixture()).replace('"base_seed":42', '"base_seed":18446744073709551615')
     .split('"seed":42').join('"seed":18446744073709551615');
@@ -100,7 +118,7 @@ test("retained history can validate a report from its exact completed status wit
   const model = await parse(reportFixture(), { checkpoint: null });
   assert.equal(model.checkpointId, status.checkpoint_id);
   assert.equal(model.worldDigest, status.world_digest_v1);
-  await assert.rejects(parse(reportFixture(), { checkpoint: null, status: { ...status, world_digest_v1: hash("f") } }), /selected saved-world study/);
+  await assert.rejects(parse(reportFixture(), { checkpoint: null, status: { ...status, world_digest_v1: worldDigest("f") } }), /selected saved-world study/);
   await assert.rejects(parse(reportFixture(), { checkpoint: { ...checkpoint, agent_count: 4 } }), /population baseline/);
 });
 
@@ -131,13 +149,13 @@ test("report identities, bounds, source bytes and terminal digests are never sub
     ["different saved tick", (r) => { r.checkpoint_tick = 11; }],
     ["different horizon", (r) => { r.horizon_ticks = 3; }],
     ["unverified initial state", (r) => { r.pre_intervention_digest_verified_for_all_branches = false; }],
-    ["different source digest", (r) => { r.pre_intervention_digest = hash("f"); }],
+    ["different source digest", (r) => { r.pre_intervention_digest = worldDigest("f"); }],
     ["different source bytes", (r) => { r.source.byte_size = 129; }],
     ["different source checksum", (r) => { r.source.checksum_blake3 = hash("e"); }],
     ["warmup cannot replace saved source", (r) => { r.source = { kind: "seeded_warmup" }; }],
     ["source traversal", (r) => { r.source.artifact_path = "../source_checkpoint.bin"; }],
     ["wrong final boundary", (r) => { r.branch_reports[1].terminal_sample.tick = 11; }],
-    ["digest disagreement", (r) => { r.branch_reports[1].final_digest = hash("f"); }],
+    ["digest disagreement", (r) => { r.branch_reports[1].final_digest = worldDigest("f"); }],
     ["unverified bundle", (r) => { r.branch_reports[0].bundle_verified = false; }],
     ["unrelated arm", (r) => { r.branch_reports[1].branch_id = "another"; }],
     ["too many arms", (r) => { r.branch_reports.push(structuredClone(r.branch_reports[1])); }],
@@ -219,8 +237,8 @@ test("first divergence and extinction bind their actual branch and observation b
 test("canonical non-hash RNG and absent hydrology divergence evidence remains inspectable", async () => {
   for (const [stage, controlEvidence, branchEvidence] of [
     ["rng", "RngProbe { words: [1, 2, 3, 4] }", "RngProbe { words: [1, 2, 3, 5] }"],
-    ["hydrology", "absent", hash("f")],
-    ["hydrology", hash("e"), "absent"],
+    ["hydrology", "absent", worldDigest("f")],
+    ["hydrology", worldDigest("e"), "absent"],
   ]) {
     const report = reportFixture(), first = report.branch_reports[1].first_divergence;
     first.stage = stage;

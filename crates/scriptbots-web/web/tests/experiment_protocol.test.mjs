@@ -7,6 +7,7 @@ import {
 } from "../experiment-protocol.js";
 
 const hash = (letter) => letter.repeat(64);
+const worldDigest = (letter) => letter.repeat(16);
 const largestSeed = "18446744073709551615";
 const clone = (value) => structuredClone(value);
 
@@ -31,7 +32,7 @@ function statusFixture({ seeds = ["7", largestSeed], state = "completed", arms =
     total_ticks: state === "completed" ? 200 : 0, target_ticks: 200,
     checkpoint_progress: state === "pending" ? { state: "unavailable", reason: "not_started" }
       : { state: "observed", tick: state === "completed" ? 200 : 50, checkpoint_digest: hash("d"), source: "published" },
-    final_digest: state === "completed" ? hash(arm === 0 ? "a" : "b") : null,
+    final_digest: state === "completed" ? worldDigest(arm === 0 ? "a" : "b") : null,
     bundle_path: state === "completed" ? `/retained/experiments/browser-cohort/browser-cohort-${variant}-seed${seed}` : null,
     error_reason: state === "failed" ? "owner construction refused" : null,
   })));
@@ -190,7 +191,7 @@ test("status binds the complete canonical family, seed and run matrix to the req
     planDigest: hash("c"), minimumGeneration: 8,
   });
   assert.equal(status.runs[1].seed, largestSeed);
-  assert.equal(status.runs[0].final_digest, hash("a"));
+  assert.equal(status.runs[0].final_digest, worldDigest("a"));
   assert.equal(status.runs[0].checkpoint_progress.checkpoint_digest, hash("d"));
   assert.ok(Object.isFrozen(status.runs[0].checkpoint_progress));
   assert.throws(() => { status.runs[0].seed = "8"; }, TypeError);
@@ -199,6 +200,21 @@ test("status binds the complete canonical family, seed and run matrix to the req
   assert.throws(() => validateExperimentStatus(statusFixture(), { minimumGeneration: 10 }), /stale/);
   const request = requestFixture(); request.seeds[0] = "8";
   assert.throws(() => validateExperimentStatus(statusFixture(), { request }), /immutable request/);
+});
+
+test("scientific state digests and artifact checksums retain their distinct wire formats", () => {
+  assert.equal(validateExperimentStatus(statusFixture()).runs[0].final_digest, worldDigest("a"));
+  for (const finalDigest of [hash("a"), "a".repeat(15), "a".repeat(17), "A".repeat(16), "g".repeat(16)]) {
+    const fixture = statusFixture();
+    fixture.runs[0].final_digest = finalDigest;
+    assert.throws(() => validateExperimentStatus(fixture), /final world digest/);
+  }
+  const checkpoint = statusFixture();
+  checkpoint.runs[0].checkpoint_progress.checkpoint_digest = worldDigest("a");
+  assert.throws(() => validateExperimentStatus(checkpoint), /checkpoint bytes digest/);
+  const plan = statusFixture();
+  plan.plan_digest = worldDigest("a");
+  assert.throws(() => validateExperimentStatus(plan), /experiment plan digest/);
 });
 
 test("historical catalogs can inspect more arms than this browser admits for creation", () => {
@@ -280,7 +296,7 @@ test("generation binding preserves terminal evidence while allowing newer checkp
   assert.throws(() => validateExperimentStatus(completed, { previousStatus: previous }), /unchanged or terminal/);
   completed.generation += 1;
   assert.equal(validateExperimentStatus(completed, { previousStatus: previous }).status, "completed");
-  const tampered = clone(completed); tampered.generation += 1; tampered.runs[0].final_digest = hash("f");
+  const tampered = clone(completed); tampered.generation += 1; tampered.runs[0].final_digest = worldDigest("f");
   assert.throws(() => validateExperimentStatus(tampered, { previousStatus: completed }), /terminal run evidence/);
 });
 

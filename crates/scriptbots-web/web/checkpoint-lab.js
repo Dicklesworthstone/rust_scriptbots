@@ -8,9 +8,13 @@ export const CHECKPOINT_LAB_PAGE_SIZE = 12;
 export const MAX_LAB_ARTIFACT_BYTES = 64 * 1024 * 1024;
 const MAX_BRANCH_TICKS = 10000;
 const POLL_MS = 2000;
-const DIGEST = /^[0-9a-f]{64}$/;
+// WorldDigestV1 uses FNV-1a64. Artifact integrity uses BLAKE3/SHA-256;
+// admitting one format must never make the other format interchangeable.
+const WORLD_DIGEST = /^[0-9a-f]{16}$/;
+const CHECKSUM = /^[0-9a-f]{64}$/;
 const ID = /^[A-Za-z0-9_-]{1,128}$/;
-const digest = (value) => typeof value === "string" && DIGEST.test(value);
+const worldDigest = (value) => typeof value === "string" && WORLD_DIGEST.test(value);
+const checksum = (value) => typeof value === "string" && CHECKSUM.test(value);
 const identifier = (value) => typeof value === "string" && ID.test(value);
 const TERMINAL = new Set(["completed", "cancelled", "failed", "stopped"]);
 const integer = (value, min = 0, max = Number.MAX_SAFE_INTEGER) =>
@@ -37,8 +41,8 @@ function errorText(error) { return String(error?.message || error || "Unknown se
 export function validateLabCheckpoint(value) {
   if (!object(value) || !identifier(value.checkpoint_id) || !integer(value.tick)
       || !integer(value.agent_count) || !integer(value.byte_size, 1)
-      || value.agent_count > value.byte_size || !digest(value.world_digest_v1)
-      || !digest(value.checksum_blake3) || !digest(value.checksum_sha256)
+      || value.agent_count > value.byte_size || !worldDigest(value.world_digest_v1)
+      || !checksum(value.checksum_blake3) || !checksum(value.checksum_sha256)
       || !text(value.schema, 128) || !value.schema.startsWith("scriptbots.world-checkpoint.")
       || !text(value.created_at_utc, 128) || !value.created_at_utc
       || (value.description != null && !text(value.description, 4096))) {
@@ -113,7 +117,7 @@ export function validateLabBranchObservation(value, previous = null) {
       || !["running", "cancelling", ...TERMINAL].includes(value.status)
       || !integer(value.source_tick) || !integer(value.target_tick)
       || !integer(value.target_tick - value.source_tick, 1, MAX_BRANCH_TICKS)
-      || !digest(value.world_digest_v1)
+      || !worldDigest(value.world_digest_v1)
       || (value.error_reason != null && !text(value.error_reason, 4096))
       || (value.status === "completed" ? !identifier(value.artifact_id) || value.error_reason != null : value.artifact_id != null)) {
     throw new Error("The host returned invalid or inexact retained study metadata");
@@ -148,7 +152,7 @@ export function validateLabBranchPage(page, cursor = null) {
 /** Catalog data supplies the identity and filename; no download URL comes from a report. */
 export function validateLabArtifact(value, branchId = null) {
   if (!object(value) || !identifier(value.artifact_id) || !integer(value.byte_size)
-      || !digest(value.checksum_blake3) || !digest(value.checksum_sha256)
+      || !checksum(value.checksum_blake3) || !checksum(value.checksum_sha256)
       || !text(value.filename, 255) || !value.filename || /[/\\\u0000-\u001f\u007f]/.test(value.filename)
       || !text(value.content_type, 128) || !/^[a-z0-9.+-]+\/[a-z0-9.+-]+$/.test(value.content_type)
       || !text(value.relative_path, 2048) || !value.relative_path
