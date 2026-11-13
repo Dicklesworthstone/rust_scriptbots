@@ -2,6 +2,56 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Checkpoint usability and experiment resource admission (2026-11-13):**
+[Source implemented and independently reviewed — Codex; browser DSR passed,
+native and full-workspace qualification open]
+
+Address `bd-e32s`, `bd-5ygz` and the per-owner resource slice of
+`bd-2z0.5.11`. Native Lab and browser checkpoint receipts, saved-study reports
+and completed experiment observations now distinguish the actual 16-character
+FNV-1a64 world digest from 64-character artifact and plan checksums. The existing
+identity, checksum and observation-order guards remain. MCP retained-state
+conflicts now return actionable tool execution failures; malformed arguments
+retain their protocol errors.
+
+A fresh browser owner can capture its genuine empty journal prefix before any
+tick or command. The volatile adapter is bound to the actual session, restores
+without an invented accepted batch, and rejects foreign sessions or completed
+owner work paired with erased history. New regressions cover clock initialization,
+exact continuation and MLP/DWRAON/Assembly worlds with zero and three founders.
+Browser fork provenance uses core's typed canonical serializer so stored f32
+values retain the same exact observations with or without arbitrary-precision
+JSON feature unification.
+
+Managed experiment runs reuse the branch-study 10,000-agent ceiling and bound
+history and narrative retention to 10,000 entries. Admission checks the initial
+configuration and every resolved intervention prefix before execution or output
+creation. Actual population is checked after a successful scientific step and
+before sealing or encoding the successor checkpoint. Crossing the ceiling fails
+the run while retaining the preceding cut. Decoded checkpoints are checked before
+executable restore and before temporary-file recovery can replace a valid parent.
+New regressions use real HostCore growth, exact resumed-versus-uninterrupted
+digests, retained failure, and repeated refusal preserving both parent and
+temporary bytes. The first crossing tick can allocate before its boundary check;
+this is a cardinality policy, not a total heap or disk guarantee.
+
+DSR ran all 210 browser tests successfully, with no skipped or cancelled tests,
+plus syntax checks for all three changed production JavaScript modules. The
+same revised tests against the original production code produced 53 failures.
+Both executions retained unchanged before/after source snapshots. The eight
+stable Rust files passed the pinned nightly's read-only Rustfmt check. The final
+runner formatting operation completed, but its later read-only check did not.
+
+Native baseline compilation reached unchanged `scriptbots-core`, then rustc was
+killed with SIGKILL before tests ran. The final combined candidate stalled during
+formatting and the execution environment became unavailable. Its native tests,
+workspace check and strict Clippy commands did not execute. UBS also refused
+because ast-grep was unavailable; no scanner pass is claimed. After the outage,
+the final runner was recovered with exact byte identity against its pre-loss
+Git blob `40f73a6323f31ab604365dd802d6fe669b3d2e31` and saved through GitHub.
+The original bead acceptance criteria, Known issues entries and broader resource,
+fault-injection, native and packaged-browser qualification remain open.
+
 **Browser matched-seed experiment workflow (2026-11-12):**
 [Source implemented and reviewed — Codex; executable and browser qualification open]
 

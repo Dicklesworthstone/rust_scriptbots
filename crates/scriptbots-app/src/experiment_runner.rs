@@ -50,6 +50,14 @@ pub(crate) const MAX_CONCURRENT_RUNS: usize = 64;
 // not measurements or guarantees of total memory, population or artifact bytes.
 const MAX_RUN_GRID_CELLS: u64 = 262_144;
 pub(crate) const MAX_CONCURRENT_GRID_CELLS: u64 = 1_048_576;
+// Match the managed branch-study population policy. These are per-owner
+// cardinality limits, not a total heap bound: a tick can cross the population
+// ceiling before the runner observes it. Refuse further work and checkpoint
+// capture at that boundary rather than truncating or changing the science.
+const MAX_RUN_POPULATION: u64 = crate::branch_study::MAX_STUDY_POPULATION;
+// WorldState preallocates its history ring from this value. The same ceiling
+// also bounds retained narrative events; both are copied into owner cuts.
+const MAX_RUN_HISTORY_ENTRIES: u64 = 10_000;
 pub(crate) const MAX_EXPERIMENT_INTERVENTIONS: usize = 64;
 pub(crate) const MAX_EXPERIMENT_INTERVENTION_PATCH_BYTES: usize = 4_096;
 const HOST_RECEIPT_DRIVE_LIMIT: usize = 16;
@@ -64,6 +72,15 @@ const REQUIRED_EXPERIMENT_ARTIFACTS: &[(&str, &str)] = &[
     ("evidence/run.json", "experiment-run-evidence"),
     FINAL_CHECKPOINT_ARTIFACT,
 ];
+
+// Public entry points always choose MAX_RUN_POPULATION. Carrying the bound
+// alongside cancellation lets the real execution path exercise a small crossing
+// population in regression tests without allocating 10,001 complete brains.
+#[derive(Clone, Copy)]
+struct RunExecutionBudget<'a> {
+    cancel: &'a std::sync::atomic::AtomicBool,
+    population_limit: u64,
+}
 
 /// Typed failure from matched-seed planning, status recovery, execution, or bundle verification.
 #[derive(Debug, Error)]
@@ -88,6 +105,28 @@ pub enum ExperimentRunnerError {
         concurrent_runs: usize,
         cells: u64,
         limit: u64,
+    },
+    /// An initial configuration or resolved intervention exceeds an owner budget.
+    #[error(
+        "variant `{variant_id}` configuration step {configuration_step} requests {requested} {resource}, exceeding the per-run limit {limit}; step 0 is the initial configuration"
+    )]
+    RunConfigCapacityExceeded {
+        variant_id: String,
+        configuration_step: u64,
+        resource: &'static str,
+        requested: u64,
+        limit: u64,
+    },
+    /// A completed boundary exceeded the population budget before checkpoint capture.
+    #[error(
+        "run `{run_id}` reached population {population} at tick {tick}, exceeding the per-run limit {limit}; last retained checkpoint tick: {retained_checkpoint_tick:?}; no successor checkpoint was published"
+    )]
+    RunPopulationCapacityExceeded {
+        run_id: String,
+        tick: u64,
+        population: u64,
+        limit: u64,
+        retained_checkpoint_tick: Option<u64>,
     },
     /// A variant names no registered protocol family supported by this runner.
     #[error("variant `{variant_id}` requests unknown brain family `{brain_family}`")]
@@ -520,12 +559,104 @@ fn invalid_checkpoint(path: &Path, reason: impl std::fmt::Display) -> Experiment
     }
 }
 
+fn validate_run_config_capacity(
+    variant_id: &str,
+    config: &ScriptBotsConfig,
+    configuration_step: u64,
+) -> Result<(), ExperimentRunnerError> {
+    for (resource, requested, limit) in [
+        (
+            "history entries",
+            u64::try_from(config.history_capacity).unwrap_or(u64::MAX),
+            MAX_RUN_HISTORY_ENTRIES,
+        ),
+        (
+            "narrative events",
+            u64::try_from(config.narrative_capacity).unwrap_or(u64::MAX),
+            MAX_RUN_HISTORY_ENTRIES,
+        ),
+        (
+            "population floor",
+            u64::try_from(config.population_minimum).unwrap_or(u64::MAX),
+            MAX_RUN_POPULATION,
+        ),
+        (
+            "population injection count",
+            u64::from(config.population_spawn_count),
+            MAX_RUN_POPULATION,
+        ),
+    ] {
+        if requested > limit {
+            return Err(ExperimentRunnerError::RunConfigCapacityExceeded {
+                variant_id: variant_id.to_owned(),
+                configuration_step,
+                resource,
+                requested,
+                limit,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn enforce_run_population(
+    world: &WorldState,
+    run_id: &str,
+    limit: u64,
+    retained_checkpoint_tick: Option<u64>,
+) -> Result<(), ExperimentRunnerError> {
+    let population = u64::try_from(world.agents().len()).unwrap_or(u64::MAX);
+    if population > limit {
+        return Err(ExperimentRunnerError::RunPopulationCapacityExceeded {
+            run_id: run_id.to_owned(),
+            tick: world.tick().0,
+            population,
+            limit,
+            retained_checkpoint_tick,
+        });
+    }
+    Ok(())
+}
+
+fn validate_run_checkpoint_capacity(
+    checkpoint: &RunCheckpointV1,
+    path: &Path,
+    population_limit: u64,
+) -> Result<(), ExperimentRunnerError> {
+    // Apply the same per-owner policy before executable restore and before a
+    // recovered temporary cut can replace the preceding admitted checkpoint.
+    let host = checkpoint.owner.host_checkpoint();
+    validate_run_config_capacity(
+        checkpoint
+            .metadata
+            .manifest
+            .identity
+            .variant_id
+            .as_deref()
+            .unwrap_or(&checkpoint.metadata.run_id),
+        host.config(),
+        host.completed_schedule_sequence().unwrap_or(0),
+    )
+    .map_err(|error| invalid_checkpoint(path, error))?;
+    let population = u64::try_from(host.world_checkpoint().agent_count()).unwrap_or(u64::MAX);
+    if population > population_limit {
+        return Err(invalid_checkpoint(
+            path,
+            format!(
+                "checkpoint population {population} exceeds the per-run limit {population_limit}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn restore_run_owner(
     checkpoint: &RunCheckpointV1,
     family: ResolvedBrainFamily,
     run_id: &str,
     path: &Path,
 ) -> Result<HostCore, ExperimentRunnerError> {
+    validate_run_checkpoint_capacity(checkpoint, path, MAX_RUN_POPULATION)?;
     let mut registry = BrainRegistry::new();
     registry
         .register_family(family.canonical_name(), family.adapter(run_id)?)
@@ -1168,6 +1299,7 @@ fn verify_restored_final_checkpoint(
         .validate()
         .map_err(|error| invalid_checkpoint(&path, error))?;
     let interventions = PreparedInterventions::new(
+        &evidence.variant_id,
         &initial_config,
         &manifest.scenario.interventions,
         evidence.total_ticks,
@@ -1944,7 +2076,10 @@ impl MatchedSeedExperimentRunner {
             seed,
             &run_id,
             &plan.digest,
-            &std::sync::atomic::AtomicBool::new(false),
+            RunExecutionBudget {
+                cancel: &std::sync::atomic::AtomicBool::new(false),
+                population_limit: MAX_RUN_POPULATION,
+            },
         )
     }
 
@@ -1983,6 +2118,20 @@ impl MatchedSeedExperimentRunner {
         state_file: &Path,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<ExperimentBatchStatus, ExperimentRunnerError> {
+        self.execute_batch_with_budget(
+            state_file,
+            RunExecutionBudget {
+                cancel,
+                population_limit: MAX_RUN_POPULATION,
+            },
+        )
+    }
+
+    fn execute_batch_with_budget(
+        &self,
+        state_file: &Path,
+        budget: RunExecutionBudget<'_>,
+    ) -> Result<ExperimentBatchStatus, ExperimentRunnerError> {
         let plan = self.validated_plan()?;
         let _lease = ExperimentStatusWriterLease::acquire(state_file)?;
         let mut status = self.load_or_create_status_locked(state_file, &plan)?;
@@ -2011,6 +2160,7 @@ impl MatchedSeedExperimentRunner {
                                     record.seed,
                                     &record.run_id,
                                     &plan.digest,
+                                    budget.population_limit,
                                 )
                             });
                             match resumed {
@@ -2083,7 +2233,7 @@ impl MatchedSeedExperimentRunner {
             .collect::<Vec<_>>();
 
         for chunk in pending.chunks(self.max_concurrency) {
-            if cancel.load(std::sync::atomic::Ordering::Acquire) {
+            if budget.cancel.load(std::sync::atomic::Ordering::Acquire) {
                 info!(
                     experiment_id = %self.experiment_id,
                     "matched-seed batch cancelled before admitting the next wave"
@@ -2141,7 +2291,7 @@ impl MatchedSeedExperimentRunner {
                                 seed,
                                 &run_id,
                                 &plan_digest,
-                                cancel,
+                                budget,
                             )
                         }),
                     ));
@@ -2311,16 +2461,11 @@ impl MatchedSeedExperimentRunner {
             }
             run_grid_cells.extend(std::iter::repeat_n(cells, self.cohort.seeds.len()));
             let interventions = PreparedInterventions::new(
+                &variant.variant_id,
                 &normalized_config,
                 &variant.interventions,
                 self.max_ticks,
-            )
-            .map_err(|reason| ExperimentRunnerError::InvalidPlan {
-                reason: format!(
-                    "variant `{}` is not executable: {reason}",
-                    variant.variant_id
-                ),
-            })?;
+            )?;
             let config_bytes = serde_json::to_vec(&(&normalized_config, &interventions.patches))
                 .map_err(|source| ExperimentRunnerError::Json {
                     operation: "serialize normalized scenario arm",
@@ -2677,15 +2822,20 @@ impl MatchedSeedExperimentRunner {
         run_id: &str,
         plan_digest: &str,
     ) -> Result<(), ExperimentRunnerError> {
+        validate_run_checkpoint_capacity(checkpoint, path, MAX_RUN_POPULATION)?;
         let family = ResolvedBrainFamily::resolve(variant)?;
         let metadata = &checkpoint.metadata;
         let manifest = &metadata.manifest;
         let host = checkpoint.owner.host_checkpoint();
         let expected_config = config_for_run(&variant.config_overrides, seed)
             .map_err(|error| invalid_checkpoint(path, error))?;
-        let interventions =
-            PreparedInterventions::new(&expected_config, &variant.interventions, self.max_ticks)
-                .map_err(|error| invalid_checkpoint(path, error))?;
+        let interventions = PreparedInterventions::new(
+            &variant.variant_id,
+            &expected_config,
+            &variant.interventions,
+            self.max_ticks,
+        )
+        .map_err(|error| invalid_checkpoint(path, error))?;
         let expected_config = serde_json::to_value(&expected_config)
             .map_err(|error| invalid_checkpoint(path, error))?;
         if metadata.plan_digest != plan_digest
@@ -2741,10 +2891,12 @@ impl MatchedSeedExperimentRunner {
         seed: u64,
         run_id: &str,
         plan_digest: &str,
+        population_limit: u64,
     ) -> Result<Option<RunCheckpointV1>, ExperimentRunnerError> {
         let path = self.run_checkpoint_path(run_id);
         let committed = read_optional_run_checkpoint(&path)?;
         if let Some(checkpoint) = &committed {
+            validate_run_checkpoint_capacity(checkpoint, &path, population_limit)?;
             self.validate_run_checkpoint(&path, checkpoint, variant, seed, run_id, plan_digest)?;
         }
         let temporary = status_temporary_path(&path)?;
@@ -2797,6 +2949,7 @@ impl MatchedSeedExperimentRunner {
                 });
             }
         };
+        validate_run_checkpoint_capacity(&candidate, &temporary, population_limit)?;
         self.validate_run_checkpoint(&temporary, &candidate, variant, seed, run_id, plan_digest)?;
         let expected_parent = committed
             .as_ref()
@@ -2857,7 +3010,9 @@ impl MatchedSeedExperimentRunner {
                 path: bundle,
             });
         }
-        if let Some(checkpoint) = self.load_run_checkpoint(variant, seed, run_id, plan_digest)? {
+        if let Some(checkpoint) =
+            self.load_run_checkpoint(variant, seed, run_id, plan_digest, MAX_RUN_POPULATION)?
+        {
             if checkpoint.owner.host_checkpoint().tick().0 != 0 {
                 return Err(invalid_checkpoint(
                     &path,
@@ -2886,13 +3041,12 @@ impl MatchedSeedExperimentRunner {
                 reason,
             }
         })?;
-        let interventions =
-            PreparedInterventions::new(&config, &variant.interventions, self.max_ticks).map_err(
-                |reason| ExperimentRunnerError::Construction {
-                    run_id: run_id.to_owned(),
-                    reason,
-                },
-            )?;
+        let interventions = PreparedInterventions::new(
+            &variant.variant_id,
+            &config,
+            &variant.interventions,
+            self.max_ticks,
+        )?;
         let mut world =
             WorldState::new(config).map_err(|source| ExperimentRunnerError::Construction {
                 run_id: run_id.to_owned(),
@@ -2905,6 +3059,7 @@ impl MatchedSeedExperimentRunner {
                 reason: format!("founder seeding failed: {source}"),
             }
         })?;
+        enforce_run_population(&world, run_id, MAX_RUN_POPULATION, None)?;
 
         let stable_run_id = Self::bundle_run_id(run_id);
         let mut identity = RunIdentityV1::new(
@@ -2980,21 +3135,25 @@ impl MatchedSeedExperimentRunner {
         seed: u64,
         run_id: &str,
         plan_digest: &str,
-        cancel: &std::sync::atomic::AtomicBool,
+        budget: RunExecutionBudget<'_>,
     ) -> Result<RunRecord, ExperimentRunnerError> {
         let path = self.run_checkpoint_path(run_id);
         let _lease = ExperimentStatusWriterLease::acquire(&path)?;
         let mut checkpoint = self
-            .load_run_checkpoint(variant, seed, run_id, plan_digest)?
+            .load_run_checkpoint(variant, seed, run_id, plan_digest, budget.population_limit)?
             .ok_or_else(|| ExperimentRunnerError::ResumeCheckpointUnavailable {
                 run_id: run_id.to_owned(),
                 completed_ticks: 0,
             })?;
         let initial_config = config_for_run(&variant.config_overrides, seed)
             .map_err(|error| invalid_checkpoint(&path, error))?;
-        let interventions =
-            PreparedInterventions::new(&initial_config, &variant.interventions, self.max_ticks)
-                .map_err(|error| invalid_checkpoint(&path, error))?;
+        let interventions = PreparedInterventions::new(
+            &variant.variant_id,
+            &initial_config,
+            &variant.interventions,
+            self.max_ticks,
+        )
+        .map_err(|error| invalid_checkpoint(&path, error))?;
         if experiment_path_exists(
             &self.staged_bundle_path(run_id),
             "inspect bundle staging before continuation",
@@ -3009,6 +3168,12 @@ impl MatchedSeedExperimentRunner {
             .to_hex()
             .to_string();
         let mut core = restore_run_owner(&checkpoint, family, run_id, &path)?;
+        enforce_run_population(
+            core.world(),
+            run_id,
+            budget.population_limit,
+            Some(checkpoint.owner.host_checkpoint().tick().0),
+        )?;
         self.observe_checkpoint_progress(
             plan_digest,
             run_id,
@@ -3027,7 +3192,7 @@ impl MatchedSeedExperimentRunner {
 
         let mut cancelled = false;
         for expected_tick in core.world_tick().0 + 1..=self.max_ticks {
-            if cancel.load(std::sync::atomic::Ordering::Acquire) {
+            if budget.cancel.load(std::sync::atomic::Ordering::Acquire) {
                 cancelled = true;
                 break;
             }
@@ -3050,6 +3215,15 @@ impl MatchedSeedExperimentRunner {
                 expected_tick,
                 interventions.due_at(expected_tick - 1),
                 &mut next_nanos,
+            )?;
+            // Observe the actual completed science before any new flush/capture
+            // or encoding. A crossing tick remains a failed, uncheckpointed
+            // attempt; the previous committed cut is left byte-for-byte intact.
+            enforce_run_population(
+                core.world(),
+                run_id,
+                budget.population_limit,
+                Some(checkpoint.owner.host_checkpoint().tick().0),
             )?;
             seal_run_checkpoint(run_id, &mut frontend, &mut core, &mut next_nanos)?;
             checkpoint.owner = core
@@ -4112,71 +4286,83 @@ struct PreparedInterventions {
 
 impl PreparedInterventions {
     fn new(
+        variant_id: &str,
         initial: &ScriptBotsConfig,
         interventions: &[ScenarioInterventionV1],
         max_ticks: u64,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, ExperimentRunnerError> {
+        let invalid = |reason: String| ExperimentRunnerError::InvalidPlan {
+            reason: format!("variant `{variant_id}` is not executable: {reason}"),
+        };
+        validate_run_config_capacity(variant_id, initial, 0)?;
         if interventions.len() > MAX_EXPERIMENT_INTERVENTIONS {
-            return Err(format!(
+            return Err(invalid(format!(
                 "intervention count exceeds the {MAX_EXPERIMENT_INTERVENTIONS}-statement cap"
-            ));
+            )));
         }
         if interventions.len() > HostCoreOptions::default().archived_command_capacity {
-            return Err(
+            return Err(invalid(
                 "intervention schedule exceeds complete owner receipt retention".to_owned(),
-            );
+            ));
         }
         let mut current = initial.clone();
         let mut current_value =
-            serde_json::to_value(&current).map_err(|error| error.to_string())?;
+            serde_json::to_value(&current).map_err(|error| invalid(error.to_string()))?;
         let mut prepared = Self {
             patches: Vec::with_capacity(interventions.len()),
-            config_digests: vec![config_value_digest(&current_value)?],
+            config_digests: vec![config_value_digest(&current_value).map_err(invalid)?],
             changed_paths: Vec::with_capacity(interventions.len()),
         };
         let mut previous_tick = 0;
         for (index, intervention) in interventions.iter().enumerate() {
             if intervention.tick >= max_ticks {
-                return Err(format!(
+                return Err(invalid(format!(
                     "intervention {} tick {} must precede the {max_ticks}-tick completion boundary",
                     index + 1,
                     intervention.tick
-                ));
+                )));
             }
             if intervention.tick < previous_tick {
-                return Err(
+                return Err(invalid(
                     "intervention ticks must be nondecreasing; same-tick order is preserved"
                         .to_owned(),
-                );
+                ));
             }
-            let sequence = u64::try_from(index + 1).map_err(|error| error.to_string())?;
+            let sequence = u64::try_from(index + 1).map_err(|error| invalid(error.to_string()))?;
             let patch = ScheduledConfigPatch::new(
                 sequence,
                 Tick(intervention.tick),
                 intervention.set.clone(),
-            )?;
+            )
+            .map_err(invalid)?;
             if patch.patch.len() > MAX_EXPERIMENT_INTERVENTION_PATCH_BYTES {
-                return Err(format!(
+                return Err(invalid(format!(
                     "intervention {sequence} exceeds the {MAX_EXPERIMENT_INTERVENTION_PATCH_BYTES}-byte canonical patch cap"
-                ));
+                )));
             }
-            validate_live_intervention_patch(&intervention.set, "")?;
-            let next = resolve_scheduled_config_patch(&current, &intervention.set)
-                .map_err(|error| format!("intervention {sequence} cannot resolve: {error}"))?;
+            validate_live_intervention_patch(&intervention.set, "").map_err(invalid)?;
+            let next =
+                resolve_scheduled_config_patch(&current, &intervention.set).map_err(|error| {
+                    invalid(format!("intervention {sequence} cannot resolve: {error}"))
+                })?;
             next.validate().map_err(|error| {
-                format!("intervention {sequence} produces an invalid config: {error}")
+                invalid(format!(
+                    "intervention {sequence} produces an invalid config: {error}"
+                ))
             })?;
+            validate_run_config_capacity(variant_id, &next, sequence)?;
             if next.rng_seed != initial.rng_seed
                 || next.persistence_interval != initial.persistence_interval
             {
-                return Err(
+                return Err(invalid(
                     "interventions cannot change the matched seed or recording policy".to_owned(),
-                );
+                ));
             }
-            let next_value = serde_json::to_value(&next).map_err(|error| error.to_string())?;
+            let next_value =
+                serde_json::to_value(&next).map_err(|error| invalid(error.to_string()))?;
             prepared
                 .config_digests
-                .push(config_value_digest(&next_value)?);
+                .push(config_value_digest(&next_value).map_err(invalid)?);
             prepared
                 .changed_paths
                 .push(scriptbots_runtime::host_core::config_changed_paths(
@@ -5425,6 +5611,395 @@ mod tests {
     }
 
     #[test]
+    fn experiment_population_preflight_checks_initial_and_every_scheduled_prefix_before_io() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let mut runner = progress_runner(&directory, vec![7]);
+        let state_file = directory.join("unopened").join("status.json");
+        for floor in [MAX_RUN_POPULATION - 1, MAX_RUN_POPULATION] {
+            runner.variants[0]
+                .config_overrides
+                .insert("population_minimum".into(), serde_json::json!(floor));
+            assert_eq!(runner.plan_batch().unwrap().len(), 1);
+        }
+        runner.variants[0].config_overrides.insert(
+            "population_minimum".into(),
+            serde_json::json!(MAX_RUN_POPULATION + 1),
+        );
+        let outcomes = [
+            runner.plan_batch().map(|_| ()),
+            runner.load_or_create_status(&state_file).map(|_| ()),
+            runner.execute_batch(&state_file).map(|_| ()),
+            runner
+                .execute_single_run(&runner.variants[0], 7)
+                .map(|_| ()),
+        ];
+        for outcome in outcomes {
+            assert!(matches!(
+                outcome,
+                Err(ExperimentRunnerError::RunConfigCapacityExceeded {
+                    variant_id,
+                    configuration_step: 0,
+                    resource: "population floor",
+                    requested,
+                    limit,
+                }) if variant_id == "mlp"
+                    && requested == MAX_RUN_POPULATION + 1
+                    && limit == MAX_RUN_POPULATION
+            ));
+        }
+        runner.variants[0]
+            .config_overrides
+            .insert("population_minimum".into(), serde_json::json!(0));
+        runner.variants[0].interventions = vec![
+            ScenarioInterventionV1 {
+                tick: 0,
+                set: serde_json::json!({"population_minimum": MAX_RUN_POPULATION}),
+            },
+            ScenarioInterventionV1 {
+                tick: 1,
+                set: serde_json::json!({"population_minimum": MAX_RUN_POPULATION + 1}),
+            },
+            ScenarioInterventionV1 {
+                tick: 2,
+                set: serde_json::json!({"population_minimum": 0}),
+            },
+        ];
+        for outcome in [
+            runner.plan_batch().map(|_| ()),
+            runner.execute_batch(&state_file).map(|_| ()),
+        ] {
+            assert!(matches!(
+                outcome,
+                Err(ExperimentRunnerError::RunConfigCapacityExceeded {
+                    configuration_step: 2,
+                    resource: "population floor",
+                    requested,
+                    ..
+                }) if requested == MAX_RUN_POPULATION + 1
+            ));
+        }
+        assert!(!runner.output_dir.exists());
+        assert!(!state_file.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn experiment_config_capacity_checks_the_allocating_history_and_population_fields() {
+        let history_limit = usize::try_from(MAX_RUN_HISTORY_ENTRIES).unwrap();
+        let population_limit = usize::try_from(MAX_RUN_POPULATION).unwrap();
+        let accepted = ScriptBotsConfig {
+            history_capacity: history_limit,
+            narrative_capacity: history_limit,
+            population_minimum: population_limit,
+            population_spawn_count: u32::try_from(MAX_RUN_POPULATION).unwrap(),
+            ..ScriptBotsConfig::default()
+        };
+        PreparedInterventions::new("boundary", &accepted, &[], 1).unwrap();
+        for (resource, config) in [
+            (
+                "history entries",
+                ScriptBotsConfig {
+                    history_capacity: history_limit + 1,
+                    ..accepted.clone()
+                },
+            ),
+            (
+                "narrative events",
+                ScriptBotsConfig {
+                    narrative_capacity: history_limit + 1,
+                    ..accepted.clone()
+                },
+            ),
+            (
+                "population injection count",
+                ScriptBotsConfig {
+                    population_spawn_count: u32::try_from(MAX_RUN_POPULATION + 1).unwrap(),
+                    ..accepted.clone()
+                },
+            ),
+        ] {
+            assert!(matches!(
+                PreparedInterventions::new("oversized", &config, &[], 1),
+                Err(ExperimentRunnerError::RunConfigCapacityExceeded {
+                    resource: observed,
+                    configuration_step: 0,
+                    requested,
+                    limit,
+                    ..
+                }) if observed == resource && requested == limit + 1
+            ));
+        }
+    }
+
+    fn population_budget_runner(directory: &Path) -> MatchedSeedExperimentRunner {
+        let mut runner = progress_runner(directory, vec![7]);
+        runner.variants[0].config_overrides.extend([
+            ("population_spawn_interval".into(), serde_json::json!(1)),
+            ("reproduction_attempt_chance".into(), serde_json::json!(0.0)),
+            ("spike_damage".into(), serde_json::json!(0.0)),
+            ("metabolism_drain".into(), serde_json::json!(0.0)),
+            ("movement_drain".into(), serde_json::json!(0.0)),
+        ]);
+        runner
+    }
+
+    #[test]
+    fn experiment_population_crossing_retains_the_last_cut_and_terminal_failure() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let runner = population_budget_runner(&directory);
+        let state_file = directory.join("status.json");
+        runner.load_or_create_status(&state_file).unwrap();
+        let plan = runner.validated_plan().unwrap();
+        let record = &plan.runs[0];
+        let (variant, family) = &plan.variants[&record.variant_id];
+        runner
+            .prepare_run_checkpoint(variant, *family, record.seed, &record.run_id, &plan.digest)
+            .unwrap();
+        let path = runner.run_checkpoint_path(&record.run_id);
+        let retained = fs::read(&path).unwrap();
+        let checkpoint = RunCheckpointV1::decode(&retained, &path).unwrap();
+        let population_limit = u64::try_from(
+            checkpoint
+                .owner
+                .host_checkpoint()
+                .world_checkpoint()
+                .agent_count(),
+        )
+        .unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let budget = RunExecutionBudget {
+            cancel: &cancel,
+            population_limit,
+        };
+        let error = runner
+            .execute_validated_run(
+                variant,
+                *family,
+                record.seed,
+                &record.run_id,
+                &plan.digest,
+                budget,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                ExperimentRunnerError::RunPopulationCapacityExceeded {
+                    run_id,
+                    tick: 1,
+                    population,
+                    limit,
+                    retained_checkpoint_tick: Some(0),
+                } if run_id == &record.run_id
+                    && *population == population_limit + 1
+                    && *limit == population_limit
+            ),
+            "{error}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), retained);
+        assert!(!status_temporary_path(&path).unwrap().exists());
+        assert!(!runner.output_dir.join(&record.run_id).exists());
+
+        let failed = runner
+            .execute_batch_with_budget(&state_file, budget)
+            .unwrap();
+        assert_eq!(failed.completed_runs, 0);
+        assert_eq!(failed.failed_runs, 1);
+        assert_eq!(failed.runs[0].state, RunState::Failed);
+        assert_eq!(failed.runs[0].total_ticks, 0);
+        assert_eq!(
+            failed.runs[0].error_reason.as_deref(),
+            Some(error.to_string().as_str())
+        );
+        assert_eq!(fs::read(&path).unwrap(), retained);
+        assert_eq!(
+            runner
+                .checkpoint_progress_snapshot(&state_file, &failed, false)
+                .unwrap()[&record.run_id]
+                .observed_tick(),
+            Some(0),
+        );
+        let status_bytes = fs::read(&state_file).unwrap();
+        assert_eq!(
+            runner
+                .execute_batch_with_budget(&state_file, budget)
+                .unwrap(),
+            failed
+        );
+        assert_eq!(fs::read(&state_file).unwrap(), status_bytes);
+        assert_eq!(fs::read(&path).unwrap(), retained);
+        assert!(!runner.output_dir.join(&record.run_id).exists());
+    }
+
+    #[test]
+    fn experiment_recovery_refuses_population_growth_before_promoting_the_next_cut() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let runner = population_budget_runner(&directory);
+        let plan = runner.validated_plan().unwrap();
+        let record = &plan.runs[0];
+        let (variant, family) = &plan.variants[&record.variant_id];
+        runner
+            .prepare_run_checkpoint(variant, *family, record.seed, &record.run_id, &plan.digest)
+            .unwrap();
+        let path = runner.run_checkpoint_path(&record.run_id);
+        let temporary = status_temporary_path(&path).unwrap();
+        let retained = fs::read(&path).unwrap();
+        let mut checkpoint = RunCheckpointV1::decode(&retained, &path).unwrap();
+        let mut owner = restore_run_owner(&checkpoint, *family, &record.run_id, &path).unwrap();
+        let population_limit = u64::try_from(owner.world().agents().len()).unwrap();
+        let (_, namespace) = host_identifiers(&record.run_id);
+        let mut frontend = NullFrontend::new(owner.local_port(), namespace);
+        let submitted = frontend
+            .submit_envelope(CommandEnvelope::new(
+                CommandId::from_client_sequence(namespace, 1),
+                HostCommand::Step,
+            ))
+            .unwrap();
+        let mut now = 0;
+        drive_command_to_volatile_commit(
+            &record.run_id,
+            "over-cap temporary checkpoint step",
+            &mut frontend,
+            &mut owner,
+            submitted.command_id(),
+            1,
+            0,
+            &mut now,
+        )
+        .unwrap();
+        seal_run_checkpoint(&record.run_id, &mut frontend, &mut owner, &mut now).unwrap();
+        checkpoint.owner = owner.capture_volatile_host_checkpoint_v1().unwrap();
+        checkpoint.metadata.parent_digest = Some(blake3::hash(&retained).to_hex().to_string());
+        assert_eq!(checkpoint.owner.host_checkpoint().tick().0, 1);
+        assert_eq!(
+            u64::try_from(
+                checkpoint
+                    .owner
+                    .host_checkpoint()
+                    .world_checkpoint()
+                    .agent_count()
+            )
+            .unwrap(),
+            population_limit + 1,
+        );
+        // This is a real, canonical next-tick cut with the exact parent. Only
+        // the smaller execution budget should prevent its atomic promotion.
+        runner
+            .validate_run_checkpoint(
+                &temporary,
+                &checkpoint,
+                variant,
+                record.seed,
+                &record.run_id,
+                &plan.digest,
+            )
+            .unwrap();
+        let candidate = checkpoint.encode(&temporary).unwrap();
+        fs::write(&temporary, &candidate).unwrap();
+        let _lease = ExperimentStatusWriterLease::acquire(&path).unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                runner.load_run_checkpoint(
+                    variant,
+                    record.seed,
+                    &record.run_id,
+                    &plan.digest,
+                    population_limit,
+                ),
+                Err(ExperimentRunnerError::InvalidCheckpoint { path: rejected, reason })
+                    if rejected == temporary && reason.contains("checkpoint population")
+            ));
+            assert_eq!(fs::read(&path).unwrap(), retained);
+            assert_eq!(fs::read(&temporary).unwrap(), candidate);
+        }
+    }
+
+    #[test]
+    fn experiment_population_budget_preserves_exact_resume_and_admits_the_boundary() {
+        let uninterrupted_dir = tempfile::tempdir().unwrap().keep();
+        let uninterrupted = population_budget_runner(&uninterrupted_dir);
+        let expected = uninterrupted
+            .execute_single_run(&uninterrupted.variants[0], 7)
+            .unwrap();
+
+        let directory = tempfile::tempdir().unwrap().keep();
+        let runner = population_budget_runner(&directory);
+        let state_file = directory.join("status.json");
+        let mut status = runner.load_or_create_status(&state_file).unwrap();
+        let plan = runner.validated_plan().unwrap();
+        let record = &plan.runs[0];
+        let (variant, family) = &plan.variants[&record.variant_id];
+        runner
+            .prepare_run_checkpoint(variant, *family, record.seed, &record.run_id, &plan.digest)
+            .unwrap();
+        let path = runner.run_checkpoint_path(&record.run_id);
+        let initial_bytes = fs::read(&path).unwrap();
+        let mut checkpoint = RunCheckpointV1::decode(&initial_bytes, &path).unwrap();
+        let mut owner = restore_run_owner(&checkpoint, *family, &record.run_id, &path).unwrap();
+        let population_limit =
+            u64::try_from(owner.world().agents().len()).unwrap() + runner.max_ticks;
+        let (_, namespace) = host_identifiers(&record.run_id);
+        let mut frontend = NullFrontend::new(owner.local_port(), namespace);
+        let command = frontend
+            .submit_envelope(CommandEnvelope::new(
+                CommandId::from_client_sequence(namespace, 1),
+                HostCommand::Step,
+            ))
+            .unwrap();
+        let mut now = 0;
+        drive_command_to_volatile_commit(
+            &record.run_id,
+            "population budget oracle step",
+            &mut frontend,
+            &mut owner,
+            command.command_id(),
+            1,
+            0,
+            &mut now,
+        )
+        .unwrap();
+        seal_run_checkpoint(&record.run_id, &mut frontend, &mut owner, &mut now).unwrap();
+        checkpoint.owner = owner.capture_volatile_host_checkpoint_v1().unwrap();
+        checkpoint.metadata.parent_digest = Some(blake3::hash(&initial_bytes).to_hex().to_string());
+        runner
+            .publish_run_checkpoint(&path, &checkpoint, &checkpoint.encode(&path).unwrap())
+            .unwrap();
+        status.runs[0].state = RunState::Running;
+        runner.save_status(&state_file, &mut status).unwrap();
+        drop(frontend);
+        drop(owner);
+
+        let actual = runner
+            .execute_batch_with_budget(
+                &state_file,
+                RunExecutionBudget {
+                    cancel: &std::sync::atomic::AtomicBool::new(false),
+                    population_limit,
+                },
+            )
+            .unwrap();
+        assert_eq!(actual.completed_runs, 1, "{actual:?}");
+        assert_eq!(actual.failed_runs, 0);
+        assert_eq!(actual.runs[0].final_digest, expected.final_digest);
+        assert_eq!(actual.runs[0].total_ticks, expected.total_ticks);
+        let final_cut = RunCheckpointV1::decode(&fs::read(&path).unwrap(), &path).unwrap();
+        assert_eq!(final_cut.owner.host_checkpoint().tick().0, runner.max_ticks);
+        assert_eq!(
+            u64::try_from(
+                final_cut
+                    .owner
+                    .host_checkpoint()
+                    .world_checkpoint()
+                    .agent_count()
+            )
+            .unwrap(),
+            population_limit,
+        );
+        runner
+            .verify_completed_status(&state_file, &actual)
+            .unwrap();
+    }
+
+    #[test]
     fn scheduled_intervention_preflight_preserves_identity_and_refuses_invalid_work() {
         let directory = tempfile::tempdir().unwrap();
         let output = directory.path().join("not-created");
@@ -5706,6 +6281,7 @@ mod tests {
             let mut checkpoint = read_optional_run_checkpoint(&path).unwrap().unwrap();
             let original_manifest = checkpoint.metadata.manifest.clone();
             let prepared = PreparedInterventions::new(
+                &variant.variant_id,
                 &config_for_run(&variant.config_overrides, record.seed).unwrap(),
                 &variant.interventions,
                 runner.max_ticks,
@@ -6904,7 +7480,7 @@ mod tests {
             }
             fs::write(&temporary, changed.encode(&path).unwrap()).unwrap();
             assert!(
-                matches!(runner.load_run_checkpoint(variant, first.seed, &first.run_id, &plan.digest),
+                matches!(runner.load_run_checkpoint(variant, first.seed, &first.run_id, &plan.digest, MAX_RUN_POPULATION),
                 Err(ExperimentRunnerError::InvalidCheckpoint { reason, .. }) if reason.contains("validated plan")),
                 "{field}"
             );
@@ -6991,7 +7567,13 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            runner.load_run_checkpoint(variant, first.seed, &first.run_id, &plan.digest),
+            runner.load_run_checkpoint(
+                variant,
+                first.seed,
+                &first.run_id,
+                &plan.digest,
+                MAX_RUN_POPULATION
+            ),
             Err(ExperimentRunnerError::InvalidCheckpoint { .. })
         ));
         assert_eq!(fs::read(&path).unwrap(), original);
@@ -6999,13 +7581,25 @@ mod tests {
         checkpoint.metadata.parent_digest = Some("0".repeat(blake3::OUT_LEN * 2));
         fs::write(&temporary, checkpoint.encode(&path).unwrap()).unwrap();
         assert!(matches!(
-            runner.load_run_checkpoint(variant, first.seed, &first.run_id, &plan.digest),
+            runner.load_run_checkpoint(
+                variant,
+                first.seed,
+                &first.run_id,
+                &plan.digest,
+                MAX_RUN_POPULATION
+            ),
             Err(ExperimentRunnerError::InvalidCheckpoint { .. })
         ));
         assert_eq!(fs::read(&path).unwrap(), original);
         fs::write(&temporary, &candidate).unwrap();
         let promoted = runner
-            .load_run_checkpoint(variant, first.seed, &first.run_id, &plan.digest)
+            .load_run_checkpoint(
+                variant,
+                first.seed,
+                &first.run_id,
+                &plan.digest,
+                MAX_RUN_POPULATION,
+            )
             .unwrap()
             .unwrap();
         assert_eq!(promoted.owner.host_checkpoint().tick().0, 1);
@@ -7015,7 +7609,13 @@ mod tests {
         fs::write(&temporary, partial).unwrap();
         assert_eq!(
             runner
-                .load_run_checkpoint(variant, first.seed, &first.run_id, &plan.digest)
+                .load_run_checkpoint(
+                    variant,
+                    first.seed,
+                    &first.run_id,
+                    &plan.digest,
+                    MAX_RUN_POPULATION
+                )
                 .unwrap()
                 .unwrap()
                 .owner
@@ -7033,7 +7633,13 @@ mod tests {
         // it cannot silently overwrite evidence or create unbounded forensic files.
         fs::write(&temporary, partial).unwrap();
         assert!(matches!(
-            runner.load_run_checkpoint(variant, first.seed, &first.run_id, &plan.digest),
+            runner.load_run_checkpoint(
+                variant,
+                first.seed,
+                &first.run_id,
+                &plan.digest,
+                MAX_RUN_POPULATION
+            ),
             Err(ExperimentRunnerError::InvalidCheckpoint { .. })
         ));
         assert_eq!(fs::read(&temporary).unwrap(), partial);
@@ -7043,7 +7649,13 @@ mod tests {
         corrupt[RUN_CHECKPOINT_MAGIC.len()] ^= 1;
         fs::write(&path, &corrupt).unwrap();
         assert!(matches!(
-            runner.load_run_checkpoint(variant, first.seed, &first.run_id, &plan.digest),
+            runner.load_run_checkpoint(
+                variant,
+                first.seed,
+                &first.run_id,
+                &plan.digest,
+                MAX_RUN_POPULATION
+            ),
             Err(ExperimentRunnerError::InvalidCheckpoint { .. })
         ));
         assert_eq!(fs::read(&path).unwrap(), corrupt);
