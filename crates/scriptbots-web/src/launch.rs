@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 
+use scriptbots_core::permalink::to_canonical_value;
 use scriptbots_core::{CoreBuildIdentityV0, ScriptBotsConfig};
 use serde::{Deserialize, Serialize};
 
@@ -292,7 +293,7 @@ impl BrowserLaunch {
         {
             return Err("browser launch changes are oversized, duplicated or unsorted".to_owned());
         }
-        let config = serde_json::to_value(&self.config).map_err(|error| error.to_string())?;
+        let config = to_canonical_value(&self.config).map_err(|error| error.to_string())?;
         for row in &self.changes {
             // Rows report the exact stored f32 value as f64. Its rounded value
             // can sit a few bits beyond a decimal registry endpoint; admission
@@ -313,12 +314,15 @@ impl BrowserLaunch {
     }
 
     pub(super) fn fork(&self, patch: &[(String, f64)]) -> Result<Self, String> {
-        let original = serde_json::to_value(&self.config).map_err(|error| error.to_string())?;
+        // Compare the actual stored f32 values widened to f64 while their type is
+        // known. Plain to_value changes their meaning when another workspace
+        // dependency enables serde_json/arbitrary_precision.
+        let original = to_canonical_value(&self.config).map_err(|error| error.to_string())?;
         validate_patch(&original, patch)?;
         let mut next = self.clone();
         scriptbots_core::gallery::apply_knob_diff(&mut next.config, patch)?;
         validate_config(&next.config, self.initial_population as usize)?;
-        let configured = serde_json::to_value(&next.config).map_err(|error| error.to_string())?;
+        let configured = to_canonical_value(&next.config).map_err(|error| error.to_string())?;
         let mut changes: BTreeMap<_, _> = self
             .changes
             .iter()
@@ -814,6 +818,69 @@ mod tests {
                 .world_digest_v1()
                 .unwrap(),
             before
+        );
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_fork_diffs_preserve_typed_float_values_with_arbitrary_precision() {
+        let mut root = recipe();
+        root.config.render.day_night = Some(scriptbots_core::RenderDayNightSettings {
+            start_phase: Some(0.123),
+            cycle_ticks: Some(1_024),
+            ..Default::default()
+        });
+        let changed = root
+            .fork(&[
+                ("food_growth_rate".to_owned(), 0.2),
+                ("population_minimum".to_owned(), 12.0),
+                ("render.day_night.start_phase".to_owned(), 0.3),
+            ])
+            .unwrap();
+        let decoded = BrowserLaunch::decode(&changed.encode().unwrap()).unwrap();
+        for (path, before, after) in [
+            ("food_growth_rate", f64::from(0.037_f32), f64::from(0.2_f32)),
+            ("population_minimum", 0.0, 12.0),
+            (
+                "render.day_night.start_phase",
+                f64::from(0.123_f32),
+                f64::from(0.3_f32),
+            ),
+        ] {
+            let row = decoded.changes.iter().find(|row| row.knob == path).unwrap();
+            assert_eq!(
+                row.parent_value.to_bits(),
+                before.to_bits(),
+                "{path} original value"
+            );
+            assert_eq!(
+                row.this_value.to_bits(),
+                after.to_bits(),
+                "{path} stored value"
+            );
+        }
+        // Returning to the real stored values removes the complete diff even
+        // when the first fork was encoded and decoded in between.
+        let restored = decoded
+            .fork(&[
+                (
+                    "food_growth_rate".to_owned(),
+                    f64::from(root.config.food_growth_rate),
+                ),
+                ("population_minimum".to_owned(), 0.0),
+                (
+                    "render.day_night.start_phase".to_owned(),
+                    f64::from(0.123_f32),
+                ),
+            ])
+            .unwrap();
+        assert!(restored.changes.is_empty());
+        assert_eq!(restored.config, root.config);
+        let mut understated = changed;
+        understated.changes[0].this_value = 0.2;
+        assert!(
+            understated.encode().is_err(),
+            "decimal metadata cannot replace the exact stored f32 observation"
         );
     }
 
