@@ -4173,6 +4173,12 @@ impl ControlHandle {
                 "ticks_per_run must be in 1..={maximum_ticks}, found {ticks_per_run}; the requested scientific horizon is never clamped"
             )));
         }
+        crate::experiment_runner::validate_experiment_workload(
+            request.variants.len(),
+            request.seeds.len(),
+            ticks_per_run,
+        )
+        .map_err(|error| ControlError::BadRequest(error.to_string()))?;
         self.data_services.recover_experiment_catalog()?;
         if request.variants.is_empty() {
             return Err(ControlError::BadRequest("variants cannot be empty".into()));
@@ -4211,13 +4217,6 @@ impl ControlHandle {
                 "seeds exceed maximum limit of 128".into(),
             ));
         }
-        let total_runs = request.variants.len().saturating_mul(request.seeds.len());
-        if total_runs > 4096 {
-            return Err(ControlError::BadRequest(format!(
-                "total batch runs ({total_runs}) exceed maximum limit of 4096"
-            )));
-        }
-
         let request_identity = request
             .idempotency_key
             .as_ref()
@@ -4647,6 +4646,9 @@ impl ControlHandle {
                 current.status
             )));
         }
+        job.runner
+            .validate_execution_workload()
+            .map_err(|error| ControlError::BadRequest(error.to_string()))?;
         let run_slots = current
             .runs
             .iter()
@@ -7892,6 +7894,153 @@ pub(crate) mod tests {
             assert_eq!(capacity.reserved_grid_cells, 0);
             assert_eq!(capacity.reserved_batches, 0);
         }
+    }
+
+    #[test]
+    fn experiment_total_tick_refusal_preserves_catalog_and_admission_state() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let (handle, _host) = handle();
+        let handle = handle.with_artifacts_dir(root.clone()).unwrap();
+        let services = handle.data_services();
+        let saved = pending_catalog_definition(&root, "saved-before-work-refusal");
+        let saved_bytes = fs::read(&saved).unwrap();
+        let before_capacity = *services.execution_capacity.lock().unwrap();
+        for concurrency in [1, 4] {
+            for two_variants in [false, true] {
+                let mut request = experiment_creation_request();
+                request.experiment_id = Some("refused-work".into());
+                request.seeds = vec![7, 11];
+                request.max_concurrency = Some(concurrency);
+                request.ticks_per_run = Some(crate::experiment_runner::MAX_TICKS_PER_RUN);
+                if two_variants {
+                    let mut challenger = request.variants[0].clone();
+                    challenger.variant_id = "challenger".into();
+                    challenger.brain_family = "dwraon".into();
+                    request.variants.push(challenger);
+                    request.ticks_per_run =
+                        Some(crate::experiment_runner::MAX_BATCH_TOTAL_TICKS / 4 + 1);
+                }
+                let outcome = handle.create_experiment(request);
+                if let Ok(admitted) = &outcome {
+                    // A restored admission bug must fail without leaving its
+                    // long-running worker alive in the negative-control build.
+                    let mut jobs = services.experiments.lock().unwrap();
+                    let job = jobs.get_mut(&admitted.experiment_id).unwrap();
+                    job.cancel
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    job.join_worker().unwrap();
+                }
+                let error = outcome.unwrap_err();
+                assert!(
+                    matches!(error, ControlError::BadRequest(ref message)
+                        if message.contains("scientific tick transitions")
+                            && message.contains("per-batch limit")),
+                    "{error}"
+                );
+                assert!(services.experiments.lock().unwrap().is_empty());
+                assert!(services.idempotency.lock().unwrap().is_empty());
+                assert!(services.artifacts.lock().unwrap().is_empty());
+                assert_eq!(*services.execution_capacity.lock().unwrap(), before_capacity);
+                assert_eq!(fs::read(&saved).unwrap(), saved_bytes);
+                assert!(!saved.with_file_name("status.json").exists());
+                assert!(!root.join("experiments/refused-work").exists());
+                assert_eq!(fs::read_dir(root.join("experiments")).unwrap().count(), 1);
+            }
+        }
+
+        // A refusal did not consume the exact request key or execution slot.
+        // The existing catalog can subsequently recover beside a real small run.
+        let mut valid = experiment_creation_request();
+        valid.experiment_id = Some("admitted-after-work-refusal".into());
+        let admitted = handle.create_experiment(valid).unwrap();
+        {
+            let mut jobs = services.experiments.lock().unwrap();
+            jobs.get_mut(&admitted.experiment_id)
+                .unwrap()
+                .join_worker()
+                .unwrap();
+        }
+        let completed = handle.get_experiment(&admitted.experiment_id).unwrap();
+        assert_eq!(completed.status, "completed", "{completed:?}");
+        assert_eq!(completed.completed_runs, 1);
+        assert_eq!(completed.failed_runs, 0);
+        assert_eq!(completed.runs[0].total_ticks, 2);
+        assert_eq!(*services.execution_capacity.lock().unwrap(), before_capacity);
+    }
+
+    #[test]
+    fn experiment_past_workload_remains_discoverable_but_cannot_resume() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let (handle, _host) = handle();
+        let handle = handle.with_artifacts_dir(root.clone()).unwrap();
+        let services = handle.data_services();
+        let directory = root
+            .canonicalize()
+            .unwrap()
+            .join("experiments")
+            .join("past-workload");
+        let runner = crate::experiment_runner::MatchedSeedExperimentRunner::new(
+            "past-workload",
+            crate::experiment_runner::MatchedSeedCohort {
+                cohort_id: "past-workload".into(),
+                seeds: vec![7, 11],
+            },
+            vec![crate::experiment_runner::ScenarioVariant {
+                variant_id: "baseline".into(),
+                brain_family: "mlp".into(),
+                config_overrides: BTreeMap::new(),
+                interventions: Vec::new(),
+            }],
+            crate::experiment_runner::MAX_TICKS_PER_RUN,
+            1,
+            &directory,
+        );
+        // Write a genuine versioned definition for a previously admitted plan.
+        // Pending records claim no completed science or missing bundle evidence.
+        ExperimentDefinitionV1 {
+            schema_version: 1,
+            experiment_id: runner.experiment_id.clone(),
+            cohort: runner.cohort.clone(),
+            variants: runner.variants.clone(),
+            max_ticks: runner.max_ticks,
+            max_concurrency: runner.max_concurrency,
+            plan_digest: runner.plan_digest().unwrap(),
+            created_at_utc: "123456".into(),
+            request_identity: None,
+        }
+        .persist(&directory)
+        .unwrap();
+        let definition = directory.join("definition.json");
+        let saved_bytes = fs::read(&definition).unwrap();
+        let before_capacity = *services.execution_capacity.lock().unwrap();
+        let observed = handle.get_experiment("past-workload").unwrap();
+        assert_eq!(observed.status, "stopped");
+        assert_eq!(observed.total_runs, 2);
+        assert!(observed.runs.iter().all(|run| {
+            run.target_ticks == crate::experiment_runner::MAX_TICKS_PER_RUN
+                && run.state == "pending"
+                && run.total_ticks == 0
+        }));
+        let error = handle.resume_experiment("past-workload").unwrap_err();
+        assert!(
+            matches!(error, ControlError::BadRequest(ref message)
+                if message.contains("scientific tick transitions")),
+            "{error}"
+        );
+        let after = handle.get_experiment("past-workload").unwrap();
+        assert_eq!(
+            serde_json::to_value(&after).unwrap(),
+            serde_json::to_value(&observed).unwrap()
+        );
+        assert_eq!(*services.execution_capacity.lock().unwrap(), before_capacity);
+        assert_eq!(fs::read(&definition).unwrap(), saved_bytes);
+        assert!(!directory.join("status.json").exists());
+        assert!(services.artifacts.lock().unwrap().is_empty());
+        let jobs = services.experiments.lock().unwrap();
+        let job = jobs.get("past-workload").unwrap();
+        assert!(job.worker.is_none());
+        assert!(!job.cancel.load(std::sync::atomic::Ordering::Acquire));
+        assert!(job.last_error.lock().unwrap().is_none());
     }
 
     pub(crate) fn comparison_catalog_runner(

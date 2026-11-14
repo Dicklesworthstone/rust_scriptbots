@@ -2241,6 +2241,18 @@ interventions as the existing experiment runner. Input is limited to a regular
 JSON file of at most 1 MiB, and the runner validates the entire plan before
 creating output. This command runs locally without a control server or LLM.
 
+A batch admits at most 4,096 variant/seed pairs and 10,000,000 scientific tick
+transitions across the entire cohort: `variants × seeds × ticks_per_run`.
+For example, two variants and twenty seeds can each run for at most 250,000 ticks.
+The same total limit applies at every `max_concurrency` setting and on resume.
+Oversized requests are rejected with their requested work and the limit; the
+runner preserves the declared horizon and retained artifacts. Read-only catalog,
+status and completed-evidence validation retain their existing provenance rules
+without applying the new execution limit. This counts logical work; it does not
+establish a wall-clock, heap or retained-disk bound.
+REST/MCP requests require `ticks_per_run` in `1..=10,000,000`; omitting it selects
+1,000 ticks. Values outside that range are rejected before catalog admission.
+
 The output directory contains canonical `status.json`, resumable checkpoint cuts,
 and portable per-run artifacts under `bundles/`. Repeat the identical command to
 continue unfinished work from its validated cuts. Already completed runs have

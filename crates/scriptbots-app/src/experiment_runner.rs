@@ -45,6 +45,10 @@ const EXPERIMENT_SUMMARY_SCHEMA_VERSION: u16 = 2;
 const MAX_BATCH_RUNS: usize = 4_096;
 pub(crate) const MAX_RUN_COMPONENT_BYTES: usize = 128;
 pub(crate) const MAX_TICKS_PER_RUN: u64 = 10_000_000;
+// A cohort shares one scientific-work allowance; adding seeds or variants must
+// not multiply the largest admitted single-run horizon. This counts logical
+// tick transitions, not elapsed time, heap use or retained artifact bytes.
+pub(crate) const MAX_BATCH_TOTAL_TICKS: u64 = MAX_TICKS_PER_RUN;
 pub(crate) const MAX_CONCURRENT_RUNS: usize = 64;
 // Admission limits for the shared dense food/terrain grid dimensions. Each cell
 // also feeds profiles, tick scratch and checkpoint state, so bounding only each
@@ -90,6 +94,16 @@ pub enum ExperimentRunnerError {
     /// A declarative experiment cannot produce an unambiguous bounded plan.
     #[error("invalid experiment plan: {reason}")]
     InvalidPlan { reason: String },
+    /// The complete seed-by-variant cohort exceeds its scientific-work allowance.
+    #[error(
+        "experiment's {runs} runs at {ticks_per_run} ticks each require {total_ticks} scientific tick transitions, exceeding the per-batch limit {limit}; reduce the horizon, seeds or variants"
+    )]
+    BatchTickCapacityExceeded {
+        runs: usize,
+        ticks_per_run: u64,
+        total_ticks: u64,
+        limit: u64,
+    },
     /// One normalized world would allocate too many dense grid cells.
     #[error(
         "variant `{variant_id}` requires {cells} dense grid cells, exceeding the per-run limit {limit}; reduce world dimensions or increase food_cell_size"
@@ -213,6 +227,45 @@ pub enum ExperimentRunnerError {
     /// A worker panicked; the run is recorded failed rather than reported complete.
     #[error("run `{run_id}` worker panicked")]
     WorkerPanicked { run_id: String },
+}
+
+fn validate_experiment_run_count(
+    variant_count: usize,
+    seed_count: usize,
+) -> Result<usize, ExperimentRunnerError> {
+    variant_count
+        .checked_mul(seed_count)
+        .filter(|count| *count <= MAX_BATCH_RUNS)
+        .ok_or_else(|| ExperimentRunnerError::InvalidPlan {
+            reason: format!(
+                "variant x seed expansion exceeds the bounded {MAX_BATCH_RUNS}-run capacity"
+            ),
+        })
+}
+
+/// Validate cohort cardinality and total logical ticks before admission side effects.
+/// Concurrency changes scheduling only; completed runs still belong to this plan.
+pub(crate) fn validate_experiment_workload(
+    variant_count: usize,
+    seed_count: usize,
+    ticks_per_run: u64,
+) -> Result<usize, ExperimentRunnerError> {
+    let runs = validate_experiment_run_count(variant_count, seed_count)?;
+    let total_ticks = u64::try_from(runs)
+        .ok()
+        .and_then(|count| count.checked_mul(ticks_per_run))
+        .ok_or_else(|| ExperimentRunnerError::InvalidPlan {
+            reason: "total scientific tick transitions overflow u64".to_owned(),
+        })?;
+    if total_ticks > MAX_BATCH_TOTAL_TICKS {
+        return Err(ExperimentRunnerError::BatchTickCapacityExceeded {
+            runs,
+            ticks_per_run,
+            total_ticks,
+            limit: MAX_BATCH_TOTAL_TICKS,
+        });
+    }
+    Ok(runs)
 }
 
 /// Matched-seed cohort specifying the identical seed schedule shared across scenario variants.
@@ -1745,7 +1798,20 @@ impl MatchedSeedExperimentRunner {
     /// Returns a typed refusal before any filesystem mutation when the plan is
     /// ambiguous, unsupported, or exceeds the runner's explicit resource bounds.
     pub fn plan_batch(&self) -> Result<Vec<RunRecord>, ExperimentRunnerError> {
+        self.validate_execution_workload()?;
         self.validated_plan().map(|plan| plan.runs)
+    }
+
+    /// Admission policy for new or resumed execution, separate from evidence validity.
+    /// Read-only status, progress and completed-bundle verification retain their
+    /// existing provenance checks even for cohorts above the current work limit.
+    pub(crate) fn validate_execution_workload(&self) -> Result<(), ExperimentRunnerError> {
+        validate_experiment_workload(
+            self.variants.len(),
+            self.cohort.seeds.len(),
+            self.max_ticks,
+        )
+        .map(|_| ())
     }
 
     /// Dense grid cells reserved by the largest executable concurrent run set.
@@ -1772,6 +1838,7 @@ impl MatchedSeedExperimentRunner {
         &self,
         state_file: &Path,
     ) -> Result<ExperimentBatchStatus, ExperimentRunnerError> {
+        self.validate_execution_workload()?;
         let plan = self.validated_plan()?;
         let _lease = ExperimentStatusWriterLease::acquire(state_file)?;
         self.load_or_create_status_locked(state_file, &plan)
@@ -2069,6 +2136,7 @@ impl MatchedSeedExperimentRunner {
         variant: &ScenarioVariant,
         seed: u64,
     ) -> Result<RunRecord, ExperimentRunnerError> {
+        self.validate_execution_workload()?;
         validate_path_component("experiment_id", &self.experiment_id)?;
         validate_path_component("variant_id", &variant.variant_id)?;
         let family = ResolvedBrainFamily::resolve(variant)?;
@@ -2174,6 +2242,7 @@ impl MatchedSeedExperimentRunner {
         state_file: &Path,
         budget: RunExecutionBudget<'_>,
     ) -> Result<ExperimentBatchStatus, ExperimentRunnerError> {
+        self.validate_execution_workload()?;
         let plan = self.validated_plan()?;
         let _lease = ExperimentStatusWriterLease::acquire(state_file)?;
         let mut status = self.load_or_create_status_locked(state_file, &plan)?;
@@ -2447,17 +2516,8 @@ impl MatchedSeedExperimentRunner {
             });
         }
 
-        let total_runs = self
-            .cohort
-            .seeds
-            .len()
-            .checked_mul(self.variants.len())
-            .filter(|count| *count <= MAX_BATCH_RUNS)
-            .ok_or_else(|| ExperimentRunnerError::InvalidPlan {
-                reason: format!(
-                    "variant x seed expansion exceeds the bounded {MAX_BATCH_RUNS}-run capacity"
-                ),
-            })?;
+        let total_runs =
+            validate_experiment_run_count(self.variants.len(), self.cohort.seeds.len())?;
 
         let mut variants = BTreeMap::new();
         let mut run_grid_cells = Vec::with_capacity(total_runs);
@@ -5546,6 +5606,109 @@ mod tests {
             ]),
             interventions: Vec::new(),
         }
+    }
+
+    #[test]
+    fn experiment_total_tick_preflight_counts_all_seeds_and_variants() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let mut runner = progress_runner(&directory, vec![7, 11, 13, 17]);
+        runner.variants = vec![
+            grid_test_variant("baseline", 40, 40, 10),
+            grid_test_variant("challenger", 60, 40, 10),
+        ];
+        runner.max_ticks = MAX_BATCH_TOTAL_TICKS / 8;
+        let boundary_ticks = runner.max_ticks;
+        for concurrency in [1, 2, MAX_CONCURRENT_RUNS] {
+            runner.max_concurrency = concurrency;
+            let runs = runner.plan_batch().unwrap();
+            assert_eq!(runs.len(), 8);
+            assert_eq!(runner.max_ticks, boundary_ticks);
+            assert_eq!(
+                runs.iter().map(|run| run.seed).collect::<Vec<_>>(),
+                vec![7, 11, 13, 17, 7, 11, 13, 17]
+            );
+
+            runner.max_ticks += 1;
+            assert!(matches!(
+                runner.plan_batch(),
+                Err(ExperimentRunnerError::BatchTickCapacityExceeded {
+                    runs: 8,
+                    ticks_per_run,
+                    total_ticks,
+                    limit,
+                }) if ticks_per_run == boundary_ticks + 1
+                    && total_ticks == MAX_BATCH_TOTAL_TICKS + 8
+                    && limit == MAX_BATCH_TOTAL_TICKS
+            ));
+            runner.max_ticks = boundary_ticks;
+        }
+
+        // Preserve the largest single-run horizon and intentional zero-tick
+        // library plans; the scientific horizon is rejected, never truncated.
+        runner.cohort.seeds = vec![7];
+        runner.variants.truncate(1);
+        runner.max_ticks = MAX_TICKS_PER_RUN;
+        assert_eq!(runner.plan_batch().unwrap().len(), 1);
+        assert_eq!(runner.max_ticks, MAX_TICKS_PER_RUN);
+        runner.max_ticks = 0;
+        assert_eq!(runner.plan_batch().unwrap().len(), 1);
+        assert_eq!(runner.max_ticks, 0);
+        assert!(!runner.output_dir.exists());
+    }
+
+    #[test]
+    fn experiment_total_tick_preflight_preserves_history_and_precedes_execution_io() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let mut runner = progress_runner(&directory, vec![7, 11]);
+        runner.max_ticks = MAX_TICKS_PER_RUN;
+        let state_file = directory.join("status.json");
+        // A historical pending cut is scientifically valid even though the
+        // current policy refuses further execution of its full declared cohort.
+        let plan = runner.validated_plan().unwrap();
+        let status = runner.initial_status(&plan);
+        let committed = canonical_status_bytes(&status).unwrap();
+        fs::write(&state_file, &committed).unwrap();
+        assert_eq!(runner.status_snapshot(&state_file).unwrap(), status);
+        assert_eq!(runner.plan_digest().unwrap(), status.plan_digest);
+        assert!(runner.concurrent_grid_cells().is_ok());
+
+        // Check the refusal first so the old-source negative control cannot
+        // proceed into a long execution after restoring the missing guard.
+        assert!(matches!(
+            runner.plan_batch(),
+            Err(ExperimentRunnerError::BatchTickCapacityExceeded { .. })
+        ));
+        let outcomes = [
+            runner.load_or_create_status(&state_file).map(|_| ()),
+            runner.execute_batch(&state_file).map(|_| ()),
+            runner
+                .execute_single_run(&runner.variants[0], 7)
+                .map(|_| ()),
+        ];
+        for outcome in outcomes {
+            assert!(matches!(
+                outcome,
+                Err(ExperimentRunnerError::BatchTickCapacityExceeded {
+                    runs: 2,
+                    total_ticks,
+                    limit,
+                    ..
+                }) if total_ticks == 2 * MAX_TICKS_PER_RUN
+                    && limit == MAX_BATCH_TOTAL_TICKS
+            ));
+        }
+        assert_eq!(runner.status_snapshot(&state_file).unwrap(), status);
+        assert_eq!(fs::read(&state_file).unwrap(), committed);
+        assert!(!status_temporary_path(&state_file).unwrap().exists());
+        assert!(!status_lock_path(&state_file).unwrap().exists());
+        assert!(!runner.output_dir.exists());
+
+        let unopened = directory.join("unopened").join("status.json");
+        assert!(matches!(
+            runner.load_or_create_status(&unopened),
+            Err(ExperimentRunnerError::BatchTickCapacityExceeded { .. })
+        ));
+        assert!(!unopened.parent().unwrap().exists());
     }
 
     #[test]

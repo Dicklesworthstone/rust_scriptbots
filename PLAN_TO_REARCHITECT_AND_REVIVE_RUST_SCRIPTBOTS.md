@@ -2,6 +2,33 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Whole-cohort experiment work admission (2026-11-13):**
+[Source implemented — Codex; executable qualification open]
+
+Continue the resource contract in `bd-2z0.5.11` and `bd-2z0.12.2`.
+The existing 10,000,000-tick single-run ceiling now also bounds the sum of
+scientific transitions across the complete variant-by-seed cohort. Previously,
+4,096 individually valid runs could admit 40,960,000,000 transitions. Shared
+checked admission computes the complete product before API catalog recovery and
+before initialization or execution acquires status-file leases or creates owners.
+Resume refuses synchronously before capacity reservation or clearing cancellation.
+Read-only status, catalog and completed-evidence validation retain their original
+science/provenance rules without applying this new execution limit. Concurrency
+and completed-run filtering do not reset the full plan's execution allowance.
+Oversized plans refuse with their requested work and limit; horizons, seeds and
+existing artifact bytes are preserved. This is a logical-work cardinality policy,
+not a wall-clock, total-memory or retained-byte guarantee.
+
+Four new regressions cover seed/variant multiplication, exact-boundary admission,
+concurrency independence, retained single-run/zero-tick-library behavior, refusal
+before execution I/O and unchanged API catalog/idempotency/capacity. Historical
+pending definitions remain discoverable while resume refuses; no completed
+historical science is invented by those fixtures. A small real run follows
+refused admission. Negative controls stop unexpectedly admitted workers before
+asserting failure. Tests are authored and source reviewed;
+native execution, compiler, formatter, Clippy, UBS and DSR remain unavailable.
+Original acceptance stays open.
+
 **Bundle input liveness (2026-11-13):**
 [Source implemented — Codex; executable qualification open]
 
