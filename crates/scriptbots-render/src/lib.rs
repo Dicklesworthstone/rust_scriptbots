@@ -14832,9 +14832,7 @@ pub fn render_genome_browser_view(
     // Render preview of first few nodes and connections
     let mut node_list = div().flex().flex_col().gap_1();
     for node in browser.nodes.iter().take(4) {
-        let bias_str = node
-            .bias
-            .map_or(String::new(), |b| format!("bias {b:+} "));
+        let bias_str = node.bias.map_or(String::new(), |b| format!("bias {b:+} "));
         let damp_str = node
             .damping
             .map_or(String::new(), |d| format!("damp {d:.2} "));

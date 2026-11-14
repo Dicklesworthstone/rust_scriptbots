@@ -16455,9 +16455,7 @@ mod owner_inspector_tests {
         assert_eq!(pages.len(), 3);
         assert!(pages[0].starts_with("Genome node 47 | retained 21 of 200\n"));
         assert!(pages[0].contains("Bias -0.5 | damping unavailable | gain +1.25"));
-        assert!(
-            pages[0].contains("Slot 0 | target 100 | weight +0 | kind recurrent unsafe line")
-        );
+        assert!(pages[0].contains("Slot 0 | target 100 | weight +0 | kind recurrent unsafe line"));
         for slot in 0..9 {
             let expected = format!("Slot {slot} | target {} |", 100 + slot);
             assert_eq!(
@@ -16526,7 +16524,10 @@ mod owner_inspector_tests {
         use scriptbots_core::genome_diff::{GenomeDelta, Locus};
 
         let precise = f64::from_bits(1.0_f64.to_bits() + 1);
-        let locus = Locus::NodeWeightWide { node: 325, conn: 299 };
+        let locus = Locus::NodeWeightWide {
+            node: 325,
+            conn: 299,
+        };
         let deltas = [
             GenomeDelta::Scalar64 {
                 locus,

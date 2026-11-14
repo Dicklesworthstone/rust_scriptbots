@@ -194,7 +194,10 @@ fn report_exposes_the_actual_block_methods_and_refuses_invalid_controls_on_empty
         "exploratory_selected_events"
     );
     assert!(out.human_md.contains("do not correct for this selection"));
-    assert!(out.human_md.contains("need not be adjacent simulation ticks"));
+    assert!(
+        out.human_md
+            .contains("need not be adjacent simulation ticks")
+    );
 
     for raw in [
         "window=0",

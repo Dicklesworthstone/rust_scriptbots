@@ -499,9 +499,8 @@ impl BrainFamilyCodec for NeuroflowFamilyAdapter {
     fn heredity_capability(&self) -> BrainHeredityCapabilityV1 {
         let mut descriptor = LOCUS_SCHEMA_DESCRIPTOR.to_vec();
         descriptor.extend_from_slice(&self.genome_header);
-        let trials =
-            u32::try_from((self.genome_bytes - self.genome_header.len()) / SCALAR_BYTES)
-                .expect("bounded NeuroFlow weight count fits u32");
+        let trials = u32::try_from((self.genome_bytes - self.genome_header.len()) / SCALAR_BYTES)
+            .expect("bounded NeuroFlow weight count fits u32");
         BrainHeredityCapabilityV1::locus_capable(
             BrainLocusSchemaIdentityV1::from_semantic_descriptor(
                 &self.family_id,
@@ -980,8 +979,7 @@ mod tests {
         .unwrap();
         let mut payload = family.genome_header.clone();
         payload.resize(family.genome_bytes, 0);
-        let offset = family.genome_header.len()
-            + (300 * (INPUT_SIZE + 1) + 1 + 299) * SCALAR_BYTES;
+        let offset = family.genome_header.len() + (300 * (INPUT_SIZE + 1) + 1 + 299) * SCALAR_BYTES;
         let precise = f64::from_bits(1.0_f64.to_bits() + 1);
         payload[offset..offset + SCALAR_BYTES].copy_from_slice(&precise.to_le_bytes());
         let genome = genome_with_payload(&family, payload);
@@ -997,15 +995,24 @@ mod tests {
         );
         assert_eq!(family.genome_loci_upper_bound(), Some(loci.len()));
         assert_eq!(
-            lookup[&Locus::NodeWeightWide { node: 325, conn: 299 }],
+            lookup[&Locus::NodeWeightWide {
+                node: 325,
+                conn: 299
+            }],
             LocusValue::Scalar64(precise)
         );
         assert_eq!(
-            lookup[&Locus::NodeTargetWide { node: 325, conn: 299 }],
+            lookup[&Locus::NodeTargetWide {
+                node: 325,
+                conn: 299
+            }],
             LocusValue::Target(324)
         );
         assert_eq!(
-            lookup[&Locus::NodeTargetWide { node: 325, conn: 255 }],
+            lookup[&Locus::NodeTargetWide {
+                node: 325,
+                conn: 255
+            }],
             LocusValue::Target(280)
         );
         let mut invalid = genome.payload().to_vec();
@@ -1515,8 +1522,7 @@ mod tests {
             let live_parent = world.agent_brain_genome(parent).unwrap();
             let live_child = world.agent_brain_genome(child).unwrap();
             family.genome_loci(live_parent).unwrap();
-            scriptbots_core::genome_diff::diff_genomes(&family, live_parent, live_child)
-                .unwrap();
+            scriptbots_core::genome_diff::diff_genomes(&family, live_parent, live_child).unwrap();
             assert_eq!(world.world_digest_v1().unwrap(), before_digest);
             assert_eq!(
                 world.checkpoint_v1().unwrap().encode().unwrap(),

@@ -990,8 +990,7 @@ mod tests {
         let before = [0.0, 2.0, 4.0, 6.0, 8.0];
         let after = [1.0, 3.0, 5.0, 7.0, 9.0, 11.0];
         assert_eq!(
-            moving_block_bootstrap_mean_difference_ci(&before, &after, 1, 128, 0.95, 42)
-                .unwrap(),
+            moving_block_bootstrap_mean_difference_ci(&before, &after, 1, 128, 0.95, 42).unwrap(),
             bootstrap_mean_difference_ci(&before, &after, 128, 0.95, 42).unwrap()
         );
         assert_eq!(
@@ -1012,14 +1011,12 @@ mod tests {
             .into_iter()
             .flat_map(|value| std::iter::repeat_n(value, 8))
             .collect();
-        let blocked =
-            block_permutation_test_mean_difference(&before, &after, 8, 256, 42).unwrap();
+        let blocked = block_permutation_test_mean_difference(&before, &after, 8, 256, 42).unwrap();
         let independent_blocks =
             permutation_test_mean_difference(&[0.0, 2.0], &[1.0, 3.0], 256, 42).unwrap();
         assert_eq!(blocked, independent_blocks);
 
-        let duplicated_ticks =
-            permutation_test_mean_difference(&before, &after, 256, 42).unwrap();
+        let duplicated_ticks = permutation_test_mean_difference(&before, &after, 256, 42).unwrap();
         assert!(
             blocked.p_value > duplicated_ticks.p_value,
             "duplicating observations inside a block must not create independent replication"
@@ -1084,16 +1081,14 @@ mod tests {
     fn block_permutation_retains_equal_and_unequal_partial_tails() {
         let before = [0.0, 0.0, 0.0, 0.0, 100.0];
         let after = [0.0, 0.0, 0.0, 0.0, -100.0];
-        let equal =
-            block_permutation_test_mean_difference(&before, &after, 2, 128, 5).unwrap();
+        let equal = block_permutation_test_mean_difference(&before, &after, 2, 128, 5).unwrap();
         assert_eq!(equal.observed, -40.0);
         // Whole tail pairs either remain or swap. Both outcomes have |difference| = 40.
         // Dropping tails, padding them or mixing them with individual points fails this.
         assert_eq!(equal.p_value, 1.0);
 
         let no_tail = [0.0; 6];
-        let unequal =
-            block_permutation_test_mean_difference(&before, &no_tail, 2, 128, 5).unwrap();
+        let unequal = block_permutation_test_mean_difference(&before, &no_tail, 2, 128, 5).unwrap();
         assert_eq!(unequal.observed, -20.0);
         assert_eq!(unequal.p_value, 1.0);
 
@@ -1116,29 +1111,23 @@ mod tests {
         let before = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0];
         let after = [2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
         let ci =
-            moving_block_bootstrap_mean_difference_ci(&before, &after, 2, 128, 0.95, 123)
-                .unwrap();
+            moving_block_bootstrap_mean_difference_ci(&before, &after, 2, 128, 0.95, 123).unwrap();
         assert_eq!(
             ci,
-            moving_block_bootstrap_mean_difference_ci(&before, &after, 2, 128, 0.95, 123)
-                .unwrap()
+            moving_block_bootstrap_mean_difference_ci(&before, &after, 2, 128, 0.95, 123).unwrap()
         );
-        let p =
-            block_permutation_test_mean_difference(&before, &after, 2, 128, 123).unwrap();
+        let p = block_permutation_test_mean_difference(&before, &after, 2, 128, 123).unwrap();
         assert_eq!(
             p,
             block_permutation_test_mean_difference(&before, &after, 2, 128, 123).unwrap()
         );
         for block in [0, 4, 6, 7] {
             assert!(
-                moving_block_bootstrap_mean_difference_ci(
-                    &before, &after, block, 128, 0.95, 123
-                )
-                .is_err()
+                moving_block_bootstrap_mean_difference_ci(&before, &after, block, 128, 0.95, 123)
+                    .is_err()
             );
             assert!(
-                block_permutation_test_mean_difference(&before, &after, block, 128, 123)
-                    .is_err()
+                block_permutation_test_mean_difference(&before, &after, block, 128, 123).is_err()
             );
         }
         assert!(matches!(

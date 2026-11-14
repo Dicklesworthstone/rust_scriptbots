@@ -161,7 +161,11 @@ fn test_genome_browser_ui_e2e() -> Result<(), Box<dyn std::error::Error>> {
                 "connection weight locus found in decoded loci"
             );
             if let Some((_, LocusValue::Scalar(s))) = expected {
-                assert_eq!(conn.weight, f64::from(*s), "weight matches decoded locus value");
+                assert_eq!(
+                    conn.weight,
+                    f64::from(*s),
+                    "weight matches decoded locus value"
+                );
             }
         }
     }

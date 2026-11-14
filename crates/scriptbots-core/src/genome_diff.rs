@@ -319,7 +319,9 @@ pub fn export_locus_trace_svg(samples: &[LocusSample], locus: Locus) -> String {
         .iter()
         .filter_map(|s| {
             let value = s.value?.scalar()?;
-            value.is_finite().then_some((f64::from(s.generation), value))
+            value
+                .is_finite()
+                .then_some((f64::from(s.generation), value))
         })
         .collect();
 
@@ -346,8 +348,8 @@ pub fn export_locus_trace_svg(samples: &[LocusSample], locus: Locus) -> String {
         let mut points = String::new();
         for (g, v) in &valid_scalars {
             let x = padding + (g - min_gen) / gen_span * (width - 2.0 * padding);
-            let y = height - padding
-                - trace_fraction(*v, min_val, max_val) * (height - 2.0 * padding);
+            let y =
+                height - padding - trace_fraction(*v, min_val, max_val) * (height - 2.0 * padding);
             if !points.is_empty() {
                 points.push(' ');
             }
@@ -547,7 +549,9 @@ pub fn export_locus_trace_png(samples: &[LocusSample], _locus: Locus) -> Vec<u8>
         .iter()
         .filter_map(|s| {
             let value = s.value?.scalar()?;
-            value.is_finite().then_some((f64::from(s.generation), value))
+            value
+                .is_finite()
+                .then_some((f64::from(s.generation), value))
         })
         .collect();
 
@@ -962,7 +966,10 @@ mod tests {
 
     #[test]
     fn f64_trace_exports_retain_one_ulp_and_subnormal_changes() {
-        let locus = Locus::NodeWeightWide { node: 325, conn: 299 };
+        let locus = Locus::NodeWeightWide {
+            node: 325,
+            conn: 299,
+        };
         let samples: Vec<_> = [1.0, f64::from_bits(1.0_f64.to_bits() + 1)]
             .into_iter()
             .zip([1, 2])

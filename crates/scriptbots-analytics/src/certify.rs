@@ -28,8 +28,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::stats::{
     self, ConfidenceInterval, EffectSizeEstimator, StatsError,
-    block_permutation_test_mean_difference, cliffs_delta, cohens_d,
-    moving_block_bootstrap_mean_ci, moving_block_bootstrap_mean_difference_ci,
+    block_permutation_test_mean_difference, cliffs_delta, cohens_d, moving_block_bootstrap_mean_ci,
+    moving_block_bootstrap_mean_difference_ci,
 };
 
 /// Versioned interval method recorded by persisted reports.
@@ -870,13 +870,15 @@ mod tests {
         assert_eq!(method.fdr, 0.1);
         assert_eq!(method.seed, 123);
         assert_eq!(method.interpretation, "exploratory_selected_events");
-        assert!(method.assumptions.contains("exchangeable equal-length blocks"));
+        assert!(
+            method
+                .assumptions
+                .contains("exchangeable equal-length blocks")
+        );
         assert!(method.assumptions.contains("event selection"));
         assert_eq!(
-            serde_json::from_str::<CertificationMethod>(
-                &serde_json::to_string(&method).unwrap()
-            )
-            .unwrap(),
+            serde_json::from_str::<CertificationMethod>(&serde_json::to_string(&method).unwrap())
+                .unwrap(),
             method
         );
     }

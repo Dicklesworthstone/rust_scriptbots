@@ -588,10 +588,11 @@ fn verify_database_projection(
         let full_path = bundle_dir.join(path);
         let (mut file, _) = open_regular_bundle_file(&full_path)?;
         let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).map_err(|error| BundleError::Io {
-            path: full_path,
-            error,
-        })?;
+        file.read_to_end(&mut bytes)
+            .map_err(|error| BundleError::Io {
+                path: full_path,
+                error,
+            })?;
         let exported: serde_json::Value = serde_json::from_slice(&bytes)?;
         if exported != actual
             || actual.as_array().map(|rows| rows.len() as u64) != Some(expected_count)
@@ -1615,8 +1616,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn bounded_bundle_refuses_fifos_without_writers()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn bounded_bundle_refuses_fifos_without_writers() -> Result<(), Box<dyn std::error::Error>> {
         use std::process::{Command, Stdio};
 
         const ROOT_ENV: &str = "SCRIPTBOTS_BUNDLE_FIFO_TEST_ROOT";
@@ -1632,9 +1632,8 @@ mod tests {
         // Run the actual verifier in a child so the original blocking opener
         // fails this regression without leaving a blocked test thread behind.
         if let Some(root) = std::env::var_os(ROOT_ENV) {
-            let expected = PathBuf::from(
-                std::env::var_os(EXPECTED_ENV).ok_or("missing FIFO refusal path")?,
-            );
+            let expected =
+                PathBuf::from(std::env::var_os(EXPECTED_ENV).ok_or("missing FIFO refusal path")?);
             let root = PathBuf::from(root);
             for (verifier, result) in [
                 ("bounded", verify_run_bundle_bounded(&root, limits)),

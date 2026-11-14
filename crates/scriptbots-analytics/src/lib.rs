@@ -2742,10 +2742,7 @@ fn render_run_comparison_markdown(machine: &RunComparisonMachine) -> String {
              Cohorts of at most twelve pairs enumerate all sign assignments; larger cohorts \
              use Monte Carlo sampling. Both require within-pair exchangeability under the null. \
              The requested Monte Carlo budget is {}; actual evaluations appear per metric.\n",
-            machine.significant,
-            machine.metrics_compared,
-            machine.fdr,
-            machine.n_permutations
+            machine.significant, machine.metrics_compared, machine.fdr, machine.n_permutations
         );
     } else {
         let _ = writeln!(

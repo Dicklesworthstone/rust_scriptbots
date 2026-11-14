@@ -460,7 +460,11 @@ fn independent_seed_endpoints_detect_the_planted_effect_and_preserve_the_null() 
     let report = compare_cohort(&control[0], &path).expect("matched-seed comparison");
     assert_eq!(report.schema_version, 2);
     assert!(report.human_md.contains("paired_sign_flip_exact | 4096"));
-    assert!(report.human_md.contains("requested Monte Carlo budget is 4000"));
+    assert!(
+        report
+            .human_md
+            .contains("requested Monte Carlo budget is 4000")
+    );
     let machine = report.machine;
     assert_eq!(machine["schema"], RUN_COMPARISON_SCHEMA_V3);
     assert_eq!(machine["mode"], "matched_seed_cohort");
@@ -540,7 +544,12 @@ fn five_seed_cohort_reports_the_complete_null_and_actual_assignment_count() {
         control.push(attributed_run(
             dir.path(),
             &format!("control-{seed}.sqlite"),
-            manifest(RunId::new(100 + u128::from(seed)), u64::from(seed), "control", 1),
+            manifest(
+                RunId::new(100 + u128::from(seed)),
+                u64::from(seed),
+                "control",
+                1,
+            ),
             &[(1, 10.0, 7.0)],
         ));
         treatment.push(attributed_run(

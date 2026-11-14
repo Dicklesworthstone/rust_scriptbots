@@ -1798,12 +1798,8 @@ impl MatchedSeedExperimentRunner {
     /// Read-only status, progress and completed-bundle verification retain their
     /// existing provenance checks even for cohorts above the current work limit.
     pub(crate) fn validate_execution_workload(&self) -> Result<(), ExperimentRunnerError> {
-        validate_experiment_workload(
-            self.variants.len(),
-            self.cohort.seeds.len(),
-            self.max_ticks,
-        )
-        .map(|_| ())
+        validate_experiment_workload(self.variants.len(), self.cohort.seeds.len(), self.max_ticks)
+            .map(|_| ())
     }
 
     /// Dense grid cells reserved by the largest executable concurrent run set.
@@ -7396,13 +7392,7 @@ mod tests {
         let (variant, family) = &plan.variants[&record.variant_id];
         let path = runner.run_checkpoint_path(&record.run_id);
         let mut checkpoint = runner
-            .initial_run_checkpoint(
-                variant,
-                *family,
-                record.seed,
-                &record.run_id,
-                &plan.digest,
-            )
+            .initial_run_checkpoint(variant, *family, record.seed, &record.run_id, &plan.digest)
             .unwrap();
         let original_manifest = checkpoint.metadata.manifest.canonical_json_bytes().unwrap();
         let mut oracle = restore_run_owner(&checkpoint, *family, &record.run_id, &path).unwrap();
@@ -7860,13 +7850,7 @@ mod tests {
         let record = &plan.runs[0];
         let (variant, family) = &plan.variants[&record.variant_id];
         runner
-            .prepare_run_checkpoint(
-                variant,
-                *family,
-                record.seed,
-                &record.run_id,
-                &plan.digest,
-            )
+            .prepare_run_checkpoint(variant, *family, record.seed, &record.run_id, &plan.digest)
             .unwrap();
         let path = runner.run_checkpoint_path(&record.run_id);
         let temporary = status_temporary_path(&path).unwrap();

@@ -16,9 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use scriptbots_brain::mlp::{MlpBrain, MlpBrainFamily};
 use scriptbots_core::genome_browser::{GenomeBrowserViewModel, MutationDiffStatus};
-use scriptbots_core::genome_diff::{
-    Locus, export_locus_trace_csv, export_locus_trace_png,
-};
+use scriptbots_core::genome_diff::{Locus, export_locus_trace_csv, export_locus_trace_png};
 use scriptbots_core::{
     AgentData, AgentId, AgentUid, BrainFamilyCodec, ScriptBotsConfig, WorldState,
 };

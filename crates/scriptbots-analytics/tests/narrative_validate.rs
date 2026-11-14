@@ -172,7 +172,11 @@ fn planted_shift_is_certified_from_complete_inputs_across_pages() {
     assert_eq!(output.machine["inference"]["resamples"], 200);
     assert_eq!(output.machine["inference"]["permutations"], 200);
     assert!(output.human_md.contains("Exploratory"));
-    assert!(output.human_md.contains("do not correct for event selection"));
+    assert!(
+        output
+            .human_md
+            .contains("do not correct for event selection")
+    );
 
     let rows = output.machine["events"].as_array().expect("events");
     assert_eq!(rows.len(), 1);

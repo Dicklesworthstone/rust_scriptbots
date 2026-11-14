@@ -515,11 +515,17 @@ mod tests {
         let loci = [
             (Locus::NodeBias(325), LocusValue::Scalar64(precise)),
             (
-                Locus::NodeWeightWide { node: 325, conn: 299 },
+                Locus::NodeWeightWide {
+                    node: 325,
+                    conn: 299,
+                },
                 LocusValue::Scalar64(-0.0),
             ),
             (
-                Locus::NodeTargetWide { node: 325, conn: 299 },
+                Locus::NodeTargetWide {
+                    node: 325,
+                    conn: 299,
+                },
                 LocusValue::Target(324),
             ),
             (Locus::NodeBias(1), LocusValue::Scalar(0.1)),

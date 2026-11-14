@@ -463,9 +463,10 @@ fn decode_bounded_loci(
         return Err(GenomeInspectionUnavailable::InvalidGenome);
     }
     let mut seen = BTreeSet::new();
-    if loci.iter().any(|(locus, value)| {
-        !seen.insert(*locus) || !value.is_finite()
-    }) {
+    if loci
+        .iter()
+        .any(|(locus, value)| !seen.insert(*locus) || !value.is_finite())
+    {
         return Err(GenomeInspectionUnavailable::InvalidGenome);
     }
     Ok(loci)
@@ -888,7 +889,10 @@ mod tests {
     #[test]
     fn genome_parent_diff_preserves_f64_ulp_and_signed_zero_and_types_overflow() {
         let (parent, child) = genome_pair();
-        let locus = Locus::NodeWeightWide { node: 325, conn: 299 };
+        let locus = Locus::NodeWeightWide {
+            node: 325,
+            conn: 299,
+        };
         let next = f64::from_bits(1.0_f64.to_bits() + 1);
         let before = vec![
             (locus, LocusValue::Scalar64(1.0)),
@@ -898,14 +902,15 @@ mod tests {
             (locus, LocusValue::Scalar64(next)),
             (Locus::NodeBias(325), LocusValue::Scalar64(0.0)),
         ];
-        let diff = inspect_parent_diff(&child, Some(&parent), &after, 0, Some(2), |_| {
-            Ok(before)
-        });
+        let diff = inspect_parent_diff(&child, Some(&parent), &after, 0, Some(2), |_| Ok(before));
         let encoded = serde_json::to_string(&diff).unwrap();
         assert!(encoded.contains("1.0000000000000002"));
         assert!(encoded.contains("-0.0"));
         assert!(encoded.contains("NodeWeightWide"));
-        let GenomeParentDiff::Ready { deltas, summary, .. } = diff else {
+        let GenomeParentDiff::Ready {
+            deltas, summary, ..
+        } = diff
+        else {
             panic!("finite exact f64 genes must be inspectable");
         };
         assert_eq!(summary.changed_loci, 2);
