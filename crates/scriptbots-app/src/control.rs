@@ -1,5 +1,5 @@
 use std::cmp::Reverse;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -697,7 +697,7 @@ pub struct CheckpointCreateRequest {
 }
 
 /// Metadata descriptor for a simulation checkpoint.
-#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CheckpointMetadataDto {
     pub checkpoint_id: String,
     pub tick: u64,
@@ -950,6 +950,14 @@ pub struct CheckpointRetentionDto {
     pub file_bytes: u64,
     pub observed_file_count_high_water: u64,
     pub observed_file_bytes_high_water: u64,
+    /// Immutable retry admissions, including incomplete requests from earlier owners.
+    /// These do not represent requests adopted by the current owner.
+    pub retained_request_records: u64,
+    pub retained_request_record_bytes: u64,
+    /// Union of binary artifact paths and checkpoint paths reserved by requests.
+    pub reserved_checkpoint_count: u64,
+    /// Derived from the configured count limit and the bounded record encoding.
+    pub max_retained_request_record_bytes: u64,
     pub request_entries: usize,
     pub pending_entries: usize,
     pub payload_cache_bytes: u64,
@@ -2596,6 +2604,9 @@ struct RetainedCheckpoint {
 const CHECKPOINT_CATALOG_SUFFIX: &str = ".checkpoint.json";
 const CHECKPOINT_CATALOG_READY_SUFFIX: &str = ".checkpoint.ready";
 const MAX_CHECKPOINT_CATALOG_RECORD_BYTES: usize = 16 * 1024;
+const CHECKPOINT_REQUEST_PREFIX: &str = "checkpoint-request-";
+const CHECKPOINT_REQUEST_SUFFIX: &str = ".json";
+const MAX_CHECKPOINT_REQUEST_RECORD_BYTES: usize = 16 * 1024;
 const MAX_CATALOG_CHECKPOINTS: usize = 1_024;
 const MAX_CHECKPOINT_DISCOVERY_ENTRIES: usize = 16_384;
 const MAX_CHECKPOINT_DISCOVERY_BYTES: u64 = 256 * 1024 * 1024;
@@ -2609,6 +2620,134 @@ struct CheckpointCatalogRecord {
     schema_version: u16,
     metadata: CheckpointMetadataDto,
     checksum_blake3: String,
+}
+
+/// Reserve the exact request before creating its payload. An admission alone
+/// never proves completion: recovery requires the ready catalog and original bytes.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointRequestAdmission {
+    schema_version: u16,
+    idempotency_key: String,
+    request_hash: String,
+    metadata: CheckpointMetadataDto,
+    /// Original capture context only. WorldCheckpointV1 excludes host identity,
+    /// and recovery never adopts this session.
+    source_session: scriptbots_runtime::HostSessionId,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointRequestRecord {
+    admission: CheckpointRequestAdmission,
+    checksum_blake3: String,
+}
+
+fn checkpoint_request_path(directory: &Path, key: &str) -> PathBuf {
+    directory.join(format!(
+        "{CHECKPOINT_REQUEST_PREFIX}{}{CHECKPOINT_REQUEST_SUFFIX}",
+        compute_blake3(key.as_bytes())
+    ))
+}
+
+fn write_checkpoint_request_admission(
+    directory: &Path,
+    key: &str,
+    retained: &RetainedCheckpoint,
+) -> Result<(), ControlError> {
+    let path = checkpoint_request_path(directory, key);
+    let admission = CheckpointRequestAdmission {
+        schema_version: 1,
+        idempotency_key: key.to_owned(),
+        request_hash: retained.request_hash.clone(),
+        metadata: retained.metadata.clone(),
+        source_session: retained.source_session,
+    };
+    let encoded = serde_json::to_vec(&admission).map_err(ControlError::serialization)?;
+    let record = CheckpointRequestRecord {
+        admission,
+        checksum_blake3: compute_blake3(&encoded),
+    };
+    let bytes = serde_json::to_vec(&record).map_err(ControlError::serialization)?;
+    if bytes.len() > MAX_CHECKPOINT_REQUEST_RECORD_BYTES {
+        return Err(checkpoint_catalog_error(
+            &path,
+            "request admission exceeds its byte bound",
+        ));
+    }
+    let file = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            file.write_all(&bytes)
+                .map_err(|error| checkpoint_catalog_error(&path, error))?;
+            file
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let (file, existing) =
+                open_artifact_file_bounded(&path, MAX_CHECKPOINT_REQUEST_RECORD_BYTES, true)
+                    .map_err(|error| checkpoint_catalog_error(&path, error))?;
+            if existing != bytes {
+                return Err(checkpoint_catalog_error(
+                    &path,
+                    "existing request admission is incomplete or different; retry cannot overwrite it",
+                ));
+            }
+            file
+        }
+        Err(error) => return Err(checkpoint_catalog_error(&path, error)),
+    };
+    file.sync_all()
+        .map_err(|error| checkpoint_catalog_error(&path, error))?;
+    verify_open_artifact(&path, &file).map_err(|error| checkpoint_catalog_error(&path, error))?;
+    #[cfg(unix)]
+    sync_checkpoint_directory(directory)
+        .map_err(|error| checkpoint_catalog_error(directory, error))?;
+    Ok(())
+}
+
+fn read_checkpoint_request_record(
+    path: &Path,
+) -> Result<CheckpointRequestAdmission, ControlError> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| checkpoint_catalog_error(path, "request admission has no directory"))?;
+    let bytes = read_artifact_file_bounded(path, MAX_CHECKPOINT_REQUEST_RECORD_BYTES)
+        .map_err(|error| checkpoint_catalog_error(path, error))?;
+    let record: CheckpointRequestRecord =
+        serde_json::from_slice(&bytes).map_err(|error| checkpoint_catalog_error(path, error))?;
+    let encoded = serde_json::to_vec(&record.admission).map_err(ControlError::serialization)?;
+    let admission = record.admission;
+    if admission.schema_version != 1
+        || record.checksum_blake3 != compute_blake3(&encoded)
+        || admission.idempotency_key.is_empty()
+        || admission.idempotency_key.len() > 1024
+        || checkpoint_request_path(directory, &admission.idempotency_key).as_path() != path
+        || !valid_checkpoint_catalog_id(&admission.metadata.checkpoint_id)
+        || !valid_branch_digest(&admission.request_hash)
+    {
+        return Err(checkpoint_catalog_error(
+            path,
+            "unsupported, inconsistent or corrupt request admission",
+        ));
+    }
+    Ok(admission)
+}
+
+fn read_checkpoint_request_admission(
+    directory: &Path,
+    key: &str,
+    request_hash: &str,
+) -> Result<CheckpointRequestAdmission, ControlError> {
+    let admission = read_checkpoint_request_record(&checkpoint_request_path(directory, key))?;
+    if admission.idempotency_key != key || admission.request_hash != request_hash {
+        return Err(ControlError::Conflict(
+            "checkpoint idempotency key reused with a changed request".to_owned(),
+        ));
+    }
+    Ok(admission)
 }
 
 fn checkpoint_catalog_error(path: &Path, error: impl std::fmt::Display) -> ControlError {
@@ -2815,6 +2954,9 @@ struct CheckpointRetentionState {
     requests: BTreeMap<String, RetainedCheckpoint>,
     file_count: u64,
     file_bytes: u64,
+    request_record_count: u64,
+    request_record_bytes: u64,
+    reservation_count: u64,
     count_high_water: u64,
     bytes_high_water: u64,
     inventory_error: Option<String>,
@@ -2837,6 +2979,67 @@ impl CheckpointRetentionState {
             })?
             .verify()
             .map_err(|error| ControlError::CheckpointRetentionUnavailable(error.to_string()))
+    }
+
+    fn request_admission(
+        &self,
+        key: &str,
+        request_hash: &str,
+    ) -> Result<Option<(PathBuf, CheckpointRequestAdmission)>, ControlError> {
+        if self.directories.len() > MAX_CHECKPOINT_DISCOVERY_ENTRIES {
+            return Err(ControlError::CheckpointRetentionUnavailable(
+                "checkpoint request discovery exceeds its directory bound".to_owned(),
+            ));
+        }
+        let mut found = None;
+        for directory in self.directories.keys() {
+            self.verify_directory(directory)?;
+            let path = checkpoint_request_path(directory, key);
+            match fs::symlink_metadata(&path) {
+                Ok(_) => {
+                    if found.is_some() {
+                        return Err(ControlError::Conflict(
+                            "checkpoint idempotency key is retained in multiple artifact directories"
+                                .to_owned(),
+                        ));
+                    }
+                    found = Some(directory.clone());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(checkpoint_catalog_error(&path, error)),
+            }
+        }
+        found
+            .map(|directory| {
+                read_checkpoint_request_admission(&directory, key, request_hash)
+                    .map(|admission| (directory, admission))
+            })
+            .transpose()
+    }
+
+    fn completed_request(
+        &self,
+        directory: &Path,
+        admission: &CheckpointRequestAdmission,
+    ) -> Result<CheckpointMetadataDto, ControlError> {
+        self.verify_directory(directory)?;
+        let metadata = read_checkpoint_catalog(directory, &admission.metadata.checkpoint_id)
+            .map_err(|error| {
+                ControlError::CheckpointRetentionUnavailable(format!(
+                    "checkpoint {} completion is unconfirmed for original source session {}: {error}; retained request identity forbids a new capture",
+                    admission.metadata.checkpoint_id,
+                    admission.source_session,
+                ))
+            })?;
+        if metadata != admission.metadata {
+            return Err(checkpoint_catalog_error(
+                &checkpoint_request_path(directory, &admission.idempotency_key),
+                "request admission disagrees with the completed checkpoint",
+            ));
+        }
+        verify_checkpoint_catalog_payload(directory, &metadata)?;
+        self.verify_directory(directory)?;
+        Ok(metadata)
     }
 
     fn add_directory(&mut self, path: &Path) -> Result<PathBuf, ControlError> {
@@ -2876,7 +3079,26 @@ impl CheckpointRetentionState {
                 "no artifact directory lease was acquired".to_owned(),
             ));
         }
-        fn scan(path: &Path, depth: usize) -> std::io::Result<(u64, u64)> {
+        fn reserve(
+            reservations: &mut BTreeSet<PathBuf>,
+            path: PathBuf,
+        ) -> std::io::Result<()> {
+            if reservations.len() >= MAX_CHECKPOINT_DISCOVERY_ENTRIES
+                && !reservations.contains(&path)
+            {
+                return Err(std::io::Error::other(
+                    "checkpoint reservations exceed their entry bound",
+                ));
+            }
+            reservations.insert(path);
+            Ok(())
+        }
+        fn scan(
+            path: &Path,
+            depth: usize,
+            entries: &mut usize,
+            reservations: &mut BTreeSet<PathBuf>,
+        ) -> std::io::Result<(u64, u64, u64, u64)> {
             if depth > 32 {
                 return Err(std::io::Error::other(
                     "checkpoint inventory exceeds its directory depth bound",
@@ -2884,11 +3106,19 @@ impl CheckpointRetentionState {
             }
             let mut count = 0_u64;
             let mut bytes = 0_u64;
+            let mut request_count = 0_u64;
+            let mut request_bytes = 0_u64;
             for entry in fs::read_dir(path)? {
                 let entry = entry?;
+                *entries = (*entries)
+                    .checked_add(1)
+                    .filter(|count| *count <= MAX_CHECKPOINT_DISCOVERY_ENTRIES)
+                    .ok_or_else(|| {
+                        std::io::Error::other("checkpoint inventory exceeds its entry bound")
+                    })?;
                 let metadata = fs::symlink_metadata(entry.path())?;
-                let (added_count, added_bytes) = if metadata.is_dir() {
-                    scan(&entry.path(), depth + 1)?
+                let (added_count, added_bytes, added_requests, added_request_bytes) = if metadata.is_dir() {
+                    scan(&entry.path(), depth + 1, entries, reservations)?
                 } else if entry
                     .path()
                     .extension()
@@ -2899,9 +3129,30 @@ impl CheckpointRetentionState {
                             "checkpoint inventory contains a non-regular binary artifact",
                         ));
                     }
-                    (1, metadata.len())
+                    reserve(reservations, entry.path())?;
+                    (1, metadata.len(), 0, 0)
+                } else if entry.file_name().to_str().is_some_and(|name| {
+                    name.starts_with(CHECKPOINT_REQUEST_PREFIX)
+                        && name.ends_with(CHECKPOINT_REQUEST_SUFFIX)
+                }) {
+                    if !metadata.is_file()
+                        || metadata.len() > MAX_CHECKPOINT_REQUEST_RECORD_BYTES as u64
+                    {
+                        return Err(std::io::Error::other(
+                            "checkpoint inventory contains an invalid request admission",
+                        ));
+                    }
+                    let request_path = entry.path();
+                    let reservation = read_checkpoint_request_record(&request_path).map_or_else(
+                        |_| request_path,
+                        |admission| path.join(format!("{}.bin", admission.metadata.checkpoint_id)),
+                    );
+                    // Unreadable/partial records reserve their own evidence path.
+                    // Only a verified identity can merge with a payload reservation.
+                    reserve(reservations, reservation)?;
+                    (0, 0, 1, metadata.len())
                 } else {
-                    (0, 0)
+                    (0, 0, 0, 0)
                 };
                 count = count
                     .checked_add(added_count)
@@ -2909,17 +3160,28 @@ impl CheckpointRetentionState {
                 bytes = bytes
                     .checked_add(added_bytes)
                     .ok_or_else(|| std::io::Error::other("checkpoint bytes overflow"))?;
+                request_count = request_count
+                    .checked_add(added_requests)
+                    .ok_or_else(|| std::io::Error::other("checkpoint request count overflow"))?;
+                request_bytes = request_bytes
+                    .checked_add(added_request_bytes)
+                    .ok_or_else(|| std::io::Error::other("checkpoint request bytes overflow"))?;
             }
-            Ok((count, bytes))
+            Ok((count, bytes, request_count, request_bytes))
         }
         let mut count = 0_u64;
         let mut bytes = 0_u64;
+        let mut request_count = 0_u64;
+        let mut request_bytes = 0_u64;
+        let mut entries = 0_usize;
+        let mut reservations = BTreeSet::new();
         for (path, lease) in &self.directories {
             lease
                 .verify()
                 .map_err(|error| ControlError::CheckpointRetentionUnavailable(error.to_string()))?;
-            let (directory_count, directory_bytes) = scan(path, 0)
-                .map_err(|error| ControlError::CheckpointRetentionUnavailable(error.to_string()))?;
+            let (directory_count, directory_bytes, directory_requests, directory_request_bytes) =
+                scan(path, 0, &mut entries, &mut reservations)
+                    .map_err(|error| ControlError::CheckpointRetentionUnavailable(error.to_string()))?;
             count = count.checked_add(directory_count).ok_or_else(|| {
                 ControlError::CheckpointRetentionUnavailable("checkpoint count overflow".to_owned())
             })?;
@@ -2928,9 +3190,31 @@ impl CheckpointRetentionState {
                     "checkpoint byte count overflow".to_owned(),
                 )
             })?;
+            request_count = request_count.checked_add(directory_requests).ok_or_else(|| {
+                ControlError::CheckpointRetentionUnavailable(
+                    "checkpoint request count overflow".to_owned(),
+                )
+            })?;
+            request_bytes = request_bytes.checked_add(directory_request_bytes).ok_or_else(|| {
+                ControlError::CheckpointRetentionUnavailable(
+                    "checkpoint request byte count overflow".to_owned(),
+                )
+            })?;
+        }
+        for retained in self.requests.values() {
+            reserve(
+                &mut reservations,
+                retained.directory.join(&retained.artifact.relative_path),
+            )
+            .map_err(|error| ControlError::CheckpointRetentionUnavailable(error.to_string()))?;
         }
         self.file_count = count;
         self.file_bytes = bytes;
+        self.request_record_count = request_count;
+        self.request_record_bytes = request_bytes;
+        self.reservation_count = u64::try_from(reservations.len()).map_err(|error| {
+            ControlError::CheckpointRetentionUnavailable(error.to_string())
+        })?;
         self.count_high_water = self.count_high_water.max(count);
         self.bytes_high_water = self.bytes_high_water.max(bytes);
         self.inventory_error = None;
@@ -2941,7 +3225,8 @@ impl CheckpointRetentionState {
         if let Some(error) = &self.inventory_error {
             return Err(ControlError::CheckpointRetentionUnavailable(error.clone()));
         }
-        if self.file_count >= self.limits.max_count
+        if self.reservation_count >= self.limits.max_count
+            || self.request_record_count >= self.limits.max_count
             || u64::try_from(self.requests.len()).unwrap_or(u64::MAX) >= self.limits.max_count
             || self
                 .file_bytes
@@ -2949,10 +3234,12 @@ impl CheckpointRetentionState {
                 .is_none_or(|bytes| bytes > self.limits.max_bytes)
         {
             return Err(ControlError::CheckpointCapacity(format!(
-                "files={} / {} bytes, request_entries={}, requested={} bytes; limits={} files / {} bytes; preserved artifacts require additional configured capacity or a separate run/directory",
+                "files={} / {} bytes, reserved_checkpoints={}, request_entries={}, retained_request_records={}, requested={} bytes; limits={} files / {} bytes; preserved artifacts require additional configured capacity or a separate run/directory",
                 self.file_count,
                 self.file_bytes,
+                self.reservation_count,
                 self.requests.len(),
+                self.request_record_count,
                 requested_bytes,
                 self.limits.max_count,
                 self.limits.max_bytes,
@@ -2970,6 +3257,9 @@ impl DataServices {
             requests: BTreeMap::new(),
             file_count: 0,
             file_bytes: 0,
+            request_record_count: 0,
+            request_record_bytes: 0,
+            reservation_count: 0,
             count_high_water: 0,
             bytes_high_water: 0,
             inventory_error: None,
@@ -4748,6 +5038,8 @@ impl ControlHandle {
     }
 
     /// Create a simulation checkpoint and register it as an artifact.
+    /// Keyed retries can recover the original completed cut after catalog reopen;
+    /// this does not resume or adopt the original owner or persistence session.
     pub fn create_checkpoint(
         &self,
         request: CheckpointCreateRequest,
@@ -4779,6 +5071,12 @@ impl ControlHandle {
             .idempotency_key
             .as_ref()
             .map(|key| format!("checkpoint:{key}"));
+        let admission = request
+            .idempotency_key
+            .as_deref()
+            .map(|key| retention.request_admission(key, &request_hash))
+            .transpose()?
+            .flatten();
         if let Some(identity) = &request_identity
             && let Some(retained) = retention.requests.get(identity).cloned()
         {
@@ -4787,7 +5085,26 @@ impl ControlHandle {
                     "checkpoint idempotency key reused with a changed request".to_owned(),
                 ));
             }
+            if let Some((directory, admission)) = &admission
+                && (directory != &retained.directory
+                    || admission.metadata != retained.metadata
+                    || admission.source_session != retained.source_session)
+            {
+                return Err(ControlError::Conflict(
+                    "checkpoint request admission disagrees with its retained source".to_owned(),
+                ));
+            }
+            if let Some(key) = request.idempotency_key.as_deref() {
+                write_checkpoint_request_admission(&retained.directory, key, &retained)?;
+            }
             return self.finish_retained_checkpoint(&mut retention, identity, retained);
+        }
+        if let Some((directory, admission)) = admission {
+            let metadata = retention.completed_request(&directory, &admission)?;
+            drop(retention);
+            self.data_services
+                .recover_checkpoint_catalogs(Some(&metadata.checkpoint_id))?;
+            return Ok(metadata);
         }
         {
             let checkpoints = self
@@ -4867,6 +5184,14 @@ impl ControlHandle {
             source_persistence_interval: captured.persistence_interval,
             source_scheduled_input_count: captured.scheduled_input_count,
         };
+        if let Some(key) = request.idempotency_key.as_deref() {
+            let admitted = write_checkpoint_request_admission(&retained.directory, key, &retained);
+            retention.refresh()?;
+            admitted?;
+            retention
+                .requests
+                .insert(identity.clone(), retained.clone());
+        }
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -4998,6 +5323,13 @@ impl ControlHandle {
             file_bytes: retention.file_bytes,
             observed_file_count_high_water: retention.count_high_water,
             observed_file_bytes_high_water: retention.bytes_high_water,
+            retained_request_records: retention.request_record_count,
+            retained_request_record_bytes: retention.request_record_bytes,
+            reserved_checkpoint_count: retention.reservation_count,
+            max_retained_request_record_bytes: retention
+                .limits
+                .max_count
+                .saturating_mul(MAX_CHECKPOINT_REQUEST_RECORD_BYTES as u64),
             request_entries: retention.requests.len(),
             pending_entries: retention
                 .requests
@@ -7634,18 +7966,29 @@ pub(crate) mod tests {
             world: WorldState,
             schedule: Option<Vec<scriptbots_runtime::ScheduledConfigPatch>>,
         ) -> Self {
+            Self::spawn_with_identity(
+                world,
+                schedule,
+                scriptbots_runtime::HostSessionId::new(0xc017),
+            )
+        }
+
+        fn spawn_with_identity(
+            world: WorldState,
+            schedule: Option<Vec<scriptbots_runtime::ScheduledConfigPatch>>,
+            session_id: scriptbots_runtime::HostSessionId,
+        ) -> Self {
             let (send, receive) = std::sync::mpsc::sync_channel(1);
             let clock_gate = Arc::new(Mutex::new(()));
             let owner_gate = Arc::clone(&clock_gate);
             let (blocked, clock_blocked) = std::sync::mpsc::channel();
             let worker = std::thread::spawn(move || {
                 use scriptbots_runtime::{
-                    FixedDeadlineHost, HostCore, HostCoreOptions, HostSessionId, ManualInstant,
-                    PlaybackSnapshot,
+                    FixedDeadlineHost, HostCore, HostCoreOptions, ManualInstant, PlaybackSnapshot,
                     channel::{ChannelHostDriver, ChannelHostOptions},
                 };
                 let mut core = HostCore::new(
-                    HostSessionId::new(0xc017),
+                    session_id,
                     world,
                     HostCoreOptions {
                         initial_playback: PlaybackSnapshot {
@@ -11774,6 +12117,407 @@ pub(crate) mod tests {
                 before.tick.0,
                 directory.display()
             );
+        }
+    }
+
+    #[test]
+    fn checkpoint_retry_recovers_the_original_cut_after_owner_restart_at_full_capacity() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let (handle, host) = checkpoint_test_handle(&directory, 4, 8 * 1024 * 1024);
+        host.wait_applied(&handle.step().unwrap());
+        let request = CheckpointCreateRequest {
+            description: Some("original scientific cut".into()),
+            idempotency_key: Some("restart-safe-create".into()),
+        };
+        let saved = handle.create_checkpoint(request.clone()).unwrap();
+        let original = handle.read_artifact_bytes(&saved.checkpoint_id).unwrap().1;
+        let admission_path =
+            checkpoint_request_path(&directory, request.idempotency_key.as_deref().unwrap());
+        let admission_bytes = fs::read(&admission_path).unwrap();
+        let admission: CheckpointRequestRecord = serde_json::from_slice(&admission_bytes).unwrap();
+        assert_eq!(
+            admission.admission.source_session,
+            scriptbots_runtime::HostSessionId::new(0xc017)
+        );
+        host.wait_applied(&handle.step().unwrap());
+        assert_eq!(handle.create_checkpoint(request.clone()).unwrap(), saved);
+        drop(handle);
+        drop(host);
+
+        let owner = TestHost::spawn_with_identity(
+            WorldState::new(ScriptBotsConfig {
+                world_width: 40,
+                world_height: 40,
+                food_cell_size: 10,
+                rng_seed: Some(57),
+                persistence_interval: 0,
+                population_minimum: 0,
+                population_spawn_interval: 0,
+                ..ScriptBotsConfig::default()
+            })
+            .unwrap(),
+            None,
+            scriptbots_runtime::HostSessionId::new(0xc018),
+        );
+        let mut restarted = owner.handle();
+        restarted.data_services = Arc::new(DataServices::new(directory.clone()));
+        let restarted = restarted
+            .with_checkpoint_retention_limits(scriptbots_storage::CheckpointRetentionLimits {
+                max_count: 1,
+                max_bytes: saved.byte_size,
+            })
+            .unwrap();
+        let mut pipeline = scriptbots_storage::StoragePipeline::unattributed_memory().unwrap();
+        let writer = pipeline.checkpoint_writer();
+        writer
+            .configure_retention(scriptbots_storage::CheckpointRetentionLimits {
+                max_count: 0,
+                max_bytes: 1024 * 1024,
+            })
+            .unwrap();
+        let restarted = restarted.with_checkpoint_writer(Some(writer));
+        let before = owner.port.scientific_digest_v1().unwrap();
+        let publication = restarted.read_snapshot().unwrap();
+        assert_eq!(before.tick.0, 0);
+        let retries = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..4)
+                .map(|_| {
+                    let request = request.clone();
+                    let restarted = &restarted;
+                    scope.spawn(move || restarted.create_checkpoint(request).unwrap())
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        for retry in retries {
+            assert_eq!(retry, saved);
+        }
+        assert_eq!(restarted.get_checkpoint(&saved.checkpoint_id).unwrap(), saved);
+        assert_eq!(
+            restarted.read_artifact_bytes(&saved.checkpoint_id).unwrap().1,
+            original
+        );
+        let usage = restarted.checkpoint_retention_usage().unwrap();
+        assert_eq!(usage.file_count, 1);
+        assert_eq!(usage.file_bytes, saved.byte_size);
+        assert_eq!(usage.request_entries, 0);
+        assert_eq!(usage.pending_entries, 0);
+        assert_eq!(usage.retained_request_records, 1);
+        assert_eq!(usage.reserved_checkpoint_count, 1);
+        assert_eq!(usage.retained_request_record_bytes, admission_bytes.len() as u64);
+        assert!(
+            usage.retained_request_record_bytes <= usage.max_retained_request_record_bytes
+        );
+        assert_eq!(usage.sql_count, Some(0));
+        let changed = CheckpointCreateRequest {
+            description: Some("different request contents".into()),
+            ..request
+        };
+        assert!(matches!(
+            restarted.create_checkpoint(changed),
+            Err(ControlError::Conflict(_))
+        ));
+        assert!(matches!(
+            restarted.create_checkpoint(CheckpointCreateRequest::default()),
+            Err(ControlError::CheckpointCapacity(_))
+        ));
+        assert_eq!(owner.port.scientific_digest_v1().unwrap(), before);
+        assert!(Arc::ptr_eq(&restarted.read_snapshot().unwrap(), &publication));
+        assert_eq!(fs::read(&admission_path).unwrap(), admission_bytes);
+        pipeline.shutdown().unwrap();
+    }
+
+    #[test]
+    fn checkpoint_retry_unfinished_admissions_never_recapture_after_reopen() {
+        let source = tempfile::tempdir().unwrap().keep();
+        let (handle, host) = checkpoint_test_handle(&source, 4, 8 * 1024 * 1024);
+        host.wait_applied(&handle.step().unwrap());
+        let request = CheckpointCreateRequest {
+            description: Some("reserved original cut".into()),
+            idempotency_key: Some("interrupted-create".into()),
+        };
+        let saved = handle.create_checkpoint(request.clone()).unwrap();
+        let admission_name = checkpoint_request_path(
+            &source,
+            request.idempotency_key.as_deref().unwrap(),
+        )
+        .file_name()
+        .unwrap()
+        .to_owned();
+        let admission_bytes = fs::read(source.join(&admission_name)).unwrap();
+        let payload_name = format!("{}.bin", saved.checkpoint_id);
+        let descriptor_name = format!("{}{CHECKPOINT_CATALOG_SUFFIX}", saved.checkpoint_id);
+        drop(handle);
+        drop(host);
+
+        for prefix in ["admission", "payload", "descriptor"] {
+            let directory = tempfile::tempdir().unwrap().keep();
+            fs::write(directory.join(&admission_name), &admission_bytes).unwrap();
+            if prefix != "admission" {
+                fs::copy(source.join(&payload_name), directory.join(&payload_name)).unwrap();
+            }
+            if prefix == "descriptor" {
+                fs::copy(source.join(&descriptor_name), directory.join(&descriptor_name)).unwrap();
+            }
+            let (restarted, owner) = checkpoint_test_handle(&directory, 1, 8 * 1024 * 1024);
+            let entries = fs::read_dir(&directory).unwrap().count();
+            let before = owner.port.scientific_digest_v1().unwrap();
+            for _ in 0..2 {
+                let error = restarted.create_checkpoint(request.clone()).unwrap_err();
+                assert!(
+                    matches!(error, ControlError::CheckpointRetentionUnavailable(ref detail)
+                        if detail.contains("completion is unconfirmed")),
+                    "{prefix}: {error}"
+                );
+            }
+            assert!(matches!(
+                restarted.create_checkpoint(CheckpointCreateRequest::default()),
+                Err(ControlError::CheckpointCapacity(_))
+            ));
+            let usage = restarted.checkpoint_retention_usage().unwrap();
+            assert_eq!(usage.retained_request_records, 1);
+            assert_eq!(usage.request_entries, 0);
+            assert_eq!(restarted.list_checkpoints(None, None).unwrap().total, 0);
+            assert_eq!(fs::read_dir(&directory).unwrap().count(), entries);
+            assert_eq!(
+                fs::read(directory.join(&admission_name)).unwrap(),
+                admission_bytes
+            );
+            assert_eq!(owner.port.scientific_digest_v1().unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn checkpoint_retry_counts_mixed_anonymous_and_unfinished_reservations_after_restart() {
+        let source = tempfile::tempdir().unwrap().keep();
+        let (handle, host) = checkpoint_test_handle(&source, 2, 8 * 1024 * 1024);
+        let request = CheckpointCreateRequest {
+            description: Some("reserved keyed cut".into()),
+            idempotency_key: Some("mixed-pending-key".into()),
+        };
+        handle.create_checkpoint(request.clone()).unwrap();
+        let first_usage = handle.checkpoint_retention_usage().unwrap();
+        assert_eq!(first_usage.file_count, 1);
+        assert_eq!(first_usage.retained_request_records, 1);
+        assert_eq!(first_usage.request_entries, 1);
+        assert_eq!(first_usage.reserved_checkpoint_count, 1);
+        host.wait_applied(&handle.step().unwrap());
+        let anonymous = handle
+            .create_checkpoint(CheckpointCreateRequest::default())
+            .expect("one completed keyed checkpoint consumes only one slot");
+        assert_eq!(
+            handle.checkpoint_retention_usage().unwrap().reserved_checkpoint_count,
+            2
+        );
+        assert!(matches!(
+            handle.create_checkpoint(CheckpointCreateRequest::default()),
+            Err(ControlError::CheckpointCapacity(_))
+        ));
+        let admission_name =
+            checkpoint_request_path(&source, request.idempotency_key.as_deref().unwrap())
+                .file_name()
+                .unwrap()
+                .to_owned();
+        let admission_bytes = fs::read(source.join(&admission_name)).unwrap();
+        drop(handle);
+        drop(host);
+
+        for intact in [true, false] {
+            let directory = tempfile::tempdir().unwrap().keep();
+            let retained_admission = if intact {
+                admission_bytes.as_slice()
+            } else {
+                &admission_bytes[..admission_bytes.len() / 2]
+            };
+            fs::write(directory.join(&admission_name), retained_admission).unwrap();
+            for suffix in [".bin", CHECKPOINT_CATALOG_SUFFIX, CHECKPOINT_CATALOG_READY_SUFFIX] {
+                let name = format!("{}{suffix}", anonymous.checkpoint_id);
+                fs::copy(source.join(&name), directory.join(&name)).unwrap();
+            }
+            let (restarted, owner) = checkpoint_test_handle(&directory, 2, 8 * 1024 * 1024);
+            let before = owner.port.scientific_digest_v1().unwrap();
+            let publication = restarted.read_snapshot().unwrap();
+            let entries = fs::read_dir(&directory).unwrap().count();
+            let usage = restarted.checkpoint_retention_usage().unwrap();
+            assert_eq!(usage.file_count, 1);
+            assert_eq!(usage.retained_request_records, 1);
+            assert_eq!(usage.request_entries, 0);
+            assert_eq!(usage.reserved_checkpoint_count, 2);
+            assert_eq!(
+                restarted.get_checkpoint(&anonymous.checkpoint_id).unwrap(),
+                anonymous
+            );
+            for new_key in [None, Some("different-new-key".to_owned())] {
+                assert!(matches!(
+                    restarted.create_checkpoint(CheckpointCreateRequest {
+                        description: None,
+                        idempotency_key: new_key,
+                    }),
+                    Err(ControlError::CheckpointCapacity(_))
+                ));
+            }
+            assert!(matches!(
+                restarted.create_checkpoint(request.clone()),
+                Err(ControlError::CheckpointRetentionUnavailable(_))
+            ));
+            assert_eq!(fs::read_dir(&directory).unwrap().count(), entries);
+            assert_eq!(
+                fs::read(directory.join(&admission_name)).unwrap(),
+                retained_admission
+            );
+            assert_eq!(owner.port.scientific_digest_v1().unwrap(), before);
+            assert!(Arc::ptr_eq(&restarted.read_snapshot().unwrap(), &publication));
+        }
+    }
+
+    #[test]
+    fn checkpoint_retry_rejects_corrupt_and_rehashed_admissions_without_new_captures() {
+        let source = tempfile::tempdir().unwrap().keep();
+        let (handle, host) = checkpoint_test_handle(&source, 4, 8 * 1024 * 1024);
+        let request = CheckpointCreateRequest {
+            description: Some("original request".into()),
+            idempotency_key: Some("corrupt-admission".into()),
+        };
+        let saved = handle.create_checkpoint(request.clone()).unwrap();
+        let admission_name = checkpoint_request_path(
+            &source,
+            request.idempotency_key.as_deref().unwrap(),
+        )
+        .file_name()
+        .unwrap()
+        .to_owned();
+        let admission_bytes = fs::read(source.join(&admission_name)).unwrap();
+        drop(handle);
+        drop(host);
+
+        for corruption in ["truncated", "checksum", "schema", "key", "metadata", "payload"] {
+            let directory = tempfile::tempdir().unwrap().keep();
+            for suffix in [".bin", CHECKPOINT_CATALOG_SUFFIX, CHECKPOINT_CATALOG_READY_SUFFIX] {
+                let name = format!("{}{suffix}", saved.checkpoint_id);
+                fs::copy(source.join(&name), directory.join(&name)).unwrap();
+            }
+            let mut record: CheckpointRequestRecord =
+                serde_json::from_slice(&admission_bytes).unwrap();
+            match corruption {
+                "checksum" | "metadata" => {
+                    record.admission.metadata.description = Some("changed contents".into());
+                }
+                "schema" => record.admission.schema_version += 1,
+                "key" => record.admission.idempotency_key = "different-original-key".into(),
+                "truncated" | "payload" => {}
+                _ => unreachable!(),
+            }
+            if corruption != "checksum" {
+                record.checksum_blake3 =
+                    compute_blake3(&serde_json::to_vec(&record.admission).unwrap());
+            }
+            let path = directory.join(&admission_name);
+            if corruption == "truncated" {
+                fs::write(&path, &admission_bytes[..admission_bytes.len() / 2]).unwrap();
+            } else {
+                fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+            }
+            if corruption == "payload" {
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(directory.join(format!("{}.bin", saved.checkpoint_id)))
+                    .unwrap()
+                    .write_all(&[0xff])
+                    .unwrap();
+            }
+            let changed = fs::read(&path).unwrap();
+            let (restarted, owner) = checkpoint_test_handle(&directory, 4, 8 * 1024 * 1024);
+            let entries = fs::read_dir(&directory).unwrap().count();
+            let before = owner.port.scientific_digest_v1().unwrap();
+            let error = restarted.create_checkpoint(request.clone()).unwrap_err();
+            assert!(
+                matches!(error, ControlError::CheckpointRetentionUnavailable(_)),
+                "{corruption}: {error}"
+            );
+            assert_eq!(restarted.checkpoint_retention_usage().unwrap().request_entries, 0);
+            assert_eq!(fs::read_dir(&directory).unwrap().count(), entries);
+            assert_eq!(fs::read(&path).unwrap(), changed);
+            assert_eq!(owner.port.scientific_digest_v1().unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn checkpoint_retry_refuses_duplicate_roots_even_with_a_cached_receipt() {
+        let first = tempfile::tempdir().unwrap().keep();
+        let second = tempfile::tempdir().unwrap().keep();
+        let (handle, host) = checkpoint_test_handle(&first, 4, 8 * 1024 * 1024);
+        let request = CheckpointCreateRequest {
+            description: Some("one original request".into()),
+            idempotency_key: Some("ambiguous-root".into()),
+        };
+        let saved = handle.create_checkpoint(request.clone()).unwrap();
+        let first_path =
+            checkpoint_request_path(&first, request.idempotency_key.as_deref().unwrap());
+        let second_path =
+            checkpoint_request_path(&second, request.idempotency_key.as_deref().unwrap());
+        let original = fs::read(&first_path).unwrap();
+        fs::write(&second_path, &original).unwrap();
+        let handle = handle.with_artifacts_dir(second.clone()).unwrap();
+        let before = host.port.scientific_digest_v1().unwrap();
+        assert!(matches!(
+            handle.create_checkpoint(request.clone()),
+            Err(ControlError::Conflict(_))
+        ));
+        let usage = handle.checkpoint_retention_usage().unwrap();
+        assert_eq!(usage.retained_request_records, 2);
+        assert_eq!(usage.file_count, 1);
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        drop(handle);
+        drop(host);
+
+        let (restarted, owner) = checkpoint_test_handle(&first, 4, 8 * 1024 * 1024);
+        let restarted = restarted.with_artifacts_dir(second).unwrap();
+        let before = owner.port.scientific_digest_v1().unwrap();
+        assert!(matches!(
+            restarted.create_checkpoint(request),
+            Err(ControlError::Conflict(_))
+        ));
+        assert_eq!(restarted.checkpoint_retention_usage().unwrap().request_entries, 0);
+        assert_eq!(owner.port.scientific_digest_v1().unwrap(), before);
+        assert_eq!(fs::read(&first_path).unwrap(), original);
+        assert_eq!(fs::read(&second_path).unwrap(), original);
+        assert!(first.join(format!("{}.bin", saved.checkpoint_id)).is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_retry_refuses_aliased_admissions_without_using_the_cached_receipt() {
+        for alias in ["symlink", "hardlink"] {
+            let directory = tempfile::tempdir().unwrap().keep();
+            let (handle, host) = checkpoint_test_handle(&directory, 4, 8 * 1024 * 1024);
+            let request = CheckpointCreateRequest {
+                description: None,
+                idempotency_key: Some("aliased-admission".into()),
+            };
+            handle.create_checkpoint(request.clone()).unwrap();
+            let path =
+                checkpoint_request_path(&directory, request.idempotency_key.as_deref().unwrap());
+            let original = fs::read(&path).unwrap();
+            let preserved = directory.join("preserved-admission");
+            fs::rename(&path, &preserved).unwrap();
+            if alias == "symlink" {
+                std::os::unix::fs::symlink(&preserved, &path).unwrap();
+            } else {
+                fs::hard_link(&preserved, &path).unwrap();
+            }
+            let before = host.port.scientific_digest_v1().unwrap();
+            assert!(
+                matches!(
+                    handle.create_checkpoint(request),
+                    Err(ControlError::CheckpointRetentionUnavailable(_))
+                ),
+                "{alias}"
+            );
+            assert_eq!(fs::read(&preserved).unwrap(), original);
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
         }
     }
 

@@ -2,6 +2,39 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Checkpoint-create retries across service reopen (2026-11-14):**
+[Source implemented and independently reviewed — Codex; executable qualification open]
+
+Keyed checkpoint creation now writes a bounded immutable admission before the
+payload, retaining the original request and captured metadata. An exact retry
+can recover a completed save from the existing artifact root even at full
+capacity. Recovery requires the original ready catalog, exact descriptor and
+verified checkpoint bytes; changed requests, corrupt or aliased records,
+conflicting roots and unfinished publication prefixes refuse before another
+capture. Historical receipts neither adopt the old owner session nor write to
+the new owner's database. The recorded session is capture context; scientific
+checkpoint bytes themselves do not encode owner identity.
+
+Retained admission count and bytes are exposed separately, including incomplete
+or unsynced files. Capacity uses the bounded union of actual payload paths and
+reserved checkpoint identities, so an admission plus its matching payload
+consumes one slot, while an unfinished admission and an unrelated anonymous
+save consume two. Unreadable or truncated admissions conservatively reserve
+their evidence path. A missing original payload stays explicitly unavailable;
+the implementation does not reconstruct missing science or overwrite uncertain
+evidence. Existing completed catalogs and anonymous saves retain their meaning.
+
+Six new regression cases cover a different live owner, concurrent cold retries,
+full retention capacity, a new SQL writer that refuses checkpoints, interrupted
+publication prefixes, mixed anonymous/incomplete reservations, corrupt/rehashed
+identity and payload, duplicate roots, and filesystem aliases. Independent source
+review caught and corrected separate-counter undercharging before publication;
+the mixed warm/cold case covers both intact and truncated admissions. The
+execution environment became unavailable during dependency preparation: these
+tests, Rust formatting, compilation, Clippy, UBS and process/platform qualification
+remain unexecuted. This contributes to `bd-2z0.16` without changing its original
+acceptance.
+
 **Lossless NeuroFlow genome inspection (2026-11-14):**
 [Source implemented and independently reviewed — Codex; executable qualification open]
 
