@@ -20,6 +20,13 @@ pub const LAB_PAGE_SIZE: usize = 12;
 pub const LAB_MAX_VARIANTS: usize = 64;
 /// Variant rows presented together by native frontends.
 pub const VARIANTS_PER_PAGE: usize = 8;
+/// Hard bound on compiled family choices retained by the native composer.
+pub const LAB_MAX_EXPERIMENT_FAMILIES: usize = 8;
+/// Hard bound on the seed vector before any capability-driven allocation.
+pub const LAB_MAX_EXPERIMENT_SEEDS: usize = 128;
+// Run IDs append "-challenger-seed" and up to twenty decimal seed digits to
+// the experiment identity. Reserve that suffix within the runner's 128-byte bound.
+const MAX_EXPERIMENT_REQUEST_ID_BYTES: usize = 92;
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 // Application verification can read FrankenSQLite on this worker. Match the
 // control worker's stack, including its existing reader recursion requirements.
@@ -123,6 +130,185 @@ impl LabMetric {
     }
 }
 
+/// Executable choices and admission limits supplied by the application runner.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LabExperimentCapabilities {
+    /// Canonical installed families that support experiment execution and continuation.
+    pub families: Vec<String>,
+    /// Maximum independent matched seed pairs admitted by the runner.
+    pub max_seed_count: usize,
+    /// Maximum scientific transitions in each arm's run.
+    pub max_ticks_per_run: u64,
+    /// Maximum total transitions across both complete seed cohorts.
+    pub max_total_ticks: u64,
+    /// Actual fresh-world configuration description supplied by the application.
+    pub launch_description: String,
+}
+
+impl LabExperimentCapabilities {
+    /// Validate the bounded native capability envelope before using its limits.
+    ///
+    /// # Errors
+    ///
+    /// Rejects excessive or duplicate family choices, invalid limits, or an
+    /// empty, overlong or control-character-containing launch description.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.families.len() > LAB_MAX_EXPERIMENT_FAMILIES
+            || self.families.iter().any(|family| {
+                family.is_empty()
+                    || family.len() > 128
+                    || !family.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+                    })
+            })
+            || self
+                .families
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != self.families.len()
+        {
+            return Err("Experiment family capabilities are invalid or exceed their bounds.".into());
+        }
+        if self.max_seed_count == 0
+            || self.max_seed_count > LAB_MAX_EXPERIMENT_SEEDS
+            || self.max_ticks_per_run == 0
+            || self.max_total_ticks == 0
+        {
+            return Err("Experiment execution capabilities contain invalid limits.".into());
+        }
+        if self.launch_description.trim().is_empty()
+            || self.launch_description.len() > 2048
+            || self.launch_description.chars().any(char::is_control)
+        {
+            return Err("Experiment launch description is missing or exceeds its bounds.".into());
+        }
+        Ok(())
+    }
+}
+
+/// One explicit two-arm family comparison in independent fresh runner worlds.
+///
+/// The two arms use the same checked consecutive seed cohort and horizon.
+/// Scientific execution is sequential; this draft never inherits the live owner.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LabExperimentDraft {
+    /// Reference family's canonical installed identity.
+    pub baseline_family: String,
+    /// Distinct comparison family's canonical installed identity.
+    pub challenger_family: String,
+    /// First disclosed seed; later seeds increment by one without wrapping.
+    pub first_seed: u64,
+    /// Independent matched seed pairs, not the total number of runs.
+    pub seed_count: usize,
+    /// Exact scientific transitions requested for every run.
+    pub ticks_per_run: u64,
+}
+
+impl Default for LabExperimentDraft {
+    fn default() -> Self {
+        Self {
+            baseline_family: String::new(),
+            challenger_family: String::new(),
+            first_seed: 42,
+            seed_count: 3,
+            ticks_per_run: 100,
+        }
+    }
+}
+
+impl LabExperimentDraft {
+    /// Materialize the exact bounded cohort without wrapping its last seed.
+    ///
+    /// # Errors
+    ///
+    /// Rejects zero or excessive seed counts and a cohort that exceeds u64.
+    pub fn seeds(&self) -> Result<Vec<u64>, String> {
+        if self.seed_count == 0 || self.seed_count > LAB_MAX_EXPERIMENT_SEEDS {
+            return Err(format!(
+                "Seed count must be in 1..={LAB_MAX_EXPERIMENT_SEEDS}."
+            ));
+        }
+        let span = u64::try_from(self.seed_count - 1)
+            .map_err(|_| "Seed count cannot be represented.".to_owned())?;
+        let last_seed = self
+            .first_seed
+            .checked_add(span)
+            .ok_or_else(|| "The seed cohort would overflow u64; choose an earlier first seed.".to_owned())?;
+        Ok((self.first_seed..=last_seed).collect())
+    }
+
+    /// Check the complete two-arm request against the observed application limits.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unavailable or identical families, unsupported seed/horizon
+    /// choices, seed overflow, or excessive/overflowing total scientific work.
+    pub fn validate(&self, capabilities: &LabExperimentCapabilities) -> Result<(), String> {
+        capabilities.validate()?;
+        if self.baseline_family == self.challenger_family
+            || !capabilities.families.contains(&self.baseline_family)
+            || !capabilities.families.contains(&self.challenger_family)
+        {
+            return Err("Choose two distinct executable brain families.".into());
+        }
+        if self.seed_count == 0 || self.seed_count > capabilities.max_seed_count {
+            return Err(format!(
+                "Seed count must be in 1..={}.",
+                capabilities.max_seed_count,
+            ));
+        }
+        if self.ticks_per_run == 0 || self.ticks_per_run > capabilities.max_ticks_per_run {
+            return Err(format!(
+                "Ticks per run must be in 1..={}.",
+                capabilities.max_ticks_per_run,
+            ));
+        }
+        let total_ticks = u64::try_from(self.seed_count)
+            .ok()
+            .and_then(|count| count.checked_mul(2))
+            .and_then(|runs| runs.checked_mul(self.ticks_per_run))
+            .ok_or_else(|| "The two-arm scientific work count overflows u64.".to_owned())?;
+        if total_ticks > capabilities.max_total_ticks {
+            return Err(format!(
+                "The two-arm cohort needs {total_ticks} transitions, exceeding {}.",
+                capabilities.max_total_ticks,
+            ));
+        }
+        self.seeds().map(|_| ())
+    }
+}
+
+/// Exact request retained until creation is observed or explicitly abandoned.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LabExperimentCreation {
+    /// Explicit experiment identity and idempotency key.
+    pub request_id: String,
+    /// Application source from which this creation was requested.
+    pub session_id: HostSessionId,
+    /// Frozen scientific inputs, reused unchanged on every retry.
+    pub draft: LabExperimentDraft,
+    /// Latest observed admission result.
+    pub state: LabExperimentCreationState,
+}
+
+/// A creation request is not a running or completed scientific experiment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LabExperimentCreationState {
+    /// The sole worker is awaiting the application response.
+    Pending,
+    /// Admission is unconfirmed; a retry must preserve every original input.
+    Retryable {
+        /// Bounded error or invalidation explanation.
+        reason: String,
+    },
+    /// The application's bounded batch identity and shape have been checked.
+    Created {
+        /// Verified retained experiment identity.
+        experiment_id: String,
+    },
+}
+
 /// One canonical narrative event within a publishing owner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LabEventIdentity {
@@ -156,6 +342,17 @@ struct SelectedEvent {
 /// A request to application data services, never a direct world operation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LabWorkflowRequest {
+    /// Read compiled experiment families and actual fresh-world admission limits.
+    ExperimentCapabilities,
+    /// Explicitly create, or retry, one immutable two-arm experiment request.
+    CreateExperiment {
+        /// Explicit experiment identity reused as the application idempotency key.
+        request_id: String,
+        /// Application source observed when the draft was submitted.
+        session_id: HostSessionId,
+        /// Complete frozen scientific choices for this creation identity.
+        draft: LabExperimentDraft,
+    },
     /// Read one experiment catalog page.
     ListExperiments {
         /// Application page cursor.
@@ -374,6 +571,17 @@ pub enum LabCheckpointSaveState {
 
 /// Application evidence returned by the shared native worker.
 pub enum LabWorkflowResponse {
+    /// Bounded compiled-family and fresh-world capabilities.
+    ExperimentCapabilities(LabExperimentCapabilities),
+    /// Source-bound creation response after application admission.
+    ExperimentCreated {
+        /// Explicit experiment identity and retry key.
+        request_id: String,
+        /// Application source checked by the adapter.
+        session_id: HostSessionId,
+        /// Actual bounded batch observation, not a completed-science claim.
+        experiment: LabExperiment,
+    },
     /// Experiment catalog page.
     Experiments(LabExperimentPage),
     /// Batch details after a read or mutation request.
@@ -423,6 +631,24 @@ pub enum LabPanel {
 /// Frontend intent reduced by the shared model.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LabAction {
+    /// Open the fresh-world experiment composer and refresh its capabilities.
+    NewExperiment,
+    /// Leave the composer without cancelling any submitted creation.
+    BackToExperiments,
+    /// Select an offered reference family in the editable draft.
+    DraftBaseline(String),
+    /// Select an offered comparison family in the editable draft.
+    DraftChallenger(String),
+    /// Set the exact first seed without silently changing the cohort size.
+    FirstSeed(u64),
+    /// Set the exact number of independent matched seed pairs.
+    SeedCount(usize),
+    /// Set the exact scientific horizon for each run.
+    TicksPerRun(u64),
+    /// Explicitly submit or retry the frozen two-arm creation.
+    CreateExperiment,
+    /// Forget an unconfirmed idle request; its admitted experiment may still exist.
+    AbandonExperimentRequest,
     /// Refresh visible application evidence.
     Refresh,
     /// Move to another experiment page.
@@ -483,6 +709,14 @@ pub struct LabWorkflows {
     context: u64,
     session: Option<HostSessionId>,
     panel: LabPanel,
+    /// Whether the fresh-world composer replaces the experiment catalog.
+    pub composing_experiment: bool,
+    /// Last bounded capabilities observed from this application source.
+    pub experiment_capabilities: Option<LabExperimentCapabilities>,
+    /// Editable choices, distinct from a frozen pending creation request.
+    pub experiment_draft: LabExperimentDraft,
+    /// One immutable creation request retained through invalidation and retry.
+    pub latest_experiment_creation: Option<LabExperimentCreation>,
     /// Last accepted experiment page.
     pub experiments: Option<LabExperimentPage>,
     experiment_cursor: Option<String>,
@@ -526,6 +760,18 @@ fn identity_is_bounded(value: &str) -> bool {
 #[must_use]
 pub fn checkpoint_request_identity_is_valid(request_id: &str) -> bool {
     identity_is_bounded(request_id)
+}
+
+/// Whether an explicit experiment identity leaves room for the longest run suffix.
+#[must_use]
+pub fn experiment_request_identity_is_valid(request_id: &str) -> bool {
+    !request_id.is_empty()
+        && request_id.len() <= MAX_EXPERIMENT_REQUEST_ID_BYTES
+        && request_id != "."
+        && !request_id.contains("..")
+        && request_id.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+        })
 }
 
 fn reserve_checkpoint_sequence(counter: &AtomicU64) -> Option<u64> {
@@ -625,6 +871,32 @@ fn batch_is_bounded(batch: &LabExperiment) -> bool {
             == batch.variants.len()
 }
 
+fn created_experiment_matches_draft(
+    experiment: &LabExperiment,
+    request_id: &str,
+    draft: &LabExperimentDraft,
+) -> bool {
+    if !batch_is_bounded(experiment)
+        || experiment.summary.experiment_id != request_id
+        || experiment.variants.len() != 2
+        || draft.seed_count.checked_mul(2) != Some(experiment.summary.total_runs)
+    {
+        return false;
+    }
+    [
+        ("baseline", &draft.baseline_family),
+        ("challenger", &draft.challenger_family),
+    ]
+    .into_iter()
+    .all(|(id, family)| {
+        experiment.variants.iter().any(|variant| {
+            variant.variant_id == id
+                && &variant.brain_family == family
+                && variant.total_runs == draft.seed_count
+        })
+    })
+}
+
 fn comparison_matches_batch(comparison: &LabComparison, batch: &LabExperiment) -> bool {
     let same_generation = comparison.status_generation == batch.generation;
     comparison.plan_digest == batch.plan_digest && same_generation
@@ -638,6 +910,13 @@ impl LabWorkflows {
         self.context = self.context.saturating_add(1);
         self.last_refresh = None;
         self.event_review = None;
+        if let Some(creation) = &mut self.latest_experiment_creation
+            && matches!(creation.state, LabExperimentCreationState::Pending)
+        {
+            creation.state = LabExperimentCreationState::Retryable {
+                reason: "Creation result discarded; the application may still admit it. Retry the exact request on its original source.".into(),
+            };
+        }
         if let Some(save) = &mut self.latest_checkpoint_save
             && matches!(save.state, LabCheckpointSaveState::Pending)
         {
@@ -653,6 +932,7 @@ impl LabWorkflows {
             self.reset_observations();
             self.session = Some(session);
             self.note_prior_checkpoint_save();
+            self.note_prior_experiment_creation();
         }
         if self.panel != panel {
             self.invalidate();
@@ -698,6 +978,247 @@ impl LabWorkflows {
     /// Any intervening selection, source or panel change clears this result.
     pub fn take_event_review(&mut self) -> Option<LabEventReview> {
         self.event_review.take()
+    }
+
+    fn note_prior_experiment_creation(&mut self) {
+        if let Some(creation) = &self.latest_experiment_creation
+            && self.session != Some(creation.session_id)
+            && !matches!(creation.state, LabExperimentCreationState::Created { .. })
+        {
+            self.notice = Some(format!(
+                "Previous source creation {} is unconfirmed. Return to that source to retry, or explicitly abandon its local retry identity before composing a new request.",
+                creation.request_id,
+            ));
+        }
+    }
+
+    fn has_unconfirmed_experiment_creation(&self) -> bool {
+        self.latest_experiment_creation.as_ref().is_some_and(|creation| {
+            !matches!(creation.state, LabExperimentCreationState::Created { .. })
+        })
+    }
+
+    /// Whether the next creation retries an unconfirmed request on this exact source.
+    #[must_use]
+    pub fn will_retry_experiment_creation(&self) -> bool {
+        self.latest_experiment_creation.as_ref().is_some_and(|creation| {
+            self.session == Some(creation.session_id)
+                && !matches!(creation.state, LabExperimentCreationState::Created { .. })
+        })
+    }
+
+    /// Whether the composer may change scientific choices before explicit submission.
+    #[must_use]
+    pub fn can_edit_experiment_draft(&self) -> bool {
+        self.composing_experiment
+            && self.panel == LabPanel::Experiments
+            && self.session.is_some()
+            && self.experiment_capabilities.is_some()
+            && !self.is_busy()
+            && !self.has_unconfirmed_experiment_creation()
+    }
+
+    /// Whether one bounded new creation or exact same-source retry can be submitted.
+    #[must_use]
+    pub fn can_create_experiment(&self) -> bool {
+        if !self.composing_experiment
+            || self.panel != LabPanel::Experiments
+            || self.session.is_none()
+            || self.submit.is_none()
+            || self.is_busy()
+            || (self.has_unconfirmed_experiment_creation()
+                && !self.will_retry_experiment_creation())
+        {
+            return false;
+        }
+        let Some(capabilities) = &self.experiment_capabilities else {
+            return false;
+        };
+        let draft = self
+            .latest_experiment_creation
+            .as_ref()
+            .filter(|_| self.will_retry_experiment_creation())
+            .map_or(&self.experiment_draft, |creation| &creation.draft);
+        draft.validate(capabilities).is_ok()
+    }
+
+    /// Whether an idle unconfirmed request can be forgotten locally.
+    ///
+    /// Forgetting the identity does not cancel an experiment that was admitted.
+    #[must_use]
+    pub fn can_abandon_experiment_request(&self) -> bool {
+        !self.is_busy() && self.has_unconfirmed_experiment_creation()
+    }
+
+    fn accept_experiment_capabilities(&mut self, capabilities: LabExperimentCapabilities) -> bool {
+        if !self.composing_experiment || self.panel != LabPanel::Experiments {
+            return false;
+        }
+        if capabilities.validate().is_err() {
+            self.experiment_capabilities = None;
+            return false;
+        }
+        if self.experiment_draft.baseline_family.is_empty()
+            && self.experiment_draft.challenger_family.is_empty()
+            && !self.has_unconfirmed_experiment_creation()
+        {
+            self.experiment_draft.baseline_family = capabilities
+                .families
+                .iter()
+                .find(|family| family.as_str() == "mlp.baseline")
+                .or_else(|| capabilities.families.first())
+                .cloned()
+                .unwrap_or_default();
+            self.experiment_draft.challenger_family = capabilities
+                .families
+                .iter()
+                .find(|family| {
+                    family.as_str() == "dwraon.baseline"
+                        && *family != &self.experiment_draft.baseline_family
+                })
+                .or_else(|| {
+                    capabilities
+                        .families
+                        .iter()
+                        .find(|family| *family != &self.experiment_draft.baseline_family)
+                })
+                .cloned()
+                .unwrap_or_default();
+        }
+        self.experiment_capabilities = Some(capabilities);
+        true
+    }
+
+    fn create_experiment(&mut self) {
+        if !self.can_create_experiment() {
+            self.set_notice("Creation requires a valid disclosed draft, current application capabilities, the Experiments composer and a free worker slot.");
+            return;
+        }
+        let Some(session_id) = self.session else {
+            return;
+        };
+        let (request_id, draft) = if self.will_retry_experiment_creation() {
+            let Some(creation) = &self.latest_experiment_creation else {
+                return;
+            };
+            (creation.request_id.clone(), creation.draft.clone())
+        } else {
+            let Some(request_id) = next_checkpoint_request(session_id)
+                .filter(|identity| experiment_request_identity_is_valid(identity))
+            else {
+                self.set_notice("Experiment request identities are exhausted.");
+                return;
+            };
+            (request_id, self.experiment_draft.clone())
+        };
+        let request = LabWorkflowRequest::CreateExperiment {
+            request_id: request_id.clone(),
+            session_id,
+            draft: draft.clone(),
+        };
+        self.latest_experiment_creation = Some(LabExperimentCreation {
+            request_id,
+            session_id,
+            draft,
+            state: LabExperimentCreationState::Pending,
+        });
+        self.start(request.clone());
+        if self.is_busy() {
+            self.set_notice("Submitting the frozen experiment request; awaiting application admission.");
+        } else {
+            let reason = self
+                .notice
+                .clone()
+                .unwrap_or_else(|| "Experiment worker did not start.".into());
+            self.experiment_creation_unconfirmed(&request, &reason);
+        }
+    }
+
+    fn experiment_creation_unconfirmed(&mut self, request: &LabWorkflowRequest, reason: &str) {
+        let LabWorkflowRequest::CreateExperiment {
+            request_id,
+            session_id,
+            draft,
+        } = request
+        else {
+            return;
+        };
+        if let Some(creation) = &mut self.latest_experiment_creation
+            && creation.request_id == *request_id
+            && creation.session_id == *session_id
+            && creation.draft == *draft
+            && !matches!(creation.state, LabExperimentCreationState::Created { .. })
+        {
+            creation.state = LabExperimentCreationState::Retryable {
+                reason: bounded_message(reason),
+            };
+        }
+    }
+
+    fn finish_experiment_creation(
+        &mut self,
+        request: &LabWorkflowRequest,
+        result: Result<LabWorkflowResponse, String>,
+    ) {
+        let LabWorkflowRequest::CreateExperiment {
+            request_id,
+            session_id,
+            draft,
+        } = request
+        else {
+            return;
+        };
+        let reason = match result {
+            Ok(LabWorkflowResponse::ExperimentCreated {
+                request_id: returned_id,
+                session_id: returned_session,
+                experiment,
+            }) if returned_id == *request_id
+                && returned_session == *session_id
+                && self.session == Some(*session_id)
+                && self.panel == LabPanel::Experiments
+                && self.composing_experiment
+                && self.latest_experiment_creation.as_ref().is_some_and(|creation| {
+                    creation.request_id == *request_id
+                        && creation.session_id == *session_id
+                        && creation.draft == *draft
+                })
+                && experiment_request_identity_is_valid(request_id)
+                && created_experiment_matches_draft(&experiment, request_id, draft) =>
+            {
+                self.notice = Some(format!(
+                    "Experiment {} admitted; observed status: {}.",
+                    experiment.summary.experiment_id, experiment.summary.status,
+                ));
+                self.latest_experiment_creation = Some(LabExperimentCreation {
+                    request_id: returned_id,
+                    session_id: returned_session,
+                    draft: draft.clone(),
+                    state: LabExperimentCreationState::Created {
+                        experiment_id: experiment.summary.experiment_id.clone(),
+                    },
+                });
+                self.composing_experiment = false;
+                self.experiments = None;
+                self.experiment_cursor = None;
+                self.selected_experiment = Some(experiment.summary.experiment_id.clone());
+                self.baseline = Some("baseline".into());
+                self.challenger = Some("challenger".into());
+                self.comparison = None;
+                self.variant_offset = 0;
+                self.accept_batch(experiment);
+                self.last_refresh = Some(Instant::now());
+                return;
+            }
+            Ok(_) => {
+                "Experiment receipt did not match the frozen request, source or two-arm cohort.".into()
+            }
+            Err(error) => bounded_message(&error),
+        };
+        self.experiment_creation_unconfirmed(request, &reason);
+        self.set_notice(format!(
+            "Experiment creation is unconfirmed: {reason}. Retry preserves the exact identity and inputs."
+        ));
     }
 
     fn note_prior_checkpoint_save(&mut self) {
@@ -919,6 +1440,9 @@ impl LabWorkflows {
     /// Current request for two distinct admitted variants.
     #[must_use]
     pub fn comparison_request(&self) -> Option<LabWorkflowRequest> {
+        if self.composing_experiment {
+            return None;
+        }
         let batch = self.batch.as_ref()?;
         let baseline = self.baseline.as_ref()?;
         let challenger = self.challenger.as_ref()?;
@@ -956,6 +1480,10 @@ impl LabWorkflows {
             || job.context != self.context
             || self.session != Some(job.session)
         {
+            self.experiment_creation_unconfirmed(
+                &job.request,
+                "Creation finished after its selection or source changed; its receipt was discarded.",
+            );
             self.checkpoint_save_unconfirmed(
                 &job.request,
                 "Save finished after the selection or session changed; its receipt was discarded.",
@@ -966,6 +1494,10 @@ impl LabWorkflows {
             );
             return None;
         }
+        if matches!(&job.request, LabWorkflowRequest::CreateExperiment { .. }) {
+            self.finish_experiment_creation(&job.request, result);
+            return None;
+        }
         if matches!(&job.request, LabWorkflowRequest::CreateCheckpoint { .. }) {
             self.finish_checkpoint_save(&job.request, result);
             return None;
@@ -973,6 +1505,9 @@ impl LabWorkflows {
         let response = match result {
             Ok(response) => response,
             Err(error) => {
+                if matches!(&job.request, LabWorkflowRequest::ExperimentCapabilities) {
+                    self.experiment_capabilities = None;
+                }
                 if matches!(
                     &job.request,
                     LabWorkflowRequest::GetExperiment { .. }
@@ -995,6 +1530,10 @@ impl LabWorkflows {
         response: LabWorkflowResponse,
     ) -> Option<(String, Arc<RenderSnapshot>)> {
         let accepted = match (request, response) {
+            (
+                LabWorkflowRequest::ExperimentCapabilities,
+                LabWorkflowResponse::ExperimentCapabilities(capabilities),
+            ) => self.accept_experiment_capabilities(capabilities),
             (
                 LabWorkflowRequest::ListExperiments { cursor },
                 LabWorkflowResponse::Experiments(page),
@@ -1081,6 +1620,9 @@ impl LabWorkflows {
             }
             _ => false,
         };
+        if !accepted && matches!(request, LabWorkflowRequest::ExperimentCapabilities) {
+            self.experiment_capabilities = None;
+        }
         if !accepted
             && matches!(
                 request,
@@ -1097,6 +1639,9 @@ impl LabWorkflows {
         } else {
             "Lab response changed, exceeded its bounds, or did not match the request; refresh before retrying.".into()
         });
+        if accepted && matches!(request, LabWorkflowRequest::ExperimentCapabilities) {
+            self.note_prior_experiment_creation();
+        }
         None
     }
 
@@ -1148,6 +1693,9 @@ impl LabWorkflows {
     fn refresh_request(&self) -> Option<LabWorkflowRequest> {
         match self.panel {
             LabPanel::Inactive | LabPanel::Narrative => None,
+            LabPanel::Experiments if self.composing_experiment => {
+                Some(LabWorkflowRequest::ExperimentCapabilities)
+            }
             LabPanel::Experiments => Some(self.selected_experiment.as_ref().map_or_else(
                 || LabWorkflowRequest::ListExperiments {
                     cursor: self.experiment_cursor.clone(),
@@ -1175,6 +1723,9 @@ impl LabWorkflows {
         let needs_refresh = match self.panel {
             LabPanel::Inactive | LabPanel::Narrative => false,
             LabPanel::Checkpoints => self.checkpoints.is_none(),
+            LabPanel::Experiments if self.composing_experiment => {
+                self.experiment_capabilities.is_none()
+            }
             LabPanel::Experiments => {
                 self.selected_experiment.is_none()
                     || self.batch.as_ref().is_none_or(|batch| {
@@ -1237,6 +1788,13 @@ impl LabWorkflows {
     /// application adapter, actual session and any unconfirmed save identity.
     pub fn reset_observations(&mut self) {
         self.invalidate();
+        self.composing_experiment = false;
+        self.experiment_capabilities = None;
+        self.experiment_draft = self
+            .latest_experiment_creation
+            .as_ref()
+            .filter(|_| self.has_unconfirmed_experiment_creation())
+            .map_or_else(LabExperimentDraft::default, |creation| creation.draft.clone());
         self.experiments = None;
         self.experiment_cursor = None;
         self.selected_experiment = None;
@@ -1252,20 +1810,115 @@ impl LabWorkflows {
         self.variant_offset = 0;
     }
 
+    fn allow_draft_edit(&mut self) -> bool {
+        if self.can_edit_experiment_draft() {
+            true
+        } else {
+            self.set_notice("Draft inputs are locked while work is pending or a creation is unconfirmed. Retry its exact inputs, or explicitly abandon it after the worker finishes.");
+            false
+        }
+    }
+
+    fn report_draft_validation(&mut self) {
+        let message = self.experiment_capabilities.as_ref().map_or_else(
+            || "Load current experiment capabilities before submitting.".to_owned(),
+            |capabilities| {
+                self.experiment_draft.validate(capabilities).map_or_else(
+                    |reason| format!("Draft cannot be submitted: {reason}"),
+                    |()| "Draft ready. Creation starts only when requested explicitly.".into(),
+                )
+            },
+        );
+        self.set_notice(message);
+    }
+
     /// Apply one native UI intent, preserving request identity and bounded state.
     pub fn dispatch(&mut self, action: LabAction) {
         match action {
+            LabAction::NewExperiment => {
+                if self.panel != LabPanel::Experiments {
+                    self.set_notice("Open the Experiments panel before creating a batch.");
+                    return;
+                }
+                self.invalidate();
+                self.composing_experiment = true;
+                if let Some(creation) = &self.latest_experiment_creation
+                    && !matches!(creation.state, LabExperimentCreationState::Created { .. })
+                {
+                    self.experiment_draft = creation.draft.clone();
+                }
+                self.experiment_capabilities = None;
+                self.comparison = None;
+                if !self.is_busy() {
+                    self.start(LabWorkflowRequest::ExperimentCapabilities);
+                }
+            }
+            LabAction::DraftBaseline(ref family) | LabAction::DraftChallenger(ref family) => {
+                if !self.allow_draft_edit() {
+                    return;
+                }
+                if !self
+                    .experiment_capabilities
+                    .as_ref()
+                    .is_some_and(|capabilities| capabilities.families.contains(family))
+                {
+                    self.set_notice("This brain family was not offered by the current runner.");
+                    return;
+                }
+                if matches!(&action, LabAction::DraftBaseline(_)) {
+                    self.experiment_draft.baseline_family = family.clone();
+                } else {
+                    self.experiment_draft.challenger_family = family.clone();
+                }
+                self.report_draft_validation();
+            }
+            LabAction::FirstSeed(seed) => {
+                if self.allow_draft_edit() {
+                    self.experiment_draft.first_seed = seed;
+                    self.report_draft_validation();
+                }
+            }
+            LabAction::SeedCount(count) => {
+                if self.allow_draft_edit() {
+                    self.experiment_draft.seed_count = count;
+                    self.report_draft_validation();
+                }
+            }
+            LabAction::TicksPerRun(ticks) => {
+                if self.allow_draft_edit() {
+                    self.experiment_draft.ticks_per_run = ticks;
+                    self.report_draft_validation();
+                }
+            }
+            LabAction::CreateExperiment => self.create_experiment(),
+            LabAction::AbandonExperimentRequest => {
+                if !self.can_abandon_experiment_request() {
+                    self.set_notice("Only an unconfirmed creation whose worker has finished can be abandoned locally.");
+                    return;
+                }
+                if let Some(creation) = self.latest_experiment_creation.take() {
+                    self.invalidate();
+                    self.set_notice(format!(
+                        "Forgot local retry identity {}. Its experiment may already exist; inspect the catalog before submitting another batch.",
+                        creation.request_id,
+                    ));
+                }
+            }
             LabAction::ReturnLive => self.invalidate(),
             LabAction::CancelRequest => {
                 self.invalidate();
                 self.set_notice("Result cancelled. The worker remains occupied until it finishes; submitted actions may still complete. Unconfirmed checkpoint saves retain their retry identity.");
             }
             LabAction::SelectExperiment(id) => self.select_experiment(id),
-            LabAction::AllExperiments => {
+            LabAction::AllExperiments | LabAction::BackToExperiments => {
                 self.invalidate();
+                self.composing_experiment = false;
                 self.selected_experiment = None;
                 self.batch = None;
                 self.comparison = None;
+                self.experiments = None;
+                self.experiment_cursor = None;
+                self.set_notice("Returned to the experiment catalog. Any admitted experiment continues independently.");
             }
             LabAction::ExperimentsPage(cursor) => {
                 self.invalidate();
@@ -1377,6 +2030,7 @@ impl LabWorkflows {
             return;
         }
         self.invalidate();
+        self.composing_experiment = false;
         self.selected_experiment = Some(id.clone());
         self.batch = None;
         self.baseline = None;
@@ -1606,6 +2260,411 @@ mod tests {
             state.experiments.is_some(),
             "the slot must reopen after the original worker exits"
         );
+    }
+
+    fn composer_test_capabilities() -> LabExperimentCapabilities {
+        LabExperimentCapabilities {
+            families: vec!["mlp.baseline".into(), "dwraon.baseline".into()],
+            max_seed_count: LAB_MAX_EXPERIMENT_SEEDS,
+            max_ticks_per_run: 1000,
+            max_total_ticks: 100_000,
+            launch_description: "Fresh runner defaults; sequential independent worlds.".into(),
+        }
+    }
+
+    fn composer_test_response(request: &LabWorkflowRequest) -> LabWorkflowResponse {
+        let LabWorkflowRequest::CreateExperiment {
+            request_id,
+            session_id,
+            draft,
+        } = request
+        else {
+            panic!("expected creation request");
+        };
+        LabWorkflowResponse::ExperimentCreated {
+            request_id: request_id.clone(),
+            session_id: *session_id,
+            experiment: LabExperiment {
+                summary: LabExperimentSummary {
+                    experiment_id: request_id.clone(),
+                    status: "pending".into(),
+                    total_runs: draft.seed_count * 2,
+                    completed_runs: 0,
+                    failed_runs: 0,
+                },
+                plan_digest: "admitted-plan".into(),
+                generation: 1,
+                variants: [
+                    ("baseline", &draft.baseline_family),
+                    ("challenger", &draft.challenger_family),
+                ]
+                .into_iter()
+                .map(|(id, family)| LabVariantProgress {
+                    variant_id: id.into(),
+                    brain_family: family.clone(),
+                    total_runs: draft.seed_count,
+                    completed_runs: 0,
+                    failed_runs: 0,
+                    running_runs: 0,
+                })
+                .collect(),
+                error_reason: None,
+            },
+        }
+    }
+
+    fn open_test_composer(submit: LabWorkflowSubmit) -> LabWorkflows {
+        let mut state = LabWorkflows {
+            submit: Some(submit),
+            ..LabWorkflows::default()
+        };
+        state.synchronize(HostSessionId::new(1), LabPanel::Experiments);
+        state.dispatch(LabAction::NewExperiment);
+        drain_worker(&mut state);
+        assert!(state.experiment_capabilities.is_some());
+        assert!(state.latest_experiment_creation.is_none());
+        state
+    }
+
+    #[test]
+    fn experiment_draft_refuses_seed_wrap_and_total_work_before_submission() {
+        let capabilities = composer_test_capabilities();
+        let mut draft = LabExperimentDraft {
+            baseline_family: "mlp.baseline".into(),
+            challenger_family: "dwraon.baseline".into(),
+            ..LabExperimentDraft::default()
+        };
+        assert_eq!(draft.seeds().unwrap(), vec![42, 43, 44]);
+        draft.validate(&capabilities).unwrap();
+        let mut exact_work = capabilities.clone();
+        exact_work.max_total_ticks = 600;
+        draft.validate(&exact_work).unwrap();
+        exact_work.max_total_ticks -= 1;
+        assert!(draft.validate(&exact_work).is_err());
+
+        draft.first_seed = u64::MAX - 1;
+        draft.seed_count = 2;
+        assert_eq!(draft.seeds().unwrap(), vec![u64::MAX - 1, u64::MAX]);
+        draft.validate(&capabilities).unwrap();
+        draft.seed_count = 3;
+        assert!(draft.seeds().is_err());
+        assert!(draft.validate(&capabilities).is_err());
+        draft.seed_count = usize::MAX;
+        assert!(draft.seeds().is_err(), "reject before allocating from the count");
+        draft.seed_count = 0;
+        assert!(draft.seeds().is_err());
+
+        draft.first_seed = 42;
+        draft.seed_count = LAB_MAX_EXPERIMENT_SEEDS;
+        draft.ticks_per_run = u64::MAX;
+        let mut overflowing_work = capabilities.clone();
+        overflowing_work.max_ticks_per_run = u64::MAX;
+        overflowing_work.max_total_ticks = u64::MAX;
+        assert!(draft.validate(&overflowing_work).unwrap_err().contains("overflows"));
+        draft.seed_count = 1;
+        draft.ticks_per_run = 100;
+        draft.challenger_family = draft.baseline_family.clone();
+        assert!(draft.validate(&capabilities).is_err());
+        draft.challenger_family = "unavailable.family".into();
+        assert!(draft.validate(&capabilities).is_err());
+    }
+
+    #[test]
+    fn composer_refuses_unbounded_capabilities_and_never_clamps_its_disclosed_defaults() {
+        let mut state = LabWorkflows::default();
+        state.synchronize(HostSessionId::new(1), LabPanel::Experiments);
+        state.composing_experiment = true;
+        for case in 0..10 {
+            let mut capabilities = composer_test_capabilities();
+            match case {
+                0 => capabilities.families = vec!["same".into(); 2],
+                1 => {
+                    capabilities.families = (0..=LAB_MAX_EXPERIMENT_FAMILIES)
+                        .map(|index| format!("family{index}"))
+                        .collect();
+                }
+                2 => capabilities.families[0] = "x".repeat(129),
+                3 => capabilities.families[0] = "invalid family".into(),
+                4 => capabilities.max_seed_count = usize::MAX,
+                5 => capabilities.max_seed_count = 0,
+                6 => capabilities.max_ticks_per_run = 0,
+                7 => capabilities.max_total_ticks = 0,
+                8 => capabilities.launch_description = "x".repeat(2049),
+                9 => capabilities.launch_description = "invalid\nmultiline".into(),
+                _ => unreachable!(),
+            }
+            assert!(capabilities.validate().is_err(), "case {case}");
+            assert!(!state.accept_experiment_capabilities(capabilities), "case {case}");
+            assert!(state.experiment_capabilities.is_none());
+        }
+        let mut capabilities = composer_test_capabilities();
+        capabilities.families.insert(0, "assembly.baseline".into());
+        capabilities.max_seed_count = 1;
+        capabilities.max_ticks_per_run = 1;
+        capabilities.max_total_ticks = 2;
+        assert!(state.accept_experiment_capabilities(capabilities));
+        assert_eq!(state.experiment_draft.baseline_family, "mlp.baseline");
+        assert_eq!(state.experiment_draft.challenger_family, "dwraon.baseline");
+        assert_eq!(state.experiment_draft.first_seed, 42);
+        assert_eq!(state.experiment_draft.seed_count, 3);
+        assert_eq!(state.experiment_draft.ticks_per_run, 100);
+        assert!(state
+            .experiment_draft
+            .validate(state.experiment_capabilities.as_ref().unwrap())
+            .is_err());
+        assert!(state.latest_experiment_creation.is_none());
+        assert!(!state.is_busy(), "capability observation starts no experiment");
+    }
+
+    #[test]
+    fn experiment_identity_leaves_room_for_the_full_width_run_seed() {
+        let identity = next_checkpoint_request(HostSessionId::new(u64::MAX)).unwrap();
+        assert!(experiment_request_identity_is_valid(&identity));
+        assert!(format!("{identity}-challenger-seed{}", u64::MAX).len() <= 128);
+        assert!(experiment_request_identity_is_valid(&"x".repeat(92)));
+        for invalid in [
+            String::new(),
+            ".".into(),
+            "contains..traversal".into(),
+            " leading".into(),
+            "trailing ".into(),
+            "a/b".into(),
+            "a\\b".into(),
+            "x".repeat(93),
+        ] {
+            assert!(!experiment_request_identity_is_valid(&invalid), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn experiment_creation_retries_frozen_inputs_after_an_unconfirmed_admission() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let observed_requests = Arc::clone(&requests);
+        let mut state = open_test_composer(Arc::new(move |request| {
+            if request == LabWorkflowRequest::ExperimentCapabilities {
+                return Ok(LabWorkflowResponse::ExperimentCapabilities(composer_test_capabilities()));
+            }
+            let mut requests = observed_requests.lock().unwrap();
+            requests.push(request.clone());
+            if requests.len() == 1 {
+                Err("admission receipt was lost".into())
+            } else {
+                Ok(composer_test_response(&request))
+            }
+        }));
+        assert!(requests.lock().unwrap().is_empty(), "opening is read-only");
+        state.dispatch(LabAction::FirstSeed(u64::MAX - 1));
+        state.dispatch(LabAction::SeedCount(2));
+        state.dispatch(LabAction::TicksPerRun(1));
+        assert!(state.can_create_experiment());
+        state.dispatch(LabAction::CreateExperiment);
+        drain_worker(&mut state);
+        let frozen = state.latest_experiment_creation.clone().unwrap();
+        assert!(state.will_retry_experiment_creation());
+        assert!(!state.can_edit_experiment_draft());
+        for edit in [
+            LabAction::FirstSeed(99),
+            LabAction::SeedCount(1),
+            LabAction::TicksPerRun(500),
+            LabAction::DraftBaseline("dwraon.baseline".into()),
+            LabAction::DraftChallenger("mlp.baseline".into()),
+        ] {
+            state.dispatch(edit);
+            assert_eq!(state.experiment_draft, frozen.draft);
+        }
+        state.dispatch(LabAction::NewExperiment);
+        drain_worker(&mut state);
+        assert_eq!(state.experiment_draft, frozen.draft);
+        state.dispatch(LabAction::CreateExperiment);
+        drain_worker(&mut state);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0], requests[1]);
+        assert!(!state.composing_experiment);
+        assert_eq!(state.selected_experiment.as_ref(), Some(&frozen.request_id));
+        assert_eq!(state.batch.as_ref().unwrap().summary.status, "pending");
+        assert_eq!(state.batch.as_ref().unwrap().summary.total_runs, 4);
+        assert!(matches!(
+            state.latest_experiment_creation.as_ref().unwrap().state,
+            LabExperimentCreationState::Created { .. }
+        ));
+    }
+
+    #[test]
+    fn unconfirmed_creation_survives_source_switches_until_exact_retry_or_explicit_abandon() {
+        for abandon_on_other_source in [false, true] {
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let observed_requests = Arc::clone(&requests);
+            let mut state = open_test_composer(Arc::new(move |request| {
+                if request == LabWorkflowRequest::ExperimentCapabilities {
+                    return Ok(LabWorkflowResponse::ExperimentCapabilities(composer_test_capabilities()));
+                }
+                let mut requests = observed_requests.lock().unwrap();
+                requests.push(request.clone());
+                if requests.len() == 1 {
+                    Err("response unavailable after submission".into())
+                } else {
+                    Ok(composer_test_response(&request))
+                }
+            }));
+            state.dispatch(LabAction::FirstSeed(137));
+            state.dispatch(LabAction::SeedCount(8));
+            state.dispatch(LabAction::CreateExperiment);
+            drain_worker(&mut state);
+            let frozen = state.latest_experiment_creation.clone().unwrap();
+
+            state.synchronize(HostSessionId::new(2), LabPanel::Experiments);
+            state.dispatch(LabAction::NewExperiment);
+            drain_worker(&mut state);
+            assert_eq!(state.experiment_draft, frozen.draft);
+            assert_eq!(state.latest_experiment_creation.as_ref().unwrap().request_id, frozen.request_id);
+            assert!(!state.will_retry_experiment_creation());
+            assert!(!state.can_edit_experiment_draft());
+            assert!(!state.can_create_experiment());
+            state.dispatch(LabAction::FirstSeed(11));
+            state.dispatch(LabAction::CreateExperiment);
+            assert_eq!(requests.lock().unwrap().len(), 1);
+            assert_eq!(state.experiment_draft, frozen.draft);
+
+            if abandon_on_other_source {
+                assert!(state.can_abandon_experiment_request());
+                state.dispatch(LabAction::AbandonExperimentRequest);
+                assert!(state.notice.as_deref().unwrap().contains("may already exist"));
+                assert!(state.latest_experiment_creation.is_none());
+                assert!(state.can_edit_experiment_draft());
+                state.dispatch(LabAction::FirstSeed(11));
+            } else {
+                state.synchronize(HostSessionId::new(1), LabPanel::Experiments);
+                state.dispatch(LabAction::NewExperiment);
+                drain_worker(&mut state);
+                assert_eq!(state.experiment_draft, frozen.draft);
+                assert!(state.will_retry_experiment_creation());
+            }
+            state.dispatch(LabAction::CreateExperiment);
+            drain_worker(&mut state);
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            if abandon_on_other_source {
+                assert_ne!(requests[0], requests[1]);
+                assert_ne!(state.selected_experiment.as_ref(), Some(&frozen.request_id));
+            } else {
+                assert_eq!(requests[0], requests[1]);
+                assert_eq!(state.selected_experiment.as_ref(), Some(&frozen.request_id));
+            }
+        }
+    }
+
+    #[test]
+    fn creation_context_changes_retain_the_worker_and_discard_late_admission_receipts() {
+        for change in 0..5 {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed_calls = Arc::clone(&calls);
+            let (started, observed_start) = std::sync::mpsc::channel();
+            let (release, released) = std::sync::mpsc::channel();
+            let released = Mutex::new(released);
+            let mut state = open_test_composer(Arc::new(move |request| {
+                if request == LabWorkflowRequest::ExperimentCapabilities {
+                    return Ok(LabWorkflowResponse::ExperimentCapabilities(composer_test_capabilities()));
+                }
+                observed_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                started.send(request.clone()).unwrap();
+                released.lock().unwrap().recv_timeout(Duration::from_secs(5)).unwrap();
+                Ok(composer_test_response(&request))
+            }));
+            state.dispatch(LabAction::CreateExperiment);
+            let original = observed_start.recv_timeout(Duration::from_secs(5)).unwrap();
+            let frozen = state.latest_experiment_creation.clone().unwrap();
+            match change {
+                0 => state.dispatch(LabAction::CancelRequest),
+                1 => state.dispatch(LabAction::BackToExperiments),
+                2 => state.dispatch(LabAction::NewExperiment),
+                3 => state.synchronize(HostSessionId::new(1), LabPanel::Checkpoints),
+                4 => state.synchronize(HostSessionId::new(2), LabPanel::Experiments),
+                _ => unreachable!(),
+            }
+            assert!(state.is_busy(), "change {change} must retain the worker");
+            assert!(!state.can_abandon_experiment_request());
+            state.dispatch(LabAction::AbandonExperimentRequest);
+            state.dispatch(LabAction::CreateExperiment);
+            assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+            assert_eq!(state.latest_experiment_creation.as_ref().unwrap().request_id, frozen.request_id);
+            assert_eq!(state.experiment_draft, frozen.draft);
+            assert_eq!(state.job.as_ref().unwrap().request, original);
+            release.send(()).unwrap();
+            drain_worker(&mut state);
+            assert!(state.selected_experiment.is_none());
+            assert!(matches!(
+                state.latest_experiment_creation.as_ref().unwrap().state,
+                LabExperimentCreationState::Retryable { .. }
+            ));
+            assert!(state.can_abandon_experiment_request());
+            state.dispatch(LabAction::AbandonExperimentRequest);
+            assert!(state.latest_experiment_creation.is_none());
+            assert!(state.notice.as_deref().unwrap().contains("may already exist"));
+        }
+    }
+
+    #[test]
+    fn creation_receipts_bind_request_source_and_both_declared_cohorts() {
+        for mismatch in 0..8 {
+            let mut state = LabWorkflows::default();
+            let session = HostSessionId::new(1);
+            state.synchronize(session, LabPanel::Experiments);
+            state.composing_experiment = true;
+            assert!(state.accept_experiment_capabilities(composer_test_capabilities()));
+            let request = LabWorkflowRequest::CreateExperiment {
+                request_id: "native-comparison".into(),
+                session_id: session,
+                draft: state.experiment_draft.clone(),
+            };
+            state.latest_experiment_creation = Some(LabExperimentCreation {
+                request_id: "native-comparison".into(),
+                session_id: session,
+                draft: state.experiment_draft.clone(),
+                state: LabExperimentCreationState::Pending,
+            });
+            let mut response = composer_test_response(&request);
+            let LabWorkflowResponse::ExperimentCreated {
+                request_id,
+                session_id,
+                experiment,
+            } = &mut response
+            else {
+                unreachable!();
+            };
+            match mismatch {
+                0 => *request_id = "another-request".into(),
+                1 => *session_id = HostSessionId::new(2),
+                2 => experiment.summary.experiment_id = "another-experiment".into(),
+                3 => experiment.variants[0].brain_family = "assembly.baseline".into(),
+                4 => {
+                    experiment.summary.total_runs += 2;
+                    for variant in &mut experiment.variants {
+                        variant.total_runs += 1;
+                    }
+                }
+                5 => experiment.variants[0].variant_id = "another-arm".into(),
+                6 => {
+                    let _ = experiment.variants.pop();
+                }
+                7 => experiment.variants.swap(0, 1),
+                _ => unreachable!(),
+            }
+            deliver(&mut state, request, response);
+            if mismatch == 7 {
+                assert_eq!(state.selected_experiment.as_deref(), Some("native-comparison"));
+                assert!(!state.composing_experiment, "valid cohort order is immaterial");
+                assert_eq!(state.baseline.as_deref(), Some("baseline"));
+                assert_eq!(state.challenger.as_deref(), Some("challenger"));
+            } else {
+                assert!(state.selected_experiment.is_none(), "mismatch {mismatch}");
+                assert!(state.composing_experiment);
+                assert!(matches!(
+                    state.latest_experiment_creation.as_ref().unwrap().state,
+                    LabExperimentCreationState::Retryable { .. }
+                ));
+            }
+        }
     }
 
     #[test]

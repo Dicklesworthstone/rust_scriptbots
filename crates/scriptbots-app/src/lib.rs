@@ -4122,6 +4122,16 @@ pub mod renderer {
         Arc::new(move |request| {
             let result =
                 match request {
+                    LabWorkflowRequest::ExperimentCapabilities => {
+                        Ok(LabWorkflowResponse::ExperimentCapabilities(
+                            native_lab_experiment_capabilities(),
+                        ))
+                    }
+                    LabWorkflowRequest::CreateExperiment {
+                        request_id,
+                        session_id,
+                        draft,
+                    } => create_lab_experiment(&control, request_id, session_id, draft),
                     LabWorkflowRequest::ListExperiments { cursor } => {
                         control
                             .list_experiments(Some(LAB_PAGE_SIZE), cursor.as_deref())
@@ -4284,6 +4294,140 @@ pub mod renderer {
             base_tick: review.base_tick,
             snapshot: review.snapshot,
         }))
+    }
+
+    #[cfg(any(feature = "gui", feature = "bevy_render", test))]
+    fn native_lab_experiment_capabilities(
+    ) -> scriptbots_runtime::lab_workflows::LabExperimentCapabilities {
+        use crate::experiment_runner::{
+            EXPERIMENT_BRAIN_FAMILIES, MAX_BATCH_TOTAL_TICKS, MAX_TICKS_PER_RUN,
+        };
+        let config = scriptbots_core::ScriptBotsConfig::default();
+        scriptbots_runtime::lab_workflows::LabExperimentCapabilities {
+            families: EXPERIMENT_BRAIN_FAMILIES
+                .iter()
+                .map(|family| (*family).to_owned())
+                .collect(),
+            max_seed_count: 128,
+            max_ticks_per_run: MAX_TICKS_PER_RUN,
+            max_total_ticks: MAX_BATCH_TOTAL_TICKS,
+            launch_description: format!(
+                "Fresh worlds with the experiment runner's default environment ({} x {}; food cell width {}) and founding population. Runs execute sequentially.",
+                config.world_width, config.world_height, config.food_cell_size,
+            ),
+        }
+    }
+
+    #[cfg(any(feature = "gui", feature = "bevy_render", test))]
+    fn validate_created_lab_experiment(
+        batch: &crate::control::ExperimentBatchStatusDto,
+        request_id: &str,
+        draft: &scriptbots_runtime::lab_workflows::LabExperimentDraft,
+    ) -> Result<(), crate::control::ControlError> {
+        use crate::control::ControlError;
+        use std::collections::BTreeSet;
+
+        let seeds: BTreeSet<_> = draft
+            .seeds()
+            .map_err(ControlError::BadRequest)?
+            .into_iter()
+            .collect();
+        let expected_runs = seeds.len().checked_mul(2).ok_or_else(|| {
+            ControlError::BadRequest("native experiment run count overflowed".into())
+        })?;
+        if batch.experiment_id != request_id
+            || batch.total_runs != expected_runs
+            || batch.runs.len() != expected_runs
+        {
+            return Err(ControlError::Conflict(
+                "created experiment does not match the requested identity and run count".into(),
+            ));
+        }
+        let mut observed = BTreeSet::new();
+        for run in &batch.runs {
+            let expected_family = match run.variant_id.as_str() {
+                "baseline" => &draft.baseline_family,
+                "challenger" => &draft.challenger_family,
+                _ => {
+                    return Err(ControlError::Conflict(
+                        "created experiment contains an unrequested arm".into(),
+                    ));
+                }
+            };
+            if &run.brain_family != expected_family
+                || run.target_ticks != draft.ticks_per_run
+                || !seeds.contains(&run.seed)
+                || !observed.insert((run.variant_id.as_str(), run.seed))
+                || run.run_id != format!("{request_id}-{}-seed{}", run.variant_id, run.seed)
+            {
+                return Err(ControlError::Conflict(
+                    "created experiment does not match the requested families, seeds and horizon"
+                        .into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(any(feature = "gui", feature = "bevy_render", test))]
+    fn create_lab_experiment(
+        control: &crate::control::ControlHandle,
+        request_id: String,
+        session_id: scriptbots_runtime::HostSessionId,
+        draft: scriptbots_runtime::lab_workflows::LabExperimentDraft,
+    ) -> Result<scriptbots_runtime::lab_workflows::LabWorkflowResponse, crate::control::ControlError>
+    {
+        use crate::control::{ControlError, ExperimentCreateRequest, ExperimentVariantDto};
+        use scriptbots_runtime::lab_workflows::{
+            LabWorkflowResponse, experiment_request_identity_is_valid,
+        };
+
+        if !experiment_request_identity_is_valid(&request_id) {
+            return Err(ControlError::BadRequest(
+                "native experiment identity must be a safe 1..=92 byte path component".into(),
+            ));
+        }
+        draft
+            .validate(&native_lab_experiment_capabilities())
+            .map_err(ControlError::BadRequest)?;
+        if control.read_snapshot()?.session_id != session_id {
+            return Err(ControlError::Conflict(
+                "native experiment launch belongs to a different owner session".into(),
+            ));
+        }
+        // Every optional field is explicit and stable. An unknown admission
+        // outcome can be retried without changing the service's payload hash.
+        let batch = control.create_experiment(ExperimentCreateRequest {
+            experiment_id: Some(request_id.clone()),
+            description: Some("Native Evolution Lab matched-seed brain-family comparison".into()),
+            variants: [
+                ("baseline", &draft.baseline_family),
+                ("challenger", &draft.challenger_family),
+            ]
+            .into_iter()
+            .map(|(variant_id, brain_family)| ExperimentVariantDto {
+                variant_id: variant_id.into(),
+                brain_family: brain_family.clone(),
+                config_overrides: None,
+                interventions: Vec::new(),
+            })
+            .collect(),
+            seeds: draft.seeds().map_err(ControlError::BadRequest)?,
+            ticks_per_run: Some(draft.ticks_per_run),
+            max_concurrency: Some(1),
+            idempotency_key: Some(format!(
+                "native-lab-experiment-v1:{:016x}:{request_id}",
+                session_id.get(),
+            )),
+        })?;
+        // Projection deliberately omits per-run seeds and horizons. Bind the
+        // authoritative service matrix to this exact request before reducing it.
+        validate_created_lab_experiment(&batch, &request_id, &draft)?;
+        Ok(LabWorkflowResponse::ExperimentCreated {
+            request_id,
+            session_id,
+            experiment: project_lab_experiment(batch)?,
+        })
     }
 
     #[cfg(any(feature = "gui", feature = "bevy_render", test))]
@@ -4614,6 +4758,233 @@ pub mod renderer {
             );
             assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
             assert_eq!(host.port.snapshot_hub().latest().world.tick, 1);
+        }
+
+        #[test]
+        // Real admission, unknown outcome, exact retry and authoritative matrix binding.
+        #[allow(clippy::too_many_lines)]
+        fn native_lab_experiment_creation_retries_the_exact_admitted_seed_matrix() {
+            use scriptbots_runtime::lab_workflows::{
+                LabAction, LabExperimentDraft, LabPanel, LabWorkflowRequest as Request,
+                LabWorkflowResponse as Response, LabWorkflows,
+            };
+            use std::sync::{
+                Mutex,
+                atomic::{AtomicBool, Ordering},
+            };
+
+            struct StopExperiments(crate::control::ControlHandle);
+            impl Drop for StopExperiments {
+                fn drop(&mut self) {
+                    let _ = self.0.data_services().shutdown_experiments();
+                }
+            }
+
+            let root = tempfile::tempdir().unwrap();
+            let host = TestHost::spawn(
+                scriptbots_core::WorldState::new(ScriptBotsConfig {
+                    rng_seed: Some(42),
+                    world_width: 120,
+                    world_height: 120,
+                    food_cell_size: 20,
+                    population_minimum: 0,
+                    persistence_interval: 0,
+                    closed: true,
+                    ..ScriptBotsConfig::default()
+                })
+                .unwrap(),
+            );
+            let handle = host
+                .handle()
+                .with_artifacts_dir(root.path().to_path_buf())
+                .unwrap();
+            let _stop = StopExperiments(handle.clone());
+            let live = handle.read_snapshot().unwrap();
+            let live_digest = host.port.scientific_digest_v1().unwrap();
+            let session_id = live.session_id;
+            let provider = lab_workflow_submit(handle.clone());
+            let capabilities = match provider(Request::ExperimentCapabilities).unwrap() {
+                Response::ExperimentCapabilities(capabilities) => capabilities,
+                _ => panic!("wrong experiment capabilities response"),
+            };
+            capabilities.validate().unwrap();
+            let draft = LabExperimentDraft {
+                baseline_family: "mlp.baseline".into(),
+                challenger_family: "dwraon.baseline".into(),
+                first_seed: u64::MAX - 1,
+                seed_count: 2,
+                ticks_per_run: 1,
+            };
+            draft.validate(&capabilities).unwrap();
+            assert!(
+                provider(Request::CreateExperiment {
+                    request_id: "wrong-source".into(),
+                    session_id: scriptbots_runtime::HostSessionId::new(
+                        session_id.get().wrapping_add(1),
+                    ),
+                    draft: draft.clone(),
+                })
+                .is_err()
+            );
+            for request_id in [
+                String::new(),
+                ".".into(),
+                "bad..identity".into(),
+                "has space".into(),
+                "x".repeat(93),
+            ] {
+                assert!(
+                    provider(Request::CreateExperiment {
+                        request_id,
+                        session_id,
+                        draft: draft.clone(),
+                    })
+                    .is_err()
+                );
+            }
+            for (index, invalid) in [
+                LabExperimentDraft {
+                    challenger_family: draft.baseline_family.clone(),
+                    ..draft.clone()
+                },
+                LabExperimentDraft {
+                    first_seed: u64::MAX,
+                    ..draft.clone()
+                },
+                LabExperimentDraft {
+                    baseline_family: "unsupported-family".into(),
+                    ..draft.clone()
+                },
+                LabExperimentDraft {
+                    seed_count: capabilities.max_seed_count + 1,
+                    first_seed: 7,
+                    ..draft.clone()
+                },
+                LabExperimentDraft {
+                    ticks_per_run: capabilities.max_total_ticks,
+                    ..draft.clone()
+                },
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                assert!(
+                    provider(Request::CreateExperiment {
+                        request_id: format!("invalid-draft-{index}"),
+                        session_id,
+                        draft: invalid,
+                    })
+                    .is_err()
+                );
+            }
+            assert_eq!(handle.list_experiments(None, None).unwrap().total, 0);
+
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&seen);
+            let service = Arc::clone(&provider);
+            let lose_first_receipt = AtomicBool::new(true);
+            let mut model = LabWorkflows::default();
+            model.submit = Some(Arc::new(move |request| {
+                let creates = matches!(&request, Request::CreateExperiment { .. });
+                if creates {
+                    recorded.lock().unwrap().push(request.clone());
+                }
+                let response = service(request)?;
+                if creates && lose_first_receipt.swap(false, Ordering::SeqCst) {
+                    Err("experiment admitted, but its response was lost".into())
+                } else {
+                    Ok(response)
+                }
+            }));
+            model.synchronize(session_id, LabPanel::Experiments);
+            model.dispatch(LabAction::NewExperiment);
+            assert!(finish_native_lab_request(&mut model).is_none());
+            model.dispatch(LabAction::DraftBaseline(draft.baseline_family.clone()));
+            model.dispatch(LabAction::DraftChallenger(draft.challenger_family.clone()));
+            model.dispatch(LabAction::FirstSeed(draft.first_seed));
+            model.dispatch(LabAction::SeedCount(draft.seed_count));
+            model.dispatch(LabAction::TicksPerRun(draft.ticks_per_run));
+            assert_eq!(model.experiment_draft, draft);
+            assert!(model.can_create_experiment());
+            model.dispatch(LabAction::CreateExperiment);
+            assert!(finish_native_lab_request(&mut model).is_none());
+            assert!(model.will_retry_experiment_creation());
+            let creation = model.latest_experiment_creation.as_ref().unwrap().clone();
+            assert_eq!(creation.draft, draft);
+            assert_eq!(handle.list_experiments(None, None).unwrap().total, 1);
+
+            // An uncertain admission freezes all draft fields until the same
+            // request is confirmed or the user explicitly abandons that receipt.
+            model.dispatch(LabAction::TicksPerRun(2));
+            assert_eq!(model.experiment_draft, draft);
+            model.dispatch(LabAction::CreateExperiment);
+            assert!(finish_native_lab_request(&mut model).is_none());
+            assert!(!model.composing_experiment);
+            assert_eq!(
+                model.selected_experiment.as_deref(),
+                Some(creation.request_id.as_str()),
+            );
+            assert_eq!(model.batch.as_ref().unwrap().summary.total_runs, 4);
+            assert_eq!(model.batch.as_ref().unwrap().variants.len(), 2);
+            assert_eq!(handle.list_experiments(None, None).unwrap().total, 1);
+            {
+                let requests = seen.lock().unwrap();
+                assert_eq!(requests.len(), 2);
+                assert_eq!(requests[0], requests[1]);
+            }
+            let conflict = provider(Request::CreateExperiment {
+                request_id: creation.request_id.clone(),
+                session_id,
+                draft: LabExperimentDraft {
+                    ticks_per_run: 2,
+                    ..draft.clone()
+                },
+            })
+            .err()
+            .expect("the same admission key must not accept a changed payload");
+            assert!(conflict.contains("different payload"), "{conflict}");
+
+            // Join every real experiment worker before dropping its artifact
+            // directory. The guard also performs this cleanup after an assertion.
+            handle.data_services().shutdown_experiments().unwrap();
+            let batch = handle.get_experiment(&creation.request_id).unwrap();
+            validate_created_lab_experiment(&batch, &creation.request_id, &draft).unwrap();
+            for arm in ["baseline", "challenger"] {
+                let seeds: std::collections::BTreeSet<_> = batch
+                    .runs
+                    .iter()
+                    .filter(|run| run.variant_id == arm)
+                    .map(|run| run.seed)
+                    .collect();
+                assert_eq!(
+                    seeds,
+                    [u64::MAX - 1, u64::MAX]
+                        .into_iter()
+                        .collect::<std::collections::BTreeSet<_>>(),
+                );
+            }
+            let mut duplicate = batch.clone();
+            duplicate.runs[1] = duplicate.runs[0].clone();
+            assert!(
+                validate_created_lab_experiment(&duplicate, &creation.request_id, &draft).is_err()
+            );
+            let mut wrong_family = batch.clone();
+            wrong_family.runs[0].brain_family = "unrequested-family".into();
+            assert!(
+                validate_created_lab_experiment(&wrong_family, &creation.request_id, &draft).is_err()
+            );
+            let mut wrong_horizon = batch.clone();
+            wrong_horizon.runs[0].target_ticks = 2;
+            assert!(
+                validate_created_lab_experiment(&wrong_horizon, &creation.request_id, &draft).is_err()
+            );
+            let mut missing = batch.clone();
+            assert!(missing.runs.pop().is_some());
+            assert!(
+                validate_created_lab_experiment(&missing, &creation.request_id, &draft).is_err()
+            );
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), live_digest);
+            assert!(Arc::ptr_eq(&handle.read_snapshot().unwrap(), &live));
         }
 
         #[test]
