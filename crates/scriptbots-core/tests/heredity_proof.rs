@@ -582,6 +582,7 @@ fn sexual_child_at_zero_mutation_is_a_per_locus_bitwise_mix() {
 const fn locus_value_bit_eq(left: LocusValue, right: LocusValue) -> bool {
     match (left, right) {
         (LocusValue::Scalar(a), LocusValue::Scalar(b)) => a.to_bits() == b.to_bits(),
+        (LocusValue::Scalar64(a), LocusValue::Scalar64(b)) => a.to_bits() == b.to_bits(),
         (LocusValue::Target(a), LocusValue::Target(b)) => a == b,
         (LocusValue::Kind(a), LocusValue::Kind(b)) => a == b,
         _ => false,

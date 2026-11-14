@@ -14,9 +14,10 @@ use scriptbots_brain::Brain;
 use scriptbots_core::{
     BrainAdapterIdentityV1, BrainEnvelopeKind, BrainEvaluator, BrainEvaluatorStateEnvelope,
     BrainFamilyCodec, BrainFamilyId, BrainGenomeEnvelope, BrainGenomeMaterial,
-    BrainHeredityCapabilityV1, BrainHeredityExclusionV1, BrainInspection, BrainInspectionError,
-    BrainInspectionSnapshot, BrainProtocolError, MAX_BRAIN_EVALUATOR_STATE_PAYLOAD_BYTES,
-    MAX_BRAIN_GENOME_PAYLOAD_BYTES, MutationRates, OffspringStatePolicy, RandomStream,
+    BrainHeredityCapabilityV1, BrainInspection, BrainInspectionError, BrainInspectionSnapshot,
+    BrainLocusSchemaIdentityV1, BrainMutationTrialGroupV1, BrainProtocolError,
+    MAX_BRAIN_EVALUATOR_STATE_PAYLOAD_BYTES, MAX_BRAIN_GENOME_PAYLOAD_BYTES, MutationRates,
+    OffspringStatePolicy, RandomStream,
 };
 
 const FAMILY_ID: &str = "neuroflow-f64-v1";
@@ -32,6 +33,8 @@ const GENOME_FIXED_HEADER_BYTES: usize = 32;
 const DIGEST_BYTES: usize = 32;
 const STATE_HEADER_BYTES: usize = STATE_MAGIC.len() + 2 * DIGEST_BYTES;
 const SCALAR_BYTES: usize = std::mem::size_of::<f64>();
+const LOCUS_SCHEMA_VERSION: u32 = 1;
+const LOCUS_SCHEMA_DESCRIPTOR: &[u8] = b"scriptbots.neuroflow-f64.loci.v1:configured-header;nodes=inputs-then-hidden-then-output;order=layer,node,bias,connection-weight-source;scalar64=exact-f64-le;row-first=bias;connections=wide-u32;structural-sources=immutable;mutation=one-primary-trial-per-bias-or-weight";
 
 /// Checkpointable `NeuroFlow` family with exact f64 heredity.
 ///
@@ -40,8 +43,8 @@ const SCALAR_BYTES: usize = std::mem::size_of::<f64>();
 /// `NeuroFlow` genomes. Existing envelope limits impose tighter architecture bounds than the
 /// legacy runner; construction checks these before allocating a network or drawing randomness.
 ///
-/// Typed genome loci remain unavailable: the shared scalar-locus vocabulary stores f32 and
-/// cannot represent this family's f64 genes without losing heritable information.
+/// Typed genome loci retain every f64 weight bit and use wide connection addresses for all
+/// valid architectures. Inspection reads the existing genome without constructing a network.
 #[derive(Debug, Clone)]
 pub struct NeuroflowFamilyAdapter {
     family_id: BrainFamilyId,
@@ -494,7 +497,19 @@ impl BrainFamilyCodec for NeuroflowFamilyAdapter {
     }
 
     fn heredity_capability(&self) -> BrainHeredityCapabilityV1 {
-        BrainHeredityCapabilityV1::excluded(BrainHeredityExclusionV1::NoCanonicalLocusSchema)
+        let mut descriptor = LOCUS_SCHEMA_DESCRIPTOR.to_vec();
+        descriptor.extend_from_slice(&self.genome_header);
+        let trials =
+            u32::try_from((self.genome_bytes - self.genome_header.len()) / SCALAR_BYTES)
+                .expect("bounded NeuroFlow weight count fits u32");
+        BrainHeredityCapabilityV1::locus_capable(
+            BrainLocusSchemaIdentityV1::from_semantic_descriptor(
+                &self.family_id,
+                LOCUS_SCHEMA_VERSION,
+                &descriptor,
+            ),
+            vec![BrainMutationTrialGroupV1::new(trials, 1, 1)],
+        )
     }
 
     fn random_genome_material(
@@ -512,6 +527,83 @@ impl BrainFamilyCodec for NeuroflowFamilyAdapter {
     fn validate_genome(&self, genome: &BrainGenomeEnvelope) -> Result<(), BrainProtocolError> {
         genome.require_protocol(&self.family_id, GENOME_SCHEMA_VERSION, GENOME_CODEC_VERSION)?;
         self.validate_genome_payload(genome.payload())
+    }
+
+    fn genome_loci(
+        &self,
+        genome: &BrainGenomeEnvelope,
+    ) -> Result<
+        Vec<(
+            scriptbots_core::genome_diff::Locus,
+            scriptbots_core::genome_diff::LocusValue,
+        )>,
+        BrainProtocolError,
+    > {
+        use scriptbots_core::genome_diff::{Locus, LocusValue};
+
+        self.validate_genome(genome)?;
+        let mut scalars = genome.payload()[self.genome_header.len()..]
+            .as_chunks::<SCALAR_BYTES>()
+            .0
+            .iter();
+        let mut loci = Vec::with_capacity(
+            self.genome_loci_upper_bound()
+                .expect("validated NeuroFlow locus count"),
+        );
+        let mut input_width = INPUT_SIZE;
+        let mut source_start = 0;
+        let mut node_start = INPUT_SIZE;
+        for output_width in self
+            .config
+            .hidden_layers
+            .iter()
+            .copied()
+            .chain(std::iter::once(OUTPUT_SIZE))
+        {
+            for row in 0..output_width {
+                let node = u32::try_from(node_start + row).expect("bounded NeuroFlow node index");
+                // NeuroFlow stores the bias first in each row, then the incoming weights.
+                loci.push((
+                    Locus::NodeBias(node),
+                    LocusValue::Scalar64(next_scalar(&mut scalars)),
+                ));
+                for column in 0..input_width {
+                    let conn = u32::try_from(column).expect("bounded NeuroFlow connection slot");
+                    loci.push((
+                        Locus::NodeWeightWide { node, conn },
+                        LocusValue::Scalar64(next_scalar(&mut scalars)),
+                    ));
+                    loci.push((
+                        Locus::NodeTargetWide { node, conn },
+                        LocusValue::Target(
+                            u32::try_from(source_start + column)
+                                .expect("bounded NeuroFlow source index"),
+                        ),
+                    ));
+                }
+            }
+            source_start = node_start;
+            node_start += output_width;
+            input_width = output_width;
+        }
+        debug_assert!(scalars.as_slice().is_empty());
+        Ok(loci)
+    }
+
+    fn genome_loci_upper_bound(&self) -> Option<usize> {
+        std::iter::once(INPUT_SIZE)
+            .chain(self.config.hidden_layers.iter().copied())
+            .zip(
+                self.config
+                    .hidden_layers
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(OUTPUT_SIZE)),
+            )
+            .try_fold(0_usize, |total, (inputs, outputs)| {
+                let per_output = inputs.checked_mul(2)?.checked_add(1)?;
+                total.checked_add(per_output.checked_mul(outputs)?)
+            })
     }
 
     fn validate_evaluator_state(
@@ -752,9 +844,176 @@ mod tests {
             })
             .is_err()
         );
+        let small = NeuroflowFamilyAdapter::new(small_config()).unwrap();
+        let BrainHeredityCapabilityV1::LocusCapable {
+            locus_schema,
+            mutation_trials,
+        } = small.heredity_capability()
+        else {
+            panic!("exact f64 genomes must participate in typed heredity proof");
+        };
+        assert_eq!(locus_schema.family_id(), small.family_id());
+        assert_eq!(locus_schema.semantic_version(), 1);
         assert_eq!(
-            baseline.heredity_capability(),
-            BrainHeredityCapabilityV1::excluded(BrainHeredityExclusionV1::NoCanonicalLocusSchema)
+            mutation_trials,
+            vec![BrainMutationTrialGroupV1::new(155, 1, 1)]
+        );
+        assert_ne!(baseline.heredity_capability(), small.heredity_capability());
+    }
+
+    #[test]
+    fn canonical_loci_preserve_bias_order_subnormals_and_one_ulp_mutations() {
+        use scriptbots_core::genome_diff::{
+            DeltaKind, GenomeDelta, Locus, LocusValue, diff_genomes,
+        };
+
+        let family = NeuroflowFamilyAdapter::new(small_config()).unwrap();
+        let mut payload = family.genome_header.clone();
+        payload.resize(family.genome_bytes, 0);
+        let precise = [-0.0_f64, 1.0, f64::from_bits(1)];
+        for (chunk, value) in payload[family.genome_header.len()..]
+            .chunks_exact_mut(SCALAR_BYTES)
+            .zip(precise)
+        {
+            chunk.copy_from_slice(&value.to_le_bytes());
+        }
+        let parent = genome_with_payload(&family, payload.clone());
+        let parent_loci = family.genome_loci(&parent).unwrap();
+        assert_eq!(family.genome_loci_upper_bound(), Some(294));
+        assert_eq!(parent_loci.len(), 294);
+        assert_eq!(parent_loci[0].0, Locus::NodeBias(25));
+        assert_eq!(
+            parent_loci[0].1.scalar().unwrap().to_bits(),
+            (-0.0_f64).to_bits()
+        );
+        assert_eq!(
+            parent_loci[1],
+            (
+                Locus::NodeWeightWide { node: 25, conn: 0 },
+                LocusValue::Scalar64(1.0),
+            )
+        );
+        assert_eq!(
+            parent_loci[2],
+            (
+                Locus::NodeTargetWide { node: 25, conn: 0 },
+                LocusValue::Target(0),
+            )
+        );
+        assert_eq!(parent_loci[3].1.scalar().unwrap().to_bits(), 1);
+        assert_eq!(
+            parent_loci[205],
+            (
+                Locus::NodeWeightWide { node: 29, conn: 0 },
+                LocusValue::Scalar64(0.0),
+            )
+        );
+        assert_eq!(
+            parent_loci[206],
+            (
+                Locus::NodeTargetWide { node: 29, conn: 0 },
+                LocusValue::Target(25),
+            )
+        );
+        assert_eq!(
+            parent_loci
+                .iter()
+                .filter(|(_, value)| matches!(value, LocusValue::Scalar64(_)))
+                .count(),
+            155
+        );
+        assert_eq!(
+            parent_loci
+                .iter()
+                .map(|(locus, _)| *locus)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            parent_loci.len()
+        );
+
+        let next = f64::from_bits(1.0_f64.to_bits() + 1);
+        let weights_start = family.genome_header.len();
+        payload[weights_start..weights_start + SCALAR_BYTES]
+            .copy_from_slice(&0.0_f64.to_le_bytes());
+        payload[weights_start + SCALAR_BYTES..weights_start + 2 * SCALAR_BYTES]
+            .copy_from_slice(&next.to_le_bytes());
+        let child = genome_with_payload(&family, payload);
+        let diff = diff_genomes(&family, &parent, &child).unwrap();
+        assert_eq!(diff.summary.changed_loci, 2);
+        assert_eq!(diff.summary.total_loci, 294);
+        assert_eq!(diff.summary.by_kind[&DeltaKind::Scalar], 2);
+        assert_eq!(diff.summary.l1.to_bits(), f64::EPSILON.to_bits());
+        let GenomeDelta::Scalar64 { before, after, .. } = diff.deltas[0] else {
+            panic!("signed zero must retain its f64 delta type");
+        };
+        assert_eq!(before.to_bits(), (-0.0_f64).to_bits());
+        assert_eq!(after.to_bits(), 0.0_f64.to_bits());
+        assert_eq!(
+            diff.deltas[1],
+            GenomeDelta::Scalar64 {
+                locus: Locus::NodeWeightWide { node: 25, conn: 0 },
+                before: 1.0,
+                after: next,
+            }
+        );
+        let encoded = serde_json::to_string(&diff).unwrap();
+        assert!(encoded.contains("1.0000000000000002"));
+        assert!(encoded.contains("-0.0"));
+        let round_trip: scriptbots_core::genome_diff::GenomeDiff =
+            serde_json::from_str(&encoded).unwrap();
+        let GenomeDelta::Scalar64 { before, .. } = round_trip.deltas[0] else {
+            panic!("round trip must preserve typed f64 differences");
+        };
+        assert_eq!(before.to_bits(), (-0.0_f64).to_bits());
+        assert_eq!(round_trip.deltas[1], diff.deltas[1]);
+        assert_ne!(parent.material_hash(), child.material_hash());
+    }
+
+    #[test]
+    fn canonical_loci_address_connections_beyond_u8_without_aliasing() {
+        use scriptbots_core::genome_diff::{Locus, LocusValue};
+
+        let family = NeuroflowFamilyAdapter::new(NeuroflowBrainConfig {
+            hidden_layers: vec![300],
+            ..small_config()
+        })
+        .unwrap();
+        let mut payload = family.genome_header.clone();
+        payload.resize(family.genome_bytes, 0);
+        let offset = family.genome_header.len()
+            + (300 * (INPUT_SIZE + 1) + 1 + 299) * SCALAR_BYTES;
+        let precise = f64::from_bits(1.0_f64.to_bits() + 1);
+        payload[offset..offset + SCALAR_BYTES].copy_from_slice(&precise.to_le_bytes());
+        let genome = genome_with_payload(&family, payload);
+        let loci = family.genome_loci(&genome).unwrap();
+        let lookup = loci
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            lookup.len(),
+            loci.len(),
+            "wide slots cannot alias earlier connections"
+        );
+        assert_eq!(family.genome_loci_upper_bound(), Some(loci.len()));
+        assert_eq!(
+            lookup[&Locus::NodeWeightWide { node: 325, conn: 299 }],
+            LocusValue::Scalar64(precise)
+        );
+        assert_eq!(
+            lookup[&Locus::NodeTargetWide { node: 325, conn: 299 }],
+            LocusValue::Target(324)
+        );
+        assert_eq!(
+            lookup[&Locus::NodeTargetWide { node: 325, conn: 255 }],
+            LocusValue::Target(280)
+        );
+        let mut invalid = genome.payload().to_vec();
+        invalid[offset..offset + SCALAR_BYTES].copy_from_slice(&f64::INFINITY.to_le_bytes());
+        assert!(
+            family
+                .genome_loci(&genome_with_payload(&family, invalid))
+                .is_err()
         );
     }
 
@@ -1243,7 +1502,7 @@ mod tests {
         let checkpoint = scriptbots_core::WorldCheckpointV1::decode(&bytes).unwrap();
         let mut registry = BrainRegistry::default();
         registry
-            .register_family(NeuroflowBrain::KIND.as_str(), Box::new(family))
+            .register_family(NeuroflowBrain::KIND.as_str(), Box::new(family.clone()))
             .unwrap();
         let mut resumed = WorldState::restore_checkpoint_v1(&checkpoint, registry).unwrap();
         assert_eq!(
@@ -1251,6 +1510,18 @@ mod tests {
             resumed.world_digest_v1().unwrap()
         );
         for _ in 0..6 {
+            let before_digest = world.world_digest_v1().unwrap();
+            let before_checkpoint = world.checkpoint_v1().unwrap().encode().unwrap();
+            let live_parent = world.agent_brain_genome(parent).unwrap();
+            let live_child = world.agent_brain_genome(child).unwrap();
+            family.genome_loci(live_parent).unwrap();
+            scriptbots_core::genome_diff::diff_genomes(&family, live_parent, live_child)
+                .unwrap();
+            assert_eq!(world.world_digest_v1().unwrap(), before_digest);
+            assert_eq!(
+                world.checkpoint_v1().unwrap().encode().unwrap(),
+                before_checkpoint
+            );
             world.step().unwrap();
             resumed.step().unwrap();
             assert_eq!(

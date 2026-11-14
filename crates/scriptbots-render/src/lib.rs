@@ -14759,7 +14759,7 @@ pub fn render_genome_browser_view(
         } => {
             let mut d_div = div().flex().flex_col().gap_1().child(
                 div().text_xs().text_color(rgb(0xa3e635)).child(format!(
-                    "Parent Agent {} · {} mutations · L1 {:.3} · Linf {:.3}",
+                    "Parent Agent {} · {} mutations · L1 {} · Linf {}",
                     parent_uid.get(),
                     total_deltas,
                     summary.l1,
@@ -14783,6 +14783,13 @@ pub fn render_genome_browser_view(
                         after,
                     } => {
                         format!("{}: node {} → node {}", locus.human(), before, after)
+                    }
+                    scriptbots_core::genome_diff::GenomeDelta::Scalar64 {
+                        locus,
+                        before,
+                        after,
+                    } => {
+                        format!("{}: {before:?} → {after:?}", locus.human())
                     }
                     scriptbots_core::genome_diff::GenomeDelta::KindFlip {
                         locus,
@@ -14827,7 +14834,7 @@ pub fn render_genome_browser_view(
     for node in browser.nodes.iter().take(4) {
         let bias_str = node
             .bias
-            .map_or(String::new(), |b| format!("bias {b:+.2} "));
+            .map_or(String::new(), |b| format!("bias {b:+} "));
         let damp_str = node
             .damping
             .map_or(String::new(), |d| format!("damp {d:.2} "));
@@ -14880,6 +14887,9 @@ pub fn render_genome_browser_view(
                         s.generation,
                         s.agent_uid.get()
                     )
+                }
+                Some(scriptbots_core::genome_diff::LocusValue::Scalar64(v)) => {
+                    format!("Gen {} (agent {}): {v:?}", s.generation, s.agent_uid.get())
                 }
                 Some(scriptbots_core::genome_diff::LocusValue::Target(t)) => {
                     format!(

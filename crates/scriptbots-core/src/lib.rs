@@ -9916,7 +9916,7 @@ fn validate_claimed_genome_loci(
                 format!("decoded duplicate locus {locus:?} at canonical index {index}"),
             ));
         }
-        if matches!(value, crate::genome_diff::LocusValue::Scalar(value) if !value.is_finite()) {
+        if !value.is_finite() {
             return Err(invalid_heredity_capability(
                 identity,
                 format!("decoded non-finite scalar at locus {locus:?}"),

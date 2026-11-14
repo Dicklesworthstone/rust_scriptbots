@@ -7,7 +7,8 @@ const DIGEST = /^[0-9a-f]{64}$/;
 const UNAVAILABLE = new Set(["missing_agent", "unbound_brain", "genome_unavailable", "unsupported",
   "source_budget_exceeded", "invalid_genome", "page_out_of_range"]);
 const PARENT_UNAVAILABLE = new Set(["parent_unavailable", "material_mismatch", "family_mismatch",
-  "schema_mismatch", "unsupported", "source_budget_exceeded", "invalid_genome", "incompatible_loci", "page_out_of_range"]);
+  "schema_mismatch", "unsupported", "source_budget_exceeded", "invalid_genome", "incompatible_loci",
+  "numerical_overflow", "page_out_of_range"]);
 const DERIVATIONS = new Map([["Founder", 0], ["Clone", 1], ["MutationOnly", 1],
   ["Crossover", 2], ["CrossoverThenMutation", 2]]);
 const count = (value, limit = 0xffff_ffff) => Number.isSafeInteger(value) && value >= 0 && value <= limit;
@@ -20,12 +21,14 @@ function validateLocus(locus) {
   if (kind === "Hyper" && count(index, 255)) return;
   if (["NodeWeight", "NodeKind", "NodeTarget"].includes(kind) && count(index?.node)
       && count(index?.conn, 255) && Object.keys(index).length === 2) return;
+  if (["NodeWeightWide", "NodeTargetWide"].includes(kind) && count(index?.node)
+      && count(index?.conn) && Object.keys(index).length === 2) return;
   throw new Error("Invalid canonical genome locus");
 }
 
 function validateValue(value) {
   const [kind, data] = tagged(value);
-  if ((kind === "Scalar" && Number.isFinite(data)) || (kind === "Target" && count(data))
+  if ((["Scalar", "Scalar64"].includes(kind) && Number.isFinite(data)) || (kind === "Target" && count(data))
       || (kind === "Kind" && count(data, 255))) return;
   throw new Error("Invalid canonical genome value");
 }
@@ -41,7 +44,7 @@ function validatePaging(page, requested, size, rows) {
 
 /** Refuse oversized, malformed, stale or differently sourced pages before rendering. */
 export function validateGenomeInspection(detail, request) {
-  if (!detail || detail.schema !== "scriptbots.genome-inspection.v1") throw new Error("Invalid genome inspection schema");
+  if (!detail || detail.schema !== "scriptbots.genome-inspection.v2") throw new Error("Invalid genome inspection schema");
   validateInspectionSource(detail, request);
   for (const [key, limit] of Object.entries(GENOME_LIMITS)) {
     if (detail.limits?.[key] !== limit) throw new Error("Genome page limits differ from the bounded protocol");
@@ -114,10 +117,10 @@ export function validateGenomeInspection(detail, request) {
     }
     for (const delta of diff.deltas) {
       const [kind, change] = tagged(delta);
-      if (!change || !["Scalar", "Retarget", "KindFlip"].includes(kind)) throw new Error("Invalid parent difference row");
+      if (!change || !["Scalar", "Scalar64", "Retarget", "KindFlip"].includes(kind)) throw new Error("Invalid parent difference row");
       validateLocus(change.locus);
       for (const value of [change.before, change.after]) {
-        if (kind === "Scalar" ? !Number.isFinite(value) : !count(value, kind === "KindFlip" ? 255 : 0xffff_ffff)) {
+        if (["Scalar", "Scalar64"].includes(kind) ? !Number.isFinite(value) : !count(value, kind === "KindFlip" ? 255 : 0xffff_ffff)) {
           throw new Error("Invalid parent difference value");
         }
       }

@@ -3498,7 +3498,7 @@ struct GenomeInspectionParams {
         ("delta_offset" = Option<usize>, Query, description = "Parent difference offset, a multiple of 32 up to 65536")
     ),
     responses(
-        (status = 200, body = Object, description = "Bounded scriptbots.genome-inspection.v1 canonical locus and parent-difference pages; unavailable source material is typed"),
+        (status = 200, body = Object, description = "Bounded scriptbots.genome-inspection.v2 exact f32/f64 locus and parent-difference pages; unavailable source material is typed"),
         (status = 400, body = ErrorResponse),
         (status = 409, body = ErrorResponse, description = "Host session or epoch changed"),
         (status = 503, body = ErrorResponse, description = "Owner read deadline or availability failure")

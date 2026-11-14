@@ -147,13 +147,13 @@ fn test_genome_browser_ui_e2e() -> Result<(), Box<dyn std::error::Error>> {
             let expected = decoded_loci.iter().find(|(l, _)| *l == locus);
             assert!(expected.is_some(), "node bias locus found in decoded loci");
             if let Some((_, LocusValue::Scalar(s))) = expected {
-                assert_eq!(bias, *s, "bias matches decoded locus value");
+                assert_eq!(bias, f64::from(*s), "bias matches decoded locus value");
             }
         }
         for conn in &node.connections {
             let locus = Locus::NodeWeight {
                 node: node.node_index,
-                conn: conn.conn_slot,
+                conn: u8::try_from(conn.conn_slot).expect("legacy connection slot fits u8"),
             };
             let expected = decoded_loci.iter().find(|(l, _)| *l == locus);
             assert!(
@@ -161,7 +161,7 @@ fn test_genome_browser_ui_e2e() -> Result<(), Box<dyn std::error::Error>> {
                 "connection weight locus found in decoded loci"
             );
             if let Some((_, LocusValue::Scalar(s))) = expected {
-                assert_eq!(conn.weight, *s, "weight matches decoded locus value");
+                assert_eq!(conn.weight, f64::from(*s), "weight matches decoded locus value");
             }
         }
     }

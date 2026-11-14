@@ -15799,7 +15799,7 @@ fn genome_node_pages(
     total: usize,
 ) -> Vec<String> {
     let scalar =
-        |value: Option<f32>| value.map_or_else(|| "unavailable".to_owned(), |v| format!("{v:+.4}"));
+        |value: Option<f64>| value.map_or_else(|| "unavailable".to_owned(), |v| format!("{v:+}"));
     let mut pages = Vec::new();
     for (index, node) in nodes.iter().enumerate() {
         let title = format!(
@@ -15828,7 +15828,7 @@ fn genome_node_pages(
                         |kind| bounded_inspector_text(&kind.lines().collect::<Vec<_>>().join(" ")),
                     );
                     format!(
-                        "Slot {} | target {} | weight {:+.4} | kind {}",
+                        "Slot {} | target {} | weight {:+} | kind {}",
                         connection.conn_slot, connection.target_node, connection.weight, kind
                     )
                 })
@@ -15879,6 +15879,13 @@ fn genome_delta_page(
                 after,
             } => {
                 format!("{}: target {} -> {}", locus.human(), before, after)
+            }
+            GenomeDelta::Scalar64 {
+                locus,
+                before,
+                after,
+            } => {
+                format!("{}: {before:?} -> {after:?}", locus.human())
             }
             GenomeDelta::KindFlip {
                 locus,
@@ -16430,8 +16437,8 @@ mod owner_inspector_tests {
                 connections: (0..9)
                     .map(|slot| BrowserConnectionView {
                         conn_slot: slot,
-                        target_node: 100 + u32::from(slot),
-                        weight: f32::from(slot) / 10.0,
+                        target_node: 100 + slot,
+                        weight: f64::from(slot) / 10.0,
                         kind: (slot == 0).then(|| "recurrent\nunsafe line".to_owned()),
                     })
                     .collect(),
@@ -16447,9 +16454,9 @@ mod owner_inspector_tests {
         let pages = genome_node_pages(&nodes, 20, 200);
         assert_eq!(pages.len(), 3);
         assert!(pages[0].starts_with("Genome node 47 | retained 21 of 200\n"));
-        assert!(pages[0].contains("Bias -0.5000 | damping unavailable | gain +1.2500"));
+        assert!(pages[0].contains("Bias -0.5 | damping unavailable | gain +1.25"));
         assert!(
-            pages[0].contains("Slot 0 | target 100 | weight +0.0000 | kind recurrent unsafe line")
+            pages[0].contains("Slot 0 | target 100 | weight +0 | kind recurrent unsafe line")
         );
         for slot in 0..9 {
             let expected = format!("Slot {slot} | target {} |", 100 + slot);
@@ -16514,6 +16521,45 @@ mod owner_inspector_tests {
     }
 
     #[test]
+    fn genome_f64_pages_show_one_ulp_and_signed_zero_changes() {
+        use scriptbots_core::genome_browser::{BrowserConnectionView, BrowserNodeView};
+        use scriptbots_core::genome_diff::{GenomeDelta, Locus};
+
+        let precise = f64::from_bits(1.0_f64.to_bits() + 1);
+        let locus = Locus::NodeWeightWide { node: 325, conn: 299 };
+        let deltas = [
+            GenomeDelta::Scalar64 {
+                locus,
+                before: 1.0,
+                after: precise,
+            },
+            GenomeDelta::Scalar64 {
+                locus: Locus::NodeBias(325),
+                before: -0.0,
+                after: 0.0,
+            },
+        ];
+        let page = genome_delta_page(&deltas, 0).unwrap();
+        assert!(page.contains("node 325 weight 299: 1.0 -> 1.0000000000000002"));
+        assert!(page.contains("node 325 bias: -0.0 -> 0.0"));
+        let nodes = [BrowserNodeView {
+            node_index: 325,
+            bias: Some(-0.0),
+            damping: None,
+            gain: None,
+            connections: vec![BrowserConnectionView {
+                conn_slot: 299,
+                target_node: 324,
+                weight: precise,
+                kind: None,
+            }],
+        }];
+        let pages = genome_node_pages(&nodes, 0, 1);
+        assert!(pages[0].contains("Bias -0"));
+        assert!(pages[0].contains("Slot 299 | target 324 | weight +1.0000000000000002"));
+    }
+
+    #[test]
     fn genome_slice_is_wired_into_owner_inspector_section() {
         use scriptbots_core::genome_browser::{
             BrowserConnectionView, BrowserNodeView, BrowserPagingMeta, GenomeBrowserViewModel,
@@ -16567,7 +16613,7 @@ mod owner_inspector_tests {
         assert!(summary.contains("Owner slice 1-1 of 100 | other nodes not loaded"));
         let node = &pages[sections.genome + 1];
         assert!(node.contains("Genome node 12 | retained 1 of 100"));
-        assert!(node.contains("Slot 2 | target 8 | weight -0.7500 | kind unavailable"));
+        assert!(node.contains("Slot 2 | target 8 | weight -0.75 | kind unavailable"));
         let mut sample = OwnerInspectorSample {
             target,
             sensors: detail.sensors,

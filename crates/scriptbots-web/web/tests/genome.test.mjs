@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { GENOME_LIMITS, GenomeInspectionController, validateGenomeInspection } from "../genome.js";
+import { GENOME_LIMITS, GenomeInspectionController, renderGenomeInspector, validateGenomeInspection } from "../genome.js";
 import { RemoteStreamClient } from "../remote.js";
 
 const UID = "18446744073709551615";
@@ -26,7 +26,7 @@ function detail(req, { total = 130, changed = 35 } = {}) {
   });
   const deltas = Array.from({ length: Math.min(32, changed - req.deltaOffset) }, (_, i) =>
     ({ Scalar: { locus: { Cell: req.deltaOffset + i }, before: 0, after: 0.5 } }));
-  return { schema: "scriptbots.genome-inspection.v1", uid: UID, limits: { ...GENOME_LIMITS }, status: "ready",
+  return { schema: "scriptbots.genome-inspection.v2", uid: UID, limits: { ...GENOME_LIMITS }, status: "ready",
     source: { sessionId: req.sessionId, epoch: req.epoch, tick: req.identity.tick,
       publicationRevision: req.identity.publicationRevision, published: revisions, inspected: { ...revisions } },
     familyId: "assembly", schemaVersion: 1, genomeDigest: HASH, generation: 4,
@@ -52,9 +52,59 @@ test("complete canonical loci and differences retain exact source, parents and i
   assert.equal(validateGenomeInspection(page, req).loci[0].value.Kind, 2, "operator locus is not an invented edge weight");
 });
 
+function preciseDetail(req) {
+  const page = detail(req, { total: 3, changed: 2 });
+  page.familyId = "neuroflow-f64-v1";
+  page.loci = [
+    { index: 0, label: "node 325 weight 299", locus: { NodeWeightWide: { node: 325, conn: 299 } },
+      value: { Scalar64: 1 + Number.EPSILON } },
+    { index: 1, label: "node 325 bias", locus: { NodeBias: 325 }, value: { Scalar64: 0 } },
+    { index: 2, label: "node 325 conn 299 target", locus: { NodeTargetWide: { node: 325, conn: 299 } },
+      value: { Target: 324 } },
+  ];
+  page.parentDiff.summary = { changed_loci: 2, total_loci: 3, l1: Number.EPSILON,
+    linf: Number.EPSILON, by_kind: { Scalar: 2 } };
+  // Parse the actual JSON number forms emitted by Rust, retaining its signed zero.
+  page.parentDiff.deltas = JSON.parse('[{"Scalar64":{"locus":{"NodeWeightWide":{"node":325,"conn":299}},"before":1.0,"after":1.0000000000000002}},{"Scalar64":{"locus":{"NodeBias":325},"before":-0.0,"after":0.0}}]');
+  return page;
+}
+
+test("f64 genome pages retain one-ULP differences, signed zero and wide connection identities", () => {
+  const req = request();
+  const page = validateGenomeInspection(preciseDetail(req), req);
+  assert.equal(page.loci[0].value.Scalar64, 1 + Number.EPSILON);
+  assert.equal(page.loci[2].locus.NodeTargetWide.conn, 299);
+  assert.equal(page.parentDiff.deltas[0].Scalar64.after - page.parentDiff.deltas[0].Scalar64.before, Number.EPSILON);
+  assert.equal(Object.is(page.parentDiff.deltas[1].Scalar64.before, -0), true);
+  assert.equal(Object.is(page.parentDiff.deltas[1].Scalar64.after, 0), true);
+  page.parentDiff = { status: "unavailable", reason: "numerical_overflow" };
+  assert.equal(validateGenomeInspection(page, req).loci.length, 3,
+    "an unrepresentable aggregate must not hide valid genome values");
+});
+
+test("genome rendering keeps f64 one-ULP changes and both zero signs visibly distinct", () => {
+  const element = () => ({ children: [], textContent: "", append(...children) { this.children.push(...children); },
+    replaceChildren(...children) { this.children = children; } });
+  const elements = new Map();
+  const panel = { dataset: {}, ownerDocument: { createElement: element },
+    querySelector(selector) {
+      if (!elements.has(selector)) elements.set(selector, element());
+      return elements.get(selector);
+    } };
+  renderGenomeInspector(panel, { status: "ready", uid: UID, detail: preciseDetail(request()) }, frame());
+  const values = elements.get("#genome-loci").children[0].children.map((cell) => cell.textContent);
+  assert.equal(values[3], "1.0000000000000002");
+  const deltas = elements.get("#genome-deltas").children.map((row) => row.children.map((cell) => cell.textContent));
+  assert.deepEqual(deltas[0].slice(2), ["1", "1.0000000000000002"]);
+  assert.deepEqual(deltas[1].slice(2), ["−0", "0"]);
+  assert.match(deltas[0][0], /slot 299/);
+  assert.match(elements.get("#genome-parent").textContent, /2\.220446049250313e-16/);
+});
+
 test("genome validation rejects malformed bounds, pages, lineage, values, summaries and material changes", () => {
   const req = request();
   for (const mutate of [
+    (d) => { d.schema = "scriptbots.genome-inspection.v1"; },
     (d) => { d.uid = "9007199254740994"; },
     (d) => { d.source.sessionId = "2"; },
     (d) => { d.source.epoch = "1"; },
@@ -68,6 +118,8 @@ test("genome validation rejects malformed bounds, pages, lineage, values, summar
     (d) => { d.loci.push(d.loci[0]); },
     (d) => { d.loci[0].index = 1; },
     (d) => { d.loci[0].value = { Scalar: Infinity }; },
+    (d) => { d.loci[0].value = { Scalar64: NaN }; },
+    (d) => { d.loci[0].locus = { NodeWeightWide: { node: 1, conn: 0x1_0000_0000 } }; },
     (d) => { d.loci[0].locus = { NodeWeight: { node: 1, conn: 256 } }; },
     (d) => { d.loci[0].label = "x".repeat(257); },
     (d) => { d.provenance.createdAt = "2"; },
@@ -79,6 +131,7 @@ test("genome validation rejects malformed bounds, pages, lineage, values, summar
     (d) => { d.parentDiff.summary.by_kind.Scalar = 34; },
     (d) => { d.parentDiff.summary.l1 = NaN; },
     (d) => { d.parentDiff.deltas[0].Scalar.after = Infinity; },
+    (d) => { d.parentDiff.deltas[0] = { Scalar64: { locus: { NodeBias: 1 }, before: 0, after: Infinity } }; },
   ]) {
     const value = detail(req); mutate(value);
     assert.throws(() => validateGenomeInspection(value, req));

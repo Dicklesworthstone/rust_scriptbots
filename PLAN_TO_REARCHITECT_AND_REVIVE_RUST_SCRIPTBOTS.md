@@ -2,6 +2,39 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Lossless NeuroFlow genome inspection (2026-11-14):**
+[Source implemented and independently reviewed — Codex; executable qualification open]
+
+NeuroFlow now exposes canonical inherited loci from its existing validated f64
+genome. Bias-first rows retain every scalar bit, including signed zero,
+subnormals and one-ULP differences, and wide connection addresses represent
+configured slots above 255 without aliasing. The architecture-bound heredity
+capability counts one primary mutation trial per actual bias/weight; immutable
+structural source loci do not inflate that denominator. This enrolls NeuroFlow
+in the existing typed heredity and genome-browser paths.
+
+Core differences and traces, runtime pages, browser validation, and GPUI/Bevy
+inspection now carry f64 values without narrowing. Difference summaries refuse
+non-finite or overflowing aggregates with typed unavailability while valid
+genome values remain inspectable. Existing f32 loci and deltas keep their old
+variant encodings; the f64 and wide-address variants are appended. The public
+genome-inspection wire schema advances to `scriptbots.genome-inspection.v2`
+with matching bundled browser validation and API documentation. Existing source
+and page bounds still apply, including explicit refusal of oversized sources.
+
+The opaque NeuroFlow genome/state codecs, adapter identity, evaluator,
+mutation/crossover algorithms and RNG routines are unchanged. Its separate
+heredity-capability attestation changes intentionally to include the new locus
+schema. Regression source covers exact bias/source order, mutation-trial counts,
+300-wide connections, malformed values, signed-zero/one-ULP serialization,
+finite aggregate overflow, SVG/PNG trace precision, wire bounds and browser/
+native rendering. The existing real-world continuation case also checks that
+repeated inspection preserves the full checkpoint and world digest before each
+transition. Independent source review is complete; compilation, Rust formatting,
+Clippy and all new test execution remain unqualified because the workspace
+became unavailable. This advances the genome-browser/heredity work in
+`bd-2z0.3` without claiming its remaining acceptance or platform qualification.
+
 **Opt-in browser recovery checkpoints (2026-11-14):**
 [Source implemented and independently reviewed — Codex; executable qualification open]
 

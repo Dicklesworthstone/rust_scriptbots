@@ -323,6 +323,8 @@ pub enum GenomeParentDiffUnavailable {
     InvalidGenome,
     /// Canonical addresses, shapes or value kinds do not align.
     IncompatibleLoci,
+    /// Exact scalar differences exceed the finite summary representation.
+    NumericalOverflow,
     /// The requested nonzero difference page starts beyond the full difference list.
     PageOutOfRange,
 }
@@ -462,7 +464,7 @@ fn decode_bounded_loci(
     }
     let mut seen = BTreeSet::new();
     if loci.iter().any(|(locus, value)| {
-        !seen.insert(*locus) || matches!(value, LocusValue::Scalar(value) if !value.is_finite())
+        !seen.insert(*locus) || !value.is_finite()
     }) {
         return Err(GenomeInspectionUnavailable::InvalidGenome);
     }
@@ -519,6 +521,9 @@ fn inspect_parent_diff(
                     GenomeParentDiffUnavailable::SchemaMismatch
                 }
                 GenomeDiffError::Unsupported { .. } => GenomeParentDiffUnavailable::Unsupported,
+                GenomeDiffError::NumericalOverflow { .. } => {
+                    GenomeParentDiffUnavailable::NumericalOverflow
+                }
                 _ => GenomeParentDiffUnavailable::IncompatibleLoci,
             });
         }
@@ -639,7 +644,7 @@ impl GenomeInspection {
         let outcome = inspect_genome_outcome(world, uid, locus_offset, delta_offset)
             .unwrap_or_else(|reason| GenomeInspectionOutcome::Unavailable { reason });
         let detail = Self {
-            schema: "scriptbots.genome-inspection.v1",
+            schema: "scriptbots.genome-inspection.v2",
             source: InspectionSource::new(source, world.epoch()),
             uid: uid.to_string(),
             limits: GenomeInspectionLimits::hard(),
@@ -784,6 +789,8 @@ mod tests {
             vec![],
             vec![locus, locus],
             vec![(Locus::Cell(0), LocusValue::Scalar(f32::NAN))],
+            vec![(Locus::NodeBias(0), LocusValue::Scalar64(f64::NAN))],
+            vec![(Locus::NodeBias(0), LocusValue::Scalar64(f64::INFINITY))],
         ] {
             assert_eq!(
                 decode_bounded_loci(Some(2), || Ok(loci)),
@@ -879,6 +886,63 @@ mod tests {
     }
 
     #[test]
+    fn genome_parent_diff_preserves_f64_ulp_and_signed_zero_and_types_overflow() {
+        let (parent, child) = genome_pair();
+        let locus = Locus::NodeWeightWide { node: 325, conn: 299 };
+        let next = f64::from_bits(1.0_f64.to_bits() + 1);
+        let before = vec![
+            (locus, LocusValue::Scalar64(1.0)),
+            (Locus::NodeBias(325), LocusValue::Scalar64(-0.0)),
+        ];
+        let after = [
+            (locus, LocusValue::Scalar64(next)),
+            (Locus::NodeBias(325), LocusValue::Scalar64(0.0)),
+        ];
+        let diff = inspect_parent_diff(&child, Some(&parent), &after, 0, Some(2), |_| {
+            Ok(before)
+        });
+        let encoded = serde_json::to_string(&diff).unwrap();
+        assert!(encoded.contains("1.0000000000000002"));
+        assert!(encoded.contains("-0.0"));
+        assert!(encoded.contains("NodeWeightWide"));
+        let GenomeParentDiff::Ready { deltas, summary, .. } = diff else {
+            panic!("finite exact f64 genes must be inspectable");
+        };
+        assert_eq!(summary.changed_loci, 2);
+        assert_eq!(summary.l1.to_bits(), f64::EPSILON.to_bits());
+        let GenomeDelta::Scalar64 { before, after, .. } = deltas[0] else {
+            panic!("a one-ULP difference must remain f64");
+        };
+        assert_eq!(before.to_bits(), 1.0_f64.to_bits());
+        assert_eq!(after.to_bits(), next.to_bits());
+        let GenomeDelta::Scalar64 { before, after, .. } = deltas[1] else {
+            panic!("a signed-zero difference must remain f64");
+        };
+        assert_eq!(before.to_bits(), (-0.0_f64).to_bits());
+        assert_eq!(after.to_bits(), 0.0_f64.to_bits());
+
+        let unrepresentable = inspect_parent_diff(
+            &child,
+            Some(&parent),
+            &[(locus, LocusValue::Scalar64(f64::MAX))],
+            0,
+            Some(1),
+            |_| Ok(vec![(locus, LocusValue::Scalar64(-f64::MAX))]),
+        );
+        assert_eq!(
+            unrepresentable,
+            GenomeParentDiff::Unavailable {
+                reason: GenomeParentDiffUnavailable::NumericalOverflow,
+            }
+        );
+        assert!(
+            serde_json::to_string(&unrepresentable)
+                .unwrap()
+                .contains("numerical_overflow")
+        );
+    }
+
+    #[test]
     fn genome_parent_diff_refuses_missing_changed_over_budget_and_misaligned_material() {
         let (parent, child) = genome_pair();
         let loci = [(Locus::NodeBias(0), LocusValue::Scalar(1.0))];
@@ -960,9 +1024,10 @@ mod tests {
             control: identity.clone(),
             config: identity.clone(),
         };
-        let locus_at = |index: usize| Locus::NodeWeight {
+        const LARGE_SCALAR: f64 = 1.234_567_890_123_456_7e250;
+        let locus_at = |index: usize| Locus::NodeWeightWide {
             node: u32::MAX - u32::try_from(index).unwrap(),
-            conn: u8::MAX,
+            conn: u32::MAX,
         };
         let mut by_kind = std::collections::BTreeMap::new();
         by_kind.insert(
@@ -970,7 +1035,7 @@ mod tests {
             MAX_GENOME_SOURCE_LOCI,
         );
         let detail = GenomeInspection {
-            schema: "scriptbots.genome-inspection.v1",
+            schema: "scriptbots.genome-inspection.v2",
             source: InspectionSource {
                 session_id: identity.clone(),
                 epoch: identity.clone(),
@@ -1008,7 +1073,7 @@ mod tests {
                                 index: MAX_GENOME_SOURCE_LOCI - GENOME_LOCUS_PAGE_SIZE + index,
                                 label: locus.human(),
                                 locus,
-                                value: LocusValue::Scalar(-f32::MAX),
+                                value: LocusValue::Scalar64(-LARGE_SCALAR),
                             }
                         })
                         .collect(),
@@ -1019,10 +1084,10 @@ mod tests {
                         summary: DiffSummary {
                             changed_loci: MAX_GENOME_SOURCE_LOCI,
                             total_loci: MAX_GENOME_SOURCE_LOCI,
-                            l1: f64::from(f32::MAX)
+                            l1: LARGE_SCALAR
                                 * 2.0
                                 * f64::from(u32::try_from(MAX_GENOME_SOURCE_LOCI).unwrap()),
-                            linf: f64::from(f32::MAX) * 2.0,
+                            linf: LARGE_SCALAR * 2.0,
                             by_kind,
                         },
                         paging: GenomeInspectionPage::new(
@@ -1031,10 +1096,10 @@ mod tests {
                             MAX_GENOME_SOURCE_LOCI,
                         ),
                         deltas: (0..GENOME_DELTA_PAGE_SIZE)
-                            .map(|index| GenomeDelta::Scalar {
+                            .map(|index| GenomeDelta::Scalar64 {
                                 locus: locus_at(index),
-                                before: -f32::MAX,
-                                after: f32::MAX,
+                                before: -LARGE_SCALAR,
+                                after: LARGE_SCALAR,
                             })
                             .collect(),
                     },
