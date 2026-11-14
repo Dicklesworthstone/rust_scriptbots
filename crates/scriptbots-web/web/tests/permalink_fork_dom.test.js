@@ -766,6 +766,104 @@ async function runOwnerLifecycleCases(page, context) {
   }
   observations.browserStorage = { storedRefusals, quotaMessage, staleStoredReads };
 
+  // Production recovery controls with real IndexedDB and the explicit owner
+  // double. These observations cover persistence/lifecycle, not codec validity.
+  const waitRecovery = async (expected) => {
+    let timeout;
+    try {
+      return await Promise.race([
+        page.evaluate((expected) => new Promise((resolve) => {
+          const status = document.getElementById("checkpoint-recovery-status");
+          const check = () => {
+            if ((expected.state === undefined || status.dataset.state === expected.state)
+                && (expected.tick === undefined || status.dataset.savedTick === expected.tick)
+                && (expected.text === undefined || status.textContent.includes(expected.text))) {
+              observer.disconnect();
+              resolve(status.textContent);
+            }
+          };
+          const observer = new MutationObserver(check);
+          observer.observe(status, { attributes: true, childList: true, characterData: true, subtree: true });
+          check();
+        }), expected),
+        new Promise((_, reject) => {
+          timeout = setTimeout(() => reject(new Error(`Recovery did not reach ${JSON.stringify(expected)}`)), 10_000);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timeout);
+    }
+  };
+  const enableRecovery = (enabled) => page.evaluate((enabled) => {
+    const input = document.getElementById("checkpoint-recovery-enabled");
+    if (input.disabled) throw new Error("Recovery unexpectedly disabled for the active local world");
+    input.checked = enabled;
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+  }, enabled);
+  await setSpeed(0);
+  await context.clock.runFor(32);
+  const recoveryOwner = activeOwner(await state());
+  if (await page.isChecked("#checkpoint-recovery-enabled")) throw new Error("Recovery opted in without user input");
+  await enableRecovery(true);
+  await context.clock.runFor(32);
+  await waitRecovery({ state: "enabled", tick: String(recoveryOwner.tick) });
+  const firstRecovery = await page.evaluate(async () => {
+    const { BrowserContinuationStore } = await import("/continuation-store.js");
+    const store = new BrowserContinuationStore(1024);
+    const record = await store.readRecovery();
+    const manual = await store.read();
+    const bytes = new Uint8Array(await record.blob.arrayBuffer());
+    return { tick: record.tick, source: record.source, manualTick: manual.tick,
+      byteTick: String(new DataView(bytes.buffer).getBigUint64(1, true)), byteTag: bytes[0] };
+  });
+  if (firstRecovery.tick !== String(recoveryOwner.tick) || firstRecovery.byteTick !== firstRecovery.tick
+      || firstRecovery.byteTag !== 42 || firstRecovery.source.sessionId !== String(2000 + recoveryOwner.id)
+      || firstRecovery.manualTick !== "37" || activeOwner(await state()).tick !== recoveryOwner.tick) {
+    throw new Error("Recovery saved a different owner cut, changed the manual slot, or advanced paused science");
+  }
+
+  await enableRecovery(false);
+  await setSpeed(1);
+  await context.clock.runFor(64);
+  await setSpeed(0);
+  const changedRecoveryTick = String(activeOwner(await state()).tick);
+  if (changedRecoveryTick === firstRecovery.tick) throw new Error("Recovery fixture did not create a newer scientific state");
+  await page.evaluate(() => {
+    const put = IDBObjectStore.prototype.put;
+    IDBObjectStore.prototype.put = function (record, key) {
+      if (key === "recovery") {
+        IDBObjectStore.prototype.put = put;
+        throw new DOMException("Controlled recovery quota refusal", "QuotaExceededError");
+      }
+      return put.call(this, record, key);
+    };
+  });
+  await enableRecovery(true);
+  await context.clock.runFor(32);
+  const recoveryQuota = await waitRecovery({ state: "error", tick: firstRecovery.tick, text: "quota" });
+  if (await page.isDisabled("#checkpoint-recovery-retry")) throw new Error("Recovery failure did not offer explicit retry");
+  const retainedRecoveryTick = await page.evaluate(async () => {
+    const { BrowserContinuationStore } = await import("/continuation-store.js");
+    return (await new BrowserContinuationStore(1024).readRecovery()).tick;
+  });
+  if (retainedRecoveryTick !== firstRecovery.tick) throw new Error("Quota refusal replaced the committed recovery slot");
+  await page.evaluate(() => document.getElementById("checkpoint-recovery-retry").click());
+  await context.clock.runFor(32);
+  await waitRecovery({ state: "enabled", tick: changedRecoveryTick });
+
+  await replace("reset");
+  if (await page.isChecked("#checkpoint-recovery-enabled")) throw new Error("Reset inherited the previous owner's recovery opt-in");
+  await page.evaluate(() => document.getElementById("checkpoint-recovery-restore").click());
+  await waitRecovery({ state: "off", tick: changedRecoveryTick, text: "Restored recovery at tick" });
+  await context.clock.runFor(32);
+  const restoredRecovery = await state();
+  if (String(activeOwner(restoredRecovery).tick) !== changedRecoveryTick || restoredRecovery.speed !== "0"
+      || await page.isChecked("#checkpoint-recovery-enabled") || restoredRecovery.pendingTimers !== 1) {
+    throw new Error("Recovery restore did not install exactly one paused owner with fresh opt-in");
+  }
+  observations.browserRecovery = { firstRecovery, recoveryQuota, restoredTick: changedRecoveryTick,
+    restoredOwner: activeOwner(restoredRecovery).id };
+
   // Production DOM/controller integration with the explicit WASM double above.
   // This proves presentation and owner lifetime, not real detector generation.
   await setSpeed(0);

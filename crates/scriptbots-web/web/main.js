@@ -3,7 +3,7 @@ import { CanvasRenderer } from "./renderers/canvas.js";
 import { WebGpuRenderer } from "./renderers/webgpu.js";
 import { environmentDescription } from "./renderers/environment.js";
 import { RemoteStreamClient } from "./remote.js";
-import { BrowserContinuationStore } from "./continuation-store.js";
+import { BrowserContinuationStore, BrowserRecoveryController } from "./continuation-store.js";
 import { InspectionController, pickAgent, renderInspector, renderInspectorSource,
   validateBrainInspection, renderBrainInspector, renderBrainSource } from "./inspector.js";
 import { GenomeInspectionController, renderGenomeInspector, renderGenomeSource } from "./genome.js";
@@ -62,6 +62,13 @@ const browserRestoreButton = document.getElementById("checkpoint-browser-restore
 const browserCheckpointStatus = document.getElementById("checkpoint-browser-status");
 let browserContinuationStore = null;
 let browserStorePending = false;
+const recoveryEnabled = document.getElementById("checkpoint-recovery-enabled");
+const recoveryRestoreButton = document.getElementById("checkpoint-recovery-restore");
+const recoveryRetryButton = document.getElementById("checkpoint-recovery-retry");
+const recoveryStatus = document.getElementById("checkpoint-recovery-status");
+let browserRecovery = null;
+let recoveryRecord = null;
+let recoveryReadStatus = "Checking for a recovery checkpoint…";
 const stepsSlider = document.getElementById("steps-per-frame");
 const populationSlider = document.getElementById("population");
 const logView = document.getElementById("log");
@@ -603,7 +610,10 @@ stepsSlider.addEventListener("input", () => {
   appendLog(`Simulation speed set to ${speedMultiplier}×`);
 });
 
-document.addEventListener("visibilitychange", applyPlaybackSpeed);
+document.addEventListener("visibilitychange", () => {
+  applyPlaybackSpeed();
+  updateCheckpointControls();
+});
 
 populationSlider.addEventListener("input", () => {
   population = Number(populationSlider.value);
@@ -658,10 +668,11 @@ function updateRemoteControls() {
 
 function updateCheckpointControls() {
   const supportsContinuation = activeBrainPreset !== "wander";
+  const recoveryBusy = browserRecovery?.pending === true;
   if (brainPresetSelect) brainPresetSelect.disabled = remoteMode;
   if (checkpointSaveButton) checkpointSaveButton.disabled = remoteMode || !simHandle || checkpointLoadPending || !supportsContinuation;
-  if (checkpointLoadInput) checkpointLoadInput.disabled = remoteMode || !wasmInitialized || checkpointLoadPending || browserStorePending;
-  const storageBusy = remoteMode || !browserContinuationStore || checkpointLoadPending || browserStorePending;
+  if (checkpointLoadInput) checkpointLoadInput.disabled = remoteMode || !wasmInitialized || checkpointLoadPending || browserStorePending || recoveryBusy;
+  const storageBusy = remoteMode || !browserContinuationStore || checkpointLoadPending || browserStorePending || recoveryBusy;
   if (browserSaveButton) browserSaveButton.disabled = storageBusy || !simHandle || !supportsContinuation;
   if (browserRestoreButton) browserRestoreButton.disabled = storageBusy;
   if (checkpointCapability) checkpointCapability.textContent = remoteMode
@@ -669,7 +680,34 @@ function updateCheckpointControls() {
     : !supportsContinuation
       ? "This Wander world is a movement demo without inherited genomes or saved continuations. Choose MLP, DWRAON or Assembly, then Reset Simulation to start an evolving world."
       : "This local world supports saved continuations. Loading a continuation preserves its brain family and resumes paused.";
+  browserRecovery?.setAvailable(!remoteMode && !!simHandle && supportsContinuation && !document.hidden
+    && !queuedReset && !checkpointLoadPending && !browserStorePending);
+  renderRecoveryControls();
   updateRecipeControls();
+}
+
+function renderRecoveryControls() {
+  const busy = browserStorePending || checkpointLoadPending;
+  if (recoveryEnabled) {
+    recoveryEnabled.checked = browserRecovery?.enabled === true;
+    recoveryEnabled.disabled = !browserRecovery || remoteMode || !simHandle || activeBrainPreset === "wander" || busy;
+  }
+  if (recoveryRestoreButton) recoveryRestoreButton.disabled = remoteMode || !wasmInitialized
+    || !browserContinuationStore || busy || browserRecovery?.pending === true;
+  if (recoveryRetryButton) recoveryRetryButton.disabled = remoteMode || !browserRecovery?.enabled
+    || !browserRecovery.error || busy || browserRecovery.pending;
+  if (!recoveryStatus) return;
+  let state = "Recovery is off for this world.";
+  if (browserRecovery?.pending) state = browserRecovery.enabled ? "Saving a recovery checkpoint…" : "Cancelling the previous world's recovery write…";
+  else if (browserRecovery?.error) state = `Recovery stopped: ${browserRecovery.error.message} Use Retry Recovery after resolving the error.`;
+  else if (browserRecovery?.enabled) state = browserRecovery.available
+    ? "Recovery is on: saving changed owner state at most once every 30 seconds."
+    : "Recovery is on, with new saves suspended while the page is hidden or another save/load is active.";
+  const saved = recoveryRecord ? ` Last observed recovery: ${storedContinuationDescription(recoveryRecord)}.` : "";
+  recoveryStatus.dataset.state = browserRecovery?.pending ? "saving" : browserRecovery?.error ? "error"
+    : browserRecovery?.enabled ? "enabled" : "off";
+  recoveryStatus.dataset.savedTick = recoveryRecord?.tick ?? "";
+  recoveryStatus.textContent = `${state}${saved}${recoveryReadStatus ? ` ${recoveryReadStatus}` : ""}`;
 }
 
 function receiveRemoteFrame(frame) {
@@ -764,6 +802,8 @@ function connectRemote() {
     remoteClient = nextClient;
     installedClient = true;
     remoteMode = true;
+    recoveryReadStatus = "";
+    browserRecovery?.attach(null);
     remoteConnected = false;
     remoteFrame = null;
     lastRemoteRequestId = null;
@@ -805,6 +845,7 @@ remoteLocal.addEventListener("click", () => {
   experiments.setEnabled(false);
   remoteClient?.disconnect();
   remoteMode = false;
+  browserRecovery?.attach(simHandle);
   remoteConnected = false;
   remoteClient = null;
   remoteFrame = null;
@@ -1080,6 +1121,7 @@ function captureAdmittedFrame(frameIdentity) {
 }
 
 window.addEventListener("pagehide", () => {
+  browserRecovery?.setEnabled(false);
   narrative.setEnabled(false);
   checkpointLab.setEnabled(false);
   experiments.setEnabled(false);
@@ -1253,6 +1295,8 @@ function replaceSimulation(next, { continuation = false, permalink = null, expec
 
   const previous = simHandle;
   simHandle = next;
+  recoveryReadStatus = "";
+  browserRecovery?.attach(next);
   activeBrainPreset = brainPreset;
   activeLaunchInfo = launchInfo;
   latestForkedLink = null;
@@ -1310,6 +1354,14 @@ function pumpSimulation() {
     if (simulationTimer !== null) clearTimeout(simulationTimer);
     simulationTimer = null;
     return;
+  }
+  if (browserRecovery?.enabled) {
+    browserRecovery.setAvailable(!document.hidden && !checkpointLoadPending && !browserStorePending
+      && !queuedReset && activeBrainPreset !== "wander");
+    // Recovery observes the completed owner boundary. Capturing never drives
+    // elapsed time, and a stalled storage write cannot enqueue more snapshots.
+    void browserRecovery.poll(() => simHandle.frame().identity,
+      () => new Blob([simHandle.checkpoint()], { type: "application/octet-stream" }));
   }
   // One outstanding callback, no snapshot queue. HostCore owns deadlines and
   // its unchanged catch-up bound; timer jitter never becomes a render tick.
@@ -1649,14 +1701,76 @@ async function discoverBrowserContinuation() {
       : "No continuation saved in this browser. Save replaces the one saved slot.";
   } catch (error) {
     browserCheckpointStatus.textContent = `Browser save discovery failed: ${error.message || error}`;
+  }
+  try {
+    const record = await browserContinuationStore.readRecovery();
+    recoveryRecord = record ? { tick: record.tick, savedAt: record.savedAt,
+      byteLength: record.blob.size, source: record.source } : null;
+    recoveryReadStatus = record ? "Restore Recovery World validates this saved state and starts paused."
+      : "No recovery checkpoint is stored yet.";
+  } catch (error) {
+    recoveryReadStatus = `Recovery discovery failed: ${error.message || error}`;
   } finally {
     browserStorePending = false;
     updateCheckpointControls();
   }
 }
 
+recoveryEnabled?.addEventListener("change", () => {
+  if (!browserRecovery || remoteMode || !simHandle || activeBrainPreset === "wander"
+      || browserStorePending || checkpointLoadPending) {
+    renderRecoveryControls();
+    return;
+  }
+  recoveryReadStatus = "";
+  browserRecovery.setEnabled(recoveryEnabled.checked);
+});
+
+recoveryRetryButton?.addEventListener("click", () => {
+  if (!browserRecovery?.enabled || remoteMode || browserStorePending || checkpointLoadPending || browserRecovery.pending) return;
+  recoveryReadStatus = "";
+  browserRecovery.retry();
+});
+
+recoveryRestoreButton?.addEventListener("click", async () => {
+  if (remoteMode || !wasmInitialized || !browserContinuationStore || browserStorePending || checkpointLoadPending || browserRecovery?.pending) return;
+  const generation = simulationGeneration;
+  const original = simHandle;
+  browserRecovery?.setEnabled(false);
+  browserStorePending = true;
+  checkpointLoadPending = true;
+  recoveryReadStatus = "Reading the recovery checkpoint…";
+  updateCheckpointControls();
+  try {
+    const record = await browserContinuationStore.readRecovery();
+    if (continuationReadIsStale(generation, original)) {
+      recoveryReadStatus = "Recovery restore cancelled because the active world changed.";
+      return;
+    }
+    if (!record) {
+      recoveryRecord = null;
+      recoveryReadStatus = "No recovery checkpoint is stored yet.";
+      return;
+    }
+    recoveryRecord = { tick: record.tick, savedAt: record.savedAt, byteLength: record.blob.size, source: record.source };
+    const bytes = new Uint8Array(await record.blob.arrayBuffer());
+    if (continuationReadIsStale(generation, original)) {
+      recoveryReadStatus = "Recovery restore cancelled because the active world changed.";
+      return;
+    }
+    const installed = installContinuation(bytes, record.tick);
+    recoveryReadStatus = `Restored recovery at tick ${installed.frame.identity.tick}; paused. Enable recovery explicitly for this restored world.`;
+  } catch (error) {
+    recoveryReadStatus = `Recovery restore failed: ${error.message || error}`;
+  } finally {
+    browserStorePending = false;
+    checkpointLoadPending = false;
+    updateCheckpointControls();
+  }
+});
+
 browserSaveButton?.addEventListener("click", async () => {
-  if (remoteMode || !simHandle || !browserContinuationStore || browserStorePending || checkpointLoadPending) return;
+  if (remoteMode || !simHandle || !browserContinuationStore || browserStorePending || checkpointLoadPending || browserRecovery?.pending) return;
   const generation = simulationGeneration;
   browserStorePending = true;
   browserCheckpointStatus.textContent = "Saving continuation in this browser…";
@@ -1680,7 +1794,7 @@ browserSaveButton?.addEventListener("click", async () => {
 });
 
 browserRestoreButton?.addEventListener("click", async () => {
-  if (remoteMode || !wasmInitialized || !browserContinuationStore || browserStorePending || checkpointLoadPending) return;
+  if (remoteMode || !wasmInitialized || !browserContinuationStore || browserStorePending || checkpointLoadPending || browserRecovery?.pending) return;
   const generation = simulationGeneration;
   const original = simHandle;
   browserStorePending = true;
@@ -1718,7 +1832,7 @@ browserRestoreButton?.addEventListener("click", async () => {
 checkpointLoadInput?.addEventListener("change", async () => {
   const file = checkpointLoadInput.files?.[0];
   checkpointLoadInput.value = "";
-  if (!file || remoteMode || !wasmInitialized || checkpointLoadPending || browserStorePending) return;
+  if (!file || remoteMode || !wasmInitialized || checkpointLoadPending || browserStorePending || browserRecovery?.pending) return;
   const generation = simulationGeneration;
   const original = simHandle;
   checkpointLoadPending = true;
@@ -1746,6 +1860,10 @@ async function bootstrap() {
     await initWasm();
     wasmInitialized = true;
     browserContinuationStore = new BrowserContinuationStore(wasm.checkpoint_byte_limit());
+    browserRecovery = new BrowserRecoveryController(browserContinuationStore, {
+      onChange: updateCheckpointControls,
+      onSaved: (record) => { recoveryRecord = record; recoveryReadStatus = "Recovery transaction completed in this browser."; },
+    });
     // GPU initialization must not hold up science or the first visible frame.
     await selectRenderer("canvas");
     if (rendererSelect.value !== "canvas") {

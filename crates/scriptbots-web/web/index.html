@@ -528,6 +528,14 @@
                 <button id="checkpoint-browser-restore" type="button" disabled>Restore Saved World (paused)</button>
                 <p>One saved continuation for this site and browser. Save replaces it; restore is always explicit. Browser storage can be cleared, so download a file for a portable copy.</p>
                 <div id="checkpoint-browser-status" role="status" aria-live="polite"></div>
+                <label for="checkpoint-recovery-enabled">
+                    <input id="checkpoint-recovery-enabled" type="checkbox" disabled />
+                    Automatically save recovery for this world
+                </label>
+                <p>Saves changed state at most every 30 seconds in a separate recovery slot; your manual save stays intact. Reset, restore or remote mode turns recovery off. A reload never restores automatically.</p>
+                <button id="checkpoint-recovery-restore" type="button" disabled>Restore Recovery World (paused)</button>
+                <button id="checkpoint-recovery-retry" type="button" disabled>Retry Recovery</button>
+                <div id="checkpoint-recovery-status" role="status" aria-live="polite">Recovery is off. Browser storage may be cleared or evicted; download a continuation file for a portable copy.</div>
             </div>
             <div class="controls" aria-label="Remote simulation">
                 <div class="chip">Remote Server</div>

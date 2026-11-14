@@ -2,6 +2,38 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Opt-in browser recovery checkpoints (2026-11-14):**
+[Source implemented and independently reviewed — Codex; executable qualification open]
+
+The local browser owner can now save automatic recovery checkpoints after
+explicit opt-in. The first eligible owner timer callback attempts a save;
+subsequent changed scientific, control or configuration revisions are eligible
+at most once every 30 seconds. This uses a separate, versioned IndexedDB slot
+and preserves the user's manual saved continuation. Capture observes an exact
+owner boundary, does not advance science, never runs from RAF, and admits only
+one pending capture/write. Hidden pages and manual save/load suspend new work.
+
+The panel acknowledges only transaction completion, exposes the exact saved
+tick and time, and latches storage failures until an explicit retry. Reset,
+restore, owner replacement and remote mode disable recovery and cancel pending
+work when still possible; late completion cannot acknowledge a replaced owner.
+Pagehide also disables recovery while retaining the owner attachment for a
+back/forward-cache return. Reload offers explicit validation and paused restore,
+without offline catch-up or silent replacement of the current world.
+
+Ten new unit cases cover separate slots, exact integer and byte bounds, commit
+acknowledgement, cancellation while opening or committing, bounded pending work,
+same-tick revisions, owner replacement, source changes and quota retry. The
+extended Playwright lifecycle journey uses real IndexedDB with the existing
+explicit WASM owner double; it covers UI admission, saved-source identity,
+manual-slot preservation, quota refusal/retry, reset opt-out and paused restore.
+It does not qualify the production WASM checkpoint codec. These new cases and
+the browser/compiler/format gates remain unexecuted after the workspace became
+unavailable. This contributes functional recovery to `bd-ywtv`; browser eviction
+and per-slot cross-tab last-completed-write behavior remain visible limitations.
+It does not establish SQLite-image or journal durability, and the original
+durability and cross-platform acceptance requirements remain open.
+
 **Publication-driven remote streams (2026-11-14):**
 [Source implemented and independently reviewed — Codex; runtime compiler check passed]
 

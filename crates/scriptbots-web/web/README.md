@@ -150,11 +150,25 @@ history/credit handling; nonempty narrative delivery requires observed records.
   replaces one IndexedDB slot for this site and browser profile. The save is
   acknowledged only when the transaction completes. A reload displays the saved
   tick and time; **Restore Saved World** is always explicit and starts paused,
-  without adding ticks for offline time. There is no autosave. Browser storage
-  clearing or eviction can remove the slot, so download a file for a portable
+  without adding ticks for offline time. Automatic recovery is off until you
+  enable it separately. Browser storage clearing or eviction can remove either
+  slot, so download a file for a portable
   copy. Quota/abort errors keep the previous save, and invalid or stale restores
   preserve the active world. Both local restore paths work after an invalid
   startup permalink; all local continuation controls are disabled in remote mode.
+- **Automatic recovery (local)**: opt in for the current world to attempt an
+  immediate save on the next owner timer callback, then save changed owner
+  state at most once every 30 seconds. Recovery uses its own IndexedDB
+  slot and never replaces **Save in This Browser**. An independent owner timer
+  observes completed science, control and configuration revisions; rendering
+  never triggers a save or a simulation tick. Hidden pages suspend new captures.
+  One capture/write can be pending, with newer changes coalesced into the next
+  eligible save. The panel shows the last transaction-confirmed tick and time.
+  A storage failure pauses recovery until **Retry Recovery** is selected.
+  Reset, restore and local/remote owner changes disable recovery and cancel an
+  outstanding write when the browser still permits it. Enabling it for a new
+  owner is explicit. After reload, **Restore Recovery World (paused)** validates the saved
+  continuation and restores it paused; nothing restores or catches up silently.
 - **Saved-world experiments (remote)**: connect to a server and open the
   **Saved-world experiments** panel. Save a server checkpoint or select an
   existing one, then run an unchanged future or a paired treatment/control
@@ -380,10 +394,18 @@ reset/remote mode using its explicit WASM double.
 its controlled IndexedDB events test adapter ordering, error handling and bounds,
 not real browser persistence or the Rust codec.
 
-The saved slot contains an opaque full-owner checkpoint Blob, not a database
-image or a batch journal. It leaves internal `CommittedVolatile` receipts intact
-and does not qualify the full SQLite-image/journal `Durable` path in `bd-ywtv`.
-Multiple tabs share the slot; the last completed manual save wins.
+Each saved slot contains an opaque full-owner checkpoint Blob, not a database
+image or a batch journal. The manual and recovery slots are separate and each
+holds one bounded checkpoint. They leave internal `CommittedVolatile` receipts
+intact and do not qualify the full SQLite-image/journal `Durable` path in
+`bd-ywtv`. Multiple tabs share both slots; the last completed transaction for a
+slot wins. An aborted replacement retains its prior save. A tab's cancelled
+pending IndexedDB open cannot accumulate opens or start a late write.
+
+Recovery-specific storage/controller regressions and the lifecycle harness cover
+these new paths. Their source was reviewed, but execution was blocked when the
+working environment became unavailable; no new browser durability or platform
+qualification is claimed.
 
 For determinism validation, run the accompanying WASM parity test:
 
