@@ -4122,6 +4122,41 @@ pub mod renderer {
         Arc::new(move |request| {
             let result =
                 match request {
+                    LabWorkflowRequest::BranchCapabilities => native_lab_branch_capabilities()
+                        .map(LabWorkflowResponse::BranchCapabilities),
+                    LabWorkflowRequest::CreateCheckpointBranch {
+                        request_id,
+                        session_id,
+                        draft,
+                    } => create_lab_checkpoint_branch(&control, request_id, session_id, draft),
+                    LabWorkflowRequest::ListCheckpointBranches { cursor } => control
+                        .list_checkpoint_branches(Some(LAB_PAGE_SIZE), cursor.as_deref())
+                        .map(|page| {
+                            LabWorkflowResponse::CheckpointBranches(
+                                scriptbots_runtime::lab_workflows::LabCheckpointBranchPage {
+                                    items: page
+                                        .items
+                                        .into_iter()
+                                        .map(project_lab_checkpoint_branch)
+                                        .collect(),
+                                    total: page.total,
+                                    offset: page.offset,
+                                    next_cursor: page.next_cursor,
+                                },
+                            )
+                        }),
+                    LabWorkflowRequest::GetCheckpointBranch { branch_id } => control
+                        .get_checkpoint_branch(&branch_id)
+                        .map(project_lab_checkpoint_branch)
+                        .map(LabWorkflowResponse::CheckpointBranch),
+                    LabWorkflowRequest::CancelCheckpointBranch { branch_id } => control
+                        .cancel_checkpoint_branch(&branch_id)
+                        .map(project_lab_checkpoint_branch)
+                        .map(LabWorkflowResponse::CheckpointBranch),
+                    LabWorkflowRequest::GetCheckpointBranchReport { branch_id } => {
+                        read_lab_checkpoint_branch_report(&control, &branch_id)
+                            .map(LabWorkflowResponse::CheckpointBranchReport)
+                    }
                     LabWorkflowRequest::ExperimentCapabilities => {
                         Ok(LabWorkflowResponse::ExperimentCapabilities(
                             native_lab_experiment_capabilities(),
@@ -4297,8 +4332,384 @@ pub mod renderer {
     }
 
     #[cfg(any(feature = "gui", feature = "bevy_render", test))]
-    fn native_lab_experiment_capabilities(
-    ) -> scriptbots_runtime::lab_workflows::LabExperimentCapabilities {
+    fn native_lab_branch_capabilities() -> Result<
+        scriptbots_runtime::lab_workflows::LabBranchCapabilities,
+        crate::control::ControlError,
+    > {
+        Ok(scriptbots_runtime::lab_workflows::LabBranchCapabilities {
+            max_ticks: crate::control::MAX_CHECKPOINT_BRANCH_TICKS,
+            max_population: usize::try_from(crate::branch_study::MAX_STUDY_POPULATION).map_err(
+                |_| {
+                    crate::control::ControlError::PayloadTooLarge(
+                        "branch population limit cannot be represented on this target".into(),
+                    )
+                },
+            )?,
+        })
+    }
+
+    #[cfg(any(feature = "gui", feature = "bevy_render", test))]
+    fn project_lab_checkpoint_branch(
+        branch: crate::control::CheckpointBranchStatusDto,
+    ) -> scriptbots_runtime::lab_workflows::LabCheckpointBranch {
+        scriptbots_runtime::lab_workflows::LabCheckpointBranch {
+            branch_id: branch.branch_id,
+            checkpoint_id: branch.checkpoint_id,
+            branch_name: branch.branch_name,
+            status: branch.status,
+            source_tick: branch.source_tick,
+            target_tick: branch.target_tick,
+            world_digest: branch.world_digest_v1,
+            artifact_id: branch.artifact_id,
+            error_reason: branch
+                .error_reason
+                .map(|reason| reason.chars().take(512).collect()),
+        }
+    }
+
+    #[cfg(any(feature = "gui", feature = "bevy_render", test))]
+    fn create_lab_checkpoint_branch(
+        control: &crate::control::ControlHandle,
+        request_id: String,
+        session_id: scriptbots_runtime::HostSessionId,
+        draft: scriptbots_runtime::lab_workflows::LabBranchDraft,
+    ) -> Result<scriptbots_runtime::lab_workflows::LabWorkflowResponse, crate::control::ControlError>
+    {
+        use crate::branch_study::StudyIntervention;
+        use crate::control::{CheckpointBranchRequest, ControlError};
+        use scriptbots_runtime::lab_workflows::{
+            LabBranchTreatment, LabWorkflowResponse, checkpoint_request_identity_is_valid,
+        };
+
+        if !checkpoint_request_identity_is_valid(&request_id) {
+            return Err(ControlError::BadRequest(
+                "native branch request identity must contain 1..=256 bytes without control characters"
+                    .into(),
+            ));
+        }
+        draft
+            .validate(&native_lab_branch_capabilities()?)
+            .map_err(ControlError::BadRequest)?;
+        if control.read_snapshot()?.session_id != session_id {
+            return Err(ControlError::Conflict(
+                "native checkpoint study belongs to a different owner session".into(),
+            ));
+        }
+        let intervention = match draft.treatment {
+            LabBranchTreatment::Unchanged => None,
+            LabBranchTreatment::Drought => Some(StudyIntervention::Drought {
+                region: None,
+                duration_ticks: u32::try_from(draft.ticks).map_err(|_| {
+                    ControlError::BadRequest("drought duration exceeds the core tick range".into())
+                })?,
+                growth_scale: 0.0,
+            }),
+            LabBranchTreatment::FoodBloom => Some(StudyIntervention::ResourceShock {
+                region: None,
+                bloom_amount: 0.5,
+                scorch: 0.0,
+            }),
+            LabBranchTreatment::ClosedWorld => {
+                Some(StudyIntervention::ClosedWorld { closed: true })
+            }
+        };
+        let idempotency_key = format!(
+            "native-lab-branch-v1:{:016x}:{request_id}",
+            session_id.get(),
+        );
+        let expected_branch_id = format!(
+            "branch-{}",
+            crate::control::compute_blake3(idempotency_key.as_bytes()),
+        );
+        match control.get_checkpoint_branch(&expected_branch_id) {
+            Ok(_) => {
+                // A retained admission owns its exact source independently of
+                // later checkpoint eviction. The create service still checks
+                // the entire immutable payload below before accepting a retry.
+            }
+            Err(ControlError::NotFound(_)) => {
+                let saved = control.get_checkpoint(&draft.checkpoint.checkpoint_id)?;
+                if saved.checkpoint_id != draft.checkpoint.checkpoint_id
+                    || saved.tick != draft.checkpoint.tick
+                    || saved.agent_count != draft.checkpoint.agent_count
+                    || saved.byte_size != draft.checkpoint.byte_size
+                    || saved.world_digest_v1 != draft.checkpoint.world_digest
+                {
+                    return Err(ControlError::Conflict(
+                        "selected checkpoint metadata changed before native study admission".into(),
+                    ));
+                }
+            }
+            Err(error) => return Err(error),
+        }
+        let branch = control.create_checkpoint_branch(CheckpointBranchRequest {
+            checkpoint_id: draft.checkpoint.checkpoint_id.clone(),
+            branch_name: draft.treatment.key().into(),
+            ticks: draft.ticks,
+            intervention,
+            idempotency_key,
+        })?;
+        if control.read_snapshot()?.session_id != session_id
+            || branch.branch_id != expected_branch_id
+            || branch.checkpoint_id != draft.checkpoint.checkpoint_id
+            || branch.branch_name != draft.treatment.key()
+            || branch.source_tick != draft.checkpoint.tick
+            || branch.world_digest_v1 != draft.checkpoint.world_digest
+            || draft.checkpoint.tick.checked_add(draft.ticks) != Some(branch.target_tick)
+        {
+            return Err(ControlError::Conflict(
+                "admitted checkpoint study does not match its source session and frozen request"
+                    .into(),
+            ));
+        }
+        Ok(LabWorkflowResponse::CheckpointBranchCreated {
+            request_id,
+            session_id,
+            branch: project_lab_checkpoint_branch(branch),
+        })
+    }
+
+    #[cfg(any(feature = "gui", feature = "bevy_render", test))]
+    fn native_lab_digest_is_valid(value: &str, bytes: usize) -> bool {
+        value.len() == bytes * 2
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    }
+
+    #[cfg(any(feature = "gui", feature = "bevy_render", test))]
+    fn project_lab_branch_outcome(
+        outcome: crate::branch_study::BranchOutcomeReport,
+        status: &crate::control::CheckpointBranchStatusDto,
+        is_control: bool,
+    ) -> Result<scriptbots_runtime::lab_workflows::LabBranchOutcome, crate::control::ControlError>
+    {
+        use crate::control::ControlError;
+        use scriptbots_runtime::lab_workflows::{LabBranchDivergence, LabBranchOutcome};
+
+        let sample = outcome.terminal_sample;
+        let expected_command = (!is_control).then_some(status.source_tick);
+        if sample.tick != status.target_tick
+            || outcome.command_applied_tick != expected_command
+            || !outcome.bundle_verified
+            || outcome.final_digest != sample.digest_overall
+            || !native_lab_digest_is_valid(&outcome.final_digest, std::mem::size_of::<u64>())
+            || !sample.food_total.is_finite()
+            || !sample.total_energy.is_finite()
+            || !sample.average_health.is_finite()
+            || outcome.extinction.final_population != sample.population
+            || outcome.recovery.final_population != sample.population
+            || outcome.recovery.baseline_tick != status.source_tick
+            || outcome.extinction.min_population > sample.population
+            || !outcome.recovery.recovery_ratio.is_finite()
+            || outcome.recovery.recovery_ratio < 0.0
+            || outcome.extinction.extinct != outcome.extinction.extinction_tick.is_some()
+            || outcome
+                .extinction
+                .extinction_tick
+                .is_some_and(|tick| tick < status.source_tick || tick > status.target_tick)
+            || (is_control && outcome.first_divergence.is_some())
+        {
+            return Err(ControlError::Conflict(
+                "checkpoint study outcome does not match its terminal boundary and recorded state"
+                    .into(),
+            ));
+        }
+        let first_divergence = outcome
+            .first_divergence
+            .map(|divergence| {
+                if divergence.branch_id != outcome.branch_id
+                    || divergence.tick < status.source_tick
+                    || divergence.tick > status.target_tick
+                    || Some(divergence.command_applied_tick) != expected_command
+                    || divergence.stage.is_empty()
+                    || divergence.stage.len() > 128
+                    || divergence.stage.chars().any(char::is_control)
+                    || divergence.control_digest.is_empty()
+                    || divergence.branch_digest.is_empty()
+                    || divergence.control_digest.len() > 2048
+                    || divergence.branch_digest.len() > 2048
+                    || divergence.control_digest == divergence.branch_digest
+                {
+                    return Err(ControlError::Conflict(
+                    "checkpoint study divergence does not match its observed branch and boundary"
+                        .into(),
+                ));
+                }
+                Ok(LabBranchDivergence {
+                    tick: divergence.tick,
+                    stage: divergence.stage,
+                    control_digest: divergence.control_digest,
+                    branch_digest: divergence.branch_digest,
+                    command_applied_tick: divergence.command_applied_tick,
+                    details: divergence.details.chars().take(512).collect(),
+                })
+            })
+            .transpose()?;
+        Ok(LabBranchOutcome {
+            tick: sample.tick,
+            population: sample.population,
+            total_food: sample.food_total,
+            total_energy: f64::from(sample.total_energy),
+            average_health: (sample.population > 0).then_some(f64::from(sample.average_health)),
+            final_digest: outcome.final_digest,
+            command_applied_tick: outcome.command_applied_tick,
+            minimum_population: outcome.extinction.min_population,
+            extinction_tick: outcome.extinction.extinction_tick,
+            baseline_population: outcome.recovery.pre_intervention_population,
+            recovery_ratio: (outcome.recovery.pre_intervention_population > 0)
+                .then_some(outcome.recovery.recovery_ratio),
+            first_divergence,
+        })
+    }
+
+    #[cfg(any(feature = "gui", feature = "bevy_render", test))]
+    fn project_lab_branch_report(
+        status: &crate::control::CheckpointBranchStatusDto,
+        metadata: crate::control::ArtifactMetadataDto,
+        report: crate::branch_study::BranchStudyReport,
+    ) -> Result<scriptbots_runtime::lab_workflows::LabBranchReport, crate::control::ControlError>
+    {
+        use crate::branch_study::{BRANCH_STUDY_REPORT_SCHEMA_VERSION, BranchStudySource};
+        use crate::control::ControlError;
+        use scriptbots_runtime::lab_workflows::{LAB_MAX_BRANCH_REPORT_BYTES, LabBranchReport};
+
+        if status.status != "completed"
+            || status.artifact_id.as_deref() != Some(metadata.artifact_id.as_str())
+            || metadata.relative_path
+                != format!("branches/{}/study/study_report.json", status.branch_id)
+            || metadata.byte_size == 0
+            || metadata.byte_size > LAB_MAX_BRANCH_REPORT_BYTES as u64
+            || !native_lab_digest_is_valid(&metadata.checksum_blake3, blake3::OUT_LEN)
+            || !native_lab_digest_is_valid(&metadata.checksum_sha256, 32)
+            || report.schema_version != BRANCH_STUDY_REPORT_SCHEMA_VERSION
+            || report.study_id != status.branch_id
+            || report.checkpoint_tick != status.source_tick
+            || report.checkpoint_tick.checked_add(report.horizon_ticks) != Some(status.target_tick)
+            || report.horizon_ticks == 0
+            || report.horizon_ticks > crate::control::MAX_CHECKPOINT_BRANCH_TICKS
+            || report.pre_intervention_digest != status.world_digest_v1
+            || !native_lab_digest_is_valid(
+                &report.pre_intervention_digest,
+                std::mem::size_of::<u64>(),
+            )
+            || !report.pre_intervention_digest_verified_for_all_branches
+            || report.control_branch_id != "control"
+            || !(1..=2).contains(&report.branch_reports.len())
+        {
+            return Err(ControlError::Conflict(
+                "checkpoint study report does not match its verified artifact and saved-source receipt"
+                    .into(),
+            ));
+        }
+        let BranchStudySource::SavedCheckpoint {
+            artifact_path,
+            byte_size,
+            checksum_blake3,
+        } = report.source
+        else {
+            return Err(ControlError::Conflict(
+                "checkpoint study report lost its saved source".into(),
+            ));
+        };
+        if artifact_path != "source_checkpoint.bin"
+            || byte_size == 0
+            || byte_size > scriptbots_core::MAX_WORLD_CHECKPOINT_BYTES as u64
+            || !native_lab_digest_is_valid(&checksum_blake3, blake3::OUT_LEN)
+        {
+            return Err(ControlError::Conflict(
+                "checkpoint study source provenance is invalid".into(),
+            ));
+        }
+        let mut control = None;
+        let mut treatment = None;
+        for outcome in report.branch_reports {
+            if outcome.branch_id == "control" && control.is_none() {
+                control = Some(project_lab_branch_outcome(outcome, status, true)?);
+            } else if outcome.branch_id == "treatment" && treatment.is_none() {
+                treatment = Some(project_lab_branch_outcome(outcome, status, false)?);
+            } else {
+                return Err(ControlError::Conflict(
+                    "checkpoint study report contains duplicate or unrequested branches".into(),
+                ));
+            }
+        }
+        let control = control.ok_or_else(|| {
+            ControlError::Conflict("checkpoint study report has no unchanged control".into())
+        })?;
+        if treatment.as_ref().is_some_and(|outcome| {
+            outcome.final_digest != control.final_digest && outcome.first_divergence.is_none()
+        }) {
+            return Err(ControlError::Conflict(
+                "checkpoint study has differing terminal digests without divergence evidence"
+                    .into(),
+            ));
+        }
+        Ok(LabBranchReport {
+            branch_id: status.branch_id.clone(),
+            artifact_id: metadata.artifact_id,
+            base_seed: report.base_seed,
+            source_tick: status.source_tick,
+            target_tick: status.target_tick,
+            source_world_digest: report.pre_intervention_digest,
+            source_byte_size: byte_size,
+            source_checksum_blake3: checksum_blake3,
+            report_byte_size: metadata.byte_size,
+            report_checksum_blake3: metadata.checksum_blake3,
+            report_checksum_sha256: metadata.checksum_sha256,
+            control,
+            treatment,
+        })
+    }
+
+    #[cfg(any(feature = "gui", feature = "bevy_render", test))]
+    fn read_lab_checkpoint_branch_report(
+        control: &crate::control::ControlHandle,
+        branch_id: &str,
+    ) -> Result<scriptbots_runtime::lab_workflows::LabBranchReport, crate::control::ControlError>
+    {
+        use crate::control::ControlError;
+        use scriptbots_runtime::lab_workflows::LAB_MAX_BRANCH_REPORT_BYTES;
+
+        let status = control.get_checkpoint_branch(branch_id)?;
+        let artifact_id = status
+            .artifact_id
+            .as_deref()
+            .filter(|_| status.status == "completed")
+            .ok_or_else(|| {
+                ControlError::Conflict(
+                    "study outcomes require a completed study with a verified report artifact"
+                        .into(),
+                )
+            })?;
+        let metadata = control.get_artifact(artifact_id)?;
+        if metadata.byte_size > LAB_MAX_BRANCH_REPORT_BYTES as u64 {
+            return Err(ControlError::PayloadTooLarge(format!(
+                "native study report exceeds {LAB_MAX_BRANCH_REPORT_BYTES} bytes",
+            )));
+        }
+        // The existing service revalidates retained paths, byte counts and both
+        // checksums. Native parsing has its own smaller report-only bound.
+        let (verified_metadata, bytes) = control.read_artifact_bytes(artifact_id)?;
+        if metadata != verified_metadata || bytes.len() > LAB_MAX_BRANCH_REPORT_BYTES {
+            return Err(ControlError::Conflict(
+                "study report changed or exceeded its native preview bound".into(),
+            ));
+        }
+        let report = serde_json::from_slice(&bytes)
+            .map_err(|error| ControlError::Serialization(error.to_string()))?;
+        let projected = project_lab_branch_report(&status, verified_metadata, report)?;
+        if control.get_checkpoint_branch(branch_id)? != status {
+            return Err(ControlError::Conflict(
+                "study receipt changed while its report was being read".into(),
+            ));
+        }
+        Ok(projected)
+    }
+
+    #[cfg(any(feature = "gui", feature = "bevy_render", test))]
+    fn native_lab_experiment_capabilities()
+    -> scriptbots_runtime::lab_workflows::LabExperimentCapabilities {
         use crate::experiment_runner::{
             EXPERIMENT_BRAIN_FAMILIES, MAX_BATCH_TOTAL_TICKS, MAX_TICKS_PER_RUN,
         };
@@ -4637,12 +5048,7 @@ pub mod renderer {
             }
             for metric in LabMetric::ALL {
                 let direct = handle
-                    .compare_experiment_variants(
-                        "gui-lab",
-                        "baseline",
-                        "challenger",
-                        metric.key(),
-                    )
+                    .compare_experiment_variants("gui-lab", "baseline", "challenger", metric.key())
                     .unwrap();
                 match provider(Request::Compare {
                     experiment_id: "gui-lab".into(),
@@ -4758,6 +5164,287 @@ pub mod renderer {
             );
             assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
             assert_eq!(host.port.snapshot_hub().latest().world.tick, 1);
+        }
+
+        #[test]
+        // Real saved source, isolated treatment, exact retry and verified outcome reader.
+        #[allow(clippy::too_many_lines)]
+        fn native_lab_checkpoint_study_preserves_its_saved_source_and_verified_outcome() {
+            use scriptbots_runtime::lab_workflows::{
+                LabAction, LabBranchDraft, LabBranchTreatment, LabCheckpointView, LabPanel,
+                LabWorkflowRequest as Request, LabWorkflowResponse as Response, LabWorkflows,
+            };
+            use std::sync::{
+                Mutex,
+                atomic::{AtomicBool, Ordering},
+            };
+
+            struct StopExperiments(crate::control::ControlHandle);
+            impl Drop for StopExperiments {
+                fn drop(&mut self) {
+                    let _ = self.0.data_services().shutdown_experiments();
+                }
+            }
+
+            let root = tempfile::tempdir().unwrap();
+            let seed = u64::MAX - 17;
+            let mut world = scriptbots_core::WorldState::new(ScriptBotsConfig {
+                rng_seed: Some(seed),
+                world_width: 120,
+                world_height: 120,
+                food_cell_size: 20,
+                population_minimum: 0,
+                population_spawn_interval: 0,
+                persistence_interval: 0,
+                closed: true,
+                topography_enabled: false,
+                initial_food: 0.1,
+                food_growth_rate: 0.0,
+                metabolism_drain: 0.0,
+                movement_drain: 0.0,
+                temperature_discomfort_rate: 0.0,
+                aging_health_decay_rate: 0.0,
+                reproduction_energy_threshold: f32::MAX,
+                ..ScriptBotsConfig::default()
+            })
+            .unwrap();
+            let brains = crate::install_brains(&mut world, crate::BrainPreset::Mlp).unwrap();
+            for _ in 0..2 {
+                let id = world
+                    .try_spawn_agent(scriptbots_core::AgentData::default())
+                    .unwrap();
+                assert!(world.bind_agent_brain(id, brains.population()[0]).unwrap());
+            }
+            let host = TestHost::spawn(world);
+            let handle = host
+                .handle()
+                .with_artifacts_dir(root.path().to_path_buf())
+                .unwrap();
+            let _stop = StopExperiments(handle.clone());
+            host.wait_applied(&handle.step().unwrap());
+            let saved = handle
+                .create_checkpoint(crate::control::CheckpointCreateRequest::default())
+                .unwrap();
+            host.wait_applied(&handle.step().unwrap());
+            host.wait_applied(&handle.step().unwrap());
+            let live = handle.read_snapshot().unwrap();
+            let digest = host.port.scientific_digest_v1().unwrap();
+            assert!(live.world.tick > saved.tick);
+            let provider = lab_workflow_submit(handle.clone());
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&observed);
+            let service = Arc::clone(&provider);
+            let lose_first = AtomicBool::new(true);
+            let mut model = LabWorkflows::default();
+            model.submit = Some(Arc::new(move |request| {
+                let creates = matches!(&request, Request::CreateCheckpointBranch { .. });
+                if creates {
+                    recorded.lock().unwrap().push(request.clone());
+                }
+                let response = service(request)?;
+                if creates && lose_first.swap(false, Ordering::SeqCst) {
+                    Err("study admitted, but its first receipt was lost".into())
+                } else {
+                    Ok(response)
+                }
+            }));
+            model.synchronize(live.session_id, LabPanel::Checkpoints);
+            model.dispatch(LabAction::Refresh);
+            assert!(finish_native_lab_request(&mut model).is_none());
+            model.dispatch(LabAction::SelectCheckpoint(saved.checkpoint_id.clone()));
+            model.dispatch(LabAction::NewCheckpointBranch);
+            assert!(finish_native_lab_request(&mut model).is_none());
+            model.dispatch(LabAction::BranchTreatment(LabBranchTreatment::FoodBloom));
+            model.dispatch(LabAction::BranchTicks(2));
+            let draft = model.branch_draft.as_ref().unwrap().clone();
+            assert_eq!(draft.checkpoint.tick, saved.tick);
+            assert_eq!(draft.checkpoint.world_digest, saved.world_digest_v1);
+            assert!(model.can_create_checkpoint_branch());
+
+            assert!(
+                provider(Request::CreateCheckpointBranch {
+                    request_id: "wrong-owner".into(),
+                    session_id: scriptbots_runtime::HostSessionId::new(
+                        live.session_id.get().wrapping_add(1)
+                    ),
+                    draft: draft.clone(),
+                })
+                .is_err()
+            );
+            let mut changed_source = draft.clone();
+            changed_source.checkpoint.tick += 1;
+            for (index, invalid) in [
+                changed_source,
+                LabBranchDraft {
+                    ticks: 0,
+                    ..draft.clone()
+                },
+                LabBranchDraft {
+                    ticks: crate::control::MAX_CHECKPOINT_BRANCH_TICKS + 1,
+                    ..draft.clone()
+                },
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                assert!(
+                    provider(Request::CreateCheckpointBranch {
+                        request_id: format!("invalid-source-{index}"),
+                        session_id: live.session_id,
+                        draft: invalid,
+                    })
+                    .is_err()
+                );
+            }
+            assert_eq!(
+                handle.list_checkpoint_branches(None, None).unwrap().total,
+                0
+            );
+
+            model.dispatch(LabAction::CreateCheckpointBranch);
+            assert!(finish_native_lab_request(&mut model).is_none());
+            assert!(model.will_retry_branch_creation());
+            let creation = model.latest_branch_creation.as_ref().unwrap().clone();
+            let admitted = handle.list_checkpoint_branches(None, None).unwrap();
+            assert_eq!(admitted.total, 1);
+            let branch_id = admitted.items[0].branch_id.clone();
+            model.dispatch(LabAction::BranchTicks(10));
+            assert_eq!(model.branch_draft.as_ref(), Some(&draft));
+
+            // Retained study identity outlives the original cut's availability.
+            // Preserve its bytes under another name to exercise that real boundary.
+            let cut_artifact = handle.get_artifact(&saved.checkpoint_id).unwrap();
+            let cut_path = root.path().join(&cut_artifact.relative_path);
+            std::fs::rename(&cut_path, cut_path.with_extension("preserved-original")).unwrap();
+            assert!(handle.read_artifact_bytes(&saved.checkpoint_id).is_err());
+            model.dispatch(LabAction::CreateCheckpointBranch);
+            assert!(finish_native_lab_request(&mut model).is_none());
+            assert_eq!(model.checkpoint_view, LabCheckpointView::BranchDetail);
+            assert_eq!(model.selected_branch.as_deref(), Some(branch_id.as_str()));
+            assert_eq!(
+                handle.list_checkpoint_branches(None, None).unwrap().total,
+                1
+            );
+            {
+                let requests = observed.lock().unwrap();
+                assert_eq!(requests.len(), 2);
+                assert_eq!(requests[0], requests[1]);
+            }
+            let conflict = provider(Request::CreateCheckpointBranch {
+                request_id: creation.request_id,
+                session_id: live.session_id,
+                draft: LabBranchDraft {
+                    ticks: 3,
+                    ..draft.clone()
+                },
+            })
+            .err()
+            .expect("retry must retain the complete scientific request");
+            assert!(conflict.contains("different request"), "{conflict}");
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            let completed = loop {
+                let status = handle.get_checkpoint_branch(&branch_id).unwrap();
+                if !matches!(status.status.as_str(), "running" | "cancelling") {
+                    break status;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "study timed out: {status:?}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            };
+            assert_eq!(
+                completed.status, "completed",
+                "{:?}",
+                completed.error_reason
+            );
+            model.dispatch(LabAction::Refresh);
+            assert!(finish_native_lab_request(&mut model).is_none());
+            model.dispatch(LabAction::ReadCheckpointBranchReport);
+            assert!(finish_native_lab_request(&mut model).is_none());
+            let report = model.branch_report.as_ref().unwrap().clone();
+            assert_eq!(report.base_seed, seed);
+            assert_eq!(report.source_tick, saved.tick);
+            assert_eq!(report.target_tick, saved.tick + 2);
+            assert_eq!(report.source_world_digest, saved.world_digest_v1);
+            let treatment = report.treatment.as_ref().unwrap();
+            assert!(treatment.total_food > report.control.total_food);
+            assert!(treatment.first_divergence.is_some());
+            assert_eq!(report.control.population, treatment.population);
+
+            let (metadata, bytes) = handle.read_artifact_bytes(&report.artifact_id).unwrap();
+            let raw: crate::branch_study::BranchStudyReport =
+                serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(report.report_byte_size, bytes.len() as u64);
+            assert_eq!(report.report_checksum_blake3, metadata.checksum_blake3);
+            assert_eq!(
+                report.control.total_food,
+                raw.branch_reports[0].terminal_sample.food_total
+            );
+            assert_eq!(treatment.final_digest, raw.branch_reports[1].final_digest);
+            let mut wrong_source = raw.clone();
+            wrong_source.checkpoint_tick += 1;
+            assert!(project_lab_branch_report(&completed, metadata.clone(), wrong_source).is_err());
+            let mut duplicate = raw.clone();
+            duplicate.branch_reports[1] = duplicate.branch_reports[0].clone();
+            assert!(project_lab_branch_report(&completed, metadata.clone(), duplicate).is_err());
+            let mut invalid_metric = raw.clone();
+            invalid_metric.branch_reports[1].terminal_sample.food_total = f64::NAN;
+            assert!(
+                project_lab_branch_report(&completed, metadata.clone(), invalid_metric).is_err()
+            );
+            let mut untraced_difference = raw.clone();
+            assert_ne!(
+                untraced_difference.branch_reports[0].final_digest,
+                untraced_difference.branch_reports[1].final_digest
+            );
+            untraced_difference.branch_reports[1].first_divergence = None;
+            assert!(
+                project_lab_branch_report(&completed, metadata.clone(), untraced_difference)
+                    .is_err()
+            );
+            let mut wrong_boundary = raw;
+            wrong_boundary.branch_reports[1].terminal_sample.tick += 1;
+            assert!(
+                project_lab_branch_report(&completed, metadata.clone(), wrong_boundary).is_err()
+            );
+
+            model.dispatch(LabAction::CheckpointBranchesPage(None));
+            assert!(finish_native_lab_request(&mut model).is_none());
+            assert_eq!(model.checkpoint_branches.as_ref().unwrap().total, 1);
+            model.dispatch(LabAction::SelectCheckpointBranch(branch_id.clone()));
+            assert!(finish_native_lab_request(&mut model).is_none());
+            assert_eq!(
+                observed.lock().unwrap().len(),
+                2,
+                "reopening must not create work"
+            );
+            match provider(Request::CancelCheckpointBranch { branch_id }).unwrap() {
+                Response::CheckpointBranch(status) => assert_eq!(status.status, "completed"),
+                _ => panic!("wrong cancellation response"),
+            }
+
+            model.dispatch(LabAction::ReadCheckpointBranchReport);
+            assert!(finish_native_lab_request(&mut model).is_none());
+            assert!(model.branch_report.is_some());
+
+            let report_path = root.path().join(&metadata.relative_path);
+            std::fs::copy(
+                &report_path,
+                report_path.with_extension("preserved-original"),
+            )
+            .unwrap();
+            std::fs::write(&report_path, b"intentional report corruption").unwrap();
+            model.dispatch(LabAction::ReadCheckpointBranchReport);
+            assert!(finish_native_lab_request(&mut model).is_none());
+            assert!(
+                model.branch_report.is_none(),
+                "failed integrity must clear prior displayed evidence"
+            );
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), digest);
+            assert!(Arc::ptr_eq(&handle.read_snapshot().unwrap(), &live));
+            handle.data_services().shutdown_experiments().unwrap();
         }
 
         #[test]
@@ -4971,12 +5658,14 @@ pub mod renderer {
             let mut wrong_family = batch.clone();
             wrong_family.runs[0].brain_family = "unrequested-family".into();
             assert!(
-                validate_created_lab_experiment(&wrong_family, &creation.request_id, &draft).is_err()
+                validate_created_lab_experiment(&wrong_family, &creation.request_id, &draft)
+                    .is_err()
             );
             let mut wrong_horizon = batch.clone();
             wrong_horizon.runs[0].target_ticks = 2;
             assert!(
-                validate_created_lab_experiment(&wrong_horizon, &creation.request_id, &draft).is_err()
+                validate_created_lab_experiment(&wrong_horizon, &creation.request_id, &draft)
+                    .is_err()
             );
             let mut missing = batch.clone();
             assert!(missing.runs.pop().is_some());

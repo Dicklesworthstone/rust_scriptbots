@@ -24,6 +24,8 @@ pub const VARIANTS_PER_PAGE: usize = 8;
 pub const LAB_MAX_EXPERIMENT_FAMILIES: usize = 8;
 /// Hard bound on the seed vector before any capability-driven allocation.
 pub const LAB_MAX_EXPERIMENT_SEEDS: usize = 128;
+/// Maximum verified JSON bytes decoded for a native saved-study preview.
+pub const LAB_MAX_BRANCH_REPORT_BYTES: usize = 1024 * 1024;
 // Run IDs append "-challenger-seed" and up to twenty decimal seed digits to
 // the experiment identity. Reserve that suffix within the runner's 128-byte bound.
 const MAX_EXPERIMENT_REQUEST_ID_BYTES: usize = 92;
@@ -168,7 +170,9 @@ impl LabExperimentCapabilities {
                 .len()
                 != self.families.len()
         {
-            return Err("Experiment family capabilities are invalid or exceed their bounds.".into());
+            return Err(
+                "Experiment family capabilities are invalid or exceed their bounds.".into(),
+            );
         }
         if self.max_seed_count == 0
             || self.max_seed_count > LAB_MAX_EXPERIMENT_SEEDS
@@ -231,10 +235,9 @@ impl LabExperimentDraft {
         }
         let span = u64::try_from(self.seed_count - 1)
             .map_err(|_| "Seed count cannot be represented.".to_owned())?;
-        let last_seed = self
-            .first_seed
-            .checked_add(span)
-            .ok_or_else(|| "The seed cohort would overflow u64; choose an earlier first seed.".to_owned())?;
+        let last_seed = self.first_seed.checked_add(span).ok_or_else(|| {
+            "The seed cohort would overflow u64; choose an earlier first seed.".to_owned()
+        })?;
         Ok((self.first_seed..=last_seed).collect())
     }
 
@@ -400,6 +403,37 @@ pub enum LabWorkflowRequest {
     ReviewCheckpoint {
         /// Stable retained checkpoint identity.
         checkpoint_id: String,
+    },
+    /// Read the compiled saved-study runner's admission limits.
+    BranchCapabilities,
+    /// Explicitly admit or exactly retry one frozen saved-source study.
+    CreateCheckpointBranch {
+        /// Stable client retry identity.
+        request_id: String,
+        /// Observed application owner to which this operation belongs.
+        session_id: HostSessionId,
+        /// Complete selected source and scientific choices.
+        draft: LabBranchDraft,
+    },
+    /// Discover retained study receipts without creating scientific work.
+    ListCheckpointBranches {
+        /// Application page cursor.
+        cursor: Option<String>,
+    },
+    /// Observe one admitted study.
+    GetCheckpointBranch {
+        /// Stable managed study identity.
+        branch_id: String,
+    },
+    /// Request cancellation of one managed study.
+    CancelCheckpointBranch {
+        /// Stable managed study identity.
+        branch_id: String,
+    },
+    /// Read and verify the selected completed study's bounded report.
+    GetCheckpointBranchReport {
+        /// Stable managed study identity.
+        branch_id: String,
     },
     /// Reconstruct a retained canonical event through the existing replay service.
     ReviewEvent {
@@ -569,6 +603,307 @@ pub enum LabCheckpointSaveState {
     Saved(LabCheckpoint),
 }
 
+/// Subviews of the existing native Checkpoints panel.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LabCheckpointView {
+    /// Retained scientific checkpoints and save/review controls.
+    #[default]
+    SavedCuts,
+    /// Explicit saved-source study choices and frozen admission receipt.
+    BranchComposer,
+    /// Bounded retained study catalog.
+    BranchCatalog,
+    /// Observed study status and verified terminal outcomes.
+    BranchDetail,
+}
+
+/// Bounded treatments shared by native frontends and the application adapter.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LabBranchTreatment {
+    /// One unchanged scientific future.
+    #[default]
+    Unchanged,
+    /// Halt food growth throughout the world for the selected horizon.
+    Drought,
+    /// Add 0.5 food units per world cell at the source boundary.
+    FoodBloom,
+    /// Disable newcomer restocking from the source boundary.
+    ClosedWorld,
+}
+
+impl LabBranchTreatment {
+    /// Complete native treatment vocabulary.
+    pub const ALL: [Self; 4] = [
+        Self::Unchanged,
+        Self::Drought,
+        Self::FoodBloom,
+        Self::ClosedWorld,
+    ];
+
+    /// Exact human-readable branch name submitted to the managed service.
+    #[must_use]
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Unchanged => "unchanged",
+            Self::Drought => "drought",
+            Self::FoodBloom => "food-bloom",
+            Self::ClosedWorld => "closed-world",
+        }
+    }
+
+    /// Short treatment choice displayed by both native frontends.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Unchanged => "Unchanged future",
+            Self::Drought => "Whole-world drought",
+            Self::FoodBloom => "Whole-world food bloom",
+            Self::ClosedWorld => "Closed world",
+        }
+    }
+
+    /// Exact preset semantics disclosed before explicit admission.
+    #[must_use]
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::Unchanged => "One unchanged control future from the saved scientific state.",
+            Self::Drought => {
+                "Treatment halts food growth throughout the world for the full selected horizon; an unchanged control uses the same saved source."
+            }
+            Self::FoodBloom => {
+                "Treatment adds 0.5 food units per world cell at the saved boundary, with no scorch; an unchanged control uses the same source."
+            }
+            Self::ClosedWorld => {
+                "Treatment disables newcomer restocking at the saved boundary; an unchanged control uses the same source."
+            }
+        }
+    }
+
+    /// Number of independent worlds advanced, not independent seed replicates.
+    #[must_use]
+    pub const fn branch_count(self) -> u64 {
+        match self {
+            Self::Unchanged => 1,
+            Self::Drought | Self::FoodBloom | Self::ClosedWorld => 2,
+        }
+    }
+}
+
+/// Actual saved-study limits supplied by the application runner.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LabBranchCapabilities {
+    /// Maximum post-checkpoint transitions per branch.
+    pub max_ticks: u64,
+    /// Maximum living population accepted in the selected source.
+    pub max_population: usize,
+}
+
+impl LabBranchCapabilities {
+    /// Refuse impossible limits before using them in native controls.
+    ///
+    /// # Errors
+    /// Returns an explanation when limits cannot represent a bounded drought.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_ticks == 0
+            || self.max_ticks > u64::from(u32::MAX)
+            || self.max_population == 0
+            || u32::try_from(self.max_population).is_err()
+        {
+            return Err(
+                "Saved-study limits must be positive and fit the runner's bounded inputs.".into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Exact saved source and scientific choices shown before admission.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LabBranchDraft {
+    /// Complete observed metadata, revalidated by the application before admission.
+    pub checkpoint: LabCheckpoint,
+    /// Number of transitions after the saved source boundary.
+    pub ticks: u64,
+    /// Explicit bounded treatment; treatments include an unchanged control.
+    pub treatment: LabBranchTreatment,
+}
+
+impl LabBranchDraft {
+    /// Validate exact choices without clamping the source, treatment or horizon.
+    ///
+    /// # Errors
+    /// Returns a refusal for invalid source evidence, bounds or tick overflow.
+    pub fn validate(&self, capabilities: &LabBranchCapabilities) -> Result<(), String> {
+        capabilities.validate()?;
+        if !checkpoint_receipt_is_bounded(&self.checkpoint)
+            || !branch_identifier_is_valid(&self.checkpoint.checkpoint_id)
+        {
+            return Err(
+                "Select a complete, valid saved checkpoint before starting a study.".into(),
+            );
+        }
+        if self.checkpoint.agent_count > capabilities.max_population {
+            return Err(format!(
+                "Saved population exceeds the runner's {}-agent limit.",
+                capabilities.max_population
+            ));
+        }
+        if self.ticks == 0 || self.ticks > capabilities.max_ticks {
+            return Err(format!(
+                "Study horizon must be in 1..={} ticks.",
+                capabilities.max_ticks
+            ));
+        }
+        if self.checkpoint.tick.checked_add(self.ticks).is_none() {
+            return Err("Saved tick plus study horizon overflows the tick counter.".into());
+        }
+        Ok(())
+    }
+}
+
+/// Immutable latest study admission, retained across invalidation and exact retry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LabBranchCreation {
+    /// Stable application retry identity.
+    pub request_id: String,
+    /// Original observed owner session.
+    pub session_id: HostSessionId,
+    /// Complete source and choices locked until confirmation or explicit abandonment.
+    pub draft: LabBranchDraft,
+    /// Observed admission outcome.
+    pub state: LabBranchCreationState,
+}
+
+/// Admission evidence, distinct from study completion.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LabBranchCreationState {
+    /// A service worker is awaiting the admission receipt.
+    Pending,
+    /// Delivery is unconfirmed; reuse the exact original request.
+    Retryable {
+        /// Bounded reason for the unconfirmed outcome.
+        reason: String,
+    },
+    /// The managed service returned a bound admission receipt.
+    Created {
+        /// Actual managed study identity.
+        branch_id: String,
+    },
+}
+
+/// Latest managed study receipt; source and target ticks are not live progress.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LabCheckpointBranch {
+    /// Stable managed study identity.
+    pub branch_id: String,
+    /// Exact saved checkpoint identity.
+    pub checkpoint_id: String,
+    /// Actual human-readable request name, not an inferred treatment.
+    pub branch_name: String,
+    /// running, cancelling, completed, cancelled, failed or stopped.
+    pub status: String,
+    /// Actual saved source boundary.
+    pub source_tick: u64,
+    /// Admitted terminal boundary, not a current progress observation.
+    pub target_tick: u64,
+    /// Scientific digest of the saved source.
+    pub world_digest: String,
+    /// Verified report identity exposed only for completed work.
+    pub artifact_id: Option<String>,
+    /// Bounded terminal failure or interruption explanation.
+    pub error_reason: Option<String>,
+}
+
+/// One bounded page of retained study receipts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LabCheckpointBranchPage {
+    /// Visible study receipts.
+    pub items: Vec<LabCheckpointBranch>,
+    /// Total retained studies.
+    pub total: usize,
+    /// Offset of this page.
+    pub offset: usize,
+    /// Cursor for the next page.
+    pub next_cursor: Option<String>,
+}
+
+/// First observed differing digest lane at a completed tick.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LabBranchDivergence {
+    /// Completed tick at which the lane differed.
+    pub tick: u64,
+    /// Diagnostic digest lane; not an internal transition ordering claim.
+    pub stage: String,
+    /// Actual bounded control lane evidence.
+    pub control_digest: String,
+    /// Actual bounded treatment lane evidence.
+    pub branch_digest: String,
+    /// Source boundary at which the intervention was applied.
+    pub command_applied_tick: u64,
+    /// Bounded explanation retained from the report.
+    pub details: String,
+}
+
+/// Compact terminal observations for one verified branch.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LabBranchOutcome {
+    /// Actual last recorded boundary.
+    pub tick: u64,
+    /// Living agents at the last boundary.
+    pub population: usize,
+    /// Ground-food energy units at the last boundary.
+    pub total_food: f64,
+    /// Sum of current live-agent energy reserves.
+    pub total_energy: f64,
+    /// Mean health units, unavailable when no agent is alive.
+    pub average_health: Option<f64>,
+    /// Scientific digest at the terminal boundary.
+    pub final_digest: String,
+    /// Intervention boundary; absent for the unchanged control.
+    pub command_applied_tick: Option<u64>,
+    /// Minimum population from the source through the final boundary.
+    pub minimum_population: usize,
+    /// First zero-population boundary, if observed.
+    pub extinction_tick: Option<u64>,
+    /// Living population at the source before the intervention.
+    pub baseline_population: usize,
+    /// Final/source population ratio, unavailable for an empty source population.
+    pub recovery_ratio: Option<f64>,
+    /// First observed divergence against control, absent for control.
+    pub first_divergence: Option<LabBranchDivergence>,
+}
+
+/// Verified compact report for one saved seed, with exact artifact provenance.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LabBranchReport {
+    /// Managed study identity.
+    pub branch_id: String,
+    /// Verified report artifact identity.
+    pub artifact_id: String,
+    /// Exact scientific seed retained by the saved source.
+    pub base_seed: u64,
+    /// Saved source boundary.
+    pub source_tick: u64,
+    /// Actual terminal boundary of every reported arm.
+    pub target_tick: u64,
+    /// Shared saved scientific digest.
+    pub source_world_digest: String,
+    /// Exact retained source envelope byte count.
+    pub source_byte_size: u64,
+    /// BLAKE3 of the retained source envelope.
+    pub source_checksum_blake3: String,
+    /// Verified report JSON byte count.
+    pub report_byte_size: u64,
+    /// BLAKE3 of the verified report JSON bytes.
+    pub report_checksum_blake3: String,
+    /// SHA-256 of the verified report JSON bytes.
+    pub report_checksum_sha256: String,
+    /// Unchanged future from the saved source.
+    pub control: LabBranchOutcome,
+    /// Matched treatment, absent for an unchanged-only study.
+    pub treatment: Option<LabBranchOutcome>,
+}
+
 /// Application evidence returned by the shared native worker.
 pub enum LabWorkflowResponse {
     /// Bounded compiled-family and fresh-world capabilities.
@@ -606,6 +941,23 @@ pub enum LabWorkflowResponse {
         /// Reconstructed scientific presentation.
         snapshot: Arc<RenderSnapshot>,
     },
+    /// Actual saved-study runner limits.
+    BranchCapabilities(LabBranchCapabilities),
+    /// Source-bound managed study admission receipt.
+    CheckpointBranchCreated {
+        /// Original client retry identity.
+        request_id: String,
+        /// Application source checked by the adapter.
+        session_id: HostSessionId,
+        /// Actual managed study receipt.
+        branch: LabCheckpointBranch,
+    },
+    /// Retained study catalog page.
+    CheckpointBranches(LabCheckpointBranchPage),
+    /// Managed study observation after read or cancellation.
+    CheckpointBranch(LabCheckpointBranch),
+    /// Verified report for the selected completed study.
+    CheckpointBranchReport(LabBranchReport),
     /// Verified event target and its retained checkpoint provenance.
     EventFrame(LabEventReview),
 }
@@ -679,6 +1031,26 @@ pub enum LabAction {
     CreateCheckpoint,
     /// Request a presentation-only reconstruction.
     ReviewCheckpoint,
+    /// Configure a saved-source study or reopen its frozen unconfirmed request.
+    NewCheckpointBranch,
+    /// Return to saved checkpoints without cancelling admitted study work.
+    BackToCheckpoints,
+    /// Open or page the retained study catalog without creating work.
+    CheckpointBranchesPage(Option<String>),
+    /// Inspect an actual retained study receipt.
+    SelectCheckpointBranch(String),
+    /// Choose one disclosed saved-study treatment.
+    BranchTreatment(LabBranchTreatment),
+    /// Set the exact post-checkpoint horizon.
+    BranchTicks(u64),
+    /// Submit or exactly retry the frozen saved-source study.
+    CreateCheckpointBranch,
+    /// Forget only the local retry identity after its worker has finished.
+    AbandonCheckpointBranchRequest,
+    /// Request cooperative cancellation of the selected managed study.
+    CancelCheckpointBranch,
+    /// Read the selected completed study's verified terminal report.
+    ReadCheckpointBranchReport,
     /// Review exactly the event that was selected when this action was rendered.
     ReviewEvent(LabEventIdentity),
     /// Discard a pending result, retaining its occupied worker slot.
@@ -741,6 +1113,23 @@ pub struct LabWorkflows {
     pub selected_checkpoint: Option<String>,
     /// One bounded save record; an old-source record is informational only.
     pub latest_checkpoint_save: Option<LabCheckpointSave>,
+    /// Current subview of the existing Checkpoints panel.
+    pub checkpoint_view: LabCheckpointView,
+    /// Actual application limits for saved-source studies.
+    pub branch_capabilities: Option<LabBranchCapabilities>,
+    /// Exact displayed source and choices, also retained while admission is unconfirmed.
+    pub branch_draft: Option<LabBranchDraft>,
+    /// Latest immutable saved-study admission and its receipt state.
+    pub latest_branch_creation: Option<LabBranchCreation>,
+    /// One bounded retained study catalog page.
+    pub checkpoint_branches: Option<LabCheckpointBranchPage>,
+    branch_cursor: Option<String>,
+    /// Selected retained study identity.
+    pub selected_branch: Option<String>,
+    /// Latest accepted status for the selected study.
+    pub branch: Option<LabCheckpointBranch>,
+    /// Verified compact report bound to the selected completed receipt.
+    pub branch_report: Option<LabBranchReport>,
     selected_event: Option<SelectedEvent>,
     event_review: Option<LabEventReview>,
     /// Bounded user-facing operation state or failure.
@@ -769,9 +1158,9 @@ pub fn experiment_request_identity_is_valid(request_id: &str) -> bool {
         && request_id.len() <= MAX_EXPERIMENT_REQUEST_ID_BYTES
         && request_id != "."
         && !request_id.contains("..")
-        && request_id.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
-        })
+        && request_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 fn reserve_checkpoint_sequence(counter: &AtomicU64) -> Option<u64> {
@@ -809,6 +1198,168 @@ fn checkpoint_receipt_is_bounded(checkpoint: &LabCheckpoint) -> bool {
             .world_digest
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn branch_identifier_is_valid(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn lowercase_hex_is_valid(value: &str, bytes: usize) -> bool {
+    value.len() == bytes
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn branch_is_bounded(branch: &LabCheckpointBranch) -> bool {
+    branch_identifier_is_valid(&branch.branch_id)
+        && branch_identifier_is_valid(&branch.checkpoint_id)
+        && branch_identifier_is_valid(&branch.branch_name)
+        && branch.branch_name.len() <= 64
+        && matches!(
+            branch.status.as_str(),
+            "running" | "cancelling" | "completed" | "cancelled" | "failed" | "stopped"
+        )
+        && branch
+            .target_tick
+            .checked_sub(branch.source_tick)
+            .is_some_and(|ticks| ticks > 0 && ticks <= u64::from(u32::MAX))
+        && lowercase_hex_is_valid(&branch.world_digest, std::mem::size_of::<u64>() * 2)
+        && branch
+            .artifact_id
+            .as_ref()
+            .is_none_or(|id| branch_identifier_is_valid(id))
+        && (branch.status == "completed") == branch.artifact_id.is_some()
+        && branch
+            .error_reason
+            .as_ref()
+            .is_none_or(|reason| reason.len() <= 2048)
+}
+
+fn branch_matches_draft(branch: &LabCheckpointBranch, draft: &LabBranchDraft) -> bool {
+    branch_is_bounded(branch)
+        && branch.checkpoint_id == draft.checkpoint.checkpoint_id
+        && branch.branch_name == draft.treatment.key()
+        && branch.source_tick == draft.checkpoint.tick
+        && Some(branch.target_tick) == draft.checkpoint.tick.checked_add(draft.ticks)
+        && branch.world_digest == draft.checkpoint.world_digest
+}
+
+fn branch_has_same_source(previous: &LabCheckpointBranch, next: &LabCheckpointBranch) -> bool {
+    previous.branch_id == next.branch_id
+        && previous.checkpoint_id == next.checkpoint_id
+        && previous.branch_name == next.branch_name
+        && previous.source_tick == next.source_tick
+        && previous.target_tick == next.target_tick
+        && previous.world_digest == next.world_digest
+}
+
+fn branch_transition_is_valid(previous: &LabCheckpointBranch, next: &LabCheckpointBranch) -> bool {
+    branch_has_same_source(previous, next)
+        && match previous.status.as_str() {
+            "running" => true,
+            "cancelling" => next.status != "running",
+            _ => previous.status == next.status && previous.artifact_id == next.artifact_id,
+        }
+}
+
+fn branch_outcome_is_bounded(
+    outcome: &LabBranchOutcome,
+    source_tick: u64,
+    target_tick: u64,
+    treatment: bool,
+) -> bool {
+    let (Ok(population), Ok(baseline_population)) = (
+        u32::try_from(outcome.population),
+        u32::try_from(outcome.baseline_population),
+    ) else {
+        return false;
+    };
+    let ratio_valid = if outcome.baseline_population == 0 {
+        outcome.recovery_ratio.is_none()
+    } else {
+        let expected = f64::from(population) / f64::from(baseline_population);
+        outcome.recovery_ratio.is_some_and(|ratio| {
+            ratio.is_finite()
+                && ratio >= 0.0
+                && (ratio - expected).abs() <= 1e-12 * expected.max(1.0)
+        })
+    };
+    let health_valid = if outcome.population == 0 {
+        outcome.average_health.is_none()
+            && outcome.total_energy.classify() == std::num::FpCategory::Zero
+    } else {
+        outcome
+            .average_health
+            .is_some_and(|health| health.is_finite() && health >= 0.0)
+    };
+    outcome.tick == target_tick
+        && outcome.total_food.is_finite()
+        && outcome.total_food >= 0.0
+        && outcome.total_energy.is_finite()
+        && outcome.total_energy >= 0.0
+        && health_valid
+        && lowercase_hex_is_valid(&outcome.final_digest, std::mem::size_of::<u64>() * 2)
+        && outcome.command_applied_tick == treatment.then_some(source_tick)
+        && outcome.minimum_population <= outcome.population
+        && outcome.minimum_population <= outcome.baseline_population
+        && (outcome.minimum_population == 0) == outcome.extinction_tick.is_some()
+        && outcome
+            .extinction_tick
+            .is_none_or(|tick| (source_tick..=target_tick).contains(&tick))
+        && ratio_valid
+        && outcome.first_divergence.as_ref().is_none_or(|divergence| {
+            treatment
+                && divergence.tick > source_tick
+                && divergence.tick <= target_tick
+                && divergence.command_applied_tick == source_tick
+                && identity_is_bounded(&divergence.stage)
+                && divergence.stage.len() <= 128
+                && !divergence.control_digest.is_empty()
+                && !divergence.branch_digest.is_empty()
+                && divergence.control_digest.len() <= 2048
+                && divergence.branch_digest.len() <= 2048
+                && divergence.control_digest != divergence.branch_digest
+                && divergence.details.len() <= 2048
+        })
+}
+
+fn branch_report_matches_receipt(report: &LabBranchReport, branch: &LabCheckpointBranch) -> bool {
+    branch_is_bounded(branch)
+        && branch.status == "completed"
+        && report.branch_id == branch.branch_id
+        && Some(&report.artifact_id) == branch.artifact_id.as_ref()
+        && report.source_tick == branch.source_tick
+        && report.target_tick == branch.target_tick
+        && report.source_world_digest == branch.world_digest
+        && report.source_byte_size > 0
+        && report.source_byte_size <= scriptbots_core::MAX_WORLD_CHECKPOINT_BYTES as u64
+        && report.report_byte_size > 0
+        && report.report_byte_size <= LAB_MAX_BRANCH_REPORT_BYTES as u64
+        && lowercase_hex_is_valid(&report.source_checksum_blake3, 64)
+        && lowercase_hex_is_valid(&report.report_checksum_blake3, 64)
+        && lowercase_hex_is_valid(&report.report_checksum_sha256, 64)
+        && branch_outcome_is_bounded(
+            &report.control,
+            report.source_tick,
+            report.target_tick,
+            false,
+        )
+        && report.treatment.as_ref().is_none_or(|treatment| {
+            treatment.baseline_population == report.control.baseline_population
+                && (treatment.final_digest == report.control.final_digest
+                    || treatment.first_divergence.is_some())
+                && branch_outcome_is_bounded(
+                    treatment,
+                    report.source_tick,
+                    report.target_tick,
+                    true,
+                )
+        })
 }
 
 fn page_is_bounded<T>(items: &[T], offset: usize, total: usize, next: Option<&str>) -> bool {
@@ -924,6 +1475,13 @@ impl LabWorkflows {
                 reason: "Save result discarded; the service may still complete. Retry the same identity only on the original source.".into(),
             };
         }
+        if let Some(creation) = &mut self.latest_branch_creation
+            && matches!(creation.state, LabBranchCreationState::Pending)
+        {
+            creation.state = LabBranchCreationState::Retryable {
+                reason: "Study admission result discarded; work may still be admitted. Retry the exact saved source and choices on their original application source.".into(),
+            };
+        }
     }
 
     /// Bind observations and future work to the actual owner and visible panel.
@@ -933,6 +1491,7 @@ impl LabWorkflows {
             self.session = Some(session);
             self.note_prior_checkpoint_save();
             self.note_prior_experiment_creation();
+            self.note_prior_branch_creation();
         }
         if self.panel != panel {
             self.invalidate();
@@ -993,18 +1552,22 @@ impl LabWorkflows {
     }
 
     fn has_unconfirmed_experiment_creation(&self) -> bool {
-        self.latest_experiment_creation.as_ref().is_some_and(|creation| {
-            !matches!(creation.state, LabExperimentCreationState::Created { .. })
-        })
+        self.latest_experiment_creation
+            .as_ref()
+            .is_some_and(|creation| {
+                !matches!(creation.state, LabExperimentCreationState::Created { .. })
+            })
     }
 
     /// Whether the next creation retries an unconfirmed request on this exact source.
     #[must_use]
     pub fn will_retry_experiment_creation(&self) -> bool {
-        self.latest_experiment_creation.as_ref().is_some_and(|creation| {
-            self.session == Some(creation.session_id)
-                && !matches!(creation.state, LabExperimentCreationState::Created { .. })
-        })
+        self.latest_experiment_creation
+            .as_ref()
+            .is_some_and(|creation| {
+                self.session == Some(creation.session_id)
+                    && !matches!(creation.state, LabExperimentCreationState::Created { .. })
+            })
     }
 
     /// Whether the composer may change scientific choices before explicit submission.
@@ -1124,7 +1687,9 @@ impl LabWorkflows {
         });
         self.start(request.clone());
         if self.is_busy() {
-            self.set_notice("Submitting the frozen experiment request; awaiting application admission.");
+            self.set_notice(
+                "Submitting the frozen experiment request; awaiting application admission.",
+            );
         } else {
             let reason = self
                 .notice
@@ -1178,11 +1743,14 @@ impl LabWorkflows {
                 && self.session == Some(*session_id)
                 && self.panel == LabPanel::Experiments
                 && self.composing_experiment
-                && self.latest_experiment_creation.as_ref().is_some_and(|creation| {
-                    creation.request_id == *request_id
-                        && creation.session_id == *session_id
-                        && creation.draft == *draft
-                })
+                && self
+                    .latest_experiment_creation
+                    .as_ref()
+                    .is_some_and(|creation| {
+                        creation.request_id == *request_id
+                            && creation.session_id == *session_id
+                            && creation.draft == *draft
+                    })
                 && experiment_request_identity_is_valid(request_id)
                 && created_experiment_matches_draft(&experiment, request_id, draft) =>
             {
@@ -1211,7 +1779,8 @@ impl LabWorkflows {
                 return;
             }
             Ok(_) => {
-                "Experiment receipt did not match the frozen request, source or two-arm cohort.".into()
+                "Experiment receipt did not match the frozen request, source or two-arm cohort."
+                    .into()
             }
             Err(error) => bounded_message(&error),
         };
@@ -1219,6 +1788,256 @@ impl LabWorkflows {
         self.set_notice(format!(
             "Experiment creation is unconfirmed: {reason}. Retry preserves the exact identity and inputs."
         ));
+    }
+
+    fn has_unconfirmed_branch_creation(&self) -> bool {
+        self.latest_branch_creation
+            .as_ref()
+            .is_some_and(|creation| {
+                !matches!(creation.state, LabBranchCreationState::Created { .. })
+            })
+    }
+
+    fn note_prior_branch_creation(&mut self) {
+        if let Some(creation) = &self.latest_branch_creation
+            && self.session != Some(creation.session_id)
+            && !matches!(creation.state, LabBranchCreationState::Created { .. })
+        {
+            self.set_notice(format!(
+                "Study request {} belongs to a previous application source and remains unconfirmed. Return to that source for exact retry, or explicitly abandon the local identity after its worker finishes. Its study may already exist.",
+                creation.request_id,
+            ));
+        }
+    }
+
+    /// Whether the next admission retries one unconfirmed request on its original source.
+    #[must_use]
+    pub fn will_retry_branch_creation(&self) -> bool {
+        self.latest_branch_creation
+            .as_ref()
+            .is_some_and(|creation| {
+                self.session == Some(creation.session_id)
+                    && !matches!(creation.state, LabBranchCreationState::Created { .. })
+            })
+    }
+
+    /// Whether the displayed saved-study draft is still editable.
+    #[must_use]
+    pub fn can_edit_branch_draft(&self) -> bool {
+        self.panel == LabPanel::Checkpoints
+            && self.checkpoint_view == LabCheckpointView::BranchComposer
+            && self.session.is_some()
+            && self.branch_capabilities.is_some()
+            && self.branch_draft.is_some()
+            && !self.is_busy()
+            && !self.has_unconfirmed_branch_creation()
+    }
+
+    /// Whether a valid disclosed study or an exact same-source retry can be submitted.
+    #[must_use]
+    pub fn can_create_checkpoint_branch(&self) -> bool {
+        if self.panel != LabPanel::Checkpoints
+            || self.checkpoint_view != LabCheckpointView::BranchComposer
+            || self.session.is_none()
+            || self.submit.is_none()
+            || self.is_busy()
+            || (self.has_unconfirmed_branch_creation() && !self.will_retry_branch_creation())
+        {
+            return false;
+        }
+        let Some(capabilities) = &self.branch_capabilities else {
+            return false;
+        };
+        self.branch_draft
+            .as_ref()
+            .filter(|draft| {
+                self.latest_branch_creation
+                    .as_ref()
+                    .filter(|_| self.has_unconfirmed_branch_creation())
+                    .is_none_or(|creation| creation.draft == **draft)
+            })
+            .is_some_and(|draft| draft.validate(capabilities).is_ok())
+    }
+
+    /// Whether local unconfirmed study identity may be forgotten without a live worker.
+    #[must_use]
+    pub fn can_abandon_branch_request(&self) -> bool {
+        !self.is_busy() && self.has_unconfirmed_branch_creation()
+    }
+
+    /// Whether the selected observed study can receive a cancellation request.
+    #[must_use]
+    pub fn can_cancel_checkpoint_branch(&self) -> bool {
+        self.panel == LabPanel::Checkpoints
+            && self.checkpoint_view == LabCheckpointView::BranchDetail
+            && self.submit.is_some()
+            && !self.is_busy()
+            && self.branch.as_ref().is_some_and(|branch| {
+                self.selected_branch.as_ref() == Some(&branch.branch_id)
+                    && branch.status == "running"
+            })
+    }
+
+    /// Whether a completed selected receipt supports a verified report read.
+    #[must_use]
+    pub fn can_read_branch_report(&self) -> bool {
+        self.panel == LabPanel::Checkpoints
+            && self.checkpoint_view == LabCheckpointView::BranchDetail
+            && self.submit.is_some()
+            && !self.is_busy()
+            && self.branch.as_ref().is_some_and(|branch| {
+                self.selected_branch.as_ref() == Some(&branch.branch_id)
+                    && branch.status == "completed"
+                    && branch.artifact_id.is_some()
+            })
+    }
+
+    fn open_branch_composer(&mut self) {
+        if self.panel != LabPanel::Checkpoints {
+            self.set_notice("Open Checkpoints before configuring a saved-source study.");
+            return;
+        }
+        let draft = if let Some(creation) = &self.latest_branch_creation
+            && !matches!(creation.state, LabBranchCreationState::Created { .. })
+        {
+            Some(creation.draft.clone())
+        } else {
+            self.selected_checkpoint_metadata()
+                .map(|checkpoint| LabBranchDraft {
+                    checkpoint: checkpoint.clone(),
+                    ticks: 100,
+                    treatment: LabBranchTreatment::Unchanged,
+                })
+        };
+        let Some(draft) = draft else {
+            self.set_notice("Select an actual retained checkpoint before configuring its future.");
+            return;
+        };
+        self.invalidate();
+        self.checkpoint_view = LabCheckpointView::BranchComposer;
+        self.branch_draft = Some(draft);
+        self.branch_capabilities = None;
+        self.branch_report = None;
+        self.note_prior_branch_creation();
+        if !self.is_busy() {
+            self.start(LabWorkflowRequest::BranchCapabilities);
+        }
+    }
+
+    fn create_checkpoint_branch(&mut self) {
+        if !self.can_create_checkpoint_branch() {
+            self.set_notice("Study admission requires a valid disclosed saved source, current runner limits, its original application source and a free worker slot.");
+            return;
+        }
+        let (Some(session_id), Some(draft)) = (self.session, self.branch_draft.clone()) else {
+            return;
+        };
+        let request_id = if self.will_retry_branch_creation() {
+            let Some(creation) = &self.latest_branch_creation else {
+                return;
+            };
+            creation.request_id.clone()
+        } else {
+            let Some(identity) = next_checkpoint_request(session_id) else {
+                self.set_notice("Study request identities are exhausted.");
+                return;
+            };
+            identity
+        };
+        let request = LabWorkflowRequest::CreateCheckpointBranch {
+            request_id: request_id.clone(),
+            session_id,
+            draft: draft.clone(),
+        };
+        self.latest_branch_creation = Some(LabBranchCreation {
+            request_id,
+            session_id,
+            draft,
+            state: LabBranchCreationState::Pending,
+        });
+        self.start(request.clone());
+        if self.is_busy() {
+            self.set_notice(
+                "Submitting the frozen saved-source study; awaiting managed admission.",
+            );
+        } else {
+            let reason = self
+                .notice
+                .clone()
+                .unwrap_or_else(|| "Study worker did not start.".into());
+            self.branch_creation_unconfirmed(&request, &reason);
+        }
+    }
+
+    fn branch_creation_unconfirmed(&mut self, request: &LabWorkflowRequest, reason: &str) {
+        let LabWorkflowRequest::CreateCheckpointBranch {
+            request_id,
+            session_id,
+            draft,
+        } = request
+        else {
+            return;
+        };
+        if let Some(creation) = &mut self.latest_branch_creation
+            && creation.request_id == *request_id
+            && creation.session_id == *session_id
+            && creation.draft == *draft
+            && !matches!(creation.state, LabBranchCreationState::Created { .. })
+        {
+            creation.state = LabBranchCreationState::Retryable {
+                reason: bounded_message(reason),
+            };
+        }
+    }
+
+    fn finish_branch_creation(
+        &mut self,
+        request: &LabWorkflowRequest,
+        result: Result<LabWorkflowResponse, String>,
+    ) {
+        let LabWorkflowRequest::CreateCheckpointBranch {
+            request_id,
+            session_id,
+            draft,
+        } = request
+        else {
+            return;
+        };
+        let reason = match result {
+            Ok(LabWorkflowResponse::CheckpointBranchCreated { request_id: returned_id, session_id: returned_session, branch })
+                if returned_id == *request_id
+                    && returned_session == *session_id
+                    && self.session == Some(*session_id)
+                    && self.panel == LabPanel::Checkpoints
+                    && self.checkpoint_view == LabCheckpointView::BranchComposer
+                    && self.latest_branch_creation.as_ref().is_some_and(|creation| {
+                        creation.request_id == *request_id
+                            && creation.session_id == *session_id
+                            && creation.draft == *draft
+                    })
+                    && checkpoint_request_identity_is_valid(request_id)
+                    && branch_matches_draft(&branch, draft) => {
+                self.set_notice(format!("Saved-source study {} admitted; observed status: {}.", branch.branch_id, branch.status));
+                self.latest_branch_creation = Some(LabBranchCreation {
+                    request_id: returned_id,
+                    session_id: returned_session,
+                    draft: draft.clone(),
+                    state: LabBranchCreationState::Created { branch_id: branch.branch_id.clone() },
+                });
+                self.checkpoint_view = LabCheckpointView::BranchDetail;
+                self.selected_branch = Some(branch.branch_id.clone());
+                self.branch = Some(branch);
+                self.branch_report = None;
+                self.checkpoint_branches = None;
+                self.branch_cursor = None;
+                self.last_refresh = Some(Instant::now());
+                return;
+            }
+            Ok(_) => "Study admission receipt did not match the frozen source, horizon, treatment or application session.".into(),
+            Err(error) => bounded_message(&error),
+        };
+        self.branch_creation_unconfirmed(request, &reason);
+        self.set_notice(format!("Study admission is unconfirmed: {reason}. Retry preserves the exact identity and choices."));
     }
 
     fn note_prior_checkpoint_save(&mut self) {
@@ -1488,6 +2307,10 @@ impl LabWorkflows {
                 &job.request,
                 "Save finished after the selection or session changed; its receipt was discarded.",
             );
+            self.branch_creation_unconfirmed(
+                &job.request,
+                "Study admission finished after its selection or application source changed; its receipt was discarded.",
+            );
             self.notice = Some(
                 "Lab request finished after its selection or session changed; result discarded."
                     .into(),
@@ -1502,11 +2325,29 @@ impl LabWorkflows {
             self.finish_checkpoint_save(&job.request, result);
             return None;
         }
+        if matches!(
+            &job.request,
+            LabWorkflowRequest::CreateCheckpointBranch { .. }
+        ) {
+            self.finish_branch_creation(&job.request, result);
+            return None;
+        }
         let response = match result {
             Ok(response) => response,
             Err(error) => {
                 if matches!(&job.request, LabWorkflowRequest::ExperimentCapabilities) {
                     self.experiment_capabilities = None;
+                }
+                if matches!(&job.request, LabWorkflowRequest::BranchCapabilities) {
+                    self.branch_capabilities = None;
+                }
+                if matches!(
+                    &job.request,
+                    LabWorkflowRequest::GetCheckpointBranch { .. }
+                        | LabWorkflowRequest::CancelCheckpointBranch { .. }
+                        | LabWorkflowRequest::GetCheckpointBranchReport { .. }
+                ) {
+                    self.branch_report = None;
                 }
                 if matches!(
                     &job.request,
@@ -1618,10 +2459,63 @@ impl LabWorkflows {
                 self.event_review = Some(review);
                 return None;
             }
+            (LabWorkflowRequest::BranchCapabilities, LabWorkflowResponse::BranchCapabilities(capabilities))
+                if self.panel == LabPanel::Checkpoints
+                    && self.checkpoint_view == LabCheckpointView::BranchComposer
+                    && capabilities.validate().is_ok() => {
+                self.branch_capabilities = Some(capabilities);
+                true
+            }
+            (LabWorkflowRequest::ListCheckpointBranches { cursor }, LabWorkflowResponse::CheckpointBranches(page)) => {
+                self.accept_branch_page(cursor.as_deref(), page)
+            }
+            (LabWorkflowRequest::GetCheckpointBranch { branch_id } | LabWorkflowRequest::CancelCheckpointBranch { branch_id },
+                LabWorkflowResponse::CheckpointBranch(branch))
+                if self.panel == LabPanel::Checkpoints
+                    && self.checkpoint_view == LabCheckpointView::BranchDetail
+                    && self.selected_branch.as_ref() == Some(branch_id)
+                    && branch.branch_id == *branch_id
+                    && branch_is_bounded(&branch)
+                    && self.branch.as_ref().is_none_or(|previous| branch_transition_is_valid(previous, &branch)) => {
+                if self.branch_report.as_ref().is_some_and(|report| !branch_report_matches_receipt(report, &branch)) {
+                    self.branch_report = None;
+                }
+                self.branch = Some(branch);
+                true
+            }
+            (LabWorkflowRequest::GetCheckpointBranchReport { branch_id }, LabWorkflowResponse::CheckpointBranchReport(report))
+                if self.panel == LabPanel::Checkpoints
+                    && self.checkpoint_view == LabCheckpointView::BranchDetail
+                    && self.selected_branch.as_ref() == Some(branch_id)
+                    && report.branch_id == *branch_id
+                    && self.branch.as_ref().is_some_and(|branch| branch_report_matches_receipt(&report, branch))
+                    && self.latest_branch_creation.as_ref()
+                        .filter(|creation| matches!(&creation.state, LabBranchCreationState::Created { branch_id: id } if id == branch_id))
+                        .is_none_or(|creation| {
+                            report.treatment.is_some() == (creation.draft.treatment != LabBranchTreatment::Unchanged)
+                                && report.source_byte_size == creation.draft.checkpoint.byte_size
+                                && report.control.baseline_population == creation.draft.checkpoint.agent_count
+                        }) => {
+                self.branch_report = Some(report);
+                true
+            }
             _ => false,
         };
         if !accepted && matches!(request, LabWorkflowRequest::ExperimentCapabilities) {
             self.experiment_capabilities = None;
+        }
+        if !accepted && matches!(request, LabWorkflowRequest::BranchCapabilities) {
+            self.branch_capabilities = None;
+        }
+        if !accepted
+            && matches!(
+                request,
+                LabWorkflowRequest::GetCheckpointBranch { .. }
+                    | LabWorkflowRequest::CancelCheckpointBranch { .. }
+                    | LabWorkflowRequest::GetCheckpointBranchReport { .. }
+            )
+        {
+            self.branch_report = None;
         }
         if !accepted
             && matches!(
@@ -1641,6 +2535,9 @@ impl LabWorkflows {
         });
         if accepted && matches!(request, LabWorkflowRequest::ExperimentCapabilities) {
             self.note_prior_experiment_creation();
+        }
+        if accepted && matches!(request, LabWorkflowRequest::BranchCapabilities) {
+            self.note_prior_branch_creation();
         }
         None
     }
@@ -1690,6 +2587,49 @@ impl LabWorkflows {
         true
     }
 
+    fn accept_branch_page(&mut self, cursor: Option<&str>, page: LabCheckpointBranchPage) -> bool {
+        if self.panel != LabPanel::Checkpoints
+            || self.checkpoint_view != LabCheckpointView::BranchCatalog
+            || cursor != self.branch_cursor.as_deref()
+            || page.offset != cursor.and_then(|value| value.parse().ok()).unwrap_or(0)
+            || !page_is_bounded(
+                &page.items,
+                page.offset,
+                page.total,
+                page.next_cursor.as_deref(),
+            )
+            || !page.items.iter().all(branch_is_bounded)
+            || page.items.iter().enumerate().any(|(index, item)| {
+                page.items[..index]
+                    .iter()
+                    .any(|previous| previous.branch_id == item.branch_id)
+            })
+        {
+            return false;
+        }
+        self.checkpoint_branches = Some(page);
+        true
+    }
+
+    fn branch_refresh_request(&self) -> Option<LabWorkflowRequest> {
+        match self.checkpoint_view {
+            LabCheckpointView::SavedCuts => Some(LabWorkflowRequest::ListCheckpoints {
+                cursor: self.checkpoint_cursor.clone(),
+            }),
+            LabCheckpointView::BranchComposer => Some(LabWorkflowRequest::BranchCapabilities),
+            LabCheckpointView::BranchCatalog => Some(LabWorkflowRequest::ListCheckpointBranches {
+                cursor: self.branch_cursor.clone(),
+            }),
+            LabCheckpointView::BranchDetail => {
+                self.selected_branch
+                    .as_ref()
+                    .map(|id| LabWorkflowRequest::GetCheckpointBranch {
+                        branch_id: id.clone(),
+                    })
+            }
+        }
+    }
+
     fn refresh_request(&self) -> Option<LabWorkflowRequest> {
         match self.panel {
             LabPanel::Inactive | LabPanel::Narrative => None,
@@ -1704,9 +2644,7 @@ impl LabWorkflows {
                     experiment_id: id.clone(),
                 },
             )),
-            LabPanel::Checkpoints => Some(LabWorkflowRequest::ListCheckpoints {
-                cursor: self.checkpoint_cursor.clone(),
-            }),
+            LabPanel::Checkpoints => self.branch_refresh_request(),
         }
     }
 
@@ -1722,7 +2660,14 @@ impl LabWorkflows {
         }
         let needs_refresh = match self.panel {
             LabPanel::Inactive | LabPanel::Narrative => false,
-            LabPanel::Checkpoints => self.checkpoints.is_none(),
+            LabPanel::Checkpoints => match self.checkpoint_view {
+                LabCheckpointView::SavedCuts => self.checkpoints.is_none(),
+                LabCheckpointView::BranchComposer => self.branch_capabilities.is_none(),
+                LabCheckpointView::BranchCatalog => true,
+                LabCheckpointView::BranchDetail => self.branch.as_ref().is_none_or(|branch| {
+                    matches!(branch.status.as_str(), "running" | "cancelling")
+                }),
+            },
             LabPanel::Experiments if self.composing_experiment => {
                 self.experiment_capabilities.is_none()
             }
@@ -1794,7 +2739,9 @@ impl LabWorkflows {
             .latest_experiment_creation
             .as_ref()
             .filter(|_| self.has_unconfirmed_experiment_creation())
-            .map_or_else(LabExperimentDraft::default, |creation| creation.draft.clone());
+            .map_or_else(LabExperimentDraft::default, |creation| {
+                creation.draft.clone()
+            });
         self.experiments = None;
         self.experiment_cursor = None;
         self.selected_experiment = None;
@@ -1805,6 +2752,18 @@ impl LabWorkflows {
         self.checkpoints = None;
         self.checkpoint_cursor = None;
         self.selected_checkpoint = None;
+        self.checkpoint_view = LabCheckpointView::SavedCuts;
+        self.branch_capabilities = None;
+        self.branch_draft = self
+            .latest_branch_creation
+            .as_ref()
+            .filter(|_| self.has_unconfirmed_branch_creation())
+            .map(|creation| creation.draft.clone());
+        self.checkpoint_branches = None;
+        self.branch_cursor = None;
+        self.selected_branch = None;
+        self.branch = None;
+        self.branch_report = None;
         self.selected_event = None;
         self.notice = None;
         self.variant_offset = 0;
@@ -1832,9 +2791,116 @@ impl LabWorkflows {
         self.set_notice(message);
     }
 
+    fn allow_branch_draft_edit(&mut self) -> bool {
+        if self.can_edit_branch_draft() {
+            true
+        } else {
+            self.set_notice("Saved-study choices are frozen while work is pending or admission is unconfirmed. Retry exactly, or explicitly abandon the local request after its worker finishes.");
+            false
+        }
+    }
+
+    fn report_branch_draft_validation(&mut self) {
+        let message = match (&self.branch_draft, &self.branch_capabilities) {
+            (Some(draft), Some(capabilities)) => draft.validate(capabilities).map_or_else(
+                |reason| format!("Study cannot be submitted: {reason}"),
+                |()| {
+                    "Saved-source study ready; execution starts only after explicit submission."
+                        .into()
+                },
+            ),
+            _ => "Select a saved source and load current study limits before submission.".into(),
+        };
+        self.set_notice(message);
+    }
+
     /// Apply one native UI intent, preserving request identity and bounded state.
     pub fn dispatch(&mut self, action: LabAction) {
         match action {
+            LabAction::NewCheckpointBranch => self.open_branch_composer(),
+            LabAction::BackToCheckpoints => {
+                self.invalidate();
+                self.checkpoint_view = LabCheckpointView::SavedCuts;
+                self.selected_branch = None;
+                self.branch = None;
+                self.branch_report = None;
+                self.set_notice("Returned to saved checkpoints. Admitted studies continue independently; an unconfirmed request keeps its exact retry identity.");
+            }
+            LabAction::CheckpointBranchesPage(cursor) => {
+                if self.panel != LabPanel::Checkpoints
+                    || cursor
+                        .as_ref()
+                        .is_some_and(|value| value.parse::<usize>().is_err())
+                {
+                    self.set_notice("Open Checkpoints and use an observed study page cursor.");
+                    return;
+                }
+                self.invalidate();
+                self.checkpoint_view = LabCheckpointView::BranchCatalog;
+                self.branch_cursor = cursor;
+                self.checkpoint_branches = None;
+                self.selected_branch = None;
+                self.branch = None;
+                self.branch_report = None;
+                if !self.is_busy() {
+                    self.start(LabWorkflowRequest::ListCheckpointBranches {
+                        cursor: self.branch_cursor.clone(),
+                    });
+                }
+            }
+            LabAction::SelectCheckpointBranch(id) => self.select_checkpoint_branch(id),
+            LabAction::BranchTreatment(treatment) => {
+                if self.allow_branch_draft_edit() {
+                    if let Some(draft) = &mut self.branch_draft {
+                        draft.treatment = treatment;
+                    }
+                    self.report_branch_draft_validation();
+                }
+            }
+            LabAction::BranchTicks(ticks) => {
+                if self.allow_branch_draft_edit() {
+                    if let Some(draft) = &mut self.branch_draft {
+                        draft.ticks = ticks;
+                    }
+                    self.report_branch_draft_validation();
+                }
+            }
+            LabAction::CreateCheckpointBranch => self.create_checkpoint_branch(),
+            LabAction::AbandonCheckpointBranchRequest => {
+                if !self.can_abandon_branch_request() {
+                    self.set_notice("Only an unconfirmed study whose worker has finished can be abandoned locally.");
+                    return;
+                }
+                if let Some(creation) = self.latest_branch_creation.take() {
+                    self.invalidate();
+                    self.set_notice(format!(
+                        "Forgot local study retry identity {}. Its study may already exist; inspect retained studies before submitting another request. This does not cancel admitted work.",
+                        creation.request_id,
+                    ));
+                }
+            }
+            LabAction::CancelCheckpointBranch => {
+                if self.can_cancel_checkpoint_branch() {
+                    if let Some(branch_id) = self.selected_branch.clone() {
+                        self.branch_report = None;
+                        self.start(LabWorkflowRequest::CancelCheckpointBranch { branch_id });
+                    }
+                } else {
+                    self.set_notice(
+                        "Cancellation requires a selected running study and a free worker slot.",
+                    );
+                }
+            }
+            LabAction::ReadCheckpointBranchReport => {
+                if self.can_read_branch_report() {
+                    if let Some(branch_id) = self.selected_branch.clone() {
+                        self.branch_report = None;
+                        self.start(LabWorkflowRequest::GetCheckpointBranchReport { branch_id });
+                    }
+                } else {
+                    self.set_notice("Read results after the selected study has a completed receipt and a verified report identity.");
+                }
+            }
             LabAction::NewExperiment => {
                 if self.panel != LabPanel::Experiments {
                     self.set_notice("Open the Experiments panel before creating a batch.");
@@ -1907,7 +2973,7 @@ impl LabWorkflows {
             LabAction::ReturnLive => self.invalidate(),
             LabAction::CancelRequest => {
                 self.invalidate();
-                self.set_notice("Result cancelled. The worker remains occupied until it finishes; submitted actions may still complete. Unconfirmed checkpoint saves retain their retry identity.");
+                self.set_notice("Result cancelled. The worker remains occupied until it finishes; submitted actions may still complete. Unconfirmed saves and admissions retain their retry identity.");
             }
             LabAction::SelectExperiment(id) => self.select_experiment(id),
             LabAction::AllExperiments | LabAction::BackToExperiments => {
@@ -1927,6 +2993,7 @@ impl LabWorkflows {
             }
             LabAction::CheckpointsPage(cursor) => {
                 self.invalidate();
+                self.checkpoint_view = LabCheckpointView::SavedCuts;
                 self.checkpoint_cursor = cursor;
                 self.checkpoints = None;
                 self.selected_checkpoint = None;
@@ -2041,6 +3108,139 @@ impl LabWorkflows {
             self.start(LabWorkflowRequest::GetExperiment { experiment_id: id });
         }
     }
+
+    fn select_checkpoint_branch(&mut self, id: String) {
+        if self.panel != LabPanel::Checkpoints || !branch_identifier_is_valid(&id) {
+            self.set_notice("Select a valid retained study from Checkpoints.");
+            return;
+        }
+        let branch = self
+            .checkpoint_branches
+            .as_ref()
+            .and_then(|page| page.items.iter().find(|branch| branch.branch_id == id))
+            .or_else(|| self.branch.as_ref().filter(|branch| branch.branch_id == id))
+            .cloned();
+        let Some(branch) = branch else {
+            self.set_notice("Refresh retained studies before selecting a missing receipt.");
+            return;
+        };
+        self.invalidate();
+        self.checkpoint_view = LabCheckpointView::BranchDetail;
+        self.selected_branch = Some(id.clone());
+        self.branch = Some(branch);
+        self.branch_report = None;
+        if !self.is_busy() {
+            self.start(LabWorkflowRequest::GetCheckpointBranch { branch_id: id });
+        }
+    }
+}
+
+/// Shared bounded presentation of actual terminal observations from one saved seed.
+///
+/// These lines do not turn repeated ticks into independent replication, infer a
+/// historical treatment, or substitute trajectory averages for endpoint values.
+#[must_use]
+pub fn branch_report_lines(report: &LabBranchReport) -> Vec<String> {
+    let mut lines = vec![
+        format!(
+            "Verified endpoints at tick {} from saved tick {}.",
+            report.target_tick, report.source_tick
+        ),
+        format!(
+            "Exact source seed: {}. One saved seed: descriptive outcomes, without independent-seed inference.",
+            report.base_seed
+        ),
+        format!("Saved scientific digest: {}.", report.source_world_digest),
+    ];
+    for (label, outcome) in [
+        ("Control", Some(&report.control)),
+        ("Treatment", report.treatment.as_ref()),
+    ] {
+        let Some(outcome) = outcome else { continue };
+        lines.push(format!(
+            "{label}: {} living agents; food {:.3} food energy units; live-agent energy {:.3} energy units.",
+            outcome.population, outcome.total_food, outcome.total_energy,
+        ));
+        lines.push(outcome.average_health.map_or_else(
+            || format!("{label} mean health: unavailable (no living agents)."),
+            |health| format!("{label} mean live-agent health: {health:.3} health units."),
+        ));
+        lines.push(format!(
+            "{label} population: source {}; minimum {}; first zero population tick {}.",
+            outcome.baseline_population,
+            outcome.minimum_population,
+            outcome
+                .extinction_tick
+                .map_or_else(|| "not observed".into(), |tick| tick.to_string()),
+        ));
+        lines.push(outcome.recovery_ratio.map_or_else(
+            || {
+                format!(
+                    "{label} final/source population ratio: unavailable (empty source population)."
+                )
+            },
+            |ratio| format!("{label} final/source population ratio: {ratio:.3}."),
+        ));
+        lines.push(format!(
+            "{label} terminal scientific digest: {}.",
+            outcome.final_digest
+        ));
+    }
+    if let Some(treatment) = &report.treatment {
+        let control = &report.control;
+        let population_difference = if treatment.population >= control.population {
+            format!("+{}", treatment.population - control.population)
+        } else {
+            format!("-{}", control.population - treatment.population)
+        };
+        lines.push(format!(
+            "Treatment minus control at the terminal tick: {population_difference} agents; food {:+.3} food energy units; energy {:+.3} energy units.",
+            treatment.total_food - control.total_food,
+            treatment.total_energy - control.total_energy,
+        ));
+        lines.push(match (treatment.average_health, control.average_health) {
+            (Some(treatment), Some(control)) => format!("Terminal mean-health difference: {:+.3} health units.", treatment - control),
+            _ => "Terminal mean-health difference: unavailable because at least one arm has no living agents.".into(),
+        });
+        if let Some(divergence) = &treatment.first_divergence {
+            lines.push(format!(
+                "First observed divergence: tick {}, digest lane {}; intervention applied at saved boundary {}.",
+                divergence.tick, divergence.stage, divergence.command_applied_tick,
+            ));
+            lines.push(format!(
+                "Divergence control evidence: {}.",
+                divergence.control_digest
+            ));
+            lines.push(format!(
+                "Divergence treatment evidence: {}.",
+                divergence.branch_digest
+            ));
+            if !divergence.details.is_empty() {
+                lines.push(format!("Divergence detail: {}", divergence.details));
+            }
+        } else {
+            lines.push(
+                "No differing digest lane was observed against control over the recorded horizon."
+                    .into(),
+            );
+        }
+    } else {
+        lines.push("Unchanged future only; this report has no treatment arm.".into());
+    }
+    lines.push(format!(
+        "Report artifact {}: {} verified bytes.",
+        report.artifact_id, report.report_byte_size
+    ));
+    lines.push(format!("Report BLAKE3: {}.", report.report_checksum_blake3));
+    lines.push(format!(
+        "Report SHA-256: {}.",
+        report.report_checksum_sha256
+    ));
+    lines.push(format!(
+        "Retained source: {} bytes; BLAKE3 {}.",
+        report.source_byte_size, report.source_checksum_blake3
+    ));
+    lines
 }
 
 fn comparison_is_bounded(comparison: &LabComparison) -> bool {
@@ -2115,7 +3315,8 @@ pub fn comparison_lines(comparison: &LabComparison) -> Vec<String> {
     if let Some(reason) = &comparison.undefined_effect_reason {
         lines.push(bounded_message(reason));
     }
-    lines.push("Values describe the selected final-state endpoint across the matched seeds.".into());
+    lines
+        .push("Values describe the selected final-state endpoint across the matched seeds.".into());
     lines
 }
 
@@ -2262,6 +3463,734 @@ mod tests {
         );
     }
 
+    fn branch_test_capabilities() -> LabBranchCapabilities {
+        LabBranchCapabilities {
+            max_ticks: 10_000,
+            max_population: 10_000,
+        }
+    }
+
+    fn branch_test_draft() -> LabBranchDraft {
+        LabBranchDraft {
+            checkpoint: saved_checkpoint(),
+            ticks: 11,
+            treatment: LabBranchTreatment::FoodBloom,
+        }
+    }
+
+    fn branch_test_receipt(draft: &LabBranchDraft, status: &str) -> LabCheckpointBranch {
+        LabCheckpointBranch {
+            branch_id: "managed-study".into(),
+            checkpoint_id: draft.checkpoint.checkpoint_id.clone(),
+            branch_name: draft.treatment.key().into(),
+            status: status.into(),
+            source_tick: draft.checkpoint.tick,
+            target_tick: draft.checkpoint.tick.checked_add(draft.ticks).unwrap(),
+            world_digest: draft.checkpoint.world_digest.clone(),
+            artifact_id: (status == "completed").then(|| "verified-study-report".into()),
+            error_reason: None,
+        }
+    }
+
+    fn branch_test_creation_response(request: &LabWorkflowRequest) -> LabWorkflowResponse {
+        let LabWorkflowRequest::CreateCheckpointBranch {
+            request_id,
+            session_id,
+            draft,
+        } = request
+        else {
+            panic!("expected saved-study creation");
+        };
+        LabWorkflowResponse::CheckpointBranchCreated {
+            request_id: request_id.clone(),
+            session_id: *session_id,
+            branch: branch_test_receipt(draft, "running"),
+        }
+    }
+
+    fn open_branch_test_composer(submit: LabWorkflowSubmit) -> LabWorkflows {
+        let mut state = LabWorkflows {
+            submit: Some(submit),
+            ..LabWorkflows::default()
+        };
+        state.synchronize(HostSessionId::new(1), LabPanel::Checkpoints);
+        let checkpoint = saved_checkpoint();
+        state.selected_checkpoint = Some(checkpoint.checkpoint_id.clone());
+        state.checkpoints = Some(LabCheckpointPage {
+            retained_bytes: checkpoint.byte_size,
+            max_bytes: checkpoint.byte_size * 2,
+            items: vec![checkpoint],
+            total: 1,
+            offset: 0,
+            next_cursor: None,
+        });
+        state.dispatch(LabAction::NewCheckpointBranch);
+        drain_worker(&mut state);
+        assert!(state.branch_capabilities.is_some());
+        assert!(state.latest_branch_creation.is_none());
+        state
+    }
+
+    fn branch_test_report() -> LabBranchReport {
+        let draft = branch_test_draft();
+        let receipt = branch_test_receipt(&draft, "completed");
+        let control = LabBranchOutcome {
+            tick: receipt.target_tick,
+            population: 3,
+            total_food: 4.0,
+            total_energy: 6.0,
+            average_health: Some(1.0),
+            final_digest: "b".repeat(16),
+            command_applied_tick: None,
+            minimum_population: 3,
+            extinction_tick: None,
+            baseline_population: 3,
+            recovery_ratio: Some(1.0),
+            first_divergence: None,
+        };
+        let treatment = LabBranchOutcome {
+            population: 2,
+            total_food: 8.0,
+            total_energy: 3.0,
+            average_health: Some(0.75),
+            final_digest: "c".repeat(16),
+            command_applied_tick: Some(receipt.source_tick),
+            minimum_population: 2,
+            recovery_ratio: Some(2.0 / 3.0),
+            first_divergence: Some(LabBranchDivergence {
+                tick: receipt.source_tick + 1,
+                stage: "food".into(),
+                control_digest: "d".repeat(16),
+                branch_digest: "e".repeat(16),
+                command_applied_tick: receipt.source_tick,
+                details: "Ground-food digest first differed at the completed boundary.".into(),
+            }),
+            ..control.clone()
+        };
+        LabBranchReport {
+            branch_id: receipt.branch_id,
+            artifact_id: receipt.artifact_id.unwrap(),
+            base_seed: u64::MAX,
+            source_tick: receipt.source_tick,
+            target_tick: receipt.target_tick,
+            source_world_digest: receipt.world_digest,
+            source_byte_size: draft.checkpoint.byte_size,
+            source_checksum_blake3: "a".repeat(64),
+            report_byte_size: 4096,
+            report_checksum_blake3: "b".repeat(64),
+            report_checksum_sha256: "c".repeat(64),
+            control,
+            treatment: Some(treatment),
+        }
+    }
+
+    #[test]
+    fn saved_study_drafts_preserve_exact_source_and_refuse_horizon_overflow() {
+        let capabilities = branch_test_capabilities();
+        let draft = branch_test_draft();
+        assert!(draft.validate(&capabilities).is_ok());
+        for treatment in LabBranchTreatment::ALL {
+            let mut chosen = draft.clone();
+            chosen.treatment = treatment;
+            assert!(chosen.validate(&capabilities).is_ok());
+            assert_eq!(chosen.checkpoint, draft.checkpoint);
+            assert!(branch_identifier_is_valid(treatment.key()));
+            assert!(!treatment.description().is_empty());
+            assert_eq!(
+                treatment.branch_count(),
+                if treatment == LabBranchTreatment::Unchanged {
+                    1
+                } else {
+                    2
+                }
+            );
+        }
+        let keys: std::collections::BTreeSet<_> = LabBranchTreatment::ALL
+            .into_iter()
+            .map(LabBranchTreatment::key)
+            .collect();
+        assert_eq!(keys.len(), LabBranchTreatment::ALL.len());
+        for ticks in [0, capabilities.max_ticks + 1, u64::MAX] {
+            let mut invalid = draft.clone();
+            invalid.ticks = ticks;
+            assert!(invalid.validate(&capabilities).is_err());
+            assert_eq!(invalid.ticks, ticks, "invalid intent must not be clamped");
+        }
+        let mut boundary = draft.clone();
+        boundary.checkpoint.tick = u64::MAX - boundary.ticks;
+        assert!(boundary.validate(&capabilities).is_ok());
+        boundary.checkpoint.tick += 1;
+        assert!(boundary.validate(&capabilities).is_err());
+        let mut invalid = draft.clone();
+        invalid.checkpoint.agent_count = capabilities.max_population + 1;
+        invalid.checkpoint.byte_size = 20_000;
+        assert!(checkpoint_receipt_is_bounded(&invalid.checkpoint));
+        assert!(invalid.validate(&capabilities).is_err());
+        invalid = draft.clone();
+        invalid.checkpoint.world_digest = "a".repeat(64);
+        assert!(
+            invalid.validate(&capabilities).is_err(),
+            "an artifact checksum is not the source world digest"
+        );
+        invalid = draft;
+        invalid.checkpoint.checkpoint_id = "../source".into();
+        assert!(invalid.validate(&capabilities).is_err());
+        for limits in [
+            LabBranchCapabilities {
+                max_ticks: 0,
+                ..capabilities.clone()
+            },
+            LabBranchCapabilities {
+                max_ticks: u64::MAX,
+                ..capabilities.clone()
+            },
+            LabBranchCapabilities {
+                max_population: 0,
+                ..capabilities
+            },
+        ] {
+            assert!(limits.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn saved_study_uncertain_admission_keeps_full_source_through_owner_changes() {
+        for abandon_elsewhere in [false, true] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let observed = Arc::clone(&calls);
+            let mut state = open_branch_test_composer(Arc::new(move |request| {
+                if request == LabWorkflowRequest::BranchCapabilities {
+                    return Ok(LabWorkflowResponse::BranchCapabilities(
+                        branch_test_capabilities(),
+                    ));
+                }
+                let mut observed = observed.lock().unwrap();
+                observed.push(request.clone());
+                if observed.len() == 1 {
+                    Err("managed admission receipt lost".into())
+                } else {
+                    Ok(branch_test_creation_response(&request))
+                }
+            }));
+            assert!(
+                calls.lock().unwrap().is_empty(),
+                "opening the composer never creates a study"
+            );
+            state.dispatch(LabAction::BranchTreatment(LabBranchTreatment::FoodBloom));
+            state.dispatch(LabAction::BranchTicks(11));
+            state.dispatch(LabAction::CreateCheckpointBranch);
+            drain_worker(&mut state);
+            let frozen = state.latest_branch_creation.clone().unwrap();
+            assert_eq!(frozen.draft, branch_test_draft());
+            assert!(state.will_retry_branch_creation());
+            state.dispatch(LabAction::BranchTreatment(LabBranchTreatment::ClosedWorld));
+            state.dispatch(LabAction::BranchTicks(1));
+            assert_eq!(state.branch_draft.as_ref(), Some(&frozen.draft));
+
+            state.synchronize(HostSessionId::new(2), LabPanel::Checkpoints);
+            state.dispatch(LabAction::NewCheckpointBranch);
+            drain_worker(&mut state);
+            assert_eq!(state.branch_draft.as_ref(), Some(&frozen.draft));
+            assert!(!state.can_edit_branch_draft());
+            assert!(!state.can_create_checkpoint_branch());
+            state.dispatch(LabAction::CreateCheckpointBranch);
+            assert_eq!(calls.lock().unwrap().len(), 1);
+            if abandon_elsewhere {
+                state.dispatch(LabAction::AbandonCheckpointBranchRequest);
+                assert!(
+                    state
+                        .notice
+                        .as_deref()
+                        .unwrap()
+                        .contains("may already exist")
+                );
+                assert!(state.can_edit_branch_draft());
+                state.dispatch(LabAction::BranchTicks(1));
+            } else {
+                state.synchronize(HostSessionId::new(1), LabPanel::Checkpoints);
+                state.dispatch(LabAction::NewCheckpointBranch);
+                drain_worker(&mut state);
+                assert_eq!(state.branch_draft.as_ref(), Some(&frozen.draft));
+                assert!(state.will_retry_branch_creation());
+            }
+            state.dispatch(LabAction::CreateCheckpointBranch);
+            drain_worker(&mut state);
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.len(), 2);
+            if abandon_elsewhere {
+                assert_ne!(calls[0], calls[1]);
+                assert_ne!(
+                    state.latest_branch_creation.as_ref().unwrap().request_id,
+                    frozen.request_id
+                );
+            } else {
+                assert_eq!(
+                    calls[0], calls[1],
+                    "source, horizon, treatment and retry identity remain exact"
+                );
+            }
+            assert_eq!(state.checkpoint_view, LabCheckpointView::BranchDetail);
+            assert_eq!(state.selected_branch.as_deref(), Some("managed-study"));
+            assert!(
+                state.branch_report.is_none(),
+                "admission is not scientific completion"
+            );
+        }
+    }
+
+    #[test]
+    fn saved_study_invalidation_retains_the_worker_until_late_admission_drains() {
+        for change in 0..7 {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed_calls = Arc::clone(&calls);
+            let (started, observed_start) = std::sync::mpsc::channel();
+            let (release, released) = std::sync::mpsc::channel();
+            let released = Mutex::new(released);
+            let mut state = open_branch_test_composer(Arc::new(move |request| {
+                if request == LabWorkflowRequest::BranchCapabilities {
+                    return Ok(LabWorkflowResponse::BranchCapabilities(
+                        branch_test_capabilities(),
+                    ));
+                }
+                observed_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                started.send(request.clone()).unwrap();
+                released
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+                Ok(branch_test_creation_response(&request))
+            }));
+            state.dispatch(LabAction::CreateCheckpointBranch);
+            let original = observed_start.recv_timeout(Duration::from_secs(5)).unwrap();
+            let frozen = state.latest_branch_creation.clone().unwrap();
+            match change {
+                0 => state.dispatch(LabAction::CancelRequest),
+                1 => state.dispatch(LabAction::BackToCheckpoints),
+                2 => state.dispatch(LabAction::NewCheckpointBranch),
+                3 => state.dispatch(LabAction::CheckpointBranchesPage(None)),
+                4 => state.synchronize(HostSessionId::new(1), LabPanel::Experiments),
+                5 => state.synchronize(HostSessionId::new(2), LabPanel::Checkpoints),
+                6 => state.reset_observations(),
+                _ => unreachable!(),
+            }
+            assert!(state.is_busy(), "change {change} must retain the worker");
+            assert!(!state.can_abandon_branch_request());
+            state.dispatch(LabAction::AbandonCheckpointBranchRequest);
+            state.dispatch(LabAction::CreateCheckpointBranch);
+            assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+            assert_eq!(state.job.as_ref().unwrap().request, original);
+            assert_eq!(state.branch_draft.as_ref(), Some(&frozen.draft));
+            release.send(()).unwrap();
+            drain_worker(&mut state);
+            assert!(state.selected_branch.is_none());
+            assert!(state.branch.is_none());
+            assert!(matches!(
+                state.latest_branch_creation.as_ref().unwrap().state,
+                LabBranchCreationState::Retryable { .. }
+            ));
+            assert!(state.can_abandon_branch_request());
+        }
+    }
+
+    #[test]
+    fn saved_study_creation_receipts_bind_the_original_source_horizon_and_treatment() {
+        for mismatch in 0..11 {
+            let mut state = LabWorkflows::default();
+            let session = HostSessionId::new(1);
+            state.synchronize(session, LabPanel::Checkpoints);
+            state.checkpoint_view = LabCheckpointView::BranchComposer;
+            let draft = branch_test_draft();
+            state.branch_draft = Some(draft.clone());
+            state.latest_branch_creation = Some(LabBranchCreation {
+                request_id: "native-branch-request".into(),
+                session_id: session,
+                draft: draft.clone(),
+                state: LabBranchCreationState::Pending,
+            });
+            let request = LabWorkflowRequest::CreateCheckpointBranch {
+                request_id: "native-branch-request".into(),
+                session_id: session,
+                draft,
+            };
+            let mut response = branch_test_creation_response(&request);
+            let LabWorkflowResponse::CheckpointBranchCreated {
+                request_id,
+                session_id,
+                branch,
+            } = &mut response
+            else {
+                unreachable!();
+            };
+            match mismatch {
+                0 => {}
+                1 => *request_id = "other-request".into(),
+                2 => *session_id = HostSessionId::new(2),
+                3 => branch.checkpoint_id = "different-cut".into(),
+                4 => branch.source_tick += 1,
+                5 => branch.target_tick += 1,
+                6 => branch.world_digest = "f".repeat(16),
+                7 => branch.branch_name = LabBranchTreatment::Drought.key().into(),
+                8 => branch.status = "completed".into(),
+                9 => branch.branch_id = "../other-study".into(),
+                10 => {
+                    state
+                        .latest_branch_creation
+                        .as_mut()
+                        .unwrap()
+                        .draft
+                        .checkpoint
+                        .byte_size += 1
+                }
+                _ => unreachable!(),
+            }
+            assert!(deliver(&mut state, request, response).is_none());
+            if mismatch == 0 {
+                assert!(matches!(
+                    state.latest_branch_creation.as_ref().unwrap().state,
+                    LabBranchCreationState::Created { .. }
+                ));
+                assert_eq!(state.branch.as_ref().unwrap().status, "running");
+            } else {
+                assert!(
+                    state.branch.is_none(),
+                    "malformed receipt {mismatch} cannot navigate to a study"
+                );
+                assert!(state.selected_branch.is_none());
+                assert!(!matches!(
+                    state.latest_branch_creation.as_ref().unwrap().state,
+                    LabBranchCreationState::Created { .. }
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn retained_study_navigation_and_cancellation_do_not_admit_new_science() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::clone(&observed);
+        let status = Arc::new(Mutex::new("running".to_owned()));
+        let service_status = Arc::clone(&status);
+        let mut state = LabWorkflows {
+            submit: Some(Arc::new(move |request| {
+                calls.lock().unwrap().push(request.clone());
+                let mut status = service_status.lock().unwrap();
+                match request {
+                    LabWorkflowRequest::ListCheckpointBranches { .. } => Ok(
+                        LabWorkflowResponse::CheckpointBranches(LabCheckpointBranchPage {
+                            items: vec![branch_test_receipt(&branch_test_draft(), &status)],
+                            total: 1,
+                            offset: 0,
+                            next_cursor: None,
+                        }),
+                    ),
+                    LabWorkflowRequest::GetCheckpointBranch { .. } => {
+                        Ok(LabWorkflowResponse::CheckpointBranch(branch_test_receipt(
+                            &branch_test_draft(),
+                            &status,
+                        )))
+                    }
+                    LabWorkflowRequest::CancelCheckpointBranch { .. } => {
+                        *status = "cancelling".into();
+                        Ok(LabWorkflowResponse::CheckpointBranch(branch_test_receipt(
+                            &branch_test_draft(),
+                            &status,
+                        )))
+                    }
+                    other => panic!("read-only navigation must not submit {other:?}"),
+                }
+            })),
+            ..LabWorkflows::default()
+        };
+        state.synchronize(HostSessionId::new(1), LabPanel::Checkpoints);
+        state.dispatch(LabAction::CheckpointBranchesPage(None));
+        drain_worker(&mut state);
+        assert_eq!(state.checkpoint_branches.as_ref().unwrap().items.len(), 1);
+        state.dispatch(LabAction::SelectCheckpointBranch("managed-study".into()));
+        drain_worker(&mut state);
+        assert!(state.can_cancel_checkpoint_branch());
+        assert!(!state.can_read_branch_report());
+        state.dispatch(LabAction::CancelCheckpointBranch);
+        drain_worker(&mut state);
+        assert_eq!(state.branch.as_ref().unwrap().status, "cancelling");
+        assert!(!state.can_cancel_checkpoint_branch());
+        *status.lock().unwrap() = "stopped".into();
+        state.dispatch(LabAction::Refresh);
+        drain_worker(&mut state);
+        assert_eq!(state.branch.as_ref().unwrap().status, "stopped");
+        let reads = observed.lock().unwrap().len();
+        state.dispatch(LabAction::ReadCheckpointBranchReport);
+        state.dispatch(LabAction::CancelCheckpointBranch);
+        state.maybe_refresh();
+        assert_eq!(
+            observed.lock().unwrap().len(),
+            reads,
+            "stopped work is not silently resumed or reported completed"
+        );
+        assert!(state.latest_branch_creation.is_none());
+        assert!(
+            state.branch_draft.is_none(),
+            "catalog receipts do not invent original treatment choices"
+        );
+        assert!(state.branch_report.is_none());
+
+        let original = state.branch.clone().unwrap();
+        let mut regressed = original.clone();
+        regressed.status = "running".into();
+        deliver(
+            &mut state,
+            LabWorkflowRequest::GetCheckpointBranch {
+                branch_id: original.branch_id.clone(),
+            },
+            LabWorkflowResponse::CheckpointBranch(regressed),
+        );
+        assert_eq!(
+            state.branch.as_ref(),
+            Some(&original),
+            "terminal receipts cannot regress to live work"
+        );
+        let mut changed = original.clone();
+        changed.world_digest = "f".repeat(16);
+        deliver(
+            &mut state,
+            LabWorkflowRequest::GetCheckpointBranch {
+                branch_id: original.branch_id.clone(),
+            },
+            LabWorkflowResponse::CheckpointBranch(changed),
+        );
+        assert_eq!(
+            state.branch.as_ref(),
+            Some(&original),
+            "a study cannot change its saved source"
+        );
+    }
+
+    #[test]
+    fn saved_study_reports_bind_terminal_values_and_artifacts_without_inventing_replication() {
+        let draft = branch_test_draft();
+        let receipt = branch_test_receipt(&draft, "completed");
+        let report = branch_test_report();
+        assert!(branch_report_matches_receipt(&report, &receipt));
+        let lines = branch_report_lines(&report);
+        assert!(lines.len() <= 32);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains(&u64::MAX.to_string()));
+        assert!(rendered.contains("descriptive outcomes"));
+        assert!(
+            rendered
+                .contains("-1 agents; food +4.000 food energy units; energy -3.000 energy units")
+        );
+        assert!(rendered.contains("First observed divergence: tick 43"));
+
+        for mismatch in 0..18 {
+            let mut state = LabWorkflows::default();
+            state.synchronize(HostSessionId::new(1), LabPanel::Checkpoints);
+            state.checkpoint_view = LabCheckpointView::BranchDetail;
+            state.selected_branch = Some(receipt.branch_id.clone());
+            state.branch = Some(receipt.clone());
+            state.branch_report = Some(report.clone());
+            state.latest_branch_creation = Some(LabBranchCreation {
+                request_id: "created-study-request".into(),
+                session_id: HostSessionId::new(1),
+                draft: draft.clone(),
+                state: LabBranchCreationState::Created {
+                    branch_id: receipt.branch_id.clone(),
+                },
+            });
+            let mut changed = report.clone();
+            match mismatch {
+                0 => changed.branch_id = "different-study".into(),
+                1 => changed.artifact_id = "different-report".into(),
+                2 => changed.source_world_digest = "d".repeat(16),
+                3 => changed.control.tick -= 1,
+                4 => changed.control.total_energy = f64::NAN,
+                5 => changed.treatment.as_mut().unwrap().total_food = f64::INFINITY,
+                6 => changed.source_byte_size += 1,
+                7 => changed.report_byte_size = LAB_MAX_BRANCH_REPORT_BYTES as u64 + 1,
+                8 => changed.report_checksum_sha256 = "a".repeat(16),
+                9 => changed.treatment = None,
+                10 => changed.control.command_applied_tick = Some(changed.source_tick),
+                11 => changed.treatment.as_mut().unwrap().average_health = None,
+                12 => changed.treatment.as_mut().unwrap().recovery_ratio = Some(2.0),
+                13 => {
+                    changed.treatment.as_mut().unwrap().extinction_tick = Some(changed.source_tick)
+                }
+                14 => {
+                    changed
+                        .treatment
+                        .as_mut()
+                        .unwrap()
+                        .first_divergence
+                        .as_mut()
+                        .unwrap()
+                        .tick = changed.source_tick
+                }
+                15 => {
+                    changed
+                        .treatment
+                        .as_mut()
+                        .unwrap()
+                        .first_divergence
+                        .as_mut()
+                        .unwrap()
+                        .branch_digest = "d".repeat(16)
+                }
+                16 => {
+                    changed
+                        .treatment
+                        .as_mut()
+                        .unwrap()
+                        .first_divergence
+                        .as_mut()
+                        .unwrap()
+                        .details = "x".repeat(2049)
+                }
+                17 => changed.treatment.as_mut().unwrap().first_divergence = None,
+                _ => unreachable!(),
+            }
+            deliver(
+                &mut state,
+                LabWorkflowRequest::GetCheckpointBranchReport {
+                    branch_id: receipt.branch_id.clone(),
+                },
+                LabWorkflowResponse::CheckpointBranchReport(changed),
+            );
+            assert!(
+                state.branch_report.is_none(),
+                "malformed report {mismatch} must clear the previous preview"
+            );
+        }
+
+        let mut historical = report.clone();
+        let divergence = historical
+            .treatment
+            .as_mut()
+            .unwrap()
+            .first_divergence
+            .as_mut()
+            .unwrap();
+        divergence.stage = "hydrology".into();
+        divergence.control_digest = "absent".into();
+        assert!(
+            branch_report_matches_receipt(&historical, &receipt),
+            "actual lane evidence is not always a hexadecimal digest"
+        );
+        historical.treatment.as_mut().unwrap().final_digest =
+            historical.control.final_digest.clone();
+        assert!(
+            branch_report_matches_receipt(&historical, &receipt),
+            "matching terminal digests do not erase an earlier observed divergence"
+        );
+        let mut extinct = report;
+        let treatment = extinct.treatment.as_mut().unwrap();
+        treatment.population = 0;
+        treatment.minimum_population = 0;
+        treatment.extinction_tick = Some(extinct.target_tick);
+        treatment.total_energy = 0.0;
+        treatment.average_health = None;
+        treatment.recovery_ratio = Some(0.0);
+        assert!(branch_report_matches_receipt(&extinct, &receipt));
+        assert!(
+            branch_report_lines(&extinct)
+                .iter()
+                .any(|line| line.contains("unavailable (no living agents)"))
+        );
+        let mut empty_source = extinct;
+        empty_source.control.population = 0;
+        empty_source.control.minimum_population = 0;
+        empty_source.control.baseline_population = 0;
+        empty_source.control.extinction_tick = Some(empty_source.source_tick);
+        empty_source.control.average_health = None;
+        empty_source.control.total_energy = 0.0;
+        empty_source.control.recovery_ratio = None;
+        let treatment = empty_source.treatment.as_mut().unwrap();
+        treatment.baseline_population = 0;
+        treatment.recovery_ratio = None;
+        assert!(branch_report_matches_receipt(&empty_source, &receipt));
+        assert!(
+            branch_report_lines(&empty_source)
+                .iter()
+                .any(|line| line.contains("unavailable (empty source population)"))
+        );
+    }
+
+    #[test]
+    fn retained_study_catalog_refuses_duplicate_rows_and_stale_report_reads() {
+        let receipt = branch_test_receipt(&branch_test_draft(), "completed");
+        let mut catalog = LabWorkflows::default();
+        catalog.synchronize(HostSessionId::new(1), LabPanel::Checkpoints);
+        catalog.checkpoint_view = LabCheckpointView::BranchCatalog;
+        for items in [
+            vec![receipt.clone(), receipt.clone()],
+            vec![receipt.clone(); LAB_PAGE_SIZE + 1],
+        ] {
+            let total = items.len();
+            deliver(
+                &mut catalog,
+                LabWorkflowRequest::ListCheckpointBranches { cursor: None },
+                LabWorkflowResponse::CheckpointBranches(LabCheckpointBranchPage {
+                    items,
+                    total,
+                    offset: 0,
+                    next_cursor: None,
+                }),
+            );
+            assert!(catalog.checkpoint_branches.is_none());
+        }
+
+        for change in 0..3 {
+            let mut state = LabWorkflows::default();
+            let session = HostSessionId::new(1);
+            state.synchronize(session, LabPanel::Checkpoints);
+            state.checkpoint_view = LabCheckpointView::BranchDetail;
+            state.selected_branch = Some(receipt.branch_id.clone());
+            state.branch = Some(receipt.clone());
+            let mut other = receipt.clone();
+            other.branch_id = "other-retained-study".into();
+            state.checkpoint_branches = Some(LabCheckpointBranchPage {
+                items: vec![receipt.clone(), other],
+                total: 2,
+                offset: 0,
+                next_cursor: None,
+            });
+            let (send, result) = std::sync::mpsc::sync_channel(1);
+            state.generation += 1;
+            state.job = Some(LabJob {
+                request: LabWorkflowRequest::GetCheckpointBranchReport {
+                    branch_id: receipt.branch_id.clone(),
+                },
+                generation: state.generation,
+                context: state.context,
+                session,
+                result,
+            });
+            match change {
+                0 => state.dispatch(LabAction::CheckpointBranchesPage(None)),
+                1 => state.dispatch(LabAction::SelectCheckpointBranch(
+                    "other-retained-study".into(),
+                )),
+                2 => {
+                    state.synchronize(HostSessionId::new(2), LabPanel::Checkpoints);
+                    state.synchronize(session, LabPanel::Checkpoints);
+                }
+                _ => unreachable!(),
+            }
+            assert!(state.is_busy());
+            assert!(
+                send.send(Ok(LabWorkflowResponse::CheckpointBranchReport(
+                    branch_test_report()
+                )))
+                .is_ok()
+            );
+            assert!(state.poll().is_none());
+            assert!(!state.is_busy());
+            assert!(
+                state.branch_report.is_none(),
+                "late report {change} must not appear under a different selection or source"
+            );
+        }
+    }
+
     fn composer_test_capabilities() -> LabExperimentCapabilities {
         LabExperimentCapabilities {
             families: vec!["mlp.baseline".into(), "dwraon.baseline".into()],
@@ -2350,7 +4279,10 @@ mod tests {
         assert!(draft.seeds().is_err());
         assert!(draft.validate(&capabilities).is_err());
         draft.seed_count = usize::MAX;
-        assert!(draft.seeds().is_err(), "reject before allocating from the count");
+        assert!(
+            draft.seeds().is_err(),
+            "reject before allocating from the count"
+        );
         draft.seed_count = 0;
         assert!(draft.seeds().is_err());
 
@@ -2360,7 +4292,12 @@ mod tests {
         let mut overflowing_work = capabilities.clone();
         overflowing_work.max_ticks_per_run = u64::MAX;
         overflowing_work.max_total_ticks = u64::MAX;
-        assert!(draft.validate(&overflowing_work).unwrap_err().contains("overflows"));
+        assert!(
+            draft
+                .validate(&overflowing_work)
+                .unwrap_err()
+                .contains("overflows")
+        );
         draft.seed_count = 1;
         draft.ticks_per_run = 100;
         draft.challenger_family = draft.baseline_family.clone();
@@ -2394,7 +4331,10 @@ mod tests {
                 _ => unreachable!(),
             }
             assert!(capabilities.validate().is_err(), "case {case}");
-            assert!(!state.accept_experiment_capabilities(capabilities), "case {case}");
+            assert!(
+                !state.accept_experiment_capabilities(capabilities),
+                "case {case}"
+            );
             assert!(state.experiment_capabilities.is_none());
         }
         let mut capabilities = composer_test_capabilities();
@@ -2408,12 +4348,17 @@ mod tests {
         assert_eq!(state.experiment_draft.first_seed, 42);
         assert_eq!(state.experiment_draft.seed_count, 3);
         assert_eq!(state.experiment_draft.ticks_per_run, 100);
-        assert!(state
-            .experiment_draft
-            .validate(state.experiment_capabilities.as_ref().unwrap())
-            .is_err());
+        assert!(
+            state
+                .experiment_draft
+                .validate(state.experiment_capabilities.as_ref().unwrap())
+                .is_err()
+        );
         assert!(state.latest_experiment_creation.is_none());
-        assert!(!state.is_busy(), "capability observation starts no experiment");
+        assert!(
+            !state.is_busy(),
+            "capability observation starts no experiment"
+        );
     }
 
     #[test]
@@ -2432,7 +4377,10 @@ mod tests {
             "a\\b".into(),
             "x".repeat(93),
         ] {
-            assert!(!experiment_request_identity_is_valid(&invalid), "{invalid:?}");
+            assert!(
+                !experiment_request_identity_is_valid(&invalid),
+                "{invalid:?}"
+            );
         }
     }
 
@@ -2442,7 +4390,9 @@ mod tests {
         let observed_requests = Arc::clone(&requests);
         let mut state = open_test_composer(Arc::new(move |request| {
             if request == LabWorkflowRequest::ExperimentCapabilities {
-                return Ok(LabWorkflowResponse::ExperimentCapabilities(composer_test_capabilities()));
+                return Ok(LabWorkflowResponse::ExperimentCapabilities(
+                    composer_test_capabilities(),
+                ));
             }
             let mut requests = observed_requests.lock().unwrap();
             requests.push(request.clone());
@@ -2497,7 +4447,9 @@ mod tests {
             let observed_requests = Arc::clone(&requests);
             let mut state = open_test_composer(Arc::new(move |request| {
                 if request == LabWorkflowRequest::ExperimentCapabilities {
-                    return Ok(LabWorkflowResponse::ExperimentCapabilities(composer_test_capabilities()));
+                    return Ok(LabWorkflowResponse::ExperimentCapabilities(
+                        composer_test_capabilities(),
+                    ));
                 }
                 let mut requests = observed_requests.lock().unwrap();
                 requests.push(request.clone());
@@ -2517,7 +4469,14 @@ mod tests {
             state.dispatch(LabAction::NewExperiment);
             drain_worker(&mut state);
             assert_eq!(state.experiment_draft, frozen.draft);
-            assert_eq!(state.latest_experiment_creation.as_ref().unwrap().request_id, frozen.request_id);
+            assert_eq!(
+                state
+                    .latest_experiment_creation
+                    .as_ref()
+                    .unwrap()
+                    .request_id,
+                frozen.request_id
+            );
             assert!(!state.will_retry_experiment_creation());
             assert!(!state.can_edit_experiment_draft());
             assert!(!state.can_create_experiment());
@@ -2529,7 +4488,13 @@ mod tests {
             if abandon_on_other_source {
                 assert!(state.can_abandon_experiment_request());
                 state.dispatch(LabAction::AbandonExperimentRequest);
-                assert!(state.notice.as_deref().unwrap().contains("may already exist"));
+                assert!(
+                    state
+                        .notice
+                        .as_deref()
+                        .unwrap()
+                        .contains("may already exist")
+                );
                 assert!(state.latest_experiment_creation.is_none());
                 assert!(state.can_edit_experiment_draft());
                 state.dispatch(LabAction::FirstSeed(11));
@@ -2564,11 +4529,17 @@ mod tests {
             let released = Mutex::new(released);
             let mut state = open_test_composer(Arc::new(move |request| {
                 if request == LabWorkflowRequest::ExperimentCapabilities {
-                    return Ok(LabWorkflowResponse::ExperimentCapabilities(composer_test_capabilities()));
+                    return Ok(LabWorkflowResponse::ExperimentCapabilities(
+                        composer_test_capabilities(),
+                    ));
                 }
                 observed_calls.fetch_add(1, AtomicOrdering::SeqCst);
                 started.send(request.clone()).unwrap();
-                released.lock().unwrap().recv_timeout(Duration::from_secs(5)).unwrap();
+                released
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
                 Ok(composer_test_response(&request))
             }));
             state.dispatch(LabAction::CreateExperiment);
@@ -2587,7 +4558,14 @@ mod tests {
             state.dispatch(LabAction::AbandonExperimentRequest);
             state.dispatch(LabAction::CreateExperiment);
             assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
-            assert_eq!(state.latest_experiment_creation.as_ref().unwrap().request_id, frozen.request_id);
+            assert_eq!(
+                state
+                    .latest_experiment_creation
+                    .as_ref()
+                    .unwrap()
+                    .request_id,
+                frozen.request_id
+            );
             assert_eq!(state.experiment_draft, frozen.draft);
             assert_eq!(state.job.as_ref().unwrap().request, original);
             release.send(()).unwrap();
@@ -2600,7 +4578,13 @@ mod tests {
             assert!(state.can_abandon_experiment_request());
             state.dispatch(LabAction::AbandonExperimentRequest);
             assert!(state.latest_experiment_creation.is_none());
-            assert!(state.notice.as_deref().unwrap().contains("may already exist"));
+            assert!(
+                state
+                    .notice
+                    .as_deref()
+                    .unwrap()
+                    .contains("may already exist")
+            );
         }
     }
 
@@ -2652,8 +4636,14 @@ mod tests {
             }
             deliver(&mut state, request, response);
             if mismatch == 7 {
-                assert_eq!(state.selected_experiment.as_deref(), Some("native-comparison"));
-                assert!(!state.composing_experiment, "valid cohort order is immaterial");
+                assert_eq!(
+                    state.selected_experiment.as_deref(),
+                    Some("native-comparison")
+                );
+                assert!(
+                    !state.composing_experiment,
+                    "valid cohort order is immaterial"
+                );
                 assert_eq!(state.baseline.as_deref(), Some("baseline"));
                 assert_eq!(state.challenger.as_deref(), Some("challenger"));
             } else {
@@ -2754,11 +4744,7 @@ mod tests {
             );
             assert!(state.notice.as_deref().unwrap().contains("did not match"));
 
-            deliver(
-                &mut state,
-                request,
-                LabWorkflowResponse::Comparison(exact),
-            );
+            deliver(&mut state, request, LabWorkflowResponse::Comparison(exact));
             assert!(state.comparison.is_some());
             state.dispatch(LabAction::Metric(different));
             assert!(
