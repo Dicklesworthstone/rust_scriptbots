@@ -8,9 +8,10 @@ use super::*;
 use scriptbots_runtime::{
     HostSessionId,
     lab_workflows::{
-        LAB_PAGE_SIZE, LabAction, LabCheckpointSaveState, LabEventIdentity, LabEventReview,
+        LAB_PAGE_SIZE, LabAction, LabBranchCreationState, LabBranchTreatment,
+        LabCheckpointSaveState, LabCheckpointView, LabEventIdentity, LabEventReview,
         LabExperimentCreationState, LabMetric, LabPanel, LabWorkflowSubmit, LabWorkflows,
-        VARIANTS_PER_PAGE, comparison_lines,
+        VARIANTS_PER_PAGE, branch_report_lines, comparison_lines,
     },
 };
 
@@ -961,9 +962,7 @@ fn experiment_creation_rows(
     let draft = model
         .latest_experiment_creation
         .as_ref()
-        .filter(|creation| {
-            !matches!(&creation.state, LabExperimentCreationState::Created { .. })
-        })
+        .filter(|creation| !matches!(&creation.state, LabExperimentCreationState::Created { .. }))
         .map(|creation| &creation.draft)
         .unwrap_or(&model.experiment_draft);
     let editing = model.can_edit_experiment_draft();
@@ -983,13 +982,19 @@ fn experiment_creation_rows(
         let current_source = presentation.source == Some(creation.session_id);
         rows.push(PanelRow::text(format!(
             "{}creation request {} | source session {}",
-            if current_source { "" } else { "Previous-source " },
+            if current_source {
+                ""
+            } else {
+                "Previous-source "
+            },
             creation.request_id,
             creation.session_id.get(),
         )));
         match &creation.state {
             LabExperimentCreationState::Pending => {
-                rows.push(PanelRow::text("Awaiting the application's experiment receipt."));
+                rows.push(PanelRow::text(
+                    "Awaiting the application's experiment receipt.",
+                ));
             }
             LabExperimentCreationState::Retryable { reason } => {
                 rows.push(PanelRow::text(format!("Creation is unconfirmed: {reason}")));
@@ -1022,15 +1027,15 @@ fn experiment_creation_rows(
         }
     }
     let Some(capabilities) = &model.experiment_capabilities else {
-        rows.push(PanelRow::text("Loading available brain families and experiment limits..."));
+        rows.push(PanelRow::text(
+            "Loading available brain families and experiment limits...",
+        ));
         return;
     };
     rows.push(PanelRow::text(capabilities.launch_description.clone()));
     rows.push(PanelRow::text(format!(
         "Limits: {} seeds | {} ticks per run | {} total run ticks.",
-        capabilities.max_seed_count,
-        capabilities.max_ticks_per_run,
-        capabilities.max_total_ticks,
+        capabilities.max_seed_count, capabilities.max_ticks_per_run, capabilities.max_total_ticks,
     )));
     for (baseline, heading) in [
         (true, "Baseline brain family"),
@@ -1068,7 +1073,11 @@ fn experiment_creation_rows(
         rows.push(PanelRow::workflow(
             format!(
                 "{}First seed {seed}",
-                if draft.first_seed == seed { "Selected: " } else { "" },
+                if draft.first_seed == seed {
+                    "Selected: "
+                } else {
+                    ""
+                },
             ),
             LabAction::FirstSeed(seed),
             editing,
@@ -1079,7 +1088,10 @@ fn experiment_creation_rows(
         LabAction::FirstSeed(draft.first_seed.checked_add(1).unwrap_or(draft.first_seed)),
         editing && draft.first_seed < u64::MAX,
     ));
-    rows.push(PanelRow::text(format!("Matched seed cohort: {}", draft.seed_count)));
+    rows.push(PanelRow::text(format!(
+        "Matched seed cohort: {}",
+        draft.seed_count
+    )));
     rows.push(PanelRow::workflow(
         "One fewer seed",
         LabAction::SeedCount(draft.seed_count.checked_sub(1).unwrap_or(draft.seed_count)),
@@ -1090,7 +1102,11 @@ fn experiment_creation_rows(
             rows.push(PanelRow::workflow(
                 format!(
                     "{}{count} seed{}",
-                    if draft.seed_count == count { "Selected: " } else { "" },
+                    if draft.seed_count == count {
+                        "Selected: "
+                    } else {
+                        ""
+                    },
                     if count == 1 { "" } else { "s" },
                 ),
                 LabAction::SeedCount(count),
@@ -1114,7 +1130,10 @@ fn experiment_creation_rows(
     rows.push(PanelRow::workflow(
         "One fewer tick",
         LabAction::TicksPerRun(
-            draft.ticks_per_run.checked_sub(1).unwrap_or(draft.ticks_per_run),
+            draft
+                .ticks_per_run
+                .checked_sub(1)
+                .unwrap_or(draft.ticks_per_run),
         ),
         editing && draft.ticks_per_run > 1,
     ));
@@ -1123,7 +1142,11 @@ fn experiment_creation_rows(
             rows.push(PanelRow::workflow(
                 format!(
                     "{}{ticks} ticks per run",
-                    if draft.ticks_per_run == ticks { "Selected: " } else { "" },
+                    if draft.ticks_per_run == ticks {
+                        "Selected: "
+                    } else {
+                        ""
+                    },
                 ),
                 LabAction::TicksPerRun(ticks),
                 editing,
@@ -1133,7 +1156,10 @@ fn experiment_creation_rows(
     rows.push(PanelRow::workflow(
         "One more tick",
         LabAction::TicksPerRun(
-            draft.ticks_per_run.checked_add(1).unwrap_or(draft.ticks_per_run),
+            draft
+                .ticks_per_run
+                .checked_add(1)
+                .unwrap_or(draft.ticks_per_run),
         ),
         editing
             && draft
@@ -1353,12 +1379,278 @@ fn previous_cursor(offset: usize) -> Option<String> {
     (offset > LAB_PAGE_SIZE).then(|| (offset - LAB_PAGE_SIZE).to_string())
 }
 
+fn branch_composer_rows(
+    model: &LabWorkflows,
+    presentation: &LabPresentation,
+    rows: &mut Vec<PanelRow>,
+) {
+    let editing = model.can_edit_branch_draft();
+    let retained = model
+        .latest_branch_creation
+        .as_ref()
+        .filter(|creation| !matches!(&creation.state, LabBranchCreationState::Created { .. }));
+    let draft = retained
+        .map(|creation| &creation.draft)
+        .or(model.branch_draft.as_ref());
+    rows.push(PanelRow::text("A FUTURE FROM A SAVED CHECKPOINT"));
+    if let Some(session) = presentation.source {
+        rows.push(PanelRow::text(format!(
+            "Application source session {}.",
+            session.get(),
+        )));
+    }
+    if let Some(creation) = retained {
+        let current_source = presentation.source == Some(creation.session_id);
+        rows.push(PanelRow::text(format!(
+            "{}study request {} | source session {}",
+            if current_source {
+                "Retained "
+            } else {
+                "Previous-source "
+            },
+            creation.request_id,
+            creation.session_id.get(),
+        )));
+        match &creation.state {
+            LabBranchCreationState::Pending => {
+                rows.push(PanelRow::text(
+                    "Awaiting the application's study admission receipt.",
+                ));
+            }
+            LabBranchCreationState::Retryable { reason } => {
+                rows.push(PanelRow::text(format!(
+                    "Study admission is unconfirmed: {reason}"
+                )));
+            }
+            LabBranchCreationState::Created { .. } => {}
+        }
+        rows.push(PanelRow::text(if current_source {
+            "Retry preserves this exact saved source, treatment, horizon and request. Abandon clears the local retry only; an admitted study may still exist in the catalog."
+        } else {
+            "This previous-source request cannot be retried here. Abandon clears the local retry only; an admitted study may still exist in the catalog."
+        }));
+        rows.push(PanelRow::workflow(
+            "Abandon unconfirmed study request",
+            LabAction::AbandonCheckpointBranchRequest,
+            model.can_abandon_branch_request(),
+        ));
+    }
+    let Some(draft) = draft else {
+        rows.push(PanelRow::text(
+            "Select a retained checkpoint to configure its future.",
+        ));
+        return;
+    };
+    rows.push(PanelRow::text(format!(
+        "Saved source: {} | completed tick {} | {} agents",
+        draft.checkpoint.checkpoint_id, draft.checkpoint.tick, draft.checkpoint.agent_count,
+    )));
+    rows.push(PanelRow::text(format!(
+        "Saved world digest: {}",
+        draft.checkpoint.world_digest,
+    )));
+    rows.push(PanelRow::text(
+        "Each future starts from this exact saved scientific state. The live owner continues separately; its session, scheduled commands and history are not transferred.",
+    ));
+    let Some(capabilities) = &model.branch_capabilities else {
+        rows.push(PanelRow::text("Loading checkpoint-study limits..."));
+        return;
+    };
+    rows.push(PanelRow::text(format!(
+        "Limits: {} future ticks per branch | {} source agents.",
+        capabilities.max_ticks, capabilities.max_population,
+    )));
+    rows.push(PanelRow::text("Treatment"));
+    for treatment in LabBranchTreatment::ALL {
+        rows.push(PanelRow::workflow(
+            format!(
+                "{}{}",
+                if draft.treatment == treatment {
+                    "Selected: "
+                } else {
+                    ""
+                },
+                treatment.label(),
+            ),
+            LabAction::BranchTreatment(treatment),
+            editing,
+        ));
+    }
+    rows.push(PanelRow::text(draft.treatment.description()));
+    rows.push(PanelRow::text(format!(
+        "Future horizon: {} ticks",
+        draft.ticks
+    )));
+    rows.push(PanelRow::workflow(
+        "One fewer future tick",
+        LabAction::BranchTicks(draft.ticks.checked_sub(1).unwrap_or(draft.ticks)),
+        editing && draft.ticks > 1,
+    ));
+    for ticks in [1, 10, 100, 240, 1_000, 10_000] {
+        if ticks <= capabilities.max_ticks {
+            rows.push(PanelRow::workflow(
+                format!(
+                    "{}{ticks} future ticks",
+                    if draft.ticks == ticks {
+                        "Selected: "
+                    } else {
+                        ""
+                    },
+                ),
+                LabAction::BranchTicks(ticks),
+                editing,
+            ));
+        }
+    }
+    rows.push(PanelRow::workflow(
+        "One more future tick",
+        LabAction::BranchTicks(draft.ticks.checked_add(1).unwrap_or(draft.ticks)),
+        editing
+            && draft
+                .ticks
+                .checked_add(1)
+                .is_some_and(|ticks| ticks <= capabilities.max_ticks),
+    ));
+    let target = draft.checkpoint.tick.checked_add(draft.ticks);
+    let total_ticks = draft.treatment.branch_count().checked_mul(draft.ticks);
+    rows.push(PanelRow::text(format!(
+        "Review: {} | {} future{} | source tick {} -> target tick {} | {} total scientific transitions.",
+        draft.treatment.label(),
+        draft.treatment.branch_count(),
+        if draft.treatment.branch_count() == 1 { "" } else { "s" },
+        draft.checkpoint.tick,
+        target.map(|tick| tick.to_string()).unwrap_or_else(|| "overflow".into()),
+        total_ticks.map(|ticks| ticks.to_string()).unwrap_or_else(|| "overflow".into()),
+    )));
+    rows.push(PanelRow::text(
+        "Outcomes describe one saved starting state. Repeated ticks are not independent seed replicates. Any selected intervention applies at the saved boundary before its next tick.",
+    ));
+    if let Err(reason) = draft.validate(capabilities) {
+        rows.push(PanelRow::text(format!("Plan needs attention: {reason}")));
+    }
+    rows.push(PanelRow::workflow(
+        if model.is_busy() {
+            "Awaiting study service"
+        } else if model.will_retry_branch_creation() {
+            "Retry this exact checkpoint study"
+        } else {
+            "Run this checkpoint study"
+        },
+        LabAction::CreateCheckpointBranch,
+        model.can_create_checkpoint_branch(),
+    ));
+}
+
+fn checkpoint_study_rows(
+    model: &LabWorkflows,
+    presentation: &LabPresentation,
+    idle: bool,
+    rows: &mut Vec<PanelRow>,
+) {
+    rows.push(PanelRow::workflow(
+        "Back to saved checkpoints",
+        LabAction::BackToCheckpoints,
+        true,
+    ));
+    rows.push(PanelRow::workflow(
+        "Retained checkpoint studies",
+        LabAction::CheckpointBranchesPage(None),
+        true,
+    ));
+    match model.checkpoint_view {
+        LabCheckpointView::BranchComposer => branch_composer_rows(model, presentation, rows),
+        LabCheckpointView::BranchCatalog => {
+            let Some(page) = &model.checkpoint_branches else {
+                rows.push(PanelRow::text("Loading retained checkpoint studies..."));
+                return;
+            };
+            rows.push(PanelRow::text(format!(
+                "{} retained studies. Reopen an observation without starting another future.",
+                page.total,
+            )));
+            if page.items.is_empty() {
+                rows.push(PanelRow::text("No checkpoint studies are retained yet."));
+            }
+            for branch in &page.items {
+                rows.push(PanelRow::workflow(
+                    format!(
+                        "{} | {} | source {} at tick {} | target tick {}",
+                        branch.branch_name,
+                        branch.status,
+                        branch.checkpoint_id,
+                        branch.source_tick,
+                        branch.target_tick,
+                    ),
+                    LabAction::SelectCheckpointBranch(branch.branch_id.clone()),
+                    true,
+                ));
+            }
+            rows.push(PanelRow::workflow(
+                "Previous studies",
+                LabAction::CheckpointBranchesPage(previous_cursor(page.offset)),
+                idle && page.offset > 0,
+            ));
+            rows.push(PanelRow::workflow(
+                "Next studies",
+                LabAction::CheckpointBranchesPage(page.next_cursor.clone()),
+                idle && page.next_cursor.is_some(),
+            ));
+        }
+        LabCheckpointView::BranchDetail => {
+            let Some(branch) = &model.branch else {
+                rows.push(PanelRow::text(
+                    "No checkpoint study observation has arrived. Refresh to retry.",
+                ));
+                return;
+            };
+            rows.push(PanelRow::text(branch.branch_name.clone()));
+            rows.push(PanelRow::text(format!(
+                "Observed status: {}",
+                branch.status
+            )));
+            rows.push(PanelRow::text(format!("Study: {}", branch.branch_id)));
+            rows.push(PanelRow::text(format!(
+                "Saved source: {} | tick {} | world digest {}",
+                branch.checkpoint_id, branch.source_tick, branch.world_digest,
+            )));
+            rows.push(PanelRow::text(format!(
+                "Requested target tick: {}. Source and target describe the plan; they are not a live progress counter.",
+                branch.target_tick,
+            )));
+            rows.push(PanelRow::workflow(
+                "Request study cancellation",
+                LabAction::CancelCheckpointBranch,
+                model.can_cancel_checkpoint_branch(),
+            ));
+            if let Some(reason) = &branch.error_reason {
+                rows.push(PanelRow::text(format!("Study outcome: {reason}")));
+            }
+            if let Some(artifact_id) = &branch.artifact_id {
+                rows.push(PanelRow::text(format!("Report artifact: {artifact_id}")));
+            }
+            rows.push(PanelRow::workflow(
+                "Read verified outcome report",
+                LabAction::ReadCheckpointBranchReport,
+                model.can_read_branch_report(),
+            ));
+            if let Some(report) = &model.branch_report {
+                rows.extend(branch_report_lines(report).into_iter().map(PanelRow::text));
+            }
+        }
+        LabCheckpointView::SavedCuts => {}
+    }
+}
+
 fn checkpoint_rows(
     model: &LabWorkflows,
     presentation: &LabPresentation,
     idle: bool,
     rows: &mut Vec<PanelRow>,
 ) {
+    if model.checkpoint_view != LabCheckpointView::SavedCuts {
+        checkpoint_study_rows(model, presentation, idle, rows);
+        return;
+    }
     let saving = model.latest_checkpoint_save.as_ref().is_some_and(|save| {
         presentation.source == Some(save.session_id)
             && matches!(&save.state, LabCheckpointSaveState::Pending)
@@ -1426,6 +1718,22 @@ fn checkpoint_rows(
         "Review selected checkpoint in world",
         LabAction::ReviewCheckpoint,
         idle && model.selected_checkpoint_metadata().is_some(),
+    ));
+    rows.push(PanelRow::workflow(
+        "Configure a checkpoint study",
+        LabAction::NewCheckpointBranch,
+        model.selected_checkpoint_metadata().is_some()
+            || model
+                .latest_branch_creation
+                .as_ref()
+                .is_some_and(|creation| {
+                    !matches!(&creation.state, LabBranchCreationState::Created { .. })
+                }),
+    ));
+    rows.push(PanelRow::workflow(
+        "Retained checkpoint studies",
+        LabAction::CheckpointBranchesPage(None),
+        model.submit.is_some(),
     ));
     let Some(page) = &model.checkpoints else {
         rows.push(PanelRow::text("No checkpoint page has been observed yet."));
@@ -1657,10 +1965,12 @@ mod tests {
     use super::*;
     use crate::terrain_tests::{motion_test_source, sample_world_snapshot};
     use scriptbots_runtime::lab_workflows::{
-        LAB_MAX_EXPERIMENT_FAMILIES, LAB_MAX_VARIANTS, LabCheckpoint, LabCheckpointPage,
-        LabCheckpointSave, LabComparison, LabExperiment, LabExperimentCapabilities,
-        LabExperimentCreation, LabExperimentDraft, LabExperimentPage, LabExperimentSummary,
-        LabVariantProgress, LabWorkflowRequest, LabWorkflowResponse,
+        LAB_MAX_EXPERIMENT_FAMILIES, LAB_MAX_VARIANTS, LabBranchCapabilities, LabBranchCreation,
+        LabBranchDivergence, LabBranchDraft, LabBranchOutcome, LabBranchReport, LabCheckpoint,
+        LabCheckpointBranch, LabCheckpointBranchPage, LabCheckpointPage, LabCheckpointSave,
+        LabComparison, LabExperiment, LabExperimentCapabilities, LabExperimentCreation,
+        LabExperimentDraft, LabExperimentPage, LabExperimentSummary, LabVariantProgress,
+        LabWorkflowRequest, LabWorkflowResponse,
     };
     use scriptbots_runtime::{HostCore, HostCoreOptions};
 
@@ -2403,9 +2713,7 @@ mod tests {
                 Interaction::Pressed,
             ));
             app.update();
-            app.world_mut()
-                .entity_mut(button)
-                .insert(Interaction::None);
+            app.world_mut().entity_mut(button).insert(Interaction::None);
             enabled
         };
         let wait = |app: &mut App, ready: &dyn Fn(&LabWorkflows) -> bool| {
@@ -2429,7 +2737,10 @@ mod tests {
                 && !model.is_busy()
         });
         assert!(press(&mut app, LabAction::DraftBaseline("dwraon".into())));
-        assert!(press(&mut app, LabAction::DraftChallenger("assembly".into())));
+        assert!(press(
+            &mut app,
+            LabAction::DraftChallenger("assembly".into())
+        ));
         assert!(press(&mut app, LabAction::FirstSeed(137)));
         // These values are reached through the adjacent-value controls, not presets.
         assert!(press(&mut app, LabAction::SeedCount(2)));
@@ -2439,7 +2750,10 @@ mod tests {
             app.world().non_send_resource::<LabWorkflows>(),
             app.world().resource::<LabPresentation>(),
         );
-        assert!(rows.iter().any(|row| row.text == "Exact seeds in each arm: [137, 138]"));
+        assert!(
+            rows.iter()
+                .any(|row| row.text == "Exact seeds in each arm: [137, 138]")
+        );
         assert!(rows.iter().any(|row| {
             row.text.starts_with("Review:")
                 && row.text.contains("4 total runs")
@@ -2448,12 +2762,20 @@ mod tests {
         assert!(press(&mut app, LabAction::CreateExperiment));
         wait(&mut app, &|model| {
             !model.is_busy()
-                && model.latest_experiment_creation.as_ref().is_some_and(|creation| {
-                    matches!(&creation.state, LabExperimentCreationState::Retryable { .. })
-                })
+                && model
+                    .latest_experiment_creation
+                    .as_ref()
+                    .is_some_and(|creation| {
+                        matches!(
+                            &creation.state,
+                            LabExperimentCreationState::Retryable { .. }
+                        )
+                    })
         });
         assert!(press(&mut app, LabAction::BackToExperiments));
-        wait(&mut app, &|model| model.experiments.is_some() && !model.is_busy());
+        wait(&mut app, &|model| {
+            model.experiments.is_some() && !model.is_busy()
+        });
         assert!(press(&mut app, LabAction::NewExperiment));
         wait(&mut app, &|model| {
             model.composing_experiment
@@ -2519,7 +2841,8 @@ mod tests {
             max_seed_count: 128,
             max_ticks_per_run: 10_000,
             max_total_ticks: 2_560_000,
-            launch_description: "Fresh fixture worlds; the live checkpoint is not inherited.".into(),
+            launch_description: "Fresh fixture worlds; the live checkpoint is not inherited."
+                .into(),
         });
         model.experiment_draft = LabExperimentDraft {
             baseline_family: families[0].clone(),
@@ -2531,25 +2854,38 @@ mod tests {
         let rows = panel_rows(&model, &presentation);
         assert!(rows.len() <= MAX_PANEL_ROWS);
         assert_eq!(
-            rows.iter().filter(|row| {
-                matches!(&row.action, Some(PanelAction::Workflow(
-                    LabAction::DraftBaseline(_) | LabAction::DraftChallenger(_)
-                )))
-            }).count(),
+            rows.iter()
+                .filter(|row| {
+                    matches!(
+                        &row.action,
+                        Some(PanelAction::Workflow(
+                            LabAction::DraftBaseline(_) | LabAction::DraftChallenger(_)
+                        ))
+                    )
+                })
+                .count(),
             LAB_MAX_EXPERIMENT_FAMILIES * 2,
         );
         assert!(rows.iter().any(|row| {
-            row.text.contains("Exact seeds")
-                && row.text.contains(&u64::MAX.to_string())
+            row.text.contains("Exact seeds") && row.text.contains(&u64::MAX.to_string())
         }));
         assert!(rows.iter().any(|row| {
             row.action == Some(PanelAction::Workflow(LabAction::CreateExperiment)) && row.enabled
         }));
-        assert!(rows.iter().any(|row| row.text == "One more seed" && !row.enabled));
-        assert!(rows.iter().any(|row| row.text == "One more tick" && !row.enabled));
+        assert!(
+            rows.iter()
+                .any(|row| row.text == "One more seed" && !row.enabled)
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.text == "One more tick" && !row.enabled)
+        );
         model.experiment_draft.first_seed = u64::MAX;
         let rows = panel_rows(&model, &presentation);
-        assert!(rows.iter().any(|row| row.text.starts_with("Seed schedule refused:")));
+        assert!(
+            rows.iter()
+                .any(|row| row.text.starts_with("Seed schedule refused:"))
+        );
         assert!(rows.iter().any(|row| {
             row.action == Some(PanelAction::Workflow(LabAction::CreateExperiment)) && !row.enabled
         }));
@@ -2567,12 +2903,18 @@ mod tests {
         });
         let rows = panel_rows(&model, &presentation);
         assert!(rows.len() <= MAX_PANEL_ROWS);
-        assert!(rows.iter().any(|row| row.text == "Application source session 71."));
+        assert!(
+            rows.iter()
+                .any(|row| row.text == "Application source session 71.")
+        );
         assert!(rows.iter().any(|row| {
             row.text.starts_with("Previous-source creation request")
                 && row.text.contains("source session 70")
         }));
-        assert!(rows.iter().any(|row| row.text == "Exact seeds in each arm: [137, 138]"));
+        assert!(
+            rows.iter()
+                .any(|row| row.text == "Exact seeds in each arm: [137, 138]")
+        );
         assert!(rows.iter().any(|row| {
             row.text.starts_with("Review:")
                 && row.text.contains("baseline family-2")
@@ -2586,15 +2928,465 @@ mod tests {
         assert!(rows.iter().any(|row| {
             row.action == Some(PanelAction::Workflow(LabAction::CreateExperiment)) && !row.enabled
         }));
-        assert!(rows.iter().filter(|row| {
-            matches!(&row.action, Some(PanelAction::Workflow(
-                LabAction::DraftBaseline(_)
-                    | LabAction::DraftChallenger(_)
-                    | LabAction::FirstSeed(_)
-                    | LabAction::SeedCount(_)
-                    | LabAction::TicksPerRun(_)
-            )))
-        }).all(|row| !row.enabled));
+        assert!(
+            rows.iter()
+                .filter(|row| {
+                    matches!(
+                        &row.action,
+                        Some(PanelAction::Workflow(
+                            LabAction::DraftBaseline(_)
+                                | LabAction::DraftChallenger(_)
+                                | LabAction::FirstSeed(_)
+                                | LabAction::SeedCount(_)
+                                | LabAction::TicksPerRun(_)
+                        ))
+                    )
+                })
+                .all(|row| !row.enabled)
+        );
+    }
+
+    fn study_checkpoint_fixture() -> LabCheckpoint {
+        LabCheckpoint {
+            checkpoint_id: "saved-study-cut".into(),
+            tick: 7,
+            agent_count: 3,
+            byte_size: 1_024,
+            world_digest: "1111111111111111".into(),
+        }
+    }
+
+    fn completed_study_fixture() -> (LabCheckpointBranch, LabBranchReport) {
+        let checkpoint = study_checkpoint_fixture();
+        let branch = LabCheckpointBranch {
+            branch_id: "retained-study-1".into(),
+            checkpoint_id: checkpoint.checkpoint_id,
+            branch_name: LabBranchTreatment::FoodBloom.key().into(),
+            status: "completed".into(),
+            source_tick: checkpoint.tick,
+            target_tick: 18,
+            world_digest: checkpoint.world_digest.clone(),
+            artifact_id: Some("retained-report-1".into()),
+            error_reason: None,
+        };
+        let report = LabBranchReport {
+            branch_id: branch.branch_id.clone(),
+            artifact_id: branch.artifact_id.clone().unwrap(),
+            base_seed: u64::MAX,
+            source_tick: branch.source_tick,
+            target_tick: branch.target_tick,
+            source_world_digest: checkpoint.world_digest,
+            source_byte_size: checkpoint.byte_size,
+            source_checksum_blake3: "a".repeat(64),
+            report_byte_size: 2_048,
+            report_checksum_blake3: "b".repeat(64),
+            report_checksum_sha256: "c".repeat(64),
+            control: LabBranchOutcome {
+                tick: branch.target_tick,
+                population: 3,
+                total_food: 4.0,
+                total_energy: 6.0,
+                average_health: Some(0.8),
+                final_digest: "2222222222222222".into(),
+                command_applied_tick: None,
+                minimum_population: 3,
+                extinction_tick: None,
+                baseline_population: 3,
+                recovery_ratio: Some(1.0),
+                first_divergence: None,
+            },
+            treatment: Some(LabBranchOutcome {
+                tick: branch.target_tick,
+                population: 2,
+                total_food: 6.0,
+                total_energy: 4.0,
+                average_health: Some(0.7),
+                final_digest: "3333333333333333".into(),
+                command_applied_tick: Some(branch.source_tick),
+                minimum_population: 2,
+                extinction_tick: None,
+                baseline_population: 3,
+                recovery_ratio: Some(2.0 / 3.0),
+                first_divergence: Some(LabBranchDivergence {
+                    tick: 8,
+                    stage: "food".into(),
+                    control_digest: "4444444444444444".into(),
+                    branch_digest: "5555555555555555".into(),
+                    command_applied_tick: branch.source_tick,
+                    details: "Fixture's first differing food lane.".into(),
+                }),
+            }),
+        };
+        (branch, report)
+    }
+
+    #[test]
+    fn checkpoint_study_buttons_retry_cancel_and_reopen_verified_outcomes() {
+        let mut presentation = LabPresentation {
+            panel: LabPanel::Checkpoints,
+            ..default()
+        };
+        let mut state = SnapshotState::default();
+        let mut motion = AgentMotionSettings { enabled: true };
+        presentation.receive_live(live_frame(12), &mut state, &mut motion);
+        presentation.source_changed = false;
+        let session = presentation.source.unwrap();
+        let checkpoint = study_checkpoint_fixture();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded_requests = Arc::clone(&requests);
+        let cancellations = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded_cancellations = Arc::clone(&cancellations);
+        let running = std::sync::Mutex::new(None);
+        let (completed, report) = completed_study_fixture();
+        let mut model = consumer(Some(Arc::new(move |request| {
+            Ok(match request {
+                LabWorkflowRequest::ListCheckpoints { .. } => {
+                    LabWorkflowResponse::Checkpoints(LabCheckpointPage {
+                        items: vec![checkpoint.clone()],
+                        total: 1,
+                        offset: 0,
+                        next_cursor: None,
+                        retained_bytes: checkpoint.byte_size,
+                        max_bytes: 1_000_000,
+                    })
+                }
+                LabWorkflowRequest::BranchCapabilities => {
+                    LabWorkflowResponse::BranchCapabilities(LabBranchCapabilities {
+                        max_ticks: 10_000,
+                        max_population: 10_000,
+                    })
+                }
+                LabWorkflowRequest::CreateCheckpointBranch {
+                    request_id,
+                    session_id,
+                    draft,
+                } => {
+                    assert_eq!(session_id, session);
+                    assert_eq!(draft.checkpoint, checkpoint);
+                    let first = {
+                        let mut requests = recorded_requests.lock().unwrap();
+                        requests.push((request_id.clone(), session_id, draft.clone()));
+                        requests.len() == 1
+                    };
+                    let mut retained = running.lock().unwrap();
+                    let branch = retained.get_or_insert_with(|| LabCheckpointBranch {
+                        branch_id: "active-study-1".into(),
+                        checkpoint_id: draft.checkpoint.checkpoint_id.clone(),
+                        branch_name: draft.treatment.key().into(),
+                        status: "running".into(),
+                        source_tick: draft.checkpoint.tick,
+                        target_tick: draft.checkpoint.tick + draft.ticks,
+                        world_digest: draft.checkpoint.world_digest.clone(),
+                        artifact_id: None,
+                        error_reason: None,
+                    });
+                    if first {
+                        return Err("study admission response was lost".into());
+                    }
+                    LabWorkflowResponse::CheckpointBranchCreated {
+                        request_id,
+                        session_id,
+                        branch: branch.clone(),
+                    }
+                }
+                LabWorkflowRequest::CancelCheckpointBranch { branch_id } => {
+                    let mut retained = running.lock().unwrap();
+                    let branch = retained.as_mut().unwrap();
+                    assert_eq!(branch_id, branch.branch_id);
+                    recorded_cancellations.lock().unwrap().push(branch_id);
+                    branch.status = "cancelled".into();
+                    LabWorkflowResponse::CheckpointBranch(branch.clone())
+                }
+                LabWorkflowRequest::ListCheckpointBranches { .. } => {
+                    let retained = running.lock().unwrap();
+                    LabWorkflowResponse::CheckpointBranches(LabCheckpointBranchPage {
+                        items: vec![retained.as_ref().unwrap().clone(), completed.clone()],
+                        total: 2,
+                        offset: 0,
+                        next_cursor: None,
+                    })
+                }
+                LabWorkflowRequest::GetCheckpointBranch { branch_id } => {
+                    LabWorkflowResponse::CheckpointBranch(if branch_id == completed.branch_id {
+                        completed.clone()
+                    } else {
+                        let retained = running.lock().unwrap();
+                        let branch = retained.as_ref().unwrap();
+                        assert_eq!(branch_id, branch.branch_id);
+                        branch.clone()
+                    })
+                }
+                LabWorkflowRequest::GetCheckpointBranchReport { branch_id } => {
+                    assert_eq!(branch_id, report.branch_id);
+                    LabWorkflowResponse::CheckpointBranchReport(report.clone())
+                }
+                other => panic!("unexpected native study request: {other:?}"),
+            })
+        })));
+        model.synchronize(session, LabPanel::Checkpoints);
+        let mut app = App::new();
+        app.insert_non_send_resource(model)
+            .insert_resource(presentation)
+            .insert_resource(state)
+            .insert_resource(motion)
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<CameraRig>()
+            .add_systems(Update, update);
+        let button = app
+            .world_mut()
+            .spawn((LabRow::default(), Interaction::None))
+            .id();
+        let press = |app: &mut App, action: LabAction| {
+            let row = panel_rows(
+                app.world().non_send_resource::<LabWorkflows>(),
+                app.world().resource::<LabPresentation>(),
+            )
+            .into_iter()
+            .find(|row| row.action == Some(PanelAction::Workflow(action.clone())))
+            .expect("production checkpoint pane exposes the action");
+            let enabled = row.enabled;
+            app.world_mut().entity_mut(button).insert((
+                LabRow {
+                    index: 0,
+                    action: row.action,
+                    enabled,
+                },
+                Interaction::Pressed,
+            ));
+            app.update();
+            app.world_mut().entity_mut(button).insert(Interaction::None);
+            enabled
+        };
+        let wait = |app: &mut App, ready: &dyn Fn(&LabWorkflows) -> bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                app.update();
+                let model = app.world().non_send_resource::<LabWorkflows>();
+                if ready(model) {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "checkpoint study worker did not finish: {:?}",
+                    model.notice,
+                );
+                std::thread::yield_now();
+            }
+        };
+        wait(&mut app, &|model| {
+            model.checkpoints.is_some() && !model.is_busy()
+        });
+        assert!(press(
+            &mut app,
+            LabAction::SelectCheckpoint("saved-study-cut".into())
+        ));
+        assert!(press(&mut app, LabAction::NewCheckpointBranch));
+        wait(&mut app, &|model| {
+            model.branch_capabilities.is_some() && !model.is_busy()
+        });
+        assert!(press(
+            &mut app,
+            LabAction::BranchTreatment(LabBranchTreatment::Drought)
+        ));
+        assert!(press(&mut app, LabAction::BranchTicks(10)));
+        assert!(press(&mut app, LabAction::BranchTicks(11)));
+        let rows = panel_rows(
+            app.world().non_send_resource::<LabWorkflows>(),
+            app.world().resource::<LabPresentation>(),
+        );
+        assert!(rows.iter().any(|row| {
+            row.text.starts_with("Review:")
+                && row.text.contains("source tick 7 -> target tick 18")
+                && row.text.contains("22 total scientific transitions")
+        }));
+        assert!(press(&mut app, LabAction::CreateCheckpointBranch));
+        wait(&mut app, &|model| {
+            !model.is_busy()
+                && model
+                    .latest_branch_creation
+                    .as_ref()
+                    .is_some_and(|creation| {
+                        matches!(&creation.state, LabBranchCreationState::Retryable { .. })
+                    })
+        });
+        assert!(!press(
+            &mut app,
+            LabAction::BranchTreatment(LabBranchTreatment::FoodBloom)
+        ));
+        assert!(!press(&mut app, LabAction::BranchTicks(1_000)));
+        assert!(press(&mut app, LabAction::BackToCheckpoints));
+        wait(&mut app, &|model| {
+            model.checkpoints.is_some() && !model.is_busy()
+        });
+        assert!(press(&mut app, LabAction::NewCheckpointBranch));
+        wait(&mut app, &|model| {
+            model.branch_capabilities.is_some() && !model.is_busy()
+        });
+        assert!(press(&mut app, LabAction::CreateCheckpointBranch));
+        wait(&mut app, &|model| {
+            !model.is_busy()
+                && model
+                    .branch
+                    .as_ref()
+                    .is_some_and(|branch| branch.status == "running")
+        });
+        assert!(press(&mut app, LabAction::CancelCheckpointBranch));
+        wait(&mut app, &|model| {
+            !model.is_busy()
+                && model
+                    .branch
+                    .as_ref()
+                    .is_some_and(|branch| branch.status == "cancelled")
+        });
+        assert!(!press(&mut app, LabAction::ReadCheckpointBranchReport));
+        assert_eq!(*cancellations.lock().unwrap(), ["active-study-1"]);
+        assert!(press(&mut app, LabAction::CheckpointBranchesPage(None)));
+        wait(&mut app, &|model| {
+            model.checkpoint_branches.is_some() && !model.is_busy()
+        });
+        assert!(press(
+            &mut app,
+            LabAction::SelectCheckpointBranch("retained-study-1".into())
+        ));
+        wait(&mut app, &|model| {
+            !model.is_busy()
+                && model
+                    .branch
+                    .as_ref()
+                    .is_some_and(|branch| branch.status == "completed")
+        });
+        assert!(press(&mut app, LabAction::ReadCheckpointBranchReport));
+        wait(&mut app, &|model| {
+            model.branch_report.is_some() && !model.is_busy()
+        });
+        let model = app.world().non_send_resource::<LabWorkflows>();
+        let report = model.branch_report.as_ref().unwrap();
+        assert_eq!(report.base_seed, u64::MAX);
+        assert_eq!(report.control.population, 3);
+        assert_eq!(report.treatment.as_ref().unwrap().population, 2);
+        assert_eq!(
+            report
+                .treatment
+                .as_ref()
+                .unwrap()
+                .first_divergence
+                .as_ref()
+                .unwrap()
+                .tick,
+            8
+        );
+        let rows = panel_rows(model, app.world().resource::<LabPresentation>());
+        assert!(rows.len() <= MAX_PANEL_ROWS);
+        for line in branch_report_lines(report) {
+            assert!(rows.iter().any(|row| row.text == line));
+        }
+        let recorded = requests.lock().unwrap();
+        assert_eq!(
+            recorded.len(),
+            2,
+            "reopening a retained study cannot create another"
+        );
+        assert_eq!(recorded[0], recorded[1]);
+        assert_eq!(recorded[0].2.checkpoint, study_checkpoint_fixture());
+        assert_eq!(recorded[0].2.treatment, LabBranchTreatment::Drought);
+        assert_eq!(recorded[0].2.ticks, 11);
+        assert_eq!(
+            app.world()
+                .resource::<SnapshotState>()
+                .latest
+                .as_ref()
+                .unwrap()
+                .tick,
+            12,
+            "study controls must preserve the displayed live owner's tick",
+        );
+    }
+
+    #[test]
+    fn checkpoint_study_composer_keeps_foreign_source_frozen_and_reports_tick_overflow() {
+        let session = HostSessionId::new(71);
+        let presentation = LabPresentation {
+            panel: LabPanel::Checkpoints,
+            source: Some(session),
+            ..default()
+        };
+        let mut model = consumer(Some(Arc::new(|_| panic!("painting cannot submit a study"))));
+        model.synchronize(session, LabPanel::Checkpoints);
+        model.checkpoint_view = LabCheckpointView::BranchComposer;
+        model.branch_capabilities = Some(LabBranchCapabilities {
+            max_ticks: 10_000,
+            max_population: 10_000,
+        });
+        model.branch_draft = Some(LabBranchDraft {
+            checkpoint: LabCheckpoint {
+                tick: u64::MAX,
+                ..study_checkpoint_fixture()
+            },
+            ticks: 10_000,
+            treatment: LabBranchTreatment::Unchanged,
+        });
+        let rows = panel_rows(&model, &presentation);
+        assert!(rows.len() <= MAX_PANEL_ROWS);
+        assert!(
+            rows.iter()
+                .any(|row| row.text.contains("target tick overflow"))
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.text == "One more future tick" && !row.enabled)
+        );
+        assert!(rows.iter().any(|row| {
+            row.action == Some(PanelAction::Workflow(LabAction::CreateCheckpointBranch))
+                && !row.enabled
+        }));
+        model.latest_branch_creation = Some(LabBranchCreation {
+            request_id: "previous-source-study".into(),
+            session_id: HostSessionId::new(70),
+            draft: LabBranchDraft {
+                checkpoint: study_checkpoint_fixture(),
+                ticks: 11,
+                treatment: LabBranchTreatment::FoodBloom,
+            },
+            state: LabBranchCreationState::Pending,
+        });
+        let rows = panel_rows(&model, &presentation);
+        assert!(rows.len() <= MAX_PANEL_ROWS);
+        assert!(
+            rows.iter()
+                .any(|row| row.text == "Application source session 71.")
+        );
+        assert!(rows.iter().any(|row| {
+            row.text.starts_with("Previous-source study request")
+                && row.text.contains("source session 70")
+        }));
+        assert!(rows.iter().any(|row| {
+            row.text.starts_with("Review:")
+                && row.text.contains(LabBranchTreatment::FoodBloom.label())
+                && row.text.contains("source tick 7 -> target tick 18")
+        }));
+        assert!(
+            rows.iter()
+                .filter(|row| {
+                    matches!(
+                        &row.action,
+                        Some(PanelAction::Workflow(
+                            LabAction::BranchTreatment(_) | LabAction::BranchTicks(_)
+                        ))
+                    )
+                })
+                .all(|row| !row.enabled)
+        );
+        assert!(rows.iter().any(|row| {
+            row.action == Some(PanelAction::Workflow(LabAction::CreateCheckpointBranch))
+                && !row.enabled
+        }));
+        assert!(rows.iter().any(|row| {
+            row.action
+                == Some(PanelAction::Workflow(
+                    LabAction::AbandonCheckpointBranchRequest,
+                ))
+                && row.enabled
+        }));
     }
 
     #[test]

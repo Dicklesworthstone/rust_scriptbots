@@ -2,6 +2,44 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Native saved-checkpoint studies (2026-11-14):**
+[Source implemented and reviewed — Codex; executable qualification open]
+
+Continue `bd-2z0.7.6.1` with complete saved-source study flows in the GPUI and
+Bevy Checkpoints panes. Select a retained scientific cut, configure an unchanged
+future or the existing whole-world drought, food-bloom or closed-world treatment,
+and review its exact source, horizon, target tick and total transitions before
+explicit admission. The original live owner continues independently.
+
+The shared model freezes the complete draft, source session and request identity
+after an uncertain admission. Exact retry uses the existing managed service and
+retained source even if the original checkpoint is no longer available. Idle
+abandonment is explicit. Navigation and source changes retain the single occupied
+worker until it drains, and late results cannot replace the current context.
+Retained study discovery and reopening are read-only; observed status and
+cancellation use the existing backend lifecycle.
+
+Completed outcome reads bind the saved source and completed receipt to the
+verified report artifact, checksums and schema. Both native panes show actual
+terminal population, food, energy and health, population extinction/recovery,
+first-divergence evidence, full-width seed and source/report provenance. Different
+terminal digests require a divergence trace; earlier divergence followed by
+terminal reconvergence remains valid. Empty-population means and empty-source
+recovery ratios are unavailable. These are descriptive outcomes from one saved
+seed, without independent-seed inference or substituted trajectory averages.
+
+Focused regression source covers the shared lifecycle, bounds and malformed
+receipts/reports; production GPUI and Bevy interactions; and a real managed study
+with a lost response, original-cut unavailability, exact retry, changed-payload
+refusal, verified food divergence, catalog reopening and corrupt-report rejection.
+The real-service case checks unchanged live scientific state and joins workers
+before temporary artifact cleanup. Independent source review is complete. Pinned
+DSR Rustfmt emission and the subsequent source-bound `--check` both passed for
+the four changed Rust modules. The bounded Cargo attempt stopped during dependency
+fetch before compilation, and low available memory currently prevents a safe
+follow-up. Compiler, executable tests, Clippy, UBS, native/platform qualification
+and the broader bead acceptance remain open.
+
 **Native Lab matched-seed experiment creation (2026-11-14):**
 [Source implemented and reviewed — Codex; executable qualification open]
 
@@ -10,8 +48,9 @@ GPUI and Bevy. The shared composer obtains the actually compiled brain-family
 catalog and runner limits from the application, exposes two distinct family arms,
 and previews the exact consecutive seed cohort, per-run horizon, total run count,
 fresh-world source and sequential execution before an explicit launch. This
-increment runs fresh experiment defaults; checkpoint branches, live-configuration
-inheritance and an arbitrary treatment editor remain separate work.
+increment runs fresh experiment defaults. Saved-checkpoint studies are covered
+above; live-configuration inheritance and an arbitrary treatment editor remain
+separate work.
 
 Native admission uses the existing experiment service, with explicit stable
 request fields and one worker slot. An unconfirmed outcome freezes the complete

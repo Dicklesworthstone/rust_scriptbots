@@ -5,14 +5,16 @@
 
 use super::*;
 use scriptbots_runtime::lab_workflows::{
-    LAB_PAGE_SIZE, LabAction, LabCheckpointSaveState, LabExperimentCreationState, LabMetric, LabPanel,
-    VARIANTS_PER_PAGE, comparison_lines,
+    LAB_PAGE_SIZE, LabAction, LabBranchCreationState, LabBranchTreatment, LabCheckpointSaveState,
+    LabCheckpointView, LabExperimentCreationState, LabMetric, LabPanel, VARIANTS_PER_PAGE,
+    branch_report_lines, comparison_lines,
 };
 #[cfg(test)]
 use scriptbots_runtime::lab_workflows::{
-    LabCheckpoint, LabCheckpointPage, LabComparison, LabExperiment, LabExperimentCapabilities,
-    LabExperimentDraft, LabExperimentPage, LabExperimentSummary, LabVariantProgress,
-    LabWorkflowRequest, LabWorkflowResponse,
+    LabBranchCapabilities, LabBranchDivergence, LabBranchDraft, LabBranchOutcome, LabBranchReport,
+    LabCheckpoint, LabCheckpointBranch, LabCheckpointBranchPage, LabCheckpointPage, LabComparison,
+    LabExperiment, LabExperimentCapabilities, LabExperimentDraft, LabExperimentPage,
+    LabExperimentSummary, LabVariantProgress, LabWorkflowRequest, LabWorkflowResponse,
 };
 
 impl SimulationView {
@@ -233,22 +235,31 @@ impl SimulationView {
                 self.host.snapshot_hub().latest().session_id.get(),
             )));
         if let Some(creation) = &state.latest_experiment_creation {
-            let current_source = self.host.snapshot_hub().latest().session_id == creation.session_id;
+            let current_source =
+                self.host.snapshot_hub().latest().session_id == creation.session_id;
             section = section.child(div().text_xs().child(format!(
                 "{}creation request {} · source session {}",
-                if current_source { "" } else { "Previous-source " },
+                if current_source {
+                    ""
+                } else {
+                    "Previous-source "
+                },
                 creation.request_id,
                 creation.session_id.get(),
             )));
             match &creation.state {
                 LabExperimentCreationState::Pending => {
                     section = section.child(
-                        div().text_xs().child("Awaiting the application's experiment receipt."),
+                        div()
+                            .text_xs()
+                            .child("Awaiting the application's experiment receipt."),
                     );
                 }
                 LabExperimentCreationState::Retryable { reason } => {
                     section = section.child(
-                        div().text_xs().child(format!("Creation is unconfirmed: {reason}")),
+                        div()
+                            .text_xs()
+                            .child(format!("Creation is unconfirmed: {reason}")),
                     );
                 }
                 LabExperimentCreationState::Created { experiment_id } => {
@@ -283,11 +294,17 @@ impl SimulationView {
         }
         let Some(capabilities) = &state.experiment_capabilities else {
             return section.child(
-                div().text_sm().child("Loading available brain families and experiment limits…"),
+                div()
+                    .text_sm()
+                    .child("Loading available brain families and experiment limits…"),
             );
         };
         section = section
-            .child(div().text_sm().child(capabilities.launch_description.clone()))
+            .child(
+                div()
+                    .text_sm()
+                    .child(capabilities.launch_description.clone()),
+            )
             .child(div().text_xs().child(format!(
                 "Limits: {} seeds · {} ticks per run · {} total run ticks.",
                 capabilities.max_seed_count,
@@ -340,7 +357,11 @@ impl SimulationView {
                 format!("lab-experiment-seed-{seed}"),
                 format!(
                     "{}First seed {seed}",
-                    if draft.first_seed == seed { "Selected: " } else { "" },
+                    if draft.first_seed == seed {
+                        "Selected: "
+                    } else {
+                        ""
+                    },
                 ),
                 LabAction::FirstSeed(seed),
                 editing,
@@ -367,7 +388,11 @@ impl SimulationView {
                     format!("lab-experiment-seed-count-{count}"),
                     format!(
                         "{}{count} seed{}",
-                        if draft.seed_count == count { "Selected: " } else { "" },
+                        if draft.seed_count == count {
+                            "Selected: "
+                        } else {
+                            ""
+                        },
                         if count == 1 { "" } else { "s" },
                     ),
                     LabAction::SeedCount(count),
@@ -376,33 +401,44 @@ impl SimulationView {
                 ));
             }
         }
-        counts = counts.child(self.lab_button(
-            "lab-experiment-seed-count-next".into(),
-            "One more seed".into(),
-            LabAction::SeedCount(draft.seed_count.checked_add(1).unwrap_or(draft.seed_count)),
-            editing
-                && draft
-                    .seed_count
-                    .checked_add(1)
-                    .is_some_and(|count| count <= capabilities.max_seed_count),
-            cx,
-        ));
-        let mut horizons = div().flex().flex_wrap().gap_2().child(self.lab_button(
-            "lab-experiment-ticks-prev".into(),
-            "One fewer tick".into(),
-            LabAction::TicksPerRun(
-                draft.ticks_per_run.checked_sub(1).unwrap_or(draft.ticks_per_run),
+        counts = counts.child(
+            self.lab_button(
+                "lab-experiment-seed-count-next".into(),
+                "One more seed".into(),
+                LabAction::SeedCount(draft.seed_count.checked_add(1).unwrap_or(draft.seed_count)),
+                editing
+                    && draft
+                        .seed_count
+                        .checked_add(1)
+                        .is_some_and(|count| count <= capabilities.max_seed_count),
+                cx,
             ),
-            editing && draft.ticks_per_run > 1,
-            cx,
-        ));
+        );
+        let mut horizons = div().flex().flex_wrap().gap_2().child(
+            self.lab_button(
+                "lab-experiment-ticks-prev".into(),
+                "One fewer tick".into(),
+                LabAction::TicksPerRun(
+                    draft
+                        .ticks_per_run
+                        .checked_sub(1)
+                        .unwrap_or(draft.ticks_per_run),
+                ),
+                editing && draft.ticks_per_run > 1,
+                cx,
+            ),
+        );
         for ticks in [1, 10, 100, 500, 1_000, 10_000] {
             if ticks <= capabilities.max_ticks_per_run {
                 horizons = horizons.child(self.lab_button(
                     format!("lab-experiment-ticks-{ticks}"),
                     format!(
                         "{}{ticks} ticks per run",
-                        if draft.ticks_per_run == ticks { "Selected: " } else { "" },
+                        if draft.ticks_per_run == ticks {
+                            "Selected: "
+                        } else {
+                            ""
+                        },
                     ),
                     LabAction::TicksPerRun(ticks),
                     editing,
@@ -410,19 +446,24 @@ impl SimulationView {
                 ));
             }
         }
-        horizons = horizons.child(self.lab_button(
-            "lab-experiment-ticks-next".into(),
-            "One more tick".into(),
-            LabAction::TicksPerRun(
-                draft.ticks_per_run.checked_add(1).unwrap_or(draft.ticks_per_run),
+        horizons = horizons.child(
+            self.lab_button(
+                "lab-experiment-ticks-next".into(),
+                "One more tick".into(),
+                LabAction::TicksPerRun(
+                    draft
+                        .ticks_per_run
+                        .checked_add(1)
+                        .unwrap_or(draft.ticks_per_run),
+                ),
+                editing
+                    && draft
+                        .ticks_per_run
+                        .checked_add(1)
+                        .is_some_and(|ticks| ticks <= capabilities.max_ticks_per_run),
+                cx,
             ),
-            editing
-                && draft
-                    .ticks_per_run
-                    .checked_add(1)
-                    .is_some_and(|ticks| ticks <= capabilities.max_ticks_per_run),
-            cx,
-        ));
+        );
         section = section
             .child(
                 div()
@@ -436,16 +477,19 @@ impl SimulationView {
                     .child(format!("Matched seed cohort: {}", draft.seed_count)),
             )
             .child(counts)
-            .child(div().text_sm().child(format!(
-                "Scientific horizon: {} ticks",
-                draft.ticks_per_run,
-            )))
+            .child(
+                div()
+                    .text_sm()
+                    .child(format!("Scientific horizon: {} ticks", draft.ticks_per_run,)),
+            )
             .child(horizons);
         match draft.seeds() {
             Ok(seeds) => {
-                section = section.child(div().text_xs().child(format!(
-                    "Exact seeds in each arm: {seeds:?}",
-                )));
+                section = section.child(
+                    div()
+                        .text_xs()
+                        .child(format!("Exact seeds in each arm: {seeds:?}",)),
+                );
             }
             Err(error) => {
                 section = section.child(
@@ -479,22 +523,28 @@ impl SimulationView {
                 )),
         );
         if let Err(reason) = draft.validate(capabilities) {
-            section = section.child(div().text_xs().child(format!("Plan needs attention: {reason}")));
+            section = section.child(
+                div()
+                    .text_xs()
+                    .child(format!("Plan needs attention: {reason}")),
+            );
         }
-        section.child(self.lab_button(
-            "lab-experiment-create".into(),
-            if state.is_busy() {
-                "Awaiting experiment service"
-            } else if state.will_retry_experiment_creation() {
-                "Retry this exact experiment"
-            } else {
-                "Run this experiment"
-            }
-            .into(),
-            LabAction::CreateExperiment,
-            state.can_create_experiment(),
-            cx,
-        ))
+        section.child(
+            self.lab_button(
+                "lab-experiment-create".into(),
+                if state.is_busy() {
+                    "Awaiting experiment service"
+                } else if state.will_retry_experiment_creation() {
+                    "Retry this exact experiment"
+                } else {
+                    "Run this experiment"
+                }
+                .into(),
+                LabAction::CreateExperiment,
+                state.can_create_experiment(),
+                cx,
+            ),
+        )
     }
 
     pub(super) fn render_lab_experiments(&self, cx: &mut Context<Self>) -> Div {
@@ -713,9 +763,10 @@ impl SimulationView {
             ));
         }
         if page.items.is_empty() {
-            panel = panel.child(
-                div().text_sm().child("No retained experiment batches. Start a matched-seed experiment above."),
-            );
+            panel =
+                panel.child(div().text_sm().child(
+                    "No retained experiment batches. Start a matched-seed experiment above.",
+                ));
         }
         panel.child(
             div()
@@ -822,14 +873,368 @@ impl SimulationView {
         section
     }
 
+    fn render_lab_branch_composer(&self, cx: &mut Context<Self>) -> Div {
+        let state = &self.lab_workflows;
+        let editing = state.can_edit_branch_draft();
+        let retained = state
+            .latest_branch_creation
+            .as_ref()
+            .filter(|creation| !matches!(&creation.state, LabBranchCreationState::Created { .. }));
+        let draft = retained
+            .map(|creation| &creation.draft)
+            .or(state.branch_draft.as_ref());
+        let mut panel = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(div().text_lg().child("A future from a saved checkpoint"))
+            .child(div().text_xs().child(format!(
+                "Application source session {}.",
+                self.host.snapshot_hub().latest().session_id.get(),
+            )));
+        if let Some(creation) = retained {
+            let current_source =
+                self.host.snapshot_hub().latest().session_id == creation.session_id;
+            panel = panel.child(div().text_xs().child(format!(
+                "{}study request {} · source session {}",
+                if current_source {
+                    "Retained "
+                } else {
+                    "Previous-source "
+                },
+                creation.request_id,
+                creation.session_id.get(),
+            )));
+            panel = panel.child(div().text_xs().child(match &creation.state {
+                LabBranchCreationState::Pending => {
+                    "Awaiting the application's study admission receipt.".to_owned()
+                }
+                LabBranchCreationState::Retryable { reason } => {
+                    format!("Study admission is unconfirmed: {reason}")
+                }
+                LabBranchCreationState::Created { .. } => String::new(),
+            }));
+            panel = panel
+                .child(div().text_xs().child(if current_source {
+                    "Retry preserves this exact saved source, treatment, horizon and request. Abandon clears the local retry only; an admitted study may still exist in the catalog."
+                } else {
+                    "This previous-source request cannot be retried here. Abandon clears the local retry only; an admitted study may still exist in the catalog."
+                }))
+                .child(self.lab_button(
+                    "lab-branch-abandon".into(),
+                    "Abandon unconfirmed study request".into(),
+                    LabAction::AbandonCheckpointBranchRequest,
+                    state.can_abandon_branch_request(),
+                    cx,
+                ));
+        }
+        let Some(draft) = draft else {
+            return panel.child("Select a retained checkpoint to configure its future.");
+        };
+        panel = panel
+            .child(div().text_sm().child(format!(
+                "Saved source: {} · completed tick {} · {} agents",
+                draft.checkpoint.checkpoint_id,
+                draft.checkpoint.tick,
+                draft.checkpoint.agent_count,
+            )))
+            .child(div().text_xs().child(format!(
+                "Saved world digest: {}",
+                draft.checkpoint.world_digest,
+            )))
+            .child(div().text_xs().child(
+                "Each future starts from this exact saved scientific state. The live owner continues separately; its session, scheduled commands and history are not transferred.",
+            ));
+        let Some(capabilities) = &state.branch_capabilities else {
+            return panel.child("Loading checkpoint-study limits…");
+        };
+        panel = panel.child(div().text_xs().child(format!(
+            "Limits: {} future ticks per branch · {} source agents.",
+            capabilities.max_ticks, capabilities.max_population,
+        )));
+        let mut treatments = div().flex().flex_wrap().gap_2();
+        for treatment in LabBranchTreatment::ALL {
+            treatments = treatments.child(self.lab_button(
+                format!("lab-branch-treatment-{}", treatment.key()),
+                format!(
+                    "{}{}",
+                    if draft.treatment == treatment {
+                        "Selected: "
+                    } else {
+                        ""
+                    },
+                    treatment.label(),
+                ),
+                LabAction::BranchTreatment(treatment),
+                editing,
+                cx,
+            ));
+        }
+        panel = panel
+            .child(div().text_sm().child("Treatment"))
+            .child(treatments)
+            .child(div().text_xs().child(draft.treatment.description()));
+        let mut horizons = div().flex().flex_wrap().gap_2().child(self.lab_button(
+            "lab-branch-ticks-prev".into(),
+            "One fewer future tick".into(),
+            LabAction::BranchTicks(draft.ticks.checked_sub(1).unwrap_or(draft.ticks)),
+            editing && draft.ticks > 1,
+            cx,
+        ));
+        for ticks in [1, 10, 100, 240, 1_000, 10_000] {
+            if ticks <= capabilities.max_ticks {
+                horizons = horizons.child(self.lab_button(
+                    format!("lab-branch-ticks-{ticks}"),
+                    format!(
+                        "{}{ticks} future ticks",
+                        if draft.ticks == ticks {
+                            "Selected: "
+                        } else {
+                            ""
+                        },
+                    ),
+                    LabAction::BranchTicks(ticks),
+                    editing,
+                    cx,
+                ));
+            }
+        }
+        horizons = horizons.child(
+            self.lab_button(
+                "lab-branch-ticks-next".into(),
+                "One more future tick".into(),
+                LabAction::BranchTicks(draft.ticks.checked_add(1).unwrap_or(draft.ticks)),
+                editing
+                    && draft
+                        .ticks
+                        .checked_add(1)
+                        .is_some_and(|ticks| ticks <= capabilities.max_ticks),
+                cx,
+            ),
+        );
+        let target = draft.checkpoint.tick.checked_add(draft.ticks);
+        let total_ticks = draft.treatment.branch_count().checked_mul(draft.ticks);
+        panel = panel
+            .child(div().text_sm().child(format!("Future horizon: {} ticks", draft.ticks)))
+            .child(horizons)
+            .child(
+                div()
+                    .id("lab-branch-preview")
+                    .debug_selector(|| "lab-branch-preview".to_owned())
+                    .text_xs()
+                    .child(format!(
+                        "Review: {} · {} future{} · source tick {} → target tick {} · {} total scientific transitions.",
+                        draft.treatment.label(),
+                        draft.treatment.branch_count(),
+                        if draft.treatment.branch_count() == 1 { "" } else { "s" },
+                        draft.checkpoint.tick,
+                        target.map(|tick| tick.to_string()).unwrap_or_else(|| "overflow".into()),
+                        total_ticks.map(|ticks| ticks.to_string()).unwrap_or_else(|| "overflow".into()),
+                    )),
+            )
+            .child(div().text_xs().child(
+                "Outcomes describe one saved starting state. Repeated ticks are not independent seed replicates. Any selected intervention applies at the saved boundary before its next tick.",
+            ));
+        if let Err(reason) = draft.validate(capabilities) {
+            panel = panel.child(
+                div()
+                    .text_xs()
+                    .child(format!("Plan needs attention: {reason}")),
+            );
+        }
+        panel.child(
+            self.lab_button(
+                "lab-branch-create".into(),
+                if state.is_busy() {
+                    "Awaiting study service"
+                } else if state.will_retry_branch_creation() {
+                    "Retry this exact checkpoint study"
+                } else {
+                    "Run this checkpoint study"
+                }
+                .into(),
+                LabAction::CreateCheckpointBranch,
+                state.can_create_checkpoint_branch(),
+                cx,
+            ),
+        )
+    }
+
+    fn render_lab_checkpoint_studies(&self, cx: &mut Context<Self>) -> Div {
+        let state = &self.lab_workflows;
+        let idle = !state.is_busy();
+        let mut panel = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(self.lab_panel_header("Checkpoint studies", cx))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .child(self.lab_button(
+                        "lab-branch-back".into(),
+                        "Back to saved checkpoints".into(),
+                        LabAction::BackToCheckpoints,
+                        true,
+                        cx,
+                    ))
+                    .child(self.lab_button(
+                        "lab-branches-catalog".into(),
+                        "Retained checkpoint studies".into(),
+                        LabAction::CheckpointBranchesPage(None),
+                        true,
+                        cx,
+                    )),
+            );
+        match state.checkpoint_view {
+            LabCheckpointView::BranchComposer => panel.child(self.render_lab_branch_composer(cx)),
+            LabCheckpointView::BranchCatalog => {
+                let Some(page) = &state.checkpoint_branches else {
+                    return panel.child("Loading retained checkpoint studies…");
+                };
+                panel = panel.child(div().text_xs().child(format!(
+                    "{} retained studies. Reopen an observation without starting another future.",
+                    page.total,
+                )));
+                if page.items.is_empty() {
+                    panel = panel.child("No checkpoint studies are retained yet.");
+                }
+                for (index, branch) in page.items.iter().enumerate() {
+                    panel = panel.child(self.lab_button(
+                        format!("lab-branch-{index}"),
+                        format!(
+                            "{} · {} · source {} at tick {} · target tick {}",
+                            branch.branch_name,
+                            branch.status,
+                            branch.checkpoint_id,
+                            branch.source_tick,
+                            branch.target_tick,
+                        ),
+                        LabAction::SelectCheckpointBranch(branch.branch_id.clone()),
+                        true,
+                        cx,
+                    ));
+                }
+                panel.child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(
+                            self.lab_button(
+                                "lab-branches-prev".into(),
+                                "Previous studies".into(),
+                                LabAction::CheckpointBranchesPage(
+                                    (page.offset > LAB_PAGE_SIZE)
+                                        .then(|| (page.offset - LAB_PAGE_SIZE).to_string()),
+                                ),
+                                idle && page.offset > 0,
+                                cx,
+                            ),
+                        )
+                        .child(self.lab_button(
+                            "lab-branches-next".into(),
+                            "Next studies".into(),
+                            LabAction::CheckpointBranchesPage(page.next_cursor.clone()),
+                            idle && page.next_cursor.is_some(),
+                            cx,
+                        )),
+                )
+            }
+            LabCheckpointView::BranchDetail => {
+                let Some(branch) = &state.branch else {
+                    return panel
+                        .child("No checkpoint study observation has arrived. Refresh to retry.");
+                };
+                panel = panel
+                    .child(div().text_lg().child(branch.branch_name.clone()))
+                    .child(div().text_sm().child(format!("Observed status: {}", branch.status)))
+                    .child(div().text_xs().child(format!("Study: {}", branch.branch_id)))
+                    .child(div().text_xs().child(format!(
+                        "Saved source: {} · tick {} · world digest {}",
+                        branch.checkpoint_id, branch.source_tick, branch.world_digest,
+                    )))
+                    .child(div().text_xs().child(format!(
+                        "Requested target tick: {}. Source and target describe the plan; they are not a live progress counter.",
+                        branch.target_tick,
+                    )))
+                    .child(self.lab_button(
+                        "lab-branch-cancel".into(),
+                        "Request study cancellation".into(),
+                        LabAction::CancelCheckpointBranch,
+                        state.can_cancel_checkpoint_branch(),
+                        cx,
+                    ));
+                if let Some(reason) = &branch.error_reason {
+                    panel = panel.child(div().text_xs().child(format!("Study outcome: {reason}")));
+                }
+                if let Some(artifact_id) = &branch.artifact_id {
+                    panel = panel.child(
+                        div()
+                            .text_xs()
+                            .child(format!("Report artifact: {artifact_id}",)),
+                    );
+                }
+                panel = panel.child(self.lab_button(
+                    "lab-branch-read-report".into(),
+                    "Read verified outcome report".into(),
+                    LabAction::ReadCheckpointBranchReport,
+                    state.can_read_branch_report(),
+                    cx,
+                ));
+                if let Some(report) = &state.branch_report {
+                    let mut evidence = div()
+                        .id("lab-branch-report")
+                        .debug_selector(|| "lab-branch-report".to_owned())
+                        .flex()
+                        .flex_col()
+                        .gap_2();
+                    for line in branch_report_lines(report) {
+                        evidence = evidence.child(div().text_xs().child(line));
+                    }
+                    panel = panel.child(evidence);
+                }
+                panel
+            }
+            LabCheckpointView::SavedCuts => panel,
+        }
+    }
+
     pub(super) fn render_lab_checkpoints(&self, cx: &mut Context<Self>) -> Div {
         let state = &self.lab_workflows;
+        if state.checkpoint_view != LabCheckpointView::SavedCuts {
+            return self.render_lab_checkpoint_studies(cx);
+        }
         let idle = !state.is_busy();
         let mut panel = div().flex().flex_col().gap_3().child(self.lab_panel_header("Saved checkpoints", cx))
             .child(self.render_lab_checkpoint_save(cx))
             .child(div().text_xs().child("Select a saved scientific cut to reconstruct it in World. The live owner keeps its current state and controls."))
             .child(self.lab_button("lab-world-live".into(), "Return World to live".into(), LabAction::ReturnLive, true, cx))
             .child(self.lab_button("lab-review-checkpoint".into(), "Review selected checkpoint in World".into(), LabAction::ReviewCheckpoint, idle && state.selected_checkpoint_metadata().is_some(), cx));
+        panel = panel
+            .child(
+                self.lab_button(
+                    "lab-new-checkpoint-branch".into(),
+                    "Configure a checkpoint study".into(),
+                    LabAction::NewCheckpointBranch,
+                    state.selected_checkpoint_metadata().is_some()
+                        || state
+                            .latest_branch_creation
+                            .as_ref()
+                            .is_some_and(|creation| {
+                                !matches!(&creation.state, LabBranchCreationState::Created { .. })
+                            }),
+                    cx,
+                ),
+            )
+            .child(self.lab_button(
+                "lab-branches-catalog".into(),
+                "Retained checkpoint studies".into(),
+                LabAction::CheckpointBranchesPage(None),
+                state.submit.is_some(),
+                cx,
+            ));
         let Some(page) = &state.checkpoints else {
             return panel.child("Loading checkpoint catalog…");
         };
@@ -895,6 +1300,305 @@ impl SimulationView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn completed_branch_fixture(draft: &LabBranchDraft) -> (LabCheckpointBranch, LabBranchReport) {
+        let checkpoint = &draft.checkpoint;
+        let target = checkpoint.tick.checked_add(draft.ticks).unwrap();
+        let branch = LabCheckpointBranch {
+            branch_id: "native-study-1".into(),
+            checkpoint_id: checkpoint.checkpoint_id.clone(),
+            branch_name: draft.treatment.key().into(),
+            status: "completed".into(),
+            source_tick: checkpoint.tick,
+            target_tick: target,
+            world_digest: checkpoint.world_digest.clone(),
+            artifact_id: Some("native-study-report-1".into()),
+            error_reason: None,
+        };
+        let control = LabBranchOutcome {
+            tick: target,
+            population: checkpoint.agent_count,
+            total_food: 4.0,
+            total_energy: if checkpoint.agent_count == 0 {
+                0.0
+            } else {
+                2.0
+            },
+            average_health: (checkpoint.agent_count > 0).then_some(1.0),
+            final_digest: "1111111111111111".into(),
+            command_applied_tick: None,
+            minimum_population: checkpoint.agent_count,
+            extinction_tick: (checkpoint.agent_count == 0).then_some(checkpoint.tick),
+            baseline_population: checkpoint.agent_count,
+            recovery_ratio: (checkpoint.agent_count > 0).then_some(1.0),
+            first_divergence: None,
+        };
+        let report = LabBranchReport {
+            branch_id: branch.branch_id.clone(),
+            artifact_id: branch.artifact_id.clone().unwrap(),
+            base_seed: 42,
+            source_tick: checkpoint.tick,
+            target_tick: target,
+            source_world_digest: checkpoint.world_digest.clone(),
+            source_byte_size: checkpoint.byte_size,
+            source_checksum_blake3: "a".repeat(64),
+            report_byte_size: 2_048,
+            report_checksum_blake3: "b".repeat(64),
+            report_checksum_sha256: "c".repeat(64),
+            treatment: (draft.treatment != LabBranchTreatment::Unchanged).then(|| {
+                LabBranchOutcome {
+                    total_food: 6.0,
+                    final_digest: "2222222222222222".into(),
+                    command_applied_tick: Some(checkpoint.tick),
+                    first_divergence: Some(LabBranchDivergence {
+                        tick: checkpoint.tick + 1,
+                        stage: "food".into(),
+                        control_digest: "3333333333333333".into(),
+                        branch_digest: "4444444444444444".into(),
+                        command_applied_tick: checkpoint.tick,
+                        details: "Fixture's first differing food lane.".into(),
+                    }),
+                    ..control.clone()
+                }
+            }),
+            control,
+        };
+        (branch, report)
+    }
+
+    #[test]
+    fn gpui_checkpoint_study_buttons_preserve_saved_source_retry_and_report() {
+        let host = TestHost::new(
+            WorldState::new(ScriptBotsConfig {
+                rng_seed: Some(42),
+                world_width: 120,
+                world_height: 120,
+                food_cell_size: 20,
+                closed: true,
+                population_minimum: 0,
+                persistence_interval: 0,
+                ..ScriptBotsConfig::default()
+            })
+            .unwrap(),
+        );
+        let saved = host.snapshot();
+        let checkpoint = LabCheckpoint {
+            checkpoint_id: "saved-study-cut".into(),
+            tick: saved.world.tick,
+            agent_count: saved.world.agents.len(),
+            byte_size: 1_024,
+            world_digest: host.port.scientific_digest_v1().unwrap().overall,
+        };
+        host.apply(scriptbots_runtime::HostCommand::UpdateSimulation(
+            SimulationCommand {
+                paused: Some(true),
+                speed_multiplier: None,
+                step_once: true,
+            },
+        ));
+        let before = host.port.scientific_digest_v1().unwrap();
+        let live_tick = host.snapshot().world.tick;
+        assert!(live_tick > checkpoint.tick);
+        let expected_checkpoint = checkpoint.clone();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        let retained_study = Mutex::new(None);
+        let mut session = GuiSession::new(
+            host.port.clone(),
+            AnalyticsSnapshotProvider::empty(),
+            Arc::new(|_| panic!("a saved-source study must not command the live owner")),
+        );
+        session.lab_submit = Some(Arc::new(move |request| {
+            Ok(match request {
+                LabWorkflowRequest::ListCheckpoints { .. } => {
+                    LabWorkflowResponse::Checkpoints(LabCheckpointPage {
+                        items: vec![checkpoint.clone()],
+                        total: 1,
+                        offset: 0,
+                        next_cursor: None,
+                        retained_bytes: checkpoint.byte_size,
+                        max_bytes: 1_000_000,
+                    })
+                }
+                LabWorkflowRequest::BranchCapabilities => {
+                    LabWorkflowResponse::BranchCapabilities(LabBranchCapabilities {
+                        max_ticks: 10_000,
+                        max_population: 10_000,
+                    })
+                }
+                LabWorkflowRequest::CreateCheckpointBranch {
+                    request_id,
+                    session_id,
+                    draft,
+                } => {
+                    assert_eq!(session_id, saved.session_id);
+                    assert_eq!(draft.checkpoint, checkpoint);
+                    let first = {
+                        let mut recorded = recorded.lock().unwrap();
+                        recorded.push((request_id.clone(), session_id, draft.clone()));
+                        recorded.len() == 1
+                    };
+                    let mut retained = retained_study.lock().unwrap();
+                    let (branch, _) =
+                        retained.get_or_insert_with(|| completed_branch_fixture(&draft));
+                    if first {
+                        return Err("study admitted but its first response was lost".into());
+                    }
+                    LabWorkflowResponse::CheckpointBranchCreated {
+                        request_id,
+                        session_id,
+                        branch: branch.clone(),
+                    }
+                }
+                LabWorkflowRequest::ListCheckpointBranches { .. } => {
+                    let retained = retained_study.lock().unwrap();
+                    let (branch, _) = retained.as_ref().unwrap();
+                    LabWorkflowResponse::CheckpointBranches(LabCheckpointBranchPage {
+                        items: vec![branch.clone()],
+                        total: 1,
+                        offset: 0,
+                        next_cursor: None,
+                    })
+                }
+                LabWorkflowRequest::GetCheckpointBranch { branch_id } => {
+                    let retained = retained_study.lock().unwrap();
+                    let (branch, _) = retained.as_ref().unwrap();
+                    assert_eq!(branch_id, branch.branch_id);
+                    LabWorkflowResponse::CheckpointBranch(branch.clone())
+                }
+                LabWorkflowRequest::GetCheckpointBranchReport { branch_id } => {
+                    let retained = retained_study.lock().unwrap();
+                    let (_, report) = retained.as_ref().unwrap();
+                    assert_eq!(branch_id, report.branch_id);
+                    LabWorkflowResponse::CheckpointBranchReport(report.clone())
+                }
+                other => panic!("unexpected checkpoint-study request: {other:?}"),
+            })
+        }));
+        let context = gpui::TestAppContext::single();
+        let windows = context
+            .update(|app| Arc::new(session).install(app))
+            .unwrap();
+        let hud = context.update(|app| windows.hud.root(app)).unwrap();
+        let mut lab = gpui::VisualTestContext::from_window(windows.hud.into(), &context);
+        lab.simulate_resize(size(px(1_000.0), px(1_800.0)));
+        let draw = |lab: &mut gpui::VisualTestContext| {
+            lab.update(|window, app| {
+                window.refresh();
+                window.draw(app).clear();
+            })
+        };
+        let click = |lab: &mut gpui::VisualTestContext, selector: &'static str| {
+            draw(lab);
+            let bounds = lab
+                .debug_bounds(selector)
+                .expect("visible production study control");
+            lab.simulate_click(bounds.center(), gpui::Modifiers::default());
+        };
+        let wait = |lab: &mut gpui::VisualTestContext, ready: &dyn Fn(&LabWorkflows) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                draw(lab);
+                if context.update(|app| ready(&hud.read(app).lab_workflows)) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "native checkpoint-study result did not arrive"
+                );
+                std::thread::yield_now();
+            }
+        };
+        click(&mut lab, "dashboard-tab-checkpoints");
+        wait(&mut lab, &|state| {
+            state.checkpoints.is_some() && !state.is_busy()
+        });
+        click(&mut lab, "lab-checkpoint-0");
+        click(&mut lab, "lab-new-checkpoint-branch");
+        wait(&mut lab, &|state| {
+            state.checkpoint_view == LabCheckpointView::BranchComposer
+                && state.branch_capabilities.is_some()
+                && !state.is_busy()
+        });
+        click(&mut lab, "lab-branch-treatment-food-bloom");
+        click(&mut lab, "lab-branch-ticks-10");
+        click(&mut lab, "lab-branch-ticks-next");
+        draw(&mut lab);
+        assert!(lab.debug_bounds("lab-branch-preview").is_some());
+        context.update(|app| {
+            let draft = hud.read(app).lab_workflows.branch_draft.as_ref().unwrap();
+            assert_eq!(draft.checkpoint, expected_checkpoint);
+            assert_eq!(draft.ticks, 11);
+            assert_eq!(draft.treatment, LabBranchTreatment::FoodBloom);
+        });
+        click(&mut lab, "lab-branch-create");
+        wait(&mut lab, &|state| {
+            !state.is_busy()
+                && state
+                    .latest_branch_creation
+                    .as_ref()
+                    .is_some_and(|creation| {
+                        matches!(&creation.state, LabBranchCreationState::Retryable { .. })
+                    })
+        });
+        click(&mut lab, "lab-branch-treatment-drought");
+        click(&mut lab, "lab-branch-ticks-1000");
+        context.update(|app| {
+            let state = &hud.read(app).lab_workflows;
+            let draft = state.branch_draft.as_ref().unwrap();
+            assert_eq!(draft.ticks, 11);
+            assert_eq!(draft.treatment, LabBranchTreatment::FoodBloom);
+        });
+        click(&mut lab, "lab-branch-create");
+        wait(&mut lab, &|state| {
+            !state.is_busy()
+                && state.checkpoint_view == LabCheckpointView::BranchDetail
+                && state
+                    .branch
+                    .as_ref()
+                    .is_some_and(|branch| branch.status == "completed")
+        });
+        click(&mut lab, "lab-branch-read-report");
+        wait(&mut lab, &|state| {
+            state.branch_report.is_some() && !state.is_busy()
+        });
+        draw(&mut lab);
+        assert!(lab.debug_bounds("lab-branch-report").is_some());
+        context.update(|app| {
+            let report = hud.read(app).lab_workflows.branch_report.as_ref().unwrap();
+            assert_eq!(report.source_world_digest, expected_checkpoint.world_digest);
+            assert_eq!(report.source_tick, expected_checkpoint.tick);
+            assert_eq!(report.target_tick, expected_checkpoint.tick + 11);
+            let treatment = report.treatment.as_ref().unwrap();
+            assert_eq!(treatment.total_food - report.control.total_food, 2.0);
+            assert_eq!(treatment.first_divergence.as_ref().unwrap().stage, "food");
+        });
+        click(&mut lab, "lab-branches-catalog");
+        wait(&mut lab, &|state| {
+            state.checkpoint_branches.is_some() && !state.is_busy()
+        });
+        click(&mut lab, "lab-branch-0");
+        wait(&mut lab, &|state| {
+            state.branch.is_some() && !state.is_busy()
+        });
+        click(&mut lab, "lab-branch-read-report");
+        wait(&mut lab, &|state| {
+            state.branch_report.is_some() && !state.is_busy()
+        });
+        let recorded = requests.lock().unwrap();
+        assert_eq!(
+            recorded.len(),
+            2,
+            "catalog reopen must not admit another study"
+        );
+        assert_eq!(
+            recorded[0], recorded[1],
+            "retry must preserve every request input"
+        );
+        assert_eq!(recorded[0].2.checkpoint, expected_checkpoint);
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        assert_eq!(host.snapshot().world.tick, live_tick);
+    }
 
     fn batch(variants: usize) -> LabExperiment {
         LabExperiment {
@@ -1037,8 +1741,8 @@ mod tests {
                         max_seed_count: 8,
                         max_ticks_per_run: 1_000,
                         max_total_ticks: 16_000,
-                        launch_description: "Fresh worlds with the fixture's declared founder recipe."
-                            .into(),
+                        launch_description:
+                            "Fresh worlds with the fixture's declared founder recipe.".into(),
                     })
                 }
                 LabWorkflowRequest::CreateExperiment {
@@ -1197,7 +1901,9 @@ mod tests {
         });
         click(&mut lab, "lab-new-experiment");
         wait(&mut lab, &|state| {
-            state.composing_experiment && state.experiment_capabilities.is_some() && !state.is_busy()
+            state.composing_experiment
+                && state.experiment_capabilities.is_some()
+                && !state.is_busy()
         });
         click(&mut lab, "lab-experiment-baseline-dwraon");
         click(&mut lab, "lab-experiment-challenger-assembly");
@@ -1218,13 +1924,22 @@ mod tests {
         click(&mut lab, "lab-experiment-create");
         wait(&mut lab, &|state| {
             !state.is_busy()
-                && state.latest_experiment_creation.as_ref().is_some_and(|creation| {
-                    matches!(&creation.state, LabExperimentCreationState::Retryable { .. })
-                })
+                && state
+                    .latest_experiment_creation
+                    .as_ref()
+                    .is_some_and(|creation| {
+                        matches!(
+                            &creation.state,
+                            LabExperimentCreationState::Retryable { .. }
+                        )
+                    })
         });
         click(&mut lab, "lab-experiment-ticks-1000");
         context.update(|app| {
-            assert_eq!(hud.read(app).lab_workflows.experiment_draft.ticks_per_run, 11);
+            assert_eq!(
+                hud.read(app).lab_workflows.experiment_draft.ticks_per_run,
+                11
+            );
         });
         click(&mut lab, "lab-experiment-create");
         wait(&mut lab, &|state| {
