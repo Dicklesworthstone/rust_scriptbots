@@ -44,7 +44,7 @@ pub(crate) const MAX_EXPERIMENT_SUMMARY_BYTES: usize = 4_096;
 const EXPERIMENT_SUMMARY_SCHEMA_VERSION: u16 = 2;
 const MAX_BATCH_RUNS: usize = 4_096;
 pub(crate) const MAX_RUN_COMPONENT_BYTES: usize = 128;
-const MAX_TICKS_PER_RUN: u64 = 10_000_000;
+pub(crate) const MAX_TICKS_PER_RUN: u64 = 10_000_000;
 pub(crate) const MAX_CONCURRENT_RUNS: usize = 64;
 // Admission limits for the shared dense food/terrain grid dimensions. Each cell
 // also feeds profiles, tick scratch and checkpoint state, so bounding only each

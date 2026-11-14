@@ -607,6 +607,8 @@ pub struct ExperimentCreateRequest {
     pub description: Option<String>,
     pub variants: Vec<ExperimentVariantDto>,
     pub seeds: Vec<u64>,
+    /// Exact positive horizon within the runner's per-run limit; never clamped.
+    /// Omitting this field selects 1,000 scientific ticks.
     pub ticks_per_run: Option<u64>,
     pub max_concurrency: Option<usize>,
     pub idempotency_key: Option<String>,
@@ -4164,6 +4166,13 @@ impl ControlHandle {
         &self,
         request: ExperimentCreateRequest,
     ) -> Result<ExperimentBatchStatusDto, ControlError> {
+        let ticks_per_run = request.ticks_per_run.unwrap_or(1_000);
+        let maximum_ticks = crate::experiment_runner::MAX_TICKS_PER_RUN;
+        if !(1..=maximum_ticks).contains(&ticks_per_run) {
+            return Err(ControlError::BadRequest(format!(
+                "ticks_per_run must be in 1..={maximum_ticks}, found {ticks_per_run}; the requested scientific horizon is never clamped"
+            )));
+        }
         self.data_services.recover_experiment_catalog()?;
         if request.variants.is_empty() {
             return Err(ControlError::BadRequest("variants cannot be empty".into()));
@@ -4208,8 +4217,6 @@ impl ControlHandle {
                 "total batch runs ({total_runs}) exceed maximum limit of 4096"
             )));
         }
-
-        let ticks_per_run = request.ticks_per_run.unwrap_or(1000).clamp(1, 10_000_000);
 
         let request_identity = request
             .idempotency_key
@@ -7788,6 +7795,103 @@ pub(crate) mod tests {
         .persist(&directory)
         .unwrap();
         directory.join("definition.json")
+    }
+
+    #[test]
+    fn experiment_horizon_refusal_precedes_catalog_and_execution_side_effects() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let (handle, _host) = handle();
+        let handle = handle.with_artifacts_dir(root.clone()).unwrap();
+        let services = handle.data_services();
+        // Leave an authentic prior admission undiscovered. An invalid new
+        // horizon must not even populate its catalog or idempotency entries.
+        let saved = pending_catalog_definition(&root, "saved-before-refusal");
+        let saved_bytes = fs::read(&saved).unwrap();
+        let catalog_entries = || {
+            fs::read_dir(root.join("experiments"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let before_entries = catalog_entries();
+        let before_capacity = *services.execution_capacity.lock().unwrap();
+        for ticks in [0, crate::experiment_runner::MAX_TICKS_PER_RUN + 1, u64::MAX] {
+            let mut request = experiment_creation_request();
+            request.experiment_id = Some("refused-horizon".into());
+            request.ticks_per_run = Some(ticks);
+            let error = handle.create_experiment(request).unwrap_err();
+            assert!(
+                matches!(error, ControlError::BadRequest(ref message)
+                    if message.contains("ticks_per_run")
+                        && message.contains(&format!("found {ticks}"))),
+                "{error}"
+            );
+            assert!(services.experiments.lock().unwrap().is_empty());
+            assert!(services.idempotency.lock().unwrap().is_empty());
+            assert!(services.artifacts.lock().unwrap().is_empty());
+            assert_eq!(*services.execution_capacity.lock().unwrap(), before_capacity);
+            assert_eq!(catalog_entries(), before_entries);
+            assert_eq!(fs::read(&saved).unwrap(), saved_bytes);
+            assert!(!saved.with_file_name("status.json").exists());
+            assert!(!root.join("experiments/refused-horizon").exists());
+        }
+    }
+
+    #[test]
+    fn experiment_horizon_admission_preserves_exact_values_and_omitted_default() {
+        for (requested, expected) in [
+            (Some(1), 1),
+            (Some(7), 7),
+            (None, 1_000),
+            (
+                Some(crate::experiment_runner::MAX_TICKS_PER_RUN),
+                crate::experiment_runner::MAX_TICKS_PER_RUN,
+            ),
+        ] {
+            let root = tempfile::tempdir().unwrap().keep();
+            let (handle, _host) = handle();
+            let handle = handle.with_artifacts_dir(root.clone()).unwrap();
+            let services = handle.data_services();
+            let mut request = experiment_creation_request();
+            request.experiment_id = Some("exact-horizon".into());
+            request.ticks_per_run = requested;
+            let admitted = handle.create_experiment(request).unwrap();
+            // Exercise real admission at the upper bound without executing a
+            // ten-million-tick test. The short positive controls finish normally.
+            if expected > 7 {
+                handle.cancel_experiment(&admitted.experiment_id).unwrap();
+            }
+            {
+                let mut jobs = services.experiments.lock().unwrap();
+                let job = jobs.get_mut(&admitted.experiment_id).unwrap();
+                job.join_worker().unwrap();
+                assert_eq!(job.runner.max_ticks, expected);
+            }
+            let observed = handle.get_experiment(&admitted.experiment_id).unwrap();
+            assert_eq!(observed.total_runs, 1);
+            assert_eq!(observed.runs[0].target_ticks, expected);
+            assert_eq!(observed.failed_runs, 0, "{observed:?}");
+            assert!(observed.error_reason.is_none(), "{observed:?}");
+            assert!(
+                matches!(observed.status.as_str(), "completed" | "cancelled"),
+                "{observed:?}"
+            );
+            if expected <= 7 {
+                assert_eq!(observed.status, "completed", "{observed:?}");
+                assert_eq!(observed.completed_runs, 1);
+                assert_eq!(observed.runs[0].total_ticks, expected);
+            }
+            let catalog: ExperimentCatalogRecord = serde_json::from_slice(
+                &fs::read(root.join("experiments/exact-horizon/definition.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(catalog.definition.max_ticks, expected);
+            assert_eq!(catalog.definition.plan_digest, observed.plan_digest);
+            let capacity = *services.execution_capacity.lock().unwrap();
+            assert_eq!(capacity.reserved_run_slots, 0);
+            assert_eq!(capacity.reserved_grid_cells, 0);
+            assert_eq!(capacity.reserved_batches, 0);
+        }
     }
 
     pub(crate) fn comparison_catalog_runner(

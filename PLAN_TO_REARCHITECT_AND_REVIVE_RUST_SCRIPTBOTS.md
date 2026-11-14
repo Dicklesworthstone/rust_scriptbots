@@ -2,6 +2,23 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Exact experiment horizons (2026-11-13):**
+[Source implemented — Codex; executable qualification open]
+
+Continue `bd-2z0.5.11` and `bd-2z0.12.2` by refusing REST/MCP
+`ticks_per_run` outside the runner's shared positive range before catalog
+recovery or admission side effects. The API previously silently clamped these
+requests, which could execute a different scientific horizon. Omission retains
+the documented 1,000-tick default; the runner's intentional zero-tick library
+support remains available.
+
+Two new regressions cover zero, the first value above the bound, `u64::MAX`,
+unchanged undiscovered catalog evidence and capacity, exact short-run completion,
+the omitted default and upper-bound admission with cooperative cancellation.
+They are authored and independently source reviewed, not executed. The execution
+host became unavailable during pinned Rust/DSR setup; no compiler, Rustfmt,
+Clippy, UBS or DSR pass is claimed. Original bead acceptance remains open.
+
 **NeuroFlow admitted to matched-seed experiments (2026-11-13):**
 [Source implemented and independently reviewed — Codex; executable qualification open]
 
