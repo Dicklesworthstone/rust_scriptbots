@@ -1104,13 +1104,27 @@ publication. You can save a source checkpoint through F7 before observing later
 events. Background narrative eviction leaves unrelated checkpoint saves and
 experiment requests intact.
 
-The experiment pane reads the same application services as GPUI. It lists retained
-batches, shows every variant through bounded pages, and reports completed,
-running and failed runs. Select baseline and challenger arms to compare verified
-population endpoints from matched seeds. Comparisons retain their plan digest,
-source generation, endpoint and available statistical results. Stop and resume
-buttons use the existing experiment runner; its returned status remains the
-authority. Create new batches through the experiment CLI or API.
+Both native experiment panes can create fresh matched-seed batches. Choose
+**New matched-seed experiment**, then **Compare brain families** for two different families
+under identical conditions, or **Compare ecological treatment** for one shared
+family with one scheduled coefficient change. The ecological choices are food
+regrowth, basal metabolism and movement cost. Review the actual fresh-run baseline,
+challenger value, seed cohort, horizon and completed-tick application boundary
+before launching. Percentage controls range from 0% to 400%; 100% is an explicit
+unchanged-value control. Both arms start from fresh experiment defaults and use
+the same independent seed pairs. Their configuration is separate from the live
+world. A shortened horizon does not silently move a requested treatment boundary.
+
+If admission is unconfirmed, the complete scientific question and request identity
+stay frozen for an exact retry. The application verifies the returned run matrix
+and canonical plan digest, including the treatment value and timing. The pane
+also lists retained batches, pages through variants and reports completed, running
+and failed runs. Select baseline and challenger arms to compare verified endpoints:
+population, total or mean live-agent energy, mean health, mean or maximum age
+counter, maximum living generation, and total food. Comparisons retain the plan
+digest, source generation, endpoint and available statistical results. Stop and
+resume use the existing runner's observed status. The experiment CLI and API
+remain available for larger scripted designs.
 
 The saved-checkpoint pane can **save the current live world**, list retained
 scientific cuts and reconstruct a selected cut for inspection. A completed save
@@ -1125,6 +1139,15 @@ Live organism picking and simulation commands are disabled during review. Click
 the banner, choose **Return live**, or press Escape with the panel closed to
 restore the newest live publication. Review does not replace or rewind the owner.
 
+A selected scientific cut can also seed a saved-checkpoint study: choose an
+unchanged continuation or the offered whole-world treatment, review its source
+and future horizon, then launch it through the application service. Retained
+studies can be reopened and their cancellation state observed. Completed outcomes
+come from verified report artifacts and show terminal population, food, energy
+and health, extinction/recovery and available first-divergence evidence. These
+outcomes describe one saved founding seed. Fresh matched-seed experiments provide
+the independent founding-seed replication.
+
 Both native frontends share one bounded workflow model. Discarding a pending
 result keeps its worker slot occupied until the operation finishes; changing
 session, panel or selection invalidates its result. File reads and experiment
@@ -1132,10 +1155,10 @@ verification run outside the render loop. Bevy retains at most one saved
 presentation and one newest live publication, and reuses a bounded pool of UI
 rows.
 
-These panes cover experiment inspection/comparison, checkpoint saving and review,
-and reconstruction at a selected narrative event tick under `bd-2z0.7.6.1` and
-`bd-ji3a`. General replay seeking, first-divergence display, artifact export and
-full native/GPU acceptance remain unfinished parts of those workflows.
+These panes cover experiment creation/comparison, saved-checkpoint studies and
+review, and reconstruction at a selected narrative event tick under `bd-2z0.7.6.1`
+and `bd-ji3a`. General replay seeking, native artifact export and full native/GPU
+acceptance remain unfinished parts of those workflows.
 Normal simulation epoch progression preserves a saved view; a change of host
 session invalidates stale observations and results.
 
@@ -1724,7 +1747,16 @@ decoder and browser together; binary stream v1 is rejected explicitly.
 
 Subscriptions contain one through three unique channels. Omitted channels do no
 projection work. `max_fps` defaults to 60 and accepts 1–120; it bounds sampling
-frequency, not simulation speed. Binary frames are capped at 8 MiB, canvas frames
+frequency, not simulation speed. Negotiated streams wake when the owner publishes,
+when a client returns consumption credit, or when its subscription changes. They
+use a one-shot delay only when pending work must wait for the current rate limit;
+an idle stream does not poll for snapshots. Publications coalesce while a client
+has no credit, and an acknowledgement can release another narrative page from
+the same publication without advancing science. Each negotiated connection uses
+one of the owner's 128 bounded publication observers; exhausted observer capacity
+returns a service-unavailable response without replacing a valid subscription.
+The pre-negotiation legacy summary lane retains its 50 ms cadence.
+Binary frames are capped at 8 MiB, canvas frames
 at 65,536 agents, and narrative pages at 64 records with bounded text. An
 unrepresentable source is refused instead of silently truncated. The shared
 decoder rejects unknown versions, trailing data, invalid lengths, non-finite
@@ -1762,16 +1794,20 @@ publication and has one socket write in flight. Until the browser consumes that
 frame, newer publications coalesce in the host's latest-value slot. This also
 bounds traffic entering a browser whose main thread has fallen behind. No per-tick
 snapshot queue or simulation lock is retained. Projection, socket writes and
-consumption acknowledgments each have a five-second deadline; expired credit is
-checked at the next sampling boundary. Queued blocking preparation is cancelled
-when the connection closes or its preparation deadline expires. Missed timer
-intervals are skipped. Preparation/write work or observed consumption round trips
+consumption acknowledgments each have a five-second deadline. An independent
+one-shot deadline expires the oldest outstanding credit even while the owner is
+paused, no new publications arrive, or all selected channels await consumption.
+Queued blocking preparation is cancelled when the connection closes or its
+preparation deadline expires. Preparation/write work or observed consumption round trips
 exceeding the current sample interval back sampling off to twice the observed
 duration, capped at one second. Eight cheap samples permit a 25% recovery toward
 the requested rate. A `stream_rate`
 JSON notice reports the requested/effective intervals in microseconds and the
 `slow_consumer` or `recovering` decision. Snapshot frames report skipped revisions;
 narrative frames preserve contiguous records or explicitly declare retention loss.
+Publication-triggered scheduling does not establish a measured frame-latency or
+throughput guarantee; those claims require the pinned clean-source DSR performance
+and multi-client qualification described by the original streaming acceptance.
 
 For reconnect, retain only frames successfully consumed by the client and send
 their session-bound cursors:

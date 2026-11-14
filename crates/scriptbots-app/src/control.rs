@@ -6323,6 +6323,12 @@ impl ControlHandle {
             .ok_or(ControlError::Lock)
     }
 
+    /// Observe immutable owner publications without submitting work or advancing science.
+    /// The hub carries latest-only data and independent publication wakeups.
+    pub(crate) fn snapshot_hub(&self) -> scriptbots_runtime::SnapshotHub {
+        self.host.snapshot_hub()
+    }
+
     /// Retrieve the current configuration snapshot.
     pub fn snapshot(&self) -> Result<ConfigSnapshot, ControlError> {
         let snapshot = self.read_snapshot()?;
@@ -7831,7 +7837,10 @@ pub(crate) mod tests {
             assert!(services.experiments.lock().unwrap().is_empty());
             assert!(services.idempotency.lock().unwrap().is_empty());
             assert!(services.artifacts.lock().unwrap().is_empty());
-            assert_eq!(*services.execution_capacity.lock().unwrap(), before_capacity);
+            assert_eq!(
+                *services.execution_capacity.lock().unwrap(),
+                before_capacity
+            );
             assert_eq!(catalog_entries(), before_entries);
             assert_eq!(fs::read(&saved).unwrap(), saved_bytes);
             assert!(!saved.with_file_name("status.json").exists());
@@ -7926,8 +7935,7 @@ pub(crate) mod tests {
                     // long-running worker alive in the negative-control build.
                     let mut jobs = services.experiments.lock().unwrap();
                     let job = jobs.get_mut(&admitted.experiment_id).unwrap();
-                    job.cancel
-                        .store(true, std::sync::atomic::Ordering::Release);
+                    job.cancel.store(true, std::sync::atomic::Ordering::Release);
                     job.join_worker().unwrap();
                 }
                 let error = outcome.unwrap_err();
@@ -7940,7 +7948,10 @@ pub(crate) mod tests {
                 assert!(services.experiments.lock().unwrap().is_empty());
                 assert!(services.idempotency.lock().unwrap().is_empty());
                 assert!(services.artifacts.lock().unwrap().is_empty());
-                assert_eq!(*services.execution_capacity.lock().unwrap(), before_capacity);
+                assert_eq!(
+                    *services.execution_capacity.lock().unwrap(),
+                    before_capacity
+                );
                 assert_eq!(fs::read(&saved).unwrap(), saved_bytes);
                 assert!(!saved.with_file_name("status.json").exists());
                 assert!(!root.join("experiments/refused-work").exists());
@@ -7965,7 +7976,10 @@ pub(crate) mod tests {
         assert_eq!(completed.completed_runs, 1);
         assert_eq!(completed.failed_runs, 0);
         assert_eq!(completed.runs[0].total_ticks, 2);
-        assert_eq!(*services.execution_capacity.lock().unwrap(), before_capacity);
+        assert_eq!(
+            *services.execution_capacity.lock().unwrap(),
+            before_capacity
+        );
     }
 
     #[test]
@@ -8032,7 +8046,10 @@ pub(crate) mod tests {
             serde_json::to_value(&after).unwrap(),
             serde_json::to_value(&observed).unwrap()
         );
-        assert_eq!(*services.execution_capacity.lock().unwrap(), before_capacity);
+        assert_eq!(
+            *services.execution_capacity.lock().unwrap(),
+            before_capacity
+        );
         assert_eq!(fs::read(&definition).unwrap(), saved_bytes);
         assert!(!directory.join("status.json").exists());
         assert!(services.artifacts.lock().unwrap().is_empty());
@@ -9323,10 +9340,16 @@ pub(crate) mod tests {
         assert_eq!(run.seed, expected_seed);
         assert_eq!(run.total_ticks, expected_ticks);
         assert_ne!(run.final_digest, baseline.final_digest);
-        let bundle_dir = Path::new(run.bundle_path.as_ref().expect("published NeuroFlow bundle"));
+        let bundle_dir = Path::new(
+            run.bundle_path
+                .as_ref()
+                .expect("published NeuroFlow bundle"),
+        );
         let verified = crate::experiment_runner::verify_portable_run_bundle(bundle_dir)
             .expect("restore configured NeuroFlow from its portable final checkpoint");
-        let final_state = verified.final_state.expect("observed NeuroFlow final science");
+        let final_state = verified
+            .final_state
+            .expect("observed NeuroFlow final science");
         assert_eq!(final_state.run_id, run.run_id);
         assert_eq!(final_state.tick, expected_ticks);
         assert_eq!(
@@ -9349,7 +9372,9 @@ pub(crate) mod tests {
         let after = handle.read_snapshot().unwrap();
         assert_eq!(after.config, live_snapshot.config);
         assert_eq!(after.world.tick, live_snapshot.world.tick);
-        runtime.shutdown().expect("join NeuroFlow experiment worker");
+        runtime
+            .shutdown()
+            .expect("join NeuroFlow experiment worker");
     }
 
     #[cfg(not(feature = "neuro"))]

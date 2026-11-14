@@ -57,13 +57,13 @@ use scriptbots_core::{
     AgentDebugInfo, AgentDebugQuery, AgentDebugSort, ConfigAuditEntry, Position, SelectionUpdate,
     Tick, TickSummaryDto,
 };
-use scriptbots_runtime::RenderSnapshot;
 use scriptbots_runtime::channel::ChannelHostPort;
 use scriptbots_runtime::remote::{REMOTE_PROTOCOL_VERSION, RemoteFrame, encode_remote_frame};
 use scriptbots_runtime::remote_subscription::{
     REMOTE_MAX_REQUEST_BYTES, RemoteChannel, RemoteDeliveryWindow, RemoteFrameAck,
     RemoteSubscription, RemoteSubscriptionError, RemoteSubscriptionRequest,
 };
+use scriptbots_runtime::{RenderSnapshot, SnapshotWatcher};
 // keep image out of servers unless needed
 
 /// Default loopback address for the REST control surface.
@@ -2707,6 +2707,41 @@ impl WsStreamCadence {
     }
 }
 
+/// One coalesced request for projection, with no recurring wake while idle or
+/// while every channel is awaiting acknowledgement. Publications and returned
+/// credits request work; neither postpones an already eligible dispatch.
+#[derive(Debug, Default)]
+struct WsStreamSchedule {
+    requested: bool,
+    last_started: Option<Duration>,
+}
+
+impl WsStreamSchedule {
+    fn request(&mut self) {
+        self.requested = true;
+    }
+
+    fn remaining(&self, now: Duration, cadence: Duration, has_credit: bool) -> Option<Duration> {
+        (self.requested && has_credit).then(|| {
+            self.last_started.map_or(Duration::ZERO, |started| {
+                started.saturating_add(cadence).saturating_sub(now)
+            })
+        })
+    }
+
+    fn start(&mut self, now: Duration) {
+        self.requested = false;
+        self.last_started = Some(now);
+    }
+}
+
+async fn wait_ws_deadline(remaining: Option<Duration>) {
+    match remaining {
+        Some(remaining) => tokio::time::sleep(remaining).await,
+        None => std::future::pending().await,
+    }
+}
+
 fn ws_interval(period: Duration) -> tokio::time::Interval {
     let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2737,9 +2772,11 @@ async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
     static NEXT_CONNECTION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let connection_id = NEXT_CONNECTION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let handle = state.handle.clone();
-    let mut interval = ws_interval(Duration::from_millis(50));
+    let mut legacy_interval = ws_interval(Duration::from_millis(50));
     let mut subscription: Option<RemoteSubscription> = None;
     let mut delivery: Option<RemoteDeliveryWindow> = None;
+    let mut publications: Option<SnapshotWatcher> = None;
+    let mut schedule = WsStreamSchedule::default();
     // Owner admission may wait longer than a presentation acknowledgement's
     // deadline. Poll one retained request alongside socket reads, with no
     // command queue, so that wait never prevents returning stream credit.
@@ -2749,6 +2786,16 @@ async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
     let connected_at = tokio::time::Instant::now();
     debug!(connection_id, "WebSocket connected");
     loop {
+        let now = connected_at.elapsed();
+        let acknowledgement_deadline = delivery
+            .as_ref()
+            .and_then(|window| window.acknowledgement_timeout_remaining(now));
+        let has_credit = subscription.as_ref().is_some_and(|stream| {
+            delivery
+                .as_ref()
+                .is_some_and(|window| window.awaiting_channels().len() < stream.channels().len())
+        });
+        let dispatch_deadline = schedule.remaining(now, cadence.current, has_credit);
         tokio::select! {
             reply = async {
                 match pending_control.as_mut() {
@@ -2764,9 +2811,27 @@ async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
                     break;
                 }
             }
-            _ = interval.tick() => {
+            _ = wait_ws_deadline(acknowledgement_deadline) => {
+                send_ws_error(&mut socket, None, AppError::service_unavailable(
+                    "remote frame acknowledgement deadline exceeded; reconnect with the last consumed cursors",
+                )).await;
+                break;
+            }
+            _ = async {
+                match publications.as_mut() {
+                    Some(watcher) => { let _ = watcher.changed().await; }
+                    None => std::future::pending().await,
+                }
+            }, if !schedule.requested => {
+                // After a throttled dispatch, the watcher can observe the same
+                // newer revision that read_snapshot already projected. That
+                // causes at most one bounded empty attempt, never an idle timer.
+                schedule.request();
+            }
+            _ = wait_ws_deadline(dispatch_deadline) => {
                 if let Some(stream) = &mut subscription {
                     let started = tokio::time::Instant::now();
+                    schedule.start(connected_at.elapsed());
                     let window = delivery.as_mut().expect("negotiation installs a delivery window");
                     if window.expired(connected_at.elapsed()) {
                         send_ws_error(&mut socket, None, AppError::service_unavailable(
@@ -2822,12 +2887,14 @@ async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
                         break;
                     }
                     if let Some(reason) = cadence.observe(started.elapsed()) {
-                        interval = ws_interval(cadence.current);
                         if !send_ws_cadence(&mut socket, &cadence, reason, connection_id).await {
                             break;
                         }
                     }
-                } else if let Ok(summary) = read_latest_tick_summary(handle.clone()).await {
+                }
+            }
+            _ = legacy_interval.tick(), if subscription.is_none() => {
+                if let Ok(summary) = read_latest_tick_summary(handle.clone()).await {
                     let dto = TickSummaryDto::from(summary);
                     if let Ok(bytes) = postcard::to_stdvec(&dto)
                         && !send_ws_message(&mut socket, WsMessage::Binary(bytes.into())).await
@@ -2854,8 +2921,11 @@ async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
                             })();
                             match consumed {
                                 Ok(elapsed) => {
+                                    // A retained event page can share its publication
+                                    // with the previous page. Credit itself must wake
+                                    // projection even when the owner stays paused.
+                                    schedule.request();
                                     if let Some(reason) = cadence.observe(elapsed) {
-                                        interval = ws_interval(cadence.current);
                                         if !send_ws_cadence(&mut socket, &cadence, reason, connection_id).await { break; }
                                     }
                                 }
@@ -2879,6 +2949,15 @@ async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
                                 }
                                 let snapshot = handle.read_snapshot().map_err(AppError::from)?;
                                 let stream = RemoteSubscription::new(&request, &snapshot).map_err(remote_subscription_error)?;
+                                // Validate the request first, and reuse an existing
+                                // bounded observer for replacement subscriptions.
+                                let watcher = if publications.is_none() {
+                                    Some(handle.snapshot_hub().watch().map_err(|error| {
+                                        AppError::service_unavailable(format!("remote publication subscription unavailable: {error}"))
+                                    })?)
+                                } else {
+                                    None
+                                };
                                 let window = RemoteDeliveryWindow::new(u128::from(snapshot.session_id.get()), WS_WRITE_TIMEOUT);
                                 let ack = json!({
                                     "type": "subscribed", "protocol_version": WS_CONTROL_PROTOCOL_VERSION,
@@ -2887,16 +2966,23 @@ async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
                                     "session_id": snapshot.session_id.get().to_string(),
                                     "channels": request.channels, "max_fps": request.max_fps,
                                 });
-                                Ok::<_, AppError>((stream, window, ack))
+                                Ok::<_, AppError>((stream, window, watcher, ack))
                             })();
                             match prepared {
-                                Ok((stream, window, ack)) => {
+                                Ok((stream, window, watcher, ack)) => {
                                     if !send_ws_message(&mut socket, WsMessage::Text(ack.to_string().into())).await {
                                         break;
                                     }
                                     debug!(connection_id, channels = ?stream.channels(), "remote subscription accepted");
                                     cadence = WsStreamCadence::new(stream.interval());
-                                    interval = ws_interval(cadence.current);
+                                    schedule = WsStreamSchedule::default();
+                                    if let Some(watcher) = watcher {
+                                        // The watcher's first change yields the current
+                                        // publication immediately after this acknowledgement.
+                                        publications = Some(watcher);
+                                    } else {
+                                        schedule.request();
+                                    }
                                     subscription = Some(stream);
                                     delivery = Some(window);
                                 }
@@ -11951,6 +12037,374 @@ mod tests {
         drop(reconnected);
         drop(canvas);
         drop(stalled);
+        server.shutdown().unwrap();
+    }
+
+    #[test]
+    fn websocket_publication_schedule_has_no_idle_or_credit_blocked_timer() {
+        let mut schedule = WsStreamSchedule::default();
+        let cadence = Duration::from_millis(20);
+        let first = Duration::from_millis(10);
+        assert_eq!(schedule.remaining(first, cadence, true), None);
+
+        schedule.request();
+        assert_eq!(schedule.remaining(first, cadence, false), None);
+        assert_eq!(
+            schedule.remaining(first, cadence, true),
+            Some(Duration::ZERO)
+        );
+        schedule.start(first);
+        assert_eq!(schedule.remaining(first, cadence, true), None);
+
+        // A publication or an ACK requests one attempt. The production select
+        // stops awaiting publications while this bit is set, coalescing their
+        // wakes as well as their frames. Repeated requests never move the deadline.
+        schedule.request();
+        let later = Duration::from_millis(15);
+        assert_eq!(
+            schedule.remaining(later, cadence, true),
+            Some(Duration::from_millis(15))
+        );
+        schedule.request();
+        assert_eq!(
+            schedule.remaining(Duration::from_millis(25), cadence, true),
+            Some(Duration::from_millis(5))
+        );
+        assert_eq!(
+            schedule.remaining(Duration::from_secs(2), cadence, false),
+            None
+        );
+        assert_eq!(
+            schedule.remaining(Duration::from_secs(2), cadence, true),
+            Some(Duration::ZERO),
+            "returned credit catches up even without another publication"
+        );
+
+        // Adaptive backoff changes the next allowed instant, not a polling rate.
+        assert_eq!(
+            schedule.remaining(later, Duration::from_millis(80), true),
+            Some(Duration::from_millis(75))
+        );
+        schedule.start(Duration::from_secs(2));
+        assert_eq!(
+            schedule.remaining(Duration::from_secs(9), cadence, true),
+            None
+        );
+    }
+
+    #[test]
+    fn websocket_publication_capacity_is_explicit_and_replacements_reuse_the_watcher() {
+        let owner = crate::control::tests::TestHost::spawn(
+            WorldState::new(ScriptBotsConfig {
+                world_width: 64,
+                world_height: 64,
+                food_cell_size: 16,
+                persistence_interval: 0,
+                rng_seed: Some(42),
+                closed: true,
+                ..ScriptBotsConfig::default()
+            })
+            .unwrap(),
+        );
+        let reservation = ControlServerReservation::prepare(ControlServerConfig {
+            rest_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            mcp_transport: McpTransportConfig::Disabled,
+            ..ControlServerConfig::default()
+        })
+        .unwrap();
+        let address = reservation.rest_address().unwrap();
+        let (server, _) = reservation.launch(owner.port.clone(), false).unwrap();
+        let handle = server.control_handle().unwrap();
+        let hub = handle.snapshot_hub();
+        let mut occupied = (0..scriptbots_runtime::MAX_SNAPSHOT_WATCHERS)
+            .map(|_| {
+                hub.watch()
+                    .expect("fill the actual bounded observer registry")
+            })
+            .collect::<Vec<_>>();
+        let mut socket = connect_websocket(address);
+        send_websocket_text(
+            &mut socket,
+            r#"{"protocol_version":2,"command":"subscribe","request_id":"invalid-before-capacity","channels":["canvas"]}"#,
+        );
+        assert_eq!(read_remote_json(&mut socket, false)["status"], 400);
+        send_websocket_text(
+            &mut socket,
+            r#"{"protocol_version":1,"command":"subscribe","request_id":"full","channels":["canvas"]}"#,
+        );
+        let refused = read_remote_json(&mut socket, false);
+        assert_eq!(refused["status"], 503);
+        assert_eq!(refused["request_id"], "full");
+        let (opcode, bytes) = read_remote_websocket_message(&mut socket);
+        assert_eq!(opcode, 2);
+        postcard::from_bytes::<TickSummaryDto>(&bytes)
+            .expect("capacity refusal preserves the unnegotiated legacy format");
+
+        drop(occupied.pop().expect("release one observer slot"));
+        send_websocket_text(
+            &mut socket,
+            r#"{"protocol_version":1,"command":"subscribe","request_id":"admitted","channels":["canvas"],"max_fps":60}"#,
+        );
+        assert_eq!(read_remote_json(&mut socket, false)["type"], "subscribed");
+        let initial = read_remote_binary(&mut socket);
+        assert!(
+            hub.watch().is_err(),
+            "the socket owns the final available slot"
+        );
+        send_websocket_text(
+            &mut socket,
+            r#"{"protocol_version":1,"command":"subscribe","request_id":"replacement","channels":["events"],"max_fps":60}"#,
+        );
+        let replacement = read_remote_json(&mut socket, true);
+        assert_eq!(replacement["type"], "subscribed");
+        assert_eq!(replacement["request_id"], "replacement");
+        let events = read_remote_binary(&mut socket);
+        assert_eq!(events.identity, initial.identity);
+        assert!(matches!(
+            events.payload,
+            scriptbots_runtime::remote::RemoteFramePayload::Events(_)
+        ));
+        assert!(
+            hub.watch().is_err(),
+            "replacement reuses its existing observer"
+        );
+
+        drop(socket);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let released = loop {
+            if let Ok(watcher) = hub.watch() {
+                break watcher;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "disconnect leaked a publication observer"
+            );
+            thread::sleep(Duration::from_millis(1));
+        };
+        assert_eq!(handle.status().unwrap().tick, 0);
+        drop(released);
+        drop(occupied);
+        server.shutdown().unwrap();
+    }
+
+    #[test]
+    fn websocket_unacknowledged_frame_expires_without_publications_or_dispatch_credit() {
+        let owner = crate::control::tests::TestHost::spawn(
+            WorldState::new(ScriptBotsConfig {
+                world_width: 64,
+                world_height: 64,
+                food_cell_size: 16,
+                persistence_interval: 0,
+                rng_seed: Some(42),
+                closed: true,
+                ..ScriptBotsConfig::default()
+            })
+            .unwrap(),
+        );
+        let reservation = ControlServerReservation::prepare(ControlServerConfig {
+            rest_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            mcp_transport: McpTransportConfig::Disabled,
+            ..ControlServerConfig::default()
+        })
+        .unwrap();
+        let address = reservation.rest_address().unwrap();
+        let (server, _) = reservation.launch(owner.port.clone(), false).unwrap();
+        let handle = server.control_handle().unwrap();
+        let mut socket = connect_websocket(address);
+        socket
+            .set_read_timeout(Some(WS_WRITE_TIMEOUT + Duration::from_secs(2)))
+            .unwrap();
+        send_websocket_text(
+            &mut socket,
+            r#"{"protocol_version":1,"command":"subscribe","channels":["canvas"],"max_fps":60}"#,
+        );
+        assert_eq!(read_remote_json(&mut socket, false)["type"], "subscribed");
+        let (opcode, bytes) = read_remote_websocket_message(&mut socket);
+        assert_eq!(opcode, 2);
+        let withheld = scriptbots_runtime::remote::decode_remote_frame(&bytes).unwrap();
+        let before = handle.read_snapshot().unwrap();
+        assert_eq!(
+            withheld.identity.publication_revision,
+            before.revision.get()
+        );
+        // There is no owner command, subsequent publication, or returned credit
+        // to drive this timeout. The independent acknowledgement deadline must.
+        let mut timeout_reply = None;
+        for _ in 0..16 {
+            let (opcode, bytes) = read_remote_websocket_message(&mut socket);
+            assert_eq!(opcode, 1, "withheld credit must not admit another frame");
+            let reply: Value = serde_json::from_slice(&bytes).unwrap();
+            if reply["type"] != "stream_rate" {
+                timeout_reply = Some(reply);
+                break;
+            }
+        }
+        let reply = timeout_reply.expect("idle acknowledgement deadline must fire");
+        assert_eq!(reply["type"], "error");
+        assert_eq!(reply["status"], 503);
+        assert!(
+            reply["message"]
+                .as_str()
+                .unwrap()
+                .contains("acknowledgement deadline exceeded")
+        );
+        let after = handle.read_snapshot().unwrap();
+        assert_eq!(after.revision, before.revision);
+        assert_eq!(after.world, before.world);
+        drop(socket);
+        server.shutdown().unwrap();
+    }
+
+    #[test]
+    fn websocket_acknowledgements_drain_real_narrative_pages_from_one_paused_publication() {
+        use scriptbots_core::{AgentData, Intervention, Region};
+        use scriptbots_runtime::remote::{REMOTE_MAX_EVENTS, RemoteFramePayload};
+
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 64,
+            world_height: 64,
+            food_cell_size: 16,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            closed: true,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            temperature_discomfort_rate: 0.0,
+            aging_health_decay_rate: 0.0,
+            spike_damage: 0.0,
+            spike_energy_cost: 0.0,
+            reproduction_energy_threshold: f32::MAX,
+            food_growth_rate: 0.0,
+            history_capacity: 16,
+            narrative_interval: 8,
+            narrative_capacity: REMOTE_MAX_EVENTS + 1,
+            persistence_interval: 0,
+            rng_seed: Some(42),
+            ..ScriptBotsConfig::default()
+        })
+        .unwrap();
+        // Actual extinction detection produces the backlog. Each cycle is
+        // longer than the detector's cooldown; no narrative rows are fabricated.
+        let cooldown = scriptbots_core::narrative::NarrativePolicy::default().cooldown_ticks;
+        for _ in 0..=REMOTE_MAX_EVENTS {
+            world
+                .try_spawn_agent(AgentData {
+                    health: 2.0,
+                    ..AgentData::default()
+                })
+                .unwrap();
+            for _ in 0..8 {
+                world.step().unwrap();
+            }
+            world
+                .enqueue_intervention(Intervention::Meteor {
+                    region: Region::All,
+                    lethality: 10.0,
+                    scorch: 0.0,
+                })
+                .unwrap();
+            for _ in 0..cooldown {
+                world.step().unwrap();
+            }
+            if world.narrative_events().len() > REMOTE_MAX_EVENTS {
+                break;
+            }
+        }
+        assert_eq!(world.narrative_events().len(), REMOTE_MAX_EVENTS + 1);
+        let owner = crate::control::tests::TestHost::spawn(world);
+        let before = owner.port.scientific_digest_v1().unwrap();
+        let reservation = ControlServerReservation::prepare(ControlServerConfig {
+            rest_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            mcp_transport: McpTransportConfig::Disabled,
+            ..ControlServerConfig::default()
+        })
+        .unwrap();
+        let address = reservation.rest_address().unwrap();
+        let (server, _) = reservation.launch(owner.port.clone(), false).unwrap();
+        let handle = server.control_handle().unwrap();
+        let snapshot = handle.read_snapshot().unwrap();
+        let mut socket = connect_websocket(address);
+        send_websocket_text(
+            &mut socket,
+            r#"{"protocol_version":1,"command":"subscribe","channels":["events"],"max_fps":120}"#,
+        );
+        assert_eq!(read_remote_json(&mut socket, false)["type"], "subscribed");
+        let (opcode, bytes) = read_remote_websocket_message(&mut socket);
+        assert_eq!(opcode, 2);
+        let first = scriptbots_runtime::remote::decode_remote_frame(&bytes).unwrap();
+        let RemoteFramePayload::Events(first_page) = &first.payload else {
+            panic!("events channel")
+        };
+        assert_eq!(first_page.events.len(), REMOTE_MAX_EVENTS);
+        assert_eq!(
+            first_page.earliest_retained,
+            snapshot.narrative_dropped_events + 1
+        );
+        assert_eq!(first_page.events[0].sequence, first_page.earliest_retained);
+        assert_eq!(
+            first_page.gap.is_some(),
+            snapshot.narrative_dropped_events != 0
+        );
+
+        // A parsing refusal is an ordered socket barrier and creates no owner
+        // publication. A second page before its ACK would violate channel credit.
+        send_websocket_text(&mut socket, r#"{"command":"speed","speed":-1}"#);
+        let mut refusal = None;
+        for _ in 0..16 {
+            let (opcode, bytes) = read_remote_websocket_message(&mut socket);
+            assert_eq!(opcode, 1, "unacknowledged event pages must not queue");
+            let reply: Value = serde_json::from_slice(&bytes).unwrap();
+            if reply["type"] != "stream_rate" {
+                refusal = Some(reply);
+                break;
+            }
+        }
+        assert_eq!(refusal.expect("invalid control reply")["status"], 400);
+        acknowledge_remote_frame(&mut socket, &first);
+        let second = read_remote_binary(&mut socket);
+        assert_eq!(
+            second.identity, first.identity,
+            "ACK must drain the same publication"
+        );
+        let RemoteFramePayload::Events(second_page) = &second.payload else {
+            panic!("events channel")
+        };
+        assert_eq!(second_page.events.len(), 1);
+        assert_eq!(second_page.after_event, first_page.next_after_event());
+        assert_eq!(second_page.gap, None);
+        let records = first_page
+            .events
+            .iter()
+            .chain(&second_page.events)
+            .map(|event| event.record.to_event_record().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records, *snapshot.narrative_events);
+
+        let mut resumed = connect_websocket(address);
+        send_websocket_text(
+            &mut resumed,
+            &json!({
+                "protocol_version":1,"command":"subscribe","channels":["events"],"max_fps":120,
+                "resume":{"session_id":first.identity.session_id.to_string(),
+                    "after_revision":first.identity.publication_revision.to_string(),
+                    "after_event":second_page.next_after_event().to_string()},
+            })
+            .to_string(),
+        );
+        assert_eq!(read_remote_json(&mut resumed, false)["type"], "subscribed");
+        let confirmation = read_remote_binary(&mut resumed);
+        let RemoteFramePayload::Events(page) = confirmation.payload else {
+            panic!("events channel")
+        };
+        assert!(
+            page.events.is_empty(),
+            "reconnect must not duplicate consumed narrative"
+        );
+        assert_eq!(page.after_event, second_page.next_after_event());
+        assert_eq!(handle.read_snapshot().unwrap().revision, snapshot.revision);
+        assert_eq!(owner.port.scientific_digest_v1().unwrap(), before);
+        drop(resumed);
+        drop(socket);
         server.shutdown().unwrap();
     }
 

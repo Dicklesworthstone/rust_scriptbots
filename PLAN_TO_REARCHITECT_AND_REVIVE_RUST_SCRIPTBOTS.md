@@ -2,6 +2,42 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Publication-driven remote streams (2026-11-14):**
+[Source implemented and independently reviewed — Codex; runtime compiler check passed]
+
+Negotiated WebSocket delivery now waits for immutable owner publications instead
+of polling the latest snapshot on a recurring interval. A shared, bounded runtime
+notification API admits at most 128 asynchronous observers per owner, creates no
+worker threads or snapshot queues, releases slots on idle disconnect, and keeps
+publication independent of observer registration locks. Cancelled waits preserve
+their last observed revision. Existing scalar subscribers are unchanged.
+
+The transport coalesces both frames and notifications while a dispatch is pending.
+A one-shot cadence delay applies only when useful work has credit; new
+publications cannot postpone an eligible dispatch. Successful acknowledgements
+also request work, so narrative pages can drain from one paused publication.
+A separate earliest-credit deadline remains active when every channel is blocked
+or no new publication arrives. Replacement subscriptions reuse their observer;
+capacity refusal preserves the prior stream. Existing projection/write bounds,
+canonical controls, single-frame channel credits, revision/gap evidence, and the
+unnegotiated legacy wire format remain intact.
+
+Regression source covers register/publish/cancel races, reentrant executor wakers,
+idle slot reuse, malformed-publication silence, deadline overflow and regression,
+and no-idle/no-credit scheduling. Real-socket cases exercise capacity refusal and
+recovery, timeout without further publication, and an actual core-generated
+65-record narrative backlog consumed as 64 plus 1 records from the same scientific
+cut, with reconnect cursors and unchanged world digest. Independent source review
+is complete. The final exact candidate passed pinned DSR formatting checks for
+all four Rust files and offline, locked runtime all-target compiler checking,
+including its regression source. No new executable-test pass is claimed. Strict
+Clippy found two notifier issues, now corrected, and five existing Lab-model
+findings; the strict gate remains open. Native application/socket execution is
+unqualified after the unchanged Asupersync dependency was externally killed in
+the preceding application build. UBS is unavailable. This is a functional
+contribution to `bd-ac4l`; sub-16 ms latency, 60 TPS multi-client soak, full
+platform/browser and original acceptance remain open and unclaimed.
+
 **Native matched-seed ecological treatments (2026-11-14):**
 [Source implemented and independently reviewed — Codex; runtime compiler check passed]
 

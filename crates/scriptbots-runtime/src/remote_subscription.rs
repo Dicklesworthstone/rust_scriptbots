@@ -403,12 +403,33 @@ impl RemoteDeliveryWindow {
     /// subtraction never wraps or treats a future send as a fresh delivery.
     #[must_use]
     pub fn expired(&self, now: Duration) -> bool {
-        !self.is_empty()
-            && (self.validate_time(now).is_err()
-                || self.pending.iter().flatten().any(|pending| {
-                    now.checked_sub(pending.sent_at)
-                        .is_none_or(|elapsed| elapsed >= self.timeout)
-                }))
+        self.acknowledgement_timeout_remaining(now) == Some(Duration::ZERO)
+    }
+
+    /// Time remaining before the earliest outstanding acknowledgement expires.
+    ///
+    /// `None` means no frame is awaiting credit. Expiration or clock regression
+    /// returns zero, so a transport can arm one deadline without periodic polling.
+    /// This read does not move a delivery's timestamp or the observed clock, and
+    /// subtraction avoids overflow when an absolute deadline cannot fit `Duration`.
+    #[must_use]
+    pub fn acknowledgement_timeout_remaining(&self, now: Duration) -> Option<Duration> {
+        if self.is_empty() {
+            return None;
+        }
+        if self.validate_time(now).is_err() {
+            return Some(Duration::ZERO);
+        }
+        self.pending
+            .iter()
+            .flatten()
+            .map(|pending| {
+                now.checked_sub(pending.sent_at)
+                    .map_or(Duration::ZERO, |elapsed| {
+                        self.timeout.saturating_sub(elapsed)
+                    })
+            })
+            .min()
     }
 
     fn validate_time(&self, now: Duration) -> Result<(), RemoteSubscriptionError> {
@@ -1065,6 +1086,80 @@ mod tests {
             window.expired(Duration::from_secs(17)),
             "the remaining channel keeps its original deadline"
         );
+    }
+
+    #[test]
+    fn remote_ack_timeout_tracks_the_earliest_credit_without_overflow_or_clock_mutation() {
+        let owner = owner();
+        let snapshot = owner.latest_snapshot();
+        let stream = RemoteSubscription::new(
+            &request(vec![RemoteChannel::Canvas, RemoteChannel::Telemetry]),
+            &snapshot,
+        )
+        .unwrap();
+        let canvas = stream
+            .next_frame(RemoteChannel::Canvas, &snapshot)
+            .unwrap()
+            .unwrap();
+        let telemetry = stream
+            .next_frame(RemoteChannel::Telemetry, &snapshot)
+            .unwrap()
+            .unwrap();
+        let mut window =
+            RemoteDeliveryWindow::new(canvas.identity.session_id, Duration::from_secs(5));
+        assert_eq!(
+            window.acknowledgement_timeout_remaining(Duration::MAX),
+            None
+        );
+        window.mark_sent(&canvas, Duration::from_secs(10)).unwrap();
+        window
+            .mark_sent(&telemetry, Duration::from_secs(12))
+            .unwrap();
+        assert_eq!(
+            window.acknowledgement_timeout_remaining(Duration::from_secs(12)),
+            Some(Duration::from_secs(3))
+        );
+        assert_eq!(
+            window.acknowledgement_timeout_remaining(Duration::from_secs(11)),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            window.acknowledgement_timeout_remaining(Duration::from_secs(15)),
+            Some(Duration::ZERO)
+        );
+        window
+            .acknowledge(&frame_ack(&canvas), Duration::from_secs(14))
+            .unwrap();
+        assert_eq!(
+            window.acknowledgement_timeout_remaining(Duration::from_secs(14)),
+            Some(Duration::from_secs(3))
+        );
+        assert_eq!(
+            window.acknowledgement_timeout_remaining(Duration::from_secs(16)),
+            Some(Duration::from_secs(1))
+        );
+        window
+            .acknowledge(&frame_ack(&telemetry), Duration::from_secs(15))
+            .unwrap();
+        assert_eq!(
+            window.acknowledgement_timeout_remaining(Duration::ZERO),
+            None
+        );
+
+        let near_limit = Duration::MAX - Duration::from_secs(1);
+        window.mark_sent(&canvas, near_limit).unwrap();
+        assert_eq!(
+            window.acknowledgement_timeout_remaining(Duration::MAX),
+            Some(Duration::from_secs(4))
+        );
+        assert!(!window.expired(Duration::MAX));
+        let mut immediate = RemoteDeliveryWindow::new(canvas.identity.session_id, Duration::ZERO);
+        immediate.mark_sent(&canvas, Duration::ZERO).unwrap();
+        assert_eq!(
+            immediate.acknowledgement_timeout_remaining(Duration::ZERO),
+            Some(Duration::ZERO)
+        );
+        assert!(immediate.expired(Duration::ZERO));
     }
 
     #[test]
