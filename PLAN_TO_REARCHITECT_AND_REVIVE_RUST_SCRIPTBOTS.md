@@ -2,6 +2,31 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Native Lab scientific endpoint comparisons (2026-11-14):**
+[Source implemented and reviewed — Codex; executable qualification open]
+
+Continue `bd-2z0.7.6.1` by exposing all eight existing final-state endpoints
+through the shared native Lab model, GPUI and Bevy controls. One typed catalog
+now supplies native choices and the runner/API vocabulary. Requests and accepted
+responses bind the exact metric as well as the experiment, arms, plan and status
+generation. Changing metrics clears old evidence and invalidates a pending result
+without freeing its occupied worker. Values and intervals name their actual
+units, including age counters rather than elapsed simulation ticks.
+
+Regression source covers wrong-metric responses, an in-flight A/B/A selection,
+real provider comparisons that distinguish equal populations from different food,
+unavailable means/maxima after extinction, and both native input paths. The
+touched GPUI checkpoint fixture now uses its actually observed saved-world digest
+instead of a placeholder that the existing receipt validator refuses. Scientific
+execution, statistical thresholds, inference rules and dependency pins are unchanged.
+
+A DSR diagnostic baseline attempted the pinned runtime check with one Cargo job,
+one Rust frontend thread and debug info disabled. The pinned FrankenSQLite fetch
+failed before compilation; the execution host then became unavailable. No
+compiler, tests, Rustfmt, Clippy, UBS or completed DSR pass is claimed. Original
+native/platform and broad bead acceptance remain open. Native experiment
+authoring is the next implementation increment.
+
 **Whole-cohort experiment work admission (2026-11-13):**
 [Source implemented — Codex; executable qualification open]
 

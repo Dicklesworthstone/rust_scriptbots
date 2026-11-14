@@ -9,7 +9,7 @@ use scriptbots_runtime::{
     HostSessionId,
     lab_workflows::{
         LAB_PAGE_SIZE, LabAction, LabCheckpointSaveState, LabEventIdentity, LabEventReview,
-        LabPanel, LabWorkflowSubmit, LabWorkflows, VARIANTS_PER_PAGE, comparison_lines,
+        LabMetric, LabPanel, LabWorkflowSubmit, LabWorkflows, VARIANTS_PER_PAGE, comparison_lines,
     },
 };
 
@@ -1036,8 +1036,32 @@ fn experiment_rows(model: &LabWorkflows, idle: bool, rows: &mut Vec<PanelRow>) {
             LabAction::VariantsPage(model.variant_offset.saturating_add(VARIANTS_PER_PAGE)),
             model.variant_offset.saturating_add(VARIANTS_PER_PAGE) < batch.variants.len(),
         ));
+        rows.push(PanelRow::text("Compare endpoint"));
+        for metric in LabMetric::ALL {
+            rows.push(PanelRow::workflow(
+                format!(
+                    "{}{} ({})",
+                    if model.metric == metric {
+                        "Selected: "
+                    } else {
+                        ""
+                    },
+                    metric.label(),
+                    metric.unit(),
+                ),
+                LabAction::Metric(metric),
+                true,
+            ));
+        }
+        rows.push(PanelRow::text(format!(
+            "{} comparison ({}): {} minus {}. Complete matched seed cohorts are required.",
+            model.metric.label(),
+            model.metric.unit(),
+            model.challenger.as_deref().unwrap_or("choose challenger"),
+            model.baseline.as_deref().unwrap_or("choose baseline"),
+        )));
         rows.push(PanelRow::workflow(
-            "Compare verified population endpoints",
+            format!("Compare verified {} endpoints", model.metric.label()),
             LabAction::Compare,
             idle && model.comparison_request().is_some(),
         ));
@@ -1391,8 +1415,9 @@ mod tests {
     use super::*;
     use crate::terrain_tests::{motion_test_source, sample_world_snapshot};
     use scriptbots_runtime::lab_workflows::{
-        LAB_MAX_VARIANTS, LabCheckpoint, LabCheckpointPage, LabCheckpointSave, LabExperiment,
-        LabExperimentSummary, LabVariantProgress, LabWorkflowRequest,
+        LAB_MAX_VARIANTS, LabCheckpoint, LabCheckpointPage, LabCheckpointSave, LabComparison,
+        LabExperiment, LabExperimentSummary, LabVariantProgress, LabWorkflowRequest,
+        LabWorkflowResponse,
     };
     use scriptbots_runtime::{HostCore, HostCoreOptions};
 
@@ -1845,6 +1870,174 @@ mod tests {
         assert!(last.iter().any(|row| row.text.starts_with(&last_variant)));
         assert!(!last.iter().any(|row| row.text.starts_with("variant-0 |")));
         assert!(first.len() <= MAX_PANEL_ROWS && last.len() <= MAX_PANEL_ROWS);
+    }
+
+    #[test]
+    fn metric_buttons_and_keyboard_compare_use_the_selected_scientific_endpoint() {
+        let mut presentation = LabPresentation {
+            panel: LabPanel::Experiments,
+            ..default()
+        };
+        let mut state = SnapshotState::default();
+        let mut motion = AgentMotionSettings { enabled: true };
+        presentation.receive_live(live_frame(12), &mut state, &mut motion);
+        presentation.source_changed = false;
+        let session = presentation.source.unwrap();
+        let (submitted, requests) = std::sync::mpsc::channel();
+        let mut model = consumer(Some(Arc::new(move |request| {
+            let LabWorkflowRequest::Compare {
+                experiment_id,
+                baseline_variant,
+                challenger_variant,
+                metric,
+            } = request
+            else {
+                panic!("the complete fixture needs only a comparison request");
+            };
+            submitted.send(metric).unwrap();
+            Ok(LabWorkflowResponse::Comparison(LabComparison {
+                experiment_id,
+                baseline_variant,
+                challenger_variant,
+                metric,
+                endpoint_tick: 12,
+                matched_seeds: vec![17],
+                mean_difference: 0.125,
+                ci_95: None,
+                standardized_effect: None,
+                p_value: None,
+                adjusted_p_value: None,
+                descriptive_only: true,
+                underpowered_reason: Some("one independent seed pair".into()),
+                undefined_effect_reason: Some("one observation".into()),
+                plan_digest: "metric-plan".into(),
+                status_generation: 1,
+            }))
+        })));
+        model.synchronize(session, LabPanel::Experiments);
+        model.selected_experiment = Some("metric-cohort".into());
+        model.baseline = Some("baseline".into());
+        model.challenger = Some("challenger".into());
+        model.batch = Some(LabExperiment {
+            summary: LabExperimentSummary {
+                experiment_id: "metric-cohort".into(),
+                status: "completed".into(),
+                total_runs: 2,
+                completed_runs: 2,
+                failed_runs: 0,
+            },
+            plan_digest: "metric-plan".into(),
+            generation: 1,
+            variants: ["baseline", "challenger"]
+                .into_iter()
+                .map(|id| LabVariantProgress {
+                    variant_id: id.into(),
+                    brain_family: "mlp".into(),
+                    total_runs: 1,
+                    completed_runs: 1,
+                    failed_runs: 0,
+                    running_runs: 0,
+                })
+                .collect(),
+            error_reason: None,
+        });
+        let rows = panel_rows(&model, &presentation);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| {
+                    matches!(
+                        &row.action,
+                        Some(PanelAction::Workflow(LabAction::Metric(_)))
+                    )
+                })
+                .count(),
+            LabMetric::ALL.len()
+        );
+        let energy_action = PanelAction::Workflow(LabAction::Metric(LabMetric::AverageEnergy));
+        let energy = rows
+            .iter()
+            .find(|row| row.action.as_ref() == Some(&energy_action))
+            .unwrap();
+        assert!(energy.enabled);
+        assert!(energy.text.contains(LabMetric::AverageEnergy.unit()));
+        let mut app = App::new();
+        app.insert_non_send_resource(model)
+            .insert_resource(presentation)
+            .insert_resource(state)
+            .insert_resource(motion)
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<CameraRig>()
+            .add_systems(Update, update);
+        app.world_mut().spawn((
+            LabRow {
+                index: 0,
+                action: energy.action.clone(),
+                enabled: energy.enabled,
+            },
+            Interaction::Pressed,
+        ));
+        app.update();
+        let model = app.world().non_send_resource::<LabWorkflows>();
+        assert_eq!(model.metric, LabMetric::AverageEnergy);
+        let rows = panel_rows(model, app.world().resource::<LabPresentation>());
+        assert!(rows.iter().any(|row| {
+            row.text.starts_with("Selected: ") && row.action.as_ref() == Some(&energy_action)
+        }));
+        let compare = rows
+            .iter()
+            .position(|row| {
+                row.enabled && row.action == Some(PanelAction::Workflow(LabAction::Compare))
+            })
+            .expect("selected endpoint has an enabled compare control");
+        app.insert_resource(LabUi {
+            rows: Vec::new(),
+            shown: rows,
+        });
+        app.world_mut().resource_mut::<LabPresentation>().focus = Some(compare);
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::Enter);
+        app.update();
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .clear();
+        assert_eq!(
+            requests
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap(),
+            LabMetric::AverageEnergy
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            app.update();
+            let model = app.world().non_send_resource::<LabWorkflows>();
+            if !model.is_busy() {
+                let comparison = model.comparison.as_ref().expect("matching endpoint result");
+                assert_eq!(comparison.metric, LabMetric::AverageEnergy);
+                assert_eq!(comparison.mean_difference, 0.125);
+                assert!(
+                    panel_rows(model, app.world().resource::<LabPresentation>())
+                        .iter()
+                        .any(|row| row.text.contains(LabMetric::AverageEnergy.unit()))
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "comparison worker did not finish"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            app.world()
+                .resource::<SnapshotState>()
+                .latest
+                .as_ref()
+                .unwrap()
+                .tick,
+            12,
+            "comparison input must not advance the live presentation"
+        );
     }
 
     #[test]

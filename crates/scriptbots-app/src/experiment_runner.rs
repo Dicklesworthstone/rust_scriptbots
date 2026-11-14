@@ -1030,16 +1030,8 @@ struct RunEvidenceV2 {
 ///
 /// These describe one completed boundary. They are not time averages, cumulative
 /// lifecycle counts, or observations over the run's unretained history.
-pub const EXPERIMENT_ENDPOINT_METRICS: [&str; 8] = [
-    "alive_agents",
-    "total_energy",
-    "average_energy",
-    "average_health",
-    "mean_age",
-    "max_age",
-    "max_generation",
-    "total_food",
-];
+pub const EXPERIMENT_ENDPOINT_METRICS: [&str; 8] =
+    scriptbots_runtime::lab_workflows::LabMetric::keys();
 
 /// Canonical V2 experiment summary, recomputable from the final checkpoint alone.
 ///

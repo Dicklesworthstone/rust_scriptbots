@@ -27,6 +27,102 @@ const LAB_WORKER_STACK_BYTES: usize = 32 * 1024 * 1024;
 static CHECKPOINT_CLIENT_NAMESPACE: OnceLock<u128> = OnceLock::new();
 static NEXT_CHECKPOINT_REQUEST: AtomicU64 = AtomicU64::new(1);
 
+/// Final-state observations supported by the experiment runner and native Lab.
+///
+/// These describe one completed boundary, not time averages or cumulative
+/// lifecycle counts. Population means and maxima require a living population;
+/// the application service refuses an unavailable endpoint instead of zero-filling it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LabMetric {
+    /// Number of living agents.
+    #[default]
+    AliveAgents,
+    /// Sum of current live-agent energy reserves.
+    TotalEnergy,
+    /// Mean current live-agent energy reserve.
+    AverageEnergy,
+    /// Mean current live-agent health.
+    AverageHealth,
+    /// Mean live-agent age counter, advanced at the configured aging cadence.
+    MeanAge,
+    /// Largest live-agent age counter, not elapsed simulation ticks.
+    MaxAge,
+    /// Largest living lineage generation.
+    MaxGeneration,
+    /// Sum of current food-grid cell energy values.
+    TotalFood,
+}
+
+impl LabMetric {
+    /// Canonical endpoint order shared with runner summaries and API schemas.
+    pub const ALL: [Self; 8] = [
+        Self::AliveAgents,
+        Self::TotalEnergy,
+        Self::AverageEnergy,
+        Self::AverageHealth,
+        Self::MeanAge,
+        Self::MaxAge,
+        Self::MaxGeneration,
+        Self::TotalFood,
+    ];
+
+    /// Exact wire key used by the runner and application comparison service.
+    #[must_use]
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::AliveAgents => "alive_agents",
+            Self::TotalEnergy => "total_energy",
+            Self::AverageEnergy => "average_energy",
+            Self::AverageHealth => "average_health",
+            Self::MeanAge => "mean_age",
+            Self::MaxAge => "max_age",
+            Self::MaxGeneration => "max_generation",
+            Self::TotalFood => "total_food",
+        }
+    }
+
+    /// Human-readable observation named by this endpoint.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::AliveAgents => "Population",
+            Self::TotalEnergy => "Total live-agent energy",
+            Self::AverageEnergy => "Mean live-agent energy",
+            Self::AverageHealth => "Mean live-agent health",
+            Self::MeanAge => "Mean age counter",
+            Self::MaxAge => "Maximum age counter",
+            Self::MaxGeneration => "Maximum living generation",
+            Self::TotalFood => "Total food",
+        }
+    }
+
+    /// Scientific units of the observed value and its unstandardized difference.
+    #[must_use]
+    pub const fn unit(self) -> &'static str {
+        match self {
+            Self::AliveAgents => "agents",
+            Self::TotalEnergy => "energy units",
+            Self::AverageEnergy => "energy units per agent",
+            Self::AverageHealth => "health units",
+            Self::MeanAge | Self::MaxAge => "age increments",
+            Self::MaxGeneration => "generations",
+            Self::TotalFood => "food energy units",
+        }
+    }
+
+    /// Canonical wire vocabulary, derived from the same catalog as UI choices.
+    #[must_use]
+    pub const fn keys() -> [&'static str; Self::ALL.len()] {
+        let mut keys = [""; Self::ALL.len()];
+        let mut index = 0;
+        while index < Self::ALL.len() {
+            keys[index] = Self::ALL[index].key();
+            index += 1;
+        }
+        keys
+    }
+}
+
 /// One canonical narrative event within a publishing owner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LabEventIdentity {
@@ -88,6 +184,8 @@ pub enum LabWorkflowRequest {
         baseline_variant: String,
         /// Variant whose observations have the reference subtracted from them.
         challenger_variant: String,
+        /// Final-state observation to compare across the matched seed pairs.
+        metric: LabMetric,
     },
     /// Read one checkpoint catalog page.
     ListCheckpoints {
@@ -177,7 +275,7 @@ pub struct LabExperiment {
     pub error_reason: Option<String>,
 }
 
-/// Source-bound paired population endpoint comparison.
+/// Source-bound paired final-state endpoint comparison.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LabComparison {
     /// Stable experiment identity.
@@ -186,11 +284,13 @@ pub struct LabComparison {
     pub baseline_variant: String,
     /// Arm whose observations are compared with the reference.
     pub challenger_variant: String,
+    /// Verified final-state observation, including its scientific units.
+    pub metric: LabMetric,
     /// Common observed endpoint.
     pub endpoint_tick: u64,
     /// Ordered unique independent seed pairs.
     pub matched_seeds: Vec<u64>,
-    /// Challenger minus baseline mean, in agents.
+    /// Challenger minus baseline mean, in the selected metric's units.
     pub mean_difference: f64,
     /// Optional confidence interval.
     pub ci_95: Option<(f64, f64)>,
@@ -335,6 +435,8 @@ pub enum LabAction {
     Baseline(String),
     /// Choose the comparison arm.
     Challenger(String),
+    /// Choose the final-state observation used by the next comparison.
+    Metric(LabMetric),
     /// Choose a bounded variant-page offset.
     VariantsPage(usize),
     /// Request a verified comparison.
@@ -392,6 +494,8 @@ pub struct LabWorkflows {
     pub baseline: Option<String>,
     /// Selected comparison arm.
     pub challenger: Option<String>,
+    /// Selected final-state endpoint, independent of the chosen arms.
+    pub metric: LabMetric,
     /// First visible variant row.
     pub variant_offset: usize,
     /// Last accepted comparison for the current plan and status generation.
@@ -831,6 +935,7 @@ impl LabWorkflows {
             experiment_id: batch.summary.experiment_id.clone(),
             baseline_variant: baseline.clone(),
             challenger_variant: challenger.clone(),
+            metric: self.metric,
         })
     }
 
@@ -911,12 +1016,14 @@ impl LabWorkflows {
                     experiment_id,
                     baseline_variant,
                     challenger_variant,
+                    metric,
                 },
                 LabWorkflowResponse::Comparison(comparison),
             ) if self.comparison_request().as_ref() == Some(request)
                 && comparison.experiment_id == *experiment_id
                 && comparison.baseline_variant == *baseline_variant
                 && comparison.challenger_variant == *challenger_variant
+                && comparison.metric == *metric
                 && self
                     .batch
                     .as_ref()
@@ -1200,6 +1307,18 @@ impl LabWorkflows {
                     self.comparison = None;
                 }
             }
+            LabAction::Metric(metric) => {
+                if self.metric != metric {
+                    self.invalidate();
+                    self.metric = metric;
+                    self.comparison = None;
+                    self.set_notice(format!(
+                        "Selected {} ({}). Request a comparison for this endpoint.",
+                        metric.label(),
+                        metric.unit(),
+                    ));
+                }
+            }
             LabAction::VariantsPage(offset) => {
                 let maximum = self.batch.as_ref().map_or(0, |batch| {
                     batch.variants.len().saturating_sub(1) / VARIANTS_PER_PAGE * VARIANTS_PER_PAGE
@@ -1304,19 +1423,22 @@ pub fn comparison_lines(comparison: &LabComparison) -> Vec<String> {
     };
     let mut lines = vec![
         format!(
-            "Verified population (agents), endpoint tick {}, {} matched seed pairs",
+            "Verified {} ({}), endpoint tick {}, {} matched seed pairs",
+            comparison.metric.label(),
+            comparison.metric.unit(),
             comparison.endpoint_tick,
             comparison.matched_seeds.len()
         ),
         format!(
-            "Challenger − baseline: {:.6} agents",
-            comparison.mean_difference
+            "Challenger − baseline: {:.6} {}",
+            comparison.mean_difference,
+            comparison.metric.unit(),
         ),
         format!(
             "95% CI: {}",
             comparison.ci_95.map_or_else(
                 || "unavailable".into(),
-                |(low, high)| format!("[{low:.6}, {high:.6}]")
+                |(low, high)| format!("[{low:.6}, {high:.6}] {}", comparison.metric.unit())
             )
         ),
         format!(
@@ -1339,9 +1461,7 @@ pub fn comparison_lines(comparison: &LabComparison) -> Vec<String> {
     if let Some(reason) = &comparison.undefined_effect_reason {
         lines.push(bounded_message(reason));
     }
-    lines.push(
-        "A population difference is an observed endpoint, not a fitness or winner claim.".into(),
-    );
+    lines.push("Values describe the selected final-state endpoint across the matched seeds.".into());
     lines
 }
 
@@ -1383,6 +1503,7 @@ mod tests {
             experiment_id: "actual-batch".into(),
             baseline_variant: "arm-00".into(),
             challenger_variant: challenger.into(),
+            metric: LabMetric::AliveAgents,
             endpoint_tick: 2,
             matched_seeds: vec![7],
             mean_difference: 3.0,
@@ -1484,6 +1605,173 @@ mod tests {
         assert!(
             state.experiments.is_some(),
             "the slot must reopen after the original worker exits"
+        );
+    }
+
+    #[test]
+    fn endpoint_catalog_preserves_wire_keys_and_renders_the_observed_units() {
+        const KEYS: [&str; LabMetric::ALL.len()] = LabMetric::keys();
+        assert_eq!(
+            KEYS,
+            [
+                "alive_agents",
+                "total_energy",
+                "average_energy",
+                "average_health",
+                "mean_age",
+                "max_age",
+                "max_generation",
+                "total_food",
+            ]
+        );
+        assert_eq!(
+            KEYS.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            KEYS.len(),
+            "each supported endpoint has a distinct wire identity"
+        );
+        assert_eq!(LabMetric::default(), LabMetric::AliveAgents);
+        let expected = [
+            ("Population", "agents"),
+            ("Total live-agent energy", "energy units"),
+            ("Mean live-agent energy", "energy units per agent"),
+            ("Mean live-agent health", "health units"),
+            ("Mean age counter", "age increments"),
+            ("Maximum age counter", "age increments"),
+            ("Maximum living generation", "generations"),
+            ("Total food", "food energy units"),
+        ];
+        for (metric, (label, unit)) in LabMetric::ALL.into_iter().zip(expected) {
+            let mut observed = comparison("arm-01");
+            observed.metric = metric;
+            observed.matched_seeds = vec![7, 11, 13];
+            observed.descriptive_only = false;
+            observed.ci_95 = Some((-1.5, 7.5));
+            observed.underpowered_reason = None;
+            observed.undefined_effect_reason = None;
+            let lines = comparison_lines(&observed);
+            assert_eq!(
+                lines[0],
+                format!("Verified {label} ({unit}), endpoint tick 2, 3 matched seed pairs")
+            );
+            assert_eq!(lines[1], format!("Challenger − baseline: 3.000000 {unit}"));
+            assert_eq!(lines[2], format!("95% CI: [-1.500000, 7.500000] {unit}"));
+            assert!(!lines.join("\n").contains("winner"));
+        }
+    }
+
+    #[test]
+    fn comparison_refuses_a_different_metric_even_with_matching_source_and_arms() {
+        let mut state = LabWorkflows::default();
+        state.synchronize(HostSessionId::new(1), LabPanel::Experiments);
+        state.selected_experiment = Some("actual-batch".into());
+        state.accept_batch(batch(2));
+        for metric in LabMetric::ALL {
+            state.dispatch(LabAction::Metric(metric));
+            let request = state.comparison_request().unwrap();
+            let mut exact = comparison("arm-01");
+            exact.metric = metric;
+            deliver(
+                &mut state,
+                request.clone(),
+                LabWorkflowResponse::Comparison(exact.clone()),
+            );
+            assert_eq!(state.comparison.as_ref(), Some(&exact));
+
+            let different = if metric == LabMetric::AliveAgents {
+                LabMetric::TotalEnergy
+            } else {
+                LabMetric::AliveAgents
+            };
+            let mut wrong_endpoint = exact.clone();
+            wrong_endpoint.metric = different;
+            deliver(
+                &mut state,
+                request.clone(),
+                LabWorkflowResponse::Comparison(wrong_endpoint),
+            );
+            assert!(
+                state.comparison.is_none(),
+                "another endpoint cannot retain or replace a verified {metric:?} comparison"
+            );
+            assert!(state.notice.as_deref().unwrap().contains("did not match"));
+
+            deliver(
+                &mut state,
+                request,
+                LabWorkflowResponse::Comparison(exact),
+            );
+            assert!(state.comparison.is_some());
+            state.dispatch(LabAction::Metric(different));
+            assert!(
+                state.comparison.is_none(),
+                "changing endpoint clears the previously verified result"
+            );
+        }
+    }
+
+    #[test]
+    fn changing_metric_during_comparison_keeps_one_worker_and_discards_its_late_result() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed_calls = Arc::clone(&calls);
+        let (started, observed_start) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let released = Mutex::new(released);
+        let mut state = LabWorkflows {
+            submit: Some(Arc::new(move |request| {
+                let LabWorkflowRequest::Compare { metric, .. } = request else {
+                    panic!("expected an endpoint comparison");
+                };
+                observed_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                started.send(metric).unwrap();
+                released
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+                let mut result = comparison("arm-01");
+                result.metric = metric;
+                Ok(LabWorkflowResponse::Comparison(result))
+            })),
+            ..LabWorkflows::default()
+        };
+        state.synchronize(HostSessionId::new(1), LabPanel::Experiments);
+        state.selected_experiment = Some("actual-batch".into());
+        state.accept_batch(batch(2));
+        state.dispatch(LabAction::Compare);
+        assert_eq!(
+            observed_start.recv_timeout(Duration::from_secs(5)).unwrap(),
+            LabMetric::AliveAgents
+        );
+        state.dispatch(LabAction::Metric(LabMetric::TotalEnergy));
+        state.dispatch(LabAction::Compare);
+        assert!(state.is_busy());
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+        // Returning to the old endpoint must not revive its discarded request.
+        state.dispatch(LabAction::Metric(LabMetric::AliveAgents));
+        release.send(()).unwrap();
+        drain_worker(&mut state);
+        assert!(state.comparison.is_none());
+        assert!(state.notice.as_deref().unwrap().contains("discarded"));
+
+        state.dispatch(LabAction::Metric(LabMetric::AverageEnergy));
+        state.dispatch(LabAction::Compare);
+        assert_eq!(
+            observed_start.recv_timeout(Duration::from_secs(5)).unwrap(),
+            LabMetric::AverageEnergy
+        );
+        let context = state.context;
+        state.dispatch(LabAction::Metric(LabMetric::AverageEnergy));
+        assert_eq!(
+            state.context, context,
+            "reselecting the same endpoint preserves its pending request"
+        );
+        release.send(()).unwrap();
+        drain_worker(&mut state);
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 2);
+        assert_eq!(
+            state.comparison.as_ref().unwrap().metric,
+            LabMetric::AverageEnergy,
+            "a new request carries the selected endpoint after the old worker drains"
         );
     }
 
@@ -2019,7 +2307,7 @@ mod tests {
     fn drain_worker(state: &mut LabWorkflows) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while state.is_busy() {
-            assert!(Instant::now() < deadline, "checkpoint worker timed out");
+            assert!(Instant::now() < deadline, "Lab worker timed out");
             assert!(state.poll().is_none());
             std::thread::yield_now();
         }

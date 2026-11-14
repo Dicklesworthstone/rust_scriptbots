@@ -5,7 +5,8 @@
 
 use super::*;
 use scriptbots_runtime::lab_workflows::{
-    LAB_PAGE_SIZE, LabAction, LabCheckpointSaveState, LabPanel, VARIANTS_PER_PAGE, comparison_lines,
+    LAB_PAGE_SIZE, LabAction, LabCheckpointSaveState, LabMetric, LabPanel, VARIANTS_PER_PAGE,
+    comparison_lines,
 };
 #[cfg(test)]
 use scriptbots_runtime::lab_workflows::{
@@ -317,6 +318,25 @@ impl SimulationView {
                         ),
                 );
             }
+            let mut metrics = div().flex().flex_wrap().gap_2();
+            for metric in LabMetric::ALL {
+                metrics = metrics.child(self.lab_button(
+                    format!("lab-metric-{}", metric.key()),
+                    format!(
+                        "{}{} ({})",
+                        if state.metric == metric {
+                            "Selected: "
+                        } else {
+                            ""
+                        },
+                        metric.label(),
+                        metric.unit(),
+                    ),
+                    LabAction::Metric(metric),
+                    true,
+                    cx,
+                ));
+            }
             panel = panel
                 .child(
                     div()
@@ -339,14 +359,18 @@ impl SimulationView {
                             cx,
                         )),
                 )
+                .child(div().text_sm().child("Compare endpoint"))
+                .child(metrics)
                 .child(div().text_xs().child(format!(
-                    "Population comparison: {} − {}. Complete matched seed cohorts are required.",
+                    "{} comparison ({}): {} − {}. Complete matched seed cohorts are required.",
+                    state.metric.label(),
+                    state.metric.unit(),
                     state.challenger.as_deref().unwrap_or("choose challenger"),
                     state.baseline.as_deref().unwrap_or("choose baseline")
                 )))
                 .child(self.lab_button(
                     "lab-compare".into(),
-                    "Compare verified population endpoints".into(),
+                    format!("Compare verified {} endpoints", state.metric.label()),
                     LabAction::Compare,
                     idle && state.comparison_request().is_some(),
                     cx,
@@ -592,14 +616,19 @@ mod tests {
         }
     }
 
-    fn comparison(challenger: &str) -> LabComparison {
+    fn comparison(challenger: &str, metric: LabMetric) -> LabComparison {
         LabComparison {
             experiment_id: "actual-batch".into(),
             baseline_variant: "arm-00".into(),
             challenger_variant: challenger.into(),
+            metric,
             endpoint_tick: 2,
             matched_seeds: vec![7],
-            mean_difference: 3.0,
+            mean_difference: if metric == LabMetric::AverageEnergy {
+                0.25
+            } else {
+                3.0
+            },
             ci_95: None,
             standardized_effect: None,
             p_value: None,
@@ -628,6 +657,7 @@ mod tests {
             .unwrap(),
         );
         let saved = host.snapshot();
+        let saved_world_digest = host.port.scientific_digest_v1().unwrap().overall;
         host.apply(scriptbots_runtime::HostCommand::UpdateSimulation(
             SimulationCommand {
                 paused: Some(true),
@@ -650,6 +680,8 @@ mod tests {
         let (review_started, observed_review) = std::sync::mpsc::channel();
         let save_requests = Arc::new(Mutex::new(Vec::new()));
         let recorded_saves = Arc::clone(&save_requests);
+        let comparison_metrics = Arc::new(Mutex::new(Vec::new()));
+        let recorded_metrics = Arc::clone(&comparison_metrics);
         session.lab_submit = Some(Arc::new(move |request| {
             Ok(match request {
                 LabWorkflowRequest::ListExperiments { .. } => {
@@ -668,11 +700,13 @@ mod tests {
                 LabWorkflowRequest::Compare {
                     baseline_variant,
                     challenger_variant,
+                    metric,
                     ..
                 } => {
                     assert_eq!(baseline_variant, "arm-00");
                     assert_eq!(challenger_variant, "arm-01");
-                    LabWorkflowResponse::Comparison(comparison("arm-01"))
+                    recorded_metrics.lock().unwrap().push(metric);
+                    LabWorkflowResponse::Comparison(comparison("arm-01", metric))
                 }
                 LabWorkflowRequest::ListCheckpoints { .. } => {
                     LabWorkflowResponse::Checkpoints(LabCheckpointPage {
@@ -681,7 +715,7 @@ mod tests {
                             tick: saved.world.tick,
                             agent_count: saved.world.agents.len(),
                             byte_size: 1,
-                            world_digest: "component-world-cut".into(),
+                            world_digest: saved_world_digest.clone(),
                         }],
                         total: 1,
                         offset: 0,
@@ -786,6 +820,35 @@ mod tests {
         wait(&mut lab, &|state| {
             state.comparison.is_some() && !state.is_busy()
         });
+        click(&mut lab, "lab-metric-average_energy");
+        context.update(|app| {
+            let state = &hud.read(app).lab_workflows;
+            assert_eq!(state.metric, LabMetric::AverageEnergy);
+            assert!(
+                state.comparison.is_none(),
+                "changing endpoint must clear the population result"
+            );
+        });
+        click(&mut lab, "lab-compare");
+        wait(&mut lab, &|state| {
+            !state.is_busy()
+                && state.comparison.as_ref().is_some_and(|result| {
+                    result.metric == LabMetric::AverageEnergy && result.mean_difference == 0.25
+                })
+        });
+        context.update(|app| {
+            let state = &hud.read(app).lab_workflows;
+            let lines = comparison_lines(state.comparison.as_ref().unwrap());
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains(LabMetric::AverageEnergy.unit()))
+            );
+        });
+        assert_eq!(
+            *comparison_metrics.lock().unwrap(),
+            [LabMetric::AliveAgents, LabMetric::AverageEnergy]
+        );
         click(&mut lab, "dashboard-tab-checkpoints");
         wait(&mut lab, &|state| {
             state.checkpoints.is_some() && !state.is_busy()

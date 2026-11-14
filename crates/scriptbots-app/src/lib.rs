@@ -4160,18 +4160,26 @@ pub mod renderer {
                         experiment_id,
                         baseline_variant,
                         challenger_variant,
+                        metric,
                     } => control
                         .compare_experiment_variants(
                             &experiment_id,
                             &baseline_variant,
                             &challenger_variant,
-                            "alive_agents",
+                            metric.key(),
                         )
-                        .map(|comparison| {
-                            LabWorkflowResponse::Comparison(LabComparison {
+                        .and_then(|comparison| {
+                            if comparison.metric != metric.key() {
+                                return Err(crate::control::ControlError::Conflict(
+                                    "comparison service returned a different scientific endpoint"
+                                        .into(),
+                                ));
+                            }
+                            Ok(LabWorkflowResponse::Comparison(LabComparison {
                                 experiment_id: comparison.experiment_id,
                                 baseline_variant: comparison.baseline_variant,
                                 challenger_variant: comparison.challenger_variant,
+                                metric,
                                 endpoint_tick: comparison.endpoint_tick,
                                 matched_seeds: comparison.matched_seeds,
                                 mean_difference: comparison.mean_difference,
@@ -4184,7 +4192,7 @@ pub mod renderer {
                                 undefined_effect_reason: comparison.undefined_effect_reason,
                                 plan_digest: comparison.plan_digest,
                                 status_generation: comparison.status_generation,
-                            })
+                            }))
                         }),
                     LabWorkflowRequest::ListCheckpoints { cursor } => control
                         .list_checkpoints(Some(LAB_PAGE_SIZE), cursor.as_deref())
@@ -4423,7 +4431,7 @@ pub mod renderer {
         #[test]
         fn native_lab_provider_uses_verified_experiment_bundles_and_saved_checkpoint_cuts() {
             use scriptbots_runtime::lab_workflows::{
-                LabWorkflowRequest as Request, LabWorkflowResponse as Response,
+                LabMetric, LabWorkflowRequest as Request, LabWorkflowResponse as Response,
             };
             let root = tempfile::tempdir().unwrap();
             let world = scriptbots_core::WorldState::new(ScriptBotsConfig {
@@ -4483,37 +4491,55 @@ pub mod renderer {
                 }
                 _ => panic!("wrong details response"),
             }
-            let direct = handle
-                .compare_experiment_variants("gui-lab", "baseline", "challenger", "alive_agents")
-                .unwrap();
-            match provider(Request::Compare {
-                experiment_id: "gui-lab".into(),
-                baseline_variant: "baseline".into(),
-                challenger_variant: "challenger".into(),
-            })
-            .unwrap()
-            {
-                Response::Comparison(comparison) => {
-                    assert_eq!(comparison.matched_seeds, vec![7, 29]);
-                    assert_eq!(
-                        comparison.mean_difference.to_bits(),
-                        direct.mean_difference.to_bits()
-                    );
-                    assert_eq!(comparison.ci_95, direct.ci_95);
-                    assert_eq!(comparison.p_value, direct.p_value);
-                    assert_eq!(comparison.adjusted_p_value, direct.adjusted_p_value);
-                    assert_eq!(comparison.standardized_effect, direct.standardized_effect);
-                    assert_eq!(comparison.plan_digest, direct.plan_digest);
-                    assert_eq!(comparison.status_generation, direct.status_generation);
-                    assert_eq!(comparison.endpoint_tick, 2);
+            for metric in LabMetric::ALL {
+                let direct = handle
+                    .compare_experiment_variants(
+                        "gui-lab",
+                        "baseline",
+                        "challenger",
+                        metric.key(),
+                    )
+                    .unwrap();
+                match provider(Request::Compare {
+                    experiment_id: "gui-lab".into(),
+                    baseline_variant: "baseline".into(),
+                    challenger_variant: "challenger".into(),
+                    metric,
+                })
+                .unwrap()
+                {
+                    Response::Comparison(comparison) => {
+                        assert_eq!(comparison.metric, metric);
+                        assert_eq!(comparison.matched_seeds, vec![7, 29]);
+                        assert_eq!(
+                            comparison.mean_difference.to_bits(),
+                            direct.mean_difference.to_bits()
+                        );
+                        assert_eq!(comparison.ci_95, direct.ci_95);
+                        assert_eq!(comparison.p_value, direct.p_value);
+                        assert_eq!(comparison.adjusted_p_value, direct.adjusted_p_value);
+                        assert_eq!(comparison.standardized_effect, direct.standardized_effect);
+                        assert_eq!(comparison.plan_digest, direct.plan_digest);
+                        assert_eq!(comparison.status_generation, direct.status_generation);
+                        assert_eq!(comparison.endpoint_tick, 2);
+                        // The fixture's arms retain different food but the same
+                        // population. Stamping a requested metric over the former
+                        // population-only result must fail this control.
+                        if metric == LabMetric::TotalFood {
+                            assert!(comparison.mean_difference > 0.0);
+                        } else if metric == LabMetric::AliveAgents {
+                            assert_eq!(comparison.mean_difference, 0.0);
+                        }
+                    }
+                    _ => panic!("wrong comparison response"),
                 }
-                _ => panic!("wrong comparison response"),
             }
             assert!(
                 provider(Request::Compare {
                     experiment_id: "gui-lab".into(),
                     baseline_variant: "baseline".into(),
-                    challenger_variant: "baseline".into()
+                    challenger_variant: "baseline".into(),
+                    metric: LabMetric::AliveAgents,
                 })
                 .is_err()
             );
@@ -4588,6 +4614,72 @@ pub mod renderer {
             );
             assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
             assert_eq!(host.port.snapshot_hub().latest().world.tick, 1);
+        }
+
+        #[test]
+        fn native_lab_metric_comparison_preserves_extinct_endpoint_refusals() {
+            use scriptbots_runtime::lab_workflows::{
+                LabMetric, LabWorkflowRequest as Request, LabWorkflowResponse as Response,
+            };
+            let root = tempfile::tempdir().unwrap();
+            let host = TestHost::spawn(
+                scriptbots_core::WorldState::new(ScriptBotsConfig {
+                    rng_seed: Some(42),
+                    population_minimum: 0,
+                    persistence_interval: 0,
+                    closed: true,
+                    ..ScriptBotsConfig::default()
+                })
+                .unwrap(),
+            );
+            let handle = host
+                .handle()
+                .with_artifacts_dir(root.path().to_path_buf())
+                .unwrap();
+            let runner = crate::control::tests::comparison_catalog_runner(
+                root.path(),
+                "native-extinct",
+                vec![7],
+                1.0,
+            );
+            let completed = runner
+                .execute_batch(&runner.output_dir.join("status.json"))
+                .unwrap();
+            assert_eq!(completed.completed_runs, completed.total_runs);
+            let before = host.port.scientific_digest_v1().unwrap();
+            let provider = lab_workflow_submit(handle);
+            let compare = |metric| {
+                provider(Request::Compare {
+                    experiment_id: "native-extinct".into(),
+                    baseline_variant: "baseline".into(),
+                    challenger_variant: "challenger".into(),
+                    metric,
+                })
+            };
+            for metric in [
+                LabMetric::AverageEnergy,
+                LabMetric::AverageHealth,
+                LabMetric::MeanAge,
+                LabMetric::MaxAge,
+                LabMetric::MaxGeneration,
+            ] {
+                let error = match compare(metric) {
+                    Ok(_) => panic!("extinct {} must be unavailable", metric.key()),
+                    Err(error) => error,
+                };
+                assert!(error.contains("unavailable"), "{error}");
+            }
+            match compare(LabMetric::TotalEnergy).unwrap() {
+                Response::Comparison(comparison) => {
+                    assert_eq!(comparison.metric, LabMetric::TotalEnergy);
+                    assert_eq!(comparison.mean_difference, 0.0);
+                    assert!(comparison.descriptive_only);
+                    assert_eq!(comparison.ci_95, None);
+                    assert_eq!(comparison.p_value, None);
+                }
+                _ => panic!("wrong comparison response"),
+            }
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
         }
 
         #[test]
