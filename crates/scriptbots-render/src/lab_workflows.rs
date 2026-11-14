@@ -5,13 +5,14 @@
 
 use super::*;
 use scriptbots_runtime::lab_workflows::{
-    LAB_PAGE_SIZE, LabAction, LabCheckpointSaveState, LabMetric, LabPanel, VARIANTS_PER_PAGE,
-    comparison_lines,
+    LAB_PAGE_SIZE, LabAction, LabCheckpointSaveState, LabExperimentCreationState, LabMetric, LabPanel,
+    VARIANTS_PER_PAGE, comparison_lines,
 };
 #[cfg(test)]
 use scriptbots_runtime::lab_workflows::{
-    LabCheckpoint, LabCheckpointPage, LabComparison, LabExperiment, LabExperimentPage,
-    LabExperimentSummary, LabVariantProgress, LabWorkflowRequest, LabWorkflowResponse,
+    LabCheckpoint, LabCheckpointPage, LabComparison, LabExperiment, LabExperimentCapabilities,
+    LabExperimentDraft, LabExperimentPage, LabExperimentSummary, LabVariantProgress,
+    LabWorkflowRequest, LabWorkflowResponse,
 };
 
 impl SimulationView {
@@ -204,6 +205,298 @@ impl SimulationView {
         header
     }
 
+    fn render_lab_experiment_creation(&self, cx: &mut Context<Self>) -> Div {
+        let state = &self.lab_workflows;
+        let editing = state.can_edit_experiment_draft();
+        let draft = state
+            .latest_experiment_creation
+            .as_ref()
+            .filter(|creation| {
+                !matches!(&creation.state, LabExperimentCreationState::Created { .. })
+            })
+            .map(|creation| &creation.draft)
+            .unwrap_or(&state.experiment_draft);
+        let mut section = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(self.lab_button(
+                "lab-experiment-back".into(),
+                "Back to experiments".into(),
+                LabAction::BackToExperiments,
+                true,
+                cx,
+            ))
+            .child(div().text_lg().child("Experiment in fresh worlds"))
+            .child(div().text_xs().child(format!(
+                "Application source session {}.",
+                self.host.snapshot_hub().latest().session_id.get(),
+            )));
+        if let Some(creation) = &state.latest_experiment_creation {
+            let current_source = self.host.snapshot_hub().latest().session_id == creation.session_id;
+            section = section.child(div().text_xs().child(format!(
+                "{}creation request {} · source session {}",
+                if current_source { "" } else { "Previous-source " },
+                creation.request_id,
+                creation.session_id.get(),
+            )));
+            match &creation.state {
+                LabExperimentCreationState::Pending => {
+                    section = section.child(
+                        div().text_xs().child("Awaiting the application's experiment receipt."),
+                    );
+                }
+                LabExperimentCreationState::Retryable { reason } => {
+                    section = section.child(
+                        div().text_xs().child(format!("Creation is unconfirmed: {reason}")),
+                    );
+                }
+                LabExperimentCreationState::Created { experiment_id } => {
+                    section = section.child(div().text_xs().child(format!(
+                        "Experiment receipt: {experiment_id}. Inspect its observed run status in the catalog.",
+                    )));
+                }
+            }
+            if !matches!(&creation.state, LabExperimentCreationState::Created { .. }) {
+                section = section
+                    .child(div().text_xs().child(format!(
+                        "Retained plan: {} versus {} · first seed {} · {} seeds · {} ticks per run.",
+                        creation.draft.baseline_family,
+                        creation.draft.challenger_family,
+                        creation.draft.first_seed,
+                        creation.draft.seed_count,
+                        creation.draft.ticks_per_run,
+                    )))
+                    .child(div().text_xs().child(if current_source {
+                        "Retry retains the exact request and plan. Abandon clears the local retry; an admitted experiment may still exist in the catalog."
+                    } else {
+                        "This previous-source request cannot be retried here. Abandon clears the local retry only; an admitted experiment may still exist in the catalog."
+                    }))
+                    .child(self.lab_button(
+                        "lab-experiment-abandon".into(),
+                        "Abandon unconfirmed request".into(),
+                        LabAction::AbandonExperimentRequest,
+                        state.can_abandon_experiment_request(),
+                        cx,
+                    ));
+            }
+        }
+        let Some(capabilities) = &state.experiment_capabilities else {
+            return section.child(
+                div().text_sm().child("Loading available brain families and experiment limits…"),
+            );
+        };
+        section = section
+            .child(div().text_sm().child(capabilities.launch_description.clone()))
+            .child(div().text_xs().child(format!(
+                "Limits: {} seeds · {} ticks per run · {} total run ticks.",
+                capabilities.max_seed_count,
+                capabilities.max_ticks_per_run,
+                capabilities.max_total_ticks,
+            )));
+        for (baseline, title) in [
+            (true, "Baseline brain family"),
+            (false, "Challenger brain family"),
+        ] {
+            let selected = if baseline {
+                &draft.baseline_family
+            } else {
+                &draft.challenger_family
+            };
+            let mut choices = div().flex().flex_wrap().gap_2();
+            for family in &capabilities.families {
+                choices = choices.child(self.lab_button(
+                    format!(
+                        "lab-experiment-{}-{}",
+                        if baseline { "baseline" } else { "challenger" },
+                        family,
+                    ),
+                    format!(
+                        "{}{}",
+                        if selected == family { "Selected: " } else { "" },
+                        family,
+                    ),
+                    if baseline {
+                        LabAction::DraftBaseline(family.clone())
+                    } else {
+                        LabAction::DraftChallenger(family.clone())
+                    },
+                    editing,
+                    cx,
+                ));
+            }
+            section = section.child(div().text_sm().child(title)).child(choices);
+        }
+        let mut first_seed = div().flex().flex_wrap().gap_2();
+        first_seed = first_seed.child(self.lab_button(
+            "lab-experiment-seed-prev".into(),
+            "Previous first seed".into(),
+            LabAction::FirstSeed(draft.first_seed.checked_sub(1).unwrap_or(draft.first_seed)),
+            editing && draft.first_seed > 0,
+            cx,
+        ));
+        for seed in [11, 42, 137] {
+            first_seed = first_seed.child(self.lab_button(
+                format!("lab-experiment-seed-{seed}"),
+                format!(
+                    "{}First seed {seed}",
+                    if draft.first_seed == seed { "Selected: " } else { "" },
+                ),
+                LabAction::FirstSeed(seed),
+                editing,
+                cx,
+            ));
+        }
+        first_seed = first_seed.child(self.lab_button(
+            "lab-experiment-seed-next".into(),
+            "Next first seed".into(),
+            LabAction::FirstSeed(draft.first_seed.checked_add(1).unwrap_or(draft.first_seed)),
+            editing && draft.first_seed < u64::MAX,
+            cx,
+        ));
+        let mut counts = div().flex().flex_wrap().gap_2().child(self.lab_button(
+            "lab-experiment-seed-count-prev".into(),
+            "One fewer seed".into(),
+            LabAction::SeedCount(draft.seed_count.checked_sub(1).unwrap_or(draft.seed_count)),
+            editing && draft.seed_count > 1,
+            cx,
+        ));
+        for count in [1, 3, 8] {
+            if count <= capabilities.max_seed_count {
+                counts = counts.child(self.lab_button(
+                    format!("lab-experiment-seed-count-{count}"),
+                    format!(
+                        "{}{count} seed{}",
+                        if draft.seed_count == count { "Selected: " } else { "" },
+                        if count == 1 { "" } else { "s" },
+                    ),
+                    LabAction::SeedCount(count),
+                    editing,
+                    cx,
+                ));
+            }
+        }
+        counts = counts.child(self.lab_button(
+            "lab-experiment-seed-count-next".into(),
+            "One more seed".into(),
+            LabAction::SeedCount(draft.seed_count.checked_add(1).unwrap_or(draft.seed_count)),
+            editing
+                && draft
+                    .seed_count
+                    .checked_add(1)
+                    .is_some_and(|count| count <= capabilities.max_seed_count),
+            cx,
+        ));
+        let mut horizons = div().flex().flex_wrap().gap_2().child(self.lab_button(
+            "lab-experiment-ticks-prev".into(),
+            "One fewer tick".into(),
+            LabAction::TicksPerRun(
+                draft.ticks_per_run.checked_sub(1).unwrap_or(draft.ticks_per_run),
+            ),
+            editing && draft.ticks_per_run > 1,
+            cx,
+        ));
+        for ticks in [1, 10, 100, 500, 1_000, 10_000] {
+            if ticks <= capabilities.max_ticks_per_run {
+                horizons = horizons.child(self.lab_button(
+                    format!("lab-experiment-ticks-{ticks}"),
+                    format!(
+                        "{}{ticks} ticks per run",
+                        if draft.ticks_per_run == ticks { "Selected: " } else { "" },
+                    ),
+                    LabAction::TicksPerRun(ticks),
+                    editing,
+                    cx,
+                ));
+            }
+        }
+        horizons = horizons.child(self.lab_button(
+            "lab-experiment-ticks-next".into(),
+            "One more tick".into(),
+            LabAction::TicksPerRun(
+                draft.ticks_per_run.checked_add(1).unwrap_or(draft.ticks_per_run),
+            ),
+            editing
+                && draft
+                    .ticks_per_run
+                    .checked_add(1)
+                    .is_some_and(|ticks| ticks <= capabilities.max_ticks_per_run),
+            cx,
+        ));
+        section = section
+            .child(
+                div()
+                    .text_sm()
+                    .child(format!("First seed: {}", draft.first_seed)),
+            )
+            .child(first_seed)
+            .child(
+                div()
+                    .text_sm()
+                    .child(format!("Matched seed cohort: {}", draft.seed_count)),
+            )
+            .child(counts)
+            .child(div().text_sm().child(format!(
+                "Scientific horizon: {} ticks",
+                draft.ticks_per_run,
+            )))
+            .child(horizons);
+        match draft.seeds() {
+            Ok(seeds) => {
+                section = section.child(div().text_xs().child(format!(
+                    "Exact seeds in each arm: {seeds:?}",
+                )));
+            }
+            Err(error) => {
+                section = section.child(
+                    div()
+                        .text_xs()
+                        .child(format!("Seed schedule refused: {error}")),
+                );
+            }
+        }
+        let total_runs = draft.seed_count.checked_mul(2);
+        let total_ticks = total_runs
+            .and_then(|runs| u64::try_from(runs).ok())
+            .and_then(|runs| runs.checked_mul(draft.ticks_per_run));
+        section = section.child(
+            div()
+                .id("lab-experiment-preview")
+                .debug_selector(|| "lab-experiment-preview".to_owned())
+                .text_xs()
+                .child(format!(
+                    "Review: baseline {} · challenger {} · {} seeds per arm · {} ticks per run · {} total runs · {} total scientific ticks. Runs execute sequentially, one owner at a time.",
+                    draft.baseline_family,
+                    draft.challenger_family,
+                    draft.seed_count,
+                    draft.ticks_per_run,
+                    total_runs
+                        .map(|count| count.to_string())
+                        .unwrap_or_else(|| "overflow".into()),
+                    total_ticks
+                        .map(|ticks| ticks.to_string())
+                        .unwrap_or_else(|| "overflow".into()),
+                )),
+        );
+        if let Err(reason) = draft.validate(capabilities) {
+            section = section.child(div().text_xs().child(format!("Plan needs attention: {reason}")));
+        }
+        section.child(self.lab_button(
+            "lab-experiment-create".into(),
+            if state.is_busy() {
+                "Awaiting experiment service"
+            } else if state.will_retry_experiment_creation() {
+                "Retry this exact experiment"
+            } else {
+                "Run this experiment"
+            }
+            .into(),
+            LabAction::CreateExperiment,
+            state.can_create_experiment(),
+            cx,
+        ))
+    }
+
     pub(super) fn render_lab_experiments(&self, cx: &mut Context<Self>) -> Div {
         let state = &self.lab_workflows;
         let idle = !state.is_busy();
@@ -212,6 +505,9 @@ impl SimulationView {
             .flex_col()
             .gap_3()
             .child(self.lab_panel_header("Experiments", cx));
+        if state.composing_experiment {
+            return panel.child(self.render_lab_experiment_creation(cx));
+        }
         if state.selected_experiment.is_some() {
             panel = panel.child(self.lab_button(
                 "lab-all-experiments".into(),
@@ -386,6 +682,13 @@ impl SimulationView {
             }
             return panel;
         }
+        panel = panel.child(self.lab_button(
+            "lab-new-experiment".into(),
+            "New matched-seed experiment".into(),
+            LabAction::NewExperiment,
+            state.submit.is_some(),
+            cx,
+        ));
         let Some(page) = &state.experiments else {
             return panel.child("Loading experiment catalog…");
         };
@@ -410,7 +713,9 @@ impl SimulationView {
             ));
         }
         if page.items.is_empty() {
-            panel = panel.child(div().text_sm().child("No retained experiment batches. Create a matched-seed batch with the experiment API or CLI, then refresh."));
+            panel = panel.child(
+                div().text_sm().child("No retained experiment batches. Start a matched-seed experiment above."),
+            );
         }
         panel.child(
             div()
@@ -616,6 +921,35 @@ mod tests {
         }
     }
 
+    fn created_batch(experiment_id: &str, draft: &LabExperimentDraft) -> LabExperiment {
+        LabExperiment {
+            summary: LabExperimentSummary {
+                experiment_id: experiment_id.into(),
+                status: "pending".into(),
+                total_runs: draft.seed_count * 2,
+                completed_runs: 0,
+                failed_runs: 0,
+            },
+            plan_digest: "created-plan".into(),
+            generation: 0,
+            variants: [
+                ("baseline", &draft.baseline_family),
+                ("challenger", &draft.challenger_family),
+            ]
+            .into_iter()
+            .map(|(id, family)| LabVariantProgress {
+                variant_id: id.into(),
+                brain_family: family.clone(),
+                total_runs: draft.seed_count,
+                completed_runs: 0,
+                failed_runs: 0,
+                running_runs: 0,
+            })
+            .collect(),
+            error_reason: None,
+        }
+    }
+
     fn comparison(challenger: &str, metric: LabMetric) -> LabComparison {
         LabComparison {
             experiment_id: "actual-batch".into(),
@@ -682,6 +1016,9 @@ mod tests {
         let recorded_saves = Arc::clone(&save_requests);
         let comparison_metrics = Arc::new(Mutex::new(Vec::new()));
         let recorded_metrics = Arc::clone(&comparison_metrics);
+        let creation_requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded_creations = Arc::clone(&creation_requests);
+        let created_experiments = Mutex::new(std::collections::BTreeMap::new());
         session.lab_submit = Some(Arc::new(move |request| {
             Ok(match request {
                 LabWorkflowRequest::ListExperiments { .. } => {
@@ -694,8 +1031,52 @@ mod tests {
                         max_run_slots: 1,
                     })
                 }
-                LabWorkflowRequest::GetExperiment { .. } => {
-                    LabWorkflowResponse::Experiment(batch(2))
+                LabWorkflowRequest::ExperimentCapabilities => {
+                    LabWorkflowResponse::ExperimentCapabilities(LabExperimentCapabilities {
+                        families: vec!["mlp".into(), "dwraon".into(), "assembly".into()],
+                        max_seed_count: 8,
+                        max_ticks_per_run: 1_000,
+                        max_total_ticks: 16_000,
+                        launch_description: "Fresh worlds with the fixture's declared founder recipe."
+                            .into(),
+                    })
+                }
+                LabWorkflowRequest::CreateExperiment {
+                    request_id,
+                    session_id,
+                    draft,
+                } => {
+                    assert_eq!(session_id, saved.session_id);
+                    let first_attempt = {
+                        let mut requests = recorded_creations.lock().unwrap();
+                        requests.push((request_id.clone(), session_id, draft.clone()));
+                        requests.len() == 1
+                    };
+                    if first_attempt {
+                        return Err("experiment receipt is unconfirmed".into());
+                    }
+                    let experiment = created_batch(&request_id, &draft);
+                    created_experiments
+                        .lock()
+                        .unwrap()
+                        .insert(request_id.clone(), experiment.clone());
+                    LabWorkflowResponse::ExperimentCreated {
+                        request_id,
+                        session_id,
+                        experiment,
+                    }
+                }
+                LabWorkflowRequest::GetExperiment { experiment_id } => {
+                    LabWorkflowResponse::Experiment(if experiment_id == "actual-batch" {
+                        batch(2)
+                    } else {
+                        created_experiments
+                            .lock()
+                            .unwrap()
+                            .get(&experiment_id)
+                            .expect("created experiment is retained")
+                            .clone()
+                    })
                 }
                 LabWorkflowRequest::Compare {
                     baseline_variant,
@@ -811,6 +1192,60 @@ mod tests {
             }
         };
         click(&mut lab, "dashboard-tab-experiments");
+        wait(&mut lab, &|state| {
+            state.experiments.is_some() && !state.is_busy()
+        });
+        click(&mut lab, "lab-new-experiment");
+        wait(&mut lab, &|state| {
+            state.composing_experiment && state.experiment_capabilities.is_some() && !state.is_busy()
+        });
+        click(&mut lab, "lab-experiment-baseline-dwraon");
+        click(&mut lab, "lab-experiment-challenger-assembly");
+        click(&mut lab, "lab-experiment-seed-137");
+        click(&mut lab, "lab-experiment-seed-count-3");
+        click(&mut lab, "lab-experiment-seed-count-prev");
+        click(&mut lab, "lab-experiment-ticks-10");
+        click(&mut lab, "lab-experiment-ticks-next");
+        draw(&mut lab);
+        assert!(lab.debug_bounds("lab-experiment-preview").is_some());
+        context.update(|app| {
+            let draft = &hud.read(app).lab_workflows.experiment_draft;
+            assert_eq!(draft.baseline_family, "dwraon");
+            assert_eq!(draft.challenger_family, "assembly");
+            assert_eq!(draft.seeds().unwrap(), [137, 138]);
+            assert_eq!(draft.ticks_per_run, 11);
+        });
+        click(&mut lab, "lab-experiment-create");
+        wait(&mut lab, &|state| {
+            !state.is_busy()
+                && state.latest_experiment_creation.as_ref().is_some_and(|creation| {
+                    matches!(&creation.state, LabExperimentCreationState::Retryable { .. })
+                })
+        });
+        click(&mut lab, "lab-experiment-ticks-1000");
+        context.update(|app| {
+            assert_eq!(hud.read(app).lab_workflows.experiment_draft.ticks_per_run, 11);
+        });
+        click(&mut lab, "lab-experiment-create");
+        wait(&mut lab, &|state| {
+            !state.is_busy()
+                && !state.composing_experiment
+                && state.latest_experiment_creation.as_ref().is_some_and(|creation| {
+                    matches!(&creation.state, LabExperimentCreationState::Created { experiment_id }
+                        if state.selected_experiment.as_ref() == Some(experiment_id))
+                })
+        });
+        {
+            let requests = creation_requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(
+                requests[0], requests[1],
+                "retry must retain the exact source, identity and draft",
+            );
+            assert_eq!(requests[0].2.seeds().unwrap(), [137, 138]);
+            assert_eq!(requests[0].2.ticks_per_run, 11);
+        }
+        click(&mut lab, "lab-all-experiments");
         wait(&mut lab, &|state| {
             state.experiments.is_some() && !state.is_busy()
         });

@@ -9,7 +9,8 @@ use scriptbots_runtime::{
     HostSessionId,
     lab_workflows::{
         LAB_PAGE_SIZE, LabAction, LabCheckpointSaveState, LabEventIdentity, LabEventReview,
-        LabMetric, LabPanel, LabWorkflowSubmit, LabWorkflows, VARIANTS_PER_PAGE, comparison_lines,
+        LabExperimentCreationState, LabMetric, LabPanel, LabWorkflowSubmit, LabWorkflows,
+        VARIANTS_PER_PAGE, comparison_lines,
     },
 };
 
@@ -811,7 +812,7 @@ fn panel_rows(model: &LabWorkflows, presentation: &LabPresentation) -> Vec<Panel
         rows.push(PanelRow::text(notice.clone()));
     }
     match presentation.panel {
-        LabPanel::Experiments => experiment_rows(model, idle, &mut rows),
+        LabPanel::Experiments => experiment_rows(model, presentation, idle, &mut rows),
         LabPanel::Checkpoints => checkpoint_rows(model, presentation, idle, &mut rows),
         LabPanel::Inactive | LabPanel::Narrative => {}
     }
@@ -952,7 +953,248 @@ fn narrative_rows(model: &LabWorkflows, presentation: &LabPresentation, rows: &m
     }
 }
 
-fn experiment_rows(model: &LabWorkflows, idle: bool, rows: &mut Vec<PanelRow>) {
+fn experiment_creation_rows(
+    model: &LabWorkflows,
+    presentation: &LabPresentation,
+    rows: &mut Vec<PanelRow>,
+) {
+    let draft = model
+        .latest_experiment_creation
+        .as_ref()
+        .filter(|creation| {
+            !matches!(&creation.state, LabExperimentCreationState::Created { .. })
+        })
+        .map(|creation| &creation.draft)
+        .unwrap_or(&model.experiment_draft);
+    let editing = model.can_edit_experiment_draft();
+    rows.push(PanelRow::workflow(
+        "Back to experiments",
+        LabAction::BackToExperiments,
+        true,
+    ));
+    rows.push(PanelRow::text("EXPERIMENT IN FRESH WORLDS"));
+    if let Some(session) = presentation.source {
+        rows.push(PanelRow::text(format!(
+            "Application source session {}.",
+            session.get(),
+        )));
+    }
+    if let Some(creation) = &model.latest_experiment_creation {
+        let current_source = presentation.source == Some(creation.session_id);
+        rows.push(PanelRow::text(format!(
+            "{}creation request {} | source session {}",
+            if current_source { "" } else { "Previous-source " },
+            creation.request_id,
+            creation.session_id.get(),
+        )));
+        match &creation.state {
+            LabExperimentCreationState::Pending => {
+                rows.push(PanelRow::text("Awaiting the application's experiment receipt."));
+            }
+            LabExperimentCreationState::Retryable { reason } => {
+                rows.push(PanelRow::text(format!("Creation is unconfirmed: {reason}")));
+            }
+            LabExperimentCreationState::Created { experiment_id } => {
+                rows.push(PanelRow::text(format!(
+                    "Experiment receipt: {experiment_id}. Inspect its observed run status in the catalog.",
+                )));
+            }
+        }
+        if !matches!(&creation.state, LabExperimentCreationState::Created { .. }) {
+            rows.push(PanelRow::text(format!(
+                "Retained plan: {} versus {} | first seed {} | {} seeds | {} ticks per run.",
+                creation.draft.baseline_family,
+                creation.draft.challenger_family,
+                creation.draft.first_seed,
+                creation.draft.seed_count,
+                creation.draft.ticks_per_run,
+            )));
+            rows.push(PanelRow::text(if current_source {
+                "Retry retains the exact request and plan. Abandon clears the local retry; an admitted experiment may still exist in the catalog."
+            } else {
+                "This previous-source request cannot be retried here. Abandon clears the local retry only; an admitted experiment may still exist in the catalog."
+            }));
+            rows.push(PanelRow::workflow(
+                "Abandon unconfirmed request",
+                LabAction::AbandonExperimentRequest,
+                model.can_abandon_experiment_request(),
+            ));
+        }
+    }
+    let Some(capabilities) = &model.experiment_capabilities else {
+        rows.push(PanelRow::text("Loading available brain families and experiment limits..."));
+        return;
+    };
+    rows.push(PanelRow::text(capabilities.launch_description.clone()));
+    rows.push(PanelRow::text(format!(
+        "Limits: {} seeds | {} ticks per run | {} total run ticks.",
+        capabilities.max_seed_count,
+        capabilities.max_ticks_per_run,
+        capabilities.max_total_ticks,
+    )));
+    for (baseline, heading) in [
+        (true, "Baseline brain family"),
+        (false, "Challenger brain family"),
+    ] {
+        rows.push(PanelRow::text(heading));
+        let selected = if baseline {
+            &draft.baseline_family
+        } else {
+            &draft.challenger_family
+        };
+        for family in &capabilities.families {
+            rows.push(PanelRow::workflow(
+                format!(
+                    "{}{}",
+                    if selected == family { "Selected: " } else { "" },
+                    family,
+                ),
+                if baseline {
+                    LabAction::DraftBaseline(family.clone())
+                } else {
+                    LabAction::DraftChallenger(family.clone())
+                },
+                editing,
+            ));
+        }
+    }
+    rows.push(PanelRow::text(format!("First seed: {}", draft.first_seed)));
+    rows.push(PanelRow::workflow(
+        "Previous first seed",
+        LabAction::FirstSeed(draft.first_seed.checked_sub(1).unwrap_or(draft.first_seed)),
+        editing && draft.first_seed > 0,
+    ));
+    for seed in [11, 42, 137] {
+        rows.push(PanelRow::workflow(
+            format!(
+                "{}First seed {seed}",
+                if draft.first_seed == seed { "Selected: " } else { "" },
+            ),
+            LabAction::FirstSeed(seed),
+            editing,
+        ));
+    }
+    rows.push(PanelRow::workflow(
+        "Next first seed",
+        LabAction::FirstSeed(draft.first_seed.checked_add(1).unwrap_or(draft.first_seed)),
+        editing && draft.first_seed < u64::MAX,
+    ));
+    rows.push(PanelRow::text(format!("Matched seed cohort: {}", draft.seed_count)));
+    rows.push(PanelRow::workflow(
+        "One fewer seed",
+        LabAction::SeedCount(draft.seed_count.checked_sub(1).unwrap_or(draft.seed_count)),
+        editing && draft.seed_count > 1,
+    ));
+    for count in [1, 3, 8] {
+        if count <= capabilities.max_seed_count {
+            rows.push(PanelRow::workflow(
+                format!(
+                    "{}{count} seed{}",
+                    if draft.seed_count == count { "Selected: " } else { "" },
+                    if count == 1 { "" } else { "s" },
+                ),
+                LabAction::SeedCount(count),
+                editing,
+            ));
+        }
+    }
+    rows.push(PanelRow::workflow(
+        "One more seed",
+        LabAction::SeedCount(draft.seed_count.checked_add(1).unwrap_or(draft.seed_count)),
+        editing
+            && draft
+                .seed_count
+                .checked_add(1)
+                .is_some_and(|count| count <= capabilities.max_seed_count),
+    ));
+    rows.push(PanelRow::text(format!(
+        "Scientific horizon: {} ticks",
+        draft.ticks_per_run,
+    )));
+    rows.push(PanelRow::workflow(
+        "One fewer tick",
+        LabAction::TicksPerRun(
+            draft.ticks_per_run.checked_sub(1).unwrap_or(draft.ticks_per_run),
+        ),
+        editing && draft.ticks_per_run > 1,
+    ));
+    for ticks in [1, 10, 100, 500, 1_000, 10_000] {
+        if ticks <= capabilities.max_ticks_per_run {
+            rows.push(PanelRow::workflow(
+                format!(
+                    "{}{ticks} ticks per run",
+                    if draft.ticks_per_run == ticks { "Selected: " } else { "" },
+                ),
+                LabAction::TicksPerRun(ticks),
+                editing,
+            ));
+        }
+    }
+    rows.push(PanelRow::workflow(
+        "One more tick",
+        LabAction::TicksPerRun(
+            draft.ticks_per_run.checked_add(1).unwrap_or(draft.ticks_per_run),
+        ),
+        editing
+            && draft
+                .ticks_per_run
+                .checked_add(1)
+                .is_some_and(|ticks| ticks <= capabilities.max_ticks_per_run),
+    ));
+    rows.push(PanelRow::text(match draft.seeds() {
+        Ok(seeds) => format!("Exact seeds in each arm: {seeds:?}"),
+        Err(error) => format!("Seed schedule refused: {error}"),
+    }));
+    let total_runs = draft.seed_count.checked_mul(2);
+    let total_ticks = total_runs
+        .and_then(|runs| u64::try_from(runs).ok())
+        .and_then(|runs| runs.checked_mul(draft.ticks_per_run));
+    rows.push(PanelRow::text(format!(
+        "Review: baseline {} | challenger {} | {} seeds per arm | {} ticks per run | {} total runs | {} total scientific ticks. Runs execute sequentially, one owner at a time.",
+        draft.baseline_family,
+        draft.challenger_family,
+        draft.seed_count,
+        draft.ticks_per_run,
+        total_runs
+            .map(|count| count.to_string())
+            .unwrap_or_else(|| "overflow".into()),
+        total_ticks
+            .map(|ticks| ticks.to_string())
+            .unwrap_or_else(|| "overflow".into()),
+    )));
+    if let Err(reason) = draft.validate(capabilities) {
+        rows.push(PanelRow::text(format!("Plan needs attention: {reason}")));
+    }
+    rows.push(PanelRow::workflow(
+        if model.is_busy() {
+            "Awaiting experiment service"
+        } else if model.will_retry_experiment_creation() {
+            "Retry this exact experiment"
+        } else {
+            "Run this experiment"
+        },
+        LabAction::CreateExperiment,
+        model.can_create_experiment(),
+    ));
+}
+
+fn experiment_rows(
+    model: &LabWorkflows,
+    presentation: &LabPresentation,
+    idle: bool,
+    rows: &mut Vec<PanelRow>,
+) {
+    if model.composing_experiment {
+        experiment_creation_rows(model, presentation, rows);
+        return;
+    }
+    if model.selected_experiment.is_none() {
+        rows.push(PanelRow::workflow(
+            "New matched-seed experiment",
+            LabAction::NewExperiment,
+            model.submit.is_some(),
+        ));
+    }
     if model.selected_experiment.is_some() {
         rows.push(PanelRow::workflow(
             "All experiments",
@@ -1075,7 +1317,7 @@ fn experiment_rows(model: &LabWorkflows, idle: bool, rows: &mut Vec<PanelRow>) {
         )));
         if page.items.is_empty() {
             rows.push(PanelRow::text(
-                "No experiments have been submitted. Create a matched-seed batch through the control CLI or API, then refresh.",
+                "No experiments have been submitted. Start a matched-seed experiment above.",
             ));
         }
         for item in &page.items {
@@ -1415,9 +1657,10 @@ mod tests {
     use super::*;
     use crate::terrain_tests::{motion_test_source, sample_world_snapshot};
     use scriptbots_runtime::lab_workflows::{
-        LAB_MAX_VARIANTS, LabCheckpoint, LabCheckpointPage, LabCheckpointSave, LabComparison,
-        LabExperiment, LabExperimentSummary, LabVariantProgress, LabWorkflowRequest,
-        LabWorkflowResponse,
+        LAB_MAX_EXPERIMENT_FAMILIES, LAB_MAX_VARIANTS, LabCheckpoint, LabCheckpointPage,
+        LabCheckpointSave, LabComparison, LabExperiment, LabExperimentCapabilities,
+        LabExperimentCreation, LabExperimentDraft, LabExperimentPage, LabExperimentSummary,
+        LabVariantProgress, LabWorkflowRequest, LabWorkflowResponse,
     };
     use scriptbots_runtime::{HostCore, HostCoreOptions};
 
@@ -2038,6 +2281,320 @@ mod tests {
             12,
             "comparison input must not advance the live presentation"
         );
+    }
+
+    fn experiment_capabilities() -> LabExperimentCapabilities {
+        LabExperimentCapabilities {
+            families: vec!["mlp".into(), "dwraon".into(), "assembly".into()],
+            max_seed_count: 8,
+            max_ticks_per_run: 10_000,
+            max_total_ticks: 160_000,
+            launch_description: "Fresh worlds with the fixture's declared founder recipe.".into(),
+        }
+    }
+
+    fn created_experiment(experiment_id: &str, draft: &LabExperimentDraft) -> LabExperiment {
+        LabExperiment {
+            summary: LabExperimentSummary {
+                experiment_id: experiment_id.into(),
+                status: "completed".into(),
+                total_runs: draft.seed_count * 2,
+                completed_runs: draft.seed_count * 2,
+                failed_runs: 0,
+            },
+            plan_digest: "created-plan".into(),
+            generation: 1,
+            variants: [
+                ("baseline", &draft.baseline_family),
+                ("challenger", &draft.challenger_family),
+            ]
+            .into_iter()
+            .map(|(id, family)| LabVariantProgress {
+                variant_id: id.into(),
+                brain_family: family.clone(),
+                total_runs: draft.seed_count,
+                completed_runs: draft.seed_count,
+                failed_runs: 0,
+                running_runs: 0,
+            })
+            .collect(),
+            error_reason: None,
+        }
+    }
+
+    #[test]
+    fn experiment_composer_buttons_keep_an_unconfirmed_plan_exact() {
+        let mut presentation = LabPresentation {
+            panel: LabPanel::Experiments,
+            ..default()
+        };
+        let mut state = SnapshotState::default();
+        let mut motion = AgentMotionSettings { enabled: true };
+        presentation.receive_live(live_frame(12), &mut state, &mut motion);
+        presentation.source_changed = false;
+        let session = presentation.source.unwrap();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_requests = Arc::clone(&requests);
+        let mut model = consumer(Some(Arc::new(move |request| {
+            Ok(match request {
+                LabWorkflowRequest::ExperimentCapabilities => {
+                    LabWorkflowResponse::ExperimentCapabilities(experiment_capabilities())
+                }
+                LabWorkflowRequest::ListExperiments { .. } => {
+                    LabWorkflowResponse::Experiments(LabExperimentPage {
+                        items: Vec::new(),
+                        total: 0,
+                        offset: 0,
+                        next_cursor: None,
+                        reserved_run_slots: 0,
+                        max_run_slots: 1,
+                    })
+                }
+                LabWorkflowRequest::CreateExperiment {
+                    request_id,
+                    session_id,
+                    draft,
+                } => {
+                    let first_attempt = {
+                        let mut observed = observed_requests.lock().unwrap();
+                        observed.push((request_id.clone(), session_id, draft.clone()));
+                        observed.len() == 1
+                    };
+                    if first_attempt {
+                        return Err("experiment receipt is unconfirmed".into());
+                    }
+                    LabWorkflowResponse::ExperimentCreated {
+                        experiment: created_experiment(&request_id, &draft),
+                        request_id,
+                        session_id,
+                    }
+                }
+                other => panic!("unexpected composer request: {other:?}"),
+            })
+        })));
+        model.synchronize(session, LabPanel::Experiments);
+        let mut app = App::new();
+        app.insert_non_send_resource(model)
+            .insert_resource(presentation)
+            .insert_resource(state)
+            .insert_resource(motion)
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<CameraRig>()
+            .add_systems(Update, update);
+        let button = app
+            .world_mut()
+            .spawn((LabRow::default(), Interaction::None))
+            .id();
+        let press = |app: &mut App, action: LabAction| {
+            let row = panel_rows(
+                app.world().non_send_resource::<LabWorkflows>(),
+                app.world().resource::<LabPresentation>(),
+            )
+            .into_iter()
+            .find(|row| row.action == Some(PanelAction::Workflow(action.clone())))
+            .expect("production composer exposes this action");
+            let enabled = row.enabled;
+            app.world_mut().entity_mut(button).insert((
+                LabRow {
+                    index: 0,
+                    action: row.action,
+                    enabled,
+                },
+                Interaction::Pressed,
+            ));
+            app.update();
+            app.world_mut()
+                .entity_mut(button)
+                .insert(Interaction::None);
+            enabled
+        };
+        let wait = |app: &mut App, ready: &dyn Fn(&LabWorkflows) -> bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                app.update();
+                if ready(app.world().non_send_resource::<LabWorkflows>()) {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "experiment worker did not finish",
+                );
+                std::thread::yield_now();
+            }
+        };
+        assert!(press(&mut app, LabAction::NewExperiment));
+        wait(&mut app, &|model| {
+            model.composing_experiment
+                && model.experiment_capabilities.is_some()
+                && !model.is_busy()
+        });
+        assert!(press(&mut app, LabAction::DraftBaseline("dwraon".into())));
+        assert!(press(&mut app, LabAction::DraftChallenger("assembly".into())));
+        assert!(press(&mut app, LabAction::FirstSeed(137)));
+        // These values are reached through the adjacent-value controls, not presets.
+        assert!(press(&mut app, LabAction::SeedCount(2)));
+        assert!(press(&mut app, LabAction::TicksPerRun(10)));
+        assert!(press(&mut app, LabAction::TicksPerRun(11)));
+        let rows = panel_rows(
+            app.world().non_send_resource::<LabWorkflows>(),
+            app.world().resource::<LabPresentation>(),
+        );
+        assert!(rows.iter().any(|row| row.text == "Exact seeds in each arm: [137, 138]"));
+        assert!(rows.iter().any(|row| {
+            row.text.starts_with("Review:")
+                && row.text.contains("4 total runs")
+                && row.text.contains("44 total scientific ticks")
+        }));
+        assert!(press(&mut app, LabAction::CreateExperiment));
+        wait(&mut app, &|model| {
+            !model.is_busy()
+                && model.latest_experiment_creation.as_ref().is_some_and(|creation| {
+                    matches!(&creation.state, LabExperimentCreationState::Retryable { .. })
+                })
+        });
+        assert!(press(&mut app, LabAction::BackToExperiments));
+        wait(&mut app, &|model| model.experiments.is_some() && !model.is_busy());
+        assert!(press(&mut app, LabAction::NewExperiment));
+        wait(&mut app, &|model| {
+            model.composing_experiment
+                && model.experiment_capabilities.is_some()
+                && !model.is_busy()
+        });
+        assert!(!press(&mut app, LabAction::TicksPerRun(1_000)));
+        assert_eq!(
+            app.world()
+                .non_send_resource::<LabWorkflows>()
+                .experiment_draft
+                .ticks_per_run,
+            11,
+        );
+        assert!(press(&mut app, LabAction::CreateExperiment));
+        wait(&mut app, &|model| {
+            !model.is_busy()
+                && !model.composing_experiment
+                && model.latest_experiment_creation.as_ref().is_some_and(|creation| {
+                    matches!(&creation.state, LabExperimentCreationState::Created { experiment_id }
+                        if model.selected_experiment.as_ref() == Some(experiment_id))
+                })
+        });
+        let observed = requests.lock().unwrap();
+        assert_eq!(observed.len(), 2);
+        assert_eq!(
+            observed[0], observed[1],
+            "retry must retain source, identity and draft",
+        );
+        assert_eq!(observed[0].1, session);
+        assert_eq!(observed[0].2.baseline_family, "dwraon");
+        assert_eq!(observed[0].2.challenger_family, "assembly");
+        assert_eq!(observed[0].2.seeds().unwrap(), [137, 138]);
+        assert_eq!(observed[0].2.ticks_per_run, 11);
+        assert_eq!(
+            app.world()
+                .resource::<SnapshotState>()
+                .latest
+                .as_ref()
+                .unwrap()
+                .tick,
+            12,
+            "experiment controls must not advance the live presentation",
+        );
+    }
+
+    #[test]
+    fn experiment_composer_bounds_and_foreign_receipt_preview_are_explicit() {
+        let session = HostSessionId::new(71);
+        let presentation = LabPresentation {
+            panel: LabPanel::Experiments,
+            source: Some(session),
+            ..default()
+        };
+        let mut model = consumer(Some(Arc::new(|_| panic!("rendering cannot submit work"))));
+        model.synchronize(session, LabPanel::Experiments);
+        model.composing_experiment = true;
+        let families = (0..LAB_MAX_EXPERIMENT_FAMILIES)
+            .map(|index| format!("family-{index}"))
+            .collect::<Vec<_>>();
+        model.experiment_capabilities = Some(LabExperimentCapabilities {
+            families: families.clone(),
+            max_seed_count: 128,
+            max_ticks_per_run: 10_000,
+            max_total_ticks: 2_560_000,
+            launch_description: "Fresh fixture worlds; the live checkpoint is not inherited.".into(),
+        });
+        model.experiment_draft = LabExperimentDraft {
+            baseline_family: families[0].clone(),
+            challenger_family: families[1].clone(),
+            first_seed: u64::MAX - 127,
+            seed_count: 128,
+            ticks_per_run: 10_000,
+        };
+        let rows = panel_rows(&model, &presentation);
+        assert!(rows.len() <= MAX_PANEL_ROWS);
+        assert_eq!(
+            rows.iter().filter(|row| {
+                matches!(&row.action, Some(PanelAction::Workflow(
+                    LabAction::DraftBaseline(_) | LabAction::DraftChallenger(_)
+                )))
+            }).count(),
+            LAB_MAX_EXPERIMENT_FAMILIES * 2,
+        );
+        assert!(rows.iter().any(|row| {
+            row.text.contains("Exact seeds")
+                && row.text.contains(&u64::MAX.to_string())
+        }));
+        assert!(rows.iter().any(|row| {
+            row.action == Some(PanelAction::Workflow(LabAction::CreateExperiment)) && row.enabled
+        }));
+        assert!(rows.iter().any(|row| row.text == "One more seed" && !row.enabled));
+        assert!(rows.iter().any(|row| row.text == "One more tick" && !row.enabled));
+        model.experiment_draft.first_seed = u64::MAX;
+        let rows = panel_rows(&model, &presentation);
+        assert!(rows.iter().any(|row| row.text.starts_with("Seed schedule refused:")));
+        assert!(rows.iter().any(|row| {
+            row.action == Some(PanelAction::Workflow(LabAction::CreateExperiment)) && !row.enabled
+        }));
+        model.latest_experiment_creation = Some(LabExperimentCreation {
+            request_id: "retained-previous-source".into(),
+            session_id: HostSessionId::new(70),
+            draft: LabExperimentDraft {
+                baseline_family: families[2].clone(),
+                challenger_family: families[3].clone(),
+                first_seed: 137,
+                seed_count: 2,
+                ticks_per_run: 11,
+            },
+            state: LabExperimentCreationState::Pending,
+        });
+        let rows = panel_rows(&model, &presentation);
+        assert!(rows.len() <= MAX_PANEL_ROWS);
+        assert!(rows.iter().any(|row| row.text == "Application source session 71."));
+        assert!(rows.iter().any(|row| {
+            row.text.starts_with("Previous-source creation request")
+                && row.text.contains("source session 70")
+        }));
+        assert!(rows.iter().any(|row| row.text == "Exact seeds in each arm: [137, 138]"));
+        assert!(rows.iter().any(|row| {
+            row.text.starts_with("Review:")
+                && row.text.contains("baseline family-2")
+                && row.text.contains("challenger family-3")
+                && row.text.contains("44 total scientific ticks")
+        }));
+        assert!(rows.iter().any(|row| {
+            row.action == Some(PanelAction::Workflow(LabAction::AbandonExperimentRequest))
+                && row.enabled
+        }));
+        assert!(rows.iter().any(|row| {
+            row.action == Some(PanelAction::Workflow(LabAction::CreateExperiment)) && !row.enabled
+        }));
+        assert!(rows.iter().filter(|row| {
+            matches!(&row.action, Some(PanelAction::Workflow(
+                LabAction::DraftBaseline(_)
+                    | LabAction::DraftChallenger(_)
+                    | LabAction::FirstSeed(_)
+                    | LabAction::SeedCount(_)
+                    | LabAction::TicksPerRun(_)
+            )))
+        }).all(|row| !row.enabled));
     }
 
     #[test]

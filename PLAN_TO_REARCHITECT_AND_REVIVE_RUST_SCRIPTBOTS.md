@@ -2,6 +2,43 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Native Lab matched-seed experiment creation (2026-11-14):**
+[Source implemented and reviewed — Codex; executable qualification open]
+
+Continue `bd-2z0.7.6.1` by closing the native catalog-to-run gap in both
+GPUI and Bevy. The shared composer obtains the actually compiled brain-family
+catalog and runner limits from the application, exposes two distinct family arms,
+and previews the exact consecutive seed cohort, per-run horizon, total run count,
+fresh-world source and sequential execution before an explicit launch. This
+increment runs fresh experiment defaults; checkpoint branches, live-configuration
+inheritance and an arbitrary treatment editor remain separate work.
+
+Native admission uses the existing experiment service, with explicit stable
+request fields and one worker slot. An unconfirmed outcome freezes the complete
+draft and request identity for exact idempotent retry. Changing panels, owners
+or result context cannot turn an old response into a new launch or silently admit
+another run. Explicitly abandoning an unconfirmed receipt warns that its batch
+may already exist. A verified creation selects the existing progress, cancellation,
+resume and scientific comparison view.
+
+Checked validation preserves full-width seeds and exact horizons, rejects
+duplicate family arms and seed overflow, and respects the complete two-arm work
+allowance. Before dropping per-run details into the native projection, the
+application checks every returned arm, seed, family, target horizon and run ID
+against the frozen request. No runner, simulation, statistical or dependency
+semantics change.
+
+Regression source covers the shared draft and worker lifecycle, native interaction
+paths, and real application admission with a deliberately lost first response.
+The real-service case uses consecutive seeds ending at `u64::MAX`, observes one
+catalog identity after retry, rejects changed-payload reuse and altered returned
+matrices, and preserves the live owner's scientific state. It explicitly joins
+experiment workers before temporary artifact cleanup, including panic cleanup.
+
+Source review is complete; compilation, tests, Rustfmt, Clippy, UBS and completed
+DSR qualification remain unexecuted because the execution host is unavailable.
+Original native/platform requirements and the broader bead remain open.
+
 **Native Lab scientific endpoint comparisons (2026-11-14):**
 [Source implemented and reviewed — Codex; executable qualification open]
 
