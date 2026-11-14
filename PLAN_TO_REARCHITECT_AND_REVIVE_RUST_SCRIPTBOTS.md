@@ -2,6 +2,23 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Bundle input liveness (2026-11-13):**
+[Source implemented — Codex; executable qualification open]
+
+Continue the bounded bundle-verification work in `bd-2z0.5.11.1`.
+Both public verifiers now open Unix inputs nonblocking before checking the
+opened handle is a regular file. A manifest or artifact FIFO can therefore
+reach its typed refusal without waiting for a writer; the ordinary verifier's
+database projection rereads use the same opener. Symlinks to regular files
+retain their existing behavior. Byte, hash, projection and database restrictions
+remain unchanged. This is not a general filesystem or database-call deadline.
+
+New regressions cover manifest/artifact FIFOs directly and through symlinks in
+reaped subprocesses, require actual typed-refusal observations, and retain
+positive symlinked-manifest/artifact verification. Existing multichunk integrity
+tests remain. Source review is complete; native tests, formatter, compiler,
+Clippy, UBS and DSR execution remain unavailable and unclaimed.
+
 **Exact experiment horizons (2026-11-13):**
 [Source implemented — Codex; executable qualification open]
 

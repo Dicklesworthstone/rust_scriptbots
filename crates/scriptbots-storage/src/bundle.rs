@@ -81,8 +81,8 @@ pub enum BundleError {
         /// Configured maximum resource usage.
         limit: u64,
     },
-    /// Bounded verification encountered an input that is not a regular file.
-    #[error("bounded bundle verification requires a regular file at {0}")]
+    /// Bundle verification encountered an input that is not a regular file.
+    #[error("bundle verification requires a regular file at {0}")]
     NonRegularFile(PathBuf),
     /// The pinned engine cannot provide bounded database semantic verification.
     #[error(
@@ -437,10 +437,14 @@ pub fn verify_run_bundle(bundle_dir: &Path) -> Result<RunBundleVerificationResul
         return Err(BundleError::InvalidManifest(manifest_path));
     }
 
-    let manifest_data = fs::read_to_string(&manifest_path).map_err(|error| BundleError::Io {
-        path: manifest_path.clone(),
-        error,
-    })?;
+    let (mut manifest_file, _) = open_regular_bundle_file(&manifest_path)?;
+    let mut manifest_data = String::new();
+    manifest_file
+        .read_to_string(&mut manifest_data)
+        .map_err(|error| BundleError::Io {
+            path: manifest_path.clone(),
+            error,
+        })?;
 
     let bundle: RunBundleV1 = serde_json::from_str(&manifest_data)?;
 
@@ -582,7 +586,9 @@ fn verify_database_projection(
         ),
     ] {
         let full_path = bundle_dir.join(path);
-        let bytes = fs::read(&full_path).map_err(|error| BundleError::Io {
+        let (mut file, _) = open_regular_bundle_file(&full_path)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map_err(|error| BundleError::Io {
             path: full_path,
             error,
         })?;
@@ -721,12 +727,18 @@ fn is_database_artifact(entry: &RunBundleArtifactEntry, path: &Path) -> bool {
     })
 }
 
-fn read_file_bounded(
-    path: &Path,
-    max_bytes: u64,
-    resource: &'static str,
-) -> Result<Vec<u8>, BundleError> {
-    let file = File::open(path).map_err(|error| BundleError::Io {
+fn open_regular_bundle_file(path: &Path) -> Result<(File, fs::Metadata), BundleError> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // A FIFO opened for reading otherwise waits for a writer before the
+        // regular-file check can run. Inspect the opened handle, preserving
+        // existing symlinks to regular files without trusting a prior path stat.
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path).map_err(|error| BundleError::Io {
         path: path.to_path_buf(),
         error,
     })?;
@@ -737,6 +749,15 @@ fn read_file_bounded(
     if !metadata.is_file() {
         return Err(BundleError::NonRegularFile(path.to_path_buf()));
     }
+    Ok((file, metadata))
+}
+
+fn read_file_bounded(
+    path: &Path,
+    max_bytes: u64,
+    resource: &'static str,
+) -> Result<Vec<u8>, BundleError> {
+    let (file, metadata) = open_regular_bundle_file(path)?;
     if metadata.len() > max_bytes {
         return Err(BundleError::VerificationLimitExceeded {
             resource,
@@ -766,17 +787,7 @@ fn read_file_bounded(
 }
 
 fn hash_file_exact_bounded(path: &Path, expected_bytes: u64) -> Result<String, BundleError> {
-    let file = File::open(path).map_err(|error| BundleError::Io {
-        path: path.to_path_buf(),
-        error,
-    })?;
-    let metadata = file.metadata().map_err(|error| BundleError::Io {
-        path: path.to_path_buf(),
-        error,
-    })?;
-    if !metadata.is_file() {
-        return Err(BundleError::NonRegularFile(path.to_path_buf()));
-    }
+    let (file, metadata) = open_regular_bundle_file(path)?;
     if metadata.len() != expected_bytes {
         return Err(BundleError::HashMismatch {
             path: path.to_path_buf(),
@@ -1555,6 +1566,178 @@ mod tests {
             verify_run_bundle(&bundle_dir)?.total_bytes_verified,
             expected_bytes
         );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn wait_for_bundle_fifo_refusal(
+        mut child: std::process::Child,
+        input: &Path,
+        refusal_marker: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::io::{Error, ErrorKind};
+        use std::time::{Duration, Instant};
+
+        let started = Instant::now();
+        let failure = loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break None,
+                Ok(None) => {}
+                Err(error) => break Some(error),
+            }
+            if started.elapsed() >= Duration::from_secs(10) {
+                break Some(Error::new(
+                    ErrorKind::TimedOut,
+                    format!(
+                        "bundle verification waited for a FIFO peer at {}",
+                        input.display()
+                    ),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        if failure.is_some() {
+            let _ = child.kill();
+        }
+        let output = child.wait_with_output()?;
+        if let Some(error) = failure {
+            return Err(error.into());
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains(refusal_marker),
+            "FIFO child did not execute a successful refusal: {};\nstdout: {stdout}\nstderr: {stderr}",
+            output.status
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_bundle_refuses_fifos_without_writers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::process::{Command, Stdio};
+
+        const ROOT_ENV: &str = "SCRIPTBOTS_BUNDLE_FIFO_TEST_ROOT";
+        const EXPECTED_ENV: &str = "SCRIPTBOTS_BUNDLE_FIFO_TEST_EXPECTED";
+        const REFUSAL_MARKER: &str = "scriptbots-bundle-fifo-refused-as-nonregular";
+        let limits = RunBundleVerificationLimits {
+            max_manifest_bytes: 1024 * 1024,
+            max_artifacts: 1,
+            max_artifact_bytes: 1024,
+            max_total_artifact_bytes: 1024,
+        };
+
+        // Run the actual verifier in a child so the original blocking opener
+        // fails this regression without leaving a blocked test thread behind.
+        if let Some(root) = std::env::var_os(ROOT_ENV) {
+            let expected = PathBuf::from(
+                std::env::var_os(EXPECTED_ENV).ok_or("missing FIFO refusal path")?,
+            );
+            let root = PathBuf::from(root);
+            for (verifier, result) in [
+                ("bounded", verify_run_bundle_bounded(&root, limits)),
+                ("ordinary", verify_run_bundle(&root)),
+            ] {
+                assert!(
+                    matches!(&result, Err(BundleError::NonRegularFile(path)) if path == &expected),
+                    "{verifier} verifier: expected a typed nonregular-file refusal, got {result:?}"
+                );
+            }
+            println!("{REFUSAL_MARKER}");
+            return Ok(());
+        }
+
+        for (manifest_input, via_symlink) in
+            [(true, false), (true, true), (false, false), (false, true)]
+        {
+            let root = temp_bundle_dir(&format!(
+                "fifo-manifest-{manifest_input}-symlink-{via_symlink}"
+            ));
+            fs::create_dir_all(&root)?;
+            let relative_path = if manifest_input {
+                "bundle_manifest.json"
+            } else {
+                "blocked.bin"
+            };
+            let input = root.join(relative_path);
+            let fifo = if via_symlink {
+                root.join("fifo-target")
+            } else {
+                input.clone()
+            };
+            assert!(
+                Command::new("mkfifo").arg(&fifo).status()?.success(),
+                "failed to create FIFO fixture {}",
+                fifo.display()
+            );
+            if via_symlink {
+                std::os::unix::fs::symlink(&fifo, &input)?;
+            }
+            if !manifest_input {
+                let mut bundle = create_run_bundle_from_artifacts(
+                    &root,
+                    RunManifestRecord::unattributed(scriptbots_runtime::RunId::new(44)),
+                    0,
+                    &[],
+                )?;
+                bundle.artifacts.push(RunBundleArtifactEntry {
+                    relative_path: relative_path.to_owned(),
+                    blake3_hex: hash_hex(b""),
+                    bytes_len: 0,
+                    artifact_type: "export".to_owned(),
+                });
+                replace_test_manifest(&root, &bundle)?;
+            }
+
+            let child = Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "bundle::tests::bounded_bundle_refuses_fifos_without_writers",
+                    "--nocapture",
+                ])
+                .env(ROOT_ENV, &root)
+                .env(EXPECTED_ENV, &input)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?;
+            wait_for_bundle_fifo_refusal(child, &input, REFUSAL_MARKER)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bundle_verification_preserves_regular_file_symlinks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let source = temp_bundle_dir("regular-symlink-source");
+        let alias = temp_bundle_dir("regular-symlink-bundle");
+        let payload = b"retained scientific artifact";
+        create_run_bundle_from_artifacts(
+            &source,
+            RunManifestRecord::unattributed(scriptbots_runtime::RunId::new(45)),
+            7,
+            &[("payload.bin", "export", payload)],
+        )?;
+        fs::create_dir_all(&alias)?;
+        for name in ["bundle_manifest.json", "payload.bin"] {
+            std::os::unix::fs::symlink(source.join(name), alias.join(name))?;
+        }
+        let bytes = u64::try_from(payload.len())?;
+        let limits = RunBundleVerificationLimits {
+            max_manifest_bytes: 1024 * 1024,
+            max_artifacts: 1,
+            max_artifact_bytes: bytes,
+            max_total_artifact_bytes: bytes,
+        };
+        for verified in [
+            verify_run_bundle(&alias)?,
+            verify_run_bundle_bounded(&alias, limits)?,
+        ] {
+            assert_eq!(verified.total_artifacts_verified, 1);
+            assert_eq!(verified.total_bytes_verified, bytes);
+        }
         Ok(())
     }
 
