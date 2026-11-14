@@ -2,6 +2,49 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Native matched-seed ecological treatments (2026-11-14):**
+[Source implemented and independently reviewed — Codex; runtime compiler check passed]
+
+Both native experiment composers now offer a controlled ecological design beside
+the existing brain-family comparison. The ecological design holds the family
+and independent founding-seed cohort constant, leaves the baseline unchanged,
+and assigns one food-growth, basal-metabolism or movement-cost coefficient to
+the challenger at an exact completed-tick boundary. Choices use the runner's
+actual fresh-world defaults and core bounds. The preview discloses the baseline,
+f32-rounded assignment, coefficient units, percentage and first affected
+transition. A 100% unchanged-value control is valid and explicitly identified.
+
+The complete treatment remains frozen through uncertain admission and exact
+retry. Edits cannot introduce a second family factor, silently clamp a requested
+boundary, or substitute the live world's configuration. Admission checks the
+canonical runner plan digest as well as every returned seed, family and horizon,
+so matching run rows cannot hide a different coefficient or application time.
+Both frontends retain the known question with current-source admitted results
+and use the existing eight verified endpoint comparisons. Unknown historical
+designs do not receive an inferred treatment description.
+
+Regression source covers numeric/boundary/capability bounds, single-factor edits,
+immutable retries and source changes, both production UI interactions, and the
+Bevy row limit under the largest composer state. Two application cases cover all
+three actual coefficient mappings and a real managed food-growth experiment:
+lost receipt, exact retry, altered-plan refusal, independently verified run
+bundles, paired food divergence, a zero-effect unchanged-value control, unchanged
+live-owner science and joined workers. Independent source review and pinned DSR
+format emission/check passed for all four changed Rust files. The exact candidate
+passed `scriptbots-runtime --all-targets` compiler checking. The focused test
+build was externally killed during runtime code generation before executing any
+tests. The native GUI application check was separately killed in the unchanged
+Asupersync dependency before reaching the provider or renderer; neither attempt
+reported a Rust source diagnostic. UBS is unavailable in this environment.
+The new test executions, native application/frontend compilation, Clippy, full
+workspace and platform qualification remain open. This continues `bd-2z0.7.6.1`
+without changing its original acceptance requirements.
+
+The preceding committed source `3e57213` separately passed a pinned DSR runtime
+all-target compiler check and all 28 focused Lab tests this session. Those passes
+qualify the earlier shared Lab implementation, not the new treatment candidate
+or the native renderer/application tests.
+
 **Native saved-checkpoint studies (2026-11-14):**
 [Source implemented and reviewed — Codex; executable qualification open]
 

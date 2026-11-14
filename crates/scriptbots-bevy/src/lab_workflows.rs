@@ -8,9 +8,10 @@ use super::*;
 use scriptbots_runtime::{
     HostSessionId,
     lab_workflows::{
-        LAB_PAGE_SIZE, LabAction, LabBranchCreationState, LabBranchTreatment,
-        LabCheckpointSaveState, LabCheckpointView, LabEventIdentity, LabEventReview,
-        LabExperimentCreationState, LabMetric, LabPanel, LabWorkflowSubmit, LabWorkflows,
+        LAB_MAX_TREATMENT_PERCENT, LAB_PAGE_SIZE, LabAction, LabBranchCreationState,
+        LabBranchTreatment, LabCheckpointSaveState, LabCheckpointView, LabEventIdentity,
+        LabEventReview, LabExperimentCapabilities, LabExperimentCreationState, LabExperimentDesign,
+        LabExperimentTreatment, LabMetric, LabPanel, LabWorkflowSubmit, LabWorkflows,
         VARIANTS_PER_PAGE, branch_report_lines, comparison_lines,
     },
 };
@@ -954,6 +955,121 @@ fn narrative_rows(model: &LabWorkflows, presentation: &LabPresentation, rows: &m
     }
 }
 
+fn experiment_treatment_rows(
+    treatment: &LabExperimentTreatment,
+    capabilities: &LabExperimentCapabilities,
+    horizon: u64,
+    editing: bool,
+    rows: &mut Vec<PanelRow>,
+) {
+    for offered in &capabilities.treatment_parameters {
+        rows.push(PanelRow::workflow(
+            format!(
+                "{}{}",
+                if treatment.parameter == offered.parameter {
+                    "Selected: "
+                } else {
+                    ""
+                },
+                offered.parameter.label(),
+            ),
+            LabAction::TreatmentParameter(offered.parameter),
+            editing,
+        ));
+    }
+    rows.push(PanelRow::text(format!(
+        "Challenger value: {}% of the disclosed baseline (0–{LAB_MAX_TREATMENT_PERCENT}%).",
+        treatment.scale_percent,
+    )));
+    rows.push(PanelRow::workflow(
+        "10 percentage points less",
+        LabAction::TreatmentPercent(
+            treatment
+                .scale_percent
+                .checked_sub(10)
+                .unwrap_or(treatment.scale_percent),
+        ),
+        editing && treatment.scale_percent >= 10,
+    ));
+    for percent in [0, 50, 100, 200, LAB_MAX_TREATMENT_PERCENT] {
+        rows.push(PanelRow::workflow(
+            format!(
+                "{}{percent}% of baseline{}",
+                if treatment.scale_percent == percent {
+                    "Selected: "
+                } else {
+                    ""
+                },
+                if percent == 100 {
+                    " (unchanged-value control)"
+                } else {
+                    ""
+                },
+            ),
+            LabAction::TreatmentPercent(percent),
+            editing,
+        ));
+    }
+    rows.push(PanelRow::workflow(
+        "10 percentage points more",
+        LabAction::TreatmentPercent(
+            treatment
+                .scale_percent
+                .checked_add(10)
+                .unwrap_or(treatment.scale_percent),
+        ),
+        editing
+            && treatment
+                .scale_percent
+                .checked_add(10)
+                .is_some_and(|percent| percent <= LAB_MAX_TREATMENT_PERCENT),
+    ));
+    rows.push(PanelRow::text(format!(
+        "Apply after completed tick {} and before the next transition; boundary must be earlier than horizon {horizon}.",
+        treatment.at_tick,
+    )));
+    rows.push(PanelRow::workflow(
+        "One boundary earlier",
+        LabAction::TreatmentTick(
+            treatment
+                .at_tick
+                .checked_sub(1)
+                .unwrap_or(treatment.at_tick),
+        ),
+        editing && treatment.at_tick > 0,
+    ));
+    for tick in [0, 10, 100] {
+        if tick < horizon {
+            rows.push(PanelRow::workflow(
+                format!(
+                    "{}At completed tick {tick}",
+                    if treatment.at_tick == tick {
+                        "Selected: "
+                    } else {
+                        ""
+                    },
+                ),
+                LabAction::TreatmentTick(tick),
+                editing,
+            ));
+        }
+    }
+    rows.push(PanelRow::workflow(
+        "One boundary later",
+        LabAction::TreatmentTick(
+            treatment
+                .at_tick
+                .checked_add(1)
+                .unwrap_or(treatment.at_tick),
+        ),
+        editing
+            && treatment
+                .at_tick
+                .checked_add(1)
+                .is_some_and(|tick| tick < horizon),
+    ));
+}
+
 fn experiment_creation_rows(
     model: &LabWorkflows,
     presentation: &LabPresentation,
@@ -1026,6 +1142,7 @@ fn experiment_creation_rows(
             ));
         }
     }
+    rows.extend(draft.question_lines().into_iter().map(PanelRow::text));
     let Some(capabilities) = &model.experiment_capabilities else {
         rows.push(PanelRow::text(
             "Loading available brain families and experiment limits...",
@@ -1037,10 +1154,50 @@ fn experiment_creation_rows(
         "Limits: {} seeds | {} ticks per run | {} total run ticks.",
         capabilities.max_seed_count, capabilities.max_ticks_per_run, capabilities.max_total_ticks,
     )));
-    for (baseline, heading) in [
-        (true, "Baseline brain family"),
-        (false, "Challenger brain family"),
-    ] {
+    let design = draft.design();
+    rows.push(PanelRow::workflow(
+        format!(
+            "{}Compare brain families{}",
+            if design == LabExperimentDesign::BrainFamilies {
+                "Selected: "
+            } else {
+                ""
+            },
+            if capabilities.families.len() < 2 {
+                " (needs two families)"
+            } else {
+                ""
+            }
+        ),
+        LabAction::ExperimentDesign(LabExperimentDesign::BrainFamilies),
+        editing && capabilities.families.len() >= 2,
+    ));
+    rows.push(PanelRow::workflow(
+        format!(
+            "{}Compare ecological treatment{}",
+            if design == LabExperimentDesign::EcologicalTreatment {
+                "Selected: "
+            } else {
+                ""
+            },
+            if capabilities.treatment_parameters.is_empty() {
+                " (unavailable)"
+            } else {
+                ""
+            }
+        ),
+        LabAction::ExperimentDesign(LabExperimentDesign::EcologicalTreatment),
+        editing && !capabilities.treatment_parameters.is_empty(),
+    ));
+    let families: &[(bool, &str)] = if design == LabExperimentDesign::EcologicalTreatment {
+        &[(true, "Shared brain family in both arms")]
+    } else {
+        &[
+            (true, "Baseline brain family"),
+            (false, "Challenger brain family"),
+        ]
+    };
+    for &(baseline, heading) in families {
         rows.push(PanelRow::text(heading));
         let selected = if baseline {
             &draft.baseline_family
@@ -1062,6 +1219,9 @@ fn experiment_creation_rows(
                 editing,
             ));
         }
+    }
+    if let Some(treatment) = &draft.treatment {
+        experiment_treatment_rows(treatment, capabilities, draft.ticks_per_run, editing, rows);
     }
     rows.push(PanelRow::text(format!("First seed: {}", draft.first_seed)));
     rows.push(PanelRow::workflow(
@@ -1246,6 +1406,14 @@ fn experiment_rows(
         )));
         if let Some(error) = &batch.error_reason {
             rows.push(PanelRow::text(format!("Run failure: {error}")));
+        }
+        if let Some(creation) = model.latest_experiment_creation.as_ref().filter(|creation| {
+            presentation.source == Some(creation.session_id)
+                && matches!(&creation.state, LabExperimentCreationState::Created { experiment_id }
+                    if experiment_id == &summary.experiment_id)
+        }) {
+            rows.push(PanelRow::text("Retained launch question:"));
+            rows.extend(creation.draft.question_lines().into_iter().map(PanelRow::text));
         }
         rows.push(PanelRow::workflow(
             "Stop at durable boundary",
@@ -1968,9 +2136,9 @@ mod tests {
         LAB_MAX_EXPERIMENT_FAMILIES, LAB_MAX_VARIANTS, LabBranchCapabilities, LabBranchCreation,
         LabBranchDivergence, LabBranchDraft, LabBranchOutcome, LabBranchReport, LabCheckpoint,
         LabCheckpointBranch, LabCheckpointBranchPage, LabCheckpointPage, LabCheckpointSave,
-        LabComparison, LabExperiment, LabExperimentCapabilities, LabExperimentCreation,
-        LabExperimentDraft, LabExperimentPage, LabExperimentSummary, LabVariantProgress,
-        LabWorkflowRequest, LabWorkflowResponse,
+        LabComparison, LabExperiment, LabExperimentCreation, LabExperimentDraft, LabExperimentPage,
+        LabExperimentParameter, LabExperimentParameterCapability, LabExperimentSummary,
+        LabVariantProgress, LabWorkflowRequest, LabWorkflowResponse,
     };
     use scriptbots_runtime::{HostCore, HostCoreOptions};
 
@@ -2596,6 +2764,15 @@ mod tests {
     fn experiment_capabilities() -> LabExperimentCapabilities {
         LabExperimentCapabilities {
             families: vec!["mlp".into(), "dwraon".into(), "assembly".into()],
+            treatment_parameters: LabExperimentParameter::ALL
+                .into_iter()
+                .map(|parameter| LabExperimentParameterCapability {
+                    parameter,
+                    baseline_value: 0.25,
+                    min_value: 0.0,
+                    max_value: 1.0,
+                })
+                .collect(),
             max_seed_count: 8,
             max_ticks_per_run: 10_000,
             max_total_ticks: 160_000,
@@ -2630,6 +2807,456 @@ mod tests {
             .collect(),
             error_reason: None,
         }
+    }
+
+    #[test]
+    fn ecological_composer_buttons_keep_the_exact_question_through_retry_and_comparison() {
+        let mut presentation = LabPresentation {
+            panel: LabPanel::Experiments,
+            ..default()
+        };
+        let mut state = SnapshotState::default();
+        let mut motion = AgentMotionSettings { enabled: true };
+        presentation.receive_live(live_frame(12), &mut state, &mut motion);
+        presentation.source_changed = false;
+        let session = presentation.source.unwrap();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_requests = Arc::clone(&requests);
+        let retained = std::sync::Mutex::new(None::<(LabExperiment, LabExperimentDraft)>);
+        let historical = created_experiment(
+            "historical-unknown-design",
+            &LabExperimentDraft {
+                baseline_family: "mlp".into(),
+                challenger_family: "dwraon".into(),
+                ..LabExperimentDraft::default()
+            },
+        );
+        let mut model = consumer(Some(Arc::new(move |request| {
+            Ok(match request {
+                LabWorkflowRequest::ExperimentCapabilities => {
+                    LabWorkflowResponse::ExperimentCapabilities(experiment_capabilities())
+                }
+                LabWorkflowRequest::ListExperiments { .. } => {
+                    LabWorkflowResponse::Experiments(LabExperimentPage {
+                        items: vec![historical.summary.clone()],
+                        total: 1,
+                        offset: 0,
+                        next_cursor: None,
+                        reserved_run_slots: 0,
+                        max_run_slots: 1,
+                    })
+                }
+                LabWorkflowRequest::CreateExperiment {
+                    request_id,
+                    session_id,
+                    draft,
+                } => {
+                    assert_eq!(session_id, session);
+                    draft.validate(&experiment_capabilities()).unwrap();
+                    let first = {
+                        let mut observed = observed_requests.lock().unwrap();
+                        observed.push((request_id.clone(), session_id, draft.clone()));
+                        observed.len() == 1
+                    };
+                    let mut retained = retained.lock().unwrap();
+                    let (experiment, _) = retained
+                        .get_or_insert_with(|| (created_experiment(&request_id, &draft), draft));
+                    if first {
+                        return Err("ecological admission response was lost".into());
+                    }
+                    LabWorkflowResponse::ExperimentCreated {
+                        request_id,
+                        session_id,
+                        experiment: experiment.clone(),
+                    }
+                }
+                LabWorkflowRequest::GetExperiment { experiment_id } => {
+                    LabWorkflowResponse::Experiment(
+                        if experiment_id == historical.summary.experiment_id {
+                            historical.clone()
+                        } else {
+                            retained.lock().unwrap().as_ref().unwrap().0.clone()
+                        },
+                    )
+                }
+                LabWorkflowRequest::Compare {
+                    experiment_id,
+                    baseline_variant,
+                    challenger_variant,
+                    metric,
+                } => {
+                    let retained = retained.lock().unwrap();
+                    let (experiment, draft) = retained.as_ref().unwrap();
+                    assert_eq!(experiment_id, experiment.summary.experiment_id);
+                    assert_eq!(baseline_variant, "baseline");
+                    assert_eq!(challenger_variant, "challenger");
+                    assert_eq!(metric, LabMetric::TotalEnergy);
+                    LabWorkflowResponse::Comparison(LabComparison {
+                        experiment_id,
+                        baseline_variant,
+                        challenger_variant,
+                        metric,
+                        endpoint_tick: draft.ticks_per_run,
+                        matched_seeds: draft.seeds().unwrap(),
+                        mean_difference: -0.25,
+                        ci_95: Some((-0.25, -0.25)),
+                        standardized_effect: None,
+                        p_value: None,
+                        adjusted_p_value: None,
+                        descriptive_only: false,
+                        underpowered_reason: Some("Small fixture cohort.".into()),
+                        undefined_effect_reason: Some("Constant paired difference.".into()),
+                        plan_digest: experiment.plan_digest.clone(),
+                        status_generation: experiment.generation,
+                    })
+                }
+                other => panic!("unexpected ecological request: {other:?}"),
+            })
+        })));
+        model.synchronize(session, LabPanel::Experiments);
+        let mut app = App::new();
+        app.insert_non_send_resource(model)
+            .insert_resource(presentation)
+            .insert_resource(state)
+            .insert_resource(motion)
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<CameraRig>()
+            .add_systems(Update, update);
+        let button = app
+            .world_mut()
+            .spawn((LabRow::default(), Interaction::None))
+            .id();
+        let press = |app: &mut App, action: LabAction| {
+            let row = panel_rows(
+                app.world().non_send_resource::<LabWorkflows>(),
+                app.world().resource::<LabPresentation>(),
+            )
+            .into_iter()
+            .find(|row| row.action == Some(PanelAction::Workflow(action.clone())))
+            .expect("production ecological composer exposes this action");
+            let enabled = row.enabled;
+            app.world_mut().entity_mut(button).insert((
+                LabRow {
+                    index: 0,
+                    action: row.action,
+                    enabled,
+                },
+                Interaction::Pressed,
+            ));
+            app.update();
+            app.world_mut().entity_mut(button).insert(Interaction::None);
+            enabled
+        };
+        let wait = |app: &mut App, ready: &dyn Fn(&LabWorkflows) -> bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                app.update();
+                if ready(app.world().non_send_resource::<LabWorkflows>()) {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "ecological result did not arrive"
+                );
+                std::thread::yield_now();
+            }
+        };
+        assert!(press(&mut app, LabAction::NewExperiment));
+        wait(&mut app, &|model| {
+            model.experiment_capabilities.is_some() && !model.is_busy()
+        });
+        assert!(press(
+            &mut app,
+            LabAction::ExperimentDesign(LabExperimentDesign::EcologicalTreatment)
+        ));
+        assert!(press(&mut app, LabAction::DraftBaseline("dwraon".into())));
+        assert!(press(
+            &mut app,
+            LabAction::TreatmentParameter(LabExperimentParameter::Metabolism)
+        ));
+        assert!(press(
+            &mut app,
+            LabAction::TreatmentParameter(LabExperimentParameter::MovementCost)
+        ));
+        assert!(press(&mut app, LabAction::TreatmentPercent(100)));
+        let rows = panel_rows(
+            app.world().non_send_resource::<LabWorkflows>(),
+            app.world().resource::<LabPresentation>(),
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.text.contains("Unchanged-value control"))
+        );
+        assert!(!rows.iter().any(|row| matches!(
+            &row.action,
+            Some(PanelAction::Workflow(LabAction::DraftChallenger(_)))
+        )));
+        assert!(press(&mut app, LabAction::TreatmentPercent(50)));
+        assert!(press(&mut app, LabAction::TreatmentPercent(60)));
+        assert!(press(&mut app, LabAction::TreatmentTick(10)));
+        assert!(press(&mut app, LabAction::TreatmentTick(11)));
+        assert!(press(&mut app, LabAction::TicksPerRun(10)));
+        assert!(!press(&mut app, LabAction::CreateExperiment));
+        assert!(requests.lock().unwrap().is_empty());
+        assert_eq!(
+            app.world()
+                .non_send_resource::<LabWorkflows>()
+                .experiment_draft
+                .treatment
+                .unwrap()
+                .at_tick,
+            11
+        );
+        assert!(press(&mut app, LabAction::TicksPerRun(100)));
+        assert!(press(&mut app, LabAction::SeedCount(2)));
+        let expected = app
+            .world()
+            .non_send_resource::<LabWorkflows>()
+            .experiment_draft
+            .clone();
+        assert_eq!(expected.baseline_family, "dwraon");
+        assert_eq!(expected.baseline_family, expected.challenger_family);
+        assert_eq!(
+            expected.treatment.unwrap(),
+            LabExperimentTreatment {
+                parameter: LabExperimentParameter::MovementCost,
+                baseline_value: 0.25,
+                scale_percent: 60,
+                at_tick: 11,
+            }
+        );
+        assert_eq!(
+            expected.treatment.unwrap().value().unwrap(),
+            f64::from(0.15_f32)
+        );
+        assert!(press(&mut app, LabAction::CreateExperiment));
+        wait(&mut app, &|model| {
+            !model.is_busy()
+                && model
+                    .latest_experiment_creation
+                    .as_ref()
+                    .is_some_and(|creation| {
+                        matches!(
+                            &creation.state,
+                            LabExperimentCreationState::Retryable { .. }
+                        )
+                    })
+        });
+        assert!(press(&mut app, LabAction::BackToExperiments));
+        wait(&mut app, &|model| {
+            model.experiments.is_some() && !model.is_busy()
+        });
+        assert!(press(&mut app, LabAction::NewExperiment));
+        wait(&mut app, &|model| {
+            model.experiment_capabilities.is_some() && !model.is_busy()
+        });
+        for action in [
+            LabAction::ExperimentDesign(LabExperimentDesign::BrainFamilies),
+            LabAction::TreatmentParameter(LabExperimentParameter::FoodGrowth),
+            LabAction::TreatmentPercent(100),
+            LabAction::TreatmentTick(0),
+            LabAction::DraftBaseline("mlp".into()),
+        ] {
+            assert!(!press(&mut app, action));
+        }
+        assert_eq!(
+            app.world()
+                .non_send_resource::<LabWorkflows>()
+                .experiment_draft,
+            expected
+        );
+        assert!(press(&mut app, LabAction::CreateExperiment));
+        wait(&mut app, &|model| {
+            !model.is_busy() && !model.composing_experiment && model.batch.is_some()
+        });
+        let rows = panel_rows(
+            app.world().non_send_resource::<LabWorkflows>(),
+            app.world().resource::<LabPresentation>(),
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.text == "Retained launch question:")
+        );
+        for line in expected.question_lines() {
+            assert!(rows.iter().any(|row| row.text == line));
+        }
+        assert_eq!(
+            rows.iter()
+                .filter(|row| matches!(
+                    &row.action,
+                    Some(PanelAction::Workflow(LabAction::Metric(_)))
+                ))
+                .count(),
+            LabMetric::ALL.len()
+        );
+        assert!(press(&mut app, LabAction::Metric(LabMetric::TotalEnergy)));
+        assert!(press(&mut app, LabAction::Compare));
+        wait(&mut app, &|model| {
+            !model.is_busy() && model.comparison.is_some()
+        });
+        let model = app.world().non_send_resource::<LabWorkflows>();
+        let comparison = model.comparison.as_ref().unwrap();
+        assert_eq!(comparison.metric, LabMetric::TotalEnergy);
+        assert_eq!(comparison.matched_seeds, [42, 43]);
+        assert_eq!(comparison.endpoint_tick, 100);
+        let rows = panel_rows(model, app.world().resource::<LabPresentation>());
+        for line in comparison_lines(comparison) {
+            assert!(rows.iter().any(|row| row.text == line));
+        }
+        assert!(press(&mut app, LabAction::AllExperiments));
+        wait(&mut app, &|model| {
+            !model.is_busy() && model.experiments.is_some()
+        });
+        assert!(press(
+            &mut app,
+            LabAction::SelectExperiment("historical-unknown-design".into())
+        ));
+        wait(&mut app, &|model| !model.is_busy() && model.batch.is_some());
+        let rows = panel_rows(
+            app.world().non_send_resource::<LabWorkflows>(),
+            app.world().resource::<LabPresentation>(),
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.text == "Retained launch question:")
+        );
+        let observed = requests.lock().unwrap();
+        assert_eq!(observed.len(), 2);
+        assert_eq!(observed[0], observed[1]);
+        assert_eq!(observed[0].2, expected);
+        assert_eq!(
+            app.world()
+                .resource::<SnapshotState>()
+                .latest
+                .as_ref()
+                .unwrap()
+                .tick,
+            12
+        );
+    }
+
+    #[test]
+    fn ecological_composer_bounds_include_frozen_foreign_question_and_review_banner() {
+        let session = HostSessionId::new(71);
+        let presentation = LabPresentation {
+            panel: LabPanel::Experiments,
+            source: Some(session),
+            review: Some(ReviewFrame {
+                source: ReviewSource::Checkpoint("saved-cut".into()),
+                tick: 7,
+            }),
+            ..default()
+        };
+        let mut model = consumer(Some(Arc::new(|request| {
+            assert!(matches!(
+                request,
+                LabWorkflowRequest::ExperimentCapabilities
+            ));
+            Err("current capabilities cannot be refreshed".into())
+        })));
+        model.synchronize(session, LabPanel::Experiments);
+        model.composing_experiment = true;
+        let families = (0..LAB_MAX_EXPERIMENT_FAMILIES)
+            .map(|index| format!("family-{index}"))
+            .collect::<Vec<_>>();
+        let mut capabilities = experiment_capabilities();
+        capabilities.families = families.clone();
+        capabilities.max_seed_count = 128;
+        capabilities.max_total_ticks = 2_560_000;
+        for parameter in &mut capabilities.treatment_parameters {
+            parameter.baseline_value = 0.5;
+        }
+        model.experiment_capabilities = Some(capabilities);
+        model.experiment_draft = LabExperimentDraft {
+            baseline_family: families[0].clone(),
+            challenger_family: families[1].clone(),
+            ..LabExperimentDraft::default()
+        };
+        let frozen = LabExperimentDraft {
+            baseline_family: families[2].clone(),
+            challenger_family: families[2].clone(),
+            first_seed: u64::MAX - 127,
+            seed_count: 128,
+            ticks_per_run: 10_000,
+            treatment: Some(LabExperimentTreatment {
+                parameter: LabExperimentParameter::FoodGrowth,
+                baseline_value: 0.25,
+                scale_percent: 100,
+                at_tick: 100,
+            }),
+        };
+        model.latest_experiment_creation = Some(LabExperimentCreation {
+            request_id: "retained-treatment".into(),
+            session_id: HostSessionId::new(70),
+            draft: frozen.clone(),
+            state: LabExperimentCreationState::Pending,
+        });
+        model.dispatch(LabAction::Refresh);
+        assert!(model.is_busy());
+        model.set_notice(
+            "Refreshing current capabilities while the previous-source question remains frozen.",
+        );
+        let rows = panel_rows(&model, &presentation);
+        assert!(rows.len() <= MAX_PANEL_ROWS);
+        assert!(
+            rows.iter()
+                .any(|row| row.text.starts_with("DISPLAYING SAVED CHECKPOINT"))
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.action == Some(PanelAction::Workflow(LabAction::CancelRequest)))
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.text.starts_with("Plan needs attention:"))
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.text.contains(&u64::MAX.to_string()))
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| matches!(
+                    &row.action,
+                    Some(PanelAction::Workflow(LabAction::DraftBaseline(_)))
+                ))
+                .count(),
+            LAB_MAX_EXPERIMENT_FAMILIES
+        );
+        for line in frozen.question_lines() {
+            assert!(rows.iter().any(|row| row.text == line));
+        }
+        assert!(rows.iter().any(|row| row.action
+            == Some(PanelAction::Workflow(LabAction::CreateExperiment))
+            && !row.enabled));
+        assert!(
+            rows.iter()
+                .filter(|row| matches!(
+                    &row.action,
+                    Some(PanelAction::Workflow(
+                        LabAction::ExperimentDesign(_)
+                            | LabAction::TreatmentParameter(_)
+                            | LabAction::TreatmentPercent(_)
+                            | LabAction::TreatmentTick(_)
+                            | LabAction::DraftBaseline(_)
+                    ))
+                ))
+                .all(|row| !row.enabled)
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while model.is_busy() {
+            let _ = model.poll();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let rows = panel_rows(&model, &presentation);
+        for line in frozen.question_lines() {
+            assert!(rows.iter().any(|row| row.text == line));
+        }
+        assert!(rows.iter().any(|row| row.action
+            == Some(PanelAction::Workflow(LabAction::AbandonExperimentRequest))
+            && row.enabled));
     }
 
     #[test]
@@ -2838,6 +3465,7 @@ mod tests {
             .collect::<Vec<_>>();
         model.experiment_capabilities = Some(LabExperimentCapabilities {
             families: families.clone(),
+            treatment_parameters: experiment_capabilities().treatment_parameters,
             max_seed_count: 128,
             max_ticks_per_run: 10_000,
             max_total_ticks: 2_560_000,
@@ -2850,6 +3478,7 @@ mod tests {
             first_seed: u64::MAX - 127,
             seed_count: 128,
             ticks_per_run: 10_000,
+            treatment: None,
         };
         let rows = panel_rows(&model, &presentation);
         assert!(rows.len() <= MAX_PANEL_ROWS);
@@ -2898,6 +3527,7 @@ mod tests {
                 first_seed: 137,
                 seed_count: 2,
                 ticks_per_run: 11,
+                treatment: None,
             },
             state: LabExperimentCreationState::Pending,
         });

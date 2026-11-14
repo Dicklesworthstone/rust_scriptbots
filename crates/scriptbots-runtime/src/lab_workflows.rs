@@ -24,6 +24,8 @@ pub const VARIANTS_PER_PAGE: usize = 8;
 pub const LAB_MAX_EXPERIMENT_FAMILIES: usize = 8;
 /// Hard bound on the seed vector before any capability-driven allocation.
 pub const LAB_MAX_EXPERIMENT_SEEDS: usize = 128;
+/// Largest disclosed multiplier of a fresh-run ecological coefficient.
+pub const LAB_MAX_TREATMENT_PERCENT: u16 = 400;
 /// Maximum verified JSON bytes decoded for a native saved-study preview.
 pub const LAB_MAX_BRANCH_REPORT_BYTES: usize = 1024 * 1024;
 // Run IDs append "-challenger-seed" and up to twenty decimal seed digits to
@@ -132,11 +134,123 @@ impl LabMetric {
     }
 }
 
+/// One live numeric coefficient supported by native ecological comparisons.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LabExperimentParameter {
+    /// Logistic food regrowth coefficient.
+    FoodGrowth,
+    /// Basal energy-drain coefficient.
+    Metabolism,
+    /// Additional drain proportional to wheel effort.
+    MovementCost,
+}
+
+impl LabExperimentParameter {
+    /// Bounded vocabulary of editable ecological coefficients.
+    pub const ALL: [Self; 3] = [Self::FoodGrowth, Self::Metabolism, Self::MovementCost];
+
+    /// Canonical core configuration key used by the actual runner patch.
+    #[must_use]
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::FoodGrowth => "food_growth_rate",
+            Self::Metabolism => "metabolism_drain",
+            Self::MovementCost => "movement_drain",
+        }
+    }
+
+    /// Native control label for this coefficient.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::FoodGrowth => "Food regrowth",
+            Self::Metabolism => "Basal metabolism",
+            Self::MovementCost => "Movement cost",
+        }
+    }
+
+    /// Coefficient vocabulary without implying an observed resource flow.
+    #[must_use]
+    pub const fn unit(self) -> &'static str {
+        match self {
+            Self::FoodGrowth => "food growth coefficient",
+            Self::Metabolism => "energy drain coefficient",
+            Self::MovementCost => "movement drain coefficient",
+        }
+    }
+}
+
+/// One coefficient's actual fresh-run value and supported core bounds.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LabExperimentParameterCapability {
+    /// Canonical coefficient offered by the compiled application.
+    pub parameter: LabExperimentParameter,
+    /// Exact f32 default promoted to f64, never inherited from the live owner.
+    pub baseline_value: f64,
+    /// Inclusive lower bound from the application's core knob schema.
+    pub min_value: f64,
+    /// Inclusive upper bound from the application's core knob schema.
+    pub max_value: f64,
+}
+
+/// One frozen challenger-only assignment at a completed-tick boundary.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LabExperimentTreatment {
+    /// The single coefficient changed by this design.
+    pub parameter: LabExperimentParameter,
+    /// Exact observed fresh-run baseline, retained unchanged across retries.
+    pub baseline_value: f64,
+    /// Percentage of the baseline, including an explicit 100% null control.
+    pub scale_percent: u16,
+    /// Completed-tick boundary; transition `at_tick + 1` first uses the assignment.
+    pub at_tick: u64,
+}
+
+impl LabExperimentTreatment {
+    /// Compute the exact f32 value the core will receive, promoted back to f64.
+    ///
+    /// # Errors
+    /// Rejects negative or non-finite baselines, excessive percentages, and
+    /// values that overflow f32. Draft validation separately checks offered bounds.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "the treatment explicitly rounds once to the core coefficient's f32 representation"
+    )]
+    pub fn value(&self) -> Result<f64, String> {
+        if !self.baseline_value.is_finite()
+            || self.baseline_value.is_sign_negative()
+            || self.baseline_value > f64::from(f32::MAX)
+            || self.scale_percent > LAB_MAX_TREATMENT_PERCENT
+        {
+            return Err(format!(
+                "Treatment requires a finite nonnegative f32 baseline and 0..={LAB_MAX_TREATMENT_PERCENT}% scale."
+            ));
+        }
+        let value = f64::from((self.baseline_value * f64::from(self.scale_percent) / 100.0) as f32);
+        if !value.is_finite() {
+            return Err("Treatment value exceeds the core's finite f32 range.".into());
+        }
+        Ok(value)
+    }
+}
+
+/// The single experimental factor selected by the native composer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LabExperimentDesign {
+    /// Two different brain families under the same fresh-run configuration.
+    #[default]
+    BrainFamilies,
+    /// One shared brain family and one scheduled ecological coefficient.
+    EcologicalTreatment,
+}
+
 /// Executable choices and admission limits supplied by the application runner.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LabExperimentCapabilities {
     /// Canonical installed families that support experiment execution and continuation.
     pub families: Vec<String>,
+    /// Bounded unique ecological choices with actual fresh-run values and core limits.
+    pub treatment_parameters: Vec<LabExperimentParameterCapability>,
     /// Maximum independent matched seed pairs admitted by the runner.
     pub max_seed_count: usize,
     /// Maximum scientific transitions in each arm's run.
@@ -153,7 +267,8 @@ impl LabExperimentCapabilities {
     /// # Errors
     ///
     /// Rejects excessive or duplicate family choices, invalid limits, or an
-    /// empty, overlong or control-character-containing launch description.
+    /// empty, overlong or control-character-containing launch description. Ecological
+    /// choices must be unique, finite, ordered within their limits and exactly f32-valued.
     pub fn validate(&self) -> Result<(), String> {
         if self.families.len() > LAB_MAX_EXPERIMENT_FAMILIES
             || self.families.iter().any(|family| {
@@ -174,6 +289,40 @@ impl LabExperimentCapabilities {
                 "Experiment family capabilities are invalid or exceed their bounds.".into(),
             );
         }
+        if self.treatment_parameters.len() > LabExperimentParameter::ALL.len()
+            || self
+                .treatment_parameters
+                .iter()
+                .enumerate()
+                .any(|(index, offered)| {
+                    let canonical_baseline = LabExperimentTreatment {
+                        parameter: offered.parameter,
+                        baseline_value: offered.baseline_value,
+                        scale_percent: 100,
+                        at_tick: 0,
+                    }
+                    .value();
+                    [offered.min_value, offered.max_value, offered.baseline_value]
+                        .iter()
+                        .any(|value| {
+                            !value.is_finite()
+                                || value.is_sign_negative()
+                                || *value > f64::from(f32::MAX)
+                        })
+                        || offered.min_value > offered.max_value
+                        || offered.baseline_value < offered.min_value
+                        || offered.baseline_value > offered.max_value
+                        || !canonical_baseline
+                            .is_ok_and(|value| value.to_bits() == offered.baseline_value.to_bits())
+                        || self.treatment_parameters[..index]
+                            .iter()
+                            .any(|other| other.parameter == offered.parameter)
+                })
+        {
+            return Err(
+                "Ecological capabilities are invalid, duplicated or exceed their bounds.".into(),
+            );
+        }
         if self.max_seed_count == 0
             || self.max_seed_count > LAB_MAX_EXPERIMENT_SEEDS
             || self.max_ticks_per_run == 0
@@ -191,16 +340,18 @@ impl LabExperimentCapabilities {
     }
 }
 
-/// One explicit two-arm family comparison in independent fresh runner worlds.
+/// One explicit two-arm comparison in independent fresh runner worlds.
 ///
 /// The two arms use the same checked consecutive seed cohort and horizon.
 /// Scientific execution is sequential; this draft never inherits the live owner.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LabExperimentDraft {
     /// Reference family's canonical installed identity.
     pub baseline_family: String,
-    /// Distinct comparison family's canonical installed identity.
+    /// Comparison family, equal to the baseline only for ecological treatment designs.
     pub challenger_family: String,
+    /// Optional single-factor assignment; absent for a brain-family comparison.
+    pub treatment: Option<LabExperimentTreatment>,
     /// First disclosed seed; later seeds increment by one without wrapping.
     pub first_seed: u64,
     /// Independent matched seed pairs, not the total number of runs.
@@ -214,6 +365,7 @@ impl Default for LabExperimentDraft {
         Self {
             baseline_family: String::new(),
             challenger_family: String::new(),
+            treatment: None,
             first_seed: 42,
             seed_count: 3,
             ticks_per_run: 100,
@@ -222,6 +374,62 @@ impl Default for LabExperimentDraft {
 }
 
 impl LabExperimentDraft {
+    /// Design inferred from the actual frozen scientific inputs.
+    #[must_use]
+    pub const fn design(&self) -> LabExperimentDesign {
+        if self.treatment.is_some() {
+            LabExperimentDesign::EcologicalTreatment
+        } else {
+            LabExperimentDesign::BrainFamilies
+        }
+    }
+
+    /// At most five shared rows describing the exact requested scientific contrast.
+    #[must_use]
+    pub fn question_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if let Some(treatment) = self.treatment {
+            lines.push(format!(
+                "{} at completed tick {}; the following transition first uses the assignment.",
+                treatment.parameter.label(),
+                treatment.at_tick,
+            ));
+            match treatment.value() {
+                Ok(value) => {
+                    lines.push(format!(
+                        "Baseline {} → challenger {} {} ({}% of baseline).",
+                        treatment.baseline_value,
+                        value,
+                        treatment.parameter.unit(),
+                        treatment.scale_percent,
+                    ));
+                    if value.to_bits() == treatment.baseline_value.to_bits() {
+                        lines.push("Unchanged-value control: the challenger assignment equals the baseline value.".into());
+                    }
+                }
+                Err(error) => lines.push(error),
+            }
+            lines.push(if self.baseline_family == self.challenger_family {
+                format!(
+                    "Both arms use {}; only one ecological coefficient is assigned.",
+                    self.baseline_family,
+                )
+            } else {
+                "Invalid ecological draft: both arms must use one shared brain family.".into()
+            });
+        } else {
+            lines.push(format!(
+                "Brain-family comparison: baseline {} → challenger {}.",
+                self.baseline_family, self.challenger_family,
+            ));
+            lines.push("Both arms use the same fresh-run configuration.".into());
+        }
+        lines.push(
+            "One independent matched pair per seed; current-world state is not inherited.".into(),
+        );
+        lines
+    }
+
     /// Materialize the exact bounded cohort without wrapping its last seed.
     ///
     /// # Errors
@@ -245,15 +453,53 @@ impl LabExperimentDraft {
     ///
     /// # Errors
     ///
-    /// Rejects unavailable or identical families, unsupported seed/horizon
-    /// choices, seed overflow, or excessive/overflowing total scientific work.
+    /// Rejects unavailable or confounded family choices, unoffered/changed baseline
+    /// coefficients, invalid treatment values or boundaries, seed overflow, unsupported
+    /// seed/horizon choices, or excessive/overflowing total scientific work.
     pub fn validate(&self, capabilities: &LabExperimentCapabilities) -> Result<(), String> {
         capabilities.validate()?;
-        if self.baseline_family == self.challenger_family
-            || !capabilities.families.contains(&self.baseline_family)
+        if !capabilities.families.contains(&self.baseline_family)
             || !capabilities.families.contains(&self.challenger_family)
         {
-            return Err("Choose two distinct executable brain families.".into());
+            return Err("Choose executable brain families offered by the current runner.".into());
+        }
+        if let Some(treatment) = self.treatment {
+            if self.baseline_family != self.challenger_family {
+                return Err(
+                    "Ecological treatment comparisons require the same brain family in both arms."
+                        .into(),
+                );
+            }
+            let offered = capabilities
+                .treatment_parameters
+                .iter()
+                .find(|offered| offered.parameter == treatment.parameter)
+                .ok_or_else(|| {
+                    "This ecological coefficient was not offered by the current runner.".to_owned()
+                })?;
+            if treatment.baseline_value.to_bits() != offered.baseline_value.to_bits() {
+                return Err("The frozen treatment baseline differs from the current runner's fresh-run value.".into());
+            }
+            let value = treatment.value()?;
+            if value < offered.min_value || value > offered.max_value {
+                return Err(format!(
+                    "{} must remain within {}..={} {}.",
+                    treatment.parameter.label(),
+                    offered.min_value,
+                    offered.max_value,
+                    treatment.parameter.unit(),
+                ));
+            }
+            if treatment.at_tick >= self.ticks_per_run {
+                return Err(
+                    "Treatment must apply at a completed-tick boundary before the run horizon."
+                        .into(),
+                );
+            }
+        } else if self.baseline_family == self.challenger_family {
+            return Err(
+                "Brain-family comparisons require two distinct executable families.".into(),
+            );
         }
         if self.seed_count == 0 || self.seed_count > capabilities.max_seed_count {
             return Err(format!(
@@ -283,7 +529,7 @@ impl LabExperimentDraft {
 }
 
 /// Exact request retained until creation is observed or explicitly abandoned.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LabExperimentCreation {
     /// Explicit experiment identity and idempotency key.
     pub request_id: String,
@@ -343,7 +589,7 @@ struct SelectedEvent {
 }
 
 /// A request to application data services, never a direct world operation.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum LabWorkflowRequest {
     /// Read compiled experiment families and actual fresh-world admission limits.
     ExperimentCapabilities,
@@ -987,6 +1233,14 @@ pub enum LabAction {
     NewExperiment,
     /// Leave the composer without cancelling any submitted creation.
     BackToExperiments,
+    /// Choose a brain-family contrast or a single ecological treatment.
+    ExperimentDesign(LabExperimentDesign),
+    /// Choose an offered ecological coefficient and freeze its actual baseline.
+    TreatmentParameter(LabExperimentParameter),
+    /// Set the disclosed baseline multiplier without silently clamping it.
+    TreatmentPercent(u16),
+    /// Set the exact completed-tick boundary for the challenger assignment.
+    TreatmentTick(u64),
     /// Select an offered reference family in the editable draft.
     DraftBaseline(String),
     /// Select an offered comparison family in the editable draft.
@@ -2791,6 +3045,85 @@ impl LabWorkflows {
         self.set_notice(message);
     }
 
+    fn set_experiment_design(&mut self, design: LabExperimentDesign) {
+        if !self.allow_draft_edit() || self.experiment_draft.design() == design {
+            return;
+        }
+        let Some(capabilities) = &self.experiment_capabilities else {
+            return;
+        };
+        if !capabilities
+            .families
+            .contains(&self.experiment_draft.baseline_family)
+        {
+            self.set_notice(
+                "Choose an offered baseline family before changing the experimental design.",
+            );
+            return;
+        }
+        match design {
+            LabExperimentDesign::BrainFamilies => {
+                let Some(challenger) = capabilities
+                    .families
+                    .iter()
+                    .find(|family| *family != &self.experiment_draft.baseline_family)
+                    .cloned()
+                else {
+                    self.set_notice(
+                        "The current runner does not offer two distinct executable families.",
+                    );
+                    return;
+                };
+                self.experiment_draft.treatment = None;
+                self.experiment_draft.challenger_family = challenger;
+            }
+            LabExperimentDesign::EcologicalTreatment => {
+                let Some(offered) = capabilities.treatment_parameters.first().copied() else {
+                    self.set_notice("The current runner does not offer ecological treatments.");
+                    return;
+                };
+                self.experiment_draft.treatment = Some(LabExperimentTreatment {
+                    parameter: offered.parameter,
+                    baseline_value: offered.baseline_value,
+                    scale_percent: 0,
+                    at_tick: 0,
+                });
+                self.experiment_draft.challenger_family =
+                    self.experiment_draft.baseline_family.clone();
+            }
+        }
+        self.report_draft_validation();
+    }
+
+    fn set_treatment_parameter(&mut self, parameter: LabExperimentParameter) {
+        if !self.allow_draft_edit() {
+            return;
+        }
+        let Some(offered) = self
+            .experiment_capabilities
+            .as_ref()
+            .and_then(|capabilities| {
+                capabilities
+                    .treatment_parameters
+                    .iter()
+                    .find(|offered| offered.parameter == parameter)
+            })
+            .copied()
+        else {
+            self.set_notice("This ecological coefficient was not offered by the current runner.");
+            return;
+        };
+        let Some(treatment) = &mut self.experiment_draft.treatment else {
+            self.set_notice(
+                "Choose the ecological treatment design before editing its coefficient.",
+            );
+            return;
+        };
+        treatment.parameter = parameter;
+        treatment.baseline_value = offered.baseline_value;
+        self.report_draft_validation();
+    }
+
     fn allow_branch_draft_edit(&mut self) -> bool {
         if self.can_edit_branch_draft() {
             true
@@ -2919,8 +3252,32 @@ impl LabWorkflows {
                     self.start(LabWorkflowRequest::ExperimentCapabilities);
                 }
             }
+            LabAction::ExperimentDesign(design) => self.set_experiment_design(design),
+            LabAction::TreatmentParameter(parameter) => self.set_treatment_parameter(parameter),
+            LabAction::TreatmentPercent(percent) => {
+                if self.allow_draft_edit()
+                    && let Some(treatment) = &mut self.experiment_draft.treatment
+                {
+                    treatment.scale_percent = percent;
+                    self.report_draft_validation();
+                }
+            }
+            LabAction::TreatmentTick(tick) => {
+                if self.allow_draft_edit()
+                    && let Some(treatment) = &mut self.experiment_draft.treatment
+                {
+                    treatment.at_tick = tick;
+                    self.report_draft_validation();
+                }
+            }
             LabAction::DraftBaseline(ref family) | LabAction::DraftChallenger(ref family) => {
                 if !self.allow_draft_edit() {
+                    return;
+                }
+                if self.experiment_draft.treatment.is_some()
+                    && matches!(&action, LabAction::DraftChallenger(_))
+                {
+                    self.set_notice("Ecological treatment arms share the baseline brain family; changing a second factor is refused.");
                     return;
                 }
                 if !self
@@ -2933,6 +3290,9 @@ impl LabWorkflows {
                 }
                 if matches!(&action, LabAction::DraftBaseline(_)) {
                     self.experiment_draft.baseline_family = family.clone();
+                    if self.experiment_draft.treatment.is_some() {
+                        self.experiment_draft.challenger_family = family.clone();
+                    }
                 } else {
                     self.experiment_draft.challenger_family = family.clone();
                 }
@@ -4194,6 +4554,19 @@ mod tests {
     fn composer_test_capabilities() -> LabExperimentCapabilities {
         LabExperimentCapabilities {
             families: vec!["mlp.baseline".into(), "dwraon.baseline".into()],
+            treatment_parameters: [
+                (LabExperimentParameter::FoodGrowth, 0.05_f32),
+                (LabExperimentParameter::Metabolism, 0.0002_f32),
+                (LabExperimentParameter::MovementCost, 0.005_f32),
+            ]
+            .into_iter()
+            .map(|(parameter, baseline)| LabExperimentParameterCapability {
+                parameter,
+                baseline_value: f64::from(baseline),
+                min_value: 0.0,
+                max_value: 1.0,
+            })
+            .collect(),
             max_seed_count: LAB_MAX_EXPERIMENT_SEEDS,
             max_ticks_per_run: 1000,
             max_total_ticks: 100_000,
@@ -4307,6 +4680,254 @@ mod tests {
     }
 
     #[test]
+    fn ecological_capabilities_refuse_unbounded_or_inexact_scientific_values() {
+        let keys: std::collections::BTreeSet<_> = LabExperimentParameter::ALL
+            .into_iter()
+            .map(LabExperimentParameter::key)
+            .collect();
+        assert_eq!(keys.len(), 3);
+        assert!(keys.contains("food_growth_rate"));
+        assert!(keys.contains("metabolism_drain"));
+        assert!(keys.contains("movement_drain"));
+        for case in 0..14 {
+            let mut capabilities = composer_test_capabilities();
+            match case {
+                0 => capabilities.treatment_parameters[1] = capabilities.treatment_parameters[0],
+                1 => capabilities
+                    .treatment_parameters
+                    .push(capabilities.treatment_parameters[0]),
+                2 => capabilities.treatment_parameters[0].baseline_value = f64::NAN,
+                3 => capabilities.treatment_parameters[0].baseline_value = f64::INFINITY,
+                4 => capabilities.treatment_parameters[0].min_value = f64::NAN,
+                5 => capabilities.treatment_parameters[0].max_value = f64::INFINITY,
+                6 => capabilities.treatment_parameters[0].min_value = -1.0,
+                7 => capabilities.treatment_parameters[0].min_value = 2.0,
+                8 => capabilities.treatment_parameters[0].min_value = 0.1,
+                9 => capabilities.treatment_parameters[0].max_value = 0.01,
+                10 => capabilities.treatment_parameters[0].baseline_value = 0.05_f64,
+                11 => capabilities.treatment_parameters[0].baseline_value = f64::MAX,
+                12 => capabilities.treatment_parameters[0].max_value = f64::from(f32::MAX) * 2.0,
+                13 => capabilities.treatment_parameters[0].baseline_value = -0.0,
+                _ => unreachable!(),
+            }
+            assert!(
+                capabilities.validate().is_err(),
+                "capability mutation {case}"
+            );
+        }
+        let mut unsupported = composer_test_capabilities();
+        unsupported.treatment_parameters.clear();
+        unsupported.validate().unwrap();
+    }
+
+    #[test]
+    fn ecological_treatment_uses_canonical_values_and_refuses_confounded_or_unobserved_changes() {
+        let capabilities = composer_test_capabilities();
+        let mut treatment = LabExperimentTreatment {
+            parameter: LabExperimentParameter::FoodGrowth,
+            baseline_value: capabilities.treatment_parameters[0].baseline_value,
+            scale_percent: 150,
+            at_tick: 99,
+        };
+        assert_eq!(
+            treatment.value().unwrap().to_bits(),
+            f64::from(0.075_f32).to_bits()
+        );
+        let mut draft = LabExperimentDraft {
+            baseline_family: "mlp.baseline".into(),
+            challenger_family: "mlp.baseline".into(),
+            treatment: Some(treatment),
+            ..LabExperimentDraft::default()
+        };
+        draft.validate(&capabilities).unwrap();
+        assert_eq!(draft.design(), LabExperimentDesign::EcologicalTreatment);
+        assert!(draft.question_lines().len() <= 5);
+        assert!(
+            draft
+                .question_lines()
+                .join(" ")
+                .contains("completed tick 99")
+        );
+
+        for boundary in [100, u64::MAX] {
+            draft.treatment.as_mut().unwrap().at_tick = boundary;
+            assert!(
+                draft.validate(&capabilities).is_err(),
+                "boundary {boundary}"
+            );
+        }
+        draft.treatment = Some(treatment);
+        draft.challenger_family = "dwraon.baseline".into();
+        assert!(
+            draft.validate(&capabilities).is_err(),
+            "do not change two scientific factors"
+        );
+        draft.challenger_family = draft.baseline_family.clone();
+        draft.treatment = None;
+        assert!(
+            draft.validate(&capabilities).is_err(),
+            "identical families need an explicit treatment design"
+        );
+
+        treatment.scale_percent = 100;
+        draft.treatment = Some(treatment);
+        draft.validate(&capabilities).unwrap();
+        assert_eq!(
+            treatment.value().unwrap().to_bits(),
+            treatment.baseline_value.to_bits()
+        );
+        assert!(
+            draft
+                .question_lines()
+                .join(" ")
+                .contains("Unchanged-value control")
+        );
+        treatment.scale_percent = LAB_MAX_TREATMENT_PERCENT + 1;
+        assert!(treatment.value().is_err());
+        draft.treatment = Some(treatment);
+        assert!(draft.validate(&capabilities).is_err());
+
+        treatment.scale_percent = LAB_MAX_TREATMENT_PERCENT;
+        draft.treatment = Some(treatment);
+        draft.validate(&capabilities).unwrap();
+        let mut bounded = capabilities.clone();
+        bounded.treatment_parameters[0].max_value = 0.1;
+        assert!(
+            draft.validate(&bounded).is_err(),
+            "application limit still binds below400%"
+        );
+        treatment.scale_percent = 0;
+        draft.treatment = Some(treatment);
+        bounded.treatment_parameters[0].min_value = 0.01;
+        assert!(
+            draft.validate(&bounded).is_err(),
+            "zero scale cannot bypass a positive minimum"
+        );
+
+        treatment.scale_percent = 100;
+        treatment.baseline_value = f64::from_bits(treatment.baseline_value.to_bits() + 1);
+        draft.treatment = Some(treatment);
+        assert!(
+            draft.validate(&capabilities).is_err(),
+            "a changed baseline is refused even when its f32 rounding matches"
+        );
+        for baseline in [f64::NAN, f64::INFINITY, -1.0, -0.0, f64::MAX] {
+            treatment.baseline_value = baseline;
+            assert!(treatment.value().is_err());
+        }
+        treatment.baseline_value = f64::from(f32::MAX);
+        treatment.scale_percent = LAB_MAX_TREATMENT_PERCENT;
+        assert!(
+            treatment.value().is_err(),
+            "finite f64 arithmetic may overflow f32"
+        );
+        treatment.baseline_value = 0.0;
+        assert_eq!(treatment.value().unwrap().to_bits(), 0.0_f64.to_bits());
+        draft.treatment = Some(treatment);
+        let mut zero_baseline = capabilities;
+        zero_baseline.treatment_parameters[0].baseline_value = 0.0;
+        draft.validate(&zero_baseline).unwrap();
+        assert!(
+            draft
+                .question_lines()
+                .join(" ")
+                .contains("Unchanged-value control")
+        );
+    }
+
+    #[test]
+    fn ecological_draft_actions_keep_one_factor_and_never_submit_implicitly() {
+        let mut state = open_test_composer(Arc::new(|request| {
+            assert_eq!(request, LabWorkflowRequest::ExperimentCapabilities);
+            Ok(LabWorkflowResponse::ExperimentCapabilities(
+                composer_test_capabilities(),
+            ))
+        }));
+        let original = state.experiment_draft.clone();
+        state.dispatch(LabAction::ExperimentDesign(
+            LabExperimentDesign::EcologicalTreatment,
+        ));
+        assert_eq!(
+            state.experiment_draft.baseline_family,
+            original.baseline_family
+        );
+        assert_eq!(
+            state.experiment_draft.challenger_family,
+            original.baseline_family
+        );
+        let treatment = state.experiment_draft.treatment.unwrap();
+        assert_eq!(treatment.parameter, LabExperimentParameter::FoodGrowth);
+        assert_eq!(treatment.scale_percent, 0);
+        assert_eq!(treatment.at_tick, 0);
+        state.dispatch(LabAction::TreatmentPercent(175));
+        state.dispatch(LabAction::TreatmentTick(10));
+        state.dispatch(LabAction::TreatmentParameter(
+            LabExperimentParameter::MovementCost,
+        ));
+        let treatment = state.experiment_draft.treatment.unwrap();
+        assert_eq!(treatment.parameter, LabExperimentParameter::MovementCost);
+        assert_eq!(
+            treatment.baseline_value.to_bits(),
+            f64::from(0.005_f32).to_bits()
+        );
+        assert_eq!(treatment.scale_percent, 175);
+        assert_eq!(treatment.at_tick, 10);
+        state.dispatch(LabAction::DraftBaseline("dwraon.baseline".into()));
+        let single_factor = state.experiment_draft.clone();
+        assert_eq!(single_factor.baseline_family, "dwraon.baseline");
+        assert_eq!(single_factor.challenger_family, "dwraon.baseline");
+        state.dispatch(LabAction::DraftChallenger("mlp.baseline".into()));
+        assert_eq!(state.experiment_draft, single_factor);
+        state.dispatch(LabAction::ExperimentDesign(
+            LabExperimentDesign::EcologicalTreatment,
+        ));
+        assert_eq!(
+            state.experiment_draft, single_factor,
+            "reselecting a mode does not reset its choices"
+        );
+        state.dispatch(LabAction::TreatmentPercent(u16::MAX));
+        assert!(!state.can_create_experiment());
+        assert_eq!(
+            state.experiment_draft.treatment.unwrap().scale_percent,
+            u16::MAX
+        );
+        state.dispatch(LabAction::TreatmentPercent(175));
+        state.dispatch(LabAction::TreatmentTick(100));
+        assert!(!state.can_create_experiment());
+        state.dispatch(LabAction::TreatmentTick(10));
+        assert!(state.can_create_experiment());
+
+        state.dispatch(LabAction::ExperimentDesign(
+            LabExperimentDesign::BrainFamilies,
+        ));
+        assert!(state.experiment_draft.treatment.is_none());
+        assert_ne!(
+            state.experiment_draft.baseline_family,
+            state.experiment_draft.challenger_family
+        );
+        assert_eq!(state.experiment_draft.baseline_family, "dwraon.baseline");
+        assert_eq!(state.experiment_draft.first_seed, original.first_seed);
+        assert_eq!(state.experiment_draft.seed_count, original.seed_count);
+        assert_eq!(state.experiment_draft.ticks_per_run, original.ticks_per_run);
+        let families = state.experiment_draft.clone();
+        state.dispatch(LabAction::TreatmentParameter(
+            LabExperimentParameter::Metabolism,
+        ));
+        state.dispatch(LabAction::TreatmentPercent(0));
+        state.dispatch(LabAction::TreatmentTick(0));
+        assert_eq!(state.experiment_draft, families);
+        let mut capabilities = composer_test_capabilities();
+        capabilities.treatment_parameters.clear();
+        assert!(state.accept_experiment_capabilities(capabilities));
+        state.dispatch(LabAction::ExperimentDesign(
+            LabExperimentDesign::EcologicalTreatment,
+        ));
+        assert_eq!(state.experiment_draft, families);
+        assert!(state.latest_experiment_creation.is_none());
+        assert!(!state.is_busy());
+    }
+
+    #[test]
     fn composer_refuses_unbounded_capabilities_and_never_clamps_its_disclosed_defaults() {
         let mut state = LabWorkflows::default();
         state.synchronize(HostSessionId::new(1), LabPanel::Experiments);
@@ -4403,6 +5024,13 @@ mod tests {
             }
         }));
         assert!(requests.lock().unwrap().is_empty(), "opening is read-only");
+        state.dispatch(LabAction::ExperimentDesign(
+            LabExperimentDesign::EcologicalTreatment,
+        ));
+        state.dispatch(LabAction::TreatmentParameter(
+            LabExperimentParameter::Metabolism,
+        ));
+        state.dispatch(LabAction::TreatmentPercent(250));
         state.dispatch(LabAction::FirstSeed(u64::MAX - 1));
         state.dispatch(LabAction::SeedCount(2));
         state.dispatch(LabAction::TicksPerRun(1));
@@ -4418,10 +5046,22 @@ mod tests {
             LabAction::TicksPerRun(500),
             LabAction::DraftBaseline("dwraon.baseline".into()),
             LabAction::DraftChallenger("mlp.baseline".into()),
+            LabAction::ExperimentDesign(LabExperimentDesign::BrainFamilies),
+            LabAction::TreatmentParameter(LabExperimentParameter::FoodGrowth),
+            LabAction::TreatmentPercent(0),
+            LabAction::TreatmentTick(1),
         ] {
             state.dispatch(edit);
             assert_eq!(state.experiment_draft, frozen.draft);
         }
+        let mut changed_capabilities = composer_test_capabilities();
+        changed_capabilities.treatment_parameters[1].baseline_value = f64::from(0.0003_f32);
+        assert!(state.accept_experiment_capabilities(changed_capabilities));
+        assert_eq!(state.experiment_draft, frozen.draft);
+        assert!(
+            !state.can_create_experiment(),
+            "a changed runner baseline must not rewrite an exact retry"
+        );
         state.dispatch(LabAction::NewExperiment);
         drain_worker(&mut state);
         assert_eq!(state.experiment_draft, frozen.draft);
@@ -4459,6 +5099,14 @@ mod tests {
                     Ok(composer_test_response(&request))
                 }
             }));
+            state.dispatch(LabAction::ExperimentDesign(
+                LabExperimentDesign::EcologicalTreatment,
+            ));
+            state.dispatch(LabAction::TreatmentParameter(
+                LabExperimentParameter::MovementCost,
+            ));
+            state.dispatch(LabAction::TreatmentPercent(350));
+            state.dispatch(LabAction::TreatmentTick(17));
             state.dispatch(LabAction::FirstSeed(137));
             state.dispatch(LabAction::SeedCount(8));
             state.dispatch(LabAction::CreateExperiment);
@@ -4480,7 +5128,17 @@ mod tests {
             assert!(!state.will_retry_experiment_creation());
             assert!(!state.can_edit_experiment_draft());
             assert!(!state.can_create_experiment());
-            state.dispatch(LabAction::FirstSeed(11));
+            for edit in [
+                LabAction::FirstSeed(11),
+                LabAction::ExperimentDesign(LabExperimentDesign::BrainFamilies),
+                LabAction::TreatmentParameter(LabExperimentParameter::FoodGrowth),
+                LabAction::TreatmentPercent(100),
+                LabAction::TreatmentTick(0),
+                LabAction::DraftBaseline("dwraon.baseline".into()),
+            ] {
+                state.dispatch(edit);
+                assert_eq!(state.experiment_draft, frozen.draft);
+            }
             state.dispatch(LabAction::CreateExperiment);
             assert_eq!(requests.lock().unwrap().len(), 1);
             assert_eq!(state.experiment_draft, frozen.draft);
@@ -4542,9 +5200,23 @@ mod tests {
                     .unwrap();
                 Ok(composer_test_response(&request))
             }));
+            state.dispatch(LabAction::ExperimentDesign(
+                LabExperimentDesign::EcologicalTreatment,
+            ));
+            state.dispatch(LabAction::TreatmentPercent(175));
+            state.dispatch(LabAction::TreatmentTick(10));
             state.dispatch(LabAction::CreateExperiment);
             let original = observed_start.recv_timeout(Duration::from_secs(5)).unwrap();
             let frozen = state.latest_experiment_creation.clone().unwrap();
+            for edit in [
+                LabAction::ExperimentDesign(LabExperimentDesign::BrainFamilies),
+                LabAction::TreatmentParameter(LabExperimentParameter::Metabolism),
+                LabAction::TreatmentPercent(100),
+                LabAction::TreatmentTick(0),
+            ] {
+                state.dispatch(edit);
+                assert_eq!(state.experiment_draft, frozen.draft);
+            }
             match change {
                 0 => state.dispatch(LabAction::CancelRequest),
                 1 => state.dispatch(LabAction::BackToExperiments),

@@ -5,16 +5,18 @@
 
 use super::*;
 use scriptbots_runtime::lab_workflows::{
-    LAB_PAGE_SIZE, LabAction, LabBranchCreationState, LabBranchTreatment, LabCheckpointSaveState,
-    LabCheckpointView, LabExperimentCreationState, LabMetric, LabPanel, VARIANTS_PER_PAGE,
-    branch_report_lines, comparison_lines,
+    LAB_MAX_TREATMENT_PERCENT, LAB_PAGE_SIZE, LabAction, LabBranchCreationState,
+    LabBranchTreatment, LabCheckpointSaveState, LabCheckpointView, LabExperimentCapabilities,
+    LabExperimentCreationState, LabExperimentDesign, LabExperimentTreatment, LabMetric, LabPanel,
+    VARIANTS_PER_PAGE, branch_report_lines, comparison_lines,
 };
 #[cfg(test)]
 use scriptbots_runtime::lab_workflows::{
     LabBranchCapabilities, LabBranchDivergence, LabBranchDraft, LabBranchOutcome, LabBranchReport,
     LabCheckpoint, LabCheckpointBranch, LabCheckpointBranchPage, LabCheckpointPage, LabComparison,
-    LabExperiment, LabExperimentCapabilities, LabExperimentDraft, LabExperimentPage,
-    LabExperimentSummary, LabVariantProgress, LabWorkflowRequest, LabWorkflowResponse,
+    LabExperiment, LabExperimentDraft, LabExperimentPage, LabExperimentParameter,
+    LabExperimentParameterCapability, LabExperimentSummary, LabVariantProgress, LabWorkflowRequest,
+    LabWorkflowResponse,
 };
 
 impl SimulationView {
@@ -207,6 +209,152 @@ impl SimulationView {
         header
     }
 
+    fn render_lab_experiment_treatment(
+        &self,
+        treatment: &LabExperimentTreatment,
+        capabilities: &LabExperimentCapabilities,
+        horizon: u64,
+        editing: bool,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let mut parameters = div().flex().flex_wrap().gap_2();
+        for offered in &capabilities.treatment_parameters {
+            parameters = parameters.child(self.lab_button(
+                format!("lab-experiment-parameter-{}", offered.parameter.key()),
+                format!(
+                    "{}{}",
+                    if treatment.parameter == offered.parameter {
+                        "Selected: "
+                    } else {
+                        ""
+                    },
+                    offered.parameter.label(),
+                ),
+                LabAction::TreatmentParameter(offered.parameter),
+                editing,
+                cx,
+            ));
+        }
+        let mut scales = div().flex().flex_wrap().gap_2().child(
+            self.lab_button(
+                "lab-experiment-percent-prev".into(),
+                "10 percentage points less".into(),
+                LabAction::TreatmentPercent(
+                    treatment
+                        .scale_percent
+                        .checked_sub(10)
+                        .unwrap_or(treatment.scale_percent),
+                ),
+                editing && treatment.scale_percent >= 10,
+                cx,
+            ),
+        );
+        for percent in [0, 50, 100, 200, LAB_MAX_TREATMENT_PERCENT] {
+            scales = scales.child(self.lab_button(
+                format!("lab-experiment-percent-{percent}"),
+                format!(
+                    "{}{percent}% of baseline{}",
+                    if treatment.scale_percent == percent {
+                        "Selected: "
+                    } else {
+                        ""
+                    },
+                    if percent == 100 {
+                        " (unchanged-value control)"
+                    } else {
+                        ""
+                    },
+                ),
+                LabAction::TreatmentPercent(percent),
+                editing,
+                cx,
+            ));
+        }
+        scales = scales.child(
+            self.lab_button(
+                "lab-experiment-percent-next".into(),
+                "10 percentage points more".into(),
+                LabAction::TreatmentPercent(
+                    treatment
+                        .scale_percent
+                        .checked_add(10)
+                        .unwrap_or(treatment.scale_percent),
+                ),
+                editing
+                    && treatment
+                        .scale_percent
+                        .checked_add(10)
+                        .is_some_and(|percent| percent <= LAB_MAX_TREATMENT_PERCENT),
+                cx,
+            ),
+        );
+        let mut boundaries = div().flex().flex_wrap().gap_2().child(
+            self.lab_button(
+                "lab-experiment-treatment-tick-prev".into(),
+                "One boundary earlier".into(),
+                LabAction::TreatmentTick(
+                    treatment
+                        .at_tick
+                        .checked_sub(1)
+                        .unwrap_or(treatment.at_tick),
+                ),
+                editing && treatment.at_tick > 0,
+                cx,
+            ),
+        );
+        for tick in [0, 10, 100] {
+            if tick < horizon {
+                boundaries = boundaries.child(self.lab_button(
+                    format!("lab-experiment-treatment-tick-{tick}"),
+                    format!(
+                        "{}At completed tick {tick}",
+                        if treatment.at_tick == tick {
+                            "Selected: "
+                        } else {
+                            ""
+                        },
+                    ),
+                    LabAction::TreatmentTick(tick),
+                    editing,
+                    cx,
+                ));
+            }
+        }
+        boundaries = boundaries.child(
+            self.lab_button(
+                "lab-experiment-treatment-tick-next".into(),
+                "One boundary later".into(),
+                LabAction::TreatmentTick(
+                    treatment
+                        .at_tick
+                        .checked_add(1)
+                        .unwrap_or(treatment.at_tick),
+                ),
+                editing
+                    && treatment
+                        .at_tick
+                        .checked_add(1)
+                        .is_some_and(|tick| tick < horizon),
+                cx,
+            ),
+        );
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(parameters)
+            .child(div().text_sm().child(format!(
+                "Challenger value: {}% of the disclosed baseline (0–{LAB_MAX_TREATMENT_PERCENT}%).",
+                treatment.scale_percent,
+            )))
+            .child(scales)
+            .child(div().text_sm().child(format!(
+                "Apply after completed tick {} and before the next transition; boundary must be earlier than horizon {horizon}.",
+                treatment.at_tick,
+            )))
+            .child(boundaries)
+    }
+
     fn render_lab_experiment_creation(&self, cx: &mut Context<Self>) -> Div {
         let state = &self.lab_workflows;
         let editing = state.can_edit_experiment_draft();
@@ -292,6 +440,17 @@ impl SimulationView {
                     ));
             }
         }
+        let mut question = div()
+            .id("lab-experiment-question")
+            .debug_selector(|| "lab-experiment-question".to_owned())
+            .flex()
+            .flex_col()
+            .gap_1()
+            .text_xs();
+        for line in draft.question_lines() {
+            question = question.child(div().child(line));
+        }
+        section = section.child(question);
         let Some(capabilities) = &state.experiment_capabilities else {
             return section.child(
                 div()
@@ -311,10 +470,60 @@ impl SimulationView {
                 capabilities.max_ticks_per_run,
                 capabilities.max_total_ticks,
             )));
-        for (baseline, title) in [
-            (true, "Baseline brain family"),
-            (false, "Challenger brain family"),
-        ] {
+        let design = draft.design();
+        section = section.child(
+            div()
+                .flex()
+                .flex_wrap()
+                .gap_2()
+                .child(self.lab_button(
+                    "lab-experiment-design-brain-families".into(),
+                    format!(
+                        "{}Compare brain families{}",
+                        if design == LabExperimentDesign::BrainFamilies {
+                            "Selected: "
+                        } else {
+                            ""
+                        },
+                        if capabilities.families.len() < 2 {
+                            " (needs two families)"
+                        } else {
+                            ""
+                        }
+                    ),
+                    LabAction::ExperimentDesign(LabExperimentDesign::BrainFamilies),
+                    editing && capabilities.families.len() >= 2,
+                    cx,
+                ))
+                .child(self.lab_button(
+                    "lab-experiment-design-ecological-treatment".into(),
+                    format!(
+                        "{}Compare ecological treatment{}",
+                        if design == LabExperimentDesign::EcologicalTreatment {
+                            "Selected: "
+                        } else {
+                            ""
+                        },
+                        if capabilities.treatment_parameters.is_empty() {
+                            " (unavailable)"
+                        } else {
+                            ""
+                        }
+                    ),
+                    LabAction::ExperimentDesign(LabExperimentDesign::EcologicalTreatment),
+                    editing && !capabilities.treatment_parameters.is_empty(),
+                    cx,
+                )),
+        );
+        let families: &[(bool, &str)] = if design == LabExperimentDesign::EcologicalTreatment {
+            &[(true, "Shared brain family in both arms")]
+        } else {
+            &[
+                (true, "Baseline brain family"),
+                (false, "Challenger brain family"),
+            ]
+        };
+        for &(baseline, title) in families {
             let selected = if baseline {
                 &draft.baseline_family
             } else {
@@ -343,6 +552,15 @@ impl SimulationView {
                 ));
             }
             section = section.child(div().text_sm().child(title)).child(choices);
+        }
+        if let Some(treatment) = &draft.treatment {
+            section = section.child(self.render_lab_experiment_treatment(
+                treatment,
+                capabilities,
+                draft.ticks_per_run,
+                editing,
+                cx,
+            ));
         }
         let mut first_seed = div().flex().flex_wrap().gap_2();
         first_seed = first_seed.child(self.lab_button(
@@ -607,6 +825,24 @@ impl SimulationView {
                 );
             if let Some(error) = &batch.error_reason {
                 panel = panel.child(div().text_xs().child(error.clone()));
+            }
+            if let Some(creation) = state.latest_experiment_creation.as_ref().filter(|creation| {
+                creation.session_id == self.host.snapshot_hub().latest().session_id
+                    && matches!(&creation.state, LabExperimentCreationState::Created { experiment_id }
+                        if experiment_id == &summary.experiment_id)
+            }) {
+                let mut question = div()
+                    .id("lab-experiment-retained-question")
+                    .debug_selector(|| "lab-experiment-retained-question".to_owned())
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .text_xs()
+                    .child("Retained launch question:");
+                for line in creation.draft.question_lines() {
+                    question = question.child(div().child(line));
+                }
+                panel = panel.child(question);
             }
             for (index, variant) in batch
                 .variants
@@ -1301,6 +1537,25 @@ impl SimulationView {
 mod tests {
     use super::*;
 
+    fn experiment_capabilities() -> LabExperimentCapabilities {
+        LabExperimentCapabilities {
+            families: vec!["mlp".into(), "dwraon".into(), "assembly".into()],
+            treatment_parameters: LabExperimentParameter::ALL
+                .into_iter()
+                .map(|parameter| LabExperimentParameterCapability {
+                    parameter,
+                    baseline_value: 0.25,
+                    min_value: 0.0,
+                    max_value: 1.0,
+                })
+                .collect(),
+            max_seed_count: 8,
+            max_ticks_per_run: 1_000,
+            max_total_ticks: 16_000,
+            launch_description: "Fresh worlds with the fixture's declared founder recipe.".into(),
+        }
+    }
+
     fn completed_branch_fixture(draft: &LabBranchDraft) -> (LabCheckpointBranch, LabBranchReport) {
         let checkpoint = &draft.checkpoint;
         let target = checkpoint.tick.checked_add(draft.ticks).unwrap();
@@ -1680,6 +1935,284 @@ mod tests {
     }
 
     #[test]
+    fn gpui_ecological_composer_preserves_question_through_retry_and_comparison() {
+        let host = TestHost::new(
+            WorldState::new(ScriptBotsConfig {
+                rng_seed: Some(42),
+                world_width: 120,
+                world_height: 120,
+                food_cell_size: 20,
+                closed: true,
+                population_minimum: 0,
+                persistence_interval: 0,
+                ..ScriptBotsConfig::default()
+            })
+            .unwrap(),
+        );
+        let source = host.snapshot().session_id;
+        let before = host.port.scientific_digest_v1().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        let retained = Mutex::new(None::<(LabExperiment, LabExperimentDraft)>);
+        let mut session = GuiSession::new(
+            host.port.clone(),
+            AnalyticsSnapshotProvider::empty(),
+            Arc::new(|_| panic!("independent treatment cannot command the live owner")),
+        );
+        session.lab_submit = Some(Arc::new(move |request| {
+            Ok(match request {
+                LabWorkflowRequest::ListExperiments { .. } => {
+                    LabWorkflowResponse::Experiments(LabExperimentPage {
+                        items: vec![batch(2).summary],
+                        total: 1,
+                        offset: 0,
+                        next_cursor: None,
+                        reserved_run_slots: 0,
+                        max_run_slots: 1,
+                    })
+                }
+                LabWorkflowRequest::ExperimentCapabilities => {
+                    LabWorkflowResponse::ExperimentCapabilities(experiment_capabilities())
+                }
+                LabWorkflowRequest::CreateExperiment {
+                    request_id,
+                    session_id,
+                    draft,
+                } => {
+                    assert_eq!(session_id, source);
+                    draft.validate(&experiment_capabilities()).unwrap();
+                    let first = {
+                        let mut recorded = recorded.lock().unwrap();
+                        recorded.push((request_id.clone(), session_id, draft.clone()));
+                        recorded.len() == 1
+                    };
+                    let mut retained = retained.lock().unwrap();
+                    let (experiment, _) = retained.get_or_insert_with(|| {
+                        let mut experiment = created_batch(&request_id, &draft);
+                        experiment.summary.status = "completed".into();
+                        experiment.summary.completed_runs = experiment.summary.total_runs;
+                        experiment.generation = 1;
+                        for variant in &mut experiment.variants {
+                            variant.completed_runs = variant.total_runs;
+                        }
+                        (experiment, draft)
+                    });
+                    if first {
+                        return Err("ecological experiment admitted; response was lost".into());
+                    }
+                    LabWorkflowResponse::ExperimentCreated {
+                        request_id,
+                        session_id,
+                        experiment: experiment.clone(),
+                    }
+                }
+                LabWorkflowRequest::GetExperiment { experiment_id } => {
+                    LabWorkflowResponse::Experiment(if experiment_id == "actual-batch" {
+                        batch(2)
+                    } else {
+                        retained.lock().unwrap().as_ref().unwrap().0.clone()
+                    })
+                }
+                LabWorkflowRequest::Compare {
+                    experiment_id,
+                    baseline_variant,
+                    challenger_variant,
+                    metric,
+                } => {
+                    let retained = retained.lock().unwrap();
+                    let (experiment, draft) = retained.as_ref().unwrap();
+                    assert_eq!(experiment_id, experiment.summary.experiment_id);
+                    assert_eq!(baseline_variant, "baseline");
+                    assert_eq!(challenger_variant, "challenger");
+                    assert_eq!(metric, LabMetric::TotalFood);
+                    LabWorkflowResponse::Comparison(LabComparison {
+                        experiment_id,
+                        baseline_variant,
+                        challenger_variant,
+                        metric,
+                        endpoint_tick: draft.ticks_per_run,
+                        matched_seeds: draft.seeds().unwrap(),
+                        mean_difference: 0.5,
+                        ci_95: Some((0.5, 0.5)),
+                        standardized_effect: None,
+                        p_value: None,
+                        adjusted_p_value: None,
+                        descriptive_only: false,
+                        underpowered_reason: Some("Small fixture cohort.".into()),
+                        undefined_effect_reason: Some("Constant paired difference.".into()),
+                        plan_digest: experiment.plan_digest.clone(),
+                        status_generation: experiment.generation,
+                    })
+                }
+                other => panic!("unexpected ecological request: {other:?}"),
+            })
+        }));
+        let context = gpui::TestAppContext::single();
+        let windows = context
+            .update(|app| Arc::new(session).install(app))
+            .unwrap();
+        let hud = context.update(|app| windows.hud.root(app)).unwrap();
+        let mut lab = gpui::VisualTestContext::from_window(windows.hud.into(), &context);
+        lab.simulate_resize(size(px(1_100.0), px(2_400.0)));
+        let draw = |lab: &mut gpui::VisualTestContext| {
+            lab.update(|window, app| {
+                window.refresh();
+                window.draw(app).clear();
+            })
+        };
+        let click = |lab: &mut gpui::VisualTestContext, selector: &'static str| {
+            draw(lab);
+            let bounds = lab
+                .debug_bounds(selector)
+                .expect("visible ecological control");
+            lab.simulate_click(bounds.center(), gpui::Modifiers::default());
+        };
+        let wait = |lab: &mut gpui::VisualTestContext, ready: &dyn Fn(&LabWorkflows) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                draw(lab);
+                if context.update(|app| ready(&hud.read(app).lab_workflows)) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "ecological experiment response did not arrive"
+                );
+                std::thread::yield_now();
+            }
+        };
+        click(&mut lab, "dashboard-tab-experiments");
+        wait(&mut lab, &|state| {
+            state.experiments.is_some() && !state.is_busy()
+        });
+        click(&mut lab, "lab-new-experiment");
+        wait(&mut lab, &|state| {
+            state.experiment_capabilities.is_some() && !state.is_busy()
+        });
+        click(&mut lab, "lab-experiment-design-ecological-treatment");
+        click(&mut lab, "lab-experiment-baseline-assembly");
+        click(&mut lab, "lab-experiment-parameter-movement_drain");
+        click(&mut lab, "lab-experiment-parameter-food_growth_rate");
+        click(&mut lab, "lab-experiment-percent-100");
+        context.update(|app| {
+            let draft = &hud.read(app).lab_workflows.experiment_draft;
+            assert_eq!(draft.baseline_family, "assembly");
+            assert_eq!(draft.baseline_family, draft.challenger_family);
+            assert!(
+                draft
+                    .question_lines()
+                    .iter()
+                    .any(|line| line.contains("Unchanged-value control"))
+            );
+        });
+        draw(&mut lab);
+        assert!(
+            lab.debug_bounds("lab-experiment-challenger-assembly")
+                .is_none()
+        );
+        click(&mut lab, "lab-experiment-percent-200");
+        click(&mut lab, "lab-experiment-percent-prev");
+        click(&mut lab, "lab-experiment-percent-next");
+        click(&mut lab, "lab-experiment-treatment-tick-10");
+        click(&mut lab, "lab-experiment-treatment-tick-next");
+        click(&mut lab, "lab-experiment-ticks-10");
+        click(&mut lab, "lab-experiment-create");
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "invalid boundary cannot admit work"
+        );
+        context.update(|app| {
+            let state = &hud.read(app).lab_workflows;
+            assert_eq!(state.experiment_draft.treatment.unwrap().at_tick, 11);
+            assert_eq!(state.experiment_draft.ticks_per_run, 10);
+            assert!(!state.can_create_experiment());
+        });
+        click(&mut lab, "lab-experiment-treatment-tick-0");
+        click(&mut lab, "lab-experiment-treatment-tick-next");
+        click(&mut lab, "lab-experiment-ticks-next");
+        click(&mut lab, "lab-experiment-seed-count-prev");
+        draw(&mut lab);
+        assert!(lab.debug_bounds("lab-experiment-question").is_some());
+        let expected = context.update(|app| hud.read(app).lab_workflows.experiment_draft.clone());
+        assert_eq!(expected.seeds().unwrap(), [42, 43]);
+        assert_eq!(
+            expected.treatment.unwrap(),
+            LabExperimentTreatment {
+                parameter: LabExperimentParameter::FoodGrowth,
+                baseline_value: 0.25,
+                scale_percent: 200,
+                at_tick: 1,
+            }
+        );
+        assert_eq!(expected.treatment.unwrap().value().unwrap(), 0.5);
+        click(&mut lab, "lab-experiment-create");
+        wait(&mut lab, &|state| {
+            !state.is_busy()
+                && state
+                    .latest_experiment_creation
+                    .as_ref()
+                    .is_some_and(|creation| {
+                        matches!(
+                            &creation.state,
+                            LabExperimentCreationState::Retryable { .. }
+                        )
+                    })
+        });
+        for selector in [
+            "lab-experiment-design-brain-families",
+            "lab-experiment-parameter-metabolism_drain",
+            "lab-experiment-percent-0",
+            "lab-experiment-treatment-tick-0",
+            "lab-experiment-baseline-dwraon",
+        ] {
+            click(&mut lab, selector);
+        }
+        context.update(|app| assert_eq!(hud.read(app).lab_workflows.experiment_draft, expected));
+        click(&mut lab, "lab-experiment-create");
+        wait(&mut lab, &|state| {
+            !state.is_busy() && !state.composing_experiment && state.batch.is_some()
+        });
+        draw(&mut lab);
+        assert!(
+            lab.debug_bounds("lab-experiment-retained-question")
+                .is_some()
+        );
+        click(&mut lab, "lab-metric-total_food");
+        click(&mut lab, "lab-compare");
+        wait(&mut lab, &|state| {
+            !state.is_busy() && state.comparison.is_some()
+        });
+        context.update(|app| {
+            let result = hud.read(app).lab_workflows.comparison.as_ref().unwrap();
+            assert_eq!(result.metric, LabMetric::TotalFood);
+            assert_eq!(result.matched_seeds, [42, 43]);
+            assert_eq!(result.endpoint_tick, 11);
+            assert!(
+                comparison_lines(result)
+                    .iter()
+                    .any(|line| line.contains(LabMetric::TotalFood.unit()))
+            );
+        });
+        click(&mut lab, "lab-all-experiments");
+        wait(&mut lab, &|state| {
+            !state.is_busy() && state.experiments.is_some()
+        });
+        click(&mut lab, "lab-experiment-0");
+        wait(&mut lab, &|state| !state.is_busy() && state.batch.is_some());
+        draw(&mut lab);
+        assert!(
+            lab.debug_bounds("lab-experiment-retained-question")
+                .is_none(),
+            "historical unknown designs must not inherit the latest question"
+        );
+        let recorded = requests.lock().unwrap();
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[0], recorded[1]);
+        assert_eq!(recorded[0].2, expected);
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+    }
+
+    #[test]
     fn gpui_lab_buttons_compare_and_review_checkpoint_without_advancing_live_owner() {
         let host = TestHost::new(
             WorldState::new(ScriptBotsConfig {
@@ -1736,14 +2269,7 @@ mod tests {
                     })
                 }
                 LabWorkflowRequest::ExperimentCapabilities => {
-                    LabWorkflowResponse::ExperimentCapabilities(LabExperimentCapabilities {
-                        families: vec!["mlp".into(), "dwraon".into(), "assembly".into()],
-                        max_seed_count: 8,
-                        max_ticks_per_run: 1_000,
-                        max_total_ticks: 16_000,
-                        launch_description:
-                            "Fresh worlds with the fixture's declared founder recipe.".into(),
-                    })
+                    LabWorkflowResponse::ExperimentCapabilities(experiment_capabilities())
                 }
                 LabWorkflowRequest::CreateExperiment {
                     request_id,

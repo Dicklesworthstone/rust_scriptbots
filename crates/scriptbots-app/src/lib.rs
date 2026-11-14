@@ -4713,11 +4713,34 @@ pub mod renderer {
         use crate::experiment_runner::{
             EXPERIMENT_BRAIN_FAMILIES, MAX_BATCH_TOTAL_TICKS, MAX_TICKS_PER_RUN,
         };
+        use scriptbots_runtime::lab_workflows::{
+            LabExperimentParameter, LabExperimentParameterCapability,
+        };
         let config = scriptbots_core::ScriptBotsConfig::default();
         scriptbots_runtime::lab_workflows::LabExperimentCapabilities {
             families: EXPERIMENT_BRAIN_FAMILIES
                 .iter()
                 .map(|family| (*family).to_owned())
+                .collect(),
+            treatment_parameters: LabExperimentParameter::ALL
+                .into_iter()
+                .filter_map(|parameter| {
+                    let range = scriptbots_core::knob_range(parameter.key())?;
+                    if range.fresh_world_only {
+                        return None;
+                    }
+                    let baseline_value = match parameter {
+                        LabExperimentParameter::FoodGrowth => config.food_growth_rate,
+                        LabExperimentParameter::Metabolism => config.metabolism_drain,
+                        LabExperimentParameter::MovementCost => config.movement_drain,
+                    };
+                    Some(LabExperimentParameterCapability {
+                        parameter,
+                        baseline_value: f64::from(baseline_value),
+                        min_value: range.min,
+                        max_value: range.max,
+                    })
+                })
                 .collect(),
             max_seed_count: 128,
             max_ticks_per_run: MAX_TICKS_PER_RUN,
@@ -4727,6 +4750,64 @@ pub mod renderer {
                 config.world_width, config.world_height, config.food_cell_size,
             ),
         }
+    }
+
+    /// Construct the exact runner plan without creating a world, worker or file.
+    /// Both admission and receipt verification use this one treatment mapping.
+    #[cfg(any(feature = "gui", feature = "bevy_render", test))]
+    fn native_lab_experiment_plan(
+        request_id: &str,
+        draft: &scriptbots_runtime::lab_workflows::LabExperimentDraft,
+    ) -> Result<crate::experiment_runner::MatchedSeedExperimentRunner, crate::control::ControlError>
+    {
+        use crate::control::ControlError;
+        use crate::experiment_runner::{
+            MatchedSeedCohort, MatchedSeedExperimentRunner, ScenarioVariant,
+        };
+
+        draft
+            .validate(&native_lab_experiment_capabilities())
+            .map_err(ControlError::BadRequest)?;
+        let intervention = draft
+            .treatment
+            .as_ref()
+            .map(|treatment| {
+                let value = treatment.value().map_err(ControlError::BadRequest)?;
+                let mut patch = serde_json::Map::new();
+                patch.insert(treatment.parameter.key().into(), serde_json::json!(value));
+                Ok::<_, ControlError>(crate::ScenarioInterventionV1 {
+                    tick: treatment.at_tick,
+                    set: serde_json::Value::Object(patch),
+                })
+            })
+            .transpose()?;
+        let variants = [
+            ("baseline", &draft.baseline_family),
+            ("challenger", &draft.challenger_family),
+        ]
+        .into_iter()
+        .map(|(variant_id, brain_family)| ScenarioVariant {
+            variant_id: variant_id.into(),
+            brain_family: brain_family.clone(),
+            config_overrides: std::collections::BTreeMap::new(),
+            interventions: if variant_id == "challenger" {
+                intervention.iter().cloned().collect()
+            } else {
+                Vec::new()
+            },
+        })
+        .collect();
+        Ok(MatchedSeedExperimentRunner::new(
+            request_id,
+            MatchedSeedCohort {
+                cohort_id: request_id.into(),
+                seeds: draft.seeds().map_err(ControlError::BadRequest)?,
+            },
+            variants,
+            draft.ticks_per_run,
+            1,
+            std::path::PathBuf::new(),
+        ))
     }
 
     #[cfg(any(feature = "gui", feature = "bevy_render", test))]
@@ -4746,12 +4827,16 @@ pub mod renderer {
         let expected_runs = seeds.len().checked_mul(2).ok_or_else(|| {
             ControlError::BadRequest("native experiment run count overflowed".into())
         })?;
+        let expected_plan = native_lab_experiment_plan(request_id, draft)?
+            .plan_digest()
+            .map_err(|error| ControlError::BadRequest(error.to_string()))?;
         if batch.experiment_id != request_id
+            || batch.plan_digest != expected_plan
             || batch.total_runs != expected_runs
             || batch.runs.len() != expected_runs
         {
             return Err(ControlError::Conflict(
-                "created experiment does not match the requested identity and run count".into(),
+                "created experiment does not match the requested identity, scientific plan and run count".into(),
             ));
         }
         let mut observed = BTreeSet::new();
@@ -4798,32 +4883,36 @@ pub mod renderer {
                 "native experiment identity must be a safe 1..=92 byte path component".into(),
             ));
         }
-        draft
-            .validate(&native_lab_experiment_capabilities())
-            .map_err(ControlError::BadRequest)?;
         if control.read_snapshot()?.session_id != session_id {
             return Err(ControlError::Conflict(
                 "native experiment launch belongs to a different owner session".into(),
             ));
         }
+        let plan = native_lab_experiment_plan(&request_id, &draft)?;
+        // The same pure runner preflight validates the complete scheduled patch
+        // before the service can reserve capacity or write an admission record.
+        plan.plan_digest()
+            .map_err(|error| ControlError::BadRequest(error.to_string()))?;
         // Every optional field is explicit and stable. An unknown admission
         // outcome can be retried without changing the service's payload hash.
         let batch = control.create_experiment(ExperimentCreateRequest {
             experiment_id: Some(request_id.clone()),
-            description: Some("Native Evolution Lab matched-seed brain-family comparison".into()),
-            variants: [
-                ("baseline", &draft.baseline_family),
-                ("challenger", &draft.challenger_family),
-            ]
-            .into_iter()
-            .map(|(variant_id, brain_family)| ExperimentVariantDto {
-                variant_id: variant_id.into(),
-                brain_family: brain_family.clone(),
-                config_overrides: None,
-                interventions: Vec::new(),
-            })
-            .collect(),
-            seeds: draft.seeds().map_err(ControlError::BadRequest)?,
+            description: Some(if draft.treatment.is_some() {
+                "Native Evolution Lab matched-seed ecological treatment comparison".into()
+            } else {
+                "Native Evolution Lab matched-seed brain-family comparison".into()
+            }),
+            variants: plan
+                .variants
+                .into_iter()
+                .map(|variant| ExperimentVariantDto {
+                    variant_id: variant.variant_id,
+                    brain_family: variant.brain_family,
+                    config_overrides: None,
+                    interventions: variant.interventions,
+                })
+                .collect(),
+            seeds: plan.cohort.seeds,
             ticks_per_run: Some(draft.ticks_per_run),
             max_concurrency: Some(1),
             idempotency_key: Some(format!(
@@ -4831,9 +4920,14 @@ pub mod renderer {
                 session_id.get(),
             )),
         })?;
-        // Projection deliberately omits per-run seeds and horizons. Bind the
-        // authoritative service matrix to this exact request before reducing it.
+        // Projection omits per-run seeds, horizons and patches. Bind the full
+        // source-aware plan and service matrix before reducing that evidence.
         validate_created_lab_experiment(&batch, &request_id, &draft)?;
+        if control.read_snapshot()?.session_id != session_id {
+            return Err(ControlError::Conflict(
+                "native experiment owner changed while admission was being observed".into(),
+            ));
+        }
         Ok(LabWorkflowResponse::ExperimentCreated {
             request_id,
             session_id,
@@ -5448,6 +5542,356 @@ pub mod renderer {
         }
 
         #[test]
+        fn native_lab_ecological_plans_use_actual_defaults_and_one_scheduled_parameter() {
+            use scriptbots_runtime::lab_workflows::{
+                LabExperimentDraft, LabExperimentParameter, LabExperimentTreatment,
+            };
+
+            let capabilities = native_lab_experiment_capabilities();
+            capabilities.validate().unwrap();
+            assert_eq!(
+                capabilities.treatment_parameters.len(),
+                LabExperimentParameter::ALL.len()
+            );
+            let defaults = serde_json::to_value(ScriptBotsConfig::default()).unwrap();
+            for parameter in &capabilities.treatment_parameters {
+                let path = parameter.parameter.key();
+                assert_eq!(
+                    parameter.baseline_value.to_bits(),
+                    defaults[path].as_f64().unwrap().to_bits()
+                );
+                let range = scriptbots_core::knob_range(path).unwrap();
+                assert!(!range.fresh_world_only);
+                assert_eq!(parameter.min_value.to_bits(), range.min.to_bits());
+                assert_eq!(parameter.max_value.to_bits(), range.max.to_bits());
+                for scale_percent in [0, 50, 100, 200, 400] {
+                    let treatment = LabExperimentTreatment {
+                        parameter: parameter.parameter,
+                        baseline_value: parameter.baseline_value,
+                        scale_percent,
+                        at_tick: 1,
+                    };
+                    let draft = LabExperimentDraft {
+                        baseline_family: "mlp.baseline".into(),
+                        challenger_family: "mlp.baseline".into(),
+                        treatment: Some(treatment),
+                        first_seed: 17,
+                        seed_count: 2,
+                        ticks_per_run: 2,
+                    };
+                    let plan = native_lab_experiment_plan("native-treatment-plan", &draft).unwrap();
+                    assert_eq!(plan.plan_batch().unwrap().len(), 4);
+                    assert_eq!(plan.cohort.seeds, [17, 18]);
+                    assert_eq!(plan.variants[0].brain_family, plan.variants[1].brain_family);
+                    assert!(
+                        plan.variants
+                            .iter()
+                            .all(|arm| arm.config_overrides.is_empty())
+                    );
+                    assert!(plan.variants[0].interventions.is_empty());
+                    let [patch] = plan.variants[1].interventions.as_slice() else {
+                        panic!("one treatment must produce exactly one scheduled patch");
+                    };
+                    assert_eq!(patch.tick, 1);
+                    assert_eq!(patch.set.as_object().unwrap().len(), 1);
+                    assert_eq!(
+                        patch.set[path],
+                        serde_json::json!(treatment.value().unwrap())
+                    );
+                    let original_digest = plan.plan_digest().unwrap();
+                    let mut different_boundary = draft.clone();
+                    different_boundary.treatment.as_mut().unwrap().at_tick = 0;
+                    assert_ne!(
+                        original_digest,
+                        native_lab_experiment_plan("native-treatment-plan", &different_boundary)
+                            .unwrap()
+                            .plan_digest()
+                            .unwrap(),
+                        "the complete plan must bind the application boundary",
+                    );
+                    if scale_percent == 100 {
+                        assert_eq!(
+                            treatment.value().unwrap().to_bits(),
+                            parameter.baseline_value.to_bits()
+                        );
+                    }
+                }
+            }
+        }
+
+        #[test]
+        #[allow(clippy::too_many_lines)]
+        fn native_lab_treatment_experiments_retry_and_compare_real_paired_endpoints() {
+            use scriptbots_runtime::lab_workflows::{
+                LabAction, LabExperimentDesign, LabExperimentParameter, LabMetric, LabPanel,
+                LabWorkflowRequest as Request, LabWorkflowResponse as Response, LabWorkflows,
+            };
+            use std::sync::{
+                Mutex,
+                atomic::{AtomicBool, Ordering},
+            };
+
+            struct StopExperiments(crate::control::ControlHandle);
+            impl Drop for StopExperiments {
+                fn drop(&mut self) {
+                    let _ = self.0.data_services().shutdown_experiments();
+                }
+            }
+
+            let root = tempfile::tempdir().unwrap();
+            let host = TestHost::spawn(
+                scriptbots_core::WorldState::new(ScriptBotsConfig {
+                    rng_seed: Some(42),
+                    world_width: 120,
+                    world_height: 120,
+                    food_cell_size: 20,
+                    food_growth_rate: 0.17,
+                    population_minimum: 0,
+                    persistence_interval: 0,
+                    closed: true,
+                    ..ScriptBotsConfig::default()
+                })
+                .unwrap(),
+            );
+            let handle = host
+                .handle()
+                .with_artifacts_dir(root.path().to_path_buf())
+                .unwrap();
+            let _stop = StopExperiments(handle.clone());
+            let live = handle.read_snapshot().unwrap();
+            let live_digest = host.port.scientific_digest_v1().unwrap();
+            let provider = lab_workflow_submit(handle.clone());
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&seen);
+            let service = Arc::clone(&provider);
+            let lose_first = AtomicBool::new(true);
+            let mut model = LabWorkflows::default();
+            model.submit = Some(Arc::new(move |request| {
+                let creates = matches!(&request, Request::CreateExperiment { .. });
+                if creates {
+                    recorded.lock().unwrap().push(request.clone());
+                }
+                let result = service(request)?;
+                if creates && lose_first.swap(false, Ordering::SeqCst) {
+                    Err("treatment admitted, but its first receipt was lost".into())
+                } else {
+                    Ok(result)
+                }
+            }));
+            model.synchronize(live.session_id, LabPanel::Experiments);
+            model.dispatch(LabAction::NewExperiment);
+            assert!(finish_native_lab_request(&mut model).is_none());
+            model.dispatch(LabAction::DraftBaseline("mlp.baseline".into()));
+            model.dispatch(LabAction::ExperimentDesign(
+                LabExperimentDesign::EcologicalTreatment,
+            ));
+            model.dispatch(LabAction::TreatmentParameter(
+                LabExperimentParameter::FoodGrowth,
+            ));
+            model.dispatch(LabAction::TreatmentPercent(0));
+            model.dispatch(LabAction::FirstSeed(17));
+            model.dispatch(LabAction::SeedCount(2));
+            model.dispatch(LabAction::TicksPerRun(2));
+            model.dispatch(LabAction::TreatmentTick(1));
+            let draft = model.experiment_draft.clone();
+            let treatment = draft.treatment.unwrap();
+            assert_eq!(draft.baseline_family, draft.challenger_family);
+            assert_eq!(
+                treatment.baseline_value.to_bits(),
+                f64::from(ScriptBotsConfig::default().food_growth_rate).to_bits()
+            );
+            assert_ne!(
+                treatment.baseline_value.to_bits(),
+                f64::from(live.config.food_growth_rate).to_bits()
+            );
+            assert!(model.can_create_experiment());
+
+            let mut late = draft.clone();
+            late.treatment.as_mut().unwrap().at_tick = late.ticks_per_run;
+            let mut foreign_baseline = draft.clone();
+            foreign_baseline.treatment.as_mut().unwrap().baseline_value = 0.123;
+            let mut confounded = draft.clone();
+            confounded.challenger_family = "dwraon.baseline".into();
+            for (index, invalid) in [late, foreign_baseline, confounded].into_iter().enumerate() {
+                assert!(
+                    provider(Request::CreateExperiment {
+                        request_id: format!("invalid-treatment-{index}"),
+                        session_id: live.session_id,
+                        draft: invalid,
+                    })
+                    .is_err()
+                );
+            }
+            assert_eq!(handle.list_experiments(None, None).unwrap().total, 0);
+
+            model.dispatch(LabAction::CreateExperiment);
+            assert!(finish_native_lab_request(&mut model).is_none());
+            assert!(model.will_retry_experiment_creation());
+            let creation = model.latest_experiment_creation.as_ref().unwrap().clone();
+            for action in [
+                LabAction::TreatmentPercent(100),
+                LabAction::TreatmentTick(0),
+                LabAction::TreatmentParameter(LabExperimentParameter::Metabolism),
+                LabAction::DraftBaseline("dwraon.baseline".into()),
+                LabAction::ExperimentDesign(LabExperimentDesign::BrainFamilies),
+            ] {
+                model.dispatch(action);
+                assert_eq!(model.experiment_draft, draft);
+            }
+            model.dispatch(LabAction::CreateExperiment);
+            assert!(finish_native_lab_request(&mut model).is_none());
+            assert_eq!(
+                model.selected_experiment.as_deref(),
+                Some(creation.request_id.as_str())
+            );
+            assert_eq!(handle.list_experiments(None, None).unwrap().total, 1);
+            {
+                let requests = seen.lock().unwrap();
+                assert_eq!(requests.len(), 2);
+                assert_eq!(requests[0], requests[1]);
+            }
+
+            let wait_for_batch = |experiment_id: &str| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+                loop {
+                    let batch = handle.get_experiment(experiment_id).unwrap();
+                    assert_eq!(batch.failed_runs, 0, "{batch:?}");
+                    assert!(batch.error_reason.is_none(), "{batch:?}");
+                    if batch.status == "completed" {
+                        assert_eq!(batch.completed_runs, batch.total_runs);
+                        break batch;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "treatment experiment timed out: {batch:?}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            };
+            let completed = wait_for_batch(&creation.request_id);
+            validate_created_lab_experiment(&completed, &creation.request_id, &draft).unwrap();
+            let mut unchanged = draft.clone();
+            unchanged.treatment.as_mut().unwrap().scale_percent = 100;
+            let mut wrong_schedule = draft.clone();
+            wrong_schedule.treatment.as_mut().unwrap().at_tick = 0;
+            for substituted in [&unchanged, &wrong_schedule] {
+                let mut foreign = completed.clone();
+                foreign.plan_digest = native_lab_experiment_plan(&creation.request_id, substituted)
+                    .unwrap()
+                    .plan_digest()
+                    .unwrap();
+                assert!(
+                    validate_created_lab_experiment(&foreign, &creation.request_id, &draft)
+                        .is_err(),
+                    "identical family/seed/horizon rows cannot substitute another treatment plan"
+                );
+            }
+            let conflict = provider(Request::CreateExperiment {
+                request_id: creation.request_id.clone(),
+                session_id: live.session_id,
+                draft: unchanged.clone(),
+            })
+            .err()
+            .expect("changed treatment must conflict with retained admission");
+            assert!(conflict.contains("different payload"), "{conflict}");
+
+            model.dispatch(LabAction::Refresh);
+            assert!(finish_native_lab_request(&mut model).is_none());
+            model.dispatch(LabAction::Metric(LabMetric::TotalFood));
+            model.dispatch(LabAction::Compare);
+            assert!(finish_native_lab_request(&mut model).is_none());
+            let comparison = model.comparison.as_ref().unwrap();
+            assert_eq!(comparison.matched_seeds, [17, 18]);
+            assert_eq!(comparison.endpoint_tick, 2);
+            assert!(
+                comparison.mean_difference < 0.0,
+                "food-growth suppression must reduce the actual endpoint: {comparison:?}"
+            );
+            assert!(!comparison.descriptive_only);
+            assert!(comparison.ci_95.is_some());
+
+            let mut endpoints = std::collections::BTreeMap::new();
+            for run in &completed.runs {
+                let directory = root
+                    .path()
+                    .join("experiments")
+                    .join(&creation.request_id)
+                    .join(&run.run_id);
+                let verified = crate::experiment_runner::verify_portable_run_bundle(&directory)
+                    .unwrap()
+                    .final_state
+                    .unwrap();
+                let bundle: scriptbots_storage::RunBundleV1 = serde_json::from_slice(
+                    &std::fs::read(directory.join("bundle_manifest.json")).unwrap(),
+                )
+                .unwrap();
+                let manifest: crate::RunManifestV3 =
+                    serde_json::from_str(&bundle.manifest.manifest_json).unwrap();
+                assert_eq!(manifest.root_seed, run.seed);
+                assert_eq!(verified.tick, 2);
+                assert_eq!(
+                    verified.scientific_digest,
+                    run.final_digest.as_ref().unwrap().as_str()
+                );
+                if run.variant_id == "baseline" {
+                    assert!(manifest.scenario.interventions.is_empty());
+                } else {
+                    assert_eq!(
+                        manifest.scenario.interventions,
+                        [crate::ScenarioInterventionV1 {
+                            tick: 1,
+                            set: serde_json::json!({"food_growth_rate": treatment.value().unwrap()}),
+                        }]
+                    );
+                }
+                endpoints.insert(
+                    (run.variant_id.as_str(), run.seed),
+                    verified.summary.total_food,
+                );
+            }
+            for seed in [17, 18] {
+                assert!(endpoints[&("challenger", seed)] < endpoints[&("baseline", seed)]);
+            }
+
+            let null_id = "native-treatment-unchanged-value";
+            assert!(matches!(
+                provider(Request::CreateExperiment {
+                    request_id: null_id.into(),
+                    session_id: live.session_id,
+                    draft: unchanged,
+                })
+                .unwrap(),
+                Response::ExperimentCreated { .. }
+            ));
+            let null_batch = wait_for_batch(null_id);
+            let null = handle
+                .compare_experiment_variants(null_id, "baseline", "challenger", "total_food")
+                .unwrap();
+            assert_eq!(null.matched_seeds, [17, 18]);
+            assert_eq!(null.mean_difference.classify(), std::num::FpCategory::Zero);
+            assert_eq!(null.ci_95, Some((0.0, 0.0)));
+            for seed in [17, 18] {
+                let baseline = null_batch
+                    .runs
+                    .iter()
+                    .find(|run| run.variant_id == "baseline" && run.seed == seed)
+                    .unwrap();
+                let challenger = null_batch
+                    .runs
+                    .iter()
+                    .find(|run| run.variant_id == "challenger" && run.seed == seed)
+                    .unwrap();
+                assert_eq!(
+                    baseline.final_digest, challenger.final_digest,
+                    "an unchanged-value control must preserve physical science"
+                );
+            }
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), live_digest);
+            assert!(Arc::ptr_eq(&handle.read_snapshot().unwrap(), &live));
+            handle.data_services().shutdown_experiments().unwrap();
+        }
+
+        #[test]
         // Real admission, unknown outcome, exact retry and authoritative matrix binding.
         #[allow(clippy::too_many_lines)]
         fn native_lab_experiment_creation_retries_the_exact_admitted_seed_matrix() {
@@ -5498,6 +5942,7 @@ pub mod renderer {
             let draft = LabExperimentDraft {
                 baseline_family: "mlp.baseline".into(),
                 challenger_family: "dwraon.baseline".into(),
+                treatment: None,
                 first_seed: u64::MAX - 1,
                 seed_count: 2,
                 ticks_per_run: 1,
