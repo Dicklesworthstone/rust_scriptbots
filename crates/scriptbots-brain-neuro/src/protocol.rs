@@ -585,7 +585,7 @@ impl BrainFamilyCodec for NeuroflowFamilyAdapter {
             node_start += output_width;
             input_width = output_width;
         }
-        debug_assert!(scalars.as_slice().is_empty());
+        debug_assert_eq!(scalars.as_slice(), &[] as &[[u8; SCALAR_BYTES]]);
         Ok(loci)
     }
 
@@ -871,7 +871,9 @@ mod tests {
         payload.resize(family.genome_bytes, 0);
         let precise = [-0.0_f64, 1.0, f64::from_bits(1)];
         for (chunk, value) in payload[family.genome_header.len()..]
-            .chunks_exact_mut(SCALAR_BYTES)
+            .as_chunks_mut::<SCALAR_BYTES>()
+            .0
+            .iter_mut()
             .zip(precise)
         {
             chunk.copy_from_slice(&value.to_le_bytes());
@@ -1087,7 +1089,9 @@ mod tests {
         ];
         let mut payload = source.payload().to_vec();
         for (chunk, value) in payload[family.genome_header.len()..]
-            .chunks_exact_mut(SCALAR_BYTES)
+            .as_chunks_mut::<SCALAR_BYTES>()
+            .0
+            .iter_mut()
             .zip(precise.iter().cycle())
         {
             chunk.copy_from_slice(&value.to_bits().to_le_bytes());
@@ -1111,7 +1115,9 @@ mod tests {
         let initial = family.initial_state(&genome, &mut rng).unwrap();
         let mut payload = initial.payload().to_vec();
         for (chunk, value) in payload[STATE_HEADER_BYTES..]
-            .chunks_exact_mut(SCALAR_BYTES)
+            .as_chunks_mut::<SCALAR_BYTES>()
+            .0
+            .iter_mut()
             .zip(precise.iter().cycle())
         {
             chunk.copy_from_slice(&value.to_bits().to_le_bytes());
@@ -1260,9 +1266,16 @@ mod tests {
         let mut chose_left = false;
         let mut chose_right = false;
         for ((value, from_left), from_right) in child.payload()[start..]
-            .chunks_exact(SCALAR_BYTES)
-            .zip(left.payload()[start..].chunks_exact(SCALAR_BYTES))
-            .zip(right.payload()[start..].chunks_exact(SCALAR_BYTES))
+            .as_chunks::<SCALAR_BYTES>()
+            .0
+            .iter()
+            .zip(left.payload()[start..].as_chunks::<SCALAR_BYTES>().0.iter())
+            .zip(
+                right.payload()[start..]
+                    .as_chunks::<SCALAR_BYTES>()
+                    .0
+                    .iter(),
+            )
         {
             assert!(value == from_left || value == from_right);
             chose_left |= value == from_left;
@@ -1365,8 +1378,8 @@ mod tests {
             Err(BrainProtocolError::SchemaVersionMismatch { .. })
         ));
         assert!(matches!(
-            family.genome_loci(&genome),
-            Err(BrainProtocolError::GenomeLociUnavailable { .. })
+            family.genome_loci(&wrong_version),
+            Err(BrainProtocolError::SchemaVersionMismatch { .. })
         ));
     }
 
