@@ -6,11 +6,18 @@ The authoritative roadmap is `PLAN_TO_REARCHITECT_AND_REVIVE_RUST_SCRIPTBOTS.md`
 
 ### First-run Lab guide
 
-The opt-in terminal walkthrough connects the live world, organism inspector,
-Pause, one scientific tick, a food-growth change, a fresh checkpoint, and a
-control/intervention study. Open it with **F1** or **First-run Lab guide** in the
-command palette; **Esc** hides it while retaining progress. Follow the displayed
-keys, then use **Enter** to continue once the required observation is available.
+The opt-in terminal and GPUI walkthrough connects the live world, organism
+inspector, Pause, one scientific tick, a food-growth change, a fresh checkpoint,
+and a control/intervention study. In the terminal, open it with **F1** or
+**First-run Lab Guide** in the command palette; **Esc** hides it while retaining
+progress. In GPUI, choose **First-run guide** in the Lab window. Its action
+buttons open the relevant tools, show the proposed growth change, and wait for
+evidence before enabling **Next**. Hiding and reopening keeps the same journey.
+
+Food-growth proposals are applied through the normal command path with owner
+checks for the observed control, scientific, and configuration revisions. If
+another client changes that boundary, the owner rejects the stale proposal.
+A user-interface precheck alone cannot protect against that race.
 
 Progress follows the actual owner, command identity, applied publication and
 journal receipt. A memory-only commitment is labelled `CommittedVolatile`.

@@ -7538,6 +7538,25 @@ impl ControlHandle {
     ) -> Result<CommandStatusDto, ControlError> {
         self.submit_control_command_with_key(command, idempotency_key)
     }
+
+    /// Submit a full configuration only at the caller's observed owner boundary.
+    ///
+    /// The owner checks all three revision guards when the command reaches its
+    /// ordered application boundary. A concurrent resume, tick, or configuration
+    /// edit therefore rejects this proposal instead of overwriting newer state.
+    /// The typed receipt preserves both rejected and admitted command identities.
+    pub fn submit_config_update(
+        &self,
+        config: Box<ScriptBotsConfig>,
+        expected: scriptbots_runtime::HostRevisions,
+    ) -> Result<scriptbots_runtime::CommandStatus, ControlError> {
+        let envelope = self
+            .prepare_control_command(ControlCommand::UpdateConfig(config), None)?
+            .expecting_control_revision(expected.control)
+            .expecting_scientific_revision(expected.scientific)
+            .expecting_config_revision(expected.config);
+        Ok(self.host.clone().submit(envelope)?)
+    }
 }
 
 fn insert_path(map: &mut Map<String, Value>, path: &str, value: Value) -> Result<(), ControlError> {
@@ -8076,6 +8095,129 @@ pub(crate) mod tests {
             .expect("world"),
         );
         (host.handle(), host)
+    }
+
+    #[test]
+    fn guarded_config_update_rejects_stale_axes_without_overwriting_the_owner() {
+        use scriptbots_runtime::{HostRevisions, RejectionReason};
+
+        let (handle, host) = handle();
+        let original = handle.read_snapshot().expect("original paused owner");
+        assert!(original.playback.paused);
+        let mut proposal = original.config.as_ref().clone();
+        proposal.food_growth_rate = 0.075;
+        assert_ne!(
+            proposal.food_growth_rate.to_bits(),
+            original.config.food_growth_rate.to_bits(),
+        );
+        let mut competing = original.config.as_ref().clone();
+        competing.food_max = 0.73;
+        assert_ne!(
+            competing.food_max.to_bits(),
+            original.config.food_max.to_bits(),
+        );
+        let changed = handle
+            .submit_command(ControlCommand::UpdateConfig(Box::new(competing)), None)
+            .expect("competing configuration admission");
+        host.wait_applied(&changed);
+        host.wait_applied(&handle.step().expect("intervening scientific tick"));
+        let current = handle.read_snapshot().expect("new owner boundary");
+        assert!(current.playback.paused);
+        assert!(current.revisions.control > original.revisions.control);
+        assert!(current.revisions.scientific > original.revisions.scientific);
+        assert!(current.revisions.config > original.revisions.config);
+        let digest = host
+            .port
+            .clone()
+            .scientific_digest_v1()
+            .expect("current scientific digest");
+
+        // Exercise each owner-side guard separately. A client precheck could
+        // not protect an admitted command from these intervening boundaries.
+        let stale_guards = [
+            (
+                HostRevisions {
+                    control: original.revisions.control,
+                    ..current.revisions
+                },
+                RejectionReason::ControlRevisionConflict {
+                    expected: original.revisions.control,
+                    actual: current.revisions.control,
+                },
+            ),
+            (
+                HostRevisions {
+                    scientific: original.revisions.scientific,
+                    ..current.revisions
+                },
+                RejectionReason::ScientificRevisionConflict {
+                    expected: original.revisions.scientific,
+                    actual: current.revisions.scientific,
+                },
+            ),
+            (
+                HostRevisions {
+                    config: original.revisions.config,
+                    ..current.revisions
+                },
+                RejectionReason::ConfigRevisionConflict {
+                    expected: original.revisions.config,
+                    actual: current.revisions.config,
+                },
+            ),
+        ];
+        let mut rejected_ids = BTreeSet::new();
+        for (expected, reason) in stale_guards {
+            let attempt = handle
+                .submit_config_update(Box::new(proposal.clone()), expected)
+                .expect("stale proposal has a typed command receipt");
+            let id = attempt.command_id();
+            assert!(
+                rejected_ids.insert(id),
+                "each explicit attempt has its own identity",
+            );
+            let settled = host.wait_finished(&id.to_string());
+            assert_eq!(settled.application_state, "rejected");
+            let receipt = host
+                .port
+                .clone()
+                .command_status(id)
+                .expect("authoritative command lookup")
+                .expect("retained stale command");
+            assert_eq!(receipt.application(), &ApplicationState::Rejected(reason));
+            let unchanged = handle.read_snapshot().expect("unchanged owner");
+            assert_eq!(unchanged.revisions, current.revisions);
+            assert_eq!(unchanged.world.tick, current.world.tick);
+            assert_eq!(unchanged.config, current.config);
+            assert_eq!(
+                host.port
+                    .clone()
+                    .scientific_digest_v1()
+                    .expect("unchanged digest"),
+                digest,
+            );
+        }
+
+        let mut fresh = current.config.as_ref().clone();
+        fresh.food_growth_rate = proposal.food_growth_rate;
+        let accepted = handle
+            .submit_config_update(Box::new(fresh.clone()), current.revisions)
+            .expect("current guarded proposal");
+        assert!(!rejected_ids.contains(&accepted.command_id()));
+        let applied = host.wait_finished(&accepted.command_id().to_string());
+        assert_eq!(applied.application_state, "applied");
+        let after = handle.read_snapshot().expect("applied current proposal");
+        assert_eq!(after.config.as_ref(), &fresh);
+        assert_eq!(after.world.tick, current.world.tick);
+        assert_eq!(after.revisions.scientific, current.revisions.scientific);
+        assert_eq!(
+            Some(after.revisions.config),
+            current.revisions.config.checked_next(),
+        );
+        assert_eq!(
+            Some(after.revisions.control),
+            current.revisions.control.checked_next(),
+        );
     }
 
     fn experiment_creation_request() -> ExperimentCreateRequest {

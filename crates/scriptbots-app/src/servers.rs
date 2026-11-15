@@ -66,6 +66,19 @@ use scriptbots_runtime::remote_subscription::{
 use scriptbots_runtime::{RenderSnapshot, SnapshotWatcher};
 // keep image out of servers unless needed
 
+/// Application-owned configuration submission with exact owner revision guards.
+///
+/// Both receipt axes are retained so native clients can distinguish admission,
+/// rejection, application, and journal commitment without inferring success.
+pub type ConfigUpdateSubmit = Arc<
+    dyn Fn(
+            Box<scriptbots_core::ScriptBotsConfig>,
+            scriptbots_runtime::HostRevisions,
+        ) -> std::result::Result<scriptbots_runtime::CommandStatus, String>
+        + Send
+        + Sync,
+>;
+
 /// Default loopback address for the REST control surface.
 pub const DEFAULT_CONTROL_REST_ADDRESS: SocketAddr =
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8088);
@@ -972,6 +985,19 @@ impl ControlRuntime {
     #[must_use]
     pub fn control_handle(&self) -> Option<ControlHandle> {
         self.control_handle.clone()
+    }
+
+    /// Build a guarded configuration adapter using the live control client's identity.
+    ///
+    /// No adapter is available for a runtime without an owner control handle.
+    #[must_use]
+    pub fn config_update_submit(&self) -> Option<ConfigUpdateSubmit> {
+        let handle = self.control_handle.clone()?;
+        Some(Arc::new(move |config, expected| {
+            handle
+                .submit_config_update(config, expected)
+                .map_err(|error| error.to_string())
+        }))
     }
 
     /// The slot a frontend publishes its presented frames into.

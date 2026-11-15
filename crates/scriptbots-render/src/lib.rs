@@ -52,6 +52,7 @@ use scriptbots_core::{
     MapGenerationError, PaintedConstraint, SamplePatternSpec, TileSpec, TilesetSpec,
     ToroidalSeamReport, check_toroidal_seams, compute_sample_hash, default_tileset_spec,
 };
+use scriptbots_runtime::lab_guide::{LabGuide, LabGuideStep};
 use scriptbots_runtime::lab_workflows::{LabWorkflowSubmit, LabWorkflows};
 use scriptbots_runtime::{FoodLayerSnapshot, RenderSnapshot, TerrainLayerSnapshot};
 use scriptbots_runtime::{HostPort, ScientificRevision, channel::ChannelHostPort};
@@ -2656,6 +2657,7 @@ struct GuiSession {
     analytics: AnalyticsSnapshotProvider,
     command_submit: Arc<dyn Fn(ControlCommand) -> Option<String> + Send + Sync + 'static>,
     map_apply_submit: Option<MapApplySubmit>,
+    config_update_submit: Option<ConfigUpdateSubmit>,
     map_sandbox: Arc<Mutex<MapSandbox>>,
     recent_commands: Arc<Mutex<VecDeque<GuiCommandRequest>>>,
     /// Focus and hover describe one experiment, not one window. Sharing the
@@ -2672,6 +2674,7 @@ struct GuiSession {
     timeline_submit: Option<TimelineReviewSubmit>,
     timeline_cancelled: Arc<AtomicBool>,
     lab_submit: Option<LabWorkflowSubmit>,
+    lab_guide: Arc<Mutex<LabGuide>>,
 }
 
 impl GuiSession {
@@ -2699,6 +2702,7 @@ impl GuiSession {
             analytics,
             command_submit,
             map_apply_submit: None,
+            config_update_submit: None,
             map_sandbox: Arc::new(Mutex::new(map_sandbox)),
             recent_commands: Arc::new(Mutex::new(VecDeque::new())),
             inspector: Arc::new(Mutex::new(inspector_state)),
@@ -2709,6 +2713,7 @@ impl GuiSession {
             timeline_submit: None,
             timeline_cancelled: Arc::new(AtomicBool::new(false)),
             lab_submit: None,
+            lab_guide: Arc::new(Mutex::new(LabGuide::default())),
         }
     }
 
@@ -2724,9 +2729,11 @@ impl GuiSession {
         view.inspector = Arc::clone(&self.inspector);
         view.camera = Arc::clone(&self.world_camera);
         view.recent_commands = Arc::clone(&self.recent_commands);
+        view.lab_guide = Arc::clone(&self.lab_guide);
         view.accessibility = Arc::clone(&self.accessibility);
         view.map_sandbox = Arc::clone(&self.map_sandbox);
         view.map_apply_submit = self.map_apply_submit.clone();
+        view.config_update_submit = self.config_update_submit.clone();
         view.timeline_cancelled = Arc::clone(&self.timeline_cancelled);
         if role == GuiViewRole::Hud {
             view.timeline_submit = self.timeline_submit.clone();
@@ -2809,6 +2816,20 @@ fn open_gui_session_windows(
     Ok(GuiWindowHandles { hud, canvas })
 }
 
+/// Configuration edits preserve the observed owner boundary through application.
+///
+/// The application attaches all three expected revisions to its normal command
+/// envelope. A concurrent control, tick, or configuration change is refused by
+/// the owner rather than overwritten by a stale whole-configuration payload.
+pub type ConfigUpdateSubmit = Arc<
+    dyn Fn(
+            Box<ScriptBotsConfig>,
+            scriptbots_runtime::HostRevisions,
+        ) -> std::result::Result<scriptbots_runtime::CommandStatus, String>
+        + Send
+        + Sync,
+>;
+
 /// Map application uses the app's guarded owner adapter, including its receipt identity.
 pub type MapApplySubmit = Arc<
     dyn Fn(
@@ -2858,6 +2879,7 @@ pub fn run_demo(
     analytics: AnalyticsSnapshotProvider,
     command_submit: Arc<dyn Fn(ControlCommand) -> Option<String> + Send + Sync + 'static>,
     map_apply_submit: MapApplySubmit,
+    config_update_submit: ConfigUpdateSubmit,
     timeline_submit: TimelineReviewSubmit,
     lab_submit: LabWorkflowSubmit,
     health_probe: GuiHealthProbe,
@@ -2878,6 +2900,7 @@ pub fn run_demo(
     let host_snapshots = host.snapshot_hub();
     let mut session = GuiSession::new(host, analytics, command_submit);
     session.map_apply_submit = Some(map_apply_submit);
+    session.config_update_submit = Some(config_update_submit);
     session.timeline_submit = Some(timeline_submit);
     session.lab_submit = Some(lab_submit);
     let session = Arc::new(session);
@@ -4638,6 +4661,7 @@ pub struct SimulationView {
     command_submit: Arc<dyn Fn(ControlCommand) -> Option<String> + Send + Sync + 'static>,
     recent_commands: Arc<Mutex<VecDeque<GuiCommandRequest>>>,
     map_apply_submit: Option<MapApplySubmit>,
+    config_update_submit: Option<ConfigUpdateSubmit>,
     map_sandbox: Arc<Mutex<MapSandbox>>,
     camera: Arc<Mutex<Camera>>,
     /// Window-local GPUI atlas images for the continuously sampled world field.
@@ -4660,6 +4684,8 @@ pub struct SimulationView {
     timeline_job: Option<TimelineReviewJob>,
     timeline_cancelled: Arc<AtomicBool>,
     lab_workflows: LabWorkflows,
+    /// One observed journey shared by the World and Lab windows.
+    lab_guide: Arc<Mutex<LabGuide>>,
     perf: PerfStats,
     last_perf: PerfSnapshot,
     /// When set, `render` must NOT overwrite `last_perf` (bd-c7pg).
@@ -4791,6 +4817,7 @@ impl SimulationView {
             command_submit,
             recent_commands: Arc::new(Mutex::new(VecDeque::new())),
             map_apply_submit: None,
+            config_update_submit: None,
             map_sandbox: Arc::new(Mutex::new(map_sandbox)),
             camera: Arc::new(Mutex::new(Camera::default())),
             world_raster_cache: Arc::new(Mutex::new(WorldRasterCache::default())),
@@ -4807,6 +4834,7 @@ impl SimulationView {
             timeline_job: None,
             timeline_cancelled: Arc::new(AtomicBool::new(false)),
             lab_workflows: LabWorkflows::default(),
+            lab_guide: Arc::new(Mutex::new(LabGuide::default())),
             perf: PerfStats::new(240),
             last_perf: PerfSnapshot::default(),
             forced_perf: None,
@@ -4867,6 +4895,7 @@ impl SimulationView {
     }
 
     fn submit_control_command(&self, command: ControlCommand) -> bool {
+        let guide_source = self.host.snapshot_hub().latest();
         let tick = self
             .read_snapshot()
             .ok()
@@ -4898,6 +4927,14 @@ impl SimulationView {
                     GuiCommandSubmission::Enqueued,
                 )
             });
+        if let GuiCommandSubmission::Enqueued(id) = &submission
+            && let Ok(mut guide) = self.lab_guide.lock()
+        {
+            // The running owner can publish between rendering and admission.
+            // Correlate against the exact source captured for this submission.
+            guide.observe_snapshot(&guide_source, None);
+            guide.record_command(&command, *id, &guide_source);
+        }
         self.record_gui_command(label, submission);
         match admitted.as_deref() {
             Some(command_id) => {
@@ -7554,6 +7591,7 @@ impl SimulationView {
                         .hover(|style| style.bg(chrome::surface_raised()))
                 }
             }))
+            .child(self.render_lab_guide_launcher(cx))
     }
 
     fn render_dashboard_status(&self, snapshot: &HudSnapshot) -> Div {
@@ -7741,7 +7779,14 @@ impl SimulationView {
                 .overflow_y_scroll()
                 .scrollbar_width(px(8.0))
                 .pr_1()
-                .child(div().w_full().max_w(px(1040.0)).mx_auto().child(body)),
+                .child(
+                    div()
+                        .w_full()
+                        .max_w(px(1040.0))
+                        .mx_auto()
+                        .child(self.render_lab_guide(cx))
+                        .child(body),
+                ),
         )
     }
 

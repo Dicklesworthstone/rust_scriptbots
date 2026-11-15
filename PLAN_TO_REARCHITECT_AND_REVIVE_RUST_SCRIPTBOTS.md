@@ -2,17 +2,25 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
-**Shared first-run Lab guide, terminal adapter (2026-11-15):**
+**Shared first-run Lab guide in terminal and GPUI (2026-11-15):**
 [Source implemented and independently reviewed — executable qualification remains open under `bd-2z0.10.4`]
 
-Added a shared, versioned eight-step walkthrough and an opt-in terminal surface:
-identify the live world, inspect a living stable UID, pause, advance one tick,
-change only food growth, save a fresh cut, run a two-arm study, and read its
-descriptive outcome. Both terminal event paths observe actual command receipts
-and publications. Admission alone cannot advance the guide; volatile journal
-commitments are labelled explicitly. Old saves, foreign owners, stale callbacks,
-unchanged single-arm continuations, and mismatched reports cannot satisfy steps.
-Hiding the guide preserves progress and opening it does not mutate science.
+Added a shared, versioned eight-step walkthrough and opt-in terminal and GPUI
+surfaces: identify the live world, inspect a living stable UID, pause, advance
+one tick, change only food growth, save a fresh cut, run a two-arm study, and
+read its descriptive outcome. Both terminal event paths and the shared World/Lab
+guide observe actual command receipts and publications. Admission alone cannot
+advance the guide; volatile journal commitments are labelled explicitly. Old
+saves, foreign owners, stale callbacks, unchanged single-arm continuations, and
+mismatched reports cannot satisfy steps. Hiding the guide preserves progress
+and opening it does not mutate science.
+
+GPUI action buttons use the existing inspector, live controls, saved-checkpoint
+composer and verified report loader. The growth-edit adapter retains the normal
+application command identity and attaches all three owner revision guards.
+That closes the race between a client precheck and application of a whole
+configuration. A real-owner regression separately exercises stale control,
+scientific and configuration rejection while preserving the competing state.
 
 Model and real-owner adapter regressions are authored but unexecuted. The
 required DSR health preflight refused insufficient storage capacity before
