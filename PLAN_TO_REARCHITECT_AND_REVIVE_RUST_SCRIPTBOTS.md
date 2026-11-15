@@ -2,9 +2,9 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
-**Portable archipelago continuation and terminal scientific comparisons (2026-11-14):**
-[Currently In Progress — Codex; `bd-16g.5`, `bd-2z0.6`; runtime source implemented
-and independently reviewed, CLI/terminal integration in progress]
+**Portable archipelago continuation and terminal scientific comparisons (2026-11-15):**
+[Source implemented and independently reviewed — Codex; `bd-16g.5`, `bd-2z0.6`;
+executable qualification open]
 
 Capture and restore the complete multi-island owner state at a settled barrier,
 including migration policy, command identities and retained volatile journals.
@@ -18,11 +18,22 @@ The runtime checkpoint now carries the complete paired volatile owner cuts in a
 canonical, checksummed 256 MiB envelope, with at most 64 islands and 4 MiB of
 metadata. Restore validates configuration/session identity, topology, cadence,
 epoch and exclusive command cursors before reconstructing executable owners.
-Four regression tests are authored for continued science/migrations and invalid
-cuts. Pinned Rustfmt source formatting and whitespace review succeeded. DSR
-refused this host during storage admission: the home filesystem is full and the
-root filesystem is below its unchanged free-space requirement. Compilation,
-test execution, Clippy and broader qualification remain unexecuted.
+The recorded CLI can export a complete final cut with `--archipelago-checkpoint`.
+`continue-archipelago` restores it, advances a bounded number of further barriers
+with the original executable brain registry, and saves a new exclusive output.
+It leaves the source checkpoint and database unchanged and explicitly reports
+that the original science database is not continued. Input size, regular-file
+identity, checksum, existing outputs, work horizon and thread count are bounded.
+
+Four runtime regressions cover continued science/migrations and invalid cuts.
+File tests cover corruption, size limits, aliases and preservation of existing
+evidence; a CLI integration regression compares actual MLP migration continuation
+against an uninterrupted run, then continues the resulting checkpoint again.
+Pinned Rustfmt source formatting and whitespace review succeeded. DSR refused
+this host during storage admission. A fresh health check still finds root, home,
+Cargo home and temporary storage below the unchanged 20 GiB-per-role minimum;
+only the scratch build root qualifies. Compilation, test execution, Clippy and
+broader qualification remain unexecuted.
 
 **Checkpoint-create retries across service reopen (2026-11-14):**
 [Source implemented and independently reviewed — Codex; executable qualification open]
