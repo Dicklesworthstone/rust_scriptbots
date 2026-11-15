@@ -2,6 +2,69 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Terminal saved-study results and portable intervention inputs (2026-11-14):**
+[Source committed and independently reviewed — Codex; terminal executable qualification remains open]
+
+The terminal journey from a saved scientific cut to an interpretable study
+result now uses the existing shared Lab provider. Bounded checkpoint and
+retained-study catalogs, explicit study selection, and verified report readback
+preserve the existing pending/final presentation rail for
+save, historical review, branch creation and cancellation. Original real-PTY,
+runtime and broader scientific qualification under `bd-2z0.6.8` remains open.
+
+Repaired the independently reproduced `StudyIntervention` JSON field-order
+failure: with arbitrary-precision JSON enabled, a valid `params`-before-`type`
+input reaches Serde's intermediate buffering and rejects finite f32 parameters.
+Preserved the current wire representation, duplicate/unknown-field refusal and
+scientific meanings. Ordinary JSON and direct JSON Value round trips passed the
+causal probe; only the reordered arbitrary-precision input failed.
+
+- [x] Connect paged saved checkpoints and retained studies to the live Replay route.
+- [x] Expose verified control/treatment report observations and their single-seed scope.
+- [x] Preserve saved-cut review, mutation ordering, bounded workers and source invalidation.
+- [x] Repair order-independent scientific intervention decoding with regression coverage.
+- [x] Run source-bound DSR checks and record their exact scope before publication.
+- [ ] Execute the actual terminal/provider/PTY regressions when the locked app graph resolves.
+
+The codec is published as `08a94fd`; Replay is published as `049553e`.
+Genuine DSR executed the actual production codec and core wire types with all
+11 extracted registry versions/checksums matching `Cargo.lock`. The original
+codec passes all three regressions normally and fails all three with arbitrary
+precision; the replacement passes all three in both modes. Strict Clippy and
+pinned formatting also pass (DSR receipt `20261114T230225-EHnII3Cv`, 4/4).
+This closes scoped codec bead `bd-2z0.12.2.2`; full-plan/CLI/API/scientific runner
+qualification remains with the parent. The initial small probe and later full
+regression matrix differ in coverage, not in the underlying field-order defect.
+
+Replay's three changed Rust files pass pinned DSR formatting (receipt
+`20261114T230325-DV4J9xya`, 3/3). Authored tests cover actual saved-canvas and
+branch-service journeys, paging, hidden-source refusal, retained worker bounds,
+changed source/route invalidation and corrupted report refusal. Those tests
+have not executed: the pinned Zed revision below still blocks the application
+dependency graph. Source review and formatting do not establish runtime passage.
+
+**Narrative queries for retained simulation runs (2026-11-14):**
+[Source implemented and independently reviewed — Codex; executable acceptance open under `bd-urtp`]
+
+Connected the storage reader's existing explicit run selection to narrative
+search and chronological windows through the shared query DTO, direct/remote
+CLI, REST and MCP. Previously, the unqualified reader refused multi-run
+databases with no selection path on these surfaces. The new optional `run_id`
+preserves that refusal when no run is chosen, validates canonical run IDs and
+refuses live-memory fallback for an explicitly selected stored run, including
+zero-limit requests. MCP advertises zero limits/windows consistently with the
+existing shared handler semantics.
+
+The new real same-file two-run regression overlaps keyword, event kind and
+tick while retaining distinguishable text/severity, checks both query modes
+across all five surfaces, and refuses omitted/unknown/malformed selections.
+Direct reads receive a conflicting live-event decoy. Missing-storage and
+canonical-ID unit regressions are also authored. Pinned DSR formatting passes
+for all four Rust files, with final server-schema check bound to SHA256
+`8a2dc3692e98e5533586dd1589d0ccb0b72ada30aa55dc8d09592aaf7d8b740a`.
+The actual storage/transport tests remain unexecuted due to the same pinned
+application dependency blocker; `bd-urtp` remains in progress.
+
 **Terminal experiment workflow convergence (2026-11-15):**
 [Source committed and independently reviewed — Codex; executable qualification under `bd-2z0.6.8`]
 
@@ -27,7 +90,7 @@ preserved, including detail-view bracket shortcuts and legacy provider regressio
   stop acknowledgements, foreign owners/navigation/shutdown and receipt eviction.
 - [ ] Execute real-provider integration and refusal/lifecycle regression cases.
 - [x] Pass pinned DSR formatting and independent source review; publish coherent code increments.
-- [ ] Export the final Beads qualification notes with `br` when the execution workspace returns.
+- [x] Reconcile original Beads notes and current progress through `br` after workspace recovery.
 
 The source-bound app check with the exact locked dependencies timed out after
 900 seconds before Rust compilation, while fetching Zed. Its offline follow-up

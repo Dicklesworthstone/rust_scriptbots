@@ -3235,6 +3235,8 @@ pub struct NarrativeSearchQueryParams {
     pub to: Option<u64>,
     /// Optional maximum number of hits (capped at 4096, default 32)
     pub limit: Option<usize>,
+    /// Stored run ID (32 lowercase hex characters); required for a multi-run database.
+    pub run_id: Option<String>,
 }
 
 #[utoipa::path(
@@ -3258,6 +3260,7 @@ async fn get_narrative_search(
         from_tick: params.from,
         to_tick: params.to,
         limit: params.limit,
+        run_id: params.run_id,
     };
     let hits = run_control(move || state.handle.narrative_search(query)).await?;
     Ok(Json(hits))
@@ -3267,6 +3270,8 @@ async fn get_narrative_search(
 pub struct NarrativeAroundQueryParams {
     /// Half-window size in ticks (capped at 10000, default 100)
     pub window: Option<u64>,
+    /// Stored run ID (32 lowercase hex characters); required for a multi-run database.
+    pub run_id: Option<String>,
 }
 
 #[utoipa::path(
@@ -3291,6 +3296,7 @@ async fn get_narrative_around(
     let query = NarrativeAroundQuery {
         tick,
         window: params.window,
+        run_id: params.run_id,
     };
     let hits = run_control(move || state.handle.narrative_around(query)).await?;
     Ok(Json(hits))
@@ -5118,6 +5124,11 @@ fn register_control_tools(builder: ServerBuilder, handle: ControlHandle) -> Serv
                     "type": "string",
                     "description": "Full-text query string (e.g. population, extinction, drought)"
                 },
+                "run_id": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{32}$",
+                    "description": "Stored run ID; required for multi-run databases. Explicit selection never uses live memory."
+                },
                 "from_tick": {
                     "type": "integer",
                     "minimum": 0,
@@ -5130,7 +5141,7 @@ fn register_control_tools(builder: ServerBuilder, handle: ControlHandle) -> Serv
                 },
                 "limit": {
                     "type": "integer",
-                    "minimum": 1,
+                    "minimum": 0,
                     "maximum": 4096,
                     "description": "Max events to return (default 32, max 4096)"
                 }
@@ -5154,9 +5165,14 @@ fn register_control_tools(builder: ServerBuilder, handle: ControlHandle) -> Serv
                     "minimum": 0,
                     "description": "Center tick to retrieve events around"
                 },
+                "run_id": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{32}$",
+                    "description": "Stored run ID; required for multi-run databases. Explicit selection never uses live memory."
+                },
                 "window": {
                     "type": "integer",
-                    "minimum": 1,
+                    "minimum": 0,
                     "maximum": 10000,
                     "description": "Half-window size in ticks (default 100, max 10000)"
                 }
@@ -6073,38 +6089,25 @@ impl ToolHandler for ControlTool {
                 make_tool_result(status)
             }
             ControlToolKind::NarrativeSearch => {
-                let query_str =
-                    arguments
-                        .get("query")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| {
-                            McpError::new(McpErrorCode::InvalidParams, "missing 'query' field")
-                        })?;
-                let from_tick = arguments.get("from_tick").and_then(|v| v.as_u64());
-                let to_tick = arguments.get("to_tick").and_then(|v| v.as_u64());
-                let limit = arguments
-                    .get("limit")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as usize);
-                let query = NarrativeSearchQuery {
-                    query: query_str.to_string(),
-                    from_tick,
-                    to_tick,
-                    limit,
-                };
+                let query: NarrativeSearchQuery = serde_json::from_value(Value::Object(arguments))
+                    .map_err(|error| {
+                        McpError::new(
+                            McpErrorCode::InvalidParams,
+                            format!("invalid narrative_search parameters: {error}"),
+                        )
+                    })?;
                 let handle = self.handle.clone();
                 let hits = run_control_mcp_sync(move || handle.narrative_search(query))?;
                 make_tool_result(hits)
             }
             ControlToolKind::NarrativeAround => {
-                let tick = arguments
-                    .get("tick")
-                    .and_then(|v| v.as_u64())
-                    .ok_or_else(|| {
-                        McpError::new(McpErrorCode::InvalidParams, "missing 'tick' field")
+                let query: NarrativeAroundQuery = serde_json::from_value(Value::Object(arguments))
+                    .map_err(|error| {
+                        McpError::new(
+                            McpErrorCode::InvalidParams,
+                            format!("invalid narrative_around parameters: {error}"),
+                        )
                     })?;
-                let window = arguments.get("window").and_then(|v| v.as_u64());
-                let query = NarrativeAroundQuery { tick, window };
                 let handle = self.handle.clone();
                 let hits = run_control_mcp_sync(move || handle.narrative_around(query))?;
                 make_tool_result(hits)

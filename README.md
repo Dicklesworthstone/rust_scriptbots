@@ -1365,6 +1365,29 @@ order by kind;
 
 JSON replay payloads are validated by ScriptBots and stored as ordinary `TEXT`. Integer flags are decoded at the storage boundary into Rust booleans.
 
+### Search narratives from a selected run
+
+`control_cli narrative search` reads the stored full-text index, and
+`control_cli narrative around` reads a chronological window. Select a run in a
+multi-run database with its canonical 32-character lowercase hexadecimal ID:
+
+```bash
+control_cli narrative search population --db runs/example.sqlite --run-id 00000000000000000000000000000001 --from-tick 100 --to-tick 500 --limit 32 --json
+control_cli narrative around 250 --db runs/example.sqlite --run-id 00000000000000000000000000000001 --window 50 --json
+```
+
+Replace the example ID with the retained run's actual ID. Omit `--db` to query
+the running service; `--run-id` is forwarded in that mode too. REST accepts
+`run_id` on `GET /api/narrative/search` and
+`GET /api/narrative/around/{tick}`. MCP tools `narrative_search` and
+`narrative_around` accept the same optional `run_id` string.
+
+An omitted selector is accepted for a single-run database. A multi-run database
+requires a selection; an unknown or malformed ID is an error. Explicit run
+selection always requires accessible stored evidence and never falls back to
+the live event ring. Search `limit: 0` still verifies an explicitly selected
+run; an around-query `window: 0` selects the exact tick.
+
 ### Offline narrative timelines
 
 Use the finished database printed by the application to read the actual emergent-event

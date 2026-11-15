@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use scriptbots_core::narrative::EventRecord;
-use scriptbots_storage::{NarrativeHit, StorageError, StorageReader};
+use scriptbots_storage::{NarrativeHit, RunId, StorageError, StorageReader};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use utoipa::{IntoParams, ToSchema};
@@ -36,6 +36,10 @@ pub struct NarrativeSearchQuery {
     /// Optional maximum number of hits (capped at 4096, default 32).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
+    /// Stored run to query, as exactly 32 lowercase hexadecimal characters.
+    /// Required for multi-run databases; an explicit selection never uses live memory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 /// Input parameters for a chronological narrative window query around a tick.
@@ -46,6 +50,10 @@ pub struct NarrativeAroundQuery {
     /// Half-window size in ticks (capped at 10000, default 100).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<u64>,
+    /// Stored run to query, as exactly 32 lowercase hexadecimal characters.
+    /// Required for multi-run databases; an explicit selection never uses live memory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 /// Standardized event hit DTO returned uniformly by REST, MCP, and CLI surfaces.
@@ -112,6 +120,9 @@ pub enum NarrativeSearchError {
     #[error("requested window {window} exceeds maximum allowable {max}")]
     WindowTooLarge { window: u64, max: u64 },
 
+    #[error("run_id must be exactly 32 lowercase hexadecimal characters")]
+    InvalidRunId,
+
     #[error("storage unavailable for narrative search: {0}")]
     StorageUnavailable(String),
 
@@ -119,8 +130,15 @@ pub enum NarrativeSearchError {
     Storage(#[from] StorageError),
 }
 
-/// Validated search query components: (clean_query, optional_tick_range, limit).
-pub type ValidatedSearchQuery = (String, Option<(u64, u64)>, usize);
+/// Validated search components: (clean_query, optional_tick_range, limit, selected_run).
+pub type ValidatedSearchQuery = (String, Option<(u64, u64)>, usize, Option<RunId>);
+
+fn parse_selected_run(value: Option<&str>) -> Result<Option<RunId>, NarrativeSearchError> {
+    value
+        .map(str::parse)
+        .transpose()
+        .map_err(|_| NarrativeSearchError::InvalidRunId)
+}
 
 /// Validate search query parameters before hitting storage.
 pub fn validate_search_query(
@@ -166,13 +184,14 @@ pub fn validate_search_query(
         None => DEFAULT_NARRATIVE_PAGE_LIMIT,
     };
 
-    Ok((trimmed.to_string(), tick_range, limit))
+    let run_id = parse_selected_run(query.run_id.as_deref())?;
+    Ok((trimmed.to_string(), tick_range, limit, run_id))
 }
 
 /// Validate around query parameters before hitting storage.
 pub fn validate_around_query(
     query: &NarrativeAroundQuery,
-) -> Result<(u64, u64), NarrativeSearchError> {
+) -> Result<(u64, u64, Option<RunId>), NarrativeSearchError> {
     let window = match query.window {
         Some(w) if w > MAX_NARRATIVE_AROUND_WINDOW => {
             return Err(NarrativeSearchError::WindowTooLarge {
@@ -184,7 +203,34 @@ pub fn validate_around_query(
         None => DEFAULT_NARRATIVE_AROUND_WINDOW,
     };
 
-    Ok((query.tick, window))
+    let run_id = parse_selected_run(query.run_id.as_deref())?;
+    Ok((query.tick, window, run_id))
+}
+
+/// Bind all storage reads to the requested run before considering any memory fallback.
+fn open_narrative_reader(
+    database_path: Option<&Path>,
+    run_id: Option<RunId>,
+) -> Result<Option<StorageReader>, NarrativeSearchError> {
+    if let Some(db_path) = database_path.filter(|path| path.exists()) {
+        let path_str = db_path.to_str().ok_or_else(|| {
+            NarrativeSearchError::StorageUnavailable(format!(
+                "database path {} is not valid UTF-8",
+                db_path.display()
+            ))
+        })?;
+        let reader = match run_id {
+            Some(run_id) => StorageReader::open_for_run(path_str, run_id)?,
+            None => StorageReader::open(path_str)?,
+        };
+        return Ok(Some(reader));
+    }
+    if let Some(run_id) = run_id {
+        return Err(NarrativeSearchError::StorageUnavailable(format!(
+            "selected run {run_id} requires an accessible database; live snapshot events cannot satisfy a stored-run query"
+        )));
+    }
+    Ok(None)
 }
 
 /// Execute a full-text search against the storage reader or in-memory fallback.
@@ -193,19 +239,12 @@ pub fn execute_narrative_search(
     snapshot_events: Option<&[EventRecord]>,
     query: NarrativeSearchQuery,
 ) -> Result<Vec<NarrativeSearchHitDto>, NarrativeSearchError> {
-    let (clean_query, tick_range, limit) = validate_search_query(&query)?;
-    if limit == 0 {
+    let (clean_query, tick_range, limit, run_id) = validate_search_query(&query)?;
+    if limit == 0 && run_id.is_none() {
         return Ok(Vec::new());
     }
 
-    if let Some(db_path) = database_path.filter(|p| p.exists()) {
-        let path_str = db_path.to_str().ok_or_else(|| {
-            NarrativeSearchError::StorageUnavailable(format!(
-                "database path {} is not valid UTF-8",
-                db_path.display()
-            ))
-        })?;
-        let reader = StorageReader::open(path_str)?;
+    if let Some(reader) = open_narrative_reader(database_path, run_id)? {
         let hits = reader.search_narrative(&clean_query, tick_range, limit)?;
         let dtos = hits.into_iter().map(NarrativeSearchHitDto::from).collect();
         return Ok(dtos);
@@ -242,16 +281,9 @@ pub fn execute_narrative_around(
     snapshot_events: Option<&[EventRecord]>,
     query: NarrativeAroundQuery,
 ) -> Result<Vec<NarrativeSearchHitDto>, NarrativeSearchError> {
-    let (center_tick, window) = validate_around_query(&query)?;
+    let (center_tick, window, run_id) = validate_around_query(&query)?;
 
-    if let Some(db_path) = database_path.filter(|p| p.exists()) {
-        let path_str = db_path.to_str().ok_or_else(|| {
-            NarrativeSearchError::StorageUnavailable(format!(
-                "database path {} is not valid UTF-8",
-                db_path.display()
-            ))
-        })?;
-        let reader = StorageReader::open(path_str)?;
+    if let Some(reader) = open_narrative_reader(database_path, run_id)? {
         let hits = reader.narrative_around_tick(center_tick, window)?;
         let dtos = hits.into_iter().map(NarrativeSearchHitDto::from).collect();
         return Ok(dtos);
@@ -317,6 +349,7 @@ mod tests {
             from_tick: None,
             to_tick: None,
             limit: None,
+            run_id: None,
         };
         assert!(matches!(
             validate_search_query(&empty),
@@ -328,6 +361,7 @@ mod tests {
             from_tick: None,
             to_tick: None,
             limit: None,
+            run_id: None,
         };
         assert!(matches!(
             validate_search_query(&ws),
@@ -342,6 +376,7 @@ mod tests {
             from_tick: None,
             to_tick: None,
             limit: None,
+            run_id: None,
         };
         assert!(matches!(
             validate_search_query(&overlong),
@@ -356,6 +391,7 @@ mod tests {
             from_tick: None,
             to_tick: None,
             limit: None,
+            run_id: None,
         };
         assert!(matches!(
             validate_search_query(&nul),
@@ -370,6 +406,7 @@ mod tests {
             from_tick: Some(100),
             to_tick: Some(50),
             limit: None,
+            run_id: None,
         };
         assert!(matches!(
             validate_search_query(&invalid),
@@ -384,6 +421,7 @@ mod tests {
             from_tick: None,
             to_tick: None,
             limit: Some(MAX_NARRATIVE_PAGE_LIMIT + 1),
+            run_id: None,
         };
         assert!(matches!(
             validate_search_query(&oversized),
@@ -395,11 +433,13 @@ mod tests {
             from_tick: None,
             to_tick: None,
             limit: Some(10),
+            run_id: None,
         };
-        let (q, range, limit) = validate_search_query(&normal).expect("valid query");
+        let (q, range, limit, run_id) = validate_search_query(&normal).expect("valid query");
         assert_eq!(q, "population");
         assert_eq!(range, None);
         assert_eq!(limit, 10);
+        assert_eq!(run_id, None);
     }
 
     #[test]
@@ -407,6 +447,7 @@ mod tests {
         let oversized = NarrativeAroundQuery {
             tick: 50,
             window: Some(MAX_NARRATIVE_AROUND_WINDOW + 1),
+            run_id: None,
         };
         assert!(matches!(
             validate_around_query(&oversized),
@@ -416,10 +457,109 @@ mod tests {
         let normal = NarrativeAroundQuery {
             tick: 100,
             window: Some(50),
+            run_id: None,
         };
-        let (center, win) = validate_around_query(&normal).expect("valid around query");
+        let (center, win, run_id) = validate_around_query(&normal).expect("valid around query");
         assert_eq!(center, 100);
         assert_eq!(win, 50);
+        assert_eq!(run_id, None);
+    }
+
+    #[test]
+    fn narrative_queries_require_canonical_run_ids_even_for_empty_pages() {
+        for run_id in [
+            "",
+            "1",
+            "0000000000000000000000000000000G",
+            "0000000000000000000000000000000A",
+            " 00000000000000000000000000000001",
+        ] {
+            let search = NarrativeSearchQuery {
+                query: "population".into(),
+                from_tick: None,
+                to_tick: None,
+                limit: Some(0),
+                run_id: Some(run_id.into()),
+            };
+            assert!(matches!(
+                validate_search_query(&search),
+                Err(NarrativeSearchError::InvalidRunId)
+            ));
+            let around = NarrativeAroundQuery {
+                tick: 10,
+                window: None,
+                run_id: Some(run_id.into()),
+            };
+            assert!(matches!(
+                validate_around_query(&around),
+                Err(NarrativeSearchError::InvalidRunId)
+            ));
+        }
+        let run_id = RunId::new(u128::MAX);
+        let search: NarrativeSearchQuery = serde_json::from_value(serde_json::json!({
+            "query": "population", "run_id": run_id.to_string()
+        }))
+        .unwrap();
+        let around: NarrativeAroundQuery = serde_json::from_value(serde_json::json!({
+            "tick": 10, "run_id": run_id.to_string()
+        }))
+        .unwrap();
+        assert_eq!(validate_search_query(&search).unwrap().3, Some(run_id));
+        assert_eq!(validate_around_query(&around).unwrap().2, Some(run_id));
+        assert!(
+            serde_json::from_value::<NarrativeSearchQuery>(serde_json::json!({
+                "query": "population", "run_id": 1
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<NarrativeAroundQuery>(serde_json::json!({
+                "tick": 10, "run_id": {"value": 1}
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn selected_narrative_runs_never_fall_back_to_live_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("unavailable.sqlite");
+        for path in [None, Some(missing.as_path())] {
+            for limit in [Some(0), None] {
+                let result = execute_narrative_search(
+                    path,
+                    Some(&[]),
+                    NarrativeSearchQuery {
+                        query: "population".into(),
+                        from_tick: None,
+                        to_tick: None,
+                        limit,
+                        run_id: Some(RunId::new(1).to_string()),
+                    },
+                );
+                assert!(matches!(
+                    result,
+                    Err(NarrativeSearchError::StorageUnavailable(_))
+                ));
+            }
+            let result = execute_narrative_around(
+                path,
+                Some(&[]),
+                NarrativeAroundQuery {
+                    tick: 10,
+                    window: None,
+                    run_id: Some(RunId::new(1).to_string()),
+                },
+            );
+            assert!(matches!(
+                result,
+                Err(NarrativeSearchError::StorageUnavailable(_))
+            ));
+        }
+        assert!(
+            !missing.exists(),
+            "queries must not create a missing database"
+        );
     }
 
     #[test]
@@ -478,6 +618,7 @@ mod tests {
                 from_tick: None,
                 to_tick: None,
                 limit: None,
+                run_id: None,
             },
         )
         .expect("in-memory search");
@@ -494,6 +635,7 @@ mod tests {
                 from_tick: Some(20),
                 to_tick: Some(60),
                 limit: Some(10),
+                run_id: None,
             },
         )
         .expect("in-memory search with range");
@@ -508,6 +650,7 @@ mod tests {
             NarrativeAroundQuery {
                 tick: 20,
                 window: Some(10),
+                run_id: None,
             },
         )
         .expect("in-memory around");
