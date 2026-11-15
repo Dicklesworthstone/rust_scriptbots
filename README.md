@@ -261,10 +261,16 @@ RUST_LOG=info cargo run -p scriptbots-app
   identity has actually been displayed. `X` can deny an unpresented request or
   discard a submitted request's result; admitted work continues independently.
 - In Replay (`7`), press `K` to save a checkpoint and use Up/Down to select a
-  catalog row. It shows that saved cut's population and first twelve characters
-  of its `WorldDigestV1`, separately from the live tick and artifact checksums.
-  The full selected checkpoint ID appears below the comparison section; table
-  IDs are shortened to keep measured columns visible in an 80-column terminal.
+  catalog row. `[` returns to the first page and `]` opens the next page;
+  `R` refreshes and Page Up/Page Down scroll the visible evidence. Each row
+  shows the saved cut's population, checkpoint ID and scientific digest,
+  separately from the observed live tick and artifact checksums.
+  `B` opens retained branch studies and `A` returns to saved checkpoints.
+  In the study catalog, Enter opens details; Enter or `V` in those details
+  reads the verified report, including actual control/treatment endpoints,
+  differences, first divergence and provenance. The report labels the result
+  as one saved seed with descriptive outcomes. A failed verification clears
+  the previous report. Browsing a study clears the hidden saved-cut selection.
   REST/MCP checkpoint metadata carries `agent_count` and the full
   `world_digest_v1`. These values describe the saved cut even after the world
   advances or an identical capture request is retried. Viewing the catalog
@@ -2454,6 +2460,11 @@ press **N**. Choose the horizon with **Up/Down** or **+/-** and the treatment wi
 **Left/Right**, then press **Enter** to start. **Esc/X** discards the draft; **X**
 in Replay requests cancellation of an active study. The status panel identifies
 the source and target ticks, observed execution state, and completed report artifact.
+Press **B** to browse retained studies, **Enter** to select one, then **Enter/V**
+to read its verified report. **[ / ]** navigate the first/next catalog page,
+**R** refreshes, and **Page Up/Page Down** scroll long results. **A/Esc** returns
+to saved checkpoints. The active study owned by this terminal is labelled
+separately from the retained study being inspected.
 
 The report compares one source trajectory and does not count its ticks as independent
 replicates. The saved cut restores science state; the original owner's pending commands,

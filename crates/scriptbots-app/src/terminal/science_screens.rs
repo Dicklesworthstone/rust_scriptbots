@@ -1160,6 +1160,201 @@ pub fn render_experiments_screen(
     }
 }
 
+/// Render saved checkpoints and verified study outcomes from the shared Lab.
+/// The terminal's existing branch composer and mutation receipts stay separate.
+pub(super) fn render_live_replay_screen(
+    frame: &mut ratatui::Frame<'_>,
+    lab: &super::TerminalReplayLab,
+    active_study: Option<&crate::control::CheckpointBranchStatusDto>,
+    live_tick: u64,
+    style: ratatui::style::Style,
+) {
+    use ratatui::{
+        layout::Rect,
+        text::Line,
+        widgets::{Clear, Paragraph, Wrap},
+    };
+    use scriptbots_runtime::lab_workflows::{LabCheckpointView, branch_report_lines};
+
+    let workflows = &lab.workflows;
+    let selected = lab.selected_row.as_deref();
+    let area = frame.area();
+    let body = Rect::new(
+        area.x,
+        area.y + area.height.min(3),
+        area.width,
+        area.height.saturating_sub(3 + SHELL_FOOTER_ROWS),
+    );
+    frame.render_widget(Clear, body);
+    let mut lines = vec![
+        "SAVED CHECKPOINTS & BRANCH STUDIES".to_owned(),
+        "Up/Down select · R refresh · PgUp/PgDn scroll · G live canvas".into(),
+        format!("Observed live tick: {live_tick}. Browsing leaves the live owner unchanged."),
+    ];
+    if let Some(study) = active_study {
+        lines.push(format!(
+            "This terminal's study {}: {} · saved {} -> target {}",
+            study.branch_name, study.status, study.source_tick, study.target_tick
+        ));
+        lines.push(format!(
+            "Study ID: {} · source digest: {}",
+            study.branch_id, study.world_digest_v1
+        ));
+        if matches!(study.status.as_str(), "running" | "cancelling") {
+            lines.push(
+                "X requests a stop of this terminal's active study and discards a pending read."
+                    .into(),
+            );
+        } else if let Some(artifact) = &study.artifact_id {
+            lines.push(format!(
+                "Completed report artifact: {artifact} · B opens retained study results."
+            ));
+        } else if let Some(error) = &study.error_reason {
+            lines.push(format!("Study outcome: {error}"));
+        }
+    }
+    let heading_rows = u16::try_from(lines.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(5);
+    let table_rows =
+        usize::from(body.height.saturating_sub(heading_rows) / 2).clamp(1, SCIENCE_TABLE_ROWS);
+    match workflows.checkpoint_view {
+        LabCheckpointView::SavedCuts => {
+            lines.push(
+                "Enter reviews saved canvas · K save · N new study · B retained studies".into(),
+            );
+            lines.push("[ first checkpoint page · ] next page".into());
+            if let Some(page) = &workflows.checkpoints {
+                lines.push(format!(
+                    "Saved cuts {}–{} of {} · retained bytes {}/{}",
+                    page.offset.saturating_add(1).min(page.total),
+                    page.offset + page.items.len(),
+                    page.total,
+                    page.retained_bytes,
+                    page.max_bytes,
+                ));
+                let index = selected
+                    .and_then(|id| page.items.iter().position(|row| row.checkpoint_id == id))
+                    .unwrap_or(0);
+                let first = first_visible_table_index(index, table_rows);
+                for row in page.items.iter().skip(first).take(table_rows) {
+                    let marker = if selected == Some(row.checkpoint_id.as_str()) {
+                        ">"
+                    } else {
+                        " "
+                    };
+                    lines.push(format!(
+                        "{marker} {} · tick {} · {} agents · {} bytes",
+                        row.checkpoint_id, row.tick, row.agent_count, row.byte_size
+                    ));
+                    lines.push(format!("  Scientific digest: {}", row.world_digest));
+                }
+                if page.items.is_empty() {
+                    lines.push(
+                        "No saved checkpoints on this page. K saves the current owner cut.".into(),
+                    );
+                }
+            } else {
+                lines.push("No checkpoint catalog page is loaded. R requests it.".into());
+            }
+        }
+        LabCheckpointView::BranchCatalog => {
+            lines.push(
+                "Enter inspects a study · A saved checkpoints · [ first study page · ] next page"
+                    .into(),
+            );
+            if let Some(page) = &workflows.checkpoint_branches {
+                lines.push(format!(
+                    "Retained studies {}–{} of {}",
+                    page.offset.saturating_add(1).min(page.total),
+                    page.offset + page.items.len(),
+                    page.total
+                ));
+                let index = selected
+                    .and_then(|id| page.items.iter().position(|row| row.branch_id == id))
+                    .unwrap_or(0);
+                let first = first_visible_table_index(index, table_rows);
+                for row in page.items.iter().skip(first).take(table_rows) {
+                    let marker = if selected == Some(row.branch_id.as_str()) {
+                        ">"
+                    } else {
+                        " "
+                    };
+                    lines.push(format!(
+                        "{marker} {} · {} · {}",
+                        row.branch_name, row.status, row.branch_id
+                    ));
+                    lines.push(format!(
+                        "  Saved tick {} -> target {} · checkpoint {}",
+                        row.source_tick, row.target_tick, row.checkpoint_id
+                    ));
+                }
+                if page.items.is_empty() {
+                    lines.push(
+                        "No retained studies on this page. A returns to saved sources.".into(),
+                    );
+                }
+            } else {
+                lines.push("No retained-study page is loaded. R requests it.".into());
+            }
+        }
+        LabCheckpointView::BranchDetail => {
+            lines.push(
+                "Enter or V reads verified results · B study catalog · A saved checkpoints".into(),
+            );
+            if let Some(study) = &workflows.branch {
+                lines.push(format!(
+                    "Study {}: {} · {}",
+                    study.branch_name, study.status, study.branch_id
+                ));
+                lines.push(format!(
+                    "Saved checkpoint {} at tick {} -> target tick {}",
+                    study.checkpoint_id, study.source_tick, study.target_tick
+                ));
+                lines.push(format!("Saved scientific digest: {}", study.world_digest));
+                if let Some(error) = &study.error_reason {
+                    lines.push(format!("Execution outcome: {error}"));
+                }
+                if let Some(artifact) = &study.artifact_id {
+                    lines.push(format!("Report artifact: {artifact}"));
+                }
+                if let Some(report) = &workflows.branch_report {
+                    lines.push(String::new());
+                    lines.extend(branch_report_lines(report));
+                } else {
+                    lines.push(
+                        "No verified endpoint report is loaded. Read results after completion."
+                            .into(),
+                    );
+                }
+            } else {
+                lines.push(
+                    "Selected study details are unavailable. R refreshes its receipt.".into(),
+                );
+            }
+        }
+        LabCheckpointView::BranchComposer => {
+            lines.push(
+                "A returns to saved checkpoints; N opens the terminal study composer.".into(),
+            );
+        }
+    }
+    if workflows.is_busy() {
+        lines.push("Loading checkpoint or study evidence…".into());
+    }
+    if let Some(notice) = &workflows.notice {
+        lines.push(notice.clone());
+    }
+    let paragraph = Paragraph::new(lines.into_iter().map(Line::from).collect::<Vec<_>>())
+        .style(style)
+        .wrap(Wrap { trim: false });
+    let maximum_scroll = paragraph
+        .line_count(body.width)
+        .saturating_sub(usize::from(body.height));
+    let scroll = u16::try_from(usize::from(lab.scroll).min(maximum_scroll)).unwrap_or(u16::MAX);
+    frame.render_widget(paragraph.scroll((scroll, 0)), body);
+}
+
 /// Render Replay science screen (checkpoints, divergence, export).
 pub fn render_replay_screen(
     frame: &mut Frame,
