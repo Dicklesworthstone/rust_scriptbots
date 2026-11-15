@@ -52,8 +52,10 @@ use scriptbots_runtime::{
     HostPort, HostSessionId, JournalState, ProjectionClientId, ProjectionRequestRevision,
     ProtocolEventCursor, RenderSnapshot, SnapshotSubscription,
     channel::ChannelHostPort,
+    lab_guide::{LabGuideSource, LabGuideStep},
     lab_workflows::{
-        LabAction, LabCheckpointView, LabExperiment, LabExperimentCreationState,
+        LabAction, LabCheckpoint, LabCheckpointSave, LabCheckpointSaveState, LabCheckpointView,
+        LabExperiment, LabExperimentCreationState,
         LabExperimentDesign, LabExperimentDraft, LabMetric, LabPanel, LabWorkflowRequest,
         LabWorkflowResponse, LabWorkflowSubmit, LabWorkflows,
     },
@@ -1743,6 +1745,7 @@ impl Model for LiveTerminalModel<'_> {
                     if self.experiment_comparison_in_flight.is_some()
                         && !app.palette_open
                         && !app.help_visible
+                        && !app.frankentui.guide.visible
                         && matches!(&event, ftui::core::event::Event::Key(key)
                             if key.kind == ftui::core::event::KeyEventKind::Press
                                 && key.modifiers == ftui::core::event::Modifiers::NONE
@@ -1758,12 +1761,16 @@ impl Model for LiveTerminalModel<'_> {
                     if self.checkpoint_review_in_flight.is_some()
                         && !app.palette_open
                         && !app.help_visible
+                        && !app.frankentui.guide.visible
                         && matches!(&event, ftui::core::event::Event::Key(key)
                             if key.kind == ftui::core::event::KeyEventKind::Press
-                                && key.modifiers == ftui::core::event::Modifiers::NONE
-                                && matches!(key.code,
-                                    ftui::core::event::KeyCode::Char('x' | 'g')
-                                        | ftui::core::event::KeyCode::Escape))
+                                && ((key.modifiers == ftui::core::event::Modifiers::NONE
+                                    && matches!(key.code,
+                                        ftui::core::event::KeyCode::Char('x' | 'g' | 'G')
+                                            | ftui::core::event::KeyCode::Escape))
+                                    || (key.modifiers == ftui::core::event::Modifiers::SHIFT
+                                        && matches!(key.code,
+                                            ftui::core::event::KeyCode::Char('g' | 'G')))))
                     {
                         self.checkpoint_review_cancelled = true;
                         app.frankentui.status_message = Some(
@@ -1782,6 +1789,7 @@ impl Model for LiveTerminalModel<'_> {
                         && key.modifiers == ftui::core::event::Modifiers::NONE
                         && !app.palette_open
                         && !app.help_visible
+                        && !app.frankentui.guide.visible
                     {
                         if key.code == ftui::core::event::KeyCode::Char('x')
                             && self
@@ -2623,6 +2631,13 @@ impl LiveTerminalModel<'_> {
                 );
             } else if let Some(handle) = app.control.control_handle() {
                 self.checkpoint_in_flight = true;
+                let session_id = app.client.session_id();
+                app.guide_checkpoint_request = Some((request_id.clone(), session_id));
+                app.frankentui.guide.observe_checkpoint_save(&LabCheckpointSave {
+                    request_id: request_id.clone(),
+                    session_id,
+                    state: LabCheckpointSaveState::Pending,
+                });
                 commands.push(Cmd::task(move || {
                     let result = handle
                         .create_checkpoint(crate::control::CheckpointCreateRequest {
@@ -3210,6 +3225,8 @@ struct TerminalApp<'a> {
     presented_command: Option<CommandId>,
     shutdown_request: Option<CommandId>,
     checkpoint_presentation_result: Option<(String, String)>,
+    guide_checkpoint_request: Option<(String, HostSessionId)>,
+    guide_growth_source: Option<(LabGuideSource, u64)>,
     defer_live_commands: bool,
     pending_selections: VecDeque<PendingTerminalSelection>,
     selection_observation_revision: Option<ControlRevision>,
@@ -3442,6 +3459,8 @@ impl<'a> TerminalApp<'a> {
             presented_command: None,
             shutdown_request: None,
             checkpoint_presentation_result: None,
+            guide_checkpoint_request: None,
+            guide_growth_source: None,
             defer_live_commands: false,
             pending_selections: VecDeque::with_capacity(PENDING_SELECTION_CAPACITY),
             selection_observation_revision: None,
@@ -3595,6 +3614,200 @@ impl<'a> TerminalApp<'a> {
         Ok(envelope)
     }
 
+    fn observe_guide_snapshot(&mut self) {
+        let selected_uid = (self.frankentui.route == frankentui_shell::ShellRoute::Inspector)
+            .then_some(self.snapshot.focused_agent_uid)
+            .flatten()
+            .map(scriptbots_core::AgentUid);
+        self.frankentui.guide_selected_uid = selected_uid.map(|uid| uid.get());
+        self.frankentui
+            .guide
+            .observe_snapshot(&self.retained_render, selected_uid);
+    }
+
+    fn record_guide_command(&mut self, envelope: &CommandEnvelope) {
+        let command = match &envelope.command {
+            HostCommand::Pause => ControlCommand::Pause,
+            HostCommand::Step => ControlCommand::Step,
+            HostCommand::UpdateSimulation(update) => {
+                ControlCommand::UpdateSimulation(update.clone())
+            }
+            HostCommand::UpdateConfig(config) => ControlCommand::UpdateConfig(config.clone()),
+            _ => return,
+        };
+        self.frankentui.guide.record_command(
+            &command,
+            envelope.command_id,
+            &self.retained_render,
+        );
+    }
+
+    fn handle_guide_input(&mut self, key: ftui::core::event::KeyCode) -> bool {
+        use ftui::core::event::KeyCode as K;
+        if key == K::F(1) {
+            self.frankentui.handle_guide_key(key);
+            self.help_visible = false;
+            self.observe_guide_snapshot();
+            self.pointer_gesture.cancel("Lab guide visibility changed");
+            self.hit_regions = HitRegionMap::default();
+            self.map_area = None;
+            return true;
+        }
+        if !self.frankentui.guide.visible {
+            return false;
+        }
+        if key == K::Enter
+            || (self.frankentui.guide_growth_draft.is_none()
+                && matches!(key, K::Char('e' | 'E')))
+        {
+            self.refresh_snapshot();
+        }
+        if self.frankentui.guide_growth_draft.is_some() {
+            match key {
+                K::Escape => {
+                    self.frankentui.guide_growth_draft = None;
+                    self.guide_growth_source = None;
+                    self.frankentui.guide_notice =
+                        Some("Food growth edit cancelled; no command submitted.".into());
+                }
+                K::Backspace => {
+                    if let Some(draft) = &mut self.frankentui.guide_growth_draft {
+                        draft.pop();
+                    }
+                }
+                K::Char(ch) if ch.is_ascii_digit() || matches!(ch, '.' | '-' | '+' | 'e' | 'E') => {
+                    if let Some(draft) = &mut self.frankentui.guide_growth_draft
+                        && draft.len() < 32
+                    {
+                        draft.push(ch);
+                    }
+                }
+                K::Enter => {
+                    let source_matches = self.guide_growth_source.is_some_and(|(source, generation)| {
+                        generation == self.frankentui.guide.generation()
+                            && source.session_id == self.retained_render.session_id
+                            && source.revisions.config == self.retained_render.revisions.config
+                            && source.revisions.scientific
+                                == self.retained_render.revisions.scientific
+                            && source.tick == self.retained_render.world.tick
+                    });
+                    if !source_matches || !self.frankentui.guide_view_is_current() {
+                        self.frankentui.guide_growth_draft = None;
+                        self.guide_growth_source = None;
+                        self.frankentui.guide_notice = Some(
+                            "The displayed source changed. Review the new values and press E to make a fresh proposal. No command was submitted."
+                                .into(),
+                        );
+                        return true;
+                    }
+                    let draft = self
+                        .frankentui
+                        .guide_growth_draft
+                        .as_deref()
+                        .expect("guide edit is present");
+                    let growth = draft.parse::<f32>().ok().filter(|value| {
+                        value.is_finite()
+                            && *value >= 0.0
+                            && *value != self.retained_render.config.food_growth_rate
+                    });
+                    let Some(growth) = growth else {
+                        self.frankentui.guide_notice = Some(
+                            "Enter a finite nonnegative rate different from the observed value."
+                                .into(),
+                        );
+                        return true;
+                    };
+                    if !self.retained_render.playback.paused
+                        || self.frankentui.guide.step() != LabGuideStep::Configure
+                    {
+                        self.frankentui.guide_notice =
+                            Some("Pause the owner and return to the Configure step first.".into());
+                        return true;
+                    }
+                    if self.frankentui.guide.ready() {
+                        self.frankentui.guide_growth_draft = None;
+                        self.guide_growth_source = None;
+                        self.frankentui.guide_notice =
+                            Some("This change is already observed. Enter continues the guide.".into());
+                        return true;
+                    }
+                    if self.frankentui.guide.pending_command_id().is_some()
+                        || self.unpresented_commands.iter().any(|pending| {
+                            matches!(&pending.envelope.command, HostCommand::UpdateConfig(_))
+                        })
+                    {
+                        self.frankentui.guide_notice =
+                            Some("Wait for the existing configuration request's receipt.".into());
+                        return true;
+                    }
+                    let mut config = self.retained_render.config.as_ref().clone();
+                    config.food_growth_rate = growth;
+                    if let Err(error) = config.validate() {
+                        self.frankentui.guide_notice =
+                            Some(format!("Configuration refused before submission: {error}"));
+                        return true;
+                    }
+                    self.frankentui.guide_growth_draft = None;
+                    let source = self
+                        .guide_growth_source
+                        .take()
+                        .expect("guide source matched before submission")
+                        .0;
+                    self.frankentui.guide_notice = Some(
+                        self.submit_with_visible_receipt_guarded(
+                            ControlCommand::UpdateConfig(Box::new(config)),
+                            Instant::now() + Duration::from_millis(5),
+                            Some(source),
+                        )
+                        .map_or_else(
+                            || "Configuration was not submitted; inspect the receipt.".into(),
+                            |id| format!("Configuration request {id}; its receipt reports the outcome."),
+                        ),
+                    );
+                }
+                _ => {}
+            }
+            return true;
+        }
+        if matches!(key, K::Char('e' | 'E'))
+            && self.frankentui.guide.step() == LabGuideStep::Configure
+            && !self.frankentui.guide.finished()
+        {
+            if self.frankentui.guide.ready() {
+                self.frankentui.guide_notice =
+                    Some("This change is already observed. Enter continues the guide.".into());
+                return true;
+            }
+            if self.frankentui.guide.pending_command_id().is_some()
+                || self.unpresented_commands.iter().any(|pending| {
+                    matches!(&pending.envelope.command, HostCommand::UpdateConfig(_))
+                })
+            {
+                self.frankentui.guide_notice =
+                    Some("Wait for the existing configuration request's receipt.".into());
+                return true;
+            }
+            if !self.frankentui.guide_view_is_current() {
+                self.frankentui.guide_notice =
+                    Some("Review the current owner and step before opening an edit.".into());
+                return true;
+            }
+            self.guide_growth_source = self
+                .frankentui
+                .guide
+                .source()
+                .map(|source| (source, self.frankentui.guide.generation()));
+            self.frankentui.guide_growth_draft =
+                Some(self.retained_render.config.food_growth_rate.to_string());
+            self.frankentui.guide_notice =
+                Some("Edit the proposed value; Enter submits and Esc cancels.".into());
+            return true;
+        }
+        self.frankentui.handle_guide_key(key);
+        self.observe_guide_snapshot();
+        true
+    }
+
     pub fn submit_envelope(
         &mut self,
         envelope: CommandEnvelope,
@@ -3629,6 +3842,14 @@ impl<'a> TerminalApp<'a> {
         let start = Instant::now();
         let result = self.client.submit(envelope.clone());
         let latency = start.elapsed();
+        if !matches!(
+            &result,
+            Err(HostAccessError::CommandIdCollision { .. }
+                | HostAccessError::CommandEvidenceBackpressure { .. }
+                | HostAccessError::CommandEvidenceClosed { .. })
+        ) {
+            self.record_guide_command(&envelope);
+        }
         match &result {
             Ok(status) => {
                 self.unresolved_commands
@@ -3642,6 +3863,9 @@ impl<'a> TerminalApp<'a> {
                     latency_micros = latency.as_micros(),
                     "terminal submitted command envelope via HostClient"
                 );
+                self.frankentui
+                    .guide
+                    .observe_status(self.client.session_id(), status);
                 let entry = frankentui_shell::CommandReceiptEntry::from_runtime_status(
                     &command_id,
                     action_name,
@@ -3805,6 +4029,20 @@ impl<'a> TerminalApp<'a> {
         command: ControlCommand,
         deadline: Instant,
     ) -> Option<String> {
+        self.submit_with_visible_receipt_guarded(command, deadline, None)
+    }
+
+    fn submit_with_visible_receipt_guarded(
+        &mut self,
+        command: ControlCommand,
+        deadline: Instant,
+        expected_source: Option<LabGuideSource>,
+    ) -> Option<String> {
+        if expected_source.is_some_and(|source| source.session_id != self.client.session_id()) {
+            self.frankentui.status_message =
+                Some("Configuration not submitted: the displayed owner changed.".into());
+            return None;
+        }
         if self.unresolved_commands.len() + self.unpresented_commands.len()
             >= UNRESOLVED_COMMAND_CAPACITY
         {
@@ -3870,8 +4108,14 @@ impl<'a> TerminalApp<'a> {
             .update(frankentui_shell::ShellMessage::CommandReceipt(
                 receipt.clone(),
             ));
-        let envelope = CommandEnvelope::new(id, host_command)
+        let mut envelope = CommandEnvelope::new(id, host_command)
             .expecting_control_revision(self.retained_render.revisions.control);
+        if let Some(source) = expected_source {
+            envelope = envelope
+                .expecting_control_revision(source.revisions.control)
+                .expecting_config_revision(source.revisions.config)
+                .expecting_scientific_revision(source.revisions.scientific);
+        }
         if let HostCommand::UpdateSelection(update) = &envelope.command {
             self.pending_selections.push_back(PendingTerminalSelection {
                 command_id: id,
@@ -3944,11 +4188,22 @@ impl<'a> TerminalApp<'a> {
         // reply failed. Keep the canonical guard and payload until authority
         // answers, and retry only when the user explicitly requests it.
         let result = self.host.submit_before(envelope.clone(), deadline);
+        if !matches!(
+            &result,
+            Err(HostAccessError::CommandIdCollision { .. }
+                | HostAccessError::CommandEvidenceBackpressure { .. }
+                | HostAccessError::CommandEvidenceClosed { .. })
+        ) {
+            self.record_guide_command(&envelope);
+        }
         match result {
             Ok(status) => {
                 self.unresolved_commands
                     .retain(|pending| pending.envelope.command_id != id);
                 self.observe_selection_status(&status);
+                self.frankentui
+                    .guide
+                    .observe_status(self.client.session_id(), &status);
                 let accepted = matches!(
                     status.application(),
                     ApplicationState::Admitted | ApplicationState::Applied(_)
@@ -4137,6 +4392,11 @@ impl<'a> TerminalApp<'a> {
                 candidates.push((pending.command_id, "UpdateSelection".into()));
             }
         }
+        if let Some(id) = self.frankentui.guide.pending_command_id()
+            && !candidates.iter().any(|(candidate, _)| *candidate == id)
+        {
+            candidates.push((id, "Lab guide command".into()));
+        }
         candidates.retain(|(id, _)| {
             !self
                 .unpresented_commands
@@ -4157,6 +4417,9 @@ impl<'a> TerminalApp<'a> {
                     self.unresolved_commands
                         .retain(|pending| pending.envelope.command_id != id);
                     self.observe_selection_status(&status);
+                    self.frankentui
+                        .guide
+                        .observe_status(self.client.session_id(), &status);
                     let receipt = frankentui_shell::CommandReceiptEntry::from_runtime_status(
                         &id,
                         action,
@@ -4615,13 +4878,15 @@ impl<'a> TerminalApp<'a> {
 
     fn draw_science_route(&mut self, frame: &mut Frame<'_>) -> bool {
         use frankentui_shell::ShellRoute;
-        if matches!(
-            self.frankentui.route,
-            ShellRoute::Dashboard
-                | ShellRoute::WorldCanvas
-                | ShellRoute::Inspector
-                | ShellRoute::HelpOverlay
-        ) {
+        if !self.frankentui.guide.visible
+            && matches!(
+                self.frankentui.route,
+                ShellRoute::Dashboard
+                    | ShellRoute::WorldCanvas
+                    | ShellRoute::Inspector
+                    | ShellRoute::HelpOverlay
+            )
+        {
             return false;
         }
         self.draw_shell_frame(frame, ftui::render::budget::DegradationLevel::Full);
@@ -4700,7 +4965,8 @@ impl<'a> TerminalApp<'a> {
         self.map_area = None;
         self.hover_tooltip = None;
         let area = frame.area();
-        let reduced_legacy = degradation >= ftui::render::budget::DegradationLevel::EssentialOnly
+        let reduced_legacy = !self.frankentui.guide.visible
+            && degradation >= ftui::render::budget::DegradationLevel::EssentialOnly
             && matches!(
                 self.frankentui.route,
                 frankentui_shell::ShellRoute::Dashboard
@@ -4766,6 +5032,7 @@ impl<'a> TerminalApp<'a> {
         }
         if self.experiment_lab.enabled
             && self.frankentui.route == frankentui_shell::ShellRoute::Experiments
+            && !self.frankentui.guide.visible
         {
             let theme = self.palette.theme();
             science_screens::render_live_experiments_screen(
@@ -4777,6 +5044,7 @@ impl<'a> TerminalApp<'a> {
         if self.replay_lab.enabled
             && self.frankentui.route == frankentui_shell::ShellRoute::Replay
             && self.frankentui.branch_draft.is_none()
+            && !self.frankentui.guide.visible
         {
             let theme = self.palette.theme();
             science_screens::render_live_replay_screen(
@@ -4794,7 +5062,11 @@ impl<'a> TerminalApp<'a> {
         if self.palette_open {
             self.draw_command_palette(frame, area);
         }
-        self.draw_toasts(frame, area);
+        if self.frankentui.guide.visible {
+            self.hit_regions.help_rect = Some(area);
+        } else {
+            self.draw_toasts(frame, area);
+        }
     }
 
     fn navigate_route(&mut self, route: frankentui_shell::ShellRoute) {
@@ -4805,6 +5077,7 @@ impl<'a> TerminalApp<'a> {
         self.map_area = None;
         self.hover_tooltip = None;
         self.refresh_science_snapshot();
+        self.observe_guide_snapshot();
     }
 
     fn handle_ftui_event(&mut self, event: ftui::core::event::Event) -> Result<bool> {
@@ -4812,6 +5085,15 @@ impl<'a> TerminalApp<'a> {
         use ftui::core::event::{Event as E, KeyCode as K, KeyEventKind as Kind, Modifiers};
         match event {
             E::Key(key) if key.kind == Kind::Press => {
+                if !self.palette_open
+                    && (key.modifiers == Modifiers::NONE || key.modifiers == Modifiers::SHIFT)
+                    && self.handle_guide_input(key.code)
+                {
+                    return Ok(false);
+                }
+                if self.frankentui.guide.visible && !self.palette_open {
+                    return Ok(false);
+                }
                 if self.frankentui.branch_draft.is_some()
                     && !self.palette_open
                     && !self.help_visible
@@ -4917,7 +5199,7 @@ impl<'a> TerminalApp<'a> {
                 }
             }
             E::Mouse(mouse) => {
-                if self.frankentui.branch_draft.is_some() {
+                if self.frankentui.branch_draft.is_some() || self.frankentui.guide.visible {
                     return Ok(false);
                 }
                 self.handle_mouse(terminal_mouse(mouse))?;
@@ -4960,6 +5242,14 @@ impl<'a> TerminalApp<'a> {
             },
         );
         let reviewed = self.replay_lab.workflows.poll();
+        if let (Some(branch), Some(report)) = (
+            self.replay_lab.workflows.branch.as_ref(),
+            self.replay_lab.workflows.branch_report.as_ref(),
+        ) {
+            self.frankentui
+                .guide
+                .observe_branch_report(session, branch, report);
+        }
         self.replay_lab.reconcile_selection();
         if active
             && self.replay_lab.refresh_saved
@@ -5181,6 +5471,28 @@ impl<'a> TerminalApp<'a> {
         result: std::result::Result<crate::control::CheckpointMetadataDto, String>,
     ) {
         use frankentui_shell::{CommandReceiptEntry, ReceiptStatusKind, ShellMessage};
+        if let Some((pending_id, session_id)) = &self.guide_checkpoint_request
+            && *pending_id == request_id
+        {
+            let state = match &result {
+                Ok(checkpoint) => LabCheckpointSaveState::Saved(LabCheckpoint {
+                    checkpoint_id: checkpoint.checkpoint_id.clone(),
+                    tick: checkpoint.tick,
+                    agent_count: checkpoint.agent_count,
+                    byte_size: checkpoint.byte_size,
+                    world_digest: checkpoint.world_digest_v1.clone(),
+                }),
+                Err(reason) => LabCheckpointSaveState::Retryable {
+                    reason: reason.chars().take(2048).collect(),
+                },
+            };
+            self.frankentui.guide.observe_checkpoint_save(&LabCheckpointSave {
+                request_id: request_id.clone(),
+                session_id: *session_id,
+                state,
+            });
+            self.guide_checkpoint_request = None;
+        }
         if result.is_ok() {
             self.replay_lab.refresh_saved = true;
         }
@@ -7673,6 +7985,7 @@ impl<'a> TerminalApp<'a> {
                 "Controls",
                 self.palette.header_style().add_modifier(Modifier::BOLD),
             )]),
+            Line::raw(" F1       Optional first-run Lab guide (hide/reopen retains progress)"),
             Line::raw(" q        Quit"),
             Line::raw(" space    Toggle pause"),
             Line::raw(" + / -    Adjust speed"),
@@ -8506,6 +8819,14 @@ impl<'a> TerminalApp<'a> {
             CommandPaletteAction::ShowHelp => {
                 self.help_visible = !self.help_visible;
             }
+            CommandPaletteAction::ShowLabGuide => {
+                self.frankentui.guide.open();
+                self.help_visible = false;
+                self.frankentui.help_visible = false;
+                self.observe_guide_snapshot();
+                self.pointer_gesture.cancel("Lab guide opened");
+                self.hit_regions = HitRegionMap::default();
+            }
             CommandPaletteAction::Quit => {
                 self.submit_simulation_command(ControlCommand::Shutdown);
                 self.push_toast("Shutdown requested");
@@ -8768,6 +9089,10 @@ impl<'a> TerminalApp<'a> {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
+        if key.code == KeyCode::F(1) && !self.palette_open {
+            self.handle_guide_input(ftui::core::event::KeyCode::F(1));
+            return Ok(false);
+        }
         if matches!(key.code, KeyCode::Char('r') | KeyCode::Char('R'))
             && key.modifiers == KeyModifiers::CONTROL
         {
@@ -9118,12 +9443,15 @@ impl<'a> TerminalApp<'a> {
             (KeyCode::Char('v'), KeyModifiers::NONE) => {
                 self.review_selected_canvas();
             }
-            (KeyCode::Char('g'), KeyModifiers::NONE) => {
+            (KeyCode::Char('g' | 'G'), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
                 self.canvas_review = None;
                 // Coordinates still describe the historical screen until paint.
                 self.map_area = None;
                 self.hover_tooltip = None;
                 self.pointer_gesture.cancel("canvas returned live");
+                if self.frankentui.route == frankentui_shell::ShellRoute::Replay {
+                    self.navigate_route(frankentui_shell::ShellRoute::WorldCanvas);
+                }
                 self.push_toast("Canvas returned live; simulation playback unchanged");
             }
             (KeyCode::Char('r') | KeyCode::Char('R'), _) => {
@@ -9291,6 +9619,7 @@ impl<'a> TerminalApp<'a> {
             Ok(None) => {}
             Err(error) => {
                 self.simulation_fault = Some(Arc::from(error.to_string()));
+                self.frankentui.guide.observe_unavailable();
                 return;
             }
         }
@@ -9526,6 +9855,7 @@ impl<'a> TerminalApp<'a> {
         );
         self.frankentui.paused = self.paused;
         self.frankentui.speed_multiplier = self.speed_multiplier;
+        self.observe_guide_snapshot();
         self.report_scheduled_patches(&world);
         self.validate_rail_selection();
         self.maybe_log_rail_first_show();
@@ -24145,6 +24475,216 @@ for case in ('panic', 'subscription', 'renderer'):
         assert_eq!(port.snapshot_hub().latest().world.tick, 0);
     }
 
+    fn terminal_guide_press(app: &mut TerminalApp<'_>, code: ftui::core::event::KeyCode) {
+        app.handle_ftui_event(ftui::core::event::Event::Key(
+            ftui::core::event::KeyEvent::new(code),
+        ))
+        .expect("guide key handled");
+    }
+
+    fn terminal_guide_frame(app: &TerminalApp<'_>, width: u16, height: u16) -> String {
+        let mut pool = ftui::render::grapheme_pool::GraphemePool::new();
+        let mut frame = ftui::render::frame::Frame::new(width, height, &mut pool);
+        app.frankentui.view(&mut frame);
+        frankentui_shell::buffer_to_string(&frame.buffer)
+    }
+
+    fn finish_terminal_guide_command(
+        app: &mut TerminalApp<'_>,
+        driver: &mut scriptbots_runtime::channel::ChannelHostDriver,
+        owner_time: &mut u64,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app.frankentui.guide.ready() {
+            driver
+                .step(scriptbots_runtime::ManualInstant::from_nanos(*owner_time))
+                .expect("actual owner boundary");
+            *owner_time += 1;
+            app.refresh_command_receipts();
+            app.refresh_snapshot();
+            assert!(
+                Instant::now() < deadline,
+                "guide still waiting on actual evidence: {}",
+                app.frankentui.guide.status(),
+            );
+            std::thread::park_timeout(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn terminal_guide_uses_actual_receipts_and_refuses_stale_configuration_proposals() {
+        use ftui::core::event::KeyCode as K;
+        let world = command_characterization_world();
+        {
+            let mut world = world.lock().unwrap();
+            let installed = crate::install_brains(&mut world, crate::BrainPreset::Mlp).unwrap();
+            let id = world
+                .try_spawn_agent(scriptbots_core::AgentData::default())
+                .unwrap();
+            assert!(world.bind_agent_brain(id, installed.population()[0]).unwrap());
+        }
+        let (mut driver, port) = terminal_manual_driver(
+            world,
+            scriptbots_runtime::channel::ChannelHostOptions::default().ingress_capacity,
+        );
+        let (runtime, _) = ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let mut app = TerminalApp::new(
+            &renderer,
+            TerminalTestHost::port_context(port.clone(), &runtime),
+        );
+        let initial = port.snapshot_hub().latest();
+        let mut owner_time = 0;
+        terminal_guide_press(&mut app, K::F(1));
+        assert!(app.frankentui.guide.visible && app.frankentui.guide.ready());
+        let frame = terminal_guide_frame(&app, 100, 32);
+        assert!(frame.contains("FIRST-RUN LAB GUIDE"));
+        assert!(frame.contains(&format!("Seed: {}", initial.visual_seed)));
+        assert!(Arc::ptr_eq(&initial, &port.snapshot_hub().latest()));
+        terminal_guide_press(&mut app, K::Enter);
+        assert_eq!(app.frankentui.guide.step(), LabGuideStep::Inspect);
+        assert!(!app.frankentui.guide.ready());
+
+        terminal_guide_press(&mut app, K::Escape);
+        terminal_guide_press(&mut app, K::Char('3'));
+        terminal_guide_press(&mut app, K::F(1));
+        assert!(app.frankentui.guide.ready());
+        assert_eq!(
+            app.frankentui.guide_selected_uid,
+            initial.world.agents.first().map(|agent| agent.uid.get()),
+        );
+        let _ = terminal_guide_frame(&app, 100, 32);
+        terminal_guide_press(&mut app, K::Enter);
+        assert_eq!(app.frankentui.guide.step(), LabGuideStep::Pause);
+        assert!(!app.frankentui.guide.ready(), "a paused snapshot is not a receipt");
+        terminal_guide_press(&mut app, K::Escape);
+        app.execute_palette_action(CommandPaletteAction::Pause);
+        assert!(!app.frankentui.guide.ready(), "submission is not application");
+        finish_terminal_guide_command(&mut app, &mut driver, &mut owner_time);
+        assert_eq!(app.retained_render.world.tick, initial.world.tick);
+
+        terminal_guide_press(&mut app, K::F(1));
+        let _ = terminal_guide_frame(&app, 100, 32);
+        terminal_guide_press(&mut app, K::Enter);
+        assert_eq!(app.frankentui.guide.step(), LabGuideStep::Step);
+        terminal_guide_press(&mut app, K::Escape);
+        terminal_guide_press(&mut app, K::Char('s'));
+        assert!(!app.frankentui.guide.ready());
+        finish_terminal_guide_command(&mut app, &mut driver, &mut owner_time);
+        assert_eq!(app.retained_render.world.tick, initial.world.tick + 1);
+
+        terminal_guide_press(&mut app, K::F(1));
+        let _ = terminal_guide_frame(&app, 100, 32);
+        terminal_guide_press(&mut app, K::Enter);
+        assert_eq!(app.frankentui.guide.step(), LabGuideStep::Configure);
+        let _ = terminal_guide_frame(&app, 100, 32);
+        terminal_guide_press(&mut app, K::Char('e'));
+        for _ in 0..32 {
+            terminal_guide_press(&mut app, K::Backspace);
+        }
+        for ch in "-1".chars() {
+            terminal_guide_press(&mut app, K::Char(ch));
+        }
+        let sequence = app.command_sequence;
+        terminal_guide_press(&mut app, K::Enter);
+        assert_eq!(app.command_sequence, sequence);
+        assert!(app.frankentui.guide_notice.as_deref().unwrap().contains("finite"));
+        assert!(!app.frankentui.guide.ready());
+        terminal_guide_press(&mut app, K::Escape);
+        terminal_guide_press(&mut app, K::Char('e'));
+
+        // Another client changes the real owner after the editor captured its
+        // source. Enter must refuse that stale proposal before allocating an ID.
+        let mut external_config = app.retained_render.config.as_ref().clone();
+        external_config.food_growth_rate += 0.02;
+        let _ = port.clone().submit_before(
+            CommandEnvelope::new(
+                CommandId::new(u128::MAX),
+                HostCommand::UpdateConfig(Box::new(external_config.clone())),
+            ),
+            Instant::now() + Duration::from_millis(5),
+        );
+        driver
+            .step(scriptbots_runtime::ManualInstant::from_nanos(owner_time))
+            .unwrap();
+        owner_time += 1;
+        terminal_guide_press(&mut app, K::Enter);
+        assert_eq!(app.command_sequence, sequence);
+        assert!(app.frankentui.guide_growth_draft.is_none());
+        assert!(app.frankentui.guide_notice.as_deref().unwrap().contains("source changed"));
+        assert_eq!(app.retained_render.config.as_ref(), &external_config);
+        assert!(!app.frankentui.guide.ready(), "another client's edit is not our receipt");
+
+        let _ = terminal_guide_frame(&app, 100, 32);
+        terminal_guide_press(&mut app, K::Char('e'));
+        for _ in 0..32 {
+            terminal_guide_press(&mut app, K::Backspace);
+        }
+        let mut expected = external_config;
+        expected.food_growth_rate += 0.25;
+        for ch in expected.food_growth_rate.to_string().chars() {
+            terminal_guide_press(&mut app, K::Char(ch));
+        }
+        let before = Arc::clone(&app.retained_render);
+        terminal_guide_press(&mut app, K::Enter);
+        assert!(!app.frankentui.guide.ready());
+        let submitted = &app.unresolved_commands.back().unwrap().envelope;
+        assert_eq!(submitted.expected_config_revision, Some(before.revisions.config));
+        assert_eq!(submitted.expected_scientific_revision, Some(before.revisions.scientific));
+        terminal_guide_press(&mut app, K::Char('e'));
+        assert!(app.frankentui.guide_growth_draft.is_none(), "pending edit cannot reopen");
+        finish_terminal_guide_command(&mut app, &mut driver, &mut owner_time);
+        assert_eq!(app.retained_render.config.as_ref(), &expected);
+        terminal_guide_press(&mut app, K::Char('e'));
+        assert!(app.frankentui.guide_growth_draft.is_none(), "completed edit cannot reopen");
+        assert_eq!(app.retained_render.world.tick, before.world.tick);
+        assert_eq!(app.retained_render.revisions.scientific, before.revisions.scientific);
+        let _ = terminal_guide_frame(&app, 100, 32);
+        terminal_guide_press(&mut app, K::Enter);
+        assert_eq!(app.frankentui.guide.step(), LabGuideStep::Checkpoint);
+        assert!(!app.frankentui.guide.ready(), "no save has been observed");
+
+        // A key from the old owner/step cannot advance a newly attached source.
+        let _ = terminal_guide_frame(&app, 100, 32);
+        let mut replacement = app.retained_render.as_ref().clone();
+        replacement.session_id = HostSessionId::new(replacement.session_id.get() + 1);
+        app.frankentui.guide.observe_snapshot(&replacement, None);
+        app.frankentui.handle_guide_key(K::Enter);
+        assert_eq!(app.frankentui.guide.step(), LabGuideStep::Identify);
+        assert!(app.frankentui.guide_notice.as_deref().unwrap().contains("changed"));
+    }
+
+    #[test]
+    fn terminal_guide_and_replay_return_keys_preserve_live_science() {
+        use ftui::core::event::{KeyCode as K, Modifiers as M};
+        with_shortcut_app(|app| {
+            let before = Arc::clone(&app.retained_render);
+            app.execute_palette_action(CommandPaletteAction::ShowLabGuide);
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+            let cells: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect();
+            assert!(cells.contains("FIRST-RUN LAB GUIDE"));
+            terminal_guide_press(app, K::Escape);
+            assert!(!app.frankentui.guide.visible);
+            for (code, modifiers) in [(K::Char('g'), M::NONE), (K::Char('G'), M::SHIFT)] {
+                app.navigate_route(frankentui_shell::ShellRoute::Replay);
+                let mut key = ftui::core::event::KeyEvent::new(code);
+                key.modifiers = modifiers;
+                app.handle_ftui_event(ftui::core::event::Event::Key(key)).unwrap();
+                assert_eq!(app.frankentui.route, frankentui_shell::ShellRoute::WorldCanvas);
+            }
+            assert_eq!(app.command_sequence, 0);
+            assert_eq!(app.retained_render.world.tick, before.world.tick);
+            assert_eq!(app.retained_render.revisions.scientific, before.revisions.scientific);
+        });
+    }
+
     fn terminal_manual_driver(
         world: SharedWorld,
         ingress_capacity: usize,
@@ -30917,8 +31457,9 @@ for case in ('panic', 'subscription', 'renderer'):
     fn test_command_palette_fuzzy_matching() {
         let items = all_command_palette_items();
         let matched = fuzzy_match_command_palette(&items, "pause");
-        assert!(!matched.is_empty(), "query 'pause' must match Toggle Pause");
-        assert_eq!(matched[0].action, CommandPaletteAction::TogglePause);
+        assert!(!matched.is_empty(), "query 'pause' must find playback controls");
+        assert_eq!(matched[0].action, CommandPaletteAction::Pause);
+        assert!(matched.iter().any(|item| item.action == CommandPaletteAction::TogglePause));
 
         let matched_cat = fuzzy_match_command_palette(&items, "science");
         assert!(
@@ -31272,6 +31813,7 @@ for case in ('panic', 'subscription', 'renderer'):
             "View",
             "Science",
             "System",
+            "Learning",
         ] {
             assert!(
                 categories.contains(domain),
@@ -31282,7 +31824,7 @@ for case in ('panic', 'subscription', 'renderer'):
         // Remaining hints belong to the preserved widget-specific bindings.
         const HUD_BINDINGS: &[&str] = &[
             "Space", "s", "+", "-", "Shift+S", "a", "r", "t", "o", "i", "w", "f", "Enter",
-            "Ctrl+T", "p / c", "?", "q / Esc", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+            "Ctrl+T", "p / c", "?", "F1", "q / Esc", "1", "2", "3", "4", "5", "6", "7", "8", "9",
         ];
         for item in &items {
             assert!(

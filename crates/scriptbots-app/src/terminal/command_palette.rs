@@ -59,6 +59,7 @@ pub enum CommandPaletteAction {
     CycleEventFilter,
     FocusEventSubject,
     ShowHelp,
+    ShowLabGuide,
     Quit,
 }
 
@@ -182,6 +183,20 @@ pub fn all_command_palette_items() -> Vec<CommandPaletteItem> {
             keybind_hint: "Space",
             category: "Playback",
             action: CommandPaletteAction::TogglePause,
+        },
+        CommandPaletteItem {
+            id: "playback.pause",
+            label: "Pause Simulation",
+            keybind_hint: "",
+            category: "Playback",
+            action: CommandPaletteAction::Pause,
+        },
+        CommandPaletteItem {
+            id: "playback.resume",
+            label: "Resume Simulation",
+            keybind_hint: "",
+            category: "Playback",
+            action: CommandPaletteAction::Resume,
         },
         CommandPaletteItem {
             id: "playback.step",
@@ -403,6 +418,13 @@ pub fn all_command_palette_items() -> Vec<CommandPaletteItem> {
             keybind_hint: "?",
             category: "System",
             action: CommandPaletteAction::ShowHelp,
+        },
+        CommandPaletteItem {
+            id: "system.lab_guide",
+            label: "First-run Lab Guide",
+            keybind_hint: "F1",
+            category: "Learning",
+            action: CommandPaletteAction::ShowLabGuide,
         },
         CommandPaletteItem {
             id: "system.quit",

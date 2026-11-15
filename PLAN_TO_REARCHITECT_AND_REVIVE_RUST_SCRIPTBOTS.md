@@ -2,6 +2,25 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Shared first-run Lab guide, terminal adapter (2026-11-15):**
+[Source implemented and independently reviewed — executable qualification remains open under `bd-2z0.10.4`]
+
+Added a shared, versioned eight-step walkthrough and an opt-in terminal surface:
+identify the live world, inspect a living stable UID, pause, advance one tick,
+change only food growth, save a fresh cut, run a two-arm study, and read its
+descriptive outcome. Both terminal event paths observe actual command receipts
+and publications. Admission alone cannot advance the guide; volatile journal
+commitments are labelled explicitly. Old saves, foreign owners, stale callbacks,
+unchanged single-arm continuations, and mismatched reports cannot satisfy steps.
+Hiding the guide preserves progress and opening it does not mutate science.
+
+Model and real-owner adapter regressions are authored but unexecuted. The
+required DSR health preflight refused insufficient storage capacity before
+checks; the workspace subsequently became unavailable. No compiler, formatter,
+Clippy, terminal, or GUI pass is claimed for these changes. Automatic first-run
+presentation, the default meadow/provenance experience, and the complete actual
+native journey remain open acceptance work; the broad bead is not closed.
+
 **Terminal saved-study results and portable intervention inputs (2026-11-14):**
 [Source committed and independently reviewed — Codex; terminal executable qualification remains open]
 

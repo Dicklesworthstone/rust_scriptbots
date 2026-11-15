@@ -17,7 +17,8 @@ use ftui::runtime::subscription::{StopSignal, SubId, Subscription};
 use ftui::runtime::{Cmd, Model, ProgramSimulator};
 use scriptbots_core::ControlCommand;
 use scriptbots_runtime::{
-    ApplicationState, CommandId, CommandStatus, JournalState, RejectionReason,
+    ApplicationState, CommandId, CommandStatus, HostSessionId, JournalState, RejectionReason,
+    lab_guide::{LabGuide, LabGuideStep},
     lab_workflows::LabMetric,
 };
 use serde::{Deserialize, Serialize};
@@ -348,6 +349,8 @@ pub enum ShellMessage {
     Navigate(ShellRoute),
     /// Toggle help overlay.
     ToggleHelp,
+    /// Open or hide the optional, receipt-driven first-run guide.
+    ToggleLabGuide,
     /// Mutating command intent submitted for host transmission.
     SubmitCommand(ControlCommand),
     /// Command receipt update from HostClient.
@@ -464,6 +467,13 @@ pub struct FrankenTuiModel {
     pub route: ShellRoute,
     pub previous_route: Option<ShellRoute>,
     pub help_visible: bool,
+    pub(super) guide: LabGuide,
+    pub(super) guide_growth_draft: Option<String>,
+    pub(super) guide_notice: Option<String>,
+    pub(super) guide_selected_uid: Option<u64>,
+    guide_scroll: std::cell::Cell<usize>,
+    guide_layout: std::cell::Cell<(usize, usize)>,
+    guide_view_identity: std::cell::Cell<Option<(HostSessionId, u64, LabGuideStep)>>,
     pub paused: bool,
     pub speed_multiplier: f32,
     pub tick: u64,
@@ -553,6 +563,13 @@ impl Default for FrankenTuiModel {
             route: ShellRoute::Dashboard,
             previous_route: None,
             help_visible: false,
+            guide: LabGuide::default(),
+            guide_growth_draft: None,
+            guide_notice: None,
+            guide_selected_uid: None,
+            guide_scroll: std::cell::Cell::new(0),
+            guide_layout: std::cell::Cell::new((0, 1)),
+            guide_view_identity: std::cell::Cell::new(None),
             paused: true,
             speed_multiplier: 1.0,
             tick: 0,
@@ -591,6 +608,194 @@ impl FrankenTuiModel {
         Self {
             route,
             ..Self::default()
+        }
+    }
+
+    /// Guide navigation is presentation-only. Actions are performed with the
+    /// existing controls after hiding this view; the guide keeps observing them.
+    pub(super) fn handle_guide_key(&mut self, key: KeyCode) -> bool {
+        if key == KeyCode::F(1) {
+            self.update(ShellMessage::ToggleLabGuide);
+            return true;
+        }
+        if !self.guide.visible {
+            return false;
+        }
+        let (maximum, page) = self.guide_layout.get();
+        let current = self.guide_scroll.get().min(maximum);
+        match key {
+            KeyCode::Escape => self.guide.visible = false,
+            KeyCode::Enter => {
+                if !self.guide_view_is_current() {
+                    self.guide_notice = Some(
+                        "The live owner or guide step changed; review the refreshed guide first."
+                            .into(),
+                    );
+                    return true;
+                }
+                if self.guide.advance() {
+                    self.guide_scroll.set(0);
+                    self.guide_notice = None;
+                }
+            }
+            KeyCode::Char('r' | 'R') => {
+                self.guide.restart();
+                self.guide_scroll.set(0);
+                self.guide_growth_draft = None;
+                self.guide_notice = None;
+            }
+            KeyCode::Up => self.guide_scroll.set(current.saturating_sub(1)),
+            KeyCode::Down => self.guide_scroll.set(current.saturating_add(1).min(maximum)),
+            KeyCode::PageUp => self.guide_scroll.set(current.saturating_sub(page)),
+            KeyCode::PageDown => self.guide_scroll.set(current.saturating_add(page).min(maximum)),
+            KeyCode::Home => self.guide_scroll.set(0),
+            KeyCode::End => self.guide_scroll.set(maximum),
+            _ => {}
+        }
+        true
+    }
+
+    pub(super) fn guide_view_is_current(&self) -> bool {
+        self.guide_view_identity.get()
+            == self
+                .guide
+                .source()
+                .map(|source| (source.session_id, self.guide.generation(), self.guide.step()))
+    }
+
+    fn guide_lines(&self) -> Vec<String> {
+        let mut lines = vec![
+            self.guide.step().title().to_owned(),
+            self.guide.step().instruction().to_owned(),
+            String::new(),
+            format!("Observed: {}", self.guide.status()),
+            if self.guide.finished() {
+                "Guide complete. R starts a new walkthrough; Esc returns to your work.".into()
+            } else if self.guide.ready() {
+                "READY: Enter advances the guide without changing the simulation.".into()
+            } else {
+                "WAITING: Next is locked until this step's evidence is observed.".into()
+            },
+            String::new(),
+        ];
+        if !self.guide.evidence().is_empty() {
+            lines.push(format!("Evidence: {}", self.guide.evidence()));
+            lines.push(String::new());
+        }
+        let controls = match self.guide.step() {
+            LabGuideStep::Identify => {
+                "Confirm the live owner, seed and scientific tick below. Enter continues."
+            }
+            LabGuideStep::Inspect => {
+                "Esc hides this guide. Press 3 for the Inspector; Left/Right selects an agent when the timeline rail is hidden (r toggles the rail). F1 reopens the guide."
+            }
+            LabGuideStep::Pause => {
+                "Esc hides this guide. Open : or Ctrl+P, search Pause and choose Pause. The guide waits for that command's application and journal receipt."
+            }
+            LabGuideStep::Step => {
+                "Esc hides this guide. Press s to request one scientific tick while paused. F1 reopens after the owner publishes the result."
+            }
+            LabGuideStep::Configure => {
+                "E edits only the food growth rate. Type a finite nonnegative value different from the displayed value; Enter submits the explicit proposal through the normal guarded command receipt."
+            }
+            LabGuideStep::Checkpoint => {
+                "Esc hides this guide. Press 7 for Replay, then k to save the current cut. The guide requires a fresh completed save from this owner, not a catalog row."
+            }
+            LabGuideStep::Branch => {
+                "Esc hides this guide. In Replay, select the saved cut below and press N. Choose a treatment with Right and a horizon with Up/Down; Enter starts the study. After completion, B opens Studies; select its row and press Enter, then Enter again to verify its report."
+            }
+            LabGuideStep::Outcome => {
+                "Esc returns to Replay's study detail. Inspect the control and treatment metrics, source and final digests, and first divergence. One saved seed is descriptive evidence, not independent replication or statistical significance."
+            }
+        };
+        lines.push(controls.into());
+        if let Some(draft) = &self.guide_growth_draft {
+            lines.push(String::new());
+            lines.push(format!("Food growth proposal: {draft}_"));
+            lines.push("Enter submits this value; Esc cancels editing; Backspace removes a character.".into());
+        }
+        if let Some(notice) = &self.guide_notice {
+            lines.push(notice.chars().take(1024).collect());
+        }
+        lines.push(String::new());
+        if let Some(source) = self.guide.source() {
+            lines.push(format!("Live owner session: {}", source.session_id.get()));
+            lines.push(format!("Observed publication: {}", source.revision.get()));
+            lines.push(format!("Scientific tick: {}", source.tick));
+            lines.push(format!("Population: {} living agents", source.population));
+            lines.push(format!(
+                "Seed: {}",
+                source.seed.map_or_else(|| "unavailable".into(), |seed| seed.to_string())
+            ));
+            lines.push(format!("Paused: {}", source.paused));
+            lines.push(format!("Food growth rate: {}", source.food_growth_rate));
+            lines.push(format!("Control revision: {}", source.revisions.control.get()));
+            lines.push(format!("Scientific revision: {}", source.revisions.scientific.get()));
+        } else {
+            lines.push("Live source unavailable; waiting for an owner publication.".into());
+        }
+        if let Some(uid) = self.guide_selected_uid {
+            lines.push(format!("Agent shown in Inspector: {uid}"));
+        }
+        if let Some(checkpoint) = self.guide.saved_checkpoint() {
+            lines.push(String::new());
+            lines.push(format!("Guide checkpoint: {}", checkpoint.checkpoint_id));
+            lines.push(format!("Saved tick: {}", checkpoint.tick));
+            lines.push(format!("Saved scientific digest: {}", checkpoint.world_digest));
+            lines.push(format!("Artifact size: {} bytes", checkpoint.byte_size));
+        }
+        lines.push(String::new());
+        lines.push("Enter: next when ready | Esc: hide | F1: reopen | R: restart".into());
+        lines.push("Up/Down, PageUp/PageDown, Home/End scroll all evidence on small screens.".into());
+        lines
+    }
+
+    fn render_guide(&self, frame: &mut Frame) {
+        self.guide_view_identity.set(
+            self.guide
+                .source()
+                .map(|source| (source.session_id, self.guide.generation(), self.guide.step())),
+        );
+        let width = usize::from(frame.width().saturating_sub(2).max(1));
+        let mut lines = Vec::new();
+        for line in self.guide_lines() {
+            let mut row = String::new();
+            let mut columns = 0;
+            for mut ch in line.chars() {
+                if ch.is_control() {
+                    ch = ' ';
+                }
+                let mut bytes = [0_u8; 4];
+                let text: &str = ch.encode_utf8(&mut bytes);
+                let char_width = ftui::core::text_width::display_width(text);
+                if columns + char_width > width && !row.is_empty() {
+                    lines.push(std::mem::take(&mut row));
+                    columns = 0;
+                }
+                row.push(ch);
+                columns += char_width;
+            }
+            lines.push(row);
+        }
+        let end = frame.height().saturating_sub(SHELL_FOOTER_ROWS);
+        let page = usize::from(end.saturating_sub(5)).max(1);
+        let maximum = lines.len().saturating_sub(page);
+        let offset = self.guide_scroll.get().min(maximum);
+        self.guide_scroll.set(offset);
+        self.guide_layout.set((maximum, page));
+        print_to_frame(
+            frame,
+            1,
+            3,
+            &format!(
+                "FIRST-RUN LAB GUIDE {}/{}",
+                self.guide.step().index() + 1,
+                LabGuideStep::ALL.len(),
+            ),
+        );
+        print_to_frame(frame, 1, 4, "Enter: next | Esc: hide | F1: guide");
+        for (row, line) in (5..end).zip(lines.iter().skip(offset)) {
+            print_to_frame(frame, 1, row, line);
         }
     }
 
@@ -766,6 +971,7 @@ impl Model for FrankenTuiModel {
 
     fn update(&mut self, msg: Self::Message) -> Cmd<Self::Message> {
         match msg {
+            ShellMessage::Event(Event::Key(key)) if self.handle_guide_key(key.code) => Cmd::none(),
             ShellMessage::Event(Event::Key(key)) if self.branch_draft.is_some() => {
                 match key.code {
                     KeyCode::Escape | KeyCode::Char('x' | 'X' | 'q' | 'Q') => {
@@ -895,6 +1101,15 @@ impl Model for FrankenTuiModel {
             }
             ShellMessage::ToggleHelp => {
                 self.help_visible = !self.help_visible;
+                Cmd::none()
+            }
+            ShellMessage::ToggleLabGuide => {
+                if self.guide.visible {
+                    self.guide.visible = false;
+                } else {
+                    self.guide.open();
+                    self.help_visible = false;
+                }
                 Cmd::none()
             }
             ShellMessage::SubmitCommand(cmd) => {
@@ -1593,9 +1808,12 @@ impl Model for FrankenTuiModel {
         }
 
         // 2. Active Route Display
-        if self.help_visible || self.route == ShellRoute::HelpOverlay {
+        if self.guide.visible {
+            self.render_guide(frame);
+        } else if self.help_visible || self.route == ShellRoute::HelpOverlay {
             if height > 3 {
                 print_to_frame(frame, 2, 3, "KEYBOARD SHORTCUTS:");
+                print_to_frame(frame, 4, 4, "  [F1]     First-run Lab guide (optional)");
                 print_to_frame(frame, 4, 5, "  [Space]  Pause / Resume simulation");
                 print_to_frame(frame, 4, 6, "  [.]      Single step simulation");
                 print_to_frame(frame, 4, 7, "  [+] / [-] Adjust playback speed");
@@ -2005,6 +2223,52 @@ impl FrankenTuiSimulatorHarness {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optional_lab_guide_navigation_is_bounded_and_requires_observed_evidence() {
+        let mut harness = FrankenTuiSimulatorHarness::new();
+        harness.init();
+        harness.inject_key(KeyCode::F(1));
+        assert!(harness.model().guide.visible);
+        assert!(!harness.model().guide.ready());
+        for _ in 0..12 {
+            harness.inject_key(KeyCode::Enter);
+        }
+        assert_eq!(harness.model().guide.step(), LabGuideStep::Identify);
+        for (width, height) in [(40, 12), (80, 24)] {
+            harness.inject_key(KeyCode::Home);
+            let mut evidence = String::new();
+            for _ in 0..64 {
+                let frame = harness.capture_frame_str(width, height);
+                evidence.extend(
+                    frame
+                        .lines()
+                        .skip(5)
+                        .take(usize::from(height - 7))
+                        .flat_map(|line| line.chars().filter(|ch| !ch.is_whitespace())),
+                );
+                let before = harness.model().guide_scroll.get();
+                harness.inject_key(KeyCode::PageDown);
+                if harness.model().guide_scroll.get() == before {
+                    break;
+                }
+            }
+            assert!(evidence.contains("WAITING:Nextislocked"));
+            assert!(evidence.contains("Livesourceunavailable"));
+            assert!(evidence.contains("F1:reopen"));
+        }
+        harness.inject_key(KeyCode::Escape);
+        assert!(!harness.model().guide.visible);
+        harness.inject_key(KeyCode::F(1));
+        assert_eq!(harness.model().guide.step(), LabGuideStep::Identify);
+        harness.inject_key(KeyCode::Char('R'));
+        for (width, height) in [(0, 0), (1, 1), (2, 5)] {
+            let _ = harness.capture_frame_str(width, height);
+        }
+        assert_eq!(harness.model().command_counter, 0);
+        assert!(harness.model().receipts.is_empty());
+        assert!(harness.model_mut().drain_effects().next().is_none());
+    }
 
     fn checkpoint_branch_harness() -> FrankenTuiSimulatorHarness {
         let mut harness = FrankenTuiSimulatorHarness::new();

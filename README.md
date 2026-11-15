@@ -4,6 +4,23 @@ ScriptBots is a modern Rust reimagining of Andrej Karpathy’s classic agent-bas
 
 The authoritative roadmap is `PLAN_TO_REARCHITECT_AND_REVIVE_RUST_SCRIPTBOTS.md`. The older GPUI port plan is retained as historical design evidence, and a sibling WebAssembly plan lives in `PLAN_TO_CREATE_SIBLING_APP_CRATE_TARGETING_WASM.md`.
 
+### First-run Lab guide
+
+The opt-in terminal walkthrough connects the live world, organism inspector,
+Pause, one scientific tick, a food-growth change, a fresh checkpoint, and a
+control/intervention study. Open it with **F1** or **First-run Lab guide** in the
+command palette; **Esc** hides it while retaining progress. Follow the displayed
+keys, then use **Enter** to continue once the required observation is available.
+
+Progress follows the actual owner, command identity, applied publication and
+journal receipt. A memory-only commitment is labelled `CommittedVolatile`.
+Saving requires a fresh request/result pair; the study must match that saved
+cut and its verified two-arm report. Its outcome describes one seed and does
+not establish a general effect. This is an optional guided path; automatic
+first-install onboarding and full native acceptance under `bd-2z0.10.4` remain
+open. The guide's newly authored tests and native builds have not been executed
+in the current implementation session.
+
 ### Philosophy & purpose
 - **Why this exists**: ScriptBots is a minimalist artificial life laboratory. By rebuilding the original simulator with rigorously deterministic Rust systems, we can observe, measure, and reproduce emergent behavior at scale—without undefined behavior or global state muddying results.
 - **What we learn**: How simple sensory channels and local rules produce complex population dynamics—cooperation vs. predation, resource gradients shaping migration, lineage divergence under different mutation schedules, and the role of perception in survival.

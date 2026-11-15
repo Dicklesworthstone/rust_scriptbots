@@ -1441,7 +1441,7 @@ fn next_checkpoint_request(session: HostSessionId) -> Option<String> {
     ))
 }
 
-fn checkpoint_receipt_is_bounded(checkpoint: &LabCheckpoint) -> bool {
+pub(crate) fn checkpoint_receipt_is_bounded(checkpoint: &LabCheckpoint) -> bool {
     identity_is_bounded(&checkpoint.checkpoint_id)
         && checkpoint.byte_size > 0
         && checkpoint.byte_size <= scriptbots_core::MAX_WORLD_CHECKPOINT_BYTES as u64
@@ -1583,7 +1583,7 @@ fn branch_outcome_is_bounded(
         })
 }
 
-fn branch_report_matches_receipt(report: &LabBranchReport, branch: &LabCheckpointBranch) -> bool {
+pub(crate) fn branch_report_matches_receipt(report: &LabBranchReport, branch: &LabCheckpointBranch) -> bool {
     branch_is_bounded(branch)
         && branch.status == "completed"
         && report.branch_id == branch.branch_id
