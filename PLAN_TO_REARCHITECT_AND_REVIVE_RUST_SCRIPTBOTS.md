@@ -2,6 +2,50 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Portable archipelago continuation and terminal scientific comparisons (2026-11-15):**
+[Source implemented and independently reviewed — Codex; `bd-16g.5`, `bd-2z0.6`;
+executable qualification open]
+
+Capture and restore the complete multi-island owner state at a settled barrier,
+including migration policy, command identities and retained volatile journals.
+Expose exclusive checkpoint export and further-barrier continuation through the
+CLI without claiming continuation of the original science database. Connect the
+terminal experiment view to the shared eight-endpoint scientific metric catalog.
+Original determinism, lifecycle, source-binding and qualification requirements
+remain unchanged.
+
+The runtime checkpoint now carries the complete paired volatile owner cuts in a
+canonical, checksummed 256 MiB envelope, with at most 64 islands and 4 MiB of
+metadata. Restore validates configuration/session identity, topology, cadence,
+epoch and exclusive command cursors before reconstructing executable owners.
+The recorded CLI can export a complete final cut with `--archipelago-checkpoint`.
+`continue-archipelago` restores it, advances a bounded number of further barriers
+with the original executable brain registry, and saves a new exclusive output.
+It leaves the source checkpoint and database unchanged and explicitly reports
+that the original science database is not continued. Input size, regular-file
+identity, checksum, existing outputs, work horizon and thread count are bounded.
+
+Four runtime regressions cover continued science/migrations and invalid cuts.
+File tests cover corruption, size limits, aliases and preservation of existing
+evidence; a CLI integration regression compares actual MLP migration continuation
+against an uninterrupted run, then continues the resulting checkpoint again.
+
+The terminal Experiments route now selects every shared `LabMetric` with `[`/`]`
+and dispatches the actual chosen service endpoint with `c` or Shift+C. Results
+bind the experiment, plan digest, source generation, variants and metric. A
+selection change invalidates the old request even after cycling away and back;
+its occupied worker remains bounded until completion. Refresh keeps the selected
+metric and preserves evidence only for the same source observation. Labels and
+units come from the shared catalog. Authored terminal regressions cover all eight
+wire keys, real population-versus-food treatment differences, unavailable empty
+cohort means, source mismatches, stale responses and the live Shift+C event path.
+
+Pinned Rustfmt source formatting and whitespace review succeeded. DSR refused
+this host during storage admission. A fresh health check still finds root, home,
+Cargo home and temporary storage below the unchanged 20 GiB-per-role minimum;
+only the scratch build root qualifies. Compilation, test execution, Clippy and
+broader qualification remain unexecuted.
+
 **Checkpoint-create retries across service reopen (2026-11-14):**
 [Source implemented and independently reviewed — Codex; executable qualification open]
 

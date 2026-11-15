@@ -574,6 +574,28 @@ impl HostCheckpointV1 {
         self.state.playback
     }
 
+    /// Bind an exclusive caller's next command identity to the retained owner authority.
+    pub(crate) fn matches_exclusive_command_cursor(&self, namespace: u64, next: u64) -> bool {
+        if next == 0 || self.state.next_admission.get() != next {
+            return false;
+        }
+        let previous = next - 1;
+        self.state.last_applied.map(|(_, id)| id)
+            == (previous != 0).then(|| CommandId::from_client_sequence(namespace, previous))
+            && self
+                .state
+                .commands
+                .iter()
+                .map(|entry| entry.status.command_id())
+                .chain(
+                    self.state
+                        .archived
+                        .iter()
+                        .map(|entry| entry.status.command_id()),
+                )
+                .all(|id| id.client_namespace() == namespace)
+    }
+
     /// Bounded chronological traces collected by the actual owner science steps.
     ///
     /// A consumer must validate each trace and refuse error captures before treating it as

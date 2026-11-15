@@ -16,6 +16,7 @@ use super::frankentui_shell::SHELL_FOOTER_ROWS;
 use ftui::render::cell::Cell;
 use ftui::render::drawing::Draw;
 use ftui::render::frame::Frame;
+use scriptbots_runtime::lab_workflows::LabMetric;
 use serde::{Deserialize, Serialize};
 
 /// Bounded, cancellable query state for a routed science screen.
@@ -211,12 +212,19 @@ pub type ExperimentComparisonSummary = crate::control::ExperimentComparisonDto;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExperimentsViewData {
     pub experiment_id: String,
+    /// Immutable plan identity observed with this batch status.
+    pub plan_digest: String,
+    /// Exact status generation used to bind asynchronous comparison results.
+    pub status_generation: u64,
     pub batch_status: String,
     pub active_arms: Vec<ExperimentArmView>,
     pub selected_arm_index: usize,
     /// Optional baseline pinned with Enter; C compares the selected variant against it.
     #[serde(default)]
     pub comparison_baseline: Option<String>,
+    /// Final-state endpoint requested by C, with the shared native scientific units.
+    #[serde(default)]
+    pub comparison_metric: LabMetric,
     pub comparison_summary: Option<ExperimentComparisonSummary>,
 }
 
@@ -224,16 +232,44 @@ impl Default for ExperimentsViewData {
     fn default() -> Self {
         Self {
             experiment_id: String::new(),
+            plan_digest: String::new(),
+            status_generation: 0,
             batch_status: "Idle".into(),
             active_arms: Vec::new(),
             selected_arm_index: 0,
             comparison_baseline: None,
+            comparison_metric: LabMetric::default(),
             comparison_summary: None,
         }
     }
 }
 
 impl ExperimentsViewData {
+    /// Evidence is displayed only for the chosen endpoint and observed batch source.
+    pub fn current_comparison(&self) -> Option<&ExperimentComparisonSummary> {
+        self.comparison_summary.as_ref().filter(|comparison| {
+            comparison.experiment_id == self.experiment_id
+                && comparison.plan_digest == self.plan_digest
+                && comparison.status_generation == self.status_generation
+                && comparison.metric == self.comparison_metric.key()
+        })
+    }
+
+    /// Move through the shared endpoint catalog and discard the previous observation.
+    pub fn cycle_comparison_metric(&mut self, forward: bool) {
+        let index = LabMetric::ALL
+            .iter()
+            .position(|metric| *metric == self.comparison_metric)
+            .unwrap_or_default();
+        let next = if forward {
+            (index + 1) % LabMetric::ALL.len()
+        } else {
+            (index + LabMetric::ALL.len() - 1) % LabMetric::ALL.len()
+        };
+        self.comparison_metric = LabMetric::ALL[next];
+        self.comparison_summary = None;
+    }
+
     /// Resolve two distinct variants, never two seed rows of the same treatment.
     pub fn comparison_pair(&self) -> Option<(String, String)> {
         let selected = &self.active_arms.get(self.selected_arm_index)?.variant_id;
@@ -784,6 +820,16 @@ pub fn render_experiments_screen(
             render_state_banner(frame, y_start + 2, None, None, Some((*query_id, error)));
         }
         ScreenDataState::Data(data) => {
+            print_text(
+                frame,
+                2,
+                y_start + 1,
+                &format!(
+                    "  [ / ] endpoint: {} ({})",
+                    data.comparison_metric.label(),
+                    data.comparison_metric.unit()
+                ),
+            );
             let status = format!(
                 "  Experiment ID: {:<16} Batch Status: {}",
                 data.experiment_id, data.batch_status
@@ -854,7 +900,7 @@ pub fn render_experiments_screen(
 
             let comp_y = y_start + 12;
             print_text(frame, 2, comp_y, "  MATCHED-SEED ENDPOINT COMPARISON:");
-            if let Some(comp) = &data.comparison_summary {
+            if let Some(comp) = data.current_comparison() {
                 print_text(
                     frame,
                     4,
@@ -864,17 +910,15 @@ pub fn render_experiments_screen(
                         comp.baseline_variant, comp.challenger_variant
                     ),
                 );
-                let metric = if comp.metric == "alive_agents" {
-                    "Population (agents)"
-                } else {
-                    &comp.metric
-                };
+                let metric = data.comparison_metric;
                 print_text(
                     frame,
                     4,
                     comp_y + 2,
                     &format!(
-                        "{metric} at tick {}: paired n={}",
+                        "{} ({}) at tick {}: paired n={}",
+                        metric.label(),
+                        metric.unit(),
                         comp.endpoint_tick,
                         comp.matched_seeds.len()
                     ),
@@ -886,8 +930,9 @@ pub fn render_experiments_screen(
                     4,
                     comp_y + 3,
                     &format!(
-                        "Challenger - baseline: {:+.3}; 95% CI: {interval}",
-                        comp.mean_difference
+                        "Challenger - baseline: {:+.3}; 95% CI: {interval} ({})",
+                        comp.mean_difference,
+                        metric.unit()
                     ),
                 );
                 print_text(
@@ -918,6 +963,22 @@ pub fn render_experiments_screen(
                 {
                     print_text(frame, 4, comp_y + 6, reason);
                 }
+                print_text(
+                    frame,
+                    4,
+                    comp_y + 7,
+                    &format!(
+                        "Plan {} | status generation {}",
+                        comp.plan_digest.get(..12).unwrap_or(&comp.plan_digest),
+                        comp.status_generation
+                    ),
+                );
+                print_text(
+                    frame,
+                    4,
+                    comp_y + 8,
+                    "Metric requests are separate comparisons, not one jointly corrected analysis.",
+                );
             } else {
                 print_text(
                     frame,

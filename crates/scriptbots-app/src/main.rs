@@ -445,6 +445,12 @@ fn main() -> Result<()> {
         }
     }
 
+    if let Some(AppSubcommand::ContinueArchipelago(args)) = &cli.subcommand {
+        let result = archipelago_report::continue_archipelago(args)?;
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+
     if let Some(AppSubcommand::MapGenerate(ref gen_args)) = cli.subcommand {
         run_map_generate(gen_args)?;
         return Ok(());
@@ -3755,6 +3761,8 @@ enum AppSubcommand {
     EconomyAudit(EconomyAuditArgs),
     /// Offline archipelago reconstruction report and population conservation audit (bd-16g.5.5.5)
     ReportArchipelago(ReportArchipelagoArgs),
+    /// Continue a complete saved multi-island checkpoint for additional barriers.
+    ContinueArchipelago(archipelago_report::ContinueArchipelagoArgs),
     /// Re-execute and compare a retained same-build matched-seed notebook.
     LabReproduce(scriptbots_app::lab::reproduction::ReproduceArgs),
     /// Generate a procedural map sandbox artifact offline.

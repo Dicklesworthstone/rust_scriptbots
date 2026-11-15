@@ -43,7 +43,8 @@ static NEXT_CHECKPOINT_REQUEST: AtomicU64 = AtomicU64::new(1);
 /// These describe one completed boundary, not time averages or cumulative
 /// lifecycle counts. Population means and maxima require a living population;
 /// the application service refuses an unavailable endpoint instead of zero-filling it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LabMetric {
     /// Number of living agents.
     #[default]

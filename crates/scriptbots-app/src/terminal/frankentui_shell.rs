@@ -18,6 +18,7 @@ use ftui::runtime::{Cmd, Model, ProgramSimulator};
 use scriptbots_core::ControlCommand;
 use scriptbots_runtime::{
     ApplicationState, CommandId, CommandStatus, JournalState, RejectionReason,
+    lab_workflows::LabMetric,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -67,8 +68,11 @@ pub enum ShellEffect {
     CancelCheckpointBranch,
     CompareExperiments {
         experiment_id: String,
+        plan_digest: String,
+        status_generation: u64,
         baseline: String,
         challenger: String,
+        metric: LabMetric,
     },
     ExportScreenData {
         format: String,
@@ -421,6 +425,10 @@ pub enum ShellMessage {
     PinComparisonBaseline,
     /// Resolve distinct baseline/challenger variants from the experiment selection.
     CompareSelectedExperiments,
+    /// Choose the previous or next final-state endpoint without running a comparison.
+    CycleComparisonMetric {
+        forward: bool,
+    },
     /// Export screen or replay artifact.
     ExportScreenData {
         format: String,
@@ -832,6 +840,11 @@ impl Model for FrankenTuiModel {
                 }
                 KeyCode::Char('c') | KeyCode::Char('C') => {
                     self.update(ShellMessage::CompareSelectedExperiments)
+                }
+                KeyCode::Char('[' | ']') if self.route == ShellRoute::Experiments => {
+                    self.update(ShellMessage::CycleComparisonMetric {
+                        forward: key.code == KeyCode::Char(']'),
+                    })
                 }
                 KeyCode::Down | KeyCode::Char('j') => self.update(ShellMessage::SelectNextItem),
                 KeyCode::Up => self.update(ShellMessage::SelectPreviousItem),
@@ -1264,7 +1277,7 @@ impl Model for FrankenTuiModel {
                 baseline,
                 challenger,
             } => {
-                let experiment_id = self
+                let source = self
                     .science
                     .experiments
                     .data()
@@ -1279,8 +1292,15 @@ impl Model for FrankenTuiModel {
                                 .iter()
                                 .any(|arm| arm.variant_id == challenger)
                     })
-                    .map(|data| data.experiment_id.clone());
-                let Some(experiment_id) = experiment_id else {
+                    .map(|data| {
+                        (
+                            data.experiment_id.clone(),
+                            data.plan_digest.clone(),
+                            data.status_generation,
+                            data.comparison_metric,
+                        )
+                    });
+                let Some((experiment_id, plan_digest, status_generation, metric)) = source else {
                     self.status_message = Some(
                         "Comparison unavailable: select two distinct variants in this experiment"
                             .into(),
@@ -1289,11 +1309,32 @@ impl Model for FrankenTuiModel {
                 };
                 if self.enqueue_effect(ShellEffect::CompareExperiments {
                     experiment_id,
+                    plan_digest,
+                    status_generation,
                     baseline,
                     challenger,
+                    metric,
                 }) {
-                    self.status_message =
-                        Some("Pending: comparison awaiting measured statistical result".into());
+                    self.status_message = Some(format!(
+                        "Pending: {} ({}) comparison awaiting measured result",
+                        metric.label(),
+                        metric.unit()
+                    ));
+                }
+                Cmd::none()
+            }
+            ShellMessage::CycleComparisonMetric { forward } => {
+                if let ScreenDataState::Data(data) = &mut self.science.experiments {
+                    data.cycle_comparison_metric(forward);
+                    self.status_message = Some(format!(
+                        "Endpoint: {} ({}); press C for a new matched-seed comparison",
+                        data.comparison_metric.label(),
+                        data.comparison_metric.unit()
+                    ));
+                } else {
+                    self.status_message = Some(
+                        "Endpoint selection unavailable: load an experiment batch first".into(),
+                    );
                 }
                 Cmd::none()
             }
@@ -1578,7 +1619,7 @@ impl Model for FrankenTuiModel {
                     frame,
                     4,
                     19,
-                    "  [C]      Compare matched-seed endpoint populations",
+                    "  [C] compare endpoint; [ / ] choose endpoint (Experiments)",
                 );
                 print_to_frame(frame, 4, 20, "  [Esc]    Cancel In-Flight Query / Dismiss");
                 print_to_frame(frame, 4, 21, "  [?]      Toggle help overlay");
@@ -2194,6 +2235,8 @@ mod tests {
         harness.dispatch(ShellMessage::SetExperimentsData(ScreenDataState::Data(
             ExperimentsViewData {
                 experiment_id: "distinct-variants".into(),
+                plan_digest: "fixture-plan".into(),
+                status_generation: 1,
                 batch_status: "completed".into(),
                 active_arms: arms,
                 ..ExperimentsViewData::default()
@@ -2202,7 +2245,7 @@ mod tests {
         harness.inject_key(KeyCode::Char('c'));
         let effects: Vec<_> = harness.model_mut().drain_effects().collect();
         assert!(matches!(effects.as_slice(),
-            [ShellEffect::CompareExperiments { experiment_id, baseline, challenger }]
+            [ShellEffect::CompareExperiments { experiment_id, baseline, challenger, metric: LabMetric::AliveAgents, .. }]
                 if experiment_id == "distinct-variants" && baseline == "baseline" && challenger == "treatment"));
 
         harness.inject_key(KeyCode::Enter);
@@ -2267,6 +2310,127 @@ mod tests {
         assert!(frame.contains("Paired variance is unavailable"));
         assert!(!frame.contains("Hedges' g"));
         assert!(!frame.contains("Paired p: 0.0000"));
+    }
+
+    #[test]
+    fn experiment_endpoint_keys_route_every_shared_metric_and_clear_previous_evidence() {
+        let mut harness = FrankenTuiSimulatorHarness::new();
+        harness.dispatch(ShellMessage::Navigate(ShellRoute::Experiments));
+        harness.dispatch(ShellMessage::SetExperimentsData(ScreenDataState::Data(
+            ExperimentsViewData {
+                experiment_id: "exp-darwin-01".into(),
+                plan_digest: "fixture-plan".into(),
+                status_generation: 1,
+                active_arms: ["arm-mlp", "arm-dwraon"]
+                    .into_iter()
+                    .map(|variant| ExperimentArmView {
+                        variant_id: variant.into(),
+                        brain_family: "mlp.baseline".into(),
+                        seed: 42,
+                        current_tick: Some(1000),
+                        target_ticks: 1000,
+                        mean_fitness: None,
+                        uncertainty_ci_95: None,
+                        digest: format!("fixture-{variant}"),
+                    })
+                    .collect(),
+                ..ExperimentsViewData::default()
+            },
+        )));
+        for expected in LabMetric::ALL {
+            let data = harness.model().science.experiments.data().unwrap();
+            assert_eq!(data.comparison_metric, expected);
+            assert!(data.comparison_summary.is_none());
+            let encoded = serde_json::to_value(data).unwrap();
+            assert_eq!(encoded["comparison_metric"], expected.key());
+            assert_eq!(
+                serde_json::from_value::<ExperimentsViewData>(encoded).unwrap(),
+                *data
+            );
+            let mut observed = data.clone();
+            let mut comparison = observed_comparison_fixture(0.5, 0.1);
+            comparison.metric = expected.key().into();
+            observed.comparison_summary = Some(comparison);
+            harness.dispatch(ShellMessage::SetExperimentsData(ScreenDataState::Data(
+                observed,
+            )));
+            let frame = harness.capture_frame_str(120, 28);
+            assert!(frame.contains(&format!(
+                "[ / ] endpoint: {} ({})",
+                expected.label(),
+                expected.unit()
+            )));
+            assert!(frame.contains(&format!(
+                "{} ({}) at tick 1000: paired n=3",
+                expected.label(),
+                expected.unit()
+            )));
+            if matches!(expected, LabMetric::MeanAge | LabMetric::MaxAge) {
+                assert!(frame.contains("age increments"));
+                assert!(!frame.contains("age (ticks)"));
+            }
+            harness.inject_key(KeyCode::Char('c'));
+            let effects: Vec<_> = harness.model_mut().drain_effects().collect();
+            assert!(matches!(effects.as_slice(),
+                [ShellEffect::CompareExperiments { metric, plan_digest, status_generation: 1, .. }]
+                if *metric == expected && plan_digest == "fixture-plan"));
+            harness.inject_key(KeyCode::Char(']'));
+            assert_eq!(harness.model_mut().drain_effects().count(), 0);
+            assert!(
+                harness
+                    .model()
+                    .science
+                    .experiments
+                    .data()
+                    .unwrap()
+                    .comparison_summary
+                    .is_none()
+            );
+        }
+        assert_eq!(
+            harness
+                .model()
+                .science
+                .experiments
+                .data()
+                .unwrap()
+                .comparison_metric,
+            LabMetric::AliveAgents
+        );
+        harness.inject_key(KeyCode::Char('['));
+        assert_eq!(
+            harness
+                .model()
+                .science
+                .experiments
+                .data()
+                .unwrap()
+                .comparison_metric,
+            LabMetric::TotalFood
+        );
+
+        let mut mismatched = harness.model().science.experiments.data().unwrap().clone();
+        mismatched.comparison_summary = Some(observed_comparison_fixture(0.5, 0.1));
+        harness.dispatch(ShellMessage::SetExperimentsData(ScreenDataState::Data(
+            mismatched,
+        )));
+        let frame = harness.capture_frame_str(120, 28);
+        assert!(frame.contains("Total food (food energy units)"));
+        assert!(
+            !frame.contains("paired n="),
+            "a previous endpoint cannot be relabelled as food"
+        );
+
+        let mut wrong_source = harness.model().science.experiments.data().unwrap().clone();
+        wrong_source.comparison_summary.as_mut().unwrap().metric = "total_food".into();
+        wrong_source.status_generation += 1;
+        assert!(wrong_source.current_comparison().is_none());
+        wrong_source.status_generation -= 1;
+        wrong_source.plan_digest = "different-plan".into();
+        assert!(wrong_source.current_comparison().is_none());
+        let mut encoded = serde_json::to_value(wrong_source).unwrap();
+        encoded["comparison_metric"] = serde_json::json!("invented_fitness");
+        assert!(serde_json::from_value::<ExperimentsViewData>(encoded).is_err());
     }
 
     #[test]
@@ -3484,6 +3648,8 @@ mod tests {
 
         let exp_data = ExperimentsViewData {
             experiment_id: "exp-darwin-01".into(),
+            plan_digest: "fixture-plan".into(),
+            status_generation: 1,
             batch_status: "Running".into(),
             active_arms: vec![
                 ExperimentArmView {
@@ -3509,6 +3675,7 @@ mod tests {
             ],
             selected_arm_index: 0,
             comparison_baseline: None,
+            comparison_metric: LabMetric::AliveAgents,
             comparison_summary: None,
         };
         harness.dispatch(ShellMessage::SetExperimentsData(ScreenDataState::Data(
@@ -3520,7 +3687,7 @@ mod tests {
         let effects: Vec<_> = harness.model_mut().drain_effects().collect();
         assert!(matches!(
             effects.as_slice(),
-            [ShellEffect::CompareExperiments { experiment_id, baseline, challenger }]
+            [ShellEffect::CompareExperiments { experiment_id, baseline, challenger, metric: LabMetric::AliveAgents, .. }]
                 if experiment_id == "exp-darwin-01" && baseline == "arm-mlp" && challenger == "arm-dwraon"
         ));
         assert!(
@@ -3701,6 +3868,8 @@ mod tests {
         // Screen 3: Experiments Data Golden
         let exp_data = ExperimentsViewData {
             experiment_id: "exp-darwin-01".into(),
+            plan_digest: "fixture-plan".into(),
+            status_generation: 1,
             batch_status: "Running".into(),
             active_arms: vec![
                 ExperimentArmView {
@@ -3726,6 +3895,7 @@ mod tests {
             ],
             selected_arm_index: 0,
             comparison_baseline: None,
+            comparison_metric: LabMetric::AliveAgents,
             comparison_summary: Some(observed_comparison_fixture(1.88, 0.002)),
         };
         harness.dispatch(ShellMessage::SetExperimentsData(ScreenDataState::Data(
@@ -4043,6 +4213,8 @@ mod tests {
         harness.inject_key(KeyCode::Char('6')); // Experiments
         let exp_data = ExperimentsViewData {
             experiment_id: "journey-exp".into(),
+            plan_digest: "journey-fixture-plan".into(),
+            status_generation: 1,
             batch_status: "Running".into(),
             active_arms: vec![
                 ExperimentArmView {
@@ -4068,6 +4240,7 @@ mod tests {
             ],
             selected_arm_index: 0,
             comparison_baseline: None,
+            comparison_metric: LabMetric::AliveAgents,
             comparison_summary: None,
         };
         harness.dispatch(ShellMessage::SetExperimentsData(ScreenDataState::Data(

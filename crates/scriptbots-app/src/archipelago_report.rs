@@ -2,24 +2,30 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::fs;
-use std::num::{NonZeroU32, NonZeroU64};
-use std::path::PathBuf;
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, ValueEnum};
 use scriptbots_core::{PersistenceBatch, ScriptBotsConfig, WorldState, WorldStateError};
+use scriptbots_runtime::archipelago::{ArchipelagoCheckpointV1, MAX_ARCHIPELAGO_CHECKPOINT_BYTES};
 use scriptbots_runtime::migrator::EmigrantSelectionRule;
 use scriptbots_runtime::{
-    Archipelago, ArchipelagoConfig, ArchipelagoMigration, EventJournalReader, HostCoreOptions,
-    HostSessionId, IslandId, IslandSpec, JournalAdmission, JournalBatch, JournalBatchId,
-    JournalPort, JournalReceipt, ShutdownCommitRequirement, Topology, VolatileJournal,
+    Archipelago, ArchipelagoConfig, ArchipelagoMigration, EventJournalReader, HostCheckpointError,
+    HostCoreOptions, HostJournalCutV1, HostSessionId, IslandId, IslandSpec, JournalAdmission,
+    JournalBatch, JournalBatchId, JournalPort, JournalReceipt, ShutdownCommitRequirement, Topology,
+    VolatileJournal, VolatileJournalCheckpointV1,
 };
 use scriptbots_storage::{ArchipelagoBarrierSink, RunManifestRecord, Storage, StorageReader};
 
-use crate::{BrainPreset, BuildProvenanceV0, FounderRecipe, install_brains, seed_founders};
+use crate::{
+    BrainPreset, BuildProvenanceV0, FounderRecipe, create_brain_registry_for_config,
+    install_brains, seed_founders,
+};
 
 const MAX_CAPTURE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_RECORDED_TICKS: u64 = 10_000_000;
@@ -41,6 +47,13 @@ enum MigrationConnections {
 /// Optional policies for recorded islands; migration is disabled unless requested.
 #[derive(Args, Debug, Clone, Default)]
 pub struct RecordedArchipelagoOptions {
+    /// Save a complete portable owner checkpoint after the final recorded barrier.
+    #[arg(
+        long = "archipelago-checkpoint",
+        value_name = "FILE",
+        requires = "run_archipelago"
+    )]
+    checkpoint_out: Option<PathBuf>,
     /// Per-island scenario overlay, repeatable as ID:JSON_OR_PATH.
     #[arg(long = "island-overlay", value_name = "ID:SPEC", action = clap::ArgAction::Append)]
     island_overlays: Vec<String>,
@@ -117,6 +130,17 @@ struct IslandCaptureJournal {
 }
 
 impl JournalPort for IslandCaptureJournal {
+    fn capture_volatile_checkpoint_v1(
+        &self,
+        session_id: HostSessionId,
+    ) -> Result<VolatileJournalCheckpointV1, HostCheckpointError> {
+        self.journal.capture_volatile_checkpoint_v1(session_id)
+    }
+
+    fn continuation_cut(&self) -> Option<HostJournalCutV1> {
+        self.journal.continuation_cut()
+    }
+
     fn try_admit(&mut self, batch: &Arc<JournalBatch>) -> JournalAdmission {
         let mut capture = self.capture.borrow_mut();
         if let Some(payload) = batch.persistence() {
@@ -263,7 +287,9 @@ fn build_recorded_archipelago(
 ///
 /// The supplied manifest describes the first island's launch world. The embedded
 /// `archipelago` extension and `islands` table identify the complete experiment. This
-/// mode records science, not a durable host-command session or checkpoint-resume artifact.
+/// mode records science, not a durable host-command session. An optional portable checkpoint
+/// preserves the complete owners and retained volatile journals; continuing it does not append
+/// to this database or turn its volatile command receipts into database durability claims.
 ///
 /// # Errors
 ///
@@ -297,6 +323,13 @@ pub fn run_recorded_archipelago(
         config.persistence_interval == 1,
         "recorded archipelago requires persistence_interval=1 so every island supplies every tick"
     );
+    if let Some(output) = &options.checkpoint_out {
+        ensure_new_checkpoint_destination(output)?;
+        ensure!(
+            output != Path::new(path),
+            "archipelago checkpoint and database must have distinct paths"
+        );
+    }
     let policy = options.migration_policy(island_count)?;
     let rayon_threads = rayon::current_num_threads();
     let migration_status = if policy.1.is_some() {
@@ -453,13 +486,230 @@ pub fn run_recorded_archipelago(
     })();
     let close = storage.close();
     match (execution, close) {
-        (Ok(result), Ok(())) => Ok(result),
+        (Ok(mut result), Ok(())) => {
+            if let Some(output) = &options.checkpoint_out {
+                let checkpoint = archipelago.checkpoint_v1().context(
+                    "recorded science is saved, but complete island owner capture refused",
+                )?;
+                result["checkpoint"] = write_archipelago_checkpoint(output, &checkpoint).context(
+                    "recorded science is saved, but checkpoint publication is unconfirmed",
+                )?;
+            }
+            Ok(result)
+        }
         (Err(error), Ok(())) => Err(error),
         (Ok(_), Err(error)) => Err(error.into()),
         (Err(error), Err(close_error)) => {
             bail!("{error:#}; storage close also failed: {close_error}")
         }
     }
+}
+
+/// Continue a portable multi-island owner cut without modifying its original run database.
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct ContinueArchipelagoArgs {
+    /// Complete portable archipelago checkpoint saved by a previous run.
+    #[arg(value_name = "CHECKPOINT")]
+    pub checkpoint: PathBuf,
+    /// New checkpoint destination; existing files are never replaced.
+    #[arg(long, short = 'o', value_name = "FILE")]
+    pub output: PathBuf,
+    /// Additional complete barriers, using the saved barrier and migration intervals.
+    #[arg(long, value_name = "N")]
+    pub barriers: NonZeroU64,
+    /// Original executable brain preset; a mismatched registry refuses restoration.
+    #[arg(long, value_enum, default_value_t = BrainPreset::Mixed)]
+    pub brain: BrainPreset,
+    /// Maximum Rayon worker threads for the continued scientific kernel (1..=64).
+    #[arg(long, default_value = "1", value_name = "N")]
+    pub threads: NonZeroUsize,
+}
+
+/// Execute a bounded portable continuation and save its exact final owner cut.
+///
+/// Both input and output are bounded checksummed artifacts. The restored islands retain their
+/// original command/session identities and actual volatile history. No database is opened, no
+/// founding population is recreated, and no elapsed wall time is converted into science ticks.
+pub fn continue_archipelago(args: &ContinueArchipelagoArgs) -> Result<serde_json::Value> {
+    ensure_new_checkpoint_destination(&args.output)?;
+    ensure!(
+        args.threads.get() <= 64,
+        "continuation threads must be in 1..=64"
+    );
+    let (checkpoint, source_blake3) = read_archipelago_checkpoint(&args.checkpoint)?;
+    let source_tick = checkpoint.barrier_tick().0;
+    let source_epoch = checkpoint.epoch();
+    let island_count = checkpoint.island_metadata().len();
+    let ticks_per_island = args
+        .barriers
+        .get()
+        .checked_mul(checkpoint.barrier_interval_ticks())
+        .context("continued tick horizon overflowed")?;
+    let transitions = ticks_per_island
+        .checked_mul(u64::try_from(island_count)?)
+        .context("continued island-transition budget overflowed")?;
+    ensure!(
+        transitions <= MAX_RECORDED_TICKS,
+        "continuation requires {transitions} island transitions; maximum is {MAX_RECORDED_TICKS}"
+    );
+    let target_tick = source_tick
+        .checked_add(ticks_per_island)
+        .context("continued target tick overflowed")?;
+    let target_epoch = source_epoch
+        .checked_add(args.barriers.get())
+        .context("continued target epoch overflowed")?;
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(args.threads.get())
+        .build()?;
+    pool.install(|| {
+        let mut archipelago = Archipelago::restore_checkpoint_v1(&checkpoint, |meta| {
+            create_brain_registry_for_config(args.brain, &meta.effective_config)
+                .map_err(|error| format!("{error:#}"))
+        })
+        .context("saved archipelago refused executable owner restoration")?;
+        let mut migration_count = 0_u64;
+        for _ in 0..args.barriers.get() {
+            let report = archipelago.step_to_barrier().context(
+                "continued archipelago did not complete its next barrier; source is unchanged",
+            )?;
+            if let Some(migration) = &report.migration {
+                migration_count = migration_count
+                    .checked_add(u64::try_from(migration.moves.len())?)
+                    .context("continued migration count overflowed")?;
+            }
+        }
+        let final_cut = archipelago
+            .checkpoint_v1()
+            .context("continued islands could not settle a complete owner checkpoint")?;
+        ensure!(
+            final_cut.barrier_tick().0 == target_tick && final_cut.epoch() == target_epoch,
+            "continued owner cut does not match the requested barrier horizon"
+        );
+        let islands = archipelago
+            .islands()
+            .map(|island| {
+                let snapshot = archipelago
+                    .island_snapshot(island.id)
+                    .context("continued island has no committed snapshot")?;
+                Ok(serde_json::json!({
+                    "island_id": island.id.0,
+                    "session_id": island.session_id.get(),
+                    "digest": archipelago.island_digest(island.id)?,
+                    "population": snapshot.world.agents.len(),
+                    "population_phase": "after_migration",
+                }))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let saved = write_archipelago_checkpoint(&args.output, &final_cut)?;
+        Ok(serde_json::json!({
+            "schema": "scriptbots.archipelago-continuation.v1", "status": "complete",
+            "source_checkpoint": args.checkpoint, "source_blake3": source_blake3,
+            "source_tick": source_tick, "source_epoch": source_epoch,
+            "tick": target_tick, "epoch": target_epoch,
+            "additional_barriers": args.barriers.get(), "ticks_per_island": ticks_per_island,
+            "island_transitions": transitions, "island_count": island_count,
+            "root_seed": checkpoint.master_seed(), "migration_count": migration_count,
+            "brain_preset": args.brain.as_str(), "rayon_threads": rayon::current_num_threads(),
+            "step_topology": "sequential_ascending", "host_journal": "committed_volatile",
+            "science_database_continued": false,
+            "source": BuildProvenanceV0::current().source_revision,
+            "checkpoint": saved, "islands": islands,
+        }))
+    })
+}
+
+fn checkpoint_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
+fn ensure_new_checkpoint_destination(path: &Path) -> Result<()> {
+    ensure!(
+        path.file_name().is_some(),
+        "checkpoint output must name a file"
+    );
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("inspect checkpoint output"),
+        Ok(_) => bail!("checkpoint output already exists: {}", path.display()),
+    }
+    ensure!(
+        fs::metadata(checkpoint_parent(path))?.is_dir(),
+        "checkpoint output parent must be an existing directory"
+    );
+    Ok(())
+}
+
+fn read_archipelago_checkpoint(path: &Path) -> Result<(ArchipelagoCheckpointV1, String)> {
+    ensure!(
+        fs::symlink_metadata(path)?.is_file(),
+        "checkpoint input must be a regular file"
+    );
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(path)
+        .context("open portable archipelago checkpoint")?;
+    let metadata = file.metadata()?;
+    ensure!(
+        metadata.is_file(),
+        "checkpoint input must be a regular file"
+    );
+    let limit = u64::try_from(MAX_ARCHIPELAGO_CHECKPOINT_BYTES)?;
+    ensure!(
+        metadata.len() <= limit,
+        "checkpoint input exceeds {limit} bytes"
+    );
+    let mut bytes = Vec::new();
+    file.take(limit + 1).read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() <= MAX_ARCHIPELAGO_CHECKPOINT_BYTES,
+        "checkpoint input grew beyond its byte bound"
+    );
+    let checkpoint = ArchipelagoCheckpointV1::decode(&bytes)
+        .context("portable archipelago checkpoint validation failed")?;
+    Ok((checkpoint, blake3::hash(&bytes).to_hex().to_string()))
+}
+
+fn write_archipelago_checkpoint(
+    path: &Path,
+    checkpoint: &ArchipelagoCheckpointV1,
+) -> Result<serde_json::Value> {
+    let bytes = checkpoint
+        .encode()
+        .context("encode complete archipelago checkpoint")?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| {
+            format!(
+                "reserve new checkpoint {}; existing files are preserved",
+                path.display()
+            )
+        })?;
+    file.write_all(&bytes)
+        .with_context(|| format!("incomplete checkpoint retained at {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("checkpoint file sync is unconfirmed at {}", path.display()))?;
+    #[cfg(unix)]
+    fs::File::open(checkpoint_parent(path))?
+        .sync_all()
+        .context("checkpoint parent-directory sync is unconfirmed")?;
+    Ok(serde_json::json!({
+        "schema": "scriptbots.archipelago-checkpoint-file.v1", "path": path,
+        "bytes": bytes.len(), "blake3": blake3::hash(&bytes).to_hex().to_string(),
+        "tick": checkpoint.barrier_tick().0, "epoch": checkpoint.epoch(),
+        "island_count": checkpoint.island_metadata().len(),
+        "file_synced": true, "host_journal": "committed_volatile",
+        "directory_synced": cfg!(unix),
+    }))
 }
 
 /// CLI arguments for the `report-archipelago` subcommand or mode.
@@ -574,6 +824,84 @@ mod tests {
         CommandEnvelope, CommandId, HostCommand, HostCore, HostPort, JournalState,
         ManualHostDriver, ManualInstant, PlaybackSnapshot,
     };
+
+    #[test]
+    fn portable_checkpoint_files_preserve_existing_evidence_and_bound_input() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut archipelago = Archipelago::new(ArchipelagoConfig {
+            islands: vec![IslandSpec::new(
+                IslandId(7),
+                "saved-island",
+                ScriptBotsConfig {
+                    world_width: 64,
+                    world_height: 64,
+                    food_cell_size: 16,
+                    closed: true,
+                    persistence_interval: 0,
+                    ..Default::default()
+                },
+            )],
+            topology: Topology::Custom(Vec::new()),
+            barrier_interval: NonZeroU64::new(2).unwrap(),
+            master_seed: 17,
+            host_options: HostCoreOptions::default(),
+            migration: None,
+        })?;
+        let cut = archipelago.checkpoint_v1()?;
+        let path = directory.path().join("source.checkpoint");
+        let receipt = write_archipelago_checkpoint(&path, &cut)?;
+        let original = fs::read(&path)?;
+        let (restored, hash) = read_archipelago_checkpoint(&path)?;
+        assert_eq!(restored.encode()?, original);
+        assert_eq!(receipt["blake3"], hash);
+        assert!(write_archipelago_checkpoint(&path, &cut).is_err());
+        assert_eq!(fs::read(&path)?, original);
+
+        let oversized = directory.path().join("oversized.checkpoint");
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&oversized)?
+            .set_len(u64::try_from(MAX_ARCHIPELAGO_CHECKPOINT_BYTES)? + 1)?;
+        assert!(
+            read_archipelago_checkpoint(&oversized)
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds")
+        );
+        let corrupt = directory.path().join("corrupt.checkpoint");
+        let mut changed = original.clone();
+        let last = changed.last_mut().unwrap();
+        *last ^= 1;
+        fs::write(&corrupt, changed)?;
+        assert!(read_archipelago_checkpoint(&corrupt).is_err());
+        assert!(read_archipelago_checkpoint(directory.path()).is_err());
+
+        // Destination refusal happens before reconstruction or stepping, including input=output.
+        let args = ContinueArchipelagoArgs {
+            checkpoint: path.clone(),
+            output: path.clone(),
+            barriers: NonZeroU64::new(1).unwrap(),
+            brain: BrainPreset::Mlp,
+            threads: NonZeroUsize::new(1).unwrap(),
+        };
+        assert!(
+            continue_archipelago(&args)
+                .unwrap_err()
+                .to_string()
+                .contains("already exists")
+        );
+        assert_eq!(fs::read(&path)?, original);
+        #[cfg(unix)]
+        {
+            let alias = directory.path().join("alias.checkpoint");
+            std::os::unix::fs::symlink(&path, &alias)?;
+            assert!(read_archipelago_checkpoint(&alias).is_err());
+            assert!(write_archipelago_checkpoint(&alias, &cut).is_err());
+            assert_eq!(fs::read(&path)?, original);
+        }
+        Ok(())
+    }
 
     #[test]
     fn recorded_founders_must_match_the_manifest_before_storage_creation() -> Result<()> {

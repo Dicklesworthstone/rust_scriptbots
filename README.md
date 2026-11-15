@@ -222,15 +222,22 @@ RUST_LOG=info cargo run -p scriptbots-app
   the runtime may select a labeled reduced-detail view. These paths are implemented; their
   current native and cross-platform qualification is tracked in the linked reality check.
 - In Experiments (`6`), select a variant row and press Enter to pin it as the
-  baseline, then select a different variant and press `C` to compare their
-  verified final populations across matched seeds. Without a pinned baseline,
+  baseline, then select a different variant. Use `[` / `]` to choose population,
+  total or mean live-agent energy, mean health, mean or maximum age counter,
+  maximum living generation, or total food; press `C` to compare that verified
+  final-state endpoint across matched seeds. Without a pinned baseline,
   `C` compares the selected variant with the next distinct variant, skipping its
-  other seed rows. The result shows the endpoint tick, paired sample count,
+  other seed rows. The result shows the metric and units, endpoint tick, paired sample count,
   challenger-minus-baseline difference, available 95% interval and paired
   statistical evidence. A single seed is descriptive only; undefined effect
-  sizes remain unavailable. Verification and analysis run in the background;
-  `x`, Escape or navigation discards a pending result. Live simulation controls
-  continue to address the live owner.
+  sizes remain unavailable. Age counters use age increments, not elapsed ticks.
+  Separate endpoint requests do not imply a jointly corrected family of tests.
+  Verification and analysis run in the background; results must match the selected
+  metric, experiment plan and source generation. Changing the metric, `x`, Escape
+  or navigation discards a pending result; returning to a previous metric does not
+  revive it. A refresh preserves the selected metric and retains evidence only
+  while the source observation is unchanged. Live simulation controls continue
+  to address the live owner.
 - In Replay (`7`), press `K` to save a checkpoint and use Up/Down to select a
   catalog row. It shows that saved cut's population and first twelve characters
   of its `WorldDigestV1`, separately from the live tick and artifact checksums.
@@ -580,19 +587,38 @@ cargo build -p scriptbots-brain-ml --features candle # library tensor inference;
    Tick summaries describe the tick before migration; final membership and world digests
    describe the state after migration. Result fields label these phases and report the
    number of moves persisted, which can be zero if no migration falls within the run.
-   This mode currently has no scheduled interventions, bootstrap, or host-session
-   checkpoint resume. The JSON result reports the observed durability watermarks.
+   This mode currently has no scheduled interventions or bootstrap. The JSON result
+   reports the observed database durability watermarks.
+   Add `--archipelago-checkpoint FILE` to save a complete portable owner cut after the
+   last recorded barrier. It includes all islands, inherited genomes and evaluator state,
+   RNG streams, migration policy and epoch, command identities and retained volatile
+   journals. Existing files are preserved; a successful save reports its byte count,
+   BLAKE3 checksum and file-sync acknowledgement.
    The manifest's `archipelago` extension records all island configs and the common root seed;
    its ordinary world fields describe island zero. For example:
 
    ```bash
    cargo run -p scriptbots-app -- --run-archipelago 3 \
      --archipelago-db runs/islands.sqlite --archipelago-ticks 100 \
+     --archipelago-checkpoint runs/islands-t100.checkpoint \
      --brain mlp --set rng_seed=42 --set persistence_interval=1
    # Add --migration-interval 25 --migration-selection random for gene flow.
    cargo run -p scriptbots-app -- report-archipelago runs/islands.sqlite \
      --verify-conservation --json runs/islands-report.json
+   cargo run -p scriptbots-app -- continue-archipelago runs/islands-t100.checkpoint \
+     --barriers 100 --brain mlp --threads 2 --output runs/islands-t200.checkpoint
    ```
+
+   `continue-archipelago` advances exactly the requested additional barriers using
+   the saved cadence and migration policy. Choose the original `--brain` preset;
+   executable registry mismatches refuse restoration. The result names the source
+   checksum, source/final ticks and epochs, final island digests, populations and
+   actual migration count. The original checkpoint and database remain unchanged:
+   continuation saves another portable cut and does not append science to the old
+   database. Retained host journal receipts remain `committed_volatile`; the saved
+   file does not turn them into a complete durable event history. Inputs are bounded
+   to 256 MiB and 64 islands, with at most 10 million aggregate island transitions
+   per invocation. Deterministic comparisons remain within the same executable lane.
 
  - `--set PATH=VALUE`: dotted-path configuration override in TOML syntax, repeatable (e.g., `--set world_width=800 --set neuroflow.enabled=true`; string values use TOML quotes). Configuration layers apply defaults → `--config` files (in order) → environment → CLI; every applied layer appends a kind-tagged content digest to the run manifest's `scenario.ordered_config_layer_digests`, and any field where one explicit layer displaced another is recorded in the manifest's `config_overrides`.
 - `--quality TIER`: visual quality shortcut for `--set render.quality=TIER`, validated at parse time (`auto|potato|low|medium|high|ultra`). The unified `render.*` settings (quality tier, post stack bloom/vignette/fog/AA, day/night cycle, TUI theme, accessibility palette) are consumed by every frontend; `None` values defer to per-tier frontend defaults.
