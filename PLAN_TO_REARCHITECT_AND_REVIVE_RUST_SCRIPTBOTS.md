@@ -4918,6 +4918,32 @@ clean source-status and source-diff digests plus Cargo.lock digest
 
 ### 7.7 experiment runner
 
+**Checkpoint recovery and replay integration — Codex, 2026-11-15:**
+[Source implemented and independently reviewed; executable qualification open]
+
+Torn temporary status writes now recover only when the existing committed
+status and required executable continuation evidence validate (`295a416`).
+The exact torn bytes are retained in one exclusive incident directory before
+normal publication resumes. Missing cuts, invalid bundles, complete invalid
+successors, aliases and repeated incidents still refuse. Existing running work
+is never reset to tick zero. Original acceptance under `bd-2z0.5.11` stays open.
+
+Saved-canvas review, event reconstruction and managed branch studies now restore
+configured NeuroFlow through a shared compiled application-preset catalog
+(`1ddb8f4`). The `reel` command's checkpoint replay uses the same catalog for
+DWRAON, Assembly and feature-enabled Ft/Neuro registries as well as MLP, Mixed
+and no-brain worlds. Full saved registry identity remains mandatory, including
+NeuroFlow constructor settings; changed settings cannot authorize a substitute.
+
+Regression source covers nonzero owner continuation, completed-bundle recovery,
+refusal and evidence preservation, all compiled replay families, independent
+uninterrupted digests, configured NeuroFlow service paths and repeatable ASCII/GIF
+encoding. Pinned DSR formatting passed for the exact four changed Rust files
+(receipt `20261114T231028-UeSIpqE3`, 1/1). The locked application check with
+`--no-default-features --features neuro` was killed with exit 137 after dependency
+downloads, before Rust source diagnostics. No compile, test or Clippy pass is
+claimed, and the original checkpoint/host qualification remains open.
+
 **Source implementation extension — Codex, 2026-11-08:** Lab proposals expose
 ordered intervention schedules as a bounded treatment axis. Configuration factors,
 canonical families and schedules form the admitted arm product, with the first

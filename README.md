@@ -316,6 +316,16 @@ RUST_LOG=info cargo run -p scriptbots-app
   slot as direct checkpoint review. Live controls continue to address the owner.
   Native-window/PTY
   and full DSR acceptance remain open.
+- Saved-checkpoint review, event reconstruction and managed branch studies recognize
+  the configured versioned NeuroFlow registry when the application is built with
+  `neuro`. The saved constructor identity must match exactly, including hidden
+  layers and activation; changing those settings after installing the registry
+  does not authorize reconstructing it from the newer settings. These consumers
+  share the application's compiled checkpoint-preset catalog. The `reel` command
+  and montage library use that catalog too, supporting exact checkpoint replay
+  for MLP, DWRAON, Assembly, Mixed, and the optional Frankentorch and configured
+  NeuroFlow presets. Custom registries and the existing restrictions on raw
+  scientific checkpoints still apply.
 - Auto selection: `SCRIPTBOTS_MODE=auto` (default) chooses only a renderer compiled into the binary—GPUI first, then Bevy—and only in a real native graphical session; otherwise it uses the terminal. Linux/Unix sessions require a display environment; local macOS sessions use the native window system without X11 variables, while SSH sessions choose the terminal.
 - Auto-mode policy overrides:
   - `SCRIPTBOTS_FORCE_TERMINAL=1` → choose terminal in Auto mode even when a display server is present.
@@ -2130,6 +2140,15 @@ without rerunning ticks. A second partial incident, unsafe paths, conflicting
 status, or an invalid checkpoint produces a refusal and preserves the evidence.
 Existing final bundle directories are never overwritten; legacy incomplete
 final directories still require explicit reconciliation.
+
+An empty or truncated temporary status write can also recover from the existing
+valid committed status. Running work requires a restorable continuation cut or
+independently verified completed bundle; completed work requires its verified
+bundle. A pending record cannot hide an advanced cut or unfinished publication.
+Recovery preserves the exact truncated bytes in one exclusively created
+`status.json.interrupted/status.tmp` directory before normal execution resumes.
+Missing evidence, invalid complete JSON, aliases and a second retained incident
+remain refusals. Recovery does not reset an already started run to tick zero.
 
 Completed experiment files also reappear through artifact list/get/download after
 restart, using their original IDs. A first request verifies the saved scientific
