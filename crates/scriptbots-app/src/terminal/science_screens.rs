@@ -793,6 +793,154 @@ pub fn render_brain_arena_screen(
     }
 }
 
+/// Render the shared application-owned Lab model in the actual terminal.
+/// Catalog rows and variants retain distinct identities; no run-row truncation
+/// can hide a challenger or silently substitute the first experiment.
+pub(super) fn render_live_experiments_screen(
+    frame: &mut ratatui::Frame<'_>,
+    workflows: &scriptbots_runtime::lab_workflows::LabWorkflows,
+    selected: Option<&str>,
+    scroll: u16,
+    style: ratatui::style::Style,
+) {
+    use ratatui::{
+        layout::Rect,
+        text::Line,
+        widgets::{Clear, Paragraph, Wrap},
+    };
+    use scriptbots_runtime::lab_workflows::comparison_lines;
+
+    let area = frame.area();
+    let body = Rect::new(
+        area.x,
+        area.y + area.height.min(3),
+        area.width,
+        area.height.saturating_sub(3 + SHELL_FOOTER_ROWS),
+    );
+    frame.render_widget(Clear, body);
+    let mut lines = vec![
+        "EXPERIMENT LAB — matched-seed studies".to_owned(),
+        "Up/Down select · Enter inspect · R refresh · PgUp/PgDn scroll".into(),
+    ];
+    if workflows.submit.is_none() {
+        lines.push("Experiment services are unavailable on this source.".into());
+    } else if let Some(batch) = &workflows.batch {
+        lines.push("A catalog · B baseline · V challenger · M or [/] metric · C compare · X discard pending result".into());
+        lines.push(format!(
+            "Experiment {}: {}",
+            batch.summary.experiment_id, batch.summary.status
+        ));
+        lines.push(format!(
+            "Completed {}/{}; failed {} · observed generation {}",
+            batch.summary.completed_runs,
+            batch.summary.total_runs,
+            batch.summary.failed_runs,
+            batch.generation
+        ));
+        if let Some(error) = &batch.error_reason {
+            lines.push(format!("Execution error: {error}"));
+        }
+        lines.push(format!(
+            "Baseline: {} · Challenger: {} · {} ({})",
+            workflows.baseline.as_deref().unwrap_or("unselected"),
+            workflows.challenger.as_deref().unwrap_or("unselected"),
+            workflows.metric.label(),
+            workflows.metric.unit()
+        ));
+        let selected_index = selected
+            .and_then(|id| batch.variants.iter().position(|row| row.variant_id == id))
+            .unwrap_or(0);
+        let first = first_visible_table_index(selected_index, SCIENCE_TABLE_ROWS);
+        lines.push(format!(
+            "Arms {}–{} of {} (all admitted seeds counted)",
+            first.saturating_add(1).min(batch.variants.len()),
+            (first + SCIENCE_TABLE_ROWS).min(batch.variants.len()),
+            batch.variants.len()
+        ));
+        for row in batch.variants.iter().skip(first).take(SCIENCE_TABLE_ROWS) {
+            let marker = if selected == Some(row.variant_id.as_str()) {
+                ">"
+            } else {
+                " "
+            };
+            lines.push(format!(
+                "{marker} {} · {} · completed {}/{} · running {} · failed {}",
+                row.variant_id,
+                row.brain_family,
+                row.completed_runs,
+                row.total_runs,
+                row.running_runs,
+                row.failed_runs
+            ));
+        }
+        if let Some(comparison) = &workflows.comparison {
+            lines.push(String::new());
+            lines.extend(comparison_lines(comparison));
+        } else {
+            lines.push(
+                "Comparison appears only after both selected arms have verified matched endpoints."
+                    .into(),
+            );
+        }
+        lines.push(format!("Admitted plan: {}", batch.plan_digest));
+    } else if workflows.selected_experiment.is_some() {
+        lines.push(format!(
+            "Selected experiment: {}",
+            workflows.selected_experiment.as_deref().unwrap_or_default()
+        ));
+        lines.push("Loading experiment details… A returns to the catalog.".into());
+    } else {
+        lines.push("[ first catalog page · ] next page · X discard pending result".into());
+        if let Some(page) = &workflows.experiments {
+            lines.push(format!(
+                "Catalog {}–{} of {} · reserved run slots {}/{}",
+                page.offset.saturating_add(1).min(page.total),
+                page.offset + page.items.len(),
+                page.total,
+                page.reserved_run_slots,
+                page.max_run_slots
+            ));
+            let selected_index = selected
+                .and_then(|id| page.items.iter().position(|row| row.experiment_id == id))
+                .unwrap_or(0);
+            let first = first_visible_table_index(selected_index, SCIENCE_TABLE_ROWS);
+            for row in page.items.iter().skip(first).take(SCIENCE_TABLE_ROWS) {
+                let marker = if selected == Some(row.experiment_id.as_str()) {
+                    ">"
+                } else {
+                    " "
+                };
+                lines.push(format!("{marker} {}", row.experiment_id));
+                lines.push(format!(
+                    "  {} · completed {}/{} · failed {}",
+                    row.status, row.completed_runs, row.total_runs, row.failed_runs
+                ));
+            }
+            if page.items.is_empty() {
+                lines.push("No retained experiments on this page.".into());
+            }
+        } else {
+            lines.push("Loading the experiment catalog…".into());
+        }
+    }
+    if workflows.is_busy() {
+        lines.push("Loading experiment data…".into());
+    }
+    if let Some(notice) = &workflows.notice {
+        lines.push(notice.clone());
+    }
+    let paragraph = Paragraph::new(lines.into_iter().map(Line::from).collect::<Vec<_>>())
+        .style(style)
+        .wrap(Wrap { trim: false });
+    let maximum_scroll = paragraph
+        .line_count(body.width)
+        .saturating_sub(usize::from(body.height));
+    let scroll = usize::from(scroll)
+        .min(maximum_scroll)
+        .min(usize::from(u16::MAX)) as u16;
+    frame.render_widget(paragraph.scroll((scroll, 0)), body);
+}
+
 /// Render Experiments science screen (variants, confidence intervals, comparison).
 pub fn render_experiments_screen(
     frame: &mut Frame,

@@ -4108,9 +4108,8 @@ pub mod renderer {
         })
     }
 
-    /// Project application services into either native Lab frontend. All I/O,
+    /// Project application services into the terminal and graphical Lab frontends. All I/O,
     /// verification and statistics execute on the shared bounded Lab worker.
-    #[cfg(any(feature = "gui", feature = "bevy_render", test))]
     #[must_use]
     pub fn lab_workflow_submit(
         control: crate::control::ControlHandle,
@@ -4277,7 +4276,6 @@ pub mod renderer {
         })
     }
 
-    #[cfg(any(feature = "gui", feature = "bevy_render", test))]
     fn retained_lab_event(
         snapshot: &scriptbots_runtime::RenderSnapshot,
         event: scriptbots_runtime::lab_workflows::LabEventIdentity,
@@ -4299,7 +4297,6 @@ pub mod renderer {
         ))
     }
 
-    #[cfg(any(feature = "gui", feature = "bevy_render", test))]
     fn review_lab_event(
         control: &crate::control::ControlHandle,
         event: scriptbots_runtime::lab_workflows::LabEventIdentity,
@@ -4331,7 +4328,6 @@ pub mod renderer {
         }))
     }
 
-    #[cfg(any(feature = "gui", feature = "bevy_render", test))]
     fn native_lab_branch_capabilities() -> Result<
         scriptbots_runtime::lab_workflows::LabBranchCapabilities,
         crate::control::ControlError,
@@ -4348,7 +4344,6 @@ pub mod renderer {
         })
     }
 
-    #[cfg(any(feature = "gui", feature = "bevy_render", test))]
     fn project_lab_checkpoint_branch(
         branch: crate::control::CheckpointBranchStatusDto,
     ) -> scriptbots_runtime::lab_workflows::LabCheckpointBranch {
@@ -4367,7 +4362,6 @@ pub mod renderer {
         }
     }
 
-    #[cfg(any(feature = "gui", feature = "bevy_render", test))]
     fn create_lab_checkpoint_branch(
         control: &crate::control::ControlHandle,
         request_id: String,
@@ -4469,7 +4463,6 @@ pub mod renderer {
         })
     }
 
-    #[cfg(any(feature = "gui", feature = "bevy_render", test))]
     fn native_lab_digest_is_valid(value: &str, bytes: usize) -> bool {
         value.len() == bytes * 2
             && value
@@ -4477,7 +4470,6 @@ pub mod renderer {
                 .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
     }
 
-    #[cfg(any(feature = "gui", feature = "bevy_render", test))]
     fn project_lab_branch_outcome(
         outcome: crate::branch_study::BranchOutcomeReport,
         status: &crate::control::CheckpointBranchStatusDto,
@@ -4563,7 +4555,6 @@ pub mod renderer {
         })
     }
 
-    #[cfg(any(feature = "gui", feature = "bevy_render", test))]
     fn project_lab_branch_report(
         status: &crate::control::CheckpointBranchStatusDto,
         metadata: crate::control::ArtifactMetadataDto,
@@ -4662,7 +4653,6 @@ pub mod renderer {
         })
     }
 
-    #[cfg(any(feature = "gui", feature = "bevy_render", test))]
     fn read_lab_checkpoint_branch_report(
         control: &crate::control::ControlHandle,
         branch_id: &str,
@@ -4707,7 +4697,6 @@ pub mod renderer {
         Ok(projected)
     }
 
-    #[cfg(any(feature = "gui", feature = "bevy_render", test))]
     fn native_lab_experiment_capabilities()
     -> scriptbots_runtime::lab_workflows::LabExperimentCapabilities {
         use crate::experiment_runner::{
@@ -4754,7 +4743,6 @@ pub mod renderer {
 
     /// Construct the exact runner plan without creating a world, worker or file.
     /// Both admission and receipt verification use this one treatment mapping.
-    #[cfg(any(feature = "gui", feature = "bevy_render", test))]
     fn native_lab_experiment_plan(
         request_id: &str,
         draft: &scriptbots_runtime::lab_workflows::LabExperimentDraft,
@@ -4810,7 +4798,6 @@ pub mod renderer {
         ))
     }
 
-    #[cfg(any(feature = "gui", feature = "bevy_render", test))]
     fn validate_created_lab_experiment(
         batch: &crate::control::ExperimentBatchStatusDto,
         request_id: &str,
@@ -4865,7 +4852,6 @@ pub mod renderer {
         Ok(())
     }
 
-    #[cfg(any(feature = "gui", feature = "bevy_render", test))]
     fn create_lab_experiment(
         control: &crate::control::ControlHandle,
         request_id: String,
@@ -4935,7 +4921,6 @@ pub mod renderer {
         })
     }
 
-    #[cfg(any(feature = "gui", feature = "bevy_render", test))]
     fn create_lab_checkpoint(
         control: &crate::control::ControlHandle,
         request_id: String,
@@ -4977,7 +4962,6 @@ pub mod renderer {
         })
     }
 
-    #[cfg(any(feature = "gui", feature = "bevy_render", test))]
     fn project_lab_experiment(
         batch: crate::control::ExperimentBatchStatusDto,
     ) -> Result<scriptbots_runtime::lab_workflows::LabExperiment, crate::control::ControlError>

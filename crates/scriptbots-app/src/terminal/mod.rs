@@ -50,7 +50,9 @@ use scriptbots_runtime::{
     ApplicationState, BrainProjectionRequest, CommandEnvelope, CommandId, CommandStatus,
     ControlRevision, HostAccessError, HostClient, HostCommand, HostCommandMappingError, HostEvent,
     HostPort, JournalState, ProjectionClientId, ProjectionRequestRevision, ProtocolEventCursor,
-    RenderSnapshot, SnapshotSubscription, channel::ChannelHostPort, lab_workflows::LabMetric,
+    RenderSnapshot, SnapshotSubscription,
+    channel::ChannelHostPort,
+    lab_workflows::{LabAction, LabMetric, LabPanel, LabWorkflows},
 };
 use scriptbots_storage::{AnalyticsSnapshot, IslandSnapshot, MetricReading};
 #[cfg(test)]
@@ -380,6 +382,147 @@ struct ExperimentComparisonTarget {
     metric: LabMetric,
 }
 
+/// The live terminal consumes the same bounded, source-validated experiment
+/// model as the native GPU frontends. Cursor and scrolling are presentation only.
+#[derive(Default)]
+struct TerminalExperimentLab {
+    workflows: LabWorkflows,
+    enabled: bool,
+    selected_row: Option<String>,
+    scroll: u16,
+}
+
+impl TerminalExperimentLab {
+    fn rows(&self) -> Vec<&str> {
+        if let Some(batch) = &self.workflows.batch {
+            batch
+                .variants
+                .iter()
+                .map(|row| row.variant_id.as_str())
+                .collect()
+        } else {
+            self.workflows
+                .experiments
+                .as_ref()
+                .map_or_else(Vec::new, |page| {
+                    page.items
+                        .iter()
+                        .map(|row| row.experiment_id.as_str())
+                        .collect()
+                })
+        }
+    }
+
+    fn reconcile_selection(&mut self) {
+        let rows = self.rows();
+        if self
+            .selected_row
+            .as_deref()
+            .is_none_or(|selected| !rows.contains(&selected))
+        {
+            self.selected_row = rows.first().map(|id| (*id).to_owned());
+        }
+    }
+
+    fn move_selection(&mut self, forward: bool) {
+        let rows = self.rows();
+        let index = self
+            .selected_row
+            .as_deref()
+            .and_then(|selected| rows.iter().position(|id| *id == selected))
+            .unwrap_or(0);
+        let next = if forward {
+            index.saturating_add(1).min(rows.len().saturating_sub(1))
+        } else {
+            index.saturating_sub(1)
+        };
+        self.selected_row = rows.get(next).map(|id| (*id).to_owned());
+        self.scroll = 0;
+    }
+
+    fn handle_key(&mut self, key: ftui::core::event::KeyCode) -> bool {
+        use ftui::core::event::KeyCode as K;
+        let action = match key {
+            K::Up => {
+                self.move_selection(false);
+                return true;
+            }
+            K::Down => {
+                self.move_selection(true);
+                return true;
+            }
+            K::PageUp => {
+                self.scroll = self.scroll.saturating_sub(6);
+                return true;
+            }
+            K::PageDown => {
+                self.scroll = self.scroll.saturating_add(6);
+                return true;
+            }
+            K::Char('r' | 'R') => LabAction::Refresh,
+            K::Char('a' | 'A') => LabAction::AllExperiments,
+            K::Char('x' | 'X') => LabAction::CancelRequest,
+            K::Escape if self.workflows.selected_experiment.is_some() => LabAction::AllExperiments,
+            K::Char('[') if self.workflows.selected_experiment.is_none() => {
+                LabAction::ExperimentsPage(None)
+            }
+            K::Char(']') if self.workflows.selected_experiment.is_none() => {
+                let Some(cursor) = self
+                    .workflows
+                    .experiments
+                    .as_ref()
+                    .and_then(|page| page.next_cursor.clone())
+                else {
+                    self.workflows
+                        .set_notice("This is the last observed experiment catalog page.");
+                    return true;
+                };
+                LabAction::ExperimentsPage(Some(cursor))
+            }
+            K::Enter if self.workflows.selected_experiment.is_none() => {
+                let Some(id) = self.selected_row.clone() else {
+                    return true;
+                };
+                LabAction::SelectExperiment(id)
+            }
+            K::Enter | K::Char('b' | 'B') if self.workflows.batch.is_some() => {
+                let Some(id) = self.selected_row.clone() else {
+                    return true;
+                };
+                LabAction::Baseline(id)
+            }
+            K::Char('v' | 'V') if self.workflows.batch.is_some() => {
+                let Some(id) = self.selected_row.clone() else {
+                    return true;
+                };
+                LabAction::Challenger(id)
+            }
+            K::Char('m' | 'M' | '[' | ']') if self.workflows.batch.is_some() => {
+                let index = LabMetric::ALL
+                    .iter()
+                    .position(|metric| *metric == self.workflows.metric)
+                    .unwrap_or(0);
+                let step = if key == K::Char('[') {
+                    LabMetric::ALL.len() - 1
+                } else {
+                    1
+                };
+                LabAction::Metric(LabMetric::ALL[(index + step) % LabMetric::ALL.len()])
+            }
+            K::Char('c' | 'C') if self.workflows.batch.is_some() => LabAction::Compare,
+            K::Enter | K::Char('b' | 'B' | 'v' | 'V' | 'm' | 'M' | 'c' | 'C' | '[' | ']') => {
+                self.workflows.set_notice("Select an experiment from the catalog and wait for its details before comparing arms.");
+                return true;
+            }
+            _ => return false,
+        };
+        self.workflows.dispatch(action);
+        self.reconcile_selection();
+        self.scroll = 0;
+        true
+    }
+}
+
 impl ExperimentComparisonTarget {
     fn matches(&self, app: &TerminalApp<'_>) -> bool {
         app.frankentui.route == frankentui_shell::ShellRoute::Experiments
@@ -570,6 +713,11 @@ impl FrameTimingSink for TerminalPresentationObserver {
 impl<'a> LiveTerminalModel<'a> {
     fn new(mut app: TerminalApp<'a>) -> Result<Self> {
         app.defer_live_commands = true;
+        app.experiment_lab.workflows.submit = app
+            .control
+            .control_handle()
+            .map(crate::renderer::lab_workflow_submit);
+        app.experiment_lab.enabled = app.experiment_lab.workflows.submit.is_some();
         app.frankentui
             .update(frankentui_shell::ShellMessage::CapabilityChanged {
                 reduced_color: !app.palette.has_color(),
@@ -1735,6 +1883,18 @@ impl LiveTerminalModel<'_> {
             }
         }
         let route = app.frankentui.route;
+        if app.experiment_lab.enabled {
+            let session = app.client.session_id();
+            let panel = if route == ShellRoute::Experiments {
+                LabPanel::Experiments
+            } else {
+                LabPanel::Inactive
+            };
+            app.experiment_lab.workflows.synchronize(session, panel);
+            app.experiment_lab.workflows.poll();
+            app.experiment_lab.reconcile_selection();
+            app.experiment_lab.workflows.maybe_refresh();
+        }
         if self.service_in_flight.is_none()
             && self.cancelled_service_route != Some(route)
             && self
@@ -1744,6 +1904,7 @@ impl LiveTerminalModel<'_> {
                 route,
                 ShellRoute::Lineages | ShellRoute::Experiments | ShellRoute::Replay
             )
+            && !(route == ShellRoute::Experiments && app.experiment_lab.enabled)
         {
             self.last_service_poll = Some(Instant::now());
             self.service_generation = self.service_generation.saturating_add(1);
@@ -2352,6 +2513,7 @@ struct TerminalApp<'a> {
     /// Whether the tiled archipelago view is active instead of the single-world terrain map (bd-16g.5.5.4).
     archipelago_view: bool,
     pub frankentui: frankentui_shell::FrankenTuiModel,
+    experiment_lab: TerminalExperimentLab,
     receipt_poll_offset: usize,
     /// Cached layout hit regions for O(1) hit testing and picking (bd-2z0.14.2.5).
     pub hit_regions: HitRegionMap,
@@ -2522,6 +2684,7 @@ impl<'a> TerminalApp<'a> {
             sub_step: 0,
             archipelago_view: false,
             frankentui: frankentui_shell::FrankenTuiModel::new(),
+            experiment_lab: TerminalExperimentLab::default(),
             receipt_poll_offset: 0,
             hit_regions: HitRegionMap::default(),
             pointer_gesture: PointerGestureState::default(),
@@ -3774,6 +3937,18 @@ impl<'a> TerminalApp<'a> {
             self.hit_regions.header_rect = Some(header);
             self.hit_regions.header_targets = self.draw_header(frame, header, &self.snapshot);
         }
+        if self.experiment_lab.enabled
+            && self.frankentui.route == frankentui_shell::ShellRoute::Experiments
+        {
+            let theme = self.palette.theme();
+            science_screens::render_live_experiments_screen(
+                frame,
+                &self.experiment_lab.workflows,
+                self.experiment_lab.selected_row.as_deref(),
+                self.experiment_lab.scroll,
+                Style::default().fg(theme.text).bg(theme.surface),
+            );
+        }
         if self.help_visible {
             self.hit_regions.help_rect = Some(area);
             self.draw_help(frame);
@@ -3823,6 +3998,16 @@ impl<'a> TerminalApp<'a> {
                 }
                 if !self.palette_open
                     && !self.help_visible
+                    && (key.modifiers == Modifiers::NONE || key.modifiers == Modifiers::SHIFT)
+                    && self.frankentui.route == ShellRoute::Experiments
+                    && self.experiment_lab.enabled
+                    && self.experiment_lab.handle_key(key.code)
+                {
+                    return Ok(false);
+                }
+                if !self.palette_open
+                    && !self.help_visible
+                    && !self.experiment_lab.enabled
                     && self.frankentui.route == ShellRoute::Experiments
                     && (key.modifiers == Modifiers::NONE || key.modifiers == Modifiers::SHIFT)
                     && matches!(key.code, K::Char('c' | 'C'))
@@ -19885,6 +20070,260 @@ for case in ('panic', 'subscription', 'renderer'):
     }
 
     #[test]
+    fn live_experiment_catalog_pages_and_reaches_every_arm() {
+        use frankentui_shell::ShellRoute;
+        use ftui::core::event::{KeyCode as K, KeyEvent, Modifiers};
+        use scriptbots_runtime::lab_workflows::{
+            LAB_MAX_VARIANTS, LAB_PAGE_SIZE, LabExperiment, LabExperimentPage,
+            LabExperimentSummary, LabVariantProgress, LabWorkflowRequest, LabWorkflowResponse,
+        };
+
+        fn key(model: &mut LiveTerminalModel<'_>, code: K) {
+            let mut event = KeyEvent::new(code);
+            if matches!(code, K::Char(character) if character.is_ascii_uppercase()) {
+                event.modifiers = Modifiers::SHIFT;
+            }
+            let _ = model.update(LiveTerminalMessage::Event(ftui::core::event::Event::Key(
+                event,
+            )));
+        }
+        fn finish(model: &mut LiveTerminalModel<'_>) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let _ = model.service_commands();
+                if !model.app.borrow().experiment_lab.workflows.is_busy() {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "fixture Lab read deadline");
+                std::thread::park_timeout(Duration::from_millis(1));
+            }
+        }
+        fn summary(id: String) -> LabExperimentSummary {
+            LabExperimentSummary {
+                experiment_id: id,
+                status: "completed".into(),
+                total_runs: LAB_MAX_VARIANTS,
+                completed_runs: LAB_MAX_VARIANTS,
+                failed_runs: 0,
+            }
+        }
+
+        // These bounded provider fixtures characterize key routing and viewport
+        // reachability, not scientific endpoints or real experiment execution.
+        let host = TerminalTestHost::take(command_characterization_world());
+        let (runtime, _) = ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let app = TerminalApp::new(&renderer, host.context(&runtime));
+        let mut model = LiveTerminalModel::new(app).unwrap();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        {
+            let mut app = model.app.borrow_mut();
+            let requests = Arc::clone(&requests);
+            app.experiment_lab.enabled = true;
+            app.experiment_lab.workflows.submit = Some(Arc::new(move |request| {
+                requests.lock().unwrap().push(request.clone());
+                match request {
+                    LabWorkflowRequest::ListExperiments { cursor } => {
+                        let offset = cursor.as_deref().unwrap_or("0").parse::<usize>().unwrap();
+                        let total = LAB_PAGE_SIZE + 2;
+                        let end = (offset + LAB_PAGE_SIZE).min(total);
+                        Ok(LabWorkflowResponse::Experiments(LabExperimentPage {
+                            items: (offset..end)
+                                .map(|index| summary(format!("fixture-{index:02}")))
+                                .collect(),
+                            total,
+                            offset,
+                            next_cursor: (end < total).then(|| end.to_string()),
+                            reserved_run_slots: 0,
+                            max_run_slots: 4096,
+                        }))
+                    }
+                    LabWorkflowRequest::GetExperiment { experiment_id } => {
+                        Ok(LabWorkflowResponse::Experiment(LabExperiment {
+                            summary: summary(experiment_id),
+                            plan_digest: "bounded-viewport-fixture".into(),
+                            generation: 7,
+                            variants: (0..LAB_MAX_VARIANTS)
+                                .map(|index| LabVariantProgress {
+                                    variant_id: format!("arm-{index:02}"),
+                                    brain_family: "mlp.baseline".into(),
+                                    total_runs: 1,
+                                    completed_runs: 1,
+                                    failed_runs: 0,
+                                    running_runs: 0,
+                                })
+                                .collect(),
+                            error_reason: None,
+                        }))
+                    }
+                    LabWorkflowRequest::Compare { .. } => {
+                        Err("Fixture has no verified endpoints".into())
+                    }
+                    _ => panic!("read-only terminal dispatched a mutation or unrelated request"),
+                }
+            }));
+            app.navigate_route(ShellRoute::Experiments);
+        }
+        finish(&mut model);
+        assert_eq!(
+            model.app.borrow().experiment_lab.selected_row.as_deref(),
+            Some("fixture-00")
+        );
+        key(&mut model, K::Char(']'));
+        finish(&mut model);
+        assert_eq!(
+            model
+                .app
+                .borrow()
+                .experiment_lab
+                .workflows
+                .experiments
+                .as_ref()
+                .unwrap()
+                .offset,
+            LAB_PAGE_SIZE
+        );
+        assert_eq!(
+            model.app.borrow().experiment_lab.selected_row.as_deref(),
+            Some("fixture-12")
+        );
+        key(&mut model, K::Down);
+        key(&mut model, K::Enter);
+        finish(&mut model);
+        assert_eq!(
+            model
+                .app
+                .borrow()
+                .experiment_lab
+                .workflows
+                .selected_experiment
+                .as_deref(),
+            Some("fixture-13")
+        );
+        assert_eq!(
+            model
+                .app
+                .borrow()
+                .experiment_lab
+                .workflows
+                .batch
+                .as_ref()
+                .unwrap()
+                .variants
+                .len(),
+            LAB_MAX_VARIANTS
+        );
+        key(&mut model, K::Char('B'));
+        for _ in 1..LAB_MAX_VARIANTS {
+            key(&mut model, K::Down);
+        }
+        key(&mut model, K::Char('V'));
+        {
+            let app = model.app.borrow();
+            assert_eq!(app.experiment_lab.selected_row.as_deref(), Some("arm-63"));
+            assert_eq!(
+                app.experiment_lab.workflows.baseline.as_deref(),
+                Some("arm-00")
+            );
+            assert_eq!(
+                app.experiment_lab.workflows.challenger.as_deref(),
+                Some("arm-63")
+            );
+        }
+        key(&mut model, K::Char('['));
+        assert_eq!(
+            model.app.borrow().experiment_lab.workflows.metric,
+            LabMetric::TotalFood
+        );
+        key(&mut model, K::Char(']'));
+        assert_eq!(
+            model.app.borrow().experiment_lab.workflows.metric,
+            LabMetric::AliveAgents
+        );
+        assert_eq!(
+            model
+                .app
+                .borrow()
+                .experiment_lab
+                .workflows
+                .selected_experiment
+                .as_deref(),
+            Some("fixture-13"),
+            "brackets cycle detail metrics without changing the selected catalog experiment"
+        );
+        for metric in LabMetric::ALL {
+            assert_eq!(model.app.borrow().experiment_lab.workflows.metric, metric);
+            key(&mut model, K::Char('C'));
+            finish(&mut model);
+            let app = model.app.borrow();
+            assert!(app.experiment_lab.workflows.comparison.is_none());
+            assert!(
+                app.experiment_lab
+                    .workflows
+                    .notice
+                    .as_deref()
+                    .unwrap()
+                    .contains("Fixture has no verified endpoints")
+            );
+            drop(app);
+            key(&mut model, K::Char('M'));
+        }
+        let metrics = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|request| match request {
+                LabWorkflowRequest::Compare {
+                    experiment_id,
+                    baseline_variant,
+                    challenger_variant,
+                    metric,
+                } => {
+                    assert_eq!(experiment_id, "fixture-13");
+                    assert_eq!(baseline_variant, "arm-00");
+                    assert_eq!(challenger_variant, "arm-63");
+                    Some(*metric)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(metrics, LabMetric::ALL);
+        let mut simulator = ftui::runtime::ProgramSimulator::new(model);
+        let text = frankentui_shell::buffer_to_string(simulator.capture_frame(100, 24));
+        assert!(
+            text.contains("> arm-63"),
+            "last admitted arm must remain visibly reachable"
+        );
+        assert!(text.contains("Baseline: arm-00"));
+        assert!(text.contains("Challenger: arm-63"));
+        key(simulator.model_mut(), K::Escape);
+        finish(simulator.model_mut());
+        assert!(
+            simulator
+                .model()
+                .app
+                .borrow()
+                .experiment_lab
+                .workflows
+                .selected_experiment
+                .is_none()
+        );
+        assert_eq!(
+            simulator
+                .model()
+                .app
+                .borrow()
+                .experiment_lab
+                .workflows
+                .experiments
+                .as_ref()
+                .unwrap()
+                .offset,
+            0
+        );
+    }
+
+    #[test]
     fn live_science_provider_records_match_real_checkpoint_and_completed_experiment() {
         use crate::control::{
             CheckpointCreateRequest, ExperimentCreateRequest, ExperimentVariantDto,
@@ -19904,10 +20343,22 @@ for case in ('panic', 'subscription', 'renderer'):
                 _ => panic!("C did not dispatch the actual comparison task"),
             }
         }
+
         fn comparison_key(code: ftui::core::event::KeyCode) -> LiveTerminalMessage {
             LiveTerminalMessage::Event(ftui::core::event::Event::Key(
                 ftui::core::event::KeyEvent::new(code),
             ))
+        }
+        fn finish_lab_read(model: &mut LiveTerminalModel<'_>) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let _ = model.service_commands();
+                if !model.app.borrow().experiment_lab.workflows.is_busy() {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "real terminal Lab read deadline");
+                std::thread::park_timeout(Duration::from_millis(1));
+            }
         }
 
         const FOUNDERS: usize = 4;
@@ -20187,80 +20638,214 @@ for case in ('panic', 'subscription', 'renderer'):
             }
         }
 
-        // Exercise the real live C adapter against the independently verified
-        // completed batch. Creating an intent must not fabricate a result, and
-        // its detached read must not mutate the live simulation.
+        // Exercise the production catalog -> detail -> comparison path without
+        // injecting any experiment view data. The provider uses the same actual
+        // service with REST disabled, and never advances the live owner.
         let mut comparison_app = TerminalApp::new(&renderer, host.context(&comparison_runtime));
         comparison_app
             .frankentui
             .update(ShellMessage::Navigate(ShellRoute::Experiments));
-        comparison_app
-            .frankentui
-            .update(ShellMessage::SetExperimentsData(ScreenDataState::Data(
-                comparison_view.clone(),
-            )));
         let mut comparison_model = LiveTerminalModel::new(comparison_app).unwrap();
-        // Isolate this worker from the independently covered periodic catalog task.
-        comparison_model.cancelled_service_route = Some(ShellRoute::Experiments);
+        finish_lab_read(&mut comparison_model);
+        {
+            let app = comparison_model.app.borrow();
+            assert!(app.experiment_lab.enabled);
+            let page = app.experiment_lab.workflows.experiments.as_ref().unwrap();
+            assert_eq!(page.items.len(), 1);
+            assert_eq!(page.items[0].experiment_id, experiment_id);
+            assert_eq!(
+                app.experiment_lab.selected_row.as_deref(),
+                Some(experiment_id)
+            );
+        }
+        let _ = comparison_model.update(comparison_key(ftui::core::event::KeyCode::Enter));
+        finish_lab_read(&mut comparison_model);
+        {
+            let app = comparison_model.app.borrow();
+            let lab = &app.experiment_lab.workflows;
+            let batch = lab.batch.as_ref().unwrap();
+            assert_eq!(batch.summary.experiment_id, experiment_id);
+            assert_eq!(batch.summary.status, "completed");
+            assert_eq!(batch.summary.completed_runs, completed.completed_runs);
+            assert_eq!(batch.variants.len(), 2);
+            for arm in &batch.variants {
+                assert_eq!(arm.total_runs, 1);
+                assert_eq!(arm.completed_runs, 1);
+                assert_eq!(arm.running_runs, 0);
+                assert_eq!(arm.failed_runs, 0);
+            }
+            assert_eq!(lab.baseline.as_deref(), Some("baseline"));
+            assert_eq!(lab.challenger.as_deref(), Some("challenger"));
+        }
+
+        // Hold only the actual comparison read to observe the pending state
+        // deterministically and prove repeated input does not add a worker.
+        use scriptbots_runtime::lab_workflows::LabWorkflowRequest;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (entered, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release, release_rx) = std::sync::mpsc::sync_channel(1);
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let comparison_calls = Arc::new(AtomicUsize::new(0));
+        {
+            let mut app = comparison_model.app.borrow_mut();
+            let provider = app.experiment_lab.workflows.submit.clone().unwrap();
+            let calls = Arc::clone(&comparison_calls);
+            app.experiment_lab.workflows.submit = Some(Arc::new(move |request| {
+                if matches!(&request, LabWorkflowRequest::Compare { .. }) {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    entered.send(()).map_err(|error| error.to_string())?;
+                    release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(10))
+                        .map_err(|error| error.to_string())?;
+                }
+                provider(request)
+            }));
+        }
         let mut shifted_compare =
             ftui::core::event::KeyEvent::new(ftui::core::event::KeyCode::Char('C'));
         shifted_compare.modifiers = ftui::core::event::Modifiers::SHIFT;
-        let work = comparison_task(comparison_model.update(LiveTerminalMessage::Event(
-            ftui::core::event::Event::Key(shifted_compare),
+        let _ = comparison_model.update(LiveTerminalMessage::Event(ftui::core::event::Event::Key(
+            shifted_compare,
         )));
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
         assert!(
-            comparison_model
-                .experiment_comparison_in_flight
-                .as_ref()
-                .is_some_and(|(_, target)| target.metric == LabMetric::AliveAgents),
-            "the advertised Shift+C control must dispatch the real selected-endpoint read"
+            comparison_model.experiment_comparison_in_flight.is_none(),
+            "live Shift+C must reach the shared Lab provider before the legacy handler"
         );
         assert!(
             comparison_model
                 .app
                 .borrow()
-                .frankentui
-                .science
-                .experiments
-                .data()
-                .unwrap()
-                .comparison_summary
+                .experiment_lab
+                .workflows
+                .comparison
                 .is_none()
         );
-        let request = comparison_model.experiment_comparison_generation;
         let _ = comparison_model.update(comparison_key(ftui::core::event::KeyCode::Char('c')));
+        assert_eq!(comparison_calls.load(Ordering::SeqCst), 1);
+        release.send(()).unwrap();
+        finish_lab_read(&mut comparison_model);
+        let observed = comparison_model
+            .app
+            .borrow()
+            .experiment_lab
+            .workflows
+            .comparison
+            .clone()
+            .expect("actual verified matched-seed comparison");
+        assert_eq!(observed.metric, LabMetric::AliveAgents);
+        assert_eq!(observed.mean_difference, 0.0);
+        assert_eq!(observed.matched_seeds, [seed]);
+        assert_eq!(observed.endpoint_tick, ticks);
+        assert!(observed.descriptive_only);
+        assert!(observed.p_value.is_none());
+        assert!(observed.ci_95.is_none());
+
+        // The shared result survives a same-source refresh and is actually
+        // rendered with its units and one-pair inference limitation.
+        let _ = comparison_model.update(comparison_key(ftui::core::event::KeyCode::Char('r')));
+        finish_lab_read(&mut comparison_model);
         assert_eq!(
-            comparison_model.experiment_comparison_generation, request,
-            "repeated input cannot create concurrent comparison workers"
+            comparison_model
+                .app
+                .borrow()
+                .experiment_lab
+                .workflows
+                .comparison
+                .as_ref(),
+            Some(&observed)
         );
-        let message = std::thread::spawn(work).join().unwrap();
-        let LiveTerminalMessage::ExperimentComparison {
-            result: Ok(comparison),
-            ..
-        } = &message
-        else {
-            panic!("real verified experiment comparison did not complete");
-        };
-        assert_eq!(comparison.metric, "alive_agents");
-        assert_eq!(comparison.mean_difference, 0.0);
-        assert_eq!(comparison.matched_seeds, [seed]);
-        assert_eq!(comparison.endpoint_tick, ticks);
-        assert!(comparison.descriptive_only);
-        assert!(comparison.p_value.is_none());
-        let observed = comparison.clone();
-        let _ = comparison_model.update(message);
+        let mut rendered = ftui::runtime::ProgramSimulator::new(comparison_model);
+        let text = frankentui_shell::buffer_to_string(rendered.capture_frame(180, 40));
+        assert!(text.contains("EXPERIMENT LAB"));
+        assert!(
+            text.contains("Verified Population (agents), endpoint tick 2, 1 matched seed pairs")
+        );
+        assert!(
+            text.contains("Descriptive only: one independent seed pair cannot support inference.")
+        );
+        assert!(text.contains(&observed.plan_digest));
+        assert!(!text.contains("Hedges' g"));
+
+        // Detail brackets choose the actual shared endpoint, not catalog pages.
+        // The retained treatment has equal empty populations but different food.
         {
-            let mut app = comparison_model.app.borrow_mut();
+            let comparison_model = rendered.model_mut();
+            let _ = comparison_model.update(comparison_key(ftui::core::event::KeyCode::Char('[')));
             assert_eq!(
-                app.frankentui
-                    .science
-                    .experiments
-                    .data()
-                    .unwrap()
-                    .comparison_summary
-                    .as_ref(),
-                Some(&observed)
+                comparison_model
+                    .app
+                    .borrow()
+                    .experiment_lab
+                    .workflows
+                    .metric,
+                LabMetric::TotalFood
             );
+            let _ = comparison_model.update(comparison_key(ftui::core::event::KeyCode::Char('c')));
+            entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            release.send(()).unwrap();
+            finish_lab_read(comparison_model);
+            {
+                let app = comparison_model.app.borrow();
+                let food = app.experiment_lab.workflows.comparison.as_ref().unwrap();
+                assert_eq!(food.metric, LabMetric::TotalFood);
+                assert!(food.mean_difference > 0.0);
+                assert_eq!(food.plan_digest, completed.plan_digest);
+                assert_eq!(food.status_generation, completed.generation);
+            }
+            let _ = comparison_model.update(comparison_key(ftui::core::event::KeyCode::Char(']')));
+            assert_eq!(
+                comparison_model
+                    .app
+                    .borrow()
+                    .experiment_lab
+                    .workflows
+                    .metric,
+                LabMetric::AliveAgents
+            );
+            assert!(
+                comparison_model
+                    .app
+                    .borrow()
+                    .experiment_lab
+                    .workflows
+                    .comparison
+                    .is_none()
+            );
+        }
+
+        // Retain the explicit DTO projection's selection/refresh regression.
+        // This compatibility path has no live provider attached.
+        let observed_dto = {
+            let handle = handle.clone();
+            std::thread::Builder::new()
+                .stack_size(32 * 1024 * 1024)
+                .spawn(move || {
+                    handle.compare_experiment_variants(
+                        experiment_id,
+                        "baseline",
+                        "challenger",
+                        "alive_agents",
+                    )
+                })
+                .unwrap()
+                .join()
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(observed_dto.mean_difference, observed.mean_difference);
+        assert_eq!(observed_dto.plan_digest, observed.plan_digest);
+        assert_eq!(observed_dto.status_generation, observed.status_generation);
+        {
+            let mut app = simulator.model().app.borrow_mut();
+            let mut projected = comparison_view.clone();
+            projected.comparison_summary = Some(observed_dto.clone());
+            app.frankentui
+                .update(ShellMessage::SetExperimentsData(ScreenDataState::Data(
+                    projected,
+                )));
             app.frankentui.update(ShellMessage::PinComparisonBaseline);
             app.frankentui.update(ShellMessage::SelectNextItem);
             let mut refresh =
@@ -20272,7 +20857,7 @@ for case in ('panic', 'subscription', 'renderer'):
             assert_eq!(refreshed.comparison_baseline.as_deref(), Some("baseline"));
             assert_eq!(
                 refreshed.comparison_summary.as_ref(),
-                Some(&observed),
+                Some(&observed_dto),
                 "periodic catalog refresh must preserve the verified comparison"
             );
             // A completed selected pair remains valid when another variant's
@@ -20298,7 +20883,7 @@ for case in ('panic', 'subscription', 'renderer'):
                         .unwrap()
                         .comparison_summary
                         .as_ref(),
-                    Some(&observed)
+                    Some(&observed_dto)
                 );
             }
             let mut changed = comparison_view.clone();
@@ -20313,13 +20898,76 @@ for case in ('panic', 'subscription', 'renderer'):
                 "changed batch evidence clears prior results"
             );
         }
-        let mut rendered = ftui::runtime::ProgramSimulator::new(comparison_model);
-        let text = frankentui_shell::buffer_to_string(rendered.capture_frame(100, 24));
+        let text = frankentui_shell::buffer_to_string(simulator.capture_frame(100, 24));
         assert!(text.contains("Population (agents) at tick 2: paired n=1"));
         assert!(text.contains("Descriptive only; no significance claim"));
         assert!(!text.contains("Hedges' g"));
+
+        // Preserve the explicit legacy message adapter's provenance guards with
+        // the real service. This submodel deliberately disables only the shared
+        // consumer; the production shared key path was exercised above.
+        let mut legacy_app = TerminalApp::new(&renderer, host.context(&comparison_runtime));
+        legacy_app
+            .frankentui
+            .update(ShellMessage::Navigate(ShellRoute::Experiments));
+        legacy_app
+            .frankentui
+            .update(ShellMessage::SetExperimentsData(ScreenDataState::Data(
+                comparison_view.clone(),
+            )));
+        let mut legacy_model = LiveTerminalModel::new(legacy_app).unwrap();
+        legacy_model.app.borrow_mut().experiment_lab.enabled = false;
+        legacy_model.cancelled_service_route = Some(ShellRoute::Experiments);
+        let mut shifted_compare =
+            ftui::core::event::KeyEvent::new(ftui::core::event::KeyCode::Char('C'));
+        shifted_compare.modifiers = ftui::core::event::Modifiers::SHIFT;
+        let work = comparison_task(legacy_model.update(LiveTerminalMessage::Event(
+            ftui::core::event::Event::Key(shifted_compare),
+        )));
+        assert!(
+            legacy_model
+                .experiment_comparison_in_flight
+                .as_ref()
+                .is_some_and(|(_, target)| target.metric == LabMetric::AliveAgents),
+            "the explicit legacy Shift+C path must dispatch its selected endpoint"
+        );
+        assert!(
+            legacy_model
+                .app
+                .borrow()
+                .frankentui
+                .science
+                .experiments
+                .data()
+                .unwrap()
+                .comparison_summary
+                .is_none()
+        );
+        let request = legacy_model.experiment_comparison_generation;
+        let _ = legacy_model.update(comparison_key(ftui::core::event::KeyCode::Char('c')));
+        assert_eq!(
+            legacy_model.experiment_comparison_generation, request,
+            "repeated legacy input cannot create concurrent comparison workers"
+        );
+        let message = std::thread::spawn(work).join().unwrap();
+        let LiveTerminalMessage::ExperimentComparison {
+            result: Ok(comparison),
+            ..
+        } = &message
+        else {
+            panic!("real legacy comparison did not complete");
+        };
+        assert_eq!(comparison.metric, "alive_agents");
+        assert_eq!(comparison.mean_difference, 0.0);
+        assert_eq!(comparison.matched_seeds, [seed]);
+        assert_eq!(comparison.endpoint_tick, ticks);
+        assert!(comparison.descriptive_only);
+        assert!(comparison.p_value.is_none());
+        let legacy_observed = comparison.clone();
+        let _ = legacy_model.update(message);
+        let mut legacy_rendered = ftui::runtime::ProgramSimulator::new(legacy_model);
         {
-            let comparison_model = rendered.model_mut();
+            let comparison_model = legacy_rendered.model_mut();
             comparison_model
                 .app
                 .borrow_mut()
@@ -20327,7 +20975,7 @@ for case in ('panic', 'subscription', 'renderer'):
                 .update(ShellMessage::SetExperimentsData(ScreenDataState::Data(
                     comparison_view.clone(),
                 )));
-            // The production key path must ask for food, not relabel the population
+            // The legacy key path must ask for food, not relabel the population
             // result. These actual worlds have equal empty populations and different food.
             let _ = comparison_model.update(comparison_key(ftui::core::event::KeyCode::Char('[')));
             for mismatch in ["metric", "plan", "generation"] {
@@ -20416,11 +21064,11 @@ for case in ('panic', 'subscription', 'renderer'):
                 "identical visible runs do not prove the same source generation"
             );
         }
-        let text = frankentui_shell::buffer_to_string(rendered.capture_frame(120, 28));
+        let text = frankentui_shell::buffer_to_string(legacy_rendered.capture_frame(120, 28));
         assert!(text.contains("Total food (food energy units) at tick 2: paired n=1"));
         assert!(!text.contains("Population (agents) at tick"));
         {
-            let comparison_model = rendered.model_mut();
+            let comparison_model = legacy_rendered.model_mut();
             let work = comparison_task(
                 comparison_model.update(comparison_key(ftui::core::event::KeyCode::Char('c'))),
             );
@@ -20497,49 +21145,86 @@ for case in ('panic', 'subscription', 'renderer'):
                     comparison_view.clone(),
                 )));
         }
+        {
+            let comparison_model = legacy_rendered.model_mut();
+            let work = comparison_task(
+                comparison_model.update(comparison_key(ftui::core::event::KeyCode::Char('c'))),
+            );
+            let (request, target) = comparison_model
+                .experiment_comparison_in_flight
+                .clone()
+                .unwrap();
+            let _ = comparison_model.update(LiveTerminalMessage::ExperimentComparison {
+                request: request - 1,
+                target,
+                result: Ok(legacy_observed),
+            });
+            assert!(
+                comparison_model.experiment_comparison_in_flight.is_some(),
+                "a stale legacy completion cannot retire the active worker"
+            );
+            assert!(
+                comparison_model
+                    .app
+                    .borrow()
+                    .frankentui
+                    .science
+                    .experiments
+                    .data()
+                    .unwrap()
+                    .comparison_summary
+                    .is_none()
+            );
+            let _ = comparison_model.update(comparison_key(ftui::core::event::KeyCode::Escape));
+            assert!(comparison_model.experiment_comparison_cancelled);
+            let _ = comparison_model.update(std::thread::spawn(work).join().unwrap());
+            assert!(comparison_model.experiment_comparison_in_flight.is_none());
+            assert!(
+                comparison_model
+                    .app
+                    .borrow()
+                    .frankentui
+                    .science
+                    .experiments
+                    .data()
+                    .unwrap()
+                    .comparison_summary
+                    .is_none(),
+                "a navigation-cancelled legacy result must not reappear"
+            );
+        }
         let comparison_model = rendered.model_mut();
-        let work = comparison_task(
-            comparison_model.update(comparison_key(ftui::core::event::KeyCode::Char('c'))),
-        );
-        let (request, target) = comparison_model
-            .experiment_comparison_in_flight
-            .clone()
-            .unwrap();
-        let _ = comparison_model.update(LiveTerminalMessage::ExperimentComparison {
-            request: request - 1,
-            target,
-            result: Ok(observed),
-        });
+        let _ = comparison_model.update(comparison_key(ftui::core::event::KeyCode::Char('c')));
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(comparison_calls.load(Ordering::SeqCst), 3);
+        let _ = comparison_model.update(comparison_key(ftui::core::event::KeyCode::Escape));
         assert!(
-            comparison_model.experiment_comparison_in_flight.is_some(),
-            "a stale completion cannot retire the active worker"
+            comparison_model
+                .app
+                .borrow()
+                .experiment_lab
+                .workflows
+                .is_busy(),
+            "discarding a result does not free a running worker"
         );
         assert!(
             comparison_model
                 .app
                 .borrow()
-                .frankentui
-                .science
-                .experiments
-                .data()
-                .unwrap()
-                .comparison_summary
+                .experiment_lab
+                .workflows
+                .selected_experiment
                 .is_none()
         );
-        let _ = comparison_model.update(comparison_key(ftui::core::event::KeyCode::Escape));
-        assert!(comparison_model.experiment_comparison_cancelled);
-        let _ = comparison_model.update(std::thread::spawn(work).join().unwrap());
-        assert!(comparison_model.experiment_comparison_in_flight.is_none());
+        release.send(()).unwrap();
+        finish_lab_read(comparison_model);
         assert!(
             comparison_model
                 .app
                 .borrow()
-                .frankentui
-                .science
-                .experiments
-                .data()
-                .unwrap()
-                .comparison_summary
+                .experiment_lab
+                .workflows
+                .comparison
                 .is_none(),
             "a navigation-cancelled result must not reappear"
         );

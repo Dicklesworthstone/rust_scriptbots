@@ -221,23 +221,28 @@ RUST_LOG=info cargo run -p scriptbots-app
   envelope; application and journal durability are shown separately. Under render pressure,
   the runtime may select a labeled reduced-detail view. These paths are implemented; their
   current native and cross-platform qualification is tracked in the linked reality check.
-- In Experiments (`6`), select a variant row and press Enter to pin it as the
-  baseline, then select a different variant. Use `[` / `]` to choose population,
-  total or mean live-agent energy, mean health, mean or maximum age counter,
-  maximum living generation, or total food; press `C` to compare that verified
-  final-state endpoint across matched seeds. Without a pinned baseline,
-  `C` compares the selected variant with the next distinct variant, skipping its
-  other seed rows. The result shows the metric and units, endpoint tick, paired sample count,
-  challenger-minus-baseline difference, available 95% interval and paired
-  statistical evidence. A single seed is descriptive only; undefined effect
-  sizes remain unavailable. Age counters use age increments, not elapsed ticks.
-  Separate endpoint requests do not imply a jointly corrected family of tests.
-  Verification and analysis run in the background; results must match the selected
-  metric, experiment plan and source generation. Changing the metric, `x`, Escape
-  or navigation discards a pending result; returning to a previous metric does not
-  revive it. A refresh preserves the selected metric and retains evidence only
-  while the source observation is unchanged. Live simulation controls continue
-  to address the live owner.
+- In Experiments (`6`), browse the retained catalog with Up/Down and Enter.
+  `]` opens the next catalog page; `[` returns to the first. Inspect a batch to
+  see completed, running and failed counts for each arm across all its seeds.
+  Up/Down reaches every admitted arm, including those beyond the visible rows.
+  Press `B` or Enter to pin a baseline and `V` to select a challenger. `M` cycles
+  population, total energy, average energy, average health, mean age, maximum
+  age, maximum generation and total food. In the detail view, `[` / `]` also
+  choose the previous or next metric. `C` compares the selected metric's
+  verified endpoints across matched seeds. Results show the metric's units,
+  endpoint tick, paired sample count, challenger-minus-baseline difference,
+  available 95% interval and paired statistical evidence. A single seed is
+  descriptive only; missing endpoints and undefined effect sizes remain
+  unavailable. Age counters use age increments, not elapsed ticks. Separate
+  endpoint requests do not imply a jointly corrected family of tests. Results
+  must match the selected metric, experiment plan and source generation;
+  changing the metric discards pending evidence, and returning to an earlier
+  metric does not revive it. `R` refreshes while retaining evidence only for an
+  unchanged source. PgUp/PgDn scrolls, and `A` or Escape returns from
+  the detail view to the catalog. `X` discards a pending result while its worker
+  finishes. The terminal shares the application Lab provider with GPUI and Bevy;
+  verification and analysis run outside painting, and live simulation controls
+  continue to address the live owner.
 - In Replay (`7`), press `K` to save a checkpoint and use Up/Down to select a
   catalog row. It shows that saved cut's population and first twelve characters
   of its `WorldDigestV1`, separately from the live tick and artifact checksums.
