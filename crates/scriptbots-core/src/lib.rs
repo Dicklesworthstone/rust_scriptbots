@@ -19319,7 +19319,7 @@ mod map_sandbox {
     }
 
     /// Generator configuration for an editor draft: either rule-based (tileset) or sample-based.
-    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[derive(Debug, Clone, PartialEq, Serialize)]
     #[serde(tag = "generator_type")]
     pub enum DraftGeneratorConfig {
         /// Rule-based wave-function-collapse using explicit tileset and adjacency rules.
@@ -19332,6 +19332,66 @@ mod map_sandbox {
             /// Exemplar pattern sample specification.
             sample: SamplePatternSpec,
         },
+    }
+
+    impl<'de> Deserialize<'de> for DraftGeneratorConfig {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            // Read the typed payload directly, even when it precedes the tag. An
+            // internally tagged derived Deserialize buffers through Serde Content;
+            // with serde_json/arbitrary_precision its nested f32 values become
+            // number maps instead of reaching deserialize_f32. Keep the existing
+            // Serialize representation and reject ambiguous or unrelated payloads.
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Fields {
+                generator_type: MapGeneratorKind,
+                #[serde(default, deserialize_with = "present_payload")]
+                tileset: Option<TilesetSpec>,
+                #[serde(default, deserialize_with = "present_payload")]
+                sample: Option<SamplePatternSpec>,
+            }
+
+            // Absence is optional while reading the fields; a present payload
+            // must have its actual type, never null. This also lets the derived
+            // struct reject duplicate fields before a second payload is read.
+            fn present_payload<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+                T: Deserialize<'de>,
+            {
+                T::deserialize(deserializer).map(Some)
+            }
+
+            let fields = Fields::deserialize(deserializer)?;
+            match fields.generator_type {
+                MapGeneratorKind::RuleBased => {
+                    if fields.sample.is_some() {
+                        return Err(serde::de::Error::unknown_field(
+                            "sample",
+                            &["generator_type", "tileset"],
+                        ));
+                    }
+                    Ok(Self::RuleBased {
+                        tileset: fields
+                            .tileset
+                            .ok_or_else(|| serde::de::Error::missing_field("tileset"))?,
+                    })
+                }
+                MapGeneratorKind::SampleBased => {
+                    if fields.tileset.is_some() {
+                        return Err(serde::de::Error::unknown_field(
+                            "tileset",
+                            &["generator_type", "sample"],
+                        ));
+                    }
+                    Ok(Self::SampleBased {
+                        sample: fields
+                            .sample
+                            .ok_or_else(|| serde::de::Error::missing_field("sample"))?,
+                    })
+                }
+            }
+        }
     }
 
     /// The editable parameters and constraints of an editor draft.
@@ -20756,6 +20816,149 @@ mod map_sandbox {
                     height: 8
                 }
             ));
+        }
+
+        #[test]
+        fn draft_generator_json_round_trip_preserves_wire_and_generated_map() {
+            for config in [
+                DraftGeneratorConfig::RuleBased {
+                    tileset: default_tileset_spec(),
+                },
+                DraftGeneratorConfig::SampleBased {
+                    sample: SamplePatternSpec {
+                        sample_id: "portable_sample".to_owned(),
+                        sample_width: 2,
+                        sample_height: 2,
+                        pattern_size: 2,
+                        sample_tiles: vec![
+                            TerrainKind::Grass,
+                            TerrainKind::Sand,
+                            TerrainKind::DeepWater,
+                            TerrainKind::Rock,
+                        ],
+                        all_orientations: false,
+                        periodic: true,
+                    },
+                },
+            ] {
+                let (kind, field, payload) = match &config {
+                    DraftGeneratorConfig::RuleBased { tileset } => (
+                        "RuleBased",
+                        "tileset",
+                        serde_json::to_string(tileset).unwrap(),
+                    ),
+                    DraftGeneratorConfig::SampleBased { sample } => (
+                        "SampleBased",
+                        "sample",
+                        serde_json::to_string(sample).unwrap(),
+                    ),
+                };
+                let encoded = serde_json::to_string(&config).unwrap();
+                assert_eq!(
+                    encoded,
+                    format!(r#"{{"generator_type":"{kind}","{field}":{payload}}}"#),
+                    "the existing tagged wire representation must not change"
+                );
+                let tag_last = format!(r#"{{"{field}":{payload},"generator_type":"{kind}"}}"#);
+                let expected_map = MapEditorDraft::new("original", 4, 4, 16, 42, config.clone())
+                    .generate_artifact()
+                    .unwrap();
+                for restored in [
+                    serde_json::from_str::<DraftGeneratorConfig>(&encoded).unwrap(),
+                    serde_json::from_str::<DraftGeneratorConfig>(&tag_last).unwrap(),
+                    serde_json::from_value::<DraftGeneratorConfig>(
+                        serde_json::from_str(&encoded).unwrap(),
+                    )
+                    .unwrap(),
+                ] {
+                    assert_eq!(restored, config);
+                    let actual_map = MapEditorDraft::new("restored", 4, 4, 16, 42, restored)
+                        .generate_artifact()
+                        .unwrap();
+                    assert_eq!(
+                        actual_map.scientific_content_hash(),
+                        expected_map.scientific_content_hash(),
+                        "imported inputs must regenerate identical scientific layers"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn draft_generator_json_preserves_every_optional_float_bit() {
+            let fields: &[fn(&mut TileSpec) -> &mut Option<f32>] = &[
+                |tile| &mut tile.fertility_bias,
+                |tile| &mut tile.temperature_bias,
+                |tile| &mut tile.elevation,
+                |tile| &mut tile.moisture,
+                |tile| &mut tile.accent,
+                |tile| &mut tile.permeability,
+                |tile| &mut tile.runoff_bias,
+                |tile| &mut tile.basin_rank,
+                |tile| &mut tile.channel_priority,
+                |tile| &mut tile.swim_cost,
+            ];
+            for field in fields {
+                for value in [
+                    None,
+                    Some(0.0),
+                    Some(-0.0),
+                    Some(f32::from_bits(1)),
+                    Some(f32::from_bits(0x3f00_0001)),
+                    Some(f32::MAX),
+                ] {
+                    let mut expected = fixture_spec();
+                    *field(&mut expected.tiles[0]) = value;
+                    let encoded = serde_json::to_vec(&DraftGeneratorConfig::RuleBased {
+                        tileset: expected.clone(),
+                    })
+                    .unwrap();
+                    let restored: DraftGeneratorConfig = serde_json::from_slice(&encoded).unwrap();
+                    assert_eq!(serde_json::to_vec(&restored).unwrap(), encoded);
+                    let DraftGeneratorConfig::RuleBased {
+                        tileset: mut actual,
+                    } = restored
+                    else {
+                        panic!("rule payload must retain its variant");
+                    };
+                    assert_eq!(
+                        field(&mut actual.tiles[0]).map(f32::to_bits),
+                        value.map(f32::to_bits)
+                    );
+                    assert_eq!(
+                        compute_tileset_hash(&actual),
+                        compute_tileset_hash(&expected)
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn draft_generator_json_refuses_ambiguous_or_malformed_envelopes() {
+            let rules =
+                r#"{"id":"rules","tiles":[{"id":"grass","terrain_kind":"Grass","elevation":0.1}]}"#;
+            let sample = r#"{"sample_id":"sample","sample_width":1,"sample_height":1,"pattern_size":1,"sample_tiles":["Sand"]}"#;
+            for (json, reason) in [
+                (format!(r#"{{"tileset":{rules}}}"#), "missing field `generator_type`"),
+                (format!(r#"{{"generator_type":"Future","tileset":{rules}}}"#), "unknown variant"),
+                (r#"{"generator_type":"RuleBased"}"#.to_owned(), "missing field `tileset`"),
+                (r#"{"generator_type":"SampleBased"}"#.to_owned(), "missing field `sample`"),
+                (r#"{"generator_type":"RuleBased","tileset":null}"#.to_owned(), "invalid type: null"),
+                (r#"{"generator_type":"SampleBased","sample":null}"#.to_owned(), "invalid type: null"),
+                (format!(r#"{{"generator_type":"RuleBased","tileset":{rules},"revision":1}}"#), "unknown field `revision`"),
+                (format!(r#"{{"generator_type":"RuleBased","generator_type":"RuleBased","tileset":{rules}}}"#), "duplicate field `generator_type`"),
+                (format!(r#"{{"generator_type":"RuleBased","tileset":{rules},"tileset":{rules}}}"#), "duplicate field `tileset`"),
+                (format!(r#"{{"generator_type":"SampleBased","sample":{sample},"sample":{sample}}}"#), "duplicate field `sample`"),
+                (format!(r#"{{"generator_type":"RuleBased","tileset":{rules},"sample":{sample}}}"#), "unknown field `sample`"),
+                (format!(r#"{{"generator_type":"SampleBased","sample":{sample},"tileset":{rules}}}"#), "unknown field `tileset`"),
+                (format!(r#"{{"generator_type":"RuleBased","tileset":{rules},"sample":null}}"#), "invalid type: null"),
+                (r#"{"generator_type":"RuleBased","tileset":{"id":"first","id":"second"}}"#.to_owned(), "duplicate field `id`"),
+                (r#"{"generator_type":"RuleBased","tileset":{"id":"rules","tiles":[{"id":"grass","terrain_kind":"Grass","elevation":null,"elevation":0.1}]}}"#.to_owned(), "duplicate field `elevation`"),
+                (r#"{"generator_type":"RuleBased","tileset":{"id":"rules","tiles":[{"id":"grass","terrain_kind":"Grass","elevation":"0.1"}]}}"#.to_owned(), "invalid type: string"),
+            ] {
+                let error = serde_json::from_str::<DraftGeneratorConfig>(&json).unwrap_err();
+                assert!(error.to_string().contains(reason), "{json}: {error}");
+            }
         }
 
         #[test]
