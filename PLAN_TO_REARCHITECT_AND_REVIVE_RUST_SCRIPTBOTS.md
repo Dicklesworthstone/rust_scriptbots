@@ -2,6 +2,28 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Portable archipelago continuation and terminal scientific comparisons (2026-11-14):**
+[Currently In Progress — Codex; `bd-16g.5`, `bd-2z0.6`; runtime source implemented
+and independently reviewed, CLI/terminal integration in progress]
+
+Capture and restore the complete multi-island owner state at a settled barrier,
+including migration policy, command identities and retained volatile journals.
+Expose exclusive checkpoint export and further-barrier continuation through the
+CLI without claiming continuation of the original science database. Connect the
+terminal experiment view to the shared eight-endpoint scientific metric catalog.
+Original determinism, lifecycle, source-binding and qualification requirements
+remain unchanged.
+
+The runtime checkpoint now carries the complete paired volatile owner cuts in a
+canonical, checksummed 256 MiB envelope, with at most 64 islands and 4 MiB of
+metadata. Restore validates configuration/session identity, topology, cadence,
+epoch and exclusive command cursors before reconstructing executable owners.
+Four regression tests are authored for continued science/migrations and invalid
+cuts. Pinned Rustfmt source formatting and whitespace review succeeded. DSR
+refused this host during storage admission: the home filesystem is full and the
+root filesystem is below its unchanged free-space requirement. Compilation,
+test execution, Clippy and broader qualification remain unexecuted.
+
 **Checkpoint-create retries across service reopen (2026-11-14):**
 [Source implemented and independently reviewed — Codex; executable qualification open]
 
