@@ -2,6 +2,82 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Terminal experiment workflow convergence (2026-11-15):**
+[Source committed and independently reviewed — Codex; executable qualification under `bd-2z0.6.8`]
+
+The terminal Experiments route now consumes the shared Lab model and application
+provider used by GPUI and Bevy. Its bounded catalog, per-arm progress and eight
+verified endpoint choices replace the former first-batch-only projection.
+The shared composer and cooperative stop/resume controls now use the terminal's
+successful-presentation boundary. Request gates retain occupied-worker bounds,
+owner identity checks and exact creation retry data. Final receipts remain
+retained until actually presented, including early failures evicted from the
+ordinary bounded history. The concurrent endpoint/provenance work below is
+preserved, including detail-view bracket shortcuts and legacy provider regressions.
+
+- [x] Read the recovery plan, authoritative Beads and actual frontend/provider paths.
+- [x] Make the existing application Lab provider available in terminal-only builds.
+- [x] Connect bounded catalog navigation and selected experiment progress across all arms.
+- [x] Expose the shared verified comparison workflow and all eight metric choices.
+- [x] Connect execution controls through the actual successful-presentation boundary.
+- [x] Connect shared experiment creation, numeric editing, scientific disclosure and exact retries.
+- [x] Author real-provider catalog/detail/comparison and bounded navigation regressions.
+- [x] Author focused mutation lifecycle tests for actual presentation callbacks,
+  numeric route interception, provider disconnection and frozen retries, distinct
+  stop acknowledgements, foreign owners/navigation/shutdown and receipt eviction.
+- [ ] Execute real-provider integration and refusal/lifecycle regression cases.
+- [x] Pass pinned DSR formatting and independent source review; publish coherent code increments.
+- [ ] Export the final Beads qualification notes with `br` when the execution workspace returns.
+
+The source-bound app check with the exact locked dependencies timed out after
+900 seconds before Rust compilation, while fetching Zed. Its offline follow-up
+identified the missing pinned GPUI/Zed revision
+`5f8a7413a31769e0882357f90dc424b3962ac72d`, which Cargo still resolves for the
+terminal-only application check. No application compile or test pass is claimed.
+
+The shared browser/comparison change is committed as `8bf8f79`; composer and
+stop/resume are committed as `7e73f77`. The workspace disconnected after final
+formatting and independent review, before the final review-wrapper invocation
+and Beads export could finish. The exact cached final sources were recovered
+and verified against their already-reviewed SHA256 hashes before GitHub
+publication; every blob and the complete resulting Git tree also matched:
+
+- `terminal/mod.rs`: `93fa3ea06bb0a7cc18f317ee5d934301567664cf8556eb347c60715defb9d35a`
+- `terminal/science_screens.rs`: `1570285107c0b10188a8137718458c3acc5847b8182cf45d30899676becd68b6`
+
+All three code increments are on `main` and its `master` mirror. The authoritative
+Beads export has not been hand-edited or marked complete; its broad original
+acceptance remains open. This plan records the final qualification boundary
+until the CLI-produced tracker updates can be exported.
+
+**Portable map generator decoding (2026-11-15):**
+[Source committed and scoped codec checks passed — Codex; full qualification under `bd-pih9`]
+
+Keep the existing `generator_type` JSON representation while replacing the
+internally tagged enum's intermediate numeric buffering with direct typed
+deserialization. The full workspace enables arbitrary-precision JSON numbers;
+that feature must not make an exported finite-f32 map draft unreadable.
+
+- [x] Trace the actual save/open/copy/paste path and the tagged generator codec.
+- [x] Reproduce the original failure with arbitrary precision enabled: an exact-locked
+  DSR codec probe accepts ordinary JSON numbers and fails with arbitrary precision.
+- [x] Implement direct typed decoding for both generator variants; author wire,
+  field-order, JSON Value and exact f32-bit regression coverage.
+- [x] Reject malformed, duplicate, unknown and mixed generator payloads; author
+  sixteen negative envelope cases without changing generator science or serialization.
+- [x] Run the actual scalar-bit and malformed-envelope tests plus both-variant
+  wire/tag-last/JSON Value checks in a source-bound DSR extraction: three passed
+  in ordinary JSON mode and three with arbitrary precision enabled. This uses
+  the exact locked serialization libraries, not the complete workspace graph.
+- [x] Pass strict Clippy on that frozen extraction with all targets and features,
+  warnings denied and all/pedantic/nursery lints enabled; pass pinned formatting.
+- [ ] Exercise real generation after round-trip and retain source-bound validation.
+
+The production repair is committed as `e4ba8de`. Full-core generated-map and
+renderer save/open/copy/paste qualification remain pending; scoped extraction
+does not count as those gates. This does not alter generator science, file
+schemas or the three separate viewport failures recorded in the original bead.
+
 **Portable archipelago continuation and terminal scientific comparisons (2026-11-15):**
 [Source implemented and independently reviewed — Codex; `bd-16g.5`, `bd-2z0.6`;
 executable qualification open]
