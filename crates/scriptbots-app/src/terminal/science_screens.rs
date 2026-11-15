@@ -798,9 +798,7 @@ pub fn render_brain_arena_screen(
 /// can hide a challenger or silently substitute the first experiment.
 pub(super) fn render_live_experiments_screen(
     frame: &mut ratatui::Frame<'_>,
-    workflows: &scriptbots_runtime::lab_workflows::LabWorkflows,
-    selected: Option<&str>,
-    scroll: u16,
+    lab: &super::TerminalExperimentLab,
     style: ratatui::style::Style,
 ) {
     use ratatui::{
@@ -810,6 +808,9 @@ pub(super) fn render_live_experiments_screen(
     };
     use scriptbots_runtime::lab_workflows::comparison_lines;
 
+    let workflows = &lab.workflows;
+    let selected = lab.selected_row.as_deref();
+    let scroll = lab.scroll;
     let area = frame.area();
     let body = Rect::new(
         area.x,
@@ -818,14 +819,17 @@ pub(super) fn render_live_experiments_screen(
         area.height.saturating_sub(3 + SHELL_FOOTER_ROWS),
     );
     frame.render_widget(Clear, body);
-    let mut lines = vec![
-        "EXPERIMENT LAB — matched-seed studies".to_owned(),
-        "Up/Down select · Enter inspect · R refresh · PgUp/PgDn scroll".into(),
-    ];
+    let mut lines = vec!["EXPERIMENT LAB — matched-seed studies".to_owned()];
+    if !workflows.composing_experiment {
+        lines.push("Up/Down select · Enter inspect · R refresh · PgUp/PgDn scroll".into());
+    }
     if workflows.submit.is_none() {
         lines.push("Experiment services are unavailable on this source.".into());
+    } else if workflows.composing_experiment {
+        lines.extend(lab.composer_lines());
     } else if let Some(batch) = &workflows.batch {
         lines.push("A catalog · B baseline · V challenger · M or [/] metric · C compare · X discard pending result".into());
+        lines.push("N new experiment · D cancel batch · U resume retained batch".into());
         lines.push(format!(
             "Experiment {}: {}",
             batch.summary.experiment_id, batch.summary.status
@@ -890,7 +894,10 @@ pub(super) fn render_live_experiments_screen(
         ));
         lines.push("Loading experiment details… A returns to the catalog.".into());
     } else {
-        lines.push("[ first catalog page · ] next page · X discard pending result".into());
+        lines.push(
+            "N new experiment · [ first catalog page · ] next page · X discard pending result"
+                .into(),
+        );
         if let Some(page) = &workflows.experiments {
             lines.push(format!(
                 "Catalog {}–{} of {} · reserved run slots {}/{}",
@@ -923,7 +930,21 @@ pub(super) fn render_live_experiments_screen(
             lines.push("Loading the experiment catalog…".into());
         }
     }
-    if workflows.is_busy() {
+    if let Some(mutation) = &lab.mutation
+        && !mutation.finished
+    {
+        let started = mutation
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .started;
+        lines.push(if started {
+            "Awaiting the experiment service result.".into()
+        } else {
+            "Request awaits a complete visible receipt before submission.".into()
+        });
+    } else if workflows.is_busy() {
         lines.push("Loading experiment data…".into());
     }
     if let Some(notice) = &workflows.notice {

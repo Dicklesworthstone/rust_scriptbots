@@ -49,10 +49,14 @@ use scriptbots_core::{
 use scriptbots_runtime::{
     ApplicationState, BrainProjectionRequest, CommandEnvelope, CommandId, CommandStatus,
     ControlRevision, HostAccessError, HostClient, HostCommand, HostCommandMappingError, HostEvent,
-    HostPort, JournalState, ProjectionClientId, ProjectionRequestRevision, ProtocolEventCursor,
-    RenderSnapshot, SnapshotSubscription,
+    HostPort, HostSessionId, JournalState, ProjectionClientId, ProjectionRequestRevision,
+    ProtocolEventCursor, RenderSnapshot, SnapshotSubscription,
     channel::ChannelHostPort,
-    lab_workflows::{LabAction, LabMetric, LabPanel, LabWorkflows},
+    lab_workflows::{
+        LabAction, LabExperiment, LabExperimentCreationState, LabExperimentDesign,
+        LabExperimentDraft, LabMetric, LabPanel, LabWorkflowRequest, LabWorkflowResponse,
+        LabWorkflowSubmit, LabWorkflows,
+    },
 };
 use scriptbots_storage::{AnalyticsSnapshot, IslandSnapshot, MetricReading};
 #[cfg(test)]
@@ -390,9 +394,572 @@ struct TerminalExperimentLab {
     enabled: bool,
     selected_row: Option<String>,
     scroll: u16,
+    mutation: Option<TerminalLabMutation>,
+    request_namespace: u128,
+    next_request: u64,
+    draft_field: usize,
+    draft_edit: Option<(TerminalLabDraftField, String)>,
+}
+
+#[derive(Clone, Copy)]
+enum TerminalLabDraftField {
+    Design,
+    Baseline,
+    Challenger,
+    FirstSeed,
+    SeedCount,
+    Ticks,
+    TreatmentParameter,
+    TreatmentPercent,
+    TreatmentTick,
+}
+
+impl TerminalLabDraftField {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Design => "Scientific contrast",
+            Self::Baseline => "Baseline brain family",
+            Self::Challenger => "Challenger brain family",
+            Self::FirstSeed => "First independent seed",
+            Self::SeedCount => "Matched seed pairs",
+            Self::Ticks => "Transitions per run",
+            Self::TreatmentParameter => "Ecological coefficient",
+            Self::TreatmentPercent => "Challenger percent of baseline",
+            Self::TreatmentTick => "Assignment after completed tick",
+        }
+    }
+
+    fn number(self, draft: &LabExperimentDraft) -> Option<u64> {
+        match self {
+            Self::FirstSeed => Some(draft.first_seed),
+            Self::SeedCount => u64::try_from(draft.seed_count).ok(),
+            Self::Ticks => Some(draft.ticks_per_run),
+            Self::TreatmentPercent => draft
+                .treatment
+                .map(|treatment| u64::from(treatment.scale_percent)),
+            Self::TreatmentTick => draft.treatment.map(|treatment| treatment.at_tick),
+            _ => None,
+        }
+    }
+
+    fn number_action(self, value: u64) -> Option<LabAction> {
+        match self {
+            Self::FirstSeed => Some(LabAction::FirstSeed(value)),
+            Self::SeedCount => usize::try_from(value).ok().map(LabAction::SeedCount),
+            Self::Ticks => Some(LabAction::TicksPerRun(value)),
+            Self::TreatmentPercent => u16::try_from(value).ok().map(LabAction::TreatmentPercent),
+            Self::TreatmentTick => Some(LabAction::TreatmentTick(value)),
+            _ => None,
+        }
+    }
+}
+
+/// The shared Lab worker still owns execution. This one-shot gate only delays
+/// its provider call until the terminal has actually presented the exact intent.
+#[derive(Default)]
+struct TerminalLabGate {
+    state: std::sync::Mutex<TerminalLabGateState>,
+    wake: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct TerminalLabGateState {
+    request: Option<TerminalLabPending>,
+    decision: Option<std::result::Result<(), String>>,
+    started: bool,
+    outcome: Option<std::result::Result<TerminalLabObservation, String>>,
+}
+
+#[derive(Clone)]
+struct TerminalLabPending {
+    request_id: String,
+    action: String,
+    request: LabWorkflowRequest,
+}
+
+enum TerminalLabObservation {
+    Batch(LabExperiment),
+    Created {
+        request_id: String,
+        session_id: HostSessionId,
+        experiment: LabExperiment,
+    },
+}
+
+struct TerminalLabMutation {
+    gate: Arc<TerminalLabGate>,
+    session: HostSessionId,
+    selected_experiment: Option<String>,
+    composing: bool,
+    receipt_recorded: bool,
+    final_receipt: Option<frankentui_shell::CommandReceiptEntry>,
+    finished: bool,
+    invalidated: Option<String>,
+}
+
+impl TerminalLabGate {
+    fn pending(&self) -> Option<TerminalLabPending> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .request
+            .clone()
+    }
+
+    fn decide(&self, decision: std::result::Result<(), String>) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.decision.is_none() {
+            state.decision = Some(decision);
+            self.wake.notify_all();
+        }
+    }
+
+    fn run(
+        &self,
+        request: LabWorkflowRequest,
+        provider: &LabWorkflowSubmit,
+        action: &LabAction,
+        local_id: &str,
+        session: HostSessionId,
+        selected_experiment: Option<&str>,
+    ) -> std::result::Result<LabWorkflowResponse, String> {
+        let (request_id, label, matches) = match (&request, action) {
+            (
+                LabWorkflowRequest::CreateExperiment {
+                    request_id,
+                    session_id,
+                    ..
+                },
+                LabAction::CreateExperiment,
+            ) => (
+                request_id.clone(),
+                "CreateExperiment".to_owned(),
+                *session_id == session,
+            ),
+            (
+                LabWorkflowRequest::CancelExperiment { experiment_id },
+                LabAction::CancelExperiment,
+            ) => (
+                local_id.to_owned(),
+                format!("CancelExperiment {experiment_id}"),
+                selected_experiment == Some(experiment_id.as_str()),
+            ),
+            (
+                LabWorkflowRequest::ResumeExperiment { experiment_id },
+                LabAction::ResumeExperiment,
+            ) => (
+                local_id.to_owned(),
+                format!("ResumeExperiment {experiment_id}"),
+                selected_experiment == Some(experiment_id.as_str()),
+            ),
+            _ => (local_id.to_owned(), "Experiment request".to_owned(), false),
+        };
+        let permission = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.request = Some(TerminalLabPending {
+                request_id,
+                action: label,
+                request: request.clone(),
+            });
+            if !matches {
+                state.decision = Some(Err("Experiment request changed before presentation".into()));
+            }
+            while state.decision.is_none() {
+                state = self
+                    .wake
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            let permission = state
+                .decision
+                .clone()
+                .expect("gate decision observed under lock");
+            state.started = permission.is_ok();
+            permission
+        };
+        let result = permission.and_then(|()| provider(request));
+        let observation = match &result {
+            Ok(LabWorkflowResponse::Experiment(batch)) => {
+                Ok(TerminalLabObservation::Batch(batch.clone()))
+            }
+            Ok(LabWorkflowResponse::ExperimentCreated {
+                request_id,
+                session_id,
+                experiment,
+            }) => Ok(TerminalLabObservation::Created {
+                request_id: request_id.clone(),
+                session_id: *session_id,
+                experiment: experiment.clone(),
+            }),
+            Ok(_) => Err("Experiment response did not match the requested operation".into()),
+            Err(error) => Err(error.clone()),
+        };
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .outcome = Some(observation);
+        result
+    }
+}
+
+impl TerminalLabMutation {
+    fn invalidate(&mut self, reason: &str) {
+        if self.invalidated.is_none() {
+            self.invalidated = Some(reason.to_owned());
+        }
+        self.gate.decide(Err(format!("Not submitted: {reason}")));
+    }
+}
+
+impl Drop for TerminalLabMutation {
+    fn drop(&mut self) {
+        self.gate.decide(Err(
+            "Not submitted: terminal request closed before presentation".into(),
+        ));
+    }
 }
 
 impl TerminalExperimentLab {
+    fn draft_fields(&self) -> Vec<TerminalLabDraftField> {
+        use TerminalLabDraftField as F;
+        let mut fields = vec![F::Design, F::Baseline];
+        if self.workflows.experiment_draft.treatment.is_none() {
+            fields.push(F::Challenger);
+        }
+        fields.extend([F::FirstSeed, F::SeedCount, F::Ticks]);
+        if self.workflows.experiment_draft.treatment.is_some() {
+            fields.extend([F::TreatmentParameter, F::TreatmentPercent, F::TreatmentTick]);
+        }
+        fields
+    }
+
+    fn composer_lines(&self) -> Vec<String> {
+        use TerminalLabDraftField as F;
+        let mut lines = vec![
+            "NEW MATCHED-SEED EXPERIMENT".into(),
+            "Up/Down field · Left/Right change · Enter type a number · S submit/retry".into(),
+            "A/Esc catalog · R refresh choices · X discard pending result · F forget an unconfirmed retry".into(),
+        ];
+        let draft = &self.workflows.experiment_draft;
+        if let Some(capabilities) = &self.workflows.experiment_capabilities {
+            lines.push(format!(
+                "Limits: {} seed pairs · {} transitions per run · {} total transitions",
+                capabilities.max_seed_count,
+                capabilities.max_ticks_per_run,
+                capabilities.max_total_ticks
+            ));
+            lines.push(capabilities.launch_description.clone());
+        } else {
+            lines.push("Loading executable brain families and experiment limits…".into());
+        }
+        for (index, field) in self.draft_fields().into_iter().enumerate() {
+            let value = match field {
+                F::Design => match draft.design() {
+                    LabExperimentDesign::BrainFamilies => "Brain-family comparison".to_owned(),
+                    LabExperimentDesign::EcologicalTreatment => {
+                        "Single ecological assignment".to_owned()
+                    }
+                },
+                F::Baseline => draft.baseline_family.clone(),
+                F::Challenger => draft.challenger_family.clone(),
+                F::TreatmentParameter => draft.treatment.map_or_else(
+                    || "unselected".into(),
+                    |treatment| treatment.parameter.label().into(),
+                ),
+                _ => field
+                    .number(draft)
+                    .map_or_else(|| "unavailable".into(), |value| value.to_string()),
+            };
+            let marker = if index == self.draft_field { ">" } else { " " };
+            lines.push(format!("{marker} {}: {value}", field.label()));
+        }
+        lines.extend(draft.question_lines());
+        if let Ok(seeds) = draft.seeds() {
+            lines.push(format!(
+                "Exact consecutive seeds: {} through {} · {} independent pairs · {} runs",
+                seeds.first().copied().unwrap_or_default(),
+                seeds.last().copied().unwrap_or_default(),
+                seeds.len(),
+                seeds.len() * 2
+            ));
+        }
+        if let Some((field, text)) = &self.draft_edit {
+            lines.push(format!(
+                "Editing {}: {text}_ · Enter accepts · Esc discards",
+                field.label()
+            ));
+        }
+        if let Some(capabilities) = &self.workflows.experiment_capabilities
+            && let Err(reason) = draft.validate(capabilities)
+        {
+            lines.push(format!("Cannot submit: {reason}"));
+        }
+        if let Some(creation) = &self.workflows.latest_experiment_creation {
+            match &creation.state {
+                LabExperimentCreationState::Pending => lines.push(format!(
+                    "Request {}: awaiting admission; scientific choices are frozen.",
+                    creation.request_id
+                )),
+                LabExperimentCreationState::Retryable { reason } => lines.push(format!(
+                    "Unconfirmed request {}: {reason} S retries these exact choices and seeds.",
+                    creation.request_id
+                )),
+                LabExperimentCreationState::Created { experiment_id } => {
+                    lines.push(format!("Previous admitted experiment: {experiment_id}"))
+                }
+            }
+        }
+        lines
+    }
+
+    fn change_draft_field(&mut self, forward: bool) {
+        use TerminalLabDraftField as F;
+        if !self.workflows.can_edit_experiment_draft() {
+            self.workflows.set_notice("Scientific choices are frozen until the current request finishes or its retry identity is explicitly forgotten.");
+            return;
+        }
+        let fields = self.draft_fields();
+        let field = fields[self.draft_field.min(fields.len() - 1)];
+        let draft = &self.workflows.experiment_draft;
+        let action = if let Some(value) = field.number(draft) {
+            let step = match field {
+                F::Ticks => 100,
+                F::TreatmentPercent => 10,
+                _ => 1,
+            };
+            let value = if forward {
+                value.checked_add(step)
+            } else {
+                value.checked_sub(step)
+            };
+            value.and_then(|value| field.number_action(value))
+        } else {
+            let choose = |length: usize, index: usize| {
+                if forward {
+                    (index + 1) % length
+                } else {
+                    (index + length - 1) % length
+                }
+            };
+            match field {
+                F::Design => Some(LabAction::ExperimentDesign(match draft.design() {
+                    LabExperimentDesign::BrainFamilies => LabExperimentDesign::EcologicalTreatment,
+                    LabExperimentDesign::EcologicalTreatment => LabExperimentDesign::BrainFamilies,
+                })),
+                F::Baseline | F::Challenger => self
+                    .workflows
+                    .experiment_capabilities
+                    .as_ref()
+                    .filter(|capabilities| !capabilities.families.is_empty())
+                    .map(|capabilities| {
+                        let selected = if matches!(field, F::Baseline) {
+                            &draft.baseline_family
+                        } else {
+                            &draft.challenger_family
+                        };
+                        let index = capabilities
+                            .families
+                            .iter()
+                            .position(|family| family == selected)
+                            .unwrap_or(0);
+                        let family = capabilities.families
+                            [choose(capabilities.families.len(), index)]
+                        .clone();
+                        if matches!(field, F::Baseline) {
+                            LabAction::DraftBaseline(family)
+                        } else {
+                            LabAction::DraftChallenger(family)
+                        }
+                    }),
+                F::TreatmentParameter => self
+                    .workflows
+                    .experiment_capabilities
+                    .as_ref()
+                    .filter(|capabilities| !capabilities.treatment_parameters.is_empty())
+                    .map(|capabilities| {
+                        let index = capabilities
+                            .treatment_parameters
+                            .iter()
+                            .position(|offered| {
+                                draft.treatment.is_some_and(|treatment| {
+                                    treatment.parameter == offered.parameter
+                                })
+                            })
+                            .unwrap_or(0);
+                        LabAction::TreatmentParameter(
+                            capabilities.treatment_parameters
+                                [choose(capabilities.treatment_parameters.len(), index)]
+                            .parameter,
+                        )
+                    }),
+                _ => None,
+            }
+        };
+        if let Some(action) = action {
+            self.workflows.dispatch(action);
+            self.draft_field = self.draft_field.min(self.draft_fields().len() - 1);
+        } else {
+            self.workflows.set_notice(
+                "This choice cannot be changed further; Enter accepts an exact numeric value.",
+            );
+        }
+        self.scroll = 0;
+    }
+
+    fn handle_composer_key(
+        &mut self,
+        key: ftui::core::event::KeyCode,
+        session: HostSessionId,
+    ) -> bool {
+        use ftui::core::event::KeyCode as K;
+        if let Some((field, text)) = &mut self.draft_edit {
+            match key {
+                K::Char(character) if character.is_ascii_digit() && text.len() < 20 => {
+                    text.push(character)
+                }
+                K::Backspace => {
+                    text.pop();
+                }
+                K::Delete => text.clear(),
+                K::Escape => self.draft_edit = None,
+                K::Enter => {
+                    if self.workflows.can_edit_experiment_draft() {
+                        if let Some(action) = text
+                            .parse()
+                            .ok()
+                            .and_then(|value| field.number_action(value))
+                        {
+                            self.workflows.dispatch(action);
+                            self.draft_edit = None;
+                        } else {
+                            self.workflows.set_notice(
+                                "Enter a whole number within this field's integer range.",
+                            );
+                        }
+                    } else {
+                        self.draft_edit = None;
+                        self.workflows.set_notice(
+                            "The source or request changed; reopen the field before editing.",
+                        );
+                    }
+                }
+                _ => {}
+            }
+            return true;
+        }
+        match key {
+            K::Up => {
+                self.draft_field = self.draft_field.saturating_sub(1);
+                self.scroll = 0;
+            }
+            K::Down => {
+                self.draft_field = (self.draft_field + 1).min(self.draft_fields().len() - 1);
+                self.scroll = 0;
+            }
+            K::Left => self.change_draft_field(false),
+            K::Right => self.change_draft_field(true),
+            K::Enter => {
+                let fields = self.draft_fields();
+                let field = fields[self.draft_field.min(fields.len() - 1)];
+                if self.workflows.can_edit_experiment_draft() {
+                    if let Some(value) = field.number(&self.workflows.experiment_draft) {
+                        self.draft_edit = Some((field, value.to_string()));
+                    } else {
+                        self.change_draft_field(true);
+                    }
+                }
+            }
+            K::Char('s' | 'S') => self.begin_mutation(LabAction::CreateExperiment, session),
+            K::Char('f' | 'F') => self.workflows.dispatch(LabAction::AbandonExperimentRequest),
+            K::Char('a' | 'A') | K::Escape => self.workflows.dispatch(LabAction::BackToExperiments),
+            K::Char('r' | 'R') => self.workflows.dispatch(LabAction::Refresh),
+            K::Char('x' | 'X') => {
+                self.cancel_unpresented_mutation("experiment request discarded");
+                self.workflows.dispatch(LabAction::CancelRequest);
+            }
+            K::Char(
+                'b' | 'B' | 'v' | 'V' | 'm' | 'M' | 'c' | 'C' | 'd' | 'D' | 'u' | 'U' | 'n' | 'N'
+                | '[' | ']',
+            ) => {
+                self.workflows.set_notice(
+                    "Use the composer fields to choose the experiment, then S to submit or retry.",
+                );
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn begin_mutation(&mut self, action: LabAction, session: HostSessionId) {
+        if self.mutation.is_some() || self.workflows.is_busy() {
+            self.workflows.set_notice("Wait for the current experiment request and its displayed result before submitting another.");
+            return;
+        }
+        if matches!(action, LabAction::CreateExperiment) && !self.workflows.can_create_experiment()
+        {
+            self.workflows.dispatch(action);
+            return;
+        }
+        let Some(provider) = self.workflows.submit.clone() else {
+            self.workflows
+                .set_notice("Experiment services are unavailable on this source.");
+            return;
+        };
+        let Some(serial) = self.next_request.checked_add(1) else {
+            self.workflows
+                .set_notice("Experiment request identities are exhausted.");
+            return;
+        };
+        self.next_request = serial;
+        let local_id = format!("terminal-lab-{:032x}-{serial}", self.request_namespace);
+        let gate = Arc::new(TerminalLabGate::default());
+        let worker_gate = Arc::clone(&gate);
+        let worker_provider = Arc::clone(&provider);
+        let worker_action = action.clone();
+        let selected_experiment = self.workflows.selected_experiment.clone();
+        let worker_selection = selected_experiment.clone();
+        self.workflows.submit = Some(Arc::new(move |request| {
+            worker_gate.run(
+                request,
+                &worker_provider,
+                &worker_action,
+                &local_id,
+                session,
+                worker_selection.as_deref(),
+            )
+        }));
+        self.workflows.dispatch(action);
+        // start() clones the provider into its one existing worker. Later reads
+        // use the ordinary provider, and refused dispatches leave no held gate.
+        self.workflows.submit = Some(provider);
+        if self.workflows.is_busy() {
+            self.mutation = Some(TerminalLabMutation {
+                gate,
+                session,
+                selected_experiment,
+                composing: self.workflows.composing_experiment,
+                receipt_recorded: false,
+                final_receipt: None,
+                finished: false,
+                invalidated: None,
+            });
+        } else {
+            gate.decide(Err("Not submitted: experiment request was refused".into()));
+        }
+    }
+
+    fn cancel_unpresented_mutation(&mut self, reason: &str) {
+        if let Some(mutation) = &mut self.mutation {
+            mutation.invalidate(reason);
+        }
+    }
+
     fn rows(&self) -> Vec<&str> {
         if let Some(batch) = &self.workflows.batch {
             batch
@@ -440,8 +1007,44 @@ impl TerminalExperimentLab {
         self.scroll = 0;
     }
 
-    fn handle_key(&mut self, key: ftui::core::event::KeyCode) -> bool {
+    fn handle_key(&mut self, key: ftui::core::event::KeyCode, session: HostSessionId) -> bool {
         use ftui::core::event::KeyCode as K;
+        if self
+            .mutation
+            .as_ref()
+            .is_some_and(|mutation| !mutation.finished)
+            && matches!(
+                key,
+                K::Enter
+                    | K::Char(
+                        'b' | 'B'
+                            | 'v'
+                            | 'V'
+                            | 'm'
+                            | 'M'
+                            | 'c'
+                            | 'C'
+                            | 'd'
+                            | 'D'
+                            | 'u'
+                            | 'U'
+                            | 'n'
+                            | 'N'
+                            | 's'
+                            | 'S'
+                            | 'r'
+                            | 'R'
+                            | '['
+                            | ']'
+                    )
+            )
+        {
+            self.workflows.set_notice("Experiment request pending. X discards its result; navigation leaves the request view.");
+            return true;
+        }
+        if self.workflows.composing_experiment && self.handle_composer_key(key, session) {
+            return true;
+        }
         let action = match key {
             K::Up => {
                 self.move_selection(false);
@@ -460,8 +1063,16 @@ impl TerminalExperimentLab {
                 return true;
             }
             K::Char('r' | 'R') => LabAction::Refresh,
+            K::Char('n' | 'N') => {
+                self.draft_field = 0;
+                self.draft_edit = None;
+                LabAction::NewExperiment
+            }
             K::Char('a' | 'A') => LabAction::AllExperiments,
-            K::Char('x' | 'X') => LabAction::CancelRequest,
+            K::Char('x' | 'X') => {
+                self.cancel_unpresented_mutation("experiment request discarded");
+                LabAction::CancelRequest
+            }
             K::Escape if self.workflows.selected_experiment.is_some() => LabAction::AllExperiments,
             K::Char('[') if self.workflows.selected_experiment.is_none() => {
                 LabAction::ExperimentsPage(None)
@@ -510,13 +1121,22 @@ impl TerminalExperimentLab {
                 LabAction::Metric(LabMetric::ALL[(index + step) % LabMetric::ALL.len()])
             }
             K::Char('c' | 'C') if self.workflows.batch.is_some() => LabAction::Compare,
+            K::Char('d' | 'D') if self.workflows.batch.is_some() => LabAction::CancelExperiment,
+            K::Char('u' | 'U') if self.workflows.batch.is_some() => LabAction::ResumeExperiment,
             K::Enter | K::Char('b' | 'B' | 'v' | 'V' | 'm' | 'M' | 'c' | 'C' | '[' | ']') => {
                 self.workflows.set_notice("Select an experiment from the catalog and wait for its details before comparing arms.");
                 return true;
             }
             _ => return false,
         };
-        self.workflows.dispatch(action);
+        if matches!(
+            action,
+            LabAction::CancelExperiment | LabAction::ResumeExperiment | LabAction::CreateExperiment
+        ) {
+            self.begin_mutation(action, session);
+        } else {
+            self.workflows.dispatch(action);
+        }
         self.reconcile_selection();
         self.scroll = 0;
         true
@@ -605,6 +1225,7 @@ struct LiveTerminalModel<'a> {
     pending_checkpoints: RefCell<VecDeque<String>>,
     presented_checkpoint: RefCell<Option<String>>,
     presented_branch: RefCell<Option<String>>,
+    presented_lab: RefCell<Option<String>>,
     branch_namespace: u128,
     branch_study: Option<TerminalBranchStudy>,
     active_request: RefCell<Option<PendingTerminalRequest>>,
@@ -686,6 +1307,7 @@ enum PendingTerminalRequest {
     Command(CommandId),
     Checkpoint(String),
     CheckpointBranch(String),
+    Lab { request_id: String, action: String },
 }
 
 impl PendingTerminalRequest {
@@ -693,6 +1315,7 @@ impl PendingTerminalRequest {
         match self {
             Self::Command(id) => id.to_string(),
             Self::Checkpoint(id) | Self::CheckpointBranch(id) => id.clone(),
+            Self::Lab { request_id, .. } => request_id.clone(),
         }
     }
 }
@@ -718,6 +1341,7 @@ impl<'a> LiveTerminalModel<'a> {
             .control_handle()
             .map(crate::renderer::lab_workflow_submit);
         app.experiment_lab.enabled = app.experiment_lab.workflows.submit.is_some();
+        app.experiment_lab.request_namespace = rand::random();
         app.frankentui
             .update(frankentui_shell::ShellMessage::CapabilityChanged {
                 reduced_color: !app.palette.has_color(),
@@ -748,6 +1372,7 @@ impl<'a> LiveTerminalModel<'a> {
             pending_checkpoints: RefCell::new(VecDeque::new()),
             presented_checkpoint: RefCell::new(None),
             presented_branch: RefCell::new(None),
+            presented_lab: RefCell::new(None),
             branch_namespace: rand::random(),
             branch_study: None,
             active_request: RefCell::new(None),
@@ -767,6 +1392,8 @@ impl<'a> LiveTerminalModel<'a> {
         app.pointer_gesture.cancel("terminal runtime failed");
         app.frankentui.on_error(&error.to_string());
         app.cancel_unpresented_commands("terminal runtime failed");
+        app.experiment_lab
+            .cancel_unpresented_mutation("terminal runtime failed");
         for request_id in self.pending_checkpoints.borrow_mut().drain(..) {
             app.record_checkpoint_result(
                 request_id,
@@ -798,10 +1425,25 @@ impl<'a> LiveTerminalModel<'a> {
                     });
             if let Some(receipt) = &presentation.request_receipt
                 && receipt_matches_active
-                && app.frankentui.receipt_for(&receipt.command_id) == Some(receipt)
+                && app.receipt_for_presentation(&receipt.command_id) == Some(receipt)
                 && !receipt.awaits_observation()
             {
                 self.active_request.borrow_mut().take();
+                if app
+                    .experiment_lab
+                    .mutation
+                    .as_ref()
+                    .is_some_and(|mutation| {
+                        mutation.finished
+                            && mutation
+                                .gate
+                                .pending()
+                                .as_ref()
+                                .is_some_and(|pending| pending.request_id == receipt.command_id)
+                    })
+                {
+                    app.experiment_lab.mutation = None;
+                }
                 app.frankentui.presentation_receipt = None;
                 app.checkpoint_presentation_result = None;
                 if app
@@ -836,6 +1478,9 @@ impl<'a> LiveTerminalModel<'a> {
                 }
                 Some(PendingTerminalRequest::CheckpointBranch(id)) => {
                     *self.presented_branch.borrow_mut() = Some(id.clone());
+                }
+                Some(PendingTerminalRequest::Lab { request_id, .. }) => {
+                    *self.presented_lab.borrow_mut() = Some(request_id.clone());
                 }
                 None => {}
             }
@@ -1197,18 +1842,34 @@ impl Model for LiveTerminalModel<'_> {
             .as_ref()
             .filter(|study| !study.started && !study.finished)
             .map(|study| PendingTerminalRequest::CheckpointBranch(study.request_id.clone()));
+        let pending_lab = app
+            .experiment_lab
+            .mutation
+            .as_ref()
+            .filter(|mutation| mutation.receipt_recorded)
+            .and_then(|mutation| mutation.gate.pending())
+            .map(|pending| PendingTerminalRequest::Lab {
+                request_id: pending.request_id,
+                action: pending.action,
+            });
         let pending_request = if self.active_request.borrow().is_some() {
             None
         } else if self.prefer_checkpoint.get() {
-            pending_checkpoint.or(pending_command).or(pending_branch)
+            pending_checkpoint
+                .or(pending_command)
+                .or(pending_branch)
+                .or(pending_lab)
         } else {
-            pending_command.or(pending_checkpoint).or(pending_branch)
+            pending_command
+                .or(pending_checkpoint)
+                .or(pending_branch)
+                .or(pending_lab)
         };
         let request_receipt = self
             .active_request
             .borrow()
             .as_ref()
-            .and_then(|request| app.frankentui.receipt_for(&request.receipt_id()))
+            .and_then(|request| app.receipt_for_presentation(&request.receipt_id()))
             .cloned();
         let checkpoint_status = app
             .checkpoint_presentation_result
@@ -1237,6 +1898,13 @@ impl Model for LiveTerminalModel<'_> {
                     PendingTerminalRequest::CheckpointBranch(id) => {
                         format!("[PENDING] id={id} StartCheckpointBranch")
                     }
+                    PendingTerminalRequest::Lab { request_id, action } => app
+                        .receipt_for_presentation(request_id)
+                        .filter(|receipt| !receipt.awaits_observation())
+                        .map_or_else(
+                            || format!("[PENDING] id={request_id} {action}"),
+                            frankentui_shell::CommandReceiptEntry::summary,
+                        ),
                 })
             });
         let mut receipt_visible = false;
@@ -1326,6 +1994,8 @@ impl Model for LiveTerminalModel<'_> {
         }
         let mut app = self.app.borrow_mut();
         app.cancel_unpresented_commands("terminal closed before submission");
+        app.experiment_lab
+            .cancel_unpresented_mutation("terminal closed before submission");
         for request_id in self.pending_checkpoints.borrow_mut().drain(..) {
             app.record_checkpoint_result(
                 request_id,
@@ -1884,16 +2554,8 @@ impl LiveTerminalModel<'_> {
         }
         let route = app.frankentui.route;
         if app.experiment_lab.enabled {
-            let session = app.client.session_id();
-            let panel = if route == ShellRoute::Experiments {
-                LabPanel::Experiments
-            } else {
-                LabPanel::Inactive
-            };
-            app.experiment_lab.workflows.synchronize(session, panel);
-            app.experiment_lab.workflows.poll();
-            app.experiment_lab.reconcile_selection();
-            app.experiment_lab.workflows.maybe_refresh();
+            let presented_lab = self.presented_lab.borrow_mut().take();
+            app.service_experiment_lab(route, presented_lab.as_deref());
         }
         if self.service_in_flight.is_none()
             && self.cancelled_service_route != Some(route)
@@ -3943,9 +4605,7 @@ impl<'a> TerminalApp<'a> {
             let theme = self.palette.theme();
             science_screens::render_live_experiments_screen(
                 frame,
-                &self.experiment_lab.workflows,
-                self.experiment_lab.selected_row.as_deref(),
-                self.experiment_lab.scroll,
+                &self.experiment_lab,
                 Style::default().fg(theme.text).bg(theme.surface),
             );
         }
@@ -4001,7 +4661,9 @@ impl<'a> TerminalApp<'a> {
                     && (key.modifiers == Modifiers::NONE || key.modifiers == Modifiers::SHIFT)
                     && self.frankentui.route == ShellRoute::Experiments
                     && self.experiment_lab.enabled
-                    && self.experiment_lab.handle_key(key.code)
+                    && self
+                        .experiment_lab
+                        .handle_key(key.code, self.client.session_id())
                 {
                     return Ok(false);
                 }
@@ -4078,6 +4740,169 @@ impl<'a> TerminalApp<'a> {
                 Ok(false)
             }
             _ => Ok(false),
+        }
+    }
+
+    fn receipt_for_presentation(
+        &self,
+        request_id: &str,
+    ) -> Option<&frankentui_shell::CommandReceiptEntry> {
+        self.experiment_lab
+            .mutation
+            .as_ref()
+            .and_then(|mutation| mutation.final_receipt.as_ref())
+            .filter(|receipt| receipt.command_id == request_id)
+            .or_else(|| self.frankentui.receipt_for(request_id))
+    }
+
+    fn service_experiment_lab(
+        &mut self,
+        route: frankentui_shell::ShellRoute,
+        presented_request: Option<&str>,
+    ) {
+        use frankentui_shell::{CommandReceiptEntry, ReceiptStatusKind, ShellMessage, ShellRoute};
+        let session = self.client.session_id();
+        let panel = if route == ShellRoute::Experiments {
+            LabPanel::Experiments
+        } else {
+            LabPanel::Inactive
+        };
+        let lab = &mut self.experiment_lab;
+        if let Some(mutation) = &mut lab.mutation {
+            if !mutation.finished
+                && (mutation.session != session
+                    || panel != LabPanel::Experiments
+                    || mutation.selected_experiment != lab.workflows.selected_experiment
+                    || mutation.composing != lab.workflows.composing_experiment)
+            {
+                mutation.invalidate("experiment selection or source changed");
+            }
+            if let Some(pending) = mutation.gate.pending() {
+                if !mutation.receipt_recorded {
+                    if self.frankentui.can_record_receipt(&pending.request_id) {
+                        mutation.receipt_recorded =
+                            self.frankentui.record_receipt(CommandReceiptEntry::new(
+                                pending.request_id.clone(),
+                                pending.action.clone(),
+                                ReceiptStatusKind::Pending,
+                            ));
+                    } else {
+                        mutation.invalidate("receipt history is full");
+                    }
+                }
+                if mutation.receipt_recorded
+                    && mutation.invalidated.is_none()
+                    && presented_request == Some(pending.request_id.as_str())
+                {
+                    mutation.gate.decide(Ok(()));
+                }
+            }
+        }
+        lab.workflows.synchronize(session, panel);
+        lab.workflows.poll();
+        let mut completed_receipt = None;
+        let mut clear_unrecorded = false;
+        if !lab.workflows.is_busy()
+            && let Some(mutation) = &mut lab.mutation
+            && !mutation.finished
+        {
+            let mut state = mutation
+                .gate
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(pending) = state.request.clone() {
+                let result = if let Some(reason) = &mutation.invalidated {
+                    Err(if state.started {
+                        format!(
+                            "Result unconfirmed after {reason}; inspect the catalog. Creation retries keep the original request identity."
+                        )
+                    } else {
+                        format!("Not submitted: {reason}")
+                    })
+                } else {
+                    match state.outcome.take().unwrap_or_else(|| Err("Experiment worker finished without an operation receipt".into())) {
+                        Ok(TerminalLabObservation::Batch(batch))
+                            if matches!(&pending.request,
+                                LabWorkflowRequest::CancelExperiment { experiment_id }
+                                | LabWorkflowRequest::ResumeExperiment { experiment_id }
+                                if *experiment_id == batch.summary.experiment_id)
+                                && lab.workflows.batch.as_ref() == Some(&batch) => Ok(batch),
+                        Ok(TerminalLabObservation::Created { request_id, session_id, experiment })
+                            if request_id == pending.request_id && session_id == session
+                                && lab.workflows.batch.as_ref() == Some(&experiment)
+                                && lab.workflows.latest_experiment_creation.as_ref().is_some_and(|creation| {
+                                    creation.request_id == request_id && creation.session_id == session_id
+                                        && matches!(&creation.state, LabExperimentCreationState::Created { experiment_id }
+                                            if *experiment_id == experiment.summary.experiment_id)
+                                }) => Ok(experiment),
+                        Ok(_) => Err("Experiment response was not accepted for this request and source".into()),
+                        Err(error) => Err(error),
+                    }
+                };
+                if mutation.receipt_recorded {
+                    completed_receipt = Some((pending, result));
+                } else {
+                    clear_unrecorded = true;
+                }
+            } else {
+                // A refused spawn never reached the provider and cannot leave
+                // a pending receipt or a gate that blocks subsequent actions.
+                clear_unrecorded = true;
+            }
+            mutation.finished = true;
+        }
+        if clear_unrecorded {
+            lab.mutation = None;
+        }
+        lab.reconcile_selection();
+        lab.workflows.maybe_refresh();
+        if let Some((pending, result)) = completed_receipt {
+            let (status, action, message) = match result {
+                Ok(batch) => (
+                    ReceiptStatusKind::Applied,
+                    format!("{} (observed {})", pending.action, batch.summary.status),
+                    format!(
+                        "{}: experiment {} observed {}; completed {}/{}; failed {}",
+                        pending.action,
+                        batch.summary.experiment_id,
+                        batch.summary.status,
+                        batch.summary.completed_runs,
+                        batch.summary.total_runs,
+                        batch.summary.failed_runs,
+                    ),
+                ),
+                Err(error) => {
+                    let error: String = error.chars().take(240).collect();
+                    (
+                        ReceiptStatusKind::Failed(error.clone()),
+                        pending.action.clone(),
+                        format!("{}: {error}", pending.action),
+                    )
+                }
+            };
+            if self.frankentui.presentation_receipt.as_deref() == Some(pending.request_id.as_str())
+            {
+                self.checkpoint_presentation_result =
+                    Some((pending.request_id.clone(), message.clone()));
+            }
+            let receipt = CommandReceiptEntry {
+                command_id: pending.request_id,
+                action,
+                status,
+                journal_state: None,
+                control_revision: self.retained_render.revisions.control.get(),
+                scientific_revision: self.retained_render.revisions.scientific.get(),
+                timestamp_tick: self.snapshot.tick,
+            };
+            if let Some(mutation) = &mut self.experiment_lab.mutation {
+                // History can evict a final result before its first pending
+                // frame. Keep this exact result until the observer confirms it.
+                mutation.final_receipt = Some(receipt.clone());
+            }
+            self.frankentui
+                .update(ShellMessage::CommandReceipt(receipt));
+            self.frankentui.update(ShellMessage::SetStatus(message));
         }
     }
 
@@ -20066,6 +20891,548 @@ for case in ('panic', 'subscription', 'renderer'):
                     .iter()
                     .all(|arm| arm.mean_fitness.is_none() && arm.uncertainty_ci_95.is_none())
             );
+        }
+    }
+
+    fn terminal_lab_key(model: &mut LiveTerminalModel<'_>, code: ftui::core::event::KeyCode) {
+        let _ = model.update(LiveTerminalMessage::Event(ftui::core::event::Event::Key(
+            ftui::core::event::KeyEvent::new(code),
+        )));
+    }
+
+    fn poll_terminal_lab(model: &mut LiveTerminalModel<'_>, until_idle: bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let _ = model.service_commands();
+            let done = {
+                let app = model.app.borrow();
+                if until_idle {
+                    !app.experiment_lab.workflows.is_busy()
+                } else {
+                    app.experiment_lab
+                        .mutation
+                        .as_ref()
+                        .is_some_and(|mutation| mutation.receipt_recorded)
+                }
+            };
+            if done {
+                return;
+            }
+            assert!(Instant::now() < deadline, "terminal Lab fixture deadline");
+            std::thread::park_timeout(Duration::from_millis(1));
+        }
+    }
+
+    fn terminal_lab_fixture_capabilities()
+    -> scriptbots_runtime::lab_workflows::LabExperimentCapabilities {
+        use scriptbots_runtime::lab_workflows::{
+            LabExperimentCapabilities, LabExperimentParameter, LabExperimentParameterCapability,
+        };
+        LabExperimentCapabilities {
+            families: vec!["mlp.baseline".into(), "dwraon.baseline".into()],
+            treatment_parameters: vec![LabExperimentParameterCapability {
+                parameter: LabExperimentParameter::ALL[0],
+                baseline_value: 1.0,
+                min_value: 0.0,
+                max_value: 4.0,
+            }],
+            max_seed_count: 128,
+            max_ticks_per_run: 1000,
+            max_total_ticks: 100_000,
+            launch_description: "Fixture fresh worlds; no scientific execution is claimed.".into(),
+        }
+    }
+
+    fn terminal_lab_fixture_batch(id: String, draft: &LabExperimentDraft) -> LabExperiment {
+        use scriptbots_runtime::lab_workflows::{LabExperimentSummary, LabVariantProgress};
+        LabExperiment {
+            summary: LabExperimentSummary {
+                experiment_id: id,
+                status: "pending".into(),
+                total_runs: draft.seed_count * 2,
+                completed_runs: 0,
+                failed_runs: 0,
+            },
+            plan_digest: "terminal-lifecycle-fixture-plan".into(),
+            generation: 1,
+            variants: [
+                ("baseline", &draft.baseline_family),
+                ("challenger", &draft.challenger_family),
+            ]
+            .into_iter()
+            .map(|(id, family)| LabVariantProgress {
+                variant_id: id.into(),
+                brain_family: family.clone(),
+                total_runs: draft.seed_count,
+                completed_runs: 0,
+                failed_runs: 0,
+                running_runs: 0,
+            })
+            .collect(),
+            error_reason: None,
+        }
+    }
+
+    #[test]
+    fn terminal_lab_presented_creation_retry_cancel_and_resume() {
+        use frankentui_shell::{ReceiptStatusKind, ShellRoute};
+        use ftui::core::event::KeyCode as K;
+        use scriptbots_runtime::lab_workflows::LabExperimentPage;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // The fixture records provider calls and preserves admitted identities.
+        // It exercises the production presentation/worker lifecycle, not real
+        // experiment execution, persistence or scientific outcomes.
+        let host = TerminalTestHost::take(command_characterization_world());
+        let (runtime, _) = ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let app = TerminalApp::new(&renderer, host.context(&runtime));
+        let mut model = LiveTerminalModel::new(app).unwrap();
+        let calls = Arc::new(std::sync::Mutex::new(Vec::<LabWorkflowRequest>::new()));
+        let batch = Arc::new(std::sync::Mutex::new(None::<LabExperiment>));
+        let fail_first_creation = AtomicBool::new(true);
+        {
+            let mut app = model.app.borrow_mut();
+            let calls = Arc::clone(&calls);
+            let batch = Arc::clone(&batch);
+            app.experiment_lab.enabled = true;
+            app.experiment_lab.workflows.submit = Some(Arc::new(move |request| {
+                match request {
+                    LabWorkflowRequest::ExperimentCapabilities => {
+                        Ok(LabWorkflowResponse::ExperimentCapabilities(
+                            terminal_lab_fixture_capabilities(),
+                        ))
+                    }
+                    LabWorkflowRequest::ListExperiments { .. } => {
+                        let items: Vec<_> = batch
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .map(|batch| batch.summary.clone())
+                            .collect();
+                        Ok(LabWorkflowResponse::Experiments(LabExperimentPage {
+                            total: items.len(),
+                            items,
+                            offset: 0,
+                            next_cursor: None,
+                            reserved_run_slots: 0,
+                            max_run_slots: 4096,
+                        }))
+                    }
+                    LabWorkflowRequest::GetExperiment { experiment_id } => {
+                        let observed = batch.lock().unwrap().as_ref().unwrap().clone();
+                        assert_eq!(observed.summary.experiment_id, experiment_id);
+                        Ok(LabWorkflowResponse::Experiment(observed))
+                    }
+                    LabWorkflowRequest::CreateExperiment {
+                        ref request_id,
+                        session_id,
+                        ref draft,
+                    } => {
+                        calls.lock().unwrap().push(request.clone());
+                        let observed = {
+                            let mut retained = batch.lock().unwrap();
+                            if let Some(previous) = retained.as_ref() {
+                                assert_eq!(
+                                    &previous.summary.experiment_id, request_id,
+                                    "retry must retain the admitted identity"
+                                );
+                            } else {
+                                *retained =
+                                    Some(terminal_lab_fixture_batch(request_id.clone(), draft));
+                            }
+                            retained.as_ref().unwrap().clone()
+                        };
+                        if fail_first_creation.swap(false, Ordering::SeqCst) {
+                            panic!("injected provider disconnect after fixture admission");
+                        }
+                        Ok(LabWorkflowResponse::ExperimentCreated {
+                            request_id: request_id.clone(),
+                            session_id,
+                            experiment: observed,
+                        })
+                    }
+                    LabWorkflowRequest::CancelExperiment { ref experiment_id }
+                    | LabWorkflowRequest::ResumeExperiment { ref experiment_id } => {
+                        calls.lock().unwrap().push(request.clone());
+                        let cancel =
+                            matches!(&request, LabWorkflowRequest::CancelExperiment { .. });
+                        let mut retained = batch.lock().unwrap();
+                        let observed = retained.as_mut().unwrap();
+                        assert_eq!(&observed.summary.experiment_id, experiment_id);
+                        observed.generation += 1;
+                        observed.summary.status =
+                            if cancel { "cancelling" } else { "running" }.into();
+                        let response = observed.clone();
+                        if cancel {
+                            // A later status read observes cancellation, distinct
+                            // from the request acknowledgement returned now.
+                            observed.generation += 1;
+                            observed.summary.status = "cancelled".into();
+                        }
+                        Ok(LabWorkflowResponse::Experiment(response))
+                    }
+                    _ => panic!("unexpected fixture request"),
+                }
+            }));
+            app.navigate_route(ShellRoute::Experiments);
+        }
+        poll_terminal_lab(&mut model, true);
+        terminal_lab_key(&mut model, K::Char('n'));
+        poll_terminal_lab(&mut model, true);
+        // Numeric input consumes route digits, and the exact cohort is shown.
+        for _ in 0..3 {
+            terminal_lab_key(&mut model, K::Down);
+        }
+        terminal_lab_key(&mut model, K::Enter);
+        terminal_lab_key(&mut model, K::Delete);
+        for digit in "900".chars() {
+            terminal_lab_key(&mut model, K::Char(digit));
+        }
+        terminal_lab_key(&mut model, K::Enter);
+        assert_eq!(model.app.borrow().frankentui.route, ShellRoute::Experiments);
+        assert_eq!(
+            model
+                .app
+                .borrow()
+                .experiment_lab
+                .workflows
+                .experiment_draft
+                .first_seed,
+            900
+        );
+        let mut simulator = ftui::runtime::ProgramSimulator::new(model);
+        let draft_text = frankentui_shell::buffer_to_string(simulator.capture_frame(180, 40));
+        assert!(draft_text.contains("Exact consecutive seeds: 900 through 902"));
+        let composer_catalog = simulator
+            .model()
+            .app
+            .borrow()
+            .experiment_lab
+            .workflows
+            .experiments
+            .clone();
+        terminal_lab_key(simulator.model_mut(), K::Char('['));
+        terminal_lab_key(simulator.model_mut(), K::Char(']'));
+        assert_eq!(
+            simulator
+                .model()
+                .app
+                .borrow()
+                .experiment_lab
+                .workflows
+                .experiments,
+            composer_catalog,
+            "detail metric shortcuts must not page the catalog from the composer"
+        );
+        terminal_lab_key(simulator.model_mut(), K::Char('s'));
+        poll_terminal_lab(simulator.model_mut(), false);
+        let creation = simulator
+            .model()
+            .app
+            .borrow()
+            .experiment_lab
+            .workflows
+            .latest_experiment_creation
+            .clone()
+            .unwrap();
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "creating an intent must not call the provider"
+        );
+        simulator.capture_frame(1, 1);
+        simulator_presentation_callback(simulator.model(), 1);
+        simulator.send(LiveTerminalMessage::Refresh);
+        simulator.capture_frame(180, 40);
+        simulator_presentation_callback(simulator.model(), 0);
+        simulator.send(LiveTerminalMessage::Refresh);
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "tiny or unpresented frames cannot submit"
+        );
+
+        // A real owner's queued control command is presented first. Its final
+        // frame must also be observed before the Lab intent can occupy the rail.
+        let command = simulator
+            .model()
+            .app
+            .borrow_mut()
+            .submit_with_visible_receipt(ControlCommand::SetSpeed(2.0))
+            .unwrap();
+        let command_frame = frankentui_shell::buffer_to_string(simulator.capture_frame(180, 40));
+        assert!(command_frame.contains(&format!("[PENDING] id={command}")));
+        simulator_presentation_callback(simulator.model(), 1);
+        simulator.send(LiveTerminalMessage::Refresh);
+        wait_for_terminal_final_receipt(&mut simulator.model().app.borrow_mut(), &command);
+        simulator.capture_frame(180, 40);
+        simulator_presentation_callback(simulator.model(), 1);
+        simulator.send(LiveTerminalMessage::Refresh);
+        assert!(calls.lock().unwrap().is_empty());
+        let pending = frankentui_shell::buffer_to_string(simulator.capture_frame(180, 40));
+        assert!(pending.contains(&format!("[PENDING] id={}", creation.request_id)));
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "rendering alone is not presentation"
+        );
+        simulator_presentation_callback(simulator.model(), 1);
+        simulator.send(LiveTerminalMessage::Refresh);
+        poll_terminal_lab(simulator.model_mut(), true);
+        {
+            let app = simulator.model().app.borrow();
+            let receipt = app.receipt_for_presentation(&creation.request_id).unwrap();
+            assert!(
+                matches!(&receipt.status, ReceiptStatusKind::Failed(reason) if reason.contains("without an operation receipt"))
+            );
+            let retry = app
+                .experiment_lab
+                .workflows
+                .latest_experiment_creation
+                .as_ref()
+                .unwrap();
+            assert_eq!(retry.request_id, creation.request_id);
+            assert_eq!(retry.draft, creation.draft);
+            assert!(matches!(
+                retry.state,
+                LabExperimentCreationState::Retryable { .. }
+            ));
+        }
+        terminal_lab_key(simulator.model_mut(), K::Char('s'));
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "retry waits for the final displayed receipt"
+        );
+        simulator.capture_frame(180, 40);
+        simulator_presentation_callback(simulator.model(), 1);
+        terminal_lab_key(simulator.model_mut(), K::Right);
+        assert_eq!(
+            simulator
+                .model()
+                .app
+                .borrow()
+                .experiment_lab
+                .workflows
+                .experiment_draft,
+            creation.draft,
+            "unconfirmed scientific choices stay frozen"
+        );
+        terminal_lab_key(simulator.model_mut(), K::Char('s'));
+        poll_terminal_lab(simulator.model_mut(), false);
+        simulator.capture_frame(180, 40);
+        simulator_presentation_callback(simulator.model(), 1);
+        simulator.send(LiveTerminalMessage::Refresh);
+        poll_terminal_lab(simulator.model_mut(), true);
+        {
+            let calls = calls.lock().unwrap();
+            assert_eq!(
+                calls[0], calls[1],
+                "retry sends the exact original source, identity and draft"
+            );
+        }
+        assert!(matches!(
+            simulator
+                .model()
+                .app
+                .borrow()
+                .experiment_lab
+                .workflows
+                .latest_experiment_creation
+                .as_ref()
+                .unwrap()
+                .state,
+            LabExperimentCreationState::Created { .. }
+        ));
+        simulator.capture_frame(180, 40);
+        simulator_presentation_callback(simulator.model(), 1);
+        terminal_lab_key(simulator.model_mut(), K::Char('d'));
+        poll_terminal_lab(simulator.model_mut(), false);
+        assert_eq!(calls.lock().unwrap().len(), 2);
+        terminal_lab_key(simulator.model_mut(), K::Char('['));
+        terminal_lab_key(simulator.model_mut(), K::Char(']'));
+        simulator.capture_frame(180, 40);
+        simulator_presentation_callback(simulator.model(), 1);
+        simulator.send(LiveTerminalMessage::Refresh);
+        poll_terminal_lab(simulator.model_mut(), true);
+        let cancelled = frankentui_shell::buffer_to_string(simulator.capture_frame(180, 40));
+        assert!(
+            cancelled.contains("observed cancelling"),
+            "request acknowledgement is not completed cancellation"
+        );
+        simulator_presentation_callback(simulator.model(), 1);
+        terminal_lab_key(simulator.model_mut(), K::Char('r'));
+        poll_terminal_lab(simulator.model_mut(), true);
+        assert_eq!(
+            simulator
+                .model()
+                .app
+                .borrow()
+                .experiment_lab
+                .workflows
+                .batch
+                .as_ref()
+                .unwrap()
+                .summary
+                .status,
+            "cancelled"
+        );
+        terminal_lab_key(simulator.model_mut(), K::Char('u'));
+        poll_terminal_lab(simulator.model_mut(), false);
+        simulator.capture_frame(180, 40);
+        simulator_presentation_callback(simulator.model(), 1);
+        simulator.send(LiveTerminalMessage::Refresh);
+        poll_terminal_lab(simulator.model_mut(), true);
+        assert_eq!(calls.lock().unwrap().len(), 4);
+        assert_eq!(
+            simulator
+                .model()
+                .app
+                .borrow()
+                .experiment_lab
+                .workflows
+                .batch
+                .as_ref()
+                .unwrap()
+                .summary
+                .status,
+            "running"
+        );
+        simulator.capture_frame(180, 40);
+        simulator_presentation_callback(simulator.model(), 1);
+        assert!(
+            simulator
+                .model()
+                .app
+                .borrow()
+                .experiment_lab
+                .mutation
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn terminal_lab_unpresented_requests_drain_and_keep_evicted_final_receipts() {
+        use frankentui_shell::{CommandReceiptEntry, MAX_RECEIPTS, ReceiptStatusKind, ShellRoute};
+        use ftui::core::event::KeyCode as K;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for cancellation in ["navigation", "foreign owner", "shutdown"] {
+            let host = TerminalTestHost::take(command_characterization_world());
+            let (runtime, _) = ControlRuntime::dummy();
+            let renderer = TerminalRenderer::default();
+            let app = TerminalApp::new(&renderer, host.context(&runtime));
+            let mut model = LiveTerminalModel::new(app).unwrap();
+            let provider_calls = Arc::new(AtomicUsize::new(0));
+            {
+                let mut app = model.app.borrow_mut();
+                let provider_calls = Arc::clone(&provider_calls);
+                app.experiment_lab.enabled = true;
+                app.experiment_lab.workflows.submit =
+                    Some(Arc::new(move |request| match request {
+                        LabWorkflowRequest::ExperimentCapabilities => {
+                            Ok(LabWorkflowResponse::ExperimentCapabilities(
+                                terminal_lab_fixture_capabilities(),
+                            ))
+                        }
+                        LabWorkflowRequest::ListExperiments { .. } => {
+                            Ok(LabWorkflowResponse::Experiments(
+                                scriptbots_runtime::lab_workflows::LabExperimentPage {
+                                    items: Vec::new(),
+                                    total: 0,
+                                    offset: 0,
+                                    next_cursor: None,
+                                    reserved_run_slots: 0,
+                                    max_run_slots: 4096,
+                                },
+                            ))
+                        }
+                        _ => {
+                            provider_calls.fetch_add(1, Ordering::SeqCst);
+                            Err("unpresented mutation reached the provider".into())
+                        }
+                    }));
+                app.navigate_route(ShellRoute::Experiments);
+            }
+            poll_terminal_lab(&mut model, true);
+            terminal_lab_key(&mut model, K::Char('n'));
+            poll_terminal_lab(&mut model, true);
+            if cancellation == "foreign owner" {
+                model
+                    .app
+                    .borrow_mut()
+                    .experiment_lab
+                    .begin_mutation(LabAction::CreateExperiment, HostSessionId::new(0xF0_12_34));
+            } else {
+                terminal_lab_key(&mut model, K::Char('s'));
+            }
+            poll_terminal_lab(&mut model, false);
+            let id = model
+                .app
+                .borrow()
+                .experiment_lab
+                .workflows
+                .latest_experiment_creation
+                .as_ref()
+                .unwrap()
+                .request_id
+                .clone();
+            if cancellation == "shutdown" {
+                let _ = model.on_shutdown();
+            } else {
+                terminal_lab_key(&mut model, K::Char('1'));
+            }
+            poll_terminal_lab(&mut model, true);
+            assert_eq!(
+                provider_calls.load(Ordering::SeqCst),
+                0,
+                "{cancellation} must prevent provider admission"
+            );
+            {
+                let mut app = model.app.borrow_mut();
+                assert!(!app.experiment_lab.workflows.is_busy());
+                assert!(matches!(
+                    app.receipt_for_presentation(&id).unwrap().status,
+                    ReceiptStatusKind::Failed(_)
+                ));
+                assert!(matches!(
+                    app.experiment_lab
+                        .workflows
+                        .latest_experiment_creation
+                        .as_ref()
+                        .unwrap()
+                        .state,
+                    LabExperimentCreationState::Retryable { .. }
+                ));
+                for index in 0..MAX_RECEIPTS {
+                    assert!(app.frankentui.record_receipt(CommandReceiptEntry::new(
+                        format!("other-{index}"),
+                        "Fixture pending action",
+                        ReceiptStatusKind::Pending
+                    )));
+                }
+                assert!(
+                    app.frankentui.receipt_for(&id).is_none(),
+                    "full pending history evicts the unpresented final result"
+                );
+                assert!(
+                    app.receipt_for_presentation(&id).is_some(),
+                    "the exact local final result remains retained"
+                );
+            }
+            let mut simulator = ftui::runtime::ProgramSimulator::new(model);
+            let text = frankentui_shell::buffer_to_string(simulator.capture_frame(180, 40));
+            assert!(text.contains("Not submitted"));
+            simulator_presentation_callback(simulator.model(), 1);
+            simulator.capture_frame(180, 40);
+            simulator_presentation_callback(simulator.model(), 1);
+            assert!(
+                simulator
+                    .model()
+                    .app
+                    .borrow()
+                    .experiment_lab
+                    .mutation
+                    .is_none()
+            );
+            assert!(simulator.model().active_request.borrow().is_none());
         }
     }
 

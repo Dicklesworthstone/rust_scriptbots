@@ -243,6 +243,23 @@ RUST_LOG=info cargo run -p scriptbots-app
   finishes. The terminal shares the application Lab provider with GPUI and Bevy;
   verification and analysis run outside painting, and live simulation controls
   continue to address the live owner.
+- In an experiment's detail view, `D` requests cooperative stop and `U` resumes
+  unfinished runs. The acknowledgement reports the observed batch status and
+  progress; a `cancelling` acknowledgement does not mean the runs have finished.
+- Press `N` in Experiments to create a matched-seed study. Choose either a
+  brain-family comparison or a single ecological treatment, then set the brain
+  families, first seed, number of seed pairs and transitions per run. Ecological
+  studies also expose the coefficient, percentage of its baseline value and
+  assignment tick. Up/Down selects a field, Left/Right changes it, and Enter
+  opens exact numeric editing. The composer shows the runner's actual choices,
+  configuration, limits and scientific question. Each seed starts independent
+  fresh worlds using those disclosed settings.
+  `S` submits or retries the exact frozen request. An unconfirmed submission
+  keeps its original identity and choices; `F` explicitly forgets that local
+  retry identity after its worker finishes. An already admitted experiment
+  remains in the catalog. Creation, stop and resume wait until their pending
+  identity has actually been displayed. `X` can deny an unpresented request or
+  discard a submitted request's result; admitted work continues independently.
 - In Replay (`7`), press `K` to save a checkpoint and use Up/Down to select a
   catalog row. It shows that saved cut's population and first twelve characters
   of its `WorldDigestV1`, separately from the live tick and artifact checksums.
