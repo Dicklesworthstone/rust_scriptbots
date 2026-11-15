@@ -38598,9 +38598,19 @@ mod tests {
                 }
             }
             let completion = world.step_outcome().expect("live policy transition");
-            control
+            let control_completion = control
                 .step_outcome()
                 .expect("unchanged-policy scientific control");
+            assert!(
+                completion.fault.is_none(),
+                "live fault at tick {tick}: {:?}",
+                completion.fault
+            );
+            assert!(
+                control_completion.fault.is_none(),
+                "control fault at tick {tick}: {:?}",
+                control_completion.fault
+            );
             replay
                 .push_with_policy(
                     narrative::NarrativeInputV1::try_from(&completion.outcome.summary).unwrap(),
