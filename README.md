@@ -222,15 +222,22 @@ RUST_LOG=info cargo run -p scriptbots-app
   the runtime may select a labeled reduced-detail view. These paths are implemented; their
   current native and cross-platform qualification is tracked in the linked reality check.
 - In Experiments (`6`), select a variant row and press Enter to pin it as the
-  baseline, then select a different variant and press `C` to compare their
-  verified final populations across matched seeds. Without a pinned baseline,
+  baseline, then select a different variant. Use `[` / `]` to choose population,
+  total or mean live-agent energy, mean health, mean or maximum age counter,
+  maximum living generation, or total food; press `C` to compare that verified
+  final-state endpoint across matched seeds. Without a pinned baseline,
   `C` compares the selected variant with the next distinct variant, skipping its
-  other seed rows. The result shows the endpoint tick, paired sample count,
+  other seed rows. The result shows the metric and units, endpoint tick, paired sample count,
   challenger-minus-baseline difference, available 95% interval and paired
   statistical evidence. A single seed is descriptive only; undefined effect
-  sizes remain unavailable. Verification and analysis run in the background;
-  `x`, Escape or navigation discards a pending result. Live simulation controls
-  continue to address the live owner.
+  sizes remain unavailable. Age counters use age increments, not elapsed ticks.
+  Separate endpoint requests do not imply a jointly corrected family of tests.
+  Verification and analysis run in the background; results must match the selected
+  metric, experiment plan and source generation. Changing the metric, `x`, Escape
+  or navigation discards a pending result; returning to a previous metric does not
+  revive it. A refresh preserves the selected metric and retains evidence only
+  while the source observation is unchanged. Live simulation controls continue
+  to address the live owner.
 - In Replay (`7`), press `K` to save a checkpoint and use Up/Down to select a
   catalog row. It shows that saved cut's population and first twelve characters
   of its `WorldDigestV1`, separately from the live tick and artifact checksums.

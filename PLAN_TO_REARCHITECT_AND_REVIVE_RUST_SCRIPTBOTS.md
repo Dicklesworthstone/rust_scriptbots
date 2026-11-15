@@ -29,6 +29,17 @@ Four runtime regressions cover continued science/migrations and invalid cuts.
 File tests cover corruption, size limits, aliases and preservation of existing
 evidence; a CLI integration regression compares actual MLP migration continuation
 against an uninterrupted run, then continues the resulting checkpoint again.
+
+The terminal Experiments route now selects every shared `LabMetric` with `[`/`]`
+and dispatches the actual chosen service endpoint with `c` or Shift+C. Results
+bind the experiment, plan digest, source generation, variants and metric. A
+selection change invalidates the old request even after cycling away and back;
+its occupied worker remains bounded until completion. Refresh keeps the selected
+metric and preserves evidence only for the same source observation. Labels and
+units come from the shared catalog. Authored terminal regressions cover all eight
+wire keys, real population-versus-food treatment differences, unavailable empty
+cohort means, source mismatches, stale responses and the live Shift+C event path.
+
 Pinned Rustfmt source formatting and whitespace review succeeded. DSR refused
 this host during storage admission. A fresh health check still finds root, home,
 Cargo home and temporary storage below the unchanged 20 GiB-per-role minimum;

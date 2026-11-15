@@ -50,7 +50,7 @@ use scriptbots_runtime::{
     ApplicationState, BrainProjectionRequest, CommandEnvelope, CommandId, CommandStatus,
     ControlRevision, HostAccessError, HostClient, HostCommand, HostCommandMappingError, HostEvent,
     HostPort, JournalState, ProjectionClientId, ProjectionRequestRevision, ProtocolEventCursor,
-    RenderSnapshot, SnapshotSubscription, channel::ChannelHostPort,
+    RenderSnapshot, SnapshotSubscription, channel::ChannelHostPort, lab_workflows::LabMetric,
 };
 use scriptbots_storage::{AnalyticsSnapshot, IslandSnapshot, MetricReading};
 #[cfg(test)]
@@ -373,8 +373,11 @@ impl CanvasReviewTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExperimentComparisonTarget {
     experiment_id: String,
+    plan_digest: String,
+    status_generation: u64,
     baseline: String,
     challenger: String,
+    metric: LabMetric,
 }
 
 impl ExperimentComparisonTarget {
@@ -387,6 +390,9 @@ impl ExperimentComparisonTarget {
                 .data()
                 .is_some_and(|data| {
                     data.experiment_id == self.experiment_id
+                        && data.plan_digest == self.plan_digest
+                        && data.status_generation == self.status_generation
+                        && data.comparison_metric == self.metric
                         && data
                             .active_arms
                             .iter()
@@ -960,9 +966,12 @@ impl Model for LiveTerminalModel<'_> {
                                 Ok(comparison) if comparison.experiment_id == target.experiment_id
                                     && comparison.baseline_variant == target.baseline
                                     && comparison.challenger_variant == target.challenger
-                                    && comparison.metric == "alive_agents" => {
+                                    && comparison.metric == target.metric.key()
+                                    && comparison.plan_digest == target.plan_digest
+                                    && comparison.status_generation == target.status_generation => {
                                     app.frankentui.status_message = Some(format!(
-                                        "Compared {} / {} across {} matched seeds at tick {}",
+                                        "Compared {} ({}): {} / {}, {} matched seeds at tick {}",
+                                        target.metric.label(), target.metric.unit(),
                                         target.baseline, target.challenger,
                                         comparison.matched_seeds.len(), comparison.endpoint_tick,
                                     ));
@@ -971,7 +980,7 @@ impl Model for LiveTerminalModel<'_> {
                                     }
                                 }
                                 Ok(_) => app.frankentui.status_message = Some(
-                                    "Comparison refused: result identity does not match this request".into(),
+                                    "Comparison refused: endpoint or batch source changed; refresh and retry".into(),
                                 ),
                                 Err(error) => app.frankentui.status_message = Some(format!(
                                     "Comparison unavailable: {error}"
@@ -989,7 +998,7 @@ impl Model for LiveTerminalModel<'_> {
                 {
                     self.experiment_comparison_cancelled = true;
                     app.frankentui.status_message = Some(
-                        "Comparison cancelled after the experiment or screen changed".into(),
+                        "Comparison cancelled after the endpoint, batch source or screen changed; wait for the read to finish before retrying".into(),
                     );
                 }
                 if let Some((_, target)) = &self.checkpoint_review_in_flight
@@ -1556,20 +1565,26 @@ impl LiveTerminalModel<'_> {
                 }
                 ShellEffect::CompareExperiments {
                     experiment_id,
+                    plan_digest,
+                    status_generation,
                     baseline,
                     challenger,
+                    metric,
                 } => {
                     let target = ExperimentComparisonTarget {
                         experiment_id,
+                        plan_digest,
+                        status_generation,
                         baseline,
                         challenger,
+                        metric,
                     };
                     if self.experiment_comparison_in_flight.is_some() {
                         app.frankentui.status_message =
                             Some("A comparison is still running; wait for its result".into());
                     } else if !target.matches(&app) || target.baseline == target.challenger {
                         app.frankentui.status_message = Some(
-                            "Comparison cancelled: two distinct variants from the current batch are required".into(),
+                            "Comparison not submitted: the chosen endpoint and two distinct variants must belong to the current batch observation".into(),
                         );
                     } else if let Some(request) =
                         self.experiment_comparison_generation.checked_add(1)
@@ -1589,7 +1604,7 @@ impl LiveTerminalModel<'_> {
                                         &target.experiment_id,
                                         &target.baseline,
                                         &target.challenger,
-                                        "alive_agents",
+                                        target.metric.key(),
                                     )
                                     .map_err(|error| error.to_string());
                                 LiveTerminalMessage::ExperimentComparison {
@@ -1989,12 +2004,15 @@ fn science_service_messages(
             let data = match result {
                 Ok(Some(batch)) => ScreenDataState::Data(ExperimentsViewData {
                     experiment_id: batch.experiment_id,
+                    plan_digest: batch.plan_digest,
+                    status_generation: batch.generation,
                     batch_status: batch
                         .error_reason
                         .map_or(batch.status, |error| format!("Failed: {error}")),
                     active_arms: experiment_arms_for_view(batch.runs),
                     selected_arm_index: 0,
                     comparison_baseline: None,
+                    comparison_metric: LabMetric::default(),
                     comparison_summary: None,
                 }),
                 Ok(None) => ScreenDataState::empty(
@@ -3803,6 +3821,16 @@ impl<'a> TerminalApp<'a> {
                         return Ok(false);
                     }
                 }
+                if !self.palette_open
+                    && !self.help_visible
+                    && self.frankentui.route == ShellRoute::Experiments
+                    && (key.modifiers == Modifiers::NONE || key.modifiers == Modifiers::SHIFT)
+                    && matches!(key.code, K::Char('c' | 'C'))
+                {
+                    self.frankentui
+                        .update(ShellMessage::CompareSelectedExperiments);
+                    return Ok(false);
+                }
                 if !self.palette_open && !self.help_visible && key.modifiers == Modifiers::NONE {
                     if let K::Char(number @ '1'..='9') = key.code {
                         let route = ShellRoute::all_screens()[number as usize - '1' as usize];
@@ -3826,10 +3854,12 @@ impl<'a> TerminalApp<'a> {
                             K::Enter if self.frankentui.route == ShellRoute::Experiments => {
                                 Some(ShellMessage::PinComparisonBaseline)
                             }
-                            K::Char('c' | 'C')
+                            K::Char('[' | ']')
                                 if self.frankentui.route == ShellRoute::Experiments =>
                             {
-                                Some(ShellMessage::CompareSelectedExperiments)
+                                Some(ShellMessage::CycleComparisonMetric {
+                                    forward: key.code == K::Char(']'),
+                                })
                             }
                             K::Char('x') => Some(ShellMessage::CancelActiveQuery),
                             K::Escape => Some(ShellMessage::Navigate(ShellRoute::Dashboard)),
@@ -4081,6 +4111,7 @@ impl<'a> TerminalApp<'a> {
                 if let Some(previous) = self.frankentui.science.experiments.data()
                     && previous.experiment_id == data.experiment_id
                 {
+                    data.comparison_metric = previous.comparison_metric;
                     data.selected_arm_index = previous
                         .selected_arm_index
                         .min(data.active_arms.len().saturating_sub(1));
@@ -4093,10 +4124,12 @@ impl<'a> TerminalApp<'a> {
                     // Selected cohorts can be complete while another variant is
                     // running or failed. Preserve verified evidence for an unchanged
                     // batch observation, and clear it when status or run data changes.
-                    if previous.batch_status == data.batch_status
+                    if previous.plan_digest == data.plan_digest
+                        && previous.status_generation == data.status_generation
+                        && previous.batch_status == data.batch_status
                         && previous.active_arms == data.active_arms
                     {
-                        data.comparison_summary = previous.comparison_summary.clone();
+                        data.comparison_summary = previous.current_comparison().cloned();
                     }
                 }
             }
@@ -6368,11 +6401,23 @@ impl<'a> TerminalApp<'a> {
             Line::raw(" S        Save ASCII screenshot"),
             Line::raw(" e        Toggle emoji mode"),
             Line::raw(" n        Toggle narrow symbols (emoji-compatible alignment)"),
-            Line::raw(" c        Cycle palette (accessibility modes)"),
+            Line::raw(
+                if self.frankentui.route == frankentui_shell::ShellRoute::Experiments {
+                    " c        Compare the chosen final-state endpoint across matched seeds"
+                } else {
+                    " c        Cycle palette (accessibility modes)"
+                },
+            ),
             Line::raw(" b        Toggle metrics baseline (set/clear)"),
             Line::raw(" x        Toggle expanded panels (auto-on on wide terminals)"),
             Line::raw(" a        Toggle tiled archipelago view"),
-            Line::raw(" [ / ]    Cycle brain layers (console view)"),
+            Line::raw(
+                if self.frankentui.route == frankentui_shell::ShellRoute::Experiments {
+                    " [ / ]    Choose experiment endpoint (population, energy, food, age...)"
+                } else {
+                    " [ / ]    Cycle brain layers (console view)"
+                },
+            ),
             Line::raw(" ↑ / ↓    Page brain heatmap rows (console view)"),
             Line::raw(" ← / →    Select rail event / change agent when rail is hidden"),
             Line::raw(" m/t/o    Focus mode: Manual / TopPredator / Oldest"),
@@ -6380,7 +6425,13 @@ impl<'a> TerminalApp<'a> {
             Line::raw(" , / .    Sense probe: cycle one eye cone / all cones"),
             Line::raw(" w        Cycle chart window (30 / 60 / 120 / 300 ticks)"),
             Line::raw(" f        Cycle event filter"),
-            Line::raw(" Enter    Focus the selected event's agent"),
+            Line::raw(
+                if self.frankentui.route == frankentui_shell::ShellRoute::Experiments {
+                    " Enter    Pin the selected variant as the comparison baseline"
+                } else {
+                    " Enter    Focus the selected event's agent"
+                },
+            ),
             Line::raw(" r        Toggle the timeline rail"),
             Line::raw(" v / g    Review selected event's cached canvas / return canvas live"),
             Line::raw(" B        Toggle sub-cell map rendering"),
@@ -19976,7 +20027,12 @@ for case in ('panic', 'subscription', 'renderer'):
             "food_cell_size": 50,
             "population_minimum": 0,
             "population_spawn_interval": 0,
+            "initial_food": 0.0,
+            "food_growth_rate": 0.0,
+            "food_decay_rate": 0.0,
         });
+        let mut challenger_overrides = overrides.clone();
+        challenger_overrides["initial_food"] = serde_json::json!(0.5);
         let created = handle
             .create_experiment(ExperimentCreateRequest {
                 experiment_id: Some(experiment_id.into()),
@@ -19991,7 +20047,7 @@ for case in ('panic', 'subscription', 'renderer'):
                     ExperimentVariantDto {
                         variant_id: "challenger".into(),
                         brain_family: "dwraon".into(),
-                        config_overrides: Some(overrides),
+                        config_overrides: Some(challenger_overrides),
                         interventions: Vec::new(),
                     },
                 ],
@@ -20034,6 +20090,8 @@ for case in ('panic', 'subscription', 'renderer'):
             panic!("completed actual experiment must produce populated arms");
         };
         assert_eq!(experiment.experiment_id, completed.experiment_id);
+        assert_eq!(experiment.plan_digest, completed.plan_digest);
+        assert_eq!(experiment.status_generation, completed.generation);
         assert_eq!(experiment.batch_status, "completed");
         assert_eq!(experiment.active_arms.len(), completed.runs.len());
         assert!(experiment.comparison_summary.is_none());
@@ -20144,8 +20202,18 @@ for case in ('panic', 'subscription', 'renderer'):
         let mut comparison_model = LiveTerminalModel::new(comparison_app).unwrap();
         // Isolate this worker from the independently covered periodic catalog task.
         comparison_model.cancelled_service_route = Some(ShellRoute::Experiments);
-        let work = comparison_task(
-            comparison_model.update(comparison_key(ftui::core::event::KeyCode::Char('c'))),
+        let mut shifted_compare =
+            ftui::core::event::KeyEvent::new(ftui::core::event::KeyCode::Char('C'));
+        shifted_compare.modifiers = ftui::core::event::Modifiers::SHIFT;
+        let work = comparison_task(comparison_model.update(LiveTerminalMessage::Event(
+            ftui::core::event::Event::Key(shifted_compare),
+        )));
+        assert!(
+            comparison_model
+                .experiment_comparison_in_flight
+                .as_ref()
+                .is_some_and(|(_, target)| target.metric == LabMetric::AliveAgents),
+            "the advertised Shift+C control must dispatch the real selected-endpoint read"
         );
         assert!(
             comparison_model
@@ -20174,6 +20242,7 @@ for case in ('panic', 'subscription', 'renderer'):
             panic!("real verified experiment comparison did not complete");
         };
         assert_eq!(comparison.metric, "alive_agents");
+        assert_eq!(comparison.mean_difference, 0.0);
         assert_eq!(comparison.matched_seeds, [seed]);
         assert_eq!(comparison.endpoint_tick, ticks);
         assert!(comparison.descriptive_only);
@@ -20249,6 +20318,185 @@ for case in ('panic', 'subscription', 'renderer'):
         assert!(text.contains("Population (agents) at tick 2: paired n=1"));
         assert!(text.contains("Descriptive only; no significance claim"));
         assert!(!text.contains("Hedges' g"));
+        {
+            let comparison_model = rendered.model_mut();
+            comparison_model
+                .app
+                .borrow_mut()
+                .frankentui
+                .update(ShellMessage::SetExperimentsData(ScreenDataState::Data(
+                    comparison_view.clone(),
+                )));
+            // The production key path must ask for food, not relabel the population
+            // result. These actual worlds have equal empty populations and different food.
+            let _ = comparison_model.update(comparison_key(ftui::core::event::KeyCode::Char('[')));
+            for mismatch in ["metric", "plan", "generation"] {
+                let work = comparison_task(
+                    comparison_model.update(comparison_key(ftui::core::event::KeyCode::Char('c'))),
+                );
+                let LiveTerminalMessage::ExperimentComparison {
+                    request,
+                    target,
+                    result: Ok(mut comparison),
+                } = std::thread::spawn(work).join().unwrap()
+                else {
+                    panic!(
+                        "real food endpoint comparison must complete before testing its identity guard"
+                    );
+                };
+                assert_eq!(comparison.metric, "total_food");
+                assert!(
+                    comparison.mean_difference > 0.0,
+                    "food treatment must differ from the zero population delta"
+                );
+                match mismatch {
+                    "metric" => comparison.metric = "alive_agents".into(),
+                    "plan" => comparison.plan_digest = "different-plan".into(),
+                    _ => comparison.status_generation += 1,
+                }
+                let _ = comparison_model.update(LiveTerminalMessage::ExperimentComparison {
+                    request,
+                    target,
+                    result: Ok(comparison),
+                });
+                let app = comparison_model.app.borrow();
+                assert!(
+                    app.frankentui
+                        .science
+                        .experiments
+                        .data()
+                        .unwrap()
+                        .comparison_summary
+                        .is_none()
+                );
+                assert!(
+                    app.frankentui
+                        .status_message
+                        .as_deref()
+                        .unwrap()
+                        .contains("Comparison refused")
+                );
+            }
+            let work = comparison_task(
+                comparison_model.update(comparison_key(ftui::core::event::KeyCode::Char('c'))),
+            );
+            let _ = comparison_model.update(std::thread::spawn(work).join().unwrap());
+            let mut app = comparison_model.app.borrow_mut();
+            let food = app
+                .frankentui
+                .science
+                .experiments
+                .data()
+                .unwrap()
+                .current_comparison()
+                .unwrap()
+                .clone();
+            assert_eq!(food.metric, "total_food");
+            assert!(food.mean_difference > 0.0);
+            assert_eq!(food.plan_digest, completed.plan_digest);
+            assert_eq!(food.status_generation, completed.generation);
+            let mut refresh =
+                ShellMessage::SetExperimentsData(ScreenDataState::Data(comparison_view.clone()));
+            app.preserve_science_selection(&mut refresh);
+            app.frankentui.update(refresh);
+            let refreshed = app.frankentui.science.experiments.data().unwrap();
+            assert_eq!(refreshed.comparison_metric, LabMetric::TotalFood);
+            assert_eq!(refreshed.current_comparison(), Some(&food));
+
+            let mut newer = comparison_view.clone();
+            newer.status_generation += 1;
+            let mut refresh = ShellMessage::SetExperimentsData(ScreenDataState::Data(newer));
+            app.preserve_science_selection(&mut refresh);
+            let ShellMessage::SetExperimentsData(ScreenDataState::Data(newer)) = refresh else {
+                unreachable!("refresh retains its message type");
+            };
+            assert_eq!(newer.comparison_metric, LabMetric::TotalFood);
+            assert!(
+                newer.comparison_summary.is_none(),
+                "identical visible runs do not prove the same source generation"
+            );
+        }
+        let text = frankentui_shell::buffer_to_string(rendered.capture_frame(120, 28));
+        assert!(text.contains("Total food (food energy units) at tick 2: paired n=1"));
+        assert!(!text.contains("Population (agents) at tick"));
+        {
+            let comparison_model = rendered.model_mut();
+            let work = comparison_task(
+                comparison_model.update(comparison_key(ftui::core::event::KeyCode::Char('c'))),
+            );
+            let generation = comparison_model.experiment_comparison_generation;
+            let _ = comparison_model.update(comparison_key(ftui::core::event::KeyCode::Char(']')));
+            let _ = comparison_model.update(comparison_key(ftui::core::event::KeyCode::Char('[')));
+            assert!(comparison_model.experiment_comparison_cancelled);
+            let _ = comparison_model.update(comparison_key(ftui::core::event::KeyCode::Char('c')));
+            assert_eq!(
+                comparison_model.experiment_comparison_generation, generation,
+                "changing the endpoint cannot free an occupied worker"
+            );
+            let _ = comparison_model.update(std::thread::spawn(work).join().unwrap());
+            assert!(comparison_model.experiment_comparison_in_flight.is_none());
+            assert!(
+                comparison_model
+                    .app
+                    .borrow()
+                    .frankentui
+                    .science
+                    .experiments
+                    .data()
+                    .unwrap()
+                    .comparison_summary
+                    .is_none(),
+                "Food -> Population -> Food must not accept the original Food response"
+            );
+
+            // Move from food through population and total energy to mean energy.
+            // The service must refuse this endpoint for the actual empty cohort.
+            for _ in 0..3 {
+                let _ =
+                    comparison_model.update(comparison_key(ftui::core::event::KeyCode::Char(']')));
+            }
+            assert_eq!(
+                comparison_model
+                    .app
+                    .borrow()
+                    .frankentui
+                    .science
+                    .experiments
+                    .data()
+                    .unwrap()
+                    .comparison_metric,
+                LabMetric::AverageEnergy
+            );
+            let work = comparison_task(
+                comparison_model.update(comparison_key(ftui::core::event::KeyCode::Char('c'))),
+            );
+            let message = std::thread::spawn(work).join().unwrap();
+            assert!(
+                matches!(&message, LiveTerminalMessage::ExperimentComparison { result: Err(error), .. } if error.contains("unavailable"))
+            );
+            let _ = comparison_model.update(message);
+            let mut app = comparison_model.app.borrow_mut();
+            assert!(
+                app.frankentui
+                    .science
+                    .experiments
+                    .data()
+                    .unwrap()
+                    .comparison_summary
+                    .is_none()
+            );
+            assert!(
+                app.frankentui
+                    .status_message
+                    .as_deref()
+                    .unwrap()
+                    .contains("Comparison unavailable")
+            );
+            app.frankentui
+                .update(ShellMessage::SetExperimentsData(ScreenDataState::Data(
+                    comparison_view.clone(),
+                )));
+        }
         let comparison_model = rendered.model_mut();
         let work = comparison_task(
             comparison_model.update(comparison_key(ftui::core::event::KeyCode::Char('c'))),
