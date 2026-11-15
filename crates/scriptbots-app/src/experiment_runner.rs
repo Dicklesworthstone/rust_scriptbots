@@ -1821,6 +1821,9 @@ impl MatchedSeedExperimentRunner {
     ///
     /// Recovers a complete interrupted publication only when it is the exact
     /// initial plan or a valid immediate successor of the committed generation.
+    /// A torn JSON prefix can instead retain the validated committed generation
+    /// when every started run has executable continuation or completed-bundle
+    /// evidence. The prefix is preserved in one exclusive incident directory.
     /// Malformed, stale, or plan-incompatible state never permits a tick-zero restart.
     pub fn load_or_create_status(
         &self,
@@ -2003,8 +2006,13 @@ impl MatchedSeedExperimentRunner {
             committed: state_file.to_path_buf(),
         };
         let bytes = read_experiment_file_bounded(temporary, MAX_STATUS_BYTES)?;
-        let candidate =
-            serde_json::from_slice::<ExperimentBatchStatus>(&bytes).map_err(|_| interrupted())?;
+        let candidate = match serde_json::from_slice::<ExperimentBatchStatus>(&bytes) {
+            Ok(candidate) => candidate,
+            Err(error) if error.is_eof() => {
+                return self.recover_torn_status_locked(state_file, temporary, &bytes, plan);
+            }
+            Err(_) => return Err(interrupted()),
+        };
         self.validate_status(temporary, &candidate, plan)?;
         if canonical_status_bytes(&candidate)? != bytes {
             return Err(interrupted());
@@ -2083,6 +2091,182 @@ impl MatchedSeedExperimentRunner {
                 .unwrap_or_else(|| Path::new(".")),
         )?;
         Ok(candidate)
+    }
+
+    /// Keep the last committed generation after a torn successor write, but only
+    /// after independently establishing how every already-started run can recover.
+    /// This does not promote any prefix fields, advance a world, publish a status,
+    /// or repair a missing owner cut. The caller holds the batch's writer lease.
+    fn recover_torn_status_locked(
+        &self,
+        state_file: &Path,
+        temporary: &Path,
+        torn_bytes: &[u8],
+        plan: &ValidatedPlan,
+    ) -> Result<ExperimentBatchStatus, ExperimentRunnerError> {
+        let interrupted = || ExperimentRunnerError::InterruptedStatusWrite {
+            temporary: temporary.to_path_buf(),
+            committed: state_file.to_path_buf(),
+        };
+        let committed_bytes = match read_experiment_file_bounded(state_file, MAX_STATUS_BYTES) {
+            Ok(bytes) => bytes,
+            Err(ExperimentRunnerError::Io { source, .. })
+                if source.kind() == io::ErrorKind::NotFound =>
+            {
+                return Err(interrupted());
+            }
+            Err(error) => return Err(error),
+        };
+        let committed = self.decode_status(state_file, &committed_bytes, plan)?;
+        if canonical_status_bytes(&committed)? != committed_bytes {
+            return Err(interrupted());
+        }
+
+        for record in &committed.runs {
+            let (variant, family) = &plan.variants[&record.variant_id];
+            match record.state {
+                RunState::Completed => {
+                    self.verify_completed_bundle(record, variant, *family, &plan.digest)?;
+                }
+                RunState::Running => {
+                    match self.recover_completed_run(record, variant, *family, &plan.digest) {
+                        Ok(_) => continue,
+                        Err(ExperimentRunnerError::ResumeCheckpointUnavailable { .. }) => {}
+                        Err(error) => return Err(error),
+                    }
+                    let path = self.run_checkpoint_path(&record.run_id);
+                    if !experiment_path_exists(
+                        &path,
+                        "inspect running checkpoint during status recovery",
+                    )? {
+                        return Err(ExperimentRunnerError::ResumeCheckpointUnavailable {
+                            run_id: record.run_id.clone(),
+                            completed_ticks: record.total_ticks,
+                        });
+                    }
+                    let _lease = ExperimentStatusWriterLease::acquire(&path)?;
+                    let checkpoint = read_optional_run_checkpoint(&path)?.ok_or_else(|| {
+                        ExperimentRunnerError::ResumeCheckpointUnavailable {
+                            run_id: record.run_id.clone(),
+                            completed_ticks: record.total_ticks,
+                        }
+                    })?;
+                    self.validate_run_checkpoint(
+                        &path,
+                        &checkpoint,
+                        variant,
+                        record.seed,
+                        &record.run_id,
+                        &plan.digest,
+                    )?;
+                    drop(restore_run_owner(
+                        &checkpoint,
+                        *family,
+                        &record.run_id,
+                        &path,
+                    )?);
+                }
+                RunState::Pending => {
+                    // A pending arm may have its prepared tick-zero cut, but it
+                    // must not hide prior scientific execution. Do not turn an
+                    // inconsistent pending status into a fresh-world restart.
+                    let path = self.run_checkpoint_path(&record.run_id);
+                    if experiment_path_exists(
+                        &self.output_dir.join(&record.run_id),
+                        "inspect pending run bundle during status recovery",
+                    )? || experiment_path_exists(
+                        &self.staged_bundle_path(&record.run_id),
+                        "inspect pending bundle staging during status recovery",
+                    )? || experiment_path_exists(
+                        &status_temporary_path(&path)?,
+                        "inspect pending checkpoint staging during status recovery",
+                    )? {
+                        return Err(interrupted());
+                    }
+                    if let Some(checkpoint) = read_optional_run_checkpoint(&path)? {
+                        self.validate_run_checkpoint(
+                            &path,
+                            &checkpoint,
+                            variant,
+                            record.seed,
+                            &record.run_id,
+                            &plan.digest,
+                        )?;
+                        if checkpoint.owner.host_checkpoint().tick().0 != 0 {
+                            return Err(interrupted());
+                        }
+                        drop(restore_run_owner(
+                            &checkpoint,
+                            *family,
+                            &record.run_id,
+                            &path,
+                        )?);
+                    }
+                }
+                RunState::Failed => {}
+            }
+        }
+
+        // The one fixed incident directory bounds retained recovery history.
+        // Creating it exclusively ensures an earlier incident, symlink, or other
+        // caller-owned path is never replaced. Moving inside that fresh directory
+        // preserves the exact torn bytes without deleting an evidence file.
+        if read_experiment_file_bounded(temporary, MAX_STATUS_BYTES)? != torn_bytes
+            || read_experiment_file_bounded(state_file, MAX_STATUS_BYTES)? != committed_bytes
+        {
+            return Err(interrupted());
+        }
+        let incident = temporary.with_extension("interrupted");
+        let mut directory = fs::DirBuilder::new();
+        directory.recursive(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            directory.mode(0o700);
+        }
+        directory
+            .create(&incident)
+            .map_err(|source| ExperimentRunnerError::Io {
+                operation: "reserve torn status incident directory",
+                path: incident.clone(),
+                source,
+            })?;
+        let mut options = OpenOptions::new();
+        options.read(true).write(cfg!(windows));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        options
+            .open(temporary)
+            .and_then(|file| file.sync_all())
+            .map_err(|source| ExperimentRunnerError::Io {
+                operation: "sync torn status evidence",
+                path: temporary.to_path_buf(),
+                source,
+            })?;
+        fs::rename(temporary, incident.join("status.tmp")).map_err(|source| {
+            ExperimentRunnerError::Io {
+                operation: "retain torn status evidence",
+                path: temporary.to_path_buf(),
+                source,
+            }
+        })?;
+        sync_parent_directory(&incident)?;
+        sync_parent_directory(
+            state_file
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new(".")),
+        )?;
+        info!(
+            experiment_id = %self.experiment_id,
+            generation = committed.generation,
+            incident = %incident.display(),
+            "retained torn status prefix; validated committed generation remains authoritative"
+        );
+        Ok(committed)
     }
 
     /// Atomically and durably flushes a validated status update to disk.
@@ -6856,6 +7040,331 @@ mod tests {
             1,
             directory.join("bundles"),
         )
+    }
+
+    #[test]
+    fn torn_status_prefix_preserves_a_nonzero_owner_cut_and_resumes_exact_science() {
+        let reference_dir = tempfile::tempdir().unwrap();
+        let reference = progress_runner(reference_dir.path(), vec![7]);
+        let expected = reference
+            .execute_single_run(&reference.variants[0], reference.cohort.seeds[0])
+            .unwrap();
+
+        let directory = tempfile::tempdir().unwrap();
+        let runner = progress_runner(directory.path(), vec![7]);
+        let state_file = directory.path().join("status.json");
+        let temporary = status_temporary_path(&state_file).unwrap();
+        let incident = temporary.with_extension("interrupted");
+        let mut running = runner.load_or_create_status(&state_file).unwrap();
+        let plan = runner.validated_plan().unwrap();
+        let record = &plan.runs[0];
+        let (variant, family) = &plan.variants[&record.variant_id];
+        runner
+            .prepare_run_checkpoint(variant, *family, record.seed, &record.run_id, &plan.digest)
+            .unwrap();
+        running.runs[0].state = RunState::Running;
+        runner.save_status(&state_file, &mut running).unwrap();
+        let committed_bytes = fs::read(&state_file).unwrap();
+        let path = runner.run_checkpoint_path(&record.run_id);
+        let initial_bytes = fs::read(&path).unwrap();
+        let mut checkpoint = RunCheckpointV1::decode(&initial_bytes, &path).unwrap();
+        let original_manifest = checkpoint.metadata.manifest.canonical_json_bytes().unwrap();
+        let mut owner = restore_run_owner(&checkpoint, *family, &record.run_id, &path).unwrap();
+        let (_, namespace) = host_identifiers(&record.run_id);
+        let mut frontend = NullFrontend::new(owner.local_port(), namespace);
+        let command = frontend
+            .submit_envelope(CommandEnvelope::new(
+                CommandId::from_client_sequence(namespace, 1),
+                HostCommand::Step,
+            ))
+            .unwrap();
+        let mut now = 0;
+        drive_command_to_volatile_commit(
+            &record.run_id,
+            "torn status recovery test step",
+            &mut frontend,
+            &mut owner,
+            command.command_id(),
+            1,
+            0,
+            &mut now,
+        )
+        .unwrap();
+        seal_run_checkpoint(&record.run_id, &mut frontend, &mut owner, &mut now).unwrap();
+        checkpoint.owner = owner.capture_volatile_host_checkpoint_v1().unwrap();
+        checkpoint.metadata.parent_digest = Some(blake3::hash(&initial_bytes).to_hex().to_string());
+        let saved_cut = checkpoint.encode(&path).unwrap();
+        runner
+            .publish_run_checkpoint(&path, &checkpoint, &saved_cut)
+            .unwrap();
+        drop(frontend);
+        drop(owner);
+
+        let mut successor = running.clone();
+        successor.generation += 1;
+        let mut prefix = canonical_status_bytes(&successor).unwrap();
+        prefix.truncate(prefix.len() / 2);
+        assert!(
+            serde_json::from_slice::<ExperimentBatchStatus>(&prefix)
+                .unwrap_err()
+                .is_eof()
+        );
+        fs::write(&temporary, &prefix).unwrap();
+
+        assert_eq!(runner.load_or_create_status(&state_file).unwrap(), running);
+        assert_eq!(fs::read(&state_file).unwrap(), committed_bytes);
+        assert_eq!(fs::read(&path).unwrap(), saved_cut);
+        assert_eq!(fs::read(incident.join("status.tmp")).unwrap(), prefix);
+        assert!(!temporary.exists());
+        assert_eq!(runner.load_or_create_status(&state_file).unwrap(), running);
+        assert_eq!(fs::read(&state_file).unwrap(), committed_bytes);
+
+        let completed = runner.execute_batch(&state_file).unwrap();
+        assert_eq!(completed.completed_runs, 1, "{completed:?}");
+        assert_eq!(completed.failed_runs, 0);
+        assert_eq!(completed.runs[0].final_digest, expected.final_digest);
+        assert_eq!(completed.runs[0].total_ticks, runner.max_ticks);
+        let final_cut = read_optional_run_checkpoint(&path).unwrap().unwrap();
+        assert_eq!(
+            final_cut.metadata.manifest.canonical_json_bytes().unwrap(),
+            original_manifest,
+        );
+        assert_eq!(fs::read(incident.join("status.tmp")).unwrap(), prefix);
+    }
+
+    #[test]
+    fn torn_status_completion_recovers_the_verified_bundle_without_another_execution() {
+        let directory = tempfile::tempdir().unwrap();
+        let runner = progress_runner(directory.path(), vec![7]);
+        let state_file = directory.path().join("status.json");
+        let temporary = status_temporary_path(&state_file).unwrap();
+        let incident = temporary.with_extension("interrupted");
+        let mut running = runner.load_or_create_status(&state_file).unwrap();
+        running.runs[0].state = RunState::Running;
+        runner.save_status(&state_file, &mut running).unwrap();
+        let record = runner
+            .execute_single_run(&runner.variants[0], runner.cohort.seeds[0])
+            .unwrap();
+        let path = runner.run_checkpoint_path(&record.run_id);
+        let final_cut = fs::read(&path).unwrap();
+        let retained_cut = directory.path().join("retained-final.checkpoint");
+        fs::rename(&path, &retained_cut).unwrap();
+        let summary_path = runner
+            .output_dir
+            .join(&record.run_id)
+            .join("exports/summary.csv");
+        let summary = fs::read(&summary_path).unwrap();
+        let committed_bytes = fs::read(&state_file).unwrap();
+        let mut completed = running.clone();
+        completed.generation += 1;
+        completed.runs[0] = record;
+        recompute_status_counts(&mut completed);
+        let mut prefix = canonical_status_bytes(&completed).unwrap();
+        prefix.truncate(prefix.len() / 2);
+        fs::write(&temporary, &prefix).unwrap();
+
+        fs::write(&summary_path, b"corrupt completed evidence\n").unwrap();
+        assert!(matches!(
+            runner.load_or_create_status(&state_file),
+            Err(ExperimentRunnerError::Bundle { .. }),
+        ));
+        assert_eq!(fs::read(&state_file).unwrap(), committed_bytes);
+        assert_eq!(fs::read(&temporary).unwrap(), prefix);
+        assert!(!incident.exists());
+
+        fs::write(&summary_path, &summary).unwrap();
+        assert_eq!(runner.execute_batch(&state_file).unwrap(), completed);
+        let completed_bytes = fs::read(&state_file).unwrap();
+        assert_eq!(runner.execute_batch(&state_file).unwrap(), completed);
+        assert_eq!(fs::read(&state_file).unwrap(), completed_bytes);
+        assert_eq!(fs::read(incident.join("status.tmp")).unwrap(), prefix);
+        assert_eq!(fs::read(&retained_cut).unwrap(), final_cut);
+        assert_eq!(fs::read(&summary_path).unwrap(), summary);
+        assert!(!path.exists(), "a finished bundle must not be reexecuted");
+    }
+
+    #[test]
+    fn torn_status_refuses_missing_cuts_corrupt_status_and_retention_conflicts() {
+        for case in [
+            "missing-cut",
+            "corrupt-cut",
+            "corrupt-committed",
+            "previous-incident",
+            "complete-invalid-json",
+            "oversized-prefix",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let runner = progress_runner(directory.path(), vec![7]);
+            let state_file = directory.path().join("status.json");
+            let temporary = status_temporary_path(&state_file).unwrap();
+            let incident = temporary.with_extension("interrupted");
+            let mut status = runner.load_or_create_status(&state_file).unwrap();
+            if matches!(case, "missing-cut" | "corrupt-cut") {
+                status.runs[0].state = RunState::Running;
+                runner.save_status(&state_file, &mut status).unwrap();
+            }
+            let checkpoint_path = runner.run_checkpoint_path(&status.runs[0].run_id);
+            if case == "corrupt-cut" {
+                fs::create_dir_all(&runner.output_dir).unwrap();
+                fs::write(&checkpoint_path, b"invalid executable owner cut").unwrap();
+            }
+            if case == "corrupt-committed" {
+                fs::write(&state_file, b"{").unwrap();
+            }
+            if case == "previous-incident" {
+                fs::create_dir(&incident).unwrap();
+                fs::write(incident.join("status.tmp"), b"earlier incident").unwrap();
+            }
+            let committed_bytes = fs::read(&state_file).unwrap();
+            let prefix = if case == "complete-invalid-json" {
+                b"{invalid}".as_slice()
+            } else {
+                b"{\"schema_version\":".as_slice()
+            };
+            fs::write(&temporary, prefix).unwrap();
+            if case == "oversized-prefix" {
+                OpenOptions::new()
+                    .write(true)
+                    .open(&temporary)
+                    .unwrap()
+                    .set_len(MAX_STATUS_BYTES + 1)
+                    .unwrap();
+            }
+
+            assert!(runner.load_or_create_status(&state_file).is_err(), "{case}");
+            assert_eq!(fs::read(&state_file).unwrap(), committed_bytes, "{case}");
+            let mut retained_prefix = vec![0; prefix.len()];
+            File::open(&temporary)
+                .unwrap()
+                .read_exact(&mut retained_prefix)
+                .unwrap();
+            assert_eq!(retained_prefix, prefix, "{case}");
+            assert_eq!(
+                fs::metadata(&temporary).unwrap().len(),
+                if case == "oversized-prefix" {
+                    MAX_STATUS_BYTES + 1
+                } else {
+                    u64::try_from(prefix.len()).unwrap()
+                },
+                "{case}",
+            );
+            if case == "previous-incident" {
+                assert_eq!(
+                    fs::read(incident.join("status.tmp")).unwrap(),
+                    b"earlier incident"
+                );
+            } else {
+                assert!(!incident.exists(), "{case}");
+            }
+            if case == "corrupt-cut" {
+                assert_eq!(
+                    fs::read(&checkpoint_path).unwrap(),
+                    b"invalid executable owner cut"
+                );
+            } else {
+                assert!(!runner.output_dir.exists(), "{case}");
+            }
+        }
+    }
+
+    #[test]
+    fn torn_initial_successor_preserves_pending_status_without_creating_a_world() {
+        let directory = tempfile::tempdir().unwrap();
+        let runner = progress_runner(directory.path(), vec![7]);
+        let state_file = directory.path().join("status.json");
+        let temporary = status_temporary_path(&state_file).unwrap();
+        let committed = runner.load_or_create_status(&state_file).unwrap();
+        let committed_bytes = fs::read(&state_file).unwrap();
+        fs::write(&temporary, b"").unwrap();
+
+        assert_eq!(
+            runner.load_or_create_status(&state_file).unwrap(),
+            committed
+        );
+        assert_eq!(fs::read(&state_file).unwrap(), committed_bytes);
+        assert_eq!(
+            fs::read(temporary.with_extension("interrupted").join("status.tmp")).unwrap(),
+            b"",
+        );
+        assert!(!runner.output_dir.exists());
+        assert!(!temporary.exists());
+    }
+
+    #[test]
+    fn torn_status_cannot_restart_an_advanced_cut_disguised_as_pending() {
+        let directory = tempfile::tempdir().unwrap();
+        let runner = progress_runner(directory.path(), vec![7]);
+        let state_file = directory.path().join("status.json");
+        let temporary = status_temporary_path(&state_file).unwrap();
+        let pending = runner.load_or_create_status(&state_file).unwrap();
+        let completed = runner
+            .execute_single_run(&runner.variants[0], runner.cohort.seeds[0])
+            .unwrap();
+        let checkpoint_path = runner.run_checkpoint_path(&completed.run_id);
+        let advanced_cut = fs::read(&checkpoint_path).unwrap();
+        // Remove bundle discovery from this probe without deleting its evidence:
+        // the inconsistent advanced owner cut alone must refuse a fresh launch.
+        fs::rename(
+            runner.output_dir.join(&completed.run_id),
+            directory.path().join("retained-completed-bundle"),
+        )
+        .unwrap();
+        let status_bytes = fs::read(&state_file).unwrap();
+        fs::write(&temporary, b"{").unwrap();
+
+        assert!(matches!(
+            runner.load_or_create_status(&state_file),
+            Err(ExperimentRunnerError::InterruptedStatusWrite { .. }),
+        ));
+        assert_eq!(fs::read(&state_file).unwrap(), status_bytes);
+        assert_eq!(fs::read(&checkpoint_path).unwrap(), advanced_cut);
+        assert_eq!(fs::read(&temporary).unwrap(), b"{");
+        assert_eq!(pending.runs[0].state, RunState::Pending);
+        assert!(!temporary.with_extension("interrupted").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn torn_status_refuses_aliases_and_preserves_an_external_incident_path() {
+        use std::os::unix::fs::symlink;
+
+        for case in [
+            "temporary-symlink",
+            "temporary-hard-link",
+            "incident-symlink",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let runner = progress_runner(directory.path(), vec![7]);
+            let state_file = directory.path().join("status.json");
+            let temporary = status_temporary_path(&state_file).unwrap();
+            let incident = temporary.with_extension("interrupted");
+            runner.load_or_create_status(&state_file).unwrap();
+            let status_bytes = fs::read(&state_file).unwrap();
+            let external = directory.path().join("external");
+            fs::create_dir(&external).unwrap();
+            fs::write(external.join("status.tmp"), b"{").unwrap();
+            match case {
+                "temporary-symlink" => symlink(external.join("status.tmp"), &temporary).unwrap(),
+                "temporary-hard-link" => {
+                    fs::hard_link(external.join("status.tmp"), &temporary).unwrap();
+                }
+                _ => {
+                    fs::write(&temporary, b"{").unwrap();
+                    symlink(&external, &incident).unwrap();
+                }
+            }
+
+            assert!(runner.load_or_create_status(&state_file).is_err(), "{case}");
+            assert_eq!(fs::read(&state_file).unwrap(), status_bytes, "{case}");
+            assert_eq!(fs::read(&temporary).unwrap(), b"{", "{case}");
+            assert_eq!(
+                fs::read(external.join("status.tmp")).unwrap(),
+                b"{",
+                "{case}"
+            );
+            assert_eq!(fs::read_dir(&external).unwrap().count(), 1, "{case}");
+            assert!(!runner.output_dir.exists(), "{case}");
+        }
     }
 
     #[test]
