@@ -50,6 +50,23 @@ impl BrainPreset {
     }
 }
 
+/// Application registry recipes eligible for automatic checkpoint reconstruction.
+///
+/// Each candidate must still match the checkpoint's complete recorded registry
+/// identity. `None` permits a world without a brain registry; it is not a fallback
+/// for unknown families. Feature-disabled recipes are never constructed.
+pub(crate) const CHECKPOINT_BRAIN_PRESETS: &[Option<BrainPreset>] = &[
+    None,
+    Some(BrainPreset::Mlp),
+    Some(BrainPreset::Dwraon),
+    Some(BrainPreset::Assembly),
+    Some(BrainPreset::Mixed),
+    #[cfg(feature = "brain-ft")]
+    Some(BrainPreset::Ft),
+    #[cfg(feature = "neuro")]
+    Some(BrainPreset::Neuro),
+];
+
 /// Registered brain families, split by whether they may found a population.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledBrains {

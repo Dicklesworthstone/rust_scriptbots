@@ -5992,17 +5992,7 @@ impl ControlHandle {
         continuity: Option<&scriptbots_core::WorldHostCheckpointV1>,
     ) -> Result<(WorldState, Option<crate::BrainPreset>), ControlError> {
         let mut restored = None;
-        for preset in [
-            None,
-            Some(crate::BrainPreset::Mlp),
-            Some(crate::BrainPreset::Dwraon),
-            Some(crate::BrainPreset::Assembly),
-            Some(crate::BrainPreset::Mixed),
-            Some(crate::BrainPreset::Ft),
-        ] {
-            if preset == Some(crate::BrainPreset::Ft) && !cfg!(feature = "brain-ft") {
-                continue;
-            }
+        for &preset in crate::brains::CHECKPOINT_BRAIN_PRESETS {
             let registry = match preset {
                 None => scriptbots_core::BrainRegistry::new(),
                 Some(preset) => {
@@ -11781,6 +11771,8 @@ pub(crate) mod tests {
             Some(crate::BrainPreset::Dwraon),
             Some(crate::BrainPreset::Assembly),
             Some(crate::BrainPreset::Mixed),
+            #[cfg(feature = "neuro")]
+            Some(crate::BrainPreset::Neuro),
         ] {
             let directory = tempfile::Builder::new()
                 .prefix("event-canvas-control-")
@@ -11788,7 +11780,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .keep();
             eprintln!("event canvas preset {preset:?}: {}", directory.display());
-            let mut world = WorldState::new(ScriptBotsConfig {
+            let mut config = ScriptBotsConfig {
                 rng_seed: Some(42),
                 world_width: 120,
                 world_height: 120,
@@ -11799,8 +11791,12 @@ pub(crate) mod tests {
                 movement_drain: 0.0,
                 reproduction_energy_threshold: 0.0,
                 ..ScriptBotsConfig::default()
-            })
-            .unwrap();
+            };
+            if preset == Some(crate::BrainPreset::Neuro) {
+                config.neuroflow.hidden_layers = vec![7, 3];
+                config.neuroflow.activation = scriptbots_core::NeuroflowActivationKind::Sigmoid;
+            }
+            let mut world = WorldState::new(config).unwrap();
             if let Some(preset) = preset {
                 let brains = crate::install_brains(&mut world, preset)
                     .unwrap()
@@ -12880,7 +12876,7 @@ pub(crate) mod tests {
             .tempdir()
             .unwrap()
             .keep();
-        let mut world = WorldState::new(ScriptBotsConfig {
+        let mut config = ScriptBotsConfig {
             world_width: 120,
             world_height: 120,
             food_cell_size: 20,
@@ -12892,8 +12888,12 @@ pub(crate) mod tests {
             topography_enabled: false,
             reproduction_energy_threshold: f32::MAX,
             ..ScriptBotsConfig::default()
-        })
-        .unwrap();
+        };
+        if preset == Some(crate::BrainPreset::Neuro) {
+            config.neuroflow.hidden_layers = vec![7, 3];
+            config.neuroflow.activation = scriptbots_core::NeuroflowActivationKind::Sigmoid;
+        }
+        let mut world = WorldState::new(config).unwrap();
         if let Some(preset) = preset {
             let installed = crate::install_brains(&mut world, preset).unwrap();
             for _ in 0..2 {
@@ -12973,6 +12973,8 @@ pub(crate) mod tests {
         for (preset, ticks) in [
             (crate::BrainPreset::Mlp, 0),
             (crate::BrainPreset::Dwraon, 1),
+            #[cfg(feature = "neuro")]
+            (crate::BrainPreset::Neuro, 2),
         ] {
             let (handle, host, checkpoint, directory) =
                 checkpoint_branch_fixture(Some(preset), ticks);
@@ -13016,7 +13018,9 @@ pub(crate) mod tests {
             assert_eq!(outcome.terminal_sample.tick, final_status.target_tick);
             assert!(outcome.bundle_verified);
             let decoded = scriptbots_core::WorldCheckpointV1::decode(&original_bytes).unwrap();
-            let mut oracle = ControlHandle::restore_canvas_world(&decoded).unwrap();
+            let registry = crate::create_brain_registry_for_config(preset, decoded.config())
+                .expect("known original preset and constructor configuration");
+            let mut oracle = WorldState::restore_checkpoint_v1(&decoded, registry).unwrap();
             for _ in 0..3 {
                 oracle.step().unwrap();
             }
@@ -13914,6 +13918,8 @@ pub(crate) mod tests {
             Some(crate::BrainPreset::Dwraon),
             Some(crate::BrainPreset::Assembly),
             Some(crate::BrainPreset::Mixed),
+            #[cfg(feature = "neuro")]
+            Some(crate::BrainPreset::Neuro),
         ] {
             let directory = tempfile::Builder::new()
                 .prefix("checkpoint-canvas-")
@@ -13924,7 +13930,7 @@ pub(crate) mod tests {
                 "checkpoint canvas preset {preset:?}: {}",
                 directory.display()
             );
-            let mut world = WorldState::new(ScriptBotsConfig {
+            let mut config = ScriptBotsConfig {
                 rng_seed: Some(42),
                 world_width: 120,
                 world_height: 120,
@@ -13932,8 +13938,12 @@ pub(crate) mod tests {
                 persistence_interval: 0,
                 closed: true,
                 ..ScriptBotsConfig::default()
-            })
-            .unwrap();
+            };
+            if preset == Some(crate::BrainPreset::Neuro) {
+                config.neuroflow.hidden_layers = vec![7, 3];
+                config.neuroflow.activation = scriptbots_core::NeuroflowActivationKind::Sigmoid;
+            }
+            let mut world = WorldState::new(config).unwrap();
             if let Some(preset) = preset {
                 let brains = crate::install_brains(&mut world, preset)
                     .unwrap()
@@ -14046,6 +14056,121 @@ pub(crate) mod tests {
                 Err(ControlError::InvalidPatch(_))
             ));
             assert_eq!(host.port.scientific_digest_v1().unwrap(), live);
+        }
+    }
+
+    #[cfg(feature = "neuro")]
+    #[test]
+    fn neuro_checkpoint_consumers_refuse_constructor_drift_without_changing_the_owner() {
+        for population in [0, 2] {
+            let directory = tempfile::Builder::new()
+                .prefix("neuro-checkpoint-constructor-")
+                .tempdir()
+                .unwrap()
+                .keep();
+            let mut original_config = ScriptBotsConfig {
+                rng_seed: Some(42),
+                world_width: 120,
+                world_height: 120,
+                food_cell_size: 20,
+                persistence_interval: 0,
+                closed: true,
+                population_minimum: 0,
+                population_spawn_interval: 0,
+                reproduction_energy_threshold: f32::MAX,
+                ..ScriptBotsConfig::default()
+            };
+            original_config.neuroflow.hidden_layers = vec![7, 3];
+            original_config.neuroflow.activation =
+                scriptbots_core::NeuroflowActivationKind::Sigmoid;
+            let mut world = WorldState::new(original_config.clone()).unwrap();
+            let installed = crate::install_brains(&mut world, crate::BrainPreset::Neuro).unwrap();
+            for _ in 0..population {
+                let id = world
+                    .try_spawn_agent(scriptbots_core::AgentData::default())
+                    .unwrap();
+                assert!(
+                    world
+                        .bind_agent_brain(id, installed.population()[0])
+                        .unwrap()
+                );
+            }
+            // The raw cut retains the existing registry identity, not its former
+            // constructor recipe. An edited config must never substitute a new factory.
+            let mut changed = original_config.clone();
+            changed.neuroflow.hidden_layers = vec![11, 5];
+            scriptbots_core::apply_control_command(
+                &mut world,
+                ControlCommand::UpdateConfig(Box::new(changed)),
+            )
+            .unwrap();
+            let host = TestHost::spawn(world);
+            let handle = host.handle().with_artifacts_dir(directory.clone()).unwrap();
+            let saved = handle
+                .create_checkpoint(CheckpointCreateRequest::default())
+                .unwrap();
+            assert_eq!(saved.agent_count, population);
+            let (_, bytes) = handle.read_artifact_bytes(&saved.checkpoint_id).unwrap();
+            let checkpoint = scriptbots_core::WorldCheckpointV1::decode(&bytes).unwrap();
+            let matching = crate::create_brain_registry_for_config(
+                crate::BrainPreset::Neuro,
+                &original_config,
+            )
+            .unwrap();
+            let restored = WorldState::restore_checkpoint_v1(&checkpoint, matching)
+                .expect("the known original registry still restores this valid source");
+            assert_eq!(
+                restored.world_digest_v1().unwrap(),
+                *checkpoint.source_digest()
+            );
+            let substituted = crate::create_brain_registry_for_config(
+                crate::BrainPreset::Neuro,
+                checkpoint.config(),
+            )
+            .unwrap();
+            assert!(matches!(
+                WorldState::restore_checkpoint_v1(&checkpoint, substituted),
+                Err(scriptbots_core::WorldCheckpointError::RegistryMismatch { .. })
+            ));
+            let before = host.port.scientific_digest_v1().unwrap();
+            let published = handle.read_snapshot().unwrap();
+            for error in [
+                handle.checkpoint_canvas(&saved.checkpoint_id).err(),
+                handle.event_canvas(saved.tick).err(),
+                handle
+                    .create_checkpoint_branch(checkpoint_branch_request(
+                        &saved.checkpoint_id,
+                        "constructor-drift",
+                    ))
+                    .err(),
+            ] {
+                assert!(
+                    matches!(
+                        &error,
+                        Some(ControlError::BadRequest(message))
+                            if message.contains("outside the compiled application presets")
+                    ),
+                    "unexpected constructor-drift outcome: {error:?}"
+                );
+            }
+            assert!(!directory.join("branches").exists());
+            assert!(
+                handle
+                    .data_services
+                    .checkpoint_branches
+                    .lock()
+                    .unwrap()
+                    .is_empty()
+            );
+            let capacity = *handle.data_services.execution_capacity.lock().unwrap();
+            assert_eq!(capacity.reserved_run_slots, 0);
+            assert_eq!(capacity.reserved_grid_cells, 0);
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+            assert!(Arc::ptr_eq(&handle.read_snapshot().unwrap(), &published));
+            assert_eq!(
+                handle.read_artifact_bytes(&saved.checkpoint_id).unwrap().1,
+                bytes
+            );
         }
     }
 
