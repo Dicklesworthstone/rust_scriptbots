@@ -6,7 +6,7 @@
 
 use scriptbots_core::narrative::EventRecord;
 use scriptbots_core::reel::{Clip, SelectionConfig, select_clips};
-use scriptbots_core::{BrainRegistry, TerrainKind, WorldCheckpointV1, WorldState};
+use scriptbots_core::{TerrainKind, WorldCheckpointV1, WorldState};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs::File;
@@ -238,37 +238,15 @@ impl ReplayProvider for CheckpointReplaySeeker {
         };
 
         if needs_restore {
-            let mut restored_world = None;
-            for &preset in crate::brains::CHECKPOINT_BRAIN_PRESETS {
-                let registry = match preset {
-                    None => BrainRegistry::new(),
-                    Some(preset) => {
-                        crate::create_brain_registry_for_config(preset, best_cp.config()).map_err(
-                            |error| {
-                                ReelReplayError::Storage(format!(
-                                    "cannot construct checkpoint brain registry {preset:?}: {error}"
-                                ))
-                            },
-                        )?
-                    }
-                };
-                match WorldState::restore_checkpoint_v1(best_cp, registry) {
-                    Ok(world) => {
-                        restored_world = Some(world);
-                        break;
-                    }
-                    Err(scriptbots_core::WorldCheckpointError::RegistryMismatch { .. }) => {}
-                    Err(error) => {
-                        return Err(ReelReplayError::Storage(format!(
-                            "failed to restore checkpoint at tick {base_tick}: {error}"
-                        )));
-                    }
-                }
-            }
-
-            let world = restored_world.ok_or_else(|| {
+            let registry = crate::brains::create_brain_registry_for_checkpoint(best_cp)
+                .map_err(|error| {
+                    ReelReplayError::Storage(format!(
+                        "checkpoint at tick {base_tick} does not match the compiled application adapters: {error}"
+                    ))
+                })?;
+            let world = WorldState::restore_checkpoint_v1(best_cp, registry).map_err(|error| {
                 ReelReplayError::Storage(format!(
-                    "checkpoint at tick {base_tick} requires a registry outside the compiled application presets"
+                    "failed to restore checkpoint at tick {base_tick}: {error}"
                 ))
             })?;
             self.current_world = Some(world);
@@ -972,6 +950,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn checkpoint_replay_preserves_saved_family_subset_and_order() {
+        let mut uninterrupted = checkpoint_world(Some(crate::BrainPreset::Dwraon));
+        uninterrupted
+            .register_brain_family(
+                scriptbots_brain::mlp::MlpBrain::KIND.as_str(),
+                Box::new(scriptbots_brain::mlp::MlpBrainFamily::new()),
+            )
+            .unwrap();
+        let checkpoint = uninterrupted.checkpoint_v1().unwrap();
+        let original = checkpoint.encode().unwrap();
+        let registry = checkpoint.required_brain_registry();
+        assert_eq!(registry.entries.len(), 2);
+        assert_eq!(
+            registry.entries[0].kind,
+            scriptbots_brain::dwraon::DwraonBrain::KIND.as_str()
+        );
+        let mut expected = vec![uninterrupted.world_digest_v1().unwrap()];
+        for _ in 3..9 {
+            uninterrupted.step().unwrap();
+            expected.push(uninterrupted.world_digest_v1().unwrap());
+        }
+        let mut seeker = CheckpointReplaySeeker::new(vec![checkpoint.clone()], 9);
+        for tick in [3, 4, 6, 5, 9, 3, 7] {
+            let replayed = seeker.seek_to_exact(tick).unwrap();
+            assert_eq!(
+                replayed.world_digest_v1().unwrap(),
+                expected[usize::try_from(tick - 3).unwrap()]
+            );
+            assert_eq!(
+                replayed.checkpoint_v1().unwrap().required_brain_registry(),
+                registry
+            );
+        }
+        assert_eq!(checkpoint.encode().unwrap(), original);
+    }
+
     #[cfg(feature = "neuro")]
     #[test]
     fn checkpoint_replay_refuses_changed_neuro_constructor_identity() {
@@ -989,7 +1004,7 @@ mod tests {
         assert!(matches!(
             seeker.seek_to_exact(3),
             Err(ReelReplayError::Storage(reason))
-                if reason.contains("outside the compiled application presets")
+                if reason.contains("does not match the compiled application adapters")
         ));
         assert!(seeker.current_world.is_none());
         assert_eq!(checkpoint.encode().unwrap(), original);

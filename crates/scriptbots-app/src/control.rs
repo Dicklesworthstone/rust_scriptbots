@@ -5939,8 +5939,8 @@ impl ControlHandle {
     ///
     /// File reads and reconstruction run on the caller's background worker. This
     /// never drives or replaces the live owner, advances science, or opens SQL.
-    /// Only exact registries produced by the compiled application presets are
-    /// supported; the core's full registry and restored-digest checks still apply.
+    /// Saved combinations of compiled adapters are restored in their original
+    /// registry order; the core's full registry and restored-digest checks apply.
     /// This is a reconstructed science projection, not the original host publication:
     /// arena handles, per-tick activity counts and presentation history are not retained.
     pub(crate) fn checkpoint_canvas(
@@ -5991,35 +5991,27 @@ impl ControlHandle {
         checkpoint: &scriptbots_core::WorldCheckpointV1,
         continuity: Option<&scriptbots_core::WorldHostCheckpointV1>,
     ) -> Result<(WorldState, Option<crate::BrainPreset>), ControlError> {
-        let mut restored = None;
-        for &preset in crate::brains::CHECKPOINT_BRAIN_PRESETS {
-            let registry = match preset {
-                None => scriptbots_core::BrainRegistry::new(),
-                Some(preset) => {
-                    crate::create_brain_registry_for_config(preset, checkpoint.config())
-                        .map_err(|error| ControlError::Serialization(error.to_string()))?
-                }
-            };
-            let candidate = match continuity {
-                Some(continuity) => {
-                    WorldState::restore_host_checkpoint_v1(checkpoint, continuity, registry)
-                }
-                None => WorldState::restore_checkpoint_v1(checkpoint, registry),
-            };
-            match candidate {
-                Ok(world) => {
-                    restored = Some((world, preset));
-                    break;
-                }
-                Err(scriptbots_core::WorldCheckpointError::RegistryMismatch { .. }) => {}
-                Err(error) => return Err(ControlError::Serialization(error.to_string())),
+        let registry = crate::brains::create_brain_registry_for_checkpoint(checkpoint)
+            .map_err(|error| {
+                ControlError::BadRequest(format!(
+                    "checkpoint registry does not match the compiled application adapters: {error}"
+                ))
+            })?;
+        let world = match continuity {
+            Some(continuity) => {
+                WorldState::restore_host_checkpoint_v1(checkpoint, continuity, registry)
             }
+            None => WorldState::restore_checkpoint_v1(checkpoint, registry),
         }
-        let (world, preset) = restored.ok_or_else(|| {
-            ControlError::BadRequest(
-                "checkpoint requires a registry outside the compiled application presets".into(),
-            )
+        .map_err(|error| match error {
+            scriptbots_core::WorldCheckpointError::RegistryMismatch { .. } => {
+                ControlError::BadRequest(format!(
+                    "checkpoint registry does not match the compiled application adapters: {error}"
+                ))
+            }
+            _ => ControlError::Serialization(error.to_string()),
         })?;
+        let preset = crate::brains::checkpoint_brain_preset(checkpoint);
         let actual_digest = world
             .world_digest_v1()
             .map_err(|error| ControlError::Serialization(error.to_string()))?;
@@ -14201,6 +14193,72 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn checkpoint_canvas_restores_saved_subsets_without_claiming_a_founder_preset() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let config = ScriptBotsConfig {
+            rng_seed: Some(42),
+            world_width: 120,
+            world_height: 120,
+            food_cell_size: 20,
+            persistence_interval: 0,
+            closed: true,
+            population_minimum: 0,
+            reproduction_attempt_chance: 0.0,
+            ..ScriptBotsConfig::default()
+        };
+        let mut world = WorldState::new(config).unwrap();
+        let first = crate::install_brains(&mut world, crate::BrainPreset::Mlp)
+            .unwrap()
+            .population[0];
+        let second = world
+            .register_brain_family(
+                scriptbots_brain::dwraon::DwraonBrain::KIND.as_str(),
+                Box::new(scriptbots_brain::dwraon::DwraonFamilyAdapter::default()),
+            )
+            .unwrap();
+        for key in [first, second] {
+            let agent = world
+                .try_spawn_agent(scriptbots_core::AgentData::default())
+                .unwrap();
+            assert!(world.bind_agent_brain(agent, key).unwrap());
+        }
+        let host = TestHost::spawn(world);
+        let handle = host.handle().with_artifacts_dir(directory.clone()).unwrap();
+        host.wait_applied(&handle.step().unwrap());
+        let saved = handle
+            .create_checkpoint(CheckpointCreateRequest::default())
+            .unwrap();
+        let (_, bytes) = handle.read_artifact_bytes(&saved.checkpoint_id).unwrap();
+        let checkpoint = scriptbots_core::WorldCheckpointV1::decode(&bytes).unwrap();
+        let (restored, preset) =
+            ControlHandle::restore_canvas_world_and_preset(&checkpoint, None).unwrap();
+        assert_eq!(preset, None);
+        assert_eq!(restored.world_digest_v1().unwrap(), *checkpoint.source_digest());
+        host.wait_applied(&handle.step().unwrap());
+        let live = host.port.scientific_digest_v1().unwrap();
+        let publication = handle.read_snapshot().unwrap();
+        let review = handle.checkpoint_canvas(&saved.checkpoint_id).unwrap();
+        assert_eq!(review.world.tick, saved.tick);
+        assert_eq!(review.world.agents.len(), saved.agent_count);
+        assert!(review.agent_visuals_complete());
+        assert!(matches!(
+            handle.create_checkpoint_branch(checkpoint_branch_request(
+                &saved.checkpoint_id,
+                "subset-preset-refusal",
+            )),
+            Err(ControlError::BadRequest(reason))
+                if reason.contains("requires a versioned compiled application brain preset")
+        ));
+        assert!(!directory.join("branches").exists());
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), live);
+        assert!(Arc::ptr_eq(&handle.read_snapshot().unwrap(), &publication));
+        assert_eq!(
+            handle.read_artifact_bytes(&saved.checkpoint_id).unwrap().1,
+            bytes
+        );
+    }
+
     #[cfg(feature = "neuro")]
     #[test]
     fn neuro_checkpoint_consumers_refuse_constructor_drift_without_changing_the_owner() {
@@ -14290,7 +14348,9 @@ pub(crate) mod tests {
                     matches!(
                         &error,
                         Some(ControlError::BadRequest(message))
-                            if message.contains("outside the compiled application presets")
+                            if message.contains(
+                                "checkpoint registry does not match the compiled application adapters"
+                            )
                     ),
                     "unexpected constructor-drift outcome: {error:?}"
                 );

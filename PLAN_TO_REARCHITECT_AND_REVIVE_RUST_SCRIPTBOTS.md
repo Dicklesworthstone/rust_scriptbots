@@ -2,6 +2,22 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Saved-world inspection and registry portability (2026-11-15):**
+[Currently In Progress — Codex; native registry restoration and browser saved-world review]
+
+Continue the existing replay and browser product loop by restoring the exact recorded
+compiled brain registry, then exposing the native read-only saved-canvas path through
+a bounded session-bound browser endpoint and explicit Review / Return to live controls.
+Saved science, synthetic presentation state and the current live owner remain distinct.
+Original checkpoint, native and browser acceptance remains with the owning Beads.
+
+The local execution workspace disconnected after DSR refused native build admission
+for insufficient disk capacity. Source candidates are being independently reviewed
+and committed through GitHub; no compiler, formatter, test or live-browser result is
+inferred from those reviews. Author regressions for registry subsets, full adapter
+identity, corrupt sources, admission limits and stale browser requests. Executable
+qualification remains required when an execution environment is available.
+
 **Mixed-family browser worlds and bounded journal writes (2026-11-16):**
 [Source committed and independently reviewed — Codex; scoped JavaScript checks
 passed; original acceptance remains open under `bd-ywtv` and `bd-50bg`]
