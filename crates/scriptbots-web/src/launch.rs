@@ -181,9 +181,10 @@ pub struct LaunchInfo {
     pub reason: Option<String>,
 }
 
-/// Version 1 freezes uniform browser seeding and records the complete effective
-/// configuration. Changes are explanatory rows against the original launch,
-/// not a replacement for the configuration or executable state.
+/// Version 1 freezes single-family browser seeding; version 2 freezes the mixed
+/// MLP, DWRAON, Assembly order. Both record the complete effective configuration.
+/// Changes are explanatory rows against the original launch, not a replacement
+/// for the configuration or executable state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct BrowserLaunch {
@@ -195,15 +196,26 @@ pub(super) struct BrowserLaunch {
     snapshot_format: SnapshotFormat,
     seed_strategy: SeedStrategy,
     default_brain: Option<BrainPreset>,
+    // Omit false to preserve every existing version 1 payload byte and field order.
+    #[serde(default, skip_serializing_if = "is_false")]
+    mixed_brains: bool,
     pub(super) build: BrowserBuildInputs,
     pub(super) changes: Vec<DiffRow>,
+}
+
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "Serde skip_serializing_if predicates receive a borrowed field"
+)]
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl BrowserLaunch {
     pub(super) fn from_fresh(spec: &SimSpec, config: ScriptBotsConfig) -> Result<Self, String> {
         let launch = Self {
             schema_version: 1,
-            founder_recipe_version: 1,
+            founder_recipe_version: if spec.mixed_brains { 2 } else { 1 },
             seed: config
                 .rng_seed
                 .ok_or_else(|| "a browser launch requires the actual resolved seed".to_owned())?,
@@ -213,6 +225,7 @@ impl BrowserLaunch {
             snapshot_format: spec.snapshot_format,
             seed_strategy: spec.seed_strategy,
             default_brain: spec.default_brain,
+            mixed_brains: spec.mixed_brains,
             build: BrowserBuildInputs::current(),
             changes: spec
                 .launch
@@ -238,6 +251,7 @@ impl BrowserLaunch {
         // The link already records the effective population policy. Applying the
         // fresh-demo override again would discard a deliberate fork assignment.
         spec.preserve_population_config = true;
+        spec.mixed_brains = self.mixed_brains;
         spec.launch = Some(self);
         spec
     }
@@ -251,15 +265,18 @@ impl BrowserLaunch {
             seed: Some(self.seed.to_string()),
             initial_population: Some(self.initial_population as usize),
             brain_preset: Some(
-                self.default_brain
-                    .map_or_else(
+                if self.mixed_brains {
+                    "mixed"
+                } else {
+                    self.default_brain.map_or_else(
                         || match self.seed_strategy {
                             SeedStrategy::Wander => "wander",
                             SeedStrategy::None => "none",
                         },
                         BrainPreset::name,
                     )
-                    .to_owned(),
+                }
+                .to_owned(),
             ),
             recipe_version: Some(self.founder_recipe_version),
             reason: Some(refusal.map_or_else(
@@ -270,8 +287,14 @@ impl BrowserLaunch {
     }
 
     fn validate(&self) -> Result<(), String> {
-        if self.schema_version != 1 || self.founder_recipe_version != 1 {
+        let expected_recipe_version = if self.mixed_brains { 2 } else { 1 };
+        if self.schema_version != 1 || self.founder_recipe_version != expected_recipe_version {
             return Err("unsupported browser launch or founder recipe version".to_owned());
+        }
+        if self.mixed_brains
+            && (self.default_brain.is_some() || self.seed_strategy != SeedStrategy::None)
+        {
+            return Err("mixed founders declare conflicting brain or wander strategies".to_owned());
         }
         if self.config.rng_seed != Some(self.seed) {
             return Err(
@@ -600,6 +623,206 @@ mod tests {
             left.inner.borrow().core.world().world_digest_v1().unwrap(),
             right.inner.borrow().core.world().world_digest_v1().unwrap()
         );
+    }
+
+    fn mixed_launch(population: usize, seed: u64) -> SimHandle {
+        let mut config = fresh(None, SeedStrategy::None, Some(seed)).spec.base_config;
+        config.rng_seed = Some(seed);
+        let options: crate::InitOptions = serde_json::from_value(serde_json::json!({
+            "seed": seed,
+            "population": population,
+            "mixed_brains": true,
+            "config": config,
+        }))
+        .unwrap();
+        let spec = options.into_spec();
+        assert_eq!(spec.default_brain, None, "mixed founders must not select default MLP");
+        handle(Simulation::new(spec).unwrap())
+    }
+
+    fn assert_mixed_founders(owner: &SimHandle, population: usize) {
+        {
+            let simulation = owner.inner.borrow();
+            assert!(simulation.spec.mixed_brains);
+            assert!(simulation.spec.continuation_brains.is_empty());
+            assert_eq!(simulation.spec.brain_families(), BrainPreset::ALL);
+            assert_eq!(simulation.core.world().agent_count(), population);
+            for (index, id) in simulation.core.world().agents().iter_handles().enumerate() {
+                let family = index % BrainPreset::ALL.len();
+                let brain = &simulation.core.world().agent_runtime(id).unwrap().brain;
+                assert_eq!(brain.kind(), Some(BrainPreset::ALL[family].kind()));
+                assert_eq!(brain.registry_key(), Some(u64::try_from(family).unwrap()));
+                assert!(simulation.core.world().agent_brain_genome(id).is_some());
+                assert!(
+                    simulation
+                        .core
+                        .world()
+                        .agent_brain_evaluator_state(id)
+                        .unwrap()
+                        .is_some()
+                );
+            }
+        }
+        let bytes = owner.inner.borrow_mut().checkpoint().unwrap();
+        let checkpoint = scriptbots_runtime::VolatileHostCheckpointV1::decode(&bytes).unwrap();
+        let required = checkpoint
+            .host_checkpoint()
+            .world_checkpoint()
+            .required_brain_registry();
+        assert_eq!(required.next_key, 3);
+        assert_eq!(required.entries.len(), 3);
+        for (index, entry) in required.entries.iter().enumerate() {
+            assert_eq!(entry.key, u64::try_from(index).unwrap());
+            assert_eq!(entry.kind, BrainPreset::ALL[index].kind());
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_mixed_founders_restart_reset_and_continue_real_science() {
+        for population in [0, 1, 2, 7] {
+            let original = mixed_launch(population, 71);
+            assert_mixed_founders(&original, population);
+            assert_eq!(original.brain_preset_js(), "mixed");
+            let metadata = original.launch_info();
+            assert_eq!(metadata.brain_preset.as_deref(), Some("mixed"));
+            assert_eq!(metadata.recipe_version, Some(2));
+            assert!(metadata.shareable);
+            let link = original.permalink_string().unwrap();
+            let restarted = init_from_permalink(&link).unwrap();
+            assert_mixed_founders(&restarted, population);
+            assert_same_world(&original, &restarted);
+            original.tick_snapshot(5).unwrap();
+            restarted.tick_snapshot(5).unwrap();
+            assert_same_world(&original, &restarted);
+            assert_eq!(original.permalink_string().unwrap(), link);
+
+            let bytes = original.inner.borrow_mut().checkpoint().unwrap();
+            let continued = handle(Simulation::from_checkpoint(&bytes).unwrap());
+            assert!(!continued.inner.borrow().spec.mixed_brains);
+            assert_eq!(
+                continued.inner.borrow().spec.continuation_brains,
+                BrainPreset::ALL
+            );
+            assert!(!continued.launch_info().shareable);
+            assert!(continued.inner.borrow_mut().reset(None).is_err());
+            for steps in [1, 2] {
+                original.tick_snapshot(steps).unwrap();
+                continued.tick_snapshot(steps).unwrap();
+                assert_same_world(&original, &continued);
+            }
+
+            original.inner.borrow_mut().reset(Some(73)).unwrap();
+            assert_mixed_founders(&original, population);
+            assert_same_world(&original, &mixed_launch(population, 73));
+            original.inner.borrow_mut().reset(None).unwrap();
+            assert_mixed_founders(&original, population);
+            assert_same_world(&original, &init_from_permalink(&link).unwrap());
+            assert_eq!(original.permalink_string().unwrap(), link);
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_mixed_forks_preserve_founders_without_changing_the_live_owner() {
+        let original = mixed_launch(7, 79);
+        original.tick_snapshot(4).unwrap();
+        let before = original.inner.borrow().core.world().world_digest_v1().unwrap();
+        let child_link = original
+            .fork_patch(&[("food_growth_rate".to_owned(), 0.2)])
+            .unwrap();
+        assert_eq!(
+            original.inner.borrow().core.world().world_digest_v1().unwrap(),
+            before
+        );
+        let recipe = BrowserLaunch::decode(&child_link).unwrap();
+        assert!(recipe.mixed_brains);
+        assert_eq!(recipe.founder_recipe_version, 2);
+        assert_eq!(recipe.initial_population, 7);
+        assert_eq!(recipe.config.food_growth_rate.to_bits(), 0.2_f32.to_bits());
+        let child = init_from_permalink(&child_link).unwrap();
+        assert_mixed_founders(&child, 7);
+        assert_eq!(child.inner.borrow().core.world_tick().0, 0);
+        let mut expected = original.inner.borrow().spec.clone();
+        expected.base_config.food_growth_rate = 0.2;
+        expected.launch = None;
+        let expected = handle(Simulation::new(expected).unwrap());
+        child.tick_snapshot(4).unwrap();
+        expected.tick_snapshot(4).unwrap();
+        assert_same_world(&child, &expected);
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_mixed_recipe_versions_and_conflicting_strategies_are_refused() {
+        let mixed = mixed_launch(3, 83);
+        let recipe = BrowserLaunch::decode(&mixed.permalink_string().unwrap()).unwrap();
+        let invalid: [fn(&mut BrowserLaunch); 5] = [
+            |launch| launch.founder_recipe_version = 1,
+            |launch| launch.founder_recipe_version = 3,
+            |launch| launch.mixed_brains = false,
+            |launch| launch.default_brain = Some(BrainPreset::Mlp),
+            |launch| launch.seed_strategy = SeedStrategy::Wander,
+        ];
+        for mutate in invalid {
+            let mut rejected = recipe.clone();
+            mutate(&mut rejected);
+            let bytes = serde_json::to_vec(&rejected).unwrap();
+            let link = encode_payload(&bytes);
+            assert!(BrowserLaunch::decode(&link).is_err());
+            assert!(init_from_permalink(&link).is_err());
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_version_one_launch_bytes_remain_identical() {
+        // Frozen pre-extension wire shape: adding fields to BrowserLaunch must
+        // never silently change the bytes or meaning of a supported v1 recipe.
+        #[derive(Serialize)]
+        struct LegacyLaunchV1<'a> {
+            schema_version: u16,
+            founder_recipe_version: u16,
+            config: &'a ScriptBotsConfig,
+            seed: u64,
+            initial_population: u32,
+            snapshot_format: SnapshotFormat,
+            seed_strategy: SeedStrategy,
+            default_brain: Option<BrainPreset>,
+            build: &'a BrowserBuildInputs,
+            changes: &'a [DiffRow],
+        }
+
+        for (brain, strategy) in [
+            (Some(BrainPreset::Mlp), SeedStrategy::None),
+            (Some(BrainPreset::Dwraon), SeedStrategy::None),
+            (Some(BrainPreset::Assembly), SeedStrategy::None),
+            (None, SeedStrategy::Wander),
+            (None, SeedStrategy::None),
+        ] {
+            let launch = fresh(brain, strategy, Some(u64::MAX - 7)).spec.launch.unwrap();
+            let legacy = LegacyLaunchV1 {
+                schema_version: 1,
+                founder_recipe_version: 1,
+                config: &launch.config,
+                seed: launch.seed,
+                initial_population: launch.initial_population,
+                snapshot_format: launch.snapshot_format,
+                seed_strategy: launch.seed_strategy,
+                default_brain: launch.default_brain,
+                build: &launch.build,
+                changes: &launch.changes,
+            };
+            let legacy_bytes = serde_json::to_vec(&legacy).unwrap();
+            assert_eq!(serde_json::to_vec(&launch).unwrap(), legacy_bytes);
+            let link = encode_payload(&legacy_bytes);
+            assert_eq!(BrowserLaunch::decode(&link).unwrap().encode().unwrap(), link);
+            let json = String::from_utf8(legacy_bytes).unwrap();
+            let explicit_false =
+                json.replacen(",\"build\":", ",\"mixed_brains\":false,\"build\":", 1);
+            assert_ne!(explicit_false, json);
+            assert!(BrowserLaunch::decode(&encode_payload(explicit_false.as_bytes())).is_err());
+        }
     }
 
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]

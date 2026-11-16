@@ -513,10 +513,11 @@
                 <button id="reset-btn" type="button">Reset Simulation</button>
                 <label for="brain-preset">Brain for new worlds</label>
                 <select id="brain-preset">
-                    <option value="mixed" disabled>Mixed continuation — choose a family to reset</option>
+                    <option value="mixed_continuation" disabled>Mixed continuation — choose a new-world preset to reset</option>
                     <option value="mlp" selected>MLP — evolving neural network</option>
                     <option value="dwraon">DWRAON — evolving recurrent network</option>
                     <option value="assembly">Assembly — evolving program (experimental)</option>
+                    <option value="mixed">Mixed MLP + DWRAON + Assembly</option>
                     <option value="wander">Wander — legacy movement demo (cannot save)</option>
                     <option value="none">Unbound (supports saved continuations)</option>
                 </select>

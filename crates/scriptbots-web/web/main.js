@@ -623,7 +623,7 @@ populationSlider.addEventListener("input", () => {
 brainPresetSelect?.addEventListener("change", updateCheckpointControls);
 
 resetButton.addEventListener("click", () => {
-  if (remoteMode || brainPresetSelect?.value === "mixed") return;
+  if (remoteMode || brainPresetSelect?.value === "mixed_continuation") return;
   if (permalinkStatus) {
     permalinkStatus.textContent = "";
   }
@@ -673,7 +673,7 @@ function updateCheckpointControls() {
   const supportsContinuation = activeBrainPreset !== "wander";
   const recoveryBusy = browserRecovery?.pending === true;
   if (brainPresetSelect) brainPresetSelect.disabled = remoteMode;
-  resetButton.disabled = remoteMode || brainPresetSelect?.value === "mixed";
+  resetButton.disabled = remoteMode || brainPresetSelect?.value === "mixed_continuation";
   if (checkpointSaveButton) checkpointSaveButton.disabled = remoteMode || !simHandle || checkpointLoadPending || !supportsContinuation;
   if (checkpointLoadInput) checkpointLoadInput.disabled = remoteMode || !wasmInitialized || checkpointLoadPending || browserStorePending || recoveryBusy;
   const storageBusy = remoteMode || !browserContinuationStore || checkpointLoadPending || browserStorePending || recoveryBusy;
@@ -684,7 +684,9 @@ function updateCheckpointControls() {
     : !supportsContinuation
       ? "This Wander world is a movement demo without inherited genomes or saved continuations. Choose MLP, DWRAON or Assembly, then Reset Simulation to start an evolving world."
       : activeBrainPreset === "mixed"
-        ? `This saved world retains ${activeBrainFamilies.join(" + ")} brain families, including any extinct family. Resume or save it to continue; choose a new-world preset before resetting.`
+        ? activeLaunchInfo?.kind === "browser_launch"
+          ? "This world starts with MLP, DWRAON and Assembly founders in repeating order. Share its recipe to restart or save a continuation to retain its evolution."
+          : `This saved world retains ${activeBrainFamilies.join(" + ")} brain families, including any extinct family. Resume or save it to continue; choose a new-world preset before resetting.`
         : "This local world supports saved continuations. Loading a continuation preserves its brain family and resumes paused.";
   browserRecovery?.setAvailable(!remoteMode && !!simHandle && supportsContinuation && !document.hidden
     && !queuedReset && !checkpointLoadPending && !browserStorePending);
@@ -1264,7 +1266,7 @@ function releaseSimulation(handle) {
   }
 }
 
-function replaceSimulation(next, { continuation = false, permalink = null, expectedTick = null } = {}) {
+function replaceSimulation(next, { continuation = false, permalink = null, expectedTick = null, expectedBrainPreset = null } = {}) {
   const nextSpeed = continuation ? 0 : speedMultiplier;
   let frame;
   let brainPreset;
@@ -1280,13 +1282,21 @@ function replaceSimulation(next, { continuation = false, permalink = null, expec
       throw new Error("Saved continuation tick does not match its checkpoint bytes");
     }
     brainPreset = next.brainPreset?.() ?? null;
+    if (expectedBrainPreset !== null && brainPreset !== expectedBrainPreset) {
+      throw new Error("The browser package did not create the requested brain preset; reload an updated package");
+    }
     launchInfo = typeof next.launchInfo === "function" ? validateLaunchInfo(next.launchInfo()) : continuation ? {
       kind: "checkpoint_continuation", semantics: "saved_owner_continuation", shareable: false,
       seed: null, initial_population: null, brain_preset: null, recipe_version: null,
       reason: "This package did not record the original launch recipe for the saved owner.",
     } : null;
-    if (continuation) {
+    if (continuation || brainPreset === "mixed") {
       brainFamilies = validateContinuationBrains(brainPreset, next.brainFamilies?.() ?? null);
+    }
+    if (!continuation && brainPreset === "mixed"
+        && (launchInfo?.kind !== "browser_launch" || launchInfo.brain_preset !== "mixed"
+          || launchInfo.recipe_version !== 2 || brainFamilies.join(",") !== "mlp,dwraon,assembly")) {
+      throw new Error("Mixed founder recipe has an inconsistent family roster");
     }
     if (launchInfo?.shareable === false) {
       permalink = null;
@@ -1325,7 +1335,9 @@ function replaceSimulation(next, { continuation = false, permalink = null, expec
   if (continuation) {
     speedMultiplier = 0;
     stepsSlider.value = "0";
-    if (brainPresetSelect) brainPresetSelect.value = brainPreset;
+  }
+  if (brainPresetSelect && brainPreset !== null) {
+    brainPresetSelect.value = continuation && brainPreset === "mixed" ? "mixed_continuation" : brainPreset;
   }
   resetPerformanceWindows(frame.snapshot);
   if (captureRequest) finishCapture(captureRequest, new Error("World changed during capture; try again"));
@@ -1620,18 +1632,20 @@ async function resetSimulation(populationOverride) {
   const defaults = default_init_options ? default_init_options() : {};
   const seed = Math.floor(Math.random() * 1_000_000);
   const preset = brainPresetSelect?.value || "mlp";
-  if (preset === "mixed") throw new Error("Choose a new-world brain preset before resetting this mixed continuation");
+  if (preset === "mixed_continuation") throw new Error("Choose a new-world brain preset before resetting this mixed continuation");
   const evolutionary = ["mlp", "dwraon", "assembly"].includes(preset);
-  if (!evolutionary && !["wander", "none"].includes(preset)) throw new Error("Choose a supported brain family");
+  const mixed = preset === "mixed";
+  if (!evolutionary && !mixed && !["wander", "none"].includes(preset)) throw new Error("Choose a supported brain family");
   const options = {
     ...defaults,
     seed,
     population: populationOverride,
     default_brain: evolutionary ? preset : null,
+    mixed_brains: mixed,
     seed_strategy: preset === "wander" ? "wander" : "none",
   };
 
-  const installed = replaceSimulation(init_sim(options));
+  const installed = replaceSimulation(init_sim(options), { expectedBrainPreset: mixed ? "mixed" : null });
   currentPermalink = installed.permalink;
   if (permalinkInput) permalinkInput.value = currentPermalink ?? "";
 

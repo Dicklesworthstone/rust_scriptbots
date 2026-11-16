@@ -125,6 +125,11 @@ const mockWasmModule = `
   }
 
   export function permalink_info(link) {
+    if (link === "sbb1.mixed_fixture") return {
+      kind: "browser_launch", semantics: "initial_conditions_restart", shareable: true,
+      seed: owners.mixedRecipe.seed, initial_population: owners.mixedRecipe.population,
+      brain_preset: "mixed", recipe_version: 2, reason: null
+    };
     return link.startsWith("sbb1.") ? {
       kind: "browser_launch", semantics: "initial_conditions_restart", shareable: true,
       seed: "18446744073709551615", initial_population: 151, brain_preset: "dwraon", recipe_version: 1, reason: null
@@ -139,12 +144,18 @@ const mockWasmModule = `
     if (link.startsWith("invalid") || link.includes("corrupt")) {
       throw new Error("permalink magic mismatch (first bytes: " + link.slice(0, 8) + ")");
     }
+    if (link === "sbb1.mixed_fixture") {
+      const recipe = permalink_info(link);
+      return createHandle("permalink", link, 0, "mixed", recipe.seed, recipe.initial_population);
+    }
     return createHandle("permalink", link, 0, link.startsWith("sbb1.") ? "dwraon" : "none");
   }
 
   export function init_sim(opts) {
-    const preset = opts.default_brain || (opts.seed_strategy === "wander" ? "wander" : "none");
-    return createHandle("reset", currentWorldLink, 0, preset, opts.seed, opts.population);
+    const preset = opts.mixed_brains && !owners.ignoreMixedChoice ? "mixed"
+      : opts.default_brain || (opts.seed_strategy === "wander" ? "wander" : "none");
+    if (preset === "mixed") owners.mixedRecipe = { seed: String(opts.seed), population: opts.population };
+    return createHandle("reset", preset === "mixed" ? "sbb1.mixed_fixture" : currentWorldLink, 0, preset, opts.seed, opts.population);
   }
 
   export function checkpoint_byte_limit() { return 1024; }
@@ -159,7 +170,9 @@ const mockWasmModule = `
     const failure = owners.nextFailure;
     owners.nextFailure = null;
     if (failure === "create") throw new Error("intentional create failure");
-    const families = preset === "mixed" ? [...(owners.checkpointFamilies || ["assembly", "mlp", "dwraon"])]
+    const families = preset === "mixed"
+      ? [...(kind === "checkpoint" ? owners.checkpointFamilies || ["assembly", "mlp", "dwraon"]
+        : owners.mixedFounderFamilies || ["mlp", "dwraon", "assembly"])]
       : ["mlp", "dwraon", "assembly"].includes(preset) ? [preset] : [];
     const record = { id: owners.records.length + 1, kind, preset, seed: String(seed), population, tick: initialTick,
       freeCalls: 0, driveCalls: 0, frameCalls: 0, narrativeReads: 0, permalinkCalls: 0, elapsed: 0, speed: 1 };
@@ -188,7 +201,7 @@ const mockWasmModule = `
         };
         if (kind === "permalink") return permalink_info(link);
         return { kind: "browser_launch", semantics: "initial_conditions_restart", shareable: failure !== "launch_unshareable",
-          seed: String(seed), initial_population: population, brain_preset: preset, recipe_version: 1,
+          seed: String(seed), initial_population: population, brain_preset: preset, recipe_version: preset === "mixed" ? 2 : 1,
           reason: failure === "launch_unshareable" ? "This owner recipe exceeds the link size limit." : null };
       },
       narrativePage(afterEvent, expectedSessionId) {
@@ -342,6 +355,39 @@ async function runOwnerLifecycleCases(page, context) {
     observations.brainFamilies.push({ preset, owner: current.id, saveDisabled: disabled });
   }
 
+  // A stale package that ignores mixed_brains, or an incomplete producer that
+  // labels only two families as mixed, must not replace the active owner.
+  const beforeMixedRequest = activeOwner(await state());
+  for (const mismatch of ["ignored", "missing_family"]) {
+    await page.evaluate((kind) => {
+      window.__ownerTest.ignoreMixedChoice = kind === "ignored";
+      window.__ownerTest.mixedFounderFamilies = kind === "missing_family" ? ["mlp", "dwraon"] : null;
+    }, mismatch);
+    await page.selectOption("#brain-preset", "mixed");
+    await replace("reset");
+    const refused = await state();
+    if (activeOwner(refused).id !== beforeMixedRequest.id || refused.records.at(-1).freeCalls !== 1) {
+      throw new Error("An unsupported mixed founder request replaced the active owner or leaked its candidate");
+    }
+  }
+  await page.evaluate(() => {
+    window.__ownerTest.ignoreMixedChoice = false;
+    window.__ownerTest.mixedFounderFamilies = null;
+  });
+  await replace("reset");
+  const freshMixed = activeOwner(await state());
+  const freshMixedControls = await page.evaluate(() => ({
+    resetDisabled: document.getElementById("reset-btn").disabled,
+    saveDisabled: document.getElementById("checkpoint-save").disabled,
+    recipeKind: document.getElementById("launch-info").dataset.kind,
+    recipeText: document.getElementById("launch-info").textContent,
+  }));
+  if (freshMixed.preset !== "mixed" || freshMixedControls.resetDisabled || freshMixedControls.saveDisabled
+      || freshMixedControls.recipeKind !== "browser_launch" || !freshMixedControls.recipeText.includes("Recipe v2")
+      || !freshMixedControls.recipeText.includes("MLP + DWRAON + Assembly")) {
+    throw new Error("The explicit mixed founder choice did not create a usable version two recipe");
+  }
+
   // A continuation can carry several actual evaluator families without inventing
   // a founder distribution. Its saved state remains runnable and saveable; only
   // an explicit new-world choice permits reset.
@@ -359,7 +405,7 @@ async function runOwnerLifecycleCases(page, context) {
     capability: document.getElementById("checkpoint-capability").textContent,
     recipeKind: document.getElementById("launch-info").dataset.kind,
   }));
-  if (mixedOwner.preset !== "mixed" || mixedState.preset !== "mixed" || mixedState.speed !== "0"
+  if (mixedOwner.preset !== "mixed" || mixedState.preset !== "mixed_continuation" || mixedState.speed !== "0"
       || !mixedControls.resetDisabled || mixedControls.saveDisabled || mixedControls.browserSaveDisabled
       || !mixedControls.capability.includes("assembly + mlp + dwraon")
       || mixedControls.recipeKind !== "checkpoint_continuation") {
@@ -389,6 +435,26 @@ async function runOwnerLifecycleCases(page, context) {
       || !await page.textContent("#checkpoint-status").then((text) => text.includes("brain-family roster"))) {
     throw new Error("Unsupported mixed families replaced the active world");
   }
+  await page.evaluate(() => {
+    window.__ownerTest.checkpointFamilies = ["assembly", "mlp"];
+  });
+  await replace("checkpoint");
+  if ((await state()).preset !== "mixed_continuation" || !await page.isDisabled("#reset-btn")) {
+    throw new Error("A saved mixture lost its explicit-reset guard");
+  }
+  await page.evaluate(() => {
+    document.getElementById("permalink-input").value = "sbb1.mixed_fixture";
+    document.getElementById("load-permalink-btn").click();
+  });
+  await context.clock.runFor(32);
+  const mixedRestart = activeOwner(await state());
+  if (mixedRestart.preset !== "mixed" || (await state()).preset !== "mixed"
+      || await page.isDisabled("#reset-btn")
+      || await page.getAttribute("#launch-info", "data-kind") !== "browser_launch") {
+    throw new Error("Loading a mixed founder recipe retained the saved-continuation reset guard");
+  }
+  observations.mixedFounders = { owner: freshMixed.id, restartedOwner: mixedRestart.id,
+    stalePackageRefused: true, missingFamilyRefused: true, recipeVersion: 2 };
   await page.evaluate(() => {
     window.__ownerTest.checkpointPreset = null;
     window.__ownerTest.checkpointFamilies = null;

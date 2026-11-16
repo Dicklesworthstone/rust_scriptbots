@@ -33,8 +33,11 @@ export function validateLaunchInfo(info) {
     if (typeof info.seed !== "string" || !/^(0|[1-9][0-9]{0,19})$/.test(info.seed)
         || BigInt(info.seed) > 18446744073709551615n) throw new Error("Recipe seed must be an exact u64 decimal string");
     if (info.kind === "browser_launch") {
+      const supportedRecipe = info.recipe_version === 1
+        ? ["mlp", "dwraon", "assembly", "wander", "none"].includes(info.brain_preset)
+        : info.recipe_version === 2 && info.brain_preset === "mixed";
       if (!Number.isSafeInteger(info.initial_population) || info.initial_population < 0 || info.initial_population > 50_000
-          || !["mlp", "dwraon", "assembly", "wander", "none"].includes(info.brain_preset) || info.recipe_version !== 1) {
+          || !supportedRecipe) {
         throw new Error("Browser launch metadata has an unsupported founder recipe");
       }
     } else if (!info.shareable || [info.initial_population, info.brain_preset, info.recipe_version].some((value) => value !== null)) {
@@ -47,7 +50,8 @@ export function validateLaunchInfo(info) {
 export function launchInfoText(info) {
   if (!info) return "Initial-condition metadata is unavailable in this browser package.";
   if (info.kind === "browser_launch") {
-    const recipe = `Initial seed ${info.seed} · ${info.initial_population} founders · ${info.brain_preset} brains. Recipe v${info.recipe_version}.`;
+    const brains = info.brain_preset === "mixed" ? "MLP + DWRAON + Assembly brains, assigned in repeating order" : `${info.brain_preset} brains`;
+    const recipe = `Initial seed ${info.seed} · ${info.initial_population} founders · ${brains}. Recipe v${info.recipe_version}.`;
     return info.shareable ? `${recipe} Links restart these initial conditions at tick zero.`
       : `${recipe} Recipe sharing unavailable: ${info.reason || "this recipe exceeds the link size limit"} Save a continuation to retain this world.`;
   }

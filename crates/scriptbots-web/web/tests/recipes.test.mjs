@@ -57,6 +57,26 @@ test("browser recipes preserve exact full-width seeds and registered empty-world
   }
 });
 
+test("mixed founders require their explicit version two recipe", () => {
+  for (const initial_population of [0, 1, 2, 7, 50_000]) {
+    const recipe = validateLaunchInfo(browserRecipe({
+      brain_preset: "mixed", recipe_version: 2, initial_population,
+    }));
+    const text = launchInfoText(recipe);
+    assert.ok(text.includes("MLP + DWRAON + Assembly"));
+    assert.ok(text.includes("assigned in repeating order"));
+    assert.ok(text.includes("Recipe v2"));
+  }
+  for (const metadata of [
+    browserRecipe({ brain_preset: "mixed" }),
+    browserRecipe({ brain_preset: "mixed", recipe_version: 3 }),
+    ...["mlp", "dwraon", "assembly", "wander", "none"].map((brain_preset) =>
+      browserRecipe({ brain_preset, recipe_version: 2 })),
+  ]) {
+    assert.throws(() => validateLaunchInfo(metadata), /unsupported founder recipe/);
+  }
+});
+
 test("malformed metadata cannot round seeds or claim a different continuation contract", () => {
   for (const metadata of [null, [], {}, browserRecipe({ semantics: "saved_owner_continuation" }),
     browserRecipe({ shareable: "true" }), browserRecipe({ seed: 9007199254740992 }),
